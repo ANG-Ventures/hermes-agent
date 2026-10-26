@@ -44,6 +44,29 @@ SHELL_RE = re.compile(r"(?<![/\w])kanban\s+(?:--board\s+\S+\s+)?(create|promote|
 SUPPRESS = "# kanban-identity: ok"
 
 
+# Raw-text prefilter for a STRING CONSTANT the AST check looks for. The decoded constant need
+# not appear contiguously in the source: Python joins adjacent literals (``"kan" "" "ban"``),
+# drops a backslash-newline inside a literal and decodes escapes (``"\x6bill"``). ``_spelled``
+# builds a pattern for every such spelling: each character may be itself or an escape that can
+# decode to it, and between characters any run of literal joints (quote, gap, optional prefix,
+# quote) or continuations. A superset: a match only means "parse it" (Prism 675e33503531,
+# 10b55641b9b8, 3c7e1b72c0b1; t_44dcc531).
+_JOINT = r"""(?:['"]{1,3}(?:[ \t\f\r\n()]|\\(?:\r\n?|\n)|#[^\r\n]*)*[rRbBuUfF]{0,2}['"]{1,3}|\\(?:\r\n?|\n))*"""
+
+
+def _spelled(word: str) -> str:
+    parts = []
+    for ch in word:
+        o = ord(ch)
+        escapes = r"\\(?:x(?i:%02x)|u(?i:%04x)|U(?i:%08x)|0{0,2}%o|N\{[^}]*\})" % (o, o, o, o)
+        parts.append("(?:%s|%s)" % (re.escape(ch), escapes))
+    return _JOINT.join(parts)
+
+
+_KANBAN_TEXT = re.compile(_spelled("kanban"))
+_VERB_TEXT = re.compile("|".join(_spelled(v) for v in sorted(VERBS)))
+
+
 def _func_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Attribute):
         return node.attr
@@ -131,6 +154,10 @@ def _requests_fixture(fn: ast.AST) -> bool:
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
+    if not (_KANBAN_TEXT.search(src) and _VERB_TEXT.search(src)):
+        # Every spawn shape spells "kanban" and a verb in a string constant (argv token,
+        # helper argument or shell string). Skips the parse of most of tests/ (t_44dcc531).
+        return []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # other files' invalid-escape Syntax/DeprecationWarnings
         tree = ast.parse(src, filename=filename)
@@ -280,7 +307,7 @@ def check_sandbox_disarm(src: str, filename: str = "<src>") -> list[str]:
 def check_conftest_sandbox(conftest: Path) -> list[str]:
     """tests/conftest.py must set the sandbox flag inside an autouse fixture."""
     try:
-        tree = ast.parse(conftest.read_text(encoding="utf-8"))
+        tree = ast.parse(conftest.read_text(encoding="utf-8-sig"))
     except (OSError, SyntaxError) as exc:
         return [f"{conftest}: unreadable: {exc}"]
     for fn in ast.walk(tree):
@@ -311,7 +338,7 @@ def main(argv: list[str]) -> int:
         problems.extend(check_conftest_sandbox(ROOT / "tests" / "conftest.py"))
     for f in files:
         try:
-            src = f.read_text(encoding="utf-8")
+            src = f.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             continue
         try:

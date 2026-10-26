@@ -1,6 +1,7 @@
 {"ts": 1792378870.0, "content": "\u2705 t_5m0ce001 completed [auto-handling\u2026]"}
-{"ts": 1792378900.0, "content": "[auto-handled] t_5m0ce001 \u2014 Verified evidence; card closed."}
+{"ts": 1792378900.0, "content": "[boomerang-wake] t_5m0ce001 \u2014 Verified evidence; card closed."}
 {"ts": 1792378901.0, "content": "\u23f8\ufe0f t_5m0ce002 blocked (needs_input): bv2 smoke: forced needs_input event"}
-{"ts": 1792378930.0, "content": "\u26a0\ufe0f auto-handle failed t_5m0ce003: write refused: state moved"}
-{"ts": 1792379140.0, "content": "[auto-handled] t_5m0ce004 - Verified evidence (summary mode)."}
-{"ts": 1792379770.0, "content": "\u26a0\ufe0f auto-handle lost t_5m0ce007 (reason: gateway restart)"}
+{"ts": 1792378930.0, "content": "\u26a0\ufe0f boomerang-wake failed t_5m0ce003: write refused: state moved"}
+{"ts": 1792379140.0, "content": "[boomerang-wake] t_5m0ce004 - Verified evidence (summary mode)."}
+{"ts": 1792379910.0, "content": "[boomerang-wake] t_5m0ce007 \u2014 Verified evidence after the restart; card closed."}
+{"ts": 1792380070.0, "content": "\u26a0\ufe0f boomerang-wake lost t_5m0ce008 (reason: gateway restart, retry spent)"}

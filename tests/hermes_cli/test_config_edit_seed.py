@@ -53,6 +53,8 @@ def _doctor_fix(tmp_path, monkeypatch, cfg):
     home = cfg.get_hermes_home()
     monkeypatch.setattr(doctor, "HERMES_HOME", home)
     monkeypatch.setattr(doctor, "PROJECT_ROOT", root)
+    # The 0600 check below is the host policy; a containerised CI runner skips the chmod by design.
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
     assert _check_config_file(True).fixed == 1
     if os.name == "posix":
         assert (home / "config.yaml").stat().st_mode & 0o777 == 0o600

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -261,8 +262,10 @@ def test_utilization_take_places_on_a_measured_pool_host(home):
 
 def test_vendored_placement_matches_canonical():
     """Cross-repo contract (like scripts/tests/test_ci_placement_ledger_adapter.py): the
-    vendored module equals hermes-home's scripts/lib/placement.py except the header note,
-    fleet_root() and the PLW1514 encodings. Skipped where no hermes-home checkout exists (CI)."""
+    vendored module equals hermes-home's scripts/lib/placement.py except the VENDORED header
+    paragraph, fleet_root() and the fork's encodings (utf-8-sig reads, encoding= on writes, the
+    footgun marker). PLACEMENT_CANONICAL names the canonical file; CI's tests.yml sets it from the
+    runners' hermes-home mirror. Skipped where neither exists (hosted runners, a bare dev box)."""
     # The suite's home-io guard forbids reading the real ~/.hermes, so the canonical
     # file is named explicitly: PLACEMENT_CANONICAL=<hermes-home>/scripts/lib/placement.py.
     env = os.environ.get("PLACEMENT_CANONICAL")
@@ -271,14 +274,37 @@ def test_vendored_placement_matches_canonical():
     src = Path(env)
     ours = Path(placement.__file__).read_text(encoding="utf-8")
     theirs = src.read_text(encoding="utf-8")
+    assert "\nVENDORED from hermes-home" in ours and "\nVENDORED from" not in theirs
+    assert _parity_body(ours) == _parity_body(theirs)
 
-    def body(text: str) -> str:
-        head, _, rest = text.partition("\nTHE RULE")
-        start = rest.index("def fleet_root()")
-        end = rest.index("def _num(")
-        return (rest[:start] + rest[end:]).replace(', encoding="utf-8")', ")")
 
-    assert body(ours) == body(theirs)
+def _parity_body(text: str) -> str:
+    """Normalise a placement.py for the parity test. utf-8-sig is tolerated on READS only
+    (``read_text(encoding="utf-8-sig")``): a WRITE with utf-8-sig emits a BOM that
+    hermes-home's strict utf-8 reader refuses, so it must stay a difference (t_9d6298ff)."""
+    head, sep, rest = text.partition("\nVENDORED from hermes-home")
+    if sep:                                       # drop the header paragraph (up to its blank line)
+        text = head + rest[rest.index("\n\n") + 1:]
+    start, end = text.index("def fleet_root()"), text.index("def _num(")
+    text = text[:start] + text[end:]
+    text = re.sub(r"  # windows-footgun: ok\b.*", "", text)
+    text = text.replace('read_text(encoding="utf-8-sig")', 'read_text(encoding="utf-8")')
+    return text.replace(', encoding="utf-8")', ")")
+
+
+def test_parity_normaliser_keeps_a_bom_write_and_tolerates_a_bom_read():
+    """Negative arm of the parity test, runnable without PLACEMENT_CANONICAL: a vendored copy
+    whose ledger write gains utf-8-sig (desk t_4ee9c117 mut2) must NOT normalise equal, while
+    the fork's utf-8-sig read stays tolerated."""
+    ours = Path(placement.__file__).read_text(encoding="utf-8")
+    write = 'with os.fdopen(fd, "w", encoding="utf-8") as fh:'
+    assert ours.count(write) == 1
+    mut2 = ours.replace(write, 'with os.fdopen(fd, "w", encoding="utf-8-sig") as fh:')
+    assert _parity_body(mut2) != _parity_body(ours)
+    read = 'read_text(encoding="utf-8-sig")'
+    assert read in ours
+    plain_reads = ours.replace(read, 'read_text(encoding="utf-8")')
+    assert _parity_body(plain_reads) == _parity_body(ours)
 
 
 # -- Prism round 1 on #1941 --------------------------------------------------
@@ -540,7 +566,7 @@ def test_live_run_reservation_is_renewed_past_the_admission_ttl(home):
     assert b.renew_reservations(now=later) == {"renewed": 2, "lapsed": 0, "reaped": 0}
     past = now + kh.RESERVE_TTL_S + 600                  # well past the original TTL
     assert set(placement.live_reservations(ledger, now=past)) == {"ci-box"}
-    assert placement.live_slots("kanban", ledger, now=past)["ci-box"] == 2
+    assert placement.live_admissions("kanban", ledger, now=past)["ci-box"] == 2
     assert b.renew_reservations(now=later + 1) is None   # not due yet
     # Without renewal both rows would lapse; a lapsed row of a live run is a leak.
     with kb.connect_closing() as conn:
@@ -595,7 +621,7 @@ _BAD_CLOCKS = [float("nan"), float("inf"), float("-inf")]
 
 
 @pytest.mark.parametrize("bad", _BAD_CLOCKS)
-@pytest.mark.parametrize("call", ["release", "renew", "reserve", "live_reservations", "live_slots"])
+@pytest.mark.parametrize("call", ["release", "renew", "reserve", "live_reservations", "live_admissions"])
 def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, call, bad):
     """``release(now=nan)`` read every row as expired and rewrote the ledger
     EMPTY, even for an unknown id; the same clock made live rows vanish from
@@ -611,12 +637,12 @@ def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, call, bad):
         "reserve": lambda: placement.reserve("ci-box", "kanban", placement.Footprint(3, 2), ttl_s=600,
                                              path=led, now=bad, admissions_path=tmp_path / "a.jsonl"),
         "live_reservations": lambda: placement.live_reservations(led, now=bad),
-        "live_slots": lambda: placement.live_slots("kanban", led, now=bad),
+        "live_admissions": lambda: placement.live_admissions("kanban", led, now=bad),
     }
     with pytest.raises(placement.PlacementError, match="now must be a finite"):
         calls[call]()
     assert led.read_bytes() == before
-    assert placement.live_slots("kanban", led, now=T0 + 1) == {"ci-box": 1}
+    assert placement.live_admissions("kanban", led, now=T0 + 1) == {"ci-box": 1}
 
 
 @pytest.mark.parametrize("bad", _BAD_CLOCKS)
@@ -673,3 +699,58 @@ def test_dispatch_books_the_assignees_profile_class(home):
     booked = {r["job_id"]: r["ram_gb"] for r in rows}
     assert booked.get(a) == 7.5
     assert b not in booked or booked[b] == TABLE["footprints"]["kanban"]["ram_gb"]
+
+
+# -- Prism post-merge on #2101 (t_bc197d33) ---------------------------------
+
+@pytest.mark.parametrize("text", [
+    "kanban:\n  admission: utilization\n",
+    "kanban:\n    admission: utilization\n",                       # 4-space indent (Prism 7ca95688be5a)
+    "kanban: {admission: utilization}\n",                        # flow style
+    "kanban: {dispatch_load_gate: {enabled: true}, admission: 'utilization'}  # c\n",
+])
+def test_admission_mode_reads_any_yaml_layout(tmp_path, text):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(text, encoding="utf-8")
+    assert placement.admission_mode(cfg) == "utilization"
+
+
+def test_admission_mode_unknown_value_is_legacy_quietly(tmp_path, capsys):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("kanban:\n  admission: turbo\n", encoding="utf-8")
+    assert placement.admission_mode(cfg) == "legacy"
+    assert capsys.readouterr().err == ""
+
+
+def test_admission_mode_parse_failure_is_legacy_and_loud(tmp_path, capsys):
+    """Prism 7ca95688be5a: a config.yaml that does not parse reads legacy, and says so on stderr."""
+    pytest.importorskip("yaml")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("kanban:\n  admission: utilization\n bad: [\n", encoding="utf-8")
+    assert placement.admission_mode(cfg) == "legacy"
+    err = capsys.readouterr().err
+    assert "kanban.admission" in err and "does not parse" in err and str(cfg) in err
+
+
+_USAGE_ROW = {"id": "r1", "host": "ace-ai", "consumer": "kanban", "threads": 2, "ram_gb": 4, "gpu_mb": 0,
+              "job_id": "t_1"}
+
+
+@pytest.mark.parametrize("row, actual", [
+    (_USAGE_ROW, {"ram_gb": 12}),                                  # Prism dd0cbea04139: cpus unmeasured
+    (_USAGE_ROW, {"cpus": 1.5}),                                   # ram unmeasured
+    (dict(_USAGE_ROW, gpu_mb=8000), {"cpus": 1.5, "ram_gb": 12}),  # the lease estimates gpu; gpu unmeasured
+])
+def test_partial_actual_leaves_class_history_unchanged(tmp_path, capsys, row, actual):
+    usage = tmp_path / "class-usage.jsonl"
+    assert placement.record_usage(row, actual, now=T0, path=usage) is None
+    assert not usage.exists()
+    assert "class usage not recorded for r1" in capsys.readouterr().err
+
+
+def test_full_actual_is_recorded(tmp_path):
+    usage = tmp_path / "class-usage.jsonl"
+    row = dict(_USAGE_ROW, gpu_mb=8000)
+    got = placement.record_usage(row, {"cpus": 1.5, "ram_gb": 12, "gpu_mib": 6000}, now=T0, path=usage)
+    assert got is not None and (got["cpus"], got["ram_gb"], got["gpu_mib"]) == (1.5, 12.0, 6000.0)
+    assert len(usage.read_text(encoding="utf-8").splitlines()) == 1

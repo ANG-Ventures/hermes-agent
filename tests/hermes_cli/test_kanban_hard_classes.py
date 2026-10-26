@@ -49,7 +49,10 @@ def home(tmp_path, monkeypatch):
     d.mkdir()
     for f in (khc.MAP_FILE, khc.INDEX_FILE):
         shutil.copy(FIXTURES / f, d / f)
-    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"capabilities": "enforce"}})
+    # These pin AC-5's identity-only hold for a body-sniffed docker card, which
+    # is now the `body_requires_mode: enforce` kill switch (t_640a4ea0).
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {
+        "capabilities": "enforce", "body_requires_mode": "enforce"}})
     return h
 
 

@@ -522,6 +522,13 @@ class GatewayAgentCacheMixin:
         Settles a pending one-shot model override first: the displaced turn's finalizer is
         generation-guarded and would otherwise leave ``/moa`` / ``/model --once`` in force."""
         self._restore_pending_one_turn_model_override(session_key)
+        persistent = self._session_state(session_key).persistent
+        # Every generation up to the one in flight is now "stopped and draining"; record it BEFORE
+        # the bump so the turn-lease stale test (``_is_session_run_invalidated``) can tell this
+        # apart from a generation merely superseded by a later inbound (t_d659b247).
+        persistent.invalidated_run_generation = max(
+            int(persistent.invalidated_run_generation), int(persistent.run_generation),
+        )
         generation = self._begin_session_run_generation(session_key)
         if reason:
             logger.info("Invalidated run generation for %s → %d (%s)", session_key, generation, reason)
@@ -537,6 +544,38 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return True
         return self._current_session_run_generation(session_key) == int(generation)
+
+    def _is_session_run_invalidated(self, session_key: str, generation: int) -> bool:
+        """True when ``generation`` was explicitly invalidated (/stop, /new, reset, eviction) for
+        ``session_key`` — NOT merely superseded by a later inbound's ``_begin_session_run_generation``.
+        The turn-lease registry's stale-holder test (t_d659b247): a superseded holder is a live
+        turn still flushing; only an invalidated one is a zombie worth the short wait."""
+        if not session_key:
+            return False
+        state = self._peek_session_state(session_key)
+        if state is None:
+            return False
+        return int(generation) <= int(state.persistent.invalidated_run_generation)
+
+    def _holds_unreleased_turn_lease(self, session_key: str) -> bool:
+        """True while ``session_key`` still holds a turn-lease token the registry recognises as the
+        current holder — the window between ``_run_agent``'s slot release and ``_handle_message``'s
+        lease release (persist + deliver). An inbound in that window must take the busy path, never
+        a fresh dispatch (t_d659b247). getattr-guarded: bare ``object.__new__`` runners."""
+        if not session_key:
+            return False
+        registry = getattr(self, "_turn_leases", None)
+        state = self._peek_session_state(session_key)
+        if registry is None or state is None:
+            return False
+        try:
+            return any(
+                not getattr(token, "released", False) and registry.is_holder(token)
+                for token in list(state.turn.lease_tokens.values())
+            )
+        except Exception:
+            logger.debug("turn lease hold check failed for %s", session_key, exc_info=True)
+            return False
 
     def _bind_adapter_run_generation(self, adapter: Any, session_key: str, generation: int | None) -> None:
         """Bind a gateway run generation to the adapter's active-session event."""
@@ -1140,6 +1179,11 @@ class GatewayAgentCacheMixin:
         # this eviction frees. Pressure-evictable agents have flushed by definition, so it's populated.
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = None
+
+    def _cached_agent_count(self) -> int:
+        """Live entries in the agent cache. Read lock-free by the runtime-status writer thread's
+        lcm_db_fds gauge (``len`` of an OrderedDict is atomic under the GIL)."""
+        return len(getattr(self, "_agent_cache", None) or ())
 
     def _agent_cache_bounds(self):
         """Operator-configured agent-cache bounds, resolved once per process (lazily, not in

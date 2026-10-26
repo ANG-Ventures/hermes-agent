@@ -4710,8 +4710,11 @@ class GatewayRunner(
         self._turn_leases = SessionTurnLeaseRegistry(
             # Lets acquire() tell a genuinely-live alias-key holder apart from a /stop'd turn still
             # draining a tool call; without it the registry blames alias routing keys for every wait
-            # and the zombie case is invisible (2026-09-20 incident).
+            # and the zombie case is invisible (2026-09-20 incident). Staleness is INVALIDATION
+            # (/stop, /new, reset, eviction), not mere non-currency: a holder superseded by a later
+            # inbound's generation bump is a live turn still flushing (t_d659b247, 2026-10-24).
             is_generation_current=self._is_session_run_current,
+            is_generation_invalidated=self._is_session_run_invalidated,
             stale_wait=_float_env("HERMES_STALE_LEASE_WAIT", DEFAULT_STALE_LEASE_WAIT),
         )
         # Stall-notified keys clear when pending clears / activity resumes / conversation boundary.
@@ -4784,6 +4787,9 @@ class GatewayRunner(
         # Value: (AIAgent, config_signature); LRU cap in _enforce_agent_cache_cap, TTL in expiry watcher.
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = threading.Lock()
+        with suppress(Exception):  # lcm_db_fds gauge denominator (t_0d987578)
+            from gateway.status import set_cached_agents_source
+            set_cached_agents_source(self._cached_agent_count)
         # Launch-time identity of the profile that owns ``self.adapters``; ``_authorization_adapter``
         # compares against this rather than the per-turn ``_active_profile_name()``. A multiplex
         # host's primary map is always the default profile, even when a named profile launched
@@ -6015,6 +6021,10 @@ class GatewayRunner(
                         current_boot_id=boot_id,
                         profile_home=profile_home,
                     )
+                    # Kanban-runtime units outlive the gateway: observe each running one so
+                    # active_count / has_live_for_session / /stop see it (spec §5.4 Boot).
+                    from tools.async_delegation_kanban import observe_running
+                    observe_running(profile_home, boot_id)
             except Exception:
                 logger.error(
                     "Async delegation recovery failed for profile=%s home=%s",

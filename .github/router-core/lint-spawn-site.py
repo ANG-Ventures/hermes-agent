@@ -12,6 +12,9 @@ SPAWN SITE (one per (file, enclosing function, kind); a function with three ssh 
   ssh             subprocess run/Popen/call/check_*/os.system/asyncio.create_subprocess_* whose argv starts
                   with ssh (a literal, a `*ssh*` helper call or name, `ssh_cmd() + [...]`), or a shell line
                   running ssh. A literal non-fleet target (github.com, localhost, 127.0.0.1) is not a spawn.
+                  A call through a parameter or local bound to one of those (`run=subprocess.run` default,
+                  `r = subprocess.run`, `functools.partial(subprocess.run, ...)`, inherited by nested functions)
+                  is that call; a parameter with no such default (a test fake) is not.
   docker-run      `docker run` / `docker container run` (argv or shell), INCLUDING a `docker run` script handed
                   to a `*ssh*` helper in the same function (the ci_runner_pool.start shape)
   systemd-run     systemd-run
@@ -62,6 +65,9 @@ import tempfile
 import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from scan_scope import is_live_source  # noqa: E402  scripts/retired/ + scripts/attic/: not live source
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_ROOT = HERE.parent
@@ -128,7 +134,7 @@ def scan_files(root: Path, strict: bool = False) -> list[str]:
         tracked = [str(Path(dp, n).relative_to(root)) for dp, _, ns in os.walk(root) for n in ns]
     out = []
     for f in sorted(tracked):
-        if EXCLUDE.search(f):
+        if EXCLUDE.search(f) or not is_live_source(f):
             continue
         if f.endswith(SCAN_EXT):
             out.append(f)
@@ -201,6 +207,70 @@ def _is_subprocess_call(call: ast.Call, bare: frozenset = frozenset()) -> bool:
                                              "create_subprocess_shell") or f.id in bare):
         return True
     return False
+
+
+def _is_partial(call) -> bool:
+    return isinstance(call, ast.Call) and _name(call.func) == "partial" and bool(call.args)
+
+
+def _runner_ref(node, bare: frozenset, known: dict):
+    """(subprocess ref, baked positional args) when ``node`` evaluates to a subprocess callable: `subprocess.run`,
+    a bare-imported `run`, a name already bound to one in ``known``, or `functools.partial(<one of those>, *args)`
+    (t_c59fff64: `def collect_remote(host, log_dir, run=subprocess.run)` spawned ssh through `run(...)` unseen).
+    None for anything else. AST only: nothing is evaluated."""
+    if isinstance(node, ast.Name) and node.id in known:
+        return known[node.id]
+    if isinstance(node, (ast.Name, ast.Attribute)) and \
+            _is_subprocess_call(ast.Call(func=node, args=[], keywords=[]), bare):
+        return node, []
+    if _is_partial(node):
+        inner = _runner_ref(node.args[0], bare, known)
+        if inner is not None:
+            return inner[0], [*inner[1], *node.args[1:]]
+    return None
+
+
+def _scope_runners(node, body: list, bare: frozenset, inherited: dict) -> dict:
+    """name -> (subprocess ref, baked args) for the callables a scope reaches subprocess through: a parameter whose
+    DEFAULT is one, a local `x = <one>` / `x = partial(<one>, ..)`, or an enclosing scope's binding not shadowed
+    here. A parameter with no default (or another default) shadows the enclosing binding: a test fake `run` is not
+    a spawn. A local rebinding to something else shadows only when no assignment in the scope binds a runner
+    (may: one path through subprocess is enough)."""
+    known = dict(inherited)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        a = node.args
+        pos = [*a.posonlyargs, *a.args]
+        defaults = [None] * (len(pos) - len(a.defaults)) + list(a.defaults)
+        for arg, d in [*zip(pos, defaults), *zip(a.kwonlyargs, a.kw_defaults)]:
+            ref = _runner_ref(d, bare, inherited) if d is not None else None   # defaults run in the enclosing scope
+            if ref is not None:
+                known[arg.arg] = ref
+            else:
+                known.pop(arg.arg, None)
+        for x in (a.vararg, a.kwarg):
+            if x is not None:
+                known.pop(x.arg, None)
+    assigns = []
+    for st in body:
+        for n in [st, *_walk_own(st)]:
+            if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                    if isinstance(t, ast.Name):
+                        assigns.append((t.id, n.value))
+    bound: set[str] = set()
+    for _ in range(4):   # alias chains (`r = run; rr = partial(r, ..)`) resolve in any source order
+        grew = False
+        for nm, v in assigns:
+            ref = _runner_ref(v, bare, known)
+            if ref is not None and nm not in bound:
+                known[nm], grew = ref, True
+                bound.add(nm)
+        if not grew:
+            break
+    for nm, _ in assigns:
+        if nm not in bound:
+            known.pop(nm, None)
+    return known
 
 
 def _call_argv(call: ast.Call) -> list:
@@ -519,6 +589,35 @@ def _apply_assign(st: _St, n) -> None:
             st.env |= {t.id for t in ast.walk(tg.value) if isinstance(t, ast.Name)}
 
 
+def _loop_bind(target, it, st: _St):
+    """The facts a `for` target can hold on any pass: the join, over the elements of an explicit literal iterable,
+    of assigning each element to the target (`for cmd in [cmd]`, `for i, cmd in [(1, ['ssh', ..])]`, Prism
+    9660245e676f). None when the elements are not known (a name, a call, a starred element, an empty literal):
+    the target is then dropped. The iterable runs once, at entry, so its elements are judged in the entry state."""
+    if not isinstance(it, (ast.List, ast.Tuple, ast.Set)) or not it.elts \
+            or any(isinstance(e, ast.Starred) for e in it.elts):
+        return None
+    out = None
+    for e in it.elts[:16]:
+        s2 = st.copy()
+        _apply_assign(s2, ast.Assign(targets=[target], value=e))
+        out = s2 if out is None else out.join(s2)
+    return out
+
+
+def _rebind_from(st: _St, names, bound) -> None:
+    """Rebind ``names`` to their facts in ``bound`` (a _loop_bind result), or drop them when bound is None."""
+    _drop(st, names)
+    if bound is None:
+        return
+    for nm in names:
+        if bound.argv.get(nm):
+            st.argv[nm] = set(bound.argv[nm])
+    for fact in ("docker", "mint", "admit", "env"):
+        getattr(st, fact).update(names & getattr(bound, fact))
+    st.alias |= {a for a in bound.alias if a & names}
+
+
 def _apply_mutation(st: _St, call: ast.Call, may: bool = False) -> None:
     """`env.pop("ALLOC_RESERVATION")` / `env.clear()` remove the reservation; `env.update(ALLOC_RESERVATION=..)` /
     `env.setdefault("ALLOC_RESERVATION", ..)` add it; `cmd.extend([..])` / `cmd.append(x)` grow a bound argv.
@@ -642,7 +741,11 @@ def _gated(call: ast.Call, st: _St) -> bool:
     return bool(PY_LITERAL_GATE.search(_all_text(call)))
 
 
-def _classify_call(n: ast.Call, st: _St, bare: frozenset) -> str | None:
+def _classify_call(n: ast.Call, st: _St, bare: frozenset, runners: dict | None = None) -> str | None:
+    if runners and isinstance(n.func, ast.Name) and n.func.id in runners:
+        # a call through an injected/aliased runner IS that subprocess call; a partial's baked args lead the argv
+        ref, baked = runners[n.func.id]
+        n = ast.Call(func=ref, args=[*baked, *n.args], keywords=n.keywords)
     argv = _call_argv(n) if _is_subprocess_call(n, bare) else []
     if argv:
         if len(argv) == 1:
@@ -678,8 +781,9 @@ class _Flow:
     in a loop body reaches an earlier call through the backedge). Each call's verdict is merged over every visit:
     its kind is the union of what any visit saw, it is gated only if EVERY visit saw it gated."""
 
-    def __init__(self, bare: frozenset):
+    def __init__(self, bare: frozenset, runners: dict | None = None):
         self.bare = bare
+        self.runners = runners or {}
         self.hits: dict[int, list] = {}   # id(call) -> [call, kinds, gated]
         self.raises: list[list] = []      # one [joined state] per enclosing try body: its potential raise points
 
@@ -691,7 +795,7 @@ class _Flow:
     def _visit(self, calls, st: _St) -> None:
         for c, may in calls:
             self._raise_point(st)   # a call can raise before its own effects
-            k = _classify_call(c, st, self.bare)
+            k = _classify_call(c, st, self.bare, self.runners)
             h = self.hits.setdefault(id(c), [c, set(), True])
             if k:
                 h[1].add(k)
@@ -716,11 +820,15 @@ class _Flow:
         if isinstance(s, (ast.For, ast.AsyncFor, ast.While)):
             loop_test = s.test if isinstance(s, ast.While) else None
             self._visit(_calls_in(s.iter if loop_test is None else loop_test), st)
+            # the target binds one element per pass (from the iterable as built at entry); calls inside the target
+            # (`for out[run([...])] in xs`) run on every pass (Prism 9660245e676f)
+            bound = _loop_bind(s.target, s.iter, st) if loop_test is None else None
             cur = st
             for _ in range(8):   # fixpoint over the backedge
                 body_in = cur.copy()
                 if loop_test is None:
-                    _drop(body_in, _rebound([s.target]))
+                    self._visit(_calls_in(s.target), body_in)
+                    _rebind_from(body_in, _rebound([s.target]), bound)
                 after = self.block(s.body, body_in)
                 if loop_test is not None:   # a while condition runs again after every pass (Prism cec4be516dc4)
                     self._visit(_calls_in(loop_test), after)
@@ -757,6 +865,7 @@ class _Flow:
             for it in s.items:
                 self._visit(_calls_in(it.context_expr), st)
                 if it.optional_vars is not None:
+                    self._visit(_calls_in(it.optional_vars), st)   # `with cm as out[run([...])]`
                     _drop(st, _rebound([it.optional_vars]))
             return self.block(s.body, st)
         if isinstance(s, getattr(ast, "Match", ())):
@@ -775,6 +884,8 @@ class _Flow:
             return st
         if isinstance(s, ast.Delete):
             for t in s.targets:
+                # a target's subexpressions run before its deletion (`del out[run([...])]`, Prism 2060cd33d39f)
+                self._visit(_calls_in(t), st)
                 if isinstance(t, ast.Name):
                     _drop(st, {t.id})
                 elif isinstance(t, ast.Subscript) and "ALLOC_RESERVATION" in _all_text(t.slice):
@@ -798,24 +909,29 @@ def py_sites(path: str, text: str) -> list[tuple[str, str, int, bool]]:
                      and n.module in ("subprocess", "os", "asyncio") for a in n.names if a.name in BARE_SUBP | OS_ATTR
                      | ASYNC_ATTR)
 
-    def collect(node, prefix):
-        # every function, class body and lambda is its own scope (none inherits another's admission facts)
+    runners = {id(tree): _scope_runners(tree, tree.body, bare, {})}
+
+    def collect(node, prefix, outer):
+        # every function, class body and lambda is its own scope (none inherits another's admission facts).
+        # Runner bindings (t_c59fff64) follow Python's lexical rule: a function sees its enclosing functions'
+        # names and the module's, never a class body's.
         for ch in ast.iter_child_nodes(node):
-            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                q = f"{prefix}.{ch.name}" if prefix else ch.name
-                scopes.append(_PyScope(q, ch, ch.body))
-                collect(ch, q)
-            elif isinstance(ch, ast.Lambda):
-                q = f"{prefix}.<lambda>" if prefix else "<lambda>"
-                scopes.append(_PyScope(q, ch, [ast.Expr(ch.body)]))
-                collect(ch, q)
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                lam = isinstance(ch, ast.Lambda)
+                q = (f"{prefix}.<lambda>" if prefix else "<lambda>") if lam else \
+                    (f"{prefix}.{ch.name}" if prefix else ch.name)
+                body = [ast.Expr(ch.body)] if lam else ch.body
+                mine = _scope_runners(ch, body, bare, outer)
+                runners[id(ch)] = mine
+                scopes.append(_PyScope(q, ch, body))
+                collect(ch, q, outer if isinstance(ch, ast.ClassDef) else mine)
             else:
-                collect(ch, prefix)
-    collect(tree, "")
+                collect(ch, prefix, outer)
+    collect(tree, "", runners[id(tree)])
     out = []
     module_argv: dict = {}
     for sc in scopes:
-        fl = _Flow(bare)
+        fl = _Flow(bare, runners.get(id(sc.node)))
         end = fl.block(sc.body, _St(module_argv))
         if sc is scopes[0]:   # module-level argv constants (BASE = ["ssh", ...]) are visible everywhere;
             module_argv = end.argv   # admission facts are never shared between scopes
@@ -1194,8 +1310,8 @@ def differential(roots, base_ref: str) -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------- selftest
-UNGATED_DOCKER = "#!/bin/bash\nstart() {\n  ssh ci-box 'docker run -d --rm runner:latest'\n}\n"
-GATED_DOCKER = ("#!/bin/bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci --job \"$1\")\n"
+UNGATED_DOCKER = "#!/usr/bin/env bash\nstart() {\n  ssh ci-box 'docker run -d --rm runner:latest'\n}\n"
+GATED_DOCKER = ("#!/usr/bin/env bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci --job \"$1\")\n"
                 "  ssh ci-box \"ALLOC_RESERVATION=$ALLOC_RESERVATION docker run -d --rm runner:latest\"\n}\n")
 UNGATED_PY_SSH = "import subprocess\n\ndef go(h):\n    subprocess.run(['ssh', '-o', 'BatchMode=yes', h, 'make test'])\n"
 # Prism 10dea09c29d3: a bare MENTION of the reservation (here: removing it) is not proof of gating
@@ -1205,8 +1321,8 @@ PR2_DICT_ENV = ("import subprocess\nimport alloc_client\n\ndef go(job):\n    d, 
 # Prism r3 208bec3a985c: a string VALUE naming the reservation does not make the dict a reservation env
 PR3_NOTE_DICT = "import subprocess\n\ndef go(h):\n    env = {'NOTE': 'ALLOC_RESERVATION'}\n    subprocess.run(['ssh', h, 'job'], env=env)\n"
 # Prism r3 d65c1a6e74e9: an admit AFTER the spawn on the same line does not gate it
-PR3_LATE_ADMIT_SH = "#!/bin/bash\nssh fleet-box job; ALLOC_RESERVATION=$(alloc-admit --consumer ci --job x)\n"
-PR3_PREFIX_ADMIT_SH = "#!/bin/bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) ssh fleet-box job\n"
+PR3_LATE_ADMIT_SH = "#!/usr/bin/env bash\nssh fleet-box job; ALLOC_RESERVATION=$(alloc-admit --consumer ci --job x)\n"
+PR3_PREFIX_ADMIT_SH = "#!/usr/bin/env bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) ssh fleet-box job\n"
 GATED_PY = ("import os, subprocess\nimport alloc_client\n\ndef go(job):\n"
             "    d, rid = alloc_client.admit('test-gate', job_id=job)\n"
             "    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
@@ -1218,7 +1334,7 @@ POOL_SHAPE = ("import subprocess\n\ndef ssh(alias, script):\n    return run_it(a
               "        script = f\"docker run -d --rm --name {name} img\"\n        ssh(host, script)\n")
 HELPER_SSH = ("import subprocess\nSSH_OPTS=['-o','BatchMode=yes']\n\ndef _ssh_cmd():\n    return ['ssh'] + SSH_OPTS\n\n"
               "def go(h, r):\n    subprocess.Popen(_ssh_cmd() + [h, r])\n")
-NOT_SPAWNS = ("#!/bin/bash\n# ssh ci-box 'docker run x'\necho \"run: ssh ci-box uptime\"\n"
+NOT_SPAWNS = ("#!/usr/bin/env bash\n# ssh ci-box 'docker run x'\necho \"run: ssh ci-box uptime\"\n"
               "git push git@github.com:o/r.git\nssh -T git@github.com\nssh-keygen -t ed25519\n")
 RUNNER_MINT = ("class Gh:\n    def jit(self, name):\n"
                "        args = ['-X', 'POST', f'orgs/{self.org}/actions/runners/generate-jitconfig', '-f', name]\n"
@@ -1232,7 +1348,7 @@ PR1_TWO_MINTS = ("class Gh:\n    def jit(self, a, b):\n"
                  "        self._gh(['-X', 'POST', 'orgs/o/actions/runners/generate-jitconfig', b])\n")
 PR1_CLASS_BODY = "import subprocess\n\nclass Worker:\n    process = subprocess.Popen(['ssh', 'ci-box', 'job'])\n"
 PR1_LAMBDA = "import subprocess\n\ndef mk(h):\n    return lambda: subprocess.run(['ssh', h, 'job'])\n"
-PR1_TWO_ON_LINE = "#!/bin/bash\nstart() {\n  docker run image; docker run another-image\n}\n"
+PR1_TWO_ON_LINE = "#!/usr/bin/env bash\nstart() {\n  docker run image; docker run another-image\n}\n"
 PR1_LOCAL_ARGV = ("import subprocess\n\ndef go(box):\n    cmd = ['ssh', '-o', 'BatchMode=yes', box, 'uptime']\n"
                   "    subprocess.run(cmd, capture_output=True)\n")
 PR1_BARE_RUN = "from subprocess import run\n\ndef go(h):\n    run(['ssh', h, 'job'])\n"
@@ -1243,8 +1359,8 @@ PR1_STARRED = "import subprocess\nBASE = ['ssh', 'ci-box']\n\ndef go():\n    sub
 PR2_LATE_ENV = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os.environ)\n"
                 "    subprocess.run(['ssh', h, 'start'], env=env)\n    env['ALLOC_RESERVATION'] = rid\n")
 PR2_ASYNC = "import asyncio\n\nasync def go():\n    await asyncio.create_subprocess_exec('docker', 'run', 'img')\n"
-PR2_PRINTF_PIPE = "#!/bin/bash\nmint() {\n  printf '%s' \"$JIT\" | ssh ci-box 'docker run --rm runner:latest'\n}\n"
-PR2_ECHO_SUBST = "#!/bin/bash\necho \"up: $(ssh ci-box uptime)\"\n"
+PR2_PRINTF_PIPE = "#!/usr/bin/env bash\nmint() {\n  printf '%s' \"$JIT\" | ssh ci-box 'docker run --rm runner:latest'\n}\n"
+PR2_ECHO_SUBST = "#!/usr/bin/env bash\necho \"up: $(ssh ci-box uptime)\"\n"
 # t_ed9b147b: #4308 Prism r3/r4 residue, one fixture each (RED on the #4308 lint, GREEN-as-RED after)
 PR3_LATE_ARGV = ("import subprocess\n\ndef go():\n    cmd = ['ssh', 'ci-box', 'job']\n    subprocess.run(cmd)\n"
                  "    cmd = ['echo', 'done']\n")
@@ -1256,13 +1372,13 @@ PR3_ENV_COPY_GATED = ("import os, subprocess\nimport alloc_client\n\ndef go(job)
                       "    d, rid = alloc_client.admit('test-gate', job_id=job)\n"
                       "    env = dict(os.environ, ALLOC_RESERVATION=rid)\n    env = dict(env, TERM='dumb')\n"
                       "    subprocess.run(['ssh', d.host, 'make test'], env=env)\n")
-PR3_CONTINUATION = "#!/bin/bash\nstart() {\n  docker \\\n    run --rm runner:latest\n}\n"
-PR3_GATE_AFTER = "#!/bin/bash\nstart() {\n  ssh ci-box job; ALLOC_RESERVATION=$(alloc-admit --consumer ci)\n}\n"
-PR3_GATE_BEFORE = ("#!/bin/bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci); "
+PR3_CONTINUATION = "#!/usr/bin/env bash\nstart() {\n  docker \\\n    run --rm runner:latest\n}\n"
+PR3_GATE_AFTER = "#!/usr/bin/env bash\nstart() {\n  ssh ci-box job; ALLOC_RESERVATION=$(alloc-admit --consumer ci)\n}\n"
+PR3_GATE_BEFORE = ("#!/usr/bin/env bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci); "
                    "ssh ci-box \"ALLOC_RESERVATION=$ALLOC_RESERVATION job\"\n}\n")
 PR3_DOCKER_GLOBAL_PY = ("import subprocess\n\ndef go():\n"
                         "    subprocess.run(['docker', '--host', 'unix:///var/run/docker.sock', 'run', 'image'])\n")
-PR3_DOCKER_GLOBAL_SH = "#!/bin/bash\nstart() {\n  docker --host ssh://ci-box run image\n}\n"
+PR3_DOCKER_GLOBAL_SH = "#!/usr/bin/env bash\nstart() {\n  docker --host ssh://ci-box run image\n}\n"
 # #4330 Prism r1
 PR5_SELECTIVE_COPY = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
                       "    child_env = {'PATH': env['PATH']}\n    subprocess.run(['ssh', h, 'job'], env=child_env)\n")
@@ -1270,18 +1386,18 @@ PR5_SPREAD_COPY_GATED = ("import os, subprocess\n\ndef go(h, rid):\n    env = di
                          "    child_env = {**env, 'TERM': 'dumb'}\n    subprocess.run(['ssh', h, 'job'], env=child_env)\n")
 PR5_SELF_CONCAT = ("def go(client):\n    script = 'docker run'\n    script = script + ' --rm image'\n"
                    "    client.ssh(script)\n")
-PR5_HEREDOC_TAIL = "#!/bin/bash\ncat <<'EOF'\nliteral \\\nEOF\nssh ci-box job\n"
-PR5_HEREDOC_UNQUOTED = "#!/bin/bash\nssh ci-box bash <<EOF\ndocker \\\n  run --rm img\nEOF\n"
+PR5_HEREDOC_TAIL = "#!/usr/bin/env bash\ncat <<'EOF'\nliteral \\\nEOF\nssh ci-box job\n"
+PR5_HEREDOC_UNQUOTED = "#!/usr/bin/env bash\nssh ci-box bash <<EOF\ndocker \\\n  run --rm img\nEOF\n"
 # #4330 Prism r2
 PR6_POP = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
            "    child_env = env.copy()\n    child_env.pop('ALLOC_RESERVATION', None)\n"
            "    subprocess.run(['ssh', h, 'job'], env=child_env)\n")
-PR6_BS_SPACE = "#!/bin/bash\necho ready \\ \nssh ci-box job\n"
+PR6_BS_SPACE = "#!/usr/bin/env bash\necho ready \\ \nssh ci-box job\n"
 PR6_LOOP_DOCKER = ("def go(client):\n    script = 'echo ready'\n    for _ in range(2):\n        client.ssh(script)\n"
                    "        script = 'docker run img'\n")
 PR6_LOOP_ARGV = ("import subprocess\n\ndef go():\n    cmd = ['echo', 'ready']\n    for _ in range(2):\n"
                  "        subprocess.run(cmd)\n        cmd = ['ssh', 'ci-box', 'job']\n")
-PR6_SUBST_ONCE = "#!/bin/bash\nOUT=$(ssh -o BatchMode=yes \\\n  ci-box uptime)\n"
+PR6_SUBST_ONCE = "#!/usr/bin/env bash\nOUT=$(ssh -o BatchMode=yes \\\n  ci-box uptime)\n"
 PR6_COND_REBIND = ("def go(client, dry_run):\n    script = 'docker run image'\n    if dry_run:\n"
                    "        script = 'echo skipped'\n    client.ssh(script)\n")
 PR6_COND_GATE = ("import os, subprocess\nimport alloc_client\n\ndef go(h, fast):\n    env = dict(os.environ)\n"
@@ -1301,10 +1417,10 @@ PR7_UPDATE_GATED = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os
                     "    env.update({'ALLOC_RESERVATION': rid})\n    subprocess.run(['ssh', h, 'job'], env=env)\n")
 PR7_INLINE_SELECT = ("import os, subprocess\n\ndef go(rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
                      "    subprocess.run(['docker', 'run', 'img'], env={'PATH': env['PATH']})\n")
-PR7_COMMENT_BS = "#!/bin/bash\nls  # see foo \\\nssh ci-box job\n"
-PR7_QUOTED_HASH_BS = "#!/bin/bash\ndocker --config \"/tmp/#c\" \\\nrun img\n"
-PR7_REPEAT_CMD = "#!/bin/bash\nssh ci-box job;ALLOC_RESERVATION=$(alloc-admit --consumer ci);ssh ci-box job\n"
-PR7_TOKEN_JOIN = "#!/bin/bash\ndocker ru\\\nn --rm image\n"
+PR7_COMMENT_BS = "#!/usr/bin/env bash\nls  # see foo \\\nssh ci-box job\n"
+PR7_QUOTED_HASH_BS = "#!/usr/bin/env bash\ndocker --config \"/tmp/#c\" \\\nrun img\n"
+PR7_REPEAT_CMD = "#!/usr/bin/env bash\nssh ci-box job;ALLOC_RESERVATION=$(alloc-admit --consumer ci);ssh ci-box job\n"
+PR7_TOKEN_JOIN = "#!/usr/bin/env bash\ndocker ru\\\nn --rm image\n"
 # #4330 Apollo r5: discovery must be a superset of main's (every ast.Call is a candidate); MAY facts never gate
 PR8_TARGET_CALL = "import subprocess\n\ndef go(outputs):\n    outputs[subprocess.check_output(['ssh', 'ci-box', 'job'])] = True\n"
 PR8_MATCH_GUARD = ("import subprocess\n\ndef go(a):\n    match a:\n        case 1 if subprocess.run(['ssh', 'ci-box', 'job']):\n"
@@ -1322,11 +1438,11 @@ PR8_DEFAULT_ARG = "import subprocess\n\ndef launch(proc=subprocess.Popen(['ssh',
 PR8_DECORATOR = "import subprocess\n\n@register(subprocess.run(['docker', 'run', 'img']))\ndef go():\n    pass\n"
 PR8_EXTEND = "import subprocess\n\ndef go():\n    cmd = []\n    cmd.extend(['ssh', 'ci-box', 'job'])\n    subprocess.run(cmd)\n"
 PR8_STAR_ECHO = "import asyncio\n\nasync def go():\n    await asyncio.create_subprocess_exec('echo', *['ssh', 'ci-box', 'job'])\n"
-PR9_SUBST_BEFORE_ADMIT = ("#!/bin/bash\nX=$(ssh fleet-box pre) ALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) "
+PR9_SUBST_BEFORE_ADMIT = ("#!/usr/bin/env bash\nX=$(ssh fleet-box pre) ALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) "
                           "ssh fleet-box work\n")
-PR9_SUBST_IN_ADMIT = ("#!/bin/bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job $(ssh fleet-box getjob)) "
+PR9_SUBST_IN_ADMIT = ("#!/usr/bin/env bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job $(ssh fleet-box getjob)) "
                       "ssh fleet-box work\n")
-PR9_SUBST_AFTER_ADMIT = ("#!/bin/bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) Y=$(ssh fleet-box post) "
+PR9_SUBST_AFTER_ADMIT = ("#!/usr/bin/env bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) Y=$(ssh fleet-box post) "
                          "ssh fleet-box work\n")
 PR9_ALIAS_DEL = ("import os, subprocess\n\ndef go(rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n    alias = env\n"
                  "    del env['ALLOC_RESERVATION']\n    subprocess.run(['ssh', 'ci-box', 'job'], env=alias)\n")
@@ -1347,8 +1463,38 @@ PR10_FINALLY_MIDRAISE = ("import os, subprocess\n\ndef go(rid):\n    env = dict(
                          "    try:\n        env.pop('ALLOC_RESERVATION')\n        prepare()\n"
                          "        env['ALLOC_RESERVATION'] = rid\n    finally:\n"
                          "        subprocess.run(['ssh', 'ci-box', 'job'], env=env)\n")
-PR8_SH_CONT_LINE = ("#!/bin/bash\ntick \\\n  --feed-cmd \"ssh ci-box 'cat log'\" \\\n"
+# t_0548c81c: calls inside del/for/with targets run (Prism 2060cd33d39f); a for target binds the elements of an
+# explicit iterable (Prism 9660245e676f)
+PR11_DEL_TARGET = "import subprocess\n\ndef go(outputs):\n    del outputs[subprocess.check_output(['ssh', 'ci-box', 'job'])]\n"
+PR11_FOR_TARGET = ("import subprocess\n\ndef go(out, xs):\n"
+                   "    for out[subprocess.check_output(['ssh', 'ci-box', 'job'])] in xs:\n        pass\n")
+PR11_WITH_TARGET = ("import subprocess\n\ndef go(out, cm):\n"
+                    "    with cm as out[subprocess.check_output(['ssh', 'ci-box', 'job'])]:\n        pass\n")
+PR11_FOR_REUSE = "import subprocess\ncmd = ['ssh', 'ci-box', 'job']\nfor cmd in [cmd]:\n    subprocess.run(cmd)\n"
+PR11_FOR_TUPLE = ("import subprocess\n\ndef go():\n    for i, cmd in [(1, ['echo']), (2, ['ssh', 'ci-box', 'job'])]:\n"
+                  "        subprocess.run(cmd)\n")
+PR11_FOR_ECHO = "import subprocess\n\ndef go():\n    for cmd in [['echo', 'a'], ['true']]:\n        subprocess.run(cmd)\n"
+PR11_FOR_GATED_ONE = ("import os, subprocess\n\ndef go(rid):\n"
+                      "    for env in [dict(os.environ, ALLOC_RESERVATION=rid), dict(os.environ)]:\n"
+                      "        subprocess.run(['ssh', 'ci-box', 'job'], env=env)\n")
+PR8_SH_CONT_LINE = ("#!/usr/bin/env bash\ntick \\\n  --feed-cmd \"ssh ci-box 'cat log'\" \\\n"
                     "  --alerts-cmd \"ssh ci-box 'cscli alerts'\"\n")
+# t_c59fff64: a spawn through an INJECTED runner (`run=subprocess.run` test seam) is that subprocess call
+INJ_DEFAULT = ("import subprocess\n\ndef collect_remote(host, run=subprocess.run):\n    def attempt(*extra):\n"
+               "        return run(['ssh', '-o', 'BatchMode=yes', *extra, host, 'job'], check=True)\n"
+               "    return attempt()\n")
+INJ_DEFAULT_DIRECT = "import subprocess\n\ndef go(h, runner=subprocess.check_output):\n    runner(['ssh', h, 'job'])\n"
+INJ_KWONLY_POPEN = "import subprocess\n\ndef go(h, *, spawn=subprocess.Popen):\n    spawn(['docker', 'run', 'img'])\n"
+INJ_PARTIAL = ("import functools, subprocess\n\ndef go(h):\n    run = functools.partial(subprocess.run, check=True)\n"
+               "    run(['ssh', h, 'job'])\n")
+INJ_PARTIAL_ARGV = ("import subprocess\nfrom functools import partial\nSSH = partial(subprocess.call, ['ssh', 'ci-box', 'job'])\n"
+                    "\ndef go():\n    SSH()\n")
+INJ_LOCAL_ALIAS = "import subprocess\n\ndef go(h):\n    r = subprocess.run\n    r(['ssh', h, 'job'])\n"
+INJ_FAKE_NO_DEFAULT = "def go(h, run):\n    run(['ssh', h, 'job'])\n"
+INJ_FAKE_OTHER_DEFAULT = "def fake(*a, **k):\n    return 0\n\ndef go(h, run=fake):\n    run(['ssh', h, 'job'])\n"
+INJ_SHADOWED = ("import subprocess\n\ndef outer(h, run=subprocess.run):\n    def inner(run):\n"
+                "        run(['ssh', h, 'job'])\n    return inner\n")
+INJ_ECHO = "import subprocess\n\ndef go(run=subprocess.run):\n    run(['echo', 'ssh'])\n"
 PY_NOT = "import subprocess\nsubprocess.run(['ssh-keygen', '-t', 'ed25519'])\nsubprocess.run(['git', 'push'])\n"
 
 
@@ -1481,6 +1627,29 @@ def selftest() -> int:
          {"h.py": PR10_HANDLER_MIDRAISE}, [], 1),
         ("#4330 r7: reservation set before the try reaches the handler -> GREEN", {"h.py": PR10_HANDLER_KEPT}, [], 0),
         ("#4330 r7: pop K; raise; K = rid: finally sees no reservation -> RED", {"f.py": PR10_FINALLY_MIDRAISE}, [], 1),
+        ("t_0548c81c: a spawn inside a del target is found -> RED (2060cd33d39f)", {"d.py": PR11_DEL_TARGET}, [], 1),
+        ("t_0548c81c: a spawn inside a for target is found -> RED", {"f.py": PR11_FOR_TARGET}, [], 1),
+        ("t_0548c81c: a spawn inside a with-as target is found -> RED", {"w.py": PR11_WITH_TARGET}, [], 1),
+        ("t_0548c81c: `for cmd in [cmd]` keeps the ssh argv -> RED (9660245e676f)", {"f.py": PR11_FOR_REUSE}, [], 1),
+        ("t_0548c81c: tuple for target binds each element's argv -> RED", {"f.py": PR11_FOR_TUPLE}, [], 1),
+        ("t_0548c81c: for over echo/true argvs is not a spawn -> GREEN", {"f.py": PR11_FOR_ECHO}, [], 0),
+        ("t_0548c81c: a for env gated on one element only does not gate -> RED", {"g.py": PR11_FOR_GATED_ONE}, [], 1),
+        ("t_c59fff64: ssh via an injected run=subprocess.run in a nested attempt() is RED",
+         {"d.py": INJ_DEFAULT}, [], 1),
+        ("t_c59fff64: the injected-default site is keyed to the nested scope (row for it is GREEN)",
+         {"d.py": INJ_DEFAULT}, [row("d.py", "collect_remote.attempt", "ssh")], 0),
+        ("t_c59fff64: plain subprocess.run ssh stays RED (unchanged)", {"go.py": UNGATED_PY_SSH}, [], 1),
+        ("t_c59fff64: runner=subprocess.check_output default is RED", {"d.py": INJ_DEFAULT_DIRECT}, [], 1),
+        ("t_c59fff64: kw-only spawn=subprocess.Popen docker run is RED", {"k.py": INJ_KWONLY_POPEN}, [], 1),
+        ("t_c59fff64: run = functools.partial(subprocess.run, ..) is RED", {"p.py": INJ_PARTIAL}, [], 1),
+        ("t_c59fff64: partial(subprocess.call, [ssh ..]) bakes the argv -> RED", {"p.py": INJ_PARTIAL_ARGV}, [], 1),
+        ("t_c59fff64: local r = subprocess.run alias is RED", {"a.py": INJ_LOCAL_ALIAS}, [], 1),
+        ("t_c59fff64: a `run` param with no default (test fake) is not a spawn -> GREEN",
+         {"f.py": INJ_FAKE_NO_DEFAULT}, [], 0),
+        ("t_c59fff64: a `run` param defaulting to a non-subprocess fake is not a spawn -> GREEN",
+         {"f.py": INJ_FAKE_OTHER_DEFAULT}, [], 0),
+        ("t_c59fff64: an inner `run` param shadows the outer injected runner -> GREEN", {"s.py": INJ_SHADOWED}, [], 0),
+        ("t_c59fff64: an injected runner running echo is not a spawn -> GREEN", {"e.py": INJ_ECHO}, [], 0),
         ("comments, echo, github.com ssh, ssh-keygen are not spawns", {"n.sh": NOT_SPAWNS, "n.py": PY_NOT}, [], 0),
         ("allowlisted (unexpired) site is GREEN", {"pool.sh": UNGATED_DOCKER}, [row("pool.sh", "start", "docker-run")], 0),
         ("allowlist row past expires is RED", {"pool.sh": UNGATED_DOCKER},

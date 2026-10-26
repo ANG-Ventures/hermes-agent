@@ -71,7 +71,7 @@ def test_cancel_during_batch_receipt_finishes_all_accepted_receipts(
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(exercise())
-    assert _json_outbox_states(tmp_path) == ["delivered"] * len(events)
+    assert _json_outbox_states(tmp_path) == ["admitted"] * len(events)
     assert set(completed) == {event["delegation_id"] for event in events}
     if with_legacy:
         assert all(ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered" for event in events)

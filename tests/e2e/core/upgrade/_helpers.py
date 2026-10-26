@@ -27,6 +27,8 @@ import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from tests._fixtures.bounds import uncapped_argv
+
 WORKTREE = Path(__file__).resolve().parents[4]
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 UID = os.getuid()
@@ -52,6 +54,15 @@ def _bwrap_usable() -> bool:
 
 
 BWRAP_OK = _bwrap_usable()
+
+
+def host_uv() -> str | None:
+    """The host's ``uv`` from PATH, else None (callers skip "uv required").
+
+    Never a fallback into the real ``~/.hermes/bin``: the home-I/O guard refuses that probe
+    mid-test, so a runner without uv on PATH went red instead of skipping (t_04dd8b69).
+    """
+    return shutil.which("uv")
 
 
 def sandbox_required_reason() -> str | None:
@@ -129,7 +140,7 @@ def isolated_env(
     if real_uv_cache.is_dir():
         env["UV_CACHE_DIR"] = str(real_uv_cache)
     base_path = os.environ.get("PATH", "/usr/bin:/bin")
-    uv = shutil.which("uv") or (str(REAL_HOME / ".hermes" / "bin" / "uv") if (REAL_HOME / ".hermes" / "bin" / "uv").exists() else None)
+    uv = host_uv()
     path_parts = [str(shim_dir), *[str(p) for p in extra_path]]
     if uv:
         path_parts.append(str(Path(uv).parent))
@@ -149,10 +160,13 @@ def sandbox_argv(argv: Sequence[str], *, writable: Iterable[Path], unshare_net: 
     hostile-network suites bridge their fakes in); ``ro_binds`` are ``(host_path, sandbox_path)``
     read-only overlays (e.g. a CA bundle over the distro trust store).
     """
+    # The sandboxed program is a whole Hermes install, not code under the test's budget: run it
+    # without the harness's per-process address-space cap (its node builds need one V8 isolate
+    # per worker; t_b56f9e1e). The test process itself stays capped.
     if not BWRAP_OK:
         if unshare_net:
             raise RuntimeError("unshare_net requires the bwrap sandbox")
-        return list(argv)
+        return uncapped_argv(argv)
     # The child's allowlisted PATH may omit the Nix-provided bwrap (notably a login shell
     # with a clean distro PATH); resolve it in the parent before wrapping the command.
     cmd = [shutil.which("bwrap") or "bwrap", "--dev-bind", "/", "/"]
@@ -181,7 +195,7 @@ def sandbox_argv(argv: Sequence[str], *, writable: Iterable[Path], unshare_net: 
     if unshare_net:
         cmd += ["--unshare-net"]
     cmd += ["--unshare-pid", "--proc", "/proc", "--die-with-parent", "--"]
-    return cmd + list(argv)
+    return uncapped_argv(cmd + list(argv))
 
 
 def run(

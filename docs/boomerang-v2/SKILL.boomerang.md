@@ -1,7 +1,7 @@
 ---
 name: boomerang
 description: >-
-  Run a scoped task in a background child agent that INHERITS this conversation — as a true fork (byte-identical prefix, reads the parent's warm cache; default) or a summary fold (fallback) — and folds only a handoff back. Use on /boomerang <task> or "boomerang this", and for auto_handle kanban wakes.
+  Run a scoped task in a background child agent that INHERITS this conversation — as a true fork (byte-identical prefix, reads the parent's warm cache; default) or a summary fold (fallback) — and folds only a handoff back. Use on /boomerang <task> or "boomerang this", and for boomerang-wake kanban cards.
 version: 2.0.0
 platforms: [linux, macos, windows]
 metadata:
@@ -107,7 +107,7 @@ Mode by entry point (spec §5.6):
 | `/boomerang --summary <task>` | `summary` |
 | `/boomerang --fork <task>` ≡ `--branch` | `fork` requested (explicit) |
 | raw `delegate_task(inherit_context=true)` with no `inherit_mode` | `summary` — unchanged from v1 (INV-1) |
-| kanban auto-handle dispatch | `fork` requested; the disposition row may say `summary` (D-6) |
+| kanban boomerang-wake dispatch | `fork` requested; the disposition row may say `summary` (D-6) |
 
 Notes:
 - **Delivery is asynchronous.** The child's handoff re-enters this conversation as a later
@@ -148,32 +148,45 @@ Each is a downgrade to `summary`, not a failure.
 `_cache_ttl`. (apx on `claude-alr` bills 1h unless the seat is in overage — Phase 0, P0.4.)
 **5m-TTL parents never fork, by design** (300 − 300 = 0): forks are for human-paced sessions.
 
-## Auto-handled kanban wakes
+## Boomerang-wake kanban cards
 
-For cards with `auto_handle` on, the gateway sends the wake to a boomerang child instead of
-interrupting the live session, unless the wake needs human judgment.
+A card's subscription level is `notify`, `wake` or `boomerang wake`. At `boomerang wake` the
+gateway sends a mechanical wake to a boomerang child instead of interrupting the live session,
+unless the wake needs human judgment.
 
-- **Default OFF (D-15).** Resolution: `card.auto_handle` (`kanban_create/update auto_handle`)
-  → home session `/autohandle on|off|status` → board default → `false`. Enable by judgment, per
-  card or per session; default-on is revisited only on measured data.
-- **Kill switches:** `delegation.boomerang.auto_handle_enabled` (default `false`; must be true
-  for any auto-handle) and `delegation.boomerang.fork_enabled`. Both read every tick, no restart.
+- **The card is the only setting.** No config knob, no session toggle, no board default. Set it
+  with `kanban create --boomerang-wake`, `kanban edit <id> --boomerang-wake|--no-boomerang-wake`,
+  `notify-subscribe --boomerang-wake`, or `kanban_create` `boomerang_wake: true`. The
+  subscription row stays `notify+wake`; the level is `tasks.boomerang_wake` only.
+- **Emergency stop:** the file `<HERMES_HOME>/state/boomerang-wake.disabled` (present = every
+  wake surfaces; one #logs line per transition), plus `delegation.boomerang.fork_enabled` for
+  fork mode. Both read every tick, no restart.
 - **Disposition precedence** (first tier that matches): card tag `irreversible`/`spend`/
   `outbound` → `surface`; `needs_input`, any `blocked`, `block_loop_detected` → `surface`;
   own-repo `review_requested` with PR green/pending → `none` (merge pass owns it); own-repo red
   `review_requested`, `completed`, `changes_requested`, first crash-class event → `auto`;
   everything else (incl. upstream-repo reviews, a second crash) → `surface`. Only an explicit
   `auto` dispatches a child.
-- **Chat lines:** `[auto-handled] <card> — <Outcome>` (one per handled wake; read it, act only if
-  wrong); `⚠️ auto-handle failed for <card>: <reason>` or `⚠️ auto-handle lost <card> (reason:
+- **`land_inherited`** (own-repo red row only): the child proves the red is main's (`inherited` proof).
+  Before enqueueing with `--allow-red-ci inherited:<family>`, the executor re-checks: (a) the PR touches none
+  of the red's owning files (the anchor source + harness, or the family's suites.json paths); (b) the anchor
+  is absent at main, or the family is red in main's newest grade. It also needs the operator coverage at the
+  head and zero open P0/P1. Any miss surfaces it.
+- **Chat lines:** `[boomerang-wake] <card> — <Outcome>` (one per handled wake; read it, act only if
+  wrong); `⚠️ boomerang-wake failed <card>: <reason>` or `⚠️ boomerang-wake lost <card> (reason:
   …)` → the original wake was re-surfaced; handle it like any wake.
+- **Gateway restart:** a child killed by a restart is re-run once on the new boot, silently (one
+  INFO line `redispatched after gateway restart` in the gateway log), when the card has not moved,
+  its D-13 retry is unspent and the claim is inside `max_minutes`. That spends the retry: a failure
+  of the re-run child, or a second restart, surfaces as `⚠️ boomerang-wake lost <card> (reason:
+  gateway restart, retry spent|card moved|budget expired)`.
 
 - **The child cannot write the board (D-19).** It runs inside the delegated-child kanban fence:
   board reads only, plus ` (subagent)` comments. It verifies and ends its final message with one
-  `<<<BOOMERANG-VERDICT nonce=…>>>` block (`complete|request_changes|redispatch|retry|surface`
+  `<<<BOOMERANG-VERDICT nonce=…>>>` block (`complete|request_changes|redispatch|retry|land_inherited|surface`
   + evidence). The gateway executor checks the nonce, the allowed-action list and that the card
-  has not moved, then does the ONE write, signed `[auto-handle]` as a machine. It never lands,
-  merges or approves. If you are the child: no verdict block, or a malformed one, means nothing
+  has not moved, then does the ONE write, signed `[boomerang-wake]` as a machine. It never merges,
+  approves or stamps coverage (`land_inherited` only enqueues the operator's own approved head). If you are the child: no verdict block, or a malformed one, means nothing
   is written and the wake goes back to the session.
 
 Full tables and downstream effects: `docs/boomerang-v2/README.md`.

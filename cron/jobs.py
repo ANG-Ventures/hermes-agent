@@ -2084,9 +2084,25 @@ def _journal_created(job: Dict[str, Any]) -> None:
     try:
         from cron.lifecycle_journal import record_created
 
-        record_created(str(job.get("id") or ""), name=job.get("name"))
+        record_created(str(job.get("id") or ""), name=job.get("name"),
+                       enabled=bool(job.get("enabled", True)))
     except Exception:
         logger.debug("cron lifecycle journal (create) unavailable", exc_info=True)
+
+
+def _journal_toggled(before: Any, job: Dict[str, Any], reason: Optional[str] = None) -> None:
+    """Journal a pause/resume when an API write flipped ``enabled`` (t_3436a10c). Call INSIDE the
+    jobs lock, after the save landed (same causality rule as removals). Never raises."""
+    after = bool(job.get("enabled", True))
+    if before is not None and bool(before) == after:
+        return
+    try:
+        from cron.lifecycle_journal import record_toggled
+
+        record_toggled(str(job.get("id") or ""), after, name=job.get("name"),
+                       reason=reason or job.get("paused_reason"))
+    except Exception:
+        logger.debug("cron lifecycle journal (toggle) unavailable", exc_info=True)
 
 
 def _journal_removed(removed_ids: Optional[Collection[str]],
@@ -2397,6 +2413,50 @@ def _validate_job_mode_invariants(
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
 
 
+# Optional home-owned write guard (t_0a8548cf). The fleet's cron lint (one sender per lane, #alerts is
+# fail-only) used to run only at reconcile/commit time, hours after the API had stored a row it rejects.
+# When <home>/scripts/cron-write-guard exists and is executable it is run on every create, and on every
+# update that touches a lint-relevant field of a row that stays enabled: candidate row as JSON on stdin,
+# the operation as argv[1]. rc 0 saves; rc 1 refuses with the guard's stderr; anything else (crash,
+# timeout, exec failure) refuses as "cron write guard unavailable" (fail closed). No guard file = no
+# fleet policy in the runtime, today's behavior.
+CRON_WRITE_GUARD_NAME = "cron-write-guard"
+CRON_WRITE_GUARD_TIMEOUT_S = 5.0
+_CRON_WRITE_GUARD_FIELDS = frozenset({"deliver", "script", "no_agent", "enabled", "state", "schedule"})
+
+
+def _cron_write_guard_path() -> Path:
+    """The guard beside the store being written: <home>/scripts/cron-write-guard."""
+    return _current_cron_store().cron_dir.parent / "scripts" / CRON_WRITE_GUARD_NAME
+
+
+def _run_cron_write_guard(job: Dict[str, Any], op: str) -> None:
+    """Raise ValueError when the home's write guard refuses (or cannot grade) this candidate row."""
+    guard = _cron_write_guard_path()
+    if not (guard.is_file() and os.access(guard, os.X_OK)):
+        return
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [str(guard), op], input=json.dumps(job, default=str), capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=CRON_WRITE_GUARD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise ValueError(
+            f"cron write guard unavailable: {guard} did not answer in "
+            f"{CRON_WRITE_GUARD_TIMEOUT_S:g}s; refusing the {op}") from None
+    except OSError as exc:
+        raise ValueError(f"cron write guard unavailable: {guard}: {exc}; refusing the {op}") from None
+    if proc.returncode == 0:
+        return
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if proc.returncode == 1 and detail:
+        raise ValueError(detail)
+    raise ValueError(
+        f"cron write guard unavailable: {guard} exited rc={proc.returncode}; refusing the {op}"
+        + (f": {detail[-600:]}" if detail else ""))
+
+
 def _oneshot_past_grace_error(run_at: Any) -> ValueError:
     return ValueError(
         f"Requested one-shot time {run_at} is more than "
@@ -2610,6 +2670,8 @@ def create_job(
     if flagship_reason:
         job["allow_flagship_reason"] = flagship_reason
     _apply_a_lane_default_fallback(job)
+    if job["enabled"]:
+        _run_cron_write_guard(job, "create")
 
     with _jobs_lock():
         save_jobs(load_jobs() + [job])
@@ -2961,8 +3023,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated.pop("pending_slot", None)
         _fill_missing_next_run(updated)
         _reject_terminal_activation(job, updated, job_id)
+        if updated.get("enabled", True) and _CRON_WRITE_GUARD_FIELDS.intersection(updates):
+            _run_cron_write_guard(updated, "update")
         jobs[i] = updated
         save_jobs(jobs)
+        _journal_toggled(job.get("enabled", True), updated)
         if updates.get("allow_flagship_reason"):
             logger.info("flagship override: cron update id=%s model=%s reason=%s", job_id, updated.get("model"), updates["allow_flagship_reason"])
         return _normalize_job_record(updated)
@@ -3228,12 +3293,14 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
             raise ValueError(_REARM_RECURRING_ERROR)
         repeat = job.get("repeat") or {}
         repeat["completed"] = 0
+        was_enabled = job.get("enabled", True)
         job.update(
             schedule=parsed_schedule, schedule_display=parsed_schedule.get("display", str(run_at)),
             repeat=repeat, run_claim=None, fire_claim=None)
         _activate_job_record(job)
         job["next_run_at"] = next_run_at
         save_jobs(jobs)
+        _journal_toggled(was_enabled, job, reason="rearmed")
         return _normalize_job_record(job)
 
     return _with_job(job_ref["id"], apply)
@@ -3757,7 +3824,8 @@ def claim_job_for_fire(
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
-        from cron.occurrences import completed_occurrence, rewound_watermark, scheduled_instant
+        from cron.occurrences import (
+            LedgerUnavailable, completed_occurrence, rewound_watermark, scheduled_instant)
 
         # ``manual`` (an off-tick run-now) must NOT stamp an occurrence identity: outside a
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
@@ -3779,15 +3847,21 @@ def claim_job_for_fire(
         if (instant is not None
                 and datetime.fromisoformat(instant) - now >= timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)):
             instant = None
-        if instant and completed_occurrence(job, instant):
-            if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
+        recurring = job.get("schedule", {}).get("kind") in {"cron", "interval"}
+        try:
+            completed = bool(instant) and completed_occurrence(job, instant)
+            watermark = rewound_watermark(job, instant) if instant and not completed else None
+        except LedgerUnavailable:
+            if not recurring:
+                return False  # a one-shot never fires on a ledger that cannot rule out a prior run
+            completed, watermark = False, None  # recurring: a duplicate beats a silent skip
+        if completed:
+            if recurring:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
                     save_jobs(jobs)
             return False
-        recurring = job.get("schedule", {}).get("kind") in {"cron", "interval"}
-        watermark = rewound_watermark(job, instant) if instant else None
         if watermark:
             # Rewound store: refuse this claim. A recurring job re-arms after the completed
             # occurrence (a slot genuinely missed after it stays past-due for the due scan's
@@ -3797,6 +3871,7 @@ def claim_job_for_fire(
                 job["next_run_at"] = nxt
                 save_jobs(jobs)
             return False
+        was_enabled = job.get("enabled", True)
         if force:
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
@@ -3810,6 +3885,8 @@ def claim_job_for_fire(
                 _record_interval_fire(job, now)
                 job["next_run_at"] = nxt
         save_jobs(jobs)
+        if force:
+            _journal_toggled(was_enabled, job, reason="forced run")
         return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
@@ -3984,6 +4061,8 @@ class _DueScan:
     now: datetime
     needs_save: bool = False
     removed: Set[str] = field(default_factory=set)
+    rewound: List[str] = field(default_factory=list)  # ids behind a completed occurrence this tick
+    paused: List[Dict[str, Any]] = field(default_factory=list)  # records this scan self-disabled (journalled)
 
     def find(self, job_id: Any) -> Optional[Dict[str, Any]]:
         return next((rj for rj in self.raw_jobs if rj["id"] == job_id), None)
@@ -4041,6 +4120,7 @@ def _self_disable_half_paused(job: Dict[str, Any], scan: _DueScan) -> None:
         rj["paused_at"] = scan.now.isoformat()
     if not rj.get("paused_reason"):
         rj["paused_reason"] = "auto-disabled: enabled+paused contradiction"
+    scan.paused.append(rj)
     scan.needs_save = True
 
 
@@ -4322,6 +4402,38 @@ def _restore_unclaimed_slot(job: Dict[str, Any], scan: _DueScan) -> Optional[str
     return slot
 
 
+# Last-warned monotonic time per one-shot id for _warn_oneshot_ledger_unavailable.
+_ledger_unavailable_warned: Dict[str, float] = {}
+
+
+def _warn_oneshot_ledger_unavailable(job: Dict[str, Any]) -> None:
+    """One WARNING per one-shot per 10 min while the ledger cannot be read (t_9b3b6e4b)."""
+    jid = str(job.get("id") or "")
+    mono = time.monotonic()
+    last = _ledger_unavailable_warned.get(jid)
+    if last is not None and mono - last < _OVERDUE_ONESHOT_WARN_INTERVAL_SECONDS:
+        return
+    _ledger_unavailable_warned[jid] = mono
+    logger.warning(
+        "cron.oneshot.ledger_unavailable job=%s id=%s next_run_at=%s: executions ledger "
+        "unreadable, cannot tell whether this one-shot already ran; not firing and not "
+        "retiring it this tick", job.get("name"), jid, job.get("next_run_at"))
+
+
+def _settle_completed_oneshot(job: Dict[str, Any], scan: _DueScan, completed_at: str) -> None:
+    """Persist terminal completion for a one-shot the ledger proves ran, so the record stops
+    re-evaluating every tick and the retention sweep can prune it. Idempotent: a finite budget
+    is set to ``times``, never incremented past it."""
+    repeat = dict(job.get("repeat") or {})
+    times = repeat.get("times")
+    if isinstance(times, int) and times > 0 and repeat.get("completed", 0) < times:
+        repeat["completed"] = times
+    fields: Dict[str, Any] = {"repeat": repeat, "last_run_at": job.get("last_run_at") or completed_at}
+    _complete_job_record(fields)
+    job.update(fields)
+    scan.persist(job["id"], **fields)
+
+
 def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float) -> bool:
     """Decide whether one enabled, non-terminal job fires this tick, persisting any repairs.
     Ordering matters: recover missing next_run_at, repair timezone shifts, re-arm stale-error
@@ -4348,14 +4460,28 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     # into both fields, and any rewrite of next_run_at (edit, re-anchor, fire-claim advance) must
     # invalidate the marker. Do not "fix" this with _ensure_aware normalization.
     manual_run = job.get("manual_run_at") == next_run
-    from cron.occurrences import completed_occurrence, rewound_watermark, scheduled_instant
+    from cron.occurrences import (
+        LedgerUnavailable, completed_occurrence_at, rewound_watermark, scheduled_instant)
 
-    if not manual_run and completed_occurrence(job, next_run):
-        new_next = d.recompute_next() if recurring else None
+    try:
+        completed_at = None if manual_run else completed_occurrence_at(job, next_run)
+        watermark = None if manual_run or completed_at else rewound_watermark(job, next_run)
+    except LedgerUnavailable:
+        if not recurring:
+            # An unreadable ledger proves nothing: never fire, retire or page a one-shot on it.
+            _warn_oneshot_ledger_unavailable(job)
+            return False
+        completed_at = watermark = None  # recurring: a duplicate beats a silent skip
+    if completed_at:
+        if not recurring:
+            _settle_completed_oneshot(job, scan, completed_at)
+            return False
+        new_next = d.recompute_next()
         if new_next:
             scan.persist(job["id"], next_run_at=new_next)
         return False
-    watermark = rewound_watermark(job, next_run) if not manual_run else None
+    if watermark:
+        scan.rewound.append(str(job["id"]))
     if watermark and not recurring:
         return False  # a one-shot already completed at a later (rescheduled) instant: never replay
     if watermark:
@@ -4459,9 +4585,16 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 job.get("name") or job.get("id") or "?")
 
     _warn_overdue_oneshots_not_due(jobs, due, scan.removed, scan.now)
+    from cron.occurrences import REWOUND_BURST_MARKER, rewound_burst_payload
+
+    burst = rewound_burst_payload(scan.rewound, scan.now.isoformat())
+    if burst:
+        _write_marker(REWOUND_BURST_MARKER, json.dumps(burst) + "\n", ".rewound_burst_")
 
     if scan.needs_save:
         save_jobs(raw_jobs, removed_ids=scan.removed or None)
+        for rj in scan.paused:
+            _journal_toggled(True, rj)
     return due
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -64,30 +65,48 @@ def _evict_oldest(container, cap: int) -> None:
             break
 
 
-def _cross_process_enabled() -> bool:
-    """The cross-process layer (flock + published last writer) exists only for detached delegation
-    workers (``delegation.detached_background``). Off, every process keeps its pre-detached,
-    process-local behaviour: no flock, and another process's write never refuses this one's edit."""
-    try:
-        from tools.delegate_tool_config import _get_detached_background
+#: Set by a process that IS a cross-process delegation unit (the kanban-runtime runner,
+#: tools/delegation_unit_worker.py): its siblings are other processes whatever the knobs say now.
+FORCE_CROSS_PROCESS = False
 
-        return bool(_get_detached_background())
+
+def _cross_process_enabled() -> bool:
+    """The cross-process layer (flock + published last writer) exists only for delegation units that run
+    in other processes: detached workers (``delegation.detached_background``) and kanban-runtime units
+    (``delegation.background_runtime: kanban``). Off, every process keeps its process-local behaviour:
+    no flock, and another process's write never refuses this one's edit."""
+    if FORCE_CROSS_PROCESS:
+        return True
+    try:
+        from tools.delegate_tool_config import _get_background_runtime, _get_detached_background
+
+        if bool(_get_detached_background()) or _get_background_runtime() == "kanban":
+            return True
+    except Exception:
+        pass
+    # Kanban units that outlived a knob flip (a gateway restarted with ``in_process``) still edit
+    # files in their own processes: this process keeps coordinating while any of them is live.
+    ad = sys.modules.get("tools.async_delegation")
+    try:
+        return bool(ad is not None and ad.kanban_active_count())
     except Exception:
         return False
 
 
 def _lock_file_for(resolved: str) -> Optional[Path]:
     """Lock file shared by every process of this install (all profiles, like the process-wide
-    registry): ``<hermes root>/state/file-locks/<sha256 of the path>``. None while the
-    cross-process layer is off."""
+    registry): ``<kanban root>/state/file-locks/<sha256 of the path>``. The kanban root is the install
+    root unless ``HERMES_KANBAN_HOME`` pins it, which the dispatcher does for every kanban-runtime unit
+    so a runner under another profile home derives the gateway's directory (spec §8 row 10). None while
+    the cross-process layer is off."""
     import hashlib
 
     if not _cross_process_enabled():
         return None
     try:
-        from hermes_constants import get_default_hermes_root
+        from hermes_cli.kanban_db import kanban_home
 
-        root = get_default_hermes_root() / "state" / "file-locks"
+        root = kanban_home() / "state" / "file-locks"
         root.mkdir(parents=True, exist_ok=True)
     except Exception:
         return None
@@ -164,7 +183,7 @@ def _foreign_writer(resolved: str) -> Optional[Tuple[str, float]]:
     if lock_file is None:
         return None
     try:
-        data = json.loads(lock_file.with_name(lock_file.name + ".writer").read_text(encoding="utf-8"))
+        data = json.loads(lock_file.with_name(lock_file.name + ".writer").read_text(encoding="utf-8-sig"))
         pid, task_id, ts = int(data["pid"]), str(data["task_id"]), float(data["ts"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -186,7 +205,7 @@ def _forget_published(resolved: str, task_id: str) -> None:
         return
     path = lock_file.with_name(lock_file.name + ".writer")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         if data.get("pid") == os.getpid() and data.get("task_id") == task_id:
             path.unlink()
     except (OSError, ValueError, AttributeError):

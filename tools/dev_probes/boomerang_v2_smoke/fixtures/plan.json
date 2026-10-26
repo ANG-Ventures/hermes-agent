@@ -2,16 +2,17 @@
   "_comment": [
     "Cross-step plan for run.py. Every kanban argv is appended to BV2_KANBAN_CMD (default 'hermes kanban').",
     "Placeholders: {board} {session} {chat} {card} {title}.",
-    "set_auto_handle: P4 (t_bcd2f011) owns the CLI flag name; the spec only says kanban_create/update gain auto_handle.",
-    "  If the live run aborts at set_auto_handle, fix the argv here, not run.py.",
+    "set_boomerang_wake: the card level is set with `kanban edit <id> --boomerang-wake` (t_7be18632).",
+    "  If the live run aborts at set_boomerang_wake, fix the argv here, not run.py.",
     "inject_failure: the AC-7 live fault (t_480d08ce), run AFTER the failure card's child is dispatched. A comment by",
     "  another session moves the card past the claim cursor, so the verdict executor refuses it ('state moved', _moved)",
     "  and run_entry -> _fail posts the warning AND re-surfaces the wake into the still-live home. null = SKIP (live).",
     "  Never rehome the card (edit --session <bogus>): that proves only the warning half ('no live home').",
     "s1_fault_hold (optional): a --body that keeps the failure card's child busy so the fault lands first.",
     "wirelog_sync: run after the step-3 canary when a remote seat served it ({sub} = the bare seat number).",
-    "expect.*: the restart line is today's real boot line; the re-surface regex is NOT in the spec contract",
-    "  (5.7 names deliver_wake + the origin-chat 'auto-handle lost' line, not a log line). Tune it once P3 lands."
+    "expect.*: the restart line is today's real boot line; the step-4 regexes are the reconciler's own INFO lines",
+    "  (gateway/kanban_boomerang_wake.py: _lost, _restart_redispatch_or_lost, run_entry 'handled'). Step 4 arm 1",
+    "  expects the redispatch (t_870c1fba); arm 2 pre-spends the card's retry (BV2_WAKE_STATE) and expects the re-surface."
   ],
   "board": "bv2-smoke",
   "commands": {
@@ -20,17 +21,19 @@
     "create": ["--board", "{board}", "create", "{title}", "--session", "{session}", "--json"],
     "notify_subscribe": ["--board", "{board}", "notify-subscribe", "{card}", "--platform", "discord",
                          "--chat-id", "{chat}", "--chat-type", "channel", "--delivery-mode", "notify+wake"],
-    "set_auto_handle": ["--board", "{board}", "edit", "{card}", "--auto-handle"],
+    "set_boomerang_wake": ["--board", "{board}", "edit", "{card}", "--boomerang-wake"],
     "complete": ["--board", "{board}", "complete", "{card}", "--summary", "bv2 smoke: forced completed event"],
     "block_needs_input": ["--board", "{board}", "block", "{card}", "--kind", "needs_input",
                           "bv2 smoke: forced needs_input event. unblock_when: after:+1d"],
     "inject_failure": ["--board", "{board}", "comment", "{card}", "--body",
-                       "bv2 smoke s1 fault: board write after the auto-handle claim; the verdict must be refused (state moved) and the wake re-surfaced"],
+                       "bv2 smoke s1 fault: board write after the boomerang-wake claim; the verdict must be refused (state moved) and the wake re-surfaced"],
     "wirelog_sync": ["python3", "~/.hermes/scripts/wirelog-fleet.py", "sync", "--sub", "{sub}"]
   },
   "expect": {
     "restart_log_regex": "Gateway running with \\d+ platform",
-    "resurface_log_regex": "re-?surfac\\w*\\b.*{card}",
+    "resurface_log_regex": "kanban boomerang-wake: {card} lost reason=gateway restart, retry spent resurfaced delivered=(?P<delivered>\\w+)",
+    "redispatch_log_regex": "kanban boomerang-wake: {card} redispatched after gateway restart \\(retry \\d+/\\d+\\) delegation=(?P<delegation>\\S+)",
+    "handled_log_regex": "kanban boomerang-wake: {card} handled action=\\S+ delegation=(?P<delegation>\\S+)",
     "fault_reason_regex": "state moved",
     "resurface_wake_log_regex": "inbound message: .*msg=.\\[kanban\\] Task {card}\\b"
   },
@@ -44,6 +47,7 @@
     "s2_fork_off": "t_5m0ce004",
     "s2_auto_off": "t_5m0ce005",
     "s3_fork": "t_5m0ce006",
-    "s4_restart": "t_5m0ce007"
+    "s4_restart": "t_5m0ce007",
+    "s4_fallback": "t_5m0ce008"
   }
 }

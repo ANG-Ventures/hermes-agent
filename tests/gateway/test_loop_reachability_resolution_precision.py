@@ -81,3 +81,18 @@ def test_eager_offload_argument_is_attributed(tmp_path):
         )
     }
     assert _sites(tmp_path, files) == ["m.py eager -> do_net via eager"]
+
+
+def test_function_local_import_after_a_form_feed_or_line_separator(tmp_path):
+    """``str.splitlines`` breaks on \\f and U+2028, the AST does not: the local-import scan must
+    number lines as the AST does or it drops this import map (t_44dcc531, Prism 22358872b569)."""
+    for odd in ("\f\f", "\u2028\u2028"):
+        files = dict(_NET)
+        files["m.py"] = (
+            f"# {odd}\n"
+            "def helper(x):\n    return x\n\n"
+            "async def f():\n"
+            "    from pkg.net import helper\n"
+            "    helper(1)\n"
+        )
+        assert _sites(tmp_path, files), f"local import lost after {odd!r}"

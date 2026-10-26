@@ -313,7 +313,17 @@ def test_an_ancestor_cgroup_limit_binds(monkeypatch):
     """Prism e023de0647d5: the leaf is unlimited, the parent slice holds memory.max."""
     gib = 1024 ** 3
     _fake_cgroups(monkeypatch, [("/cg/slice/leaf", None, int(0.1 * gib)), ("/cg/slice", 2 * gib, int(1.2 * gib))])
-    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == 2 * gib - int(1.2 * gib) - int(2 * gib * 0.35)
+    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == 2 * gib - int(1.2 * gib) - bounds._headroom(2 * gib)
+
+
+def test_a_large_cgroup_does_not_reserve_a_share_of_itself_as_headroom(monkeypatch):
+    """t_b56f9e1e: ci-runner containers are 4 GiB with 8 workers and ~630 MiB of /_work tmpfs.
+    A 35 % headroom reserved 1.4 GiB there, and with 1 GiB still free every test got the 16 MiB
+    floor. The stop overshoot is allocator speed x latency, so 1 GiB free leaves a real budget."""
+    gib = 1024 ** 3
+    _fake_cgroups(monkeypatch, [("/cg/a", 4 * gib, 3 * gib)])
+    assert bounds._headroom(4 * gib) <= bounds._headroom(gib) + 256 * 1024 ** 2
+    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) >= gib // 2
 
 
 def test_a_namespaced_container_root_cgroup_is_a_level(monkeypatch):
@@ -374,6 +384,30 @@ def test_a_browser_child_does_not_inherit_the_address_space_cap(tmp_path):
                 p = subprocess.Popen([{str(probe)!r}], stdout=subprocess.DEVNULL)
                 assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3  # never uncapped, not even mid-spawn
                 assert p.wait() == 0
+                assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3
+        ''', env={bounds._RLIMIT_ENV: "1"})
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, saved)
+    assert out.returncode == 0, out.stdout + out.stderr
+
+
+@pytest.mark.platforms("linux")
+def test_a_driven_program_and_its_descendants_run_without_the_address_space_cap(tmp_path):
+    """t_b56f9e1e: the e2e upgrade sandbox runs install.sh -> node; a node build with one V8
+    isolate per worker needs more than 6 GiB of address space. ``uncapped_argv`` lifts the cap
+    for that program and everything it execs; the test process and its other children keep it."""
+    import resource
+
+    saved = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (saved[1], saved[1]))
+    try:
+        out = _run_child(tmp_path, '''
+            import resource, subprocess
+            from tests._fixtures.bounds import uncapped_argv
+            def test_driven():
+                grandchild = ["/bin/sh", "-c", "/bin/sh -c 'ulimit -v'"]
+                assert subprocess.run(uncapped_argv(grandchild), capture_output=True, text=True).stdout.strip() == "unlimited"
+                assert subprocess.run(grandchild, capture_output=True, text=True).stdout.strip() == str(1024 ** 2)
                 assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3
         ''', env={bounds._RLIMIT_ENV: "1"})
     finally:

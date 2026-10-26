@@ -308,20 +308,49 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
-        from hermes_cli.goals import DEFAULT_NO_PROGRESS_TURNS, is_goal_synthetic_text
+        from hermes_cli.goals import (
+            DEFAULT_CHECKIN_MINUTES, DEFAULT_MAX_IDLE_CHECKINS, DEFAULT_NO_PROGRESS_TURNS, is_goal_synthetic_text,
+        )
         # A turn the goal loop did not start (user message, worker/process result) re-arms idle check-ins.
         _real_event = event is not None and not is_goal_synthetic_text(getattr(event, "text", ""))
         # api_calls > 1 means the model called at least one tool (each tool round is another API call).
         _api_calls = getattr(event, "_goal_turn_api_calls", None) if event is not None else None
         _made_tools = None if _api_calls is None else int(_api_calls) > 1
         _no_progress = self._goal_int_setting("no_progress_turns", DEFAULT_NO_PROGRESS_TURNS)
+        # Continuation gate (Ace 2026-10-22, option b): only a write turn or a human message re-fires
+        # the continuation; wakes/pages/NO_REPLY answered with reads leave it to the idle check-in.
+        _effect = getattr(event, "_goal_turn_effect", None) if event is not None else None
+        _user_spoke = bool(
+            _real_event and not getattr(event, "internal", False)
+            and not getattr(getattr(event, "source", None), "is_bot", False)
+        )
+        _nudge_read_only = bool(self._goals_config().get("nudge_on_read_only_turns", False))
+        # The hold targets wakes and pages, not the loop's own heartbeat: a continuation/check-in turn
+        # the goal fired itself is exempt (it answered the loop, so the loop keeps going).
+        _goal_turn = event is not None and not _real_event
+        _checkin = self._goal_int_setting("checkin_minutes", DEFAULT_CHECKIN_MINUTES)
+        _max_checkins = self._goal_int_setting("max_idle_checkins", DEFAULT_MAX_IDLE_CHECKINS)
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
                 active_delegations=_active_deleg, real_event=_real_event,
                 made_tool_calls=_made_tools, no_progress_turns=_no_progress,
+                turn_effect=_effect, user_spoke=_user_spoke or _goal_turn,
+                nudge_on_read_only_turns=_nudge_read_only, checkin_minutes=_checkin, max_checkins=_max_checkins,
             ),
         )
+        _sid = getattr(session_entry, "session_id", "?")
+        if decision.get("held"):
+            logger.info(
+                "goal continuation held for %s: turn effect %s, user_spoke=%s (next nudge: idle check-in)",
+                _sid, _effect, _user_spoke,
+            )
+        elif decision.get("should_continue"):
+            logger.info(
+                "goal continuation queued for %s: turn effect %s, user_spoke=%s, goal_turn=%s%s",
+                _sid, _effect, _user_spoke, _goal_turn,
+                f" ({decision['hold_overridden']})" if decision.get("hold_overridden") else "",
+            )
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:

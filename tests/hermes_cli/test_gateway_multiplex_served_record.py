@@ -39,6 +39,11 @@ def served_root(tmp_path, monkeypatch):
     import hermes_constants
     import gateway.status as status
     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+    # These tests are about the served record, not the container refusal: a containerized runner
+    # would otherwise stop `gateway install` / the setup service step before the multiplexer check.
+    import hermes_cli.gateway as gw
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+    monkeypatch.setattr(gw, "is_container", lambda: False)
     # Liveness is a VERIFIED identity: this pytest process stands in for the default gateway only
     # because its command line reads as one; any other PID keeps its real command line.
     real_cmdline = status._read_process_cmdline

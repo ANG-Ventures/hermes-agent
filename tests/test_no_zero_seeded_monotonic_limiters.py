@@ -37,6 +37,8 @@ because ``elapsed`` is not bound directly from a monotonic call.
 from __future__ import annotations
 
 import ast
+import re
+import unicodedata
 import warnings
 from pathlib import Path
 
@@ -60,6 +62,33 @@ _SKIP_DIRS = {
 
 _MONOTONIC_FUNCS = {"monotonic", "monotonic_ns", "perf_counter", "perf_counter_ns"}
 _LOOP_GETTERS = {"get_running_loop", "get_event_loop"}
+# Text every ``_is_monotonic_call`` match needs: a ``_MONOTONIC_FUNCS`` name (direct call, or
+# the alias's import/assignment) or ``<...loop>[()] . time``. A file without it has no
+# monotonic left side, so the tree scan skips its parse: 1 in 9 files is parsed and the scan
+# fits the per-test wall clock on a 4-CPU CI slice (t_44dcc531). Between tokens: whitespace,
+# line continuations, parentheses and comments, as the tokenizer allows. A comment ends at
+# LF, CRLF or a bare CR (the tokenizer accepts all three).
+_TOK_GAP = r"(?:\s|[()\\]|#[^\r\n]*(?:\r\n?|\n))*"
+_CLOCK_TEXT = re.compile(r"monotonic|perf_counter")
+# ``<...loop>(<any args>).time``: the getter's arguments may nest parentheses, so the owner and
+# the ``.time`` are tested separately (a superset; a match only means "parse it").
+_LOOP_TEXT = re.compile(r"(?i:loop)\b")
+_DOT_TIME_TEXT = re.compile(r"\." + _TOK_GAP + r"time\b")
+
+
+def _gate_texts(source: str):
+    """The source, and its NFKC form when it can differ: the tokenizer NFKC-normalises
+    identifiers, so ``time.ｍｏｎｏｔｏｎｉｃ()`` is ``time.monotonic()`` to the AST."""
+    yield source
+    if not source.isascii():
+        yield unicodedata.normalize("NFKC", source)
+
+
+def _may_spell_a_clock(source: str) -> bool:
+    return any(
+        _CLOCK_TEXT.search(t) or (_LOOP_TEXT.search(t) and _DOT_TIME_TEXT.search(t))
+        for t in _gate_texts(source)
+    )
 
 
 def _call_name(func: ast.expr) -> str | None:
@@ -73,14 +102,15 @@ def _call_name(func: ast.expr) -> str | None:
 _NUMERIC_WRAPPERS = {"int", "float", "round", "floor", "ceil", "trunc"}
 
 
-def _monotonic_aliases(tree: ast.AST) -> frozenset[str]:
+def _monotonic_aliases(nodes) -> frozenset[str]:
     """Names that refer to a monotonic clock function in this module.
 
     ``from time import monotonic as _mono`` and ``_clock = time.monotonic``
-    make ``_mono()`` / ``_clock()`` monotonic calls.
+    make ``_mono()`` / ``_clock()`` monotonic calls. ``nodes`` is every node of the
+    module (the union of the scopes' own nodes, so the tree is not walked again).
     """
     aliases: set[str] = set()
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, ast.ImportFrom) and node.module == "time":
             for alias in node.names:
                 if alias.name in _MONOTONIC_FUNCS:
@@ -157,6 +187,9 @@ class _Scope:
         self.bindings: dict[str, list[ast.expr | None]] = {}
         self.attrs: dict[str, list[ast.expr | None]] = {}  # ClassDef only
         self.item_stores: list[tuple[str, object, ast.expr]] = []
+        self.own: list[ast.AST] = []  # _own_nodes(node), collected once by _build_scopes
+        self.assigns: list[ast.AST] = []  # the Assign/AnnAssign nodes of ``own``
+        self.children: list[_Scope] = []
 
     def class_attrs(self) -> dict[str, list[ast.expr | None]]:
         """Attribute seeds of the nearest enclosing class ({} if none)."""
@@ -275,15 +308,15 @@ def _assign_pairs(child: ast.AST):
         yield child.target, child.value
 
 
-def _class_nodes(cls: ast.ClassDef):
-    """Nodes of ``cls`` incl. its methods, but not nested classes (whose
-    ``self`` is a different object)."""
-    stack = list(ast.iter_child_nodes(cls))
+def _class_assigns(cls: _Scope):
+    """Assignments of class ``cls`` incl. its methods, but not nested classes (whose
+    ``self`` is a different object). Read from the scopes' collected nodes: the scopes
+    partition the tree, so this is the class subtree without walking it again."""
+    stack = [cls]
     while stack:
-        node = stack.pop()
-        yield node
-        if not isinstance(node, ast.ClassDef):
-            stack.extend(ast.iter_child_nodes(node))
+        scope = stack.pop()
+        yield from scope.assigns
+        stack.extend(c for c in scope.children if not isinstance(c.node, ast.ClassDef))
 
 
 def _build_scopes(tree: ast.Module) -> list[_Scope]:
@@ -307,12 +340,16 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
                 + [a for a in (args.vararg, args.kwarg) if a is not None]
             ):
                 scope.bindings.setdefault(arg.arg, []).append(None)
-        for child in _own_nodes(node):
+        if parent is not None:
+            parent.children.append(scope)
+        scope.own = list(_own_nodes(node))
+        for child in scope.own:
             if isinstance(child, ast.Global):
                 scope.globals.update(child.names)
             elif isinstance(child, ast.Nonlocal):
                 scope.nonlocals.update(child.names)
-            else:
+            elif isinstance(child, (ast.Assign, ast.AnnAssign)):
+                scope.assigns.append(child)
                 for target, value in _assign_pairs(child):
                     if isinstance(target, ast.Name):
                         scope.bindings.setdefault(target.id, []).append(value)
@@ -336,7 +373,7 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
             attrs: dict[str, list[ast.expr | None]] = {
                 k: list(v) for k, v in scope.bindings.items()
             }
-            for sub in _class_nodes(scope.node):
+            for sub in _class_assigns(scope):
                 for target, value in _assign_pairs(sub):
                     attr = _self_attr(target)
                     if attr is not None:
@@ -371,15 +408,18 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
 
 def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> list[str]:
     """Return ``file:line: name`` for each ``<monotonic> - <0-seeded name>``."""
+    if not _may_spell_a_clock(source):
+        return []  # no clock spelled: no left side can be monotonic, skip the parse
     with warnings.catch_warnings():
         # Scanning the whole tree compiles files with invalid escape sequences.
         warnings.simplefilter("ignore")
         tree = ast.parse(source, filename=filename)
     hits: list[str] = []
     lines = source.splitlines()
-    aliases = _monotonic_aliases(tree)
-    for scope in _build_scopes(tree):
-        for node in _own_nodes(scope.node):
+    scopes = _build_scopes(tree)
+    aliases = _monotonic_aliases(node for scope in scopes for node in scope.own)
+    for scope in scopes:
+        for node in scope.own:
             if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)):
                 continue
             # Reviewed escape for a guarded 0 sentinel (``if x == 0: x = now``
@@ -453,6 +493,11 @@ def _iter_python_files():
         yield path, rel
 
 
+@pytest.mark.slow_test(
+    180,
+    reason="parses the ~1,000 tree files that spell a clock; measured in ci-runner-ang-hermes:1 --cpus 4 "
+    "on ci-box: 46 s alone, 123 s beside 7 busy workers (t_44dcc531)",
+)
 def test_no_zero_seeded_monotonic_limiters_in_tree():
     hits: list[str] = []
     for path, rel in _iter_python_files():
@@ -675,3 +720,34 @@ def heartbeat_current_worker_from_env(progress_at=None):
 def test_detector_shapes(source, expected):
     hits = find_zero_seeded_monotonic_diffs(source)
     assert sorted(h.split(": ", 1)[1] for h in hits) == sorted(expected)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "import asyncio\ndef f(p):\n    last = 0\n"
+            "    if asyncio.get_event_loop(p()).time() - last > 5:\n        last = 1\n",
+            id="loop-getter-with-nested-parens",
+        ),
+        pytest.param(
+            "import time\ndef f():\n    last = 0\n"
+            "    if time.\uff4d\uff4f\uff4e\uff4f\uff54\uff4f\uff4e\uff49\uff43() - last > 5:\n"
+            "        last = 1\n",
+            id="nfkc-identifier",
+        ),
+        pytest.param(
+            "import time\ndef f():\n    last = 0\n"
+            "    if time.\\\nmonotonic() - last > 5:\n        last = 1\n",
+            id="continuation-after-dot",
+        ),
+        pytest.param(
+            "import asyncio\rdef f(loop):\r    last = 0\r"
+            "    if (loop. # c\r time)() - last > 5:\r        last = 1\r",
+            id="comment-after-dot-bare-cr",
+        ),
+    ],
+)
+def test_prefilter_scans_every_spelling_the_ast_flags(source):
+    """The raw-text prefilter must never skip a file the AST would flag (t_44dcc531)."""
+    assert find_zero_seeded_monotonic_diffs(source) == ["<src>:4: last"]

@@ -1293,7 +1293,7 @@ def sample_psi(root: str = "/proc/pressure") -> dict:
     out: dict = {}
     for res, key in (("cpu", "psi_cpu_some10"), ("memory", "psi_mem_some10"), ("io", "psi_io_some10")):
         try:
-            with open(os.path.join(root, res), encoding="utf-8") as fh:
+            with open(os.path.join(root, res), encoding="utf-8-sig") as fh:
                 for ln in fh:
                     if ln.startswith("some "):
                         out[key] = float(dict(kv.split("=", 1) for kv in ln.split()[1:])["avg10"])
@@ -1317,8 +1317,8 @@ def utilization_context() -> dict:
         hid = table.resolve(UTIL_HOST_ALIAS)
         if hid:
             host, spec = hid, table.hosts[hid]
-            ceiling = spec.slots_for("kanban")
-            reason = str(((json.loads(table.path.read_text(encoding="utf-8"))["hosts"][hid].get("consumers") or {})
+            ceiling = spec.ceiling_for("kanban")
+            reason = str(((json.loads(table.path.read_text(encoding="utf-8-sig"))["hosts"][hid].get("consumers") or {})
                           .get("kanban") or {}).get("_ceiling_reason") or "")
         prior = _pl.need_of(table.footprint("kanban"))
     except Exception as exc:  # no table = no ceiling, the prior footprint; never a crash in the tick

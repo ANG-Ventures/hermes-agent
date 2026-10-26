@@ -48,7 +48,9 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from tests.e2e.core._pending_fixes import known_gate
+from tests.e2e.core._pm_dependencies import select_test_dependencies
 from tests.e2e.core.security._helpers import (
+    REPO_ROOT,
     BoundaryBreach,
     canary,
     hermetic_env,
@@ -238,6 +240,8 @@ def home(tmp_path: Path) -> Path:
     home = tmp_path / "home"
     # The model is never called: the launcher hands off to the TUI stand-in before any turn.
     write_home(home / ".hermes", "http://127.0.0.1:9/v1", api_key=canary("unused-key"))
+    # The launcher resolves node through PM; point the sandbox at the runner's provisioned store.
+    select_test_dependencies(home / ".hermes", REPO_ROOT)
     probe = tmp_path / "tui-probe" / "dist"
     probe.mkdir(parents=True)
     (probe / "entry.js").write_text(PROBE_ENTRY, encoding="utf-8")
@@ -247,10 +251,12 @@ def home(tmp_path: Path) -> Path:
 def _resume(home: Path, sid: str) -> tuple[subprocess.CompletedProcess, dict | None]:
     """Run ``hermes --tui --resume SID``; return the process result and what the TUI child received."""
     out = home.parent / f"handoff-{uuid.uuid4().hex}.json"
+    # The module skips unless node is on PATH. A runner whose PM store has no node (offbox ci) would
+    # otherwise refuse the lazy install; HERMES_NODE is the launcher's own explicit-node override.
     result = run_hermes(
         ["--tui", "--resume", sid], home, timeout=90,
         extra_env={"HERMES_TUI_DIR": str(home.parent / "tui-probe"), "HERMES_SKIP_NODE_BOOTSTRAP": "1",
-                   "ATTACH_PROBE_OUT": str(out)})
+                   "HERMES_NODE": shutil.which("node") or "", "ATTACH_PROBE_OUT": str(out)})
     handoff = json.loads(out.read_text(encoding="utf-8")) if out.exists() else None
     return result, handoff
 

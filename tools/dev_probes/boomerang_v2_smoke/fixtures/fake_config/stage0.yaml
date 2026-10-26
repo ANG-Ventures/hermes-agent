@@ -3,5 +3,4 @@ model:
 delegation:
   max_concurrent_children: 3
   boomerang:
-    auto_handle_enabled: true
     fork_enabled: true  # stage 0

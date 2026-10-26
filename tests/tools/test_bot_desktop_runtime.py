@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.bot_desktop import runtime, thumbnail
+from tools.bot_desktop import resources, runtime, thumbnail
 
 
 @pytest.mark.parametrize("pm", sorted(runtime.PACKAGES))
@@ -124,6 +124,8 @@ runtime._X_LOCK_DIR = scratch / "xlocks"
 runtime._ALLOC_LOCK = scratch / "alloc.lock"
 runtime.missing_binaries = lambda: []
 runtime.geometry = lambda: "800x600"
+from tools.bot_desktop import resources
+resources.min_free_mb = lambda: 0  # the memory gate has its own tests; a 4 GiB CI slice must not refuse this one
 os.environ["HERMES_BD_XLOCK_DIR"] = str(scratch / "xlocks")
 try:
     st = runtime.start(wait_seconds=10)
@@ -228,6 +230,8 @@ def in_process_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "_ALLOC_LOCK", tmp_path / "alloc.lock")
     monkeypatch.setattr(runtime, "missing_binaries", lambda: [])
     monkeypatch.setattr(runtime, "geometry", lambda: "800x600")
+    # Launcher/lock logic only: the memory gate (test_bot_desktop_resources.py) must not depend on the host.
+    monkeypatch.setattr(resources, "min_free_mb", lambda: 0)
     monkeypatch.setenv("HERMES_BD_XLOCK_DIR", str(tmp_path / "xlocks"))
     yield tmp_path
     with contextlib.suppress(Exception):

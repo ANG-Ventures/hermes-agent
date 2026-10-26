@@ -638,12 +638,6 @@ gateway:
     channel_not_joined: "目前不在語音頻道中。"
     channel_left: "已離開語音頻道。"
     transcript_echo: "**[語音]** <@{user}>：{text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ 本工作階段 YOLO 模式 **已關閉** — 危險指令將需要批准。"
     enabled: "⚡ 本工作階段 YOLO 模式 **已開啟** — 所有指令自動批准。請謹慎使用。"
@@ -1723,8 +1717,6 @@ slash:
     description: "切換專注檢視 — 只顯示你的提示與最終回應"
   footer:
     description: "切換最終回覆的閘道執行階段中繼資料頁尾"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "切換 YOLO 模式（略過所有危險指令批准）"
   approvals:

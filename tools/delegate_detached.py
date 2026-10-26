@@ -56,7 +56,7 @@ def _write_json(path: Path, data: Dict[str, Any]) -> None:
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
@@ -258,7 +258,7 @@ def signal_group(pid: Any, create_time: Any, sig: int) -> bool:
     if not pid_alive(pid, create_time):
         return False
     try:
-        os.killpg(int(pid), sig)  # AttributeError on Windows (no process groups): plain kill below
+        os.killpg(int(pid), sig)  # AttributeError on Windows (no process groups): plain kill below  # windows-footgun: ok — AttributeError on Windows is caught and falls back to os.kill
         return True
     except (ProcessLookupError, PermissionError, OSError, AttributeError):
         try:

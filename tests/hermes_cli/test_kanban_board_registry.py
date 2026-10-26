@@ -43,7 +43,7 @@ def _policy(home: Path, value: str) -> None:
 
 def _pin(monkeypatch, path: Path) -> None:
     """A dispatched worker's DB pin. The sandbox flag would neutralise it, so drop that."""
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — the pin under test is what the sandbox neutralises; HERMES_KANBAN_DB points at a tmp_path DB
     monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
     reg._PINNED_BOARD_MEMO.clear()
 

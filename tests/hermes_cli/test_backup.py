@@ -258,6 +258,60 @@ class TestShouldExclude:
         assert _should_exclude(Path("forensics-archive/sub-vps-3/2026-10-01/journal.jsonl"))
         assert not _should_exclude(Path("skills/x/forensics-archive/notes.md"))
 
+    def test_full_tier_bytes_cut(self):
+        """t_7da95544: the 10-25 full would have carried 367.3 GiB and died at the 3600 s ceiling. Each regenerable
+        or one-off bulk tree is pruned root-anchored; the small state next to it stays in."""
+        from hermes_cli.backup import _matches_path_glob, _should_exclude
+        for p in (
+            "state/backup/pre-583-restart-20260811T164348/state.db",
+            "state/backup/receipts/x.json",
+            "profiles/aegis/incidents/2026-09-12-apollo-sqlite/captured-state.db",
+            "profiles/daedalus/sessions/s.jsonl",
+            "profiles/daedalus/state.db",
+            "profiles/daedalus/lcm.db",
+            "profiles/daedalus/lcm-archive.db",
+            "profiles/daedalus/blackbox/turns.db",
+            "var/lcm-dedup-20260925-0528/lcm.pre-dedup.db",
+            "var/lcm-dedup-replay-dedup-20260925-2137-mopup/lcm.pre.db",
+            "var/lcm-prune-20260924/lcm.pre-prune.db",
+            "state/blackbox-backfill-bak-20260924-1715/default.turns.db",
+            "var/work-delivery-drift-cache/r.git/objects/pack/p.pack",
+            "var/ledger-snap/subs.snapshot.db",
+            "var/ledger/ledger.db.bak-t_1358e96e-20261017082220",
+            "blackbox/pre-orphan-repair-t_ab5f2c3f/turns.db",
+            "var/oneshot/f5854.tgz",
+            "state/gitconfig-watch/events.ndjson",
+            "state/gitconfig-watch/backstop-poller.ndjson",
+            ".sqlite-snapshots/fleet-sqlite-snapshot-1-x/state.db",
+            "var/ledger/.sqlite-snapshots/fleet-sqlite-snapshot-2-y/ledger.db",
+            "lcm.db.pre-replay-dedup-20260925",
+            "state.db.broken-20260919-171433",
+            "state.db.broken-20260919-171433-wal",
+            "recovery/agora-session-continuity-20261013/aegis-repair/preapply-state.db",
+            "var/detached/land-5480-x/log",
+        ):
+            assert _should_exclude(Path(p)), p
+        for d in ("state/backup/offsite2", "profiles/aegis/incidents", "var/lcm-prune-20260924", "blackbox/pre-x"):
+            assert _matches_path_glob((*Path(d).parts, "_")), d
+        for p in (
+            "state/backup/last-success-fleet-backup",       # heartbeats directly in state/backup/
+            "state.db", "lcm.db",                           # the root's own stores
+            "profiles/aegis/config.yaml",
+            "profiles/aegis/memories/MEMORY.md",
+            "var/oneshot/land-home-pr.sh",                  # operator one-shot scripts stay
+            "var/oneshot/keep.tgz.txt",
+            "var/ledger/ledger.db",
+            "state/gitconfig-watch/liveness.json",
+            "state/gitconfig-watch/events.ndjson.1-notes/x.txt",
+            "blackbox/blackbox.db",
+            "skills/x/var/oneshot/a.tgz",                   # root-anchored
+            "skills/x/profiles/p/state.db",
+            "profiles/aegis/skills/x/state.db",             # only the profile's top-level store
+            "recovery/agora-session-continuity-20261013/REPORT.md",
+            "recovery/agora-session-continuity-20261013/aegis-repair/chronological/a.json",
+        ):
+            assert not _should_exclude(Path(p)), p
+
     def test_excludes_cache_forensic_artifacts(self):
         """cache/forensic-*/ holds DELIBERATELY TORN forensic specimens — they are
         expected to fail PRAGMA integrity_check forever, by construction.
@@ -377,6 +431,118 @@ class TestShouldExclude:
 # ---------------------------------------------------------------------------
 
 class TestIterBackupFiles:
+    @staticmethod
+    def _git(cwd, *argv):
+        import subprocess
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        return subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, text=True).stdout
+
+    def test_root_worktrees_carry_only_dirty_and_untracked(self, tmp_path, monkeypatch):
+        """t_7da95544: root wt/ + worktrees/ were 549 k of the 1.43 M files the full tier listed. A checkout's
+        clean tracked files live in its repository; only the work that exists nowhere else rides (t_e95deca8).
+        A clone whose HEAD is on no remote, and a checkout git cannot read, walk whole."""
+        import shutil as _sh
+        if _sh.which("git") is None:
+            pytest.skip("git not installed")
+        from hermes_cli import backup as B
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        parent = tmp_path / "parent"
+        self._git(tmp_path, "init", "-q", "-b", "main", str(parent))
+        for rel in ("clean.py", "sub/clean2.py", "mod.py", "staged.py"):
+            (parent / rel).parent.mkdir(parents=True, exist_ok=True)
+            (parent / rel).write_text("base\n")
+        (parent / ".gitignore").write_text("ignored.log\n")
+        self._git(parent, "add", "-A")
+        self._git(parent, "commit", "-q", "-m", "base")
+        wt = root / "wt" / "op"
+        self._git(parent, "worktree", "add", "-q", "--detach", str(wt), "main")
+        (wt / "mod.py").write_text("edited\n")                 # unstaged edit
+        (wt / "staged.py").write_text("staged\n")
+        self._git(wt, "add", "staged.py")                      # staged edit
+        (wt / "new" ).mkdir()
+        (wt / "new" / "evidence.md").write_text("unique\n")    # untracked
+        (wt / "ignored.log").write_text("x\n")                 # untracked + ignored: still unique, still carried
+        clone = root / "worktrees" / "full-clone"              # HEAD == origin/main: dirty-only
+        self._git(tmp_path, "clone", "-q", str(parent), str(clone))
+        (clone / "sub" / "clean2.py").write_text("edited\n")
+        ahead = root / "projects" / "ahead"                    # nested anywhere, HEAD on no remote: walked whole
+        self._git(tmp_path, "clone", "-q", str(parent), str(ahead))
+        (ahead / "local.py").write_text("x\n")
+        self._git(ahead, "add", "local.py")
+        self._git(ahead, "commit", "-q", "-m", "local only")
+        broken = root / "worktrees" / "broken"                 # pointer to a missing gitdir: walked whole
+        broken.mkdir(parents=True)
+        (broken / ".git").write_text("gitdir: /nonexistent/x\n")
+        (broken / "a.py").write_text("x\n")
+
+        got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
+        assert {"wt/op/mod.py", "wt/op/staged.py", "wt/op/new/evidence.md", "wt/op/ignored.log"} <= got
+        assert not {"wt/op/clean.py", "wt/op/sub/clean2.py", "wt/op/.gitignore"} & got, got
+        assert "worktrees/full-clone/sub/clean2.py" in got and "worktrees/full-clone/clean.py" not in got
+        assert {"projects/ahead/clean.py", "projects/ahead/local.py"} <= got
+        assert "worktrees/broken/a.py" in got
+
+        # git failing for a worktree (timeout) falls back to the whole tree, never to dropping it
+        def _boom(*a, **k):
+            raise B.subprocess.TimeoutExpired("git", 1)
+        monkeypatch.setattr(B, "_worktree_git", _boom)
+        got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
+        assert {"wt/op/clean.py", "wt/op/sub/clean2.py", "wt/op/mod.py"} <= got
+
+    def test_skip_worktree_and_assume_unchanged_files_are_never_clean(self, tmp_path):
+        """Prism a5c80df2341e on #2299: `git diff HEAD` does not report edits to files flagged skip-worktree (S) or
+        assume-unchanged (h), so the clean-set subtraction classified them as clean and dropped them. The live
+        Studio tree pins cron/jobs.json skip-worktree in three checkouts. Flagged paths are never clean."""
+        import shutil as _sh
+        if _sh.which("git") is None:
+            pytest.skip("git not installed")
+        from hermes_cli import backup as B
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        parent = tmp_path / "parent"
+        self._git(tmp_path, "init", "-q", "-b", "main", str(parent))
+        for rel in ("plain.py", "pinned.json", "flagged.txt"):
+            (parent / rel).write_text("base\n")
+        self._git(parent, "add", "-A")
+        self._git(parent, "commit", "-q", "-m", "base")
+        clone = root / "worktrees" / "c"                        # HEAD == origin/main: dirty-only
+        self._git(tmp_path, "clone", "-q", str(parent), str(clone))
+        self._git(clone, "update-index", "--skip-worktree", "pinned.json")
+        self._git(clone, "update-index", "--assume-unchanged", "flagged.txt")
+        (clone / "pinned.json").write_text("LOCAL EDIT\n")
+        (clone / "flagged.txt").write_text("LOCAL EDIT\n")
+        assert "pinned.json" not in self._git(clone, "diff", "--name-only", "HEAD")   # the premise: git hides it
+        got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
+        assert {"worktrees/c/pinned.json", "worktrees/c/flagged.txt"} <= got, got
+        assert "worktrees/c/plain.py" not in got
+
+    def test_combined_skip_worktree_and_assume_unchanged_is_never_clean(self, tmp_path):
+        """Prism 5cdbb59d31bc on #2305: a file with BOTH flags shows as lowercase `s` in `git ls-files -v`, which
+        the h/S filter admitted as clean, dropping its local edit. Only a plain `H` entry may be clean."""
+        import shutil as _sh
+        if _sh.which("git") is None:
+            pytest.skip("git not installed")
+        from hermes_cli import backup as B
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        parent = tmp_path / "parent"
+        self._git(tmp_path, "init", "-q", "-b", "main", str(parent))
+        for rel in ("plain.py", "config.json"):
+            (parent / rel).write_text("base\n")
+        self._git(parent, "add", "-A")
+        self._git(parent, "commit", "-q", "-m", "base")
+        clone = root / "worktrees" / "c"                        # HEAD == origin/main: dirty-only
+        self._git(tmp_path, "clone", "-q", str(parent), str(clone))
+        self._git(clone, "update-index", "--skip-worktree", "config.json")
+        self._git(clone, "update-index", "--assume-unchanged", "config.json")
+        (clone / "config.json").write_text("LOCAL EDIT\n")
+        assert self._git(clone, "ls-files", "-v", "config.json").startswith("s ")   # the premise: lowercase s
+        got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
+        assert "worktrees/c/config.json" in got, got
+        assert "worktrees/c/plain.py" not in got
+
     def test_manual_and_automatic_paths_share_one_walk(self, tmp_path):
         """Both backup entry points must select the identical file set.
 
@@ -3269,7 +3435,8 @@ class TestWorktreeUnpushedCommitBundles:
 
         with zipfile.ZipFile(out_zip, "r") as zf:
             names = zf.namelist()
-            assert "wt/dirty/b.txt" in names
+            # b.txt is committed (clean vs HEAD), so the dirty-only worktree walk leaves it to the bundle (t_7da95544)
+            assert "wt/dirty/b.txt" not in names
             # A credential in a remote URL must never reach the archive.
             assert not any(b"s3cret-tok" in zf.read(n) for n in names if n.startswith("wt/"))
             bundle = tmp_path / "restored.bundle"

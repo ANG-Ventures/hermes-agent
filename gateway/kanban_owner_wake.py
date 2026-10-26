@@ -76,7 +76,7 @@ STATE_FILENAME = "kanban_owner_wake.json"
 
 SCAN_KINDS = (
     "blocked", "stalled", "crashed", "gave_up", "timed_out", "reclaimed",
-    "completed", "review_requested", "skipped_nonspawnable",
+    "completed", "review_requested", "skipped_nonspawnable", "review_deadman",
 )
 STUCK_KINDS = frozenset({"stalled", "crashed", "gave_up", "timed_out"})
 # Kinds the per-subscription notify+wake path turns into a wake. The owner-wake
@@ -96,6 +96,7 @@ TRIGGER_STUCK = "stuck"
 TRIGGER_LAST_BLOCKER = "last_blocker_done"
 TRIGGER_RED_HANDBACK = "red_handback"
 TRIGGER_WOKE_NONSPAWNABLE = "woke_nonspawnable"
+TRIGGER_REVIEW_DEADMAN = "review_deadman"
 
 _WAKE_OFF_RE = re.compile(r"^\s*wake\s*:\s*off\s*$", re.I | re.M)
 # A block reason that names WHEN or ON WHAT the card can move again.
@@ -245,7 +246,7 @@ def _read_main_red_state() -> Optional[dict]:
     from hermes_constants import get_default_hermes_root
 
     try:
-        return json.loads((get_default_hermes_root() / "state" / MAIN_RED_STATE).read_text(encoding="utf-8"))
+        return json.loads((get_default_hermes_root() / "state" / MAIN_RED_STATE).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
 
@@ -294,6 +295,9 @@ def describe(item: dict) -> str:
                 "auto-spawn — decide: reassign to a worker or do it")
     elif trig == TRIGGER_RED_HANDBACK:
         out = f"handed back for review but the PR cannot land ({item.get('pr_state')})"
+    elif trig == TRIGGER_REVIEW_DEADMAN:
+        out = (f"waiting {item.get('waiting_min') or '?'}m in review on you with no owner comment (review deadman "
+               "tier 1): land it, request changes, or comment why it waits")
     else:
         out = str(item.get("kind"))
     if reason:
@@ -754,6 +758,7 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
          boards: Optional[Iterable[dict]] = None) -> int:
     """Read new events on every board into ``state.pending``. Returns events queued."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_delegations_board as _kdb
 
     if boards is None:
         try:
@@ -765,6 +770,8 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
     memo: dict = {}
     for meta in boards:
         slug = str(meta.get("slug") or kb.DEFAULT_BOARD)
+        if _kdb.is_delegations_board(slug):
+            continue  # a background unit reports through its own outbox; its card never wakes the session
         try:
             path = Path(meta["db_path"]).expanduser() if meta.get("db_path") else kb.kanban_db_path(slug)
             resolved = str(path.resolve())
@@ -871,6 +878,9 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
             return None
         item.update(trigger=TRIGGER_RED_HANDBACK, pr_state=verdict["state"],
                     red_keys=verdict["keys"], inherited_only=verdict["inherited_only"])
+    elif kind == "review_deadman":
+        # t_1e0ffee4: the review deadman's tier-1 page as an event (hermes-home kanban-review-deadman.py)
+        item.update(trigger=TRIGGER_REVIEW_DEADMAN, waiting_min=(payload or {}).get("waiting_min"))
     else:
         return None
     return item
@@ -1099,7 +1109,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
 
-    from gateway import kanban_auto_handle as _ah
+    from gateway import kanban_boomerang_wake as _ah
 
     auto_on = _ah.enabled()
     store = getattr(runner, "session_store", None)
@@ -1202,12 +1212,12 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             # Same kill switch as the notifier's terminal-pending branch (``_s5``).
             if suppress_cfgs[owner_profile].enabled and suppress_cfgs[owner_profile].actionable_only:
                 items = await asyncio.to_thread(terminal_pending_items, kb, card, items, current.get("status"))
-        # Boomerang v2 P3b (spec §5.5), AFTER the suppressor: an auto-handled item is a
+        # Boomerang v2 P3b (spec §5.5), AFTER the suppressor: a boomerang-wake item is a
         # child's, not a turn; one the notifier already claimed is skipped here.
         if items:
             before = items
             items = await _ah.owner_wake_filter(runner, card, items, entry, dispatch_on=auto_on)
-            _log_needs_input_cut(key, before, items, "an auto-handle claim owns it")
+            _log_needs_input_cut(key, before, items, "a boomerang-wake claim owns it")
         if not items:
             state.pending.pop(key, None)
             continue

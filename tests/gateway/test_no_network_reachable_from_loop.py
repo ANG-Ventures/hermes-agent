@@ -154,6 +154,14 @@ def _sites(root: Path, modules) -> list[str]:
     )
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _live_index_built_in_setup():
+    """Build the live tree's index once, in SETUP: the tests below read the memoized copy.
+    20-60 s on a 4-CPU CI slice, outside the per-test wall clock (t_44dcc531)."""
+    repo = _repo_root()
+    build_index(repo, derive_scanned_modules(repo, SCAN_ROOTS), noqa_token=NOQA_TOKEN)
+
+
 @pytest.fixture(scope="module")
 def live_sites() -> list[str]:
     repo = _repo_root()

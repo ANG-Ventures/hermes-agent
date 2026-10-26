@@ -27,7 +27,6 @@ from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent
 from gateway.session import AsyncSessionStore, SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
-from gateway.slash_commands_autohandle import GatewayAutoHandleCommandsMixin
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 from gateway.slash_commands_model import GatewayModelCommandsMixin, _model_switch_skew_guard
 from gateway.slash_commands_branch_thread import merge_delta_rows
@@ -398,8 +397,7 @@ class GatewaySlashCommandsMixin(
     GatewayModelCommandsMixin,
     GatewaySessionCommandsMixin,
     GatewayStatusCommandsMixin,
-    GatewayGoalCommandsMixin,
-    GatewayAutoHandleCommandsMixin):
+    GatewayGoalCommandsMixin):
     """In-session slash-command handlers for GatewayRunner (plus the helpers the sibling mixins share)."""
 
     async_session_store: AsyncSessionStore
@@ -784,7 +782,14 @@ class GatewaySlashCommandsMixin(
 
         # Idle /stop also blocks future automatic arrivals, without double-cancelling children.
         from gateway import queue_mgmt
-        self._session_state(session_key).persistent.run_generation += 1
+        # Idle /stop is an explicit invalidation (it can land in the turn-lease flush window, slot
+        # released, lease held): record the watermark before the bump so the lease registry reads
+        # the still-flushing holder as stopped, not superseded (t_d659b247 review).
+        _persistent = self._session_state(session_key).persistent
+        _persistent.invalidated_run_generation = max(
+            int(_persistent.invalidated_run_generation), int(_persistent.run_generation),
+        )
+        _persistent.run_generation += 1
         self._session_state(session_key).conversation.automatic_turns_paused = True
         queue_mgmt.hold_user_items(self, session_key, self._delivery_adapter_for(source))
         # Same contract as the busy path (run_agent_cache): a marker write failure must not abort

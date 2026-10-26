@@ -953,9 +953,10 @@
       "gateway/kanban_notify_suppress.py",
       "gateway/kanban_home_route.py",
       "gateway/kanban_wake_disposition.py",
-      "gateway/kanban_auto_handle.py",
+      "gateway/kanban_boomerang_wake.py",
       "gateway/kanban_prism_answers.py",
-      "gateway/run_turn.py"
+      "gateway/run_turn.py",
+      "gateway/run_turn_*.py"
     ],
     "why": "Cross-path contract over the two rows above (kanban notify_suppress, kanban owner-wake). Three wake defects shipped in four days with every per-feature test green: self-close echoes (t_4c7da648 #1901), the suppressor never firing in Discord threads (t_d654c294 #2019), a red handback waking twice (t_b1d26df7 #2021). The canary drives one real notifier tick (owner-wake tick at its tail) per event and counts turns at adapter.handle_message, the path read from metadata.kanban_owner_wake: W1 green handback 1 notifier; W2 red handback + wake sub 1 notifier naming the red; W3 red handback, no sub, 1 owner-wake; W4/W5 home-session self-close in a group chat / Discord thread 0 turns + self-session receipt; W6 foreign close on a thread-homed card 1; W7 needs_input block + wake sub 1 notifier; W8 operator-profile close of the last blocker 1 owner-wake (NEVER_SUPPRESS_TRIGGERS); W9 wake-only sub never suppressed. W8b home-session close of the last blocker 1 owner-wake (the own-session pre-filter honours NEVER_SUPPRESS_TRIGGERS, t_f3323c8a); W8c worker close of the last blocker with a notify+wake sub 1 notifier turn naming the ready children (marked carried, so the owner-wake drops its last_blocker_done, t_f3323c8a). W21/W22 (t_6e9f48cc, Ace 2026-10-22: ~14 mechanical review handbacks surfaced to the owner in one night): an own-repo handback whose SUMMARY answers every Prism key open at its head (prism_soft_gate round + its prism-verdict grammar) is ONE fork child (row own_repo_review_all_keys_answered) and zero turns; one unanswered key keeps the green row (merge pass, one notifier turn). W23 (t_f36d21e8, 2026-10-22 05:43-07:12: accepted wakes for G-LINT/SB-L never reached a turn): at the interrupt-depth cap the drain re-seated its dequeued follow-up over the overflow head _promote_queued_event had just staged, replacing a queued wake; both queued wakes must survive the capped drain in order.",
     "lifecycle": "fork-permanent",
@@ -1236,5 +1237,46 @@
       "telegram"
     ],
     "proposed_canary": "tests/fork_canaries/test_fork_canary_short_aliases.py (RED-proof: see card t_92c49fb6)"
+  },
+  {
+    "feature": "/goal continuation re-fires only after a turn that changed state (write-class tool call) or a human message; read-only/no-tool wakes leave the next nudge to the idle check-in (t_c4ac59ae)",
+    "tests": [
+      "tests/gateway/test_goal_continuation_turn_effect.py"
+    ],
+    "paths": [
+      "hermes_cli/goal_turn_effects.py",
+      "hermes_cli/goals.py",
+      "gateway/run_goals.py",
+      "gateway/run_turn.py",
+      "gateway/run_turn_*.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "Ace 2026-10-22 13:43/14:06 PT (#github-alternatives, ruling option b): a goal armed with --checkin-minutes 30 got '[Continuing toward your standing goal]' every 2-6 min on a busy board (session 20261018_220948_05ec4d95, 12:12..13:48) because every kanban wake / review-deadman page / NO_REPLY answer was followed by a continuation turn that re-read unchanged state. Not a spacing timer: the continuation edge is gated on the turn's tool-call effect class; judge done/blocked/wait/budget verdicts still run every turn. Kill switch goals.nudge_on_read_only_turns: true.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "turn-lease flush window: an inbound while the previous turn still holds the turn lease (slot released, persist/deliver running) is queued, not dispatched; stale holder = invalidated, not superseded; a lease rejection holds the prompts queued behind it (t_d659b247)",
+    "tests": [
+      "tests/gateway/test_turn_lease_flush_window.py"
+    ],
+    "paths": [
+      "gateway/turn_lease.py",
+      "gateway/session_state.py",
+      "gateway/run_inbound.py",
+      "gateway/run_inbound_*.py",
+      "gateway/run_agent_cache.py"
+    ],
+    "why": "2026-10-24 14:45 Apollo default gateway: _run_agent released the turn slot at 'response ready' while _handle_message held the turn lease through a ~170 s persist+deliver; a same-key kanban wake was dispatched as a fresh turn (gen 3), the registry read the live gen-2 holder as 'stopped and draining' because gen 2 was no longer current, clipped the wait to 5 s and bounced it, and Ace's voice message queued behind gen 3 was dropped with the bounce. Fixed by: _hm_queue_during_lease_flush (queue while a lease token is still held), PersistentState.invalidated_run_generation + is_generation_invalidated (supersession is not invalidation), _hm_lease_rejection_reply (hold + count queued prompts on a fail-closed rejection). The lease and its stale-holder predicate are fork-only, so a parity merge resolving these files toward upstream silently reopens all three.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
   }
 ]

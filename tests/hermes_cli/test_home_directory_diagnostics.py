@@ -7,6 +7,13 @@ import pytest
 from hermes_cli import config
 
 
+@pytest.fixture(autouse=True)
+def _host_not_container(monkeypatch):
+    # The mode assertions pin the host policy; a containerised CI runner (ci-box) is a real
+    # container signal that skips the chmod, so the runner's own container-ness must not leak in.
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+
+
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("subdir", (".", *config._HERMES_HOME_SUBDIRS))
 def test_unavailable_directory_links_are_diagnosed_without_creating_targets(tmp_path, monkeypatch, subdir):

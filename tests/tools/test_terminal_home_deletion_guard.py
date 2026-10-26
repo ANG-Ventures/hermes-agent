@@ -47,7 +47,7 @@ def test_rm_rf_of_hermes_home_is_rejected(fake_home):
 
 def test_script_invoked_by_path_is_rejected(fake_home, tmp_path):
     script = tmp_path / "rd.sh"
-    script.write_text('#!/bin/bash\nrm -rf "$HERMES_HOME"\n')
+    script.write_text('#!/usr/bin/env bash\nrm -rf "$HERMES_HOME"\n')
     with pytest.raises(terminal_module._Rejected):
         _run(f"bash {script}")
 

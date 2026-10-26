@@ -89,6 +89,9 @@ class TestScratchDirPermissionPolicy:
         for var in ("HERMES_HOME_MODE", "HERMES_MANAGED", "HERMES_CONTAINER",
                     "HERMES_SKIP_CHMOD", "HERMES_UID", "HERMES_GID"):
             monkeypatch.delenv(var, raising=False)
+        # A containerised CI runner is a real container signal; the cases below are about the
+        # host policy, so the runner's own container-ness must not leak in either.
+        monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
 
     def test_default_is_owner_only(self, tmp_path, monkeypatch):
         self._isolate_env(monkeypatch, tmp_path)

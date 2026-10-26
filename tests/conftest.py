@@ -401,6 +401,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(
         hermes_constants, "_get_platform_default_hermes_home", isolated_platform_default
     )
+    # The CI runners are Docker containers (/.dockerenv), so the canonical container signal
+    # made every owner-only chmod a no-op there and the 0600/0700 tests red on ci-box/ace-ai only.
+    # Like HERMES_CONTAINER (blanked in step 2), the runner's own container-ness is not a test
+    # input; tests of the container policy set it explicitly (t_b56f9e1e).
+    monkeypatch.setattr(hermes_constants, "_detect_container", lambda: False)
     fake_hermes_home = tmp_path / "hermes_test"
     fake_hermes_home.mkdir()
     (fake_hermes_home / "sessions").mkdir()
@@ -1164,6 +1169,53 @@ def _state_db_write_guard(request, monkeypatch):
     monkeypatch.setattr(
         _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
     )
+    yield
+
+
+# ── state.db holder scan: only this test's own processes are suspects ───────
+# ``hermes_state_holders.foreign_state_db_holders`` walks the WHOLE host's
+# /proc and, by design, counts a process it cannot inspect (fd readlink/listdir
+# EACCES) as a holder of ANY state.db when its argv looks like Hermes. On a
+# shared CI/worker host other jobs' ``python -m hermes_cli`` children (runner
+# containers, other users) are exactly that, so a test's private tmp state.db
+# read as "held" whenever one happened to be alive: 0/3/6/6/8 failures across
+# identical runs on ace-media (t_9b59804a). A process the test did not spawn
+# cannot hold a fresh tmp_path DB, so its argv is withheld from the scan
+# (``None`` = "not identifiable", the scan's own answer for an unreadable
+# cmdline). Descendants of this pytest process — the real holders the tests
+# spawn — keep the production fail-closed path. Readable-fd inode matches are
+# untouched. A test that patches ``_read_proc_argv`` itself overrides this.
+
+
+def _pid_descends_from(pid: int, ancestor: int) -> bool:
+    for _ in range(64):
+        if pid == ancestor:
+            return True
+        if pid <= 1:
+            return False
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                pid = int(handle.read().rsplit(b")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _holder_scan_ignores_unrelated_host_processes(monkeypatch):
+    holders = sys.modules.get("hermes_state_holders")
+    if holders is None or not sys.platform.startswith("linux"):
+        yield
+        return
+    real_read_proc_argv = holders._read_proc_argv
+    test_pid = os.getpid()
+
+    def _read_proc_argv(pid):
+        if not _pid_descends_from(pid, test_pid):
+            return None
+        return real_read_proc_argv(pid)
+
+    monkeypatch.setattr(holders, "_read_proc_argv", _read_proc_argv)
     yield
 
 

@@ -18,6 +18,13 @@ import pytest
 pytestmark = pytest.mark.platforms("posix")
 
 
+@pytest.fixture(autouse=True)
+def _host_not_container(monkeypatch):
+    # These cases pin the host policy; a containerised CI runner (ci-box) is a real container
+    # signal that skips the chmod, so the runner's own container-ness must not leak in.
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+
+
 class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""
 

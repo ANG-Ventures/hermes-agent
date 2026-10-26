@@ -57,7 +57,7 @@ _log = logging.getLogger(__name__)
 def read_mirrors(fleet_dir: Path) -> Dict[str, Tuple[str, Tuple[str, ...]]]:
     """``{owner/repo (lower): (mirror path, hosts)}``; {} on any doubt."""
     try:
-        doc = json.loads((Path(fleet_dir) / MIRRORS_FILE).read_text(encoding="utf-8"))
+        doc = json.loads((Path(fleet_dir) / MIRRORS_FILE).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     repos = doc.get("repos") if isinstance(doc, dict) and doc.get("schema") == 1 else None
@@ -161,8 +161,9 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     workspace holds something else (never overwritten)."""
     w, m, b = shlex.quote(workspace), shlex.quote(mirror), shlex.quote(branch)
     url = shlex.quote(url or f"https://github.com/{slug}.git")
+    from hermes_cli.kanban_worker_hosts import WORKSPACE_MODE  # t_69e47673: pool workspace, never world-searchable
     return (
-        f"set -e; w={w}; mkdir -p -- \"$w\"; "
+        f"set -e; w={w}; mkdir -p -m {WORKSPACE_MODE} -- \"$w\"; "
         # the mirror is owned by the runner user: trust that one path only
         f"export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0={m}; "
         "if [ -d \"$w/.git\" ]; then "

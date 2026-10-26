@@ -638,12 +638,6 @@ gateway:
     channel_not_joined: "音声チャンネルに参加していません。"
     channel_left: "音声チャンネルから退出しました。"
     transcript_echo: "**[音声]** <@{user}>: {text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ このセッションの YOLO モードは **OFF** — 危険なコマンドには承認が必要です。"
     enabled: "⚡ このセッションの YOLO モードは **ON** — すべてのコマンドが自動承認されます。注意して使用してください。"
@@ -1723,8 +1717,6 @@ slash:
     description: "フォーカス表示を切り替え — 自分のプロンプトと最終応答のみを表示"
   footer:
     description: "最終返信に付くゲートウェイのランタイムメタデータフッターを切り替え"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "YOLO モードを切り替え（危険なコマンドの承認をすべてスキップ）"
   approvals:

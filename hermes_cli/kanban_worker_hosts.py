@@ -80,6 +80,16 @@ class RemoteWorkspaceUnavailable(RuntimeError):
 
 
 _BOARD_ROOT_RC = 86
+# t_69e47673: a card's workspace on a POOL host is created 0770 (kanbanw + the board root's setgid group, never
+# world-searchable): nothing but the worker uid reads it, and a 0775 tree put ~2M dirs inside the ci-box prism lane
+# reset walk; a 0770 dir is pruned at depth 1. `mkdir -m` is umask-independent and touches the LAST component only,
+# so an existing dir (a re-run, the board root) keeps its mode. The Studio local-uid hop keeps the umask (its access
+# is the scratch-root ACL, kanbanw-studio-provision.sh).
+WORKSPACE_MODE = "0770"
+
+
+def _mkdir_mode(host: PoolHost) -> str:
+    return f"-m {WORKSPACE_MODE} " if host.name != LOCAL_HOST_NAME else ""
 
 
 def prepare_remote_workspace(host: PoolHost, workspace: str,
@@ -93,7 +103,7 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
     proc = runner(
         # The root is proven by CREATING under it (ENOSPC / inodes / quota pass
         # an access test; Prism d762ee26a639), then the probe dir is removed.
-        _ssh_argv(host, f"mkdir -p -- {w} && exit 0; "
+        _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && exit 0; "
                         f"t=$(mktemp -d {b}/.hermes-root-probe.XXXXXX 2>/dev/null) && "
                         f"{{ rmdir -- \"$t\"; exit 1; }}; exit {_BOARD_ROOT_RC}"),
         capture_output=True, text=True, encoding="utf-8", errors="replace",

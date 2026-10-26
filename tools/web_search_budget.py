@@ -47,7 +47,7 @@ def _today() -> str:
 
 def _load() -> dict:
     try:
-        d = json.loads(_state_path().read_text())
+        d = json.loads(_state_path().read_text(encoding="utf-8-sig"))
         if d.get("day") == _today():
             return d
     except Exception:  # noqa: BLE001 — missing/corrupt file = fresh day

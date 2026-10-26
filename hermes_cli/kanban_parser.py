@@ -9,6 +9,7 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+import sys
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
@@ -121,7 +122,30 @@ _WHY = _arg("--why", action="store_true",
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
+# Tiers sit on the fleet's live scale (store ORDER BY priority DESC): 0 is the default/normal
+# pile, ~80 is the ready pile, 100-300 is operator-urgent (measured 2026-10-24 on kanban.db).
+# A p0 must sort ABOVE every existing card, so it is 300, not a small ordinal (Prism P1 f02195f23922).
+_P_TIERS = {"p0": 300, "p1": 200, "p2": 100, "p3": 0}
+
+
+def priority_value(text: str) -> int:
+    """``--priority`` accepts the signed int the store keeps (higher = first) OR a
+    ``p0``..``p3`` tier (p0=300, p1=200, p2=100, p3=0: the fleet's live scale, p0 = highest). An operator who
+    types ``--priority p2`` against an int-only flag gets a refusal whose last line is
+    the create schema, which never mentions ``--priority`` -- the real cause scrolls off
+    (2026-10-24, three refused creates in a row on the vegas-theft board)."""
+    t = text.strip().lower()
+    if t in _P_TIERS:
+        return _P_TIERS[t]
+    try:
+        return int(t)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: want an int (higher = first) or a tier p0..p3 (p0 = highest)")
+
+
+_PRIORITY = _arg("--priority", type=priority_value, default=0,
+                 help="Priority tiebreaker: int (higher = first) or p0..p3 (p0 = highest)")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -361,10 +385,10 @@ _SPECS = [
                   "review). Best for open-ended cards one shot rarely finishes."),
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
-        _arg("--auto-handle", choices=("true", "false"), dest="auto_handle", default=None,
-             help="Boomerang v2: let mechanical wakes on this card be auto-handled by a "
-                  "background child (true) or always surface (false). Omit to inherit the "
-                  "home session's /autohandle, then the board default (off)."),
+        _arg("--boomerang-wake", action="store_true", dest="boomerang_wake",
+             help="Subscription level 'boomerang wake': mechanical wakes on this card are "
+                  "handled by a background boomerang child (the calling chat subscribes "
+                  "--boomerang-wake). Omit for notify / wake."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -673,10 +697,14 @@ _SPECS = [
             _arg("--worker-ok", action="store_const", const=False, dest="no_worker",
                  help="Clear the no-worker flag"),
         ),
-        _arg("--auto-handle", choices=("true", "false", "inherit"), dest="auto_handle",
-             default=None,
-             help="Boomerang v2 auto-handle flag: true / false, or inherit to clear it "
-                  "(home session /autohandle, then board default, then off)."),
+        _group(
+            _arg("--boomerang-wake", action="store_const", const=True, dest="boomerang_wake",
+                 default=None,
+                 help="Set the card's level to 'boomerang wake' (the card column; "
+                      "subscription rows are unchanged)"),
+            _arg("--no-boomerang-wake", action="store_const", const=False, dest="boomerang_wake",
+                 help="Drop the card back to plain wake"),
+        ),
         # fork #1614: per-card skill list; fork #1612: needs-input pager opt-out.
         _arg("--skill", action="append", default=[], dest="skills", metavar="NAME",
              help="Append a skill to force-load into the worker (repeatable; "
@@ -887,17 +915,21 @@ _SPECS = [
         _arg("--notifier-profile",
              help="Profile gateway that owns/delivers this subscription (default: active profile)"),
         # choices: single source of truth shared with the DB/watcher enum.
-        _arg("--delivery-mode", choices=kbn._NOTIFY_DELIVERY_MODES,
+        _arg("--delivery-mode", choices=(*kbn._NOTIFY_DELIVERY_MODES, *kbn.BOOMERANG_REQUEST_MODES),
              help="How the kanban-notifier reacts to terminal events for this "
                   "subscription: 'notify' (passive message only; default), "
                   "'notify+wake' (message AND wake the destination gateway agent so "
-                  "it reads the full board context and replies in its own voice), or "
-                  "'wake' (wake the agent only, no passive message). Omit to leave an "
-                  "existing subscription's mode unchanged (new subs default to 'notify')."),
+                  "it reads the full board context and replies in its own voice), "
+                  "'wake' (wake the agent only, no passive message), or the boomerang "
+                  "wake level 'notify+boomerang' / 'boomerang' (stored as notify+wake / wake "
+                  "and sets the card's boomerang_wake once this chat holds the wake). Omit to leave an existing subscription's "
+                  "mode unchanged (new subs default to 'notify')."),
         _arg("--wake", action="store_true",
              help="Shorthand for --delivery-mode notify+wake. One waker per card: "
                   "when another chat holds the wake this sub is stored notify "
                   "(use --takeover to move it)."),
+        _arg("--boomerang-wake", action="store_true", dest="boomerang_wake",
+             help="Shorthand for --delivery-mode notify+boomerang (boomerang wake level)."),
         _arg("--takeover", action="store_true",
              help="Move the card's wake to this chat; the old waker drops to notify."),
         _arg("--also", action="store_true",
@@ -1199,6 +1231,10 @@ def _schema_on_usage_error(sub: argparse._SubParsersAction) -> None:
             _verb = name
 
             def error(self, message):
-                super().error(f"{message}\n{schema_text(self._verb)}")
+                # Schema FIRST, the actual refusal LAST: a tool/terminal that tails the
+                # output shows the cause, not the example line (2026-10-24: three
+                # `--priority p2` refusals read as "the wrapper wants a different shape").
+                self.print_usage(sys.stderr)
+                self.exit(2, f"{schema_text(self._verb)}\n{self.prog}: error: {message}\n")
 
         p.__class__ = _SchemaOnError

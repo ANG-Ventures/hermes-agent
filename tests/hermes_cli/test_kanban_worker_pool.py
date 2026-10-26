@@ -148,6 +148,31 @@ def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_ro
         kwp.parse_roles(roles)
 
 
+def test_ci_runner_role_is_count_free_and_other_roles_keep_their_count(tmp_path):
+    """t_1acfaa85: hermes-home#6459 writes ``"ci-runner": {}``; the pool must still load."""
+    def doc(roles):
+        return {"schema": 1, "hosts": {"a": {"roles": roles, "state": "active"}}}
+
+    assert kwp.parse_roles(doc({"ci-runner": {}})) == {"a": ({"ci-runner": None}, "active")}
+    assert kwp.parse_roles(doc({"ci-runner": {"slots": 3}})) == {"a": ({"ci-runner": 3}, "active")}
+    for role in ("kanban-worker", "review-worker"):
+        with pytest.raises(kwp.PoolError, match=r'must be \{"slots": N\}'):
+            kwp.parse_roles(doc({role: {}}))
+    with pytest.raises(kwp.PoolError, match="ci-runner must be"):
+        kwp.parse_roles(doc({"ci-runner": {"slots": 3, "x": 1}}))
+    with pytest.raises(kwp.PoolError, match="slots must be 1..64"):
+        kwp.parse_roles(doc({"ci-runner": {"slots": 0}}))
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {"slots": 4}, "ci-runner": {}}, "state": "active"},
+        "ace-media": {"roles": {"kanban-worker": {"slots": 4}, "ci-runner": {}}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert cfg.refused is None
+    assert sorted(h.name for h in cfg.pool_hosts) == ["ace-ai", "ace-media"]
+    assert {h.slots for h in cfg.pool_hosts} == {4}
+
+
 def _studio_registered(fleet: Path, policy_hosts=None):
     """The QA t_1302fe6c repro: mac-studio carries the kanban-worker role and
     sits FIRST in the sidecar priority, while the placement policy says
@@ -482,6 +507,45 @@ def test_live_far_end_still_pins_beside_a_terminal_one(kanban_home):
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (done_p,))
         conn.commit()
         assert kbd._linked_ids(conn, [child])[child] == ("blocks", live_p)
+
+
+def test_parent_with_outgoing_after_merge_edge_is_placeable(kanban_home):
+    """t_250a7fc5: t_041ad167 (host: ci-box) sat 20 h on
+    ``not_portable:linked(after-merge->t_84e763a3)``, its OWN outgoing edge.
+    The edge gates the child on the parent's PR; it never holds the parent."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, body="host: ace-ai")
+        (child,) = _make(conn, 1, assignee="beta")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        assert parent not in kbd._linked_ids(conn, [parent, child])
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (parent,)).fetchone()
+        assert kbd._route_row(conn, row, _plan(free=2)) == ("pin", "ace-ai")
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert (parent, "ace-ai") in spawned and parent not in res.placement_waits
+
+
+def test_child_of_unmerged_after_merge_parent_is_not_placeable(kanban_home):
+    """The other direction still gates: the child is demoted to todo by the
+    link (never spawned) and its incoming edge still names it linked."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1, body="host: ace-ai")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0] == "todo"
+        assert kbd._linked_ids(conn, [child])[child] == ("after-merge", parent)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert all(s[0] != child for s in spawned)
+
+
+def test_legacy_lineage_mode_still_pins_the_after_merge_parent(kanban_home):
+    """Kill switch: ``lineage_pins: legacy`` keeps every link pinning."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1)
+        (child,) = _make(conn, 1, assignee="beta")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        assert kbd._linked_ids(conn, [parent], _pr.LINEAGE_PINS_LEGACY)[parent] == (
+            "after-merge", child)
 
 
 def test_legacy_lineage_mode_still_pins_a_terminal_parent(kanban_home):

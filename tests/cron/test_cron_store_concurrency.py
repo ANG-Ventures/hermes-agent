@@ -270,6 +270,44 @@ class TestVanishedJobGuard:
         assert "recent" in remaining
 
 
+class TestToggleJournal:
+    """t_3436a10c: pause/resume are journalled, so a NON-API writer that flips `enabled` (the 10-24
+    jobs.json union that laid origin's paused rows over three resumed Tiresias crons) is detectable."""
+
+    def _events(self, jid):
+        return [(e["event"], e.get("enabled")) for e in read_entries() if e["job_id"] == jid]
+
+    def test_pause_resume_and_create_record_the_toggle(self, tmp_cron_dir):
+        from cron.jobs import pause_job, resume_job
+
+        job = create_job(prompt="a", schedule="every 1h", name="tiresias-daily")
+        pause_job(job["id"], reason="dormant")
+        resume_job(job["id"])
+        assert self._events(job["id"]) == [("created", True), ("paused", None), ("resumed", None)]
+        paused = [e for e in read_entries() if e["event"] == "paused"]
+        assert paused[0]["reason"] == "dormant"
+
+    def test_an_edit_that_keeps_enabled_journals_nothing(self, tmp_cron_dir):
+        from cron.jobs import update_job
+
+        job = create_job(prompt="a", schedule="every 1h", name="quiet")
+        update_job(job["id"], {"prompt": "b"})
+        assert self._events(job["id"]) == [("created", True)]
+
+    def test_created_paused_records_enabled_false(self, tmp_cron_dir):
+        job = create_job(prompt="a", schedule="every 1h", name="dormant", paused=True)
+        assert self._events(job["id"]) == [("created", False)]
+
+    def test_toggle_events_do_not_make_the_vanished_guard_unavailable(self, tmp_cron_dir):
+        from cron.jobs import pause_job
+
+        job = create_job(prompt="a", schedule="every 1h", name="x")
+        pause_job(job["id"], reason="r")
+        _, malformed = read_entries_with_health()
+        assert malformed == 0
+        assert check_vanished_jobs().status == STATUS_OK
+
+
 class TestCronStatusSurface:
     """The guard must reach an operator, not just return a dataclass."""
 

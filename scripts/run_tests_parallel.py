@@ -34,8 +34,8 @@ Usage:
     pytest failure. Tokens after ``--`` are never validated.
 
 Environment:
-    HERMES_TEST_WORKERS  Worker-count CEILING (default: effective_cpus*2).
-                         Clamped to max(2, effective_cpus*2), where
+    HERMES_TEST_WORKERS  Worker-count CEILING (default: effective_cpus).
+                         Clamped to max(2, effective_cpus), where
                          effective_cpus is read from the cgroup CPU quota
                          rather than the host core count — `docker run
                          --cpus 2` on a 24-core box still reports 24 from
@@ -195,8 +195,12 @@ def resolve_worker_count(
     above, because the value that is right for a 4-vCPU hosted runner is 6x
     oversubscribed on a 2-CPU self-hosted container. ``HERMES_TEST_WORKERS_FORCE=1``
     bypasses the clamp for deliberate oversubscription experiments.
+
+    One worker per CPU, not two (t_58979a5e): at 2x, the 4-CPU hermes-agent-ci
+    runner containers (cpu.max ``400000 100000``) ran 8 workers, and 26 tests
+    that take 9-20 s on a quiet box blew their 60/90/105 s per-test walls.
     """
-    default = max(2, effective_cpus * 2)
+    default = max(2, effective_cpus)
     if requested is None:
         return default
     if force:
@@ -349,8 +353,9 @@ _DEFAULT_IDLE_TIMEOUT_SECONDS = 240.0
 def scaled_file_timeout(base: float, workers: int, effective_cpus: int) -> float:
     """Scale the DEFAULT per-file ceiling by worker oversubscription.
 
-    Workers default to 2x the CPU quota, so each file gets roughly half a CPU
-    and its wall time stretches by the same ratio. A fixed 300s wall turned a
+    Workers default to the CPU quota; an oversubscribed run (``-j`` below a
+    larger quota, or HERMES_TEST_WORKERS_FORCE=1) gives each file less than a
+    CPU and stretches its wall time by the same ratio. A fixed 300s wall turned a
     file that takes ~80s on a quiet box into a "hang" on a 4-vCPU runner with
     8 workers (merge groups 36213157250/36213163045/36213168317). Never below
     ``base``. An explicit --file-timeout / env value is used verbatim.

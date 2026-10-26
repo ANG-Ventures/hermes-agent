@@ -195,12 +195,12 @@ def test_referenced_script_whose_python_heredoc_prints_json_passes(tmp_path):
     """fp4 (hit while filing the review): a .sh that only prints JSON quoting the incident."""
     script = tmp_path / "sendback.sh"
     script.write_text(
-        f"#!/bin/bash\npython3 - <<'PY'\nimport json\nprint(json.dumps({{'items': ['never {BOOTOUT}', 'no {RESTART}']}}))\nPY\n",
+        f"#!/usr/bin/env bash\npython3 - <<'PY'\nimport json\nprint(json.dumps({{'items': ['never {BOOTOUT}', 'no {RESTART}']}}))\nPY\n",
         encoding="utf-8",
     )
     assert not _blocked(f"bash {script}")
     real = tmp_path / "real.sh"
-    real.write_text(f"#!/bin/bash\n{BOOTOUT}\n", encoding="utf-8")
+    real.write_text(f"#!/usr/bin/env bash\n{BOOTOUT}\n", encoding="utf-8")
     assert _blocked(f"bash {real}")
 
 

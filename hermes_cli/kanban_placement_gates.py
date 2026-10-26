@@ -148,7 +148,7 @@ def read_series(paths: Iterable[Path]) -> List[dict]:
     out: List[dict] = []
     for p in paths:
         try:
-            text = Path(p).read_text(encoding="utf-8")
+            text = Path(p).read_text(encoding="utf-8-sig")
         except FileNotFoundError:
             continue
         for line in text.splitlines():

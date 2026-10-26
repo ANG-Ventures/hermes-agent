@@ -27,7 +27,7 @@ from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
-    wake_progress_header,
+    wake_chrome_muted, wake_progress_header,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -2141,6 +2141,11 @@ class GatewayTurnMixin:
         # The /goal no-progress stop reads this (streamed turns return None, so not from the result).
         with suppress(Exception):
             event._goal_turn_api_calls = int(agent_result.get("api_calls", 0) or 0)
+        # The /goal continuation gate reads this: write | read | none over this turn's tool calls, or
+        # None (unknown, never held) when compaction during the run erased the turn boundary.
+        with suppress(Exception):
+            from hermes_cli.goal_turn_effects import turn_effect_for_result
+            event._goal_turn_effect = turn_effect_for_result(agent_result, agent_messages)
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
@@ -4133,7 +4138,8 @@ class GatewayTurnMixin:
             if callable(_mark_turn):
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
-    def _queue_leftover_steer(self, text: str, source: SessionSource, session_key: str) -> None:
+    def _queue_leftover_steer(self, text: str, source: SessionSource, session_key: str, *,
+                              internal: bool = False) -> None:
         """Append a leftover /steer to the session's /queue overflow (behind the pending follow-up);
         a leftover "/stop" or "/new" must never reach the agent."""
         parts = text.strip().split(None, 1)
@@ -4148,7 +4154,7 @@ class GatewayTurnMixin:
                     )
                     return
         self._session_state(session_key).conversation.queued_events.append(
-            MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+            MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
         )
         logger.info(
             "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
@@ -4202,15 +4208,21 @@ class GatewayTurnMixin:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
+        _steer_internal = bool(result and result.get("_pending_steer_internal"))
         if result and not pending and not pending_event and result.get("pending_steer"):
             pending = result.get("pending_steer")
+            if _steer_internal:
+                # A steered completion re-seated as text runs as the internal wake it was, not as a
+                # human turn (visible fallback, auth path, no silence allowance) (t_506536db).
+                pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source,
+                                             internal=True)
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
         elif result and result.get("pending_steer") and adapter and session_key:
             # Fork (2026-09-29): a follow-up already owns the next turn. Queue the leftover steer
             # behind it instead of dropping it — on the overflow tail, never the head slot (the
             # depth-cap branch re-seats pending_event in the head slot and would overwrite it; the
             # next drain promotes the overflow head). Same slash-command guard as the pending text.
-            self._queue_leftover_steer(result["pending_steer"], source, session_key)
+            self._queue_leftover_steer(result["pending_steer"], source, session_key, internal=_steer_internal)
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):
@@ -4346,6 +4358,11 @@ class GatewayTurnMixin:
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
+            if adapter and pending_event is None and pending:
+                # An event-less follow-up (leftover /steer, interrupt text) has no slot entry to put
+                # back. No adapter defines ``queue_message``, so it used to vanish here; a completion
+                # steered into the capped turn after its last tool batch was lost (t_97a879af).
+                pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source)
             if adapter and pending_event:
                 # The drain already promoted the overflow head into the slot; merging would REPLACE it
                 # (two internal TEXT wakes never merge), losing an accepted wake (t_f36d21e8). Put the
@@ -4354,8 +4371,6 @@ class GatewayTurnMixin:
                 if occupant is not None and occupant is not pending_event:
                     self._session_state(session_key).conversation.queued_events.insert(0, occupant)
                 adapter._pending_messages[session_key] = pending_event
-            elif adapter and hasattr(adapter, 'queue_message'):
-                adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
@@ -4867,7 +4882,10 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
-        if scheduled_heartbeat:
+        # An internal wake in a page channel (fleet #alerts) gets the same quiet chrome (t_c40d3277).
+        quiet_chrome = scheduled_heartbeat or wake_chrome_muted(
+            persist_user_display_kind, source, disp.user_config)
+        if quiet_chrome:
             # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic
             # liveness notices would create a user-visible ping before its final result is known.
             # Keep status callbacks intact for approvals and actionable failures.
@@ -4914,7 +4932,7 @@ class GatewayTurnMixin:
         # Periodic "still working" notifications so the user knows the agent hasn't died.
         _executor_task_holder: list = [None]  # bound once the executor future exists (see below)
         _notify_task = (
-            None if (scheduled_heartbeat or turn_ctx.mute_notification_reply)
+            None if (quiet_chrome or turn_ctx.mute_notification_reply)
             else spawn(self._run_agent_notify_long_running(disp, turn_ctx, _executor_task_holder))
         )
 
@@ -4939,6 +4957,15 @@ class GatewayTurnMixin:
                 logger.info("PHASE=stale_drain_skipped session=%s gen=%s", session_key, turn_ctx.run_generation)
                 pending_event, pending = None, None
             else:
+                if isinstance(result, dict):
+                    # Provenance of the leftover steer: internal only when the leftover is built from
+                    # internal steer entries of the agent's buffer. Called on EVERY turn end, leftover
+                    # or not, so it retires entries a tool batch drained mid-turn (t_506536db).
+                    from gateway.run_busy import leftover_steer_is_internal
+                    _internal = leftover_steer_is_internal(
+                        turn_ctx.agent_holder[0] if turn_ctx.agent_holder else None, result.get("pending_steer"))
+                    if result.get("pending_steer"):
+                        result["_pending_steer_internal"] = _internal
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )

@@ -833,7 +833,7 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
-def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
+def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = False) -> bool:
     """Subscribe the originating chat to ``task_id`` when configured.
 
     Gated by ``kanban.cli_auto_subscribe`` (default False). ``hermes kanban
@@ -845,18 +845,23 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
     ``gateway.session_context.get_session_env``) subscribes; bare CLI /
     cron / script creates stay silent regardless of the knob.
 
+    ``--boomerang-wake`` IS a subscription level, so it subscribes the calling
+    gateway chat as its waker whatever the knob says (row ``notify+wake``; the level is
+    ``tasks.boomerang_wake``).
+
     Returns True when a subscription row was written. Never raises — a
     notification bookkeeping failure must not fail the create.
     """
     try:
         from hermes_cli.config import cfg_get, load_config
 
-        if not cfg_get(load_config(), "kanban", "cli_auto_subscribe", default=False):
+        if not boomerang_wake and not cfg_get(load_config(), "kanban", "cli_auto_subscribe", default=False):
             return False
         from tools.kanban_tools import subscribe_calling_session
 
         return subscribe_calling_session(
-            conn, task_id, require_platform_identity=True
+            conn, task_id, require_platform_identity=True,
+            wake=True if boomerang_wake else None,
         )
     except Exception:
         return False
@@ -1005,7 +1010,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
-                auto_handle=_AUTO_HANDLE_ARG.get(getattr(args, "auto_handle", None)),
+                boomerang_wake=True if getattr(args, "boomerang_wake", False) else None,
                 initial_status=getattr(args, "initial_status", "running"),
                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                  if is_dispatcher_owned_worker_context() else None),
@@ -1030,7 +1035,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             auto_added = bool(kb.created_skills_auto_added(
                 conn, task_id, after_event_id=_event_mark))
             dup_warning = kb.near_duplicate_warning(conn, task_id)
-            auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
+            auto_subscribed = _maybe_cli_auto_subscribe(
+                conn, task_id, boomerang_wake=bool(getattr(args, "boomerang_wake", False)))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1419,6 +1425,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             placement = kpv.task_block(conn, task.id)
         except kb.sqlite3.Error:  # older/minimal board schema
             placement = None
+        level = kbn.card_level(task.boomerang_wake, kbn.list_notify_subs(conn, task.id))
         try:
             from hermes_cli import kanban_pr_owner as kpo
 
@@ -1433,6 +1440,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         _print_json({
             "task": _task_to_dict(task),
             "home": _home_label(task.session_id, unhomed=task.unhomed),
+            "level": level,
             "latest_summary": latest_summary,
             "workspace_refusal": refusal,
             "held_repo": held,
@@ -1473,6 +1481,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("priority", task.priority)
     if task.no_worker:
         field("dispatch", "operator-only")
+    field("level", level)
     field("session", task.session_id or (kb.UNHOMED_SESSION if task.unhomed else "-"))
     field("home", _home_label(task.session_id, unhomed=task.unhomed))
     if task.tenant:
@@ -3187,6 +3196,7 @@ def _last_event_id(conn, task_id: str) -> int:
 _COMPLETION_OUTCOME_EVENTS = {
     "completion_route_refused": "open-PR review route refused",
     "completion_routed_to_review": "handoff names still-OPEN PR(s)",
+    "completion_no_new_head": "no new PR head since the send-back; it stands",
     "workspace_held": "workspace held",
 }
 
@@ -3331,7 +3341,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
             except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError,
-                    StaleHandbackHeadError, SupersededContentError) as draft_err:
+                    StaleHandbackHeadError, SupersededContentError, kb.NotLandableError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
@@ -3354,7 +3364,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 )
             else:
                 after = kb.get_task(conn, tid)
-                if getattr(after, "status", None) == "review":
+                from hermes_cli import kanban_handback_new_head as _nh
+                # THIS invocation's outcome (its run's ended row), never the card's current
+                # status: a successor may already hold the card (Prism a0341975cd2e).
+                bounced = _nh.bounced_note(conn, tid, _worker_run_id_for(tid))
+                if bounced is not None:
+                    print(f"Returned {tid} to its worker, {bounced}")
+                elif getattr(after, "status", None) == "review":
                     print(f"Routed {tid} to review, NOT done: "
                           f"{outcome or 'handoff names a still-OPEN PR'}")
                 elif external is not None:
@@ -3400,10 +3416,6 @@ def _cmd_priority(args: argparse.Namespace) -> int:
         return 0 if _set_priority(conn, args.task_id, args.priority) else 1
 
 
-# ``--auto-handle`` word -> stored tri-state (Boomerang v2 D-15); ``inherit`` clears to NULL.
-_AUTO_HANDLE_ARG = {"true": True, "false": False, "inherit": None}
-
-
 def _cmd_edit(args: argparse.Namespace) -> int:
     raw_meta = getattr(args, "metadata", None)
     metadata = None
@@ -3440,17 +3452,17 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     add_skills = list(getattr(args, "skills", None) or [])
     clear_skills = bool(getattr(args, "clear_skills", False))
     do_skills = bool(add_skills) or clear_skills
-    auto_handle_arg = getattr(args, "auto_handle", None)
+    boomerang_arg = getattr(args, "boomerang_wake", None)
 
     if result is None and (summary is not None or raw_meta is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
     if (not do_result and not do_fields and not do_model and not do_session
             and no_worker is None and new_priority is None and page is None and not do_skills
-            and auto_handle_arg is None):
+            and boomerang_arg is None):
         return _err(
             "kanban: nothing to edit (pass --title, --body, --result, --model, --clear-model, "
             "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
-            "--skill, --clear-skills or --auto-handle)", 2)
+            "--skill, --clear-skills, --boomerang-wake or --no-boomerang-wake)", 2)
 
     rc = 0
     with kbc.connect_closing() as conn:
@@ -3465,12 +3477,12 @@ def _cmd_edit(args: argparse.Namespace) -> int:
                 f"{args.task_id}: dispatch: "
                 + ("operator-only (no-worker)" if no_worker else "worker-ok")
             )
-        if auto_handle_arg is not None:
-            if not kb.set_task_auto_handle(
-                conn, args.task_id, _AUTO_HANDLE_ARG[auto_handle_arg], operator=_profile_author(),
+        if boomerang_arg is not None:
+            if not kb.set_task_boomerang_wake(
+                conn, args.task_id, bool(boomerang_arg), operator=_profile_author(),
             ):
                 return _err(f"cannot edit {args.task_id} (unknown id)")
-            print(f"{args.task_id}: auto-handle: {auto_handle_arg}")
+            print(f"{args.task_id}: level: " + ("boomerang wake" if boomerang_arg else "not boomerang wake"))
         if page is not None:
             if not kb.set_needs_input_page(
                 conn, args.task_id, page, operator=_profile_author(),
@@ -4431,6 +4443,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             notifier_profile=args.notifier_profile or _profile_identity(),
             delivery_mode=(
                 getattr(args, "delivery_mode", None)
+                or ("notify+boomerang" if getattr(args, "boomerang_wake", False) else None)
                 or ("notify+wake" if getattr(args, "wake", False) else None)
             ),
             delivery_metadata=delivery_metadata or None,
@@ -4439,8 +4452,8 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         )
         waker = kbn.card_waker(conn, args.task_id)
         wants_wake = (
-            getattr(args, "delivery_mode", None) in kbn.NOTIFY_WAKE_MODES
-            or getattr(args, "wake", False)
+            getattr(args, "delivery_mode", None) in (*kbn.NOTIFY_WAKE_MODES, *kbn.BOOMERANG_REQUEST_MODES)
+            or getattr(args, "wake", False) or getattr(args, "boomerang_wake", False)
         )
         thread = args.thread_id or ""
         if wants_wake and outcome != "kept" and waker is not None and not (
@@ -5121,10 +5134,12 @@ def _run_slash(rest: str) -> str:
     except argparse.ArgumentError as exc:
         # py>=3.12 raises here (exit_on_error=False) without calling error(), so the
         # schema-on-miss hook in kanban_parser never runs on this path (t_cd1bcea4).
+        # Schema is context, the ArgumentError is the answer -- it goes LAST so a reader
+        # (or a tail) sees the cause, not the example line (2026-10-24).
         schema = ""
         if tokens and tokens[0] in kvi.VERB_SCHEMAS and "input: required" not in str(exc):
-            schema = "\n" + kvi.schema_text(tokens[0])
-        return f"⚠ /kanban usage error\n{_usage_for_error()}\n{exc}{schema}"
+            schema = kvi.schema_text(tokens[0]) + "\n"
+        return f"⚠ /kanban usage error\n{_usage_for_error()}\n{schema}error: {exc}"
 
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         try:

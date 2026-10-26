@@ -22,9 +22,11 @@ on:
 permissions:
   contents: read
 
+# push:main keys by run_id and never cancels: under CI_MAIN_GROUP_PER_SHA two
+# main runs are live at once and a shared ref group would cancel one's child.
 concurrency:
-  group: lint-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  group: lint-${{ (github.ref_type == 'tag' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != 'refs/heads/main' }}
 
 jobs:
   lint-diff:
@@ -182,7 +184,9 @@ jobs:
     name: Windows footguns (blocking)
     # Hosted by design — short, no LAN dependency. See `lint-diff` above.
     runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    # 16 serial lint steps: 5m0s ran out at step 13 on a loaded ci-box once step 1 stopped failing
+    # (mirror run 39900711727, t_3475d957).
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1

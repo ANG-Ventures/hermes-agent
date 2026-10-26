@@ -143,6 +143,61 @@ def test_rewound_oneshot_completed_at_a_later_reschedule_does_not_refire(tmp_pat
         assert _next_run(job["id"]) == restored  # no recurring successor computed for a one-shot
 
 
+def _burst_marker():
+    from cron.occurrences import REWOUND_BURST_MARKER
+
+    return jobs._current_cron_store().cron_dir / REWOUND_BURST_MARKER
+
+
+def test_rewound_burst_in_one_tick_writes_the_marker(tmp_path, monkeypatch):
+    """2026-10-23 16:20:05: 422 jobs rewound in one tick and only the log knew (t_3d311bd1)."""
+    import json
+
+    from cron.occurrences import REWOUND_BURST_SAMPLE, REWOUND_BURST_THRESHOLD
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with jobs.use_cron_store(tmp_path / "cron"):
+        now = jobs._hermes_now()
+        ran = (now - timedelta(minutes=20)).replace(microsecond=0).isoformat()
+        stale = (now - timedelta(hours=5)).replace(microsecond=0).isoformat()
+        ids = []
+        for index in range(REWOUND_BURST_THRESHOLD + 5):
+            job = _job("hourly-%d" % index)
+            _complete(job["id"], ran)
+            ids.append(job["id"])
+        stored = jobs.load_jobs()
+        for row in stored:
+            row["next_run_at"] = stale
+        jobs.save_jobs(stored)
+
+        assert jobs.get_due_jobs() == []
+        marker = json.loads(_burst_marker().read_text())
+        assert marker["count"] == len(ids)
+        assert marker["threshold"] == REWOUND_BURST_THRESHOLD
+        assert marker["sample_ids"] == ids[:REWOUND_BURST_SAMPLE]
+        assert marker["tick_at"]
+        # The schedule resumed after the watermark, so the next tick sees no rewind and keeps
+        # the marker as-is (one episode, not one marker per tick).
+        jobs.get_due_jobs()
+        assert json.loads(_burst_marker().read_text()) == marker
+
+
+def test_rewound_jobs_below_the_threshold_write_no_marker(tmp_path, monkeypatch):
+    from cron.occurrences import REWOUND_BURST_THRESHOLD
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with jobs.use_cron_store(tmp_path / "cron"):
+        now = jobs._hermes_now()
+        ran = (now - timedelta(minutes=20)).replace(microsecond=0).isoformat()
+        for index in range(REWOUND_BURST_THRESHOLD - 1):
+            job = _job("hourly-%d" % index)
+            _complete(job["id"], ran)
+            _rewind(job["id"], (now - timedelta(hours=5)).replace(microsecond=0).isoformat())
+
+        assert jobs.get_due_jobs() == []
+        assert not _burst_marker().exists()
+
+
 def test_retention_keeps_the_newest_valid_completion_not_a_poisoned_later_one(tmp_path, monkeypatch):
     """Prism #1797 f84fc879b9dd: a poisoned future-slot completion must not displace the valid
     watermark from the per-job retention exemption, or a rewind re-runs today's completed slot."""

@@ -4028,11 +4028,12 @@ def _stop_own_spawn(proc: Optional[subprocess.Popen], grace: float = 5.0) -> Non
                 group = proc.pid
         except OSError:
             group = None
+    born = _kb._member_birth(proc.pid) if group is not None else None
 
     def _signal(sig) -> None:
         try:
             if group is not None:
-                os.killpg(group, sig)
+                os.killpg(group, sig)  # windows-footgun: ok — group is set only under hasattr(os, "killpg") above
             else:
                 os.kill(proc.pid, sig)
         except (ProcessLookupError, PermissionError):
@@ -4049,6 +4050,11 @@ def _stop_own_spawn(proc: Optional[subprocess.Popen], grace: float = 5.0) -> Non
         time.sleep(0.05)
     # Unconditional: group members that outlived or ignored SIGTERM.
     _signal(getattr(signal, "SIGKILL", signal.SIGTERM))
+    if group is not None and born is not None:
+        # A tool that setpgid()s out of the group is still in the worker's session (Prism
+        # ffe521cbbb21). Swept while the leader is unreaped (its pid, so the sid, is not
+        # reusable), bounded by the leader's own birth: there is no spawned event yet.
+        _kb._reap_worker_session(proc.pid, born_after=born, born_before=time.time())
     try:
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
@@ -4131,11 +4137,14 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
             ),
         )
     except Exception as exc:
-        if state.launched and state.pid:
-            # Failed after the process started (pid/placement write): stop it before the run
-            # is ended, so a reported failure never leaves a unit running (Prism 6a23557fb4be).
-            _stop_own_spawn(state.proc)
-            _kb._abort_lost_claim_spawn(conn, claimed, int(state.pid))
+        # Failed after the process started (pid/placement write, or the spawner raising after
+        # it handed over its Popen): stop it before the run is ended, so a reported failure
+        # never leaves a unit running (Prism 6a23557fb4be). The handle alone proves a process
+        # exists, whether or not the spawner got as far as returning a pid (Prism a80612555536).
+        _stop_own_spawn(state.proc)
+        pid = state.pid if state.launched else None
+        if pid:
+            _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
         host_fault = _host_fault(exc)
         _record_task_failure(
             conn, claimed.id, str(exc), outcome="spawn_failed", release_claim=True, end_run=True,
@@ -4443,6 +4452,9 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
             for me, other, other_status in ((r[0], r[1], r[4]), (r[1], r[0], r[3])):
                 if mode != _pr.LINEAGE_PINS_LEGACY and other_status in _TERMINAL_STATUSES:
                     continue  # a terminal far end pins nothing (t_6d9e7d90)
+                if (mode != _pr.LINEAGE_PINS_LEGACY and kind in _pr.CHILD_ONLY_LINK_KINDS
+                        and me == r[0]):
+                    continue  # the parent's own outgoing after-merge edge (t_250a7fc5)
                 if me not in best or edge < best[me]:
                     best[me] = edge
                     out[me] = (kind, other)
@@ -4568,9 +4580,12 @@ def _wait_history(conn, tids: list, since_ts: int) -> "tuple[dict, dict]":
 
 
 def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
-                            reached=()) -> None:
+                            reached=(), local_binding: Optional[dict] = None) -> None:
     """One ``placement_wait`` task_event per held ready card
-    ``{code, detail, reason, route, host, since}`` (spec §4.2).
+    ``{code, detail, reason, route, host, since}`` (spec §4.2). A
+    ``local_full`` row also carries ``local_binding`` (``{binding,
+    binding_detail}``, ``_pr.local_full_binding``): gate vs board quota. It is
+    not part of the dedup key.
 
     Written only when the card's dedup key ``(code, route, host)`` differs
     from its latest one in the current episode, or that one is older than
@@ -4640,10 +4655,13 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
                         seen = list(dict.fromkeys(k[0] for k in recent if k[0] != _pr.FLAPPING))
                         code, detail, host = _pr.FLAPPING, "|".join(seen), None
                         reason = f"{code} ({detail})"
-            writes.append((tid, {
+            payload = {
                 "code": code, "detail": detail, "reason": reason, "route": route,
                 "host": host, "since": since,
-            }))
+            }
+            if code == _pr.LOCAL_FULL and local_binding:
+                payload.update(local_binding)
+            writes.append((tid, payload))
         if not writes:
             return
         with _kb.write_txn(conn):
@@ -4898,6 +4916,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             row["body"], skills, caps,
             pin_host=pin if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None,
             any_pin=pin == _kwp.PIN_ANY)
+        if verdict.body_ignored and caps_out is not None:
+            # Advisory body pin no host may serve (t_640a4ea0): placed without it, recorded.
+            caps_out.setdefault("body_ignored", {})[row["id"]] = verdict.body_ignored[0]
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked, workspace_bind=bind,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
@@ -5407,6 +5428,8 @@ def _caps_into_result(result, caps, caps_out: dict) -> None:
         result.placement_caps.setdefault(tid, {})["reasons"] = reasons
     for tid, hosts in (caps_out.get("only") or {}).items():
         result.placement_caps.setdefault(tid, {})["only"] = list(hosts)
+    for tid, req in (caps_out.get("body_ignored") or {}).items():
+        result.placement_caps.setdefault(tid, {})["body_ignored"] = f"requires_body_ignored:{req.cap}"
 
 
 def _identity_only_unplanned(rows) -> dict:
@@ -7317,13 +7340,20 @@ def _dispatch_once_locked(
         from hermes_cli.kanban_host_affinity import record_affinity_events
         from hermes_cli import kanban_host_capabilities as _khc
         _cap_comments = _khc.pending_comments(conn, result, _caps, _caps_out)
+        # Held at host=none on the previous tick too: read before this tick's waits land.
+        _held = _khc.held_pending(conn, result)
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
         # The pin-lacks park blocks the card: ownership first, as for access contradictions.
         _drop_foreign(conn, _caps_out.get("pin_lacks") or {}, default_assignee)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
+        _held_own = dict(_held)
+        _drop_foreign(conn, _held_own, default_assignee)
+        _khc.notify_held(conn, board, list(_held_own.items()))
     _park_access_contradictions(conn, result, dry_run, default_assignee)
-    _record_placement_waits(conn, result, row_route, dry_run, _wait_reached)
+    _record_placement_waits(
+        conn, result, row_route, dry_run, _wait_reached,
+        local_binding=_pr.local_full_binding(spawn_paused, local_budget, ready_local, local_spawned))
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
         1 for tid in result.placement_waits
@@ -7379,6 +7409,7 @@ def _dispatch_once_locked(
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         _review_origin_host = None
+        _review_rid = None
         if row['id'] in _review_pause_pins:
             # A resumed paused card's first review run goes back to its origin (fleet pause resume fence).
             _pin_host = _review_pause_pins[row['id']]
@@ -7450,6 +7481,7 @@ def _dispatch_once_locked(
             continue
         if _review_origin_host is not None:
             _review_origin_host = spillover.take(row['assignee'], pin=_review_origin_host.name)
+            _review_rid = getattr(spillover, "last_reservation", None)
             if _review_origin_host is None:
                 result.placement_waits[row['id']] = spillover.refusal
                 continue
@@ -7468,9 +7500,11 @@ def _dispatch_once_locked(
         except _kph.PauseHeld as exc:
             _pause_held_at_claim(conn, result, exc)
             if _review_origin_host is not None:
-                spillover.release(_review_origin_host, getattr(spillover, "last_reservation", None))
+                spillover.release(_review_origin_host, _review_rid)
             continue
         if claimed is None:
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
         # Review spawns are workers too: a capacity window that re-routes the
         # ready lane but silently leaves reviewers on a capped provider would
@@ -7508,8 +7542,12 @@ def _dispatch_once_locked(
             _kb._release_claim_for_workspace_refusal(
                 conn, claimed.id, result, str(exc),
             )
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
         except Exception as exc:
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it
             # re-runs the identical git probe against the identical path. Block
@@ -7545,12 +7583,16 @@ def _dispatch_once_locked(
         )
         if not _kb._claim_still_held(conn, claimed):
             _kb._abort_lost_claim_spawn(conn, claimed, None)
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             from hermes_cli.kanban_continuation import record_placement
             if not record_placement(conn, claimed.id, claimed.current_run_id,
                                     _review_origin_host.name if _review_origin_host else None):
+                if _review_origin_host is not None:
+                    spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
                 continue
             if _review_origin_host:
                 _kb._kwh.prepare_remote_workspace(_review_origin_host, str(workspace))

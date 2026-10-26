@@ -1651,6 +1651,10 @@ DEFAULT_CONFIG = {
         # Durable background units run in their own process and survive a gateway restart
         # (docs/dev/delegate-detached-background.md). false = in-gateway threads (kill switch).
         "detached_background": False,  # default OFF (Ace ruling option B, t_7ccdc21b); the replacement is t_414b4d92
+        # Where a restart-durable gateway background unit runs: "in_process" (gateway threads) or
+        # "kanban" (one card on the internal `delegations` board, its own process; survives a gateway
+        # restart, docs/dev/delegate-background-on-kanban-runtime.md). "in_process" is the kill switch.
+        "background_runtime": "in_process",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
@@ -1663,6 +1667,10 @@ DEFAULT_CONFIG = {
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
+        # Gateway: a turn whose tool calls were all reads (or none: a NO_REPLY, a page answered in
+        # chat) and that the user did not author queues no continuation; the idle check-in is the
+        # next nudge. True restores a continuation after every judged-continue turn.
+        "nudge_on_read_only_turns": False,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
@@ -2403,6 +2411,11 @@ DEFAULT_CONFIG = {
         # of `fleet-host capabilities --sync` (generated_by + source_hash);
         # a hand-written index runs warn. Absent host-capabilities.json = off.
         # See hermes_cli/kanban_host_capabilities.py.
+        # kanban.placement.body_requires_mode (t_640a4ea0, read per tick from
+        # the ROOT config): advisory (absent) = a body-sniffed capability no
+        # host may serve never holds the card (event requires_body_ignored);
+        # enforce = it holds at host=none as before. A `requires:` line always
+        # enforces; a host=none hold past one tick gets ONE card comment.
         # route_first (t_7133e03d, read per tick): every ready row is routed
         # and every held row gets a placement_wait, including rows a total
         # gate or an exhausted budget holds; false restores the silent early
@@ -2477,11 +2490,14 @@ DEFAULT_CONFIG = {
         "needs_input_pager": True,
         # Also page a card parked as `dependency` on a parent that is blocked.
         "needs_input_pager_dependency": False,
-        # Per-row kill switches for Boomerang auto-handle disposition rows, on top
-        # of delegation.boomerang.auto_handle_enabled (t_6e9f48cc).
+        # Per-row kill switches for boomerang wake disposition rows, on top of the
+        # state/boomerang-wake.disabled stop file (t_6e9f48cc, t_7be18632).
         # review_all_answered: an own-repo review handback whose text answers every
         # open Prism key forks a child to post the lines, coverage and enqueue.
-        "auto_handle_rows": {"review_all_answered": True},
+        # review_deadman: a review-deadman tier-1 event on a boomerang-wake card
+        # forks a child for the attended read (why-waits comment or surface);
+        # false = the owner-wake delivers it as a plain turn (t_1e0ffee4).
+        "boomerang_wake_rows": {"review_all_answered": True, "review_deadman": True},
         # "platform:chat_id" (e.g. "discord:1480525090331561984"). When set,
         # the notifier posts done / ready-for-review / blocked lines there
         # instead of the subscriber's chat; the wake still goes to the

@@ -1072,6 +1072,22 @@ class AIAgent(
         # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
         _quietly(self._close_codex_session)
+        # The context engine is per-agent too (init_agent re-selects it on rebuild) and a plugin engine such as
+        # LCM holds ~5 sqlite connections per instance. Eviction without this leaked them for the gateway's
+        # life: 2026-10-23 Apollo hit 1,996 open handles on lcm.db and the 4,096 fd ceiling (EMFILE) after
+        # ~175 idle-TTL evictions, and every file open — state.db included — failed until a restart.
+        _quietly(lambda: self._shutdown_context_engine())
+
+    def _shutdown_context_engine(self) -> None:
+        """Release the per-agent context engine's resources (idempotent). Engines without ``shutdown()``
+        (the built-in compressor) just get dropped; a rebuilt agent gets a fresh engine from init_agent."""
+        engine = getattr(self, "context_compressor", None)
+        if engine is None:
+            return
+        self.context_compressor = None
+        shutdown = getattr(engine, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
 
     def close(self) -> None:
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
@@ -1085,6 +1101,7 @@ class AIAgent(
         _quietly(self._drop_shared_client, lambda c: self._close_openai_client(c, reason="agent_close", shared=True))
         self._close_request_clients("agent_close")
         _quietly(self._close_codex_session)
+        _quietly(lambda: self._shutdown_context_engine())
         # Free conversation history proactively: callers may still hold the closed agent. The DB-flush
         # settled-prefix snapshot and the streamed-text accumulator are shadow copies of the same transcript;
         # on a closed delegate child they were the only remaining owners, pinning its history in the parent heap.

@@ -6,6 +6,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 _spec = importlib.util.spec_from_file_location(
     "check_kanban_test_identity", ROOT / "scripts" / "check_kanban_test_identity.py")
@@ -148,3 +150,24 @@ def test_conftest_arming_with_a_non_truthy_value_does_not_count(tmp_path):
     bad.write_text('import pytest\n@pytest.fixture(autouse=True)\ndef _env(monkeypatch):\n'
                    '    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "2")\n')
     assert lint.check_conftest_sandbox(bad)
+
+
+# The raw-text prefilter in front of the AST check must never skip a file the AST would flag:
+# each spelling below decodes to an unguarded ``kanban create`` spawn (t_44dcc531,
+# Prism 675e33503531, 10b55641b9b8).
+_BS = chr(92)
+_SPLIT_SPAWNS = {
+    "backslash-newline-in-literal": '["kan' + _BS + '\nban", "create"]',
+    "backslash-crlf-in-literal": '["kan' + _BS + '\r\nban", "cre' + _BS + '\r\nate"]',
+    "implicit-join": '["kan" "ban", "cre" "ate"]',
+    "implicit-join-empty-literal": '["kan" "" "ban", "create"]',
+    "implicit-join-in-shell-string": '"kanban cre" "ate demo", shell=True',
+    "continuation-between-literals": '["kan" ' + _BS + '\n "ban", "create"]',
+    "hex-escape": '["\\x6banban", "\\x63reate"]',
+}
+
+
+@pytest.mark.parametrize("argv", list(_SPLIT_SPAWNS.values()), ids=list(_SPLIT_SPAWNS))
+def test_a_split_spelling_of_the_spawn_is_still_scanned(argv):
+    src = "import subprocess\ndef test_spawn():\n    subprocess.run(" + argv + ")\n"
+    assert lint.check_source(src), "the prefilter skipped a file the AST flags"

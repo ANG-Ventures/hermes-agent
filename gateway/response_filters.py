@@ -310,6 +310,30 @@ def wake_progress_header(message: Any, display_kind: Any, metadata: Optional[dic
     return t("gateway.progress.wake_head", label=label)
 
 
+def wake_chrome_muted(display_kind: Any, source: Any, user_config: Optional[dict]) -> bool:
+    """True when an internal wake runs in an act-now page channel: its chrome (tool-progress
+    bubbles, interim messages, the "still working" heartbeat) is not a page, so it stays out
+    (t_c40d3277: ~105 lines/day of "🔔 wake · internal" in fleet #alerts from a /loop watch
+    homed there). The final reply is unchanged. ``display.wake_chrome_muted_chats`` lists chat
+    ids; unset means the fleet #alerts channel on Discord; ``[]`` disables. Human turns never.
+    """
+    if not is_machinery_display_kind(display_kind):
+        return False
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    if not chat_id:
+        return False
+    configured = ((user_config or {}).get("display") or {}).get("wake_chrome_muted_chats")
+    if configured is None:
+        from gateway.config import Platform
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+        from gateway.kanban_watchers import _needs_input_channels
+        configured = [_needs_input_channels()[0]]
+    if not isinstance(configured, (list, tuple, set)):
+        configured = [configured]
+    return chat_id in {str(c) for c in configured if c}
+
+
 def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
     """Whether a successful bare silence marker may remain silent for this turn."""
     return is_machinery_display_kind(display_kind) or reply_expected is False

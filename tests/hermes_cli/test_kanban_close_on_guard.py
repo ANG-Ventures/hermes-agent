@@ -126,6 +126,19 @@ def test_machine_authors_and_marked_bodies_are_exempt(fleet):
     assert _comments(tid) == [ACK_1047, marked]
 
 
+BOOMERANG_RECEIPT = ("[boomerang-wake] complete: PR #5084 merged; the card's close-on: merged condition is met")
+
+
+def test_boomerang_wake_executor_receipt_is_exempt(fleet):
+    """t_befc7c69: the executor (gateway/kanban_boomerang_wake.AUTHOR) posts receipts that quote the gate."""
+    from gateway import kanban_boomerang_wake as bw
+
+    assert bw.AUTHOR in guard.MACHINE_AUTHORS
+    guard.check_comment(bw.AUTHOR, BOOMERANG_RECEIPT)
+    with pytest.raises(guard.CloseOnLineRefused):
+        guard.check_comment("apollo", BOOMERANG_RECEIPT)
+
+
 def test_unreadable_library_allows(fleet):
     home, tid = fleet
     (home / "scripts" / "lib" / "close_on.py").unlink()

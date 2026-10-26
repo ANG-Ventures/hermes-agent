@@ -485,6 +485,31 @@ def _lifecycle_gc_due(db_path: str, interval_hours: float) -> bool:
         return True
 
 
+_STORAGE_HELPER_ATTRS = ("_adaptive_retrieval", "_store", "_dag", "_lifecycle", "_assertions", "_query_views")
+
+
+class _StorageGuard:
+    """GC backstop that closes one ``_bind_storage`` generation of SQLite helpers (t_0d987578).
+
+    Referenced only by the engine that bound the helpers and by its shallow copies (lcm_grep's
+    ``copy.copy(engine)`` copies the attribute), so it is finalized only when none of them can still
+    use the helpers. Every store connection is ``check_same_thread=False``, so closing from the GC
+    thread is legal. A store's ``close()`` is idempotent, so an explicit ``shutdown()`` first is fine.
+    """
+
+    __slots__ = ("_helpers",)
+
+    def __init__(self, helpers):
+        self._helpers = [h for h in helpers if h is not None]
+
+    def __del__(self) -> None:
+        for helper in getattr(self, "_helpers", ()):
+            try:
+                helper.close()
+            except BaseException:  # never raise from a finalizer, incl. during interpreter teardown
+                pass
+
+
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
@@ -911,24 +936,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         except Exception:
             self._close_storage()
             raise
+        # GC backstop for an engine nobody shut down (t_0d987578). It lives on a guard object, not
+        # on LCMEngine.__del__: a shallow copy (tools.py lcm_grep's read_engine) shares this guard
+        # along with the helpers, so the guard fires only once the owner AND every copy are gone.
+        self._storage_guard = _StorageGuard(
+            [getattr(self, a, None) for a in _STORAGE_HELPER_ATTRS])
 
-    def _close_storage(self) -> None:
-        """Best-effort close of currently bound SQLite helpers."""
-        for attr in (
-            "_adaptive_retrieval",
-            "_store",
-            "_dag",
-            "_lifecycle",
-            "_assertions",
-            "_query_views",
-        ):
+    def _close_storage(self) -> bool:
+        """Best-effort close of currently bound SQLite helpers; ``True`` when every close succeeded."""
+        ok = True
+        for attr in _STORAGE_HELPER_ATTRS:
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
+                    ok = False
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        return ok
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -8117,13 +8143,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
-        self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+        """Close every store this engine opened. Idempotent: a second call is a no-op.
+
+        Called on agent eviction/close (run_agent ``_shutdown_context_engine``) and, as a
+        backstop, from ``__del__``; each store's ``close()`` also tolerates a double close.
+        """
+        self._finalize_storage(unregister=True)
+
+    def _finalize_storage(self, *, unregister: bool) -> None:
+        if getattr(self, "_closed", False):
+            return
+        if unregister:
+            try:
+                self._unregister_active_engine_binding()
+            except Exception:
+                logger.debug("LCM failed unregistering engine binding at shutdown", exc_info=True)
+        # Marked closed only once every store closed, so a failed close is retried by the next
+        # shutdown() instead of leaking its connection.
+        if self._close_storage():
+            self._closed = True

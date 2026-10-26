@@ -43,7 +43,7 @@ expect 0 "spawn-site: real tree is clean" "${PY[@]}" "$spawn" --root "$root"
 fresh_copy
 expect 0 "spawn-site: the copied tree is clean too (the copy is faithful)" "${PY[@]}" "$spawn" --root "$tmp/tree"
 mkdir -p "$tmp/tree/planted"
-printf '#!/bin/bash\nstart() {\n  ssh ci-box %s\n}\n' "'docker run -d --rm img:latest'" > "$tmp/tree/planted/pool.sh"
+printf '#!/usr/bin/env bash\nstart() {\n  ssh ci-box %s\n}\n' "'docker run -d --rm img:latest'" > "$tmp/tree/planted/pool.sh"
 expect 1 "spawn-site: planted bare docker-run spawn is red" "${PY[@]}" "$spawn" --root "$tmp/tree"
 rm "$tmp/tree/planted/pool.sh"
 printf 'import subprocess\n\n\ndef go(h):\n    subprocess.run(["ssh", h, "make test"])\n' > "$tmp/tree/planted/go.py"

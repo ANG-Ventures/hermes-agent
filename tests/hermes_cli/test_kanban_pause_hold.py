@@ -484,6 +484,26 @@ def test_resumed_review_card_never_spawns_locally(home, mkplan, monkeypatch):
             assert (ids["E"], "ci-box") in spawned
 
 
+# -- Prism f2ecf9033a2d (t_8a8aad55): a lost review claim refunds its spillover take ---
+
+def test_lost_review_claim_refunds_the_spillover_take(home, monkeypatch):
+    monkeypatch.setattr(kb._kwh, "prepare_remote_workspace", lambda host, ws, **k: None)
+    from hermes_cli import kanban_continuation as kc
+    calls = []
+    monkeypatch.setattr(kc, "record_placement", lambda *a, **k: calls.append(a) or False)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="rv", assignee="alpha", body="x")
+        _set(conn, tid, status="review", origin_host="ci-box")
+        _manifest(home, "resumed", [{"lane": "kanban", "id": tid, "resume": {"new_run_id": None}}])
+        plan = _plan()
+        taken, slots = dict(plan.taken), dict(plan.slots)
+        res, spawned = _tick(conn, plan)
+        assert calls and calls[-1][3] == "ci-box"        # the review row reached the pinned record_placement
+        assert tid not in {t for t, _ in spawned}
+        assert {k: v for k, v in plan.taken.items() if v} == {k: v for k, v in taken.items() if v}
+        assert plan.slots == slots
+
+
 # -- Prism c3421355edd2: a resume pin never yields to a route to ANOTHER host ---
 
 @pytest.mark.parametrize("route", [("pin", "ace-ai"), ("origin", "ace-ai")])

@@ -33,8 +33,7 @@ FAKE_KEY = "sk-fake-e2e-install-update"
 
 
 def real_uv() -> str | None:
-    cand = shutil.which("uv") or str(H.REAL_HOME / ".hermes" / "bin" / "uv")
-    return cand if cand and Path(cand).exists() else None
+    return H.host_uv()
 
 
 def git(*args: str, cwd: Path, check: bool = True, env: dict | None = None) -> str:

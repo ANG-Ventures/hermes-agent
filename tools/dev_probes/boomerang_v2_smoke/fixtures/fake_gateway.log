@@ -1,12 +1,17 @@
 2026-10-18 20:00:00,100 INFO gateway.run: Gateway running with 5 platform(s)
-2026-10-18 20:01:05,200 INFO gateway.kanban_watchers: kanban notifier: auto-handled t_5m0ce001 disposition=auto
+2026-10-18 20:01:05,200 INFO gateway.kanban_watchers: kanban notifier: boomerang-wake t_5m0ce001 disposition=auto
 2026-10-18 20:01:05,300 INFO gateway.kanban_watchers: kanban notifier: delivered blocked event for t_5m0ce002 (surface)
-2026-10-18 20:01:06,000 INFO gateway.kanban_watchers: kanban notifier: auto-handled t_5m0ce003 disposition=auto
+2026-10-18 20:01:06,000 INFO gateway.kanban_watchers: kanban notifier: boomerang-wake t_5m0ce003 disposition=auto
 2026-10-18 20:01:30,000 INFO gateway.run: inbound message: platform=discord user=fixture-user chat=1561469136796782633 msg='[kanban] Task t_5m0ce003 completed. Title: bv2 smoke s1: forced child failure' reply_to_id=None reply_to_text=''
 2026-10-18 20:05:10,000 INFO tools.delegate_tool: boomerang.fork_ineligible reason=fork_enabled
-2026-10-18 20:05:10,100 INFO gateway.kanban_watchers: kanban notifier: auto-handled t_5m0ce004 disposition=auto
+2026-10-18 20:05:10,100 INFO gateway.kanban_watchers: kanban notifier: boomerang-wake t_5m0ce004 disposition=auto
 2026-10-18 20:07:00,000 INFO gateway.kanban_watchers: kanban notifier: delivered completed event for t_5m0ce005 (surface)
 2026-10-18 20:10:00,000 INFO tools.delegate_tool: boomerang.fork served_by=local read_share=0.97
-2026-10-18 20:15:00,000 INFO gateway.kanban_watchers: kanban notifier: auto-handled t_5m0ce007 disposition=auto
+2026-10-18 20:15:00,500 INFO gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake t_5m0ce007 disposition=auto row=completed path=notifier delegation=deleg_s4a0001
 2026-10-18 20:16:00,000 INFO gateway.run: Gateway running with 5 platform(s)
-2026-10-18 20:16:04,500 WARNING gateway.kanban_auto_handle: reconcile: re-surfaced wake for t_5m0ce007 (reason=gateway restart)
+2026-10-18 20:16:05,100 INFO gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake t_5m0ce007 disposition=auto row=completed path=notifier+restart delegation=deleg_s4a0002
+2026-10-18 20:16:05,200 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_5m0ce007 redispatched after gateway restart (retry 1/1) delegation=deleg_s4a0002
+2026-10-18 20:18:30,000 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_5m0ce007 handled action=close delegation=deleg_s4a0002
+2026-10-18 20:20:00,000 INFO gateway.kanban_watchers: kanban notifier: boomerang-wake t_5m0ce008 disposition=auto row=completed path=notifier delegation=deleg_s4b0001
+2026-10-18 20:21:00,000 INFO gateway.run: Gateway running with 5 platform(s)
+2026-10-18 20:21:05,300 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_5m0ce008 lost reason=gateway restart, retry spent resurfaced delivered=True delegation=deleg_s4b0001

@@ -16,6 +16,7 @@ refusal paging) as the loop bodies ``GatewayRunner`` runs.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 import os
 import sqlite3
@@ -232,22 +233,117 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     return format_home_line(sid, row)
 
 
+class _SessionOriginReader:
+    """One reused SessionDB per state.db path for the notifier's origin lookups (t_69e10010).
+
+    Constructing a SessionDB runs the full writable open path (fd-table scans under the startup
+    lock); the notifier used to do that once per actor per subscription per tick. The handle comes
+    from ``hermes_state_registry.acquire``, the process-wide registry the gateway's session store
+    also opens through, so in a gateway it is the runner's own writer and nothing new is opened.
+    The path is resolved per call (``_default_db_path`` follows the context-local HERMES_HOME),
+    the handle is dropped when the file at the path was replaced or a read fails, and ``close()``
+    returns every reference when the watcher stops.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._dbs: dict[str, Any] = {}
+        # Prism c1643c48add2: set by close(). A ``_collect`` worker that is still running when the
+        # watcher's ``finally`` closes the reader must not park a fresh registry reference here
+        # where nothing would release it; after close, get_session() takes and returns one per call.
+        self._closed = False
+
+    def _handle(self, key: str):
+        """``(db, owned)``: the cached handle (``owned`` False), or, after ``close()``, a fresh
+        reference the caller must release (``owned`` True)."""
+        from hermes_state_common import stat_db_file_identity
+
+        with self._lock:
+            db = self._dbs.get(key)
+        if db is not None and getattr(db, "_db_file_identity", None) == stat_db_file_identity(Path(key)):
+            return db, False
+        if db is not None:
+            self._drop(key, db)
+        from hermes_state_registry import acquire
+
+        db = acquire(Path(key))
+        with self._lock:
+            other = None if self._closed else self._dbs.setdefault(key, db)
+        if other is None:  # closed: the caller owns this reference and releases it itself
+            return db, True
+        if other is not db:
+            self._release(db)
+        return other, False
+
+    def _drop(self, key: str, db) -> None:
+        with self._lock:
+            if self._dbs.get(key) is db:
+                del self._dbs[key]
+            else:
+                return
+        self._release(db)
+
+    @staticmethod
+    def _release(db) -> None:
+        try:
+            from hermes_state_registry import release_or_close
+
+            release_or_close(db)
+        except Exception:
+            logger.debug("kanban notifier: origin reader release failed", exc_info=True)
+
+    def get_session(self, session_id: str):
+        from hermes_state import _default_db_path
+
+        key = str(_default_db_path())
+        db, owned = self._handle(key)
+        try:
+            return db.get_session(session_id)
+        except Exception:
+            if not owned:
+                self._drop(key, db)
+            raise
+        finally:
+            if owned:  # taken after close(): nothing else will return it
+                self._release(db)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            dbs, self._dbs = list(self._dbs.values()), {}
+        for db in dbs:
+            self._release(db)
+
+
+# Set by the notifier watcher for its lifetime; ``asyncio.to_thread`` copies it into ``_collect``.
+_ORIGIN_READER: "contextvars.ContextVar[Optional[_SessionOriginReader]]" = contextvars.ContextVar(
+    "kanban_notifier_origin_reader", default=None,
+)
+
+
 def _session_origin(session_id: str) -> Optional[dict]:
     """The ``origin_json`` dict a session was opened from, or None.
 
-    Blocking state.db lookup; call from a worker thread only.
+    Blocking state.db lookup; call from a worker thread only. Inside the notifier watcher the
+    lookup reuses its ``_SessionOriginReader``; elsewhere it opens (and closes) one SessionDB.
     """
     row = None
     try:
-        from hermes_state import SessionDB
+        reader = _ORIGIN_READER.get()
+        if reader is not None:
+            row = reader.get_session(session_id)
+        else:
+            from hermes_state import SessionDB
 
-        db = SessionDB()
-        try:
-            row = db.get_session(session_id)
-        finally:
-            close = getattr(db, "close", None)
-            if callable(close):
-                close()
+            db = SessionDB()
+            try:
+                row = db.get_session(session_id)
+            finally:
+                close = getattr(db, "close", None)
+                if callable(close):
+                    close()
     except Exception:
         return None
     raw = (row or {}).get("origin_json")
@@ -341,6 +437,13 @@ def _format_spawn_routes(routes, sources=None) -> str:
         f"kind={route_kind(route)}"
         for task_id, route in entries.items()
     )
+
+
+def _held_by_requires(res) -> int:
+    """Ready cards a ``requires:`` pin holds at host=none this tick (t_640a4ea0)."""
+    waits = getattr(res, "placement_waits", None) or {}
+    return sum(1 for tid, a in (getattr(res, "placement_affinity", None) or {}).items()
+               if a.get("host") == "none" and str(waits.get(tid, "")).startswith("requires_unsatisfied"))
 
 
 def _format_lane_expiry(lane, route, successor="profile default") -> str:
@@ -1769,6 +1872,11 @@ class GatewayKanbanWatchersMixin:
         """Clear notifier-visible ownership before releasing the OS lock."""
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
+        try:
+            from tools.async_delegation_kanban import set_dispatcher_active
+            set_dispatcher_active(False)
+        except Exception:
+            pass
         _release_singleton_lock(handle)
     async def _sleep_between_ticks(self, interval: float) -> None:
         """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
@@ -1779,6 +1887,19 @@ class GatewayKanbanWatchersMixin:
             slept += 1.0
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Run the notifier loop with ONE reused state.db reader for origin lookups (t_69e10010):
+        ``_session_origin`` used to construct a SessionDB per actor per tick; the reader is set
+        for this task's context (``asyncio.to_thread`` carries it into ``_collect``) and every
+        reference it took is returned when the watcher stops."""
+        reader = _SessionOriginReader()
+        token = _ORIGIN_READER.set(reader)
+        try:
+            await self._kanban_notifier_watcher_loop(interval)
+        finally:
+            _ORIGIN_READER.reset(token)
+            reader.close()
+
+    async def _kanban_notifier_watcher_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
@@ -1947,7 +2068,7 @@ class GatewayKanbanWatchersMixin:
                     from hermes_cli import kanban_open_pr as _open_pr
 
                     _cg_query = getattr(self, "_kanban_close_gate_query", None) or _open_pr.memo_query()
-                    from gateway import kanban_auto_handle as _ah
+                    from gateway import kanban_boomerang_wake as _ah
                     from gateway import kanban_owner_wake as _ow
 
                     _auto_on = _ah.enabled()
@@ -2256,20 +2377,19 @@ class GatewayKanbanWatchersMixin:
                                                 _kids = []
                                             if _kids:
                                                 ready_state[_ev.id] = _kids
-                                    # Boomerang v2 P3b (spec §5.5): events whose wake an
-                                    # auto-handle child takes instead. AFTER the suppressor;
-                                    # only when the kill switch is on (read every tick).
+                                    # Boomerang v2 P3b (spec §5.5): events whose wake a
+                                    # boomerang-wake child takes instead. AFTER the suppressor;
+                                    # only while the stop file is absent (read every tick).
                                     auto: dict = {}
                                     if _auto_on and _wake_mode:
                                         try:
                                             auto = _ah.collect_candidates(
-                                                _kb, conn, slug, task, events, _home_sid,
-                                                getattr(self, "session_store", None),
+                                                _kb, conn, slug, task, events,
                                                 skip=set(suppressed) | set(wake_noise),
                                                 pr_health=_red_health, memo=_red_memo,
                                             )
                                         except Exception as _ah_exc:
-                                            logger.warning("kanban notifier: auto-handle gate for %s failed "
+                                            logger.warning("kanban notifier: boomerang-wake gate for %s failed "
                                                            "(%s); surfacing", sub["task_id"], _ah_exc)
                                             auto = {}
                                     logger.debug(
@@ -2426,13 +2546,13 @@ class GatewayKanbanWatchersMixin:
                             )
                             mode = "notify"
                     wake_agent = mode in ("notify+wake", "wake")
-                    # Host load1 alone never stops an auto-handle child: the child REPLACES the
+                    # Host load1 alone never stops a boomerang-wake child: the child REPLACES the
                     # session's wake turn, so downgrading it saves nothing, and on a box idling
-                    # above the band auto-handle never ran (smoke 2026-10-19: load 55-75 for
+                    # above the band boomerang wake never ran (smoke 2026-10-19: load 55-75 for
                     # hours). Same rule as a human-owned wake (t_b7b31563): dispatcher
                     # proc_paused and a capped lane still downgrade. Only AUTO events use it.
                     # Host contention alone (load1 band OR measured cpu busy, t_0e52c7ab #2114 made cpu
-                    # the default axis) never stops an auto-handle child; lane / proc_paused still do.
+                    # the default axis) never stops a boomerang-wake child; lane / proc_paused still do.
                     _ah_load_exempt = bool(
                         d.get("auto") and wake_downgrade
                         and str(wake_downgrade).startswith(("host load", "host cpu"))
@@ -3148,7 +3268,7 @@ class GatewayKanbanWatchersMixin:
                             # Boomerang v2 P3b: a claimed auto event is the child's, not the
                             # session's: its wake is withheld. A failed dispatch stays here
                             # and wakes as today (INV-6).
-                            from gateway import kanban_auto_handle as _ah
+                            from gateway import kanban_boomerang_wake as _ah
 
                             _wake_kinds = await _ah.notifier_dispatch(
                                 self, d, sub, board_slug, task, _wake_kinds, _synth,
@@ -3396,15 +3516,15 @@ class GatewayKanbanWatchersMixin:
                 await _owner_wake.tick(self)
             except Exception as exc:
                 logger.warning("kanban owner-wake tick failed: %s", exc)
-            # Boomerang v2 P3b (spec §5.7): open auto-handle claims whose child died (a
+            # Boomerang v2 P3b (spec §5.7): open boomerang-wake claims whose child died (a
             # restart empties the in-process registry, so the first tick after startup
             # re-surfaces them) or outlived max_minutes. A no-op with no claim file.
             try:
-                from gateway import kanban_auto_handle as _ah_rec
+                from gateway import kanban_boomerang_wake as _ah_rec
 
                 await _ah_rec.reconcile(self)
             except Exception as exc:
-                logger.warning("kanban auto-handle reconcile failed: %s", exc)
+                logger.warning("kanban boomerang-wake reconcile failed: %s", exc)
             # t_b7b31563: fire deferred human-owner wakes once the gate clears
             # or their ceiling passes.
             try:
@@ -3683,6 +3803,11 @@ class GatewayKanbanWatchersMixin:
         else:
             return
         self._kanban_dispatcher_lock_handle = _lock_handle
+        try:
+            from tools.async_delegation_kanban import set_dispatcher_active
+            set_dispatcher_active(True)  # §5.1.5: a dispatcher now reaps this process's unit workers
+        except Exception:
+            logger.debug("kanban dispatcher: could not flag the delegations runtime", exc_info=True)
         if waiting_logged or unavailable_logged:
             logger.warning("kanban dispatcher: assumed leadership after standby (%s)", _lock_path)
         else:
@@ -3889,6 +4014,7 @@ class GatewayKanbanWatchersMixin:
         # wall-clock start of each board's current zero-spawn streak while
         # the gate had allowance (published to `hermes kanban diagnostics`).
         from hermes_cli import kanban_load_gate as _klg
+        from hermes_cli import kanban_placement_reasons as _kpr
         _board_rr = {"tick": 0}
         _board_starved_since: dict[str, float] = {}
 
@@ -4149,7 +4275,7 @@ class GatewayKanbanWatchersMixin:
                 _paused = _spawn_paused
                 if _paused is None and _limit is not None and _limit <= 0:
                     _paused = (
-                        f"load gate: this tick's allowance of {_allowance} "
+                        f"{_kpr.QUOTA_SPENT_PREFIX}{_allowance} "
                         f"spawn(s) is used by other boards"
                     )
                 # spawn_limit is an int whenever the gate is enabled (0 when
@@ -4181,9 +4307,10 @@ class GatewayKanbanWatchersMixin:
                 elif _ready > 0:
                     logger.info(
                         "kanban dispatcher [%s]: ready=%d quota=%d spawned=%d "
-                        "starved=%d allowance=%s",
+                        "starved=%d allowance=%s held_by_requires=%d",
                         slug, _ready, _quota, _n,
                         _ready if _n == 0 else 0, _allowance,
+                        _held_by_requires(res),
                     )
                     _prev = _board_starved_since.get(slug)
                     if _n > 0:

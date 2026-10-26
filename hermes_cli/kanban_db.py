@@ -2598,9 +2598,9 @@ class Task:
     origin_host: Optional[str] = None
     # Task whose workspace this card works in (``--workspace-of``, t_6d5bc652).
     workspace_of: Optional[str] = None
-    # Boomerang v2 D-15 tri-state: True/False = the card decides; None = inherit
-    # (home session /autohandle -> board default -> off).
-    auto_handle: Optional[bool] = None
+    # Boomerang wake level (Ace 2026-10-22): True/False = the card's subscription level is
+    # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
+    boomerang_wake: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2626,7 +2626,7 @@ class Task:
             pin_sub_fallback=bool(g("pin_sub_fallback")),
             next_eligible_at=g("next_eligible_at"),
             no_worker=bool(g("no_worker")),
-            auto_handle=None if g("auto_handle") is None else bool(g("auto_handle")),
+            boomerang_wake=None if g("boomerang_wake") is None else bool(g("boomerang_wake")),
         )
 
 # Columns every schema version has (KeyError if the SELECT omitted them).
@@ -2895,10 +2895,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- A placement constraint (co-locate via bind_host) and a retention key;
     -- never an owner of the directory. NULL = its own workspace.
     workspace_of         TEXT,
-    -- Boomerang v2 P3 (D-15): may a mechanical wake on this card be handled by an
-    -- auto boomerang child? 1/0 = the card decides; NULL (default) = inherit the
-    -- home session's /autohandle, then the board default, then off.
-    auto_handle          INTEGER
+    -- Boomerang wake level: 1 = mechanical wakes on this card are handled by a
+    -- background boomerang child; 0/NULL = they surface. The card is the only setting.
+    boomerang_wake       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -6023,7 +6022,7 @@ def create_task(
     i_mean_blocks: bool = False,
     continues: Optional[str] = None,
     workspace_of: Optional[str] = None,
-    auto_handle: Optional[bool] = None,
+    boomerang_wake: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -6524,7 +6523,7 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
                         goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of, auto_handle
+                        workspace_of, boomerang_wake
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
@@ -6556,7 +6555,7 @@ def create_task(
                         completion_contract,
                         brain,
                         workspace_of,
-                        None if auto_handle is None else (1 if auto_handle else 0),
+                        None if boomerang_wake is None else (1 if boomerang_wake else 0),
                     ),
                 )
                 for pid in parents:
@@ -6565,6 +6564,8 @@ def create_task(
                         "(parent_id, child_id, kind) VALUES (?, ?, ?)",
                         (pid, task_id, parents_kind),
                     )
+                if boomerang_wake is not None:   # mirror into the legacy column (Prism 921e843952a6)
+                    write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
                 from hermes_cli import kanban_continuation as _kcont_create
                 if continues:
                     _kcont_create.transfer_workspace(conn, continues, task_id)
@@ -6597,7 +6598,7 @@ def create_task(
                         "provider_override": provider_override,
                         "minted_by": _minted_by(create_origin),
                         **({"brain": brain} if brain else {}),
-                        **({"auto_handle": bool(auto_handle)} if auto_handle is not None else {}),
+                        **({"boomerang_wake": bool(boomerang_wake)} if boomerang_wake is not None else {}),
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),
@@ -7030,29 +7031,29 @@ def _set_no_worker_locked(
     return True
 
 
-def set_task_auto_handle(
+def set_task_boomerang_wake(
     conn: sqlite3.Connection,
     task_id: str,
-    value: Optional[bool],
+    value: bool,
     *,
     operator: Optional[str] = None,
 ) -> bool:
-    """Set a card's ``auto_handle`` tri-state (Boomerang v2 D-15): True/False, or None
-    to clear it back to inherit. False for an unknown id. A change records
-    ``auto_handle_set``; writing the current value is a silent no-op."""
-    stored = None if value is None else (1 if value else 0)
+    """Set a card's boomerang wake level on/off. False for an unknown id. A change records
+    ``boomerang_wake_set``; writing the current value is a silent no-op. Subscription rows
+    are untouched: the level lives only on the card (Apollo F-1)."""
+    stored = 1 if value else 0
     with write_txn(conn):
-        row = conn.execute("SELECT auto_handle FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             return False
-        if row["auto_handle"] == stored:
+        write_card_boomerang_wake(conn, task_id, stored)   # also re-syncs a stale legacy mirror
+        if row["boomerang_wake"] == stored:
             return True
-        conn.execute("UPDATE tasks SET auto_handle = ? WHERE id = ?", (stored, task_id))
-        payload: dict = {"auto_handle": None if value is None else bool(value)}
+        payload: dict = {"boomerang_wake": bool(value)}
         if operator:
             payload["operator"] = operator
-        _append_event(conn, task_id, "auto_handle_set", payload)
-    notify_task_updated(conn, task_id, ("auto_handle",))
+        _append_event(conn, task_id, "boomerang_wake_set", payload)
+    notify_task_updated(conn, task_id, ("boomerang_wake",))
     return True
 
 
@@ -9684,6 +9685,8 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "external": "done",
     "review_requested": "review",
     "changes_requested": "changes_requested",
+    # A no-op handback bounce (t_f716021d): the send-back still stands.
+    "no_new_head": "changes_requested",
     "blocked": "blocked",
     "dependency_wait": "blocked",
 }
@@ -10360,6 +10363,74 @@ class ExternalCloseError(ValueError):
         )
 
 
+def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
+    """Forge L0 section 2.3 (a), card PRE t_7ff229a7: run hermes-home ``scripts/lib/landable.py check`` on each
+    of the card's OWN open fleet PRs before the open-PR route, so the worker hears what fleet-merge would refuse at
+    land in its own run. -> ``[(repo#n, refusal text)]`` for each PR the verifier refused (rc 1).
+
+    The policy lives in hermes-home (one copy, the lander's own predicates); this only calls it. Kill switch:
+    ``<hermes root>/config/landing-policy.json`` ``"pre_pr": "on"|"off"`` (missing = off): off = no subprocess,
+    the handoff proceeds as today. Fail-open on everything else (script absent, timeout, rc 3 unreadable): the
+    land-time copy of every gate stays as the backstop. ``KANBAN_PRE_PR_SCRIPT`` overrides the path (tests);
+    inside pytest with no override nothing runs. ``--draft-ok`` is always passed: drafts stay with the freshness
+    gate that runs next (``DraftPrError``, ``completion_blocked_draft_pr`` and the audited ``draft_ok`` override,
+    t_f38605be), so this gate never pre-empts them. It has no stale/behind check either, so nothing the freshness
+    update would fix is refused here (Prism b1fdf6186eca).
+    """
+    script = os.environ.get("KANBAN_PRE_PR_SCRIPT") or ""
+    if not script:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return []
+        try:
+            from hermes_constants import get_default_hermes_root
+            root = get_default_hermes_root()
+        except Exception:  # noqa: BLE001 -- fail-open
+            return []
+        try:
+            with open(root / "config" / "landing-policy.json", encoding="utf-8-sig") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            return []
+        if not isinstance(cfg, dict) or cfg.get("pre_pr") != "on":
+            return []
+        script = str(root / "scripts" / "lib" / "landable.py")
+    if not os.path.isfile(script):
+        return []
+    out = []
+    for ref in refs:
+        argv = [sys.executable, script, "check", "--repo", ref.repo, "--pr", str(ref.number),
+                "--card", task_id, "--worker", worker or "worker", "--draft-ok"]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
+                                  stdin=subprocess.DEVNULL, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log.warning("pre-PR verifier %s#%s did not run: %s", ref.repo, ref.number, exc)
+            continue
+        if proc.returncode != 1:
+            continue
+        text = ""
+        try:
+            text = str(json.loads((proc.stdout or "").strip().splitlines()[-1]).get("text") or "")
+        except (ValueError, IndexError, AttributeError):
+            pass
+        out.append((f"{ref.repo}#{ref.number}", text or (proc.stdout or "").strip()[-2000:]))
+    return out
+
+
+class NotLandableError(ValueError):
+    """Raised by ``complete_task`` when the pre-PR verifier refuses one of the card's own open PRs
+    (Forge L0 section 2.3, card PRE). Nothing is mutated beyond the ``completion_blocked_pre_pr`` event."""
+
+    def __init__(self, task_id: str, refusals: list):
+        self.task_id = task_id
+        self.prs = [pr for pr, _ in refusals]
+        super().__init__(
+            "handoff refused by the pre-PR verifier (fleet-merge would refuse it at land):\n"
+            + "\n".join(text for _, text in refusals)
+            + f"\n{task_id} is still in-flight (no state change)."
+        )
+
+
 class EmptyDraftOverrideError(ValueError):
     """Raised by ``complete_task`` when ``draft_ok`` is given but blank.
 
@@ -10846,31 +10917,58 @@ def complete_task(
                          task_id, ", ".join(mentioned))
             with write_txn(conn):
                 _append_event(conn, task_id, "completion_unowned_pr_mentions", {"prs": mentioned})
+        if still_open and not review_claimed:
+            # Pre-PR verifier (Forge L0 section 2.3 (a), card PRE): the card's OWN fleet PRs only, never a mention.
+            # Own = declared in the handoff OR owned by head-branch provenance (b1fdf6186eca).
+            own_keys = {(r.repo.lower(), r.number) for r in _open_pr.split_fleet(_open_pr.extract_pr_refs(
+                metadata=metadata, survivor_pr=survivor_pr))[0]}
+            own_keys |= {(r.repo.lower(), r.number) for r in branch_owned_prs}
+            refusals = _pre_pr_refusals(
+                [r for r in still_open if (r.repo.lower(), r.number) in own_keys],
+                task_id=task_id, worker=candidate.assignee or "",
+            )
+            if refusals:
+                with write_txn(conn):
+                    _append_event(conn, task_id, "completion_blocked_pre_pr",
+                                  {"prs": [pr for pr, _ in refusals]})
+                raise NotLandableError(task_id, refusals)
+        # No-op handback (t_f716021d), decided BEFORE the freshness gate so a completion
+        # that will bounce never arms fleet-merge on the head the reviewer sent back
+        # (Prism 6dc02dcaa12e, r2).
+        no_new = None
+        if (still_open and expected_run_id is not None and candidate.status == 'running'
+                and not review_claimed and not negative_trigger):
+            from hermes_cli import kanban_handback_new_head as _nh
+            no_new = _nh.verdict(conn, task_id, still_open)
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
             # DraftPrError, nothing mutated), update a stale head, arm a green
             # non-milestone PR through fleet-merge.sh.
             from hermes_cli import kanban_pr_freshness as _fresh
-            try:
-                # Arm only the card's OWN handoff PR(s), never a PR the prose
-                # merely mentions (FleetReview #1234 finding).
-                freshness = _fresh.check(
-                    still_open, task_id=task_id,
-                    allow_arm=not is_milestone_card(conn, task_id),
-                    armable={
-                        f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
-                            metadata=metadata, survivor_pr=survivor_pr,
-                        )
-                    },
-                    draft_ok=draft_ok is not None,
+            # Arm only the card's OWN handoff PR(s), never a PR the prose
+            # merely mentions (FleetReview #1234 finding).
+            armable = {
+                f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
+                    metadata=metadata, survivor_pr=survivor_pr,
                 )
-            except _fresh.DraftPrError as draft_err:
-                with write_txn(conn):
-                    _append_event(
-                        conn, task_id, "completion_blocked_draft_pr",
-                        {"prs": draft_err.prs},
+            }
+            may_arm = not is_milestone_card(conn, task_id)
+
+            def _freshness_gate(refs, allow_arm):
+                try:
+                    return _fresh.check(
+                        refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
+                        draft_ok=draft_ok is not None,
                     )
-                raise
+                except _fresh.DraftPrError as draft_err:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, task_id, "completion_blocked_draft_pr",
+                            {"prs": draft_err.prs},
+                        )
+                    raise
+
+            freshness = _freshness_gate(still_open, no_new is None and may_arm)
             overridden = freshness.get("draft_override") or []
             if overridden:
                 # Audited, never silent (t_f38605be): the intentionally-open
@@ -10883,6 +10981,37 @@ def complete_task(
                 still_open = [
                     r for r in still_open if f"{r.repo}#{r.number}" not in overridden
                 ]
+        if no_new is not None:
+            # The freshness gate can update-branch after the verdict; a moved head is
+            # content the verdict never judged, so it routes (Prism 4f5d7679ba58).
+            no_new = _nh.still_holds(no_new, freshness)
+            if no_new is None and still_open and may_arm:
+                # The voided verdict routes to review like any handback, so arm it as one: the gate
+                # ran with arming off for the verdict (Prism 188c162a38e9). A PR the gate just
+                # update-branched is left to fleet-merge once its fresh CI is green, as in check().
+                gated = freshness.get("prs") or {}
+                rearm = [r for r in still_open
+                         if "update_branch" not in (gated.get(f"{r.repo}#{r.number}") or {})]
+                if rearm:
+                    again = _freshness_gate(rearm, True)
+                    freshness = dict(freshness, prs={**gated, **(again.get("prs") or {})})
+        if still_open and no_new is not None:
+            # No-op handback (t_f716021d): nothing on the PR the reviewer has not
+            # seen, so the send-back stands and the card goes back to its worker.
+            from hermes_cli import kanban_handback_new_head as _nh
+            # The run's own handoff and artifacts survive the bounce (Prism 9c7fd6708b92).
+            from hermes_cli import kanban_negative_handoff as _neg
+            bounce_meta, staged = _stage_routed_scratch_artifacts(
+                conn, task_id, dict(metadata or {}, no_new_head=no_new),
+                summary=summary, result=result,
+            )
+            ok = _nh.bounce(
+                conn, task_id, no_new, expected_run_id=expected_run_id,
+                summary=_neg.routed_summary(_nh.comment(no_new["seen"]), summary, result),
+                metadata=bounce_meta,
+            )
+            _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+            return ok
         if still_open:
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
@@ -13000,6 +13129,12 @@ def redact_review_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_review_value(item) for item in value)
     return redact_sensitive_json(value, force=True)
+
+
+def redact_review_handoff(summary: Any, metadata: Any) -> tuple:
+    """The ONE redaction of a review-lane handoff (summary, metadata), shared by :func:`request_review` and the
+    no-op handback bounce so the two durable paths cannot drift (Prism cde5d0610ef1, t_f716021d)."""
+    return redact_review_value(summary), redact_review_value(metadata)
 HUMAN_REVIEWER_SENTINEL = "human"
 
 
@@ -13492,8 +13627,7 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
-    summary = redact_review_value(summary)
-    metadata = redact_review_value(metadata)
+    summary, metadata = redact_review_handoff(summary, metadata)
 
     # ── Review-round cap (kanban.max_review_rounds) ────────────────────────
     # Evaluated BEFORE the transaction because block_task opens its own.
@@ -13547,7 +13681,14 @@ def request_review(
 
             _neg_result = negative_result_match(summary, metadata)
             if _neg_result is not None:
-                reviewer = HUMAN_REVIEWER_SENTINEL
+                # The board's named human lane (human:apollo) when configured;
+                # the bare sentinel only when no human lane is configured. The
+                # negative-result flag rides its own review_negative_result event.
+                _configured = configured_review_assignee()
+                reviewer = (
+                    _configured.casefold() if is_human_reviewer(_configured)
+                    else HUMAN_REVIEWER_SENTINEL
+                )
         if _skip_review and _neg_result is None:
             skip_meta = dict(metadata or {})
             skip_meta["review_skipped"] = "policy_none" if _policy == "none" else "non_milestone"
@@ -13555,6 +13696,15 @@ def request_review(
                 conn, task_id, summary=summary, metadata=skip_meta,
                 expected_run_id=expected_run_id,
             )
+            if done:
+                # A no-op handback bounce (t_f716021d) left the card with its worker:
+                # neither completed nor reviewed, so no review_skipped event. Read from
+                # THIS run's ended row BEFORE the card's status, which a successor may
+                # already have moved to review (Prism 35bc66834b1d).
+                from hermes_cli import kanban_handback_new_head as _nh
+                _bounced = _nh.bounced_note(conn, task_id, expected_run_id)
+                if _bounced is not None:
+                    return _ret(True, _bounced)
             if done and _task_status(conn, task_id) == "review":
                 return _ret(True, "open PR named in the handoff — auto-routed to review instead of done")
             if not done:
@@ -14568,11 +14718,7 @@ def requeue_task(
         ).fetchone()
         if row is None:
             return False, f"task {task_id} not found"
-        if drop_origin and row['status'] == 'blocked':
-            # Dropping state does not waive incomplete blocking parents.
-            target_status = 'todo' if unsatisfied_parents(conn, task_id) else 'ready'
-            conn.execute("UPDATE tasks SET status=? WHERE id=?", (target_status, task_id))
-        elif row["status"] != "ready":
+        if row["status"] != "ready" and not (drop_origin and row['status'] == 'blocked'):
             return False, (
                 f"task {task_id} is {row['status']!r}; requeue only applies to "
                 f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
@@ -14580,7 +14726,17 @@ def requeue_task(
             )
         if drop_origin:
             from hermes_cli import kanban_continuation as kc
-            kc.drop_origin(conn, task_id, actor=actor, files=_origin_files)
+            # Drop first: a blocked card is promoted only when an origin was
+            # actually dropped (Prism 954a3633bcc2, t_8a8aad55).
+            if not kc.drop_origin(conn, task_id, actor=actor, files=_origin_files):
+                if row['status'] == 'blocked':
+                    return False, (f"task {task_id} stays blocked: it has no origin to drop, so "
+                                   f"--drop-origin cannot clear the block (use unblock)")
+                return False, f"task {task_id} has no origin to drop"
+        if drop_origin and row['status'] == 'blocked':
+            # Dropping state does not waive incomplete blocking parents.
+            target_status = 'todo' if unsatisfied_parents(conn, task_id) else 'ready'
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (target_status, task_id))
         _append_event(
             conn, task_id, "requeued", {"actor": actor, "reason": reason},
         )
@@ -16888,7 +17044,9 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
 # continuation, not a duplicate: one spawn after the newest PR comment
 # consumes it, like an operator requeue. Deliberately NOT in the operator
 # tuple above (overlap-hold release and failure staleness stay operator-only).
-_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute",)
+# The no-op handback bounce (``kanban_handback_new_head.EVENT``, t_f716021d) is
+# one too: it returns the card to its worker with the send-back still standing.
+_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute", "completion_no_new_head")
 
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:
@@ -18013,10 +18171,12 @@ def sweep_terminal_workspace_orphans(
     for proc in psutil.process_iter(["pid", "ppid", "uids"]):
         info = proc.info
         pid = info.get("pid") or 0
-        if pid <= 1 or pid == me or not _init_parented(proc, info.get("ppid")):
-            continue
         uids = info.get("uids")
-        if uids is None or uids.real != uid:
+        # uid before _init_parented: on Linux that reads the PARENT's name per process
+        # (a 12.8k-process shared host spent seconds per tick on other users' parents).
+        if pid <= 1 or pid == me or uids is None or uids.real != uid:
+            continue
+        if not _init_parented(proc, info.get("ppid")):
             continue
         try:
             cwd = proc.cwd()
@@ -21503,6 +21663,7 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
     connect,
     connect_closing,
     init_db,
+    write_card_boomerang_wake,
     write_txn,
 )
 from hermes_cli.kanban_db_workspace import (  # noqa: E402
