@@ -196,9 +196,13 @@ def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: D
             if url and _no_key(own.get("api_key")):
                 # An explicit URL skips model.api_key, so the profile's own endpoint resolves to the
                 # placeholder (t_d79419d5). The URL-less lookup carries model.api_key; take it only when
-                # it answers for this same URL, never another endpoint's key (Prism 467b28edd66c).
+                # it answers for this same URL, never another endpoint's key (Prism 467b28edd66c). The
+                # resolved URL alone is not enough: CUSTOM_BASE_URL overrides the URL but model.api_key
+                # still binds, so model.base_url must be this URL too (Prism 77e50d54c51e).
+                from hermes_cli.runtime_provider import _get_model_config
+
                 bare = resolve_runtime_provider(requested=requested_custom, target_model=target)
-                if _same_url(bare.get("base_url"), url):
+                if _same_url(bare.get("base_url"), url) and _same_url(_get_model_config().get("base_url"), url):
                     own = bare
         except Exception as exc:
             raise RuntimeError(f"delegation {record_id or '(unknown)'}: no credential for the parent's custom "

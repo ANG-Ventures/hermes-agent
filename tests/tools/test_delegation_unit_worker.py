@@ -649,7 +649,7 @@ def test_persist_accepts_a_plain_route_url(home):
 _PARENT_URL, _DELEG_URL, _PARENT_KEY = "http://127.0.0.1:9/parent/v1", "http://127.0.0.1:9/deleg/v1", "sk-parent-own-7f3a"
 
 
-def _real_resolver_build(monkeypatch, unit, home, model_block):
+def _real_resolver_build(monkeypatch, unit, home, model_block, cfg_url=_PARENT_URL, env=None):
     """build_parent on the REAL resolver and a real config.yaml (the drill d "ownkey" shape)."""
     import sys
     from hermes_cli import config as config_mod
@@ -657,8 +657,10 @@ def _real_resolver_build(monkeypatch, unit, home, model_block):
     for var in ("CUSTOM_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY",
                 "OPENROUTER_BASE_URL", "HERMES_INFERENCE_PROVIDER"):
         monkeypatch.delenv(var, raising=False)
+    for var, value in (env or {}).items():
+        monkeypatch.setenv(var, value)
     (home / "config.yaml").write_text(model_block + f"delegation:\n  base_url: {_DELEG_URL}\n")
-    assert config_mod.load_config()["model"]["base_url"] == _PARENT_URL
+    assert config_mod.load_config()["model"]["base_url"] == cfg_url
     built = {}
 
     class FakeAgent:
@@ -706,3 +708,20 @@ def test_placeholder_on_the_parent_url_fails_closed(unit, monkeypatch):
         _build_on_route(monkeypatch, unit, fake_resolve, {
             "requested_provider": "custom", "model": "m", "explicit_base_url": "http://deleg/v1",
             "parent_base_url": "http://parent/v1"})
+
+
+def test_custom_base_url_env_on_the_parent_url_never_sends_the_config_endpoints_key(unit, home, monkeypatch):
+    """Prism 77e50d54c51e: model.base_url is endpoint A with A's model.api_key, CUSTOM_BASE_URL points at
+    the parent's endpoint B. The URL-less lookup answers base_url B but still binds model.api_key (A's key),
+    so a resolved-URL check alone forwards A's key. The fallback must also require model.base_url == B."""
+    import hermes_cli.runtime_provider as rp
+
+    other_url, other_key = "http://127.0.0.1:9/other/v1", "sk-oth...9c1d"
+    with pytest.raises(RuntimeError) as err:
+        _real_resolver_build(monkeypatch, unit, home, (
+            f"model:\n  provider: custom\n  default: m\n  base_url: {other_url}\n  api_key: {other_key}\n"),
+            cfg_url=other_url, env={"CUSTOM_BASE_URL": _PARENT_URL})
+    assert unit.did in str(err.value) and "delegation.api_key" in str(err.value)
+    # The premise: the resolver itself binds A's key to B's URL (else this test proves nothing).
+    bare = rp.resolve_runtime_provider(requested="custom", target_model="m")
+    assert bare["base_url"].rstrip("/") == _PARENT_URL and bare["api_key"] == other_key
