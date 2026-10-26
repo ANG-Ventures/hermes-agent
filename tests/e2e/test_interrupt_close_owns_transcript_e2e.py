@@ -84,6 +84,9 @@ def _run_lane(tmp_path: Path, owns: bool, *, sabotage_omit: bool = False) -> dic
         (home / "config.yaml").write_text(
             f"model:\n  default: stub-model\n  provider: {provider}\n"
             f"terminal:\n  cwd: {work}\n"
+            # Host-load-bound and off the asserted path: the toolchain probe waits up to
+            # 10 s per phase on a loaded host (t_3a2b8314).
+            f"agent:\n  environment_probe: false\n"
         )
         env = {
             k: v for k, v in environ_snapshot().items()
@@ -94,6 +97,9 @@ def _run_lane(tmp_path: Path, owns: bool, *, sabotage_omit: bool = False) -> dic
             "TERMINAL_CWD": str(work),
             "STUB_BRIDGE_KEY": "stub-key",
             "PYTHONPATH": str(REPO),
+            # The scratch state.db is this test's alone; the darwin fd scan of every host
+            # process on each SessionDB open costs tens of seconds under load (t_3a2b8314).
+            "HERMES_STATE_DELETED_WAL_CHECK": "registry",
         })
         if sabotage_omit:
             # Red-pre-fix control: force the owns_transcript lookup False in
