@@ -21487,6 +21487,7 @@ from hermes_cli.kanban_db_board_registry import (  # noqa: E402
     KanbanCardNotFound,
     board_named_by_pin,
     board_of_task,
+    pin_names_no_board,
     pinned_board,
     pinned_board_error,
     raw_db_pin,

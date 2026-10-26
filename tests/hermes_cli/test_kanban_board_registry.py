@@ -466,3 +466,88 @@ def test_board_of_task_and_pinned_board_cost_is_recorded(home, monkeypatch, caps
               f"(threshold 250 ms)")
     assert cpu[p95] * 1000 < 250
     assert pin_cpu_ms < 250
+
+
+def _argv(*argv: str) -> argparse.Namespace:
+    from hermes_cli.kanban_parser import build_parser
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers(dest="cmd"))
+    return parser.parse_args(list(argv))
+
+
+# --- a real board named ``override`` is a board, not the unnamed-pin sentinel ------------------
+# (Prism 45a44320e2b8 / 36b894e284eb on #2199, carried by this branch.)
+
+def _db_of(conn) -> Path:
+    return Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+
+
+def test_real_board_named_override_routes_to_its_own_db_from_the_tool(home):
+    """``kanban_tools._board("override")`` with no pin opens board override's DB, not default's.
+    Mutation: drop the ``pin_names_no_board`` guard -> the tool opens ``<home>/kanban.db``."""
+    from tools import kanban_tools as kt
+    kb.create_board("override")
+    with kt._board("override", verb="list") as (_kb, conn):
+        assert _db_of(conn) == (kb.board_dir("override") / "kanban.db").resolve()
+
+
+def test_real_board_named_override_routes_to_its_own_db_from_the_cli(home, capsys):
+    """``hermes kanban --board override create`` writes the card on board override."""
+    kb.create_board("override")
+    rc = kanban.kanban_command(_argv("kanban", "--board", "override", "create", "on-override",
+                                     "--assignee", "dev", "--home", "operator", "--json"))
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    import json
+    tid = json.loads(out)["id"]
+    assert kb.board_of_task(tid) == "override"
+
+
+def test_unnamed_pin_still_routes_off_the_pin(home, monkeypatch, tmp_path):
+    """The sentinel keeps meaning "the pin is the DB" when the pin names no board."""
+    db = tmp_path / "elsewhere" / "custom.db"
+    db.parent.mkdir()
+    kbc.connect(db_path=db).close()
+    _pin(monkeypatch, db)
+    from tools import kanban_tools as kt
+    with kt._board(None, verb="list") as (_kb, conn):
+        assert _db_of(conn) == db.resolve()
+    assert reg.pin_names_no_board(kb.PINNED_SLUG) is True
+    assert reg.pin_names_no_board("alpha") is False
+
+
+def test_unnamed_pin_beside_a_real_override_board_is_still_the_pin(home, monkeypatch, tmp_path):
+    """Board ``override`` exists AND the pin names no board: the pin still routes the open."""
+    kb.create_board("override")
+    db = tmp_path / "elsewhere" / "custom.db"
+    db.parent.mkdir()
+    kbc.connect(db_path=db).close()
+    _pin(monkeypatch, db)
+    assert reg.pin_names_no_board(kb.PINNED_SLUG) is True
+
+
+# --- ``boards show`` validates --board like every other verb (Prism 3a6b8fcc39cd) ---------------
+
+def test_boards_show_refuses_an_unknown_board(home, capsys):
+    rc = kanban.kanban_command(_argv("kanban", "--board", "nosuchboard", "boards", "show"))
+    out, err = capsys.readouterr()
+    assert rc != 0
+    assert "does not exist" in err and "Board: nosuchboard" not in out
+
+
+def test_boards_show_refuses_a_malformed_board_with_rc2(home, capsys):
+    rc = kanban.kanban_command(_argv("kanban", "--board", "BAD SLUG!", "boards", "show"))
+    assert rc == 2
+    assert "invalid board slug" in capsys.readouterr().err
+
+
+def test_boards_show_under_an_unnamed_pin_does_not_describe_a_board_called_override(
+        home, monkeypatch, tmp_path, capsys):
+    db = tmp_path / "elsewhere" / "custom.db"
+    db.parent.mkdir()
+    kbc.connect(db_path=db).close()
+    _pin(monkeypatch, db)
+    rc = kanban.kanban_command(_argv("kanban", "boards", "show"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Board: override" not in out and str(db) in out

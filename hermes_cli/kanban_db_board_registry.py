@@ -111,6 +111,23 @@ def pinned_board() -> Optional[str]:
     return board_named_by_pin(raw) if raw else None
 
 
+def pin_names_no_board(slug: Optional[str]) -> bool:
+    """True only when ``slug`` is the sentinel for a ``HERMES_KANBAN_DB`` pin that names no
+    board. ``override`` is also a valid board slug (Prism 45a44320e2b8 / 36b894e284eb): with no
+    pin, or with a pin on board ``override``'s own DB, it is that board and routes like any other.
+    """
+    if slug != PINNED_SLUG:
+        return False
+    raw = raw_db_pin()
+    if not raw or board_named_by_pin(raw) != PINNED_SLUG:
+        return False
+    _kb = _facade()
+    if not _kb.board_exists(PINNED_SLUG):
+        return True
+    return not _kb._pin_file_agrees(_kb._board_db_path_ignoring_pin(PINNED_SLUG),
+                                    Path(raw).expanduser())
+
+
 def pinned_board_error() -> Optional[str]:
     """Why the current pin could not be named, or ``None`` (no pin, or it was named)."""
     raw = raw_db_pin()

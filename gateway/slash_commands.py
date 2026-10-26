@@ -707,7 +707,14 @@ class GatewaySlashCommandsMixin(
         def _sub():
             from hermes_cli import kanban_db_connect as _kbc
             from hermes_cli import kanban_db_notify as _kbn
-            conn = _kbc.connect(board=requested_board)
+            if requested_board:
+                conn = _kbc.connect(board=requested_board)
+            else:
+                # The CLI may have derived the board (--parent/--continues/--workspace-of, or a
+                # --board after the verb); the card itself says where it landed (Prism 35e770f2b096).
+                from pathlib import Path
+                from hermes_cli import kanban_db_board_registry as _kbr
+                conn = _kbc.connect(db_path=Path(_kbr.locate(task_id)[1]))
             try:
                 _kbn.add_notify_sub(
                     conn, task_id=task_id, platform=platform_str, chat_id=chat_id, chat_type=chat_type,

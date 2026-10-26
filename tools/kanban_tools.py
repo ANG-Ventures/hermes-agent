@@ -396,7 +396,7 @@ def _board(board: Optional[str], *, verb: str, card_ids: Iterable[Optional[str]]
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     slug = kbsel.resolve_slug(board, verb=verb, card_ids=[str(c) for c in card_ids if c])
-    if slug == kb.PINNED_SLUG:  # a pin outside every board's layout: the pin routes the open
+    if kb.pin_names_no_board(slug):  # a pin outside every board's layout: the pin routes the open
         scope, target = contextlib.nullcontext(), None
     else:
         scope, target = kb.scoped_current_board(slug), slug

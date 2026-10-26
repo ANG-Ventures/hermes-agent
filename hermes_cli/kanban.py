@@ -357,7 +357,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         msg = str(exc)
         return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
     board_scope = contextlib.nullcontext()
-    if resolved and resolved != kb.PINNED_SLUG:
+    if resolved and not kb.pin_names_no_board(resolved):
         board_scope = kb.scoped_current_board(resolved)
 
     with board_scope:

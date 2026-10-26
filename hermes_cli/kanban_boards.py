@@ -127,6 +127,13 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
     if not current:
         print("no board pinned; pass --board <slug> (boards: hermes kanban boards list)")
         return 0
+    if getattr(args, "board", None) is None and kb.pin_names_no_board(current):
+        print(f"Pinned DB (names no board): {kb.raw_db_pin()}\n"
+              "  Address a board with `hermes kanban --board <slug> <verb>`.")
+        return 0
+    if current != kb.DEFAULT_BOARD and not kb.board_exists(current):  # Prism 3a6b8fcc39cd
+        return _err(f"kanban boards show: board {current!r} does not exist "
+                    f"(boards: hermes kanban boards list)")
     meta = kb.read_board_metadata(current)
     counts = _board_task_counts(current)
     print(f"Board: {current}\n  Display name: {meta.get('name', '')}")
