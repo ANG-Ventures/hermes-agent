@@ -2817,3 +2817,41 @@ def test_r4_closes_round17_mid_export_sibling_write(temp_home, monkeypatch):
     assert seen["child"].startswith("REFUSED"), seen  # with CRON_DEGRADED_LOCK_WRITES=proceed the child dies on "database is locked" instead
     assert not _db(temp_home).exists()
     assert not any(j.get("last_error") == "sibling-mid-export" for j in cj.load_jobs())
+
+
+def test_orphans_only_cache_requires_every_remaining_row_to_be_undefined(temp_home, monkeypatch):
+    """647d59796c3e: a fold that kept a DEFINED job's row (changed mid-export under the proceed
+    knob) must not cache the db as orphans-only; the next load still overlays the row."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    cj.mark_job_run(a["id"], True)
+    real_retire = cj._retire_runtime_rows
+
+    def sibling_changes_a_mid_export(conn, texts):
+        rs.upsert_rows(conn, {a["id"]: {"last_status": "changed-mid-export"}})
+        return real_retire(conn, texts)
+
+    monkeypatch.setattr(cj, "_retire_runtime_rows", sibling_changes_a_mid_export)
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    cj.load_jobs()  # fold 1 keeps a's changed row (db survives, NOT cached); the re-read folds again
+    assert str(_db(temp_home)) not in cj._KILL_SWITCH_ORPHANS_ONLY, \
+        "a defined job's row remained: never cached"
+    # the newer value is visible, not hidden behind a stale 'orphans only' verdict
+    assert cj.get_job(a["id"])["last_status"] == "changed-mid-export"
+    assert not _db(temp_home).exists()  # the second fold carried it into jobs.json
+
+
+def test_backup_pair_capture_refuses_under_a_contended_lock(temp_home, monkeypatch):
+    """d893e459f0ce, R4: the quick-snapshot / profile-export pair capture is not exclusive in a
+    contended section; it refuses rather than copying a pair the real holder is changing."""
+    import pytest
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    cj.create_job(prompt="x", schedule="every 5m", name="cap")
+    _degrade_lock(monkeypatch, cj)
+    with pytest.raises(cj.CronLockDegraded):
+        with backup._cron_store_lock(temp_home):
+            pass

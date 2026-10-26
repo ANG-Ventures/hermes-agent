@@ -1655,11 +1655,18 @@ def _cron_store_lock(home: Path):
     (t_94e91559: runtime rows live in the db; a remove_job between the two copies would
     otherwise pair a definition with no row). Best effort: no lock when cron cannot load."""
     try:
-        from cron.jobs import _jobs_lock, use_cron_store
+        from cron.jobs import CronLockDegraded, _jobs_lock, _write_refused_by_r4, use_cron_store
     except Exception:
         yield
         return
     with use_cron_store(home), _jobs_lock():
+        if _write_refused_by_r4():
+            # Prism d893e459f0ce, ruling R4: a section that could not take the cross-process lock
+            # is not exclusive; the real holder may be mid-write across the two files. A pair
+            # copied now could pair old definitions with newer runtime. Refuse the capture.
+            raise CronLockDegraded(
+                f"the cron jobs lock is degraded (another process holds {home / 'cron' / '.jobs.lock'}); "
+                "refusing to capture jobs.json + runtime_state.db as a pair (nothing copied). Retry")
         yield
 
 

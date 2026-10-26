@@ -1865,10 +1865,27 @@ def _kill_switch_orphans_only() -> bool:
 
 
 def _note_kill_switch_orphans_only() -> None:
+    """Cache the db as 'orphans only' ONLY after verifying it: every remaining row must lack a
+    definition in jobs.json (Prism 647d59796c3e: the fold also returns successfully when a row
+    was kept because it changed mid-export; caching that would hide live runtime behind the
+    file). A db with a defined job's row stays a split store until the next locked fold."""
     path = _runtime_db_path()
     ident = _kill_switch_pair_identity(path)
-    if ident[0] is not None:
-        _KILL_SWITCH_ORPHANS_ONLY[str(path)] = ident
+    if ident[0] is None:
+        return
+    try:
+        rows = _rs.read_all(_current_cron_store().cron_dir)
+        data, _ = _parse_jobs_file(_current_cron_store().jobs_file)
+        file_jobs = data.get("jobs") if isinstance(data, dict) else data
+        defined = {str(j.get("id")) for j in (file_jobs or []) if isinstance(j, dict)}
+    except Exception:
+        return  # unreadable: never cache a state we could not verify
+    if any(jid in defined for jid in rows):
+        logger.warning("cron runtime-state: %d row(s) for defined job(s) remain in %s after the "
+                       "fold; keeping the split store (not cached as orphans-only)",
+                       sum(1 for jid in rows if jid in defined), _rs.DB_NAME)
+        return
+    _KILL_SWITCH_ORPHANS_ONLY[str(path)] = ident
 
 
 def _runtime_db_path() -> Path:
