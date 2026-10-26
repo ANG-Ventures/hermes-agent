@@ -655,12 +655,26 @@ def _private_ranges(db_path, *, shm_only: bool = False) -> Dict[str, Tuple[Ident
     return out
 
 
+def _reown_if_inherited(held: Held) -> None:
+    """A record minted in ANOTHER process (inherited across fork) carries the parent's claims, which
+    this process never counted: _reset_after_fork() emptied the counts and closed the descriptors.
+    Extending it as-is would skip those inodes in _arm_private() and return a non-empty record with
+    no protection in this process (Prism 76f036318f66). Clear it and take it over, so the caller's
+    hold()/refresh_shm() arms every inode afresh."""
+    pid = getattr(held, "pid", None)
+    if pid is not None and pid != os.getpid():
+        held.clear()
+        getattr(held, "unarmed", {}).clear()
+        held.pid = os.getpid()
+
+
 def hold(db_path, held: Optional[Held] = None) -> Held:
     """Lock the guard ranges on ``state.db`` and its ``-shm`` (private mode: on this module's own
     descriptor per inode, O(1) in the fd-table size). Returns the record :func:`release` needs;
     pass it back to extend an existing one (a ``-shm`` minted after open, a reopened connection).
     Idempotent per handle: an inode already in *held* is not counted twice. Never raises."""
     held = _Held() if held is None else held
+    _reown_if_inherited(held)
     if not supported():
         return held
     if _MODE == "private":
@@ -691,6 +705,8 @@ def refresh_shm(db_path, held: Held) -> Held:
     is the old full :func:`hold`. Never raises; a missing ``-shm`` is a no-op."""
     if not supported():
         return held
+    if getattr(held, "pid", os.getpid()) != os.getpid():
+        return hold(db_path, held)  # inherited across fork: re-own and arm db + -shm afresh (Prism 76f036318f66)
     if _MODE != "private":
         return hold(db_path, held)
     try:

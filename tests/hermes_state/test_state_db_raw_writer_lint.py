@@ -271,8 +271,11 @@ def _scan_all(path: Path, rel: str):
     later item of the same ``with`` statement."""
     try:
         text = path.read_text(encoding="utf-8")
-        if "connect" not in text or ("sqlite" not in text and "_connect_tracked_db" not in text):
-            return []  # cheap pre-filter: most files never open sqlite
+        # Cheap pre-filter: most files never open sqlite. Every name _is_sqlite_connect() accepts must
+        # pass it, or a module that only calls open_db() is skipped whole (Prism 59340fbddbd2).
+        if not any(name in text for name in ("connect", *_TRACKED_CONNECTS)) or (
+                "sqlite" not in text and not any(name in text for name in _TRACKED_CONNECTS)):
+            return []
         tree = ast.parse(text, filename=rel)
     except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
         return []
@@ -363,6 +366,18 @@ def test_lint_sees_open_db_on_state_db_by_its_label(tmp_path):
         "    return open_db(_db_path(), db_label='shared-state.db (rooms)')\n"
     )
     assert [(fn, line) for _rel, fn, line in _scan(src, "probe.py")] == [("_connect", 3)]
+
+
+def test_lint_prefilter_keeps_a_module_that_only_calls_open_db(tmp_path):
+    """Prism 59340fbddbd2: the pre-filter required the text "connect", so a module whose only state.db
+    writer is ``open_db(state_db)`` (no "connect" anywhere) was skipped whole."""
+    src = tmp_path / "probe.py"
+    src.write_text(
+        "from hermes_cli.sqlite_util import open_db\n"
+        "def writer(state_db):\n"
+        "    return open_db(state_db)\n"
+    )
+    assert [(fn, line) for _rel, fn, line in _scan(src, "probe.py")] == [("writer", 3)]
 
 
 def test_lint_flags_a_raw_writer_and_passes_read_only(tmp_path):

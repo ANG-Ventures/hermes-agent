@@ -1597,3 +1597,44 @@ def test_reader_through_a_dangling_filename_symlink_pins_the_target(tmp_path):
     finally:
         lg.unregister_reader(token)
     assert shm_ident not in lg._FDS
+
+
+
+def test_inherited_record_is_reowned_and_rearmed_in_a_fork_child(tmp_path):
+    """Prism 76f036318f66: hold()/refresh_shm() in a fork child extended the parent's record and
+    skipped its inodes, returning a non-empty record with no lock and no count in the child. The child
+    now re-owns the record and arms it: the foreign EXCLUSIVE is refused by the CHILD's own guard once
+    the parent has released."""
+    if not lg.supported() or not hasattr(os, "fork"):
+        pytest.skip("no OFD locks / fork")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    held = lg.hold(db)
+    r, w = os.pipe()
+    go_r, go_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        try:
+            os.close(r)
+            os.close(go_w)
+            h = lg.hold(db, held)
+            h = lg.refresh_shm(db, h)
+            ok = bool(h) and h.pid == os.getpid() and all(lg._HANDLES.get(i) == 1 for i in h)
+            os.write(w, b"1" if ok else b"0")
+            os.read(go_r, 1)  # parent released its guard and probed
+        finally:
+            os._exit(0)
+    os.close(w)
+    os.close(go_r)
+    try:
+        assert os.read(r, 1) == b"1", "the child's hold() did not re-own and count the inherited record"
+        lg.release(held)  # the parent's guard is gone; only the child's own can refuse now
+        assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
+        assert _foreign_exclusive(str(shm), *_DMS) == "REFUSED"
+    finally:
+        os.write(go_w, b"x")
+        os.waitpid(pid, 0)
+        os.close(r)
+        os.close(go_w)
