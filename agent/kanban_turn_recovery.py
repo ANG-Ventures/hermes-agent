@@ -377,7 +377,9 @@ def recover_failed_kanban_turns(
 
     ``persist_pending()`` (see :func:`persist_pending_transcript`) runs right before each
     model re-entry. When it returns False the attempt is spent without entering the model,
-    so an unsaved row is never handed to the next turn as durable history.
+    so an unsaved row is never handed to the next turn as durable history. Because that
+    write can block on contention, ownership is re-proved after it succeeds and before
+    ``turn_fn`` runs.
     """
     attempts = 0
     check = claim_check or worker_claim_is_live
@@ -421,6 +423,12 @@ def recover_failed_kanban_turns(
                 except Exception:
                     logger.debug("kanban turn-recovery emit failed", exc_info=True)
             continue
+        # The persist step is a real state.db write that can wait out lock contention for
+        # minutes; the run can be settled, reclaimed or expire meanwhile. Re-prove ownership
+        # once more so the model is only re-entered by a worker that still holds the claim.
+        if persist_pending is not None and not check():
+            _emit_recovery_skipped(emit)
+            return attempts
         turn_fn(build_recovery_nudge(result, attempt=attempts, max_attempts=max_recovery_attempts()))
 
 
