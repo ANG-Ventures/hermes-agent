@@ -55,6 +55,7 @@ import ast
 import bisect
 import copy
 import datetime as dt
+import heapq
 import itertools
 import json
 import os
@@ -213,64 +214,154 @@ def _is_partial(call) -> bool:
     return isinstance(call, ast.Call) and _name(call.func) == "partial" and bool(call.args)
 
 
-def _runner_ref(node, bare: frozenset, known: dict):
-    """(subprocess ref, baked positional args) when ``node`` evaluates to a subprocess callable: `subprocess.run`,
-    a bare-imported `run`, a name already bound to one in ``known``, or `functools.partial(<one of those>, *args)`
-    (t_c59fff64: `def collect_remote(host, log_dir, run=subprocess.run)` spawned ssh through `run(...)` unseen).
-    None for anything else. AST only: nothing is evaluated."""
+def _runner_ref(node, bare: frozenset, known: dict) -> list:
+    """[(subprocess ref, baked positional args)]: every subprocess callable ``node`` may evaluate to: `subprocess.run`,
+    a bare-imported `run`, a name already bound to one (or more) in ``known``, or `functools.partial(<one of those>,
+    *args)` (t_c59fff64: `def collect_remote(host, log_dir, run=subprocess.run)` spawned ssh through `run(...)`
+    unseen). Empty for anything else. AST only: nothing is evaluated."""
     if isinstance(node, ast.Name) and node.id in known:
-        return known[node.id]
+        return list(known[node.id])
     if isinstance(node, (ast.Name, ast.Attribute)) and \
             _is_subprocess_call(ast.Call(func=node, args=[], keywords=[]), bare):
-        return node, []
+        return [(node, [])]
     if _is_partial(node):
-        inner = _runner_ref(node.args[0], bare, known)
-        if inner is not None:
-            return inner[0], [*inner[1], *node.args[1:]]
-    return None
+        return [(r, [*b, *node.args[1:]]) for r, b in _runner_ref(node.args[0], bare, known)]
+    if isinstance(node, ast.Subscript) and isinstance(node.value, (ast.ListComp, ast.GeneratorExp, ast.SetComp)):
+        # `[lr for _ in xs][0]`: an element of a comprehension; its own targets shadow (t_8ad18b12)
+        own = {t.id for g in node.value.generators for t in ast.walk(g.target) if isinstance(t, ast.Name)}
+        return _runner_ref(node.value.elt, bare - own, {k: v for k, v in known.items() if k not in own})
+    return []
 
 
-def _scope_runners(node, body: list, bare: frozenset, inherited: dict) -> dict:
-    """name -> (subprocess ref, baked args) for the callables a scope reaches subprocess through: a parameter whose
-    DEFAULT is one, a local `x = <one>` / `x = partial(<one>, ..)`, or an enclosing scope's binding not shadowed
-    here. A parameter with no default (or another default) shadows the enclosing binding: a test fake `run` is not
-    a spawn. A local rebinding to something else shadows only when no assignment in the scope binds a runner
-    (may: one path through subprocess is enough)."""
-    known = dict(inherited)
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-        a = node.args
-        pos = [*a.posonlyargs, *a.args]
-        defaults = [None] * (len(pos) - len(a.defaults)) + list(a.defaults)
-        for arg, d in [*zip(pos, defaults), *zip(a.kwonlyargs, a.kw_defaults)]:
-            ref = _runner_ref(d, bare, inherited) if d is not None else None   # defaults run in the enclosing scope
-            if ref is not None:
-                known[arg.arg] = ref
-            else:
-                known.pop(arg.arg, None)
-        for x in (a.vararg, a.kwarg):
-            if x is not None:
-                known.pop(x.arg, None)
-    assigns = []
+def _add_alts(known: dict, nm: str, alts: list) -> bool:
+    if not alts:   # an assignment with no runner alternative records nothing (an empty entry would mask the
+        return False   # bare-import fallback in _runner_ref, Prism b100b2d9f80a)
+    cur = known.setdefault(nm, [])
+    seen = {(ast.dump(r), tuple(map(ast.dump, b))) for r, b in cur}
+    grew = False
+    for r, b in alts:
+        k = (ast.dump(r), tuple(map(ast.dump, b)))
+        if k not in seen:   # no cap: a dropped alternative could be the subprocess one (Prism b68d2fca7e3b)
+            seen.add(k)
+            cur.append((r, b))
+            grew = True
+    return grew
+
+
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _own_assigns(body: list) -> list:
+    """[(name, value)] of the plain-name assignments a scope body makes itself (nested def/class bodies excluded)."""
+    out = []
     for st in body:
+        if isinstance(st, _DEFS):
+            continue   # its body is its own scope (_walk_own(st) would yield the def's own statements)
         for n in [st, *_walk_own(st)]:
             if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
                 for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
                     if isinstance(t, ast.Name):
-                        assigns.append((t.id, n.value))
-    bound: set[str] = set()
-    for _ in range(4):   # alias chains (`r = run; rr = partial(r, ..)`) resolve in any source order
+                        out.append((t.id, n.value))
+    return out
+
+
+def _fn_locals(f) -> set:
+    """Names local to function ``f``: its parameters and the names it assigns without `global` / `nonlocal`."""
+    a = f.args
+    params = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg) if x is not None}
+    return params | ({nm for nm, _ in _own_assigns(f.body)} - _declared(f.body, (ast.Global, ast.Nonlocal)))
+
+
+def _declared(body: list, kind) -> set:
+    """Names a scope body declares `global` / `nonlocal` (``kind``: one ast class or a tuple)."""
+    return {g for st in body if not isinstance(st, _DEFS) for n in [st, *_walk_own(st)]
+            if isinstance(n, kind) for g in n.names}
+
+
+def _scope_runners(node, body: list, bare: frozenset, inherited: dict) -> dict:
+    """name -> [(subprocess ref, baked args)] for the callables a scope reaches subprocess through: a parameter whose
+    DEFAULT is one, a local `x = <one>` / `x = partial(<one>, ..)`, or an enclosing scope's binding not shadowed
+    here. MAY: every assignment in the scope is one alternative (one branch binding `run = partial(.., ['echo'])`
+    leaves the other branch's `run = subprocess.run`, Prism 8fd7ab674141). A name assigned in a function is local
+    there, so it never sees the enclosing binding (`runner = fake; invoke = runner` is not subprocess, Prism
+    ce17a6dacbd1); at module level an assignment may not run, so the import binding stays an alternative. A
+    parameter with no default (or another default) shadows the enclosing binding: a test fake `run` is not a spawn.
+    Nested def/class bodies are their own scopes and never bind here (Prism 95af992489bd)."""
+    known = {k: list(v) for k, v in inherited.items()}
+    is_fn = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+    params: set[str] = set()
+    if is_fn:
+        a = node.args
+        pos = [*a.posonlyargs, *a.args]
+        defaults = [None] * (len(pos) - len(a.defaults)) + list(a.defaults)
+        for arg, d in [*zip(pos, defaults), *zip(a.kwonlyargs, a.kw_defaults)]:
+            params.add(arg.arg)
+            ref = _runner_ref(d, bare, inherited) if d is not None else []   # defaults run in the enclosing scope
+            known.pop(arg.arg, None)
+            if ref:
+                known[arg.arg] = ref
+        for x in (a.vararg, a.kwarg):
+            if x is not None:
+                params.add(x.arg)
+                known.pop(x.arg, None)
+    assigns = _own_assigns(body)
+    own_names = {nm for nm, _ in assigns}   # shadowing is decided by THIS scope's assignments only: a nested def's
+    # `nonlocal x` may bind past this function to an outer x, so it never makes x local here (Prism de3afa4559bd)
+    # a nested function's assignment to a name it declares `global` (any depth) binds the module's name, and one it
+    # declares `nonlocal` binds this function's: both are alternatives HERE (`def install(): global runner;
+    # runner = subprocess.run`, Prism f64f05e33ae3). Its own locals never are (Prism 95af992489bd).
+    kind = ast.Nonlocal if is_fn else ast.Global
+    exports = []   # (def, enclosing functions, names it binds here): the value resolves in the DEFINING scope
+    # (Prism 093e422a62c5), i.e. through every function between here and the def (Prism 5434b042f044)
+    # ONLY there: the exported right-hand side is never also resolved here, where a name it reads may be bound to
+    # something else (`lr = subprocess.run` here, `lr = print` local to the exporter, Prism b7d07f333edc)
+    export_names: set[str] = set()
+    for d, chain in _walk_chain(node):
+        # a class body may declare `global` / `nonlocal` too (`class Install: global runner; runner = ..`): same export
+        if d is not node and isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = _declared(d.body, kind)
+            if is_fn:   # `nonlocal x` two defs deep binds HERE unless a function between binds x (t_8ad18b12)
+                names -= {nm for f in chain for nm in _fn_locals(f)}
+            own = {nm for nm, _ in _own_assigns(d.body) if nm in names}
+            export_names |= own
+            if own:
+                exports.append((d, chain, own))
+    if is_fn:
+        # `global x` / `nonlocal x` names are not local: the enclosing binding stays reachable (Prism 087ccd93f08c)
+        decl = _declared(body, (ast.Global, ast.Nonlocal))
+        for nm in own_names - params - decl:
+            known.pop(nm, None)   # local throughout the function: the enclosing binding is unreachable
+    else:
+        decl = set()
+    for nm in own_names | export_names if not is_fn else decl:
+        if nm not in known:
+            plain = _runner_ref(ast.Name(id=nm, ctx=ast.Load()), bare, {})
+            if plain:   # `from subprocess import run`, then a `run = ...` that may not run: the import stays an
+                known[nm] = plain   # alternative (module level, or a `global run` in a function, Prism b100b2d9f80a)
+    # alias chains (`r = run; rr = partial(r, ..)`) resolve in any source order: each round extends every chain by at
+    # least one binding, so one round per binding reaches the fixpoint; a fixed count drops long exported chains
+    # (five reverse-ordered installers, Prism e694e43ce56f). Still bounded: a `r = partial(r, ..)` cycle stops.
+    for _ in range(len(assigns) + sum(len(n) for _d, _c, n in exports) + 1):
         grew = False
         for nm, v in assigns:
-            ref = _runner_ref(v, bare, known)
-            if ref is not None and nm not in bound:
-                known[nm], grew = ref, True
-                bound.add(nm)
+            grew = _add_alts(known, nm, _runner_ref(v, bare, known)) or grew
+        for d, chain, names in exports:   # `def install(): global runner; lr = subprocess.run; runner = lr`
+            enc = known
+            for f in chain:   # `def outer(): lr = subprocess.run; def install(): global runner; runner = lr`
+                enc = _scope_runners(f, f.body, bare, enc)
+            if not is_fn:   # names the exporter declares `global` resolve in the MODULE, not a shadowing enclosing local
+                enc = dict(enc)
+                for g in _declared(d.body, ast.Global):
+                    if g in known:
+                        enc[g] = known[g]
+                    else:
+                        enc.pop(g, None)
+            dk = _scope_runners(d, d.body, bare, enc)
+            for nm in names:
+                grew = _add_alts(known, nm, dk.get(nm, [])) or grew
         if not grew:
             break
-    for nm, _ in assigns:
-        if nm not in bound:
-            known.pop(nm, None)
-    return known
+    return {k: v for k, v in known.items() if v}
 
 
 def _call_argv(call: ast.Call) -> list:
@@ -291,20 +382,27 @@ def _call_argv(call: ast.Call) -> list:
     return pos[:1]
 
 
-def _argv_head(node, known: dict | None = None) -> list:
+def _argv_head(node, known: dict | None = None, prog: bool = False) -> list:
     """The FULL argv tokens (never truncated: an endpoint can sit after the 4th token): str for a literal, 'SSH' for
-    an ssh helper, None for unknown. ``known`` maps a local name to the argv it was bound to (`cmd = [...]`)."""
+    an ssh helper, None for unknown. ``known`` maps a local name to the argv it was bound to (`cmd = [...]`).
+    ``prog``: a leading name bound to one token is that token (`[cmd, 'ci-box', ..]`); _heads takes this view AS
+    WELL AS the plain one, never instead of it, so a binding the flow cannot prove keeps main's reading (t_8ad18b12)."""
     known = known or {}
     if isinstance(node, ast.Name) and node.id in known:
         return list(known[node.id])
+    if _sub_key(node) in known:   # `cmd['a']` with cmd = {'a': ['ssh', ..]} (t_8ad18b12)
+        return list(known[_sub_key(node)])
     if isinstance(node, (ast.List, ast.Tuple)):
         out = []
         for e in node.elts:
             t = _literal_text(e)
+            b = known.get(e.id) if isinstance(e, ast.Name) else None
             if t is not None and "\x00" not in t:
                 out.append(t)
+            elif prog and b is not None and len(b) == 1 and isinstance(b[0], str) and not out:
+                out.append(b[0])   # `[prog, 'ci-box', 'job']` with prog = '/usr/bin/ssh' (t_8ad18b12)
             elif isinstance(e, ast.Starred):
-                sub = _argv_head(e.value, known)
+                sub = _argv_head(e.value, known, prog)
                 out += sub if sub else [None]
             elif "ssh" in _name(e).lower() and not isinstance(e, ast.Constant) and not out:
                 out.append("SSH")
@@ -312,13 +410,22 @@ def _argv_head(node, known: dict | None = None) -> list:
                 out.append(None)
         return out
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return _argv_head(node.left, known) + _argv_head(node.right, known)
+        return _argv_head(node.left, known, prog) + _argv_head(node.right, known, prog)
     if isinstance(node, (ast.Call, ast.Name, ast.Attribute)) and "ssh" in _name(node).lower():
         return ["SSH"]
     t = _literal_text(node)
     if t is not None:
         return [t]   # a shell string: classified as text
     return []
+
+
+def _sub_key(node) -> str | None:
+    """The argv-binding key of `name['k']` (a constant str/int key), or None. A dict literal bound to a name binds
+    each such element under this key, so `run(cmd['a'])` sees the argv the dict carried (t_8ad18b12)."""
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and isinstance(node.slice, ast.Constant) \
+            and isinstance(node.slice.value, (str, int)):
+        return f"{node.value.id}[{node.slice.value!r}]"
+    return None
 
 
 def _classify_argv(head: list) -> str | None:
@@ -476,26 +583,51 @@ def _heads(node, st: _St) -> list:
     names it uses (capped)."""
     out, seen = [], set()
     for arm in _arms(node):
-        used = sorted({x.id for x in ast.walk(arm) if isinstance(x, ast.Name) and st.argv.get(x.id)})
+        used = sorted({k for x in ast.walk(arm) for k in [x.id if isinstance(x, ast.Name) else _sub_key(x)]
+                       if k is not None and st.argv.get(k)})
         views: list[dict] = [{}]
         for nm in used:
-            views = [dict(v, **{nm: list(h)}) for v in views for h in st.argv[nm]][:32]
+            views = [dict(v, **{nm: list(h)}) for v in views for h in st.argv[nm]]
+            if len(views) > 32:
+                break
+        if len(views) > 32:   # truncating: rank EVERY composed view of the arm, then keep 32 (t_540a3e9a). Ranking
+            # one name's alternatives against a single view loses a spawn that composes only under a later view
+            # of another name (Prism 8ca6f3c667ce, 753c64420f1d). Lazy product, O(32) memory, hash-seed-free key.
+            def rank(combo):
+                v = dict(zip(used, map(list, combo)))
+                return [((not _classify_argv(c), not _spawnish(c), repr(c), repr(combo)), v)
+                        for c in (_argv_head(arm, v), _argv_head(arm, v, True))]
+            alts = [sorted(st.argv[nm], key=repr) for nm in used]
+            best: dict = {}   # one view per distinct composed head BEFORE the cap (Prism 7f9bc8fca3a7), BOTH
+            # views' heads ranked, so a program-name head never hides behind its view's plain head (6772d0283d54)
+            for key, v in itertools.chain.from_iterable(map(rank, itertools.product(*alts))):
+                best[key[2]] = min(best.get(key[2], (key, v)), (key, v), key=lambda kv: kv[0])
+            views = [v for _, v in heapq.nsmallest(32, best.values(), key=lambda kv: kv[0])]
         for v in views:
-            h = _argv_head(arm, v)
-            if repr(h) not in seen:
-                seen.add(repr(h))
-                out.append(h)
+            for h in (_argv_head(arm, v), _argv_head(arm, v, True)):
+                if repr(h) not in seen:
+                    seen.add(repr(h))
+                    out.append(h)
     return out
 
 
 def _drop(st: _St, names) -> None:
     for nm in names:
         st.argv.pop(nm, None)
+        for k in [k for k in st.argv if k.startswith(nm + "[")]:   # its dict-element bindings (`cmd['a']`)
+            del st.argv[k]
     st.docker -= names
     st.mint -= names
     st.admit -= names
     st.env -= names
-    st.alias = {a for a in st.alias if not a & names}
+    # rebinding the middle of a chain (`a = env; b = a; a = {}`) leaves env and b naming one mapping: connect the
+    # rebound name's neighbours before its edges go (Prism 91c6c5c1db77). Eliminate one name at a time and exclude
+    # only that name, so names rebound in the SAME call (`a, b = {}, {}` over env~a~b~c) still bridge env~c
+    # (Prism 73953ef77e50)
+    for nm in names:
+        nb = {o for a in st.alias if nm in a for o in a} - {nm}
+        st.alias |= {frozenset((x, y)) for x in nb for y in nb if x < y}
+        st.alias = {a for a in st.alias if nm not in a}
 
 
 def _unreserve(st: _St, names) -> None:
@@ -555,6 +687,15 @@ def _apply_assign(st: _St, n) -> None:
                     h = {tuple(x) for x in _heads(e, st) if x}
                     if h:
                         pairs[t.id] = h
+    elems = {}   # `cmd = {'a': ['ssh', ..]}`: each constant-keyed element binds `cmd['a']` (t_8ad18b12)
+    if isinstance(v, ast.Dict):
+        for tg in targets:
+            if isinstance(tg, ast.Name):
+                for k, e in zip(v.keys, v.values):
+                    sk = _sub_key(ast.Subscript(value=tg, slice=k)) if k is not None else None
+                    h = {tuple(x) for x in _heads(e, st) if x} if sk else set()
+                    if h:
+                        elems[sk] = h
     vnames = {x.id for x in ast.walk(v) if isinstance(x, ast.Name)}
     is_admit = isinstance(v, ast.Call) and _name(v.func) in ("admit", "alloc_admit") and (
         isinstance(v.func, ast.Name) or bool(re.search(r"alloc|placement|^pl$", _recv(v.func))))
@@ -574,10 +715,14 @@ def _apply_assign(st: _St, n) -> None:
         if isinstance(tg, ast.Name) and heads:
             st.argv[tg.id] = set(heads)
     st.argv.update(pairs)
+    st.argv.update(elems)
+    for tg in targets:   # `cmd['a'] = [...]`: ADDS an alternative, never replaces one (Apollo r7 on #6662)
+        if _sub_key(tg) and heads:
+            st.argv[_sub_key(tg)] = st.argv.get(_sub_key(tg), set()) | heads
     if is_admit:
         st.admit |= names
-    if carries:
-        st.env |= names
+    if carries:   # a whole binding only: `env['NOTE'] = note` stores a value, it reserves no key (Prism 89766342164e)
+        st.env |= rb
     if isinstance(v, ast.Name):   # `alias = env`: one mapping, two names (a mutation through either reaches both)
         st.alias |= {frozenset((t, v.id)) for t in rb if t != v.id}
     if docker:
@@ -589,19 +734,55 @@ def _apply_assign(st: _St, n) -> None:
             st.env |= {t.id for t in ast.walk(tg.value) if isinstance(t, ast.Name)}
 
 
-def _loop_bind(target, it, st: _St):
+LOOP_ELTS_CAP = 64   # distinct literal elements judged per `for`; past it the target keeps no must fact
+SPAWN_WORDS = frozenset({"ssh", "docker", "run", "systemd-run", "launchctl", "kickstart", "gh", "workflow",
+                         "hermes", "kanban", "dispatch"})
+
+
+def _spawnish(head) -> bool:
+    """A head that is a spawn argv, or may become one once composed (`['docker'] + cmd` with cmd = ['run', ..]):
+    it classifies, or one of its tokens is a word _classify_argv keys on, or a shell string that classifies."""
+    if _classify_argv(list(head)):
+        return True
+    return any(t == "SSH" or isinstance(t, str) and (
+        os.path.basename(t.strip()) in SPAWN_WORDS or "generate-jitconfig" in t or "runners/registration-token" in t
+        or (" " in t.strip() and _classify_shell_text(t) is not None)) for t in head)
+
+
+def _elt_spawnish(e, st: _St) -> bool:
+    """A loop element past LOOP_ELTS_CAP is still judged when any argv inside it (`(1, ['ssh', ..])`) is spawn-ish."""
+    return any(_spawnish(h) for sub in ast.walk(e) if isinstance(sub, ast.expr) for h in _heads(sub, st))
+
+
+def _loop_bind(target, it, st: _St, cur: _St | None = None):
     """The facts a `for` target can hold on any pass: the join, over the elements of an explicit literal iterable,
     of assigning each element to the target (`for cmd in [cmd]`, `for i, cmd in [(1, ['ssh', ..])]`, Prism
     9660245e676f). None when the elements are not known (a name, a call, a starred element, an empty literal):
-    the target is then dropped. The iterable runs once, at entry, so its elements are judged in the entry state."""
+    the target is then dropped. The iterable runs once, at entry, so its elements are judged in the entry state
+    ``st``, except a bare NAME element: it is a reference to a mapping the body may have mutated on an earlier pass
+    (`for e in [env, env]: run(env=e); e.pop(K)`), so it is judged in ``cur``, this pass's state (Prism
+    55945507686d). The first LOOP_ELTS_CAP distinct elements are judged; past it the gating (must) facts of the
+    target are dropped, never kept from a prefix (Prism 11d54303a061), and only the spawn-ish elements are judged,
+    so an ssh list after 70 echo lists still binds the target (t_540a3e9a)."""
     if not isinstance(it, (ast.List, ast.Tuple, ast.Set)) or not it.elts \
             or any(isinstance(e, ast.Starred) for e in it.elts):
         return None
+    own = _rebound([target])
+    uniq: dict = {}
+    for e in it.elts:
+        uniq.setdefault(ast.dump(e), e)
+    elts = list(uniq.values())
     out = None
-    for e in it.elts[:16]:
-        s2 = st.copy()
+    for i, e in enumerate(elts):
+        live = cur is not None and isinstance(e, ast.Name) and e.id not in own
+        if i >= LOOP_ELTS_CAP and not _elt_spawnish(e, cur if live else st):
+            continue
+        s2 = (cur if live else st).copy()
         _apply_assign(s2, ast.Assign(targets=[target], value=e))
         out = s2 if out is None else out.join(s2)
+    if len(elts) > LOOP_ELTS_CAP:
+        out.admit -= own
+        out.env -= own
     return out
 
 
@@ -611,8 +792,9 @@ def _rebind_from(st: _St, names, bound) -> None:
     if bound is None:
         return
     for nm in names:
-        if bound.argv.get(nm):
-            st.argv[nm] = set(bound.argv[nm])
+        for k, v in bound.argv.items():
+            if v and (k == nm or k.startswith(nm + "[")):
+                st.argv[k] = set(v)
     for fact in ("docker", "mint", "admit", "env"):
         getattr(st, fact).update(names & getattr(bound, fact))
     st.alias |= {a for a in bound.alias if a & names}
@@ -658,6 +840,14 @@ def _walk_own(node):
         yield n
         if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             stack.extend(ast.iter_child_nodes(n))
+
+
+def _walk_chain(node, chain=()):
+    """(descendant, enclosing functions below ``node``) for every descendant of ``node``; class bodies are not
+    enclosing scopes for what they contain (Python's lexical rule), so they never join the chain."""
+    for ch in ast.iter_child_nodes(node):
+        yield ch, chain
+        yield from _walk_chain(ch, chain + (ch,) if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)) else chain)
 
 
 _COMPS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
@@ -741,11 +931,19 @@ def _gated(call: ast.Call, st: _St) -> bool:
     return bool(PY_LITERAL_GATE.search(_all_text(call)))
 
 
-def _classify_call(n: ast.Call, st: _St, bare: frozenset, runners: dict | None = None) -> str | None:
+def _classify_kinds(n: ast.Call, st: _St, bare: frozenset, runners: dict | None = None) -> set:
+    """Every spawn kind a call may be. A call through an injected/aliased runner IS that subprocess call (a partial's
+    baked args lead the argv); MAY: the name can hold any of its alternatives, so each is classified and every kind
+    is kept, so an allowlisted docker-run alternative never hides an ssh one (Prism 12a2f225f299)."""
     if runners and isinstance(n.func, ast.Name) and n.func.id in runners:
-        # a call through an injected/aliased runner IS that subprocess call; a partial's baked args lead the argv
-        ref, baked = runners[n.func.id]
-        n = ast.Call(func=ref, args=[*baked, *n.args], keywords=n.keywords)
+        return {k for ref, baked in runners[n.func.id]
+                for k in _classify_call(ast.Call(func=ref, args=[*baked, *n.args], keywords=n.keywords), st, bare)}
+    return _classify_call(n, st, bare)
+
+
+def _classify_call(n: ast.Call, st: _St, bare: frozenset) -> set:
+    """Every spawn kind one call's argv may be (a loop target can hold an ssh AND a docker-run list: both are kept,
+    so an allowlisted kind never hides another, Prism 12a2f225f299). Empty for a non-spawn."""
     argv = _call_argv(n) if _is_subprocess_call(n, bare) else []
     if argv:
         if len(argv) == 1:
@@ -754,26 +952,26 @@ def _classify_call(n: ast.Call, st: _St, bare: frozenset, runners: dict | None =
         else:
             # one argv across the expansion boundary: ('docker', *ARGS) / (*base, 'run', img) resolve in place
             heads = _heads(ast.List(elts=list(argv), ctx=ast.Load()), st)
-        kinds = sorted({k for k in map(_classify_argv, heads) if k})
+        kinds = {k for k in map(_classify_argv, heads) if k}
         if kinds:
-            return kinds[0]
+            return kinds
         names = {x.id for a in argv for x in ast.walk(a) if isinstance(x, ast.Name)}
-        return "runner-mint" if names & st.mint else None
+        return {"runner-mint"} if names & st.mint else set()
     if "ssh" in _name(n.func).lower() and not isinstance(n.func, ast.Attribute) or \
             (isinstance(n.func, ast.Attribute) and "ssh" in n.func.attr.lower()):
         # a call to an ssh helper: a spawn only when it ships a `docker run` script (the pool's start)
         names = {x.id for a in n.args for x in ast.walk(a) if isinstance(x, ast.Name)}
         if names & st.docker or any(DOCKER_RUN.search(_all_text(a)) for a in n.args):
-            return "docker-run"
-        return None
+            return {"docker-run"}
+        return set()
     if _name(n.func) in NAMED_SPAWNS:
-        return "named"
+        return {"named"}
     if _name(n.func) in ("run", "check_output", "gh", "_gh", "gh_api", "api"):
         vals = [*n.args, *(k.value for k in n.keywords)]
         if any(re.search(r"generate-jitconfig|runners/registration-token", _all_text(a)) for a in vals) or \
                 {x.id for a in vals for x in ast.walk(a) if isinstance(x, ast.Name)} & st.mint:
-            return "runner-mint"   # every mint call counts (no per-scope suppression)
-    return None
+            return {"runner-mint"}   # every mint call counts (no per-scope suppression)
+    return set()
 
 
 class _Flow:
@@ -795,10 +993,10 @@ class _Flow:
     def _visit(self, calls, st: _St) -> None:
         for c, may in calls:
             self._raise_point(st)   # a call can raise before its own effects
-            k = _classify_call(c, st, self.bare, self.runners)
+            ks = _classify_kinds(c, st, self.bare, self.runners)
             h = self.hits.setdefault(id(c), [c, set(), True])
-            if k:
-                h[1].add(k)
+            if ks:
+                h[1] |= ks
                 h[2] = h[2] and _gated(c, st)
             _apply_mutation(st, c, may)
             self._raise_point(st)
@@ -822,13 +1020,13 @@ class _Flow:
             self._visit(_calls_in(s.iter if loop_test is None else loop_test), st)
             # the target binds one element per pass (from the iterable as built at entry); calls inside the target
             # (`for out[run([...])] in xs`) run on every pass (Prism 9660245e676f)
-            bound = _loop_bind(s.target, s.iter, st) if loop_test is None else None
             cur = st
             for _ in range(8):   # fixpoint over the backedge
                 body_in = cur.copy()
                 if loop_test is None:
                     self._visit(_calls_in(s.target), body_in)
-                    _rebind_from(body_in, _rebound([s.target]), bound)
+                    # rebound per pass: a name element sees the body's mutations from the earlier passes
+                    _rebind_from(body_in, _rebound([s.target]), _loop_bind(s.target, s.iter, st, body_in))
                 after = self.block(s.body, body_in)
                 if loop_test is not None:   # a while condition runs again after every pass (Prism cec4be516dc4)
                     self._visit(_calls_in(loop_test), after)
@@ -936,8 +1134,8 @@ def py_sites(path: str, text: str) -> list[tuple[str, str, int, bool]]:
         if sc is scopes[0]:   # module-level argv constants (BASE = ["ssh", ...]) are visible everywhere;
             module_argv = end.argv   # admission facts are never shared between scopes
         for c, kinds, gated in fl.hits.values():
-            if kinds:
-                out.append((sc.name, sorted(kinds)[0], c.lineno, gated))
+            for k in sorted(kinds):   # one site per kind: an allowlist row covers its own kind only (Prism 12a2f225f299)
+                out.append((sc.name, k, c.lineno, gated))
     out.sort(key=lambda r: r[2])
     return out
 
@@ -1495,7 +1693,164 @@ INJ_FAKE_OTHER_DEFAULT = "def fake(*a, **k):\n    return 0\n\ndef go(h, run=fake
 INJ_SHADOWED = ("import subprocess\n\ndef outer(h, run=subprocess.run):\n    def inner(run):\n"
                 "        run(['ssh', h, 'job'])\n    return inner\n")
 INJ_ECHO = "import subprocess\n\ndef go(run=subprocess.run):\n    run(['echo', 'ssh'])\n"
+# t_f7b70a42: the 10 Prism findings of the router-core re-pin wave (hermes-agent#2259, prism-router#683,
+# fleet-ops-scripts#285), each fixture verbatim from the reader repro (var/oneshot/desk-t_6b4d3881/repro.py)
+RP_DEF_BODY_LEAK = ("import subprocess\nfrom functools import partial\nfrom subprocess import run\ndef unused():\n"
+                    "    run = partial(subprocess.run, ['echo'])\ndef go():\n    run(['ssh', 'ci-box', 'job'])\n")
+RP_SUBSCRIPT_KEY = ("import subprocess\ndef go():\n    note = 'ALLOC_RESERVATION=rid'\n    env = {}\n"
+                    "    env['NOTE'] = note\n    subprocess.run(['ssh', 'ci-box', 'job'], env=env)\n")
+RP_SURVIVING_ALIAS = ("import subprocess\ndef go():\n    env = {'ALLOC_RESERVATION': 'rid'}\n    a = env\n    b = a\n"
+                      "    a = {}\n    env.pop('ALLOC_RESERVATION')\n    subprocess.run(['ssh', 'ci-box', 'job'], env=b)\n")
+# Prism 73953ef77e50: two adjacent middle names rebound in ONE call (tuple / multi-name for-target) must still
+# reconnect env~c through the chain as it stood before the call
+RP_TUPLE_MID_REBIND = ("import os, subprocess\ndef go(rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
+                       "    a = env\n    b = a\n    c = b\n    a, b = {}, {}\n    env.pop('ALLOC_RESERVATION')\n"
+                       "    subprocess.run(['ssh', 'ci-box', 'job'], env=c)\n")
+RP_FOR_MID_REBIND = ("import os, subprocess\ndef go(rid, pairs):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
+                     "    a = env\n    b = a\n    c = b\n    for a, b in pairs:\n        env.pop('ALLOC_RESERVATION')\n"
+                     "        subprocess.run(['ssh', 'ci-box', 'job'], env=c)\n")
+# the Prism repro as a function is UnboundLocalError on both branches (`run` is local); the same text at module
+# scope runs, and the function shape that runs binds `run` on both branches
+RP_BRANCH_RUNNER = ("from functools import partial\nfrom subprocess import run\nif flag:\n"
+                    "    run = partial(run, ['echo'])\n    run()\nelse:\n    run(['ssh', 'ci-box', 'job'])\n")
+RP_BRANCH_RUNNER_FN = ("import subprocess\nfrom functools import partial\ndef go(flag):\n    if flag:\n"
+                       "        run = partial(subprocess.run, ['echo'])\n    else:\n        run = subprocess.run\n"
+                       "    run(['ssh', 'ci-box', 'job'])\n")
+RP_LOOP_STALE = ("import os, subprocess\ndef go(rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
+                 "    for e in [env, env]:\n        subprocess.run(['ssh', 'ci-box', 'job'], env=e)\n"
+                 "        e.pop('ALLOC_RESERVATION', None)\n")
+RP_LOOP_KEPT = ("import os, subprocess\ndef go(rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
+                "    for e in [env, env]:\n        subprocess.run(['ssh', 'ci-box', 'job'], env=e)\n")
+RP_TRUNCATED = ("import os, subprocess\ndef go(rid):\n    g = dict(os.environ, ALLOC_RESERVATION=rid)\n"
+                "    for env in [" + "g, " * 16 + "{}]:\n        subprocess.run(['ssh', 'ci-box', 'job'], env=env)\n")
+RP_TRUNCATED_ARGV = ("import subprocess\ndef go():\n    for cmd in [" + "['echo'], " * 16 + "['ssh', 'ci-box', 'job']]:\n"
+                     "        subprocess.run(cmd)\n")
+RP_SHADOWED_ALIAS = ("import subprocess\nrunner = subprocess.run\ndef fake(*a, **k):\n    pass\ndef go():\n"
+                     "    runner = fake\n    invoke = runner\n    invoke(['ssh', 'ci-box', 'job'])\n")
+RP_LOCAL_ALIAS_CHAIN = ("import subprocess\ndef go():\n    runner = subprocess.run\n    invoke = runner\n"
+                        "    invoke(['ssh', 'ci-box', 'job'])\n")
 PY_NOT = "import subprocess\nsubprocess.run(['ssh-keygen', '-t', 'ed25519'])\nsubprocess.run(['git', 'push'])\n"
+
+
+# Prism round 1 on #6512
+RP_GLOBAL_RUNNER = ("import subprocess\nfrom functools import partial\nrunner = subprocess.run\ndef go():\n"
+                    "    global runner\n    runner = partial(runner, ['ssh', 'ci-box', 'job'])\n    runner()\n")
+RP_TWO_KINDS = ("import subprocess\nfrom functools import partial\ndef go(flag):\n    if flag:\n"
+                "        run = partial(subprocess.run, ['ssh', 'ci-box', 'job'])\n    else:\n"
+                "        run = partial(subprocess.run, ['docker', 'run', 'image'])\n    run()\n")
+RP_NINE_ALTS = ("import subprocess\nfrom functools import partial\n"
+                + "".join(f"r = partial(subprocess.run, ['echo', '{i}'])\n" for i in range(8))
+                + "def go(run=r):\n    run = subprocess.run\n    run(['ssh', 'ci-box', 'job'])\n")
+
+
+# Prism round 2 on #6512
+RP_GLOBAL_INSTALL = ("import subprocess\ndef install():\n    global runner\n    runner = subprocess.run\ninstall()\n"
+                     "runner(['ssh', 'ci-box', 'job'])\n")
+RP_GLOBAL_IMPORT_KEPT = ("from subprocess import run\ndef fake(*a, **k):\n    pass\ndef go(flag):\n    global run\n"
+                         "    if flag:\n        run = fake\n    invoke = run\n    invoke(['ssh', 'ci-box', 'job'])\n")
+RP_NONLOCAL_INSTALL = ("import subprocess\ndef outer():\n    runner = None\n    def install():\n        nonlocal runner\n"
+                       "        runner = subprocess.run\n    install()\n    runner(['ssh', 'ci-box', 'job'])\n")
+
+
+# desk read r1 on #6512 (t_f7b70a42): an export through a local alias resolves in the defining scope; a loop target
+# holding ssh AND docker-run lists keeps both kinds
+RP_GLOBAL_EXPORT_VIA_LOCAL = ("import subprocess\ndef install():\n    global runner\n    local_run = subprocess.run\n"
+                              "    runner = local_run\ninstall()\nrunner(['ssh', 'ci-box', 'job'])\n")
+RP_NONLOCAL_EXPORT_VIA_LOCAL = ("import subprocess\ndef outer():\n    runner = print\n    def inner():\n"
+                                "        nonlocal runner\n        lr = subprocess.run\n        runner = lr\n    inner()\n"
+                                "    runner(['ssh', 'h', 'j'])\n")
+RP_LOOP_TWO_KINDS = ("import subprocess\n\n\ndef go():\n    for cmd in ["
+                     + ", ".join(["['ssh', 'ci-box', 'job']"] * 16 + ["['docker', 'run', 'image']"])
+                     + "]:\n        subprocess.run(cmd)\n")
+# desk r4 (093e422a62c5 re-opened): a class body exporting through `global` / `nonlocal` reaches the enclosing scope
+RP_GLOBAL_CLASS_INSTALL = ("import subprocess\nclass Install:\n    global runner\n    runner = subprocess.run\n"
+                           "runner(['ssh', 'ci-box', 'job'])\n")
+RP_NONLOCAL_CLASS_INSTALL = ("import subprocess\ndef outer():\n    runner = print\n    class Install:\n"
+                             "        nonlocal runner\n        runner = subprocess.run\n    runner(['ssh', 'ci-box', 'job'])\n")
+RP_NONLOCAL_PAST_MIDDLE = ("import subprocess\ndef outer():\n    runner = subprocess.run\n    def middle(flag):\n"
+                           "        if flag:\n            def inner():\n                nonlocal runner\n"
+                           "                runner = print\n        invoke = runner\n        invoke(['ssh', 'h', 'job'])\n"
+                           "    middle(False)\n")
+RP_NONLOCAL_PARTIAL_DIRECT = ("import subprocess\nfrom functools import partial\ndef outer():\n"
+                              "    runner = subprocess.run\n    def mid():\n        def inner():\n"
+                              "            nonlocal runner\n            runner = partial(subprocess.run, ['echo'])\n"
+                              "        runner(['ssh', 'ci-box', 'job'])\n    mid()\n")
+# t_540a3e9a: elements past LOOP_ELTS_CAP are classified when spawn-ish (desk probe P3c on #6512)
+RP_LOOP_PAST_CAP = ("import subprocess\ndef go():\n    for cmd in ["
+                    + ", ".join([f"['echo', '{i}']" for i in range(70)] + ["['ssh', 'h', 'j']"])
+                    + "]:\n        subprocess.run(cmd)\n")
+RP_LOOP_PAST_CAP_TUPLE = ("import subprocess\ndef go():\n    for i, cmd in ["
+                          + ", ".join([f"({i}, ['echo', '{i}'])" for i in range(70)] + ["(70, ['docker', 'run', 'img'])"])
+                          + "]:\n        subprocess.run(cmd)\n")
+RP_LOOP_PAST_CAP_NONE = ("import subprocess\ndef go():\n    for cmd in ["
+                         + ", ".join(f"['echo', '{i}']" for i in range(71)) + "]:\n        subprocess.run(cmd)\n")
+# Prism 723aa276d5fc: a spawn head outranks heads that only carry a spawn word ('run') when _heads truncates
+RP_LOOP_SPAWNWORD_33 = ("import subprocess\ndef go():\n    for cmd in [['ssh', 'h', 'j'], "
+                        + ", ".join(f"['echo', 'run', '{i}']" for i in range(32)) + "]:\n        subprocess.run(cmd)\n")
+# Prism 8ca6f3c667ce: the _heads cap ranks the COMPOSED head: ['run','img'] spawns only under ['docker'] + cmd
+RP_LOOP_COMPOSED_DOCKER = ("import subprocess\ndef go():\n    for cmd in ["
+                           + ", ".join(f"['ssh', 'h', '{i}']" for i in range(32))
+                           + ", ['run', 'img']]:\n        subprocess.run(['docker'] + cmd)\n")
+# Prism 5434b042f044: a nested `global` exporter resolves in its DEFINING scope (outer()'s local_run), not the module's
+RP_GLOBAL_EXPORT_NESTED = ("import subprocess\ndef outer():\n    local_run = subprocess.run\n    def install():\n"
+                           "        global runner\n        runner = local_run\n    install()\nouter()\n"
+                           "runner(['ssh', 'ci-box', 'job'])\n")
+# Prism 4433291449e8: a name the exporter declares `global` resolves in the MODULE, never in a shadowing outer() local
+RP_GLOBAL_EXPORT_SHADOWED = ("import subprocess\nlr = subprocess.run\ndef outer():\n    lr = print\n    def install():\n"
+                             "        global runner, lr\n        x = lr\n        runner = x\n    install()\nouter()\n"
+                             "runner(['ssh', 'ci-box', 'job'])\n")
+# Prism b7d07f333edc: an exported RHS resolves ONLY in the exporter's scope; install()'s local `lr = print` is what
+# `runner = lr` binds, never the module's `lr = subprocess.run`
+RP_EXPORT_RHS_LOCAL = ("import subprocess\nlr = subprocess.run\nrunner = print\ndef outer():\n    def install():\n"
+                       "        global runner\n        lr = print\n        runner = lr\n    install()\nouter()\n"
+                       "runner(['ssh', 'h', 'j'])\n")
+RP_EXPORT_RHS_LOCAL_NONLOCAL = ("import subprocess\ndef outer():\n    lr = subprocess.run\n    runner = print\n"
+                                "    def install():\n        nonlocal runner\n        lr = print\n        runner = lr\n"
+                                "    install()\n    runner(['ssh', 'h', 'j'])\n")
+# control: with no exporter-local `lr`, the exporter's `lr` IS the module's subprocess.run
+RP_EXPORT_RHS_MODULE = ("import subprocess\nlr = subprocess.run\nrunner = print\ndef outer():\n    def install():\n"
+                        "        global runner\n        runner = lr\n    install()\nouter()\nrunner(['ssh', 'h', 'j'])\n")
+# Prism e694e43ce56f: five exporters defined in reverse dependency order need five rounds; the alias loop runs to a
+# fixpoint, never a fixed round count
+RP_EXPORT_CHAIN_REVERSED = ("import subprocess\n"
+                            "def install5(): global runner; runner = r4\ndef install4(): global r4; r4 = r3\n"
+                            "def install3(): global r3; r3 = r2\ndef install2(): global r2; r2 = r1\n"
+                            "def install1(): global r1; r1 = subprocess.run\n"
+                            "install1(); install2(); install3(); install4(); install5()\n"
+                            "runner(['ssh', 'h', 'job'])\n")
+
+# t_8ad18b12: four pre-existing misses (desk-t_e3dbf19f a4/a5, desk-t_540a3e9a C4/C5), each with a GREEN control
+RP_EXPORT_COMP = ("import subprocess\ndef outer():\n    lr = subprocess.run\n    def install():\n        global runner\n"
+                  "        runner = [lr for _ in range(1)][0]\n    install()\nouter()\nrunner(['ssh', 'ci-box', 'job'])\n")
+RP_EXPORT_COMP_SHADOW = ("import subprocess\ndef outer():\n    lr = subprocess.run\n    def install():\n"
+                         "        global runner\n        runner = [lr for lr in [print]][0]\n    install()\nouter()\n"
+                         "runner(['ssh', 'ci-box', 'job'])\n")
+RP_NONLOCAL_TWO_DEEP = ("import subprocess\ndef outer():\n    runner = print\n    def mid():\n        lr = subprocess.run\n"
+                        "        def install():\n            nonlocal runner\n            runner = lr\n        install()\n"
+                        "    mid()\n    runner(['ssh', 'ci-box', 'job'])\nouter()\n")
+RP_NONLOCAL_TWO_DEEP_MID = ("import subprocess\ndef outer():\n    runner = print\n    def mid():\n        runner = print\n"
+                            "        lr = subprocess.run\n        def install():\n            nonlocal runner\n"
+                            "            runner = lr\n        install()\n    mid()\n    runner(['ssh', 'ci-box', 'job'])\n"
+                            "outer()\n")
+RP_LOOP_PROG_NAME = ("import subprocess\ndef go():\n    for cmd in [" + ", ".join(f"'echo{i}'" for i in range(70))
+                     + ", '/usr/bin/ssh']:\n        subprocess.run([cmd, 'ci-box', 'job'])\n")
+RP_LOOP_PROG_NAME_NONE = ("import subprocess\ndef go():\n    for cmd in [" + ", ".join(f"'echo{i}'" for i in range(70))
+                          + "]:\n        subprocess.run([cmd, 'ci-box', 'job'])\n")
+RP_LOOP_DICT_ARGV = ("import subprocess\ndef go():\n    for cmd in [" + ", ".join(f"{{'a': ['echo', '{i}']}}" for i in range(70))
+                     + ", {'a': ['ssh', 'h', 'j']}]:\n        subprocess.run(cmd['a'])\n")
+RP_COMP_SHADOW_BARE = ("from subprocess import run\nrunner = [run for run in [print]][0]\nrunner(['ssh', 'h', 'job'])\n")
+RP_PROG_PARAM_SHADOW = ("import subprocess\nssh_prog = 'echo'\ndef go(ssh_prog):\n    subprocess.run([ssh_prog, 'ci-box', 'job'])\n"
+                        "go('ssh')\n")
+RP_DICT_ELEM_STORE = ("import subprocess\ncmd = {}\ncmd['a'] = ['ssh', 'h', 'job']\nsubprocess.run(cmd['a'])\n")
+RP_DICT_ELEM_REBOUND = ("import subprocess\ncmd = {'a': ['docker', 'run', 'img']}\ncmd['a'] = ['echo', 'hi']\n"
+                        "subprocess.run(cmd['a'])\n")
+RP_LOOP_DICT_OTHER_KEY = ("import subprocess\ndef go():\n    for cmd in [{'a': ['echo', '0']}, {'b': ['ssh', 'h', 'j']}]:\n"
+                          "        subprocess.run(cmd['a'])\n")
+
+
+# fixtures where the BASE lint reports a site that is not a spawn, fixed on purpose: kept out of the differential
+# corpus (each is a GREEN case above, so the fix itself is still gated)
+DIFF_FP_FIXED = frozenset((RP_SHADOWED_ALIAS, RP_EXPORT_RHS_LOCAL, RP_EXPORT_RHS_LOCAL_NONLOCAL))
 
 
 def selftest() -> int:
@@ -1650,6 +2005,101 @@ def selftest() -> int:
          {"f.py": INJ_FAKE_OTHER_DEFAULT}, [], 0),
         ("t_c59fff64: an inner `run` param shadows the outer injected runner -> GREEN", {"s.py": INJ_SHADOWED}, [], 0),
         ("t_c59fff64: an injected runner running echo is not a spawn -> GREEN", {"e.py": INJ_ECHO}, [], 0),
+        ("t_f7b70a42: a runner bound inside an unused def does not leak to the module -> RED (95af992489bd)",
+         {"r.py": RP_DEF_BODY_LEAK}, [], 1),
+        ("t_f7b70a42: env['NOTE'] = <reservation-shaped string> does not reserve env -> RED (89766342164e)",
+         {"r.py": RP_SUBSCRIPT_KEY}, [], 1),
+        ("t_f7b70a42: rebinding the middle alias keeps env~b; env.pop reaches b -> RED (91c6c5c1db77)",
+         {"r.py": RP_SURVIVING_ALIAS}, [], 1),
+        ("t_e3dbf19f: `a, b = {}, {}` over chain env~a~b~c keeps env~c; env.pop reaches c -> RED (73953ef77e50)",
+         {"r.py": RP_TUPLE_MID_REBIND}, [], 1),
+        ("t_e3dbf19f: `for a, b in ...:` body: chain env~a~b~c keeps env~c; env.pop reaches c -> RED",
+         {"r.py": RP_FOR_MID_REBIND}, [], 1),
+        ("t_f7b70a42: one branch's runner rebinding does not cover the other branch -> RED (8fd7ab674141)",
+         {"r.py": RP_BRANCH_RUNNER}, [], 1),
+        ("t_f7b70a42: run bound to echo on one branch, subprocess.run on the other: the ssh call is RED",
+         {"r.py": RP_BRANCH_RUNNER_FN}, [], 1),
+        ("t_f7b70a42: e.pop on pass 1 reaches pass 2 through the backedge -> RED (55945507686d, 8246d4b3283e)",
+         {"r.py": RP_LOOP_STALE}, [], 1),
+        ("t_f7b70a42: the same loop without the pop stays gated -> GREEN", {"r.py": RP_LOOP_KEPT}, [], 0),
+        ("t_f7b70a42: a 17th ungated element of a literal iterable fails closed -> RED (11d54303a061, 8a0c5638db5a)",
+         {"r.py": RP_TRUNCATED}, [], 1),
+        ("t_f7b70a42: a 17th ssh argv element of a literal iterable is still classified -> RED",
+         {"r.py": RP_TRUNCATED_ARGV}, [], 1),
+        ("t_f7b70a42: a local rebinding shadows an inherited runner alias -> GREEN (ce17a6dacbd1)",
+         {"r.py": RP_SHADOWED_ALIAS}, [], 0),
+        ("#6512 r1: `global runner` keeps the module binding; its partial ssh call is RED (087ccd93f08c)",
+         {"r.py": RP_GLOBAL_RUNNER}, [], 1),
+        ("#6512 r1: a docker-run row does not hide the ssh alternative -> RED (12a2f225f299)",
+         {"r.py": RP_TWO_KINDS}, [row("r.py", "go", "docker-run")], 1),
+        ("#6512 r1: rows for both kinds -> GREEN", {"r.py": RP_TWO_KINDS},
+         [row("r.py", "go", "docker-run"), row("r.py", "go", "ssh")], 0),
+        ("#6512 r1: a 9th runner alternative is never dropped -> RED (b68d2fca7e3b)", {"r.py": RP_NINE_ALTS}, [], 1),
+        ("#6512 r2: a `global runner` bound in install() reaches the module call -> RED (f64f05e33ae3)",
+         {"r.py": RP_GLOBAL_INSTALL}, [], 1),
+        ("#6512 r2: `global run; if flag: run = fake` keeps the imported run -> RED (b100b2d9f80a)",
+         {"r.py": RP_GLOBAL_IMPORT_KEPT}, [], 1),
+        ("#6512 r2: a `nonlocal runner` bound in a nested def reaches the outer call -> RED",
+         {"r.py": RP_NONLOCAL_INSTALL}, [], 1),
+        ("desk r1: a `global runner` exported through a local alias in install() is RED (093e422a62c5)",
+         {"r.py": RP_GLOBAL_EXPORT_VIA_LOCAL}, [], 1),
+        ("desk r1: a `nonlocal runner` exported through a local alias is RED", {"r.py": RP_NONLOCAL_EXPORT_VIA_LOCAL},
+         [], 1),
+        ("desk r1: 16 ssh + 1 docker-run loop elements, docker-run row only -> RED (12a2f225f299)",
+         {"r.py": RP_LOOP_TWO_KINDS}, [row("r.py", "go", "docker-run")], 1),
+        ("desk r1: the same loop with rows for both kinds -> GREEN", {"r.py": RP_LOOP_TWO_KINDS},
+         [row("r.py", "go", "docker-run"), row("r.py", "go", "ssh")], 0),
+        ("desk r2: an inner `nonlocal runner` never shadows the outer runner in middle -> RED (de3afa4559bd)",
+         {"r.py": RP_NONLOCAL_PAST_MIDDLE}, [], 1),
+        ("t_4c2c8b0b: an exported `runner = lr` reads install()'s local lr (print), not the module's -> GREEN "
+         "(b7d07f333edc)", {"r.py": RP_EXPORT_RHS_LOCAL}, [], 0),
+        ("t_4c2c8b0b: same shape through `nonlocal runner` in a function -> GREEN",
+         {"r.py": RP_EXPORT_RHS_LOCAL_NONLOCAL}, [], 0),
+        ("t_4c2c8b0b: control: no exporter-local lr, the module's subprocess.run reaches runner -> RED",
+         {"r.py": RP_EXPORT_RHS_MODULE}, [], 1),
+        ("t_4c2c8b0b: five reverse-ordered `global` exporters still reach the module call -> RED (e694e43ce56f)",
+         {"r.py": RP_EXPORT_CHAIN_REVERSED}, [], 1),
+        ("desk r4: a class body `global runner` install reaches the module call -> RED (093e422a62c5)",
+         {"r.py": RP_GLOBAL_CLASS_INSTALL}, [], 1),
+        ("desk r4: a class body `nonlocal runner` install reaches the outer call -> RED",
+         {"r.py": RP_NONLOCAL_CLASS_INSTALL}, [], 1),
+        ("Prism 053b9f69ae12: a grandchild `nonlocal` echo partial keeps the outer runner in mid -> RED",
+         {"r.py": RP_NONLOCAL_PARTIAL_DIRECT}, [], 1),
+        ("t_540a3e9a: an ssh list after 70 distinct echo lists is classified -> RED (desk P3c)",
+         {"r.py": RP_LOOP_PAST_CAP}, [], 1),
+        ("t_540a3e9a: a docker-run tuple element past the cap is classified -> RED",
+         {"r.py": RP_LOOP_PAST_CAP_TUPLE}, [], 1),
+        ("t_540a3e9a: 71 echo lists stay a non-spawn -> GREEN", {"r.py": RP_LOOP_PAST_CAP_NONE}, [], 0),
+        ("t_8ad18b12: a comprehension in the exporter (`[lr for _ in ..][0]`) reaches the module call -> RED",
+         {"r.py": RP_EXPORT_COMP}, [], 1),
+        ("t_8ad18b12: control: the comprehension's own `lr` (print) shadows outer()'s -> GREEN",
+         {"r.py": RP_EXPORT_COMP_SHADOW}, [], 0),
+        ("t_8ad18b12: a `nonlocal runner` exporter two defs deep binds outer()'s runner -> RED",
+         {"r.py": RP_NONLOCAL_TWO_DEEP}, [], 1),
+        ("t_8ad18b12: control: mid() binds its own runner, outer()'s stays print -> GREEN",
+         {"r.py": RP_NONLOCAL_TWO_DEEP_MID}, [], 0),
+        ("t_8ad18b12: a loop variable as the program name (`[cmd, 'ci-box', ..]`, ssh past the cap) -> RED",
+         {"r.py": RP_LOOP_PROG_NAME}, [], 1),
+        ("t_8ad18b12: control: 70 echo program names stay a non-spawn -> GREEN", {"r.py": RP_LOOP_PROG_NAME_NONE}, [], 0),
+        ("t_8ad18b12: an argv taken by subscript from a dict element (`cmd['a']`, past the cap) -> RED",
+         {"r.py": RP_LOOP_DICT_ARGV}, [], 1),
+        ("t_8ad18b12: control: the ssh argv sits under another key -> GREEN", {"r.py": RP_LOOP_DICT_OTHER_KEY}, [], 0),
+        ("Prism 6e4add456480: a comprehension target shadows a bare-imported run -> GREEN",
+         {"r.py": RP_COMP_SHADOW_BARE}, [], 0),
+        ("Apollo r7: the prog-name view is added to main's reading (a param named ssh_prog stays ssh) -> RED",
+         {"r.py": RP_PROG_PARAM_SHADOW}, [], 1),
+        ("Apollo r7: `cmd['a'] = [ssh ..]` binds the element -> RED", {"r.py": RP_DICT_ELEM_STORE}, [], 1),
+        ("Apollo r7: an element store adds, never replaces (docker run kept: allowlist, not silence) -> RED",
+         {"r.py": RP_DICT_ELEM_REBOUND}, [], 1),
+        ("Prism 723aa276d5fc: ssh + 32 ['echo','run',i] lists is classified -> RED",
+         {"r.py": RP_LOOP_SPAWNWORD_33}, [], 1),
+        ("Prism 8ca6f3c667ce: ['docker'] + cmd over 32 ssh lists + ['run','img'] is classified -> RED",
+         {"r.py": RP_LOOP_COMPOSED_DOCKER}, [], 1),
+        ("#6549: a nested `global runner` bound to outer()'s local runner reaches the module call -> RED "
+         "(5434b042f044)", {"r.py": RP_GLOBAL_EXPORT_NESTED}, [], 1),
+        ("#6549: an exporter's `global lr` resolves to the module subprocess.run, not outer()'s local print -> RED "
+         "(4433291449e8)", {"r.py": RP_GLOBAL_EXPORT_SHADOWED}, [], 1),
+        ("t_f7b70a42: a local runner alias chain still resolves -> RED", {"r.py": RP_LOCAL_ALIAS_CHAIN}, [], 1),
         ("comments, echo, github.com ssh, ssh-keygen are not spawns", {"n.sh": NOT_SPAWNS, "n.py": PY_NOT}, [], 0),
         ("allowlisted (unexpired) site is GREEN", {"pool.sh": UNGATED_DOCKER}, [row("pool.sh", "start", "docker-run")], 0),
         ("allowlist row past expires is RED", {"pool.sh": UNGATED_DOCKER},
@@ -1697,6 +2147,56 @@ def selftest() -> int:
     ok = (4, "EOF") in got
     print(f"{'ok  ' if ok else 'FAIL'} #4330 r1: quoted heredoc body is not folded into its terminator: {got[2:4]}")
     bad += not ok
+    # _heads past its 32-view cap keeps the spawn head whatever the set order (t_540a3e9a: PYTHONHASHSEED=2 lost
+    # the ssh at element 63). A list in the worst order (spawn last) stands in for an unlucky hash seed.
+    hst = _St()
+    hst.argv["cmd"] = [("echo", str(i)) for i in range(40)] + [("ssh", "h", "j")]  # type: ignore  # a list: fixed worst order
+    got = [h for h in _heads(ast.parse("cmd", mode="eval").body, hst) if _classify_argv(list(h))]
+    ok = got == [["ssh", "h", "j"]]
+    print(f"{'ok  ' if ok else 'FAIL'} t_540a3e9a: _heads past the 32-view cap keeps the ssh head in any order: {got}")
+    bad += not ok
+    # Prism 723aa276d5fc: a head _classify_argv accepts outranks heads that only carry a spawn word ('run')
+    hst = _St()
+    hst.argv["cmd"] = [("ssh", "h", "j")] + [("echo", "run", str(i)) for i in range(32)]  # type: ignore  # list order
+    got = [h for h in _heads(ast.parse("cmd", mode="eval").body, hst) if _classify_argv(list(h))]
+    ok = got == [["ssh", "h", "j"]]
+    print(f"{'ok  ' if ok else 'FAIL'} Prism 723aa276d5fc: _heads cap keeps ssh over 32 echo-run heads: {got}")
+    bad += not ok
+    # Prism 8ca6f3c667ce: the cap ranks the COMPOSED head, so ('run','img') under ['docker'] + cmd (a spawn only once
+    # composed) is not displaced by 32 ssh alternatives that compose to a non-spawning 'docker ssh ..'
+    hst = _St()
+    hst.argv["cmd"] = [("ssh", "h", str(i)) for i in range(32)] + [("run", "img")]  # type: ignore  # list order
+    got = [h for h in _heads(ast.parse("['docker'] + cmd", mode="eval").body, hst) if _classify_argv(list(h))]
+    ok = got == [["docker", "run", "img"]]
+    print(f"{'ok  ' if ok else 'FAIL'} Prism 8ca6f3c667ce: _heads cap ranks the composed head (docker run kept): {got}")
+    bad += not ok
+    # Prism 753c64420f1d: two argv names. ('run','img') spawns only under a=('docker',), a LATER view than
+    # views[0] (a=('echo',)); ranking b against views[0] alone sorted it last and the cap dropped it
+    hst = _St()
+    hst.argv["a"] = [("echo",), ("docker",)]  # type: ignore  # list order: echo is views[0]
+    hst.argv["b"] = [("docker", str(i)) for i in range(16)] + [("run", "img")]  # type: ignore
+    got = [h for h in _heads(ast.parse("a + b", mode="eval").body, hst) if _classify_argv(list(h))]
+    ok = got == [["docker", "run", "img"]]
+    print(f"{'ok  ' if ok else 'FAIL'} Prism 753c64420f1d: _heads cap ranks composed views across names: {got}")
+    bad += not ok
+    # Prism 7f9bc8fca3a7: `base + [cfg['a']]` does not read cfg['a'] into the head, so its 32 alternatives compose
+    # to ONE docker head per base view; 32 identical docker views filled the cap and dropped every ssh head
+    hst = _St()
+    hst.argv["base"] = [("docker", "run", "img"), ("ssh", "h", "j")]  # type: ignore
+    hst.argv["cfg['a']"] = [("x", str(i)) for i in range(32)]  # type: ignore
+    got = sorted(h[0] for h in _heads(ast.parse("base + [cfg['a']]", mode="eval").body, hst) if _classify_argv(list(h)))
+    ok = got == ["docker", "ssh"]
+    print(f"{'ok  ' if ok else 'FAIL'} Prism 7f9bc8fca3a7: _heads dedups composed heads before the 32 cap: {got}")
+    bad += not ok
+    # Prism 6772d0283d54: every view's plain head is ['SSH', ..] (the *ssh* name), which out-ranked the program-name
+    # head, so dedup by the winning head collapsed 32 echo views + 1 systemd-run view into one echo view
+    hst = _St()
+    hst.argv["ssh_prog"] = [(f"echo{i}",) for i in range(32)] + [("systemd-run",)]  # type: ignore
+    got = sorted({k for h in _heads(ast.parse("[ssh_prog, 'ci-box', 'job']", mode="eval").body, hst)
+                  for k in [_classify_argv(list(h))] if k})
+    ok = got == ["ssh", "systemd-run"]
+    print(f"{'ok  ' if ok else 'FAIL'} Prism 6772d0283d54: _heads cap keeps the program-name view's kind: {got}")
+    bad += not ok
     # unreadable allowlist is blind (rc 2), never clean
     d = tree({"pool.sh": GATED_DOCKER}, None)
     (d / "fleet").mkdir()
@@ -1710,6 +2210,8 @@ def selftest() -> int:
     corpus = Path(tempfile.mkdtemp(prefix="spawn-site-corpus-"))
     for i, (_, files, _, _) in enumerate(cases):
         for n, b in files.items():
+            if b in DIFF_FP_FIXED:
+                continue   # a base false positive this lint removes on purpose: not a missing site
             (corpus / f"c{i:03d}" / n).parent.mkdir(parents=True, exist_ok=True)
             (corpus / f"c{i:03d}" / n).write_text(b)
     ref = os.environ.get("SPAWN_LINT_BASE", "origin/main")
@@ -1718,7 +2220,7 @@ def selftest() -> int:
     print(f"{'ok  ' if ok else 'FAIL'} differential vs {ref}: {status}, {len(missing)} base-lint sites missing"
           + ("" if ok else f": {missing[:10]}"))
     bad += not ok
-    print(f"selftest: {len(cases) + 5 - bad}/{len(cases) + 5} pass")
+    print(f"selftest: {len(cases) + 7 - bad}/{len(cases) + 7} pass")
     return 1 if bad else 0
 
 

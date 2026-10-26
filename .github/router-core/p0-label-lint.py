@@ -169,7 +169,10 @@ def _eval(expr: str, known: dict, matrix_vals: dict) -> list:
             b = atom()
             out = []
             for x, y in itertools.product(a, b):
-                if isinstance(x, tuple) or isinstance(y, tuple):
+                # GitHub coerces mismatched types to numbers ('1' == 1, null == 0, true == 1 are all true) and compares
+                # arrays/objects by identity: neither is Python equality, so the comparison is opaque (Prism
+                # 72620c748e95: `'1' == 1` pruned a runnable PR job requesting p0)
+                if isinstance(x, tuple) or isinstance(y, tuple) or type(x) is not type(y) or isinstance(x, (list, dict)):
                     out += [True, False]
                     continue
                 eq = (x.lower() == y.lower()) if isinstance(x, str) and isinstance(y, str) else x == y
@@ -668,6 +671,10 @@ PUSH_ONLY_IF_WRAPPED = PUSH_ONLY_IF.replace("if: github.event_name == 'push'",
 OPAQUE_IF = PUSH_ONLY_IF.replace("if: github.event_name == 'push'", "if: always() && vars.X == 'y'")
 PR_ONLY_IF_POOL = POOL_MAIN.replace("  t:\n", "  t:\n    if: github.event_name == 'pull_request'\n")
 CALLER_IF = CALLER.replace("    uses:", "    if: github.event_name == 'pull_request'\n    uses:")
+# t_f7b70a42 (Prism 72620c748e95): GitHub coerces mismatched types to numbers ('1' == 1 is true, null == 0 is
+# true); a PR job whose `if` needs that coercion may run, so its p0 request is R1
+COERCE_IF = PR_P0.replace("  t:\n", "  t:\n    if: \"'1' == 1\"\n")
+COERCE_NULL_IF = PR_P0.replace("  t:\n", "  t:\n    if: \"null == 0\"\n")
 REG_RESET = ("[Service]\nEnvironment=NO_DEFAULT_LABELS=1\nEnvironment=\nEnvironment=LABELS=p0\n"
              "Environment=POOL_SIZE=2\n")
 REG_GOOD = ("[Service]\nEnvironment=LABELS=p0\nEnvironment=NO_DEFAULT_LABELS=1\nEnvironment=POOL_SIZE=2\n")
@@ -737,6 +744,10 @@ def selftest() -> int:
         ("${{ }}-wrapped event `if` excluding PR is GREEN", {"w.yml": PUSH_ONLY_IF_WRAPPED}, None, None, 0),
         ("opaque job `if` may run on a PR: p0 is RED (R1)", {"w.yml": OPAQUE_IF}, None, None, 1),
         ("PR-only job `if` on the pool is GREEN (no main outcome)", {"w.yml": PR_ONLY_IF_POOL}, None, None, 0),
+        ("t_f7b70a42: `'1' == 1` coerces in GitHub: the PR p0 job may run -> RED (72620c748e95)",
+         {"w.yml": COERCE_IF}, None, None, 1),
+        ("t_f7b70a42: `null == 0` coerces in GitHub: the PR p0 job may run -> RED", {"w.yml": COERCE_NULL_IF},
+         None, None, 1),
         ("caller job `if` (PR only) skips the callee's main pool job (GREEN)",
          {"w.yml": CALLER_IF, "c.yml": LOCAL_CALLEE}, None, None, 0),
     ]
