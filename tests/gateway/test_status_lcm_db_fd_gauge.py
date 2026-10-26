@@ -2,7 +2,7 @@
 
 The gauge runs on the ``gateway-runtime-status-writer`` thread only, counts this process's
 descriptors on lcm.db by ``(st_dev, st_ino)``, and warns at most once per 10 minutes when
-``lcm_db_fds > 3 * max(cached_agents, 1)``. Clock injected; no sleeps.
+``lcm_db_fds > 3 * max(active_agents, cached_agents, 1)``. Clock injected; no sleeps.
 """
 
 from __future__ import annotations
@@ -135,6 +135,47 @@ def test_scan_is_rate_limited_between_turn_boundary_writes():
     clock.t += 60
     gauge.annotate({})
     assert len(calls) == 2
+
+
+def _verdict(caplog, *, fds, active, cached):
+    """One fresh gauge scan over a status payload carrying ``active_agents``; True iff it warned."""
+    caplog.clear()
+    gauge = _gauge(_Clock(), [fds], [cached])
+    payload = {"active_agents": active}
+    gauge.annotate(payload)
+    assert payload["lcm_db_fds"] == fds and payload["cached_agents"] == cached
+    return len(_warnings(caplog)) == 1
+
+
+def test_denominator_is_max_of_active_and_cached_t_1913e49b(caplog):
+    caplog.set_level(logging.WARNING, logger="gateway.status")
+    # 2026-10-26 06:08 pid 23958: 136 handles flat at active=22 cached=17 = 6.2/live engine. Healthy.
+    assert not _verdict(caplog, fds=136, active=22, cached=17)
+    # Same handle count with only 5 engines alive is 27/agent: a leak.
+    assert _verdict(caplog, fds=136, active=5, cached=5)
+    msg = _warnings(caplog)[0].getMessage()
+    assert "136 open fds" in msg and "5 active" in msg and "5 cached" in msg
+    # Active alone carries the denominator when the cache is small.
+    assert not _verdict(caplog, fds=66, active=22, cached=0)
+    assert _verdict(caplog, fds=67, active=22, cached=0)
+
+
+def test_2026_10_23_evicted_engine_leak_still_trips(caplog):
+    """1,996 lcm.db handles (evicted engines never shut down, fixed by #2285). Even at the cache cap
+    (``_AGENT_CACHE_MAX_SIZE`` 128) with every cached agent also mid-turn, 3x is 384."""
+    caplog.set_level(logging.WARNING, logger="gateway.status")
+    assert _verdict(caplog, fds=1996, active=22, cached=17)
+    assert _verdict(caplog, fds=1996, active=128, cached=128)
+
+
+def test_missing_or_bad_active_agents_falls_back_to_cached(caplog):
+    caplog.set_level(logging.WARNING, logger="gateway.status")
+    for raw in (None, "junk", -4):
+        caplog.clear()
+        gauge = _gauge(_Clock(), [61], [20])
+        payload = {} if raw is None else {"active_agents": raw}
+        gauge.annotate(payload)
+        assert len(_warnings(caplog)) == 1
 
 
 def test_gauge_failure_never_breaks_the_status_write(tmp_path, monkeypatch):

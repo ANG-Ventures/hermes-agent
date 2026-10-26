@@ -212,8 +212,10 @@ class _LcmFdGauge:
     Runs ONLY on the ``gateway-runtime-status-writer`` thread, never on a write/open hot path.
     The fd scan is rate-limited to once per ``scan_interval_s`` (status writes also happen on
     every turn boundary); between scans the last sample is republished. Warns at most once per
-    ``warn_interval_s`` when ``lcm_db_fds > 3 * max(cached_agents, 1)``: evicted engines are
-    leaking their sqlite connections again.
+    ``warn_interval_s`` when ``lcm_db_fds > 3 * max(active_agents, cached_agents, 1)``: evicted
+    engines are leaking their sqlite connections again. ``active_agents`` (from the same status
+    payload) is in the denominator because every in-flight turn holds a live LCM engine whether
+    or not its agent is cached (t_1913e49b).
     """
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic,
@@ -240,20 +242,20 @@ class _LcmFdGauge:
                 fds = self._count_fds(ids) if ids else 0
                 cached = self._cached_agents()
                 self._sample = (fds, cached)
-                self._maybe_warn(now, fds, cached)
+                self._maybe_warn(now, fds, cached, parse_active_agents(payload.get("active_agents")))
             payload["lcm_db_fds"], payload["cached_agents"] = self._sample
         except Exception:
             logger.debug("lcm_db_fds gauge failed", exc_info=True)
 
-    def _maybe_warn(self, now: float, fds: Optional[int], cached: Optional[int]) -> None:
-        if fds is None or fds <= 3 * max(cached or 0, 1):
+    def _maybe_warn(self, now: float, fds: Optional[int], cached: Optional[int], active: int = 0) -> None:
+        if fds is None or fds <= 3 * max(active, cached or 0, 1):
             return
         if self._last_warn is not None and now - self._last_warn < self._warn_interval_s:
             return
         self._last_warn = now
         logger.warning(
-            "lcm.db descriptor leak suspected: %d open fds on lcm.db vs %s cached agent(s) "
-            "(threshold 3x); evicted LCM engines may not be shutting down", fds, cached)
+            "lcm.db descriptor leak suspected: %d open fds on lcm.db vs max(%d active, %s cached) "
+            "agent(s) (threshold 3x); evicted LCM engines may not be shutting down", fds, active, cached)
 
 
 _LCM_FD_GAUGE = _LcmFdGauge()
