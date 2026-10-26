@@ -19,13 +19,13 @@ pytestmark = pytest.mark.live_system_guard_bypass
 
 def _guard(home, body: str):
     path = home / "scripts" / "cron-write-guard"
-    path.write_text("#!/bin/sh\n" + body + "\n")
+    path.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
 
 
 def _stored(home):
-    data = json.loads((home / "cron" / "jobs.json").read_text())
+    data = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8-sig"))
     return data.get("jobs", data) if isinstance(data, dict) else data
 
 
@@ -41,7 +41,7 @@ def test_guard_not_executable_is_ignored(hermes_env):
     from cron.jobs import create_job
 
     path = hermes_env / "scripts" / "cron-write-guard"
-    path.write_text("#!/bin/sh\nexit 1\n")
+    path.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     path.chmod(0o644)
     create_job(prompt=None, schedule="every 5m", script="x.sh", no_agent=True)
 
@@ -73,7 +73,7 @@ def test_guard_receives_candidate_row_and_op(hermes_env):
     _guard(hermes_env, f'echo "$1" >> {log}; cat >> {log}; echo >> {log}; exit 0')
     job = create_job(prompt=None, schedule="every 5m", script="x.sh", no_agent=True, deliver="local")
     update_job(job["id"], {"deliver": "discord:1"})
-    lines = [ln for ln in log.read_text().splitlines() if ln]
+    lines = [ln for ln in log.read_text(encoding="utf-8-sig").splitlines() if ln]
     assert lines[0] == "create" and json.loads(lines[1])["id"] == job["id"]
     assert lines[2] == "update" and json.loads(lines[3])["deliver"] == "discord:1"
     assert _stored(hermes_env)[0]["deliver"] == "discord:1"
