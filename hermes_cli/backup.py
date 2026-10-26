@@ -1153,6 +1153,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         print(f"  {i}/{file_count} files ...")
         logger.info("backup phase=archive status=progress completed=%d total=%d", i, file_count)
 
+    files_to_add, cron_homes = _split_cron_pairs(files_to_add)
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
             archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         total_bytes = _write_zip_entries(
@@ -1160,13 +1161,16 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
             on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
             on_vanished=lambda rel: vanished.append(str(rel)))
+        total_bytes += _zip_cron_pairs(zf, hermes_root, cron_homes, out_path,
+                                       lambda rel, exc: errors.append(f"{rel}: {exc}"))
         late_added = 0
         if vanished:
             # A rename looks like a vanish here: the old path is gone and the new one was never
             # listed. Re-scan once and archive what the first scan did not list, so moved data
             # still lands and only a true deletion stays a WARN.
             listed = {str(rel) for _, rel in files_to_add}
-            late = [(a, r) for a, r in _iter_backup_files(hermes_root, out_path) if str(r) not in listed]
+            late, _ = _split_cron_pairs(list(_iter_backup_files(hermes_root, out_path)))
+            late = [(a, r) for a, r in late if str(r) not in listed]
             late_added = len(late)
             file_count += late_added
             total_bytes += _write_zip_entries(
@@ -1381,6 +1385,9 @@ def run_import(args) -> Optional[int]:
         # import replaced with one holding fewer rows. A restore is allowed to
         # do that — it just must not do it silently (issue #100960).
         db_shrunk: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+        from cron import store_pair
+        from cron.store_pair import pair_home
+        cron_pairs: Dict[Tuple[str, ...], Dict[str, str]] = {}
         home_dir = Path.home().resolve()
         # Resolved once: every member is published via a temp file, and mkstemp
         # would otherwise create newly restored files as 0600.
@@ -1460,6 +1467,16 @@ def run_import(args) -> Optional[int]:
                 skipped_runtime.append(rel)
                 continue
 
+            # I4 (t_82c613d9): a cron store pair is restored as ONE unit after the loop, under
+            # that store's lock. A stray ``runtime_state.db.*`` copy is never installed.
+            store_home = pair_home(parts)
+            if store_home is not None:
+                if parts[-1] in (store_pair.JOBS_NAME, store_pair.DB_NAME):
+                    cron_pairs.setdefault(store_home, {})[parts[-1]] = member
+                else:
+                    skipped_runtime.append(rel)
+                continue
+
             target = hermes_root.joinpath(*parts)
 
             # Security: reject absolute paths and traversals
@@ -1489,6 +1506,16 @@ def run_import(args) -> Optional[int]:
 
             if restored % 500 == 0:
                 print(f"  {restored}/{file_count} files ...")
+
+        for store_home, pair_members in cron_pairs.items():
+            label = "/".join((*store_home, store_pair.CRON_DIR))
+            try:  # refuses a db with no jobs.json (rows without definitions), store untouched
+                hermes_root.joinpath(*store_home).mkdir(parents=True, exist_ok=True)
+                restored += len(store_pair.restore_members(
+                    {name: (lambda m=m: zf.open(m)) for name, m in pair_members.items()},
+                    hermes_root.joinpath(*store_home)))
+            except (OSError, ValueError, RuntimeError, *_ZIP_MEMBER_READ_ERRORS) as exc:
+                errors.append(f"  {label}: {exc}")
 
         elapsed = time.monotonic() - t0
 
@@ -1675,25 +1702,43 @@ _CRON_JOBS_REL = "cron/jobs.json"
 _CRON_RUNTIME_REL = "cron/runtime_state.db"
 
 
-@contextmanager
-def _cron_store_lock(home: Path):
-    """Hold *home*'s cron jobs lock so jobs.json and runtime_state.db are captured as ONE unit
-    (t_94e91559: runtime rows live in the db; a remove_job between the two copies would
-    otherwise pair a definition with no row). Best effort: no lock when cron cannot load."""
-    try:
-        from cron.jobs import CronLockDegraded, _jobs_lock, _write_refused_by_r4, use_cron_store
-    except Exception:
-        yield
-        return
-    with use_cron_store(home), _jobs_lock():
-        if _write_refused_by_r4():
-            # Prism d893e459f0ce, ruling R4: a section that could not take the cross-process lock
-            # is not exclusive; the real holder may be mid-write across the two files. A pair
-            # copied now could pair old definitions with newer runtime. Refuse the capture.
-            raise CronLockDegraded(
-                f"the cron jobs lock is degraded (another process holds {home / 'cron' / '.jobs.lock'}); "
-                "refusing to capture jobs.json + runtime_state.db as a pair (nothing copied). Retry")
-        yield
+def _split_cron_pairs(files: List[Tuple[Path, Path]]) -> Tuple[List[Tuple[Path, Path]], List[Tuple[str, ...]]]:
+    """Take every cron store pair member (``[profiles/<n>/]cron/jobs.json`` and
+    ``runtime_state.db*``) out of a full-backup file list; return ``(others, store_homes)``.
+    The pairs are archived by :func:`_zip_cron_pairs` as one unit each (invariant I4,
+    t_82c613d9: Prism 30138fa3c582 and duplicates)."""
+    from cron.store_pair import pair_home
+
+    others: List[Tuple[Path, Path]] = []
+    homes: List[Tuple[str, ...]] = []
+    for abs_path, rel_path in files:
+        home = pair_home(tuple(Path(rel_path).parts))
+        if home is None:
+            others.append((abs_path, rel_path))
+        elif home not in homes:
+            homes.append(home)
+    return others, homes
+
+
+def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[str, ...]],
+                    out_path: Path, on_error) -> int:
+    """Capture each store's pair under its cron lock (``cron.store_pair.capture``) beside the
+    output zip and archive both halves; return bytes archived. A refused capture is ONE error for
+    the whole pair: neither half is archived alone."""
+    from cron import store_pair
+
+    total = 0
+    for home in homes:
+        rel_cron = Path(*home, store_pair.CRON_DIR)
+        with tempfile.TemporaryDirectory(prefix=".cron-pair-", dir=str(out_path.parent)) as tmp:
+            try:
+                names = store_pair.capture(hermes_root.joinpath(*home), Path(tmp))
+                for name in names:
+                    _write_zip_file(zf, Path(tmp) / name, str(rel_cron / name))
+                    total += (Path(tmp) / name).stat().st_size
+            except (OSError, ValueError, RuntimeError) as exc:
+                on_error(rel_cron / store_pair.JOBS_NAME, exc)
+    return total
 
 
 # Config paths the update flow must never change (#64160): model routing and the MoA section are
@@ -1885,19 +1930,20 @@ def _create_quick_snapshot_locked(
     # recoverable database.
     oversized_skipped: list[str] = []
 
-    def _quick_items():
-        # The cron pair is yielded together, inside the cron store lock (see _cron_store_lock).
-        for rel in _QUICK_STATE_FILES:
-            if rel == _CRON_RUNTIME_REL:
-                continue
-            if rel == _CRON_JOBS_REL:
-                with _cron_store_lock(home):
-                    yield rel
-                    yield _CRON_RUNTIME_REL
-                continue
-            yield rel
-
-    for rel in _quick_items():
+    for rel in _QUICK_STATE_FILES:
+        if rel == _CRON_RUNTIME_REL:
+            continue  # captured with jobs.json, below
+        if rel == _CRON_JOBS_REL:
+            # I4 (t_82c613d9): the pair is captured as ONE unit under the cron store lock.
+            from cron import store_pair
+            try:
+                for name in store_pair.capture(home, staging_dir / store_pair.CRON_DIR):
+                    pair_rel = f"{store_pair.CRON_DIR}/{name}"
+                    manifest[pair_rel] = (staging_dir / pair_rel).stat().st_size
+            except store_pair.PairRefused as exc:
+                failed_dbs.append(_CRON_RUNTIME_REL)
+                print(f"  ⚠ Snapshot: cron store pair NOT captured: {exc}")
+            continue
         src = home / rel
         if not src.exists():
             continue
@@ -2131,10 +2177,18 @@ def restore_quick_snapshot(
         meta = json.load(f)
 
     restored = 0
-    for rel in meta.get("files", {}):
-        if rel == _CRON_RUNTIME_REL:
-            # Captured, never restored (t_94e91559): runtime bookkeeping comes from the live db
-            # and schedule fields are recomputed by the scheduler. The pair restore is t_82c613d9.
+    files = meta.get("files", {})
+    if _CRON_JOBS_REL in files or _CRON_RUNTIME_REL in files:
+        # I4 (t_82c613d9): the pair is restored as ONE unit under the cron store lock. A snapshot
+        # without runtime_state.db (taken before #2287) clears the live rows: its jobs.json
+        # carries the runtime it was taken with, adopted on the next load.
+        from cron import store_pair
+        try:
+            restored += len(store_pair.restore(snap_dir / store_pair.CRON_DIR, home))
+        except (store_pair.PairRefused, OSError, RuntimeError) as exc:
+            logger.error("Failed to restore the cron store pair from %s: %s", snapshot_id, exc)
+    for rel in files:
+        if rel in (_CRON_JOBS_REL, _CRON_RUNTIME_REL):
             continue
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
@@ -2265,9 +2319,10 @@ def restore_cron_jobs_if_emptied(
         return None
 
     try:
-        live_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snap_path, live_path)
-    except (OSError, PermissionError) as exc:
+        # I4 (t_82c613d9, Prism 10c3c30e47f6): the snapshot's PAIR, never jobs.json alone.
+        from cron import store_pair
+        store_pair.restore(snap_path.parent, home)
+    except (OSError, ValueError, RuntimeError) as exc:
         logger.error(
             "Cron jobs were emptied during update but auto-restore failed: %s", exc
         )
@@ -2402,12 +2457,9 @@ def restore_cron_prompt_fields_if_degraded(
         return None
 
     try:
-        live_path.parent.mkdir(parents=True, exist_ok=True)
-        with _atomic_output_path(live_path) as tmp_path:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(live_doc, f, indent=2)
-                f.write("\n")
-    except (OSError, PermissionError) as exc:
+        from cron import store_pair
+        store_pair.publish_definitions(home, live_doc)
+    except (OSError, ValueError, RuntimeError) as exc:
         logger.error(
             "Cron job prompts were degraded during update but auto-restore "
             "failed: %s",
@@ -2834,14 +2886,17 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         return published
 
     archive_started = time.monotonic()
+    plain_files, cron_homes = _split_cron_pairs(files_to_add)
     try:
         with _atomic_output_path(out_path, _publish_path) as archive_path, zipfile.ZipFile(
                 archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             _write_zip_entries(
-                zf, files_to_add, out_path, on_db_failure=_db_failure, track_bytes=False,
+                zf, plain_files, out_path, on_db_failure=_db_failure, track_bytes=False,
                 on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
                 on_progress=lambda i: logger.info(
                     "automatic backup phase=archive status=progress completed=%d total=%d", i, len(files_to_add)))
+            _zip_cron_pairs(zf, hermes_root, cron_homes, out_path,
+                            lambda rel, exc: errors.append(f"{rel}: {exc}"))
     except (OSError, _SQLiteSnapshotError) as exc:
         # The hidden partial is already gone; ``out_path`` may be a previous valid backup: keep it.
         logger.warning("Full-zip backup: zip write failed: %s", exc)

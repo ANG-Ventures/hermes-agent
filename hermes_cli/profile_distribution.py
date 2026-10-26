@@ -396,17 +396,11 @@ def _merge_cron_store(src: Path, home: Path) -> None:
     from cron import jobs as cron_jobs
     from cron.job_definition import import_job_definitions
 
+    from cron.store_pair import read_definitions
+
     dest = home.joinpath(*_CRON_STORE_REL)
     try:
-        with tempfile.TemporaryDirectory(prefix="hermes_dist_cron_") as tmp:
-            staged_store = Path(tmp) / "cron"
-            staged_store.mkdir()
-            shutil.copy2(src, staged_store / "jobs.json")
-            with cron_jobs.use_cron_store(tmp):
-                shipped = {
-                    job["id"]: job for job in cron_jobs.load_jobs()
-                    if isinstance(job, dict) and job.get("id")
-                }
+        shipped = {job["id"]: job for job in read_definitions(src) if job.get("id")}
         with cron_jobs.use_cron_store(home):
             import_job_definitions(
                 shipped, paused_reason="Installed from a profile distribution; review it, then resume.")

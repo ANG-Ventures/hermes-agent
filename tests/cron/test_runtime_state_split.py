@@ -857,24 +857,25 @@ def test_quick_snapshot_copies_jobs_and_runtime_db_under_one_cron_lock(temp_home
     from cron import jobs as cj
     from hermes_cli import backup
 
+    from cron import store_pair
+
     created = cj.create_job(prompt="x", schedule="every 5m", name="snap")
     cj.mark_job_run(created["id"], True)
     held = {}
-    real_copy2, real_db = shutil.copy2, backup._safe_copy_db
+    real_write, real_db = store_pair._private_write, store_pair._copy_db
 
-    def copy2(src, dst, *a, **kw):
-        if str(src).endswith("cron/jobs.json"):
+    def private_write(path, data):
+        if str(path).endswith("cron/jobs.json"):
             held["jobs"] = getattr(cj._jobs_lock_state, "depth", 0)
-        return real_copy2(src, dst, *a, **kw)
+        return real_write(path, data)
 
-    def safe_copy_db(src, dst):
+    def copy_db(src, dst):
         if str(src).endswith("cron/runtime_state.db"):
             held["db"] = getattr(cj._jobs_lock_state, "depth", 0)
-            held["section"] = id(cj._jobs_lock_state)
         return real_db(src, dst)
 
-    monkeypatch.setattr(backup.shutil, "copy2", copy2)
-    monkeypatch.setattr(backup, "_safe_copy_db", safe_copy_db)
+    monkeypatch.setattr(store_pair, "_private_write", private_write)
+    monkeypatch.setattr(store_pair, "_copy_db", copy_db)
     assert backup.create_quick_snapshot(hermes_home=temp_home)
     assert held.get("jobs", 0) >= 1 and held.get("db", 0) >= 1
 
@@ -1325,10 +1326,10 @@ def test_repeat_completed_from_row_is_normalized(temp_home):
     assert next(j for j in cj.load_jobs() if j["id"] == jid)["repeat"]["completed"] == 0
 
 
-def test_quick_snapshot_restore_takes_runtime_from_live_db(temp_home):
-    """Interim (t_82c613d9 owns the pair restore): restoring a quick snapshot restores
-    definitions; runtime_state.db is captured but never restored, so runtime bookkeeping comes
-    from the live db (I1) and no pre-restore db copy is written into cron/."""
+def test_quick_snapshot_restore_restores_the_pair(temp_home):
+    """I4 (t_82c613d9, Prism 731075bc7763 / b5190aaf4349): restoring a quick snapshot restores
+    jobs.json AND runtime_state.db as one unit, so definitions and runtime are from one moment,
+    and no pre-restore db copy is written into cron/ (e3dd44d3f3ec)."""
     from cron import jobs as cj
     from hermes_cli import backup
 
@@ -1344,7 +1345,7 @@ def test_quick_snapshot_restore_takes_runtime_from_live_db(temp_home):
         cj.mark_job_run(jid, True)
     assert backup.restore_quick_snapshot(snap, hermes_home=temp_home)
     job = cj.get_job(jid)
-    assert job["name"] == "snap" and job["repeat"]["completed"] == 7
+    assert job["name"] == "snap" and job["repeat"]["completed"] == 3
     assert not [p for p in (temp_home / "cron").iterdir() if "pre-restore" in p.name]
 
 
@@ -2858,11 +2859,16 @@ def test_backup_pair_capture_refuses_under_a_contended_lock(temp_home, monkeypat
     from cron import jobs as cj
     from hermes_cli import backup
 
+    from cron import store_pair
+
     cj.create_job(prompt="x", schedule="every 5m", name="cap")
     _degrade_lock(monkeypatch, cj)
     with pytest.raises(cj.CronLockDegraded):
-        with backup._cron_store_lock(temp_home):
+        with store_pair.lock(temp_home):
             pass
+    with pytest.raises(cj.CronLockDegraded):
+        store_pair.capture(temp_home, temp_home / "out")
+    assert not (temp_home / "out" / "jobs.json").exists()
 
 
 # --- Prism round 19 (#2287 @ a83e4d5d) ------------------------------------------------------------
