@@ -2932,11 +2932,29 @@ def _merge_unexpected_disk_jobs(
     reconciled_ids: List[str] = []
     new_ids: Set[str] = set()
     changed = False
+    # t_0cae2938: an id this section LOADED that is gone from disk now, and whose last journal
+    # event is `removed`, was removed through the API by a sibling after our load. Writing our
+    # stale copy back would resurrect it with no `created` event (Studio 10-26: ffe40c023e7f was
+    # journaled removed at 04:12, back on disk and firing at 06:39).
+    vanished = [str(j["id"]) for j in jobs
+                if isinstance(j, dict) and j.get("id") and str(j["id"]) not in disk_by_id
+                and baseline is not None and str(j["id"]) in baseline
+                and str(j["id"]) not in intended_remove]
+    sibling_removed: Set[str] = set()
+    if vanished:
+        from cron.lifecycle_journal import last_removed
+        sibling_removed = last_removed(vanished)
     for job in jobs:
         if not isinstance(job, dict) or not job.get("id"):
             reconciled.append(job)
             continue
         jid = str(job["id"])
+        if jid in sibling_removed:
+            changed = True
+            logger.warning(
+                "Cron job %s was removed through the API after this writer's load; not "
+                "writing the stale copy back (t_0cae2938)", jid)
+            continue
         new_ids.add(jid)
         disk_job = disk_by_id.get(jid)
         if disk_job is None or baseline is None:

@@ -269,6 +269,35 @@ def read_entries_with_health(
     return entries, malformed
 
 
+def last_removed(job_ids) -> set:
+    """The ids in *job_ids* whose LAST journal event is ``removed`` (append order, whole file).
+
+    Read by the store's merge (t_0cae2938): a save whose payload still carries a row a sibling
+    removed through the API after this writer's load must not write that row back. Malformed lines
+    are skipped (the guard reports them). Best effort: an unreadable journal returns an empty set,
+    which keeps the pre-existing merge behaviour."""
+    wanted = {str(i) for i in job_ids if i}
+    if not wanted:
+        return set()
+    last: Dict[str, str] = {}
+    try:
+        path = _journal_path()
+        if not path.exists():
+            return set()
+        with open(path, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("job_id") in wanted and rec.get("event") in EVENTS:
+                    last[rec["job_id"]] = rec["event"]
+    except Exception:
+        logger.debug("cron lifecycle journal read failed", exc_info=True)
+        return set()
+    return {i for i, ev in last.items() if ev == EVENT_REMOVED}
+
+
 def _parse_at(raw: Any):
     from datetime import datetime, timezone
 
