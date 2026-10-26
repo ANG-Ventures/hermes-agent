@@ -2220,6 +2220,10 @@ class GatewayShutdownMixin:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
         await self._finalize_shutdown_agents(ctx.active_agents)
+        # Before adapter teardown: a /goal continuation queued here is spooled with the adapter queue.
+        _drain_post_turn = getattr(self, "_drain_post_turn_tasks", None)  # bare shutdown doubles lack it
+        if callable(_drain_post_turn):
+            await _drain_post_turn(10.0)
         # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         _cache = getattr(self, "_agent_cache", None)

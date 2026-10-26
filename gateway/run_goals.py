@@ -24,6 +24,10 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# True inside a post-turn hook task that runs after the turn's reply was sent: the adapter's
+# post-delivery callback has already fired, so a /goal status notice is sent directly.
+_AFTER_DELIVERY: contextvars.ContextVar[bool] = contextvars.ContextVar("post_turn_after_delivery", default=False)
+
 
 class GatewayGoalsMixin:
     """Goal/heartbeat continuation, post-turn hooks and loop-wakeup watcher methods for GatewayRunner."""
@@ -298,7 +302,7 @@ class GatewayGoalsMixin:
         session_key = None
         with suppress(Exception):
             session_key = self._session_key_for_source(source)
-        if session_key and hasattr(adapter, "register_post_delivery_callback"):
+        if session_key and not _AFTER_DELIVERY.get() and hasattr(adapter, "register_post_delivery_callback"):
             try:
                 active = getattr(adapter, "_active_sessions", {}).get(session_key)
                 generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
@@ -411,6 +415,59 @@ class GatewayGoalsMixin:
                 )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
+
+    def _schedule_post_turn_hooks(self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None):
+        """Run the post-turn hooks AFTER this turn's reply is delivered (t_3acac80f): the /goal judge
+        is a 5-12 s aux-LLM call that sat between "response ready" and the adapter's send. The adapter
+        sends what the turn task (our caller) returns, so the hook task waits for that task; per-session
+        chaining keeps judge evaluations in turn order. Shutdown drains these (_drain_post_turn_tasks)."""
+        turn_task = asyncio.current_task()
+        tasks = self.__dict__.setdefault("_post_turn_tasks", set())
+        tails = self.__dict__.setdefault("_post_turn_tails", {})
+        key = self._session_key_for_source(source) if source is not None else None
+        prev = tails.get(key)
+
+        async def _run() -> None:
+            waits = {t for t in (prev, turn_task) if t is not None and t is not asyncio.current_task()}
+            if waits:
+                await asyncio.wait(waits)
+            _AFTER_DELIVERY.set(True)
+            started = time.monotonic()
+            try:
+                await self._run_post_turn_hooks(
+                    agent_result=agent_result, source=source, is_internal=is_internal, event=event,
+                )
+            except Exception as exc:
+                logger.debug("post-turn hook failed: %s", exc)
+            # The turn task already ran the adapter's end-of-turn drain, so a continuation the judge
+            # just queued would wait for the next inbound: start it on the idle session (never while
+            # draining; adapter shutdown spools the slot for the next boot).
+            adapter = self._delivery_adapter_for(source) if key and not getattr(self, "_draining", False) else None
+            if adapter is not None and key not in getattr(adapter, "_active_sessions", {key: 0}):
+                pending = getattr(adapter, "_pending_messages", {}).pop(key, None)
+                if pending is not None:
+                    adapter._start_session_processing(pending, key)
+            took = time.monotonic() - started
+            if took > 2.0:
+                logger.info("PHASE=post_turn_hooks session=%s s=%.2f (after delivery)", key or "unknown", took)
+
+        task = asyncio.get_running_loop().create_task(_run())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        tails[key] = task
+        task.add_done_callback(lambda t: tails.pop(key, None) if tails.get(key) is t else None)
+        return task
+
+    async def _drain_post_turn_tasks(self, timeout: float = 10.0) -> None:
+        """Shutdown: let in-flight post-turn hooks queue their continuation (it spools across the
+        restart via the draining inbound path) instead of dying with the loop."""
+        pending = [t for t in self.__dict__.get("_post_turn_tasks", ()) if not t.done()]
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=timeout)
+        if still:
+            logger.warning("Shutdown: %d post-turn hook task(s) still running after %.0fs; abandoning",
+                           len(still), timeout)
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
