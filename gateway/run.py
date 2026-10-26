@@ -9608,8 +9608,23 @@ class GatewayRunner(
                     seen.add(id(event))
                     if await self._preserve_followup_across_restart(key, event, None):
                         spooled += 1
-        # Held /queue items (after /stop) restore as HELD on the next boot, never as a turn
-        # (spec 2026-10-12 D22/I13). Removed only once durably spooled.
+        spooled += await self._spool_held_queues_for_restart(seen)
+        return spooled
+
+    async def _spool_held_queues_for_restart(self, seen: Optional[set] = None) -> int:
+        """Spool /stop-held /queue items so the next boot restores them as HELD, never as a turn
+        (spec 2026-10-12 D22/I13). Removed only once durably spooled, so a second call is a no-op.
+
+        Called EARLY in stop() (before the drain) as well as from the late sweep: the late sweep
+        never runs when the shutdown watchdog force-exits a wedged drain, and an unspooled held
+        item is then re-injected by the platform's restart backfill as a fresh turn (a /stop-held
+        voice note answered twice, 2026-10-26 03:11).
+        """
+        from collections.abc import Mapping as _Mapping
+
+        if seen is None:
+            seen = set()
+        spooled = 0
         held_by_session = getattr(self, "_held_queues", None)
         if isinstance(held_by_session, _Mapping):
             for key, events in list(held_by_session.items()):

@@ -1996,6 +1996,18 @@ class GatewayShutdownMixin:
         # Notify all chats with active agents BEFORE draining — adapters are still connected here.
         await self._notify_active_sessions_of_shutdown()
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
+        # Fork: spool /stop-held /queue items NOW, before the drain. They are idle by definition
+        # (no turn consumes them), and the late sweep in _stop_release_runtime_state never runs
+        # when the shutdown watchdog force-exits a wedged drain; an unspooled held item is then
+        # re-injected by the restart backfill as a fresh turn (2026-10-26 03:11).
+        _spool_held = getattr(self, "_spool_held_queues_for_restart", None)
+        if callable(_spool_held):
+            try:
+                _held_n = await _spool_held()
+                if _held_n:
+                    logger.info("Shutdown phase: spooled %d held /queue item(s) before drain", _held_n)
+            except Exception:
+                logger.warning("early held-queue spool failed; late sweep will retry", exc_info=True)
         # Fork: cancel boot auto-resumes that were SCHEDULED but whose turn never started, and
         # re-mark them resumable. BEFORE the drain wait: a pending sentinel still counts in
         # ``len(self._running_agents)``, so leaving these in place makes the drain wait out its full
