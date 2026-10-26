@@ -860,6 +860,13 @@ class SessionDB(
         # is transient EMFILE, and a permanent flag would demote every reader forever.
         self._read_open_failed_at = 0.0
         self._wal_active, self._write_count = False, 0
+        # Periodic PASSIVE checkpoint runs on its OWN connection, off self._lock, in one background thread
+        # (single-flight via _ckpt_lock; lock order _ckpt_lock -> _lock). Measured 2026-10-25 on the live
+        # gateway: run under self._lock it held every writer for >=42 s on a 6.25 GB state.db.
+        self._ckpt_conn: Optional[sqlite3.Connection] = None
+        self._ckpt_lock = threading.Lock()
+        self._ckpt_thread: Optional[threading.Thread] = None
+        self._retired_ckpt_conn: Optional[sqlite3.Connection] = None  # kept open with a retired handle
         # File identity of the opened state.db, compared on every write so an out-of-band
         # replace cannot limp through in-place surgery (inode: mv/new-file; application_id: cp).
         self._db_file_identity: Optional[tuple] = None
@@ -1299,7 +1306,7 @@ class SessionDB(
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
+                    self._kick_wal_checkpoint()
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
@@ -1756,26 +1763,54 @@ class SessionDB(
             return "a deleted WAL generation (split-brain)"
         return None
 
+    def _kick_wal_checkpoint(self) -> None:
+        """Start the periodic checkpoint in the background; a checkpoint already running absorbs this
+        kick. The writer that hit the interval returns at once instead of waiting out the checkpoint."""
+        t = self._ckpt_thread
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=self._try_wal_checkpoint, name="state-db-wal-checkpoint", daemon=True)
+        self._ckpt_thread = t
+        t.start()
+
+    def _checkpoint_conn_locked(self) -> sqlite3.Connection:
+        """The dedicated checkpoint connection (opened once, closed in close()). Caller holds self._lock,
+        so its open/close is ordered against the writer's own open/close and the WAL lock guard."""
+        if self._ckpt_conn is None:
+            self._ckpt_conn = _connect_tracked_db(
+                self.db_path, tracking_path=self.db_path, check_same_thread=False, timeout=1.0,
+                isolation_level=None,
+            )
+        return self._ckpt_conn
+
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint; never raises. PASSIVE never blocks writers;
         TRUNCATE corrupted B-trees on 65K+ page databases under exclusive-lock I/O pressure.
 
         Previous TRUNCATE strategy caused B-tree corruption on large databases (65K+ pages) due to the
         exclusive-lock I/O pressure from checkpointing thousands of frames at once (issue #45383).
+
+        The PRAGMA runs on a dedicated connection OUTSIDE self._lock: SQLite's PASSIVE mode does not block
+        writers, but holding the process-wide Python write lock around it did (every writer queued for the
+        whole checkpoint). Only the guard refresh and the connection lookup take self._lock.
         """
         if self._quarantine_reason() is not None:
             return
-        try:
-            with self._lock:
-                if self._conn is None:
-                    return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
-                if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        with self._ckpt_lock:
+            try:
+                with self._lock:
+                    if self._conn is None or self._db_replaced:
+                        return  # closed or replaced underneath the timer: nothing to checkpoint
+                    if self._wal_lock_guard:
+                        _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
+                    conn = self._checkpoint_conn_locked()
+                    if self._wal_lock_guard:
+                        _lockguard.hold(self.db_path, self._wal_lock_guard)  # cover the checkpoint conn's fds
+                result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
-        except Exception as exc:
-            logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+            except Exception as exc:
+                logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
     def __enter__(self) -> "SessionDB":
         """``with SessionDB(path) as db:`` closes on exit; owners must release deterministically.
@@ -1820,7 +1855,7 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
-        with self._lock:
+        with self._ckpt_lock, self._lock:
             if self._conn:
                 generation_lost = not self.read_only and (
                     self._db_wal_generation_lost
@@ -1847,6 +1882,12 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+                ckpt, self._ckpt_conn = self._ckpt_conn, None
+                if ckpt is not None:  # closed while the guard still holds (a close() cancels POSIX locks)
+                    if retire_without_close:
+                        self._retired_ckpt_conn = ckpt  # keep its fds with the retired generation
+                    else:
+                        self._close_connection_quietly(ckpt)
                 _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)
