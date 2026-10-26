@@ -171,6 +171,46 @@ def _any_board(boards, connect, test) -> bool:
     return False
 
 
+_OUT_OF_TICK_SQL = (
+    "SELECT r.id, r.started_at, r.claim_lock FROM task_runs r WHERE r.started_at >= ? "
+    "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)")
+
+
+def out_of_tick_local_starts(boards, connect, since: float, own_claimer: str) -> list:
+    """``[(key, started_at)]`` of every LOCAL run (no worker_placed event)
+    started at/after ``since`` on any board that THIS process did not claim
+    (``task_runs.claim_lock`` != ``own_claimer``): a ``kanban admit``, a
+    one-shot ``kanban dispatch`` or another dispatcher's spawn (t_32e8796a).
+    The same rows ``kanban_ops._recent_local_starts`` books for the CLI path,
+    minus this process's own spawns, which ``finish_tick`` already booked.
+    ``key`` is ``(db path, run id)``. An unreadable board contributes nothing."""
+    from hermes_cli import kanban_db as _kb
+
+    out, seen = [], set()
+    for b in boards or ():
+        slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
+        conn = None
+        try:
+            path = str(_kb.kanban_db_path(slug).expanduser().resolve())
+            if path in seen:
+                continue
+            seen.add(path)
+            conn = connect(board=slug)
+            for rid, started, lock in conn.execute(
+                    _OUT_OF_TICK_SQL, (int(since), kwp.PLACED_EVENT)).fetchall():
+                if lock != own_claimer:
+                    out.append(((path, int(rid)), float(started)))
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return out
+
+
 class GateTickBuilder:
     """Builds the tick's ``GateTick``. Boards tick sequentially in ONE thread
     after this (PRD I-12): the shared plan's ledger is unlocked."""
@@ -189,6 +229,7 @@ class GateTickBuilder:
         self._signal: Optional[kwp.TargetSignal] = None
         self._boards = None                        # last build()'s boards (renewal)
         self._renewed_at: float = 0.0
+        self._seeded: Dict[tuple, float] = {}      # out-of-tick local runs already booked
 
     def _root(self):
         return self._fleet_dir().parent
@@ -222,6 +263,7 @@ class GateTickBuilder:
         self._remote_by_host = dict(remote_by_host)
         self._boards = boards
         self.running_local = running_local
+        self.seed_out_of_tick(boards)
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
         if gate.enabled and allowance is None and klg.loadavg_supported():
             # Enabled gate, load1 unreadable on a host that has the sampler:
@@ -231,6 +273,36 @@ class GateTickBuilder:
         plan = self.plan_pool(boards, remote_by_host)
         return GateTick(band=gate.band, spill_reason=gate.spill_reason,
                         local_allowance=allowance, spawn_paused=paused, remote_plan=plan)
+
+    def seed_out_of_tick(self, boards, *, now_wall: Optional[float] = None,
+                         now_mono: Optional[float] = None) -> int:
+        """Book every LOCAL run started inside ``admission.DEFAULT_SETTLE_S``
+        that this process did not spawn into the gate's ramp, once each, aged
+        by its ``started_at`` (as the CLI path does, kanban_ops
+        ``_cli_utilization_gate``). Without it a ``kanban admit`` on this host
+        is invisible to the next tick until its CPU shows (t_32e8796a)."""
+        gate = self.gate
+        if not getattr(gate, "enabled", False):
+            return 0
+        from hermes_cli import admission as _ad
+        from hermes_cli import kanban_db as _kb
+
+        now_wall = time.time() if now_wall is None else now_wall
+        now_mono = time.monotonic() if now_mono is None else now_mono
+        horizon = now_wall - _ad.DEFAULT_SETTLE_S
+        self._seeded = {k: t for k, t in self._seeded.items() if t >= horizon}
+        try:
+            rows = out_of_tick_local_starts(boards, self._connect, horizon, _kb._claimer_id())
+        except Exception:
+            return 0
+        n = 0
+        for key, started in rows:
+            if key in self._seeded:
+                continue
+            self._seeded[key] = started
+            gate.record_spawns(1, now=now_mono - max(0.0, now_wall - started))
+            n += 1
+        return n
 
     def plan_pool(self, boards, remote_by_host: Dict[str, int]) -> Optional[kwp.SpilloverPlan]:
         """The ONE pool plan for this tick, or None. Runs iff

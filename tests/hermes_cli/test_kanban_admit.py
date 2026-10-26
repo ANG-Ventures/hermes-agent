@@ -21,7 +21,8 @@ from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
 
 TOKEN = "op-token-test"
-GATE = {"enabled": True, "pause_above": 64, "resume_below": 48, "max_spawn_per_tick": 16}
+GATE = {"enabled": True, "pause_above": 64, "resume_below": 48, "max_spawn_per_tick": 16, "ecore_gate": "off"}
+LOCAL_NAME = "admit-test-box"     # this machine's hostname in every test, whatever venue runs it
 POOL_HOST = kwp.PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user=kwp.SSH_USER, slots=4, capacity_pct=0.8,
                          absence="required", profiles=("alpha",), state="active", enabled=True, priority=0)
 POOL = kwp.PoolConfig(hosts=("ace-ai",), profiles=("alpha",), pool_hosts=(POOL_HOST,))
@@ -33,6 +34,10 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Pin the local identity: kwp._studio_words() and the claim lock read the
+    # hostname, so on a pool host (ace-ai) `local` would otherwise BE that host.
+    import socket
+    monkeypatch.setattr(socket, "gethostname", lambda: LOCAL_NAME)
     kb.init_db()
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
@@ -146,6 +151,154 @@ def test_admit_refuses_a_running_card_naming_its_host(board, monkeypatch):
     with pytest.raises(ka.AdmitRefused, match="already running on ace-ai"):
         ka.admit(tid, "ace-ai", "again", spawn_fn=_spawn, measure_remote_fn=_remote())
     assert len(_events(tid)) == 1
+
+
+def test_admit_refuses_a_locally_running_card_naming_the_canonical_host(board, monkeypatch):
+    _hot_local(monkeypatch)
+    tid = _card()
+    ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).claim_lock.startswith(LOCAL_NAME + ":")
+    with pytest.raises(ka.AdmitRefused, match=r"already running on studio$"):
+        ka.admit(tid, "studio", "again", spawn_fn=_spawn)
+
+
+def test_floor_refuses_non_finite_measurements():
+    nan, inf = float("nan"), float("inf")
+    assert "unmeasured" in ka.floor_refusal(ka.Measure("h", nan, 8, nan, 4.0))
+    assert "unmeasured" in ka.floor_refusal(ka.Measure("h", 1.0, 8, inf, 4.0))
+    assert "load1/threads unmeasured" in ka.floor_refusal(ka.Measure("h", nan, 8, 50.0, 4.0))
+    assert "load1/threads unmeasured" in ka.floor_refusal(ka.Measure("h", 1.0, -4, 50.0, 4.0))
+    assert "not a finite threshold" in ka.floor_refusal(ka.Measure("h", 1.0, 8, 50.0, nan))
+    assert ka.floor_refusal(ka.Measure("h", 1.0, 8, 50.0, 4.0)) is None
+
+
+def test_admit_refuses_when_the_workspace_admission_refuses(board, monkeypatch):
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+
+    _hot_local(monkeypatch)
+    tid = _card()
+
+    def refuse(task, board=None, conn=None):
+        raise WorkspaceUnavailable("workspaces_root_unmounted: /Volumes/x")
+
+    monkeypatch.setattr(kb, "_validate_workspace_admission", refuse)
+    SPAWNS.clear()
+    with pytest.raises(ka.AdmitRefused, match="workspace unavailable: workspaces_root_unmounted"):
+        ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    assert SPAWNS == [] and _status(tid) == "ready"
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).claim_lock is None
+
+
+def test_a_local_admit_lowers_the_next_gateway_tick_allowance_by_one(board, monkeypatch):
+    """The gateway tick seeds its ramp with LOCAL runs it did not spawn (an
+    admit, a one-shot dispatch), so a local admit counts against the host's
+    budget on the very next tick, before its CPU shows in load1."""
+    from gateway import kanban_gate_tick as kgt
+
+    _hot_local(monkeypatch, load1=40.0)        # (64 - 40) / cost 2 = 12 admitted, under the cap
+    monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
+    cfg = {"dispatch_load_gate": dict(GATE)}
+
+    def gateway_allowance():
+        gate = klg.gate_from_config({"kanban": cfg})
+        builder = kgt.standalone_builder(gate, lambda: cfg)
+        with monkeypatch.context() as m:
+            m.setattr(kb, "_claimer_id", lambda: "gateway-box:999")   # the gateway is another process
+            return builder.build(kgt.live_boards()).local_allowance
+
+    before = gateway_allowance()
+    ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)
+    after = gateway_allowance()
+    assert (before, after) == (12, 11)
+
+
+def test_the_gateway_tick_does_not_rebook_its_own_spawns_or_a_seeded_run_twice(board, monkeypatch):
+    from gateway import kanban_gate_tick as kgt
+
+    _hot_local(monkeypatch, load1=40.0)
+    tid = _card()
+    ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    gate = klg.gate_from_config({"kanban": {"dispatch_load_gate": dict(GATE)}})
+    builder = kgt.standalone_builder(gate, lambda: {})
+    boards = kgt.live_boards()
+    assert builder.seed_out_of_tick(boards) == 0                   # claimed by this process: already booked
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "gateway-box:999")
+    assert builder.seed_out_of_tick(boards) == 1
+    assert builder.seed_out_of_tick(boards) == 0                   # once per run
+    assert gate.ramp_workers() == 1
+
+
+def test_admit_refuses_a_draining_pool_host(board, monkeypatch):
+    import dataclasses
+
+    draining = dataclasses.replace(POOL_HOST, state="draining")
+    pool = dataclasses.replace(POOL, pool_hosts=(draining,))
+    monkeypatch.setattr(ka, "_pool_and_signal", lambda cfg: (pool, None, board / "fleet"))
+    tid = _card()
+    with pytest.raises(ka.AdmitRefused, match="ace-ai is not eligible"):
+        ka.admit(tid, "ace-ai", "ruling", spawn_fn=_spawn, measure_remote_fn=_remote())
+    assert _status(tid) == "ready"
+
+
+def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
+    from types import SimpleNamespace
+
+    sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0,
+                            pressure_text=json.dumps({"at": 1000.0, "mem_available_gb": 100.0}))
+    monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
+    signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=60.0),
+                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+    m = ka.measure_remote(POOL_HOST, signal)
+    assert m.mem_available_gb is None and "unmeasured" in ka.floor_refusal(m)
+
+
+def test_an_unreadable_local_placement_table_refuses_instead_of_a_zero_reserve(board, monkeypatch):
+    from hermes_cli import placement as pl
+
+    _hot_local(monkeypatch, load1=10.0)
+    table = pl.fleet_root() / pl.TABLE_REL
+    table.parent.mkdir(parents=True, exist_ok=True)
+    table.write_text("{not json")
+    with pytest.raises(ka.AdmitRefused, match="not a finite threshold"):
+        ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)
+
+
+def test_the_board_owner_root_config_kill_switch_refuses(board, monkeypatch):
+    _hot_local(monkeypatch)
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"admin_admit": {"enabled": False}})
+    tid = _card()
+    with pytest.raises(ka.AdmitRefused, match="kanban.admin_admit.enabled: false"):
+        ka.admit(tid, "studio", "ruling", kanban_cfg={}, spawn_fn=_spawn)
+    assert _status(tid) == "ready"
+
+
+def test_admit_refuses_what_the_browser_gate_would_hold(board, monkeypatch):
+    _hot_local(monkeypatch)
+    seen = {}
+
+    def gate(conn, rows, result, route, dry_run, assignee=None, *, park=True, join=True):
+        seen.update(dry_run=dry_run, park=park, join=join, route=dict(route))
+        route[rows[0]["id"]] = ("wait", "browser_join_off")
+
+    monkeypatch.setattr(kbd, "_browser_gate", gate)
+    tid = _card()
+    SPAWNS.clear()
+    with pytest.raises(ka.AdmitRefused, match="browser admission refuses on studio: browser_join_off"):
+        ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    assert SPAWNS == [] and _status(tid) == "ready"
+    assert seen["dry_run"] is True and seen["park"] is False and seen["join"] is False
+
+
+def test_no_pool_still_runs_the_dispatchers_local_routing(board, monkeypatch):
+    _hot_local(monkeypatch)
+    monkeypatch.setattr(ka, "_pool_and_signal", lambda cfg: (None, None, board / "fleet"))
+    monkeypatch.setattr(kbd, "_route_row", lambda conn, row, plan, *a, **k: ("wait", "capability:gpu"))
+    tid = _card()
+    with pytest.raises(ka.AdmitRefused, match="studio is not eligible.*wait: capability:gpu"):
+        ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    assert _status(tid) == "ready"
 
 
 def test_kill_switch_off_refuses(board, monkeypatch):

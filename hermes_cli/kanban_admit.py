@@ -24,6 +24,7 @@ headroom it overrode.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -42,6 +43,10 @@ _LOCK_WAIT_SECONDS = 30.0
 
 class AdmitRefused(RuntimeError):
     """Admission refused; the message is the operator-facing line."""
+
+
+class _WorkspaceRefused(Exception):
+    """The workspace admission refused (WorkspaceUnavailable) before launch."""
 
 
 @dataclass
@@ -64,15 +69,25 @@ def enabled(kanban_cfg: Optional[dict]) -> bool:
     return sec.get("enabled", True) is not False
 
 
+def _finite(x) -> bool:
+    try:
+        return x is not None and not isinstance(x, bool) and math.isfinite(float(x))
+    except (TypeError, ValueError):
+        return False
+
+
 def floor_refusal(m: Measure) -> Optional[str]:
-    """The measured-danger refusal line for ``m``, or None to admit."""
-    if m.mem_available_gb is None:
+    """The measured-danger refusal line for ``m``, or None to admit. A
+    non-finite measurement or threshold (NaN, inf) is unmeasured: refuse."""
+    if not _finite(m.mem_reserve_gb):
+        return f"{m.host}: mem_reserve_gb {m.mem_reserve_gb!r} is not a finite threshold; refusing, fail closed"
+    if not _finite(m.mem_available_gb):
         return (f"{m.host}: memory available is unmeasured (threshold: mem_reserve_gb "
                 f"{m.mem_reserve_gb:g} GB); refusing, fail closed")
     if m.mem_available_gb < m.mem_reserve_gb:
         return (f"{m.host}: memory available {m.mem_available_gb:.1f} GB < mem_reserve_gb "
                 f"{m.mem_reserve_gb:g} GB")
-    if m.load1 is None or not m.threads:
+    if not _finite(m.load1) or not _finite(m.threads) or m.threads <= 0:
         return f"{m.host}: load1/threads unmeasured (threshold: threads x {LOAD_FACTOR:g}); refusing, fail closed"
     limit = m.threads * LOAD_FACTOR
     if m.load1 > limit:
@@ -134,6 +149,18 @@ def eligible_hosts(conn, row, pool, signal, assignee: str, board: Optional[str])
         pin, ignored = kwp.resolve_pin(row["body"], known, kwp.pin_aliases(kb.kanban_home() / "fleet"))
         if pin not in (None, kwp.PIN_ANY, kwp.PIN_STUDIO) or (pin is None and ignored and known):
             return set(), f"pinned to {pin or ignored} and no pool plan is possible"
+        # Still the dispatcher's routing (capabilities, waits) over an empty
+        # pool: only the pool part is absent, never the local checks (Prism 4cc3d57f613b).
+        empty = kwp.PoolConfig()
+        plan = kwp.SpilloverPlan(hosts={}, slots={}, config=empty, signal=None, dry_run=True)
+        plan.continuation_dry_run = True
+        route, arg = kbd._route_row(conn, row, plan, assignee, {}, None, None, None,
+                                    caps=kbd._capability_tick(empty),
+                                    binds=kbd._workspace_binds(conn, [row], dry_run=True), board=board)
+        if route == "wait":
+            return set(), f"wait: {arg}"
+        if route != "local":
+            return set(), f"{route} {arg or ''} and no pool plan is possible".replace("  ", " ")
         return {LOCAL}, "local (no worker pool configured)"
     plan = kwp.SpilloverPlan(hosts={h.name: h for h in pool.pool_hosts}, slots={}, config=pool,
                              signal=signal, dry_run=True)
@@ -148,8 +175,12 @@ def eligible_hosts(conn, row, pool, signal, assignee: str, board: Optional[str])
         return set(), f"wait: {arg}"
     if route == "local":
         return {LOCAL}, f"local{f' ({arg})' if arg else ''}"
+    # A draining host takes no new work, override or not (Prism c477ed3abe8a).
     serves = {n for n, h in plan.hosts.items() if assignee in h.profiles and h.enabled
-              and plan.board_refusal(n, board) is None}
+              and getattr(h, "state", "active") == "active" and plan.board_refusal(n, board) is None}
+    if route in ("pin", "origin") and wt_out.get(row["id"]) is not None:
+        # admit never ports a worktree (Prism 5eb6b21cd4cc / 80052f93b9ce).
+        return set(), f"{route} {arg}: a worktree card on a pool host needs the dispatcher's port; admit runs worktrees local only"
     if route in ("pin", "origin"):
         host = {n.lower(): n for n in plan.hosts}.get(str(arg).lower(), arg)
         if host not in serves:
@@ -165,6 +196,23 @@ def eligible_hosts(conn, row, pool, signal, assignee: str, board: Optional[str])
     return remote | (set() if cap_only else {LOCAL}), "portable"
 
 
+def browser_refusal(conn, row, host: str, assignee: str) -> Optional[str]:
+    """The dispatcher's browser resolution gate for this card on ``host`` (dry,
+    no lease join): None when the card has no browser need or routes legacy;
+    otherwise the refusal / wait it would hit. admit takes no browser lease, so a
+    lease plan refuses too (Prism ea7a86c55e01 / 5a903db1ddcf). A gate fault refuses."""
+    route = {row["id"]: ("pin", host) if host != LOCAL else ("local", None)}
+    result = kb.DispatchResult()
+    try:
+        kbd._browser_gate(conn, [row], result, route, True, assignee, park=False, join=False)
+    except Exception as exc:
+        return f"browser gate error: {exc}"
+    got = route[row["id"]]
+    if got[0] == "wait":
+        return f"browser admission refuses on {host}: {got[1]}"
+    return None
+
+
 # -- measurement --------------------------------------------------------------
 
 def measure_local() -> Measure:
@@ -177,12 +225,15 @@ def measure_local() -> Measure:
     threads, reserve = os.cpu_count(), 0.0
     try:
         from hermes_cli import placement as pl
-        table = pl.load_hosts()
-        hid = table.resolve(klg.UTIL_HOST_ALIAS)
-        if hid:
-            threads, reserve = table.hosts[hid].threads, float(table.hosts[hid].mem_reserve_gb)
+        if (pl.fleet_root() / pl.TABLE_REL).exists():
+            # A table that exists but cannot be read is an unknown threshold,
+            # never "no reserve": the floor refuses on NaN (Prism a6c5f61c871f).
+            table = pl.load_hosts()
+            hid = table.resolve(klg.UTIL_HOST_ALIAS)
+            if hid:
+                threads, reserve = table.hosts[hid].threads, float(table.hosts[hid].mem_reserve_gb)
     except Exception:
-        pass
+        reserve = float("nan")
     load1, _ = klg.sample_loadavg()
     gate = klg.gate_from_config(None)
     try:
@@ -210,8 +261,10 @@ def measure_remote(host, signal) -> Measure:
         load1, ncpu = sample.load1, sample.ncpu
         if signal is not None:
             stale = signal.policy.stale_after_s
-            mem = kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text or "",
-                                   stale_after_s=stale, local_now=time.time()).get("mem_available_gb")
+            fields = kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text or "",
+                                      stale_after_s=stale, local_now=time.time())
+            # A stale/undated pressure sample is unmeasured memory (Prism 142f1bce53e2 / caafe5f5edc2).
+            mem = fields.get("mem_available_gb") if fields.get("sample_status") == "fresh" else None
             got, pressure = kwp.read_pressure(sample.remote_now, sample.pressure_text or "", stale_after_s=stale)
             band = got[1] if got else kwp.BAND_UNKNOWN
     elif sample is not None:
@@ -233,17 +286,21 @@ def measure_remote(host, signal) -> Measure:
 
 # -- the verb -------------------------------------------------------------------
 
-def _running_host(conn, task) -> str:
+def _running_host(conn, task, canon: Callable[[str], str] = lambda w: w) -> str:
+    """The host the card's current run is on, canonicalised like ``--host``."""
     row = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND run_id = ? "
         "ORDER BY id DESC LIMIT 1", (task.id, kb._kwh.PLACED_EVENT, task.current_run_id)).fetchone()
     if row is not None:
         try:
             import json
-            return str(json.loads(row[0]).get("host") or "?")
+            host = json.loads(row[0]).get("host")
+            if host:
+                return canon(str(host))
         except Exception:
             pass
-    return (task.claim_lock or "?").split(":", 1)[0]
+    word = (task.claim_lock or "").split(":", 1)[0]
+    return canon(word) if word else "?"
 
 
 def _actor() -> str:
@@ -263,7 +320,9 @@ def admit(task_id: str, host_word: str, reason: str, *, kanban_cfg: Optional[dic
     if kanban_cfg is None:
         from hermes_cli.kanban_ops import _kanban_config
         kanban_cfg = _kanban_config()
-    if not enabled(kanban_cfg):
+    if not (enabled(kanban_cfg) and enabled(kbd._root_kanban_cfg())):
+        # Either the caller's profile or the board owner's root config can
+        # turn it off (Prism 6220ec27e4d9).
         raise AdmitRefused("kanban admit is disabled (kanban.admin_admit.enabled: false)")
     if not (reason or "").strip():
         raise AdmitRefused("--reason is required: quote the ruling")
@@ -280,21 +339,22 @@ def admit(task_id: str, host_word: str, reason: str, *, kanban_cfg: Optional[dic
                 if held:
                     return _admit_locked(conn, task_id, host, reason.strip(), pool, signal, board,
                                          spawn_fn, measure_local_fn or measure_local,
-                                         measure_remote_fn or measure_remote)
+                                         measure_remote_fn or measure_remote,
+                                         canon=lambda w: canonical_host(w, pool, fleet_dir))
             if time.monotonic() >= deadline:
                 raise AdmitRefused(f"{task_id}: board tick lock busy for {_LOCK_WAIT_SECONDS:.0f}s; retry")
             time.sleep(0.2)
 
 
 def _admit_locked(conn, task_id, host, reason, pool, signal, board, spawn_fn,
-                  measure_local_fn, measure_remote_fn) -> dict:
+                  measure_local_fn, measure_remote_fn, canon: Callable[[str], str] = lambda w: w) -> dict:
     from hermes_cli import kanban_headroom as kh
 
     task = kb.get_task(conn, task_id)
     if task is None:
         raise AdmitRefused(f"{task_id}: no such card")
     if task.status == "running" or (task.current_run_id is not None and task.claim_lock):
-        raise AdmitRefused(f"{task_id}: already running on {_running_host(conn, task)}")
+        raise AdmitRefused(f"{task_id}: already running on {_running_host(conn, task, canon)}")
     if task.status != "ready" or task.claim_lock:
         raise AdmitRefused(f"{task_id}: status is {task.status}, admit takes a ready card only")
     if getattr(task, "no_worker", False):
@@ -310,6 +370,9 @@ def _admit_locked(conn, task_id, host, reason, pool, signal, board, spawn_fn,
     if host not in hosts:
         raise AdmitRefused(f"{task_id}: {host} is not eligible for this card ({why}); "
                            f"eligible: {', '.join(sorted(hosts)) or 'none'}")
+    browser = browser_refusal(conn, row, host, assignee)
+    if browser is not None:
+        raise AdmitRefused(f"{task_id}: {browser}")
     pool_host = None if host == LOCAL else {h.name: h for h in pool.pool_hosts}[host]
     m = measure_local_fn() if pool_host is None else measure_remote_fn(pool_host, signal)
     danger = floor_refusal(m)
@@ -349,11 +412,23 @@ def _spawn(conn, task_id, host, pool_host, payload, signal, board, spawn_fn, kh)
             raise AdmitRefused(f"{task_id}: reservation failed: {exc}") from exc
     launch = kbd._LaunchState()
     try:
+        from hermes_cli.kanban_workspace_policy import (
+            WorkspaceUnavailable, validate_mount, validate_persisted, validate_target,
+        )
         try:
+            # The dispatcher's own workspace admission (kanban_db_dispatch, ready
+            # path): protected root, mount, target and persisted checks.
+            protected = kb._validate_workspace_admission(claimed, board=board, conn=conn)
             if claimed.workspace_kind == "worktree":
                 workspace, branch = kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace, branch = kbw.resolve_workspace(claimed, board=board), None
+            if protected is not None:
+                validate_mount(protected.root, expected_mount=protected.mount_path)
+                validate_target(protected.root, workspace)
+                validate_persisted(workspace)
+        except WorkspaceUnavailable as exc:
+            raise _WorkspaceRefused(str(exc)) from exc
         except Exception as exc:
             raise RuntimeError(f"workspace: {exc}") from exc
         kbw.set_workspace_path(conn, claimed.id, str(workspace))
@@ -396,6 +471,15 @@ def _spawn(conn, task_id, host, pool_host, payload, signal, board, spawn_fn, kh)
                 arg=host, rule="admission_override", placed_host=pool_host, plan=None,
                 entry="admit", gate=gate, take_refusal=None),
         )
+    except _WorkspaceRefused as exc:
+        # Nothing launched: release the claim exactly as the dispatcher does
+        # (workspace_refused run, no failure count), refund the reservation.
+        if rid:
+            kh.release_id(signal, rid)
+        from types import SimpleNamespace
+        kb._release_claim_for_workspace_refusal(
+            conn, claimed.id, SimpleNamespace(workspace_refused=[], stranded_by_mount_loss=[]), str(exc))
+        raise AdmitRefused(f"{task_id}: workspace unavailable: {exc}") from exc
     except Exception as exc:
         kbd._stop_own_spawn(launch.proc)
         if launch.launched and launch.pid:
