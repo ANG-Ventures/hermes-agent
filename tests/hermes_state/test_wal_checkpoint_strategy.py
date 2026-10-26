@@ -59,9 +59,10 @@ class TestTryWalCheckpointPassive:
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = tracking_execute
         mock_conn.fetchone.return_value = None
-        db._conn = mock_conn
+        db._ckpt_conn = mock_conn  # the periodic checkpoint runs on its own connection
 
         db._try_wal_checkpoint()
+        db._ckpt_conn = None
 
         passive_calls = [c for c in execute_calls if "wal_checkpoint(PASSIVE)" in c]
         truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
@@ -75,15 +76,14 @@ class TestTryWalCheckpointPassive:
     def test_failed_checkpoint_never_raises_and_is_not_silent(self, db, caplog):
         """The periodic checkpoint runs from the write path: a failing PASSIVE
         checkpoint must not raise into the caller, and must leave a WARNING."""
-        real_conn = db._conn
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = sqlite3.OperationalError("disk I/O error")
-        db._conn = mock_conn
+        db._ckpt_conn = mock_conn
         try:
             with caplog.at_level(logging.WARNING, logger="hermes_state"):
                 db._try_wal_checkpoint()
         finally:
-            db._conn = real_conn
+            db._ckpt_conn = None
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
@@ -220,6 +220,74 @@ class TestCheckpointFrequency:
                 (f"sess_{_i}", "test", _time.time()),
             ))
 
+        if db._ckpt_thread is not None:
+            db._ckpt_thread.join(10)  # the periodic checkpoint now runs in the background
         assert call_count[0] == 1, (
             f"Expected 1 checkpoint after {n} writes, got {call_count[0]}"
         )
+
+
+class TestCheckpointNeverHoldsTheWriteLock:
+    """2026-10-25, live gateway: the periodic PASSIVE checkpoint ran under SessionDB._lock and held
+    19-23 queued writers for >=42 s on a 6.25 GB state.db (py-spy: _try_wal_checkpoint -> PRAGMA at the
+    lock holder). PASSIVE itself never blocks writers; the Python lock around it did."""
+
+    def _blocking_ckpt(self, db):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        real = db._checkpoint_conn_locked()
+
+        class Slow:
+            def execute(self, sql, *a, **k):
+                if "wal_checkpoint" in sql:
+                    entered.set()
+                    release.wait(10)
+                return real.execute(sql, *a, **k)
+
+        db._ckpt_conn = Slow()
+        return entered, release, real
+
+    def test_a_write_completes_while_a_checkpoint_is_running(self, db):
+        """Red on base: the PRAGMA ran inside `with self._lock`, so this write waited for it."""
+        import threading
+        import time as _time
+        entered, release, real = self._blocking_ckpt(db)
+        t = threading.Thread(target=db._try_wal_checkpoint)
+        t.start()
+        try:
+            assert entered.wait(5), "checkpoint never started"
+            started = _time.monotonic()
+            db._execute_write(lambda conn: conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES ('w', 'test', 0)"))
+            assert _time.monotonic() - started < 2.0, "a writer waited on the running checkpoint"
+        finally:
+            release.set()
+            t.join(10)
+            db._ckpt_conn = real
+
+    def test_the_interval_writer_does_not_wait_for_the_checkpoint(self, db):
+        """Red on base: the Nth write ran the checkpoint inline before returning."""
+        import time as _time
+        entered, release, real = self._blocking_ckpt(db)
+        try:
+            n = db._CHECKPOINT_EVERY_N_WRITES
+            started = _time.monotonic()
+            for i in range(n):
+                db._execute_write(lambda conn, _i=i: conn.execute(
+                    "INSERT INTO sessions (id, source, started_at) VALUES (?, 'test', 0)", (f"k{_i}",)))
+            assert entered.wait(5), "the interval write did not start a checkpoint"
+            assert _time.monotonic() - started < 5.0, "the interval writer waited for the checkpoint"
+        finally:
+            release.set()
+            if db._ckpt_thread is not None:
+                db._ckpt_thread.join(10)
+            db._ckpt_conn = real
+
+    def test_close_closes_the_checkpoint_connection(self, db):
+        db._try_wal_checkpoint()
+        assert db._ckpt_conn is not None
+        conn = db._ckpt_conn
+        db.close()
+        assert db._ckpt_conn is None
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")

@@ -518,6 +518,31 @@ class TestIterBackupFiles:
         assert {"worktrees/c/pinned.json", "worktrees/c/flagged.txt"} <= got, got
         assert "worktrees/c/plain.py" not in got
 
+    def test_combined_skip_worktree_and_assume_unchanged_is_never_clean(self, tmp_path):
+        """Prism 5cdbb59d31bc on #2305: a file with BOTH flags shows as lowercase `s` in `git ls-files -v`, which
+        the h/S filter admitted as clean, dropping its local edit. Only a plain `H` entry may be clean."""
+        import shutil as _sh
+        if _sh.which("git") is None:
+            pytest.skip("git not installed")
+        from hermes_cli import backup as B
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        parent = tmp_path / "parent"
+        self._git(tmp_path, "init", "-q", "-b", "main", str(parent))
+        for rel in ("plain.py", "config.json"):
+            (parent / rel).write_text("base\n")
+        self._git(parent, "add", "-A")
+        self._git(parent, "commit", "-q", "-m", "base")
+        clone = root / "worktrees" / "c"                        # HEAD == origin/main: dirty-only
+        self._git(tmp_path, "clone", "-q", str(parent), str(clone))
+        self._git(clone, "update-index", "--skip-worktree", "config.json")
+        self._git(clone, "update-index", "--assume-unchanged", "config.json")
+        (clone / "config.json").write_text("LOCAL EDIT\n")
+        assert self._git(clone, "ls-files", "-v", "config.json").startswith("s ")   # the premise: lowercase s
+        got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
+        assert "worktrees/c/config.json" in got, got
+        assert "worktrees/c/plain.py" not in got
+
     def test_manual_and_automatic_paths_share_one_walk(self, tmp_path):
         """Both backup entry points must select the identical file set.
 
