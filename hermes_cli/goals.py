@@ -501,6 +501,8 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
+    # Bumped by every GoalManager save; GoalManager._save compares the stored row before writing.
+    revision: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -509,7 +511,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at")}
         return cls(
             goal=data.get("goal", ""),
@@ -686,23 +688,28 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
 
 def load_goal(session_id: str) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
+    return _load_goal_raw(session_id)[0]
+
+
+def _load_goal_raw(session_id: str) -> Tuple[Optional[GoalState], Optional[str]]:
+    """``(state, stored row text)``; the text is the revision GoalManager._save compares against."""
     if not session_id:
-        return None
+        return None, None
     db = _get_session_db()
     if db is None:
-        return None
+        return None, None
     try:
         raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
         logger.debug("GoalManager: get_meta failed: %s", exc)
-        return None
+        return None, None
     if not raw:
-        return None
+        return None, None
     try:
-        return GoalState.from_json(raw)
+        return GoalState.from_json(raw), raw
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
-        return None
+        return None, raw
 
 
 def list_active_goal_session_ids() -> List[str]:
@@ -1279,7 +1286,8 @@ class GoalManager:
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._state, self._stored = _load_goal_raw(session_id)
+        self.lost_write = False   # a save found the row changed since load (another writer won)
 
     # --- introspection ------------------------------------------------
 
@@ -1324,8 +1332,30 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
+    def _save(self, *, force: bool = False) -> Optional[GoalState]:
+        """Compare-and-set against the row this manager loaded: a writer holding a stale copy (the
+        post-delivery /goal judge while the user ran /goal pause or clear) drops its write and adopts
+        the stored state instead of resurrecting it. ``force``: an explicit user verb, always wins."""
+        db = _get_session_db() if self.session_id and self._state is not None else None
+        if db is None or force:
+            if self._state is not None:
+                self._state.revision += 1
+            save_goal(self.session_id, self._state)
+            self._stored = self._state.to_json() if self._state is not None else None
+            return self._state
+        self._state.revision += 1
+        raw = self._state.to_json()
+        try:
+            written = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
+        except Exception as exc:
+            logger.debug("GoalManager: compare_and_set_meta failed: %s", exc)
+            return self._state
+        if written:
+            self._stored = raw
+        else:
+            logger.info("GoalManager: goal for %s changed since load; dropped the stale write", self.session_id)
+            self.lost_write = True
+            self._state, self._stored = _load_goal_raw(self.session_id)
         return self._state
 
     def _require_goal(self) -> GoalState:
@@ -1356,7 +1386,7 @@ class GoalManager:
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
         )
-        return self._save()
+        return self._save(force=True)
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""
@@ -1371,7 +1401,7 @@ class GoalManager:
         self._state.status = "paused"
         self._state.paused_reason = reason
         self._state.clear_wait()   # a wait barrier is meaningless once paused
-        return self._save()
+        return self._save(force=True)
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
@@ -1381,13 +1411,13 @@ class GoalManager:
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
-        return self._save()
+        return self._save(force=True)
 
     def clear(self) -> None:
         if self._state is None:
             return
         self._state.status = "cleared"
-        self._save()
+        self._save(force=True)
         self._state = None
 
     def mark_done(self, reason: str) -> None:
@@ -1663,7 +1693,17 @@ class GoalManager:
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
-    def evaluate_after_turn(
+    def evaluate_after_turn(self, last_response: str, **kwargs: Any) -> Dict[str, Any]:
+        """See ``_evaluate_after_turn``. A save that lost to a newer stored state (the user paused,
+        cleared or replaced the goal while the judge ran) never continues on the stale copy."""
+        self.lost_write = False
+        decision = self._evaluate_after_turn(last_response, **kwargs)
+        if not self.lost_write:
+            return decision
+        status = self._state.status if self._state else None
+        return {**_decision(status, False, None, "stale", "goal changed while the judge ran", ""), "held": "stale"}
+
+    def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0, real_event: bool = False, made_tool_calls: Optional[bool] = None,
