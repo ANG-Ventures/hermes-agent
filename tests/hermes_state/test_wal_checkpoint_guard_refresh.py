@@ -35,12 +35,6 @@ class _TimedLock:
         self._inner.release()
         return False
 
-    def acquire(self, *a, **kw):
-        return self._inner.acquire(*a, **kw)
-
-    def release(self):
-        self._inner.release()
-
 
 @pytest.fixture()
 def scans(monkeypatch):

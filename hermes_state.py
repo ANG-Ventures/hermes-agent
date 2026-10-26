@@ -1796,10 +1796,7 @@ class SessionDB(
         The PRAGMA runs on a dedicated connection OUTSIDE self._lock: SQLite's PASSIVE mode does not block
         writers, but holding the process-wide Python write lock around it did (every writer queued for the
         whole checkpoint). Only the guard refresh and the connection lookup take self._lock.
-
-        The guard refresh is an fd-table scan (~500 fstats, each a GIL handoff under load), so it runs only
-        when the guard can have changed: the checkpoint connection's first use, or a -shm inode the guard
-        does not hold yet (t_0d85826a: 13.8% of write-path samples were this scan under _lock).
+        The guard refresh (an fd-table scan) runs only on the checkpoint conn's first use or a new -shm inode.
         """
         if self._quarantine_reason() is not None:
             return
