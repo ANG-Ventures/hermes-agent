@@ -2555,3 +2555,89 @@ def test_export_keeps_a_job_a_degraded_sibling_created_after_the_snapshot(temp_h
     cj.export_runtime_to_json(retire=False)
     ids = {j["id"] for j in cj.load_jobs()}
     assert {a["id"], "sibling-b", "sibling-c"} <= ids, ids
+
+
+def test_retire_drop_is_inside_the_empty_check_transaction(temp_home, monkeypatch):
+    """1756ca4cf04c: a sibling cannot commit a row between the final empty-table check and the
+    unlink: both happen inside one BEGIN IMMEDIATE transaction, so the sibling's write blocks
+    (busy) until the db is gone and then recreates a fresh db rather than losing a row."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+    import sqlite3
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="txn")
+    cj.mark_job_run(created["id"], True)
+    real_drop = rs.drop_database
+    seen = {}
+
+    def sibling_write_then_drop(cron_dir):
+        # a degraded sibling tries to commit while we hold the writer slot
+        sib = sqlite3.connect(str(rs.db_path(cron_dir)), timeout=0.2)
+        try:
+            sib.execute("BEGIN IMMEDIATE")
+            sib.execute("INSERT INTO job_runtime(job_id, fields, updated_at) VALUES ('J', '{}', 0)")
+            sib.execute("COMMIT")
+            seen["committed"] = True
+        except sqlite3.OperationalError as e:
+            seen["busy"] = str(e)
+        finally:
+            sib.close()
+        return real_drop(cron_dir)
+
+    monkeypatch.setattr(rs, "drop_database", sibling_write_then_drop)
+    cj.export_runtime_to_json(retire=True)
+    assert "busy" in seen and "committed" not in seen, seen
+    assert not _db(temp_home).exists()
+
+
+def test_full_save_after_its_row_was_folded_keeps_the_folded_values(temp_home, monkeypatch):
+    """c2d58ecce953: a full-store save (not the single-job fast path) whose baseline row was folded
+    and retired by an export in ANOTHER process must rebase against the folded record, not
+    resurrect its stale copy."""
+    import copy
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="fold-full")
+    cj.mark_job_run(created["id"], False, error="old")
+    with cj._jobs_lock():
+        jobs = cj.load_jobs()  # this section's baseline: row present, last_error=old
+        frozen = copy.deepcopy(cj._jobs_lock_state.load_baseline)
+        # another PROCESS updates last_error and exports with retire (its own lock section)
+        cj.mark_job_run(created["id"], False, error="newer")
+        cj.export_runtime_to_json(retire=True)
+        assert not _db(temp_home).exists()
+        cj._jobs_lock_state.load_baseline = frozen  # ours is unchanged by the other process
+        j = next(j for j in jobs if j["id"] == created["id"])
+        j["last_dispatch"] = "mine"
+        cj.save_jobs(jobs)
+    merged = next(j for j in cj.load_jobs() if j["id"] == created["id"])
+    assert merged["last_error"] == "newer", merged
+    assert merged.get("last_dispatch") == "mine"
+
+
+def test_export_reconciles_a_degraded_sibling_edit_to_an_existing_job(temp_home, monkeypatch):
+    """4f29022e225a: a degraded sibling PAUSES job J between the export's read and its publish; the
+    export must not republish its stale enabled=True over the pause."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="pause-race")
+    cj.mark_job_run(created["id"], True)
+    store = cj._current_cron_store()
+    real_merge = cj._merge_unexpected_disk_jobs
+    state = {}
+
+    def sibling_pause_then_merge(defs, **kw):
+        if "p" not in state:
+            data = json.loads(store.jobs_file.read_text(encoding="utf-8"))
+            for j in data["jobs"]:
+                if j["id"] == created["id"]:
+                    j["enabled"] = False
+                    j["state"] = "paused"
+            store.jobs_file.write_text(json.dumps(data), encoding="utf-8")
+            state["p"] = True
+        return real_merge(defs, **kw)
+
+    monkeypatch.setattr(cj, "_merge_unexpected_disk_jobs", sibling_pause_then_merge)
+    cj.export_runtime_to_json(retire=False)
+    merged = next(j for j in cj.load_jobs() if j["id"] == created["id"])
+    assert merged.get("enabled") is False and merged.get("state") == "paused", merged

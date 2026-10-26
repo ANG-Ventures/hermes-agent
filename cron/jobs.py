@@ -2322,6 +2322,10 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
                 raise RuntimeError(
                     f"{jobs_file} has no jobs list; refusing runtime export "
                     f"(rows kept in {_rs.DB_NAME})")
+            # Prism 4f29022e225a: record what we read as this section's baseline, so the publish's
+            # shrink-merge reconciles a degraded sibling's edit to an EXISTING job (a pause) per
+            # field instead of republishing our stale definition over it.
+            _record_load_baseline(jobs)
         _guard_against_test_write_to_live_store(jobs_file)
         _recover_pending_now()  # a generation the file names is part of the rows to export
         # Count what we could NOT read (Prism 61ba1c33f294): a row that is not a JSON object has
@@ -2388,16 +2392,21 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
             # that entered degraded mode can commit a row we never read (a job with no row before)
             # between the snapshot and here; dropping the file would lose it unfolded. Drop only an
             # EMPTY table, else keep the db and refuse/log exactly as a changed row does.
+            # Prism 1756ca4cf04c: the empty check and the unlink happen inside ONE write
+            # transaction (BEGIN IMMEDIATE holds the db's single writer slot). A degraded sibling's
+            # write waits on that slot (or fails busy) and cannot commit between the check and the
+            # removal; after the unlink its retry recreates a fresh empty db, no row is lost.
             with _runtime_txn() as conn:
                 left = [r[0] for r in conn.execute("SELECT job_id FROM job_runtime").fetchall()]
-            if left:
-                msg = (f"{len(left)} runtime row(s) appeared while exporting ({', '.join(left)}); "
-                       f"{_rs.DB_NAME} kept (not folded into jobs.json). Re-run the export")
-                if keep_orphans:
-                    logger.warning("cron runtime-state: %s", msg)
-                    return applied
-                raise RuntimeRetireRefused(msg)
-            _rs.drop_database(cron_dir)
+                if left:
+                    msg = (f"{len(left)} runtime row(s) appeared while exporting "
+                           f"({', '.join(left)}); {_rs.DB_NAME} kept (not folded into jobs.json). "
+                           "Re-run the export")
+                    if keep_orphans:
+                        logger.warning("cron runtime-state: %s", msg)
+                        return applied
+                    raise RuntimeRetireRefused(msg)
+                _rs.drop_database(cron_dir)
         logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
                        "jobs.json%s", applied, f" and removed {_rs.DB_NAME}" if retire else "")
         return applied
@@ -2481,6 +2490,18 @@ class _SingleJobScope:
         self.removed: Optional[Collection[str]] = None
 
 
+def _folded_runtime_rows() -> Dict[str, Dict[str, Any]]:
+    """Runtime halves of every record in jobs.json on disk (the folded values after an export
+    retired the database). Empty when the file is unreadable."""
+    try:
+        data, _ = _parse_jobs_file(_current_cron_store().jobs_file)
+    except Exception:
+        return {}
+    file_jobs = data.get("jobs") if isinstance(data, dict) else data
+    return {str(j.get("id")): _rs.split_job(copy.deepcopy(j))[1]
+            for j in (file_jobs or []) if isinstance(j, dict) and j.get("id")}
+
+
 def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
     """``_with_job`` fast path (sqlite mode, caller holds ``_jobs_lock``): build ONE record from
     the cached definition + its row, run *fn* on a one-element list, then persist only the row
@@ -2535,13 +2556,7 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
             # while *fn* ran; its values now live in jobs.json). Merging against {} would read every
             # unchanged baseline field as a concurrent delete and write a partial row that then
             # overrides the folded file. Reconcile against the folded record instead.
-            try:
-                data, _ = _parse_jobs_file(_current_cron_store().jobs_file)
-            except Exception:
-                data = None
-            file_jobs = data.get("jobs") if isinstance(data, dict) else data
-            folded = next((_rs.split_job(copy.deepcopy(j))[1] for j in (file_jobs or [])
-                           if isinstance(j, dict) and str(j.get("id")) == str(job_id)), None)
+            folded = _folded_runtime_rows().get(str(job_id))
             disk = folded if folded is not None else dict(base_runtime)
         disk = disk or {}
         merged = _reconcile_job_fields(new_runtime, disk, base_runtime) if disk != base_runtime \
@@ -3015,10 +3030,19 @@ def _save_split_unlocked(
     def merged_changes(conn) -> Tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Any]]:
         disk_rows = _rs._rows_of(conn)
         out: Dict[str, Dict[str, Any]] = {}
+        folded_rows: Optional[Dict[str, Dict[str, Any]]] = None
         for jid, row in changed.items():
-            if not replace and base_runtime is not None and jid in disk_rows \
-                    and jid in base_runtime:
-                row = _reconcile_job_fields(row, disk_rows[jid], base_runtime[jid])
+            if not replace and base_runtime is not None and jid in base_runtime:
+                if jid in disk_rows:
+                    row = _reconcile_job_fields(row, disk_rows[jid], base_runtime[jid])
+                elif base_runtime[jid]:
+                    # Prism c2d58ecce953: our baseline row is GONE (an export folded and retired
+                    # it; its newer values live in jobs.json). Rebase against the folded record,
+                    # as _with_job_runtime does, instead of resurrecting our stale copy.
+                    if folded_rows is None:
+                        folded_rows = _folded_runtime_rows()
+                    if jid in folded_rows:
+                        row = _reconcile_job_fields(row, folded_rows[jid], base_runtime[jid])
             out[jid] = row
         deletes = [str(i) for i in (removed_ids or ()) if i]
         if replace and prune_runtime:
