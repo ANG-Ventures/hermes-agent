@@ -919,6 +919,42 @@ class GatewayShutdownMixin:
         from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
+    async def _open_resume_mark_batch(self, log_prefix: str):
+        """Open the store's resume-mark batch off-loop; returns the store, or None to save per mark.
+
+        Cancellation-safe: ``begin`` runs in a worker thread that a cancel cannot stop, so a cancel
+        that lands while it waits for the store lock (or after it returned) is answered by closing
+        the batch from that thread / the executor. Every completed begin gets exactly one end.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None or not hasattr(store, "begin_resume_mark_batch"):
+            return None
+        gate = threading.Lock()
+        state = {"cancelled": False, "opened": False}
+
+        def _begin() -> bool:
+            store.begin_resume_mark_batch()
+            with gate:
+                if not state["cancelled"]:
+                    state["opened"] = True
+                    return True
+            store.end_resume_mark_batch()  # cancelled before we got here: nothing marked, close it
+            return False
+
+        try:
+            return store if await asyncio.to_thread(_begin) else None
+        except asyncio.CancelledError:
+            with gate:
+                state["cancelled"] = True
+                close_now = state["opened"]
+            if close_now:
+                # begin finished but its result never reached us; close off-loop, do not block the loop.
+                asyncio.get_running_loop().run_in_executor(None, store.end_resume_mark_batch)
+            raise
+        except Exception as e:
+            logger.warning("%s: could not open the mark batch: %s", log_prefix, e)
+            return None
+
     async def _mark_running_sessions_resume_pending(self, log_prefix: str, *, interrupted: bool = False) -> list:
         """Mark every non-pending running session resume_pending; returns the keys marked.
 
@@ -941,11 +977,9 @@ class GatewayShutdownMixin:
         _todo = [_sk for _sk, _agent in list(self._running_agents.items()) if _agent is not _AGENT_PENDING_SENTINEL]
         if not _todo:
             return marked
-        _store = None
         _t0 = time.monotonic()
-        with _log_suppressed(logging.WARNING, "%s: could not open the mark batch: %s", log_prefix):
-            await asyncio.to_thread(self.session_store.begin_resume_mark_batch)
-            _store = self.session_store
+        _store = await self._open_resume_mark_batch(log_prefix)
+        _alerts: list[str] = []
         try:
             for _sk in _todo:
                 with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
@@ -954,18 +988,24 @@ class GatewayShutdownMixin:
                         if _marked:
                             marked.append(_sk)
                         if _alert and callable(_notify_suspended):
-                            await _notify_suspended(_sk)
+                            _alerts.append(_sk)
                     else:
                         await self.async_session_store.mark_resume_pending(_sk, reason)
                         marked.append(_sk)
         finally:
             if _store is not None:
-                # FAIL-OPEN: a failed save is logged and never aborts the stop.
+                # FAIL-OPEN: a failed save is logged and never aborts the stop. A cancel that lands
+                # here still lets the worker thread finish the save (to_thread is not interruptible).
                 with _log_suppressed(logging.WARNING, "%s: batched sessions.json save failed: %s", log_prefix):
                     await asyncio.to_thread(_store.end_resume_mark_batch)
             logger.info(
                 "Shutdown phase: %s marked %d session(s) in %.2fs", log_prefix, len(marked), time.monotonic() - _t0,
             )
+        # Replay alerts go out only AFTER the batched save: a stalled notification must never keep a
+        # mark from becoming durable before the service manager kills the process.
+        for _sk in _alerts:
+            with _log_suppressed(logging.DEBUG, "%s replay alert failed for %s: %s", log_prefix, _sk):
+                await _notify_suspended(_sk)
         return marked
 
     def _restart_notification_allowed(self, platform: Platform) -> bool:

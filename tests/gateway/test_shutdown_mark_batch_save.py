@@ -81,3 +81,80 @@ def test_mark_outside_a_batch_still_saves_immediately(tmp_path):
     store._save = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
     assert store.mark_resume_pending(entry.session_key, "restart_timeout") is True
     assert len(calls) == 1
+
+
+def test_cancel_while_opening_the_batch_leaves_no_open_batch(tmp_path, monkeypatch):
+    """Prism 55d3f612994e: a cancel while ``begin`` waits on the store lock must not leave the
+    batch depth raised (that would silently defer every later resume-mark save)."""
+    import threading
+    from gateway.run import GatewayRunner
+
+    runner, store, keys, _saves = _runner_with_sessions(tmp_path, monkeypatch, n=2)
+    entered = threading.Event()
+    real_begin = store.begin_resume_mark_batch
+
+    def _slow_begin():
+        entered.set()
+        real_begin()
+
+    monkeypatch.setattr(store, "begin_resume_mark_batch", _slow_begin)
+
+    async def _scenario():
+        store._lock.acquire()
+        try:
+            task = asyncio.create_task(GatewayRunner._mark_running_sessions_resume_pending(runner, "mark"))
+            await asyncio.to_thread(entered.wait, 5)
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            store._lock.release()
+        for _ in range(100):  # the begin thread finishes after the lock is released
+            await asyncio.sleep(0.01)
+            if not getattr(store, "_resume_mark_batch_depth", 0):
+                break
+
+    asyncio.run(_scenario())
+    assert getattr(store, "_resume_mark_batch_depth", 0) == 0
+    calls = []
+    real = store._save
+    store._save = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    assert store.mark_resume_pending(keys[0], "restart_timeout") is True
+    assert len(calls) == 1, "a mark after the cancelled pass must still save immediately"
+
+
+def test_stalled_replay_alert_does_not_delay_the_durable_save(tmp_path, monkeypatch):
+    """Prism 353a5b148665: the replay alert is sent AFTER the batched save, so a notification
+    that stalls until the stop deadline cannot keep the marks out of sessions.json."""
+    from gateway.run import GatewayRunner
+
+    runner, store, keys, _saves = _runner_with_sessions(tmp_path, monkeypatch, n=3)
+
+    def _mark(sk, interrupted=False):
+        store.mark_resume_pending(sk, "restart_timeout")
+        return True, "restart_timeout", True
+
+    durable_at_alert = []
+
+    async def _notify(sk):
+        reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        reloaded._ensure_loaded()
+        durable_at_alert.append(all(reloaded._entries[k].resume_pending for k in keys))
+        await asyncio.sleep(3600)  # stalls until the process is killed
+
+    runner._mark_resume_pending_for_shutdown = _mark
+    runner._notify_restart_loop_suspended = _notify
+
+    async def _scenario():
+        task = asyncio.create_task(GatewayRunner._mark_running_sessions_resume_pending(runner, "mark"))
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if durable_at_alert:
+                break
+        task.cancel()  # the stop deadline
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_scenario())
+    assert durable_at_alert == [True], durable_at_alert
