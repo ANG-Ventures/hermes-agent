@@ -123,6 +123,9 @@ def fill(kb, conn: sqlite3.Connection, task, comments: list, runs: list, events:
         for table in ("task_comments", "task_runs", "task_events"):
             rows = _archived_models(kb, conn, task, table)
             if table == "task_runs":
+                # Board wins on a duplicate id even when the run filters dropped the board copy.
+                board_ids = {r[0] for r in conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (task.id,))}
+                rows = [r for r in rows if r.id not in board_ids]
                 if not include_active:
                     rows = [r for r in rows if r.ended_at is not None]
                 if state_type is not None:

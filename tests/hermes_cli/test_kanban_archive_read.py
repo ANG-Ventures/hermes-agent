@@ -223,3 +223,35 @@ def test_show_does_not_attach_anything_to_the_board_connection(board):
         assert [row[1] for row in conn.execute("PRAGMA database_list")] == dbs
         assert "karch" not in dbs and "kevarch" not in dbs
         assert conn.execute("SELECT type, name FROM sqlite_temp_master").fetchall() == temp
+
+
+def test_board_run_wins_even_when_run_filters_drop_it(board):
+    from hermes_cli import kanban_archive_read as kar
+    tid = make_card()
+    archive(board, tid)
+    ca = sqlite3.connect(os.path.join(os.path.dirname(board), "kanban-archive.db"))
+    rid = ca.execute("SELECT id FROM archived_runs WHERE task_id=?", (tid,)).fetchone()[0]
+    ca.close()
+    with kb.connect() as conn:
+        conn.execute("INSERT INTO task_runs (id, task_id, status, started_at, ended_at) VALUES (?,?,?,?,?)",
+                     (rid, tid, "failed", 1, 2))
+        conn.commit()
+        task = kb.get_task(conn, tid)
+        runs = kb.list_runs(conn, tid, state_type="status", state_name="done")
+        assert runs == []
+        _c, runs, _e = kar.fill(kb, conn, task, [], runs, [], state_type="status", state_name="done")
+    assert runs == []
+
+
+def test_latest_review_reviewer_comes_from_archived_events(board):
+    tid = make_card()
+    with kb.connect() as conn:
+        rid = conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
+        conn.execute("UPDATE task_runs SET outcome='changes_requested' WHERE id=?", (rid,))
+        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+                     (tid, rid, "changes_requested", json.dumps({"reviewer": "apollo"}), 5))
+        conn.commit()
+    assert tool_show(tid)["latest_review"]["reviewer"] == "apollo"
+    archive(board, tid)
+    out = tool_show(tid)
+    assert out["latest_review"]["run_id"] == rid and out["latest_review"]["reviewer"] == "apollo"
