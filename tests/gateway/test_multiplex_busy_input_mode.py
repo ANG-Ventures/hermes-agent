@@ -127,6 +127,7 @@ async def test_secondary_profile_busy_mode_controls_live_busy_behavior(
     agent = MagicMock()
     agent._active_children = []
     agent.steer.return_value = True
+    steer = agent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
     runner._running_agents[session_key] = agent
 
     result = await runner._handle_active_session_busy_message(event, session_key)
@@ -134,16 +135,16 @@ async def test_secondary_profile_busy_mode_controls_live_busy_behavior(
     assert result is handled
     assert adapter._busy_text_mode == expected_text_mode
     if expected_action == "queue":
-        agent.steer.assert_not_called()
+        steer.assert_not_called()
         agent.interrupt.assert_not_called()
     elif expected_action == "steer":
-        agent.steer.assert_called_once()
-        injected = agent.steer.call_args.args[0]
+        steer.assert_called_once()
+        injected = steer.call_args.args[0]
         assert injected.endswith("follow up")
         assert '"chat_id": "chat-1"' in injected
         agent.interrupt.assert_not_called()
     else:
-        agent.steer.assert_not_called()
+        steer.assert_not_called()
         agent.interrupt.assert_called_once_with("follow up")
 
 
@@ -167,17 +168,18 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
     agent = MagicMock()
     agent._active_children = []
     agent.steer.return_value = True
+    steer = agent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
     runner._running_agents[session_key] = agent
 
     assert await runner._handle_message(event) is None
 
     agent.interrupt.assert_not_called()
     if secondary_mode == "queue":
-        agent.steer.assert_not_called()
+        steer.assert_not_called()
         assert adapter._pending_messages[session_key] is event
     else:
-        agent.steer.assert_called_once()
-        injected = agent.steer.call_args.args[0]
+        steer.assert_called_once()
+        injected = steer.call_args.args[0]
         assert injected.endswith("follow up")
         assert '"chat_id": "chat-1"' in injected
         assert session_key not in adapter._pending_messages
@@ -320,13 +322,14 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
     agent = MagicMock()
     agent._active_children = []
     agent.steer.return_value = True
+    steer = agent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
     runner._running_agents[routed_session_key] = agent
 
     await adapter.handle_message(event)
 
     assert event.source.profile == "research"
-    agent.steer.assert_called_once()
-    injected = agent.steer.call_args.args[0]
+    steer.assert_called_once()
+    injected = steer.call_args.args[0]
     assert injected.endswith("follow up")
     assert '"chat_id": "chat-1"' in injected
     agent.interrupt.assert_not_called()
