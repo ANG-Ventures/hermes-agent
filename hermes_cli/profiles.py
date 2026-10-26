@@ -2192,54 +2192,19 @@ def _staged_cron_dir(staged: Path) -> Path:
 
 
 def _capture_cron_pair(profile_dir: Path, staged_cron: Path) -> None:
-    """Re-copy the staged ``cron/jobs.json`` + ``cron/runtime_state.db`` as ONE consistent unit:
-    under the profile's cron store lock, the db through the SQLite backup API (a raw copytree of a
-    live WAL database can pair a main file with a -wal from a different moment, and a remove_job
-    between the two copies pairs a definition with no row). The staged -wal/-shm are dropped (the
-    backup image owns none). Raises ValueError when the db cannot be captured (t_94e91559).
+    """I4 (t_82c613d9): replace copytree's two-moment copy of the cron pair with ONE capture of
+    the live pair under the profile's cron store lock (``cron.store_pair.capture``). The export
+    folds it (``store_pair.scrub``) after ``extra_files`` are applied, so an explicit
+    cron/jobs.json override is folded with the live rows (Prism 13e40ddef8fa). Raises ValueError
+    when the live pair cannot be captured. Only the STAGED copy is touched."""
+    from cron import store_pair
 
-    Whether the live db exists is decided UNDER the lock (Prism 4b5951846a0e): a runtime-export
-    that retired the db after copytree must not leave copytree's two-moment db/jobs.json pair for
-    the fold. Staged db files are always removed first, so a stray -wal/-shm with no main db
-    (Prism 789c2932efbe) never reaches the archive. Only the STAGED copy is touched."""
-    from cron.runtime_state import DB_NAME, SIDECAR_SUFFIXES
-    from hermes_cli.backup import _cron_store_lock
-    from hermes_cli.backup_sqlite import _safe_copy_db
-
-    src_cron = profile_dir / "cron"
     if not staged_cron.is_dir():
         return
-    with _cron_store_lock(profile_dir):
-        staged_had_db = (staged_cron / DB_NAME).exists()
-        live_has_db = (src_cron / DB_NAME).exists()
-        if not staged_had_db:
-            stray = [DB_NAME + sfx for sfx in SIDECAR_SUFFIXES[1:]
-                     if (staged_cron / (DB_NAME + sfx)).exists()]
-            if stray:
-                logger.warning("profile export: dropped stray %s (no %s) from the staged copy",
-                               ", ".join(stray), DB_NAME)
-        # -journal too (Prism 15391e1b7adf): a journal_mode=delete db's hot rollback journal holds
-        # pre-images of runtime rows and would reach the archive unscrubbed.
-        for sfx in SIDECAR_SUFFIXES:
-            with contextlib.suppress(FileNotFoundError):
-                (staged_cron / (DB_NAME + sfx)).unlink()
-        if not (staged_had_db or live_has_db):
-            return  # the store never had a db: copytree's jobs.json is one consistent file
-        # A db was involved: the live jobs.json is re-read under the lock (a retire that ran after
-        # copytree folded the runtime into it), and paired with the db captured below if any.
-        if (src_cron / "jobs.json").exists():
-            shutil.copy2(src_cron / "jobs.json", staged_cron / "jobs.json")
-        else:
-            # Prism 8f9783e7bc58: the live definitions are gone, so copytree's staged jobs.json
-            # is from another moment than the db captured below. Remove it: the fold then has
-            # no definitions, refuses, and the export fails closed instead of pairing the two.
-            with contextlib.suppress(FileNotFoundError):
-                (staged_cron / "jobs.json").unlink()
-        if not live_has_db:
-            return
-        if not _safe_copy_db(src_cron / DB_NAME, staged_cron / DB_NAME):
-            raise ValueError(f"refusing export: could not capture {src_cron / DB_NAME} "
-                             "consistently (SQLite backup failed)")
+    try:
+        store_pair.capture(profile_dir, staged_cron)
+    except store_pair.PairRefused as exc:
+        raise ValueError(f"refusing export: {exc}") from exc
 
 
 def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, str]] = None) -> Path:
@@ -2270,19 +2235,17 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
         # refused (no definitions to fold into) would ship unscrubbed: refuse the export instead.
         # The live pair is captured BEFORE extra_files, so an explicit cron/jobs.json override
         # wins over the captured copy (Prism 13e40ddef8fa).
-        from cron.runtime_state import db_path, fold_staged_copy
+        from cron import store_pair
         _capture_cron_pair(profile_dir, _staged_cron_dir(staged))
         for rel, content in (extra_files or {}).items():
             target = staged.joinpath(*normalize_archive_parts(rel))
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-        staged_cron = _staged_cron_dir(staged)
-        if db_path(staged_cron).exists() and not fold_staged_copy(staged_cron):
-            raise ValueError(
-                f"refusing export: {profile_dir / 'cron'} has a runtime_state.db that cannot be "
-                "folded in full into readable jobs.json definitions (the database would ship "
-                "unscrubbed); "
-                "repair cron/jobs.json or run `hermes cron runtime-export --to-json --retire` first")
+        _staged_cron_dir(staged)
+        # Every runtime_state.db* left anywhere in the staged tree (an extra_files cron dir, a
+        # stray *.pre-restore copy, a nested profile store) is folded or dropped: the scrubber
+        # below skips binaries (Prism 0191332b0702).
+        store_pair.scrub(staged)
         _scrub_export_secrets(staged)
         return Path(make_targz(base, tmpdir, canon))
 
@@ -2335,6 +2298,11 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
                 else:
                     child.unlink()
         drop_profile_role(final_source)
+        # I4 (t_82c613d9): an archive's cron store arrives as one jobs.json (exports fold the db
+        # into it). A db copy in a hand-built or older archive is folded or dropped, never
+        # installed beside a jobs.json from another moment.
+        from cron import store_pair
+        store_pair.scrub(final_source, what="import")
         shutil.move(str(final_source), str(profile_dir))
     return profile_dir
 

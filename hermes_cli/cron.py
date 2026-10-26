@@ -1039,12 +1039,13 @@ def cron_runtime_export(args) -> int:
     refuses (rc 2) while rows without a definition exist unless ``--drop-orphans``, and whenever the
     jobs lock is degraded. Orphan row ids are listed; without ``--retire`` they stay in the
     database. Idempotent (no db = 0 jobs)."""
-    from cron.jobs import (CronLockDegraded, RuntimeExportNotWritten, RuntimeRetireRefused,
-                           export_runtime_to_json)
+    from cron import store_pair
+    from cron.jobs import CronLockDegraded, RuntimeExportNotWritten, RuntimeRetireRefused
 
     retire = bool(getattr(args, "retire", False))
     try:
-        count = export_runtime_to_json(
+        # I4 (t_82c613d9): the fold (and --retire's db drop) is one pair operation.
+        count = store_pair.export_to_json(
             retire=retire, drop_orphans=bool(getattr(args, "drop_orphans", False)))
     except RuntimeRetireRefused as exc:  # orphans, or a degraded jobs lock
         print(color(f"runtime-export refused: {exc}", Colors.RED))
