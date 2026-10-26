@@ -4814,6 +4814,42 @@ def _tick_routes(result, ready_rows, row_route: dict, row_rules: dict, planned: 
         result.routes.append(entry)
 
 
+def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
+    """``(only, job)`` for a portable row: the pool hosts it may land on (None = any)
+    and its placement job. Shared by the ready loop and ``kanban admit`` (t_32e8796a)."""
+    _job = None
+    from hermes_cli import kanban_worker_pool as _kwp_take
+    try:
+        _skills = json.loads(row["skills"] or "[]") or []
+    except (TypeError, ValueError, IndexError, KeyError):
+        _skills = []
+    _skills = tuple(s for s in _skills if isinstance(s, str))
+    _targets = _manifest_targets(_skills, assignee) if _skills else {}
+    _only = _kwp_take.reach_allowed_hosts(
+        body=row["body"], skills=_skills, pool=plan.config, targets=_targets)
+    if getattr(getattr(plan, "signal", None), "placement_table", None) is not None:
+        from hermes_cli import kanban_headroom as _kh_job
+        _job = _kh_job.job_for_row(conn, row, affinity_targets=_targets)
+    # A body naming Studio-only resources lands only on a host
+    # whose caps cover them (t_aea826a9); never widen ``_only``.
+    _need_hosts = _kwp_take.needs_allowed_hosts(
+        row["body"], plan.config,
+        honor_declared=caps is not None and not caps.legacy_body)
+    if _need_hosts is not None:
+        _only = _need_hosts if _only is None else tuple(
+            h for h in _only if h.lower() in {n.lower() for n in _need_hosts})
+    if cap_only:
+        # Hosts advertising the card's capability (t_90887924),
+        # intersected with the reach proof when both apply.
+        _only = tuple(cap_only) if _only is None else \
+            tuple(h for h in _only if h in cap_only)
+    if wt_port is not None:
+        # A worktree card lands only where its repo's mirror is.
+        _only = wt_port[2] if _only is None else tuple(
+            h for h in _only if h.lower() in wt_port[2])
+    return _only, _job
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
@@ -7005,36 +7041,8 @@ def _dispatch_once_locked(
             _only = None
             _job = None
             if route == "portable":
-                from hermes_cli import kanban_worker_pool as _kwp_take
-                try:
-                    _skills = json.loads(row["skills"] or "[]") or []
-                except (TypeError, ValueError, IndexError, KeyError):
-                    _skills = []
-                _skills = tuple(s for s in _skills if isinstance(s, str))
-                _targets = _manifest_targets(_skills, row_assignee) if _skills else {}
-                _only = _kwp_take.reach_allowed_hosts(
-                    body=row["body"], skills=_skills, pool=spillover.config, targets=_targets)
-                if getattr(getattr(spillover, "signal", None), "placement_table", None) is not None:
-                    from hermes_cli import kanban_headroom as _kh_job
-                    _job = _kh_job.job_for_row(conn, row, affinity_targets=_targets)
-                # A body naming Studio-only resources lands only on a host
-                # whose caps cover them (t_aea826a9); never widen ``_only``.
-                _need_hosts = _kwp_take.needs_allowed_hosts(
-                    row["body"], spillover.config,
-                    honor_declared=_caps is not None and not _caps.legacy_body)
-                if _need_hosts is not None:
-                    _only = _need_hosts if _only is None else tuple(
-                        h for h in _only if h.lower() in {n.lower() for n in _need_hosts})
-                if _cap_only:
-                    # Hosts advertising the card's capability (t_90887924),
-                    # intersected with the reach proof when both apply.
-                    _only = tuple(_cap_only) if _only is None else \
-                        tuple(h for h in _only if h in _cap_only)
-                _wt_port = _worktree_ports.get(row["id"])
-                if _wt_port is not None:
-                    # A worktree card lands only where its repo's mirror is.
-                    _only = _wt_port[2] if _only is None else tuple(
-                        h for h in _only if h.lower() in _wt_port[2])
+                _only, _job = _portable_only(conn, row, row_assignee, spillover, _caps, _cap_only,
+                                             _worktree_ports.get(row["id"]))
             _board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
             # Scorer-backed takes (pins included) book a reservation for this card.
             _take_kw = {} if getattr(getattr(spillover, "signal", None), "placement_table", None) is None \
