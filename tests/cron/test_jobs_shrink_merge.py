@@ -254,3 +254,36 @@ def test_stale_save_keeps_a_row_the_journal_does_not_say_was_removed(hermes_env)
         jobs_file.write_text(json.dumps({"jobs": []}), encoding="utf-8")
         jobs._save_jobs_unlocked(stale)
     assert lost["id"] in {j["id"] for j in load_jobs()}
+
+
+@pytest.mark.parametrize("bad_line", [
+    b'{"job_id": [], "event": "created"}',        # unhashable job_id: TypeError on `in wanted`
+    b'{"job_id": {"a": 1}, "event": "removed"}',  # unhashable job_id (dict)
+    b'{"job_id": "x", "event": []}',              # unhashable event: TypeError on `in EVENTS`
+    b'\xff\xfe not utf-8 \x80',                   # undecodable bytes: UnicodeDecodeError from the iterator
+    b'[1, 2, 3]',                                 # valid JSON, not an object
+])
+def test_malformed_journal_line_does_not_discard_removal_evidence(hermes_env, bad_line):
+    """t_19a16be2 (Prism 66ed29e2672d on #2337): ONE malformed journal line made last_removed() raise
+    into its outer handler and return an empty set, so a stale save resurrected an API-removed job.
+    A bad line is skipped on its own; the valid `removed` evidence around it still counts."""
+    import cron.jobs as jobs
+    from cron.jobs import create_job, load_jobs
+    from cron.lifecycle_journal import JOURNAL_FILENAME, last_removed, record_removed
+
+    gone = create_job(prompt="gone", schedule="every 5m", name="gone", deliver="local")
+    jobs_file = jobs._current_cron_store().jobs_file
+    journal = hermes_env / "cron" / JOURNAL_FILENAME
+
+    with jobs._jobs_lock():
+        stale = jobs.load_jobs()
+        data = json.loads(jobs_file.read_text(encoding="utf-8"))
+        data["jobs"] = [j for j in data["jobs"] if j["id"] != gone["id"]]
+        jobs_file.write_text(json.dumps(data), encoding="utf-8")
+        record_removed(gone["id"])
+        with open(journal, "ab") as f:
+            f.write(bad_line + b"\n")
+        assert last_removed([gone["id"]]) == {gone["id"]}
+        jobs._save_jobs_unlocked(stale)
+
+    assert gone["id"] not in {j["id"] for j in load_jobs()}, "malformed line let a stale save resurrect a removed job"
