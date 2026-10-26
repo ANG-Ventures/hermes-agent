@@ -30,6 +30,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
+from cron import runtime_state as _rs
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,58 @@ def _job_running_in_this_process(job_id: str) -> bool:
         return True
 
 
+def _jobs_lock_degraded() -> bool:
+    """True inside a ``_jobs_lock`` section that holds only the in-process lock (no cross-process
+    flock): a sibling process may write concurrently."""
+    return bool(getattr(_jobs_lock_state, "degraded", False))
+
+
+def _destructive_ok() -> bool:
+    """Apollo ruling R1 (t_94e91559): a DEGRADED jobs lock permits no destructive action on the
+    runtime store. True only inside a ``_jobs_lock`` section that holds the cross-process lock.
+    Every site that discards a pending generation, retires rows or drops the database is guarded
+    by this one predicate (``tests/cron/test_runtime_state_split.py`` checks each call site)."""
+    return bool(getattr(_jobs_lock_state, "depth", 0)) and not _jobs_lock_degraded()
+
+
+# Apollo ruling R4 (t_94e91559, 2026-10-25): a DEGRADED jobs lock permits NO WRITE to either store,
+# not only no destructive one (R1). 36 of the 128 Prism findings on the split described a sibling
+# that proceeded after a lock failure and wrote between our read and our write; with two stores
+# every interleaving of that sibling is a new finding. One writer by construction removes the
+# actor. Reads stay allowed. Measured: in production the lock degrades only on EMFILE (every logged
+# line is Errno 24), where the proceeding sibling mostly cannot open sqlite or a temp file either.
+# Knob (operator escape hatch, not a mode): CRON_DEGRADED_LOCK_WRITES=proceed restores #60703's
+# torn-write-beats-dead-scheduler behaviour.
+_DEGRADED_LOCK_WRITES_ENV = "CRON_DEGRADED_LOCK_WRITES"
+
+
+class CronLockDegraded(RuntimeError):
+    """A write was attempted inside a ``_jobs_lock`` section that holds only the in-process lock
+    (ruling R4). Nothing was written. The CLI prints the message and exits 2."""
+
+
+def _degraded_writes_proceed() -> bool:
+    return os.environ.get(_DEGRADED_LOCK_WRITES_ENV, "refuse").strip().lower() == "proceed"
+
+
+def _write_refused_by_r4() -> bool:
+    """True inside a section that holds only the in-process lock although a flock backend EXISTS
+    (timeout or open/lock error): a sibling process may be writing. A platform with no backend
+    at all is not this case (``no_backend``), nor is the operator knob."""
+    return (_jobs_lock_degraded() and not getattr(_jobs_lock_state, "no_backend", False)
+            and not _degraded_writes_proceed())
+
+
+def _refuse_write_if_degraded(what: str) -> None:
+    """The single choke point every store write passes (``_runtime_txn`` for sqlite,
+    ``_publish_jobs_json`` for jobs.json). Raises ``CronLockDegraded`` under R4."""
+    if _write_refused_by_r4():
+        raise CronLockDegraded(
+            f"the cron jobs lock is degraded (no cross-process lock on {_jobs_lock_file()}); "
+            f"refusing to write {what} (ruling R4: one writer by construction; nothing written). "
+            f"Retry when no other process holds the lock, or set {_DEGRADED_LOCK_WRITES_ENV}=proceed")
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
     return _current_cron_store().cron_dir / ".jobs.lock"
@@ -358,12 +411,14 @@ def _jobs_lock():
         _jobs_lock_state.load_stamp = None
         _jobs_lock_state.load_baseline = None
         lock_fd = None
+        acquired = False
         try:
             try:
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -376,7 +431,15 @@ def _jobs_lock():
             except (OSError, IOError) as e:
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
+                               "proceeding with in-process lock only (reads only: writes in this "
+                               "section refuse, ruling R4)", e)
+            # Degraded = no cross-process exclusion this section (timeout, open/lock failure, or
+            # no flock backend); irreversible operator steps read it (``_jobs_lock_degraded``).
+            _jobs_lock_state.degraded = not acquired
+            # R4 distinguishes "the lock exists and we could not take it" (timeout, EMFILE: a
+            # sibling may be writing; refuse) from "this platform has no flock backend" (nothing
+            # to take; the #80624 shrink-merge is the only cross-process guard and stays in force).
+            _jobs_lock_state.no_backend = acquired is None
             try:
                 yield
             finally:
@@ -386,6 +449,10 @@ def _jobs_lock():
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
             _jobs_lock_state.load_baseline = None
+            _jobs_lock_state.degraded = False
+            _jobs_lock_state.no_backend = False
+    # Outside the lock: the coalesced jobs.json mirror (t_94e91559) takes its own section.
+    _mirror_after_section()
 
 
 @contextlib.contextmanager
@@ -481,7 +548,7 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
             yield False
             return
         with _jobs_lock():
-            job = next((item for item in load_jobs() if item.get("id") == job_id), None)
+            job = _locked_job_view(job_id)
             claim = job.get("fire_claim") if isinstance(job, dict) else None
             owns_claim = isinstance(claim, dict) and claim.get("by") == expected_owner
             if job is None:
@@ -1694,9 +1761,64 @@ def load_jobs() -> List[Dict[str, Any]]:
             except (TypeError, ValueError, OverflowError):
                 rep["completed"] = 0
             repair = repair or "invalid repeat.completed normalized"
+    locked = bool(getattr(_jobs_lock_state, "depth", 0))
+    split = _rs.enabled()
+    if not split and _runtime_db_path().exists() and not _kill_switch_orphans_only():
+        # Kill switch: fold the rows back BEFORE any repair save, and from the RAW file: the
+        # export validates the payload itself and refuses (raises) on a missing or jobless store,
+        # which must never be "repaired" to [] first and then exported over the only runtime copy.
+        if not locked:
+            with _jobs_lock():
+                return load_jobs()
+        if _destructive_ok():
+            export_runtime_to_json(keep_orphans=True)
+            if _runtime_db_path().exists():
+                # Only rows with no definition are left (kept, never dropped silently): remember
+                # the db's identity so later loads do not re-fold it, and say so once.
+                _note_kill_switch_orphans_only()
+                _warn_json_mode_with_runtime_db()
+            return load_jobs()  # re-read the folded file
+        # R1: the fold retires rows, which a degraded lock forbids, so the database stays. R3:
+        # json mode is in effect only once the fold has happened; until then this store is read
+        # (and written, see _split_store) exactly as in sqlite mode.
+        _warn_degraded_fold_once()
+        split = True
+    if split:
+        # jobs.json is a read-only MIRROR of the merged view (see cron/runtime_state.py): a job
+        # with a row takes its runtime ONLY from the row (file runtime keys dropped first). A job
+        # with no row but runtime in the file (first load after upgrade, or after the json kill
+        # switch) has that runtime ADOPTED into a row under the lock; the file is not rewritten.
+        file_gen = data.get("runtime_gen") if isinstance(data, dict) else None
+        if (repair or _runtime_pending()) and not locked:
+            with _jobs_lock():
+                return load_jobs()
+        rows = _read_runtime_rows(file_gen)
+        adopt = [j for j in jobs if str(j.get("id") or "") and str(j.get("id")) not in rows
+                 and _rs.has_runtime(j)]
+        if adopt and not locked:
+            with _jobs_lock():
+                return load_jobs()
+        if adopt and not _write_refused_by_r4():
+            rows = _adopt_file_runtime(adopt, rows)
+        # else (Prism 3aeaad041925, R4): a contended section reads; the file's runtime for these
+        # jobs is returned unchanged (no row to overlay) and a later locked load adopts it.
+        # Overlay rows BEFORE any repair save below: that save must see the stored runtime, or it
+        # would read every row's absence as "cleared" and overwrite the rows with {}.
+        jobs = [_rs.overlay_row(job, rows[str(job.get("id"))])
+                if str(job.get("id")) in rows else job for job in jobs]
+        # The row is the authority for repeat.completed now: apply the same normalization the
+        # file value got above, to the merged value (Prism a73bd19ead9a). In memory only: the
+        # next runtime save of that job persists the normalized value through the row.
+        for job in jobs:
+            _normalize_repeat_completed(job)
+        if not locked and _jobs_file_stamp(jobs_file) != pre_read_stamp:
+            # Unlocked read raced a writer (e.g. a runtime-export that replaced the definitions and
+            # dropped the database between our two reads): retry consistently under the lock.
+            with _jobs_lock():
+                return load_jobs()
     # Persist even an empty result, or an all-junk store repeats the repair on every tick.
     if repair:
-        if not getattr(_jobs_lock_state, "depth", 0):
+        if not locked:
             # An unlocked snapshot may predate a locked writer's update to a job it already holds
             # (the shrink-merge only restores missing ids), so re-read and repair under the lock.
             with _jobs_lock():
@@ -1705,11 +1827,855 @@ def load_jobs() -> List[Dict[str, Any]]:
             logger.warning("%s", note)
         # Keep the shrink-merge (a degraded-lock sibling's create may have landed since the read)
         # unless disk is STILL a shape the merge would refuse: a sibling may have rewritten it.
-        save_jobs(jobs, replace=unmergeable and _peek_jobs_unlocked() is None)
+        save_jobs(jobs, replace=unmergeable and _peek_jobs_unlocked() is None,
+                  prune_runtime=False)  # a repair never deletes rows (see save_jobs)
         logger.warning("Auto-repaired jobs.json (%s)", repair)
+        pre_read_stamp = None
     _record_load_stamp(pre_read_stamp)
     _record_load_baseline(jobs)
     return jobs
+
+
+# --- Runtime-state split (t_94e91559): hot runtime fields live in cron/runtime_state.db ---
+
+# json kill switch: (db identity, jobs.json identity) after a fold that kept only orphan rows, so
+# load_jobs does not re-fold an unchanged pair on every read. jobs.json is part of the key (Prism
+# 6391b0c09102): a definition re-added for an orphan id changes the file, not the db, and must
+# trigger a re-fold that carries the row's runtime onto it.
+_KILL_SWITCH_ORPHANS_ONLY: Dict[str, Tuple[Optional[Tuple[int, int, int]], ...]] = {}
+
+
+def _db_identity(path: Path) -> Optional[Tuple[int, int, int]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _kill_switch_pair_identity(path: Path) -> Tuple[Optional[Tuple[int, int, int]], ...]:
+    # Prism ec644af502fe: a WAL commit changes the -wal file, not the main db's inode/size/mtime,
+    # so the WAL identity is part of the key or a sibling's adopted rows would stay invisible.
+    return (_db_identity(path), _db_identity(Path(str(path) + "-wal")),
+            _db_identity(_current_cron_store().jobs_file))
+
+
+def _kill_switch_orphans_only() -> bool:
+    path = _runtime_db_path()
+    known = _KILL_SWITCH_ORPHANS_ONLY.get(str(path))
+    return known is not None and known == _kill_switch_pair_identity(path)
+
+
+def _note_kill_switch_orphans_only() -> None:
+    """Cache the db as 'orphans only' ONLY after verifying it: every remaining row must lack a
+    definition in jobs.json (Prism 647d59796c3e: the fold also returns successfully when a row
+    was kept because it changed mid-export; caching that would hide live runtime behind the
+    file). A db with a defined job's row stays a split store until the next locked fold."""
+    path = _runtime_db_path()
+    ident = _kill_switch_pair_identity(path)
+    if ident[0] is None:
+        return
+    try:
+        rows = _rs.read_all(_current_cron_store().cron_dir)
+        data, _ = _parse_jobs_file(_current_cron_store().jobs_file)
+        file_jobs = data.get("jobs") if isinstance(data, dict) else data
+        defined = {str(j.get("id")) for j in (file_jobs or []) if isinstance(j, dict)}
+    except Exception:
+        return  # unreadable: never cache a state we could not verify
+    if any(jid in defined for jid in rows):
+        logger.warning("cron runtime-state: %d row(s) for defined job(s) remain in %s after the "
+                       "fold; keeping the split store (not cached as orphans-only)",
+                       sum(1 for jid in rows if jid in defined), _rs.DB_NAME)
+        return
+    _KILL_SWITCH_ORPHANS_ONLY[str(path)] = ident
+
+
+def _runtime_db_path() -> Path:
+    return _rs.db_path(_current_cron_store().cron_dir)
+
+
+def _split_store() -> bool:
+    """Apollo ruling R3 (t_94e91559): json mode is in effect only once the fold has happened.
+    While runtime_state.db exists (and is not the orphans-only remainder of a fold), every read
+    and write behaves as in sqlite mode whatever ``HERMES_CRON_RUNTIME_STATE`` says: the kill
+    switch changes what the next successful fold does (load_jobs, R1-gated), not what the store
+    is now. A json-only write next to the rows would be overlaid by an older row on the next
+    read and overwritten by the fold (Prism b696f63bccc1, ef86e5d00d84)."""
+    if _rs.enabled():
+        return True
+    return _runtime_db_path().exists() and not _kill_switch_orphans_only()
+
+
+def _fast_split() -> bool:
+    """Single-job fast paths (caller holds ``_jobs_lock``): sqlite mode, or json mode while the db
+    stays because the fold cannot run now (degraded lock, R1 + R3). With the cross-process lock in
+    json mode the full ``load_jobs()`` path runs instead, and it folds first."""
+    return _rs.enabled() or (not _destructive_ok() and _split_store())
+
+
+def _normalize_repeat_completed(job: Dict[str, Any]) -> bool:
+    """Same rule load_jobs applies to the file's value, for a value merged from a runtime row:
+    a non-negative int, else 0. Returns True when it changed the record."""
+    rep = job.get("repeat")
+    if not (isinstance(rep, dict) and "completed" in rep and (
+            type(rep["completed"]) is not int or rep["completed"] < 0)):
+        return False
+    try:
+        rep["completed"] = max(int(rep["completed"]), 0)
+    except (TypeError, ValueError, OverflowError):
+        rep["completed"] = 0
+    return True
+
+
+def _runtime_write_allowed() -> bool:
+    """False when the test-context live-store guard would refuse a write to this store."""
+    try:
+        _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
+        return True
+    except RuntimeError:
+        return False
+
+
+def _read_runtime_rows(file_gen: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """All rows, after recovering an interrupted two-phase save (see ``_save_split_unlocked``):
+    a pending generation the definitions file names is rolled forward, any other is dropped."""
+    cron_dir = _current_cron_store().cron_dir
+    existed = _rs.db_path(cron_dir).exists()
+    if not existed and not _runtime_write_allowed():
+        return {}
+    # Open first, then decide (Prism 8cd4fa44c9bb): the rows come from the same connection that
+    # created or found the database, so a sibling that creates it and writes rows after our
+    # existence check is read, not answered with {}.
+    with _rs.connect(cron_dir) as conn:  # creates it when absent (0600, see runtime_state.connect)
+        conn.execute("BEGIN")
+        pending = _rs.pending_gens(conn)
+        rows = _rs._rows_of(conn)
+        if pending and _write_refused_by_r4():
+            # Prism 5fef6ead34bb: a contended section may not resolve the journal (R4), but it must
+            # still SEE a committed generation's rows, or it reads (and a later save re-merges
+            # from) pre-commit runtime. Same in-memory resolution merged_jobs uses; one snapshot.
+            rows = _rs.resolve_committed_in_memory(conn, rows, file_gen)
+        conn.execute("COMMIT")
+    if not existed:
+        _secure_runtime_db()
+    if pending and _runtime_write_allowed() and getattr(_jobs_lock_state, "depth", 0) \
+            and not _write_refused_by_r4():
+        # Locked only: an unlocked reader cannot tell a crashed save from one in flight. A
+        # contended section (R4) keeps the in-memory resolution above instead.
+        _recover_pending_runtime(file_gen)
+        return _rs.read_all(cron_dir)
+    return rows
+
+
+def _runtime_pending() -> bool:
+    if not _runtime_db_path().exists():
+        return False
+    with _rs.connect(_current_cron_store().cron_dir) as conn:
+        return bool(_rs.pending_gens(conn))
+
+
+_DEGRADED_FOLD_WARNED: Set[str] = set()
+
+
+def _warn_degraded_fold_once() -> None:
+    path = _runtime_db_path()
+    if str(path) in _DEGRADED_FOLD_WARNED:
+        return
+    _DEGRADED_FOLD_WARNED.add(str(path))
+    logger.error("cron runtime-state: %s=json but the cron jobs lock is degraded; not folding %s "
+                 "back into jobs.json (that retires rows). Reading the merged view until a load "
+                 "holds the cross-process lock", _rs.ENV_MODE, path)
+
+
+def _discard_pending(conn, gen: str) -> None:
+    """Drop pending generation *gen* (caller owns the transaction and has checked
+    ``_destructive_ok()``, ruling R1)."""
+    conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
+
+
+def _gen_lock_path(gen: str) -> Path:
+    return _current_cron_store().cron_dir / f".runtime-gen-{gen}.lock"
+
+
+@contextlib.contextmanager
+def _gen_owner_lock(gen: str):
+    """Held (flock LOCK_EX) by the save that owns generation *gen* from BEFORE its stage until
+    after its apply/discard, so recovery can tell a live in-flight sibling (lock busy) from a
+    crashed one (lock free) without guessing from age. Best effort: with no flock backend or no
+    fd to spare it yields without a lock, and recovery falls back to the age bound."""
+    path = _gen_lock_path(gen)
+    fd = None
+    if fcntl is not None:
+        try:
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            fd = None
+            _unlink_quiet(str(path))
+    try:
+        yield
+    finally:
+        if fd is not None:
+            _unlink_quiet(str(path))  # unlink while held: no reader can lock a stale file
+            os.close(fd)
+
+
+def _gen_owner_alive(gen: str) -> Optional[bool]:
+    """True = the owning save holds its lock (in flight); False = the lock file exists and is free
+    (owner died); None = no lock file (staged by an earlier build, or no flock): unknown."""
+    if fcntl is None:
+        return None
+    try:
+        fd = os.open(str(_gen_lock_path(gen)), os.O_RDWR)  # never create: absence is the signal
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _recover_pending_runtime(file_gen: Optional[str]) -> None:
+    """Roll forward every COMMITTED generation: one whose commit marker is set in the database
+    (``published_at``, ruling R2) or that the file names, oldest publication first; merge3 makes
+    a replay of rows already applied harmless. An unpublished generation is discarded ONLY when
+    the jobs lock is not degraded (R1) and its owner is provably dead: its owner's lock file is
+    free (the owner died before publishing), or, when no lock file exists, it is older than
+    ``_rs.pending_discard_after()`` by its staged_at. A generation whose owner still holds its
+    lock is a sibling between its stage and its publish, whatever its age: it is left alone."""
+    with _defs_cache_lock:
+        _defs_cache.clear()  # entries parsed while a generation was pending are marked unusable
+    if _write_refused_by_r4():
+        # R4: recovery applies or discards rows, i.e. writes. A degraded section reads the merged
+        # view with the generation still pending; the next section holding the lock resolves it.
+        logger.warning("cron runtime-state: pending generation(s) left for the next locked "
+                       "section (jobs lock degraded, ruling R4)")
+        return
+    with _runtime_txn() as conn:
+        ages = _rs.pending_gen_ages(conn)
+        committed = _rs.published_gens(conn)
+        if file_gen and file_gen in ages and file_gen not in committed:
+            committed.append(file_gen)
+        bound = _rs.pending_discard_after()
+        now = _rs._now()
+        for gen in committed:
+            n = _rs.apply_pending(conn, gen)
+            logger.warning("cron runtime-state: rolled interrupted save %s forward "
+                           "(%d row(s))", gen, n)
+        for gen, staged_at in ages.items():
+            if gen in committed:
+                continue
+            alive = _gen_owner_alive(gen)
+            dead = alive is False or (alive is None and (
+                staged_at is None or now - staged_at >= bound))
+            if dead and _destructive_ok():
+                _discard_pending(conn, gen)
+                _unlink_quiet(str(_gen_lock_path(gen)))
+                logger.warning("cron runtime-state: discarded interrupted save %s (its "
+                               "definitions never reached jobs.json)", gen)
+
+
+def _secure_runtime_db() -> None:
+    """chmod 600 like jobs.json (the file is already created 0600; this also covers a database
+    an older build or an operator created), and hand a root-created database back to the cron
+    dir's owner so a root CLI write cannot lock the gateway user out."""
+    cron_dir = _current_cron_store().cron_dir
+    try:
+        owner = os.stat(cron_dir)
+    except OSError:
+        owner = None
+    base = _rs.db_path(cron_dir)
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(base) + suffix)
+        if path.exists():
+            _secure_file(path)
+            with contextlib.suppress(OSError):
+                current = os.stat(path)
+                if owner is not None and (current.st_uid, current.st_gid) != (
+                        owner.st_uid, owner.st_gid):
+                    _preserve_file_ownership(path, owner)
+
+
+@contextlib.contextmanager
+def _runtime_txn():
+    """Guarded runtime-db write transaction (the same test-context live-store guard every
+    jobs.json write takes), then the permission/ownership pass when the db or a sidecar is new
+    or we are root."""
+    _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
+    _refuse_write_if_degraded(_rs.DB_NAME)
+    base = _runtime_db_path()
+    fresh = not all(Path(str(base) + s).exists() for s in ("", "-wal", "-shm"))
+    with _rs.transaction(_current_cron_store().cron_dir) as conn:
+        yield conn
+    if fresh or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        _secure_runtime_db()
+
+
+def _write_runtime_rows(rows: Dict[str, Dict[str, Any]], *, delete_ids: Collection[str] = (),
+                        current: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
+    with _runtime_txn() as conn:
+        return _rs.upsert_rows(conn, rows, delete_ids=delete_ids, current=current)
+
+
+def _adopt_file_runtime(adopt: List[Dict[str, Any]],
+                        rows: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Adopt the runtime fields of row-less jobs from jobs.json into rows (caller holds
+    ``_jobs_lock``); returns the updated rows. This is the one-shot migration on first load after
+    upgrade, and also covers a file the json kill switch wrote. jobs.json is NOT rewritten: it
+    already carries exactly these values, so the rows are written without marking the mirror
+    dirty. Idempotent: an adopted job has a row, and a row always wins over the file."""
+    new_rows = {str(j["id"]): _rs.split_job(j)[1] for j in adopt}
+    with _runtime_txn() as conn:
+        existing = _rs._rows_of(conn)
+        new_rows = {jid: r for jid, r in new_rows.items() if jid not in existing}
+        _rs.upsert_rows(conn, new_rows, dirty=False)
+        if new_rows:
+            _record_mirror_stamp_if_unknown(conn)
+        out = {**existing, **new_rows}
+    if new_rows:
+        logger.warning("cron runtime-state: adopted runtime fields of %d job(s) from jobs.json "
+                       "into %s", len(new_rows), _rs.DB_NAME)
+    return out
+
+
+def _file_runtime_gen() -> Optional[str]:
+    """The pending-generation id the on-disk jobs.json names, or None (error paths only: this
+    parses the whole file)."""
+    try:
+        data, _ = _parse_jobs_file(_current_cron_store().jobs_file)
+    except Exception:
+        return None
+    gen = data.get("runtime_gen") if isinstance(data, dict) else None
+    return gen if isinstance(gen, str) else None
+
+
+def _recover_pending_now() -> None:
+    """Resolve an interrupted two-phase save before anything reads or replaces rows (caller holds
+    ``_jobs_lock``): roll forward the generation the file names, drop any other."""
+    if _runtime_pending():
+        _recover_pending_runtime(_file_runtime_gen())
+
+
+def _mirror_stamp(jobs_file: Path) -> Optional[Tuple[float, float, float]]:
+    """``(inode, size, mtime_ns)`` of jobs.json: an equal-length in-place rewrite keeps inode and
+    size, only the mtime moves (Prism a131d31922ac)."""
+    try:
+        st = jobs_file.stat()
+    except OSError:
+        return None
+    return float(st.st_ino), float(st.st_size), float(st.st_mtime_ns)
+
+
+_MIRROR_STAMP_KEYS = ("file_ino", "file_size", "file_mtime_ns")
+
+
+def _store_mirror_stamp(conn, stamp: Tuple[float, float, float]) -> None:
+    conn.executemany("INSERT OR REPLACE INTO mirror_state(k, v) VALUES (?, ?)",
+                     list(zip(_MIRROR_STAMP_KEYS, stamp)))
+
+
+def _known_mirror_stamp(conn) -> Optional[Tuple[Optional[float], ...]]:
+    """The recorded identity, or None when none was recorded. A database from an earlier PR head
+    recorded no mtime: that reads as a mismatch once, and the next flush records all three."""
+    known = tuple(_rs._state(conn, k) for k in _MIRROR_STAMP_KEYS)
+    return None if known[0] is None and known[1] is None else known
+
+
+def _record_mirror_written(conn, seq: float) -> None:
+    """jobs.json now reflects every row write up to *seq* (read in the snapshot whose rows were
+    written into the file); remember the file's identity so an out-of-band replacement (a git
+    level) is detected as a stale mirror."""
+    # Prism 001ff3e96a30: a degraded sibling can publish and certify a NEWER mirror between our
+    # pre-rename newer-mirror check and our rename. Our file is then stale: certifying its stamp
+    # would make every later flush see "clean rows, known file" and leave the stale file on disk
+    # for good. Record the stamp only when nothing newer was flushed; otherwise leave the
+    # identity mismatched so the next flush repairs the file.
+    already = _rs._state(conn, "flushed")
+    _rs.mark_flushed(conn, seq)
+    if already is not None and float(already) > float(seq):
+        return
+    published = getattr(_jobs_lock_state, "published_stamp", None)
+    _jobs_lock_state.published_stamp = None
+    on_disk = _mirror_stamp(_current_cron_store().jobs_file)
+    # Prism 82966426a22c: certify the file THIS flush published, and only while it still occupies
+    # the path. A sibling's rename that landed over it (or under it) means the file on disk is not
+    # the one *seq* describes: leave the identity unrecorded so the next flush repairs it.
+    if on_disk is not None and published is not None and on_disk == published:
+        _store_mirror_stamp(conn, on_disk)
+
+
+def _record_mirror_stamp_if_unknown(conn) -> None:
+    """First adoption (Prism 79bacc90b295): jobs.json carries exactly the adopted values, so record
+    its identity and an out-of-band replacement is detected from the first tick. Only when no
+    identity is known yet: a known one that no longer matches is a replacement the next flush
+    must repair, and the seq is untouched (other rows may still be ahead of the file)."""
+    if _known_mirror_stamp(conn) is not None:
+        return
+    stamp = _mirror_stamp(_current_cron_store().jobs_file)
+    if stamp is not None:
+        _store_mirror_stamp(conn, stamp)
+
+
+def maybe_flush_runtime_mirror(*, force: bool = False) -> bool:
+    """Rewrite jobs.json as the merged view when the rows moved past it and the coalescing window
+    (``HERMES_CRON_MIRROR_INTERVAL_S``, default 30 s, ``0`` = every touch) has elapsed, or when
+    the file was replaced out of band. Runs from the scheduler tick and after each write section
+    (never inside one: it would clobber the caller's load baseline). Writes nothing when the
+    file already equals the merged view. Returns True when the file was rewritten."""
+    if getattr(_jobs_lock_state, "depth", 0) or not _rs.enabled():
+        return False
+    store = _current_cron_store()
+    if not _rs.db_path(store.cron_dir).exists() or not _runtime_write_allowed():
+        return False
+    with _rs.connect(store.cron_dir, create=False) as conn:
+        if conn is None:
+            return False
+        since = _rs.dirty_since(conn)
+        known = _known_mirror_stamp(conn)
+    replaced = known is not None and _mirror_stamp(store.jobs_file) != known
+    if since is None and not replaced:
+        return False
+    interval = _rs.mirror_interval()
+    if since is not None and not replaced and not force and interval > 0 \
+            and _rs._now() - since < interval:
+        return False
+    with _jobs_lock():
+        with _rs.connect(store.cron_dir, create=False) as conn:
+            if conn is None:
+                return False
+            seq = _rs.mirror_seq(conn)  # BEFORE the rows are read: a later write stays dirty
+            epoch = _rs.mirror_epoch(conn)
+        jobs = load_jobs()  # merged view; recovers a pending generation under the lock
+        try:
+            data, _ = _parse_jobs_file(store.jobs_file)
+        except Exception:
+            data = None
+        current = data.get("jobs") if isinstance(data, dict) else None
+        wrote = not (isinstance(current, list) and current == jobs
+                     and "runtime_gen" not in data)
+        if wrote:
+            rows = _rs.read_all(store.cron_dir)
+
+            def to_mirror(payload: List[Any]) -> List[Any]:
+                # After the shrink-merge (a degraded-lock sibling's create is kept): every job
+                # with a row shows exactly its row, never a runtime value merged from disk.
+                return [_rs.overlay_row(j, rows[str(j.get("id"))])
+                        if isinstance(j, dict) and str(j.get("id")) in rows else j
+                        for j in payload]
+
+            mark = (epoch, seq) if epoch is not None else None
+            if not _save_jobs_unlocked(jobs, overlay=to_mirror, mirror_mark=mark,
+                                       mirror_only=True):
+                return False  # a newer mirror is on disk: stays dirty (Prism e5b0da3eb246)
+            _rs.MIRROR_WRITES += 1
+        with _runtime_txn() as conn:
+            _record_mirror_written(conn, seq)
+    return wrote
+
+
+def _mirror_after_section() -> None:
+    """Coalesced mirror flush when an outermost ``_jobs_lock`` section exits (every write path
+    and the scheduler tick's due scan run inside one). Never re-entered from its own section and
+    never fails the caller."""
+    if getattr(_jobs_lock_state, "mirror_flushing", False):
+        return
+    _jobs_lock_state.mirror_flushing = True
+    try:
+        maybe_flush_runtime_mirror()
+    except Exception:
+        logger.warning("cron runtime-state: jobs.json mirror flush failed", exc_info=True)
+    finally:
+        _jobs_lock_state.mirror_flushing = False
+
+
+def _write_definitions_file(defs: List[Dict[str, Any]], *,
+                            authoritative_rows: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+    """Atomic temp+rename of *defs* as jobs.json. Used by the migration and the export only.
+    Prism d925dce7cb01: the caller holds the lock, but a sibling whose lock acquisition timed out
+    proceeds DEGRADED and can create a job after the caller read the file; the shrink-merge
+    (``_merge_unexpected_disk_jobs``, the same guard every save takes) keeps that job."""
+    jobs_file = _current_cron_store().jobs_file
+    _guard_against_test_write_to_live_store(jobs_file)
+    stat_before = None
+    with contextlib.suppress(OSError):
+        stat_before = os.stat(jobs_file)
+    tmp_path = None
+    try:
+        for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
+            defs = _merge_unexpected_disk_jobs(defs)
+            if authoritative_rows:
+                # Prism 7b52062e31e5: the shrink-merge reconciles DEFINITIONS against a concurrent
+                # file; runtime comes from the rows, never from a file the merge saw. Re-overlay so
+                # an out-of-band file replacement cannot rewind a counter the db still holds.
+                defs = [_rs.overlay_row(d, authoritative_rows[str(d.get("id"))])
+                        if isinstance(d, dict) and str(d.get("id")) in authoritative_rows else d
+                        for d in defs]
+            tmp_path = _stage_jobs_payload(jobs_file, defs)
+            # Verify-after-stage, as _save_jobs_unlocked does: a sibling landing during
+            # serialization forces another merge round.
+            if attempt < _SAVE_JOBS_MERGE_ATTEMPTS and _unmerged_disk_jobs(defs, None):
+                _unlink_quiet(tmp_path)
+                tmp_path = None
+                continue
+            break
+        replaced = _publish_jobs_json(tmp_path, jobs_file)
+    except BaseException:
+        _unlink_quiet(tmp_path)
+        raise
+    fsync_directory(replaced.parent)
+    _secure_file(jobs_file)
+    _preserve_file_ownership(jobs_file, stat_before)
+    _record_load_stamp(None)
+
+
+class RuntimeRetireRefused(RuntimeError):
+    """``runtime-export --retire`` refused (operator rollback step, nothing written)."""
+
+
+class RuntimeExportNotWritten(CronLockDegraded):
+    """``runtime-export`` on a degraded jobs lock (ruling R1, Prism 0e7b265dc160): the export may
+    READ but not PUBLISH, since the definitions it read may already be stale. ``jobs`` is the
+    merged payload it would have written; nothing is on disk."""
+
+    def __init__(self, jobs: List[Any]):
+        self.jobs = jobs
+        super().__init__(
+            f"lock degraded: not written (no cross-process lock on {_jobs_lock_file()}); jobs.json "
+            f"and {_rs.DB_NAME} are unchanged")
+
+
+class RuntimeOrphansRefused(RuntimeRetireRefused):
+    """``runtime-export --retire`` refused: rows with no definition in jobs.json would be lost."""
+
+    def __init__(self, ids: List[str]):
+        self.ids = ids
+        super().__init__(
+            f"{len(ids)} runtime row(s) have no definition in jobs.json ({', '.join(ids)}); "
+            f"refusing to retire {_rs.DB_NAME} (rows kept). Re-add the definitions, or pass "
+            "--drop-orphans to discard them")
+
+
+def _retire_runtime_rows(conn, folded: Dict[str, str]) -> List[str]:
+    """Compare-and-delete the rows folded into jobs.json (caller checked ``_destructive_ok()``,
+    R1): ``folded`` maps each job id to the row text the export snapshot read. A row a
+    degraded-lock sibling rewrote since is kept (its newer value is not in the file); returns
+    those ids (Prism c10b8ca4d934 / fb81a100b27c)."""
+    return _rs.delete_rows_if_unchanged(conn, folded)
+
+
+def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retire: bool = True,
+                           drop_orphans: bool = False, keep_orphans: bool = False) -> int:
+    """Reverse of the migration (kill switch ``HERMES_CRON_RUNTIME_STATE=json`` and
+    ``hermes cron runtime-export --to-json``): write every row back into its job in jobs.json.
+    With *retire*, then remove the database. For a job with a row (even an empty one) the row is
+    authoritative: the file's runtime keys are dropped first, so a cleared value cannot be
+    resurrected. Refuses (raises, writes nothing, deletes nothing) on a missing jobs.json or a
+    payload without a jobs list while the database exists: the definitions may only be temporarily
+    missing, and the rows are the only copy of the runtime state.
+
+    Rows whose job is not in jobs.json (a git level dropped the definition) have no record to
+    carry them: their ids are logged and the rows stay in the database. *retire* then REFUSES
+    (``RuntimeOrphansRefused``, nothing written) unless *drop_orphans* (Prism 747baaf507d1), or,
+    with *keep_orphans* (the json kill switch's automatic fold in load_jobs, which must not raise),
+    retires every row that HAS a definition and keeps only the orphan rows in the database.
+    *retire* on a degraded jobs lock refuses on EVERY path, *keep_orphans* included (ruling R1;
+    load_jobs checks ``_destructive_ok()`` before it calls here). Returns the number of jobs that
+    had a row."""
+    with _jobs_lock():
+        jobs_file = _current_cron_store().jobs_file
+        cron_dir = _current_cron_store().cron_dir
+        if not _rs.db_path(cron_dir).exists():
+            return 0
+        if retire and not _destructive_ok():
+            # Prism 21c210e015e8, ruling R1: without the cross-process lock a sibling's committed
+            # row write between our read and the delete below would be lost with the database.
+            raise RuntimeRetireRefused(
+                f"the cron jobs lock is degraded (no cross-process lock on {_jobs_lock_file()}); "
+                f"refusing to retire {_rs.DB_NAME} (nothing written, rows kept). Retry when no "
+                "other process holds the lock")
+        if jobs is None:
+            if not jobs_file.exists():
+                raise RuntimeError(
+                    f"{jobs_file} is missing; refusing runtime export (rows kept in {_rs.DB_NAME})")
+            data, _ = _parse_jobs_file(jobs_file)
+            jobs = data.get("jobs") if isinstance(data, dict) else data
+            if not isinstance(jobs, list):
+                raise RuntimeError(
+                    f"{jobs_file} has no jobs list; refusing runtime export "
+                    f"(rows kept in {_rs.DB_NAME})")
+            # Prism 4f29022e225a: record what we read as this section's baseline, so the publish's
+            # shrink-merge reconciles a degraded sibling's edit to an EXISTING job (a pause) per
+            # field instead of republishing our stale definition over it.
+            _record_load_baseline(jobs)
+        _guard_against_test_write_to_live_store(jobs_file)
+        _recover_pending_now()  # a generation the file names is part of the rows to export
+        # Count what we could NOT read (Prism 61ba1c33f294): a row that is not a JSON object has
+        # no record to fold into, and dropping the database would delete it unread.
+        with _rs.connect(cron_dir) as conn:
+            conn.execute("BEGIN")  # one snapshot: the parsed rows AND the texts retire compares
+            rows, unreadable = _rs._rows_and_unreadable(conn)
+            texts = _rs.row_texts(conn)
+            conn.execute("COMMIT")
+        if unreadable and retire and not keep_orphans:
+            raise RuntimeError(
+                f"{len(unreadable)} runtime row(s) in {_rs.DB_NAME} are not readable JSON objects "
+                f"({', '.join(unreadable)}); refusing to retire it (nothing written, rows kept)")
+        file_ids = {str(j.get("id")) for j in jobs if isinstance(j, dict)}
+        orphans = sorted(jid for jid in rows if jid not in file_ids)
+        if orphans:
+            if retire and not (drop_orphans or keep_orphans):
+                raise RuntimeOrphansRefused(orphans)
+            logger.warning("cron runtime-state: %d runtime row(s) have no definition in jobs.json"
+                           " (%s); %s", len(orphans), ", ".join(orphans),
+                           "dropped with the database" if retire and drop_orphans
+                           else "kept in the database")
+        # keep_orphans (kill switch, must not raise): unreadable rows are kept like orphans.
+        kept = ([] if drop_orphans else orphans) + unreadable
+        if unreadable:
+            logger.error("cron runtime-state: %d unreadable runtime row(s) kept in %s: %s",
+                         len(unreadable), _rs.DB_NAME, ", ".join(unreadable))
+        applied = 0
+        merged: List[Any] = []
+        for job in jobs:
+            row = rows.get(str(job.get("id"))) if isinstance(job, dict) else None
+            if row is not None:
+                job = _rs.overlay_row(job, row)
+                applied += 1
+            merged.append(job)
+        if not _destructive_ok():
+            # Only reachable without retire (retire refused above). The jobs list may predate a
+            # sibling's write (the read is outside any cross-process lock): never publish it.
+            raise RuntimeExportNotWritten(merged)
+        if applied or not kept:
+            _write_definitions_file(merged, authoritative_rows=rows)
+        changed: List[str] = []
+        if retire and _destructive_ok():  # compare-and-delete the folded rows only
+            with _runtime_txn() as conn:
+                changed = _retire_runtime_rows(
+                    conn, {j: texts[j] for j in rows if j not in kept and j in texts})
+        if retire and changed:
+            # A sibling wrote these rows after our snapshot: jobs.json carries the older value,
+            # so the database (still the source of truth for them) is kept.
+            msg = (f"{len(changed)} runtime row(s) changed while exporting "
+                   f"({', '.join(changed)}); {_rs.DB_NAME} kept (those rows are newer than "
+                   "jobs.json). Re-run the export")
+            if keep_orphans:
+                logger.warning("cron runtime-state: %s", msg)
+                return applied
+            raise RuntimeRetireRefused(msg)
+        if retire and kept:
+            logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
+                           "jobs.json; %s kept for %d row(s)", applied, _rs.DB_NAME,
+                           len(kept))
+            return applied
+        if retire and _destructive_ok():
+            # Prism 40994c5a66e9: compare-and-delete covers only the rows in OUR snapshot. A sibling
+            # that entered degraded mode can commit a row we never read (a job with no row before)
+            # between the snapshot and here; dropping the file would lose it unfolded. Drop only an
+            # EMPTY table, else keep the db and refuse/log exactly as a changed row does.
+            # Prism 1756ca4cf04c: the empty check and the unlink happen inside ONE write
+            # transaction (BEGIN IMMEDIATE holds the db's single writer slot). A degraded sibling's
+            # write waits on that slot (or fails busy) and cannot commit between the check and the
+            # removal; after the unlink its retry recreates a fresh empty db, no row is lost.
+            # Prism 8f84982f235d: Windows cannot unlink a database SQLite holds open, so the drop
+            # runs AFTER the check's connection closes. Exclusion holds anyway: we are inside a
+            # NON-degraded section (_destructive_ok), so every other writer takes the same flock
+            # and, under R4, a contended one refuses before writing. The txn only gives the check
+            # a consistent read.
+            with _runtime_txn() as conn:
+                left = [r[0] for r in conn.execute("SELECT job_id FROM job_runtime").fetchall()]
+            if left:
+                msg = (f"{len(left)} runtime row(s) appeared while exporting "
+                       f"({', '.join(left)}); {_rs.DB_NAME} kept (not folded into jobs.json). "
+                       "Re-run the export")
+                if keep_orphans:
+                    logger.warning("cron runtime-state: %s", msg)
+                    return applied
+                raise RuntimeRetireRefused(msg)
+            _rs.drop_database(cron_dir)
+        logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
+                       "jobs.json%s", applied, f" and removed {_rs.DB_NAME}" if retire else "")
+        return applied
+
+
+# Parsed definitions keyed by jobs.json stamp, for the single-job fast path: a runtime touch then
+# costs one stat() instead of a 1.4 MB parse + whole-store deepcopy. Never handed out: callers get
+# a deepcopy of ONE record.
+_defs_cache: Dict[str, Tuple[Tuple[Any, Optional[int]], Dict[str, Dict[str, Any]], bool]] = {}
+_defs_cache_lock = threading.Lock()
+
+
+def _cached_definition(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]], bool]:
+    """``(usable, definition_copy, file_has_runtime)``. ``usable`` is False when the fast path
+    must not be used (file missing/unreadable/non-canonical, duplicate ids, pending generation):
+    the caller then takes the full load_jobs() path, which repairs/recovers. A job whose
+    ``file_has_runtime`` is True and that has NO row also needs that path (adoption)."""
+    jobs_file = _current_cron_store().jobs_file
+    stamp = _jobs_file_stamp(jobs_file)
+    if stamp is None:
+        return False, None, False
+    # Prism f92e5396970e: a generation published (R2 marker) by a save that crashed before its
+    # rename leaves jobs.json's stamp unchanged; key the cache on the newest published pending
+    # rowid too, so the reparse below sees the pending generation and the full path recovers it.
+    with _rs.connect(_current_cron_store().cron_dir, create=False) as conn:
+        token = _rs.published_token(conn) if conn is not None else None
+    stamp = (stamp, token)
+    key = str(jobs_file)
+    with _defs_cache_lock:
+        cached = _defs_cache.get(key)
+    if cached is None or cached[0] != stamp:
+        try:
+            data, strict_retry = _parse_jobs_file(jobs_file)
+        except Exception:
+            return False, None, False
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        by_id: Dict[str, Dict[str, Any]] = {}
+        # A pending two-phase generation needs the full load_jobs() recovery first.
+        usable = not strict_retry and isinstance(jobs, list) and not _runtime_pending()
+        for job in jobs if isinstance(jobs, list) else ():
+            if not isinstance(job, dict) or not job.get("id") or str(job["id"]) in by_id:
+                usable = False
+                break
+            # jobs.json is the merged MIRROR: keep the definition half, and remember whether the
+            # file carried runtime (a job with no row must then be adopted by load_jobs first).
+            by_id[str(job["id"])] = (_rs.strip_runtime(job), _rs.has_runtime(job))
+        cached = (stamp, by_id, usable)
+        with _defs_cache_lock:
+            _defs_cache[key] = cached
+    if not cached[2]:
+        return False, None, False
+    found = cached[1].get(str(job_id))
+    if found is None:
+        return True, None, False
+    return True, copy.deepcopy(found[0]), found[1]
+
+
+def _read_one_row(job_id: Any) -> Optional[Dict[str, Any]]:
+    """The job's row, or ``None`` when it has none.
+
+    A ``create=True`` read can be the FIRST opener of the database (Prism 2c3f3aae44ab): a root
+    process reading a runtime-free job would otherwise leave a root-owned 0600 db that the profile
+    owner cannot open. Run the same permission/ownership pass ``_runtime_txn`` runs when the db or a
+    sidecar is new or we are root."""
+    base = _runtime_db_path()
+    fresh = not Path(base).exists()  # a read opens no -wal/-shm, so key freshness on the db file alone
+    create = _runtime_write_allowed()
+    with _rs.connect(_current_cron_store().cron_dir, create=create) as conn:
+        row = _rs.read_row(conn, str(job_id)) if conn is not None else None
+    if create and (fresh or (hasattr(os, "geteuid") and os.geteuid() == 0)):
+        _secure_runtime_db()
+    return row
+
+
+class _SingleJobScope:
+    """Marks a ``_with_job`` fast-path list so ``save_jobs`` records the save instead of writing."""
+
+    def __init__(self, jobs: List[Dict[str, Any]]):
+        self.jobs = jobs
+        self.saved = False
+        self.removed: Optional[Collection[str]] = None
+
+
+def _folded_runtime_rows() -> Dict[str, Dict[str, Any]]:
+    """Runtime halves of every record in jobs.json on disk (the folded values after an export
+    retired the database). Empty when the file is unreadable."""
+    try:
+        data, _ = _parse_jobs_file(_current_cron_store().jobs_file)
+    except Exception:
+        return {}
+    file_jobs = data.get("jobs") if isinstance(data, dict) else data
+    return {str(j.get("id")): _rs.split_job(copy.deepcopy(j))[1]
+            for j in (file_jobs or []) if isinstance(j, dict) and j.get("id")}
+
+
+def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
+    """``_with_job`` fast path (sqlite mode, caller holds ``_jobs_lock``): build ONE record from
+    the cached definition + its row, run *fn* on a one-element list, then persist only the row
+    when *fn*'s save left the definition half untouched. The row write re-reads the row inside its
+    IMMEDIATE transaction and three-way merges per key against what *fn* started from, so a
+    degraded-lock sibling's concurrent write to a key *fn* did not touch survives. Any definition
+    change or removal takes the full load/save path with the record *fn* produced."""
+    usable, definition, file_runtime = _cached_definition(job_id)
+    if not usable:
+        return _MISSING_FAST
+    if definition is None:
+        return missing
+    base_runtime = _read_one_row(job_id)
+    if base_runtime is None:
+        if file_runtime:
+            return _MISSING_FAST  # load_jobs adopts the file's runtime into a row first
+        base_runtime = {}
+    job = definition
+    _rs.apply_runtime(job, copy.deepcopy(base_runtime))
+    _normalize_repeat_completed(job)  # same view load_jobs hands out (a73bd19ead9a)
+    original_def = _rs.strip_runtime(copy.deepcopy(job))
+    original_job = copy.deepcopy(job)  # the baseline *fn* started from (definition + row)
+    jobs = [job]
+    scope = _SingleJobScope(jobs)
+    prior = getattr(_jobs_lock_state, "single_job_scope", None)
+    _jobs_lock_state.single_job_scope = scope
+    try:
+        result = fn(jobs, 0, job)
+    finally:
+        _jobs_lock_state.single_job_scope = prior
+    if not scope.saved:
+        return result
+    if scope.removed or len(jobs) != 1 or str(jobs[0].get("id")) != str(job_id):
+        full = [j for j in load_jobs() if str(j.get("id")) != str(job_id)] + list(jobs)
+        save_jobs(full, removed_ids=scope.removed)
+        return result
+    new_def, new_runtime = _rs.split_job(jobs[0])
+    if new_def != original_def:
+        full = load_jobs()
+        for i, existing in enumerate(full):
+            if str(existing.get("id")) == str(job_id):
+                # Reconcile against the ORIGINAL baseline *fn* started from, not this fresh
+                # load: a degraded-lock sibling's write since then (e.g. a pause) is in the fresh
+                # baseline, so a plain replace would read our stale copy of it as our own change.
+                full[i] = _reconcile_job_fields(jobs[0], existing, original_job)
+        save_jobs(full)
+        return result
+    with _runtime_txn() as conn:
+        disk = _rs.read_row(conn, str(job_id))
+        if disk is None and base_runtime is not None:
+            # Prism 736d658ee6b2 (+ ee01a8d9dc87: an EMPTY baseline row is still a row that was
+            # folded; recover whenever the row is absent, never on truthiness): the row we started from is GONE (an export folded and retired it
+            # while *fn* ran; its values now live in jobs.json). Merging against {} would read every
+            # unchanged baseline field as a concurrent delete and write a partial row that then
+            # overrides the folded file. Reconcile against the folded record instead.
+            folded = _folded_runtime_rows().get(str(job_id))
+            disk = folded if folded is not None else dict(base_runtime)
+        disk = disk or {}
+        merged = _reconcile_job_fields(new_runtime, disk, base_runtime) if disk != base_runtime \
+            else new_runtime
+        _rs.upsert_rows(conn, {str(job_id): merged})
+    return result
+
+
+_MISSING_FAST = object()
+
+
+def _locked_job_view(job_id: Any) -> Optional[Dict[str, Any]]:
+    """One merged record (caller holds ``_jobs_lock``): the cached definition + its row in sqlite
+    mode (same view the ``_with_job`` writers use), else a full ``load_jobs()`` scan."""
+    if _fast_split():
+        usable, definition, file_runtime = _cached_definition(job_id)
+        if usable:
+            if definition is None:
+                return None
+            row = _read_one_row(job_id)
+            if row is not None or not file_runtime:
+                _rs.apply_runtime(definition, row or {})
+                _normalize_repeat_completed(definition)
+                return definition
+    return next((item for item in load_jobs() if item.get("id") == job_id), None)
 
 
 def _guard_against_test_write_to_live_store(jobs_file: Path) -> None:
@@ -1879,6 +2845,13 @@ def _reconcile_job_fields(
     for key in set(disk_job) | set(baseline_job):
         in_payload = key in payload_job
         base_val = baseline_job.get(key)
+        if key == "repeat" and all(isinstance(v, dict) for v in (
+                payload_job.get(key), disk_job.get(key), base_val)):
+            # Prism 60d10bb9ae09: ``repeat`` mixes a definition key (``times``) with a runtime
+            # counter (``completed``, a row field). Merge per sub-key, so editing the limit keeps
+            # a sibling's concurrent completion instead of reverting it with our stale copy.
+            merged[key] = _reconcile_job_fields(payload_job[key], disk_job[key], base_val)
+            continue
         ours_changed = (
             (key in baseline_job) != in_payload
             or (in_payload and payload_job[key] != base_val)
@@ -2012,14 +2985,27 @@ def _unlink_quiet(path: Optional[str]) -> None:
             os.unlink(path)
 
 
-def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
-    """Serialize the store payload to a fsynced temp file next to *jobs_file*; return its path."""
+def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]],
+                        runtime_gen: Optional[str] = None,
+                        overlay: Optional[Callable[[List[Any]], List[Any]]] = None,
+                        mirror_mark: Optional[Tuple[float, float]] = None) -> str:
+    """Serialize the store payload to a fsynced temp file next to *jobs_file*; return its path.
+    ``runtime_gen`` (sqlite mode) names the pending runtime generation this definitions write
+    pairs with (see ``cron.runtime_state.stage_pending``); ``overlay`` (sqlite mode) turns the
+    merged definitions into the mirror's merged view just before serialization; ``mirror_mark``
+    ``(epoch, seq)`` is embedded FIRST so ``_file_mirror_mark`` reads it from a short prefix."""
+    if overlay is not None:
+        jobs = overlay(jobs)
+    payload: Dict[str, Any] = {}
+    if mirror_mark is not None:
+        payload[_rs.MIRROR_EPOCH_KEY], payload[_rs.MIRROR_SEQ_KEY] = mirror_mark
+    payload.update({"jobs": jobs, "updated_at": _hermes_now().isoformat()})
+    if runtime_gen:
+        payload["runtime_gen"] = runtime_gen
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(
-                {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
-                f, indent=2, ensure_ascii=False)
+            json.dump(payload, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
@@ -2033,11 +3019,16 @@ _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
-):
+    replace: bool = False, runtime_gen: Optional[str] = None,
+    overlay: Optional[Callable[[List[Any]], List[Any]]] = None,
+    mirror_mark: Optional[Tuple[float, float]] = None, mirror_only: bool = False,
+) -> bool:
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
-    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes)."""
+    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes).
+    The rename goes through ``_publish_jobs_json`` (sibling generation recovery in sqlite mode).
+    ``mirror_only`` (the coalesced mirror flush): skip the rename when the file already carries a
+    newer ``mirror_mark``; returns False then, True when the file was replaced."""
     jobs_file = _current_cron_store().jobs_file
     _guard_against_test_write_to_live_store(jobs_file)
     ensure_dirs()
@@ -2054,7 +3045,7 @@ def _save_jobs_unlocked(
         for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
             if not replace:
                 jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-            tmp_path = _stage_jobs_payload(jobs_file, jobs)
+            tmp_path = _stage_jobs_payload(jobs_file, jobs, runtime_gen, overlay, mirror_mark)
             # Verify-after-stage: a sibling landing during serialization forces another merge round.
             if (
                 not replace
@@ -2065,7 +3056,10 @@ def _save_jobs_unlocked(
                 tmp_path = None
                 continue
             # fsync the directory the rename actually landed in (atomic_replace resolves symlinks).
-            replaced = Path(atomic_replace(tmp_path, jobs_file))
+            replaced = _publish_jobs_json(tmp_path, jobs_file, own_gen=runtime_gen,
+                                          newer_than=mirror_mark if mirror_only else None)
+            if replaced is None:
+                return False  # a newer mirror is already on disk; _publish_jobs_json dropped tmp
             tmp_path = None
             fsync_directory(replaced.parent)
             _secure_file(jobs_file)
@@ -2073,10 +3067,245 @@ def _save_jobs_unlocked(
             # Invalidate (never refresh) the stamp: a refresh would let a nested save certify disk
             # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
             _record_load_stamp(None)
-            return
+            return True
     except BaseException:
         _unlink_quiet(tmp_path)
         raise
+
+
+def _save_split_unlocked(
+    jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
+    replace: bool = False, prune_runtime: bool = False,
+) -> None:
+    """sqlite-mode save (caller holds ``_jobs_lock``): runtime fields -> one row per CHANGED job;
+    jobs.json -> rewritten only when a definition changed (or ids were added/removed/reordered),
+    and then as the MERGED view (definitions + the rows as committed), which also resets the
+    mirror's coalescing window. A tick that only stamped ``pending_slot``/``last_dispatch``
+    therefore writes rows and leaves the file to the coalesced mirror flush.
+
+    Changed rows are three-way merged per key (load baseline -> ours, disk) inside the IMMEDIATE
+    transaction, as ``_reconcile_job_fields`` does for the file; a ``replace`` save is
+    authoritative and skips that. A save that changes BOTH halves is a two-phase commit: rows
+    staged under a generation id, jobs.json renamed carrying that id, then rows applied;
+    ``_recover_pending_runtime`` rolls a crash forward or back on next load."""
+    # A sibling that crashed after its rename left a generation the file names: roll it forward
+    # BEFORE we replace the file (a write without its runtime_gen would orphan it).
+    _recover_pending_now()
+    baseline = getattr(_jobs_lock_state, "load_baseline", None)
+    stamp = getattr(_jobs_lock_state, "load_stamp", None)
+    defs: List[Dict[str, Any]] = []
+    runtime_rows: Dict[str, Dict[str, Any]] = {}
+    for job in jobs:
+        if not isinstance(job, dict):
+            defs.append(job)
+            continue
+        definition, runtime = _rs.split_job(job)
+        defs.append(definition)
+        if job.get("id"):
+            runtime_rows[str(job["id"])] = runtime
+    base_defs: Optional[Dict[str, Dict[str, Any]]] = None
+    base_runtime: Optional[Dict[str, Dict[str, Any]]] = None
+    if baseline is not None:
+        base_defs, base_runtime = {}, {}
+        for jid, record in baseline.items():
+            base_defs[jid], base_runtime[jid] = _rs.split_job(record)
+    defs_unchanged = (
+        not replace and not removed_ids and base_defs is not None and stamp is not None
+        and _jobs_file_stamp(_current_cron_store().jobs_file) == stamp
+        and [str(d.get("id")) for d in defs if isinstance(d, dict)] == list(base_defs)
+        and all(base_defs.get(str(d.get("id"))) == d for d in defs if isinstance(d, dict))
+    )
+    if replace:
+        changed = dict(runtime_rows)  # wholesale: the supplied runtime is authoritative
+    else:
+        changed = {jid: row for jid, row in runtime_rows.items()
+                   if base_runtime is None or base_runtime.get(jid) != row}
+
+    def merged_changes(conn) -> Tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Any]]:
+        disk_rows = _rs._rows_of(conn)
+        out: Dict[str, Dict[str, Any]] = {}
+        folded_rows: Optional[Dict[str, Dict[str, Any]]] = None
+        for jid, row in changed.items():
+            if not replace and base_runtime is not None and jid in base_runtime:
+                if jid in disk_rows:
+                    row = _reconcile_job_fields(row, disk_rows[jid], base_runtime[jid])
+                else:
+                    # Prism c2d58ecce953 (+ ee01a8d9dc87: regardless of baseline truthiness): our baseline row is GONE (an export folded and retired
+                    # it; its newer values live in jobs.json). Rebase against the folded record,
+                    # as _with_job_runtime does, instead of resurrecting our stale copy.
+                    if folded_rows is None:
+                        folded_rows = _folded_runtime_rows()
+                    if jid in folded_rows:
+                        row = _reconcile_job_fields(row, folded_rows[jid], base_runtime[jid])
+            out[jid] = row
+        deletes = [str(i) for i in (removed_ids or ()) if i]
+        if replace and prune_runtime:
+            # Intentional wholesale replace only: rows for ids no longer in the store go with
+            # them. Never on load_jobs' auto-repair, whose payload is whatever survived a
+            # malformed file (an empty list for {"jobs": "invalid"}): pruning there would wipe
+            # every row, i.e. the only copy of the runtime state.
+            deletes += [jid for jid in disk_rows if jid not in runtime_rows]
+        return out, deletes, disk_rows
+
+    def refresh_baseline() -> None:
+        # The section's baseline becomes exactly the payload we just saved, BOTH halves, every
+        # job (Prism 60b9541dae29): a later save of the same list then diffs against what we
+        # persisted, so restoring a value we changed (definition or runtime) is a change again,
+        # while a key we never touched still yields to a sibling's value on disk. Not the merged
+        # rows: a sibling's key folded in from disk would then read as OUR change and revert it.
+        if getattr(_jobs_lock_state, "load_baseline", None) is None:
+            return
+        _jobs_lock_state.load_baseline = {
+            str(j["id"]): copy.deepcopy(j) for j in jobs if isinstance(j, dict) and j.get("id")}
+
+    if defs_unchanged:
+        if changed:
+            with _runtime_txn() as conn:
+                rows, deletes, disk_rows = merged_changes(conn)
+                _rs.upsert_rows(conn, rows, delete_ids=deletes, current=disk_rows)
+            refresh_baseline()
+        return
+
+    saved_baseline = baseline
+    gen = uuid.uuid4().hex
+    with _gen_owner_lock(gen):  # held until the generation is applied or discarded
+        _save_split_two_phase(gen, defs, merged_changes, removed_ids=removed_ids,
+                              replace=replace, base_defs=base_defs,
+                              saved_baseline=saved_baseline)
+    refresh_baseline()
+
+
+def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, base_defs,
+                          saved_baseline) -> None:
+    """Stage -> rename -> apply for ``_save_split_unlocked`` (caller holds the generation's owner
+    lock). Each staged row records the row it was computed from, so ``apply_pending`` merges a
+    sibling's intervening write instead of replacing it (Prism 682ece27eb8b)."""
+    with _runtime_txn() as conn:
+        rows, deletes, disk_rows = merged_changes(conn)
+        rows = {jid: r for jid, r in rows.items()
+                if jid not in disk_rows or disk_rows[jid] != r}
+        if rows or deletes:
+            _rs.stage_pending(conn, gen, rows, deletes,
+                              bases={jid: disk_rows.get(jid) for jid in rows})
+        else:
+            gen = None
+        seq = _rs.mirror_seq(conn)
+        epoch = _rs.mirror_epoch(conn)
+    final_rows = {jid: r for jid, r in {**disk_rows, **rows}.items() if jid not in set(deletes)}
+
+    def to_mirror(payload: List[Any]) -> List[Any]:
+        # After the shrink-merge (which may have pulled a sibling's mirror runtime back in):
+        # every job with a row shows exactly the row it will have once this save commits.
+        return [_rs.overlay_row(j, final_rows[str(j.get("id"))])
+                if isinstance(j, dict) and str(j.get("id")) in final_rows else j
+                for j in payload]
+
+    if base_defs is not None:
+        # The shrink-merge reconciles DEFINITIONS against disk; give it a definitions view.
+        _jobs_lock_state.load_baseline = base_defs
+    try:
+        _save_jobs_unlocked(defs, removed_ids=removed_ids, replace=replace, runtime_gen=gen,
+                            overlay=to_mirror,
+                            mirror_mark=(epoch, seq) if epoch is not None else None)
+    except BaseException:
+        if gen is not None:
+            with contextlib.suppress(Exception), _runtime_txn() as conn:
+                named = _file_runtime_gen() == gen
+                if named or (gen in _rs.published_gens(conn) and not _destructive_ok()):
+                    # The rename landed before the failure (fsync/chmod/chown, or a signal), or,
+                    # on a degraded lock, a sibling's rename may since have erased the file's
+                    # name for it: the marker (R2) says committed. Roll forward.
+                    _rs.apply_pending(conn, gen)
+                elif _destructive_ok():
+                    # With the cross-process lock no sibling renamed over us, so a file that does
+                    # not name gen means our rename never landed: the marker set just before it
+                    # is withdrawn with the generation.
+                    _discard_pending(conn, gen)
+        raise
+    finally:
+        _jobs_lock_state.load_baseline = saved_baseline
+    with _runtime_txn() as conn:
+        if gen is not None:
+            _rs.apply_pending(conn, gen)
+        _record_mirror_written(conn, seq)
+
+
+_MIRROR_MARK_RE = re.compile(
+    r'^\{\s*"%s":\s*(-?[0-9.eE+]+),\s*"%s":\s*(-?[0-9.eE+]+)'
+    % (re.escape(_rs.MIRROR_EPOCH_KEY), re.escape(_rs.MIRROR_SEQ_KEY)))
+
+
+def _file_mirror_mark(jobs_file: Path) -> Optional[Tuple[float, float]]:
+    """``(epoch, seq)`` a mirror write embedded at the top of jobs.json, or None (no mark, or a
+    file not written by a mirror-aware save). Reads a short prefix, never the whole file."""
+    try:
+        with open(jobs_file, "r", encoding="utf-8-sig") as fh:
+            head = fh.read(256)
+    except OSError:
+        return None
+    m = _MIRROR_MARK_RE.match(head)
+    if not m:
+        return None
+    try:
+        return float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+
+
+def _publish_jobs_json(tmp_path: str, jobs_file: Path, *, own_gen: Optional[str] = None,
+                       newer_than: Optional[Tuple[float, float]] = None) -> Optional[Path]:
+    """The one rename over jobs.json for every save (two-phase definition save AND the coalesced
+    mirror flush, Prism 093e1acfc350). In sqlite mode it first rolls forward a generation a sibling
+    published since our recovery, because the rename erases the marker that commits it. Returns
+    the path the rename landed on (``atomic_replace`` resolves symlinks).
+
+    ``newer_than`` (mirror flush, Prism e5b0da3eb246): our ``(epoch, seq)``. When the file on disk
+    already carries a NEWER seq of the same database epoch (a concurrent flush under a degraded
+    lock published a later snapshot), the stale tmp is dropped and None returned: the caller leaves
+    the mirror dirty."""
+    try:
+        _refuse_write_if_degraded(jobs_file.name)  # R4: the one jobs.json write choke point
+    except CronLockDegraded:
+        _unlink_quiet(tmp_path)
+        raise
+    if newer_than is not None:
+        on_disk = _file_mirror_mark(jobs_file)
+        if on_disk is not None and on_disk[0] == newer_than[0] and on_disk[1] > newer_than[1]:
+            _unlink_quiet(tmp_path)
+            logger.info("cron runtime-state: skipped a stale jobs.json mirror (seq %s < %s on "
+                        "disk)", newer_than[1], on_disk[1])
+            return None
+    if _split_store() and _runtime_db_path().exists():
+        _roll_forward_published_sibling(own_gen)
+    if own_gen:
+        # R2: the commit marker lives in the database, set in its own transaction BEFORE the
+        # rename; a sibling's later rename can erase the file's "runtime_gen", never this.
+        with _runtime_txn() as conn:
+            _rs.mark_published(conn, own_gen)
+    # Prism 82966426a22c: remember the identity of the file WE publish (inode, size and mtime
+    # survive the rename) so certification can bind to it, never to a later occupant of the path.
+    _jobs_lock_state.published_stamp = _mirror_stamp(Path(tmp_path))
+    return Path(atomic_replace(tmp_path, jobs_file))
+
+
+def _roll_forward_published_sibling(own_gen: Optional[str]) -> None:
+    """Right before our rename replaces jobs.json: if the file on disk names ANOTHER generation
+    that is still pending, a degraded-lock sibling published it after our entry recovery ran
+    (I3: a generation the file names is committed). Apply it now, merged (I2), because our rename
+    erases the only marker that commits it; recovery would later find it unnamed and, with its
+    owner gone, discard it (Prism 9083dea60b86). Marked dirty: the mirror we are about to write was
+    computed before these rows, so the next flush rewrites it. A live sibling's own later apply
+    then finds nothing left to apply."""
+    if not _runtime_pending():  # cheap: no pending generation, nothing the rename could erase
+        return
+    file_gen = _file_runtime_gen()
+    if not file_gen or file_gen == own_gen:
+        return
+    with _runtime_txn() as conn:
+        if file_gen in _rs.pending_gens(conn):
+            n = _rs.apply_pending(conn, file_gen)
+            logger.warning("cron runtime-state: rolled sibling save %s forward before replacing "
+                           "jobs.json (%d row(s))", file_gen, n)
 
 
 def _journal_created(job: Dict[str, Any]) -> None:
@@ -2129,12 +3358,14 @@ def _journal_removed(removed_ids: Optional[Collection[str]],
 
 def save_jobs(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
+    replace: bool = False, prune_runtime: bool = False,
 ):
     """Save all jobs to storage.
 
     See ``_save_jobs_unlocked`` for ``removed_ids`` / ``replace`` semantics
-    (shrink-merge guard against concurrent-create clobber, #80624).
+    (shrink-merge guard against concurrent-create clobber, #80624). ``prune_runtime`` (sqlite
+    mode, only with ``replace=True``) also deletes the runtime rows of ids absent from *jobs*:
+    pass it only for an intentional wholesale replace (definition import, CLI), never a repair.
     """
     # Fire the test-context guard BEFORE acquiring _jobs_lock() (which calls
     # ensure_dirs() and touches the advisory .jobs.lock). This keeps a blocked
@@ -2143,8 +3374,20 @@ def save_jobs(
     # shared chokepoint for the other (non-save_jobs) write paths; the guard is
     # idempotent and cheap so the double-check is harmless.
     _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
+    scope = getattr(_jobs_lock_state, "single_job_scope", None)
+    if scope is not None and jobs is scope.jobs and not replace:
+        # _with_job fast path: the scope persists (row only, or a full save) once fn returns.
+        scope.saved = True
+        if removed_ids:
+            scope.removed = set(scope.removed or ()) | {str(i) for i in removed_ids}
+        return
     with _jobs_lock():
-        _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
+        if _split_store():  # R3: json mode with the db present saves as sqlite mode
+            _save_split_unlocked(jobs, removed_ids=removed_ids, replace=replace,
+                                 prune_runtime=prune_runtime)
+        else:
+            _warn_json_mode_with_runtime_db()
+            _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
         # Journal INSIDE the lock, after the write lands. After, because a
         # removal that raised never happened and must not leave an audit
         # record claiming it did. Inside, because the journal's append order
@@ -2153,6 +3396,23 @@ def save_jobs(
         # create AFTER our removal, and the guard would then report an
         # intentionally-removed job as vanished.
         _journal_removed(removed_ids)
+
+
+_JSON_MODE_DB_WARNED: Set[str] = set()
+
+
+def _warn_json_mode_with_runtime_db() -> None:
+    """Kill-switch (json mode) save while runtime_state.db still exists: the rows are newer than
+    anything this save writes and nothing folds them in. The json mode is an operator rollback
+    entered via ``hermes cron runtime-export --to-json --retire`` (folds and retires the db); say so,
+    once per store per process (Prism 7ffd35b7bd2a, accepted as by-design)."""
+    path = _runtime_db_path()
+    if str(path) in _JSON_MODE_DB_WARNED or not path.exists():
+        return
+    _JSON_MODE_DB_WARNED.add(str(path))
+    logger.error("cron runtime-state: %s=json but %s still exists; its runtime rows are not "
+                 "in jobs.json. Run `hermes cron runtime-export --to-json --retire` to fold them back "
+                 "and retire the database", _rs.ENV_MODE, path)
 
 
 _MISSING = object()
@@ -2164,6 +3424,10 @@ def _with_job(
     """Run ``fn(jobs, i, job)`` on the first match under ``_jobs_lock()``; ``fn`` saves. *missing*
     if none."""
     with _jobs_lock():
+        if _fast_split():
+            result = _with_job_runtime(job_id, fn, missing)
+            if result is not _MISSING_FAST:
+                return result
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job.get("id") == job_id:
@@ -3682,6 +4946,26 @@ def _refresh_claim(jobs: List[Dict[str, Any]], claim: Any, expected_owner: str) 
     return True
 
 
+def _refresh_claim_row(job_id: str, claim_key: str, expected_owner: str,
+                       once_only: bool) -> Optional[bool]:
+    """sqlite-mode compare-and-refresh (caller holds ``_jobs_lock``): one owner-guarded UPDATE on
+    the job's row, no jobs.json read or write. ``None`` = fast path unusable (file needs a
+    repair/migration first); the caller then takes the ``_with_job`` path."""
+    usable, definition, _file_runtime = _cached_definition(job_id)
+    if not usable:
+        return None
+    if definition is None:
+        return False
+    if once_only and (definition.get("schedule") or {}).get("kind") != "once":
+        return False
+    # Same test-context live-store guard, and the same 0600/ownership pass on a new db or sidecar
+    # (a root CLI heartbeat must not leave a root-owned -wal/-shm the gateway cannot open), as
+    # every other runtime write: through _runtime_txn, never a bare connection.
+    with _runtime_txn() as conn:
+        return _rs.refresh_claim_conn(conn, str(job_id), claim_key, expected_owner,
+                                      _hermes_now().isoformat())
+
+
 def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     """Refresh a one-shot's ``run_claim`` timestamp while its run is alive, so an expired claim
     really means the claiming process died. Compare-and-refresh on ``expected_owner`` stops a stale
@@ -3697,6 +4981,12 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
             return False
         return _refresh_claim(jobs, job.get("run_claim"), expected_owner)
 
+    if _split_store():
+        with _jobs_lock():
+            fast = (_refresh_claim_row(job_id, "run_claim", expected_owner, once_only=True)
+                    if _fast_split() else None)
+            if fast is not None:
+                return fast
     return _with_job(job_id, apply, False)
 
 
@@ -3868,6 +5158,12 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     def apply(jobs, _i, job):
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
+    if _split_store():
+        with _jobs_lock():
+            fast = (_refresh_claim_row(job_id, "fire_claim", expected_owner, once_only=False)
+                    if _fast_split() else None)
+            if fast is not None:
+                return fast
     return _with_job(job_id, apply, False)
 
 

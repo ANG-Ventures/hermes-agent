@@ -1033,11 +1033,43 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_runtime_export(args) -> int:
+    """``hermes cron runtime-export --to-json [--retire [--drop-orphans]]`` (t_94e91559): fold
+    runtime_state.db back into jobs.json; ``--retire`` also removes the database (kill switch) and
+    refuses (rc 2) while rows without a definition exist unless ``--drop-orphans``, and whenever the
+    jobs lock is degraded. Orphan row ids are listed; without ``--retire`` they stay in the
+    database. Idempotent (no db = 0 jobs)."""
+    from cron.jobs import (CronLockDegraded, RuntimeExportNotWritten, RuntimeRetireRefused,
+                           export_runtime_to_json)
+
+    retire = bool(getattr(args, "retire", False))
+    try:
+        count = export_runtime_to_json(
+            retire=retire, drop_orphans=bool(getattr(args, "drop_orphans", False)))
+    except RuntimeRetireRefused as exc:  # orphans, or a degraded jobs lock
+        print(color(f"runtime-export refused: {exc}", Colors.RED))
+        return 2
+    except RuntimeExportNotWritten as exc:  # degraded lock without --retire: print, write nothing
+        print(color(f"runtime-export: {exc}", Colors.RED))
+        print(json.dumps({"jobs": exc.jobs}, indent=2, ensure_ascii=False))
+        return 2
+    except CronLockDegraded as exc:  # R4: any other write under a degraded lock
+        print(color(f"runtime-export: lock degraded: not written ({exc})", Colors.RED))
+        return 2
+    except Exception as exc:
+        print(color(f"runtime-export failed: {exc}", Colors.RED))
+        return 1
+    print(f"runtime-export: wrote runtime fields of {count} job(s) back into jobs.json"
+          + ("; removed runtime_state.db" if retire else ""))
+    return 0
+
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False), as_json=getattr(a, "json", False)) or 0,
     "status": lambda a: cron_status() or 0,
     "doctor": lambda a: cron_doctor(),
+    "runtime-export": lambda a: cron_runtime_export(a),
     "tick": lambda a: cron_tick(),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),

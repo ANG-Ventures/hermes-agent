@@ -1638,6 +1638,7 @@ def run_import(args) -> Optional[int]:
 # outside state.db, so it is listed explicitly — ``hermes update`` snapshots this set (#15733).
 _QUICK_STATE_FILES = (
     "state.db", "config.yaml", ".env", "auth.json", "cron/jobs.json", "cron/executions.db",
+    "cron/runtime_state.db",  # cron runtime fields (t_94e91559): jobs.json is definitions-only
     "gateway_state.json", "channel_directory.json", "channel_aliases.json", "processes.json",
     "gateway/discord_message_recovery.db",  # Discord reconnect replay ledger
     # Per-profile user stores, destroyed if the update flow replaces the file and the post-update
@@ -1671,6 +1672,28 @@ def _newest_first(root: Path, keep_entry) -> List[Path]:
 
 # Kept in sync with ``_QUICK_STATE_FILES`` and ``cron/jobs.py``'s ``JOBS_FILE``.
 _CRON_JOBS_REL = "cron/jobs.json"
+_CRON_RUNTIME_REL = "cron/runtime_state.db"
+
+
+@contextmanager
+def _cron_store_lock(home: Path):
+    """Hold *home*'s cron jobs lock so jobs.json and runtime_state.db are captured as ONE unit
+    (t_94e91559: runtime rows live in the db; a remove_job between the two copies would
+    otherwise pair a definition with no row). Best effort: no lock when cron cannot load."""
+    try:
+        from cron.jobs import CronLockDegraded, _jobs_lock, _write_refused_by_r4, use_cron_store
+    except Exception:
+        yield
+        return
+    with use_cron_store(home), _jobs_lock():
+        if _write_refused_by_r4():
+            # Prism d893e459f0ce, ruling R4: a section that could not take the cross-process lock
+            # is not exclusive; the real holder may be mid-write across the two files. A pair
+            # copied now could pair old definitions with newer runtime. Refuse the capture.
+            raise CronLockDegraded(
+                f"the cron jobs lock is degraded (another process holds {home / 'cron' / '.jobs.lock'}); "
+                "refusing to capture jobs.json + runtime_state.db as a pair (nothing copied). Retry")
+        yield
 
 
 # Config paths the update flow must never change (#64160): model routing and the MoA section are
@@ -1862,7 +1885,19 @@ def _create_quick_snapshot_locked(
     # recoverable database.
     oversized_skipped: list[str] = []
 
-    for rel in _QUICK_STATE_FILES:
+    def _quick_items():
+        # The cron pair is yielded together, inside the cron store lock (see _cron_store_lock).
+        for rel in _QUICK_STATE_FILES:
+            if rel == _CRON_RUNTIME_REL:
+                continue
+            if rel == _CRON_JOBS_REL:
+                with _cron_store_lock(home):
+                    yield rel
+                    yield _CRON_RUNTIME_REL
+                continue
+            yield rel
+
+    for rel in _quick_items():
         src = home / rel
         if not src.exists():
             continue
@@ -2097,6 +2132,10 @@ def restore_quick_snapshot(
 
     restored = 0
     for rel in meta.get("files", {}):
+        if rel == _CRON_RUNTIME_REL:
+            # Captured, never restored (t_94e91559): runtime bookkeeping comes from the live db
+            # and schedule fields are recomputed by the scheduler. The pair restore is t_82c613d9.
+            continue
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
         try:
