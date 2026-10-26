@@ -1507,7 +1507,7 @@ class GatewayNotificationsMixin:
         return "deliver"
 
     @staticmethod
-    def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
+    def _settle_durable_claim_sync(kind: str, delegation_id: str, claim_id: str) -> None:
         """Best-effort ``drop``/``release`` of a durable completion claim."""
         fn_name, fail_msg = _DURABLE_CLAIM_OPS[kind]
         try:
@@ -1515,6 +1515,20 @@ class GatewayNotificationsMixin:
             getattr(_ad, fn_name)(delegation_id, claim_id)
         except Exception:
             logger.log(logging.WARNING if kind == "complete" else logging.DEBUG, fail_msg, exc_info=True)
+
+    async def _settle_durable_claim(self, kind: str, delegation_id: str, claim_id: str) -> None:
+        await self._settle_durable_claims(kind, [(delegation_id, claim_id)])
+
+    async def _settle_durable_claims(self, kind: str, claims) -> None:
+        """``_settle_durable_claim_sync`` off the loop: the ledger UPDATE (BEGIN IMMEDIATE on state.db)
+        waits on the SQLite writer lock and froze the event loop for up to 120 s (t_6b37ae49). A bare
+        shielded executor future, as for the receipts: a cancelled awaiter (these run in ``finally``
+        and ``except BaseException``) must not drop the release; copy_context keeps the profile home."""
+        def _settle_all():
+            for delegation_id, claim_id in claims:
+                self._settle_durable_claim_sync(kind, delegation_id, claim_id)
+        await asyncio.shield(asyncio.get_running_loop().run_in_executor(
+            None, contextvars.copy_context().run, _settle_all))
 
     async def _completion_delivery_ready(self, evt: dict) -> bool:
         """Unavailable owners/transports must not spend a durable delivery attempt."""
@@ -1585,7 +1599,7 @@ class GatewayNotificationsMixin:
             # Cancelled (or failed) while verifying the target: the row was claimed above but the caller
             # never sees this claim object, so release it here or it stays held until the orphan sweep.
             if claim.claim_id:
-                self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
+                await self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
             raise
 
     async def _preflight_completion_target(self, evt: dict, claim: "_CompletionClaim", is_async: bool):
@@ -1621,7 +1635,7 @@ class GatewayNotificationsMixin:
                 verdict = "retry"
             else:
                 if claim.claim_id:
-                    self._settle_durable_claim("drop", claim.delegation_id, claim.claim_id)
+                    await self._settle_durable_claim("drop", claim.delegation_id, claim.claim_id)
                 claim.proceed = False
                 return claim
         if verdict == "terminal":
@@ -1635,7 +1649,7 @@ class GatewayNotificationsMixin:
         elif verdict == "retry":
             # Transient uncertainty: tell the watcher to re-poll rather than drop or misroute.
             if claim.claim_id:
-                self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
+                await self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
             claim.proceed, claim.early_result = False, False
         return claim
 
@@ -1769,11 +1783,11 @@ class GatewayNotificationsMixin:
                     self._completion_deliveries_inflight.discard(identity)
             if not accepted:
                 operation = "defer" if refused else "release"
-                if claim.claim_id:
-                    self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
-                for sibling, claim_id in sibling_claims:
-                    if claim_id:
-                        self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
+                pending = [(claim.delegation_id, claim.claim_id)] if claim.claim_id else []
+                pending += [(sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims if claim_id]
+                if pending:
+                    # One shielded hop for the whole batch, so a second cancel cannot skip a sibling.
+                    await self._settle_durable_claims(operation, pending)
 
     async def _retarget_completion_at_compression_tip(self, evt: dict, parent_session_id: str) -> None:
         """Compression rotation: pin a deliverable completion at the live tip so downstream pinning
