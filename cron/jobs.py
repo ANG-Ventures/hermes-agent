@@ -3387,6 +3387,29 @@ def _journal_toggled(before: Any, job: Dict[str, Any], reason: Optional[str] = N
         logger.debug("cron lifecycle journal (toggle) unavailable", exc_info=True)
 
 
+# Keys an edit journal record never carries: scheduler runtime (cron/runtime_state.py) and the toggle state the
+# pause/resume events already journal.
+_EDIT_JOURNAL_SKIP = frozenset(_rs.RUNTIME_FIELDS) | {"enabled", "state", "paused_at", "paused_reason"}
+
+
+def _journal_updated(before: Dict[str, Any], after: Dict[str, Any]) -> None:
+    """Journal an API edit of a row's definition (t_71499bfa): one ``edits.jsonl`` record naming every
+    changed key with its ``from``/``to``. Call INSIDE the jobs lock, after the save landed. Never raises."""
+    try:
+        fields = {
+            k: {"from": before.get(k), "to": after.get(k)}
+            for k in sorted(set(before) | set(after))
+            if k not in _EDIT_JOURNAL_SKIP and before.get(k) != after.get(k)
+        }
+        if not fields:
+            return
+        from cron.lifecycle_journal import record_updated
+
+        record_updated(str(after.get("id") or ""), fields, name=after.get("name"))
+    except Exception:
+        logger.debug("cron lifecycle journal (update) unavailable", exc_info=True)
+
+
 def _journal_removed(removed_ids: Optional[Collection[str]],
                      reason: Optional[str] = None) -> None:
     """Journal intentional removals. Never raises into the caller.
@@ -4312,6 +4335,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         jobs[i] = updated
         save_jobs(jobs)
         _journal_toggled(job.get("enabled", True), updated)
+        _journal_updated(job, updated)
         if updates.get("allow_flagship_reason"):
             logger.info("flagship override: cron update id=%s model=%s reason=%s", job_id, updated.get("model"), updates["allow_flagship_reason"])
         return _normalize_job_record(updated)

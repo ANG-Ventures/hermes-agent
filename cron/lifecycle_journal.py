@@ -64,11 +64,19 @@ EVENT_PAUSED = "paused"
 EVENT_RESUMED = "resumed"
 EVENTS = (EVENT_CREATED, EVENT_REMOVED, EVENT_PAUSED, EVENT_RESUMED)
 
+# t_71499bfa: an API edit of an existing row's DEFINITION (prompt, schedule, script, model, ...) goes to its
+# own file beside lifecycle.jsonl, one {"event": "updated", "job_id", "fields": {key: {"from", "to"}}, "at",
+# "actor"} per write. Not lifecycle.jsonl: read_entries_with_health counts any event outside EVENTS as
+# malformed, and check_vanished_jobs then refuses to certify the store (#2349). hermes-home's push gate and
+# cron-jobs-runtime-committer read it (scripts/lib/autocommit_tier.py) so an API edit is data, not a hand edit.
+EDITS_FILENAME = "edits.jsonl"
+EVENT_UPDATED = "updated"
 
-def _journal_path() -> Path:
+
+def _journal_path(filename: str = JOURNAL_FILENAME) -> Path:
     from cron.jobs import _current_cron_store
 
-    return _current_cron_store().cron_dir / JOURNAL_FILENAME
+    return _current_cron_store().cron_dir / filename
 
 
 @contextlib.contextmanager
@@ -135,10 +143,10 @@ def _ends_with_newline(path: Path) -> bool:
         return True  # unreadable: the append below will fail loudly enough
 
 
-def _append(record: Dict[str, Any]) -> None:
+def _append(record: Dict[str, Any], filename: str = JOURNAL_FILENAME) -> None:
     """Append one record. Best effort — never raises into a cron write."""
     try:
-        path = _journal_path()
+        path = _journal_path(filename)
         with _journal_lock(path):
             # Separator-before-record, under the lock: heals a torn tail so the
             # new event lands on its own parseable line. The torn remnant stays
@@ -197,6 +205,22 @@ def record_removed(job_id: str, *, reason: Optional[str] = None,
         "actor": actor or _default_actor(),
         "at": _hermes_now().isoformat(),
     })
+
+
+def record_updated(job_id: str, fields: Dict[str, Dict[str, Any]], *, name: Optional[str] = None,
+                   actor: Optional[str] = None) -> None:
+    """Journal an API edit of a row's definition to ``edits.jsonl``: ``fields`` is {key: {"from", "to"}}
+    for exactly the keys the write changed. Nothing is written when ``fields`` is empty."""
+    if not job_id or not fields:
+        return
+    _append({
+        "event": EVENT_UPDATED,
+        "job_id": str(job_id),
+        "name": name,
+        "fields": fields,
+        "actor": actor or _default_actor(),
+        "at": _hermes_now().isoformat(),
+    }, EDITS_FILENAME)
 
 
 def _default_actor() -> str:
@@ -568,10 +592,12 @@ def check_vanished_jobs(
 
 __all__ = [
     "DEFAULT_WINDOW_HOURS",
+    "EDITS_FILENAME",
     "EVENT_CREATED",
     "EVENT_PAUSED",
     "EVENT_REMOVED",
     "EVENT_RESUMED",
+    "EVENT_UPDATED",
     "EVENTS",
     "JOURNAL_FILENAME",
     "MAX_WINDOW_HOURS",
@@ -586,4 +612,5 @@ __all__ = [
     "record_created",
     "record_removed",
     "record_toggled",
+    "record_updated",
 ]
