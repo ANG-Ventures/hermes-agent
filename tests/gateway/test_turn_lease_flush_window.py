@@ -250,6 +250,27 @@ async def test_r1_internal_wake_during_flush_is_queued_silently(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+async def test_r1_requeue_laps_log_the_flush_queue_once(monkeypatch, tmp_path, caplog):
+    """The requeue back-off re-dispatches a queued wake about once a second for the whole flush;
+    each lap re-queues it. One INFO line per flush window, not one per lap (94 lines on 10-25)."""
+    rig = _Rig(monkeypatch, tmp_path)
+    gate = rig.hold_flush("first")
+    caplog.set_level(logging.INFO, logger="gateway.run")
+
+    await rig.adapter.handle_message(_msg("first"))
+    await _wait_for(rig.flush_entered["first"].is_set, "first turn to reach its flush")
+    for _ in range(3):
+        await asyncio.wait_for(rig.runner._handle_message(_msg("wake", internal=True)), timeout=5)
+        rig.adapter._pending_messages.pop(KEY, None)  # the adapter's back-off lap takes it again
+    info = [r for r in caplog.records if r.levelno == logging.INFO and "PHASE=lease_flush_queued" in r.getMessage()]
+    assert len(info) == 1, [r.getMessage()[:80] for r in info]
+
+    gate.set()
+    rig.adapter._pending_messages[KEY] = _msg("wake", internal=True)
+    await rig.settle(expect_calls=2)
+
+
+@pytest.mark.asyncio
 async def test_r1_adapter_door_inbound_behind_direct_path_holder(monkeypatch, tmp_path, caplog):
     """Holder entered the runner directly (boot resume / slash re-dispatch: no adapter guard), so
     the next message comes through ``adapter.handle_message`` and reaches ``_handle_message`` as a
