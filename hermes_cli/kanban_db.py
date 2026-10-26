@@ -7156,8 +7156,10 @@ def assign_task(
             )
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
         # a no-op re-assign or an unassign, which must not lift ``active_pr``.
+        # ``status`` lets _latest_review_provenance read an operator reassignment of a card IN REVIEW as the
+        # new reviewer of record (SB-K key 766baef3760b): no review_requested is written for it.
         _append_event(
-            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
+            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"], "status": row["status"]},
         )
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee",))
@@ -10380,6 +10382,28 @@ class ExternalCloseError(ValueError):
         )
 
 
+def landing_policy_knob(name: str) -> Optional[str]:
+    """One knob of hermes-home ``config/landing-policy.json`` (Forge L0 kill switches), or None. Missing file /
+    key / unreadable = None (off). ``KANBAN_LANDING_POLICY`` overrides the path (tests); inside pytest with no
+    override it reads nothing, so a dev box's live policy never leaks into the suite."""
+    path = os.environ.get("KANBAN_LANDING_POLICY") or ""
+    if not path:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None
+        try:
+            from hermes_constants import get_default_hermes_root
+            path = str(get_default_hermes_root() / "config" / "landing-policy.json")
+        except Exception:  # noqa: BLE001 -- off
+            return None
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    v = cfg.get(name) if isinstance(cfg, dict) else None
+    return v if isinstance(v, str) else None
+
+
 def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
     """Forge L0 section 2.3 (a), card PRE t_7ff229a7: run hermes-home ``scripts/lib/landable.py check`` on each
     of the card's OWN open fleet PRs before the open-PR route, so the worker hears what fleet-merge would refuse at
@@ -10548,8 +10572,16 @@ def _enforce_branch_base(
         payload = {"failures": failures}
         if untied:
             payload["survivor_merged_untied"] = untied
+        # Forge L0 §2.4 "Also changed" (SB-P): with the sendback producers on, a stale base is ADVISORY. The
+        # event is still recorded (now with advisory=true) and the handoff proceeds; a real conflict reaches
+        # the worker as a `sendback(source=conflict)` from the PR, not as a refused handoff.
+        advisory = landing_policy_knob("sendback") == "on"
+        if advisory:
+            payload["advisory"] = True
         with write_txn(conn):
             _append_event(conn, task.id, "completion_blocked_stale_base", payload)
+        if advisory:
+            return
         raise
     except Exception as exc:  # the guard must never break a handoff by crashing
         _log.warning("branch-base guard skipped for %s: %s", task.id, exc)
@@ -13943,9 +13975,24 @@ def _latest_review_provenance(conn: sqlite3.Connection, task_id: str):
     "who reviews this card" (every review cycle records the resolved reviewer,
     explicit or inherited). ``None`` = never reviewed, or that cycle resolved
     no reviewer (unconfigured board); ``False`` = the event exists but its
-    reviewer is missing/blank/malformed."""
-    event = _latest_event(conn, task_id, "review_requested")
-    if event is None:
+    reviewer is missing/blank/malformed.
+
+    An operator reassignment of the card while it was IN REVIEW (an ``assigned``
+    event recorded with ``status == "review"``) newer than that event is the
+    reviewer of record instead (SB-K key 766baef3760b): the live assignee and
+    the recorded reviewer must not diverge."""
+    for row in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('review_requested', 'assigned') ORDER BY id DESC", (task_id,),
+    ):
+        if row["kind"] == "review_requested":
+            event = row
+            break
+        moved = _json_dict(row["payload"])
+        if moved.get("status") == "review":
+            reviewer = moved.get("assignee")
+            return reviewer if isinstance(reviewer, str) and reviewer.strip() else None
+    else:
         return None
     payload = _json_dict(_row_get(event, "payload"))
     if "reviewer" not in payload:
@@ -14629,11 +14676,16 @@ def request_sendback(
         if status in ("ready", "todo"):
             # A card demoted from review (reopened parent) still names the
             # reviewer: restore the implementer as the review branch does.
+            # Only then (SB-K key d3eaed71c036): any other assignee is an
+            # operator's explicit choice (a reassign after a lane outage) and
+            # stands.
             implementer = _review_handoff_implementer(conn, task_id)
             extra: dict = {}
             if implementer is not None:
                 extra["implementer"] = implementer
-                if row["assignee"] != implementer:
+                last_reviewer = _latest_review_provenance(conn, task_id)
+                if (row["assignee"] != implementer and isinstance(last_reviewer, str)
+                        and row["assignee"] == last_reviewer):
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = ? WHERE id = ? AND status = ?",
                         (implementer, task_id, status),

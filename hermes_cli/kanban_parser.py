@@ -821,6 +821,11 @@ _SPECS = [
         # ``--operator "<who: why>"`` comes from the home-guard loop in build_parser;
         # on request-changes it is also the operator send-back (coverage waived).
     ], help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("sendback", [
+        _TASK_ID,
+        _arg("--payload", required=True,
+             help="The Forge L0 section 2.4 sendback row as a JSON object (source, reason, summary, evidence, ...)"),
+    ], help="Producer verb: return a PR defect (CI red, Prism, lander, conflict, revert) to the card's implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
