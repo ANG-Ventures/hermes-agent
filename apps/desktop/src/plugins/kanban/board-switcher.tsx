@@ -54,8 +54,6 @@ import type { BoardMeta } from './types'
 import { errText, FIELD_LABEL, useKanban } from './ui'
 
 const NO_PROJECT = '__none__'
-/** Mirrors `kanban_db.DEFAULT_BOARD` — the board that always exists. */
-const DEFAULT_BOARD = 'default'
 
 /** Board scope = a first-class Hermes project. Its primary repo becomes the
  *  board's default workspace root; new tasks inherit it as a worktree with a
