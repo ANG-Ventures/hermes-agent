@@ -192,8 +192,14 @@ def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: D
         # rather than send that endpoint's key elsewhere (Prism 467b28edd66c).
         raise RuntimeError(f"delegation {record_id or '(unknown)'}: legacy route for an anonymous custom "
                            "parent has no parent_base_url; set delegation.api_key for the delegation endpoint")
+    # requested_provider may be None on the route: resolving None answers for the profile's DEFAULT
+    # provider, not the parent's, so key on the recorded parent provider; neither recorded -> fail closed.
+    provider = route.get("requested_provider") or parent_provider
+    if not provider:
+        raise RuntimeError(f"delegation {record_id or '(unknown)'}: route records no parent provider; "
+                           "set delegation.api_key for the delegation endpoint")
     try:
-        own = resolve_runtime_provider(requested=route.get("requested_provider") or None,
+        own = resolve_runtime_provider(requested=provider,
                                        target_model=route.get("model") or execution.get("model") or None)
     except Exception:
         # A URL-only custom parent has no endpoint without the recorded URL, so a URL-less re-resolve
