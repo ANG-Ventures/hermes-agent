@@ -2462,7 +2462,7 @@ DEFAULT_CONFIG = {
             "worker_load_cost_max": 4.0,
             "slope_window_seconds": 600,
             "cpu_corroborate": True,
-            "cpu_busy_pause": 0.70,
+            "cpu_busy_pause": 0.90,  # Ace 2026-10-26: every CPU admission line 90%
             "worker_cpu_cost": 1.0,
             # t_a7978f86: E-core band saturation (Apple silicon) at or above
             # ecore_busy_pause is no local CPU headroom. off | report (log
