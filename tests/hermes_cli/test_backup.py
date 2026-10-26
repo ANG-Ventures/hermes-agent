@@ -491,6 +491,33 @@ class TestIterBackupFiles:
         got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
         assert {"wt/op/clean.py", "wt/op/sub/clean2.py", "wt/op/mod.py"} <= got
 
+    def test_skip_worktree_and_assume_unchanged_files_are_never_clean(self, tmp_path):
+        """Prism a5c80df2341e on #2299: `git diff HEAD` does not report edits to files flagged skip-worktree (S) or
+        assume-unchanged (h), so the clean-set subtraction classified them as clean and dropped them. The live
+        Studio tree pins cron/jobs.json skip-worktree in three checkouts. Flagged paths are never clean."""
+        import shutil as _sh
+        if _sh.which("git") is None:
+            pytest.skip("git not installed")
+        from hermes_cli import backup as B
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        parent = tmp_path / "parent"
+        self._git(tmp_path, "init", "-q", "-b", "main", str(parent))
+        for rel in ("plain.py", "pinned.json", "flagged.txt"):
+            (parent / rel).write_text("base\n")
+        self._git(parent, "add", "-A")
+        self._git(parent, "commit", "-q", "-m", "base")
+        clone = root / "worktrees" / "c"                        # HEAD == origin/main: dirty-only
+        self._git(tmp_path, "clone", "-q", str(parent), str(clone))
+        self._git(clone, "update-index", "--skip-worktree", "pinned.json")
+        self._git(clone, "update-index", "--assume-unchanged", "flagged.txt")
+        (clone / "pinned.json").write_text("LOCAL EDIT\n")
+        (clone / "flagged.txt").write_text("LOCAL EDIT\n")
+        assert "pinned.json" not in self._git(clone, "diff", "--name-only", "HEAD")   # the premise: git hides it
+        got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
+        assert {"worktrees/c/pinned.json", "worktrees/c/flagged.txt"} <= got, got
+        assert "worktrees/c/plain.py" not in got
+
     def test_manual_and_automatic_paths_share_one_walk(self, tmp_path):
         """Both backup entry points must select the identical file set.
 
