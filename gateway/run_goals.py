@@ -8,6 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import logging
 import time
@@ -70,6 +71,35 @@ class GatewayGoalsMixin:
             await self._run_in_executor_with_context(_warm_goals_db)
         except Exception as exc:
             logger.warning("%s: session DB warm-up failed: %s", label, exc)
+
+    async def _claim_off_loop(self, claim, give_back):
+        """Run a state.db CLAIM (``claim()``: a heartbeat fire, a /loop tick) in the executor and return
+        its result. A worker thread cannot be stopped: if the caller is cancelled while the claim waits on
+        the SessionDB lock, the thread still persists it, and nobody would dispatch or abandon it (Prism
+        fd214c8b7386). So the hop is shielded, and on cancel ``give_back(result)`` runs off the loop once
+        the claim lands, under the caller's contextvars (profile home)."""
+        hop = asyncio.ensure_future(self._run_in_executor_with_context(claim))
+        try:
+            return await asyncio.shield(hop)
+        except asyncio.CancelledError:
+            ctx = contextvars.copy_context()
+
+            def _orphaned(done):
+                if done.cancelled() or done.exception() is not None:
+                    return
+                result = done.result()
+
+                def _run():
+                    try:
+                        give_back(result)
+                    except Exception:
+                        logger.warning("giving back an orphaned claim failed", exc_info=True)
+
+                with suppress(RuntimeError):  # loop already closed: nothing left to run it on
+                    done.get_loop().run_in_executor(None, ctx.run, _run)
+
+            hop.add_done_callback(_orphaned)
+            raise
 
     async def _session_entry_for_manager(self, event: "MessageEvent", label: str):
         """Session entry for a /goal or /heartbeat manager, or None when lookup fails. Warms the
@@ -171,7 +201,12 @@ class GatewayGoalsMixin:
             m = HeartbeatManager(session_id=session_id)
             return m, (m.due_prompt() if m.has_heartbeat() else None)
 
-        mgr, prompt = await self._run_in_executor_with_context(_claim)
+        def _give_back(claimed):
+            m, p = claimed
+            if p:
+                m.abandon_fire()
+
+        mgr, prompt = await self._claim_off_loop(_claim, _give_back)
         if not mgr.has_heartbeat():
             watch.pop(quick_key, None)
             return
@@ -494,7 +529,7 @@ class GatewayGoalsMixin:
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+        wakeup = await self._claim_off_loop(mgr.fire_tick, lambda w: w and mgr.abandon_tick())
         if not wakeup:
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
