@@ -616,6 +616,19 @@ def apply_pending(conn: sqlite3.Connection, gen: str) -> int:
     return written
 
 
+def resolve_committed_in_memory(conn: sqlite3.Connection, rows: Dict[str, Dict[str, Any]],
+                                file_gen: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    """Apply every COMMITTED pending generation (published, R2, or named by the file) onto
+    *rows* in memory, in recovery order, WITHOUT writing: the view a reader gets when it may not
+    resolve the journal itself (read-only callers, a contended section under R4)."""
+    committed = published_gens(conn)
+    if isinstance(file_gen, str) and file_gen and file_gen not in committed:
+        committed.append(file_gen)
+    for gen in committed:
+        _apply_entries(rows, _pending_entries(conn, gen))
+    return rows
+
+
 def merged_jobs(jobs_file: Path, *, strict: bool = False,
                 complete: bool = False) -> List[Dict[str, Any]]:
     """READ-ONLY merged view for out-of-process readers (cron-health, dashboards, watchers that
@@ -663,11 +676,7 @@ def merged_jobs(jobs_file: Path, *, strict: bool = False,
             # A save that crashed after publishing left its generation staged: published (R2) or
             # named by the file, it is committed. Resolve it the way load_jobs' recovery
             # (apply_pending, same order) will, without writing.
-            committed = published_gens(conn)
-            if isinstance(file_gen, str) and file_gen and file_gen not in committed:
-                committed.append(file_gen)
-            for gen in committed:
-                _apply_entries(rows, _pending_entries(conn, gen))
+            resolve_committed_in_memory(conn, rows, file_gen)
             conn.execute("COMMIT")
         finally:
             conn.close()

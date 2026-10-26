@@ -1795,11 +1795,13 @@ def load_jobs() -> List[Dict[str, Any]]:
         rows = _read_runtime_rows(file_gen)
         adopt = [j for j in jobs if str(j.get("id") or "") and str(j.get("id")) not in rows
                  and _rs.has_runtime(j)]
-        if adopt:
-            if not locked:
-                with _jobs_lock():
-                    return load_jobs()
+        if adopt and not locked:
+            with _jobs_lock():
+                return load_jobs()
+        if adopt and not _write_refused_by_r4():
             rows = _adopt_file_runtime(adopt, rows)
+        # else (Prism 3aeaad041925, R4): a contended section reads; the file's runtime for these
+        # jobs is returned unchanged (no row to overlay) and a later locked load adopts it.
         # Overlay rows BEFORE any repair save below: that save must see the stored runtime, or it
         # would read every row's absence as "cleared" and overwrite the rows with {}.
         jobs = [_rs.overlay_row(job, rows[str(job.get("id"))])
@@ -1948,11 +1950,18 @@ def _read_runtime_rows(file_gen: Optional[str] = None) -> Dict[str, Dict[str, An
         conn.execute("BEGIN")
         pending = _rs.pending_gens(conn)
         rows = _rs._rows_of(conn)
+        if pending and _write_refused_by_r4():
+            # Prism 5fef6ead34bb: a contended section may not resolve the journal (R4), but it must
+            # still SEE a committed generation's rows, or it reads (and a later save re-merges
+            # from) pre-commit runtime. Same in-memory resolution merged_jobs uses; one snapshot.
+            rows = _rs.resolve_committed_in_memory(conn, rows, file_gen)
         conn.execute("COMMIT")
     if not existed:
         _secure_runtime_db()
-    if pending and _runtime_write_allowed() and getattr(_jobs_lock_state, "depth", 0):
-        # Locked only: an unlocked reader cannot tell a crashed save from one in flight.
+    if pending and _runtime_write_allowed() and getattr(_jobs_lock_state, "depth", 0) \
+            and not _write_refused_by_r4():
+        # Locked only: an unlocked reader cannot tell a crashed save from one in flight. A
+        # contended section (R4) keeps the in-memory resolution above instead.
         _recover_pending_runtime(file_gen)
         return _rs.read_all(cron_dir)
     return rows
@@ -2286,7 +2295,8 @@ def _mirror_after_section() -> None:
         _jobs_lock_state.mirror_flushing = False
 
 
-def _write_definitions_file(defs: List[Dict[str, Any]]) -> None:
+def _write_definitions_file(defs: List[Dict[str, Any]], *,
+                            authoritative_rows: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
     """Atomic temp+rename of *defs* as jobs.json. Used by the migration and the export only.
     Prism d925dce7cb01: the caller holds the lock, but a sibling whose lock acquisition timed out
     proceeds DEGRADED and can create a job after the caller read the file; the shrink-merge
@@ -2300,6 +2310,13 @@ def _write_definitions_file(defs: List[Dict[str, Any]]) -> None:
     try:
         for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
             defs = _merge_unexpected_disk_jobs(defs)
+            if authoritative_rows:
+                # Prism 7b52062e31e5: the shrink-merge reconciles DEFINITIONS against a concurrent
+                # file; runtime comes from the rows, never from a file the merge saw. Re-overlay so
+                # an out-of-band file replacement cannot rewind a counter the db still holds.
+                defs = [_rs.overlay_row(d, authoritative_rows[str(d.get("id"))])
+                        if isinstance(d, dict) and str(d.get("id")) in authoritative_rows else d
+                        for d in defs]
             tmp_path = _stage_jobs_payload(jobs_file, defs)
             # Verify-after-stage, as _save_jobs_unlocked does: a sibling landing during
             # serialization forces another merge round.
@@ -2437,7 +2454,7 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
             # sibling's write (the read is outside any cross-process lock): never publish it.
             raise RuntimeExportNotWritten(merged)
         if applied or not kept:
-            _write_definitions_file(merged)
+            _write_definitions_file(merged, authoritative_rows=rows)
         changed: List[str] = []
         if retire and _destructive_ok():  # compare-and-delete the folded rows only
             with _runtime_txn() as conn:
@@ -2467,17 +2484,22 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
             # transaction (BEGIN IMMEDIATE holds the db's single writer slot). A degraded sibling's
             # write waits on that slot (or fails busy) and cannot commit between the check and the
             # removal; after the unlink its retry recreates a fresh empty db, no row is lost.
+            # Prism 8f84982f235d: Windows cannot unlink a database SQLite holds open, so the drop
+            # runs AFTER the check's connection closes. Exclusion holds anyway: we are inside a
+            # NON-degraded section (_destructive_ok), so every other writer takes the same flock
+            # and, under R4, a contended one refuses before writing. The txn only gives the check
+            # a consistent read.
             with _runtime_txn() as conn:
                 left = [r[0] for r in conn.execute("SELECT job_id FROM job_runtime").fetchall()]
-                if left:
-                    msg = (f"{len(left)} runtime row(s) appeared while exporting "
-                           f"({', '.join(left)}); {_rs.DB_NAME} kept (not folded into jobs.json). "
-                           "Re-run the export")
-                    if keep_orphans:
-                        logger.warning("cron runtime-state: %s", msg)
-                        return applied
-                    raise RuntimeRetireRefused(msg)
-                _rs.drop_database(cron_dir)
+            if left:
+                msg = (f"{len(left)} runtime row(s) appeared while exporting "
+                       f"({', '.join(left)}); {_rs.DB_NAME} kept (not folded into jobs.json). "
+                       "Re-run the export")
+                if keep_orphans:
+                    logger.warning("cron runtime-state: %s", msg)
+                    return applied
+                raise RuntimeRetireRefused(msg)
+            _rs.drop_database(cron_dir)
         logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
                        "jobs.json%s", applied, f" and removed {_rs.DB_NAME}" if retire else "")
         return applied

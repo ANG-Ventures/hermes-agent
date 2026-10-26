@@ -2208,8 +2208,8 @@ def test_retire_keeps_db_when_a_row_changed_after_the_export_snapshot(temp_home,
     real_write = cj._write_definitions_file
     calls = []
 
-    def write_then_sibling(defs):
-        real_write(defs)
+    def write_then_sibling(defs, **kw):
+        real_write(defs, **kw)
         calls.append(1)
         rs.write_rows(temp_home / "cron",
                       {created["id"]: {"last_status": f"sibling{len(calls)}"}})
@@ -2443,8 +2443,8 @@ def test_retire_keeps_db_when_a_new_row_appeared_after_the_export_snapshot(temp_
         conn.commit()
     real_write = cj._write_definitions_file
 
-    def write_then_sibling_adds_b(defs):
-        real_write(defs)
+    def write_then_sibling_adds_b(defs, **kw):
+        real_write(defs, **kw)
         rs.write_rows(temp_home / "cron", {b["id"]: {"next_run_at": "2030-01-01T13:00:00+00:00"}})
 
     monkeypatch.setattr(cj, "_write_definitions_file", write_then_sibling_adds_b)
@@ -2565,36 +2565,44 @@ def test_export_keeps_a_job_a_degraded_sibling_created_after_the_snapshot(temp_h
 
 
 def test_retire_drop_is_inside_the_empty_check_transaction(temp_home, monkeypatch):
-    """1756ca4cf04c: a sibling cannot commit a row between the final empty-table check and the
-    unlink: both happen inside one BEGIN IMMEDIATE transaction, so the sibling's write blocks
-    (busy) until the db is gone and then recreates a fresh db rather than losing a row."""
+    """1756ca4cf04c, restated under R4 + 8f84982f235d: between the final empty-table check and the
+    unlink, a SIBLING CRON PROCESS cannot commit a row: retire runs in a non-degraded section (it
+    holds the jobs flock), so the sibling's section is contended and refuses before writing (R4).
+    The unlink itself runs with no connection open (Windows). A raw sqlite3 writer that bypasses
+    the cron lock is not a cron writer and is out of the contract."""
+    import subprocess
+    import sys
     from cron import jobs as cj
     from cron import runtime_state as rs
-    import sqlite3
 
     created = cj.create_job(prompt="x", schedule="every 5m", name="txn")
     cj.mark_job_run(created["id"], True)
+    child_src = (
+        "import os, sys\n"
+        "os.environ['HERMES_HOME'] = sys.argv[1]\n"
+        "import cron.jobs as cj\n"
+        "cj._JOBS_LOCK_TIMEOUT_SECONDS = 0.2\n"
+        "try:\n"
+        "    cj.mark_job_run(sys.argv[2], False, error='sibling-before-drop')\n"
+        "    print('WRITTEN')\n"
+        "except cj.CronLockDegraded:\n"
+        "    print('REFUSED')\n"
+    )
     real_drop = rs.drop_database
     seen = {}
 
-    def sibling_write_then_drop(cron_dir):
-        # a degraded sibling tries to commit while we hold the writer slot
-        sib = sqlite3.connect(str(rs.db_path(cron_dir)), timeout=0.2)
-        try:
-            sib.execute("BEGIN IMMEDIATE")
-            sib.execute("INSERT INTO job_runtime(job_id, fields, updated_at) VALUES ('J', '{}', 0)")
-            sib.execute("COMMIT")
-            seen["committed"] = True
-        except sqlite3.OperationalError as e:
-            seen["busy"] = str(e)
-        finally:
-            sib.close()
+    def sibling_then_drop(cron_dir):
+        out = subprocess.run([sys.executable, "-c", child_src, str(temp_home), created["id"]],
+                             capture_output=True, text=True, timeout=60,
+                             env={**os.environ, "PYTHONPATH": os.getcwd()})
+        seen["child"] = (out.stdout.strip().splitlines() or ["?"])[-1]
         return real_drop(cron_dir)
 
-    monkeypatch.setattr(rs, "drop_database", sibling_write_then_drop)
+    monkeypatch.setattr(rs, "drop_database", sibling_then_drop)
     cj.export_runtime_to_json(retire=True)
-    assert "busy" in seen and "committed" not in seen, seen
+    assert seen["child"] == "REFUSED", seen
     assert not _db(temp_home).exists()
+    assert not any(j.get("last_error") == "sibling-before-drop" for j in cj.load_jobs())
 
 
 def test_full_save_after_its_row_was_folded_keeps_the_folded_values(temp_home, monkeypatch):
@@ -2855,3 +2863,111 @@ def test_backup_pair_capture_refuses_under_a_contended_lock(temp_home, monkeypat
     with pytest.raises(cj.CronLockDegraded):
         with backup._cron_store_lock(temp_home):
             pass
+
+
+# --- Prism round 19 (#2287 @ a83e4d5d) ------------------------------------------------------------
+
+def test_contended_read_defers_adoption_and_returns_the_file_runtime(temp_home, monkeypatch):
+    """3aeaad041925: a job carrying file runtime but no row is adopted only by a section that may
+    write. A contended read (R4) returns the jobs, the file's runtime visible, nothing raised."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="adopt")
+    data = json.loads(_jobs_file(temp_home).read_text())
+    data["jobs"][0]["last_status"] = "from-file"
+    _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+    with rs.connect(temp_home / "cron") as conn:
+        conn.execute("DELETE FROM job_runtime"); conn.commit()
+    _degrade_lock(monkeypatch, cj)
+    with cj._jobs_lock():
+        jobs = cj.load_jobs()
+    assert next(j for j in jobs if j["id"] == created["id"])["last_status"] == "from-file"
+    assert rs.read_all(temp_home / "cron") == {}  # nothing adopted under contention
+
+
+def test_contended_read_sees_a_committed_pending_generation(temp_home, monkeypatch):
+    """5fef6ead34bb: a published (committed) generation must be visible to a contended read even
+    though only a locked section may apply it; the journal itself is left for that section."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="pending")
+    cron = temp_home / "cron"
+    gen = "c" * 32
+    with rs.transaction(cron) as conn:
+        rs.stage_pending(conn, gen, {created["id"]: {"last_status": "committed-gen"}})
+        rs.mark_published(conn, gen)
+    _degrade_lock(monkeypatch, cj)
+    with cj._jobs_lock():
+        job = next(j for j in cj.load_jobs() if j["id"] == created["id"])
+    assert job["last_status"] == "committed-gen"
+    with rs.connect(cron) as conn:
+        assert gen in rs.pending_gens(conn), "a contended read must not resolve the journal"
+
+
+def test_export_rows_stay_authoritative_through_the_shrink_merge(temp_home, monkeypatch):
+    """7b52062e31e5: row and mirror agree completed=2; an out-of-band restore of an older mirror
+    (completed=0) lands between the export's snapshot and its merge. Export must publish 2."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="finite", repeat=5)
+    cj.mark_job_run(created["id"], True); cj.mark_job_run(created["id"], True)
+    cj.maybe_flush_runtime_mirror(force=True)
+    store = cj._current_cron_store()
+    real_merge = cj._merge_unexpected_disk_jobs
+    state = {}
+
+    def older_mirror_restored_then_merge(defs, **kw):
+        if "r" not in state:
+            data = json.loads(store.jobs_file.read_text(encoding="utf-8"))
+            for j in data["jobs"]:
+                if j["id"] == created["id"]:
+                    j.setdefault("repeat", {})["completed"] = 0
+            store.jobs_file.write_text(json.dumps(data), encoding="utf-8")
+            state["r"] = True
+        return real_merge(defs, **kw)
+
+    monkeypatch.setattr(cj, "_merge_unexpected_disk_jobs", older_mirror_restored_then_merge)
+    cj.export_runtime_to_json(retire=True)
+    assert not _db(temp_home).exists()
+    job = next(j for j in cj.load_jobs() if j["id"] == created["id"])
+    assert job["repeat"]["completed"] == 2, job["repeat"]
+
+
+def test_retire_drops_the_database_after_its_connection_closes(temp_home, monkeypatch):
+    """8f84982f235d: Windows cannot unlink a database SQLite holds open; drop_database must run
+    with no runtime connection open (simulated: the drop fails if any connection is still open)."""
+    import sqlite3
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="win")
+    cj.mark_job_run(created["id"], True)
+    open_conns = []
+    real_connect = sqlite3.connect
+
+    class Tracked(sqlite3.Connection):
+        def close(self):
+            if self in open_conns:
+                open_conns.remove(self)
+            return super().close()
+
+    def tracking_connect(*a, **kw):
+        kw.setdefault("factory", Tracked)
+        c = real_connect(*a, **kw)
+        open_conns.append(c)
+        return c
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    real_drop = rs.drop_database
+
+    def windows_drop(cron_dir):
+        if open_conns:
+            raise PermissionError("[WinError 32] the database is held open by %d connection(s)"
+                                  % len(open_conns))
+        return real_drop(cron_dir)
+
+    monkeypatch.setattr(rs, "drop_database", windows_drop)
+    cj.export_runtime_to_json(retire=True)
+    assert not _db(temp_home).exists()
