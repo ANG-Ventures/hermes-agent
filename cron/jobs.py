@@ -2413,6 +2413,50 @@ def _validate_job_mode_invariants(
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
 
 
+# Optional home-owned write guard (t_0a8548cf). The fleet's cron lint (one sender per lane, #alerts is
+# fail-only) used to run only at reconcile/commit time, hours after the API had stored a row it rejects.
+# When <home>/scripts/cron-write-guard exists and is executable it is run on every create, and on every
+# update that touches a lint-relevant field of a row that stays enabled: candidate row as JSON on stdin,
+# the operation as argv[1]. rc 0 saves; rc 1 refuses with the guard's stderr; anything else (crash,
+# timeout, exec failure) refuses as "cron write guard unavailable" (fail closed). No guard file = no
+# fleet policy in the runtime, today's behavior.
+CRON_WRITE_GUARD_NAME = "cron-write-guard"
+CRON_WRITE_GUARD_TIMEOUT_S = 5.0
+_CRON_WRITE_GUARD_FIELDS = frozenset({"deliver", "script", "no_agent", "enabled", "state", "schedule"})
+
+
+def _cron_write_guard_path() -> Path:
+    """The guard beside the store being written: <home>/scripts/cron-write-guard."""
+    return _current_cron_store().cron_dir.parent / "scripts" / CRON_WRITE_GUARD_NAME
+
+
+def _run_cron_write_guard(job: Dict[str, Any], op: str) -> None:
+    """Raise ValueError when the home's write guard refuses (or cannot grade) this candidate row."""
+    guard = _cron_write_guard_path()
+    if not (guard.is_file() and os.access(guard, os.X_OK)):
+        return
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [str(guard), op], input=json.dumps(job, default=str), capture_output=True,
+            text=True, timeout=CRON_WRITE_GUARD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise ValueError(
+            f"cron write guard unavailable: {guard} did not answer in "
+            f"{CRON_WRITE_GUARD_TIMEOUT_S:g}s; refusing the {op}") from None
+    except OSError as exc:
+        raise ValueError(f"cron write guard unavailable: {guard}: {exc}; refusing the {op}") from None
+    if proc.returncode == 0:
+        return
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if proc.returncode == 1 and detail:
+        raise ValueError(detail)
+    raise ValueError(
+        f"cron write guard unavailable: {guard} exited rc={proc.returncode}; refusing the {op}"
+        + (f": {detail[-600:]}" if detail else ""))
+
+
 def _oneshot_past_grace_error(run_at: Any) -> ValueError:
     return ValueError(
         f"Requested one-shot time {run_at} is more than "
@@ -2588,6 +2632,8 @@ def create_job(
         job["reasoning_effort"] = normalized_reasoning_effort
     if flagship_reason:
         job["allow_flagship_reason"] = flagship_reason
+    if job["enabled"]:
+        _run_cron_write_guard(job, "create")
 
     with _jobs_lock():
         save_jobs(load_jobs() + [job])
@@ -2939,6 +2985,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated.pop("pending_slot", None)
         _fill_missing_next_run(updated)
         _reject_terminal_activation(job, updated, job_id)
+        if updated.get("enabled", True) and _CRON_WRITE_GUARD_FIELDS.intersection(updates):
+            _run_cron_write_guard(updated, "update")
         jobs[i] = updated
         save_jobs(jobs)
         _journal_toggled(job.get("enabled", True), updated)
