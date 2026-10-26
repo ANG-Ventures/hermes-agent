@@ -228,8 +228,33 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
     except Exception as exc:
         # Fenced = no card exists, or it is archived (a started runner's card read stops it). An
         # unfenced card may still have a runner: the caller must not run the unit a second time.
+        # The attempt is still ``running`` while its card is archived and the runner waited on: hold the
+        # card-end watcher off it until the caller has superseded it (Prism 3209d222e4a1).
+        if task_id:
+            hold_launch_fence(task_id)
         fenced = not task_id or (_archive_quietly(task_id) and _runner_gone(task_id))
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "task_id": task_id, "fenced": fenced}
+
+
+#: Cards of failed launches whose attempt the dispatch worker is still fencing/superseding: the card-end
+#: watcher leaves them alone, or it would fail the attempt and the in-process fallback would be refused.
+_launch_fence: set = set()
+_launch_fence_lock = threading.Lock()
+
+
+def hold_launch_fence(task_id: str) -> None:
+    with _launch_fence_lock:
+        _launch_fence.add(task_id)
+
+
+def release_launch_fence(task_id: Optional[str]) -> None:
+    with _launch_fence_lock:
+        _launch_fence.discard(task_id)
+
+
+def _fenced_launch(task_id: str) -> bool:
+    with _launch_fence_lock:
+        return task_id in _launch_fence
 
 
 #: How long a failed launch waits for an archived card's runner to exit (it reads its card every 5 s).
@@ -465,6 +490,8 @@ def drain_profile(profile_home: Path, boot_id: str, *,
             logger.debug("async_delegation_kanban_registry_unreadable home=%s", profile_home, exc_info=True)
             return out
         for row, body in ended:
+            if _fenced_launch(row["id"]):
+                continue  # a failed launch is fencing it: its dispatch worker decides the outcome
             delegation_id, attempt_id = body["delegation_id"], body.get("attempt_id")
             record = records.get(delegation_id)
             if record is None:

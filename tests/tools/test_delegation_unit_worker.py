@@ -405,16 +405,21 @@ def test_direct_endpoint_without_a_delegation_key_inherits_the_parent_own_key(un
     assert any(not c.get("explicit_base_url") and c.get("requested") == "openrouter" for c in calls)
 
 
-def test_url_only_custom_parent_keeps_the_resolved_key_when_the_url_less_lookup_fails(unit, monkeypatch):
-    """Prism 1b48ed1b0fa3: requested=custom with only a URL -> the URL-less own-key lookup raises; the
-    key the first (URL) resolution found is kept and the parent is still built."""
+def test_legacy_anonymous_custom_route_without_parent_base_url_fails_closed(unit, monkeypatch):
+    """Prism 467b28edd66c (supersedes the 1b48ed1b0fa3 keep-the-URL-key fallback): a route written before
+    parent_base_url existed, for an anonymous custom parent, fails the unit naming the record; the bare
+    ``custom`` lookup (the profile's DEFAULT endpoint key) is never made."""
     import sys
     import hermes_cli.config as config_mod
     import hermes_cli.runtime_provider as rp
 
+    url_less = []
+
     def fake_resolve(**kw):
         if not kw.get("explicit_base_url"):
-            raise RuntimeError("custom provider has no endpoint configured")
+            url_less.append(kw)
+            return {"api_key": "default-endpoint-key", "base_url": "http://default/v1", "provider": "custom",
+                    "requested_provider": kw.get("requested"), "api_mode": "chat_completions"}
         return {"api_key": "url-resolved-key", "base_url": kw["explicit_base_url"], "provider": "custom",
                 "requested_provider": kw.get("requested"), "api_mode": "chat_completions"}
 
@@ -431,9 +436,10 @@ def test_url_only_custom_parent_keeps_the_resolved_key_when_the_url_less_lookup_
     record["execution"].update({
         "credential_ref": {"source": "delegation_config", "parent_provider": "custom"},
         "route": {"requested_provider": "custom", "model": "m", "explicit_base_url": "http://lab/v1"}})
-    duw.build_parent(record)
-    assert built["api_key"] == "url-resolved-key" and built["base_url"] == "http://lab/v1"
-
+    with pytest.raises(RuntimeError, match=unit.did):
+        duw.build_parent(record)
+    assert url_less == [], "the default endpoint's key was looked up"
+    assert built == {}
 
 
 def _build_on_route(monkeypatch, unit, fake_resolve, route):

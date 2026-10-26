@@ -1242,3 +1242,64 @@ def test_inconclusive_scan_bound_counts_from_the_card_end_across_a_restart(monke
     rec = _record(did)
     assert rec["state"] == "failed" and ad.active_count() == 0
     assert "inconclusive" in json.dumps(rec)
+
+
+# ── Prism round 4 on #2269 (t_e92403ba) ─────────────────────────────────────
+
+
+def test_card_end_watcher_between_archive_and_supersede_keeps_the_fallback(monkeypatch, tmp_path):
+    """3209d222e4a1: the failed launch archived its card; the card-end watcher drains before the
+    supersede -> it must not fail the attempt: the in-process fallback runs, one terminal outcome."""
+    drains = []
+
+    def gone_after_a_drain(task_id):
+        drains.append(akb.drain_profile(Path(ad._registry_path().parent.parent), BOOT, scan=lambda t: []))
+        return True
+
+    monkeypatch.setattr(akb, "_runner_gone", gone_after_a_drain)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    did = handle["delegation_id"]
+    rec = _record(did)
+    assert drains and drains[0]["failed"] == 0, "the watcher failed an attempt that was being fenced"
+    assert len(calls) == 1 and rec["state"] == "done"
+    terminal = [e for e in rec["outbox"] if e.get("type") == "async_delegation"]
+    assert len(terminal) == 1 and terminal[0]["payload"]["attempt_id"] == rec["attempt"]["attempt_id"]
+    assert akb._launch_fence == set(), "the fence is released once the fallback is decided"
+
+
+def test_alias_permuted_lock_roots_are_taken_in_one_shared_order(tmp_path, monkeypatch):
+    """2c3a22ac560f: two processes that see the same lock dirs through different (bind-mount) aliases
+    must take them in the same order; path-string order is not shared, (st_dev, st_ino) is."""
+    import os
+    from tools import file_state
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (tmp_path / "z_a").symlink_to(a, target_is_directory=True)
+    (tmp_path / "y_b").symlink_to(b, target_is_directory=True)
+    # A bind mount is not visible to realpath: model it by making realpath see no alias.
+    monkeypatch.setattr(file_state.os.path, "realpath", lambda p: str(p))
+    real_open = os.open
+
+    def order(roots):
+        opened = []
+
+        def rec_open(path, *args, **kw):
+            fd = real_open(path, *args, **kw)
+            st = os.fstat(fd)
+            opened.append((st.st_dev, st.st_ino))
+            return fd
+
+        monkeypatch.setattr(file_state, "_lock_files_for", lambda resolved: [r / "lk" for r in roots])
+        monkeypatch.setattr(file_state.os, "open", rec_open)
+        try:
+            with file_state._cross_process_lock("/x"):
+                pass
+        finally:
+            monkeypatch.setattr(file_state.os, "open", real_open)
+        return opened
+
+    view1 = order([a, b])
+    view2 = order([tmp_path / "y_b", tmp_path / "z_a"])
+    assert len(view1) == 2 and view1 == view2, "alias views acquire the shared locks in different orders"

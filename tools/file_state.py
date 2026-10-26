@@ -137,6 +137,11 @@ def _dir_identity(root: Path):
         return real
 
 
+def _lock_order_key(lock_file: Path):
+    ident = _dir_identity(lock_file.parent)
+    return (0, ident[0], ident[1], "") if isinstance(ident, tuple) else (1, 0, 0, str(ident))
+
+
 def _lock_files_for(resolved: str) -> List[Path]:
     """Every lock file of *resolved* (see ``_lock_roots``), primary first; [] while the layer is off or
     no lock directory can be created."""
@@ -204,7 +209,9 @@ def _cross_process_lock(resolved: str):
         return
     fds = []
     try:
-        for lock_file in sorted(_lock_files_for(resolved), key=lambda p: os.path.realpath(str(p))):
+        # Ordered by filesystem identity of the lock directory, not a path string: processes that see the
+        # same directories through different (bind-mount) aliases share this order (Prism 2c3a22ac560f).
+        for lock_file in sorted(_lock_files_for(resolved), key=_lock_order_key):
             try:
                 fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
             except OSError:
