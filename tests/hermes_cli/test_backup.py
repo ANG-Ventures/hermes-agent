@@ -312,6 +312,35 @@ class TestShouldExclude:
         ):
             assert not _should_exclude(Path(p)), p
 
+    def test_full_tier_file_count_cut(self):
+        """t_87fd92a8: derived indexes, API caches, git mirrors and the finished land-request pairs (their rows are
+        in state/merge-ledger.jsonl) are pruned root-anchored; queue files and the measurements stay in."""
+        from hermes_cli.backup import _matches_path_glob, _should_exclude
+        for p in (
+            "var/prism/index/0000dc38de09.json",
+            "state/ci-job-durations/jobs/ANG-Ventures/hermes-home/123.json",
+            "var/pr-git-mirror/ANG-Ventures__hermes-home.git/objects/pack/p.pack",
+            "var/mirror-ci/hermes-agent.git/HEAD",
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.done.json",
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.result.json",
+        ):
+            assert _should_exclude(Path(p)), p
+        for d in ("var/prism/index", "state/ci-job-durations/jobs", "var/pr-git-mirror", "var/mirror-ci"):
+            assert _matches_path_glob((*Path(d).parts, "_")), d
+        for p in (
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.json",            # queued request
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.inflight",
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.parked.json",
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.unparked.json",
+            "var/land-requests/sub/x.done.json",                            # file glob is depth-exact
+            "state/merge-ledger.jsonl",
+            "var/ci-job-durations.json",
+            "state/ci-job-durations/state.json",
+            "var/prism/ledger.jsonl",
+            "skills/x/var/prism/index/a.json",                              # root-anchored
+        ):
+            assert not _should_exclude(Path(p)), p
+
     def test_excludes_cache_forensic_artifacts(self):
         """cache/forensic-*/ holds DELIBERATELY TORN forensic specimens — they are
         expected to fail PRAGMA integrity_check forever, by construction.
