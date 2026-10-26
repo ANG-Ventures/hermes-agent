@@ -1796,19 +1796,29 @@ class SessionDB(
         The PRAGMA runs on a dedicated connection OUTSIDE self._lock: SQLite's PASSIVE mode does not block
         writers, but holding the process-wide Python write lock around it did (every writer queued for the
         whole checkpoint). Only the guard refresh and the connection lookup take self._lock.
+
+        The guard refresh is an fd-table scan (~500 fstats, each a GIL handoff under load), so it runs only
+        when the guard can have changed: the checkpoint connection's first use, or a -shm inode the guard
+        does not hold yet (t_0d85826a: 13.8% of write-path samples were this scan under _lock).
         """
         if self._quarantine_reason() is not None:
             return
         with self._ckpt_lock:
             try:
+                try:  # stat outside _lock: under GIL load one syscall pays a full handoff
+                    st = os.stat(f"{self.db_path}-shm")
+                    shm_ident = (st.st_dev, st.st_ino)
+                except OSError:
+                    shm_ident = None
                 with self._lock:
                     if self._conn is None or self._db_replaced:
                         return  # closed or replaced underneath the timer: nothing to checkpoint
-                    if self._wal_lock_guard:
-                        _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
+                    first_use = self._ckpt_conn is None
                     conn = self._checkpoint_conn_locked()
-                    if self._wal_lock_guard:
-                        _lockguard.hold(self.db_path, self._wal_lock_guard)  # cover the checkpoint conn's fds
+                    guard = self._wal_lock_guard
+                    if guard and (first_use or (shm_ident is not None and shm_ident not in guard)):
+                        # a -shm minted after open, and/or the checkpoint conn's new fds
+                        _lockguard.hold(self.db_path, guard)
                 result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
