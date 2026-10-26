@@ -1,0 +1,51 @@
+name: Warm self-hosted caches
+
+# The ONE self-hosted job that saves the setup-pm caches (t_58979a5e).
+# Self-hosted jobs restore only: their post-job upload runs at ~0.1 MB/s and
+# outlived timeout-minutes (#2267). Hosted runners cannot seed them either,
+# because the uv key carries os-version (the runner kernel). Without this
+# job every slice goes cold for good once the existing entries age out.
+# Same setup-pm inputs as tests.yml `test`, so the keys are the ones the
+# slices restore. actions/cache skips the save on an exact hit, so the long
+# upload only happens when the lock, the PM code or the runner kernel changes.
+#
+# A top-level workflow, NOT a job inside tests.yml: tests.yml is reusable, and
+# its caller job's result (ci.yaml / ci-local.yaml `tests`, read by
+# all-checks-pass) covers every job inside it. A slow or failed upload here
+# never delays or reds the main gate.
+# Rollback: vars.CI_SELFHOSTED_CACHE_WARM=off.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One warm at a time; a newer main push replaces the pending one.
+concurrency:
+  group: warm-selfhosted-cache
+  cancel-in-progress: false
+
+jobs:
+  warm-selfhosted-cache:
+    name: Warm self-hosted setup-pm caches
+    if: >-
+      github.ref == 'refs/heads/main'
+      && vars.CI_SELFHOSTED_CACHE_WARM != 'off'
+      && contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted')
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    # ~225 MB (tools + uv) at the measured 0.1 MB/s is ~38 min of upload.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+
+      - name: Set up locked Python and test dependencies (saving)
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+          save-on-self-hosted: 'true'
