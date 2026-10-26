@@ -1154,7 +1154,9 @@ def _handle_request_review(args: dict, **kw) -> str:
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
         if fail_reason and fail_reason.startswith("NOT handed back"):
-            return _ok_landed(kb, conn, tid, "ready", note=fail_reason)
+            # This invocation's own bounce, never a re-read: a successor may already hold the card
+            # (Prism 42d6d2f869f5; same receipt as _handle_complete).
+            return _ok(task_id=tid, run_id=_worker_run_id(tid), status="ready", note=fail_reason)
         return _ok_landed(kb, conn, tid, "review")
 
 

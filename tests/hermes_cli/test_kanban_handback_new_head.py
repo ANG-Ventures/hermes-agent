@@ -364,3 +364,67 @@ def test_only_operator_proven_runless_coverage_counts(tmp_path, monkeypatch):
         kb.add_comment(conn, tid, "builder", _coverage(C))            # runless implementer label: refused
         assert kb.request_changes(conn, tid, reason="BEHAVIOUR: build r7", operator="apollo: test")[0]
         assert nh.seen_head(conn, tid, nh._pending_send_back(conn, tid)) == A
+
+
+def test_a_voided_verdict_is_armed_like_any_handback(sent_back, monkeypatch):
+    """Prism 188c162a38e9: the gate ran unarmed for the verdict; when still_holds() voids it the completion
+    routes to review, and that PR is armed as any review handback is."""
+    from hermes_cli import kanban_pr_freshness as fresh
+    key = "ANG-Ventures/example-home#670"
+    calls = []
+
+    def check(refs, *, allow_arm, **kw):
+        calls.append(allow_arm)
+        entry = {"head": C}
+        if allow_arm:
+            entry["automerge"] = "fleet-merge spawned (log)"
+        return {"prs": {key: entry}}
+
+    monkeypatch.setattr(fresh, "check", check)
+    status, kinds, _ = _complete_as_worker(sent_back, monkeypatch, "unchanged")
+    assert status == "review" and nh.EVENT not in kinds
+    assert calls == [False, True]
+    with kb.connect() as conn:
+        assert kb.latest_run(conn, sent_back).metadata["handoff_freshness"]["prs"][key]["automerge"] \
+            .startswith("fleet-merge spawned")
+
+
+def test_a_voided_verdict_on_an_updated_branch_is_not_rearmed(sent_back, monkeypatch):
+    """The gate's update-branch voids the verdict; the new head's CI is fleet-merge's, as in check()."""
+    from hermes_cli import kanban_pr_freshness as fresh
+    calls = []
+
+    def check(refs, *, allow_arm, **kw):
+        calls.append(allow_arm)
+        return {"prs": {"ANG-Ventures/example-home#670": {"head": A, "update_branch": "requested"}}}
+
+    monkeypatch.setattr(fresh, "check", check)
+    assert _complete_as_worker(sent_back, monkeypatch, "unchanged")[0] == "review"
+    assert calls == [False]
+
+
+def test_request_review_tool_reports_its_own_bounce_when_a_successor_claimed(sent_back, monkeypatch):
+    """Prism 42d6d2f869f5: the tool's bounced receipt is this invocation's run, never a re-read of the card."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "none")
+    monkeypatch.setattr(kb, "configured_max_review_rounds", lambda: 0)
+    monkeypatch.setattr(nh, "_default_reader", lambda: lambda repo, n, seen: VIEWS["unchanged"])
+    with kb.connect() as conn:
+        run = kb.claim_task(conn, sent_back).current_run_id
+    real = kb.request_review
+
+    def bounce_then_successor(conn, tid, *a, **kw):
+        out = real(conn, tid, *a, **kw)
+        kb.claim_task(conn, tid)
+        return out
+
+    monkeypatch.setattr(kb, "request_review", bounce_then_successor)
+    monkeypatch.setattr(kt, "_worker_guard", lambda name, args: sent_back)
+    monkeypatch.setattr(kt, "_worker_run_id", lambda tid: run)
+    out = json.loads(kt._handle_request_review({"summary": f"r2 {PR}"}))
+    with kb.connect() as conn:
+        successor = kb.get_task(conn, sent_back)
+    assert successor.status == "running" and successor.current_run_id != run
+    assert out["ok"] and out["note"].startswith("NOT handed back")
+    assert out["run_id"] == run and out["status"] == "ready"

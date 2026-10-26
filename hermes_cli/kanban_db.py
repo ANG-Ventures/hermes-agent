@@ -10945,26 +10945,30 @@ def complete_task(
             # DraftPrError, nothing mutated), update a stale head, arm a green
             # non-milestone PR through fleet-merge.sh.
             from hermes_cli import kanban_pr_freshness as _fresh
-            try:
-                # Arm only the card's OWN handoff PR(s), never a PR the prose
-                # merely mentions (FleetReview #1234 finding).
-                freshness = _fresh.check(
-                    still_open, task_id=task_id,
-                    allow_arm=no_new is None and not is_milestone_card(conn, task_id),
-                    armable={
-                        f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
-                            metadata=metadata, survivor_pr=survivor_pr,
-                        )
-                    },
-                    draft_ok=draft_ok is not None,
+            # Arm only the card's OWN handoff PR(s), never a PR the prose
+            # merely mentions (FleetReview #1234 finding).
+            armable = {
+                f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
+                    metadata=metadata, survivor_pr=survivor_pr,
                 )
-            except _fresh.DraftPrError as draft_err:
-                with write_txn(conn):
-                    _append_event(
-                        conn, task_id, "completion_blocked_draft_pr",
-                        {"prs": draft_err.prs},
+            }
+            may_arm = not is_milestone_card(conn, task_id)
+
+            def _freshness_gate(refs, allow_arm):
+                try:
+                    return _fresh.check(
+                        refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
+                        draft_ok=draft_ok is not None,
                     )
-                raise
+                except _fresh.DraftPrError as draft_err:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, task_id, "completion_blocked_draft_pr",
+                            {"prs": draft_err.prs},
+                        )
+                    raise
+
+            freshness = _freshness_gate(still_open, no_new is None and may_arm)
             overridden = freshness.get("draft_override") or []
             if overridden:
                 # Audited, never silent (t_f38605be): the intentionally-open
@@ -10981,6 +10985,16 @@ def complete_task(
             # The freshness gate can update-branch after the verdict; a moved head is
             # content the verdict never judged, so it routes (Prism 4f5d7679ba58).
             no_new = _nh.still_holds(no_new, freshness)
+            if no_new is None and still_open and may_arm:
+                # The voided verdict routes to review like any handback, so arm it as one: the gate
+                # ran with arming off for the verdict (Prism 188c162a38e9). A PR the gate just
+                # update-branched is left to fleet-merge once its fresh CI is green, as in check().
+                gated = freshness.get("prs") or {}
+                rearm = [r for r in still_open
+                         if "update_branch" not in (gated.get(f"{r.repo}#{r.number}") or {})]
+                if rearm:
+                    again = _freshness_gate(rearm, True)
+                    freshness = dict(freshness, prs={**gated, **(again.get("prs") or {})})
         if still_open and no_new is not None:
             # No-op handback (t_f716021d): nothing on the PR the reviewer has not
             # seen, so the send-back stands and the card goes back to its worker.
