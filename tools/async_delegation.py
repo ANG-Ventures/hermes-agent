@@ -1548,7 +1548,7 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         delegation_id=delegation_id, attempt_id=old_attempt, profile_home=Path(profile_home),
         profile=str(kanban.get("profile") or "default"), goal=str(record.get("goal") or ""),
         cwd=str(kanban.get("cwd") or ""), session_id=kanban.get("session_id"),
-        spawn_fn=kanban.get("spawn_fn"))
+        spawn_fn=kanban.get("spawn_fn"), slot_key=record.get("slot_key"))
     if launched.get("ok"):
         with _records_lock:
             rec = _records.get(delegation_id)
@@ -1571,6 +1571,14 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         return True
     logger.warning("async_delegation_kanban_spawn_failed delegation_id=%s attempt_id=%s error=%s",
                    delegation_id, old_attempt, launched.get("error"))
+    try:
+        return _fall_back_in_process(delegation_id, record, launched, old_attempt, profile_home)
+    finally:
+        _akb.release_launch_fence(launched.get("task_id"))
+
+
+def _fall_back_in_process(delegation_id: str, record: Dict[str, Any], launched: Dict[str, Any],
+                          old_attempt: str, profile_home: Any) -> bool:
     if not launched.get("fenced"):
         # The card could not be archived and its runner may have started: running the unit here too
         # would put two writers on one tree. Deliver the error instead (Q1: no automatic re-run).

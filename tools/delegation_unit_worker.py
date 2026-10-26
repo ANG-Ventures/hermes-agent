@@ -159,6 +159,57 @@ def _delegation_api_key(execution: Dict[str, Any], cfg: Dict[str, Any]) -> Optio
     return str(((cfg.get("delegation") or {}).get("api_key")) or "").strip() or None
 
 
+def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: Dict[str, Any],
+                    record_id: Optional[str] = None) -> Any:
+    """The key the in-process child inherits on a direct endpoint with no ``delegation.api_key``: the
+    parent's OWN key, resolved on its own route. The route's ``explicit_base_url`` (the delegation
+    endpoint) must not take part, or the resolver answers for that endpoint, not the parent."""
+    if ((execution.get("credential_ref") or {}).get("source") != "delegation_config"
+            or not route.get("explicit_base_url")):
+        return runtime.get("api_key")
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    if "parent_base_url" in route:
+        # An anonymous custom parent is identified by its endpoint alone: resolve its key on that URL.
+        # A bare ``custom`` lookup would answer for the profile's DEFAULT custom endpoint and send that
+        # endpoint's key to another one (Prism 1b48ed1b0fa3): no URL-keyed key fails the unit instead.
+        url = route.get("parent_base_url")
+        try:
+            own = resolve_runtime_provider(requested=route.get("requested_provider") or "custom",
+                                           target_model=route.get("model") or execution.get("model") or None,
+                                           explicit_base_url=url) if url else {}
+        except Exception as exc:
+            raise RuntimeError(f"no credential for the parent's custom endpoint {url}: {exc}") from exc
+        if not own.get("api_key"):
+            raise RuntimeError(f"no credential for the parent's custom endpoint {url or '(unrecorded)'}; "
+                               "set delegation.api_key for the delegation endpoint")
+        return own["api_key"]
+    requested = str(route.get("requested_provider") or "").strip().lower()
+    parent_provider = (execution.get("credential_ref") or {}).get("parent_provider")
+    if requested == "custom" or (not requested and parent_provider == "custom"):
+        # A route recorded before ``parent_base_url`` existed, for an anonymous custom parent: its endpoint
+        # is unknown, and the bare ``custom`` lookup answers for the profile's DEFAULT endpoint. Fail closed
+        # rather than send that endpoint's key elsewhere (Prism 467b28edd66c).
+        raise RuntimeError(f"delegation {record_id or '(unknown)'}: legacy route for an anonymous custom "
+                           "parent has no parent_base_url; set delegation.api_key for the delegation endpoint")
+    # requested_provider may be None on the route: resolving None answers for the profile's DEFAULT
+    # provider, not the parent's, so key on the recorded parent provider; neither recorded -> fail closed.
+    provider = route.get("requested_provider") or parent_provider
+    if not provider:
+        raise RuntimeError(f"delegation {record_id or '(unknown)'}: route records no parent provider; "
+                           "set delegation.api_key for the delegation endpoint")
+    try:
+        own = resolve_runtime_provider(requested=provider,
+                                       target_model=route.get("model") or execution.get("model") or None)
+    except Exception:
+        # A URL-only custom parent has no endpoint without the recorded URL, so a URL-less re-resolve
+        # can fail: keep the key the first resolution found, as before (Prism 1b48ed1b0fa3).
+        logger.warning("delegation_unit_parent_key_unresolved requested=%s", route.get("requested_provider"),
+                       exc_info=True)
+        return runtime.get("api_key")
+    return own.get("api_key") or runtime.get("api_key")
+
+
 def build_parent(record: Dict[str, Any]):
     """Step 3: the parent ``AIAgent`` from the CLI's resolver, keyed on the recorded route; the
     parent never runs a turn. Children get the profile's own ``delegation:`` config (read by the
@@ -177,7 +228,9 @@ def build_parent(record: Dict[str, Any]):
     cfg = load_config() or {}
     pr = cfg.get("provider_routing") or {}
     kwargs: Dict[str, Any] = {
-        "api_key": _delegation_api_key(execution, cfg) or runtime.get("api_key"), "base_url": runtime.get("base_url"),
+        "api_key": _delegation_api_key(execution, cfg) or _parent_own_key(
+            execution, route, runtime, record.get("delegation_id")),
+        "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"), "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"), "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),

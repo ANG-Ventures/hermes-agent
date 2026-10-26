@@ -385,7 +385,7 @@ def test_card_end_watcher_vs_late_runner_write(monkeypatch, tmp_path, spawner):
     task_id = _record(did)["kanban"]["task_id"]
     attempt = _record(did)["attempt"]["attempt_id"]
     _end_card(task_id, "archived")  # the worker died: archived with no result yet
-    counts = _drain()
+    counts = akb.drain_profile(Path(ad._registry_path().parent.parent), BOOT, scan=lambda t: [])
     assert counts["failed"] == 1
     queued = _queued()
     assert len(queued) == 1 and queued[0]["status"] == "error"
@@ -883,3 +883,423 @@ def test_file_state_keeps_coordinating_while_a_kanban_unit_survives_a_knob_flip(
     _observe("deleg_b1")
     assert ad.kanban_active_count() == 1
     assert file_state._cross_process_enabled()
+
+
+# ── Prism round 2 on #2252 (t_e92403ba, P3 prerequisite) ────────────────────
+
+
+def test_inconclusive_scan_on_an_ended_card_defers_finalization(monkeypatch, tmp_path, spawner):
+    """b9c7faa6b9ff: a dead runner's card ended, the lineage scan is unknown -> nothing is failed or settled."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _end_card(task_id, "archived")
+    profile_home = Path(ad._registry_path().parent.parent)
+    counts = akb.drain_profile(profile_home, BOOT, scan=lambda t: None)
+    assert counts["failed"] == 0 and _record(did)["state"] == "running"
+    assert ad.active_count() == 1 and _queued() == []
+    assert akb.DRAINED_EVENT not in _card(task_id)[1]
+    # The next tick with a conclusive scan finalizes it once.
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: [])["failed"] == 1
+    assert _record(did)["state"] == "failed" and ad.active_count() == 0
+
+
+def test_archive_error_leaves_the_card_unmarked_for_a_later_drain(monkeypatch, tmp_path, spawner):
+    """3c418e16ae80 / 4bdeea5a54f9: the drained marker is written only after the archive succeeds."""
+    from hermes_cli import kanban_db as kb
+
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _runner_writes(did)
+    _end_card(task_id, "done")
+    _drain()
+    _deliver(_queued())
+    real = kb.archive_task
+
+    def locked(*a, **kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(kb, "archive_task", locked)
+    assert _drain()["drained"] == 0
+    card, kinds = _card(task_id)
+    assert akb.DRAINED_EVENT not in kinds and card.status == "done"
+    monkeypatch.setattr(kb, "archive_task", real)
+    assert _drain()["drained"] == 1
+    card, kinds = _card(task_id)
+    assert kinds.count(akb.DRAINED_EVENT) == 1 and card.status == "archived"
+
+
+def _no_thread(monkeypatch):
+    """The cancel thread never runs (the gateway exits before it is scheduled)."""
+    monkeypatch.setattr(akb.threading, "Thread",
+                        lambda *a, **kw: SimpleNamespace(start=lambda: None))
+
+
+def test_lost_cancel_thread_is_replayed_by_the_next_drain(monkeypatch, tmp_path, spawner):
+    """db67263672cf: the cancel is a durable step the drain replays until the card is stopped."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _no_thread(monkeypatch)
+    assert ad.interrupt_for_session(parent_session_id="parent-1", reason="/stop") == 1
+    assert _record(did)["state"] == "cancelled" and _card(task_id)[0].status == "running"
+    _drain()
+    assert _card(task_id)[0].status == "archived"
+    _drain()
+    assert ad.active_count() == 0 and _queued() == []
+
+
+def test_boot_replays_a_cancel_whose_archive_never_landed(monkeypatch, tmp_path, spawner):
+    """bf4d3770409a: cancelled record + live card at boot -> observed, and the drain archives the card."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _no_thread(monkeypatch)
+    ad.interrupt_for_session(parent_session_id="parent-1", reason="/stop")
+    assert _record(did)["state"] == "cancelled" and _card(task_id)[0].status == "running"
+    ad._reset_for_tests()  # the gateway exited before the archive thread ran
+    profile_home = Path(ad._registry_path().parent.parent)
+    assert akb.observe_running(profile_home, "200:2") == 1
+    akb.drain_profile(profile_home, "200:2")
+    assert _card(task_id)[0].status == "archived"
+    akb.drain_profile(profile_home, "200:2")
+    assert ad.active_count() == 0 and _queued() == []
+    # A cancelled record whose card already ended is not observed again.
+    ad._reset_for_tests()
+    assert akb.observe_running(profile_home, "300:3") == 0
+
+
+def test_observer_keeps_the_call_shared_slot(monkeypatch, tmp_path, spawner):
+    """6c7b2821d59e / b338fdf966fd: units of one call share one slot after a restart too."""
+    threads = _sync_executor(monkeypatch)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir(exist_ok=True)
+    ids = []
+    for k in range(2):
+        h = ad.dispatch_async_delegation_batch(
+            goals=[f"g{k}"], context=None, toolsets=None, role="leaf", model="m",
+            session_key="agent:main:telegram:dm:1", parent_session_id="parent-1",
+            runner=lambda: {"status": "completed"}, max_async_children=3, durable_spec=_spec(cwd),
+            current_boot_id=BOOT, slot_key=ids[0] if ids else None,
+            kanban={"profile": "default", "cwd": str(cwd), "session_id": "parent-1", "spawn_fn": spawner})
+        ids.append(h["delegation_id"])
+    for t in threads:
+        t.join(timeout=30)
+    assert "slot_key" not in _record(ids[0])["kanban"]
+    assert _record(ids[1])["kanban"]["slot_key"] == ids[0]
+    ad._reset_for_tests()
+    profile_home = Path(ad._registry_path().parent.parent)
+    assert akb.observe_running(profile_home, "200:2") == 2
+    assert {ad._records[d]["slot_key"] for d in ids} == {ids[0]}
+
+
+def test_already_queued_completion_is_not_rewritten_every_tick(monkeypatch, tmp_path, spawner):
+    """16b52722c58f: a completion queued this boot and awaiting its ack costs no registry write per tick."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _runner_writes(did)
+    _end_card(task_id, "done")
+    assert _drain()["queued"] == 1
+    queued = _queued()
+    writes = []
+    real = store.locked_registry
+
+    def counting(*a, **kw):
+        writes.append(kw.get("write", True))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(store, "locked_registry", counting)
+    assert _drain() == {"drained": 0, "queued": 0, "failed": 0, "lost": 0}
+    assert True not in writes, "no registry write while the ack is pending"
+    assert ad.active_count() == 0
+    _deliver(queued)
+    assert _drain()["drained"] == 1
+
+
+# ── Prism round 3/4 on #2252 (t_e92403ba) ─────────────────────────────────
+
+
+def test_spawn_failure_with_a_live_runner_on_the_archived_card_is_not_fenced(monkeypatch, tmp_path):
+    """a5d56a755e4f: the archive succeeded but the card's runner still runs (between card reads) ->
+    not fenced: the unit must not also run in-process."""
+    procs = []
+
+    def spawn_then_raise(task, workspace, *, on_popen=None, **kw):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+        procs.append(proc)
+        raise OSError("spawn bookkeeping failed after the worker started (test)")
+
+    runner = SimpleNamespace(pid=4321, cmdline=lambda: ["hermes", "delegation-unit"])
+    monkeypatch.setattr(akb, "lineage_processes", lambda task_id: [runner])
+    monkeypatch.setattr(akb, "FENCE_WAIT_SECONDS", 0.2)
+    try:
+        handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawn_then_raise)
+        rec = _record(handle["delegation_id"])
+        assert calls == [], "no in-process run beside a live runner"
+        assert rec["state"] == "failed" and rec["attempt"]["generation"] == 0
+    finally:
+        for proc in procs:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_spawn_failure_with_an_unknown_scan_is_not_fenced(monkeypatch, tmp_path):
+    """a5d56a755e4f: an unreadable process table is never proof the runner is gone."""
+    monkeypatch.setattr(akb, "lineage_processes", lambda task_id: None)
+    monkeypatch.setattr(akb, "FENCE_WAIT_SECONDS", 0.2)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    assert calls == [] and _record(handle["delegation_id"])["state"] == "failed"
+
+
+def test_spawn_failure_with_no_runner_still_falls_back_in_process(monkeypatch, tmp_path):
+    monkeypatch.setattr(akb, "lineage_processes", lambda task_id: [])
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    assert len(calls) == 1 and _record(handle["delegation_id"])["state"] == "done"
+
+
+def test_parent_route_keeps_the_endpoint_of_an_anonymous_custom_route():
+    """9885df0cd889: provider=custom with no custom:<name> -> the endpoint is persisted; re-resolving
+    the bare name would land on the profile's default endpoint."""
+    parent = SimpleNamespace(requested_provider="custom", provider="custom", model="m",
+                             base_url="http://10.0.0.5:8080/v1")
+    assert akb.parent_route(parent, {"base_url": ""})["explicit_base_url"] == "http://10.0.0.5:8080/v1"
+    parent.requested_provider = None
+    assert akb.parent_route(parent, {})["explicit_base_url"] == "http://10.0.0.5:8080/v1"
+    named = SimpleNamespace(requested_provider="custom:lab", provider="custom", model="m",
+                            base_url="http://10.0.0.5:8080/v1")
+    assert akb.parent_route(named, {})["explicit_base_url"] is None, "a named endpoint re-resolves by name"
+    pinned = SimpleNamespace(requested_provider="custom", provider="custom", model="m", base_url="http://a/v1")
+    assert akb.parent_route(pinned, {"base_url": "http://deleg/v1"})["explicit_base_url"] == "http://deleg/v1"
+
+
+def test_parent_route_re_resolves_a_raw_named_custom_provider(monkeypatch):
+    """ad67d9f22615: a configured custom provider requested by its raw name (``lab``, not
+    ``custom:lab``) is named: its endpoint re-resolves by name, never persisted as an override."""
+    import hermes_cli.runtime_provider_custom as rpc
+
+    monkeypatch.setattr(rpc, "has_named_custom_provider", lambda name: name == "lab")
+    raw = SimpleNamespace(requested_provider="lab", provider="custom", model="m", base_url="http://10.0.0.5:8080/v1")
+    assert akb.parent_route(raw, {})["explicit_base_url"] is None, "a raw named provider re-resolves by name"
+    unknown = SimpleNamespace(requested_provider="ollama", provider="custom", model="m", base_url="http://o/v1")
+    assert akb.parent_route(unknown, {})["explicit_base_url"] == "http://o/v1", "an unconfigured alias stays anonymous"
+
+
+def test_no_working_file_lock_keeps_the_unit_in_process(eligible, monkeypatch):
+    """7bf4070bc0f0: flock unsupported (ENOLCK) in the lock directory -> the unit stays in-process."""
+    import fcntl
+
+    real = fcntl.flock
+
+    def no_lock(fd, op):
+        raise OSError(37, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", no_lock)
+    assert akb.ineligible_reason(**eligible) == "no_file_locks"
+    monkeypatch.setattr(fcntl, "flock", real)
+    assert akb.ineligible_reason(**eligible) is None
+
+
+def test_lock_and_writer_span_the_install_root_and_the_kanban_root(home, monkeypatch, tmp_path):
+    """a2f98fb174ac: a detached worker coordinates in the install root's file-locks, a kanban unit in
+    the kanban root's: a write published by either is seen by the other, and both locks are held."""
+    import fcntl
+
+    import tools.delegate_tool_config as dtc
+    from tools import file_state
+
+    monkeypatch.setattr(dtc, "_get_detached_background", lambda: True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kroot"))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    target = str(tmp_path / "f.txt")
+    files = file_state._lock_files_for(target)
+    assert len(files) == 2 and files[0].parent == tmp_path / "kroot" / "state" / "file-locks"
+    assert files[1].parent == home / "state" / "file-locks"
+    # A sibling from before the kanban root took over published only in the install root.
+    legacy = files[1].with_name(files[1].name + ".writer")
+    legacy.write_text(json.dumps({"task_id": "old-unit", "ts": time.time() + 5, "pid": 1, "create_time": None}))
+    assert file_state._foreign_writer(target)[0] == "old-unit"
+    held = []
+    with file_state.FileStateRegistry().lock_path(target):
+        for f in files:
+            fd = __import__("os").open(f, __import__("os").O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(False)
+            except BlockingIOError:
+                held.append(True)
+            finally:
+                __import__("os").close(fd)
+    assert held == [True, True]
+
+
+# ── Prism round 1 on #2269 ─────────────────────────────────────────────────
+
+
+def test_boot_keeps_a_cancelled_unit_whose_card_read_was_inconclusive(monkeypatch, tmp_path, spawner):
+    """3b8946d15b24 / 68f494996a96: the boot card read fails -> nothing is observed yet; the next drain,
+    with SQLite back, retries the read, observes the cancelled unit and archives its live card."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _no_thread(monkeypatch)
+    ad.interrupt_for_session(parent_session_id="parent-1", reason="/stop")
+    ad._reset_for_tests()
+    profile_home = Path(ad._registry_path().parent.parent)
+    real = akb._board_state
+    monkeypatch.setattr(akb, "_board_state", lambda: None)  # "database is locked" at boot
+    assert akb.observe_running(profile_home, "200:2") == 0
+    monkeypatch.setattr(akb, "_board_state", real)
+    akb.drain_profile(profile_home, "200:2")
+    assert _card(task_id)[0].status == "archived"
+    akb.drain_profile(profile_home, "200:2")
+    assert ad.active_count() == 0
+
+
+def test_permanently_inconclusive_scan_still_finalizes_an_ended_card(monkeypatch, tmp_path, spawner):
+    """42bc969f2f92: the deferral on an unknown scan is bounded: past the limit the dead runner's
+    record is failed and its error delivered once."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _end_card(task_id, "archived")
+    profile_home = Path(ad._registry_path().parent.parent)
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: None)["failed"] == 0
+    assert _record(did)["state"] == "running"
+    monkeypatch.setattr(akb, "INCONCLUSIVE_SCAN_LIMIT_SECONDS", 0.0)
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: None)["failed"] == 1
+    assert _record(did)["state"] == "failed" and ad.active_count() == 0
+
+
+
+# ── Prism round 3 on #2269 (t_e92403ba) ────────────────────────────────────
+
+
+def test_a_symlinked_alias_of_the_kanban_root_takes_one_lock_and_never_hangs(home, monkeypatch, tmp_path):
+    """66442f47f3d4 / 17c51e65b828: the kanban root is a symlink to the install root -> one lock root,
+    and taking the path lock completes (two opens of one inode would self-deadlock on LOCK_EX)."""
+    import tools.delegate_tool_config as dtc
+    from tools import file_state
+
+    monkeypatch.setattr(dtc, "_get_detached_background", lambda: True)
+    alias = tmp_path / "kroot-alias"
+    alias.symlink_to(home, target_is_directory=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(alias))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    target = str(tmp_path / "f.txt")
+    assert len(file_state._lock_files_for(target)) == 1
+    done = threading.Event()
+
+    def take():
+        with file_state.FileStateRegistry().lock_path(target):
+            done.set()
+
+    t = threading.Thread(target=take, daemon=True)
+    t.start()
+    assert done.wait(timeout=10), "the path lock self-deadlocked on an aliased lock root"
+
+
+def test_unreadable_board_at_boot_does_not_resurrect_a_settled_cancelled_record(monkeypatch, tmp_path, spawner):
+    """68f494996a96: a cancelled record whose card already ended and drained, board unreadable at boot
+    -> no observer; the next conclusive drain does not observe it either."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _no_thread(monkeypatch)
+    ad.interrupt_for_session(parent_session_id="parent-1", reason="/stop")
+    _drain()
+    _drain()
+    assert _card(task_id)[0].status == "archived" and akb.DRAINED_EVENT in _card(task_id)[1]
+    assert ad.active_count() == 0
+    ad._reset_for_tests()
+    profile_home = Path(ad._registry_path().parent.parent)
+    real = akb._board_state
+    monkeypatch.setattr(akb, "_board_state", lambda: None)
+    assert akb.observe_running(profile_home, "200:2") == 0
+    assert ad.active_count() == 0
+    monkeypatch.setattr(akb, "_board_state", real)
+    akb.drain_profile(profile_home, "200:2")
+    assert ad.active_count() == 0
+
+
+def test_inconclusive_scan_bound_counts_from_the_card_end_across_a_restart(monkeypatch, tmp_path, spawner):
+    """42bc969f2f92: the bound is measured from the card's end, so a gateway that restarted (fresh
+    in-memory clock) still finalizes a long-dead runner, with the inconclusive reason in the error."""
+    from hermes_cli import kanban_db as kb
+
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _end_card(task_id, "archived")
+    with kb.connect_closing(board="delegations") as conn:
+        conn.execute("UPDATE task_events SET created_at = created_at - 7200 WHERE task_id = ?", (task_id,))
+        conn.commit()
+    akb._inconclusive_since.clear()  # a restarted gateway
+    monkeypatch.setattr(akb, "INCONCLUSIVE_SCAN_LIMIT_SECONDS", 600.0)
+    profile_home = Path(ad._registry_path().parent.parent)
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: None)["failed"] == 1
+    rec = _record(did)
+    assert rec["state"] == "failed" and ad.active_count() == 0
+    assert "inconclusive" in json.dumps(rec)
+
+
+# ── Prism round 4 on #2269 (t_e92403ba) ─────────────────────────────────────
+
+
+def test_card_end_watcher_between_archive_and_supersede_keeps_the_fallback(monkeypatch, tmp_path):
+    """3209d222e4a1: the failed launch archived its card; the card-end watcher drains before the
+    supersede -> it must not fail the attempt: the in-process fallback runs, one terminal outcome."""
+    drains = []
+
+    def gone_after_a_drain(task_id):
+        drains.append(akb.drain_profile(Path(ad._registry_path().parent.parent), BOOT, scan=lambda t: []))
+        return True
+
+    monkeypatch.setattr(akb, "_runner_gone", gone_after_a_drain)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    did = handle["delegation_id"]
+    rec = _record(did)
+    assert drains and drains[0]["failed"] == 0, "the watcher failed an attempt that was being fenced"
+    assert len(calls) == 1 and rec["state"] == "done"
+    terminal = [e for e in rec["outbox"] if e.get("type") == "async_delegation"]
+    assert len(terminal) == 1 and terminal[0]["payload"]["attempt_id"] == rec["attempt"]["attempt_id"]
+    assert akb._launch_fence == set(), "the fence is released once the fallback is decided"
+
+
+def test_alias_permuted_lock_roots_are_taken_in_one_shared_order(tmp_path, monkeypatch):
+    """2c3a22ac560f: two processes that see the same lock dirs through different (bind-mount) aliases
+    must take them in the same order; path-string order is not shared, (st_dev, st_ino) is."""
+    import os
+    from tools import file_state
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (tmp_path / "z_a").symlink_to(a, target_is_directory=True)
+    (tmp_path / "y_b").symlink_to(b, target_is_directory=True)
+    # A bind mount is not visible to realpath: model it by making realpath see no alias.
+    monkeypatch.setattr(file_state.os.path, "realpath", lambda p: str(p))
+    real_open = os.open
+
+    def order(roots):
+        opened = []
+
+        def rec_open(path, *args, **kw):
+            fd = real_open(path, *args, **kw)
+            st = os.fstat(fd)
+            opened.append((st.st_dev, st.st_ino))
+            return fd
+
+        monkeypatch.setattr(file_state, "_lock_files_for", lambda resolved: [r / "lk" for r in roots])
+        monkeypatch.setattr(file_state.os, "open", rec_open)
+        try:
+            with file_state._cross_process_lock("/x"):
+                pass
+        finally:
+            monkeypatch.setattr(file_state.os, "open", real_open)
+        return opened
+
+    view1 = order([a, b])
+    view2 = order([tmp_path / "y_b", tmp_path / "z_a"])
+    assert len(view1) == 2 and view1 == view2, "alias views acquire the shared locks in different orders"
