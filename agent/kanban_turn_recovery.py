@@ -321,6 +321,25 @@ def build_recovery_nudge(result: Any, *, attempt: int, max_attempts: int) -> str
     )
 
 
+def persist_pending_transcript(agent: Any, messages: Any, durable_history: Any = None) -> bool:
+    """Write the failed turn's unsaved rows to state.db BEFORE they become recovery history.
+
+    The recovery turn receives these messages as ``conversation_history``, and the flush
+    treats every history dict without a marker as already durable
+    (``agent/session_persistence.py::_db_flush_collect``): a row a failed flush left unsaved
+    would be stamped persisted without ever being written. ``durable_history`` is the
+    history the ORIGINAL turn was given (the only rows the flush may still assume durable);
+    every other unmarked row in ``messages`` is written here. False means the write failed
+    and the recovery turn must not run on this history.
+    """
+    if not messages:
+        return True
+    flush = getattr(agent, "_flush_messages_to_session_db", None)
+    if flush is None:
+        return True
+    return flush(messages, durable_history) is not False
+
+
 def _emit_recovery_skipped(emit: Optional[Callable[[str], None]]) -> None:
     """The one "no proof, no retry" line — fail-closed is worth saying out loud."""
     message = (
@@ -342,6 +361,7 @@ def recover_failed_kanban_turns(
     sleep_fn: Callable[[float], None] = time.sleep,
     emit: Optional[Callable[[str], None]] = None,
     claim_check: Optional[Callable[[], bool]] = None,
+    persist_pending: Optional[Callable[[], bool]] = None,
 ) -> int:
     """Retry an authorised kanban worker turn in place; returns attempts made.
 
@@ -354,6 +374,10 @@ def recover_failed_kanban_turns(
     self-holding a claim is claim-lifetime policy (#95318), not this module's;
     if the lease expires while sleeping, the re-proof fails and the attempt is
     not made.
+
+    ``persist_pending()`` (see :func:`persist_pending_transcript`) runs right before each
+    model re-entry. When it returns False the attempt is spent without entering the model,
+    so an unsaved row is never handed to the next turn as durable history.
     """
     attempts = 0
     check = claim_check or worker_claim_is_live
@@ -385,6 +409,18 @@ def recover_failed_kanban_turns(
         if not check():
             _emit_recovery_skipped(emit)
             return attempts
+        if persist_pending is not None and not persist_pending():
+            message = (
+                f"[kanban] {kanban_task_id() or 'task'}: the failed turn's transcript could not be "
+                f"saved (attempt {attempts}/{max_recovery_attempts()}); not re-entering the model"
+            )
+            logger.warning("%s", message)
+            if emit is not None:
+                try:
+                    emit(message)
+                except Exception:
+                    logger.debug("kanban turn-recovery emit failed", exc_info=True)
+            continue
         turn_fn(build_recovery_nudge(result, attempt=attempts, max_attempts=max_recovery_attempts()))
 
 
@@ -397,6 +433,7 @@ __all__ = [
     "kanban_task_id",
     "kanban_turn_recovery_enabled",
     "max_recovery_attempts",
+    "persist_pending_transcript",
     "recover_failed_kanban_turns",
     "recovery_delay_seconds",
     "should_recover_turn",

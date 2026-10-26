@@ -775,3 +775,151 @@ def test_goal_mode_continues_after_a_successful_authorized_recovery(
     assert _drive(cli_mod, driver) == 0
     assert len(entered) == 2
     assert goal_spy == [("done", driver)]
+
+
+# ── unsaved rows of the failed turn (Prism 65c1c9869d40 on #2317) ────────────
+
+def _real_flush_agent(tmp_path, sid="S-rec"):
+    """A real ``SessionDB`` behind the real flush: the durability contract is the store's."""
+    from run_agent import AIAgent
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(sid, source="cli")
+    agent = SimpleNamespace(
+        _session_db=db, _session_db_created=True, _persist_disabled=False, session_id=sid,
+        _session_persist_lock=None, _flushed_db_message_ids=set(), _flushed_db_message_session_id=None,
+        _last_flushed_db_idx=0, _persist_user_message_idx=None, _persist_user_message_override=None,
+        _persist_user_message_timestamp=None, _pending_cli_user_message=None,
+    )
+    agent._ensure_db_session = lambda: None
+    agent._flush_messages_to_session_db = AIAgent._flush_messages_to_session_db.__get__(agent, AIAgent)
+    agent._flush_messages_to_session_db_unlocked = (
+        AIAgent._flush_messages_to_session_db_unlocked.__get__(agent, AIAgent))
+    return agent, db
+
+
+def _lock_writes(db):
+    def _locked(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    db.append_messages_batch = _locked
+
+
+def _storage_busy_turn(agent, db, prior):
+    """The original turn: its flush hits a held write lock, so its new rows stay unsaved."""
+    turn = [*prior, {"role": "user", "content": "accepted input"},
+            {"role": "assistant", "content": "partial answer"}]
+    real_write = db.append_messages_batch
+    _lock_writes(db)
+    try:
+        assert agent._flush_messages_to_session_db(turn, prior) is False
+    finally:
+        db.append_messages_batch = real_write
+    return {**_storage_busy(), "messages": turn}
+
+
+def _contents(db, sid="S-rec"):
+    return [m.get("content") for m in db.get_messages(sid)]
+
+
+@pytest.mark.parametrize("wire_persist", [True, False], ids=["persisted", "unwired-base-shape"])
+def test_recovery_writes_the_failed_turns_unsaved_rows(wire_persist, clear_kanban_env, tmp_path,
+                                                       monkeypatch):
+    """The recovery turn gets the failed turn's messages as ``conversation_history``, and the
+    flush stamps unmarked history rows durable WITHOUT writing them. The pending rows must
+    reach state.db first. ``unwired-base-shape`` is the #2317 loop (no persist step): the rows
+    are lost for good, which pins the bug the persist step closes."""
+    from agent.kanban_turn_recovery import persist_pending_transcript
+
+    _worker_env(monkeypatch, recovery=1)
+    agent, db = _real_flush_agent(tmp_path)
+    result = _storage_busy_turn(agent, db, prior=[])
+    assert _contents(db) == []  # nothing landed on the busy turn
+
+    def _recovery_turn(nudge):
+        history = result["messages"]  # exactly what both drivers hand the next turn
+        live = [*history, {"role": "user", "content": nudge}, {"role": "assistant", "content": "done"}]
+        assert agent._flush_messages_to_session_db(live, history) is True
+
+    recover_failed_kanban_turns(
+        _recovery_turn, lambda: result, sleep_fn=lambda _s: None, claim_check=lambda: True,
+        persist_pending=(lambda: persist_pending_transcript(agent, result["messages"], []))
+        if wire_persist else None,
+    )
+
+    rows = _contents(db)
+    if wire_persist:
+        assert rows[:2] == ["accepted input", "partial answer"]
+        assert len(rows) == 4 and rows[3] == "done"  # every row exactly once
+    else:
+        assert "accepted input" not in rows and rows[-1] == "done"
+
+
+def test_recovery_does_not_reenter_when_the_pending_write_fails(clear_kanban_env, tmp_path,
+                                                                monkeypatch):
+    """Still locked: the turn is not run on history that would be stamped durable unsaved."""
+    from agent.kanban_turn_recovery import persist_pending_transcript
+
+    _worker_env(monkeypatch, recovery=2)
+    agent, db = _real_flush_agent(tmp_path)
+    result = _storage_busy_turn(agent, db, prior=[])
+    _lock_writes(db)
+    entered: list = []
+
+    attempts = recover_failed_kanban_turns(
+        entered.append, lambda: result, sleep_fn=lambda _s: None, claim_check=lambda: True,
+        persist_pending=lambda: persist_pending_transcript(agent, result["messages"], []),
+    )
+
+    assert entered == [] and attempts == 2  # budget spent, model never re-entered
+
+
+def test_pending_write_keeps_the_original_history_boundary(clear_kanban_env, tmp_path):
+    """Rows the first turn was given as history are not written a second time."""
+    from agent.kanban_turn_recovery import persist_pending_transcript
+
+    agent, db = _real_flush_agent(tmp_path)
+    db.append_message("S-rec", "user", "old q")
+    db.append_message("S-rec", "assistant", "old a")
+    prior = [{"role": "user", "content": "old q"}, {"role": "assistant", "content": "old a"}]
+    result = _storage_busy_turn(agent, db, prior=prior)
+
+    assert persist_pending_transcript(agent, result["messages"], prior) is True
+    assert _contents(db) == ["old q", "old a", "accepted input", "partial answer"]
+
+
+@pytest.mark.parametrize("driver", DRIVERS)
+def test_drivers_persist_the_failed_turns_messages_before_reentry(driver, cli_harness, live_claim,
+                                                                  monkeypatch):
+    """Both drivers wire the persist step with the messages the next turn receives."""
+    import agent.kanban_turn_recovery as rec
+
+    _worker_env(monkeypatch, recovery=1)
+    monkeypatch.setattr(rec, "RECOVERY_DELAYS_SECONDS", (0.0,))
+    pending = [{"role": "user", "content": "accepted input"}]
+    calls: list = []
+    monkeypatch.setattr(rec, "persist_pending_transcript",
+                        lambda agent, messages, history: calls.append((messages, history)) or True)
+    busy = {**_storage_busy(), "messages": pending}
+    cli_mod, entered, ui = cli_harness(driver, [busy, _success()])
+    if driver == "chat":
+        # chat() syncs the failed turn's messages onto cli.conversation_history, as production does.
+        orig_init = cli_mod.HermesCLI.__init__
+
+        def _init(self, **kw):
+            orig_init(self, **kw)
+            orig_chat = self.chat
+
+            def _chat(query, images=None):
+                resp = orig_chat(query, images)
+                self.conversation_history = self._last_turn_result.get("messages") or []
+                return resp
+
+            self.chat = _chat
+
+        monkeypatch.setattr(cli_mod.HermesCLI, "__init__", _init)
+
+    assert _drive(cli_mod, driver) == 0
+    assert len(entered) == 2
+    assert calls and calls[0][0] == pending and calls[0][1] == []
