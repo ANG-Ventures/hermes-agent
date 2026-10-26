@@ -787,7 +787,14 @@ class GatewayInboundMixin:
             if self._queue_depth(_quick_key, adapter=adapter) <= depth_before:
                 # Depth cap refused it (logged there); nothing queued, so do not ack a queue.
                 return None
-            logger.info(
+            # One INFO line per flush window (30 s), DEBUG for the requeue laps after it.
+            _turn = self._session_state(_quick_key).turn
+            _log_now = time.time()
+            _level = logging.INFO if _log_now - _turn.flush_log_ts >= 30 else logging.DEBUG
+            if _level == logging.INFO:
+                _turn.flush_log_ts = _log_now
+            logger.log(
+                _level,
                 "PHASE=lease_flush_queued session=%s internal=%s depth=%d: previous turn still holds "
                 "the turn lease (persist/deliver); queued instead of dispatching a fresh turn",
                 _quick_key, bool(is_internal), self._queue_depth(_quick_key, adapter=adapter),
