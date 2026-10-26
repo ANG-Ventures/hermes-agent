@@ -174,15 +174,21 @@ def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: D
         # A bare ``custom`` lookup would answer for the profile's DEFAULT custom endpoint and send that
         # endpoint's key to another one (Prism 1b48ed1b0fa3): no URL-keyed key fails the unit instead.
         url = route.get("parent_base_url")
+        # The failure text reaches the unit's output and logs: redacted URL, never the resolver's own text
+        # (it may echo the raw URL or a key) (Prism 51f33268a501).
+        from tools.async_delegation_store import redact_url
+
+        shown = redact_url(url) if url else "(unrecorded)"
         try:
             own = resolve_runtime_provider(requested=route.get("requested_provider") or "custom",
                                            target_model=route.get("model") or execution.get("model") or None,
                                            explicit_base_url=url) if url else {}
         except Exception as exc:
-            raise RuntimeError(f"no credential for the parent's custom endpoint {url}: {exc}") from exc
+            raise RuntimeError(f"delegation {record_id or '(unknown)'}: no credential for the parent's custom "
+                               f"endpoint {shown} ({type(exc).__name__})") from None
         if not own.get("api_key"):
-            raise RuntimeError(f"no credential for the parent's custom endpoint {url or '(unrecorded)'}; "
-                               "set delegation.api_key for the delegation endpoint")
+            raise RuntimeError(f"delegation {record_id or '(unknown)'}: no credential for the parent's custom "
+                               f"endpoint {shown}; set delegation.api_key for the delegation endpoint")
         return own["api_key"]
     requested = str(route.get("requested_provider") or "").strip().lower()
     parent_provider = (execution.get("credential_ref") or {}).get("parent_provider")
@@ -198,16 +204,19 @@ def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: D
     if not provider:
         raise RuntimeError(f"delegation {record_id or '(unknown)'}: route records no parent provider; "
                            "set delegation.api_key for the delegation endpoint")
+    # ``runtime`` is the delegation endpoint's resolution, keyed on the profile's DEFAULT provider: never a
+    # substitute for the parent's own key. No key on the parent's provider fails the unit (Prism 467b28edd66c).
     try:
         own = resolve_runtime_provider(requested=provider,
                                        target_model=route.get("model") or execution.get("model") or None)
-    except Exception:
-        # A URL-only custom parent has no endpoint without the recorded URL, so a URL-less re-resolve
-        # can fail: keep the key the first resolution found, as before (Prism 1b48ed1b0fa3).
-        logger.warning("delegation_unit_parent_key_unresolved requested=%s", route.get("requested_provider"),
-                       exc_info=True)
-        return runtime.get("api_key")
-    return own.get("api_key") or runtime.get("api_key")
+    except Exception as exc:
+        raise RuntimeError(f"delegation {record_id or '(unknown)'}: the parent's provider {provider} did not "
+                           f"resolve ({type(exc).__name__}); set delegation.api_key for the delegation endpoint"
+                           ) from None
+    if not own.get("api_key"):
+        raise RuntimeError(f"delegation {record_id or '(unknown)'}: no credential for the parent's provider "
+                           f"{provider}; set delegation.api_key for the delegation endpoint")
+    return own["api_key"]
 
 
 def build_parent(record: Dict[str, Any]):
@@ -257,11 +266,13 @@ def build_parent(record: Dict[str, Any]):
         if value is not None:
             kwargs[key] = value
     parent = AIAgent(**kwargs)
+    from tools.async_delegation_store import redact_url
+
     setattr(parent, "_delegate_depth", int(execution.get("parent_depth") or 0))
     setattr(parent, "terminal_cwd", execution.get("workspace_hint") or None)
     logger.info("delegation_unit_route provider=%s requested=%s base_url=%s api_mode=%s model=%s only=%s "
                 "ignore=%s data_collection=%s prefill=%d", getattr(parent, "provider", None),
-                getattr(parent, "requested_provider", None), getattr(parent, "base_url", None),
+                getattr(parent, "requested_provider", None), redact_url(getattr(parent, "base_url", None)),
                 getattr(parent, "api_mode", None), getattr(parent, "model", None), pr.get("only"),
                 pr.get("ignore"), pr.get("data_collection"), len(kwargs.get("prefill_messages") or []))
     return parent
