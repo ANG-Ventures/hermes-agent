@@ -2440,7 +2440,7 @@ def _run_cron_write_guard(job: Dict[str, Any], op: str) -> None:
     try:
         proc = subprocess.run(
             [str(guard), op], input=json.dumps(job, default=str), capture_output=True,
-            text=True, timeout=CRON_WRITE_GUARD_TIMEOUT_S)
+            text=True, encoding="utf-8", errors="replace", timeout=CRON_WRITE_GUARD_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         raise ValueError(
             f"cron write guard unavailable: {guard} did not answer in "
