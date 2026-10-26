@@ -2641,3 +2641,63 @@ def test_export_reconciles_a_degraded_sibling_edit_to_an_existing_job(temp_home,
     cj.export_runtime_to_json(retire=False)
     merged = next(j for j in cj.load_jobs() if j["id"] == created["id"])
     assert merged.get("enabled") is False and merged.get("state") == "paused", merged
+
+
+def test_kill_switch_orphans_cache_sees_a_wal_only_commit(temp_home, monkeypatch):
+    """ec644af502fe: a SQLite-mode sibling's WAL commit changes -wal, not the main db's identity.
+    The orphans-only cache must include the WAL identity, or json-mode readers keep returning the
+    pre-commit runtime for a defined job."""
+    import sqlite3
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    b = cj.create_job(prompt="x", schedule="every 5m", name="b")
+    data = json.loads(_jobs_file(temp_home).read_text())
+    data["jobs"] = [j for j in data["jobs"] if j["id"] != b["id"]]
+    _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+    rs.write_rows(temp_home / "cron", {a["id"]: {"last_status": "ok"},
+                                       b["id"]: {"last_status": "kept-b"}})
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    cj.load_jobs()
+    assert set(rs.read_all(temp_home / "cron")) == {b["id"]}  # orphans-only fold cached
+    # a sqlite-mode sibling adopts a's runtime and commits through the WAL (main db unchanged)
+    keep = sqlite3.connect(str(_db(temp_home)))  # a reader keeps the WAL from checkpointing away
+    keep.execute("PRAGMA journal_mode=wal"); keep.execute("SELECT count(*) FROM job_runtime").fetchall()
+    main_before = cj._db_identity(_db(temp_home))
+    with rs.connect(temp_home / "cron") as conn:
+        conn.execute("PRAGMA journal_mode=wal")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("BEGIN IMMEDIATE")
+        rs.upsert_rows(conn, {a["id"]: {"last_status": "sibling-wal"}})
+        conn.execute("COMMIT")
+    assert cj._db_identity(_db(temp_home)) == main_before, "precondition: main db identity unchanged"
+    jobs = {j["id"]: j for j in cj.load_jobs()}
+    keep.close()
+    assert jobs[a["id"]]["last_status"] == "sibling-wal", jobs[a["id"]].get("last_status")
+
+
+def test_fold_race_recovery_applies_to_an_empty_baseline_row(temp_home, monkeypatch):
+    """ee01a8d9dc87: a callback that started from an EMPTY row {} must still rebase against the
+    folded record when its row is gone (an export folded+retired it), or the partial write masks
+    the folded fields."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="empty-base")
+    with rs.connect(temp_home / "cron") as conn:
+        conn.execute("UPDATE job_runtime SET fields='{}' WHERE job_id=?", (created["id"],))
+        conn.commit()
+
+    def fn(jobs, idx, job):
+        cj.mark_job_run(created["id"], True)  # lock holder writes last_run_at ...
+        cj.export_runtime_to_json(retire=True)  # ... and exports with retire
+        job["next_run_at"] = "2030-01-01T00:00:00+00:00"
+        cj.save_jobs(jobs)
+        return True
+
+    with cj._jobs_lock():
+        assert cj._with_job_runtime(created["id"], fn, None) is True
+    merged = next(j for j in cj.load_jobs() if j["id"] == created["id"])
+    assert merged.get("last_run_at"), merged
+    assert merged["next_run_at"] == "2030-01-01T00:00:00+00:00"

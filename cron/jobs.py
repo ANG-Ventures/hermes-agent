@@ -1808,7 +1808,10 @@ def _db_identity(path: Path) -> Optional[Tuple[int, int, int]]:
 
 
 def _kill_switch_pair_identity(path: Path) -> Tuple[Optional[Tuple[int, int, int]], ...]:
-    return (_db_identity(path), _db_identity(_current_cron_store().jobs_file))
+    # Prism ec644af502fe: a WAL commit changes the -wal file, not the main db's inode/size/mtime,
+    # so the WAL identity is part of the key or a sibling's adopted rows would stay invisible.
+    return (_db_identity(path), _db_identity(Path(str(path) + "-wal")),
+            _db_identity(_current_cron_store().jobs_file))
 
 
 def _kill_switch_orphans_only() -> bool:
@@ -2551,8 +2554,9 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
         return result
     with _runtime_txn() as conn:
         disk = _rs.read_row(conn, str(job_id))
-        if disk is None and base_runtime:
-            # Prism 736d658ee6b2: the row we started from is GONE (an export folded and retired it
+        if disk is None and base_runtime is not None:
+            # Prism 736d658ee6b2 (+ ee01a8d9dc87: an EMPTY baseline row is still a row that was
+            # folded; recover whenever the row is absent, never on truthiness): the row we started from is GONE (an export folded and retired it
             # while *fn* ran; its values now live in jobs.json). Merging against {} would read every
             # unchanged baseline field as a concurrent delete and write a partial row that then
             # overrides the folded file. Reconcile against the folded record instead.
@@ -3035,8 +3039,8 @@ def _save_split_unlocked(
             if not replace and base_runtime is not None and jid in base_runtime:
                 if jid in disk_rows:
                     row = _reconcile_job_fields(row, disk_rows[jid], base_runtime[jid])
-                elif base_runtime[jid]:
-                    # Prism c2d58ecce953: our baseline row is GONE (an export folded and retired
+                else:
+                    # Prism c2d58ecce953 (+ ee01a8d9dc87: regardless of baseline truthiness): our baseline row is GONE (an export folded and retired
                     # it; its newer values live in jobs.json). Rebase against the folded record,
                     # as _with_job_runtime does, instead of resurrecting our stale copy.
                     if folded_rows is None:
