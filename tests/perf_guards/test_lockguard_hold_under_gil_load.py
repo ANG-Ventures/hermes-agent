@@ -89,7 +89,7 @@ def test_hold_is_constant_in_fd_count_under_gil_load(tmp_path, monkeypatch):
             held = lg.hold(db)
             timings.append(time.perf_counter() - t0)
             assert held, "hold() armed nothing on a live WAL database"
-            lg.close_fds(lg.release(held))
+            lg.release(held)
             _sample_floor()
         monkeypatch.setattr(os, "listdir", real_listdir)
     finally:

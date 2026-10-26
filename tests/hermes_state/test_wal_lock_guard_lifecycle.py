@@ -70,7 +70,7 @@ def test_guard_never_outlives_the_handle_under_fd_reuse(tmp_path, monkeypatch):
     finally:
         c.close()
     assert _foreign_exclusive_ok(str(path)), "a lock survived the last handle's close"
-    assert not lg._HANDLES and not lg._FDS
+    assert not lg._HANDLES
     assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
 
 
@@ -100,4 +100,4 @@ def test_closing_writer_stays_guarded_until_sqlite_closes(tmp_path, monkeypatch)
     db.close()
     assert in_gap["shm"] == shm, "a sibling's close unlinked -shm under the closing writer"
     assert not os.path.exists(f"{path}-wal"), "the true last close must still end the generation"
-    assert _foreign_exclusive_ok(str(path)) and not lg._HANDLES and not lg._FDS
+    assert _foreign_exclusive_ok(str(path)) and not lg._HANDLES
