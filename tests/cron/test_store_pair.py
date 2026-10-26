@@ -365,3 +365,174 @@ def test_runtime_export_folds_the_pair_and_writes_no_side_file(home, capsys):
     assert [n for n in names if n.startswith("runtime_state") or "orphan" in n] == [], names
     doc = json.loads((home / "cron" / "jobs.json").read_text())
     assert doc["jobs"][0]["repeat"]["completed"] == 4
+
+
+
+# --- Prism round 1 on #2331 (round-2 send-back) ----------------------------------------------
+
+def _fail_runtime_db_copy(monkeypatch, how):
+    """Make the SQLite capture of the LIVE runtime_state.db fail: ``refused`` returns False (the
+    store_pair capture refuses), ``oserror`` raises."""
+    from hermes_cli import backup, backup_sqlite
+
+    real = backup_sqlite._safe_copy_db
+
+    def copy_db(src, dst, **kw):
+        if Path(src).name == "runtime_state.db" and Path(src).parent.parent.name == "home":
+            if how == "oserror":
+                raise OSError("simulated read failure")
+            return False
+        return real(src, dst, **kw)
+
+    monkeypatch.setattr(backup_sqlite, "_safe_copy_db", copy_db)
+    monkeypatch.setattr(backup, "_safe_copy_db", copy_db)
+
+
+@pytest.mark.parametrize("leg", ["quick_snapshot", "hermes_backup"])
+def test_capture_refuses_a_symlinked_pair_member(home, tmp_path, monkeypatch, leg):
+    """Prism 8661dfe2d768: the backup walkers never follow a link, but the pair capture reopened
+    ``cron/jobs.json`` through one and archived a file outside the home."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    _job(cj, "a", 1)
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"jobs": [{"id": "SECRET-OUTSIDE", "name": "x"}]}))
+    (home / "cron" / "jobs.json").unlink()
+    (home / "cron" / "jobs.json").symlink_to(outside)
+    if leg == "quick_snapshot":
+        snap = backup.create_quick_snapshot(hermes_home=home)
+        sdir = backup._quick_snapshot_root(home) / (snap or "none")
+        assert not (sdir / "cron" / "jobs.json").exists()
+        if snap:
+            meta = json.loads((sdir / "manifest.json").read_text())
+            assert "cron/runtime_state.db" in meta["failed_dbs"]
+            assert "cron/jobs.json" not in meta["files"]
+    else:
+        zpath = tmp_path / "out" / "b.zip"
+        zpath.parent.mkdir()
+        assert backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0)) is False
+        with zipfile.ZipFile(zpath) as zf:
+            names = zf.namelist()
+            assert not {"cron/jobs.json", "cron/runtime_state.db"} & set(names), names
+            assert not any(b"SECRET-OUTSIDE" in zf.read(n) for n in names)
+
+
+def test_import_refuses_a_cron_dir_linked_outside_the_home(home, tmp_path, monkeypatch):
+    """Prism dbf3e89fdfa5: the pair branch of `hermes import` skipped the per-file containment
+    check, so a ``cron`` dir symlinked outside HERMES_HOME was written through."""
+    import hermes_cli.gateway as gw
+    from hermes_cli.backup import run_import
+
+    monkeypatch.setattr(gw, "ensure_gateway_service", lambda **kw: True)
+    monkeypatch.setattr(gw, "_is_service_running", lambda: True)
+    outside = tmp_path / "outside-cron"
+    outside.mkdir()
+    (home / "cron").rmdir()
+    (home / "cron").symlink_to(outside)
+    _archive(tmp_path / "b.zip", {"config.yaml": "model: x\n",
+                                  "cron/jobs.json": json.dumps({"jobs": [{"id": "j", "name": "n"}]})})
+    rc = run_import(Namespace(zipfile=str(tmp_path / "b.zip"), force=True))
+    assert rc == 1
+    assert list(outside.iterdir()) == []
+
+
+def test_failed_restore_keeps_a_db_backup_beside_the_live_store(home, monkeypatch):
+    """Prism daf60a454f51: the failed-restore cleanup removed every ``runtime_state.db*`` in the
+    LIVE cron dir, including an operator's ``runtime_state.db.bak``."""
+    from cron import jobs as cj
+    from hermes_cli import backup, backup_sqlite
+
+    _job(cj, "a", 2)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    for p in (home / "cron").glob("runtime_state.db*"):
+        p.unlink()
+    (home / "cron" / "runtime_state.db.bak").write_bytes(b"operator copy")
+    real = backup_sqlite._safe_copy_db
+
+    def copy_db(src, dst, **kw):
+        if snap in str(src):  # the snapshot db cannot be installed
+            Path(dst).write_bytes(b"half-written")
+            return False
+        return real(src, dst, **kw)
+
+    monkeypatch.setattr(backup_sqlite, "_safe_copy_db", copy_db)
+    backup.restore_quick_snapshot(snap, hermes_home=home)
+    assert (home / "cron" / "runtime_state.db.bak").read_bytes() == b"operator copy"
+    assert not (home / "cron" / "runtime_state.db").exists()
+
+
+@pytest.mark.parametrize("how", ["refused", "oserror"])
+def test_quick_snapshot_keeps_jobs_json_when_the_db_capture_fails(home, monkeypatch, how):
+    """Prism 5aa2d785f5af: a refused pair capture dropped jobs.json from the snapshot (the file
+    the cron-loss net restores from), and an OSError aborted the whole snapshot."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    _job(cj, "a", 2)
+    _fail_runtime_db_copy(monkeypatch, how)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    assert snap
+    sdir = backup._quick_snapshot_root(home) / snap
+    meta = json.loads((sdir / "manifest.json").read_text())
+    assert "cron/jobs.json" in meta["files"] and (sdir / "cron" / "jobs.json").is_file()
+    assert "cron/runtime_state.db" in meta["failed_dbs"]
+    assert not (sdir / "cron" / "runtime_state.db").exists()
+
+
+@pytest.mark.parametrize("leg", ["restore", "auto_restore"])
+def test_snapshot_with_a_failed_db_keeps_the_live_rows(home, leg):
+    """Prism 72fe227c70de: a snapshot whose runtime db failed (or was skipped) was read as a
+    pre-#2287 json-only snapshot, and its restore wiped every live runtime row."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    a, b = _job(cj, "a", 2), _job(cj, "b", 3)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    # The shape a failed db capture leaves: jobs.json kept, the db absent and named in failed_dbs.
+    sdir = backup._quick_snapshot_root(home) / snap
+    (sdir / "cron" / "runtime_state.db").unlink()
+    meta = json.loads((sdir / "manifest.json").read_text())
+    meta["files"].pop("cron/runtime_state.db")
+    meta["failed_dbs"] = ["cron/runtime_state.db"]
+    (sdir / "manifest.json").write_text(json.dumps(meta))
+    for _ in range(4):
+        cj.mark_job_run(a, True)
+    if leg == "restore":
+        cj.update_job(a, {"name": "renamed"})
+        assert backup.restore_quick_snapshot(snap, hermes_home=home)
+        assert cj.get_job(a)["name"] == "a"
+    else:
+        cj.remove_job(b)
+        assert backup.restore_cron_jobs_if_emptied(snap, hermes_home=home)
+    rows = _rows(home / "cron")
+    assert _completed(rows, a) == 6  # live runtime kept, not cleared
+    assert cj.get_job(a)["repeat"]["completed"] == 6
+
+
+@pytest.mark.parametrize("leg", ["hermes_backup", "automatic_full_backup"])
+def test_zip_never_publishes_a_half_pair(home, tmp_path, monkeypatch, leg):
+    """Prism 077416e0ccaf: a write failure between the two halves left cron/jobs.json in the
+    archive without its db, and the archive was published."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    _job(cj, "a", 2)
+    real = backup._write_zip_file
+
+    def write_zip_file(zf, path, arcname):
+        if arcname.endswith("cron/runtime_state.db"):
+            raise OSError("simulated write failure")
+        return real(zf, path, arcname)
+
+    monkeypatch.setattr(backup, "_write_zip_file", write_zip_file)
+    out = tmp_path / "out"
+    out.mkdir()
+    zpath = out / "b.zip"
+    if leg == "hermes_backup":
+        with pytest.raises(SystemExit) as ei:
+            backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+        assert ei.value.code == 1
+    else:
+        assert backup._write_full_zip_backup(zpath, home) is None
+    assert [p.name for p in out.iterdir() if p.suffix == ".zip"] == []

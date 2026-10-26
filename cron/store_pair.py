@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import IO, Callable, Dict, Iterator, List, Optional, Tuple
@@ -110,6 +111,15 @@ def _unlink_db_files(cron_dir: Path) -> None:
                     os.unlink(entry.path)
 
 
+def _unlink_created_db(db_file: Path) -> None:
+    """Failed-restore cleanup in a LIVE store (Prism daf60a454f51): only the main db this attempt
+    created and its SQLite sidecars. Never a ``runtime_state.db.bak`` / ``.pre-restore-*`` copy
+    someone keeps beside it; prefix-wide removal is ``scrub``'s, on a staged tree only."""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"{db_file}{suffix}")
+
+
 def _private_write(path: Path, data: bytes) -> None:
     """Create *path* exclusively (never through a planted link) 0600 and write *data*."""
     with contextlib.suppress(FileNotFoundError):
@@ -151,15 +161,18 @@ def capture(home: Path, dest: Path, *, fold: bool = False) -> List[str]:
         _discard(dest)  # a staging dir: never leave a pair member from another moment in it
     with lock(home):
         jobs_src, db_src = live / JOBS_NAME, live / DB_NAME
-        if not jobs_src.is_file():
-            if db_src.exists():
+        # The backup walkers never follow a link; the pair path must not reopen one (Prism
+        # 8661dfe2d768): a member that is a symlink or not a regular file refuses the pair.
+        has_jobs, has_db = _regular_member(jobs_src), _regular_member(db_src)
+        if not has_jobs:
+            if has_db:
                 raise PairRefused(f"{db_src} exists but {jobs_src} does not; refusing to capture "
                                   "runtime rows with no definitions")
             return []
         dest.mkdir(parents=True, exist_ok=True)
         _private_write(dest / JOBS_NAME, jobs_src.read_bytes())
         written = [JOBS_NAME]
-        if db_src.exists():
+        if has_db:
             if not _copy_db(db_src, dest / DB_NAME):
                 _discard(dest)
                 raise PairRefused(f"could not capture {db_src} consistently (SQLite backup "
@@ -176,6 +189,35 @@ def capture(home: Path, dest: Path, *, fold: bool = False) -> List[str]:
     return written
 
 
+def capture_definitions(home: Path, dest: Path) -> bool:
+    """Fallback for a quick snapshot whose pair capture failed: ``dest/jobs.json`` only, under
+    the lock, and NO db (the caller records the db as failed so a restore keeps the live rows).
+    Returns False when *home* has no jobs.json. Same link policy as ``capture``."""
+    home, dest = Path(home), Path(dest)
+    if dest.is_dir():
+        _discard(dest)
+    with lock(home):
+        jobs_src = home / CRON_DIR / JOBS_NAME
+        if not _regular_member(jobs_src):
+            return False
+        dest.mkdir(parents=True, exist_ok=True)
+        _private_write(dest / JOBS_NAME, jobs_src.read_bytes())
+    return True
+
+
+def _regular_member(path: Path) -> bool:
+    """True for a regular, non-symlink file; False when absent; ``PairRefused`` for anything
+    else (a symlink, a directory, a device): the pair is never captured through a link."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise PairRefused(f"{path} is not a regular file (symlink or special file); refusing to "
+                          "capture the cron store pair through it (nothing captured)")
+    return True
+
+
 def _discard(dest: Path) -> None:
     _unlink_db_files(dest)
     with contextlib.suppress(FileNotFoundError):
@@ -186,7 +228,7 @@ def _discard(dest: Path) -> None:
 
 # --- restore -------------------------------------------------------------------------------
 
-def restore(src: Path, home: Path) -> List[str]:
+def restore(src: Path, home: Path, *, db_failed: bool = False) -> List[str]:
     """Restore the pair in directory *src* onto *home*'s live store as ONE unit, under the store
     lock, with nothing written unless every check passes first.
 
@@ -196,6 +238,10 @@ def restore(src: Path, home: Path) -> List[str]:
     * no db in *src* (json-only snapshot or archive): the live rows, pending generations and
       mirror bookkeeping are cleared, then the file replaces jobs.json; its runtime fields are
       adopted on the next load. The file's db-bound keys are dropped (they named another db).
+    * no db in *src* because its capture FAILED or was skipped (``db_failed=True``, from the
+      snapshot manifest's ``failed_dbs`` / ``oversized_skipped``; Prism 72fe227c70de): that is not
+      a json-only snapshot. Only jobs.json is restored; the live db and its rows are kept (a row
+      wins, I1), never cleared.
 
     The live db is copied aside (private temp, never into ``cron/``) before it is replaced, and
     put back if the jobs.json publish fails. Returns the names restored. Raises ``PairRefused`` /
@@ -221,7 +267,8 @@ def restore(src: Path, home: Path) -> List[str]:
         with tempfile.TemporaryDirectory(prefix="hermes-cron-pair-") as tmp:
             rollback = Path(tmp) / DB_NAME
             had_db = db_file.exists()
-            if had_db and not _copy_db(db_file, rollback):
+            touches_db = has_db or (had_db and not db_failed)
+            if had_db and touches_db and not _copy_db(db_file, rollback):
                 raise PairRefused(f"could not copy the live {db_file} aside before the restore; "
                                   "nothing restored")
             if has_db:
@@ -229,10 +276,10 @@ def restore(src: Path, home: Path) -> List[str]:
                                else _copy_db(db_src, db_file))
                 if not restored_db:
                     if not had_db:
-                        _unlink_db_files(live)
+                        _unlink_created_db(db_file)
                     raise PairRefused(f"{db_src} failed its integrity check or could not be "
                                       "restored; live store unchanged")
-            elif had_db:
+            elif touches_db:
                 with cj._runtime_txn() as conn:
                     conn.execute("DELETE FROM job_runtime")
                     conn.execute("DELETE FROM pending_runtime")
@@ -240,17 +287,19 @@ def restore(src: Path, home: Path) -> List[str]:
             try:
                 _publish_jobs(cj, jobs_file, raw)
             except BaseException:
-                if had_db:
+                if had_db and touches_db:
                     _restore_db(rollback, db_file)
                 elif has_db:
-                    _unlink_db_files(live)
+                    _unlink_created_db(db_file)
                 raise
             if has_db:
                 cj._secure_runtime_db()
         with cj._defs_cache_lock:
             cj._defs_cache.clear()
     logger.warning("cron store pair restored into %s from %s (%s)", live, src,
-                   "jobs.json + runtime_state.db" if has_db else "jobs.json only; live rows cleared")
+                   "jobs.json + runtime_state.db" if has_db
+                   else "jobs.json only; live rows kept (snapshot db capture failed)" if db_failed
+                   else "jobs.json only; live rows cleared")
     return [JOBS_NAME, DB_NAME] if has_db else [JOBS_NAME]
 
 

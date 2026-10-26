@@ -1084,6 +1084,9 @@ def run_backup(args) -> bool:
     except BackupInProgressError as exc:
         print(f"Error: {exc}")
         raise SystemExit(2) from exc
+    except _PairArchiveError as exc:  # the partial zip was discarded; nothing published
+        print(f"Error: {exc}. No archive written.")
+        raise SystemExit(1) from exc
 
 
 def _census_gate(files_to_add, census_out: str, gate_cmd: Optional[str]) -> None:
@@ -1509,6 +1512,15 @@ def run_import(args) -> Optional[int]:
 
         for store_home, pair_members in cron_pairs.items():
             label = "/".join((*store_home, store_pair.CRON_DIR))
+            # Same destination containment as the per-file path, BEFORE anything is written
+            # (Prism dbf3e89fdfa5): a cron dir (or store home) linked outside hermes_root refuses.
+            pair_dir = hermes_root.joinpath(*store_home, store_pair.CRON_DIR)
+            try:
+                for target in (pair_dir, *(pair_dir / name for name in pair_members)):
+                    target.resolve().relative_to(hermes_root.resolve())
+            except ValueError:
+                errors.append(f"  {label}: path traversal blocked")
+                continue
             try:  # refuses a db with no jobs.json (rows without definitions), store untouched
                 hermes_root.joinpath(*store_home).mkdir(parents=True, exist_ok=True)
                 restored += len(store_pair.restore_members(
@@ -1733,12 +1745,31 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
         with tempfile.TemporaryDirectory(prefix=".cron-pair-", dir=str(out_path.parent)) as tmp:
             try:
                 names = store_pair.capture(hermes_root.joinpath(*home), Path(tmp))
-                for name in names:
+            except (OSError, ValueError, RuntimeError) as exc:
+                on_error(rel_cron / store_pair.JOBS_NAME, exc)  # neither half archived
+                continue
+            # Prism 077416e0ccaf: a write failure AFTER the first half landed would leave a
+            # half pair in the zip. That aborts the archive; a failure on the first half (which
+            # _write_zip_file already dropped) skips the pair as one error.
+            archived = 0
+            for name in names:
+                try:
                     _write_zip_file(zf, Path(tmp) / name, str(rel_cron / name))
                     total += (Path(tmp) / name).stat().st_size
-            except (OSError, ValueError, RuntimeError) as exc:
-                on_error(rel_cron / store_pair.JOBS_NAME, exc)
+                except (OSError, ValueError) as exc:
+                    if archived:
+                        raise _PairArchiveError(
+                            f"{rel_cron}: archiving {name} failed after {archived} pair member(s) "
+                            f"were written ({exc}); refusing to publish a half cron store pair"
+                        ) from exc
+                    on_error(rel_cron / name, exc)
+                    break
+                archived += 1
     return total
+
+
+class _PairArchiveError(OSError):
+    """A cron store pair was half written into a zip: the archive must not be published."""
 
 
 # Config paths the update flow must never change (#64160): model routing and the MoA section are
@@ -1940,9 +1971,17 @@ def _create_quick_snapshot_locked(
                 for name in store_pair.capture(home, staging_dir / store_pair.CRON_DIR):
                     pair_rel = f"{store_pair.CRON_DIR}/{name}"
                     manifest[pair_rel] = (staging_dir / pair_rel).stat().st_size
-            except store_pair.PairRefused as exc:
+            except (store_pair.PairRefused, OSError, RuntimeError) as exc:
+                # Prism 5aa2d785f5af: keep jobs.json (restore_cron_jobs_if_emptied depends on
+                # it) and name the db as failed, so a restore keeps the live rows instead of
+                # reading this as a json-only snapshot (72fe227c70de).
                 failed_dbs.append(_CRON_RUNTIME_REL)
-                print(f"  ⚠ Snapshot: cron store pair NOT captured: {exc}")
+                print(f"  ⚠ Snapshot: cron runtime db NOT captured (jobs.json only): {exc}")
+                try:
+                    if store_pair.capture_definitions(home, staging_dir / store_pair.CRON_DIR):
+                        manifest[_CRON_JOBS_REL] = (staging_dir / _CRON_JOBS_REL).stat().st_size
+                except (store_pair.PairRefused, OSError, RuntimeError) as exc2:
+                    logger.warning("Could not snapshot %s: %s", _CRON_JOBS_REL, exc2)
             continue
         src = home / rel
         if not src.exists():
@@ -2139,6 +2178,15 @@ def list_quick_snapshots(
     return results
 
 
+def _snapshot_cron_db_failed(meta: Any) -> bool:
+    """True when the snapshot's runtime db was present but NOT captured (failed or skipped), as
+    opposed to a json-only snapshot taken before #2287 (Prism 72fe227c70de)."""
+    if not isinstance(meta, dict):
+        return False
+    return any(_CRON_RUNTIME_REL in (meta.get(k) or ())
+               for k in ("failed_dbs", "oversized_skipped"))
+
+
 def restore_quick_snapshot(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
@@ -2184,7 +2232,8 @@ def restore_quick_snapshot(
         # carries the runtime it was taken with, adopted on the next load.
         from cron import store_pair
         try:
-            restored += len(store_pair.restore(snap_dir / store_pair.CRON_DIR, home))
+            restored += len(store_pair.restore(snap_dir / store_pair.CRON_DIR, home,
+                                               db_failed=_snapshot_cron_db_failed(meta)))
         except (store_pair.PairRefused, OSError, RuntimeError) as exc:
             logger.error("Failed to restore the cron store pair from %s: %s", snapshot_id, exc)
     for rel in files:
@@ -2321,7 +2370,11 @@ def restore_cron_jobs_if_emptied(
     try:
         # I4 (t_82c613d9, Prism 10c3c30e47f6): the snapshot's PAIR, never jobs.json alone.
         from cron import store_pair
-        store_pair.restore(snap_path.parent, home)
+        meta: Dict[str, Any] = {}
+        with suppress(OSError, ValueError):
+            meta = json.loads((snap_path.parent.parent / "manifest.json").read_text(
+                encoding="utf-8-sig"))
+        store_pair.restore(snap_path.parent, home, db_failed=_snapshot_cron_db_failed(meta))
     except (OSError, ValueError, RuntimeError) as exc:
         logger.error(
             "Cron jobs were emptied during update but auto-restore failed: %s", exc
