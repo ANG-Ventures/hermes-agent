@@ -120,8 +120,8 @@ runs:
     # self-hosted pool uploads at ~0.1 MB/s, so the save outlived the job's
     # timeout-minutes and cancelled 8 jobs whose steps had passed (mirror run
     # 40122483687; same cause as the ace-e2e-vm restore-only rule in tests.yml).
-    # save-on-self-hosted lifts that for ONE designated job (tests.yml
-    # warm-selfhosted-cache): hosted runners can never write a key self-hosted
+    # save-on-self-hosted lifts that for ONE designated job (the top-level
+    # warm-selfhosted-cache.yml workflow): hosted runners can never write a key self-hosted
     # reads (os-version is the runner kernel), so without it the pool goes cold
     # for good once the existing entries age out (t_58979a5e).
     # pm/**/__pycache__ is excluded from the hash: the prepare step imports pm
