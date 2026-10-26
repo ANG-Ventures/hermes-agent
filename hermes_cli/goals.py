@@ -1275,6 +1275,10 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
+class _StaleGoalWrite(Exception):
+    """A save inside evaluate_after_turn lost the compare-and-set (internal control flow)."""
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -1288,6 +1292,7 @@ class GoalManager:
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state, self._stored = _load_goal_raw(session_id)
         self.lost_write = False   # a save found the row changed since load (another writer won)
+        self._evaluating = False
 
     # --- introspection ------------------------------------------------
 
@@ -1356,6 +1361,8 @@ class GoalManager:
             logger.info("GoalManager: goal for %s changed since load; dropped the stale write", self.session_id)
             self.lost_write = True
             self._state, self._stored = _load_goal_raw(self.session_id)
+            if self._evaluating:
+                raise _StaleGoalWrite()  # abort: nothing more of this evaluation may touch the new row
         return self._state
 
     def _require_goal(self) -> GoalState:
@@ -1696,10 +1703,13 @@ class GoalManager:
     def evaluate_after_turn(self, last_response: str, **kwargs: Any) -> Dict[str, Any]:
         """See ``_evaluate_after_turn``. A save that lost to a newer stored state (the user paused,
         cleared or replaced the goal while the judge ran) never continues on the stale copy."""
-        self.lost_write = False
-        decision = self._evaluate_after_turn(last_response, **kwargs)
-        if not self.lost_write:
-            return decision
+        self.lost_write, self._evaluating = False, True
+        try:
+            return self._evaluate_after_turn(last_response, **kwargs)
+        except _StaleGoalWrite:
+            pass
+        finally:
+            self._evaluating = False
         status = self._state.status if self._state else None
         return {**_decision(status, False, None, "stale", "goal changed while the judge ran", ""), "held": "stale"}
 
