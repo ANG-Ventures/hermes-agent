@@ -996,6 +996,15 @@ class TurnRunner:
         if ctx.mute_notification_reply:
             _warn_route_drop("muted")
             return dropped
+        if is_route_change:
+            from gateway.response_filters import route_notice_muted
+            if route_notice_muted(ctx.source, ctx.user_config):
+                # Not a drop: a page channel does not take route telemetry (t_733b4104). INFO, and
+                # never queued for redelivery.
+                logger.info("route-change status not posted to page channel %s: %s",
+                            ctx._status_chat_id,
+                            _redact_gateway_user_facing_secrets(str(message or ""))[:160])
+                return False
         resolver = ctx._current_status_adapter
         try:
             adapter = resolver() if callable(resolver) else None
