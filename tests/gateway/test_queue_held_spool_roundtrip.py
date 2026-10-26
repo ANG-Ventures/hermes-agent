@@ -91,3 +91,34 @@ async def test_held_records_are_never_stale(tmp_path, monkeypatch):
     later = time.time() + rf.MAX_REPLAY_AGE_S + 3600
     records, stale = rf.take_followups(now=later)
     assert stale == 0 and [r["text"] for r in records] == ["old"]
+
+
+@pytest.mark.asyncio
+async def test_held_items_spool_before_drain_survive_forced_exit(tmp_path, monkeypatch):
+    """The shutdown watchdog can os._exit a wedged drain before the late sweep runs. Held items
+    must already be on disk once the teardown's notify phase is done (2026-10-26 03:11: a /stop-held
+    voice note was missed by the spool and re-injected by restart backfill as a new turn)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    before, _ = _runner()
+    before._session_state(KEY).conversation.held_queue.extend([_ev("voice"), _ev("link")])
+
+    async def _noop(*a, **k):
+        return None
+
+    before._restart_requested = True
+    before._cancel_secondary_profile_reconnect_tasks = _noop
+    before._notify_active_sessions_of_shutdown = _noop
+    before._cancel_pending_boot_resumes_for_shutdown = _noop
+    before._mark_api_runs_shutdown_requested = lambda: None
+    before._clear_plugin_message_injector = lambda: None
+    ctx = SimpleNamespace(elapsed=lambda: 0.0, started_at=None)
+    await before._stop_begin_teardown(ctx)
+    # Simulated forced exit: nothing after _stop_begin_teardown runs.
+    assert list(before._session_state(KEY).conversation.held_queue) == []
+    assert len(sorted(rf.spool_dir().glob("*.json"))) == 2
+
+    after, _ = _runner()
+    await after._load_restart_followups()
+    assert [e.text for e in after._session_state(KEY).conversation.held_queue] == ["voice", "link"]
+    assert after._restore_queue == []                                             # never a turn
+    assert await before._spool_held_queues_for_restart() == 0                     # late sweep no-op
