@@ -405,6 +405,38 @@ def test_failed_backup_leaves_no_artifact_and_blocks_compaction(monkeypatch):
     assert oct(backups[0].stat().st_mode & 0o777) == "0o600"
 
 
+def test_acknowledge_backs_up_the_locked_registry_even_if_cwd_moves(tmp_path, monkeypatch):
+    """The pre-compaction backup is of the registry the transaction locked, not a re-resolved path:
+    a relative profile home whose cwd changes mid-transaction must not back up another profile."""
+    now = time.time()
+    src, _ = _seed(now)
+    doc = json.loads(src.read_text())
+    record, event = next(
+        (r, e) for r in doc["records"].values() if r.get("state") in store._TERMINAL_STATES
+        for e in r.get("outbox") or [] if store._compact_delivered_event(r, e, dry_run=True))
+    event["state"] = "pending"  # a terminal record's undelivered event, about to be acknowledged
+    event_id = event["event_id"]
+    a, b = tmp_path / "A", tmp_path / "B"
+    for root in (a, b):
+        dest = root / "profile" / "state" / src.name
+        store._prepare_directory(dest)
+        store._write(dest, doc)
+    _clear_cache()
+    real_compact = store._compact_delivered_event
+
+    def move_cwd(record, event, dry_run=False):
+        if dry_run:
+            os.chdir(b)  # another thread changes cwd after the registry was loaded
+        return real_compact(record, event, dry_run=dry_run)
+
+    monkeypatch.chdir(a)
+    monkeypatch.setattr(store, "_compact_delivered_event", move_cwd)
+    assert store.acknowledge(event_id, outcome="delivered", profile_home=Path("profile"))
+    a_state, b_state = a / "profile" / "state", b / "profile" / "state"
+    assert list(a_state.glob(f"{src.name}.pre-compact-*")), "the locked (A) registry must be backed up"
+    assert not list(b_state.glob(f"{src.name}.pre-compact-*")), "another profile's registry was backed up"
+
+
 def test_compacted_resync_onto_empty_mirror_row_never_reopens_delivery(monkeypatch):
     """A compacted canonical envelope resynced onto a mirror row whose event_json is gone must leave
     the row settled (``delivered``), never ``pending`` with a body-less replay source."""

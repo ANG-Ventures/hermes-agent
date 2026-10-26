@@ -2391,7 +2391,9 @@ def acknowledge(
         return admit(event_id, profile_home=profile_home, **(admission or {}))
     if outcome not in {"delivered", "dropped"}:
         raise ValueError("outcome must be delivered, dropped or admitted")
-    with locked_registry(profile_home) as registry:
+    # Resolve once: the lock, the backup and the persist all name this file even if cwd moves.
+    path = registry_path(profile_home)
+    with locked_registry(path.parent.parent) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
             if str(delegation_id) in invalid_record_ids:
@@ -2406,7 +2408,7 @@ def acknowledge(
                     # D5: a delivered event's body is never read again (identity stays).
                     # Never without a complete pre-compaction backup on disk first.
                     if (_compact_delivered_event(record, event, dry_run=True)
-                            and _backup_before_first_compaction(registry_path(profile_home))):
+                            and _backup_before_first_compaction(path)):
                         _compact_delivered_event(record, event)
                     logger.info(
                         "async_delegation_outbox_%s event_id=%s reason=%s",
