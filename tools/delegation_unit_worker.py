@@ -159,6 +159,15 @@ def _delegation_api_key(execution: Dict[str, Any], cfg: Dict[str, Any]) -> Optio
     return str(((cfg.get("delegation") or {}).get("api_key")) or "").strip() or None
 
 
+def _no_key(key: Any) -> bool:
+    """Empty, or the resolver's ``no-key-required`` placeholder for a keyless custom endpoint: no credential."""
+    return not key or (isinstance(key, str) and key.strip() == "no-key-required")
+
+
+def _same_url(a: Any, b: Any) -> bool:
+    return bool(a) and bool(b) and str(a).strip().rstrip("/") == str(b).strip().rstrip("/")
+
+
 def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: Dict[str, Any],
                     record_id: Optional[str] = None) -> Any:
     """The key the in-process child inherits on a direct endpoint with no ``delegation.api_key``: the
@@ -179,14 +188,22 @@ def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: D
         from tools.async_delegation_store import redact_url
 
         shown = redact_url(url) if url else "(unrecorded)"
+        requested_custom = route.get("requested_provider") or "custom"
+        target = route.get("model") or execution.get("model") or None
         try:
-            own = resolve_runtime_provider(requested=route.get("requested_provider") or "custom",
-                                           target_model=route.get("model") or execution.get("model") or None,
+            own = resolve_runtime_provider(requested=requested_custom, target_model=target,
                                            explicit_base_url=url) if url else {}
+            if url and _no_key(own.get("api_key")):
+                # An explicit URL skips model.api_key, so the profile's own endpoint resolves to the
+                # placeholder (t_d79419d5). The URL-less lookup carries model.api_key; take it only when
+                # it answers for this same URL, never another endpoint's key (Prism 467b28edd66c).
+                bare = resolve_runtime_provider(requested=requested_custom, target_model=target)
+                if _same_url(bare.get("base_url"), url):
+                    own = bare
         except Exception as exc:
             raise RuntimeError(f"delegation {record_id or '(unknown)'}: no credential for the parent's custom "
                                f"endpoint {shown} ({type(exc).__name__})") from None
-        if not own.get("api_key"):
+        if _no_key(own.get("api_key")):
             raise RuntimeError(f"delegation {record_id or '(unknown)'}: no credential for the parent's custom "
                                f"endpoint {shown}; set delegation.api_key for the delegation endpoint")
         return own["api_key"]

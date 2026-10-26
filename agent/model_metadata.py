@@ -24,6 +24,7 @@ from agent import model_metadata_http
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL, openrouter_variant_base
+from tools.async_delegation_store import redact_url  # base_url userinfo never reaches agent.log
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, without_persistence_fields
 
 logger = logging.getLogger(__name__)
@@ -883,9 +884,9 @@ def _reconcile_local_cached_context_length(model: str, base_url: str, cached: in
     if not (live_ctx and live_ctx > 0 and live_ctx != cached):
         return cached
     if live_ctx < MINIMUM_CONTEXT_LENGTH:
-        logger.info("Live local probe for %s@%s reports %s (< minimum %s); invalidating stale cache — agent init should reject", model, base_url, f"{live_ctx:,}", f"{MINIMUM_CONTEXT_LENGTH:,}")
+        logger.info("Live local probe for %s@%s reports %s (< minimum %s); invalidating stale cache — agent init should reject", model, redact_url(base_url), f"{live_ctx:,}", f"{MINIMUM_CONTEXT_LENGTH:,}")
     else:
-        logger.info("Reconciling stale local cache entry %s@%s: %s -> %s (live probe)", model, base_url, f"{cached:,}", f"{live_ctx:,}")
+        logger.info("Reconciling stale local cache entry %s@%s: %s -> %s (live probe)", model, redact_url(base_url), f"{cached:,}", f"{live_ctx:,}")
     _invalidate_cached_context_length(model, base_url)
     if live_ctx >= MINIMUM_CONTEXT_LENGTH:
         _maybe_cache_local_context_length(model, base_url, live_ctx)
@@ -2543,7 +2544,7 @@ def _resolve_custom_codex_route_context_length(model: str, base_url: str, api_ke
     does not know take the ordinary endpoint probes."""
     ctx, _source = _resolve_codex_oauth_context_length_with_source(model)
     if ctx:
-        logger.info("Using Codex OAuth context length %s for model %r (codex_responses route at %s)", f"{ctx:,}", model, base_url)
+        logger.info("Using Codex OAuth context length %s for model %r (codex_responses route at %s)", f"{ctx:,}", model, redact_url(base_url))
         return ctx
     return _resolve_custom_endpoint_context_length(model, base_url, api_key, provider)
 
