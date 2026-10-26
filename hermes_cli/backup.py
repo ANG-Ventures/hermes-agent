@@ -212,6 +212,14 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     ("blackbox", "pre-*"),                  # blackbox pre-repair/pre-backfill rollback copies (4.4 GiB)
     ("profiles", "*", "blackbox"),          # per-profile turn telemetry (daedalus 5.5 GiB); restic excludes it too
     ("var", "detached"),                    # detached-run.py run dirs + logs, self-pruned at 7 days (54 k files)
+    # 2026-10-26 (t_87fd92a8): still 680 k files after the bytes cut against a 400 k target. File-count rows, each
+    # a derived index, an API cache or a git mirror whose source of record is elsewhere:
+    ("var", "prism", "index"),              # one json per Prism finding key (56 k); rebuilt from the signed record
+                                            # mirror + route ledger by `prism-findings-route.py --index-backfill`
+    ("state", "ci-job-durations", "jobs"),  # per-run GitHub Actions jobs cache (22 k), re-read from the API; the
+                                            # measurement itself (var/ci-job-durations.json) stays in
+    ("var", "pr-git-mirror"),               # bare GitHub mirrors for PR git facts (16 k), same class as mirrors/
+    ("var", "mirror-ci"),                   # bare hermes-agent mirror for CI (8.7 k), same class as mirrors/
 )
 
 # ROOT-anchored FILE globs: one fnmatch pattern per path component and the same length as the path, so
@@ -230,6 +238,12 @@ _EXCLUDED_ROOT_FILE_PATH_GLOBS = (
     ("profiles", "*", "state.db"),
     ("profiles", "*", "lcm.db"),
     ("profiles", "*", "lcm-archive.db"),
+    # 2026-10-26 (t_87fd92a8): one <ulid>.done.json + <ulid>.result.json pair per FINISHED land request (26 k
+    # files). land_request.py also appends each request with its status/rc/detail as a `land-request` row to
+    # state/merge-ledger.jsonl (13,068 rows vs 13,061 pairs), which stays in; only the result's output_tail and
+    # readback are not in the ledger. Queue files (<ulid>.json, .inflight, .parked.json, .unparked.json) stay in.
+    ("var", "land-requests", "*.done.json"),
+    ("var", "land-requests", "*.result.json"),
 )
 
 # Git checkouts below the root (any dir holding a ``.git`` file or dir, the root's own checkout excluded) carry
