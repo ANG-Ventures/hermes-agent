@@ -4,6 +4,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -288,6 +289,68 @@ _EXCLUDED_ROOT_FILE_GLOBS = ("*.db.bak*", "*.db.*.bak", "*.sqlite.bak*",
                              # t_7da95544: same class, other spellings (lcm.db.pre-replay-dedup-20260925 6.2 GB,
                              # state.db.broken-20260919-171433 3.7 GB + its -wal)
                              "*.db.pre-*", "*.db.broken-*")
+
+# --- Generic exclude CLASSES (t_98bb8096). Each names where the data's other copy lives. ---
+# Class 1, rollback copies of a SQLite DB at ANY depth (`<x>.db.bak*`, `<x>.db.<tag>.bak`, `<x>.sqlite.bak*`,
+# `<x>.db.pre-*`, `<x>.db.broken-*`, `<x>.db-bak-*`). Second copy: the live sibling `<x>.db` in the same dir, which
+# the archive carries via sqlite backup. Dropped ONLY while that sibling exists (_is_db_rollback_copy, walker-side),
+# so a lone renamed DB is never lost. The root-only _EXCLUDED_ROOT_FILE_GLOBS above stays unconditional.
+_DB_ROLLBACK_RE = re.compile(
+    r"^(?P<db>.+?\.db)(?:\.bak.*|\..+\.bak|\.pre-.*|\.broken-.*|-bak-.*)$|^(?P<sq>.+?\.sqlite)\.bak.*$")
+
+# Class 2, rollback DIRS directly under state/ or var/ (depth 2, root-anchored; see _EXCLUDED_ROOT_PATH_GLOBS).
+# Second copy: the live tree they were copied from, itself in the archive.
+_ROLLBACK_DIR_GLOBS = ("*-bak-[0-9]*", "*.pre-*", "*.broken-*")
+
+# Class 3, incident/forensics capture DIRS at depth <= 3 (dir component index 0..2). Second copy: the weekly
+# forensics -> NAS lane (forensics-weekly-archive.sh -> tank/backups/forensics), as for root forensics-archive/.
+# Skill trees are user content, never captures, so a skill dir that merely shares the prefix is kept.
+_CAPTURE_DIR_GLOBS = ("forensic-*", "forensics-*", "incident-capture-*")
+_CAPTURE_DIR_MAX_DEPTH = 3
+_CAPTURE_EXEMPT_ROOTS = frozenset({"skills", "skills-shared", "optional-skills"})
+
+# Class 4, staging/export artifacts at any depth under state/ or var/: `*.partial` files (interrupted downloads/
+# copies), `*-staging/` dirs and `export-*.tgz|.tar|.zip` files. Second copy: the source they were staged or
+# exported from (the export is a re-runnable snapshot of it; a .partial is an incomplete duplicate).
+_STAGING_ROOTS = frozenset({"state", "var"})
+_STAGING_DIR_GLOB = "*-staging"
+_STAGING_FILE_GLOBS = ("*.partial", "export-*.tgz", "export-*.tar", "export-*.zip")
+# Append-only logs are NOT a class here: they are bounded at the writer (t_db7f0a2e), and hermes-home's weekly
+# scripts/lints/backup-exclude-classes-lint.py reports regrowth.
+
+
+def _is_db_rollback_copy(hermes_root: Path, rel_path: Path) -> bool:
+    """True when *rel_path* is a class-1 rollback copy whose live sibling DB exists in the same dir."""
+    m = _DB_ROLLBACK_RE.match(rel_path.name)
+    if not m:
+        return False
+    live = m.group("db") or m.group("sq")
+    try:
+        return (hermes_root / rel_path.parent / live).is_file()
+    except OSError:
+        return False
+
+
+def _matches_class_dir(parts: tuple[str, ...]) -> bool:
+    """Classes 2-4 on ANCESTOR components only (same discipline as _matches_path_glob): a FILE is never
+    dropped because its own name looks like a rollback/capture/staging dir."""
+    ancestors = parts[:-1]
+    if len(ancestors) >= 2 and ancestors[0] in _STAGING_ROOTS and any(
+            fnmatch.fnmatchcase(ancestors[1], g) for g in _ROLLBACK_DIR_GLOBS):
+        return True
+    if ancestors and ancestors[0] in _STAGING_ROOTS and any(
+            fnmatch.fnmatchcase(a, _STAGING_DIR_GLOB) for a in ancestors[1:]):
+        return True
+    if ancestors and ancestors[0] not in _CAPTURE_EXEMPT_ROOTS and any(
+            fnmatch.fnmatchcase(a, g) for a in ancestors[:_CAPTURE_DIR_MAX_DEPTH] for g in _CAPTURE_DIR_GLOBS):
+        return True
+    return False
+
+
+def _is_staging_file(parts: tuple[str, ...]) -> bool:
+    """Class 4 file rule: a staging/export artifact file anywhere under state/ or var/."""
+    return len(parts) >= 2 and parts[0] in _STAGING_ROOTS and any(
+        fnmatch.fnmatchcase(parts[-1], g) for g in _STAGING_FILE_GLOBS)
 
 # Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE
 # scratch root (tool caches, telemetry cuts, per-incident capture dirs) — not agent
@@ -635,6 +698,8 @@ def _should_exclude(rel_path: Path) -> bool:
         return True
     if _matches_path_glob(parts) or _is_excluded_cache_path(parts):
         return True
+    if _matches_class_dir(parts) or _is_staging_file(parts):
+        return True
     name = rel_path.name
     if len(parts) == 1 and any(fnmatch.fnmatchcase(name, g) for g in _EXCLUDED_ROOT_FILE_GLOBS):
         return True
@@ -668,7 +733,8 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             and not d.startswith(_EXCLUDED_DIR_PREFIXES)
             and not any(rel_dir.name == parent and d == child for parent, child in _EXCLUDED_PARENT_CHILD)
             and not _matches_path_glob((*(rel_dir / d).parts, "_"))
-            and not _is_excluded_cache_path((*(rel_dir / d).parts, "_"))]
+            and not _is_excluded_cache_path((*(rel_dir / d).parts, "_"))
+            and not _matches_class_dir((*(rel_dir / d).parts, "_"))]
         if skipped_dirs is not None:
             skipped_dirs.update(str(rel_dir / d) for d in set(dirnames) - set(kept))
         # No walk may follow a junction.
@@ -679,7 +745,8 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             # zipfile.write() follows file symlinks, so skip links before any archive write can
             # copy data from outside HERMES_HOME; never archive the output zip into itself, neither
             # published nor as its open staging file (a re-scan runs while that file is growing).
-            if _should_exclude(rel) or _is_stale_land_pair(hermes_root, rel):
+            if (_should_exclude(rel) or _is_stale_land_pair(hermes_root, rel)
+                    or _is_db_rollback_copy(hermes_root, rel)):
                 continue
             if clean and Path(*rel.parts[len(co_parts):]).as_posix() in clean:
                 continue  # tracked + unmodified in a git checkout: the repository and its remotes have it
