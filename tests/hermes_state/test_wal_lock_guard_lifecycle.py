@@ -3,8 +3,8 @@
 Three shapes the first cut got wrong (review on #110544): a writer reopened after ``close()``
 raced a live caller came back unguarded; the periodic checkpoint's guard refresh could land after
 ``close()`` and pin an OFD lock with no connection behind it; and refcounts keyed on a reusable
-descriptor NUMBER mistook a recycled fd for a surviving lock (since t_2aad1d42 every handle locks
-its own private fds, so there is no refcount at all). Linux-only: OFD locks + ``/proc``.
+descriptor NUMBER mistook a recycled fd for a surviving lock (since t_2aad1d42 the guard sits on one
+private fd per inode, counted per handle, never on SQLite's own fds). Linux-only: OFD locks + ``/proc``.
 """
 
 import os
@@ -14,6 +14,7 @@ import sys
 
 import pytest
 
+import hermes_state_lockguard as lg
 from hermes_state import SessionDB
 from tests.hermes_state._wal_generation_harness import make_db, pin_wal, require_wal
 
@@ -69,7 +70,7 @@ def test_guard_never_outlives_the_handle_under_fd_reuse(tmp_path, monkeypatch):
     finally:
         c.close()
     assert _foreign_exclusive_ok(str(path)), "a lock survived the last handle's close"
-    assert not (a._wal_lock_guard or b._wal_lock_guard or c._wal_lock_guard)
+    assert not lg._HANDLES and not lg._FDS
     assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
 
 
@@ -99,4 +100,4 @@ def test_closing_writer_stays_guarded_until_sqlite_closes(tmp_path, monkeypatch)
     db.close()
     assert in_gap["shm"] == shm, "a sibling's close unlinked -shm under the closing writer"
     assert not os.path.exists(f"{path}-wal"), "the true last close must still end the generation"
-    assert _foreign_exclusive_ok(str(path)) and not db._wal_lock_guard
+    assert _foreign_exclusive_ok(str(path)) and not lg._HANDLES and not lg._FDS

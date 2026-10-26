@@ -1791,7 +1791,7 @@ class SessionDB(
                 if self._conn is None:
                     return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
                 if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted/replaced after open: O(1)
+                    _lockguard.refresh_shm(self.db_path, self._wal_lock_guard)  # a -shm minted/replaced after open: one stat
                 result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
@@ -1870,12 +1870,12 @@ class SessionDB(
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
                 guard_fds = _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
-                    self._pin_connection(self._conn)  # the private fds stay open with the pinned connection
+                    self._pin_connection(self._conn)  # guard_fds stay open with the pinned connection
                     self._conn = None
                 else:
                     conn, self._conn = self._conn, None
                     self._close_connection_quietly(conn)
-                    _lockguard.close_fds(guard_fds)  # after the close: see lockguard._unlock()
+                    _lockguard.close_fds(guard_fds)  # after the close: see lockguard.release()
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
