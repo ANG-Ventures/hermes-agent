@@ -40,3 +40,22 @@ def test_openai_client_closed_record_has_no_password(caplog):
     assert msgs, "expected the 'OpenAI client closed' INFO line"
     assert all(_PW not in m and "k3y-594614e2" not in m for m in msgs)
     assert "base_url=http://127.0.0.1:8123/v1" in msgs[0]
+
+
+def test_model_metadata_info_lines_have_no_password(caplog, monkeypatch):
+    from agent import model_metadata as mm
+
+    monkeypatch.setattr(mm, "_query_local_context_length", lambda *a, **k: 64_000)
+    monkeypatch.setattr(mm, "_invalidate_cached_context_length", lambda *a, **k: None)
+    monkeypatch.setattr(mm, "_maybe_cache_local_context_length", lambda *a, **k: None)
+    monkeypatch.setattr(mm, "_resolve_codex_oauth_context_length_with_source", lambda *a, **k: (272_000, "t"))
+    with caplog.at_level(logging.INFO, logger=mm.logger.name):
+        mm._reconcile_local_cached_context_length("m", _URL, 32_000)  # reconcile line
+        monkeypatch.setattr(mm, "_query_local_context_length", lambda *a, **k: 1_000)
+        mm._reconcile_local_cached_context_length("m", _URL, 32_000)  # < minimum line
+        mm._resolve_custom_codex_route_context_length("m", _URL, "", "custom")  # codex route line
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("Reconciling stale local cache entry" in m for m in msgs)
+    assert any("Live local probe for" in m for m in msgs)
+    assert any("codex_responses route at" in m for m in msgs)
+    assert all(_PW not in m and "k3y-594614e2" not in m for m in msgs), msgs
