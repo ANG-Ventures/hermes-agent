@@ -2,7 +2,8 @@
 
 The gauge runs on the ``gateway-runtime-status-writer`` thread only, counts this process's
 descriptors on lcm.db by ``(st_dev, st_ino)``, and warns at most once per 10 minutes when
-``lcm_db_fds > 3 * max(active_agents, cached_agents, 1)``. Clock injected; no sleeps.
+``lcm_db_fds > 2 * per_engine * max(active_agents, cached_agents, 1)`` (per_engine =
+len(_STORAGE_HELPER_ATTRS), 6 today). Clock injected; no sleeps.
 """
 
 from __future__ import annotations
@@ -90,14 +91,14 @@ def test_payload_carries_lcm_db_fds_and_cached_agents(tmp_path, monkeypatch):
 
 
 def test_warns_exactly_once_per_ten_minutes_when_ratio_exceeded(caplog):
-    clock, fds, cached = _Clock(), [130], [20]  # 130 > 3*20 -> leak
+    clock, fds, cached = _Clock(), [250], [20]  # 250 > 2*6*20 -> leak
     gauge = _gauge(clock, fds, cached)
     caplog.set_level(logging.WARNING, logger="gateway.status")
 
     for _ in range(10):  # every minute for 10 minutes minus a tick
         payload = {}
         gauge.annotate(payload)
-        assert payload == {"lcm_db_fds": 130, "cached_agents": 20}
+        assert payload == {"lcm_db_fds": 250, "cached_agents": 20}
         clock.t += 59.9
     assert len(_warnings(caplog)) == 1
 
@@ -107,15 +108,15 @@ def test_warns_exactly_once_per_ten_minutes_when_ratio_exceeded(caplog):
 
 
 def test_no_warning_at_or_below_threshold(caplog):
-    clock, fds, cached = _Clock(), [60], [20]  # exactly 3x: not exceeded
+    clock, fds, cached = _Clock(), [240], [20]  # exactly 2x expected: not exceeded
     gauge = _gauge(clock, fds, cached)
     caplog.set_level(logging.WARNING, logger="gateway.status")
     gauge.annotate({})
-    fds[0], cached[0] = 3, 0  # empty cache: denominator floors at 1, 3 <= 3
+    fds[0], cached[0] = 12, 0  # empty cache: denominator floors at 1, 12 <= 12
     clock.t += 61
     gauge.annotate({})
     assert _warnings(caplog) == []
-    fds[0] = 4
+    fds[0] = 13
     clock.t += 61
     gauge.annotate({})
     assert len(_warnings(caplog)) == 1
@@ -155,15 +156,23 @@ def test_denominator_is_max_of_active_and_cached_t_1913e49b(caplog):
     assert _verdict(caplog, fds=136, active=5, cached=5)
     msg = _warnings(caplog)[0].getMessage()
     assert "136 open fds" in msg and "5 active" in msg and "5 cached" in msg
-    # Active alone carries the denominator when the cache is small.
-    assert not _verdict(caplog, fds=66, active=22, cached=0)
-    assert _verdict(caplog, fds=67, active=22, cached=0)
+    assert "6 handles/engine" in msg and "threshold 60" in msg
+    # Active alone carries the denominator when the cache is small: 2 * 6 * 22 = 264.
+    assert not _verdict(caplog, fds=264, active=22, cached=0)
+    assert _verdict(caplog, fds=265, active=22, cached=0)
+
+
+def test_per_engine_count_is_derived_from_the_storage_helper_tuple():
+    from plugins.context_engine.lcm.engine import _STORAGE_HELPER_ATTRS
+    assert status._lcm_handles_per_engine() == len(_STORAGE_HELPER_ATTRS)
 
 
 def test_2026_10_23_evicted_engine_leak_still_trips(caplog):
-    """1,996 lcm.db handles (evicted engines never shut down, fixed by #2285). Even at the cache cap
-    (``_AGENT_CACHE_MAX_SIZE`` 128) with every cached agent also mid-turn, 3x is 384."""
+    """1,996 lcm.db handles (evicted engines never shut down, fixed by #2285). At active=107 the
+    threshold is 2*6*107 = 1,284; even at the cache cap (``_AGENT_CACHE_MAX_SIZE`` 128) with every
+    cached agent also mid-turn it is 1,536."""
     caplog.set_level(logging.WARNING, logger="gateway.status")
+    assert _verdict(caplog, fds=1996, active=107, cached=17)
     assert _verdict(caplog, fds=1996, active=22, cached=17)
     assert _verdict(caplog, fds=1996, active=128, cached=128)
 
@@ -172,7 +181,7 @@ def test_missing_or_bad_active_agents_falls_back_to_cached(caplog):
     caplog.set_level(logging.WARNING, logger="gateway.status")
     for raw in (None, "junk", -4):
         caplog.clear()
-        gauge = _gauge(_Clock(), [61], [20])
+        gauge = _gauge(_Clock(), [241], [20])
         payload = {} if raw is None else {"active_agents": raw}
         gauge.annotate(payload)
         assert len(_warnings(caplog)) == 1
