@@ -547,12 +547,17 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
         if not acquired:
             yield False
             return
-        with _jobs_lock():
-            job = _locked_job_view(job_id)
-            claim = job.get("fire_claim") if isinstance(job, dict) else None
-            owns_claim = isinstance(claim, dict) and claim.get("by") == expected_owner
-            if job is None:
-                owns_claim = self_removal_delivery_allowed(job_id)
+        # sqlite mode: the ownership check is one committed row read, so it does not queue on
+        # the global _jobs_lock (live 2026-10-26 after #2287: 6 of ~18 _jobs_lock waiters were
+        # this check). The per-job fence held above is what excludes claim_job_for_fire.
+        usable, job = _fast_job_view(job_id) if _rs.enabled() else (False, None)
+        if not usable:
+            with _jobs_lock():
+                job = _locked_job_view(job_id)
+        claim = job.get("fire_claim") if isinstance(job, dict) else None
+        owns_claim = isinstance(claim, dict) and claim.get("by") == expected_owner
+        if job is None:
+            owns_claim = self_removal_delivery_allowed(job_id)
         yield owns_claim
 
 
@@ -2510,6 +2515,7 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
 # a deepcopy of ONE record.
 _defs_cache: Dict[str, Tuple[Tuple[Any, Optional[int]], Dict[str, Dict[str, Any]], bool]] = {}
 _defs_cache_lock = threading.Lock()
+_defs_parse_lock = threading.Lock()
 
 
 def _cached_definition(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]], bool]:
@@ -2531,24 +2537,31 @@ def _cached_definition(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]], boo
     with _defs_cache_lock:
         cached = _defs_cache.get(key)
     if cached is None or cached[0] != stamp:
-        try:
-            data, strict_retry = _parse_jobs_file(jobs_file)
-        except Exception:
-            return False, None, False
-        jobs = data.get("jobs") if isinstance(data, dict) else None
-        by_id: Dict[str, Dict[str, Any]] = {}
-        # A pending two-phase generation needs the full load_jobs() recovery first.
-        usable = not strict_retry and isinstance(jobs, list) and not _runtime_pending()
-        for job in jobs if isinstance(jobs, list) else ():
-            if not isinstance(job, dict) or not job.get("id") or str(job["id"]) in by_id:
-                usable = False
-                break
-            # jobs.json is the merged MIRROR: keep the definition half, and remember whether the
-            # file carried runtime (a job with no row must then be adopted by load_jobs first).
-            by_id[str(job["id"])] = (_rs.strip_runtime(job), _rs.has_runtime(job))
-        cached = (stamp, by_id, usable)
-        with _defs_cache_lock:
-            _defs_cache[key] = cached
+        # One parse per stamp: claim heartbeats no longer queue on _jobs_lock, so without this
+        # every concurrent heartbeat would re-parse the 1.4 MB file after a mirror rewrite.
+        with _defs_parse_lock:
+            with _defs_cache_lock:
+                cached = _defs_cache.get(key)
+            if cached is None or cached[0] != stamp:
+                try:
+                    data, strict_retry = _parse_jobs_file(jobs_file)
+                except Exception:
+                    return False, None, False
+                jobs = data.get("jobs") if isinstance(data, dict) else None
+                by_id: Dict[str, Dict[str, Any]] = {}
+                # A pending two-phase generation needs the full load_jobs() recovery first.
+                usable = not strict_retry and isinstance(jobs, list) and not _runtime_pending()
+                for job in jobs if isinstance(jobs, list) else ():
+                    if not isinstance(job, dict) or not job.get("id") or str(job["id"]) in by_id:
+                        usable = False
+                        break
+                    # jobs.json is the merged MIRROR: keep the definition half, and remember
+                    # whether the file carried runtime (a job with no row must then be adopted
+                    # by load_jobs first).
+                    by_id[str(job["id"])] = (_rs.strip_runtime(job), _rs.has_runtime(job))
+                cached = (stamp, by_id, usable)
+                with _defs_cache_lock:
+                    _defs_cache[key] = cached
     if not cached[2]:
         return False, None, False
     found = cached[1].get(str(job_id))
@@ -2662,19 +2675,31 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
 _MISSING_FAST = object()
 
 
+def _fast_job_view(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """``(usable, record)``: the cached definition + its committed row, with no ``_jobs_lock``
+    needed (the definition cache has its own lock; the row is one SQLite read). ``usable`` is
+    False when only the full ``load_jobs()`` path can answer (repair, pending generation, a
+    row-less job whose runtime still sits in jobs.json)."""
+    usable, definition, file_runtime = _cached_definition(job_id)
+    if not usable:
+        return False, None
+    if definition is None:
+        return True, None
+    row = _read_one_row(job_id)
+    if row is None and file_runtime:
+        return False, None
+    _rs.apply_runtime(definition, row or {})
+    _normalize_repeat_completed(definition)
+    return True, definition
+
+
 def _locked_job_view(job_id: Any) -> Optional[Dict[str, Any]]:
     """One merged record (caller holds ``_jobs_lock``): the cached definition + its row in sqlite
     mode (same view the ``_with_job`` writers use), else a full ``load_jobs()`` scan."""
     if _fast_split():
-        usable, definition, file_runtime = _cached_definition(job_id)
+        usable, view = _fast_job_view(job_id)
         if usable:
-            if definition is None:
-                return None
-            row = _read_one_row(job_id)
-            if row is not None or not file_runtime:
-                _rs.apply_runtime(definition, row or {})
-                _normalize_repeat_completed(definition)
-                return definition
+            return view
     return next((item for item in load_jobs() if item.get("id") == job_id), None)
 
 
@@ -4966,6 +4991,32 @@ def _refresh_claim_row(job_id: str, claim_key: str, expected_owner: str,
                                       _hermes_now().isoformat())
 
 
+def _refresh_claim_unlocked(job_id: str, claim_key: str, expected_owner: str,
+                            once_only: bool) -> Optional[bool]:
+    """sqlite-mode claim heartbeat WITHOUT ``_jobs_lock``. The owner-guarded UPDATE runs inside
+    the row's own ``BEGIN IMMEDIATE`` transaction, which is already the compare-and-set: the
+    global lock added nothing but a convoy (live 2026-10-26, after #2287: 14-21 threads waiting
+    on ``_jobs_lock``, 5 of them heartbeats/``lost()`` re-checks). ``None`` = take the locked
+    path (json mode, or the definition needs the full load first).
+
+    Ownership and at-most-once are unchanged: the UPDATE only lands while the row's owner column
+    is *expected_owner*, and every side effect still checks ownership under the per-job fire
+    fence that ``claim_job_for_fire`` also holds."""
+    if not _rs.enabled():
+        return None
+    result = _refresh_claim_row(job_id, claim_key, expected_owner, once_only)
+    if result and not getattr(_jobs_lock_state, "depth", 0) \
+            and _jobs_file_lock.acquire(blocking=False):
+        # The locked path flushed the coalesced jobs.json mirror on its section exit (a no-op
+        # inside the coalescing window); keep that, but never wait for it: if another thread
+        # holds the lock, its own section exit flushes.
+        try:
+            _mirror_after_section()
+        finally:
+            _jobs_file_lock.release()
+    return result
+
+
 def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     """Refresh a one-shot's ``run_claim`` timestamp while its run is alive, so an expired claim
     really means the claiming process died. Compare-and-refresh on ``expected_owner`` stops a stale
@@ -4981,6 +5032,9 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
             return False
         return _refresh_claim(jobs, job.get("run_claim"), expected_owner)
 
+    fast = _refresh_claim_unlocked(job_id, "run_claim", expected_owner, once_only=True)
+    if fast is not None:
+        return fast
     if _split_store():
         with _jobs_lock():
             fast = (_refresh_claim_row(job_id, "run_claim", expected_owner, once_only=True)
@@ -5154,10 +5208,14 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     outlive the TTL, and the owner check stops a stale runner from refreshing a recovered claim.
     Deliberately NOT under ``_under_fire_fence``: the run thread holds the per-job fence across
     delivery, and the fence's reentrancy is per thread, so the heartbeat thread would time out and
-    report a false ownership loss. ``_jobs_lock`` already serializes the compare-and-refresh."""
+    report a false ownership loss. In sqlite mode the row's own transaction serializes the
+    compare-and-refresh (no ``_jobs_lock``); elsewhere ``_jobs_lock`` does."""
     def apply(jobs, _i, job):
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
+    fast = _refresh_claim_unlocked(job_id, "fire_claim", expected_owner, once_only=False)
+    if fast is not None:
+        return fast
     if _split_store():
         with _jobs_lock():
             fast = (_refresh_claim_row(job_id, "fire_claim", expected_owner, once_only=False)
