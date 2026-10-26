@@ -79,6 +79,21 @@ _TERMINAL_TURN_EXIT_PREFIXES = ("max_iterations_reached",)
 
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
+#: ``failure_reason`` of a turn stopped because another process held the state.db write lock past
+#: the write patience (``agent/turn_finalizer.py``). Transient by nature, and the in-memory
+#: conversation is intact (the next flush writes the unsaved rows), so the turn is retried in place
+#: after a backoff instead of exiting rc=1 as a crash (t_d9caaea3: two workers lost at 00:31).
+STORAGE_BUSY_REASON = "session_persistence_failed:locked"
+
+
+def is_storage_busy(result: Any) -> bool:
+    """True for a failed turn whose only problem was a busy state.db write lock."""
+    return (
+        isinstance(result, dict)
+        and result.get("failed") is True
+        and str(result.get("failure_reason") or "") == STORAGE_BUSY_REASON
+    )
+
 
 def kanban_task_id() -> Optional[str]:
     """The dispatcher-set kanban task id, or ``None`` when this is not a worker run.
@@ -153,6 +168,8 @@ def should_recover_turn(result: Any, *, attempt: int) -> bool:
         return False
     if result.get("failed") is not True:
         return False
+    if is_storage_busy(result):
+        return True
     if result.get("failure_retryable") is not True:
         return False
     if str(result.get("failure_reason") or "") in _NON_RECOVERABLE_REASONS:
@@ -285,9 +302,13 @@ def build_recovery_nudge(result: Any, *, attempt: int, max_attempts: int) -> str
     if isinstance(result, dict):
         error = _truncate(str(result.get("error") or result.get("final_response") or ""))
     task_id = kanban_task_id() or "this task"
+    cause = (
+        "session storage was busy (another process held the state database write lock)"
+        if is_storage_busy(result) else "the API call failed after all retries"
+    )
     return (
-        "[System: the previous turn ended UNFINISHED — the API call failed after "
-        f"all retries and the turn was interrupted (recovery attempt {attempt}/{max_attempts}). "
+        f"[System: the previous turn ended UNFINISHED — {cause} "
+        f"and the turn was interrupted (recovery attempt {attempt}/{max_attempts}). "
         f"Error: {error or 'provider stream failure'}.\n\n"
         f"Task `{task_id}` is still `running`. This is the SAME session, with your full "
         "context — nothing you already read, wrote, or computed is lost. Do NOT start over.\n\n"
@@ -345,8 +366,9 @@ def recover_failed_kanban_turns(
             return attempts
         attempts += 1
         delay = recovery_delay_seconds(attempts)
+        failure = "session storage busy" if is_storage_busy(result) else "provider failure"
         message = (
-            f"[kanban] provider failure on {kanban_task_id() or 'task'} — retrying the turn in place "
+            f"[kanban] {failure} on {kanban_task_id() or 'task'} — retrying the turn in place "
             f"(attempt {attempts}/{max_recovery_attempts()}) after {int(delay)}s; session context preserved"
         )
         logger.warning("%s", message)
@@ -369,7 +391,9 @@ def recover_failed_kanban_turns(
 __all__ = [
     "DEFAULT_MAX_RECOVERY_ATTEMPTS",
     "RECOVERY_DELAYS_SECONDS",
+    "STORAGE_BUSY_REASON",
     "build_recovery_nudge",
+    "is_storage_busy",
     "kanban_task_id",
     "kanban_turn_recovery_enabled",
     "max_recovery_attempts",

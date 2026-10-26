@@ -78,7 +78,9 @@ from hermes_state_profile_repair import SessionProfileRepairMixin
 from hermes_state_schema import SessionSchemaMixin, _FTS_TRIGRAM_TRIGGERS
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
-from hermes_state_lockowners import describe_write_lock_holders, hold_ended, hold_started, log_write_lock_holders
+from hermes_state_lockowners import (
+    describe_write_lock_holders, hold_committing, hold_ended, hold_started, log_write_lock_holders,
+)
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
@@ -1294,6 +1296,7 @@ class SessionDB(
                         hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
                         fn_started = True
                         result = fn(self._conn)
+                        hold_committing(hold)  # a long hold then says callback vs commit I/O
                         self._conn.commit()
                     except BaseException:
                         try:
