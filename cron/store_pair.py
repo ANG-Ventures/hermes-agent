@@ -20,7 +20,7 @@ copy/move/rename/open-for-write of either half outside this module and the store
                              db with an empty one: the restored file's runtime is adopted on the
                              next load, never mixed with the live rows.
   restore_members(...)       same, from archive members (``hermes import``).
-  publish_definitions(...)   a definition-only rewrite of the live jobs.json, under the lock.
+  publish_definitions(...)   a definition-only edit of the live jobs (read+edit+save, one lock).
   scrub(staged_root)         export/import rule for a STAGED tree: fold every cron db into its
                              jobs.json, then drop every ``runtime_state.db*`` (binary,
                              unscrubbable, or a foreign image); refuses when a fold cannot place
@@ -416,18 +416,23 @@ def scrub(staged_root: Path, *, what: str = "export") -> None:
 
 # --- other legs ---------------------------------------------------------------------------
 
-def publish_definitions(home: Path, doc: object) -> None:
-    """Rewrite *home*'s live jobs.json with *doc* (a definition-only repair, e.g. the post-update
-    prompt-field net) under the store lock, through the store's own jobs.json choke point. The
-    db is not touched: its rows stay authoritative for runtime (a row always wins)."""
+def publish_definitions(home: Path, edit: Callable[[List[dict]], bool]) -> bool:
+    """A definition-only repair of *home*'s live jobs (e.g. the post-update prompt-field net):
+    under the store lock, load the live jobs, let *edit* change them in place, and save through
+    ``save_jobs`` (its shrink-merge) when *edit* returns True. Read, edit and write are one lock
+    section (Prism 643fd504e41a): a job created or edited by a sibling is never dropped by a
+    document read before the lock. The db rows stay authoritative for runtime. Returns whether
+    anything was saved."""
     from cron import jobs as cj
 
-    raw = json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
-    _parse_payload(raw, "definitions")
     with lock(home), cj.use_cron_store(home):
-        _publish_jobs(cj, Path(home) / CRON_DIR / JOBS_NAME, raw)
+        jobs = cj.load_jobs()
+        if not edit(jobs):
+            return False
+        cj.save_jobs(jobs)
         with cj._defs_cache_lock:
             cj._defs_cache.clear()
+    return True
 
 
 def read_definitions(jobs_src: Path) -> List[dict]:

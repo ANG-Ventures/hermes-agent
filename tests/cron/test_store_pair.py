@@ -675,3 +675,71 @@ def test_snapshot_pair_restore_never_writes_through_a_link(home, tmp_path, leg, 
     assert _rows(ocron) == orows
     if link != "live_cron_dir":
         assert (home / "cron" / "jobs.json").read_bytes() == live_json  # nothing half-restored
+
+
+@pytest.mark.parametrize("leg", ["hermes_backup", "automatic_full_backup"])
+def test_zip_stat_failure_after_a_written_member_aborts(home, tmp_path, monkeypatch, leg):
+    """Prism 7edcf5c778ea: the member count was bumped only after the size stat(), so a stat
+    failure after jobs.json was already WRITTEN into the zip took the first-member path (skip the
+    pair as one error) and published an archive holding jobs.json without its db."""
+    import pathlib
+
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    _job(cj, "a", 2)
+    real_write, real_stat, written = backup._write_zip_file, pathlib.Path.stat, []
+
+    def write_zip_file(zf, path, arcname):
+        real_write(zf, path, arcname)
+        if Path(arcname).parent.name == "cron" and Path(arcname).name in ("jobs.json",
+                                                                         "runtime_state.db"):
+            written.append(Path(path))
+
+    def stat(self, *a, **kw):
+        if written and self == written[0]:
+            raise OSError("simulated stat failure")
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(backup, "_write_zip_file", write_zip_file)
+    monkeypatch.setattr(pathlib.Path, "stat", stat)
+    out = tmp_path / "out"
+    out.mkdir()
+    zpath = out / "b.zip"
+    if leg == "hermes_backup":
+        with pytest.raises(SystemExit) as ei:
+            backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+        assert ei.value.code == 1
+    else:
+        assert backup._write_full_zip_backup(zpath, home) is None
+    assert written
+    assert [p.name for p in out.iterdir() if p.suffix == ".zip"] == []
+
+
+def test_prompt_restore_keeps_a_job_created_before_the_publish(home):
+    """Prism 643fd504e41a: restore_cron_prompt_fields_if_degraded read the live jobs.json outside
+    the store lock and published that stale document, dropping a job created in between."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    jid = _job(cj, "brief", 1)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    cj.update_job(jid, {"prompt": "brief"})  # degraded: prompt collapsed to the name
+    real, created = backup._load_cron_jobs_doc, []
+
+    def load(path):
+        doc = real(path)
+        if not created and backup._quick_snapshot_root(home) in Path(path).parents:
+            created.append(_job(cj, "late", 1))  # a sibling create between read and write
+        return doc
+
+    backup._load_cron_jobs_doc = load
+    try:
+        result = backup.restore_cron_prompt_fields_if_degraded(snap, hermes_home=home)
+    finally:
+        backup._load_cron_jobs_doc = real
+    assert created and result and result["prompts"] == 1
+    assert cj.get_job(jid)["prompt"] == "p"
+    assert cj.get_job(created[0]) is not None
+    on_disk = {j["id"] for j in json.loads((home / "cron" / "jobs.json").read_text())["jobs"]}
+    assert created[0] in on_disk

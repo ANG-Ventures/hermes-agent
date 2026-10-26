@@ -1854,6 +1854,9 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
             for name in names:
                 try:
                     _write_zip_file(zf, Path(tmp) / name, str(rel_cron / name))
+                    # Prism 7edcf5c778ea: counted the moment it is IN the zip, so a failure after
+                    # this point (the size stat) aborts instead of skipping a half-written pair.
+                    archived += 1
                     total += (Path(tmp) / name).stat().st_size
                 except (OSError, ValueError) as exc:
                     if archived:
@@ -1863,7 +1866,6 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
                         ) from exc
                     on_error(rel_cron / name, exc)
                     break
-                archived += 1
     return total
 
 
@@ -2606,27 +2608,30 @@ def restore_cron_prompt_fields_if_degraded(
             snap_by_id[str(job.get("id", ""))] = job
 
     restored_ids: list[str] = []
-    live_jobs = _cron_jobs_list(live_doc)
-    for job in live_jobs:
-        if not isinstance(job, dict):
-            continue
-        snap_job = snap_by_id.get(str(job.get("id", "")))
-        if snap_job is None:
-            continue
-        if not _prompt_degraded(job):
-            continue
-        snap_prompt = snap_job.get("prompt")
-        if not isinstance(snap_prompt, str) or not snap_prompt.strip():
-            continue
-        job["prompt"] = snap_prompt
-        restored_ids.append(str(job.get("id", "")))
 
-    if not restored_ids:
-        return None
+    def _restore_prompts(live_jobs: list) -> bool:
+        # Runs under the store lock on the jobs loaded there (Prism 643fd504e41a): the unlocked
+        # read above only decides whether there is anything to do.
+        restored_ids.clear()
+        for job in live_jobs:
+            if not isinstance(job, dict):
+                continue
+            snap_job = snap_by_id.get(str(job.get("id", "")))
+            if snap_job is None:
+                continue
+            if not _prompt_degraded(job):
+                continue
+            snap_prompt = snap_job.get("prompt")
+            if not isinstance(snap_prompt, str) or not snap_prompt.strip():
+                continue
+            job["prompt"] = snap_prompt
+            restored_ids.append(str(job.get("id", "")))
+        return bool(restored_ids)
 
     try:
         from cron import store_pair
-        store_pair.publish_definitions(home, live_doc)
+        if not store_pair.publish_definitions(home, _restore_prompts):
+            return None
     except (OSError, ValueError, RuntimeError) as exc:
         logger.error(
             "Cron job prompts were degraded during update but auto-restore "
