@@ -642,3 +642,67 @@ def test_persist_accepts_a_plain_route_url(home):
     spec = {"profile": "default", "execution": {"route": {"parent_base_url": "http://parent/v1?region=us",
                                                           "explicit_base_url": "http://deleg/v1"}}}
     store._assert_nonsecret_settings(spec)
+
+
+# --- t_d79419d5: anonymous custom parent + delegation.base_url, no delegation.api_key ------------------
+
+_PARENT_URL, _DELEG_URL, _PARENT_KEY = "http://127.0.0.1:9/parent/v1", "http://127.0.0.1:9/deleg/v1", "sk-parent-own-7f3a"
+
+
+def _real_resolver_build(monkeypatch, unit, home, model_block):
+    """build_parent on the REAL resolver and a real config.yaml (the drill d "ownkey" shape)."""
+    import sys
+    from hermes_cli import config as config_mod
+
+    for var in ("CUSTOM_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY",
+                "OPENROUTER_BASE_URL", "HERMES_INFERENCE_PROVIDER"):
+        monkeypatch.delenv(var, raising=False)
+    (home / "config.yaml").write_text(model_block + f"delegation:\n  base_url: {_DELEG_URL}\n")
+    assert config_mod.load_config()["model"]["base_url"] == _PARENT_URL
+    built = {}
+
+    class FakeAgent:
+        def __init__(self, **kw):
+            built.update(kw)
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    parent = SimpleNamespace(requested_provider="custom", provider="custom", model="m", base_url=_PARENT_URL)
+    record = _record(unit.did)
+    record["execution"].update({
+        "credential_ref": {"source": "delegation_config", "parent_provider": "custom"},
+        "route": akb.parent_route(parent, {"base_url": _DELEG_URL})})
+    duw.build_parent(record)
+    return built
+
+
+def test_anonymous_custom_parent_sends_its_model_api_key_not_the_placeholder(unit, home, monkeypatch):
+    """Drill d ownkey (t_3646c28e run 40317): model.provider=custom + model.base_url + model.api_key,
+    delegation.base_url set, no delegation.api_key. in_process sends model.api_key; the kanban unit sent
+    ``no-key-required`` because the URL-keyed lookup ignores model.api_key. It must send the parent's key."""
+    built = _real_resolver_build(monkeypatch, unit, home, (
+        f"model:\n  provider: custom\n  default: m\n  base_url: {_PARENT_URL}\n  api_key: {_PARENT_KEY}\n"))
+    assert built["api_key"] == _PARENT_KEY
+    assert built["base_url"] == _DELEG_URL, "the endpoint stays the delegation's"
+
+
+def test_anonymous_custom_parent_with_no_key_fails_closed_never_the_placeholder(unit, home, monkeypatch):
+    """Same shape, no model.api_key anywhere: the resolver answers ``no-key-required``; the unit fails
+    closed with the redacted error instead of sending the placeholder."""
+    with pytest.raises(RuntimeError) as err:
+        _real_resolver_build(monkeypatch, unit, home,
+                             f"model:\n  provider: custom\n  default: m\n  base_url: {_PARENT_URL}\n")
+    assert unit.did in str(err.value) and "delegation.api_key" in str(err.value)
+
+
+def test_placeholder_on_the_parent_url_fails_closed(unit, monkeypatch):
+    """The URL-keyed lookup returning the ``no-key-required`` placeholder is no credential."""
+    def fake_resolve(**kw):
+        url = kw.get("explicit_base_url")
+        return {"api_key": "no-key-required" if url == "http://parent/v1" else "default-endpoint-key",
+                "base_url": url or "http://default/v1", "provider": "custom",
+                "requested_provider": kw.get("requested"), "api_mode": "chat_completions"}
+
+    with pytest.raises(RuntimeError, match="http://parent/v1"):
+        _build_on_route(monkeypatch, unit, fake_resolve, {
+            "requested_provider": "custom", "model": "m", "explicit_base_url": "http://deleg/v1",
+            "parent_base_url": "http://parent/v1"})
