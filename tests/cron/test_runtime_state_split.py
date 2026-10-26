@@ -2452,9 +2452,11 @@ def test_retire_keeps_db_when_a_new_row_appeared_after_the_export_snapshot(temp_
 
 
 def test_stale_mirror_publication_is_not_certified(temp_home):
-    """001ff3e96a30: flush A read seq=1; a degraded sibling B published and certified seq=2 before
-    A's rename landed. A's file is stale. A must not record that stale file's identity as the known
-    mirror: the next flush has to see a mismatch and repair the file."""
+    """001ff3e96a30 + 82966426a22c: certification binds to the file THIS flush published. Two shapes:
+    (1) a stale caller certifies after a newer certification (flushed > seq): no stamp recorded;
+    (2) the newer caller certifies while a STALE rename has landed over its file: the occupant of the
+    path is not the file it published, so no stamp is recorded either. Both leave the identity
+    mismatched so the next flush repairs the file."""
     from cron import jobs as cj
     from cron import runtime_state as rs
 
@@ -2463,12 +2465,93 @@ def test_stale_mirror_publication_is_not_certified(temp_home):
     cj.maybe_flush_runtime_mirror(force=True)
     store = cj._current_cron_store()
     with cj._runtime_txn() as conn:
-        rs.mark_flushed(conn, 10**9)  # sibling B certified a far newer mirror
+        rs.mark_flushed(conn, 10**9)  # (1) sibling certified a far newer mirror
         before = cj._known_mirror_stamp(conn)
-    # A publishes its stale snapshot (any rewrite of the file) and records seq=1
     store.jobs_file.write_text(store.jobs_file.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    cj._jobs_lock_state.published_stamp = cj._mirror_stamp(store.jobs_file)
     with cj._runtime_txn() as conn:
         cj._record_mirror_written(conn, 1.0)
-        after = cj._known_mirror_stamp(conn)
-    assert after == before, "a stale publication must not be certified as the known mirror"
-    assert after != cj._mirror_stamp(store.jobs_file)
+        assert cj._known_mirror_stamp(conn) == before
+    # (2) we published a file, then a stale sibling rename replaced it before we certified
+    cj._jobs_lock_state.published_stamp = cj._mirror_stamp(store.jobs_file)
+    store.jobs_file.write_text(store.jobs_file.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with cj._runtime_txn() as conn:
+        cj._record_mirror_written(conn, 10**9 + 1)
+        assert cj._known_mirror_stamp(conn) == before, "a later occupant of the path is never certified"
+        assert cj._known_mirror_stamp(conn) != cj._mirror_stamp(store.jobs_file)
+    # our own file still on the path when we certify: recorded as before
+    cj._jobs_lock_state.published_stamp = cj._mirror_stamp(store.jobs_file)
+    with cj._runtime_txn() as conn:
+        cj._record_mirror_written(conn, 10**9 + 2)
+        assert cj._known_mirror_stamp(conn) == cj._mirror_stamp(store.jobs_file)
+
+
+def test_runtime_write_after_its_row_was_folded_keeps_unrelated_fields(temp_home, monkeypatch):
+    """736d658ee6b2: _with_job_runtime read a row, an export folded+retired it while the callback
+    ran, then the callback changed one field. The write must not become a partial row that drops
+    next_run_at (a merge against {} reads every unchanged field as a delete): it reconciles
+    against the folded record, so the merged view keeps next_run_at AND the change."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="fold-race")
+    cj.mark_job_run(created["id"], False, error="boom")
+    with rs.connect(temp_home / "cron") as conn:
+        before = rs.read_row(conn, created["id"])
+    assert before.get("next_run_at") and before.get("last_error") == "boom"
+
+    def fn(jobs, idx, job):
+        cj.export_runtime_to_json(retire=True)  # folds and retires the row under us
+        assert not _db(temp_home).exists()
+        job["last_error"] = "fixed"
+        cj.save_jobs(jobs)
+        return True
+
+    with cj._jobs_lock():
+        assert cj._with_job_runtime(created["id"], fn, None) is True
+    merged = next(j for j in cj.load_jobs() if j["id"] == created["id"])
+    assert merged["last_error"] == "fixed"
+    assert merged.get("next_run_at") == before["next_run_at"], merged
+
+
+def test_export_keeps_a_job_a_degraded_sibling_created_after_the_snapshot(temp_home, monkeypatch):
+    """d925dce7cb01: the export read jobs.json, then a degraded-lock sibling created job b; the
+    export's publish must not erase b (shrink-merge before the rename, as every save does)."""
+    from cron import jobs as cj
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    cj.mark_job_run(a["id"], True)
+    store = cj._current_cron_store()
+    real_stage = cj._stage_jobs_payload
+    state = {}
+
+    def stage_after_sibling_create(jobs_file, defs, *args, **kw):
+        if "b" not in state:  # the sibling's write lands on disk after our read, before our rename
+            data = json.loads(store.jobs_file.read_text(encoding="utf-8"))
+            b = dict(a); b["id"], b["name"] = "sibling-b", "b"
+            data["jobs"].append(b)
+            store.jobs_file.write_text(json.dumps(data), encoding="utf-8")
+            state["b"] = b["id"]
+        return real_stage(jobs_file, defs, *args, **kw)
+
+    monkeypatch.setattr(cj, "_stage_jobs_payload", stage_after_sibling_create)
+    cj.export_runtime_to_json(retire=False)
+    ids = {j["id"] for j in cj.load_jobs()}
+    assert a["id"] in ids and "sibling-b" in ids, ids
+    # and the sibling lands BEFORE staging (between the export's read and its publish)
+    state.clear(); monkeypatch.setattr(cj, "_stage_jobs_payload", real_stage)
+    real_merge = cj._merge_unexpected_disk_jobs
+
+    def sibling_then_merge(defs, **kw):
+        if "c" not in state:
+            data = json.loads(store.jobs_file.read_text(encoding="utf-8"))
+            c = dict(a); c["id"], c["name"] = "sibling-c", "c"
+            data["jobs"].append(c)
+            store.jobs_file.write_text(json.dumps(data), encoding="utf-8")
+            state["c"] = c["id"]
+        return real_merge(defs, **kw)
+
+    monkeypatch.setattr(cj, "_merge_unexpected_disk_jobs", sibling_then_merge)
+    cj.export_runtime_to_json(retire=False)
+    ids = {j["id"] for j in cj.load_jobs()}
+    assert {a["id"], "sibling-b", "sibling-c"} <= ids, ids

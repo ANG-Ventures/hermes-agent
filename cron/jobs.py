@@ -2121,9 +2121,14 @@ def _record_mirror_written(conn, seq: float) -> None:
     _rs.mark_flushed(conn, seq)
     if already is not None and float(already) > float(seq):
         return
-    stamp = _mirror_stamp(_current_cron_store().jobs_file)
-    if stamp is not None:
-        _store_mirror_stamp(conn, stamp)
+    published = getattr(_jobs_lock_state, "published_stamp", None)
+    _jobs_lock_state.published_stamp = None
+    on_disk = _mirror_stamp(_current_cron_store().jobs_file)
+    # Prism 82966426a22c: certify the file THIS flush published, and only while it still occupies
+    # the path. A sibling's rename that landed over it (or under it) means the file on disk is not
+    # the one *seq* describes: leave the identity unrecorded so the next flush repairs it.
+    if on_disk is not None and published is not None and on_disk == published:
+        _store_mirror_stamp(conn, on_disk)
 
 
 def _record_mirror_stamp_if_unknown(conn) -> None:
@@ -2211,15 +2216,27 @@ def _mirror_after_section() -> None:
 
 
 def _write_definitions_file(defs: List[Dict[str, Any]]) -> None:
-    """Atomic temp+rename of *defs* as jobs.json (no shrink-merge: the caller holds the lock and
-    just read the file). Used by the migration and the export only."""
+    """Atomic temp+rename of *defs* as jobs.json. Used by the migration and the export only.
+    Prism d925dce7cb01: the caller holds the lock, but a sibling whose lock acquisition timed out
+    proceeds DEGRADED and can create a job after the caller read the file; the shrink-merge
+    (``_merge_unexpected_disk_jobs``, the same guard every save takes) keeps that job."""
     jobs_file = _current_cron_store().jobs_file
     _guard_against_test_write_to_live_store(jobs_file)
     stat_before = None
     with contextlib.suppress(OSError):
         stat_before = os.stat(jobs_file)
-    tmp_path = _stage_jobs_payload(jobs_file, defs)
+    tmp_path = None
     try:
+        for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
+            defs = _merge_unexpected_disk_jobs(defs)
+            tmp_path = _stage_jobs_payload(jobs_file, defs)
+            # Verify-after-stage, as _save_jobs_unlocked does: a sibling landing during
+            # serialization forces another merge round.
+            if attempt < _SAVE_JOBS_MERGE_ATTEMPTS and _unmerged_disk_jobs(defs, None):
+                _unlink_quiet(tmp_path)
+                tmp_path = None
+                continue
+            break
         replaced = _publish_jobs_json(tmp_path, jobs_file)
     except BaseException:
         _unlink_quiet(tmp_path)
@@ -2512,7 +2529,21 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
         save_jobs(full)
         return result
     with _runtime_txn() as conn:
-        disk = _rs.read_row(conn, str(job_id)) or {}
+        disk = _rs.read_row(conn, str(job_id))
+        if disk is None and base_runtime:
+            # Prism 736d658ee6b2: the row we started from is GONE (an export folded and retired it
+            # while *fn* ran; its values now live in jobs.json). Merging against {} would read every
+            # unchanged baseline field as a concurrent delete and write a partial row that then
+            # overrides the folded file. Reconcile against the folded record instead.
+            try:
+                data, _ = _parse_jobs_file(_current_cron_store().jobs_file)
+            except Exception:
+                data = None
+            file_jobs = data.get("jobs") if isinstance(data, dict) else data
+            folded = next((_rs.split_job(copy.deepcopy(j))[1] for j in (file_jobs or [])
+                           if isinstance(j, dict) and str(j.get("id")) == str(job_id)), None)
+            disk = folded if folded is not None else dict(base_runtime)
+        disk = disk or {}
         merged = _reconcile_job_fields(new_runtime, disk, base_runtime) if disk != base_runtime \
             else new_runtime
         _rs.upsert_rows(conn, {str(job_id): merged})
@@ -3128,6 +3159,9 @@ def _publish_jobs_json(tmp_path: str, jobs_file: Path, *, own_gen: Optional[str]
         # rename; a sibling's later rename can erase the file's "runtime_gen", never this.
         with _runtime_txn() as conn:
             _rs.mark_published(conn, own_gen)
+    # Prism 82966426a22c: remember the identity of the file WE publish (inode, size and mtime
+    # survive the rename) so certification can bind to it, never to a later occupant of the path.
+    _jobs_lock_state.published_stamp = _mirror_stamp(Path(tmp_path))
     return Path(atomic_replace(tmp_path, jobs_file))
 
 
