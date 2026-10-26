@@ -312,6 +312,11 @@ def _sync_completion(conn, event, result, disposition=None):
     same_event = _same_completion_event(json.loads(row[0] or "null"), event)
     if result is None:
         result = json.loads(row[1]) if same_event and row[1] else None
+    if same_event and row[0] and _store.is_compacted_payload(event):
+        # The canonical envelope was compacted after delivery (D5). The mirror's event_json is
+        # the replay source if this row is ever pending again: keep its full body rather than
+        # overwriting it with the identity-only stub.
+        event = json.loads(row[0])
     if not same_event:
         conn.execute(
             """UPDATE async_delegations SET delivery_state='pending',
