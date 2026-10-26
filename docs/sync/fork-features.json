@@ -1278,5 +1278,42 @@
     "surfaces": [
       "gateway"
     ]
+  },
+  {
+    "feature": "idle-TTL-evicted AIAgent closes its per-agent LCM context-engine clone (release_clients/close -> _shutdown_context_engine)",
+    "tests": [
+      "tests/agent/test_context_engine_released_on_evict.py"
+    ],
+    "paths": [
+      "run_agent.py"
+    ],
+    "why": "2026-10-23 Apollo gateway EMFILE wedge: 4,200 fds against a 4,096 soft limit, ~1,996 of them lcm.db handles leaked by idle-TTL-evicted agents whose per-agent LCM context-engine clone was never shut down; session storage and model-preference reads failed. Fixed by hermes-agent#2237 (squash 84975a7787e, 2026-10-24): AIAgent._shutdown_context_engine() called once from release_clients() and close(), tolerant of engines without shutdown() and of shutdown errors. tests/tools/test_delegate_child_lifecycle.py::_real_agent_methods stubs _shutdown_context_engine; keep that stub in sync. Upstream has no _shutdown_context_engine (0 hits in upstream/main run_agent.py): PR shape is a re-author patching run_agent.py release_clients()/close(); repro = build an agent with a context engine, evict it, count open engine handles.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "cron"
+    ]
+  },
+  {
+    "feature": "SessionDB periodic PASSIVE WAL checkpoint runs on its own connection, off SessionDB._lock",
+    "tests": [
+      "tests/hermes_state/test_wal_checkpoint_strategy.py::TestCheckpointNeverHoldsTheWriteLock"
+    ],
+    "paths": [
+      "hermes_state.py",
+      "hermes_state_*.py"
+    ],
+    "why": "2026-10-25 Apollo: 19-23 state.db writers queued for 42+ s behind _try_wal_checkpoint running inside the shared SessionDB._lock write lock on a 6.25 GB state.db. Fixed by hermes-agent#2311 (merge e12b459f94df, 2026-10-26): the interval checkpoint uses a dedicated _ckpt_conn under single-flight _ckpt_lock (lock order _ckpt_lock -> _lock), the interval writer never waits on it, and close() closes the checkpoint connection. Upstream has no _ckpt_conn (0 hits in upstream/main hermes_state.py): PR shape is a re-author patching hermes_state.py _try_wal_checkpoint; repro = block a checkpoint and assert a concurrent write completes.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "cron"
+    ]
   }
 ]

@@ -12,6 +12,7 @@ import errno
 import json
 import logging
 import os
+import threading
 from typing import Optional
 
 from cron.env_settings import cron_env_setting
@@ -135,6 +136,30 @@ def _credential_store_scope_label() -> str:
     return f"[profile '{get_active_profile_name() or 'default'}', HERMES_HOME {get_hermes_home()}]"
 
 
+_ROUTES_CACHE_LOCK = threading.Lock()
+# (primary_home, current_home) -> (source signature, tuple of ProfileRoute)
+_ROUTES_CACHE: dict = {}
+
+
+def _routes_source_signature(primary_home) -> tuple:
+    """Stat signature of every file ``gateway.config_loader.read_yaml_layers`` reads: the primary
+    home's ``config.yaml`` and the managed-scope ``config.yaml`` (``None`` when absent)."""
+    from utils import file_signature
+    from hermes_cli.managed_scope import get_managed_dir
+
+    managed_dir = get_managed_dir()
+    paths = [primary_home / "config.yaml"]
+    if managed_dir is not None:
+        paths.append(managed_dir / "config.yaml")
+    sig = []
+    for path in paths:
+        try:
+            sig.append((str(path), file_signature(path.stat())))
+        except OSError:
+            sig.append((str(path), None))
+    return tuple(sig)
+
+
 def _primary_profile_routes_for_current_home() -> list:
     """Primary gateway ``profile_routes`` targeting the profile being served; ``[]`` if this IS the
     primary home. Satellite crons are ticked and delivered by the primary gateway (a satellite
@@ -158,6 +183,16 @@ def _primary_profile_routes_for_current_home() -> list:
         ):
             return []  # this IS the primary home — nothing to consult
 
+        # Every cron run calls this (preflight + SharedRouteAdapters); re-parsing the layers each
+        # time was 6.5% of Apollo's GIL time. Cache on the stat signature of each file
+        # read_yaml_layers consults: the user config.yaml and the managed-scope config.yaml.
+        cache_key = (str(primary_home.expanduser()), str(current_home.expanduser()))
+        signature = _routes_source_signature(primary_home.expanduser())
+        with _ROUTES_CACHE_LOCK:
+            hit = _ROUTES_CACHE.get(cache_key)
+            if hit is not None and hit[0] == signature:
+                return list(hit[1])
+
         # Same layers the primary gateway's own loader reads: routes pinned in the managed scope
         # (/etc/hermes/config.yaml) never reached the raw user-file read (#121212), so preflight
         # false-blocked and routed delivery failed closed on centrally-managed installs.
@@ -166,15 +201,17 @@ def _primary_profile_routes_for_current_home() -> list:
         routes_raw = layered.get("profile_routes")
         if routes_raw is None and isinstance(layered.get("gateway"), dict):
             routes_raw = layered["gateway"].get("profile_routes")
-        if not isinstance(routes_raw, list):
-            return []
-
-        from gateway.profile_routing import parse_profile_routes
-        from hermes_cli.profiles import profile_matches_home
-        return [
-            route for route in parse_profile_routes(routes_raw)
-            if route.enabled and profile_matches_home(route.profile)
-        ]
+        routes: list = []
+        if isinstance(routes_raw, list):
+            from gateway.profile_routing import parse_profile_routes
+            from hermes_cli.profiles import profile_matches_home
+            routes = [
+                route for route in parse_profile_routes(routes_raw)
+                if route.enabled and profile_matches_home(route.profile)
+            ]
+        with _ROUTES_CACHE_LOCK:
+            _ROUTES_CACHE[cache_key] = (signature, tuple(routes))
+        return list(routes)
     except Exception:
         logger.debug("primary-gateway profile-route lookup unavailable", exc_info=True)
         return []
