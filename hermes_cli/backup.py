@@ -1264,7 +1264,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
             # listed. Re-scan once and archive what the first scan did not list, so moved data
             # still lands and only a true deletion stays a WARN.
             listed = {str(rel) for _, rel in files_to_add}
-            late, _ = _split_cron_pairs(list(_iter_backup_files(hermes_root, out_path)))
+            late, late_homes = _split_cron_pairs(list(_iter_backup_files(hermes_root, out_path)))
             late = [(a, r) for a, r in late if str(r) not in listed]
             late_added = len(late)
             file_count += late_added
@@ -1273,6 +1273,11 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
                 on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
                 on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
                 on_vanished=lambda rel: vanished.append(str(rel)))
+            # Prism 3c9a7b0dc534: a store renamed with its profile is a pair the first pass never
+            # saw; archive it as one unit too, never drop it with the rescan's homes.
+            total_bytes += _zip_cron_pairs(zf, hermes_root,
+                                           [h for h in late_homes if h not in cron_homes],
+                                           out_path, lambda rel, exc: errors.append(f"{rel}: {exc}"))
         # External memory-provider state never includes ``.db`` files in practice, so no
         # SQLite snapshot is needed; _write_zip_file still drops a failed partial member.
         for abs_path, arcname in external_to_add:
@@ -1608,7 +1613,9 @@ def run_import(args) -> Optional[int]:
             # (Prism dbf3e89fdfa5): a cron dir (or store home) linked outside hermes_root refuses.
             pair_dir = hermes_root.joinpath(*store_home, store_pair.CRON_DIR)
             try:
-                for target in (pair_dir, *(pair_dir / name for name in pair_members)):
+                # BOTH live members, not only those in the archive (Prism 4c71a06241bb): a
+                # json-only restore rewrites the live db too.
+                for target in (pair_dir, *(pair_dir / name for name in store_pair.PAIR_NAMES)):
                     target.resolve().relative_to(hermes_root.resolve())
             except ValueError:
                 errors.append(f"  {label}: path traversal blocked")
@@ -2270,6 +2277,15 @@ def list_quick_snapshots(
     return results
 
 
+def _contained(path: Path, root: Path) -> bool:
+    """True when *path* resolves (links followed) inside *root*."""
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def _snapshot_cron_db_failed(meta: Any) -> bool:
     """True when the snapshot's runtime db was present but NOT captured (failed or skipped), as
     opposed to a json-only snapshot taken before #2287 (Prism 72fe227c70de)."""
@@ -2324,6 +2340,13 @@ def restore_quick_snapshot(
         # carries the runtime it was taken with, adopted on the next load.
         from cron import store_pair
         try:
+            # Same containment as the per-file restore below, for BOTH members on both sides,
+            # before the pair lock is taken (Prism dd8a638040cd); store_pair.restore then refuses
+            # any link in the live store or the source.
+            for member in (_CRON_JOBS_REL, _CRON_RUNTIME_REL):
+                if not (_contained(snap_dir / member, snap_dir)
+                        and _contained(home / member, home)):
+                    raise store_pair.PairRefused(f"{member}: path traversal blocked")
             restored += len(store_pair.restore(snap_dir / store_pair.CRON_DIR, home,
                                                db_failed=_snapshot_cron_db_failed(meta)))
         except (store_pair.PairRefused, OSError, RuntimeError) as exc:

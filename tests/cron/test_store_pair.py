@@ -536,3 +536,142 @@ def test_zip_never_publishes_a_half_pair(home, tmp_path, monkeypatch, leg):
     else:
         assert backup._write_full_zip_backup(zpath, home) is None
     assert [p.name for p in out.iterdir() if p.suffix == ".zip"] == []
+
+
+# --- Prism post-merge review of #2331 @739fe4e9 (t_9d1a7eb0) -----------------------------------
+
+def test_interrupted_publish_rolls_back_both_halves(home, monkeypatch):
+    """Prism 21c9d75bea4a: an interrupt after ``_publish_jobs_json`` replaced jobs.json but before
+    ``_publish_jobs`` returned rolled back only the db, leaving the snapshot's definitions paired
+    with the live rows."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    jid = _job(cj, "snap", 3)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    cj.update_job(jid, {"name": "live"})
+    _job(cj, "live-only", 1)
+    for _ in range(4):
+        cj.mark_job_run(jid, True)
+    before_json = (home / "cron" / "jobs.json").read_bytes()
+    before_rows = _rows(home / "cron")
+    real, fired = cj._record_load_stamp, []
+
+    def interrupt(stamp):
+        if not fired:
+            fired.append(1)
+            raise KeyboardInterrupt
+        return real(stamp)
+
+    monkeypatch.setattr(cj, "_record_load_stamp", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        backup.restore_quick_snapshot(snap, hermes_home=home)
+    assert fired
+    assert (home / "cron" / "jobs.json").read_bytes() == before_json
+    assert _rows(home / "cron") == before_rows
+    monkeypatch.setattr(cj, "_record_load_stamp", real)
+    assert cj.get_job(jid)["name"] == "live"
+    assert cj.get_job(jid)["repeat"]["completed"] == 7
+
+
+def test_backup_rescan_archives_the_pair_of_a_renamed_profile(home, tmp_path, monkeypatch):
+    """Prism 3c9a7b0dc534: the rename-recovery rescan dropped the cron homes it found, so a profile
+    renamed during the backup lost its jobs.json + runtime_state.db from the archive."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    pa = home / "profiles" / "a"
+    (pa / "cron").mkdir(parents=True)
+    (pa / "config.yaml").write_text("model: x\n")
+    with cj.use_cron_store(pa):
+        _job(cj, "pj", 2)
+    real, renamed = backup._write_zip_entries, []
+
+    def write_entries(zf, files, *a, **kw):
+        if not renamed:
+            renamed.append(1)
+            (home / "profiles" / "a").rename(home / "profiles" / "b")
+        return real(zf, files, *a, **kw)
+
+    monkeypatch.setattr(backup, "_write_zip_entries", write_entries)
+    zpath = tmp_path / "out" / "b.zip"
+    zpath.parent.mkdir()
+    backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    assert "profiles/b/config.yaml" in names
+    assert {"profiles/b/cron/jobs.json", "profiles/b/cron/runtime_state.db"} <= names, names
+
+
+def _other_store(tmp_path):
+    """A populated cron store OUTSIDE the home under test: (cron dir, jobs bytes, rows)."""
+    from cron import jobs as cj
+
+    other = tmp_path / "other-home"
+    (other / "cron").mkdir(parents=True)
+    with cj.use_cron_store(other):
+        _job(cj, "outside", 5)
+    return other / "cron", (other / "cron" / "jobs.json").read_bytes(), _rows(other / "cron")
+
+
+def test_import_refuses_a_live_runtime_db_linked_outside_the_home(home, tmp_path, monkeypatch):
+    """Prism 4c71a06241bb: a JSON-only archive passed the containment check (only the members in
+    the archive were checked) and the json-only branch cleared the rows of the db the live
+    runtime_state.db symlink pointed at, in another home."""
+    import hermes_cli.gateway as gw
+    from hermes_cli.backup import run_import
+
+    monkeypatch.setattr(gw, "ensure_gateway_service", lambda **kw: True)
+    monkeypatch.setattr(gw, "_is_service_running", lambda: True)
+    ocron, ojson, orows = _other_store(tmp_path)
+    assert orows
+    for p in (home / "cron").glob("runtime_state.db*"):
+        p.unlink()
+    (home / "cron" / "runtime_state.db").symlink_to(ocron / "runtime_state.db")
+    _archive(tmp_path / "b.zip", {"config.yaml": "model: x\n",
+                                  "cron/jobs.json": json.dumps({"jobs": [{"id": "j", "name": "n"}]})})
+    rc = run_import(Namespace(zipfile=str(tmp_path / "b.zip"), force=True))
+    assert rc == 1
+    assert _rows(ocron) == orows
+    assert (ocron / "jobs.json").read_bytes() == ojson
+
+
+@pytest.mark.parametrize("leg", ["restore", "auto_restore"])
+@pytest.mark.parametrize("link", ["live_cron_dir", "live_db", "snapshot_member"])
+def test_snapshot_pair_restore_never_writes_through_a_link(home, tmp_path, leg, link):
+    """Prism dd8a638040cd / 4c71a06241bb: the quick-snapshot pair branch ran before the per-file
+    containment checks, so a live ``cron/`` (or member) symlinked outside the home was written
+    through, and a snapshot member linked outside the snapshot was read."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    a, b = _job(cj, "a", 2), _job(cj, "b", 3)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    sdir = backup._quick_snapshot_root(home) / snap
+    ocron, ojson, orows = _other_store(tmp_path)
+    if leg == "auto_restore":
+        cj.remove_job(b)
+    if link == "live_cron_dir":
+        (home / "cron").rename(home / "cron-real")
+        (home / "cron").symlink_to(ocron)
+    elif link == "live_db":
+        for p in (home / "cron").glob("runtime_state.db*"):
+            p.unlink()
+        (home / "cron" / "runtime_state.db").symlink_to(ocron / "runtime_state.db")
+    else:
+        (sdir / "cron" / "runtime_state.db").unlink()
+        (sdir / "cron" / "runtime_state.db").symlink_to(ocron / "runtime_state.db")
+    live_json = (home / "cron" / "jobs.json").read_bytes()
+
+    if leg == "restore":
+        backup.restore_quick_snapshot(snap, hermes_home=home)
+    else:
+        if link == "live_cron_dir":
+            # the live count is read through the link; make it lower than the snapshot's
+            (ocron / "jobs.json").write_bytes(json.dumps({"jobs": []}).encode())
+            ojson = (ocron / "jobs.json").read_bytes()
+        assert backup.restore_cron_jobs_if_emptied(snap, hermes_home=home) is None
+    assert (ocron / "jobs.json").read_bytes() == ojson
+    assert _rows(ocron) == orows
+    if link != "live_cron_dir":
+        assert (home / "cron" / "jobs.json").read_bytes() == live_json  # nothing half-restored
