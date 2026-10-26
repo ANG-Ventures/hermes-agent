@@ -666,13 +666,24 @@ def _checkout_clean_tracked(checkout: Path, rel_parts: tuple) -> Optional[frozen
             if ahead.returncode != 0 or ahead.stdout.strip() != "0":
                 return None
             # `--not --remotes` with no remote-tracking refs at all counts every commit, so "0" means HEAD is on one
-        tracked = _worktree_git(checkout, "ls-files", "-z")
+        # -v prefixes each path with its index flag: `h` assume-unchanged, `S` skip-worktree. `git diff HEAD` does not
+        # report working-tree edits to those files, so they are never "clean" here: they are carried like any
+        # modified file (Prism a5c80df2341e; the live tree pins cron/jobs.json skip-worktree).
+        tracked = _worktree_git(checkout, "ls-files", "-v", "-z")
         changed = _worktree_git(checkout, "diff", "-z", "--name-only", "--no-renames", "HEAD")
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     if tracked.returncode != 0 or changed.returncode != 0:
         return None
-    return frozenset(p for p in tracked.stdout.split("\0") if p) - {p for p in changed.stdout.split("\0") if p}
+    clean = set()
+    for row in tracked.stdout.split("\0"):
+        if len(row) < 3 or row[1] != " ":
+            continue
+        flag, path = row[0], row[2:]
+        if flag in ("h", "S"):
+            continue
+        clean.add(path)
+    return frozenset(clean) - {p for p in changed.stdout.split("\0") if p}
 
 
 # --- SQLite safe copy ---
