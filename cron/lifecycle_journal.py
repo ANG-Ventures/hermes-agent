@@ -240,9 +240,15 @@ def read_entries_with_health(
     cutoff = _hermes_now() - timedelta(hours=window_hours)
     entries: List[Dict[str, Any]] = []
     malformed = 0
-    with open(path, "r", encoding="utf-8-sig") as f:
-        for seq, line in enumerate(f):
-            line = line.strip()
+    with open(path, "rb") as f:
+        for seq, raw in enumerate(f):
+            try:
+                # Per-line decode (t_19a16be2): a non-UTF-8 line is ONE malformed record, never an
+                # exception out of the file iterator that abandons the whole read.
+                line = raw.decode("utf-8-sig").strip()
+            except UnicodeDecodeError:
+                malformed += 1
+                continue
             if not line:
                 continue
             try:
@@ -274,8 +280,10 @@ def last_removed(job_ids) -> set:
 
     Read by the store's merge (t_0cae2938): a save whose payload still carries a row a sibling
     removed through the API after this writer's load must not write that row back. Malformed lines
-    are skipped (the guard reports them). Best effort: an unreadable journal returns an empty set,
-    which keeps the pre-existing merge behaviour."""
+    are skipped ONE AT A TIME (the guard reports them): a line that is not UTF-8, not JSON, not an
+    object, or carries a non-string ``job_id``/``event`` must never abandon the scan, or one bad line
+    discards every valid removal and a stale save resurrects the row (t_19a16be2). Best effort: an
+    unreadable journal FILE returns an empty set, which keeps the pre-existing merge behaviour."""
     wanted = {str(i) for i in job_ids if i}
     if not wanted:
         return set()
@@ -284,14 +292,17 @@ def last_removed(job_ids) -> set:
         path = _journal_path()
         if not path.exists():
             return set()
-        with open(path, "r", encoding="utf-8-sig") as f:
-            for line in f:
+        with open(path, "rb") as f:
+            for raw in f:
                 try:
-                    rec = json.loads(line)
-                except ValueError:
+                    rec = json.loads(raw.decode("utf-8-sig"))
+                except ValueError:  # UnicodeDecodeError and JSONDecodeError are both ValueError
                     continue
-                if isinstance(rec, dict) and rec.get("job_id") in wanted and rec.get("event") in EVENTS:
-                    last[rec["job_id"]] = rec["event"]
+                if not isinstance(rec, dict):
+                    continue
+                jid, event = rec.get("job_id"), rec.get("event")
+                if isinstance(jid, str) and isinstance(event, str) and jid in wanted and event in EVENTS:
+                    last[jid] = event
     except Exception:
         logger.debug("cron lifecycle journal read failed", exc_info=True)
         return set()
@@ -331,32 +342,35 @@ def prune() -> int:
 def _prune_locked(path: Path) -> int:
     """Read and replace while holding the same mutex as every appender."""
     cutoff = _hermes_now() - timedelta(days=_RETENTION_DAYS)
-    kept: List[str] = []
+    kept: List[bytes] = []
     dropped = 0
     try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped:
+        # Bytes in, bytes out (t_19a16be2): a non-UTF-8 line is kept verbatim like any other
+        # unparseable line, instead of raising out of the iterator and aborting every prune.
+        with open(path, "rb") as f:
+            for raw in f:
+                stripped_raw = raw.strip()
+                if not stripped_raw:
                     continue
                 try:
+                    stripped = stripped_raw.decode("utf-8-sig")
                     at = _parse_at(json.loads(stripped).get("at"))
                 except Exception:
-                    kept.append(stripped)  # unparseable: keep, never guess away
+                    kept.append(stripped_raw)  # unparseable: keep, never guess away
                     continue
                 if at is not None and at < cutoff:
                     dropped += 1
                 else:
-                    kept.append(stripped)
+                    kept.append(stripped.encode("utf-8"))
         if not dropped:
             return 0
         from utils import atomic_replace
 
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".lifecycle_",
                                    suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "wb") as f:
             for line in kept:
-                f.write(line + "\n")
+                f.write(line + b"\n")
             f.flush()
             os.fsync(f.fileno())
         atomic_replace(tmp, path)
