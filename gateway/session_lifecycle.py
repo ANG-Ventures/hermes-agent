@@ -248,9 +248,36 @@ class SessionLifecycleMixin:
                 session_key, reason, resume_kind=resume_kind, resume_handoff=resume_handoff,
                 resume_request_id=resume_request_id,
             ):
-                self._save()
+                if getattr(self, "_resume_mark_batch_depth", 0):
+                    self._resume_mark_batch_pending = getattr(
+                        self, "_resume_mark_batch_pending", 0) + 1
+                else:
+                    self._save()
                 return True
         return False
+
+    def begin_resume_mark_batch(self) -> None:
+        """Defer the sessions.json save of every ``mark_resume_pending`` until the matching
+        ``end_resume_mark_batch``. A shutdown pass marks every running session, and a per-mark
+        ``_save()`` rewrites the whole file each time (11.1 s for 10 sessions, t_edfc146c).
+        Nests; only the outermost end saves."""
+        with self._lock:
+            self._resume_mark_batch_depth = getattr(self, "_resume_mark_batch_depth", 0) + 1
+
+    def end_resume_mark_batch(self) -> int:
+        """Close a batch; the outermost close persists the deferred marks with ONE ``_save()``.
+        Returns the number of marks it persisted (0 = no save). A save error propagates to the
+        caller; the in-memory marks stand either way."""
+        with self._lock:
+            depth = max(0, getattr(self, "_resume_mark_batch_depth", 0) - 1)
+            self._resume_mark_batch_depth = depth
+            if depth:
+                return 0
+            pending = getattr(self, "_resume_mark_batch_pending", 0)
+            self._resume_mark_batch_pending = 0
+            if pending:
+                self._save()
+            return pending
 
     def clear_resume_pending(self, session_key: str, **kw) -> bool:
         """Clear the resume-pending flag after a successful resumed turn; True if cleared.

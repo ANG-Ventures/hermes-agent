@@ -935,19 +935,37 @@ class GatewayShutdownMixin:
         # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service
         # manager during the drain, the durable marker is already written so the next gateway boot can
         # recover in-flight sessions (#27856).
-        for _sk, _agent in list(self._running_agents.items()):
-            if _agent is _AGENT_PENDING_SENTINEL:
-                continue
-            with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
-                if callable(_mark_fork):
-                    _marked, _reason, _alert = await asyncio.to_thread(_mark_fork, _sk, interrupted=interrupted)
-                    if _marked:
+        # ONE sessions.json save per pass, not one per session (t_edfc146c: 10 per-mark rewrites of a
+        # 1.5 MB file took 11.1 s of the 50 s stop budget). The batch only defers the save; the
+        # per-session decision, PHASE=shutdown_mark line and replay alert are unchanged.
+        _store = self.session_store
+        _batched = False
+        _t0 = time.monotonic()
+        with _log_suppressed(logging.WARNING, "%s: could not open the mark batch: %s", log_prefix):
+            await asyncio.to_thread(_store.begin_resume_mark_batch)
+            _batched = True
+        try:
+            for _sk, _agent in list(self._running_agents.items()):
+                if _agent is _AGENT_PENDING_SENTINEL:
+                    continue
+                with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
+                    if callable(_mark_fork):
+                        _marked, _reason, _alert = await asyncio.to_thread(_mark_fork, _sk, interrupted=interrupted)
+                        if _marked:
+                            marked.append(_sk)
+                        if _alert and callable(_notify_suspended):
+                            await _notify_suspended(_sk)
+                    else:
+                        await self.async_session_store.mark_resume_pending(_sk, reason)
                         marked.append(_sk)
-                    if _alert and callable(_notify_suspended):
-                        await _notify_suspended(_sk)
-                else:
-                    await self.async_session_store.mark_resume_pending(_sk, reason)
-                    marked.append(_sk)
+        finally:
+            if _batched:
+                # FAIL-OPEN: a failed save is logged and never aborts the stop.
+                with _log_suppressed(logging.WARNING, "%s: batched sessions.json save failed: %s", log_prefix):
+                    await asyncio.to_thread(_store.end_resume_mark_batch)
+            logger.info(
+                "Shutdown phase: %s marked %d session(s) in %.2fs", log_prefix, len(marked), time.monotonic() - _t0,
+            )
         return marked
 
     def _restart_notification_allowed(self, platform: Platform) -> bool:
