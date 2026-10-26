@@ -265,6 +265,71 @@ def test_an_unreadable_local_placement_table_refuses_instead_of_a_zero_reserve(b
         ka.admit(_card(), "studio", "ruling", spawn_fn=_spawn)
 
 
+def test_an_invalid_remote_placement_table_refuses_instead_of_a_zero_reserve(board, monkeypatch):
+    """Prism 6e8b5b41758b: kh.load_table() returns None for an INVALID table
+    too; the remote floor must not read that as a 0 GB reserve."""
+    from types import SimpleNamespace
+
+    from hermes_cli import placement as pl
+
+    table = pl.fleet_root() / pl.TABLE_REL
+    table.parent.mkdir(parents=True, exist_ok=True)
+    table.write_text("{not json")
+    sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0,
+                            pressure_text=json.dumps({"at": 2000.0, "mem_available_gb": 100.0}))
+    monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
+    signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=60.0),
+                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+    m = ka.measure_remote(POOL_HOST, signal)
+    assert m.mem_available_gb == 100.0
+    refusal = ka.floor_refusal(m)
+    assert refusal is not None and "not a finite threshold" in refusal and str(table) in refusal
+    # An ABSENT table is still "no reserve configured": 0 GB, admits.
+    table.unlink()
+    assert ka.floor_refusal(ka.measure_remote(POOL_HOST, signal)) is None
+
+
+def test_admit_applies_the_active_lane_model_override_card_pin_wins(board, monkeypatch):
+    """Prism edcd308fa63f / cbdc23241724: an admitted card spawns on the lane
+    route like a tick spawn; a card's own override beats it; an expired lane
+    row is ignored."""
+    import time as _time
+
+    _hot_local(monkeypatch)
+    seen = {}
+
+    def spawn(task, workspace, *, board=None, placement=None):
+        seen[task.id] = (task.model_override, task.provider_override)
+        return 4242
+
+    now = int(_time.time())
+    with kb.connect_closing() as conn:
+        kb.set_lane_model_override(conn, provider="lane-prov", model="lane-model",
+                                   expires_at=now + 3600, reason="capacity", assignee="alpha")
+    lane = _card()
+    ka.admit(lane, "studio", "ruling", spawn_fn=spawn)
+    assert seen[lane] == ("lane-model", "lane-prov")
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, lane).model_override is None       # never persisted onto the card
+        [route] = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='dispatch_lane_route'", (lane,))]
+    assert route == {"provider": "lane-prov", "model": "lane-model"}
+
+    pinned = _card()
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET model_override='card-model', provider_override='card-prov' WHERE id=?",
+                     (pinned,))
+    ka.admit(pinned, "studio", "ruling", spawn_fn=spawn)
+    assert seen[pinned] == ("card-model", "card-prov")
+
+    with kb.connect_closing() as conn:
+        kb.set_lane_model_override(conn, provider="lane-prov", model="lane-model",
+                                   expires_at=now - 1, reason="capacity", assignee="alpha", now=now - 100)
+    expired = _card()
+    ka.admit(expired, "studio", "ruling", spawn_fn=spawn)
+    assert seen[expired] == (None, None)
+
+
 def test_the_board_owner_root_config_kill_switch_refuses(board, monkeypatch):
     _hot_local(monkeypatch)
     monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {"admin_admit": {"enabled": False}})

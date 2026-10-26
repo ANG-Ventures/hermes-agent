@@ -59,6 +59,7 @@ class Measure:
     mem_available_gb: Optional[float]
     mem_reserve_gb: float
     extra: dict = field(default_factory=dict)   # band / headroom the admission overrides
+    threshold_error: Optional[str] = None       # why mem_reserve_gb is unknown (names the table)
 
 
 def enabled(kanban_cfg: Optional[dict]) -> bool:
@@ -80,7 +81,9 @@ def floor_refusal(m: Measure) -> Optional[str]:
     """The measured-danger refusal line for ``m``, or None to admit. A
     non-finite measurement or threshold (NaN, inf) is unmeasured: refuse."""
     if not _finite(m.mem_reserve_gb):
-        return f"{m.host}: mem_reserve_gb {m.mem_reserve_gb!r} is not a finite threshold; refusing, fail closed"
+        why = f" ({m.threshold_error})" if m.threshold_error else ""
+        return (f"{m.host}: mem_reserve_gb {m.mem_reserve_gb!r} is not a finite threshold{why}; "
+                f"refusing, fail closed")
     if not _finite(m.mem_available_gb):
         return (f"{m.host}: memory available is unmeasured (threshold: mem_reserve_gb "
                 f"{m.mem_reserve_gb:g} GB); refusing, fail closed")
@@ -215,6 +218,28 @@ def browser_refusal(conn, row, host: str, assignee: str) -> Optional[str]:
 
 # -- measurement --------------------------------------------------------------
 
+def _host_row(table, word: str, threads):
+    """``(threads, mem_reserve_gb, threshold_error)`` for ``word`` from the
+    placement table: its row, else ``threads`` / 0 GB (no table file, or no row).
+    ``table`` None is re-read from the file: a table that exists but cannot be
+    read is an unknown threshold, never "no reserve", so the reserve is NaN and
+    the floor refuses naming the table (Prism a6c5f61c871f, 6e8b5b41758b)."""
+    from hermes_cli import placement as pl
+
+    path = pl.fleet_root() / pl.TABLE_REL
+    try:
+        if table is None:
+            if not path.exists():
+                return threads, 0.0, None
+            table = pl.load_hosts(path)
+        hid = table.resolve(word)
+        if hid:
+            return table.hosts[hid].threads, float(table.hosts[hid].mem_reserve_gb), None
+    except Exception as exc:
+        return threads, float("nan"), f"placement table {path} unreadable: {exc}"
+    return threads, 0.0, None
+
+
 def measure_local() -> Measure:
     """This host: load1, threads and mem_reserve_gb from its placement-table row
     (``local`` alias; os.cpu_count() / 0 GB without one), memory from psutil, and
@@ -222,18 +247,7 @@ def measure_local() -> Measure:
     from hermes_cli import kanban_load_gate as klg
 
     ctx = klg.utilization_context()
-    threads, reserve = os.cpu_count(), 0.0
-    try:
-        from hermes_cli import placement as pl
-        if (pl.fleet_root() / pl.TABLE_REL).exists():
-            # A table that exists but cannot be read is an unknown threshold,
-            # never "no reserve": the floor refuses on NaN (Prism a6c5f61c871f).
-            table = pl.load_hosts()
-            hid = table.resolve(klg.UTIL_HOST_ALIAS)
-            if hid:
-                threads, reserve = table.hosts[hid].threads, float(table.hosts[hid].mem_reserve_gb)
-    except Exception:
-        reserve = float("nan")
+    threads, reserve, terr = _host_row(None, klg.UTIL_HOST_ALIAS, os.cpu_count())
     load1, _ = klg.sample_loadavg()
     gate = klg.gate_from_config(None)
     try:
@@ -243,7 +257,7 @@ def measure_local() -> Measure:
     return Measure(LOCAL, load1, threads, ctx.get("mem_available_gb"), reserve, extra={
         "band": gate.band, "gate_state": getattr(gate, "state", None), "spill_reason": gate.spill_reason,
         "gate_allowance": allowance, "spawn_paused": paused, "admission": gate.admission,
-    })
+    }, threshold_error=terr)
 
 
 def measure_remote(host, signal) -> Measure:
@@ -269,19 +283,17 @@ def measure_remote(host, signal) -> Measure:
             band = got[1] if got else kwp.BAND_UNKNOWN
     elif sample is not None:
         load1, ncpu = sample
-    threads, reserve = ncpu, 0.0
+    # kh.load_table() gives the signal None for an INVALID table as well as an
+    # absent one; _host_row re-reads the file, so only an absent table is 0 GB.
     table = signal.placement_table if signal is not None else None
-    if table is not None:
-        hid = table.resolve(host.name)
-        if hid:
-            threads, reserve = table.hosts[hid].threads, float(table.hosts[hid].mem_reserve_gb)
+    threads, reserve, terr = _host_row(table, host.name, ncpu)
     hot = None
     if signal is not None:
         st = kwp._load_state(signal.state_path).get(host.name)
         hot = bool(st.get("hot")) if isinstance(st, dict) else None
     return Measure(host.name, load1, threads, mem, reserve, extra={
         "band": band, "hot": hot, "pressure": pressure or None, "ncpu": ncpu,
-    })
+    }, threshold_error=terr)
 
 
 # -- the verb -------------------------------------------------------------------
@@ -396,6 +408,17 @@ def _spawn(conn, task_id, host, pool_host, payload, signal, board, spawn_fn, kh)
         raise AdmitRefused(f"{task_id}: fleet pause hold: {exc.reason}") from exc
     if claimed is None:
         raise AdmitRefused(f"{task_id}: not claimable (claimed by a tick meanwhile?)")
+    # Route precedence exactly as the dispatcher tick: a card's own override
+    # wins, else the active (unexpired) lane override, else the profile
+    # default. In-memory only: never persisted onto the card (Prism
+    # edcd308fa63f / cbdc23241724).
+    lane_source = kb.apply_lane_model_override(
+        claimed, kb.get_lane_model_override(conn, assignee=(claimed.assignee or "").strip() or None))
+    if lane_source is not None and claimed.provider_override:
+        with kbc.write_txn(conn):
+            kb._append_event(conn, claimed.id, "dispatch_lane_route", {
+                "provider": claimed.provider_override, "model": claimed.model_override,
+            }, run_id=claimed.current_run_id)
     rid = None
     plan = None
     if pool_host is not None and signal is not None and signal.placement_table is not None:
