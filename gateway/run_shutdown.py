@@ -938,16 +938,16 @@ class GatewayShutdownMixin:
         # ONE sessions.json save per pass, not one per session (t_edfc146c: 10 per-mark rewrites of a
         # 1.5 MB file took 11.1 s of the 50 s stop budget). The batch only defers the save; the
         # per-session decision, PHASE=shutdown_mark line and replay alert are unchanged.
-        _store = self.session_store
-        _batched = False
+        _todo = [_sk for _sk, _agent in list(self._running_agents.items()) if _agent is not _AGENT_PENDING_SENTINEL]
+        if not _todo:
+            return marked
+        _store = None
         _t0 = time.monotonic()
         with _log_suppressed(logging.WARNING, "%s: could not open the mark batch: %s", log_prefix):
-            await asyncio.to_thread(_store.begin_resume_mark_batch)
-            _batched = True
+            await asyncio.to_thread(self.session_store.begin_resume_mark_batch)
+            _store = self.session_store
         try:
-            for _sk, _agent in list(self._running_agents.items()):
-                if _agent is _AGENT_PENDING_SENTINEL:
-                    continue
+            for _sk in _todo:
                 with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                     if callable(_mark_fork):
                         _marked, _reason, _alert = await asyncio.to_thread(_mark_fork, _sk, interrupted=interrupted)
@@ -959,7 +959,7 @@ class GatewayShutdownMixin:
                         await self.async_session_store.mark_resume_pending(_sk, reason)
                         marked.append(_sk)
         finally:
-            if _batched:
+            if _store is not None:
                 # FAIL-OPEN: a failed save is logged and never aborts the stop.
                 with _log_suppressed(logging.WARNING, "%s: batched sessions.json save failed: %s", log_prefix):
                     await asyncio.to_thread(_store.end_resume_mark_batch)
