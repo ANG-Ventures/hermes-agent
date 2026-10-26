@@ -456,3 +456,77 @@ def test_compacted_resync_onto_empty_mirror_row_never_reopens_delivery(monkeypat
     ad.restore_undelivered_completions(q)
     assert q.empty(), "a delivered completion is never replayed"
     assert ad.get_durable_delegation(identifier)["result"] == result
+
+
+# Prism f-0eee9075234c750b / f-c1639a34a054a6d2 ────────────────────────────────
+
+def test_delivered_ack_backs_up_the_registry_it_locked_even_if_cwd_moves(tmp_path, monkeypatch):
+    """A relative ``profile_home`` is resolved ONCE: a cwd change after the load must not make the
+    pre-compaction backup copy another profile while this one is compacted without a backup."""
+    now = time.time()
+    rec = _record(random.Random(7), 3, now, state="done", age=30, pending=True, payload_kb=2)
+    event_id = rec["outbox"][0]["event_id"]
+    dirs = {}
+    for name in ("A", "B"):
+        root = tmp_path / name
+        path = root / "profile" / "state" / "async-delegations.json"
+        store._prepare_directory(path)
+        store._write(path, {"schema_version": store.SCHEMA_VERSION, "updated_at": now,
+                            "records": {rec["delegation_id"]: json.loads(json.dumps(rec))}})
+        dirs[name] = path
+    b_before = dirs["B"].read_bytes()
+    _clear_cache()
+    monkeypatch.chdir(tmp_path / "A")
+    real_load = store._load
+
+    def load_then_cwd_moves(*args, **kwargs):
+        result = real_load(*args, **kwargs)
+        os.chdir(tmp_path / "B")  # another thread changes cwd mid-transaction
+        return result
+
+    monkeypatch.setattr(store, "_load", load_then_cwd_moves)
+    assert store.acknowledge(event_id, outcome="delivered", profile_home=Path("profile"))
+    monkeypatch.setattr(store, "_load", real_load)
+
+    a_backups = list(dirs["A"].parent.glob(f"{dirs['A'].name}.pre-compact-*"))
+    assert len(a_backups) == 1, "the registry that was compacted must be the one backed up"
+    backed_up = json.loads(a_backups[0].read_text())["records"][rec["delegation_id"]]["outbox"][0]
+    assert not _compacted(backed_up["payload"]) and backed_up["payload"].get("results")
+    assert _compacted(json.loads(dirs["A"].read_text())["records"][rec["delegation_id"]]["outbox"][0]["payload"])
+    assert not list(dirs["B"].parent.glob(f"{dirs['B'].name}.pre-compact-*")), "B must be untouched"
+    assert dirs["B"].read_bytes() == b_before
+
+
+def test_windows_never_skips_content_verification_on_a_stamp_hit(monkeypatch):
+    """On Windows ``st_ctime_ns`` is creation time, so a same-size in-place rewrite that restores
+    the mtime keeps the whole stamp: content verification must stay on there."""
+    path, _ = _seed(time.time())
+    old = time.time() - 60
+    os.utime(path, (old, old))
+    _clear_cache()
+    monkeypatch.setattr(sys, "platform", "win32")
+    creation_ns = path.stat().st_mtime_ns  # Windows ctime: creation time, never moved by writes
+    real_fstat = os.fstat
+
+    class _WinStat:
+        def __init__(self, st):
+            self._st = st
+
+        def __getattr__(self, name):
+            return creation_ns if name == "st_ctime_ns" else getattr(self._st, name)
+
+    monkeypatch.setattr(store.os, "fstat", lambda fd: _WinStat(real_fstat(fd)))
+    with store.locked_registry(write=False) as registry:
+        assert "_invalid_record_ids" not in registry
+    with store.locked_registry(write=False):
+        pass  # a confirmed hit past the hash window
+    st = path.stat()
+    raw = path.read_bytes()
+    needle = b'"last_error": null'
+    at = raw.index(needle)
+    forged = raw[:at] + b'"last_error": 1234' + raw[at + len(needle):]
+    with open(path, "r+b") as fh:
+        fh.write(forged)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # the full (Windows) stamp is unchanged
+    with store.locked_registry(write=False) as registry:
+        assert registry.get("_invalid_record_ids"), "a same-stamp rewrite must be re-read on Windows"

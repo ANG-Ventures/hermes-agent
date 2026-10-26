@@ -13,6 +13,7 @@ import math
 import logging
 import marshal
 import os
+import sys
 import threading
 import time
 import traceback
@@ -182,6 +183,12 @@ _REGISTRY_CACHE_LOCK = threading.Lock()
 _CACHE_HASH_WINDOW_SECONDS = 2.0
 
 
+def _ctime_is_creation_time() -> bool:
+    """On Windows ``st_ctime_ns`` is creation time, not the last metadata change: a same-size
+    in-place rewrite that restores the mtime keeps the whole stamp, so every hit is content-verified."""
+    return os.name == "nt" or sys.platform.startswith(("win", "cygwin"))
+
+
 def _invalidate_cache(path: Path) -> None:
     with _REGISTRY_CACHE_LOCK:
         _REGISTRY_CACHE.pop(str(path), None)
@@ -229,7 +236,7 @@ def _load(
             # rewrite in that tick would leave the stat key unchanged, so confirm by content.
             # Once a confirmed hit lands past the window, any later rewrite moves the ctime.
             changed = max(st.st_mtime_ns, st.st_ctime_ns) / 1e9
-            if cached[2] - changed < _CACHE_HASH_WINDOW_SECONDS:
+            if _ctime_is_creation_time() or cached[2] - changed < _CACHE_HASH_WINDOW_SECONDS:
                 raw = handle.read()
             if raw is None or hashlib.sha256(raw).hexdigest() == cached[1]:
                 if raw is not None and now - changed >= _CACHE_HASH_WINDOW_SECONDS:
@@ -415,14 +422,19 @@ def locked_registry(
     *,
     timeout: float = 5.0,
     write: bool = True,
+    path: Path | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Lock, load, and optionally atomically persist one profile registry.
 
     ``write=False`` yields the process-wide cached registry: it is READ-ONLY (every in-tree
     write=False caller only reads, or copies before handing data out). ``write=True`` yields a
-    private copy, so a writer can never mutate the cache in place.
+    private copy, so a writer can never mutate the cache in place. ``path`` (an already-resolved
+    registry path) lets a caller that needs the path again (backup) use the very file locked here.
     """
-    path = registry_path(profile_home)
+    if path is None:
+        path = registry_path(profile_home)
+    elif profile_home is not None:
+        raise ValueError("pass profile_home or path, not both")
     lpath = path.with_suffix(".lock")  # Same captured home, even if cwd/symlink changes.
     _prepare_directory(path)
     deadline = time.monotonic() + max(0.0, timeout)
@@ -844,7 +856,7 @@ def persist_dispatch(
     path = registry_path(profile_home)
     try:
         _assert_nonsecret_settings(durable_spec)
-        with locked_registry(profile_home) as registry:
+        with locked_registry(path=path) as registry:
             _prune(registry, now, path)
             if len(registry["records"]) >= record_limit:
                 logger.error(
@@ -2391,9 +2403,10 @@ def acknowledge(
         return admit(event_id, profile_home=profile_home, **(admission or {}))
     if outcome not in {"delivered", "dropped"}:
         raise ValueError("outcome must be delivered, dropped or admitted")
-    # Resolve once: the lock, the backup and the persist all name this file even if cwd moves.
+    # Resolve ONCE: the lock, the pre-compaction backup and the persist must all hit the same file
+    # even if a relative profile home's cwd changes mid-transaction (Prism f-0eee9075234c750b).
     path = registry_path(profile_home)
-    with locked_registry(path.parent.parent) as registry:
+    with locked_registry(path=path) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
             if str(delegation_id) in invalid_record_ids:
