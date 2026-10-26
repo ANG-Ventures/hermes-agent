@@ -238,13 +238,38 @@ _EXCLUDED_ROOT_FILE_PATH_GLOBS = (
     ("profiles", "*", "state.db"),
     ("profiles", "*", "lcm.db"),
     ("profiles", "*", "lcm-archive.db"),
-    # 2026-10-26 (t_87fd92a8): one <ulid>.done.json + <ulid>.result.json pair per FINISHED land request (26 k
-    # files). land_request.py also appends each request with its status/rc/detail as a `land-request` row to
-    # state/merge-ledger.jsonl (13,068 rows vs 13,061 pairs), which stays in; only the result's output_tail and
-    # readback are not in the ledger. Queue files (<ulid>.json, .inflight, .parked.json, .unparked.json) stay in.
-    ("var", "land-requests", "*.done.json"),
-    ("var", "land-requests", "*.result.json"),
+    # var/land-requests/<ulid>.done.json + .result.json pairs are NOT a path rule: see _is_stale_land_pair.
 )
+
+# 2026-10-26 (t_87fd92a8, Prism cc81fb1d8a06): one <ulid>.done.json + <ulid>.result.json pair per land request
+# (26 k files). A done pair is NOT always history: a result whose status is ARMED/QUEUED is a live auto-merge
+# intent, and readers decide current state from the pair files themselves, not from state/merge-ledger.jsonl:
+# kanban_terminal_pending (6 h, extends an approved card's claim), apollo-land-autopilot re-arm (72 h),
+# fleet-merge-horizon-watch (72 h), mq_eviction_watch (48 h). So only pairs whose NEWER half is older than every
+# such horizon are pruned, both halves together, and a pair with a half missing or a <ulid>.parked.json (park()
+# finishes the request but it stays live until .unparked.json) is kept. Queue files are never pruned.
+_LAND_REQUEST_DIR = ("var", "land-requests")
+_LAND_PAIR_SUFFIXES = (".done.json", ".result.json")
+_LAND_PAIR_KEEP_S = 7 * 86400
+
+
+def _is_stale_land_pair(hermes_root: Path, rel_path: Path, now: Optional[float] = None) -> bool:
+    """True when *rel_path* is half of a finished land-request pair that no live reader can still need."""
+    parts = rel_path.parts
+    if len(parts) != 3 or parts[:2] != _LAND_REQUEST_DIR:
+        return False
+    sfx = next((s for s in _LAND_PAIR_SUFFIXES if parts[2].endswith(s)), None)
+    uid = parts[2][: -len(sfx)] if sfx else ""
+    if not uid:
+        return False
+    d = hermes_root.joinpath(*_LAND_REQUEST_DIR)
+    if (d / f"{uid}.parked.json").exists() and not (d / f"{uid}.unparked.json").exists():
+        return False
+    try:
+        newest = max((d / f"{uid}{s}").stat().st_mtime for s in _LAND_PAIR_SUFFIXES)
+    except OSError:
+        return False  # a half is missing: not provably a finished pair
+    return (time.time() if now is None else now) - newest > _LAND_PAIR_KEEP_S
 
 # Git checkouts below the root (any dir holding a ``.git`` file or dir, the root's own checkout excluded) carry
 # only what exists nowhere else: tracked files that differ from HEAD plus every untracked file (t_e95deca8's
@@ -654,7 +679,7 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             # zipfile.write() follows file symlinks, so skip links before any archive write can
             # copy data from outside HERMES_HOME; never archive the output zip into itself, neither
             # published nor as its open staging file (a re-scan runs while that file is growing).
-            if _should_exclude(rel):
+            if _should_exclude(rel) or _is_stale_land_pair(hermes_root, rel):
                 continue
             if clean and Path(*rel.parts[len(co_parts):]).as_posix() in clean:
                 continue  # tracked + unmodified in a git checkout: the repository and its remotes have it
