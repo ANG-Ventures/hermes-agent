@@ -134,13 +134,14 @@ class ReleaseSuperseded(ValueError):
     """``--if-latest-release <id>``: a newer release-bearing comment exists (or ``<id>`` is unknown)."""
 
 
-def newer_release_comment(conn, task_id: str, comment_id: int) -> Optional[str]:
+def newer_release_comment(conn, task_id: str, comment_id: int, new_body: str = "") -> Optional[str]:
     """Why ``comment_id`` is NOT the card's latest release-bearing comment, or None when it is.
 
     Release-bearing = a ``close-on:`` line (``close_on.LINE_RE``) in a comment that is not
     automation (:data:`MACHINE_AUTHORS`, ``our_authors.is_machine``). Order is the closer's:
     ``(created_at, id)``. Fails closed: an unknown id, one on another card, or an anchor that is
-    not itself release-bearing (Prism 1a7315c3ea79) is a refusal.
+    not itself release-bearing (Prism 1a7315c3ea79) is a refusal, and so is a newer operator
+    ``review_coverage`` gate (Prism 2918b8f9f46e, :func:`_newer_coverage_gate`) unless ``new_body`` restates it.
     Called inside the comment insert's write transaction (Prism 3406ba8bbfd9 / f3498875f176)."""
     row = conn.execute("SELECT task_id, created_at, author, body FROM task_comments WHERE id = ?",
                        (int(comment_id),)).fetchone()
@@ -171,7 +172,40 @@ def newer_release_comment(conn, task_id: str, comment_id: int) -> Optional[str]:
             (task_id, int(comment_id), at, at, int(comment_id))):
         if release_bearing(author, body):
             return f"comment {cid} ({author}) is a newer release-bearing comment than {comment_id}"
-    return None
+    return _newer_coverage_gate(conn, task_id, int(comment_id), lib, authors, line_re, new_body)
+
+
+# Who may set a card's machine gate, the merge pass's close_on_trusted(): Apollo, a human, Argus, a conversion.
+_GATE_TRUSTED = ("argus", "close-on-convert")
+_COVERAGE_SRC_RE = re.compile(r"review_coverage comment (\d+) ")
+
+
+def _newer_coverage_gate(conn, task_id, comment_id, lib, authors, line_re, new_body) -> Optional[str]:
+    """Prism 2918b8f9f46e: an operator ``review_coverage`` record carrying ``close_on`` (or a HOLD verdict without
+    one) is a gate ``close_on.release()`` never reads. When ``close_on.latest()``, with the merge pass's trust rule,
+    names such a record as the card's current gate (newest wins, so it is not older than the anchor), the append
+    would supersede it: refuse, unless that gate is the very line being appended. Fails closed when the grammar's
+    ``latest`` or ``our_authors.is_ours`` is unavailable or ``latest`` raises."""
+    latest, is_ours = getattr(lib, "latest", None), getattr(authors, "is_ours", None)
+    if latest is None or is_ours is None:
+        return "close_on.latest / our_authors.is_ours cannot be loaded; refusing the conditional append"
+
+    def trusted(author) -> bool:
+        a = str(author or "").strip().lower()
+        return bool(is_ours(a)) or a.startswith("human:") or a in _GATE_TRUSTED
+
+    try:
+        st = latest(conn, task_id, trusted=trusted, is_machine=authors.is_machine)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable gate is a refusal, never a pass
+        return f"the card's latest close gate cannot be read ({exc}); refusing the conditional append"
+    m = _COVERAGE_SRC_RE.match(str((st or {}).get("source") or ""))
+    if not m or int(m.group(1)) == comment_id:
+        return None
+    cid = int(m.group(1))
+    gates = [g.group("gate") for g in line_re.finditer(str(new_body or ""))]
+    if gates and " ".join(gates[-1].split()) == " ".join(str(st.get("raw") or "").split()):
+        return None
+    return (f"comment {cid} is a newer operator review_coverage gate `{str(st.get('raw'))[:120]}` than {comment_id}")
 
 
 def refusal(author: str, body: str) -> Optional[str]:

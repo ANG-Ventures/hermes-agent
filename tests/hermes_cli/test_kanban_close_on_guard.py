@@ -26,6 +26,7 @@ ACK_1047 = ("DEADMAN ACK (Apollo 11:25 PT): #4737 MERGED a9fd8b9fc7. The closer 
             "`close-on: merged` posted above; the next review-merge-pass tick completes this card.")
 
 CLOSE_ON_LIB = textwrap.dedent(r'''
+    import json
     import re
     LINE_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?[*_`]*close-on[*_`]*[ \t]*:[*_`]*[ \t]*(?P<gate>[^\n]*)$", re.I | re.M)
 
@@ -39,9 +40,46 @@ CLOSE_ON_LIB = textwrap.dedent(r'''
         if re.fullmatch(r"[0-9a-f]{12}", head) and text.strip():
             return {"kind": "cron"}
         return None
+
+    def _hold_verdict(rec):
+        v = re.sub(r"[-\s]+", "_", str(rec.get("verdict") or "").strip().upper())
+        return v in ("CHANGES_REQUESTED", "REQUEST_CHANGES", "BLOCK", "BLOCKED", "REJECT", "REJECTED")
+
+    def latest(con, tid, trusted=lambda a: True, is_machine=lambda b: False, prose_gate=None, include_block=False):
+        # The comment half of scripts/lib/close_on.latest(): close-on lines (order 1), review_coverage records
+        # carrying close_on or a HOLD verdict (order 2); newest (created_at, order) wins.
+        found = []
+        for cid, author, body, t in con.execute("SELECT id, author, body, created_at FROM task_comments "
+                                                "WHERE task_id=? ORDER BY created_at, id", (tid,)):
+            if is_machine(body) or not trusted(author):
+                continue
+            for m in LINE_RE.finditer(body or ""):
+                found.append((int(t or 0), 1, m.group("gate").strip(), None, f"comment {cid} ({author})"))
+            for line in str(body or "").splitlines():
+                s = line.strip()
+                if not s.startswith("review_coverage:"):
+                    continue
+                try:
+                    rec = json.loads(s.split(":", 1)[1].strip())
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("close_on"):
+                    found.append((int(t or 0), 2, str(rec["close_on"]), None, f"review_coverage comment {cid} ({author})"))
+                elif _hold_verdict(rec):
+                    found.append((int(t or 0), 2, "(review_coverage %s without close_on)" % rec.get("verdict"), None,
+                                  f"review_coverage comment {cid} ({author})"))
+        if not found:
+            return None
+        t, _, raw, p, src = max(found, key=lambda f: (f[0], f[1]))
+        return {"raw": raw, "parsed": p, "source": src, "at": t}
 ''')
 
 OUR_AUTHORS_LIB = textwrap.dedent('''
+    def is_ours(author):
+        return isinstance(author, str) and author.strip().lower() in ("apollo", "default", "human:apollo")
+
     def is_machine(body):
         return isinstance(body, str) and body.lstrip().startswith("[review-merge-pass]")
 ''')
@@ -304,9 +342,9 @@ def test_if_latest_release_check_shares_the_insert_transaction(fleet, monkeypatc
     seen = []
     real = guard.newer_release_comment
 
-    def spy(conn, task_id, cid):
+    def spy(conn, task_id, cid, new_body=""):
         seen.append(conn.in_transaction)
-        return real(conn, task_id, cid)
+        return real(conn, task_id, cid, new_body)
 
     monkeypatch.setattr(guard, "newer_release_comment", spy)
     with kb.connect_closing() as conn:
@@ -341,3 +379,56 @@ def test_if_latest_release_fails_closed_without_the_automation_classifier(fleet)
         with kb.connect_closing() as conn:
             kb.add_comment(conn, tid, "daedalus", "close-on: merged", if_latest_release=c2)
     assert _comments(tid) == [HOLD, "[review-merge-pass]\nclose-on: merged"]
+
+
+def _coverage(rec):
+    return "review_coverage: " + json.dumps(rec)
+
+
+def test_if_latest_release_refuses_when_an_operator_coverage_gate_arrived_after_the_check(fleet, capsys):
+    """Prism 2918b8f9f46e: the merge pass's statement check passes on hold c1, then an operator posts a
+    review_coverage record with a different close_on (a gate close_on.release() never reads), then the conditional
+    insert anchored on c1 must refuse (rc 3) and write nothing."""
+    home, tid = fleet
+    c1 = _post(tid, "apollo", HOLD)
+    lib = guard._load("close_on")
+    with kb.connect_closing() as conn:   # the merge pass's statement check: the hold is the card's latest gate
+        assert lib.latest(conn, tid)["source"].startswith(f"comment {c1} (")
+    gate = _coverage({"verdict": "APPROVE", "close_on": "pr-merged o/r#9"})
+    c2 = _post(tid, "apollo", gate)
+    rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))
+    assert rc == 3 and f"comment {c2}" in err and "review_coverage" in err, err
+    assert _comments(tid) == [HOLD, gate]
+    # a HOLD verdict without close_on is a newer manual statement: same refusal
+    hold = _coverage({"verdict": "CHANGES_REQUESTED"})
+    _post(tid, "human:ace", hold)
+    rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))
+    assert rc == 3 and "review_coverage" in err, err
+
+
+def test_if_latest_release_ignores_a_coverage_record_the_closer_does_not_trust(fleet, capsys):
+    """An implementer's review_coverage close_on is not a gate (close_on_trusted): the append still posts."""
+    _, tid = fleet
+    c1 = _post(tid, "apollo", HOLD)
+    _post(tid, "daedalus", _coverage({"verdict": "APPROVE", "close_on": "pr-merged o/r#9"}))
+    _post(tid, "default", "[review-merge-pass] " + _coverage({"close_on": "pr-merged o/r#9"}))
+    assert _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))[0] == 0
+    assert _comments(tid)[-1] == "close-on: merged"
+
+
+def test_if_latest_release_passes_when_the_coverage_gate_is_the_line_being_posted(fleet, capsys):
+    _, tid = fleet
+    c1 = _post(tid, "apollo", HOLD)
+    _post(tid, "apollo", _coverage({"verdict": "APPROVE", "close_on": "merged"}))
+    assert _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))[0] == 0
+
+
+def test_if_latest_release_fails_closed_without_close_on_latest(fleet, capsys):
+    home, tid = fleet
+    c1 = _post(tid, "apollo", HOLD)
+    lib = home / "scripts" / "lib" / "close_on.py"
+    lib.write_text(CLOSE_ON_LIB.replace("def latest(", "def _gone("), encoding="utf-8")
+    guard._LIB_CACHE.clear()
+    rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))
+    assert rc == 3 and "close_on.latest" in err, err
+    assert _comments(tid) == [HOLD]

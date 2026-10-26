@@ -8078,7 +8078,7 @@ def _add_comment_txn(
                 ReleaseSuperseded, newer_release_comment,
             )
 
-            why = newer_release_comment(conn, task_id, if_latest_release)
+            why = newer_release_comment(conn, task_id, if_latest_release, body)
             if why:
                 raise ReleaseSuperseded(why)
         cur = conn.execute(
