@@ -2679,13 +2679,23 @@ def _fast_job_view(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """``(usable, record)``: the cached definition + its committed row, with no ``_jobs_lock``
     needed (the definition cache has its own lock; the row is one SQLite read). ``usable`` is
     False when only the full ``load_jobs()`` path can answer (repair, pending generation, a
-    row-less job whose runtime still sits in jobs.json)."""
+    row-less job whose runtime still sits in jobs.json).
+
+    Prism d580516d5fa5: without ``_jobs_lock`` an export (``retire=True``) can fold the row into
+    jobs.json and delete it between the definition read and the row read; the stale
+    ``file_runtime`` would then hand out a record without its claim. jobs.json is replaced by
+    rename on every write, so an unchanged stamp across both reads proves the pair is one
+    generation; a changed one falls back to the locked path."""
+    jobs_file = _current_cron_store().jobs_file
+    stamp = _jobs_file_stamp(jobs_file)  # BEFORE the definition read (fail-safe on a race)
     usable, definition, file_runtime = _cached_definition(job_id)
     if not usable:
         return False, None
     if definition is None:
         return True, None
     row = _read_one_row(job_id)
+    if stamp is None or _jobs_file_stamp(jobs_file) != stamp:
+        return False, None
     if row is None and file_runtime:
         return False, None
     _rs.apply_runtime(definition, row or {})

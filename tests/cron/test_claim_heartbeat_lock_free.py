@@ -136,3 +136,56 @@ def test_json_mode_heartbeat_still_takes_the_locked_path(temp_home, monkeypatch)
     assert not (temp_home / "cron" / "runtime_state.db").exists()
     assert cj._refresh_claim_unlocked(created["id"], "fire_claim", owner, once_only=False) is None
     assert cj.heartbeat_fire_claim(created["id"], expected_owner=owner) is True
+
+
+def test_fence_revalidates_definition_after_unlocked_row_read(temp_home, monkeypatch):
+    """Prism d580516d5fa5: the unlocked view reads the cached definition, then the row. An
+    ``export_runtime_to_json(retire=True)`` in between folds the claim into jobs.json and
+    removes the row; the stale ``file_runtime=False`` must not turn that into a claim-less
+    record (the legitimate owner would read as lost and drop its output)."""
+    import json
+
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    (jid, owner), = _claimed_jobs(cj, 1)
+    jobs_file = temp_home / "cron" / "jobs.json"
+    data = json.loads(jobs_file.read_text())
+    data["jobs"] = [rs.strip_runtime(j) for j in data["jobs"]]  # definition-only mirror
+    jobs_file.write_text(json.dumps(data))
+    assert cj._cached_definition(jid)[2] is False  # file carries no runtime for the job
+
+    real_read = cj._read_one_row
+    fired = []
+
+    def read_after_export(job_id):
+        if not fired:
+            fired.append(cj.export_runtime_to_json(retire=True))
+        return real_read(job_id)
+
+    monkeypatch.setattr(cj, "_read_one_row", read_after_export)
+    with cj.fire_claim_fence(jid, expected_owner=owner) as owns:
+        assert fired == [1]
+        assert owns is True
+
+
+def test_unlocked_heartbeat_mirror_flush_still_takes_the_cross_process_flock(temp_home,
+                                                                            monkeypatch):
+    """Prism 8ed4073eaf1e: the heartbeat's try-acquire of the in-process lock only gates the
+    flush; the flush itself (``maybe_flush_runtime_mirror``) still writes jobs.json inside a
+    full ``_jobs_lock()`` section, so the cross-process flock on .jobs.lock is held."""
+    from cron import jobs as cj
+
+    (jid, owner), = _claimed_jobs(cj, 1)
+    monkeypatch.setenv("HERMES_CRON_MIRROR_INTERVAL_S", "0")
+    real_save = cj._save_jobs_unlocked
+    seen = []
+
+    def spy_save(*a, **kw):
+        seen.append((kw.get("mirror_only"), cj._jobs_lock_state.depth,
+                     cj._jobs_lock_state.degraded))
+        return real_save(*a, **kw)
+
+    monkeypatch.setattr(cj, "_save_jobs_unlocked", spy_save)
+    assert cj.heartbeat_fire_claim(jid, expected_owner=owner) is True
+    assert (True, 1, False) in seen, seen  # mirror written under the flocked section
