@@ -207,3 +207,50 @@ def test_nested_create_survives_outer_stale_save(hermes_env):
     ids = {j["id"] for j in load_jobs()}
     assert created["id"] in ids, "nested create was clobbered by outer stale save"
     assert seed["id"] in ids
+
+
+def test_stale_save_does_not_resurrect_a_sibling_api_removal(hermes_env):
+    """t_0cae2938 (Studio 10-26, ffe40c023e7f): a writer loads, a sibling removes a job through the API
+    (journaled `removed`), the writer saves its stale payload. The row must stay gone: written back it
+    runs again with no `created` event, and the journal no longer describes the store."""
+    import cron.jobs as jobs
+    from cron.jobs import create_job, load_jobs
+    from cron.lifecycle_journal import JOURNAL_FILENAME, record_removed
+
+    keep = create_job(prompt="keep", schedule="every 5m", name="keep", deliver="local")
+    gone = create_job(prompt="gone", schedule="every 5m", name="gone", deliver="local")
+    jobs_file = jobs._current_cron_store().jobs_file
+
+    with jobs._jobs_lock():
+        stale = jobs.load_jobs()
+        # the sibling's API removal, under a degraded lock: row off disk, `removed` journaled
+        data = json.loads(jobs_file.read_text(encoding="utf-8"))
+        data["jobs"] = [j for j in data["jobs"] if j["id"] != gone["id"]]
+        jobs_file.write_text(json.dumps(data), encoding="utf-8")
+        record_removed(gone["id"])
+        for j in stale:
+            if j["id"] == keep["id"]:
+                j["name"] = "keep-renamed"   # this writer's own edit still lands
+        jobs._save_jobs_unlocked(stale)
+
+    by_id = {j["id"]: j for j in load_jobs()}
+    assert gone["id"] not in by_id, "stale save resurrected a job the API removed"
+    assert by_id[keep["id"]]["name"] == "keep-renamed"
+    events = [json.loads(ln)["event"] for ln in (hermes_env / "cron" / JOURNAL_FILENAME).read_text().splitlines()
+              if json.loads(ln)["job_id"] == gone["id"]]
+    assert events == ["created", "removed"]
+
+
+def test_stale_save_keeps_a_row_the_journal_does_not_say_was_removed(hermes_env):
+    """The guard reads the journal, not mere absence: a row missing from disk with no `removed` event (a
+    non-API writer dropped it) is written back as before (#80624's lost-write repair)."""
+    import cron.jobs as jobs
+    from cron.jobs import create_job, load_jobs
+
+    lost = create_job(prompt="lost", schedule="every 5m", name="lost", deliver="local")
+    jobs_file = jobs._current_cron_store().jobs_file
+    with jobs._jobs_lock():
+        stale = jobs.load_jobs()
+        jobs_file.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+        jobs._save_jobs_unlocked(stale)
+    assert lost["id"] in {j["id"] for j in load_jobs()}
