@@ -586,6 +586,9 @@ _SPECS = [
                   "text with backticks or $(...): the shell never sees it."),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
+        _arg("--if-latest-release", type=int, metavar="COMMENT_ID",
+             help="Append only while COMMENT_ID is still the card's newest release-bearing "
+                  "(close-on:) comment, checked in the insert's transaction; else exit 3, nothing written"),
         _WHY,
     ], help="Append a comment"),
     _cmd("attach", [

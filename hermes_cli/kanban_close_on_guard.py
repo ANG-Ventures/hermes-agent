@@ -23,6 +23,7 @@ Operator off-switch: ``<fleet root>/state/close-on-comment-policy-off`` (the hoo
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -122,6 +123,146 @@ def check_comment(author: str, body: str) -> None:
             f"{REFUSAL_HINT}. Valid: `close-on: merged`, `close-on: <cron-id> <text>`, "
             "`close-on: <ISO-8601 with offset> <text>`, or a close-on predicate / `manual:` gate."
         )
+
+
+# Fallback when the fleet grammar cannot be loaded: the same shape as close_on.LINE_RE. The
+# conditional append fails CLOSED, so it needs a line matcher even when the guard above fails open.
+_LINE_RE_FALLBACK = re.compile(
+    r"^[ \t]*(?:[-*][ \t]+)?[*_`]*close-on[*_`]*[ \t]*:[*_`]*[ \t]*(?P<gate>[^\n]*)$", re.I | re.M)
+
+
+class ReleaseSuperseded(ValueError):
+    """``--if-latest-release <id>``: a newer release-bearing comment exists (or ``<id>`` is unknown)."""
+
+
+def newer_release_comment(conn, task_id: str, comment_id: int, new_body: str = "", author: str = "",
+                          now: Optional[int] = None) -> Optional[str]:
+    """Why ``comment_id`` is NOT the card's latest release-bearing comment, or None when it is.
+
+    Release-bearing = a ``close-on:`` line (``close_on.LINE_RE``) in a comment whose author and body pass
+    :func:`gate_setter_from` (Prism 70d6e09af5e2: the ONE trust rule, shared with the coverage-gate check). Order is
+    the closer's: ``(created_at, id)``. Fails closed: an unknown id, one on another card, or an anchor that is not
+    itself release-bearing (Prism 1a7315c3ea79) is a refusal, and so is a newer operator ``review_coverage`` gate
+    (Prism 2918b8f9f46e, :func:`_newer_coverage_gate`) unless the whole appended body restates it (Prism
+    85d133b843df). Called inside the comment insert's write transaction (Prism 3406ba8bbfd9 / f3498875f176)."""
+    row = conn.execute("SELECT task_id, created_at, author, body FROM task_comments WHERE id = ?",
+                       (int(comment_id),)).fetchone()
+    if row is None or row[0] != task_id:
+        return f"comment {comment_id} is not a comment on {task_id}"
+    lib, authors, ops = _load("close_on"), _load("our_authors"), _load("operator_identity")
+    gate_setter = gate_setter_from(authors, ops)
+    if gate_setter is None:
+        # Without the automation-marker classifier a [review-merge-pass] comment posted as `default` would read as
+        # human and could hide an older operator hold (Prism 1a7315c3ea79); without operator_identity an operator's
+        # newer gate is invisible (Prism f9c75767e0e1). The conditional append fails CLOSED.
+        return ("our_authors.is_ours / our_authors.is_machine / operator_identity.is_operator cannot be loaded; "
+                "refusing the conditional append")
+    line_re = getattr(lib, "LINE_RE", None) or _LINE_RE_FALLBACK
+
+    def release_bearing(author_, body) -> bool:
+        return gate_setter(author_, body) and bool(line_re.search(str(body or "")))
+
+    if not release_bearing(row[2], row[3]):
+        return f"comment {comment_id} ({row[2]}) is not a release-bearing comment"
+    at = int(row[1] or 0)
+    for cid, author_, body in conn.execute(
+            "SELECT id, author, body FROM task_comments WHERE task_id = ? AND id != ? "
+            "AND (created_at > ? OR (created_at = ? AND id > ?)) ORDER BY created_at, id",
+            (task_id, int(comment_id), at, at, int(comment_id))):
+        if release_bearing(author_, body):
+            return f"comment {cid} ({author_}) is a newer release-bearing comment than {comment_id}"
+    return _newer_coverage_gate(conn, task_id, int(comment_id), lib, authors, line_re, gate_setter,
+                                new_body, author, now)
+
+
+def gate_setter_from(authors, ops):
+    """THE predicate for "who may set a card's gate" -> ``gate_setter(author, body) -> bool``, or None when a piece
+    of it cannot be loaded. It is the merge pass's land_pr_release write-boundary rule (hermes-home#6559, Prism
+    f9c75767e0e1): ``our_authors.is_ours``, ``human:*``, Argus, the close-on conversion, or
+    ``operator_identity.is_operator``; a body that leads with an automation marker (``our_authors.is_machine``) is
+    never a gate, whoever posted it. Both the newer-release scan and the coverage-gate check route through it
+    (Prism 70d6e09af5e2), so they cannot disagree about a conversion's gate."""
+    is_ours, is_machine = getattr(authors, "is_ours", None), getattr(authors, "is_machine", None)
+    is_operator = getattr(ops, "is_operator", None)
+    if is_ours is None or is_machine is None or is_operator is None:
+        return None
+
+    def gate_setter(author, body) -> bool:
+        a = str(author or "").strip().lower()
+        trusted = bool(is_ours(a)) or a.startswith("human:") or a in _GATE_TRUSTED or bool(is_operator(a))
+        return trusted and not is_machine(body)
+
+    return gate_setter
+
+
+_GATE_TRUSTED = ("argus", "close-on-convert")
+_COVERAGE_SRC_RE = re.compile(r"review_coverage comment (\d+) ")
+
+
+def _body_gates(body, line_re) -> list[str]:
+    """Every gate the body states: each ``close-on:`` line and each ``review_coverage`` record's ``close_on`` (a HOLD
+    record without one counts as a gate no restate can match), whitespace-normalised."""
+    out = [" ".join(m.group("gate").split()) for m in line_re.finditer(str(body or ""))]
+    for line in str(body or "").splitlines():
+        s = line.strip()
+        if not s.startswith("review_coverage:"):
+            continue
+        try:
+            rec = json.loads(s.split(":", 1)[1].strip())
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(" ".join(str(rec.get("close_on") or "(review_coverage without close_on)").split()))
+    return out
+
+
+def _restates(conn, task_id, gate_raw, latest, authors, gate_setter, line_re, new_body, author, now) -> bool:
+    """Prism 85d133b843df: the appended body restates ``gate_raw`` only when (a) its author may set a gate and every
+    gate it states, close-on lines and review_coverage records alike, is that gate, and (b) with the comment inserted,
+    the card's effective gate by ``close_on.latest()`` is still that gate. (b) runs the closer's own reader on a
+    tentative insert under a savepoint, rolled back before returning, so the whole body is judged, not one line."""
+    gates = _body_gates(new_body, line_re)
+    want = " ".join(str(gate_raw or "").split())
+    if not gates or any(g != want for g in gates) or not gate_setter(author, new_body):
+        return False
+    sp = "hermes_if_latest_release_probe"
+    conn.execute(f"SAVEPOINT {sp}")
+    try:
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                     (task_id, str(author or "").strip(), str(new_body or "").strip(), now))
+        st = latest(conn, task_id, trusted=lambda a: gate_setter(a, ""), is_machine=authors.is_machine)
+    finally:
+        conn.execute(f"ROLLBACK TO {sp}")
+        conn.execute(f"RELEASE {sp}")
+    return bool(st) and " ".join(str(st.get("raw") or "").split()) == want
+
+
+def _newer_coverage_gate(conn, task_id, comment_id, lib, authors, line_re, gate_setter, new_body, author,
+                         now) -> Optional[str]:
+    """Prism 2918b8f9f46e: an operator ``review_coverage`` record carrying ``close_on`` (or a HOLD verdict without
+    one) is a gate ``close_on.release()`` never reads. When ``close_on.latest()``, read with :func:`gate_setter_from`,
+    names such a record as the card's current gate (newest wins, so it is not older than the anchor), the append
+    would supersede it: refuse, unless the appended body restates that gate (:func:`_restates`). Fails closed when
+    ``close_on.latest`` is unavailable or raises."""
+    latest = getattr(lib, "latest", None)
+    if latest is None:
+        return "close_on.latest cannot be loaded; refusing the conditional append"
+    trusted = lambda a: gate_setter(a, "")  # noqa: E731 -- the author half; latest() applies is_machine itself
+    try:
+        st = latest(conn, task_id, trusted=trusted, is_machine=authors.is_machine)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable gate is a refusal, never a pass
+        return f"the card's latest close gate cannot be read ({exc}); refusing the conditional append"
+    m = _COVERAGE_SRC_RE.match(str((st or {}).get("source") or ""))
+    if not m or int(m.group(1)) == comment_id:
+        return None
+    cid = int(m.group(1))
+    try:
+        if _restates(conn, task_id, st.get("raw"), latest, authors, gate_setter, line_re, new_body, author,
+                     int(now if now is not None else (st.get("at") or 0))):
+            return None
+    except Exception as exc:  # noqa: BLE001 -- an unverifiable restate is a refusal
+        return f"the appended body's effective gate cannot be read ({exc}); refusing the conditional append"
+    return (f"comment {cid} is a newer operator review_coverage gate `{str(st.get('raw'))[:120]}` than {comment_id}")
 
 
 def refusal(author: str, body: str) -> Optional[str]:

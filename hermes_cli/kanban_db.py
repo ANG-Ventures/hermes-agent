@@ -7986,6 +7986,7 @@ def add_comment(
     run_id: Optional[int] = None,
     session_ref: Optional[str] = None,
     claimed_author: Optional[str] = None,
+    if_latest_release: Optional[int] = None,
 ) -> int:
     """Append a comment, recording who wrote it and from which run/session.
 
@@ -7998,6 +7999,12 @@ def add_comment(
     allowed to use (``kanban comment --author`` without the operator token).
     It is recorded on the ``commented`` event and the journal only; every
     reader of ``task_comments.author`` keeps seeing the real author.
+
+    ``if_latest_release`` is a comment id: the insert happens only while that
+    comment is still the card's newest release-bearing (``close-on:``) comment,
+    checked in the same write transaction, else
+    :class:`~hermes_cli.kanban_close_on_guard.ReleaseSuperseded` and nothing
+    is written (Prism 3406ba8bbfd9 / f3498875f176).
     """
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -8026,13 +8033,14 @@ def add_comment(
         try:
             return _add_comment_txn(
                 conn, task_id, author, body, run_id, session_ref, now,
-                claimed_author,
+                claimed_author, if_latest_release,
             )
         finally:
             conn.execute("PRAGMA query_only=ON")
             _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
     return _add_comment_txn(
-        conn, task_id, author, body, run_id, session_ref, now, claimed_author
+        conn, task_id, author, body, run_id, session_ref, now, claimed_author,
+        if_latest_release,
     )
 
 
@@ -8056,6 +8064,7 @@ def _add_comment_txn(
     session_ref: Optional[str],
     now: int,
     claimed_author: Optional[str] = None,
+    if_latest_release: Optional[int] = None,
 ) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -8064,6 +8073,14 @@ def _add_comment_txn(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        if if_latest_release is not None:
+            from hermes_cli.kanban_close_on_guard import (
+                ReleaseSuperseded, newer_release_comment,
+            )
+
+            why = newer_release_comment(conn, task_id, if_latest_release, body, author, now)
+            if why:
+                raise ReleaseSuperseded(why)
         cur = conn.execute(
             "INSERT INTO task_comments "
             "(task_id, author, body, run_id, session_ref, created_at) "
