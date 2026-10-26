@@ -6,6 +6,32 @@ docs of config.yaml.
 
 
 from hermes_cli.lazy_registry import LazyFilledDict
+from hermes_cli import load_lines as _load_lines
+
+
+def _kanban_cpu_lines() -> dict:
+    """The kanban dispatch_load_gate CPU keys from the fleet CPU-line registry (Ace 2026-10-26 04:40: "one central
+    registry that controls all of this for all the devices"): hermes-home ``fleet/placement-policy.json``
+    ``cpu_lines``, lane ``kanban``, this host, found via $HERMES_HOME and read by the vendored stdlib reader
+    ``hermes_cli/load_lines.py`` (byte-identical to hermes-home ``scripts/lib/load_lines.py``).
+    Registry present -> cpu_busy_pause + the four spill keys (a SET the gate validates). Registry absent (any
+    install without hermes-home) -> cpu_busy_pause 0.90 only (== the registry default), spill stays unarmed, and
+    nothing is printed (this module is imported by every CLI call). config.yaml
+    ``kanban.dispatch_load_gate.<key>`` stays an explicit override. The gateway builds its LoadGate at boot, so a
+    registry change is live at the next gateway restart."""
+    try:
+        block, _src = _load_lines.load()
+    except Exception:  # noqa: BLE001 -- a broken registry must never break config import
+        block = None
+    if block is None:
+        return {"cpu_busy_pause": 0.90}  # load-lines: fallback (== cpu_lines.default.admit)
+    h = _load_lines.host_id()
+    line = lambda kind: _load_lines.resolve(h, "kanban", kind)[0]  # noqa: E731
+    return {"cpu_busy_pause": line("admit"), "cpu_spill": line("spill"), "spill_fraction": line("spill"),
+            "cpu_spill_resume": line("resume"), "cpu_pause": line("hot")}
+
+
+_KANBAN_CPU = _kanban_cpu_lines()
 
 
 #: Image every container terminal backend (docker/modal/daytona/singularity) uses unless the
@@ -2462,7 +2488,9 @@ DEFAULT_CONFIG = {
             "worker_load_cost_max": 4.0,
             "slope_window_seconds": 600,
             "cpu_corroborate": True,
-            "cpu_busy_pause": 0.70,
+            # CPU lines: the fleet registry (cpu_lines lane kanban; _kanban_cpu_lines above). The four spill
+            # keys (present only when the registry is found) are validated as a SET by the gate.
+            **_KANBAN_CPU,
             "worker_cpu_cost": 1.0,
             # t_a7978f86: E-core band saturation (Apple silicon) at or above
             # ecore_busy_pause is no local CPU headroom. off | report (log
