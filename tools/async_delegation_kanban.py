@@ -118,12 +118,17 @@ def parent_route(parent_agent: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
     requested = getattr(parent_agent, "requested_provider", None)
     requested = requested if isinstance(requested, str) and requested else None
     explicit = str(cfg.get("base_url") or "").strip() or None
-    if explicit is None and _anonymous_custom(parent_agent, requested):
+    route = {"requested_provider": requested, "model": getattr(parent_agent, "model", None) or None,
+             "explicit_base_url": explicit}
+    if _anonymous_custom(parent_agent, requested):
         # An anonymous custom endpoint (no ``custom:<name>`` to re-resolve by) exists only as the
-        # parent's base_url: re-resolving the bare name lands on the profile's default endpoint.
-        explicit = str(getattr(parent_agent, "base_url", None) or "").strip() or None
-    return {"requested_provider": requested, "model": getattr(parent_agent, "model", None) or None,
-            "explicit_base_url": explicit}
+        # parent's base_url: re-resolving the bare name lands on the profile's default endpoint. The
+        # worker keys the parent's own credential on this URL, never on the bare name (1b48ed1b0fa3).
+        parent_url = str(getattr(parent_agent, "base_url", None) or "").strip() or None
+        route["parent_base_url"] = parent_url
+        if explicit is None:
+            route["explicit_base_url"] = parent_url
+    return route
 
 
 def _anonymous_custom(parent_agent: Any, requested: Optional[str]) -> bool:
@@ -389,7 +394,9 @@ def _ended_cards(conn) -> List[Any]:
     # differs between launch spellings), is what the registry is keyed on.
     marks = ",".join("?" for _ in ENDED_STATUSES)
     return conn.execute(
-        f"SELECT id, status, body, created_at FROM tasks WHERE status IN ({marks}) "
+        f"SELECT id, status, body, created_at, "
+        "(SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = tasks.id) AS ended_at "
+        f"FROM tasks WHERE status IN ({marks}) "
         "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = tasks.id AND e.kind = ?)",
         (*ENDED_STATUSES, DRAINED_EVENT),
     ).fetchall()
@@ -419,6 +426,8 @@ def drain_profile(profile_home: Path, boot_id: str, *,
     out = {"drained": 0, "queued": 0, "failed": 0, "lost": 0}
     profile_home = Path(profile_home)
     home = profile_home.resolve()
+    if str(home) in _cancel_scan_pending and _board_state():
+        observe_running(profile_home, boot_id, cancelled_only=True)  # retry the inconclusive boot read
     live = _live_kanban_units(profile_home)
     if any(not task_id for task_id in live.values()):
         _refresh_cardless(profile_home, boot_id, live)
@@ -470,13 +479,17 @@ def drain_profile(profile_home: Path, boot_id: str, *,
                 # The runner died without a result: what its children left (setsid'd tools carry the
                 # K6 lineage tag) goes now, create-time checked; never a live runner process.
                 procs = (scan or lineage_processes)(row["id"])
-                if procs is None and not _inconclusive_expired(row["id"]):
+                waited = _inconclusive_expired(row["id"], row["ended_at"]) if procs is None else None
+                if procs is None and waited is None:
                     continue  # scan unknown: a tool may still be writing; retry next tick (bounded)
                 _inconclusive_since.pop(row["id"], None)
                 _kill_leftovers([p for p in (procs or []) if not _is_runner(p, row["id"])])
                 tail = _log_tail(row["id"])
-                if _store.fail_attempt(delegation_id, str(attempt_id),
-                                       f"unit worker ended without a result: {tail}",
+                why = "unit worker ended without a result"
+                if waited is not None:
+                    why += (f" (dead runner; lineage scan inconclusive for {waited:.0f}s, "
+                            "leftover tool processes could not be checked or reaped)")
+                if _store.fail_attempt(delegation_id, str(attempt_id), f"{why}: {tail}",
                                        profile_home=profile_home, queued_boot_id=None):
                     out["failed"] += 1
             elif not _needs_enqueue(record, boot_id):
@@ -503,13 +516,20 @@ INCONCLUSIVE_SCAN_LIMIT_SECONDS = 600.0
 _inconclusive_since: Dict[str, float] = {}
 
 
-def _inconclusive_expired(task_id: str) -> bool:
+def _inconclusive_expired(task_id: str, ended_at: Any = None) -> Optional[float]:
+    """Seconds the deferral has lasted once past the limit, else None. Measured from the card's last
+    event (durable: a gateway restart does not restart the clock) or, without one, from this
+    process's first inconclusive scan of it."""
     first = _inconclusive_since.setdefault(task_id, time.monotonic())
-    if time.monotonic() - first < INCONCLUSIVE_SCAN_LIMIT_SECONDS:
-        return False
-    logger.warning("async_delegation_kanban_scan_inconclusive_finalized task_id=%s after=%.0fs",
-                   task_id, time.monotonic() - first)
-    return True
+    waited = time.monotonic() - first
+    try:
+        waited = max(waited, time.time() - float(ended_at)) if ended_at is not None else waited
+    except (TypeError, ValueError):
+        pass
+    if waited < INCONCLUSIVE_SCAN_LIMIT_SECONDS:
+        return None
+    logger.warning("async_delegation_kanban_scan_inconclusive_finalized task_id=%s after=%.0fs", task_id, waited)
+    return waited
 
 
 def _needs_enqueue(record: Dict[str, Any], boot_id: str) -> bool:
@@ -709,10 +729,15 @@ def _boot_alive(boot_id: str) -> bool:
         return True  # unknown is never dead
 
 
-def observe_running(profile_home: Path, boot_id: str) -> int:
+#: Profile homes whose boot read of cancelled cards was inconclusive: each conclusive drain retries it.
+_cancel_scan_pending: set = set()
+
+
+def observe_running(profile_home: Path, boot_id: str, *, cancelled_only: bool = False) -> int:
     """Boot: one observer live record per running kanban record of this profile, so
     ``active_count``, ``has_live_for_session`` and ``/stop`` see the unit; and archive this
-    profile's delegations cards older than 48 h whose record is terminal or missing."""
+    profile's delegations cards older than 48 h whose record is terminal or missing.
+    ``cancelled_only``: the drain's retry of an inconclusive boot read (cancelled records only)."""
     from tools import async_delegation as ad
 
     profile_home = Path(profile_home)
@@ -721,9 +746,19 @@ def observe_running(profile_home: Path, boot_id: str) -> int:
     except Exception:
         return 0
     added = 0
+    home_key = str(profile_home.resolve())
     cancelled = _cancelled_with_live_card(records, profile_home)
+    if cancelled is None:
+        # Unknown is not live: observing every cancelled record would resurrect long-settled ones as
+        # observers that never settle (Prism 68f494996a96). A later conclusive drain retries the read.
+        _cancel_scan_pending.add(home_key)
+        cancelled = set()
+    else:
+        _cancel_scan_pending.discard(home_key)
     for delegation_id, durable in records.items():
         if not _store.is_kanban_record(durable):
+            continue
+        if cancelled_only and delegation_id not in cancelled:
             continue
         if durable.get("state") != "running" and delegation_id not in cancelled:
             continue
@@ -754,15 +789,17 @@ def observe_running(profile_home: Path, boot_id: str) -> int:
                 **({"kanban_cancel": True} if delegation_id in cancelled else {}),
                 "_context": contextvars.copy_context()}
         added += 1
-    _archive_stale_cards(records, profile_home)
+    if not cancelled_only:
+        _archive_stale_cards(records, profile_home)
     return added
 
 
-def _cancelled_with_live_card(records: Dict[str, Dict[str, Any]], profile_home: Path) -> set:
+def _cancelled_with_live_card(records: Dict[str, Dict[str, Any]], profile_home: Path) -> Optional[set]:
     """Cancelled kanban records whose card has not ended: the cancel's archive never landed (the
-    gateway exited before its thread ran). Boot observes them so the drain replays the archive. An
-    inconclusive read (board check or card SELECT failed) keeps the candidate: boot runs once, and a
-    discarded one would never be retried (Prism 3b8946d15b24). The drain re-reads its card each tick."""
+    gateway exited before its thread ran). Boot observes them so the drain replays the archive.
+    None: the read was inconclusive (board check, connect or a card SELECT failed); the caller
+    observes nothing and the drain retries the whole read on a later tick (Prism 3b8946d15b24,
+    68f494996a96)."""
     candidates = {d: str((r.get("kanban") or {}).get("task_id") or "") for d, r in records.items()
                   if r.get("state") == "cancelled" and _store.is_kanban_record(r)
                   and (r.get("kanban") or {}).get("task_id")}
@@ -772,23 +809,19 @@ def _cancelled_with_live_card(records: Dict[str, Dict[str, Any]], profile_home: 
     if board is False:
         return set()
     if board is None:
-        return set(candidates)
+        logger.warning("async_delegation_kanban_cancel_scan_inconclusive home=%s (board check failed)", profile_home)
+        return None
     kb = _kb()
     out = set()
     try:
         with kb.connect_closing(board=_board()) as conn:
             for delegation_id, task_id in candidates.items():
-                try:
-                    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
-                except Exception:
-                    logger.warning("async_delegation_kanban_cancel_scan_failed task_id=%s", task_id, exc_info=True)
-                    out.add(delegation_id)
-                    continue
+                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 if row is not None and row["status"] not in ENDED_STATUSES:
                     out.add(delegation_id)
     except Exception:
-        logger.warning("async_delegation_kanban_cancel_scan_failed home=%s", profile_home, exc_info=True)
-        return set(candidates)
+        logger.warning("async_delegation_kanban_cancel_scan_inconclusive home=%s", profile_home, exc_info=True)
+        return None
     return out
 
 

@@ -1138,8 +1138,8 @@ def test_lock_and_writer_span_the_install_root_and_the_kanban_root(home, monkeyp
 
 
 def test_boot_keeps_a_cancelled_unit_whose_card_read_was_inconclusive(monkeypatch, tmp_path, spawner):
-    """3b8946d15b24: the boot card read fails -> the cancelled unit is still observed (cancel-marked),
-    and the next drain, with SQLite back, archives its live card."""
+    """3b8946d15b24 / 68f494996a96: the boot card read fails -> nothing is observed yet; the next drain,
+    with SQLite back, retries the read, observes the cancelled unit and archives its live card."""
     handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
     did = handle["delegation_id"]
     task_id = _record(did)["kanban"]["task_id"]
@@ -1149,7 +1149,7 @@ def test_boot_keeps_a_cancelled_unit_whose_card_read_was_inconclusive(monkeypatc
     profile_home = Path(ad._registry_path().parent.parent)
     real = akb._board_state
     monkeypatch.setattr(akb, "_board_state", lambda: None)  # "database is locked" at boot
-    assert akb.observe_running(profile_home, "200:2") == 1
+    assert akb.observe_running(profile_home, "200:2") == 0
     monkeypatch.setattr(akb, "_board_state", real)
     akb.drain_profile(profile_home, "200:2")
     assert _card(task_id)[0].status == "archived"
@@ -1171,3 +1171,74 @@ def test_permanently_inconclusive_scan_still_finalizes_an_ended_card(monkeypatch
     assert akb.drain_profile(profile_home, BOOT, scan=lambda t: None)["failed"] == 1
     assert _record(did)["state"] == "failed" and ad.active_count() == 0
 
+
+
+# ── Prism round 3 on #2269 (t_e92403ba) ────────────────────────────────────
+
+
+def test_a_symlinked_alias_of_the_kanban_root_takes_one_lock_and_never_hangs(home, monkeypatch, tmp_path):
+    """66442f47f3d4 / 17c51e65b828: the kanban root is a symlink to the install root -> one lock root,
+    and taking the path lock completes (two opens of one inode would self-deadlock on LOCK_EX)."""
+    import tools.delegate_tool_config as dtc
+    from tools import file_state
+
+    monkeypatch.setattr(dtc, "_get_detached_background", lambda: True)
+    alias = tmp_path / "kroot-alias"
+    alias.symlink_to(home, target_is_directory=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(alias))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    target = str(tmp_path / "f.txt")
+    assert len(file_state._lock_files_for(target)) == 1
+    done = threading.Event()
+
+    def take():
+        with file_state.FileStateRegistry().lock_path(target):
+            done.set()
+
+    t = threading.Thread(target=take, daemon=True)
+    t.start()
+    assert done.wait(timeout=10), "the path lock self-deadlocked on an aliased lock root"
+
+
+def test_unreadable_board_at_boot_does_not_resurrect_a_settled_cancelled_record(monkeypatch, tmp_path, spawner):
+    """68f494996a96: a cancelled record whose card already ended and drained, board unreadable at boot
+    -> no observer; the next conclusive drain does not observe it either."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _no_thread(monkeypatch)
+    ad.interrupt_for_session(parent_session_id="parent-1", reason="/stop")
+    _drain()
+    _drain()
+    assert _card(task_id)[0].status == "archived" and akb.DRAINED_EVENT in _card(task_id)[1]
+    assert ad.active_count() == 0
+    ad._reset_for_tests()
+    profile_home = Path(ad._registry_path().parent.parent)
+    real = akb._board_state
+    monkeypatch.setattr(akb, "_board_state", lambda: None)
+    assert akb.observe_running(profile_home, "200:2") == 0
+    assert ad.active_count() == 0
+    monkeypatch.setattr(akb, "_board_state", real)
+    akb.drain_profile(profile_home, "200:2")
+    assert ad.active_count() == 0
+
+
+def test_inconclusive_scan_bound_counts_from_the_card_end_across_a_restart(monkeypatch, tmp_path, spawner):
+    """42bc969f2f92: the bound is measured from the card's end, so a gateway that restarted (fresh
+    in-memory clock) still finalizes a long-dead runner, with the inconclusive reason in the error."""
+    from hermes_cli import kanban_db as kb
+
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _end_card(task_id, "archived")
+    with kb.connect_closing(board="delegations") as conn:
+        conn.execute("UPDATE task_events SET created_at = created_at - 7200 WHERE task_id = ?", (task_id,))
+        conn.commit()
+    akb._inconclusive_since.clear()  # a restarted gateway
+    monkeypatch.setattr(akb, "INCONCLUSIVE_SCAN_LIMIT_SECONDS", 600.0)
+    profile_home = Path(ad._registry_path().parent.parent)
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: None)["failed"] == 1
+    rec = _record(did)
+    assert rec["state"] == "failed" and ad.active_count() == 0
+    assert "inconclusive" in json.dumps(rec)

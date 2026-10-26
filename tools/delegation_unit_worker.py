@@ -168,6 +168,21 @@ def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: D
         return runtime.get("api_key")
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
+    if "parent_base_url" in route:
+        # An anonymous custom parent is identified by its endpoint alone: resolve its key on that URL.
+        # A bare ``custom`` lookup would answer for the profile's DEFAULT custom endpoint and send that
+        # endpoint's key to another one (Prism 1b48ed1b0fa3): no URL-keyed key fails the unit instead.
+        url = route.get("parent_base_url")
+        try:
+            own = resolve_runtime_provider(requested=route.get("requested_provider") or "custom",
+                                           target_model=route.get("model") or execution.get("model") or None,
+                                           explicit_base_url=url) if url else {}
+        except Exception as exc:
+            raise RuntimeError(f"no credential for the parent's custom endpoint {url}: {exc}") from exc
+        if not own.get("api_key"):
+            raise RuntimeError(f"no credential for the parent's custom endpoint {url or '(unrecorded)'}; "
+                               "set delegation.api_key for the delegation endpoint")
+        return own["api_key"]
     try:
         own = resolve_runtime_provider(requested=route.get("requested_provider") or None,
                                        target_model=route.get("model") or execution.get("model") or None)

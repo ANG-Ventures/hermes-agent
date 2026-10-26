@@ -110,12 +110,31 @@ def _lock_roots() -> List[Path]:
     try:
         from hermes_constants import get_default_hermes_root
 
-        legacy = get_default_hermes_root() / "state" / "file-locks"
-        if not roots or os.path.abspath(str(legacy)) != os.path.abspath(str(roots[0])):
-            roots.append(legacy)
+        roots.append(get_default_hermes_root() / "state" / "file-locks")
     except Exception:
         pass
-    return roots
+    # Two spellings of ONE directory (a symlink, a bind mount) would open the same lock inode twice, and
+    # the second LOCK_EX would wait on the first forever: keep one root per filesystem identity
+    # (Prism 66442f47f3d4 / 17c51e65b828).
+    out: List[Path] = []
+    seen = set()
+    for root in roots:
+        ident = _dir_identity(root)
+        if ident not in seen:
+            seen.add(ident)
+            out.append(root)
+    return out
+
+
+def _dir_identity(root: Path):
+    """``(st_dev, st_ino)`` of *root* (created if missing), else its realpath."""
+    real = os.path.realpath(str(root))
+    try:
+        os.makedirs(real, exist_ok=True)
+        st = os.stat(real)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return real
 
 
 def _lock_files_for(resolved: str) -> List[Path]:
@@ -185,7 +204,7 @@ def _cross_process_lock(resolved: str):
         return
     fds = []
     try:
-        for lock_file in sorted(_lock_files_for(resolved), key=str):
+        for lock_file in sorted(_lock_files_for(resolved), key=lambda p: os.path.realpath(str(p))):
             try:
                 fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
             except OSError:

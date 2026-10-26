@@ -434,3 +434,62 @@ def test_url_only_custom_parent_keeps_the_resolved_key_when_the_url_less_lookup_
     duw.build_parent(record)
     assert built["api_key"] == "url-resolved-key" and built["base_url"] == "http://lab/v1"
 
+
+
+def _build_on_route(monkeypatch, unit, fake_resolve, route):
+    import sys
+    import hermes_cli.config as config_mod
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(rp, "resolve_runtime_provider", fake_resolve)
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"delegation": {"base_url": "http://deleg/v1"}})
+    built = {}
+
+    class FakeAgent:
+        def __init__(self, **kw):
+            built.update(kw)
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    record = _record(unit.did)
+    record["execution"].update({"credential_ref": {"source": "delegation_config", "parent_provider": "custom"},
+                                "route": route})
+    duw.build_parent(record)
+    return built
+
+
+def test_anonymous_custom_parent_key_is_resolved_on_its_url_never_the_default_endpoint(unit, monkeypatch):
+    """Prism 1b48ed1b0fa3: the profile has a DEFAULT custom endpoint; the parent ran on another URL ->
+    its key is resolved on that URL, the default endpoint's key is never sent."""
+    def fake_resolve(**kw):
+        url = kw.get("explicit_base_url")
+        key = {"http://parent/v1": "parent-url-key", "http://deleg/v1": "deleg-url-key"}.get(url, "default-endpoint-key")
+        return {"api_key": key, "base_url": url or "http://default/v1", "provider": "custom",
+                "requested_provider": kw.get("requested"), "api_mode": "chat_completions"}
+
+    built = _build_on_route(monkeypatch, unit, fake_resolve, {
+        "requested_provider": "custom", "model": "m", "explicit_base_url": "http://deleg/v1",
+        "parent_base_url": "http://parent/v1"})
+    assert built["api_key"] == "parent-url-key"
+    assert built["base_url"] == "http://deleg/v1"
+
+
+def test_anonymous_custom_parent_with_no_url_keyed_credential_fails_the_unit(unit, monkeypatch):
+    """Prism 1b48ed1b0fa3: no credential for the parent's URL -> a clear error, no substitute key."""
+    def fake_resolve(**kw):
+        url = kw.get("explicit_base_url")
+        key = "" if url == "http://parent/v1" else "default-endpoint-key"
+        return {"api_key": key, "base_url": url or "http://default/v1", "provider": "custom",
+                "requested_provider": kw.get("requested"), "api_mode": "chat_completions"}
+
+    with pytest.raises(RuntimeError, match="http://parent/v1"):
+        _build_on_route(monkeypatch, unit, fake_resolve, {
+            "requested_provider": "custom", "model": "m", "explicit_base_url": "http://deleg/v1",
+            "parent_base_url": "http://parent/v1"})
+
+
+def test_parent_route_records_the_anonymous_parent_url_beside_a_delegation_endpoint():
+    """Prism 1b48ed1b0fa3: delegation.base_url set + anonymous custom parent -> the parent's own URL is
+    recorded so the worker can key its credential on it."""
+    parent = SimpleNamespace(requested_provider="custom", provider="custom", model="m", base_url="http://parent/v1")
+    route = akb.parent_route(parent, {"base_url": "http://deleg/v1"})
+    assert route["explicit_base_url"] == "http://deleg/v1" and route["parent_base_url"] == "http://parent/v1"
