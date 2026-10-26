@@ -104,3 +104,52 @@ def test_guard_timeout_refuses_as_unavailable(hermes_env, monkeypatch):
     _guard(hermes_env, "sleep 5")
     with pytest.raises(ValueError, match="cron write guard unavailable.*did not answer"):
         cron.jobs.create_job(prompt=None, schedule="every 5m", script="x.sh", no_agent=True)
+
+
+# Activation paths (Prism 106422bc0b86): a row created paused is never graded, and rearm_oneshot /
+# claim_job_for_fire(force=True) enable it without update_job. _activate_job_record grades it.
+
+def test_forced_fire_of_paused_violating_row_is_refused_and_store_untouched(hermes_env):
+    from cron.jobs import claim_job_for_fire, create_job
+
+    job = create_job(prompt=None, schedule="every 5m", script="x.sh", no_agent=True,
+                     deliver="discord:1480528231286181948", paused=True)
+    log = hermes_env / "guard.log"
+    _guard(hermes_env, f'echo "$1" >> {log}; echo "double sender: use --deliver local" >&2; exit 1')
+    with pytest.raises(ValueError, match="double sender"):
+        claim_job_for_fire(job["id"], force=True)
+    assert log.read_text(encoding="utf-8").split() == ["activate"]
+    row = _stored(hermes_env)[0]
+    assert row["enabled"] is False and not row.get("fire_claim")
+
+
+def test_rearm_of_completed_violating_oneshot_is_refused_and_store_untouched(hermes_env):
+    from cron.jobs import create_job, mark_job_run, rearm_oneshot
+    from datetime import datetime, timedelta, timezone
+
+    job = create_job(prompt=None, schedule="in 30m", script="x.sh", no_agent=True,
+                     deliver="discord:1480528231286181948")
+    mark_job_run(job["id"], success=True)
+    before = _stored(hermes_env)
+    assert before[0]["enabled"] is False
+    _guard(hermes_env, 'echo "refused by lint" >&2; exit 1')
+    with pytest.raises(ValueError, match="refused by lint"):
+        rearm_oneshot(job["id"], (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
+    assert _stored(hermes_env) == before
+
+
+def test_clean_paused_row_still_activates_and_enabled_row_is_not_regraded(hermes_env):
+    from cron.jobs import claim_job_for_fire, create_job
+
+    log = hermes_env / "guard.log"
+    paused = create_job(prompt=None, schedule="every 5m", script="x.sh", no_agent=True,
+                        deliver="local", paused=True)
+    live = create_job(prompt=None, schedule="every 5m", script="x.sh", no_agent=True, deliver="local")
+    _guard(hermes_env, f'echo "$1" >> {log}; cat >> {log}; echo >> {log}; exit 0')
+    assert claim_job_for_fire(paused["id"], force=True) is True
+    assert claim_job_for_fire(live["id"], force=True) is True
+    lines = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln]
+    assert lines[0] == "activate" and len(lines) == 2
+    graded = json.loads(lines[1])
+    assert graded["id"] == paused["id"] and graded["enabled"] is True and graded["state"] == "scheduled"
+    assert all(j["enabled"] for j in _stored(hermes_env))
