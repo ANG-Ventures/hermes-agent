@@ -643,6 +643,34 @@ def test_backup_rescan_does_not_archive_an_already_captured_store_twice(home, tm
     assert profile_pairs == ["profiles/a/cron/jobs.json"], names
 
 
+@pytest.mark.parametrize("linked", [("jobs.json",), ("jobs.json", "runtime_state.db")])
+def test_zip_pairs_archives_two_stores_sharing_a_hard_linked_jobs_json(home, tmp_path, linked):
+    """Prism fd3e5e76e488: the rename skip matched ONE shared member identity, so a second store
+    whose jobs.json is hard-linked to the first's (distinct runtime_state.db) was dropped from the
+    backup in the first pass, with both stores still in place and no error. Even when both members
+    are linked, the first store has not moved, so the second path is archived too."""
+    import os
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    for name in ("a", "b"):
+        (home / name / "cron").mkdir(parents=True)
+        with cj.use_cron_store(home / name):
+            _job(cj, f"j{name}", 1)
+    for member in linked:
+        (home / "b" / "cron" / member).unlink()
+        os.link(home / "a" / "cron" / member, home / "b" / "cron" / member)
+    errors, out = [], tmp_path / "out"
+    out.mkdir()
+    with zipfile.ZipFile(out / "p.zip", "w") as zf:
+        backup._zip_cron_pairs(zf, home, [("a",), ("b",)], out / "p.zip",
+                               lambda rel, exc: errors.append((rel, exc)), {})
+        names = set(zf.namelist())
+    assert not errors, errors
+    assert {"a/cron/jobs.json", "a/cron/runtime_state.db",
+            "b/cron/jobs.json", "b/cron/runtime_state.db"} <= names, names
+
+
 def _other_store(tmp_path):
     """A populated cron store OUTSIDE the home under test: (cron dir, jobs bytes, rows)."""
     from cron import jobs as cj

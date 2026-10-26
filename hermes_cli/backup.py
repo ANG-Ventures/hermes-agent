@@ -1256,7 +1256,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
             on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
             on_vanished=lambda rel: vanished.append(str(rel)))
-        captured: set = set()  # identities of the stores archived so far (Prism dafc6732ca54)
+        captured: dict = {}  # store identity -> home it was archived from (Prism dafc6732ca54)
         total_bytes += _zip_cron_pairs(zf, hermes_root, cron_homes, out_path,
                                        lambda rel, exc: errors.append(f"{rel}: {exc}"), captured)
         late_added = 0
@@ -1835,38 +1835,45 @@ def _split_cron_pairs(files: List[Tuple[Path, Path]]) -> Tuple[List[Tuple[Path, 
     return others, homes
 
 
-def _pair_member_identities(hermes_root: Path, home: Tuple[str, ...]) -> set:
-    """``{(st_dev, st_ino)}`` of *home*'s live jobs.json and runtime_state.db (a rename keeps the
-    inode); a missing or unreadable member contributes nothing."""
+def _pair_member_identities(hermes_root: Path, home: Tuple[str, ...]) -> tuple:
+    """``((st_dev, st_ino) | None, (st_dev, st_ino) | None)`` of *home*'s live jobs.json and
+    runtime_state.db, in that order (a rename keeps both inodes); a missing or unreadable member
+    is ``None``. The whole tuple identifies a store: one shared member (a hard-linked jobs.json
+    beside a distinct db) is not the same store (Prism fd3e5e76e488)."""
     from cron import store_pair
 
-    idents = set()
+    idents = []
     for name in (store_pair.JOBS_NAME, store_pair.DB_NAME):
         try:
             st = os.lstat(hermes_root.joinpath(*home, store_pair.CRON_DIR, name))
         except OSError:
+            idents.append(None)
             continue
-        idents.add((st.st_dev, st.st_ino))
-    return idents
+        idents.append((st.st_dev, st.st_ino))
+    return tuple(idents)
 
 
 def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[str, ...]],
-                    out_path: Path, on_error, captured: Optional[set] = None) -> int:
+                    out_path: Path, on_error, captured: Optional[dict] = None) -> int:
     """Capture each store's pair under its cron lock (``cron.store_pair.capture``) beside the
     output zip and archive both halves; return bytes archived. A refused capture is ONE error for
-    the whole pair: neither half is archived alone. *captured*, when given, collects the
-    :func:`_pair_member_identities` of every store archived in full; a store whose jobs.json OR
-    runtime_state.db identity is already in it is not archived again (Prism dafc6732ca54: the
-    same store seen again under a renamed profile)."""
+    the whole pair: neither half is archived alone. *captured*, when given, maps the
+    :func:`_pair_member_identities` of every store archived in full to the home it was archived
+    from. A store is skipped only when BOTH member identities match a captured store AND that
+    store's original home no longer holds them, i.e. the same store moved (Prism dafc6732ca54:
+    seen again under a renamed profile). One shared member, or a store still at its first path,
+    is a different store and is archived (Prism fd3e5e76e488)."""
     from cron import store_pair
 
     total = 0
     for home in homes:
         rel_cron = Path(*home, store_pair.CRON_DIR)
-        idents = _pair_member_identities(hermes_root, home) if captured is not None else set()
-        if idents & (captured or set()):
-            logger.info("backup: skipping cron store %s, already archived under another path "
-                        "(renamed during the backup)", rel_cron)
+        idents = _pair_member_identities(hermes_root, home) if captured is not None else None
+        first = captured.get(idents) if captured is not None and any(idents) else None
+        if first is not None and first != home \
+                and _pair_member_identities(hermes_root, first) != idents:
+            logger.info("backup: skipping cron store %s, already archived as %s (renamed during "
+                        "the backup)", rel_cron, Path(*first, store_pair.CRON_DIR))
             continue
         with tempfile.TemporaryDirectory(prefix=".cron-pair-", dir=str(out_path.parent)) as tmp:
             try:
@@ -1893,8 +1900,8 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
                         ) from exc
                     on_error(rel_cron / name, exc)
                     break
-            if captured is not None and names and archived == len(names):
-                captured |= idents
+            if captured is not None and names and archived == len(names) and any(idents):
+                captured.setdefault(idents, home)
     return total
 
 
