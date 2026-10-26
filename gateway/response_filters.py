@@ -334,6 +334,28 @@ def wake_chrome_muted(display_kind: Any, source: Any, user_config: Optional[dict
     return chat_id in {str(c) for c in configured if c}
 
 
+def route_notice_muted(source: Any, user_config: Optional[dict]) -> bool:
+    """True when a route-change notice ("🔄 Model fallback (relay busy): A → B") would post into an
+    act-now page channel. A fallback the agent already rode out is telemetry, not a page
+    (t_733b4104: 30 lines/day in fleet #alerts from the alerts-handling session). The hop is still
+    in the fallback_events ledger and the gateway log. ``display.route_notice_muted_chats`` lists
+    chat ids; unset means the fleet #alerts channel on Discord; ``[]`` disables.
+    """
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    if not chat_id:
+        return False
+    configured = ((user_config or {}).get("display") or {}).get("route_notice_muted_chats")
+    if configured is None:
+        from gateway.config import Platform
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+        from gateway.kanban_watchers import _needs_input_channels
+        configured = [_needs_input_channels()[0]]
+    if not isinstance(configured, (list, tuple, set)):
+        configured = [configured]
+    return chat_id in {str(c) for c in configured if c}
+
+
 def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
     """Whether a successful bare silence marker may remain silent for this turn."""
     return is_machinery_display_kind(display_kind) or reply_expected is False
