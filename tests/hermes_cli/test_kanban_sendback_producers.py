@@ -196,7 +196,7 @@ def test_stale_base_guard_advisory_only_for_a_pr_conflict(kanban_home, tmp_path,
     def stale(*a, **k):
         raise bb.StaleBaseError("t_x", [report])
     monkeypatch.setattr(bb, "enforce_handoff", stale)
-    monkeypatch.setattr(kb, "_owns_fleet_pr", lambda metadata, survivor_pr: pr == "pr")
+    monkeypatch.setattr(kb, "_owns_fleet_pr", lambda metadata, survivor_pr, reports=(): pr == "pr")
     # keep the open-PR route out of it: this test is the guard alone
     monkeypatch.setattr(op, "open_pr_refs", lambda *a, **k: [], raising=False)
     with kbc.connect() as conn:
@@ -232,6 +232,79 @@ def test_sendback_restores_over_a_legacy_reviewer_swap(kanban_home: SimpleNamesp
         assert kb.claim_review_task(conn, tid) is None
         assert (kb.get_task(conn, tid).status, kb.get_task(conn, tid).assignee) == ("todo", "reviewer-b")
         assert kb._latest_review_provenance(conn, tid) == "reviewer-b"
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        assert kb.get_task(conn, tid).assignee == "dev"
+
+
+def _checkout(tmp_path, name, url):
+    d = tmp_path / name
+    d.mkdir()
+    _git(d, "init", "-q")
+    _git(d, "remote", "add", "origin", url)
+    return d
+
+
+def test_conflict_advisory_needs_a_pr_on_every_failing_repo(tmp_path) -> None:
+    """Prism bda9414a767d: an own PR on repo A does not make a conflict in repo B (no PR) advisory."""
+    a = _checkout(tmp_path, "a", "https://github.com/ANG-Ventures/repo-a.git")
+    b = _checkout(tmp_path, "b", "git@github.com:ANG-Ventures/repo-b.git")
+    rep = lambda path: SimpleNamespace(repo=str(path), failures=["does not merge cleanly"], conflicts=["x"])
+    md = {"pr_url": "https://github.com/ANG-Ventures/repo-a/pull/7"}
+    assert kb._owns_fleet_pr(md, None, [rep(a)]) is True
+    assert kb._owns_fleet_pr(md, None, [rep(a), rep(b)]) is False
+    md2 = {"pr_url": ["https://github.com/ANG-Ventures/repo-a/pull/7", "https://github.com/ANG-Ventures/repo-b/pull/9"]}
+    assert kb._owns_fleet_pr(md2, None, [rep(a), rep(b)]) is True
+    assert kb._owns_fleet_pr(md, None, []) is False
+
+
+def test_sendback_keeps_an_operator_assignment_of_a_former_reviewer(kanban_home: SimpleNamespace) -> None:
+    """Prism 4509b37e638c: reviewer argus -> swap to reviewer-b -> demoted -> the operator assigns argus: argus is a
+    reviewer of the cycle, but the assignment came after the card left review, so the sendback keeps it."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        tid = kb.create_task(conn, title="former reviewer", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(conn, tid, summary="PR ready", reviewer="argus",
+                                 expected_run_id=claimed.current_run_id)
+        assert kb.assign_task(conn, tid, "reviewer-b", request_changes_reason=None,
+                              pr_query=lambda repo, n: "MERGED")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+        assert kb.claim_review_task(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "todo"
+        assert kb.assign_task(conn, tid, "argus")              # explicit, after the review exit
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        assert kb.get_task(conn, tid).assignee == "argus"
+
+
+def test_reviewer_swap_after_a_review_resume_counts(kanban_home: SimpleNamespace) -> None:
+    """Prism 2a08733c4d2a: block + unblock restores a review card to review without a new review_requested; a
+    swap made then is a reviewer of the cycle, so the demoted card's sendback restores the implementer."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        tid = kb.create_task(conn, title="resumed review", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(conn, tid, summary="PR ready", reviewer="human",
+                                 expected_run_id=claimed.current_run_id)
+        assert kb.block_task(conn, tid, reason="park")
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "review"
+        assert kb.assign_task(conn, tid, "argus", request_changes_reason=None,
+                              pr_query=lambda repo, n: "MERGED")
+        assert "argus" in kb._review_cycle_reviewers(conn, tid)
+        assert kb._latest_review_provenance(conn, tid) == "argus"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+        assert kb.claim_review_task(conn, tid) is None
+        assert (kb.get_task(conn, tid).status, kb.get_task(conn, tid).assignee) == ("todo", "argus")
         _tick(kanban_home)
         assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
         assert kb.get_task(conn, tid).assignee == "dev"

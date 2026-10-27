@@ -10380,33 +10380,57 @@ class ExternalCloseError(ValueError):
         )
 
 
-# Event kinds that take a card OUT of review (or end the review cycle). An ``assigned`` event between the latest
-# ``review_requested`` and the first of these was a reviewer swap made while the card sat in review.
+# Event kinds that take a card OUT of review (or end the review cycle). An ``assigned`` event while the latest
+# review cycle is open (after its ``review_requested``, before an exit, or after a resume back INTO review) is a
+# reviewer swap.
 _REVIEW_EXIT_KINDS = ("dependency_wait", "changes_requested", "sendback", "blocked", "completed", "unblocked",
                       "reopened", "requeued", "archived", "triage_resolved")
+# Of those, the kinds that can also put the card BACK in review: ``unblocked`` / ``promoted`` with
+# ``status: review`` (a parked or dependency-held review card resuming its review phase; Prism 2a08733c4d2a).
+_REVIEW_RESUME_KINDS = ("unblocked", "promoted")
 
 
-def _review_swaps(conn: sqlite3.Connection, task_id: str) -> list:
-    """Assignees of the ``assigned`` events made while the latest review cycle was open, oldest first. Derived
-    from the event ORDER, not from a payload field, so a reassignment written by any version counts
-    (Prism 1953ce5049b5)."""
+def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
+    """``(swaps, last_assignment_in_review)`` for the latest review cycle, from the event ORDER (not a payload
+    field, so a reassignment written by any version counts; Prism 1953ce5049b5).
+
+    ``swaps``: assignees of ``assigned`` events made while the card was in review, oldest first. A review phase
+    resumed by ``unblocked``/``promoted`` with ``status: review`` counts as in review again (2a08733c4d2a).
+    ``last_assignment_in_review``: False when the newest ``assigned`` event of the cycle was made while the card
+    was OUT of review -- an operator's explicit choice (4509b37e638c); True otherwise (none, or made in review).
+    ``(None, True)`` when the card was never reviewed."""
     rr = conn.execute(
         "SELECT max(id) FROM task_events WHERE task_id = ? AND kind = 'review_requested'", (task_id,),
     ).fetchone()[0]
     if rr is None:
-        return []
-    out = []
-    marks = ",".join("?" for _ in _REVIEW_EXIT_KINDS)
+        return None, True
+    kinds = ("assigned", *_REVIEW_EXIT_KINDS, *_REVIEW_RESUME_KINDS)
+    marks = ",".join("?" for _ in kinds)
+    swaps: list = []
+    in_review = True
+    last_in_review = True
     for row in conn.execute(
-        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
-        f"AND kind IN ('assigned', {marks}) ORDER BY id", (task_id, rr, *_REVIEW_EXIT_KINDS),
+        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? AND kind IN ({marks}) ORDER BY id",
+        (task_id, rr, *kinds),
     ):
-        if row["kind"] != "assigned":
-            break
-        a = _json_dict(row["payload"]).get("assignee")
-        if _nonblank_str(a):
-            out.append(a)
-    return out
+        kind = row["kind"]
+        if kind == "assigned":
+            last_in_review = in_review
+            a = _json_dict(row["payload"]).get("assignee")
+            if in_review and _nonblank_str(a):
+                swaps.append(a)
+            continue
+        if kind in _REVIEW_RESUME_KINDS and _json_dict(row["payload"]).get("status") == "review":
+            in_review = True
+        elif kind in _REVIEW_EXIT_KINDS:
+            in_review = False
+    return swaps, last_in_review
+
+
+def _review_swaps(conn: sqlite3.Connection, task_id: str) -> list:
+    """Assignees of the ``assigned`` events made while the latest review cycle was open, oldest first
+    (:func:`_review_cycle_scan`)."""
+    return _review_cycle_scan(conn, task_id)[0] or []
 
 
 def _stale_base_is_conflict_only(reports) -> bool:
@@ -10419,10 +10443,37 @@ def _stale_base_is_conflict_only(reports) -> bool:
         for r in failing)
 
 
-def _owns_fleet_pr(metadata: Optional[dict], survivor_pr) -> bool:
+_GITHUB_SLUG_RE = re.compile(r"github\.com[:/]+([^/\s]+/[^/\s]+?)(?:\.git)?/?$", re.IGNORECASE)
+
+
+def _checkout_github_slugs(path) -> set:
+    """Lower-cased ``owner/repo`` of every GitHub remote of the checkout at *path* (fork remotes included)."""
+    try:
+        proc = subprocess.run(["git", "-C", str(path), "remote", "-v"], capture_output=True, text=True,
+                              timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    out = set()
+    for line in (proc.stdout or "").splitlines() if proc.returncode == 0 else ():
+        parts = line.split()
+        if len(parts) >= 2:
+            m = _GITHUB_SLUG_RE.search(parts[1])
+            if m:
+                out.add(m.group(1).lower())
+    return out
+
+
+def _owns_fleet_pr(metadata: Optional[dict], survivor_pr, reports=()) -> bool:
+    """True when the handoff names an own fleet PR on the repository of EVERY failing report (Prism
+    bda9414a767d): a conflict in a checkout with no PR of its own has no conflict producer to send it back."""
     from hermes_cli import kanban_open_pr as _open_pr
     try:
-        return bool(_open_pr.split_fleet(_open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0])
+        own = {str(r.repo).lower() for r in
+               _open_pr.split_fleet(_open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]}
+        if not own:
+            return False
+        failing = [r for r in reports if getattr(r, "failures", None)]
+        return bool(failing) and all(_checkout_github_slugs(r.repo) & own for r in failing)
     except Exception:  # noqa: BLE001 -- unreadable = not provably PR-backed: the guard refuses as before
         return False
 
@@ -10621,10 +10672,11 @@ def _enforce_branch_base(
         # event is still recorded (now with advisory=true) and the handoff proceeds; the conflict reaches the
         # worker as a `sendback(source=conflict)` from the PR. Only that case (Prism 1172e7254787): every failing
         # report is a merge conflict and nothing else (foreign commits / out-of-scope edits still refuse), and
-        # the handoff names a fleet PR of its own (no PR = nothing a conflict producer can send back on).
+        # the handoff names a fleet PR of its own on EVERY failing repository (bda9414a767d; no PR = nothing a
+        # conflict producer can send back on).
         advisory = (landing_policy_knob("sendback") == "on"
                     and _stale_base_is_conflict_only(err.reports)
-                    and _owns_fleet_pr(metadata, survivor_pr))
+                    and _owns_fleet_pr(metadata, survivor_pr, err.reports))
         if advisory:
             payload["advisory"] = True
         with write_txn(conn):
@@ -14734,11 +14786,16 @@ def request_sendback(
             # Only then (SB-K key d3eaed71c036): any other assignee is an
             # operator's explicit choice (a reassign after a lane outage) and
             # stands.
+            # Read at action time, inside this txn: restore only when the current assignee is a reviewer of the
+            # cycle AND no assignment was made after the card left review (4509b37e638c): an operator who moved
+            # the demoted card -- even to a former reviewer -- made an explicit choice, and a sendback never
+            # overwrites an assignment it did not set.
             implementer = _review_handoff_implementer(conn, task_id)
             extra: dict = {}
             if implementer is not None:
                 extra["implementer"] = implementer
-                if row["assignee"] != implementer and row["assignee"] in _review_cycle_reviewers(conn, task_id):
+                if (row["assignee"] != implementer and _review_cycle_scan(conn, task_id)[1]
+                        and row["assignee"] in _review_cycle_reviewers(conn, task_id)):
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = ? WHERE id = ? AND status = ?",
                         (implementer, task_id, status),
