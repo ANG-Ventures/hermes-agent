@@ -173,6 +173,12 @@ COMPOUND = tuple(t for t in (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, 
                              ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef) if t is not None)
 
 
+# compound statements whose body runs on some ticks only; a plain `if` is handled with its both-arms / plan-guard
+# exemptions, and a nested def / lambda / class is skipped by _walk_eager (Prism 84d48881bad3)
+GUARDS = tuple(t for t in (ast.While, ast.Try, getattr(ast, "TryStar", None), ast.With, ast.AsyncWith, ast.For,
+                           ast.AsyncFor, getattr(ast, "Match", None)) if t is not None)
+
+
 def _ready_route_comp(n) -> bool:
     """A comprehension with one generator over `ready_rows` that calls _route_row."""
     return (isinstance(n, (ast.DictComp, ast.ListComp, ast.SetComp, ast.GeneratorExp)) and bool(_route_calls(n))
@@ -267,9 +273,21 @@ def check_dispatcher(root: Path) -> list[str]:
             elif isinstance(st, ast.If):
                 if _routes_ready(st.body) and _routes_ready(st.orelse):
                     return True
+            elif _match_routes_every_case(st):
+                return True
             elif not isinstance(st, COMPOUND) and any(_ready_route_comp(n) for n in _walk_eager(st)):
                 return True
         return False
+    def _match_routes_every_case(st) -> bool:
+        """A `match` that ends in an irrefutable, unguarded `case _:` and whose EVERY case routes the ready rows
+        runs one routing arm each tick, like an if/else whose both arms route (desk send-back on #7265). No
+        wildcard, a guarded wildcard, or one case that does not route keeps it a guard."""
+        if not (hasattr(ast, "Match") and isinstance(st, ast.Match) and st.cases):
+            return False
+        last = st.cases[-1]
+        if not (isinstance(last.pattern, ast.MatchAs) and last.pattern.pattern is None and last.guard is None):
+            return False
+        return all(_routes_ready(c.body) for c in st.cases)
     def _passes_plan(c, plan: str) -> bool:
         """`_route_row(conn, row, <plan>, ...)` or `_route_row(conn, row, plan=<plan>, ...)`."""
         if len(c.args) >= 3:
@@ -322,10 +340,15 @@ def check_dispatcher(root: Path) -> list[str]:
             for inner in ast.walk(st):
                 if inner is not st:
                     guarded.add(id(inner))
-        elif isinstance(st, (ast.While, ast.Try, ast.With, ast.AsyncWith)):
-            for inner in ast.walk(st):
-                if inner is not st:
-                    guarded.add(id(inner))
+        elif isinstance(st, GUARDS) and not _match_routes_every_case(st):
+            # a loop over anything but the ready rows may run 0 times, a for/while else clause, an except /
+            # except* handler and a match case run only on some ticks (Prism 84d48881bad3). A for's iterable and
+            # a match subject are evaluated every time the statement runs, so they are not under its guard.
+            head = {id(getattr(st, f)) for f in ("iter", "subject") if getattr(st, f, None) is not None}
+            for c in ast.iter_child_nodes(st):
+                if id(c) not in head:
+                    for inner in ast.walk(c):
+                        guarded.add(id(inner))
     # D1: _route_row presented for every ready row (eager code only: a comprehension inside a nested def or
     # lambda runs only if something calls it)
     d1 = False
@@ -336,7 +359,7 @@ def check_dispatcher(root: Path) -> list[str]:
             if calls and len(gens) == 1 and _over_ready(gens[0].iter):
                 if id(n) in guarded:
                     out.append(f"{rel}:{n.lineno}: {ROUTE_FN} comprehension over {READY} sits under a guard "
-                               f"(if/try/with/loop): every ready row must be routed each tick, unconditionally")
+                               f"(if/try/with/loop/match): every ready row must be routed each tick, unconditionally")
                 elif gens[0].ifs:
                     out.append(f"{rel}:{n.lineno}: {ROUTE_FN} comprehension over {READY} carries a filter: "
                                f"every ready row must be routed each tick")
@@ -352,7 +375,7 @@ def check_dispatcher(root: Path) -> list[str]:
                 for c in ast.walk(n)):
             out += [f.replace("ready loop", f"{ROUTE_FN} loop") for f in _early_exits(n.body, rel)]
             if id(n) in guarded:
-                out.append(f"{rel}:{n.lineno}: {ROUTE_FN} loop over {READY} sits under a guard (if/try/with/loop): "
+                out.append(f"{rel}:{n.lineno}: {ROUTE_FN} loop over {READY} sits under a guard (if/try/with/loop/match): "
                            f"every ready row must be routed each tick, unconditionally (Prism 1d133dcecb68)")
             if not _unconditional_in_loop(n):
                 out.append(f"{rel}:{n.lineno}: {ROUTE_FN} in the loop over {READY} is conditional or skippable: "
@@ -618,6 +641,32 @@ DISPATCH_ARM_LAMBDA_ELSE_ROUTE_CALL = DISPATCH_OK.replace(_COMP, (
     '    if planned:\n        later = lambda: {r["id"]: _route_row(conn, r) for r in ready_rows}\n') + _ELSE_ROUTE_CALL, 1)
 DISPATCH_ELSE_ROUTE_THEN_DEF_RETURN = DISPATCH_BOTH_ARMS.replace(
     _ELSE_ROUTE, _ELSE_ROUTE + '            def cb():\n                return r\n', 1)
+# Prism 84d48881bad3: a routing loop / comprehension under a compound statement that runs on some ticks only
+_ROUTE_FOR = '        for r in ready_rows:\n            row_route[r["id"]] = _route_row(conn, r)\n'
+DISPATCH_OTHER_LOOP_FOR = DISPATCH_OK.replace(_COMP, '    row_route = {}\n    for _ in attempts:\n' + _ROUTE_FOR, 1)
+DISPATCH_OTHER_LOOP_COMP = DISPATCH_OK.replace(_COMP, '    for _ in attempts:\n    ' + _COMP, 1)
+DISPATCH_LOOP_ELSE_FOR = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    for _ in attempts:\n        pass\n    else:\n') + _ROUTE_FOR, 1)
+DISPATCH_MATCH_FOR = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    match mode:\n        case 1:\n') + _ROUTE_FOR.replace('        ', '            '), 1)
+DISPATCH_TRYSTAR_FOR = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    try:\n        pass\n    except* ValueError:\n') + _ROUTE_FOR, 1)
+DISPATCH_ASYNC_FOR = DISPATCH_OK.replace(_COMP, '    row_route = {}\n    async for _ in attempts:\n' + _ROUTE_FOR, 1)
+_CASE_FOR = _ROUTE_FOR.replace('        ', '            ')
+DISPATCH_MATCH_ALL_ROUTE = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    match mode:\n        case 1:\n') + _CASE_FOR + '        case _:\n' + _CASE_FOR, 1)
+DISPATCH_MATCH_ALL_ROUTE_NO_WILD = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    match mode:\n        case 1:\n') + _CASE_FOR + '        case 2:\n' + _CASE_FOR, 1)
+DISPATCH_MATCH_ONE_CASE_SKIPS = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    match mode:\n        case 1:\n') + _CASE_FOR + '        case _:\n            pass\n', 1)
+DISPATCH_IF_ARM_MATCH_ALL_ROUTE = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    if planned:\n        match mode:\n            case 1:\n')
+    + _CASE_FOR.replace('            ', '                ') + '            case _:\n'
+    + _CASE_FOR.replace('            ', '                ') + '    else:\n' + _ROUTE_FOR, 1)
+# a for's iterable runs whenever the for does: routing there is not under the for's guard
+DISPATCH_ROUTE_IN_FOR_ITER = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    for rid, rt in [(r["id"], _route_row(conn, r)) for r in ready_rows]:\n'
+    '        row_route[rid] = rt\n'), 1)
 POOL_OK = '''#!/usr/bin/env bash
 while true; do
   i=1
@@ -765,6 +814,28 @@ def selftest() -> int:
          {D: DISPATCH_ARM_LAMBDA_ELSE_ROUTE_CALL}, ["dispatcher"], 1),
         ("dispatcher: else-arm loop routes then a nested def holding `return` is GREEN (#7256 desk Ne5)",
          {D: DISPATCH_ELSE_ROUTE_THEN_DEF_RETURN}, ["dispatcher"], 0),
+        ("dispatcher: routing for-loop inside `for _ in attempts:` (may run 0 times) is RED (Prism 84d48881bad3)",
+         {D: DISPATCH_OTHER_LOOP_FOR}, ["dispatcher"], 1),
+        ("dispatcher: routing comprehension inside `for _ in attempts:` is RED (Prism 84d48881bad3)",
+         {D: DISPATCH_OTHER_LOOP_COMP}, ["dispatcher"], 1),
+        ("dispatcher: routing for-loop in a for-else clause is RED (Prism 84d48881bad3)",
+         {D: DISPATCH_LOOP_ELSE_FOR}, ["dispatcher"], 1),
+        ("dispatcher: routing for-loop inside a match case is RED (Prism 84d48881bad3)",
+         {D: DISPATCH_MATCH_FOR}, ["dispatcher"], 1),
+        ("dispatcher: routing for-loop inside an except* handler is RED (Prism 84d48881bad3)",
+         {D: DISPATCH_TRYSTAR_FOR}, ["dispatcher"], 1),
+        ("dispatcher: routing for-loop inside `async for _ in attempts:` is RED (Prism 84d48881bad3, #7265 desk)",
+         {D: DISPATCH_ASYNC_FOR}, ["dispatcher"], 1),
+        ("dispatcher: match whose every case routes, ending in `case _:`, is GREEN (#7265 desk)",
+         {D: DISPATCH_MATCH_ALL_ROUTE}, ["dispatcher"], 0),
+        ("dispatcher: match whose every case routes but has no `case _:` is RED (#7265 desk)",
+         {D: DISPATCH_MATCH_ALL_ROUTE_NO_WILD}, ["dispatcher"], 1),
+        ("dispatcher: match ending in `case _:` with one case not routing is RED (#7265 desk)",
+         {D: DISPATCH_MATCH_ONE_CASE_SKIPS}, ["dispatcher"], 1),
+        ("dispatcher: if arm holding an every-case-routes match, else routes, is GREEN (#7265 desk)",
+         {D: DISPATCH_IF_ARM_MATCH_ALL_ROUTE}, ["dispatcher"], 0),
+        ("dispatcher: routing comprehension as a for's iterable is GREEN (Prism 84d48881bad3)",
+         {D: DISPATCH_ROUTE_IN_FOR_ITER}, ["dispatcher"], 0),
         ("dispatcher: no _route_row over ready_rows is RED", {D: DISPATCH_NO_ROUTE}, ["dispatcher"], 1),
         ("dispatcher: _route_row under `if` in a for loop is RED", {D: DISPATCH_COND_ROUTE}, ["dispatcher"], 1),
         ("dispatcher: unconditional _route_row in a for loop is GREEN", {D: DISPATCH_LOOP_ROUTE}, ["dispatcher"], 0),
