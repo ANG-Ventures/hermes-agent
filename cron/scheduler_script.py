@@ -495,6 +495,7 @@ def _run_job_script(
         if _job_timeout > 0:
             script_timeout = min(script_timeout, _job_timeout)
     outcome_record = None
+    proc = None
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
@@ -636,9 +637,11 @@ def _run_job_script(
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
     finally:
-        # This process observed the end itself (or never started the script): its own path
-        # records the run. Only an owner that dies mid-run leaves the record for settle().
-        _outcome_records.discard(outcome_record)
+        # A script that never started leaves no evidence worth keeping. Once it ran, the record
+        # stays until the caller durably records the run (finish_execution discards it), so a
+        # crash between here and mark_job_run still leaves settle() the real exit status.
+        if outcome_record is not None and proc is None:
+            _outcome_records.discard(outcome_record)
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:

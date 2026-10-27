@@ -205,7 +205,6 @@ def test_signal_death_still_reported_as_negative_returncode(env):
     ok, out = ss._run_job_script("self-term.sh", job_id="j1", execution_id="e1abc")
     assert not ok
     assert "exited with code -15" in out, out
-    assert _records(env) == []
 
 
 @pytest.mark.parametrize("rc", [0, 3], ids=["ok", "fails"])
@@ -235,3 +234,143 @@ def test_settled_outcome_counts_the_run_once(env, rc):
     assert final["next_run_at"] == counted["next_run_at"]
     assert final["failure_streak"] == (0 if rc == 0 else 1), final
     assert final.get("enabled", True) and final.get("state") != "completed"
+
+
+def test_record_outlives_the_runner_until_the_run_is_recorded(env):
+    """Prism 111cd4f574ad: the runner returning is not the run being recorded. The record stays
+    until finish_execution writes the attempt's terminal row."""
+    from cron import scheduler_script as ss
+    from cron import script_outcome_records as rec
+
+    (env / "scripts" / "ok.sh").write_text("echo hi\n", encoding="utf-8")
+    ok, out = ss._run_job_script("ok.sh", job_id="j1", execution_id="e2abc")
+    assert ok and out.strip() == "hi"
+    assert "e2abc.rc" in _records(env), _records(env)
+    rec.discard_execution("e2abc")
+    assert _records(env) == []
+
+
+def test_shim_does_not_depend_on_the_job_path(env):
+    """Prism ca1a3f91facb: a script run with a PATH that has no mv/cat still publishes its exit
+    status and still delivers its output."""
+    from cron import script_outcome_records as rec
+
+    base = rec.begin("j1", "e3abc")
+    argv = rec.wrap_argv(base, ["/bin/sh", "-c", "printf hello"])
+    res = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                         env={"PATH": "/nonexistent"})
+    assert res.returncode == 0
+    assert res.stdout == "hello"
+    assert (Path(str(base) + ".rc")).read_text(encoding="utf-8-sig").strip() == "0"
+
+
+def test_backgrounded_helper_does_not_hold_the_runner_stderr(env):
+    """Prism 986c4845a87b: a helper the script backgrounds with its output redirected must not
+    inherit the runner's stderr pipe through the shim's fd 3."""
+    from cron import scheduler_script as ss
+
+    release = env / "helper-release"
+    # The helper exits on its own once released (bounded at ~30 s), so nothing is signalled.
+    (env / "scripts" / "wrap.sh").write_text(
+        f'( n=0; while [ ! -f "{release}" ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done )'
+        ' >/dev/null 2>&1 </dev/null &\necho started\n', encoding="utf-8")
+    t0 = time.monotonic()
+    try:
+        ok, out = ss._run_job_script("wrap.sh", job_id="j1", execution_id="e4abc",
+                                     timeout_seconds=15)
+    finally:
+        release.touch()
+    assert ok, out
+    assert out.strip() == "started"
+    assert time.monotonic() - t0 < 10
+
+
+def test_record_without_note_pid_waits_for_the_running_shim(env):
+    """Prism 289e05dabb81: the owner died between Popen and note_pid. The shim's own pid file
+    identifies the running script, so settle keeps the record past the grace period."""
+    from cron import script_outcome_records as rec
+
+    base = rec.begin("j1", "e5abc")
+    meta_path = Path(str(base) + ".json")
+    meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+    meta["owner_pid"] = 2 ** 22 - 7  # a pid that is not running
+    meta["owner_started_at"] = 1
+    meta["started_at"] = time.time() - 120  # past the no-identity grace period
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    release = env / "release5"
+    shim = subprocess.Popen(rec.wrap_argv(base, ["/bin/sh", "-c", f'while [ ! -f "{release}" ]; do sleep 0.05; done']),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _wait(lambda: Path(str(base) + ".pid").exists(), what="shim pid")
+        assert rec.settle() == 0
+        assert "e5abc.json" in _records(env), "a live shim's record must be kept"
+    finally:
+        release.touch()
+        shim.wait(10)
+    assert "e5abc.rc" in _records(env)
+
+
+def test_busy_fence_keeps_the_record_for_a_later_pass(env, monkeypatch):
+    """Prism f26e557657af: a fence that cannot be taken is not a reason to drop the evidence."""
+    import contextlib
+
+    import cron.jobs as jobs
+    from cron.jobs import get_job
+
+    job, started, release = _make_job(env, 0)
+    _gateway_dies_mid_run(env, job["id"], started)
+    release.touch()
+    _wait(lambda: any(n.endswith(".rc") for n in _records(env)), what="exit status")
+    from cron.executions import recover_interrupted_executions
+    from cron.scheduler_provider import _settle_script_outcomes
+
+    assert recover_interrupted_executions() == 1
+
+    @contextlib.contextmanager
+    def busy(job_id, *, timeout=None):
+        yield False
+
+    real = jobs._fire_job_lock
+    monkeypatch.setattr(jobs, "_fire_job_lock", busy)
+    assert _settle_script_outcomes() == 0
+    assert any(n.endswith(".rc") for n in _records(env)), "record must survive a busy fence"
+    monkeypatch.setattr(jobs, "_fire_job_lock", real)
+    assert _settle_script_outcomes() == 1
+    assert get_job(job["id"])["last_status"] == "ok"
+    assert _records(env) == []
+
+
+def test_newer_attempt_seen_under_the_fence_is_not_overwritten(env, monkeypatch):
+    """Prism 00449436b876 / 696260cb6b5c: the newest-attempt check runs inside the fence. A newer
+    attempt that lands while settle waits for the fence wins."""
+    import contextlib
+
+    import cron.jobs as jobs
+    from cron.executions import create_execution, recover_interrupted_executions
+    from cron.jobs import get_job, mark_job_run
+    from cron.scheduler_provider import _settle_script_outcomes
+
+    job, started, release = _make_job(env, 3)
+    _gateway_dies_mid_run(env, job["id"], started)
+    release.touch()
+    _wait(lambda: any(n.endswith(".rc") for n in _records(env)), what="exit status")
+    assert recover_interrupted_executions() == 1
+
+    real = jobs._fire_job_lock
+    landed = []
+
+    @contextlib.contextmanager
+    def newer_run_lands_first(job_id, *, timeout=None):
+        # E2 starts and records success just before settle gets the fence (once).
+        if not landed:
+            landed.append(True)
+            create_execution(job_id, source="manual")
+            mark_job_run(job_id, True)
+        with real(job_id, timeout=timeout) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(jobs, "_fire_job_lock", newer_run_lands_first)
+    assert _settle_script_outcomes() == 0
+    final = get_job(job["id"])
+    assert final["last_status"] == "ok", final
+    assert final["last_error"] is None

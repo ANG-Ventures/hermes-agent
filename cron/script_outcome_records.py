@@ -14,8 +14,8 @@ The fix gives the script's own exit status a durable home:
   stderr to files and writes its exit code to ``<execution_id>.rc`` the moment it exits, then
   replays the captured output on the original pipes. The script itself never writes to the
   scheduler's pipe, so a dead reader can no longer kill it with SIGPIPE either.
-* The runner deletes the record once it has observed the exit itself (every normal, timeout and
-  cancel path), so a record only survives when the owner process died mid-run.
+* The record is deleted once the owner has durably recorded the run (``finish_execution`` wrote
+  the attempt's terminal row), so a record only survives when the owner process died before that.
 * ``settle`` runs after restart recovery and on the periodic dead-owner reap. For a record whose
   owner process is gone it reads ``.rc``: the job is graded by that real outcome (when the
   attempt is still the job's newest). A record with no ``.rc`` whose script pid is still alive
@@ -43,25 +43,43 @@ RECORDS_DIRNAME = "script-runs"
 STRAY_RECORD_MAX_AGE_SECONDS = 7 * 24 * 3600
 # The settle output doc keeps the tail of the captured stdout/stderr, not an unbounded file.
 _OUTPUT_TAIL_BYTES = 16 * 1024
-_SUFFIXES = (".json", ".rc", ".rc.tmp", ".out", ".err")
+_SUFFIXES = (".json", ".pid", ".rc", ".rc.tmp", ".out", ".err")
+# A record with no script identity at all (no note_pid, no shim .pid) this long after begin():
+# the shim never started (its first act writes .pid), so no exit status can ever arrive.
+_NO_SCRIPT_GRACE_SECONDS = 60
 
-# $1 = record base path, the rest = the script argv. The exit code is published with an atomic
-# rename so a reader never sees a half-written .rc. The replay goes to the original pipes; if
-# the reader is gone the shim may die on SIGPIPE, after the .rc is already durable.
+# $1 = record base path, $2/$3 = absolute mv/cat (the job's PATH must not decide whether the
+# exit status is published or the output replayed), the rest = the script argv. The shim's own
+# pid is written first with builtins only, so settle knows the script's identity even when the
+# owner died before note_pid. fd 3 keeps the real stderr for the replay and is closed for the
+# script, so a helper the script backgrounds never holds the runner's stderr pipe open. The
+# exit code is published with an atomic rename so a reader never sees a half-written .rc. The
+# replay goes to the original pipes; if the reader is gone the shim may die on SIGPIPE, after
+# the .rc is already durable.
 _SHIM = (
-    # fd 3 keeps the real stderr; the shim's own (e.g. macOS sh's "Terminated: 15") is dropped.
-    'rec=$1; shift; exec 3>&2 2>/dev/null; '
-    '"$@" >"$rec.out" 2>"$rec.err"; rc=$?; '
-    'printf "%s\\n" "$rc" >"$rec.rc.tmp" && mv -f "$rec.rc.tmp" "$rec.rc"; '
-    'cat "$rec.out"; cat "$rec.err" >&3; '
+    'rec=$1; mv=$2; cat=$3; shift 3; printf "%s\\n" "$$" >"$rec.pid"; '
+    # The shim's own stderr (e.g. macOS sh's "Terminated: 15") is dropped.
+    'exec 3>&2 2>/dev/null; '
+    '"$@" >"$rec.out" 2>"$rec.err" 3>&-; rc=$?; '
+    'printf "%s\\n" "$rc" >"$rec.rc.tmp" && "$mv" -f "$rec.rc.tmp" "$rec.rc"; '
+    '"$cat" "$rec.out"; "$cat" "$rec.err" >&3; '
     # A signal death is re-raised so Popen still sees -N (the shutdown-kill re-queue reads it).
     'if [ "$rc" -gt 128 ]; then kill -s "$(kill -l "$rc")" $$ 2>/dev/null; fi; '
     'exit "$rc"'
 )
 
 
+def _system_tool(name: str) -> Optional[str]:
+    for directory in ("/bin", "/usr/bin"):
+        candidate = f"{directory}/{name}"
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def supported() -> bool:
-    return sys.platform != "win32" and os.path.isfile("/bin/sh")
+    return (sys.platform != "win32" and os.path.isfile("/bin/sh")
+            and _system_tool("mv") is not None and _system_tool("cat") is not None)
 
 
 def _records_dir() -> Path:
@@ -113,7 +131,8 @@ def begin(job_id: str, execution_id: Optional[str]) -> Optional[Path]:
 
 
 def wrap_argv(base: Path, argv: List[str]) -> List[str]:
-    return ["/bin/sh", "-c", _SHIM, "hermes-cron-script", str(base), *argv]
+    return ["/bin/sh", "-c", _SHIM, "hermes-cron-script", str(base),
+            _system_tool("mv") or "mv", _system_tool("cat") or "cat", *argv]
 
 
 def note_pid(base: Path, pid: int) -> None:
@@ -142,11 +161,55 @@ def discard(base: Optional[Path]) -> None:
             logger.debug("could not remove %s%s", base, suffix, exc_info=True)
 
 
-def _read_rc(base: Path) -> Optional[int]:
+def discard_execution(execution_id: Optional[str]) -> None:
+    """The owner durably recorded this attempt: its outcome record is no longer evidence."""
+    if not execution_id or not supported():
+        return
     try:
-        return int(Path(str(base) + ".rc").read_text(encoding="utf-8-sig").strip())
+        discard(_base(execution_id))
+    except Exception:
+        logger.debug("could not discard outcome record of %s", execution_id, exc_info=True)
+
+
+def _read_int(base: Path, suffix: str) -> Optional[int]:
+    try:
+        return int(Path(str(base) + suffix).read_text(encoding="utf-8-sig").strip())
     except (OSError, ValueError):
         return None
+
+
+def _read_rc(base: Path) -> Optional[int]:
+    return _read_int(base, ".rc")
+
+
+def _script_alive(meta: Dict[str, Any], base: Path) -> Optional[bool]:
+    """True/False when the script's identity is known; None when nothing identifies it yet."""
+    from cron.executions import _owner_is_live, _process_start_time
+
+    script_pid = meta.get("script_pid")
+    if script_pid:
+        return _owner_is_live(int(script_pid), meta.get("script_started_at"))
+    shim_pid = _read_int(base, ".pid")
+    if not shim_pid:
+        return None
+    # The shim wrote its own pid; no start time was persisted, so a live pid counts only when
+    # that process started after begin() (a recycled pid is older than the record).
+    try:
+        from gateway.status import _pid_exists
+
+        if not _pid_exists(shim_pid):
+            return False
+    except Exception:
+        return True
+    started = _process_start_time(shim_pid)
+    if started is None:
+        return True  # cannot compare -> cannot prove death
+    begun = float(meta.get("started_at") or 0)
+    # get_process_start_time is not always epoch seconds (Linux: clock ticks since boot);
+    # compare only when it looks like an epoch value, else treat the live pid as the shim.
+    if started > 10**9 and started + 2 < begun:
+        return False
+    return True
 
 
 def _tail(path: Path) -> str:
@@ -177,29 +240,24 @@ def _newer_run_recorded(job: Dict[str, Any], meta: Dict[str, Any]) -> bool:
         return False
 
 
-def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> bool:
-    """Grade the job by the script's real exit code. True when ``jobs.json`` was written."""
+APPLIED, SKIPPED, RETRY = "applied", "skipped", "retry"
+
+
+def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> str:
+    """Grade the job by the script's real exit code.
+
+    APPLIED: ``jobs.json`` was written. SKIPPED: the outcome must never be applied (a newer
+    attempt, the job deleted); the record can go. RETRY: the job's fire fence could not be taken;
+    keep the record for a later pass. The newest-attempt and already-counted reads happen under
+    the same fence as the write, so an attempt that finishes meanwhile cannot be overwritten.
+    """
     from cron.executions import latest_execution
-    from cron.jobs import correct_counted_run_outcome, get_job, mark_job_run, save_job_output
+    from cron.jobs import (
+        _fire_job_lock, correct_counted_run_outcome, get_job, mark_job_run, save_job_output,
+    )
 
     job_id = str(meta["job_id"])
     execution_id = str(meta["execution_id"])
-    latest = latest_execution(job_id)
-    if latest is not None and latest.get("id") != execution_id:
-        # A newer attempt exists (an interval job fired again, or someone ran it by hand):
-        # its own result is the current one.
-        logger.info(
-            "Job '%s': script outcome record %s is older than the newest attempt %s; not applied",
-            job_id, execution_id, latest.get("id"))
-        return False
-    job = get_job(job_id)
-    if job is None:
-        return False
-    # Recorded after this run started = restart recovery (or the shutdown mark) already counted
-    # this run via mark_job_run. With the attempt still the newest, that write is about THIS run.
-    already_counted = _newer_run_recorded(job, meta)
-    if latest is None and already_counted:
-        return False  # attempt pruned from the ledger and the job has run since
     try:
         finished = Path(str(base) + ".rc").stat().st_mtime
     except OSError:
@@ -210,13 +268,36 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> bool:
     if not success:
         error = (f"Script exited with code {rc} (read from the script's own exit status after "
                  "the scheduler restarted mid-run)")
-    if already_counted:
-        # Replace the unknown/interrupted stamp; never count the run a second time (repeat,
-        # next_run_at and streaks were advanced by that first write).
-        if not correct_counted_run_outcome(job_id, success, error, last_run_at=finished_iso):
-            return False
-    elif not mark_job_run(job_id, success, error):
-        return False
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            logger.warning("Job '%s': fire fence busy; script outcome %s kept for a later pass",
+                           job_id, execution_id)
+            return RETRY
+        latest = latest_execution(job_id)
+        if latest is not None and latest.get("id") != execution_id:
+            # A newer attempt exists (an interval job fired again, or someone ran it by hand):
+            # its own result is the current one.
+            logger.info(
+                "Job '%s': script outcome record %s is older than the newest attempt %s; "
+                "not applied", job_id, execution_id, latest.get("id"))
+            return SKIPPED
+        job = get_job(job_id)
+        if job is None:
+            return SKIPPED
+        # Recorded after this run started = restart recovery (or the shutdown mark) already
+        # counted this run via mark_job_run. With the attempt still the newest, that write is
+        # about THIS run.
+        already_counted = _newer_run_recorded(job, meta)
+        if latest is None and already_counted:
+            return SKIPPED  # attempt pruned from the ledger and the job has run since
+        # The fence is held (re-entrant), so a False below means the job vanished: SKIPPED.
+        if already_counted:
+            # Replace the unknown/interrupted stamp; never count the run a second time
+            # (repeat, next_run_at and streaks were advanced by that first write).
+            if not correct_counted_run_outcome(job_id, success, error, last_run_at=finished_iso):
+                return SKIPPED
+        elif not mark_job_run(job_id, success, error):
+            return SKIPPED
     name = job.get("name") or job_id
     stdout = _tail(Path(str(base) + ".out"))
     stderr = _tail(Path(str(base) + ".err"))
@@ -237,7 +318,7 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> bool:
     logger.warning(
         "Job '%s': run %s outlived a scheduler restart and exited %d; recorded as %s from its "
         "own exit status (t_854cd586)", name, execution_id, rc, "ok" if success else "error")
-    return True
+    return APPLIED
 
 
 def settle() -> int:
@@ -249,7 +330,7 @@ def settle() -> int:
         names = os.listdir(directory)
     except (FileNotFoundError, NotADirectoryError):
         return 0
-    from cron.executions import _owner_is_live
+    from cron.executions import _owner_is_live, get_execution
 
     graded = 0
     for name in names:
@@ -270,26 +351,37 @@ def settle() -> int:
             except OSError:
                 pass
             continue
+        try:
+            row = get_execution(str(meta["execution_id"]))
+        except Exception:
+            row = None
+        if row is not None and row.get("status") in ("completed", "failed"):
+            discard(base)  # the owner recorded this attempt itself
+            continue
         if _owner_is_live(owner_pid, meta.get("owner_started_at")):
             continue  # the owner is still waiting on this script and will record it itself
         rc = _read_rc(base)
         if rc is None:
-            script_pid = meta.get("script_pid")
-            if script_pid and _owner_is_live(int(script_pid), meta.get("script_started_at")):
+            alive = _script_alive(meta, base)
+            if alive:
                 continue  # orphan still running; a later pass reads its exit status
-            if script_pid is None and time.time() - float(meta.get("started_at") or 0) < 60:
-                continue  # owner died between begin() and Popen; give the record a moment
+            if alive is None and (time.time() - float(meta.get("started_at") or 0)
+                                  < _NO_SCRIPT_GRACE_SECONDS):
+                continue  # the shim may not have written its pid yet
             logger.info(
                 "Job '%s': script run %s ended without an exit status (killed); left as restart "
                 "recovery recorded it", meta.get("job_id"), meta.get("execution_id"))
             discard(base)
             continue
         try:
-            if _record_outcome(meta, base, rc):
-                graded += 1
+            result = _record_outcome(meta, base, rc)
         except Exception:
             logger.warning("Job '%s': applying script outcome record failed",
                            meta.get("job_id"), exc_info=True)
             continue
+        if result == RETRY:
+            continue
+        if result == APPLIED:
+            graded += 1
         discard(base)
     return graded
