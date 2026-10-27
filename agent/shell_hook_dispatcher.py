@@ -1,8 +1,9 @@
 """Run several Python shell hooks from ONE interpreter start (driver: agent/shell_hooks_batch.py, t_f010356f).
 
-Hermes starts ``<python> shell_hook_dispatcher.py`` once per tool call instead of one
-``<python> <hook>.py`` per configured hook. stdin is one JSON object
-``{"hooks": [{"script", "args", "timeout"}, ...], "stdin": "<hook payload>"}``.
+Hermes keeps ``<python> shell_hook_dispatcher.py --serve`` warm and sends it one request per tool
+call, instead of one ``<python> <hook>.py`` per configured hook. A request is one JSON object
+``{"hooks": [{"script", "args", "timeout"}, ...], "stdin": "<hook payload>"}``: one per stdin line
+with ``--serve`` (each answered by its rows then ``{"end": true}``), or all of stdin without it.
 
 Each hook runs in a forked child that looks to the hook like a fresh ``<python> <script> <args...>``:
 its own process group, the payload on a pipe at fd 0, its own stdout / stderr pipes, ``sys.argv``,
@@ -222,9 +223,28 @@ def _finish(sel, h, timed_out):
 
 
 def main():
-    request = json.loads(sys.stdin.read())
+    """One request on stdin (read to EOF), or with ``--serve`` one request per stdin line until EOF,
+    each answered by its rows and then ``{"end": true}`` (the warm dispatcher, t_e920d269)."""
+    if "--serve" in sys.argv[1:]:
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return
+            _run_request(json.loads(line))
+            _emit({"end": True})
+    _run_request(json.loads(sys.stdin.read()))
+
+
+def _run_request(request):
     payload = request["stdin"].encode("utf-8")
     sel = selectors.DefaultSelector()
+    try:
+        _run_hooks(request, payload, sel)
+    finally:
+        sel.close()
+
+
+def _run_hooks(request, payload, sel):
     live = []
     for i, hook in enumerate(request["hooks"]):
         h = _start(i, hook, payload)
