@@ -1275,6 +1275,9 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
+_UNPINNED = object()  # evaluate_after_turn(baseline=...) not given
+
+
 class _StaleGoalWrite(Exception):
     """A save inside evaluate_after_turn lost the compare-and-set (internal control flow)."""
 
@@ -1697,9 +1700,18 @@ class GoalManager:
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
-    def evaluate_after_turn(self, last_response: str, **kwargs: Any) -> Dict[str, Any]:
+    def evaluate_after_turn(self, last_response: str, *, baseline: Any = _UNPINNED, **kwargs: Any) -> Dict[str, Any]:
         """See ``_evaluate_after_turn``. A save that lost to a newer stored state (the user paused,
-        cleared or replaced the goal while the judge ran) never continues on the stale copy."""
+        cleared or replaced the goal while the judge ran) never continues on the stale copy.
+        ``baseline``: the stored row when the turn ended; a different row now is a goal the turn never saw."""
+        if _get_session_db() is not None:  # CAS baseline = the row as of evaluation start, not construction
+            now = _load_goal_raw(self.session_id)
+            if now[1] != self._stored:  # another manager wrote the row since our last load/save
+                self._state, self._stored = now
+        if baseline is not _UNPINNED and baseline != self._stored:
+            logger.info("GoalManager: goal for %s changed since the turn ended; skipped the evaluation", self.session_id)
+            status = self._state.status if self._state else None
+            return {**_decision(status, False, None, "stale", "goal changed since the turn ended", ""), "held": "stale"}
         self._evaluating = True
         try:
             return self._evaluate_after_turn(last_response, **kwargs)

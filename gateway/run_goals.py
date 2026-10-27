@@ -328,7 +328,7 @@ class GatewayGoalsMixin:
         return await self._run_in_executor_with_context(factory, sid)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None, goal_pin: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -376,7 +376,7 @@ class GatewayGoalsMixin:
         _max_checkins = self._goal_int_setting("max_idle_checkins", DEFAULT_MAX_IDLE_CHECKINS)
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=True, background_processes=_bg_procs,
+                final_response or "", **({"baseline": goal_pin[0]} if goal_pin else {}), user_initiated=True, background_processes=_bg_procs,
                 active_delegations=_active_deleg, real_event=_real_event,
                 made_tool_calls=_made_tools, no_progress_turns=_no_progress,
                 turn_effect=_effect, user_spoke=_user_spoke or _goal_turn,
@@ -401,6 +401,12 @@ class GatewayGoalsMixin:
             await self._defer_goal_status_notice_after_delivery(source, msg)
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
+            return
+        # A /goal pause or clear that landed during the status send wins: enqueue only onto the row we wrote.
+        from hermes_cli.goals import _load_goal_raw
+        now, _ = await self._run_in_executor_with_context(_load_goal_raw, mgr.session_id)
+        if now is None or now.status != "active" or now.revision != mgr.state.revision:
+            logger.info("goal continuation for %s dropped: goal changed during the status send", _sid)
             return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
         try:
@@ -434,6 +440,12 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.debug("post-turn hook failed: %s", exc)
             return
+        # Pin the goal row as of turn end: a /goal set during the send is not judged on this reply.
+        with suppress(Exception):
+            from hermes_cli.goals import _load_goal_raw
+            sid = self.session_store.peek_session_id(session_key)
+            if isinstance(sid, str) and sid:
+                kwargs["goal_pin"] = ((await self._run_in_executor_with_context(_load_goal_raw, sid))[1],)
 
         # The routed profile scope (home/secret/terminal contextvars) is left before the adapter fires the
         # callback; run the hooks in the context captured here so they read the routed profile's state.db.
@@ -456,7 +468,7 @@ class GatewayGoalsMixin:
         adapter.register_post_delivery_callback(session_key, _hooks, generation=generation)
 
     async def _run_post_turn_hooks(
-        self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
+        self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None, goal_pin: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
@@ -474,7 +486,7 @@ class GatewayGoalsMixin:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                extra = {"event": event} if label == "goal continuation" else {}
+                extra = {"event": event, "goal_pin": goal_pin} if label == "goal continuation" else {}
                 await hook(session_entry=session_entry, source=source, final_response=final_text, **extra)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)

@@ -164,8 +164,12 @@ def test_stale_evaluation_aborts_before_touching_the_replacement_goal(goal_db, m
     old.state.idle_wakes = 1
     old._save()
     stale = goals.GoalManager("abort")
-    goals.GoalManager("abort").set("new")
-    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("blocked", "impossible", False, None, False))
+
+    def judge(*_a, **_k):  # the user replaces the goal while the judge runs
+        goals.GoalManager("abort").set("new")
+        return ("blocked", "impossible", False, None, False)
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
     decision = stale.evaluate_after_turn("old reply", real_event=True)
     stored = goals.load_goal("abort")
     assert decision["should_continue"] is False
@@ -284,3 +288,51 @@ async def test_slow_quality_gate_is_not_cut_by_a_callback_bound(monkeypatch, tmp
             break
         await asyncio.sleep(0)
     assert outcome == ["done"]
+
+
+def test_cached_manager_evaluates_after_another_instance_wrote(goal_db, monkeypatch):
+    """Prism f64b5ac573b7: the CAS baseline is the row at evaluation start, not at construction."""
+    cached = goals.GoalManager("cli")
+    cached.set("finish")
+    goals.GoalManager("cli").set_checkin_minutes(5)  # another manager writes the row (CLI loop tick)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "more", False, None, False))
+    decision = cached.evaluate_after_turn("did a thing", made_tool_calls=True)
+    assert decision["verdict"] != "stale" and decision["should_continue"] is True
+
+
+@pytest.mark.asyncio
+async def test_goal_set_during_the_send_is_not_judged_on_the_old_reply(goal_db, monkeypatch):
+    """Prism 49118239454b: no goal at turn end, /goal B during the send -> B untouched."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner()
+    pin = (goals._load_goal_raw(entry.session_id)[1],)  # captured at turn end: no goal
+    goals.GoalManager(entry.session_id, default_max_turns=1).set("B")
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "more", False, None, False))
+    await runner._post_turn_goal_continuation(
+        session_entry=entry, source=src, final_response="old reply", goal_pin=pin,
+    )
+    stored = goals.load_goal(entry.session_id)
+    assert (stored.goal, stored.status, stored.turns_used) == ("B", "active", 0)
+    assert not adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_pause_during_the_status_send_drops_the_continuation(goal_db, monkeypatch):
+    """Prism a3be91a7b685: /goal pause completing during the status notice wins."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner()
+    goals.GoalManager(entry.session_id).set("finish")
+    real_send = adapter.send
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        await asyncio.to_thread(lambda: goals.GoalManager(entry.session_id).pause())  # /goal pause lands
+        return await real_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    adapter.send = send
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "more", False, None, False))
+    await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="ok")
+    assert adapter.sends, "no status notice was sent"
+    assert goals.load_goal(entry.session_id).status == "paused"
+    assert not adapter._pending_messages
