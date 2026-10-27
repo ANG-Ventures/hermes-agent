@@ -858,6 +858,86 @@ def test_zip_pairs_records_the_identity_it_captured_not_the_one_sampled_before(h
     assert {"profiles/a/cron/jobs.json", "profiles/b/cron/jobs.json"} <= names, names
 
 
+def test_zip_pairs_records_the_captured_store_not_the_path_after_the_zip_writes(home, tmp_path,
+                                                                                monkeypatch):
+    """Prism a398ca30beda: the identity was re-read from the live path AFTER the members were
+    written into the zip. A rename + a replacement store at the path while the members were being
+    written recorded the REPLACEMENT as archived; once it moved too, the rescan skipped it and its
+    pair was never archived (and the store that WAS archived was archived a second time)."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    pa, pb, pc = (home / "profiles" / n for n in ("a", "b", "c"))
+    (pa / "cron").mkdir(parents=True)
+    with cj.use_cron_store(pa):
+        _job(cj, "archived", 2)
+    real, raced = backup._write_zip_file, []
+
+    def write_zip_file(zf, path, arcname):
+        real(zf, path, arcname)
+        if not raced:  # A captured; while its members are zipped, A -> b and C appears at a
+            raced.append(1)
+            pa.rename(pb)
+            (pa / "cron").mkdir(parents=True)
+            with cj.use_cron_store(pa):
+                _job(cj, "replacement", 1)
+
+    monkeypatch.setattr(backup, "_write_zip_file", write_zip_file)
+    out, errors, captured = tmp_path / "out", [], {}
+    out.mkdir()
+    with zipfile.ZipFile(out / "p.zip", "w") as zf:
+        backup._zip_cron_pairs(zf, home, [("profiles", "a")], out / "p.zip",
+                               lambda rel, exc: errors.append((rel, exc)), captured)
+        pa.rename(pc)  # C moves away before the rescan
+        backup._zip_cron_pairs(zf, home, [("profiles", "b"), ("profiles", "c")], out / "p.zip",
+                               lambda rel, exc: errors.append((rel, exc)), captured)
+        names = set(zf.namelist())
+    assert raced and not errors, errors
+    assert "profiles/c/cron/jobs.json" in names, names  # C's pair is in the archive
+    assert "profiles/b/cron/jobs.json" not in names, names  # A is archived once, as profiles/a
+
+
+def test_capture_refuses_when_the_store_is_replaced_while_it_is_read(home, tmp_path, monkeypatch):
+    """Prism a398ca30beda (class): capture() reports the identity of the cron directory it read.
+    A rename + replacement between its member reads would pair one store's jobs.json with another
+    store's db under an identity that names neither, so it refuses instead."""
+    from cron import jobs as cj
+    from cron import store_pair
+
+    pa = home / "profiles" / "a"
+    (pa / "cron").mkdir(parents=True)
+    with cj.use_cron_store(pa):
+        _job(cj, "a", 1)
+    real = store_pair._copy_db
+
+    def copy_db(src, dst):
+        pa.rename(home / "profiles" / "b")
+        (pa / "cron").mkdir(parents=True)
+        with cj.use_cron_store(pa):
+            _job(cj, "c", 1)
+        return real(src, dst)
+
+    monkeypatch.setattr(store_pair, "_copy_db", copy_db)
+    ident = []
+    with pytest.raises(store_pair.PairRefused, match="replaced while"):
+        store_pair.capture(pa, tmp_path / "dest", identity=ident)
+    assert ident == []
+    assert not (tmp_path / "dest" / "jobs.json").exists()
+
+
+def test_capture_reports_the_identity_of_the_directory_it_read(home, tmp_path):
+    import os
+
+    from cron import jobs as cj
+    from cron import store_pair
+
+    _job(cj, "a", 1)
+    ident = []
+    assert store_pair.capture(home, tmp_path / "dest", identity=ident)
+    st = os.lstat(home / "cron")
+    assert ident == [(st.st_dev, st.st_ino)]
+
+
 @pytest.mark.parametrize("leg", ["hermes_backup", "automatic_full_backup"])
 def test_zip_stat_failure_after_a_written_member_aborts(home, tmp_path, monkeypatch, leg):
     """Prism 7edcf5c778ea: the member count was bumped only after the size stat(), so a stat

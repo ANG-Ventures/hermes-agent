@@ -1872,8 +1872,10 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
                         "the backup)", rel_cron, Path(*first, store_pair.CRON_DIR))
             continue
         with tempfile.TemporaryDirectory(prefix=".cron-pair-", dir=str(out_path.parent)) as tmp:
+            read_from: List[tuple] = []
             try:
-                names = store_pair.capture(hermes_root.joinpath(*home), Path(tmp))
+                names = store_pair.capture(hermes_root.joinpath(*home), Path(tmp),
+                                           identity=read_from)
             except (OSError, ValueError, RuntimeError) as exc:
                 on_error(rel_cron / store_pair.JOBS_NAME, exc)  # neither half archived
                 continue
@@ -1896,13 +1898,12 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
                         ) from exc
                     on_error(rel_cron / name, exc)
                     break
-            if captured is not None and names and archived == len(names) and idents:
-                # Prism 268968d0f1f5: *idents* was sampled before capture() took the lock; a
-                # rename + a new store at this path in between archived the NEW store. Record
-                # the identity actually at the path now, so the moved store is not skipped.
-                idents = _store_identity(hermes_root, home)
-            if captured is not None and names and archived == len(names) and idents:
-                captured.setdefault(idents, home)
+            if captured is not None and names and archived == len(names) and read_from:
+                # Prism 268968d0f1f5 / a398ca30beda: record the identity of the cron directory
+                # capture() actually read under its lock. The pre-capture sample can name a store
+                # moved away before the lock, and a re-read of the path now can name a store that
+                # replaced it while the members were zipped; either would skip an unarchived store.
+                captured.setdefault(read_from[0], home)
     return total
 
 
