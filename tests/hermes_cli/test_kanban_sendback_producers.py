@@ -165,24 +165,44 @@ def _git(cwd, *args):
                                "HOME": str(cwd)}).stdout
 
 
-@pytest.mark.parametrize("knob", ["on", "off"])
-def test_stale_base_guard_advisory_only_under_sendback_on(kanban_home, tmp_path, monkeypatch, knob) -> None:
-    """The guard's refusal (StaleBaseError) is turned into a recorded advisory event under `sendback: on`;
-    under `off` it still refuses exactly as before."""
-    from hermes_cli import kanban_branch_base as bb
+def _stale(conflicts=("a.py",), foreign=(), out_of_scope=()):
+    fails = (["does not merge cleanly"] if conflicts else []) + (["foreign"] if foreign else []) \
+        + (["out of scope"] if out_of_scope else [])
+    return SimpleNamespace(repo="ws/repo", failures=fails, conflicts=list(conflicts), foreign_commits=list(foreign),
+                           out_of_scope=list(out_of_scope), render=lambda: "ws/repo: stale")
 
+
+@pytest.mark.parametrize("case,advisory", [
+    ("on conflict pr", True),         # the one advisory case
+    ("off conflict pr", False),       # kill switch off: refuses as today
+    ("on conflict nopr", False),      # no PR: no conflict producer can send it back (Prism 1172e7254787)
+    ("on foreign pr", False),         # foreign commits are not a conflict
+    ("on scope pr", False),           # out-of-scope edits are not a conflict
+])
+def test_stale_base_guard_advisory_only_for_a_pr_conflict(kanban_home, tmp_path, monkeypatch, case, advisory) -> None:
+    """Under `sendback: on` the guard records-and-proceeds ONLY for a merge-conflict-only failure on a handoff that
+    names its own fleet PR; foreign commits, out-of-scope edits and PR-less handoffs still refuse."""
+    from hermes_cli import kanban_branch_base as bb
+    from hermes_cli import kanban_open_pr as op
+
+    knob, kind, pr = case.split()
     pol = tmp_path / "landing-policy.json"
     pol.write_text('{"sendback": "%s"}' % knob)
     monkeypatch.setenv("KANBAN_LANDING_POLICY", str(pol))
+    monkeypatch.setattr(kb, "configured_receipt_gate", lambda: False)   # not the subject (as test_kanban_receipt_gate)
+    report = {"conflict": _stale(), "foreign": _stale(conflicts=(), foreign=("abc x",)),
+              "scope": _stale(conflicts=(), out_of_scope=("z.py",))}[kind]
 
     def stale(*a, **k):
-        raise bb.StaleBaseError("t_x", [SimpleNamespace(repo="ws/repo", failures=["behind origin/main by 40"], render=lambda: "ws/repo: behind")])
+        raise bb.StaleBaseError("t_x", [report])
     monkeypatch.setattr(bb, "enforce_handoff", stale)
-    monkeypatch.setattr(kb, "configured_receipt_gate", lambda: False)   # not the subject (as test_kanban_receipt_gate)
+    monkeypatch.setattr(kb, "_owns_fleet_pr", lambda metadata, survivor_pr: pr == "pr")
+    # keep the open-PR route out of it: this test is the guard alone
+    monkeypatch.setattr(op, "open_pr_refs", lambda *a, **k: [], raising=False)
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="slice", assignee="dev")
         run = kb.claim_task(conn, tid).current_run_id
-        if knob == "on":
+        if advisory:
             assert kb.complete_task(conn, tid, summary="done", expected_run_id=run)
             assert kb.get_task(conn, tid).status == "done"
         else:
@@ -190,4 +210,28 @@ def test_stale_base_guard_advisory_only_under_sendback_on(kanban_home, tmp_path,
                 kb.complete_task(conn, tid, summary="done", expected_run_id=run)
             assert kb.get_task(conn, tid).status == "running"
         ev = [e for e in kb.list_events(conn, tid) if e.kind == "completion_blocked_stale_base"]
-        assert len(ev) == 1 and bool(ev[0].payload.get("advisory")) is (knob == "on")
+        assert len(ev) == 1 and bool(ev[0].payload.get("advisory")) is advisory
+
+
+def test_sendback_restores_over_a_legacy_reviewer_swap(kanban_home: SimpleNamespace) -> None:
+    """Prism 1953ce5049b5: a reviewer swap made while the card sat in review (an `assigned` row of any version, no
+    status field) is a reviewer of the cycle, so after the card is demoted its sendback restores the implementer."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        tid = kb.create_task(conn, title="legacy swap", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(conn, tid, summary="PR ready", reviewer="reviewer-a",
+                                 expected_run_id=claimed.current_run_id)
+        with kb.write_txn(conn):   # the legacy row: a reviewer swap while in review, payload without status
+            conn.execute("UPDATE tasks SET assignee = 'reviewer-b' WHERE id = ?", (tid,))
+            kb._append_event(conn, tid, "assigned", {"assignee": "reviewer-b", "from": "reviewer-a"})
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+        assert kb.claim_review_task(conn, tid) is None
+        assert (kb.get_task(conn, tid).status, kb.get_task(conn, tid).assignee) == ("todo", "reviewer-b")
+        assert kb._latest_review_provenance(conn, tid) == "reviewer-b"
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        assert kb.get_task(conn, tid).assignee == "dev"

@@ -7156,10 +7156,8 @@ def assign_task(
             )
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
         # a no-op re-assign or an unassign, which must not lift ``active_pr``.
-        # ``status`` lets _latest_review_provenance read an operator reassignment of a card IN REVIEW as the
-        # new reviewer of record (SB-K key 766baef3760b): no review_requested is written for it.
         _append_event(
-            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"], "status": row["status"]},
+            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
         )
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee",))
@@ -10382,6 +10380,53 @@ class ExternalCloseError(ValueError):
         )
 
 
+# Event kinds that take a card OUT of review (or end the review cycle). An ``assigned`` event between the latest
+# ``review_requested`` and the first of these was a reviewer swap made while the card sat in review.
+_REVIEW_EXIT_KINDS = ("dependency_wait", "changes_requested", "sendback", "blocked", "completed", "unblocked",
+                      "reopened", "requeued", "archived", "triage_resolved")
+
+
+def _review_swaps(conn: sqlite3.Connection, task_id: str) -> list:
+    """Assignees of the ``assigned`` events made while the latest review cycle was open, oldest first. Derived
+    from the event ORDER, not from a payload field, so a reassignment written by any version counts
+    (Prism 1953ce5049b5)."""
+    rr = conn.execute(
+        "SELECT max(id) FROM task_events WHERE task_id = ? AND kind = 'review_requested'", (task_id,),
+    ).fetchone()[0]
+    if rr is None:
+        return []
+    out = []
+    marks = ",".join("?" for _ in _REVIEW_EXIT_KINDS)
+    for row in conn.execute(
+        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        f"AND kind IN ('assigned', {marks}) ORDER BY id", (task_id, rr, *_REVIEW_EXIT_KINDS),
+    ):
+        if row["kind"] != "assigned":
+            break
+        a = _json_dict(row["payload"]).get("assignee")
+        if _nonblank_str(a):
+            out.append(a)
+    return out
+
+
+def _stale_base_is_conflict_only(reports) -> bool:
+    """True when every failing branch-base report fails ONLY on merge conflicts (no foreign commits, no
+    out-of-scope edits, no other failure line)."""
+    failing = [r for r in reports if getattr(r, "failures", None)]
+    return bool(failing) and all(
+        getattr(r, "conflicts", None) and not getattr(r, "foreign_commits", None)
+        and not getattr(r, "out_of_scope", None) and len(r.failures) == 1
+        for r in failing)
+
+
+def _owns_fleet_pr(metadata: Optional[dict], survivor_pr) -> bool:
+    from hermes_cli import kanban_open_pr as _open_pr
+    try:
+        return bool(_open_pr.split_fleet(_open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0])
+    except Exception:  # noqa: BLE001 -- unreadable = not provably PR-backed: the guard refuses as before
+        return False
+
+
 def landing_policy_knob(name: str) -> Optional[str]:
     """One knob of hermes-home ``config/landing-policy.json`` (Forge L0 kill switches), or None. Missing file /
     key / unreadable = None (off). ``KANBAN_LANDING_POLICY`` overrides the path (tests); inside pytest with no
@@ -10573,9 +10618,13 @@ def _enforce_branch_base(
         if untied:
             payload["survivor_merged_untied"] = untied
         # Forge L0 §2.4 "Also changed" (SB-P): with the sendback producers on, a stale base is ADVISORY. The
-        # event is still recorded (now with advisory=true) and the handoff proceeds; a real conflict reaches
-        # the worker as a `sendback(source=conflict)` from the PR, not as a refused handoff.
-        advisory = landing_policy_knob("sendback") == "on"
+        # event is still recorded (now with advisory=true) and the handoff proceeds; the conflict reaches the
+        # worker as a `sendback(source=conflict)` from the PR. Only that case (Prism 1172e7254787): every failing
+        # report is a merge conflict and nothing else (foreign commits / out-of-scope edits still refuse), and
+        # the handoff names a fleet PR of its own (no PR = nothing a conflict producer can send back on).
+        advisory = (landing_policy_knob("sendback") == "on"
+                    and _stale_base_is_conflict_only(err.reports)
+                    and _owns_fleet_pr(metadata, survivor_pr))
         if advisory:
             payload["advisory"] = True
         with write_txn(conn):
@@ -13977,23 +14026,15 @@ def _latest_review_provenance(conn: sqlite3.Connection, task_id: str):
     no reviewer (unconfigured board); ``False`` = the event exists but its
     reviewer is missing/blank/malformed.
 
-    An operator reassignment of the card while it was IN REVIEW (an ``assigned``
-    event recorded with ``status == "review"``) newer than that event is the
-    reviewer of record instead (SB-K key 766baef3760b): the live assignee and
-    the recorded reviewer must not diverge."""
-    for row in conn.execute(
-        "SELECT kind, payload FROM task_events WHERE task_id = ? "
-        "AND kind IN ('review_requested', 'assigned') ORDER BY id DESC", (task_id,),
-    ):
-        if row["kind"] == "review_requested":
-            event = row
-            break
-        moved = _json_dict(row["payload"])
-        if moved.get("status") == "review":
-            reviewer = moved.get("assignee")
-            return reviewer if isinstance(reviewer, str) and reviewer.strip() else None
-    else:
+    An operator reassignment made while that review cycle was still open (see
+    :func:`_review_swaps`) is the reviewer of record instead (SB-K key
+    766baef3760b): the live assignee and the recorded reviewer must not diverge."""
+    event = _latest_event(conn, task_id, "review_requested")
+    if event is None:
         return None
+    swaps = _review_swaps(conn, task_id)
+    if swaps:
+        return swaps[-1]
     payload = _json_dict(_row_get(event, "payload"))
     if "reviewer" not in payload:
         return False
@@ -14605,6 +14646,20 @@ def _sendback_payload_error(payload: Any) -> Optional[str]:
     return None
 
 
+def _review_cycle_reviewers(conn: sqlite3.Connection, task_id: str) -> set:
+    """Every reviewer of the latest review cycle: the newest ``review_requested`` reviewer plus each reviewer swap
+    made while that cycle was open (:func:`_review_swaps`). A reassignment after the card left review is an
+    operator's explicit choice and is not in the set (d3eaed71c036)."""
+    rr = _latest_event(conn, task_id, "review_requested")
+    if rr is None:
+        return set()
+    out = set(_review_swaps(conn, task_id))
+    rv = _json_dict(_row_get(rr, "payload")).get("reviewer")
+    if _nonblank_str(rv):
+        out.add(rv)
+    return out
+
+
 def _review_handoff_implementer(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """The implementer recorded by the latest ``review_requested``, or ``None``."""
     requested = _latest_event(conn, task_id, "review_requested")
@@ -14683,9 +14738,7 @@ def request_sendback(
             extra: dict = {}
             if implementer is not None:
                 extra["implementer"] = implementer
-                last_reviewer = _latest_review_provenance(conn, task_id)
-                if (row["assignee"] != implementer and isinstance(last_reviewer, str)
-                        and row["assignee"] == last_reviewer):
+                if row["assignee"] != implementer and row["assignee"] in _review_cycle_reviewers(conn, task_id):
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = ? WHERE id = ? AND status = ?",
                         (implementer, task_id, status),
