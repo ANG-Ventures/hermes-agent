@@ -7,6 +7,11 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
 (a) DRAFT -> refuse. A draft PR is not a handoff (hermes-agent#821 sat as a
     draft in the review lane). :class:`DraftPrError` is raised; the card stays
     in-flight so the worker can ``ace_gate.py ready`` and retry.
+    Exception (t_c1ee61ae): the worker's OWN draft -- head branch names this card
+    and the repo is listed in ``config/worker-pr-draft.json`` (the gh-shim opens
+    those as drafts) -- is flipped ready via ``ace_gate.py ready`` (review hold /
+    Ace gate still refuse) and not armed in the same handoff. Any foreign draft
+    still refuses, before any flip. Kill switch ``KANBAN_HANDOFF_DRAFT_FLIP=0``.
 (b) STALE -> update. A head more than :data:`STALE_BEHIND_MAX` (20, the same
     number as fleet-merge.sh ``FLEET_MERGE_STALE_BASE_MAX``) commits behind its
     base AND reported ``mergeable_state=behind`` (a strict up-to-date rule blocks
@@ -43,6 +48,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -214,11 +220,76 @@ def spawn_arm(repo: str, number: int, sha: str, task_id: str, ci_report: str = "
 
 
 ArmFn = Callable[..., Optional[str]]   # (repo, number, sha, task_id[, ci_report]) -> log path
+ReadyFn = Callable[[str, int], Optional[int]]   # (repo, number) -> ace_gate.py rc, None = not run
+
+
+def worker_draft_flip_enabled() -> bool:
+    return os.environ.get("KANBAN_HANDOFF_DRAFT_FLIP", "1").strip() != "0"
+
+
+def worker_draft_repos(path: Optional[str] = None) -> set:
+    """Casefolded repos listed in ``<hermes root>/config/worker-pr-draft.json`` (t_c1ee61ae).
+
+    The file the gh-shim reads to open worker PRs as drafts (t_ea770a43). Absent/unreadable/
+    malformed -> empty set (no flip: the draft refusal is unchanged). ``KANBAN_WORKER_PR_DRAFT``
+    overrides the path (tests)."""
+    if path is None:
+        path = os.environ.get("KANBAN_WORKER_PR_DRAFT") or ""
+        if not path:
+            try:
+                from hermes_constants import get_default_hermes_root
+                path = str(get_default_hermes_root() / "config" / "worker-pr-draft.json")
+            except Exception:  # noqa: BLE001 -- fail-safe: no flip
+                return set()
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    repos = d.get("repos") if isinstance(d, dict) else None
+    if not isinstance(repos, list):
+        return set()
+    return {r.casefold() for r in repos if isinstance(r, str)}
+
+
+def _owns_draft(ref, pr: dict, task_id: str) -> bool:
+    """The worker's own draft: head branch names THIS card and the repo is a worker-draft repo."""
+    from hermes_cli.kanban_open_pr import branch_names_card
+    head_ref = str(((pr.get("head") or {}).get("ref")) or "")
+    return branch_names_card(head_ref, task_id) and ref.repo.casefold() in worker_draft_repos()
+
+
+def ace_gate_ready(repo: str, number: int) -> Optional[int]:
+    """``scripts/ace_gate.py ready <repo> <n>`` (the only sanctioned un-draft). rc, or None if not run."""
+    from hermes_constants import get_default_hermes_root
+    script = get_default_hermes_root() / "scripts" / "ace_gate.py"
+    if not script.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable or "python3", str(script), "ready", repo, str(number)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            timeout=90, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.warning("handoff freshness: ace_gate ready %s#%s failed: %s", repo, number, exc)
+        return None
+    if proc.returncode != 0:
+        _log.warning("handoff freshness: ace_gate ready %s#%s rc=%s: %s", repo, number,
+                     proc.returncode, (proc.stderr or "").strip()[:300])
+    return proc.returncode
+
+
+def _default_ready() -> Optional[ReadyFn]:
+    # Same seam as _default_gh: never un-draft a live PR from pytest.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    return ace_gate_ready
 
 
 def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
-          armable=None, draft_ok: bool = False) -> dict:
+          armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -248,6 +319,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
 
     views = []
     drafts = []
+    own_drafts: dict = {}
     for ref in refs:
         key = f"{ref.repo}#{ref.number}"
         pr = gh(f"repos/{ref.repo}/pulls/{ref.number}")
@@ -259,11 +331,33 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         if pr.get("draft") is True:
             drafts.append(key)
             entry["draft"] = True
+            if worker_draft_flip_enabled() and _owns_draft(ref, pr, task_id):
+                own_drafts[key] = (ref, key, pr, entry)
             continue
         views.append((ref, key, pr, entry))
-    if drafts:
-        if not draft_ok:
+    if drafts and not draft_ok:
+        # t_c1ee61ae: the worker's OWN draft (head branch names this card, repo listed in
+        # config/worker-pr-draft.json) is flipped ready through ace_gate.py instead of refused.
+        # A foreign draft still refuses, before any flip; a failed flip (review hold rc=21, Ace-gated
+        # rc=20, read failure) refuses like before.
+        own = {k for k in drafts if k in own_drafts}
+        foreign = [k for k in drafts if k not in own]
+        if foreign or not own:
             raise DraftPrError(task_id, drafts)
+        ready = ready or _default_ready()
+        failed = []
+        for ref, key, pr, entry in own_drafts.values():
+            rc = ready(ref.repo, ref.number) if ready is not None else None
+            entry["draft_flip"] = f"ready via ace_gate.py (rc={rc})"
+            if rc != 0:
+                failed.append(key)
+                continue
+            entry["draft"] = False
+            views.append((ref, key, dict(pr, draft=False), entry))
+        if failed:
+            raise DraftPrError(task_id, failed)
+        report["draft_flipped"] = sorted(own)
+    elif drafts:
         report["draft_override"] = drafts
 
     for ref, key, pr, entry in views:
@@ -295,7 +389,13 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             entry["update_branch"] = "requested" if upd is not None else "failed (fail-open)"
             # The new head has fresh CI; arming is fleet-merge's job once it is green.
             continue
-        if allow_arm and armable_keys is not None and key.lower() not in armable_keys:
+        if entry.get("draft_flip"):
+            # Just un-drafted: the head's only check-runs are the draft-skipped ones (`skipped`
+            # counts green), so arming now would land on CI that never ran. CI + Prism start on
+            # the ready event; the lander arms it from there.
+            if allow_arm:
+                entry["automerge"] = "not armed: flipped ready at handback, CI starts now"
+        elif allow_arm and armable_keys is not None and key.lower() not in armable_keys:
             entry["automerge"] = "not armed: PR only mentioned, not this card's handoff PR"
         elif allow_arm and automerge_enabled():
             ci = _ci_report(gh, ref.repo, head)

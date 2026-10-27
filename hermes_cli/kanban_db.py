@@ -11007,8 +11007,11 @@ def complete_task(
                 # ran with arming off for the verdict (Prism 188c162a38e9). A PR the gate just
                 # update-branched is left to fleet-merge once its fresh CI is green, as in check().
                 gated = freshness.get("prs") or {}
+                # A PR flipped ready this handoff is not re-armed either (t_c1ee61ae): its CI
+                # starts on the ready event, its draft-skipped check-runs read green.
                 rearm = [r for r in still_open
-                         if "update_branch" not in (gated.get(f"{r.repo}#{r.number}") or {})]
+                         if not {"update_branch", "draft_flip"} & set(
+                             gated.get(f"{r.repo}#{r.number}") or {})]
                 if rearm:
                     again = _freshness_gate(rearm, True)
                     freshness = dict(freshness, prs={**gated, **(again.get("prs") or {})})
