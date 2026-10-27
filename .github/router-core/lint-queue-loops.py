@@ -116,6 +116,19 @@ def _eager_parent(fn, gen) -> bool:
     return False
 
 
+DEFERRED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _walk_eager(node):
+    """ast.walk that does not descend into a nested def / lambda / class: code there runs only if something calls
+    it, so a routing comprehension in an uncalled helper (or one called only under `if cond:`) routes nothing."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        stack.extend(c for c in ast.iter_child_nodes(n) if not isinstance(c, DEFERRED))
+
+
 def _route_calls(node) -> list:
     return [c for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
             and c.func.id == ROUTE_FN]
@@ -182,20 +195,42 @@ def _leaves_outer_loop(st) -> bool:
     return walk(st, True)
 
 
+def _ends_outer_loop(st) -> bool:
+    """`st` can END the enclosing loop: a break that belongs to it, or a return anywhere (a continue only ends
+    the iteration, so it is harmless once the row is routed)."""
+    def walk(n, own: bool) -> bool:
+        if isinstance(n, DEFERRED):
+            return False
+        if isinstance(n, ast.Return) or (own and isinstance(n, ast.Break)):
+            return True
+        if isinstance(n, (ast.For, ast.AsyncFor, ast.While)):
+            return any(walk(c, False) for c in n.body) or any(walk(c, own) for c in n.orelse)
+        return any(walk(c, own) for c in ast.iter_child_nodes(n))
+    return walk(st, True)
+
+
 def _block_routes(stmts) -> bool:
     """The statement list routes its row on every pass: a TOP-LEVEL simple statement writes row_route[...] or
     calls _route_row unconditionally, or a top-level if/else routes in BOTH arms; no earlier statement can leave
-    the loop's iteration first."""
+    the loop's iteration first, and no LATER statement can end the loop (a trailing break / return routes only
+    the first row: Prism 19377e67cb32 / b89a0617821b)."""
+    routed = False
     for st in stmts:
+        if routed:
+            if _ends_outer_loop(st):
+                return False
+            continue
         if not isinstance(st, COMPOUND):
             calls = _route_calls(st)
             if _writes_row_route(st) or (calls and not all(_conditional_inside(st, c) for c in calls)):
-                return True
+                routed = True
+                continue
         elif isinstance(st, ast.If) and _block_routes(st.body) and _block_routes(st.orelse):
-            return True
+            routed = True
+            continue
         if _leaves_outer_loop(st):
             return False
-    return False
+    return routed
 
 
 def _loop_routes_every_row(loop) -> bool:
@@ -224,20 +259,48 @@ def check_dispatcher(root: Path) -> list[str]:
     def _routes_ready(stmts) -> bool:
         # Only an UNCONDITIONAL route at the arm's own statement level counts (Prism 1d133dcecb68): a nested
         # `if cond: for r in ready_rows: ...` in the arm, or a loop body of `if r["ok"]: row_route[...] = ...`,
-        # routes only some ticks / some rows.
+        # routes only some ticks / some rows. A nested if/else counts when BOTH of its arms route.
         for st in stmts:
             if isinstance(st, (ast.For, ast.AsyncFor)):
                 if _over_ready(st.iter) and _loop_routes_every_row(st):
                     return True
-            elif not isinstance(st, COMPOUND) and any(_ready_route_comp(n) for n in ast.walk(st)):
+            elif isinstance(st, ast.If):
+                if _routes_ready(st.body) and _routes_ready(st.orelse):
+                    return True
+            elif not isinstance(st, COMPOUND) and any(_ready_route_comp(n) for n in _walk_eager(st)):
+                return True
+        return False
+    def _passes_plan(c, plan: str) -> bool:
+        """`_route_row(conn, row, <plan>, ...)` or `_route_row(conn, row, plan=<plan>, ...)`."""
+        if len(c.args) >= 3:
+            return isinstance(c.args[2], ast.Name) and c.args[2].id == plan
+        return len(c.args) == 2 and any(k.arg == "plan" and isinstance(k.value, ast.Name) and k.value.id == plan
+                                        for k in c.keywords)
+    def _rebinds(n, name: str) -> bool:
+        """A comprehension target in `n` binds `name`: the `plan` inside is that loop variable, not the guard's."""
+        return any(isinstance(g, ast.comprehension) and any(isinstance(t, ast.Name) and t.id == name
+                                                            for t in ast.walk(g.target))
+                   for g in ast.walk(n))
+    def _plan_routes(stmts, plan: str) -> bool:
+        """The guard body routes every ready row with `plan`: a top-level ready_rows routing comprehension (eager
+        code only, never inside a nested def / lambda) whose every _route_row passes the guard's own `plan`, or a
+        nested if/else whose BOTH arms do."""
+        for b in stmts:
+            if isinstance(b, ast.If):
+                if _plan_routes(b.body, plan) and _plan_routes(b.orelse, plan):
+                    return True
+            elif not isinstance(b, COMPOUND) and any(
+                    _ready_route_comp(n) and not _rebinds(n, plan)
+                    and all(_passes_plan(c, plan) for c in _route_calls(n))
+                    for n in _walk_eager(b)):
                 return True
         return False
     def _plan_guard(st) -> bool:
         """The live dispatcher's `if spillover is not None:` shape, and only that: `if <plan> is not None:` whose
         body routes every ready row with `<plan>` as the PLAN argument of _route_row (the third positional,
-        `_route_row(conn, row, plan, ...)`), AND whose else arm is the no-plan path: a top-level loop over the
-        same ready rows that writes row_route[...] (pins wait; every other row takes the spawn loop's
-        `row_route.get(id, ("local", None))` default). No else, `else: pass`, a guard on any other name
+        `_route_row(conn, row, plan, ...)`, or `plan=<plan>`), AND whose else arm is the no-plan path: a top-level
+        loop over the same ready rows that writes row_route[...] (pins wait; every other row takes the spawn
+        loop's `row_route.get(id, ("local", None))` default). No else, `else: pass`, a guard on any other name
         (`if conn is not None:`), or a body that does not pass the guard name as the plan still marks the arms
         guarded (desk send-back on hermes-home#7231)."""
         t = st.test
@@ -246,10 +309,7 @@ def check_dispatcher(root: Path) -> list[str]:
                 and t.comparators[0].value is None):
             return False
         plan = t.left.id
-        body_ok = any(
-            _ready_route_comp(n) and all(len(c.args) >= 3 and isinstance(c.args[2], ast.Name)
-                                         and c.args[2].id == plan for c in _route_calls(n))
-            for b in st.body if not isinstance(b, COMPOUND) for n in ast.walk(b))
+        body_ok = _plan_routes(st.body, plan)
         else_ok = any(isinstance(b, (ast.For, ast.AsyncFor)) and _over_ready(b.iter) and _writes_row_route(b)
                       for b in st.orelse)
         return body_ok and else_ok
@@ -257,16 +317,19 @@ def check_dispatcher(root: Path) -> list[str]:
     for st in ast.walk(fn):
         if isinstance(st, ast.If) and not (_routes_ready(st.body) and _routes_ready(st.orelse)) \
                 and not _plan_guard(st):
+            # every node under the `if`, the else arm's own statements included (Prism d75c20691309:
+            # `if skip: pass / else: for r in ready_rows: ...` routes only on the ticks that take the else)
             for inner in ast.walk(st):
-                if inner is not st and not any(inner is x for x in st.orelse):
+                if inner is not st:
                     guarded.add(id(inner))
         elif isinstance(st, (ast.While, ast.Try, ast.With, ast.AsyncWith)):
             for inner in ast.walk(st):
                 if inner is not st:
                     guarded.add(id(inner))
-    # D1: _route_row presented for every ready row
+    # D1: _route_row presented for every ready row (eager code only: a comprehension inside a nested def or
+    # lambda runs only if something calls it)
     d1 = False
-    for n in ast.walk(fn):
+    for n in _walk_eager(fn):
         if isinstance(n, (ast.DictComp, ast.ListComp, ast.SetComp, ast.GeneratorExp)):
             calls = _route_calls(n)
             gens = n.generators
@@ -501,6 +564,60 @@ DISPATCH_ELSE_LOOP_OTHER_ROWS = DISPATCH_BOTH_ARMS.replace(
     '        for r in pinned_rows:\n            row_route[r["id"]] = ("wait"', 1)
 DISPATCH_ELSE_LOOP_ROUTE_CALL = DISPATCH_OK.replace(_COMP, _PLANNED + _ELSE_LOOP + (
     '            _route_row(conn, r)\n'), 1)
+# t_0266053d: plan guard over-strict shapes, a trailing loop exit, the else-arm guard marking, inner-scope `plan`
+_ELSE_PIN = ('    else:\n        for r in ready_rows:\n            if pinned(r):\n'
+             '                row_route[r["id"]] = ("wait", "pool_unavailable")\n')
+DISPATCH_PLAN_GUARD_NESTED_IF_ELSE = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    if plan is not None:\n        if fast:\n'
+    '            row_route = {r["id"]: _route_row(conn, r, plan) for r in ready_rows}\n        else:\n'
+    '            row_route = {r["id"]: _route_row(conn, r, plan, 1) for r in ready_rows}\n') + _ELSE_PIN, 1)
+DISPATCH_PLAN_GUARD_NESTED_IF_ELSE_ONE_ARM = DISPATCH_PLAN_GUARD_NESTED_IF_ELSE.replace(
+    '            row_route = {r["id"]: _route_row(conn, r, plan, 1) for r in ready_rows}\n',
+    '            row_route = {}\n', 1)
+DISPATCH_PLAN_GUARD_KWARG = DISPATCH_PLAN_GUARD.replace("_route_row(conn, r, plan)", "_route_row(conn, r, plan=plan)", 1)
+DISPATCH_PLAN_GUARD_KWARG_OTHER = DISPATCH_PLAN_GUARD.replace("_route_row(conn, r, plan)",
+                                                              "_route_row(conn, r, plan=conn)", 1)
+DISPATCH_PLAN_GUARD_COMP_REBINDS = DISPATCH_PLAN_GUARD.replace(
+    '{r["id"]: _route_row(conn, r, plan) for r in ready_rows}',
+    '{plan["id"]: _route_row(conn, plan, plan) for plan in ready_rows}', 1)
+DISPATCH_PLAN_GUARD_LAMBDA = DISPATCH_PLAN_GUARD.replace(
+    '        row_route = {r["id"]: _route_row(conn, r, plan) for r in ready_rows}\n',
+    '        row_route = (lambda plan: {r["id"]: _route_row(conn, r, plan) for r in ready_rows})\n', 1)
+DISPATCH_UNCALLED_DEF = DISPATCH_OK.replace(_COMP, (
+    '    def later(plan):\n        return {r["id"]: _route_row(conn, r, plan) for r in ready_rows}\n'
+    '    row_route = {}\n'), 1)
+DISPATCH_HELPER_UNDER_IF = DISPATCH_OK.replace(_COMP, (
+    '    def _route_all():\n        return {r["id"]: _route_row(conn, r) for r in ready_rows}\n'
+    '    row_route = {}\n    if cond:\n        row_route = _route_all()\n'), 1)
+_ELSE_ROUTE = '            row_route[r["id"]] = ("wait", "pool_unavailable")\n'
+DISPATCH_ELSE_ROUTE_THEN_BREAK = DISPATCH_BOTH_ARMS.replace(_ELSE_ROUTE, _ELSE_ROUTE + '            break\n', 1)
+DISPATCH_ELSE_ROUTE_THEN_RETURN = DISPATCH_BOTH_ARMS.replace(_ELSE_ROUTE, _ELSE_ROUTE + '            return\n', 1)
+DISPATCH_ELSE_ROUTE_THEN_CONTINUE = DISPATCH_BOTH_ARMS.replace(_ELSE_ROUTE, _ELSE_ROUTE + '            continue\n', 1)
+DISPATCH_ELSE_ROUTE_THEN_INNER_BREAK = DISPATCH_BOTH_ARMS.replace(
+    _ELSE_ROUTE, _ELSE_ROUTE + '            for d in r["deps"]:\n                break\n', 1)
+DISPATCH_SKIP_ELSE_ROUTES = DISPATCH_OK.replace(_COMP, (
+    '    row_route = {}\n    if skip:\n        pass\n    else:\n        for r in ready_rows:\n'
+    '            row_route[r["id"]] = _route_row(conn, r)\n'), 1)
+DISPATCH_BOTH_ARMS_NESTED_IF_ELSE = DISPATCH_BOTH_ARMS.replace(
+    '    if planned:\n        row_route = {r["id"]: _route_row(conn, r) for r in ready_rows}\n',
+    '    if planned:\n        if fast:\n            row_route = {r["id"]: _route_row(conn, r) for r in ready_rows}\n'
+    '        else:\n            row_route = {r["id"]: _route_row(conn, r, 1) for r in ready_rows}\n', 1)
+# the plan only reaches _route_row through an uncalled lambda; the comprehension that runs routes without it
+DISPATCH_PLAN_GUARD_PLAN_ONLY_IN_LAMBDA = DISPATCH_PLAN_GUARD_NOT_AN_ARG.replace(
+    '        row_route = {r["id"]: _route_row(conn, r) for r in ready_rows}\n',
+    '        later = lambda: {r["id"]: _route_row(conn, r, plan) for r in ready_rows}\n'
+    '        row_route = {r["id"]: _route_row(conn, r) for r in ready_rows}\n', 1)
+# desk r2 on #7256: the routing arm's comprehension is only in deferred code (a def body, a lambda); the else arm
+# routes with _route_row in a ready_rows loop, so only the arm check can turn the `if` into a guard
+_ELSE_ROUTE_CALL = ('    else:\n        row_route = {}\n        for r in ready_rows:\n'
+                    '            row_route[r["id"]] = _route_row(conn, r)\n')
+DISPATCH_ARM_DEF_ELSE_ROUTE_CALL = DISPATCH_OK.replace(_COMP, (
+    '    if planned:\n        def later():\n'
+    '            return {r["id"]: _route_row(conn, r) for r in ready_rows}\n') + _ELSE_ROUTE_CALL, 1)
+DISPATCH_ARM_LAMBDA_ELSE_ROUTE_CALL = DISPATCH_OK.replace(_COMP, (
+    '    if planned:\n        later = lambda: {r["id"]: _route_row(conn, r) for r in ready_rows}\n') + _ELSE_ROUTE_CALL, 1)
+DISPATCH_ELSE_ROUTE_THEN_DEF_RETURN = DISPATCH_BOTH_ARMS.replace(
+    _ELSE_ROUTE, _ELSE_ROUTE + '            def cb():\n                return r\n', 1)
 POOL_OK = '''#!/usr/bin/env bash
 while true; do
   i=1
@@ -612,6 +729,42 @@ def selftest() -> int:
          {D: DISPATCH_ELSE_LOOP_OTHER_ROWS}, ["dispatcher"], 1),
         ("dispatcher: else-arm loop with a bare top-level _route_row(...) call is GREEN (#7231 desk r2)",
          {D: DISPATCH_ELSE_LOOP_ROUTE_CALL}, ["dispatcher"], 0),
+        ("dispatcher: plan guard body is an if/else routing with the plan in BOTH arms, GREEN (t_0266053d N4b)",
+         {D: DISPATCH_PLAN_GUARD_NESTED_IF_ELSE}, ["dispatcher"], 0),
+        ("dispatcher: plan guard body is an if/else routing in ONE arm only, RED (t_0266053d)",
+         {D: DISPATCH_PLAN_GUARD_NESTED_IF_ELSE_ONE_ARM}, ["dispatcher"], 1),
+        ("dispatcher: plan guard passing `plan=<plan>` by keyword is GREEN (t_0266053d N5)",
+         {D: DISPATCH_PLAN_GUARD_KWARG}, ["dispatcher"], 0),
+        ("dispatcher: plan guard passing `plan=<another name>` by keyword is RED (t_0266053d)",
+         {D: DISPATCH_PLAN_GUARD_KWARG_OTHER}, ["dispatcher"], 1),
+        ("dispatcher: plan guard whose comprehension target rebinds `plan` is RED (t_0266053d)",
+         {D: DISPATCH_PLAN_GUARD_COMP_REBINDS}, ["dispatcher"], 1),
+        ("dispatcher: plan guard body routing inside an uncalled `lambda plan:` is RED (t_0266053d)",
+         {D: DISPATCH_PLAN_GUARD_LAMBDA}, ["dispatcher"], 1),
+        ("dispatcher: routing comprehension only in an uncalled nested def is RED (t_0266053d)",
+         {D: DISPATCH_UNCALLED_DEF}, ["dispatcher"], 1),
+        ("dispatcher: routing helper called only under `if cond:` is RED (t_0266053d)",
+         {D: DISPATCH_HELPER_UNDER_IF}, ["dispatcher"], 1),
+        ("dispatcher: else-arm loop routes then `break` is RED (Prism 19377e67cb32 / b89a0617821b)",
+         {D: DISPATCH_ELSE_ROUTE_THEN_BREAK}, ["dispatcher"], 1),
+        ("dispatcher: else-arm loop routes then `return` is RED (Prism 19377e67cb32 / b89a0617821b)",
+         {D: DISPATCH_ELSE_ROUTE_THEN_RETURN}, ["dispatcher"], 1),
+        ("dispatcher: else-arm loop routes then `continue` is GREEN (t_0266053d)",
+         {D: DISPATCH_ELSE_ROUTE_THEN_CONTINUE}, ["dispatcher"], 0),
+        ("dispatcher: else-arm loop routes then a nested loop's own `break` is GREEN (t_0266053d)",
+         {D: DISPATCH_ELSE_ROUTE_THEN_INNER_BREAK}, ["dispatcher"], 0),
+        ("dispatcher: `if skip: pass / else:` routing for-loop is RED (Prism d75c20691309)",
+         {D: DISPATCH_SKIP_ELSE_ROUTES}, ["dispatcher"], 1),
+        ("dispatcher: if/else whose routing arm is itself an if/else routing in BOTH arms is GREEN (t_0266053d)",
+         {D: DISPATCH_BOTH_ARMS_NESTED_IF_ELSE}, ["dispatcher"], 0),
+        ("dispatcher: plan guard where the plan reaches _route_row only in an uncalled lambda is RED (t_0266053d)",
+         {D: DISPATCH_PLAN_GUARD_PLAN_ONLY_IN_LAMBDA}, ["dispatcher"], 1),
+        ("dispatcher: arm routing only in an uncalled nested def, else routes via _route_row, is RED (#7256 desk M7)",
+         {D: DISPATCH_ARM_DEF_ELSE_ROUTE_CALL}, ["dispatcher"], 1),
+        ("dispatcher: arm routing only in an uncalled lambda, else routes via _route_row, is RED (#7256 desk Nd2)",
+         {D: DISPATCH_ARM_LAMBDA_ELSE_ROUTE_CALL}, ["dispatcher"], 1),
+        ("dispatcher: else-arm loop routes then a nested def holding `return` is GREEN (#7256 desk Ne5)",
+         {D: DISPATCH_ELSE_ROUTE_THEN_DEF_RETURN}, ["dispatcher"], 0),
         ("dispatcher: no _route_row over ready_rows is RED", {D: DISPATCH_NO_ROUTE}, ["dispatcher"], 1),
         ("dispatcher: _route_row under `if` in a for loop is RED", {D: DISPATCH_COND_ROUTE}, ["dispatcher"], 1),
         ("dispatcher: unconditional _route_row in a for loop is GREEN", {D: DISPATCH_LOOP_ROUTE}, ["dispatcher"], 0),
