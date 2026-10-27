@@ -752,11 +752,14 @@ def test_import_refuses_a_live_runtime_db_linked_outside_the_home(home, tmp_path
 
 
 @pytest.mark.parametrize("leg", ["restore", "auto_restore"])
-@pytest.mark.parametrize("link", ["live_cron_dir", "live_db", "snapshot_member"])
+@pytest.mark.parametrize("link", ["live_cron_dir", "live_db", "live_db_hardlink", "snapshot_member"])
 def test_snapshot_pair_restore_never_writes_through_a_link(home, tmp_path, leg, link):
     """Prism dd8a638040cd / 4c71a06241bb: the quick-snapshot pair branch ran before the per-file
     containment checks, so a live ``cron/`` (or member) symlinked outside the home was written
-    through, and a snapshot member linked outside the snapshot was read."""
+    through, and a snapshot member linked outside the snapshot was read. Prism 6245695b492f: a
+    live db HARD-linked to another home's db is a regular file, and was restored in place."""
+    import os
+
     from cron import jobs as cj
     from hermes_cli import backup
 
@@ -773,6 +776,10 @@ def test_snapshot_pair_restore_never_writes_through_a_link(home, tmp_path, leg, 
         for p in (home / "cron").glob("runtime_state.db*"):
             p.unlink()
         (home / "cron" / "runtime_state.db").symlink_to(ocron / "runtime_state.db")
+    elif link == "live_db_hardlink":
+        for p in (home / "cron").glob("runtime_state.db*"):
+            p.unlink()
+        os.link(ocron / "runtime_state.db", home / "cron" / "runtime_state.db")
     else:
         (sdir / "cron" / "runtime_state.db").unlink()
         (sdir / "cron" / "runtime_state.db").symlink_to(ocron / "runtime_state.db")
@@ -790,6 +797,65 @@ def test_snapshot_pair_restore_never_writes_through_a_link(home, tmp_path, leg, 
     assert _rows(ocron) == orows
     if link != "live_cron_dir":
         assert (home / "cron" / "jobs.json").read_bytes() == live_json  # nothing half-restored
+
+
+def test_auto_restore_refuses_a_symlinked_snapshot_cron_dir(home, tmp_path):
+    """Prism 17c97989d85c: restore() lstat()ed only the two source members, so a snapshot whose
+    ``cron/`` DIRECTORY is a symlink into another home passed, and the post-update auto-restore
+    (no containment check of its own) restored that home's pair here."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    a, b = _job(cj, "a", 2), _job(cj, "b", 3)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    sdir = backup._quick_snapshot_root(home) / snap
+    other = tmp_path / "other-home"
+    (other / "cron").mkdir(parents=True)
+    with cj.use_cron_store(other):
+        _job(cj, "o1", 1), _job(cj, "o2", 1)
+    cj.remove_job(b)
+    (sdir / "cron").rename(sdir / "cron-real")
+    (sdir / "cron").symlink_to(other / "cron")
+    live_json, live_rows = (home / "cron" / "jobs.json").read_bytes(), _rows(home / "cron")
+    assert backup.restore_cron_jobs_if_emptied(snap, hermes_home=home) is None
+    assert (home / "cron" / "jobs.json").read_bytes() == live_json
+    assert _rows(home / "cron") == live_rows and a in live_rows
+
+
+def test_zip_pairs_records_the_identity_it_captured_not_the_one_sampled_before(home, tmp_path,
+                                                                                monkeypatch):
+    """Prism 268968d0f1f5: the store identity was sampled BEFORE capture() took its lock. A rename
+    plus a replacement store at the old path in between archived the replacement under the moved
+    store's identity, and the rescan then skipped the moved store: its pair was never archived."""
+    from cron import jobs as cj
+    from cron import store_pair
+    from hermes_cli import backup
+
+    pa, pb = home / "profiles" / "a", home / "profiles" / "b"
+    (pa / "cron").mkdir(parents=True)
+    with cj.use_cron_store(pa):
+        _job(cj, "moved", 2)
+    real, raced = store_pair.capture, []
+
+    def capture(h, dest, **kw):
+        if not raced:
+            raced.append(1)
+            pa.rename(pb)
+            (pa / "cron").mkdir(parents=True)
+            with cj.use_cron_store(pa):
+                _job(cj, "replacement", 1)
+        return real(h, dest, **kw)
+
+    monkeypatch.setattr(store_pair, "capture", capture)
+    out, errors, captured = tmp_path / "out", [], {}
+    out.mkdir()
+    with zipfile.ZipFile(out / "p.zip", "w") as zf:
+        for homes in ([("profiles", "a")], [("profiles", "b")]):  # pass 1, then the rescan
+            backup._zip_cron_pairs(zf, home, homes, out / "p.zip",
+                                   lambda rel, exc: errors.append((rel, exc)), captured)
+        names = set(zf.namelist())
+    assert raced and not errors, errors
+    assert {"profiles/a/cron/jobs.json", "profiles/b/cron/jobs.json"} <= names, names
 
 
 @pytest.mark.parametrize("leg", ["hermes_backup", "automatic_full_backup"])
