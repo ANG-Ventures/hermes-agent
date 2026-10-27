@@ -247,9 +247,13 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> str:
     """Grade the job by the script's real exit code.
 
     APPLIED: ``jobs.json`` was written. SKIPPED: the outcome must never be applied (a newer
-    attempt, the job deleted); the record can go. RETRY: the job's fire fence could not be taken;
-    keep the record for a later pass. The newest-attempt and already-counted reads happen under
-    the same fence as the write, so an attempt that finishes meanwhile cannot be overwritten.
+    attempt, the job deleted, or another settler already consumed the record). RETRY: the job's
+    fire fence could not be taken; keep the record for a later pass.
+
+    The whole consumption happens under one fire fence: the record is re-read (``rc`` passed in
+    was read outside it), applied, its output saved and the record removed before the fence is
+    released. A second settler that read the same record earlier then finds it gone and applies
+    nothing (Prism e9387d975af3), and an attempt that finishes meanwhile cannot be overwritten.
     """
     from cron.executions import latest_execution
     from cron.jobs import (
@@ -258,21 +262,29 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> str:
 
     job_id = str(meta["job_id"])
     execution_id = str(meta["execution_id"])
-    try:
-        finished = Path(str(base) + ".rc").stat().st_mtime
-    except OSError:
-        finished = time.time()
-    finished_iso = datetime.fromtimestamp(finished).astimezone().isoformat()
-    success = rc == 0
-    error = None
-    if not success:
-        error = (f"Script exited with code {rc} (read from the script's own exit status after "
-                 "the scheduler restarted mid-run)")
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             logger.warning("Job '%s': fire fence busy; script outcome %s kept for a later pass",
                            job_id, execution_id)
             return RETRY
+        # Revalidate under the fence: a concurrent settler may have consumed the record since
+        # the caller read it. No .json or no .rc now = nothing left to apply.
+        rc = _read_rc(base)
+        try:
+            finished = Path(str(base) + ".rc").stat().st_mtime
+            Path(str(base) + ".json").stat()
+        except OSError:
+            rc = None
+        if rc is None:
+            logger.info("Job '%s': script outcome record %s already consumed; not applied",
+                        job_id, execution_id)
+            return SKIPPED
+        finished_iso = datetime.fromtimestamp(finished).astimezone().isoformat()
+        success = rc == 0
+        error = None
+        if not success:
+            error = (f"Script exited with code {rc} (read from the script's own exit status "
+                     "after the scheduler restarted mid-run)")
         latest = latest_execution(job_id)
         if latest is not None and latest.get("id") != execution_id:
             # A newer attempt exists (an interval job fired again, or someone ran it by hand):
@@ -280,41 +292,49 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> str:
             logger.info(
                 "Job '%s': script outcome record %s is older than the newest attempt %s; "
                 "not applied", job_id, execution_id, latest.get("id"))
+            discard(base)
             return SKIPPED
         job = get_job(job_id)
         if job is None:
+            discard(base)
             return SKIPPED
         # Recorded after this run started = restart recovery (or the shutdown mark) already
         # counted this run via mark_job_run. With the attempt still the newest, that write is
         # about THIS run.
         already_counted = _newer_run_recorded(job, meta)
         if latest is None and already_counted:
+            discard(base)
             return SKIPPED  # attempt pruned from the ledger and the job has run since
         # The fence is held (re-entrant), so a False below means the job vanished: SKIPPED.
         if already_counted:
             # Replace the unknown/interrupted stamp; never count the run a second time
             # (repeat, next_run_at and streaks were advanced by that first write).
-            if not correct_counted_run_outcome(job_id, success, error, last_run_at=finished_iso):
-                return SKIPPED
-        elif not mark_job_run(job_id, success, error):
+            applied = correct_counted_run_outcome(job_id, success, error,
+                                                  last_run_at=finished_iso)
+        else:
+            applied = mark_job_run(job_id, success, error)
+        if not applied:
+            discard(base)
             return SKIPPED
-    name = job.get("name") or job_id
-    stdout = _tail(Path(str(base) + ".out"))
-    stderr = _tail(Path(str(base) + ".err"))
-    doc = (
-        f"# Cron Job: {name}\n\n**Job ID:** {job_id}\n"
-        f"**Run Time:** {finished_iso}\n**Mode:** no_agent (script, settled after restart)\n\n"
-        f"**Status:** {'ok' if success else f'exit {rc}'} — the scheduler restarted while this "
-        "script ran; this record was written from the script's own exit status. Its output "
-        "was not delivered.\n\n---\n\n"
-        + (stdout or "(no stdout)")
-        + (f"\n\nstderr:\n{stderr}" if stderr else "")
-        + "\n"
-    )
-    try:
-        save_job_output(job_id, doc)
-    except Exception:
-        logger.debug("Job '%s': could not save settled output", job_id, exc_info=True)
+        name = job.get("name") or job_id
+        stdout = _tail(Path(str(base) + ".out"))
+        stderr = _tail(Path(str(base) + ".err"))
+        doc = (
+            f"# Cron Job: {name}\n\n**Job ID:** {job_id}\n"
+            f"**Run Time:** {finished_iso}\n**Mode:** no_agent (script, settled after restart)\n\n"
+            f"**Status:** {'ok' if success else f'exit {rc}'} — the scheduler restarted while "
+            "this script ran; this record was written from the script's own exit status. Its "
+            "output was not delivered.\n\n---\n\n"
+            + (stdout or "(no stdout)")
+            + (f"\n\nstderr:\n{stderr}" if stderr else "")
+            + "\n"
+        )
+        try:
+            save_job_output(job_id, doc)
+        except Exception:
+            logger.debug("Job '%s': could not save settled output", job_id, exc_info=True)
+        # Consumed: remove the record before the fence is released.
+        discard(base)
     logger.warning(
         "Job '%s': run %s outlived a scheduler restart and exited %d; recorded as %s from its "
         "own exit status (t_854cd586)", name, execution_id, rc, "ok" if success else "error")
@@ -379,9 +399,7 @@ def settle() -> int:
             logger.warning("Job '%s': applying script outcome record failed",
                            meta.get("job_id"), exc_info=True)
             continue
-        if result == RETRY:
-            continue
         if result == APPLIED:
             graded += 1
-        discard(base)
+        # APPLIED/SKIPPED removed the record under the fence; RETRY keeps it.
     return graded

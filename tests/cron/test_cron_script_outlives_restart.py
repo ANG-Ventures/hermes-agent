@@ -374,3 +374,42 @@ def test_newer_attempt_seen_under_the_fence_is_not_overwritten(env, monkeypatch)
     final = get_job(job["id"])
     assert final["last_status"] == "ok", final
     assert final["last_error"] is None
+
+
+def test_concurrent_settlers_apply_the_record_once(env):
+    """Prism e9387d975af3: settler B read the record (meta and .rc) before settler A applied and
+    removed it. B must not re-apply its cached copy: no current-time last_run_at, no empty
+    output doc."""
+    from cron import script_outcome_records as rec
+    from cron.executions import recover_interrupted_executions
+    from cron.jobs import get_job
+    from cron.scheduler_provider import _settle_script_outcomes
+
+    job, started, release = _make_job(env, 0)
+    _gateway_dies_mid_run(env, job["id"], started)
+    release.touch()
+    _wait(lambda: any(n.endswith(".rc") for n in _records(env)), what="exit status")
+    assert recover_interrupted_executions() == 1
+
+    # B's view, taken before A runs.
+    name = next(n for n in _records(env) if n.endswith(".json"))
+    base = env / "cron" / "script-runs" / name[: -len(".json")]
+    meta_b = json.loads(Path(str(base) + ".json").read_text(encoding="utf-8-sig"))
+    rc_b = rec._read_rc(base)
+    assert rc_b == 0
+
+    # A settles and consumes the record.
+    assert _settle_script_outcomes() == 1
+    after_a = get_job(job["id"])
+    assert after_a["last_status"] == "ok"
+    assert _records(env) == []
+    out_dir = env / "cron" / "output" / job["id"]
+    docs_a = sorted(p.name for p in out_dir.glob("*.md"))
+
+    time.sleep(1.1)  # a re-apply would stamp a visibly later last_run_at / a new output file
+    assert rec._record_outcome(meta_b, base, rc_b) == rec.SKIPPED
+    after_b = get_job(job["id"])
+    assert after_b["last_run_at"] == after_a["last_run_at"], (after_a, after_b)
+    assert after_b["last_status"] == "ok"
+    assert sorted(p.name for p in out_dir.glob("*.md")) == docs_a
+    assert not any("(no stdout)" in p.read_text(encoding="utf-8-sig") for p in out_dir.glob("*.md"))
