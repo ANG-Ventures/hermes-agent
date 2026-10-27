@@ -634,6 +634,16 @@ def _repo_probe_signature(workspace_path: str) -> Optional[tuple]:
         if common is not None:
             configs.append(os.path.join(common, "config"))
             configs.append(os.path.join(gitdir, "config.worktree"))
+            # Per-worktree HEAD: ``[includeIf "onbranch:..."]`` makes the
+            # effective config (and so the remotes) depend on the checked-out
+            # branch. HEAD is tiny; fold in its content as well as its stat.
+            head_path = os.path.join(gitdir, "HEAD")
+            try:
+                with open(head_path, "rb") as fh:
+                    head_bytes = fh.read(4096)
+            except FileNotFoundError:
+                head_bytes = None
+            parts.append(("head", head_bytes, _stat_sig(head_path)))
         configs.append(os.path.expanduser("~/.gitconfig"))
         for cfg in configs:
             parts.append(_stat_sig(cfg))

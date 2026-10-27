@@ -158,6 +158,26 @@ def test_invisible_config_dependency_is_reprobed_after_ttl(
     assert prg._remotes_for(str(repo)) == {"o/r", "acme/new"}
 
 
+def test_branch_conditional_include_is_seen_on_checkout(tmp_path, git_spawns, probe_clock):
+    """Prism P1: ``[includeIf "onbranch:..."]`` remotes follow the worktree HEAD."""
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "old"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                    "--allow-empty", "-m", "init"], cwd=repo, check=True)
+    subprocess.run(["git", "branch", "new"], cwd=repo, check=True)
+    gitdir = repo / ".git"
+    (gitdir / "old.inc").write_text('[remote "origin"]\n\turl = https://github.com/acme/old.git\n')
+    (gitdir / "new.inc").write_text('[remote "origin"]\n\turl = https://github.com/acme/new.git\n')
+    with open(gitdir / "config", "a", encoding="utf-8") as fh:
+        fh.write('[includeIf "onbranch:old"]\n\tpath = old.inc\n'
+                 '[includeIf "onbranch:new"]\n\tpath = new.inc\n')
+    assert prg._remotes_for(str(repo)) == {"acme/old"}
+    subprocess.run(["git", "checkout", "-q", "new"], cwd=repo, check=True)
+    # Same clock reading: no TTL expiry, only a HEAD-aware signature sees this.
+    assert prg._remotes_for(str(repo)) == {"acme/new"}
+
+
 def test_repeat_within_ttl_still_hits_the_cache(tmp_path, git_spawns, probe_clock):
     repo, _ext = _git_init_with_include(tmp_path)
     for _ in range(10):
