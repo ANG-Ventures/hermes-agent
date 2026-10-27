@@ -2251,12 +2251,38 @@ def maybe_flush_runtime_mirror(*, force: bool = False) -> bool:
     if since is not None and not replaced and not force and interval > 0 \
             and _rs._now() - since < interval:
         return False
+    # Single-flight (t_45a4bee2): the due test above runs unlocked and every outermost section
+    # exit runs it, so once the window elapses every exiting thread passes it and convoys on the
+    # global lock, each re-reading the whole file just to find nothing to write. One flusher per
+    # process: the in-flight one reads seq under the lock before the rows, so any write it misses
+    # stays dirty for the next due call. ``force`` waits for the in-flight flush instead.
+    if not _mirror_flush_gate.acquire(blocking=force):
+        return False
+    try:
+        return _flush_runtime_mirror_locked(store)
+    finally:
+        _mirror_flush_gate.release()
+
+
+# Process-local single-flight gate for the jobs.json mirror flush (see maybe_flush_runtime_mirror).
+_mirror_flush_gate = threading.Lock()
+
+
+def _flush_runtime_mirror_locked(store) -> bool:
     with _jobs_lock():
         with _rs.connect(store.cron_dir, create=False) as conn:
             if conn is None:
                 return False
             seq = _rs.mirror_seq(conn)  # BEFORE the rows are read: a later write stays dirty
             epoch = _rs.mirror_epoch(conn)
+            # Double-checked under the lock: a sibling process (or the flusher we waited behind)
+            # may have published the merged view while we queued. Clean rows and a known file
+            # mean nothing to do: skip the full load and parse of jobs.json.
+            since = _rs.dirty_since(conn)
+            known = _known_mirror_stamp(conn)
+        if since is None and not (known is not None
+                                  and _mirror_stamp(store.jobs_file) != known):
+            return False
         jobs = load_jobs()  # merged view; recovers a pending generation under the lock
         try:
             data, _ = _parse_jobs_file(store.jobs_file)
