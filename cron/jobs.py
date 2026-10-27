@@ -2641,19 +2641,22 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
     if not scope.saved:
         return result
     if scope.removed or len(jobs) != 1 or str(jobs[0].get("id")) != str(job_id):
-        full = [j for j in load_jobs() if str(j.get("id")) != str(job_id)] + list(jobs)
-        save_jobs(full, removed_ids=scope.removed)
+        with _shallow_baseline():
+            full = [j for j in load_jobs() if str(j.get("id")) != str(job_id)] + list(jobs)
+            save_jobs(full, removed_ids=scope.removed)
         return result
     new_def, new_runtime = _rs.split_job(jobs[0])
     if new_def != original_def:
-        full = load_jobs()
-        for i, existing in enumerate(full):
-            if str(existing.get("id")) == str(job_id):
-                # Reconcile against the ORIGINAL baseline *fn* started from, not this fresh
-                # load: a degraded-lock sibling's write since then (e.g. a pause) is in the fresh
-                # baseline, so a plain replace would read our stale copy of it as our own change.
-                full[i] = _reconcile_job_fields(jobs[0], existing, original_job)
-        save_jobs(full)
+        with _shallow_baseline():
+            full = load_jobs()
+            for i, existing in enumerate(full):
+                if str(existing.get("id")) == str(job_id):
+                    # Reconcile against the ORIGINAL baseline *fn* started from, not this fresh
+                    # load: a degraded-lock sibling's write since then (e.g. a pause) is in the
+                    # fresh baseline, so a plain replace would read our stale copy of it as our
+                    # own change. A new record: the loaded one is never edited in place.
+                    full[i] = _reconcile_job_fields(jobs[0], existing, original_job)
+            save_jobs(full)
         return result
     with _runtime_txn() as conn:
         disk = _rs.read_row(conn, str(job_id))
@@ -2848,11 +2851,37 @@ def _record_load_baseline(jobs: Optional[List[Dict[str, Any]]]) -> None:
     if jobs is None:
         _jobs_lock_state.load_baseline = None
         return
-    baseline: Dict[str, Dict[str, Any]] = {}
-    for job in jobs:
-        if isinstance(job, dict) and job.get("id"):
-            baseline[str(job["id"])] = copy.deepcopy(job)
-    _jobs_lock_state.load_baseline = baseline
+    _jobs_lock_state.load_baseline = _baseline_of(jobs)
+
+
+def _baseline_of(jobs: List[Any]) -> Dict[str, Dict[str, Any]]:
+    """``{id: record}`` deep copies, or shallow ones inside ``_shallow_baseline``."""
+    shallow = getattr(_jobs_lock_state, "shallow_baseline", False)
+    return {str(j["id"]): (_shallow_record(j) if shallow else copy.deepcopy(j))
+            for j in jobs if isinstance(j, dict) and j.get("id")}
+
+
+def _shallow_record(job: Dict[str, Any]) -> Dict[str, Any]:
+    # ``repeat`` is the one nested value the save path writes IN PLACE (rs.apply_runtime /
+    # _normalize_repeat_completed set ``completed`` on it); every other key is replaced, never edited.
+    out = dict(job)
+    if isinstance(out.get("repeat"), dict):
+        out["repeat"] = dict(out["repeat"])
+    return out
+
+
+@contextlib.contextmanager
+def _shallow_baseline():
+    """t_14b3fa1d: a load -> save section whose loaded records are never handed to arbitrary code
+    (``_with_job_runtime``'s full-save branches: they only swap list entries for new records) keeps
+    a shallow baseline instead of deep-copying the whole registry under the GIL on every cron fire.
+    Outermost ``_jobs_lock`` section only; an enclosing section keeps deep copies."""
+    prior = getattr(_jobs_lock_state, "shallow_baseline", False)
+    _jobs_lock_state.shallow_baseline = getattr(_jobs_lock_state, "depth", 0) == 1
+    try:
+        yield
+    finally:
+        _jobs_lock_state.shallow_baseline = prior
 
 
 def _reconcile_job_fields(
@@ -3208,8 +3237,7 @@ def _save_split_unlocked(
         # rows: a sibling's key folded in from disk would then read as OUR change and revert it.
         if getattr(_jobs_lock_state, "load_baseline", None) is None:
             return
-        _jobs_lock_state.load_baseline = {
-            str(j["id"]): copy.deepcopy(j) for j in jobs if isinstance(j, dict) and j.get("id")}
+        _jobs_lock_state.load_baseline = _baseline_of(jobs)
 
     if defs_unchanged:
         if changed:
