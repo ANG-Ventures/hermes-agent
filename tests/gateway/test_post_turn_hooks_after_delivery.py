@@ -179,3 +179,108 @@ def test_user_verb_after_a_concurrent_save_is_not_lost(goal_db):
     b.set_checkin_minutes(5)
     a.add_gate("false")
     assert [g.command for g in goals.load_goal("s").gates] == ["false"]
+
+
+@pytest.mark.asyncio
+async def test_stop_mid_judge_keeps_a_queued_follow_up(monkeypatch, tmp_path):
+    """Prism e5e53ccb615c: a follow-up queued before the judge survives /stop and runs next."""
+    rig = _Rig(monkeypatch, tmp_path)
+    log, completes = [], []
+    _slow_hooks(rig, 5.0, log)
+
+    async def on_complete(event, outcome):
+        completes.append((event.text.split("\n\n")[0], outcome))
+
+    rig.adapter.on_processing_complete = on_complete
+    gate = rig.hold_flush("first")
+    await rig.adapter.handle_message(_msg("first"))
+    await asyncio.wait_for(rig.flush_entered["first"].wait(), 5)
+    await rig.adapter.handle_message(_msg("second"))  # queued during the turn
+    gate.set()
+    await _wait_for(lambda: log, "judge start")
+    assert [c.split("\n\n")[0] for c in rig.calls] == ["first"]
+
+    async def no_reply(*_a, **_kw):
+        return None
+
+    rig.adapter._dispatch_inline_reply = no_reply
+    await rig.adapter._dispatch_active_session_command(_msg("/stop"), KEY, "stop")
+    await _wait_for(lambda: len(rig.calls) >= 2, "queued follow-up after /stop", timeout=10)
+    assert rig.calls[1].split("\n\n")[0] == "second"
+    assert [c for c in completes if c[0] == "first"] == [("first", base.ProcessingOutcome.CANCELLED)]
+
+
+@pytest.mark.asyncio
+async def test_deferred_hooks_run_in_the_routed_profile_scope(monkeypatch, tmp_path):
+    """Prism 2363a8f52a0d: the hooks read profile B's state.db, not the launch profile's."""
+    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    home_a.mkdir(), home_b.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    goals._DB_CACHE.clear()
+    rig = _Rig(monkeypatch, tmp_path)
+
+    def set_goal_in_b():
+        token = set_hermes_home_override(str(home_b))
+        try:
+            goals.GoalManager("routed").set("goal in B")
+        finally:
+            reset_hermes_home_override(token)
+
+    await asyncio.to_thread(set_goal_in_b)
+    seen = []
+
+    async def hooks(**_kw):
+        state = await asyncio.to_thread(goals.load_goal, "routed")
+        seen.append((str(get_hermes_home()), state.goal if state else None))
+
+    rig.runner._run_post_turn_hooks = hooks
+    real_handler = rig.runner._handle_message
+
+    async def routed_handler(event):  # what run_adapters does: enter B's scope for the turn only
+        token = set_hermes_home_override(str(home_b))
+        try:
+            return await real_handler(event)
+        finally:
+            reset_hermes_home_override(token)
+
+    rig.adapter.set_message_handler(routed_handler)
+    try:
+        await rig.adapter.handle_message(_msg("first"))
+        await _wait_for(lambda: seen, "deferred hooks", timeout=10)
+    finally:
+        goals._DB_CACHE.clear()
+    assert seen == [(str(home_b), "goal in B")]
+
+
+@pytest.mark.asyncio
+async def test_slow_quality_gate_is_not_cut_by_a_callback_bound(monkeypatch, tmp_path):
+    """Prism 9355f9ec7aa1: parity with the old inline await; a 125 s gate is not cancelled."""
+    rig = _Rig(monkeypatch, tmp_path)
+    loop = asyncio.get_running_loop()
+    real_time, offset = loop.time, [0.0]
+    monkeypatch.setattr(loop, "time", lambda: real_time() + offset[0])
+    started, release, outcome = asyncio.Event(), asyncio.Event(), []
+
+    async def gate_hooks(**_kw):
+        started.set()
+        try:
+            await release.wait()
+            outcome.append("done")
+        except asyncio.CancelledError:
+            outcome.append("cancelled")
+            raise
+
+    rig.runner._run_post_turn_hooks = gate_hooks
+    await rig.adapter.handle_message(_msg("first"))
+    await asyncio.wait_for(started.wait(), 5)
+    offset[0] = 125.0  # the clock passes 125 s while the gate runs
+    for _ in range(20):
+        await asyncio.sleep(0)
+    release.set()
+    for _ in range(200):
+        if outcome:
+            break
+        await asyncio.sleep(0)
+    assert outcome == ["done"]

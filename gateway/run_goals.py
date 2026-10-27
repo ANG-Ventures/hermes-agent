@@ -27,8 +27,6 @@ logger = logging.getLogger("gateway.run")
 # True while the post-turn hooks run as the adapter's post-delivery callback: that slot has already
 # been popped, so a /goal status notice is sent directly (registering would fire on the NEXT turn).
 _AFTER_DELIVERY: contextvars.ContextVar[bool] = contextvars.ContextVar("post_turn_after_delivery", default=False)
-# The /goal judge is a 5-12 s aux-LLM call (t_3acac80f); the adapter's default callback bound is 30 s.
-_POST_TURN_HOOKS_TIMEOUT_SECONDS = 120.0
 
 
 class GatewayGoalsMixin:
@@ -437,16 +435,24 @@ class GatewayGoalsMixin:
                 logger.debug("post-turn hook failed: %s", exc)
             return
 
+        # The routed profile scope (home/secret/terminal contextvars) is left before the adapter fires the
+        # callback; run the hooks in the context captured here so they read the routed profile's state.db.
+        ctx = contextvars.copy_context()
+
+        async def _run() -> None:
+            _AFTER_DELIVERY.set(True)  # inside the task's copy of ctx only
+            await self._run_post_turn_hooks(**kwargs)
+
         async def _hooks() -> None:
-            token, started = _AFTER_DELIVERY.set(True), time.monotonic()
+            started = time.monotonic()
             try:
-                await self._run_post_turn_hooks(**kwargs)
+                await asyncio.create_task(_run(), context=ctx)  # cancelling this await cancels the task
             finally:
-                _AFTER_DELIVERY.reset(token)
                 if (took := time.monotonic() - started) > 2.0:
                     logger.info("PHASE=post_turn_hooks session=%s s=%.2f (after delivery)", session_key, took)
 
-        _hooks.post_delivery_timeout = _POST_TURN_HOOKS_TIMEOUT_SECONDS
+        # Unbounded, as the inline await was: the judge and the gates (300 s each) carry their own timeouts.
+        _hooks.post_delivery_timeout = None
         adapter.register_post_delivery_callback(session_key, _hooks, generation=generation)
 
     async def _run_post_turn_hooks(
