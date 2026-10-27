@@ -268,17 +268,33 @@ class SessionLifecycleMixin:
         """Close a batch; the outermost close persists the deferred marks with ONE ``_save()``.
         Returns the number of marks it persisted (0 = no save). A save error propagates to the
         caller; the in-memory marks stand either way, and the pending count is kept so the next
-        batch close retries the save (Prism ada9ec75ce70)."""
+        flush retries the save (Prism ada9ec75ce70)."""
         with self._lock:
             depth = max(0, getattr(self, "_resume_mark_batch_depth", 0) - 1)
             self._resume_mark_batch_depth = depth
             if depth:
                 return 0
+        return self.flush_pending_resume_marks()
+
+    def flush_pending_resume_marks(self) -> int:
+        """Persist batched marks a failed save left pending; returns the count persisted (0 = no-op).
+
+        The store owns the retry (Prism de5ea0bdfab3): any caller, with or without new marks, can
+        flush. No-op inside an open batch (its close saves). The count is acknowledged only after
+        the ``with self._lock`` exits, because ``_StoreLock`` runs the actual disk/SQLite write on
+        release and a deferred failure surfaces there; a raise leaves the count for the next flush.
+        """
+        with self._lock:
+            if getattr(self, "_resume_mark_batch_depth", 0):
+                return 0
             pending = getattr(self, "_resume_mark_batch_pending", 0)
-            if pending:
-                self._save()
-                self._resume_mark_batch_pending = 0
-            return pending
+            if not pending:
+                return 0
+            self._save()
+        with self._lock:  # persisted: acknowledge only what this save covered
+            self._resume_mark_batch_pending = max(
+                0, getattr(self, "_resume_mark_batch_pending", 0) - pending)
+        return pending
 
     def clear_resume_pending(self, session_key: str, **kw) -> bool:
         """Clear the resume-pending flag after a successful resumed turn; True if cleared.
