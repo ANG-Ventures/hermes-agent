@@ -2053,6 +2053,60 @@ def test_sibling_generation_published_in_the_rename_window_survives(temp_home):
     assert _pending(temp_home) == []
 
 
+def test_sibling_published_after_the_pending_query_rolls_forward_before_our_rename(temp_home):
+    """Prism dff5d592a655: the pending-generation query in _roll_forward_published_sibling is a
+    snapshot. A degraded-lock sibling B that stages, marks published and renames jobs.json naming
+    gB AFTER that query must still be rolled forward by A's save before A's rename erases the name:
+    the guard may skip the file read only when nothing at all is pending, never because the
+    snapshot showed A's own generation alone."""
+    import sys
+
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    b = cj.create_job(prompt="x", schedule="every 5m", name="b")
+    cj.mark_job_run(a["id"], True)
+    gen_b = "d" * 32
+    real_pending = rs.pending_gens
+    fired = []
+
+    def pending_then_sibling_publishes(conn):
+        out = real_pending(conn)
+        frame, in_guard = sys._getframe(1), False
+        while frame is not None:
+            in_guard |= frame.f_code.co_name == "_roll_forward_published_sibling"
+            frame = frame.f_back
+        if in_guard and not fired:
+            fired.append(list(out))
+            with rs.transaction(temp_home / "cron") as sib:
+                row = rs.read_row(sib, a["id"]) or {}
+                rs.stage_pending(sib, gen_b, {a["id"]: dict(row, last_status="sibling")},
+                                 bases={a["id"]: row})
+                rs.mark_published(sib, gen_b)
+            data = json.loads(_jobs_file(temp_home).read_text())
+            data["runtime_gen"] = gen_b
+            _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+            cj._gen_lock_path(gen_b).write_text("")  # B died: lock file free
+        return out
+
+    # A two-phase save of our own (definition AND runtime change): it stages its own generation,
+    # which is the only one pending when the guard looks.
+    full = [dict(j, name="b2", last_status="ours") if j["id"] == b["id"] else j
+            for j in cj.load_jobs()]
+    rs.pending_gens = pending_then_sibling_publishes
+    try:
+        cj.save_jobs(full)
+    finally:
+        rs.pending_gens = real_pending
+    assert fired and len(fired[0]) == 1 and gen_b not in fired[0]  # only ours at the snapshot
+    # Read the rows directly: get_job would run entry recovery and hide a skipped roll-forward.
+    assert gen_b not in _pending(temp_home)
+    with rs.connect(temp_home / "cron") as conn:
+        assert (rs.read_row(conn, a["id"]) or {}).get("last_status") == "sibling"
+    assert cj.get_job(b["id"])["name"] == "b2"
+
+
 def test_stale_file_gen_never_deletes_a_published_generation(temp_home, clock):
     """01add2c86d6d, ruling R2: recovery runs with a stale file_gen (None here) while a dead
     sibling's generation is published; the marker makes it committed, so it is rolled forward
