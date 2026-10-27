@@ -1224,17 +1224,23 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     the exit into one module object while reaping through another (stale)
     one makes ``_classify_worker_exit`` return ``unknown`` — silently turning
     a clean-exit protocol violation into a plain crash.
+
+    The fake pids are dead by fiat for the CLAIM too, not just the reap:
+    claim_task's ``_prior_worker_still_alive`` probes the previous run's
+    spawned pid, and on a host with a large pid_max (ci-box: 4194304) a
+    literal like 991002 can be a live unrelated process (a root kworker on
+    2026-10-27, t_61a33e01), which refused the next claim.
     """
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
     host_prefix = _kb._claimer_id().split(":", 1)[0]
-    claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
-    assert claimed is not None, "task was not claimable for the next attempt"
-    _kbd._set_worker_pid(conn, tid, fake_pid)
-    _kbd._record_worker_exit(fake_pid, raw_status)
     original_alive = _kb._pid_alive
     _kb._pid_alive = lambda p: False
     try:
+        claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+        assert claimed is not None, "task was not claimable for the next attempt"
+        _kbd._set_worker_pid(conn, tid, fake_pid)
+        _kbd._record_worker_exit(fake_pid, raw_status)
         return _kbd.detect_crashed_workers(conn)
     finally:
         _kb._pid_alive = original_alive
