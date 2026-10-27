@@ -7,6 +7,17 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
 (a) DRAFT -> refuse. A draft PR is not a handoff (hermes-agent#821 sat as a
     draft in the review lane). :class:`DraftPrError` is raised; the card stays
     in-flight so the worker can ``ace_gate.py ready`` and retry.
+    Exception (t_c1ee61ae): the worker's OWN draft -- head branch names this card
+    and the repo is listed in ``config/worker-pr-draft.json`` (the gh-shim opens
+    those as drafts) -- is flipped ready via ``ace_gate.py ready`` (review hold /
+    Ace gate still refuse) and not armed in the same handoff. Any foreign draft
+    still refuses, before any flip. Kill switch ``KANBAN_HANDOFF_DRAFT_FLIP=0``.
+    Each flip is recorded as ``{head, at}`` (``at`` = epoch taken BEFORE the
+    flip call) in ``report["draft_flipped_at"]`` / ``DraftPrError.flipped``; the
+    caller persists it and passes it back as ``flipped=`` on every later
+    handoff. A flipped PR is armed only on POSITIVE post-ready evidence: one
+    check-runs snapshot (the same one (c) grades) holding a non-skipped run
+    whose ``started_at`` is after ``at`` (Prism d34048d53f3c).
 (b) STALE -> update. A head more than :data:`STALE_BEHIND_MAX` (20, the same
     number as fleet-merge.sh ``FLEET_MERGE_STALE_BASE_MAX``) commits behind its
     base AND reported ``mergeable_state=behind`` (a strict up-to-date rule blocks
@@ -43,6 +54,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -59,9 +71,11 @@ GhFn = Callable[..., Optional[dict]]
 class DraftPrError(ValueError):
     """A handoff named an OPEN PR that GitHub reports as a draft."""
 
-    def __init__(self, task_id: str, prs: list):
+    def __init__(self, task_id: str, prs: list, flipped: Optional[dict] = None):
         self.task_id = task_id
         self.prs = list(prs)
+        # PRs this call DID flip ready before another failed: {key: {"head", "at"}}; persist them.
+        self.flipped = dict(flipped or {})
         super().__init__(
             f"handoff refused: {', '.join(self.prs)} "
             f"{'is a DRAFT PR' if len(self.prs) == 1 else 'are DRAFT PRs'}. "
@@ -110,10 +124,25 @@ def _default_gh() -> Optional[GhFn]:
     return gh_api
 
 
-def _ci_report(gh: GhFn, repo: str, sha: str) -> str:
-    """'' when the head is CI-green, else a one-line description of why not (red/pending/none/unreadable)."""
+def _check_runs(gh: GhFn, repo: str, sha: str):
+    """One check-runs snapshot for ``sha``: the list, or None when unreadable."""
     runs = gh(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")
     items = (runs or {}).get("check_runs")
+    if not isinstance(items, list) or not all(isinstance(r, dict) for r in items):
+        return None
+    return items
+
+
+_UNREAD = object()
+
+
+def _ci_report(gh: GhFn, repo: str, sha: str, items=_UNREAD) -> str:
+    """'' when the head is CI-green, else a one-line description of why not (red/pending/none/unreadable).
+
+    ``items``: a check-runs snapshot already read by the caller (None = unreadable), so the arm decision
+    and the green grade come from the SAME read (Prism d34048d53f3c)."""
+    if items is _UNREAD:
+        items = _check_runs(gh, repo, sha)
     if not isinstance(items, list):
         return "check-runs unreadable"
     if not items:
@@ -138,6 +167,33 @@ def _ci_report(gh: GhFn, repo: str, sha: str) -> str:
     if state in ("failure", "error") or (state == "pending" and (status or {}).get("total_count")):
         parts.append(f"commit status {state}")
     return "; ".join(parts)
+
+
+def _iso_epoch(value) -> Optional[float]:
+    if not isinstance(value, str) or not value:
+        return None
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _post_ready_ci(items: list, flipped_at: Optional[float]) -> bool:
+    """POSITIVE evidence that CI ran after the PR left draft, from one check-runs snapshot.
+
+    With a recorded flip time: at least one run that is not ``skipped`` and whose ``started_at``
+    is after ``flipped_at`` (a pre-ready lint success does not count, Prism d34048d53f3c). With no
+    record (an own PR un-drafted outside this gate): at least one non-skipped run."""
+    for r in items:
+        if r.get("conclusion") == "skipped":
+            continue
+        if flipped_at is None:
+            return True
+        started = _iso_epoch(r.get("started_at"))
+        if started is not None and started > flipped_at:
+            return True
+    return False
 
 
 def _ci_green(gh: GhFn, repo: str, sha: str) -> bool:
@@ -214,11 +270,77 @@ def spawn_arm(repo: str, number: int, sha: str, task_id: str, ci_report: str = "
 
 
 ArmFn = Callable[..., Optional[str]]   # (repo, number, sha, task_id[, ci_report]) -> log path
+ReadyFn = Callable[[str, int], Optional[int]]   # (repo, number) -> ace_gate.py rc, None = not run
+
+
+def worker_draft_flip_enabled() -> bool:
+    return os.environ.get("KANBAN_HANDOFF_DRAFT_FLIP", "1").strip() != "0"
+
+
+def worker_draft_repos(path: Optional[str] = None) -> set:
+    """Casefolded repos listed in ``<hermes root>/config/worker-pr-draft.json`` (t_c1ee61ae).
+
+    The file the gh-shim reads to open worker PRs as drafts (t_ea770a43). Absent/unreadable/
+    malformed -> empty set (no flip: the draft refusal is unchanged). ``KANBAN_WORKER_PR_DRAFT``
+    overrides the path (tests)."""
+    if path is None:
+        path = os.environ.get("KANBAN_WORKER_PR_DRAFT") or ""
+        if not path:
+            try:
+                from hermes_constants import get_default_hermes_root
+                path = str(get_default_hermes_root() / "config" / "worker-pr-draft.json")
+            except Exception:  # noqa: BLE001 -- fail-safe: no flip
+                return set()
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    repos = d.get("repos") if isinstance(d, dict) else None
+    if not isinstance(repos, list):
+        return set()
+    return {r.casefold() for r in repos if isinstance(r, str)}
+
+
+def _owns_draft(ref, pr: dict, task_id: str) -> bool:
+    """The worker's own draft: head branch names THIS card and the repo is a worker-draft repo."""
+    from hermes_cli.kanban_open_pr import branch_names_card
+    head_ref = str(((pr.get("head") or {}).get("ref")) or "")
+    return branch_names_card(head_ref, task_id) and ref.repo.casefold() in worker_draft_repos()
+
+
+def ace_gate_ready(repo: str, number: int) -> Optional[int]:
+    """``scripts/ace_gate.py ready <repo> <n>`` (the only sanctioned un-draft). rc, or None if not run."""
+    from hermes_constants import get_default_hermes_root
+    script = get_default_hermes_root() / "scripts" / "ace_gate.py"
+    if not script.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable or "python3", str(script), "ready", repo, str(number)], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+            timeout=90, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.warning("handoff freshness: ace_gate ready %s#%s failed: %s", repo, number, exc)
+        return None
+    if proc.returncode != 0:
+        _log.warning("handoff freshness: ace_gate ready %s#%s rc=%s: %s", repo, number,
+                     proc.returncode, (proc.stderr or "").strip()[:300])
+    return proc.returncode
+
+
+def _default_ready() -> Optional[ReadyFn]:
+    # Same seam as _default_gh: never un-draft a live PR from pytest.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    return ace_gate_ready
 
 
 def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
-          armable=None, draft_ok: bool = False) -> dict:
+          armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
+          flipped: Optional[dict] = None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -231,6 +353,9 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     All draft checks run before any mutation, so a refused handoff has changed
     nothing on GitHub. With ``draft_ok`` drafts are not refused: they are listed
     in ``report["draft_override"]`` and skipped by (b)/(c) (the caller audits).
+
+    ``flipped``: persisted flip records ``{"o/r#n": {"head": sha, "at": epoch}}`` from earlier
+    handoffs of this card (t_c1ee61ae); a recorded PR is armed only on post-flip CI evidence.
     """
     report: dict = {"prs": {}, "checked_at": int(time.time())}
     # Never update-branch or arm a third-party PR (t_06dccfe3): the caller
@@ -245,9 +370,11 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             return report
     arm = arm or spawn_arm
     armable_keys = None if armable is None else {str(k).lower() for k in armable}
+    flip_records = {str(k).lower(): v for k, v in (flipped or {}).items() if isinstance(v, dict)}
 
     views = []
     drafts = []
+    own_drafts: dict = {}
     for ref in refs:
         key = f"{ref.repo}#{ref.number}"
         pr = gh(f"repos/{ref.repo}/pulls/{ref.number}")
@@ -259,11 +386,37 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         if pr.get("draft") is True:
             drafts.append(key)
             entry["draft"] = True
+            if worker_draft_flip_enabled() and _owns_draft(ref, pr, task_id):
+                own_drafts[key] = (ref, key, pr, entry)
             continue
         views.append((ref, key, pr, entry))
-    if drafts:
-        if not draft_ok:
+    if drafts and not draft_ok:
+        # t_c1ee61ae: the worker's OWN draft (head branch names this card, repo listed in
+        # config/worker-pr-draft.json) is flipped ready through ace_gate.py instead of refused.
+        # A foreign draft still refuses, before any flip; a failed flip (review hold rc=21, Ace-gated
+        # rc=20, read failure) refuses like before.
+        own = {k for k in drafts if k in own_drafts}
+        foreign = [k for k in drafts if k not in own]
+        if foreign or not own:
             raise DraftPrError(task_id, drafts)
+        ready = ready or _default_ready()
+        failed = []
+        flipped_now: dict = {}
+        for ref, key, pr, entry in own_drafts.values():
+            at = int(time.time())  # BEFORE the flip: every post-ready run starts after it
+            rc = ready(ref.repo, ref.number) if ready is not None else None
+            entry["draft_flip"] = f"ready via ace_gate.py (rc={rc})"
+            if rc != 0:
+                failed.append(key)
+                continue
+            entry["draft"] = False
+            flipped_now[key] = {"head": str(((pr.get("head") or {}).get("sha")) or ""), "at": at}
+            views.append((ref, key, dict(pr, draft=False), entry))
+        if failed:
+            raise DraftPrError(task_id, failed, flipped_now)
+        report["draft_flipped"] = sorted(own)
+        report["draft_flipped_at"] = flipped_now
+    elif drafts:
         report["draft_override"] = drafts
 
     for ref, key, pr, entry in views:
@@ -295,10 +448,33 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             entry["update_branch"] = "requested" if upd is not None else "failed (fail-open)"
             # The new head has fresh CI; arming is fleet-merge's job once it is green.
             continue
-        if allow_arm and armable_keys is not None and key.lower() not in armable_keys:
+        if entry.get("draft_flip"):
+            # Just un-drafted: the head's only check-runs are the draft-skipped ones (`skipped`
+            # counts green), so arming now would land on CI that never ran. CI + Prism start on
+            # the ready event; the lander arms it from there.
+            if allow_arm:
+                entry["automerge"] = "not armed: flipped ready at handback, CI starts now"
+        elif allow_arm and armable_keys is not None and key.lower() not in armable_keys:
             entry["automerge"] = "not armed: PR only mentioned, not this card's handoff PR"
         elif allow_arm and automerge_enabled():
-            ci = _ci_report(gh, ref.repo, head)
+            # ONE snapshot decides both "has CI run since ready" and "is it green" (Prism d34048d53f3c:
+            # two reads let a transient None on the first bypass the barrier).
+            items = _check_runs(gh, ref.repo, head)
+            record = flip_records.get(key.lower())
+            if record is not None or _owns_draft(ref, pr, task_id):
+                # Retry safety (Prism 982040536d15, d34048d53f3c): a PR flipped ready by an earlier
+                # handoff of this card is armed only on POSITIVE post-ready evidence. Unreadable is
+                # not evidence; a pre-ready lint success beside skipped tests is not either.
+                at = record.get("at") if record is not None else None
+                at = float(at) if isinstance(at, (int, float)) else None
+                if record is not None and at is None:
+                    entry["automerge"] = "not armed: flip record has no time"
+                    continue
+                if items is None or not _post_ready_ci(items, at):
+                    entry["automerge"] = ("not armed: own worker PR, no CI started after the ready flip yet"
+                                          if items is not None else "not armed: check-runs unreadable")
+                    continue
+            ci = _ci_report(gh, ref.repo, head, items)
             if not ci:
                 log = arm(ref.repo, ref.number, head, task_id)
                 entry["automerge"] = f"fleet-merge spawned ({log})" if log else "not spawned"

@@ -10970,20 +10970,40 @@ def complete_task(
                 )
             }
             may_arm = not is_milestone_card(conn, task_id)
+            # Ready-flip evidence from earlier handoffs of this card (t_c1ee61ae, Prism
+            # d34048d53f3c): a PR flipped ready before is armed only on post-flip CI.
+            flip_records: dict = {}
+            for (payload,) in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'handoff_draft_flipped' "
+                "ORDER BY id", (task_id,),
+            ).fetchall():
+                try:
+                    flip_records.update((json.loads(payload) or {}).get("flipped") or {})
+                except (TypeError, ValueError, AttributeError):
+                    continue
+
+            def _record_flips(flipped):
+                if flipped:
+                    flip_records.update(flipped)
+                    with write_txn(conn):
+                        _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
 
             def _freshness_gate(refs, allow_arm):
                 try:
-                    return _fresh.check(
+                    out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
-                        draft_ok=draft_ok is not None,
+                        draft_ok=draft_ok is not None, flipped=dict(flip_records),
                     )
                 except _fresh.DraftPrError as draft_err:
+                    _record_flips(draft_err.flipped)
                     with write_txn(conn):
                         _append_event(
                             conn, task_id, "completion_blocked_draft_pr",
                             {"prs": draft_err.prs},
                         )
                     raise
+                _record_flips(out.get("draft_flipped_at"))
+                return out
 
             freshness = _freshness_gate(still_open, no_new is None and may_arm)
             overridden = freshness.get("draft_override") or []
@@ -11007,8 +11027,11 @@ def complete_task(
                 # ran with arming off for the verdict (Prism 188c162a38e9). A PR the gate just
                 # update-branched is left to fleet-merge once its fresh CI is green, as in check().
                 gated = freshness.get("prs") or {}
+                # A PR flipped ready this handoff is not re-armed either (t_c1ee61ae): its CI
+                # starts on the ready event, its draft-skipped check-runs read green.
                 rearm = [r for r in still_open
-                         if "update_branch" not in (gated.get(f"{r.repo}#{r.number}") or {})]
+                         if not {"update_branch", "draft_flip"} & set(
+                             gated.get(f"{r.repo}#{r.number}") or {})]
                 if rearm:
                     again = _freshness_gate(rearm, True)
                     freshness = dict(freshness, prs={**gated, **(again.get("prs") or {})})
