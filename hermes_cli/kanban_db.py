@@ -10443,37 +10443,109 @@ def _stale_base_is_conflict_only(reports) -> bool:
         for r in failing)
 
 
-_GITHUB_SLUG_RE = re.compile(r"github\.com[:/]+([^/\s]+/[^/\s]+?)(?:\.git)?/?$", re.IGNORECASE)
+_GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
+_SCP_REMOTE_RE = re.compile(r"^(?:[^@/:\s]+@)?(?P<host>[^/:\s]+):(?P<path>[^\s]+)$")
 
 
-def _checkout_github_slugs(path) -> set:
-    """Lower-cased ``owner/repo`` of every GitHub remote of the checkout at *path* (fork remotes included)."""
-    try:
-        proc = subprocess.run(["git", "-C", str(path), "remote", "-v"], capture_output=True, text=True,
-                              timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return set()
-    out = set()
-    for line in (proc.stdout or "").splitlines() if proc.returncode == 0 else ():
+def _github_remote_slug(url) -> Optional[str]:
+    """Lower-cased ``owner/repo`` when *url* is a GitHub remote, else None (Prism e0b806db9787).
+
+    The HOST is parsed and must be GitHub itself: ``https://git.example.org/github.com/o/r.git`` is not a GitHub
+    remote. Shapes: ``https://[user@]github.com/o/r[.git][/]``, ``ssh://git@github.com[:port]/o/r[.git]``,
+    ``git://github.com/o/r`` and Git's SCP form ``[user@]github.com:o/r[.git]``. A local path is never one.
+    """
+    from urllib.parse import urlsplit
+
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        try:
+            parts = urlsplit(raw)
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            return None
+        if parts.scheme.lower() not in ("https", "http", "ssh", "git", "git+ssh", "ssh+git"):
+            return None
+        path = parts.path
+    else:
+        m = _SCP_REMOTE_RE.match(raw)
+        if not m:
+            return None
+        host, path = m.group("host").lower(), m.group("path")
+    if host not in _GITHUB_HOSTS:
+        return None
+    path = path.strip("/")
+    if path.lower().endswith(".git"):
+        path = path[:-4]
+    segs = path.split("/")
+    if len(segs) != 2 or not all(segs) or any(s in (".", "..") for s in segs):
+        return None
+    return "/".join(segs).lower()
+
+
+def _checkout_pr_identity(path) -> tuple:
+    """``(github_slugs, branch)`` of the checkout at *path*: the ``owner/repo`` of every GitHub remote (fork
+    remotes included) and its current branch (None when detached or unreadable).
+
+    The ONE place the stale-base advisory resolves checkout ownership. Git runs with every inherited ``GIT_*``
+    variable removed (Prism 92574423ea6e; superset of ``kanban_branch_base._SCRUB_ENV``): an inherited
+    ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_CEILING_DIRECTORIES`` / ``GIT_CONFIG_*`` would answer for another
+    repository than ``-C <path>``.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+    def _run(*args):
+        try:
+            proc = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=10, check=False, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout if proc.returncode == 0 else None
+
+    slugs = set()
+    for line in (_run("remote", "-v") or "").splitlines():
         parts = line.split()
         if len(parts) >= 2:
-            m = _GITHUB_SLUG_RE.search(parts[1])
-            if m:
-                out.add(m.group(1).lower())
-    return out
+            slug = _github_remote_slug(parts[1])
+            if slug:
+                slugs.add(slug)
+    branch = (_run("symbolic-ref", "-q", "--short", "HEAD") or "").strip() or None
+    return slugs, branch
 
 
-def _owns_fleet_pr(metadata: Optional[dict], survivor_pr, reports=()) -> bool:
-    """True when the handoff names an own fleet PR on the repository of EVERY failing report (Prism
-    bda9414a767d): a conflict in a checkout with no PR of its own has no conflict producer to send it back."""
+def _owns_fleet_pr(metadata: Optional[dict], survivor_pr, reports=(), query_fn=None) -> bool:
+    """True when EVERY failing report's checkout is backed by an own fleet PR that can receive its conflict
+    sendback: a PR the handoff names, on one of the checkout's GitHub repos (bda9414a767d), read live as OPEN
+    (47c7fe02343a, b570e340e7e7: a merged, closed or missing PR has no conflict producer), whose head branch is
+    the checkout's branch (an open PR of the same repo for other work does not carry this checkout).
+    Anything unreadable is not provably backed: the guard refuses as before.
+    """
     from hermes_cli import kanban_open_pr as _open_pr
     try:
-        own = {str(r.repo).lower() for r in
-               _open_pr.split_fleet(_open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]}
-        if not own:
-            return False
+        own = _open_pr.split_fleet(_open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
         failing = [r for r in reports if getattr(r, "failures", None)]
-        return bool(failing) and all(_checkout_github_slugs(r.repo) & own for r in failing)
+        if not own or not failing:
+            return False
+        query = _open_pr.memo_query(query_fn)
+        if query is None:
+            return False
+        for rep in failing:
+            slugs, branch = _checkout_pr_identity(rep.repo)
+            if not slugs or not branch:
+                return False
+            backed = False
+            for ref in own:
+                if str(ref.repo).lower() not in slugs:
+                    continue
+                state = query(ref.repo, ref.number)
+                if (isinstance(state, dict) and str(state.get("state") or "").upper() == "OPEN"
+                        and str(state.get("head_ref") or "") == branch):
+                    backed = True
+                    break
+            if not backed:
+                return False
+        return True
     except Exception:  # noqa: BLE001 -- unreadable = not provably PR-backed: the guard refuses as before
         return False
 
@@ -10672,9 +10744,10 @@ def _enforce_branch_base(
         # event is still recorded (now with advisory=true) and the handoff proceeds; the conflict reaches the
         # worker as a `sendback(source=conflict)` from the PR. Only that case (Prism 1172e7254787): every failing
         # report is a merge conflict and nothing else (foreign commits / out-of-scope edits still refuse), and
-        # the handoff names a fleet PR of its own on EVERY failing repository (bda9414a767d; no PR = nothing a
-        # conflict producer can send back on).
+        # EVERY failing checkout is backed by an OPEN own fleet PR from its branch (bda9414a767d, 47c7fe02343a;
+        # no live PR = nothing a conflict producer can send back on).
         advisory = (landing_policy_knob("sendback") == "on"
+                    and not untied   # b570e340e7e7: a merged PR not tied to the checkout never excuses it
                     and _stale_base_is_conflict_only(err.reports)
                     and _owns_fleet_pr(metadata, survivor_pr, err.reports))
         if advisory:

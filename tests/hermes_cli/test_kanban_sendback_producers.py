@@ -237,25 +237,136 @@ def test_sendback_restores_over_a_legacy_reviewer_swap(kanban_home: SimpleNamesp
         assert kb.get_task(conn, tid).assignee == "dev"
 
 
-def _checkout(tmp_path, name, url):
+def _checkout(tmp_path, name, url, branch="wt/feature"):
     d = tmp_path / name
     d.mkdir()
     _git(d, "init", "-q")
-    _git(d, "remote", "add", "origin", url)
+    _git(d, "checkout", "-q", "-b", branch)
+    if url:
+        _git(d, "remote", "add", "origin", url)
     return d
+
+
+def _prs(**states):
+    """query_fn stub: ``repo-a_7="OPEN"`` -> ANG-Ventures/repo-a#7 is OPEN from branch wt/feature."""
+    table = {}
+    for k, v in states.items():
+        repo, num = k.rsplit("_", 1)
+        state, _, head = v.partition("@")
+        table[(f"ang-ventures/{repo.replace('_', '-')}", int(num))] = {"state": state, "head_ref": head or "wt/feature"}
+    return lambda repo, number: table.get((repo.lower(), number), {"state": "NOT_FOUND"})
+
+
+def _rep(path):
+    return SimpleNamespace(repo=str(path), failures=["does not merge cleanly"], conflicts=["x"])
+
+
+@pytest.mark.parametrize("url,slug", [
+    ("https://github.com/ANG-Ventures/repo-a.git", "ang-ventures/repo-a"),
+    ("https://github.com/ANG-Ventures/repo-a", "ang-ventures/repo-a"),
+    ("https://github.com/ANG-Ventures/repo-a/", "ang-ventures/repo-a"),
+    ("https://x-access-token:t@github.com/ANG-Ventures/repo-a.git", "ang-ventures/repo-a"),
+    ("git@github.com:ANG-Ventures/repo-a.git", "ang-ventures/repo-a"),
+    ("git@github.com:ANG-Ventures/repo-a", "ang-ventures/repo-a"),
+    ("ssh://git@github.com/ANG-Ventures/repo-a.git", "ang-ventures/repo-a"),
+    ("ssh://git@ssh.github.com:443/ANG-Ventures/repo-a.git", "ang-ventures/repo-a"),
+    ("https://github.com/Kyzcreig/repo-a.git", "kyzcreig/repo-a"),            # fork remote
+    ("https://git.example.org/github.com/ANG-Ventures/repo-a.git", None),    # e0b806db9787: github.com in the path
+    ("git@git.example.org:github.com/ANG-Ventures/repo-a.git", None),
+    ("https://github.com.evil.org/ANG-Ventures/repo-a.git", None),
+    ("https://evil.org/x?github.com/ANG-Ventures/repo-a", None),
+    ("https://github.com/ANG-Ventures/repo-a/pull/7", None),
+    ("/srv/mirrors/github.com/ANG-Ventures/repo-a.git", None),               # local path
+    ("file:///srv/github.com/ANG-Ventures/repo-a.git", None),
+    ("", None),
+])
+def test_github_remote_slug_shapes(url, slug) -> None:
+    assert kb._github_remote_slug(url) == slug
+
+
+def test_checkout_identity_fork_and_missing_remote(tmp_path) -> None:
+    fork = _checkout(tmp_path, "f", "https://github.com/ANG-Ventures/repo-a.git")
+    _git(fork, "remote", "add", "fork", "git@github.com:Kyzcreig/repo-a.git")
+    assert kb._checkout_pr_identity(fork) == ({"ang-ventures/repo-a", "kyzcreig/repo-a"}, "wt/feature")
+    bare = _checkout(tmp_path, "n", None)
+    assert kb._checkout_pr_identity(bare) == (set(), "wt/feature")
+    md = {"pr_url": "https://github.com/ANG-Ventures/repo-a/pull/7"}
+    assert kb._owns_fleet_pr(md, None, [_rep(bare)], query_fn=_prs(repo_a_7="OPEN")) is False
 
 
 def test_conflict_advisory_needs_a_pr_on_every_failing_repo(tmp_path) -> None:
     """Prism bda9414a767d: an own PR on repo A does not make a conflict in repo B (no PR) advisory."""
     a = _checkout(tmp_path, "a", "https://github.com/ANG-Ventures/repo-a.git")
     b = _checkout(tmp_path, "b", "git@github.com:ANG-Ventures/repo-b.git")
-    rep = lambda path: SimpleNamespace(repo=str(path), failures=["does not merge cleanly"], conflicts=["x"])
+    q = _prs(repo_a_7="OPEN", repo_b_9="OPEN")
     md = {"pr_url": "https://github.com/ANG-Ventures/repo-a/pull/7"}
-    assert kb._owns_fleet_pr(md, None, [rep(a)]) is True
-    assert kb._owns_fleet_pr(md, None, [rep(a), rep(b)]) is False
+    assert kb._owns_fleet_pr(md, None, [_rep(a)], query_fn=q) is True
+    assert kb._owns_fleet_pr(md, None, [_rep(a), _rep(b)], query_fn=q) is False
     md2 = {"pr_url": ["https://github.com/ANG-Ventures/repo-a/pull/7", "https://github.com/ANG-Ventures/repo-b/pull/9"]}
-    assert kb._owns_fleet_pr(md2, None, [rep(a), rep(b)]) is True
-    assert kb._owns_fleet_pr(md, None, []) is False
+    assert kb._owns_fleet_pr(md2, None, [_rep(a), _rep(b)], query_fn=q) is True
+    assert kb._owns_fleet_pr(md, None, [], query_fn=q) is False
+
+
+def test_conflict_advisory_ignores_a_github_path_on_another_host(tmp_path) -> None:
+    """Prism e0b806db9787: a remote on git.example.org whose PATH holds github.com/o/r is not that repo."""
+    a = _checkout(tmp_path, "a", "https://git.example.org/github.com/ANG-Ventures/repo-a.git")
+    md = {"pr_url": "https://github.com/ANG-Ventures/repo-a/pull/7"}
+    assert kb._owns_fleet_pr(md, None, [_rep(a)], query_fn=_prs(repo_a_7="OPEN")) is False
+
+
+def test_conflict_advisory_scrubs_inherited_git_dir(tmp_path, monkeypatch) -> None:
+    """Prism 92574423ea6e: GIT_DIR pointing at checkout B must not lend B's remotes to checkout A."""
+    a = _checkout(tmp_path, "a", "https://github.com/ANG-Ventures/repo-a.git")
+    b = _checkout(tmp_path, "b", "https://github.com/ANG-Ventures/repo-b.git")
+    monkeypatch.setenv("GIT_DIR", str(b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(b))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    md = {"pr_url": "https://github.com/ANG-Ventures/repo-b/pull/9"}
+    assert kb._checkout_pr_identity(a)[0] == {"ang-ventures/repo-a"}
+    assert kb._owns_fleet_pr(md, None, [_rep(a)], query_fn=_prs(repo_b_9="OPEN")) is False
+
+
+@pytest.mark.parametrize("state,backed", [
+    ("OPEN", True),
+    ("OPEN@other/branch", False),   # an open PR of the repo for other work does not carry this checkout
+    ("MERGED", False),              # 47c7fe02343a: a merged PR cannot receive the conflict sendback
+    ("CLOSED", False),
+    ("NOT_FOUND", False),
+])
+def test_conflict_advisory_needs_a_live_pr_from_the_checkout_branch(tmp_path, state, backed) -> None:
+    a = _checkout(tmp_path, "a", "https://github.com/ANG-Ventures/repo-a.git")
+    md = {"pr_url": "https://github.com/ANG-Ventures/repo-a/pull/7"}
+    assert kb._owns_fleet_pr(md, None, [_rep(a)], query_fn=_prs(repo_a_7=state)) is backed
+    assert kb._owns_fleet_pr(md, None, [_rep(a)], query_fn=lambda r, n: None) is False   # unreadable
+
+
+def test_untied_merged_pr_keeps_the_stale_base_refusal(kanban_home, tmp_path, monkeypatch) -> None:
+    """Prism b570e340e7e7: when the declared PRs are merged but not tied to the failing checkout
+    (`survivor_merged_untied`), the advisory exception never applies, whatever the PR lookup says."""
+    from hermes_cli import kanban_branch_base as bb
+    from hermes_cli import kanban_open_pr as op
+
+    pol = tmp_path / "landing-policy.json"
+    pol.write_text('{"sendback": "on"}')
+    monkeypatch.setenv("KANBAN_LANDING_POLICY", str(pol))
+    monkeypatch.setattr(kb, "configured_receipt_gate", lambda: False)
+
+    def stale(*a, **k):
+        raise bb.StaleBaseError("t_x", [_stale()])
+    monkeypatch.setattr(bb, "enforce_handoff", stale)
+    monkeypatch.setattr(kb, "_merged_survivor_prs", lambda md, sp: [("ANG-Ventures/repo#7 @ abc", "h", "m")])
+    monkeypatch.setattr(bb, "pr_landed_checkout", lambda rep, prs: False)
+    monkeypatch.setattr(kb, "_owns_fleet_pr", lambda *a, **k: True)   # even a lookup that says "backed"
+    monkeypatch.setattr(op, "open_pr_refs", lambda *a, **k: [], raising=False)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="slice", assignee="dev")
+        run = kb.claim_task(conn, tid).current_run_id
+        with pytest.raises(bb.StaleBaseError):
+            kb.complete_task(conn, tid, summary="done", expected_run_id=run)
+        assert kb.get_task(conn, tid).status == "running"
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "completion_blocked_stale_base"]
+        assert len(ev) == 1 and not ev[0].payload.get("advisory")
+        assert ev[0].payload.get("survivor_merged_untied") == ["ws/repo"]
 
 
 def test_sendback_keeps_an_operator_assignment_of_a_former_reviewer(kanban_home: SimpleNamespace) -> None:
