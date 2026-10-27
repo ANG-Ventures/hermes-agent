@@ -207,6 +207,36 @@ def test_signal_death_still_reported_as_negative_returncode(env):
     assert "exited with code -15" in out, out
 
 
+def test_explicit_exit_143_is_not_a_signal_death(env):
+    """Prism 2b28c5552d47: a script that EXITS 143 was not killed. The shim must keep it a normal
+    exit (Popen 143), or the shutdown-kill re-queue would re-fire a run whose side effects ran."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+
+    import threading
+
+    started, release = env / "started-143", env / "release-143"
+    (env / "scripts" / "exit-143.sh").write_text(
+        f'touch "{started}"\nwhile [ ! -f "{release}" ]; do sleep 0.05; done\n'
+        "echo side-effect\nexit 143\n", encoding="utf-8")
+
+    def shutdown_mid_run():
+        _wait(started.exists, what="the script to start")
+        sched.signal_shutdown("test: scheduler shutdown while the script exits 143")
+        release.touch()
+
+    t = threading.Thread(target=shutdown_mid_run)
+    t.start()
+    ok, out = ss._run_job_script("exit-143.sh", job_id="j143", execution_id="e143abc")
+    t.join()
+    assert sched.is_shutting_down()
+    assert not ok
+    assert "exited with code 143" in out, out
+    assert "Killed by gateway shutdown" not in out, out
+    assert "j143" not in sched._restart_killed_job_ids
+    assert (env / "cron" / "script-runs" / "e143abc.rc").read_text(encoding="utf-8").strip() == "143"
+
+
 @pytest.mark.parametrize("rc", [0, 3], ids=["ok", "fails"])
 def test_settled_outcome_counts_the_run_once(env, rc):
     """Prism 3b8d4e8ba014: recovery's reconcile already ran mark_job_run for this run; the settled

@@ -10,7 +10,7 @@ job read Down until its next natural fire although it had finished cleanly (medi
 The fix gives the script's own exit status a durable home:
 
 * ``begin`` writes ``<cron>/script-runs/<execution_id>.json`` (job, execution, owner pid) and
-  ``wrap_argv`` runs the script under a tiny ``/bin/sh`` shim that sends the script's stdout and
+  ``wrap_argv`` runs the script under a tiny stdlib Python shim that sends the script's stdout and
   stderr to files and writes its exit code to ``<execution_id>.rc`` the moment it exits, then
   replays the captured output on the original pipes. The script itself never writes to the
   scheduler's pipe, so a dead reader can no longer kill it with SIGPIPE either.
@@ -22,7 +22,8 @@ The fix gives the script's own exit status a durable home:
   is left for a later pass; one whose script is gone without an ``.rc`` was killed, and stays
   as recovery recorded it.
 
-POSIX only (the shim is ``/bin/sh``); Windows keeps the previous behaviour.
+POSIX only (the shim re-raises signals and relies on sessions); Windows keeps the previous
+behaviour.
 """
 
 from __future__ import annotations
@@ -48,38 +49,54 @@ _SUFFIXES = (".json", ".pid", ".rc", ".rc.tmp", ".out", ".err")
 # the shim never started (its first act writes .pid), so no exit status can ever arrive.
 _NO_SCRIPT_GRACE_SECONDS = 60
 
-# $1 = record base path, $2/$3 = absolute mv/cat (the job's PATH must not decide whether the
-# exit status is published or the output replayed), the rest = the script argv. The shim's own
-# pid is written first with builtins only, so settle knows the script's identity even when the
-# owner died before note_pid. fd 3 keeps the real stderr for the replay and is closed for the
-# script, so a helper the script backgrounds never holds the runner's stderr pipe open. The
+# argv[1] = record base path, the rest = the script argv. The shim is this interpreter run in
+# isolated mode with the stdlib only, so the job's PATH and PYTHON* env cannot decide whether the
+# exit status is published or the output replayed. Its own pid is written first, so settle knows
+# the script's identity even when the owner died before note_pid. The script gets only fds 0-2
+# (its output goes to files), so a helper it backgrounds never holds the runner's pipes open. The
 # exit code is published with an atomic rename so a reader never sees a half-written .rc. The
-# replay goes to the original pipes; if the reader is gone the shim may die on SIGPIPE, after
-# the .rc is already durable.
-_SHIM = (
-    'rec=$1; mv=$2; cat=$3; shift 3; printf "%s\\n" "$$" >"$rec.pid"; '
-    # The shim's own stderr (e.g. macOS sh's "Terminated: 15") is dropped.
-    'exec 3>&2 2>/dev/null; '
-    '"$@" >"$rec.out" 2>"$rec.err" 3>&-; rc=$?; '
-    'printf "%s\\n" "$rc" >"$rec.rc.tmp" && "$mv" -f "$rec.rc.tmp" "$rec.rc"; '
-    '"$cat" "$rec.out"; "$cat" "$rec.err" >&3; '
-    # A signal death is re-raised so Popen still sees -N (the shutdown-kill re-queue reads it).
-    'if [ "$rc" -gt 128 ]; then kill -s "$(kill -l "$rc")" $$ 2>/dev/null; fi; '
-    'exit "$rc"'
-)
-
-
-def _system_tool(name: str) -> Optional[str]:
-    for directory in ("/bin", "/usr/bin"):
-        candidate = f"{directory}/{name}"
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+# replay goes to the original pipes; if the reader is gone it is dropped, after the .rc is
+# already durable. A shell shim cannot be used: ``$?`` is 143 both for ``exit 143`` and for a
+# SIGTERM death, so re-raising every status above 128 turned a normal exit into a shutdown kill
+# and made an already-run script eligible for the shutdown-kill re-fire (Prism 2b28c5552d47).
+# The wait status read here keeps the two apart: only a real signal death is re-raised, so Popen
+# still sees -N for it; the .rc keeps the shell convention (128+N) for settle's grading.
+_SHIM = r"""
+import os, signal, subprocess, sys
+rec = sys.argv[1]
+for name in ("SIGINT", "SIGPIPE"):
+    if hasattr(signal, name):
+        signal.signal(getattr(signal, name), signal.SIG_DFL)
+with open(rec + ".pid", "w") as fh:
+    fh.write("%d\n" % os.getpid())
+try:
+    with open(rec + ".out", "wb") as out, open(rec + ".err", "wb") as err:
+        code = subprocess.call(sys.argv[2:], stdout=out, stderr=err)
+except OSError as exc:
+    with open(rec + ".err", "ab") as err:
+        err.write(("%s\n" % exc).encode())
+    code = 127
+rc = 128 - code if code < 0 else code
+with open(rec + ".rc.tmp", "w") as fh:
+    fh.write("%d\n" % rc)
+os.replace(rec + ".rc.tmp", rec + ".rc")
+for suffix, fd in ((".out", 1), (".err", 2)):
+    try:
+        with open(rec + suffix, "rb") as fh:
+            data = fh.read()
+        while data:
+            data = data[os.write(fd, data):]
+    except OSError:
+        pass
+if code < 0:
+    signal.signal(-code, signal.SIG_DFL)
+    os.kill(os.getpid(), -code)
+sys.exit(rc)
+"""
 
 
 def supported() -> bool:
-    return (sys.platform != "win32" and os.path.isfile("/bin/sh")
-            and _system_tool("mv") is not None and _system_tool("cat") is not None)
+    return sys.platform != "win32" and bool(sys.executable) and os.path.isfile(sys.executable)
 
 
 def _records_dir() -> Path:
@@ -131,8 +148,7 @@ def begin(job_id: str, execution_id: Optional[str]) -> Optional[Path]:
 
 
 def wrap_argv(base: Path, argv: List[str]) -> List[str]:
-    return ["/bin/sh", "-c", _SHIM, "hermes-cron-script", str(base),
-            _system_tool("mv") or "mv", _system_tool("cat") or "cat", *argv]
+    return [sys.executable, "-I", "-c", _SHIM, str(base), *argv]
 
 
 def note_pid(base: Path, pid: int) -> None:
