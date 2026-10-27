@@ -107,6 +107,16 @@ def test_link_repointed_to_the_umbrella_passes(tmp_path, monkeypatch):
     assert result["success"] is True, result
 
 
+def test_oversize_reference_fails_closed(tmp_path, monkeypatch):
+    big = "Unique operational instruction.\n" * 100000
+    with _curator(tmp_path, monkeypatch) as root:
+        _plant(root, "source", refs={"references/large.md": big})
+        result = _remove("source", "references/large.md")
+    assert result["success"] is False, result
+    assert result.get("_content_not_carried") is True
+    assert (root / "source" / "references" / "large.md").exists()
+
+
 def test_archive_copies_do_not_count_as_carried(tmp_path, monkeypatch):
     with _curator(tmp_path, monkeypatch) as root:
         _plant(root, "source", refs={"references/fd-plateau-soak-test.md": REFERENCE})

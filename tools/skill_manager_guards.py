@@ -295,8 +295,8 @@ def _carry_candidates(target: Path):
 def _uncarried_lines(target: Path) -> list:
     """Distinctive lines of *target* that appear in no other file under the skills roots."""
     try:
-        if target.stat().st_size > _CARRY_MAX_BYTES:
-            return []
+        if target.stat().st_size > _CARRY_MAX_BYTES:  # unverifiable: fail closed, never skip
+            return [f"<file exceeds the {_CARRY_MAX_BYTES}-byte carry check; move it whole>"]
         missing = _carry_lines(target.read_text(encoding="utf-8"))
         if target.suffix.lower() in {".md", ".markdown"}:  # a merge retitles; headings carry no facts
             missing = {ln for ln in missing if not _MD_HEADING.match(ln)}
