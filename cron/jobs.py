@@ -4945,6 +4945,39 @@ def mark_job_run(
     return _under_fire_fence(job_id, locked, timeout=lock_timeout)
 
 
+def correct_counted_run_outcome(
+    job_id: str, success: bool, error: Optional[str], *, last_run_at: str,
+) -> bool:
+    """Replace the outcome of a run ``mark_job_run`` ALREADY counted (restart recovery wrote it as
+    ``unknown``/interrupted) with the run's real outcome (t_854cd586). Only status, error and
+    streak fields change: ``repeat.completed``, ``next_run_at`` and the claims were advanced by
+    that first call and must not advance twice. The failure the first call counted is undone."""
+    def apply(jobs, _i, job):
+        prior_failure = job.get("last_status") not in ("ok", "delivery_failed")
+        streak = int(job.get("failure_streak") or 0)
+        if prior_failure and streak > 0:
+            streak -= 1
+        job["last_run_at"] = last_run_at
+        job["last_status"] = "ok" if success else "error"
+        job["last_error"] = None if success else error
+        job["error_repeat_streak"] = 0 if success else 1
+        if success:
+            job.pop("preflight_alerted", None)
+            job.pop("last_fire_error", None)
+            job.pop(RESTART_REQUEUE_COUNT_KEY, None)
+            job["failure_streak"] = 0
+        else:
+            job["failure_streak"] = streak + 1
+        save_jobs(jobs)
+        return True
+
+    def locked():
+        found = _with_job(job_id, apply, missing=_MISSING)
+        return False if found is _MISSING else found
+
+    return _under_fire_fence(job_id, locked)
+
+
 def _write_oneshot_diagnostic(job: Dict[str, Any], text: str, what: str) -> bool:
     """Best-effort operator-visible trace in the job's output dir; never breaks the caller."""
     try:

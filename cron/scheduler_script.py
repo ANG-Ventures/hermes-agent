@@ -21,6 +21,7 @@ import threading
 import time
 from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
+from cron import script_outcome_records as _outcome_records
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -453,7 +454,7 @@ def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
     *, timeout_seconds: Optional[int] = None, job_name: Optional[str] = None,
-    job_id: Optional[str] = None,
+    job_id: Optional[str] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -466,7 +467,9 @@ def _run_job_script(
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
     ``.py`` scripts (#8714). timeout_seconds: per-job ceiling (``_job_script_kwargs``) that may
     only LOWER the global ``cron.script_timeout_seconds`` cap. job_name / job_id: for the timeout
-    log line and the shutdown-kill re-fire flag.
+    log line and the shutdown-kill re-fire flag. execution_id: a no_agent job's attempt; when set
+    the script's exit status is also written to a durable record so a run that outlives this
+    process is graded by its real outcome after restart (cron/script_outcome_records.py).
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
@@ -491,10 +494,15 @@ def _run_job_script(
             _job_timeout = 0
         if _job_timeout > 0:
             script_timeout = min(script_timeout, _job_timeout)
+    outcome_record = None
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
             return False, err
+        if execution_id and job_id:
+            outcome_record = _outcome_records.begin(job_id, execution_id)
+            if outcome_record is not None:
+                argv = _outcome_records.wrap_argv(outcome_record, argv)
         from tools.environments.local import build_subprocess_env
         # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
         # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
@@ -549,6 +557,8 @@ def _run_job_script(
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
+        if outcome_record is not None:
+            _outcome_records.note_pid(outcome_record, proc.pid)
         # Registered so the shutdown drain can TERMINATE this script (see
         # cron.scheduler.terminate_running_scripts); deregistered on EVERY exit so a later drain
         # never signals a dead or recycled pid. start_new_session (POSIX) / the win32
@@ -625,6 +635,10 @@ def _run_job_script(
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        # This process observed the end itself (or never started the script): its own path
+        # records the run. Only an owner that dies mid-run leaves the record for settle().
+        _outcome_records.discard(outcome_record)
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:
@@ -650,6 +664,11 @@ def _run_job_script_with_claim_heartbeat(
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     script_kwargs = _sched._job_script_kwargs(job)
+
+    # no_agent only: the script IS the job. A pre-run script feeds an agent that dies with the
+    # process, so its exit status is not the job's outcome.
+    if job.get("no_agent") and job.get("execution_id"):
+        script_kwargs = {**script_kwargs, "execution_id": str(job["execution_id"])}
 
     def run() -> tuple[bool, str]:
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,

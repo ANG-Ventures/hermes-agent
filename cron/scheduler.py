@@ -5522,6 +5522,10 @@ def _maybe_reap_dead_owners() -> None:
                 "Reclaimed %d cron execution(s) whose owner process died "
                 "before reaching a terminal state (marked unknown)",
                 _reclaimed)
+        # A no_agent script left running by a dead scheduler is graded once it exits (t_854cd586).
+        from cron.scheduler_provider import _settle_script_outcomes
+
+        _settle_script_outcomes()
     except Exception as _reap_exc:
         logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 
