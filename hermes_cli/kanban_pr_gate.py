@@ -385,7 +385,16 @@ def assert_write_allowed(
     # A stubbed DEPLOY oracle fabricates the other half of the unblock
     # evidence ("merged AND live"), so it is held to the same identity test.
     deploy_real = deploy_fn is None or deploy_fn is _REAL_IS_DEPLOYED
-    if (query_fn is None or query_fn is _REAL_QUERY_PR) and deploy_real:
+    # The batched oracle is reached through the MODULE ATTRIBUTE ``query_prs``
+    # (the dispatcher prefetch never receives it as an argument), so a probe
+    # that rebinds ``kanban_pr_gate.query_prs`` fabricates verdicts while
+    # ``query_fn`` still looks genuine. Hold it to the same identity test.
+    batch_real = globals().get("query_prs") is _REAL_QUERY_PRS
+    if (
+        (query_fn is None or query_fn is _REAL_QUERY_PR)
+        and deploy_real
+        and batch_real
+    ):
         return  # real oracles: the verdict is evidence, not fabrication.
     if _db_is_sandboxed():
         return
@@ -812,6 +821,42 @@ _BATCH_TIMEOUT_SECONDS = _QUERY_TIMEOUT_SECONDS * 3
 _PR_NODE_FIELDS = "state mergedAt mergeCommit { oid }"
 
 
+# GraphQL ``Int`` is a signed 32-bit integer. A literal outside this range makes
+# GitHub reject the WHOLE document (``errors``, no ``data``), so such a number
+# must never be written into a batch: it cannot name a real PR anyway.
+_GQL_INT_MAX = 2**31 - 1
+
+# ``errors`` types that describe the CALL, not one node. Splitting a chunk on
+# these would multiply calls into a rate limit / outage, so they stay
+# whole-chunk "cannot tell".
+_CALL_LEVEL_ERROR_TYPES = frozenset({
+    "RATE_LIMITED", "RATE_LIMIT", "SECONDARY_RATE_LIMIT", "FORBIDDEN",
+    "INTERNAL", "SERVICE_UNAVAILABLE", "TIMEOUT", "UNAUTHORIZED",
+})
+
+
+def _is_document_rejection(payload) -> bool:
+    """True when ``payload`` is errors-only and no error is call-level.
+
+    That is the shape of a document GitHub refused to execute (e.g. a literal
+    one node made invalid). Splitting the chunk isolates the bad node so it
+    cannot blind its neighbours.
+    """
+    if not isinstance(payload, dict) or payload.get("data"):
+        return False
+    errors = payload.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return False
+    for err in errors:
+        if not isinstance(err, dict):
+            return False
+        etype = str(err.get("type") or "").upper()
+        message = str(err.get("message") or "").lower()
+        if etype in _CALL_LEVEL_ERROR_TYPES or "rate limit" in message:
+            return False
+    return True
+
+
 def _query_pr_chunk(repo: str, numbers: list[int]) -> dict[int, Optional[dict]]:
     """One ``gh api graphql`` call for ``numbers`` (<= _BATCH_CHUNK) in ``repo``.
 
@@ -855,6 +900,14 @@ def _query_pr_chunk(repo: str, numbers: list[int]) -> dict[int, Optional[dict]]:
     data = payload.get("data") if isinstance(payload, dict) else None
     repository = data.get("repository") if isinstance(data, dict) else None
     if not isinstance(repository, dict):
+        if len(numbers) > 1 and _is_document_rejection(payload):
+            # GitHub refused the whole document (no data at all). Bisect so a
+            # single bad node costs O(log n) extra calls instead of blinding
+            # every neighbour on every tick. Results keep the same contract:
+            # anything still unresolved stays None.
+            mid = len(numbers) // 2
+            out.update(_query_pr_chunk(repo, numbers[:mid]))
+            out.update(_query_pr_chunk(repo, numbers[mid:]))
         return out
     for n in numbers:
         node = repository.get(f"p{n}")
@@ -880,7 +933,13 @@ def query_prs(repo: str, numbers: Iterable[int]) -> dict[int, Optional[dict]]:
     per repo instead of one per open PR.
     """
     ordered = list(dict.fromkeys(int(n) for n in numbers))
-    out: dict[int, Optional[dict]] = {}
+    # A number outside GraphQL's Int range would make GitHub reject the whole
+    # chunk; it can never name a real PR, so it is None exactly like NOT_FOUND
+    # and never enters a batch.
+    out: dict[int, Optional[dict]] = {
+        n: None for n in ordered if not 1 <= n <= _GQL_INT_MAX
+    }
+    ordered = [n for n in ordered if 1 <= n <= _GQL_INT_MAX]
     for i in range(0, len(ordered), _BATCH_CHUNK):
         out.update(_query_pr_chunk(repo, ordered[i:i + _BATCH_CHUNK]))
     return out
@@ -950,6 +1009,9 @@ def _prune_cache() -> None:
 # the guard checks and vouch for its own stub. That is exactly how the
 # 2026-09-21 probe fabricated 20 gate_auto_resolved events.
 _REAL_QUERY_PR = query_pr
+# Same capture for the batched oracle the prefetch reaches via the module
+# attribute: a rebound ``kanban_pr_gate.query_prs`` must not vouch for itself.
+_REAL_QUERY_PRS = query_prs
 
 
 # ---------------------------------------------------------------------------

@@ -333,3 +333,118 @@ def test_injected_query_seam_still_used_per_pr(kanban_home, monkeypatch) -> None
     assert sorted(seen) == [("o/r", 1), ("o/r", 2), ("o/r", 3)]
     assert fake.calls == []
     assert result.payloads[("o/r", 2)]["state"] == "OPEN"
+
+
+# ---------------------------------------------------------------------------
+# Prism P1-A: one out-of-range number must not blind its batch neighbours
+# ---------------------------------------------------------------------------
+
+
+class _RejectsOutOfRange(FakeGh):
+    """GitHub rejects the whole document when a literal overflows GraphQL Int."""
+
+    def __call__(self, args, *a, **kw):
+        if (isinstance(args, list) and args[:3] == ["gh", "api", "graphql"]
+                and any(int(n) > 2**31 - 1 for _, n in _ALIAS_RE.findall(args[-1]))):
+            self.calls.append(list(args))
+            return self._done(args, 1, json.dumps({"errors": [{
+                "message": "Argument 'number' on Field 'pullRequest' has an "
+                           "invalid value (30000000000). Expected type 'Int!'.",
+                "extensions": {"code": "argumentLiteralsIncompatible"},
+            }]}))
+        return super().__call__(args, *a, **kw)
+
+
+def test_out_of_range_number_never_enters_a_batch(monkeypatch) -> None:
+    big = 30_000_000_000
+    fake = _install(monkeypatch, _RejectsOutOfRange(
+        {("o/r", 1): "OPEN", ("o/r", 2): "MERGED", ("o/r", 3): "CLOSED"},
+    ))
+    batch = prg.query_prs("o/r", [1, big, 2, 3])
+    assert batch[big] is None
+    assert batch[1]["state"] == "OPEN"
+    assert batch[2]["state"] == "MERGED"
+    assert batch[3]["state"] == "CLOSED"
+    assert fake.calls, "valid numbers were never queried"
+    assert big not in _numbers_queried(fake)
+    # Non-positive numbers are equally unrepresentable as a real PR.
+    assert prg.query_prs("o/r", [0])[0] is None
+
+
+def test_errors_only_document_rejection_splits_so_valid_nodes_resolve(
+    monkeypatch,
+) -> None:
+    # Defence in depth: a node the range filter cannot foresee makes GitHub
+    # reject the whole document; the chunk must bisect, not go blind.
+    poison = 4
+
+    class _RejectsPoison(FakeGh):
+        def __call__(self, args, *a, **kw):
+            if (isinstance(args, list) and args[:3] == ["gh", "api", "graphql"]
+                    and poison in [int(n) for _, n in _ALIAS_RE.findall(args[-1])]):
+                self.calls.append(list(args))
+                return self._done(args, 1, json.dumps(
+                    {"errors": [{"message": "Parse error on node p4"}]}))
+            return super().__call__(args, *a, **kw)
+
+    states = {("o/r", n): "OPEN" for n in (1, 2, 3, 5, 6)}
+    fake = _install(monkeypatch, _RejectsPoison(states))
+    batch = prg._query_pr_chunk("o/r", [1, 2, 3, poison, 5, 6])
+    assert batch[poison] is None
+    assert all(batch[n]["state"] == "OPEN" for n in (1, 2, 3, 5, 6))
+    assert len(fake.calls) <= 2 * 6  # bounded bisection
+
+
+def test_rate_limited_errors_only_is_not_split(monkeypatch) -> None:
+    fake = _install(
+        monkeypatch,
+        FakeGh({("o/r", n): "OPEN" for n in range(1, 6)}, mode="errors_only"),
+    )
+    batch = prg._query_pr_chunk("o/r", [1, 2, 3, 4, 5])
+    assert all(v is None for v in batch.values())
+    assert len(fake.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Prism P1-B: a rebound batched oracle is held to the fabricated-oracle guard
+# ---------------------------------------------------------------------------
+
+
+def _fabricated_batch(repo, numbers):
+    return {
+        int(n): {"state": "MERGED", "mergedAt": _AFTER_ANY_BLOCK,
+                 "mergeCommitSha": "f" * 40}
+        for n in numbers
+    }
+
+
+def test_replacing_query_prs_without_sandbox_is_refused(
+    kanban_home, monkeypatch,
+) -> None:
+    fake = _install(monkeypatch, FakeGh({}))
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, ["o/r#7"])
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — proves the guard refuses without the declaration
+    monkeypatch.setattr(prg, "query_prs", _fabricated_batch)
+    assert prg.query_pr is prg._REAL_QUERY_PR
+    with pytest.raises(prg.SandboxEscape):
+        prg.assert_write_allowed(None)
+    with kb.connect() as conn:
+        with pytest.raises(prg.SandboxEscape):
+            prg.prefetch_pr_gate_states(conn, max_lookups=500, now=1000.0)
+        assert kb.get_task(conn, tid).status == "blocked"
+    assert fake.calls == []
+    # Exactly the same verdict a replaced query_fn gets.
+    with pytest.raises(prg.SandboxEscape):
+        prg.assert_write_allowed(lambda repo, number: None)
+
+
+def test_replacing_query_prs_with_sandbox_declared_is_allowed(
+    kanban_home, monkeypatch,
+) -> None:
+    monkeypatch.setattr(prg, "query_prs", _fabricated_batch)
+    prg.assert_write_allowed(None)
+    with kb.connect() as conn:
+        _blocked_card(conn, ["o/r#7"])
+        result = prg.prefetch_pr_gate_states(conn, max_lookups=500, now=1000.0)
+    assert result.payloads[("o/r", 7)]["state"] == "MERGED"
