@@ -706,7 +706,7 @@ def _load_goal_raw(session_id: str, *, strict: bool = False) -> Tuple[Optional[G
     if db is None:
         return None, None
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        raw = db.get_meta_committed(_meta_key(session_id))
     except Exception as exc:
         if strict:
             raise

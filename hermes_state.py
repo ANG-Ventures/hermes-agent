@@ -1993,6 +1993,13 @@ class SessionDB(
             row = self._conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else row[0]
 
+    def get_meta_committed(self, key: str) -> Optional[str]:
+        """``get_meta`` via ``_read_ctx``: under WAL a pooled reader, never queued behind this process's
+        writers on ``self._lock`` (t_04b5d027: a goal pin / loop load waited out writer retries while
+        a foreign process held the write lock). For keys no in-flight write transaction reads back."""
+        row = self._read_one("SELECT value FROM state_meta WHERE key = ?", (key,))
+        return None if row is None else row[0]
+
     def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:
         """Upsert state_meta[key]; with ``cursor`` the write is inline (the caller already holds a
         transaction — nesting BEGIN IMMEDIATE would deadlock)."""
