@@ -585,3 +585,44 @@ def test_pause_and_resume_during_the_judge_stops_the_stale_evaluation(goal_db, m
     _continue_judge(monkeypatch, seen, during=[flip])
     decision = mgr.evaluate_after_turn("did a thing", made_tool_calls=True)
     assert seen == [[]] and decision["should_continue"] is False and decision["verdict"] == "stale"
+
+
+def test_a_newer_evaluation_during_the_judge_stops_the_older_one(goal_db, monkeypatch):
+    """Prism 74493a4898d5: a competing evaluation keeps goal/created_at/resumed_at, so it must not be
+    retried like a /subgoal edit. Newer turn B saves ``continue`` while older turn A's judge runs; A's
+    ``done`` loses the CAS and stays lost instead of retrying onto B's row."""
+    goals.GoalManager("ce").set("A")
+    older = goals.GoalManager("ce")
+    calls = []
+
+    def judge(goal, reply, subgoals=None, **_k):
+        calls.append(reply)
+        if reply == "A":  # older turn's judge: the newer turn B is evaluated and saved meanwhile
+            goals.GoalManager("ce").evaluate_after_turn("B", made_tool_calls=True)
+            return ("done", "finished", False, None, False)
+        return ("continue", "unfinished", False, None, False)
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    decision = older.evaluate_after_turn("A", made_tool_calls=True)
+    assert calls == ["A", "B"], "the stale evaluation was retried"
+    assert decision["should_continue"] is False and decision["verdict"] == "stale"
+    stored = goals.load_goal("ce")
+    assert (stored.status, stored.last_verdict, stored.turns_used) == ("active", "continue", 1)
+
+
+@pytest.mark.asyncio
+async def test_a_newer_evaluation_after_the_pin_skips_the_older_judge(goal_db, monkeypatch):
+    """Same class at the turn-end pin: a row another evaluation advanced is not a nonterminal edit."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner({"checkin_minutes": 0})
+    sid = entry.session_id
+    goals.GoalManager(sid).set("A")
+    pin = (goals._load_goal_raw(sid)[1],)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "unfinished", False, None, False))
+    goals.GoalManager(sid).evaluate_after_turn("B", made_tool_calls=True)  # newer turn, already judged
+    judged = []
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: judged.append(1) or ("done", "x", False, None, False))
+    await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="A", goal_pin=pin)
+    assert not judged and not adapter._pending_messages
+    assert goals.load_goal(sid).status == "active"

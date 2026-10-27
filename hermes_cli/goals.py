@@ -506,6 +506,9 @@ class GoalState:
     # Stamped by resume(): with goal + created_at it is the active goal's identity (same_active_goal), so a
     # pause+resume (which enqueues its own continuation) is not mistaken for a nonterminal edit.
     resumed_at: float = 0.0
+    # Bumped by every save an evaluate_after_turn makes: a row another evaluation advanced is not the row
+    # this one judged, so same_active_goal is false and the older evaluation never retries onto it.
+    evaluation_writes: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -514,7 +517,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at", "resumed_at")}
         return cls(
             goal=data.get("goal", ""),
@@ -1294,11 +1297,13 @@ def _row_state(raw: Optional[str]) -> Optional[GoalState]:
 
 def same_active_goal(a: Optional[GoalState], b: Optional[GoalState]) -> bool:
     """Both rows are the SAME activation of the same goal and both active: set() stamps created_at (a
-    replacement restarts it), resume() stamps resumed_at. A nonterminal edit (/subgoal, gate, contract,
-    check-in interval) keeps this true; pause, clear, done, resume or a replacement makes it false."""
+    replacement restarts it), resume() stamps resumed_at, every evaluation save bumps evaluation_writes.
+    A nonterminal edit (/subgoal, gate, contract, check-in interval) keeps this true; pause, clear, done,
+    resume, a replacement or another evaluation's write makes it false."""
     return (
         a is not None and b is not None and a.status == "active" and b.status == "active"
         and a.goal == b.goal and a.created_at == b.created_at and a.resumed_at == b.resumed_at
+        and a.evaluation_writes == b.evaluation_writes
     )
 
 
@@ -1372,6 +1377,8 @@ class GoalManager:
             save_goal(self.session_id, self._state)
             return self._state
         self._state.revision += 1
+        if self._evaluating:
+            self._state.evaluation_writes += 1
         raw = self._state.to_json()
         try:
             if self._evaluating:
@@ -1386,8 +1393,9 @@ class GoalManager:
             self._stored = raw
             return self._state
         logger.info("GoalManager: goal for %s changed since load; dropped the stale write", self.session_id)
+        lost_to = self._stored
         self._state, self._stored = _load_goal_raw(self.session_id)
-        raise _StaleGoalWrite()  # abort: nothing more of this evaluation may touch the new row
+        raise _StaleGoalWrite(lost_to)  # abort: nothing more of this evaluation may touch the new row
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1744,14 +1752,14 @@ class GoalManager:
             status = self._state.status if self._state else None
             return {**_decision(status, False, None, "stale", "goal changed since the turn ended", ""), "held": "stale"}
         for _attempt in range(_STALE_RETRIES + 1):
-            evaluated = _row_state(self._stored)  # the row as judged, before the evaluation mutates _state
             self._evaluating = True
             try:
                 return self._evaluate_after_turn(last_response, **kwargs)
-            except _StaleGoalWrite:
-                pass  # _save reloaded the newer row
+            except _StaleGoalWrite as lost:
+                evaluated = _row_state(lost.args[0])  # the row the failed CAS expected; _save reloaded the newer one
             finally:
                 self._evaluating = False
+            # Retry only a nonterminal edit; a row another evaluation advanced keeps the old abort.
             if not same_active_goal(evaluated, self._state):
                 break
             logger.info("GoalManager: goal for %s was edited while the judge ran; re-evaluating", self.session_id)
