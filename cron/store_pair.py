@@ -147,7 +147,17 @@ def _parse_payload(raw: bytes, origin: str) -> object:
 
 # --- capture -------------------------------------------------------------------------------
 
-def capture(home: Path, dest: Path, *, fold: bool = False) -> List[str]:
+def _dir_identity(path: Path) -> Optional[Tuple[int, int]]:
+    """``(st_dev, st_ino)`` of *path* itself (``os.lstat``), ``None`` when it is missing."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def capture(home: Path, dest: Path, *, fold: bool = False,
+            identity: Optional[List[Tuple[int, int]]] = None) -> List[str]:
     """Copy *home*'s live pair into directory *dest* (``dest/jobs.json``, ``dest/runtime_state.db``)
     inside ONE cron lock section: the db through the SQLite backup API, so the rows, the pending
     generations and the file that names them are from one moment. Returns the names written
@@ -156,12 +166,18 @@ def capture(home: Path, dest: Path, *, fold: bool = False) -> List[str]:
 
     ``fold=True`` (every export): the copied rows are folded into ``dest/jobs.json`` and no
     database is left in *dest*; a fold that cannot place every row refuses (``PairRefused``) and
-    removes what it wrote, so the caller never ships an unscrubbed db or a half pair."""
+    removes what it wrote, so the caller never ships an unscrubbed db or a half pair.
+
+    *identity*, when given, gets the ``(st_dev, st_ino)`` of the ``cron/`` directory the members
+    were read from, sampled under the lock before the reads and checked after them (Prism
+    a398ca30beda): the caller records the store it captured, never the path's later occupant. A
+    directory replaced while it was read refuses, since the halves may come from two stores."""
     home, dest = Path(home), Path(dest)
     live = home / CRON_DIR
     if dest.is_dir():
         _discard(dest)  # a staging dir: never leave a pair member from another moment in it
     with lock(home):
+        read_from = _dir_identity(live)
         jobs_src, db_src = live / JOBS_NAME, live / DB_NAME
         # The backup walkers never follow a link; the pair path must not reopen one (Prism
         # 8661dfe2d768): a member that is a symlink or not a regular file refuses the pair.
@@ -180,6 +196,12 @@ def capture(home: Path, dest: Path, *, fold: bool = False) -> List[str]:
                 raise PairRefused(f"could not capture {db_src} consistently (SQLite backup "
                                   "failed); nothing captured")
             written.append(DB_NAME)
+        if read_from is None or _dir_identity(live) != read_from:
+            _discard(dest)
+            raise PairRefused(f"{live} was replaced while it was captured (renamed or swapped); "
+                              "nothing captured, the halves may belong to two stores")
+    if identity is not None:
+        identity.append(read_from)
     if fold and DB_NAME in written:
         if not _rs.fold_staged_copy(dest):
             _discard(dest)
