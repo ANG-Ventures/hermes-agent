@@ -30,7 +30,8 @@ from agent.skill_utils import (
     SKILL_PROMPT_DESC_LIMIT)
 from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
-    _containing_skills_root, _curator_consolidation_delete_guard, _is_path_redirect, _maybe_auto_propose_org_edit,
+    _containing_skills_root, _curator_consolidation_delete_guard, _curator_remove_file_carry_guard,
+    _is_path_redirect, _maybe_auto_propose_org_edit,
     _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import (
     _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
@@ -872,6 +873,8 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return _err(f"File '{file_path}' not found in skill '{name}'.", available_files=available or None)
     if read_guard := _background_review_read_before_write_guard(name, target, "remove_file", file_path):
         return read_guard
+    if carry_guard := _curator_remove_file_carry_guard(name, skill_dir, target, file_path):
+        return carry_guard
     target.unlink()
     _rmdir_if_empty(target.parent, skill_dir)
     return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
