@@ -1897,6 +1897,11 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
                     on_error(rel_cron / name, exc)
                     break
             if captured is not None and names and archived == len(names) and idents:
+                # Prism 268968d0f1f5: *idents* was sampled before capture() took the lock; a
+                # rename + a new store at this path in between archived the NEW store. Record
+                # the identity actually at the path now, so the moved store is not skipped.
+                idents = _store_identity(hermes_root, home)
+            if captured is not None and names and archived == len(names) and idents:
                 captured.setdefault(idents, home)
     return total
 
@@ -2382,7 +2387,8 @@ def restore_quick_snapshot(
                         and _contained(home / member, home)):
                     raise store_pair.PairRefused(f"{member}: path traversal blocked")
             restored += len(store_pair.restore(snap_dir / store_pair.CRON_DIR, home,
-                                               db_failed=_snapshot_cron_db_failed(meta)))
+                                               db_failed=_snapshot_cron_db_failed(meta),
+                                               root=snap_dir))
         except (store_pair.PairRefused, OSError, RuntimeError) as exc:
             logger.error("Failed to restore the cron store pair from %s: %s", snapshot_id, exc)
     for rel in files:
@@ -2523,7 +2529,8 @@ def restore_cron_jobs_if_emptied(
         with suppress(OSError, ValueError):
             meta = json.loads((snap_path.parent.parent / "manifest.json").read_text(
                 encoding="utf-8-sig"))
-        store_pair.restore(snap_path.parent, home, db_failed=_snapshot_cron_db_failed(meta))
+        store_pair.restore(snap_path.parent, home, db_failed=_snapshot_cron_db_failed(meta),
+                           root=_quick_snapshot_root(home) / snapshot_id)
     except (OSError, ValueError, RuntimeError) as exc:
         logger.error(
             "Cron jobs were emptied during update but auto-restore failed: %s", exc
