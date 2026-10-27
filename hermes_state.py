@@ -1934,33 +1934,40 @@ class SessionDB(
                 pass
 
     def _retire_connections_at_finalization(self, no_ckpt_on_close) -> None:
-        """Leave every writable connection unable to checkpoint when it is finalized (Prism 24f888f2a0c1).
+        """Keep a writer's teardown finalization from checkpointing stale frames (Prism 24f888f2a0c1).
 
-        No imports and no lock: the flag arrives bound at definition time and the pin callable at
-        __init__. SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE where sqlite3 has setconfig (3.12+), else the
-        pre-bound C-reference pin close() uses for a lost generation (< 3.12). The dedicated
-        checkpoint connection is covered too: whichever connection is finalized last runs the
-        checkpoint. A healthy WAL left behind is replayed by the next open."""
+        Import-free and lock-free, reading only ``__dict__`` (teardown order is undefined): the
+        flag arrives bound at definition time and the pin callable (ctypes Py_IncRef) at __init__.
+
+        - 3.12+ (setconfig): SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE on the writer and checkpoint
+          connections. A healthy WAL left behind is replayed by the next open.
+        - < 3.12: when the handle already recorded a lost WAL generation, pin the exact writer
+          connection once, as close() does. Retained unclosed, it keeps the process from ever being
+          the last connection, so no close-time checkpoint runs. The durable capture
+          (_settle_lost_generation_locked / _capture_retired_generation) is NOT attempted here: it
+          imports, logs and writes files. That capture is lost for this exit; the pin is what
+          prevents the corruption. A loss not yet detected (flag still False) is not probed for:
+          no stat calls in a finalizer."""
         d = self.__dict__
-        retire = d.get("_retire_connection")
-        for name in ("_conn", "_ckpt_conn"):
-            conn = d.get(name)
-            if conn is None or (name == "_conn" and d.get("_connection_pinned")):
-                continue
-            setconfig = getattr(conn, "setconfig", None)
-            if no_ckpt_on_close is not None and setconfig is not None:
-                try:
-                    setconfig(no_ckpt_on_close, True)
-                    continue
-                except Exception:
-                    pass
-            if retire is not None:
-                try:
-                    retire(conn)
-                except Exception:
-                    pass
-                if name == "_conn":
-                    d["_connection_pinned"] = True
+        if d.get("read_only", True):
+            return
+        if no_ckpt_on_close is not None:
+            for name in ("_conn", "_ckpt_conn"):
+                setconfig = getattr(d.get(name), "setconfig", None)
+                if setconfig is not None:
+                    try:
+                        setconfig(no_ckpt_on_close, True)
+                    except BaseException:
+                        pass
+        conn, retire = d.get("_conn"), d.get("_retire_connection")
+        if (conn is None or retire is None or d.get("_connection_pinned")
+                or not d.get("_db_wal_generation_lost")):
+            return
+        try:
+            retire(conn)
+            d["_connection_pinned"] = True
+        except BaseException:
+            pass
 
     # ── Async token accounting (SessionUsageMixin) ──
     # queue_token_counts() is a deque append; a single-writer thread applies deltas in

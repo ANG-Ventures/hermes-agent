@@ -39,19 +39,25 @@ def test_finalization_switches_off_the_close_time_checkpoint(tmp_path, monkeypat
         db.close()
 
 
-def test_finalization_pins_where_setconfig_is_missing(tmp_path, monkeypatch):
-    """< 3.12 path, driven on any runtime: no flag bound, so the pre-bound retirement pin is used."""
+def test_finalization_pins_a_lost_generation_where_setconfig_is_missing(tmp_path, monkeypatch):
+    """< 3.12 path, driven on any runtime: no flag bound, so the pre-bound retirement pin is used,
+    once, on the exact writer connection, and only for a handle that recorded the loss."""
     db = _writer_with_ckpt_conn(tmp_path, monkeypatch)
-    conns = [db._conn, db._ckpt_conn]
+    conn = db._conn
     pins = []
     db._retire_connection = pins.append
     try:
         db.__del__(_finalizing=lambda: True, _no_ckpt_on_close=None)
-        assert pins == conns and db._connection_pinned
+        assert pins == [] and not db._connection_pinned, "no recorded loss: nothing to pin"
+        db._db_wal_generation_lost = True
         db.__del__(_finalizing=lambda: True, _no_ckpt_on_close=None)
-        assert pins == conns + [conns[1]], "the writer connection must not be pinned twice"
+        assert pins == [conn] and db._connection_pinned
+        db.__del__(_finalizing=lambda: True, _no_ckpt_on_close=None)
+        assert pins == [conn], "the writer connection must not be pinned twice"
     finally:
         db._retire_connection = None
+        db._db_wal_generation_lost = False
+        db._connection_pinned = False
         db.close()
 
 
@@ -67,7 +73,13 @@ def test_read_only_handle_is_left_alone_at_finalization(tmp_path, monkeypatch):
 
 
 @pytest.mark.platforms("linux")
-@pytest.mark.parametrize("halt", [False, True], ids=["loss-unobserved", "loss-captured-at-halt"])
+@pytest.mark.parametrize("halt", [
+    # An undetected loss is covered only where setconfig exists: on < 3.12 the finalizer does not
+    # probe the sidecars (no stat calls at teardown), so only a recorded loss is pinned.
+    pytest.param(False, marks=pytest.mark.skipif(
+        _FLAG is None or not hasattr(sqlite3.Connection, "setconfig"), reason="needs setconfig (3.12+)")),
+    True,
+], ids=["loss-unobserved", "loss-captured-at-halt"])
 def test_unclosed_writer_at_exit_does_not_overwrite_the_newer_generation(tmp_path, halt):
     """The Prism repro: a writer retained to interpreter teardown after its sidecars were taken away and a
     newer generation was checkpointed through the path. The OFD lock guard is off in the child: it refuses
