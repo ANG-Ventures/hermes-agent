@@ -183,8 +183,9 @@ def test_unchanged_registry_parses_and_checksums_once(monkeypatch):
     for _ in range(100):
         with store.locked_registry(write=False) as registry:
             assert len(registry["records"]) == N_RECORDS
-            first = first if first is not None else registry
-            assert registry is first  # the shared read-only snapshot
+            if first is not None:
+                assert registry is not first and registry == first  # private copies of one parse
+            first = registry
     assert len(loads) == 1
     assert len(checksums) == N_RECORDS  # exactly one checksum pass
 
@@ -530,3 +531,54 @@ def test_windows_never_skips_content_verification_on_a_stamp_hit(monkeypatch):
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # the full (Windows) stamp is unchanged
     with store.locked_registry(write=False) as registry:
         assert registry.get("_invalid_record_ids"), "a same-stamp rewrite must be re-read on Windows"
+
+
+
+def test_caller_mutating_a_shared_read_never_corrupts_later_reads():
+    """Prism 81679117ed4f: the cached registry is shared, so a reader that mutates what it was
+    handed (or tries to) must not change what the next cache-hit reader in this process sees."""
+    import contextlib
+
+    _seed(time.time())
+    reads = (store.read_registry, lambda: store.locked_registry(write=False).__enter__())
+    for read in reads:
+        shared = read()
+        record = shared["records"]["deleg_00000000"]
+        for mutate in (
+            lambda: record.__setitem__("state", "corrupted"),
+            lambda: record["attempt"].__setitem__("last_error", "corrupted"),
+            lambda: record.setdefault("injected", 1),
+            lambda: record.setdefault("outbox", []).append({"state": "corrupted"}),
+            lambda: shared["records"].pop("deleg_00000001"),
+            lambda: shared.update({"schema_version": -1}),
+        ):
+            with contextlib.suppress(TypeError):
+                mutate()
+        assert store._REGISTRY_CACHE  # the next read is a cache HIT, not a re-parse
+        with store.locked_registry(write=False) as again:
+            fresh = again["records"]["deleg_00000000"]
+            assert fresh["state"] == "running"
+            assert fresh["attempt"]["last_error"] is None
+            assert "injected" not in fresh
+            assert all(e.get("state") != "corrupted" for e in fresh.get("outbox", []))
+            assert "deleg_00000001" in again["records"]
+            assert again["schema_version"] == store.SCHEMA_VERSION
+        with store.locked_registry() as writable:  # the write path's private copy is clean and mutable
+            writable["records"]["deleg_00000000"]["attempt"]["last_error"] = None
+            assert writable["records"]["deleg_00000000"]["state"] == "running"
+            assert "deleg_00000001" in writable["records"]
+
+
+def test_shared_read_still_copies_as_plain_mutable_json():
+    import copy as _copy
+
+    _seed(time.time())
+    record = store.read_registry()["records"]["deleg_00000000"]
+    assert isinstance(record, dict) and isinstance(record.get("outbox", []), list)
+    for clone in (json.loads(json.dumps(record)), _copy.deepcopy(record), {**record}, dict(record)):
+        clone["state"] = "mine"
+    deep = _copy.deepcopy(record)
+    deep["attempt"]["last_error"] = "mine"
+    deep.setdefault("outbox", []).append({"x": 1})
+    assert store.read_registry()["records"]["deleg_00000000"]["state"] == "running"
+    assert store.read_registry()["records"]["deleg_00000000"]["attempt"]["last_error"] is None

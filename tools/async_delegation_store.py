@@ -173,8 +173,9 @@ def _record_checksum(record: dict[str, Any]) -> str:
 # cached_at, registry, strict_error)}. st_ctime_ns is kernel-owned: any write, or an os.utime that
 # restores an old mtime, moves it, so a same-size in-place rewrite never keeps the stat key. The registry is the lenient (quarantining) parse; ``strict_error`` is
 # the RegistryError a strict load of the same bytes raises (None when every record is valid).
-# The cached object is READ-ONLY: ``locked_registry(write=False)`` and ``read_registry`` hand it
-# out as is, ``write=True`` callers get a private copy. Integrity checksums are verified on every
+# The cached object is NEVER handed out: every load returns a private marshal copy of it (~5 ms on
+# the 2.8 MB compacted live registry vs ~90 ms parse + checksums), so a caller that mutates what
+# it read cannot corrupt later reads (Prism 81679117ed4f). Integrity checksums are verified on every
 # miss (the first load after any change), so a corrupted file is still caught once it changes.
 _REGISTRY_CACHE: dict[str, tuple[tuple[int, int, int, int], str, float, dict[str, Any], str | None]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
@@ -211,9 +212,8 @@ def _load(
 ) -> dict[str, Any]:
     """Load a registry; strict mode raises on the first invalid record, lenient quarantines.
 
-    Served from ``_REGISTRY_CACHE`` while the file's (mtime_ns, size, inode, ctime_ns) is unchanged. A
-    ``private=False`` result may be the SHARED cached object and must be treated as read-only;
-    ``private=True`` (the write path) always returns an object nobody else holds.
+    Served from ``_REGISTRY_CACHE`` while the file's (mtime_ns, size, inode, ctime_ns) is unchanged.
+    Every result is a private copy nobody else holds; ``private`` is kept for call-site clarity.
     ``trusted_records`` (the records this process just wrote and hashed) forces a re-parse and
     skips re-hashing a record only when the parsed record is EQUAL to the one written.
     """
@@ -246,7 +246,7 @@ def _load(
                 registry, strict_error = cached[3], cached[4]
                 if strict_error is not None and not allow_invalid_records:
                     raise RegistryError(strict_error)
-                return _copy_registry(registry) if private else registry
+                return _copy_registry(registry)
         if raw is None:
             raw = handle.read()
     data, strict_error = _parse_registry(raw, path, trusted_records=trusted_records)
@@ -254,7 +254,7 @@ def _load(
         _REGISTRY_CACHE[key] = (stamp, hashlib.sha256(raw).hexdigest(), now, data, strict_error)
     if strict_error is not None and not allow_invalid_records:
         raise RegistryError(strict_error)
-    return _copy_registry(data) if private else data
+    return _copy_registry(data)
 
 
 def _parse_registry(
@@ -378,7 +378,7 @@ def _parse_registry(
 
 
 def read_registry(profile_home: Path | None = None) -> dict[str, Any]:
-    """The registry, possibly the SHARED cached object: callers must not mutate it."""
+    """The registry, as a private copy the caller may mutate freely."""
     return _load(registry_path(profile_home))
 
 
