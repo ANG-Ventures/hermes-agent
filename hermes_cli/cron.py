@@ -356,6 +356,9 @@ def cron_run_now(job_id: str) -> int:
     result = run_job_now(job_id, verbose=True)
 
     job_id = result.get("job_id", job_id)
+    if result.get("deferred_to"):
+        print(color(f"⏸ Job {job_id} not started: {result['error']}", Colors.YELLOW))
+        return 1
     if result.get("success"):
         print(color(f"✓ Job {job_id} completed", Colors.GREEN))
         if result.get("output_file"):
