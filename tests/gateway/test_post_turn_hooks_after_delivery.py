@@ -445,3 +445,47 @@ def test_transient_refresh_failure_keeps_the_loaded_goal(goal_db, monkeypatch):
     assert not fails, "the refresh read never ran"
     assert decision["should_continue"] is True
     assert goals.load_goal("locked").status == "active"
+
+
+@pytest.mark.asyncio
+async def test_unbounded_goal_hook_does_not_unbound_a_chained_callback(monkeypatch):
+    """Prism fc4a550234d2: chaining the unbounded /goal hook made every callback in the chain unbounded,
+    so a stalled callback registered beside it held the session forever. Each link keeps its own bound."""
+    monkeypatch.setattr(base, "_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS", 0.2)
+    ran = []
+
+    async def stalled():
+        await asyncio.Event().wait()
+
+    async def goal_hook():
+        ran.append("goal")
+
+    goal_hook.post_delivery_timeout = None
+    chained = base.BasePlatformAdapter._chain_callbacks(stalled, goal_hook)
+    assert chained.post_delivery_timeout is None  # the chain itself stays unbounded for the judge
+    await asyncio.wait_for(chained(), timeout=5)  # the stalled link times out alone; the goal hook runs
+    assert ran == ["goal"]
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_end_pin_skips_the_deferred_judge(goal_db, monkeypatch):
+    """Prism 'Unpinned Evaluation' (run_goals.py:455): a transient read failure at turn end used to leave
+    the judge unpinned, so a /goal set during the send was judged on the old reply. Skip instead; the
+    idle check-in re-evaluates later."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner()
+    goals.GoalManager(entry.session_id, default_max_turns=1).set("B")
+    judged = []
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: judged.append(1) or ("done", "ok", False, None, False))
+    await runner._post_turn_goal_continuation(
+        session_entry=entry, source=src, final_response="old reply", goal_pin=runner_goal_pin_failed(),
+    )
+    stored = goals.load_goal(entry.session_id)
+    assert (stored.goal, stored.status, stored.turns_used) == ("B", "active", 0)
+    assert not judged
+
+
+def runner_goal_pin_failed():
+    from gateway.run_goals import GOAL_PIN_FAILED
+    return GOAL_PIN_FAILED

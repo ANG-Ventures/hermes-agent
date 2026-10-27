@@ -27,6 +27,9 @@ logger = logging.getLogger("gateway.run")
 # True while the post-turn hooks run as the adapter's post-delivery callback: that slot has already
 # been popped, so a /goal status notice is sent directly (registering would fire on the NEXT turn).
 _AFTER_DELIVERY: contextvars.ContextVar[bool] = contextvars.ContextVar("post_turn_after_delivery", default=False)
+# goal_pin sentinel: the turn-end goal row could not be read, so the deferred judge is skipped (the idle
+# check-in re-evaluates later); judging unpinned could score a goal set during the send on this reply.
+GOAL_PIN_FAILED = ("<goal pin failed>",)
 
 
 class GatewayGoalsMixin:
@@ -332,6 +335,8 @@ class GatewayGoalsMixin:
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        if goal_pin is GOAL_PIN_FAILED:  # the turn-end pin could not be read: never judge unpinned
+            return
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -453,12 +458,15 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("post-turn hook failed: %s", exc)
         # Pin the goal row as of turn end: a /goal set during the send is not judged on this reply.
-        with suppress(Exception):  # a failed read leaves it unpinned, never pinned as "no goal"
+        try:
             from hermes_cli.goals import _load_goal_raw
             sid = self.session_store.peek_session_id(session_key)
             if isinstance(sid, str) and sid:
                 kwargs["goal_pin"] = ((await self._run_in_executor_with_context(
                     lambda: _load_goal_raw(sid, strict=True)))[1],)
+        except Exception as exc:  # unpinned would judge a goal set during the send on this reply: skip
+            logger.warning("goal pin for %s failed, deferred judge skipped: %s", session_key, exc)
+            kwargs["goal_pin"] = GOAL_PIN_FAILED
 
         # The routed profile scope (home/secret/terminal contextvars) is left before the adapter fires the
         # callback; run the hooks in the context captured here so they read the routed profile's state.db.

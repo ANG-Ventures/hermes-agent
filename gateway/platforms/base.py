@@ -4341,7 +4341,10 @@ class BasePlatformAdapter(ABC):
                 try:
                     _result = _cb()
                     if inspect.isawaitable(_result):
-                        await _result
+                        # Each link keeps ITS bound (Prism fc4a550234d2): an unbounded /goal hook in the
+                        # chain must not unbound a stalled neighbour and hold the session forever.
+                        _b = getattr(_cb, "post_delivery_timeout", _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+                        await (_result if _b is None else asyncio.wait_for(_result, timeout=_b))
                 except Exception:
                     logger.debug("Post-delivery callback failed", exc_info=True)
         # The chain keeps the longest bound a link asked for.
