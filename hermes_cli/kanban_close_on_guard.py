@@ -274,6 +274,14 @@ class ApproveStampRefused(ValueError):
 # INPUT; on 2026-10-27 12:10 a stamp built with json.dumps inside a script file and posted through
 # the CLI (comment 153767 on t_e215d33f) never showed it a literal. This is the same rule at the
 # write itself, which the CLI verb, the kanban_comment tool and the dashboard all reach.
+#
+# This is a CONTRACT TRIPWIRE, not an authentication boundary (Prism c20514bbf30a). The marker is a
+# plain env var, and a caller that sets it on purpose passes. The callers it constrains are operator
+# sessions, and they already hold the operator token, so no secret the writer holds would be one those
+# sessions lack. What it stops is the observed failure: an operator session (or a lander) hand-building
+# a stamp without the release decision, by habit or a copied script. Setting the marker by hand is a
+# deliberate bypass, visible in the script text. Authorization of who may post as an operator stays
+# with the operator-token check on `--author`.
 APPROVE_WRITER_ENV = "OPERATOR_APPROVE_WRITER"
 APPROVE_STAMP_OFF = ("state", "approve-stamp-guard-off")   # the hook's marker, under the fleet root
 APPROVE_WRITER_CMD = ("python3 scripts/lib/operator_approve.py --card <c> --head <40hex> --pr <owner/repo#N> "
@@ -341,7 +349,8 @@ def is_operator_approve_stamp(author: str, body: str) -> bool:
 
 def check_approve_stamp(author: str, body: str) -> None:
     """Raise :class:`ApproveStampRefused` for an operator APPROVE stamp posted without the writer's
-    ``OPERATOR_APPROVE_WRITER=1``. Off-switch: ``<fleet root>/state/approve-stamp-guard-off``."""
+    ``OPERATOR_APPROVE_WRITER=1``. Off-switch: ``<fleet root>/state/approve-stamp-guard-off``.
+    A tripwire on the writer contract, not an auth check: see the note above ``APPROVE_WRITER_ENV``."""
     if os.environ.get(APPROVE_WRITER_ENV) == "1":
         return
     if not is_operator_approve_stamp(author, body):
