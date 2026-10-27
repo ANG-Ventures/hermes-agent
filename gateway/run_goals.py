@@ -456,7 +456,10 @@ class GatewayGoalsMixin:
         # it would complete a wakeup tick fired during the send (bookkeeping, no LLM call). Only the judge waits.
         _t0 = time.monotonic()
         try:  # the class method: an instance override of _run_post_turn_hooks stands for the deferred judge
-            await GatewayGoalsMixin._run_post_turn_hooks(self, **kwargs, parts=("loop completion",))
+            # is_internal=True: no routing touch before the send. That upsert is a state.db WRITE that waits out
+            # any foreign writer's hold (t_04b5d027: 4.05 s); the deferred judge's own lookup touches after it.
+            await GatewayGoalsMixin._run_post_turn_hooks(
+                self, **{**kwargs, "is_internal": True}, parts=("loop completion",))
         except Exception as exc:
             logger.debug("post-turn hook failed: %s", exc)
         _t1 = time.monotonic()
