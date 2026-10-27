@@ -62,7 +62,6 @@ class GatewayGoalCommandsMixin:
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
         try:
             adapter, quick_key = self._adapter_and_key_for(event)
-            self._cancel_post_turn_hooks(quick_key)
             if adapter and quick_key:
                 self._clear_goal_pending_continuations(quick_key, adapter)
         except Exception as exc:

@@ -522,7 +522,6 @@ class GatewayAgentCacheMixin:
         Settles a pending one-shot model override first: the displaced turn's finalizer is
         generation-guarded and would otherwise leave ``/moa`` / ``/model --once`` in force."""
         self._restore_pending_one_turn_model_override(session_key)
-        self._cancel_post_turn_hooks(session_key)  # /stop, /new: no judge acts on the old run
         persistent = self._session_state(session_key).persistent
         # Every generation up to the one in flight is now "stopped and draining"; record it BEFORE
         # the bump so the turn-lease stale test (``_is_session_run_invalidated``) can tell this

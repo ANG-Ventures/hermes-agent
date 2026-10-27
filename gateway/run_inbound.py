@@ -1620,9 +1620,9 @@ class GatewayInboundMixin:
                     _quick_key, exc.session_id,
                 )
                 return self._hm_lease_rejection_reply(event, source, _quick_key)
-            # Off the reply's critical path: the /goal judge is a 5-12 s aux-LLM call (t_3acac80f).
-            self._schedule_post_turn_hooks(
-                agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
+            await self._post_turn_hooks_after_delivery(
+                _quick_key, _run_generation, agent_result=_agent_result, source=source,
+                is_internal=is_internal, event=event,
             )
             return _agent_result
         finally:

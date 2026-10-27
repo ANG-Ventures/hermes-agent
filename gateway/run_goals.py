@@ -24,12 +24,11 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
-# True inside a post-turn hook task that runs after the turn's reply was sent: the adapter's
-# post-delivery callback has already fired, so a /goal status notice is sent directly.
+# True while the post-turn hooks run as the adapter's post-delivery callback: that slot has already
+# been popped, so a /goal status notice is sent directly (registering would fire on the NEXT turn).
 _AFTER_DELIVERY: contextvars.ContextVar[bool] = contextvars.ContextVar("post_turn_after_delivery", default=False)
-# The session run generation the post-turn task was scheduled under: a /stop or /new since then
-# (an explicit invalidation) means its continuation must not reach the session.
-_POST_TURN_GEN: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar("post_turn_generation", default=None)
+# The /goal judge is a 5-12 s aux-LLM call (t_3acac80f); the adapter's default callback bound is 30 s.
+_POST_TURN_HOOKS_TIMEOUT_SECONDS = 120.0
 
 
 class GatewayGoalsMixin:
@@ -340,9 +339,6 @@ class GatewayGoalsMixin:
             max_turns = self._goal_max_turns_from_config()
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
 
-        _fence_key = self._session_key_for_source(source) if source is not None else None
-        if _fence_key and self._post_turn_invalidated(_fence_key):
-            return  # the user paused/cleared the goal or ran /stop or /new after this turn
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
         if mgr is None or not mgr.is_active():
             return
@@ -412,7 +408,7 @@ class GatewayGoalsMixin:
         try:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key and not self._post_turn_invalidated(_quick_key):
+            if adapter and _quick_key:
                 # Synthetic continuation from the goal judge — not authored by the human. Without
                 # this flag the shared-multi-user sender prefix would stamp "[<user>] " onto it
                 # (impersonation; same class as the boot-resume ghost message, 2026-07-10).
@@ -422,104 +418,36 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
-    def _schedule_post_turn_hooks(self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None):
-        """Run the post-turn hooks AFTER this turn's reply is delivered (t_3acac80f): the /goal judge
-        is a 5-12 s aux-LLM call that sat between "response ready" and the adapter's send. The adapter
-        sends what the turn task (our caller) returns, so the hook task waits for that task; per-session
-        chaining keeps judge evaluations in turn order. Shutdown drains these (_drain_post_turn_tasks)."""
-        turn_task = asyncio.current_task()
-        tasks = self.__dict__.setdefault("_post_turn_tasks", set())
-        tails = self.__dict__.setdefault("_post_turn_tails", {})
-        key = self._session_key_for_source(source) if source is not None else None
-        prev = tails.get(key)
-        fences = self.__dict__.setdefault("_post_turn_fences", {})
-        generation = (self._current_session_run_generation(key), fences.get(key, 0)) if key else None
-
-        async def _run() -> None:
-            waits = {t for t in (prev, turn_task) if t is not None and t is not asyncio.current_task()}
-            if waits:
-                await asyncio.wait(waits)
-            _AFTER_DELIVERY.set(True)
-            _POST_TURN_GEN.set(generation)
-            started = time.monotonic()
+    async def _post_turn_hooks_after_delivery(
+        self, session_key: str, generation: int, *, agent_result: Any, source: Any, is_internal: bool,
+        event: Any = None,
+    ) -> None:
+        """Run the post-turn hooks (the /goal judge) AFTER the reply is sent (t_3acac80f): as the
+        adapter's post-delivery callback, which fires in the session task's finally after the send and
+        before the session guard is released. The session stays busy while the judge runs, so a new
+        message queues behind it and /stop cancels it with the turn. Inline when this turn is not the
+        adapter's session task (a /retry or handoff turn) or the adapter has no callback slot."""
+        kwargs = dict(agent_result=agent_result, source=source, is_internal=is_internal, event=event)
+        adapter = self._delivery_adapter_for(source) if session_key else None
+        owned = adapter is not None and getattr(adapter, "_session_tasks", {}).get(session_key) is asyncio.current_task()
+        if not (owned and hasattr(adapter, "register_post_delivery_callback")):
             try:
-                await self._run_post_turn_hooks(
-                    agent_result=agent_result, source=source, is_internal=is_internal, event=event,
-                )
+                await self._run_post_turn_hooks(**kwargs)
             except Exception as exc:
                 logger.debug("post-turn hook failed: %s", exc)
-            # The turn task already ran the adapter's end-of-turn drain, so a continuation the judge
-            # just queued would wait for the next inbound: start it on the idle session (never while
-            # draining; adapter shutdown spools the slot for the next boot).
-            idle_ok = key and not getattr(self, "_draining", False) and not self._post_turn_invalidated(key)
-            adapter = self._delivery_adapter_for(source) if idle_ok else None
-            if adapter is not None and key not in getattr(adapter, "_active_sessions", {key: 0}):
-                pending = getattr(adapter, "_pending_messages", {}).pop(key, None)
-                if pending is not None:
-                    adapter._start_session_processing(pending, key)
-            took = time.monotonic() - started
-            if took > 2.0:
-                logger.info("PHASE=post_turn_hooks session=%s s=%.2f (after delivery)", key or "unknown", took)
-
-        task = asyncio.get_running_loop().create_task(_run(), name=f"post-turn:{key}")
-        task.post_turn_route = (key, source, generation)
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
-        tails[key] = task
-        task.add_done_callback(lambda t: tails.pop(key, None) if tails.get(key) is t else None)
-        return task
-
-    async def _drain_post_turn_tasks(self, timeout: float = 10.0) -> None:
-        """Shutdown: let in-flight post-turn hooks queue their continuation (it spools across the
-        restart via the draining inbound path) instead of dying with the loop."""
-        pending = [t for t in self.__dict__.get("_post_turn_tasks", ()) if not t.done()]
-        if not pending:
             return
-        _done, still = await asyncio.wait(pending, timeout=timeout)
-        if still:
-            # Cancel, never let one enqueue after the adapter spool. The continuation it owed is queued
-            # now, before the spool, so it survives the restart even with idle check-ins off.
-            for task in still:
-                task.cancel()
-                key, source, generation = getattr(task, "post_turn_route", (None, None, None))
-                token = _POST_TURN_GEN.set(generation)
-                try:
-                    if key and not self._post_turn_invalidated(key):
-                        await asyncio.wait_for(self._spool_owed_goal_continuation(key, source), 2.0)
-                except Exception as exc:
-                    logger.warning("Shutdown: owed /goal continuation for %s not spooled: %s", key, exc)
-                finally:
-                    _POST_TURN_GEN.reset(token)
-            logger.warning("Shutdown: %d post-turn hook task(s) still running after %.0fs; cancelled: %s",
-                           len(still), timeout, ", ".join(sorted(t.get_name() for t in still)))
 
-    async def _spool_owed_goal_continuation(self, key: str, source: Any) -> None:
-        from hermes_cli.goals import GoalManager
-        entry = await self.async_session_store.get_or_create_session(source, touch_activity=False)
-        def _owed() -> Optional[str]:  # state.db reads (and is_waiting's lazy clear) stay off the loop
-            mgr = GoalManager(entry.session_id)
-            return mgr.next_continuation_prompt() if mgr.is_active() and not mgr.is_waiting() else None
+        async def _hooks() -> None:
+            token, started = _AFTER_DELIVERY.set(True), time.monotonic()
+            try:
+                await self._run_post_turn_hooks(**kwargs)
+            finally:
+                _AFTER_DELIVERY.reset(token)
+                if (took := time.monotonic() - started) > 2.0:
+                    logger.info("PHASE=post_turn_hooks session=%s s=%.2f (after delivery)", session_key, took)
 
-        prompt = await self._run_in_executor_with_context(_owed)
-        adapter = self._delivery_adapter_for(source)
-        if prompt and adapter is not None:
-            self._enqueue_fifo(key, self._synthetic_prompt_event(source, prompt, internal=True), adapter)
-
-    def _post_turn_invalidated(self, key: str) -> bool:
-        """True when this post-turn task's goal work is fenced: /stop or /new invalidated its run, or
-        /goal pause|clear ran after it was scheduled (GoalManager._save also refuses a stale write)."""
-        captured = _POST_TURN_GEN.get()
-        if captured is None:
-            return False
-        gen, fence = captured
-        return self._is_session_run_invalidated(key, gen) or self.__dict__.get("_post_turn_fences", {}).get(key, 0) != fence
-
-    def _cancel_post_turn_hooks(self, key: Optional[str]) -> None:
-        """Fence the /goal work of every post-turn task scheduled so far for ``key`` (queued ones never
-        judge, an in-flight judge never enqueues). Not a task cancel: the same task settles /loop."""
-        if key:
-            fences = self.__dict__.setdefault("_post_turn_fences", {})
-            fences[key] = fences.get(key, 0) + 1
+        _hooks.post_delivery_timeout = _POST_TURN_HOOKS_TIMEOUT_SECONDS
+        adapter.register_post_delivery_callback(session_key, _hooks, generation=generation)
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,

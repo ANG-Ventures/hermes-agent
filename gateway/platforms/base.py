@@ -4344,6 +4344,9 @@ class BasePlatformAdapter(ABC):
                         await _result
                 except Exception:
                     logger.debug("Post-delivery callback failed", exc_info=True)
+        # The chain keeps the longest bound a link asked for (the /goal judge hooks need 120 s).
+        _chained.post_delivery_timeout = max(
+            getattr(_cb, "post_delivery_timeout", _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS) for _cb in callbacks)
         return _chained
 
     @staticmethod
@@ -5494,7 +5497,8 @@ class BasePlatformAdapter(ABC):
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 _post_result = _post_cb()
                 if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+                    await asyncio.wait_for(_post_result, timeout=getattr(
+                        _post_cb, "post_delivery_timeout", _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS))
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
@@ -5620,6 +5624,8 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
+                # Before the hand-off: this turn's callbacks (the /goal judge) finish before the next turn.
+                await self._fire_post_delivery_callback(session_key, interrupt_event)
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:

@@ -1291,7 +1291,6 @@ class GoalManager:
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state, self._stored = _load_goal_raw(session_id)
-        self.lost_write = False   # a save found the row changed since load (another writer won)
         self._evaluating = False
 
     # --- introspection ------------------------------------------------
@@ -1337,10 +1336,10 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def _save(self, *, force: bool = False) -> Optional[GoalState]:
-        """Compare-and-set against the row this manager loaded: a writer holding a stale copy (the
-        post-delivery /goal judge while the user ran /goal pause or clear) drops its write and adopts
-        the stored state instead of resurrecting it. ``force``: an explicit user verb, always wins."""
+    def _save(self) -> Optional[GoalState]:
+        """Inside ``evaluate_after_turn`` the write is compare-and-set against the row this manager
+        loaded: a judge holding a stale copy (the user ran /goal pause or clear meanwhile) drops its
+        write and aborts. Every other caller is a user verb or a fresh read-modify-write; it writes."""
         db = _get_session_db() if self.session_id and self._state is not None else None
         if db is None:  # not persisted (warned); _stored still mirrors the row as last seen
             save_goal(self.session_id, self._state)
@@ -1348,23 +1347,20 @@ class GoalManager:
         self._state.revision += 1
         raw = self._state.to_json()
         try:
-            if force:
+            if self._evaluating:
+                written = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
+            else:
                 db.set_meta(_meta_key(self.session_id), raw)
                 written = True
-            else:
-                written = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
         except Exception as exc:
-            logger.debug("GoalManager: compare_and_set_meta failed: %s", exc)
+            logger.debug("GoalManager: goal write failed: %s", exc)
             return self._state
         if written:
             self._stored = raw
-        else:
-            logger.info("GoalManager: goal for %s changed since load; dropped the stale write", self.session_id)
-            self.lost_write = True
-            self._state, self._stored = _load_goal_raw(self.session_id)
-            if self._evaluating:
-                raise _StaleGoalWrite()  # abort: nothing more of this evaluation may touch the new row
-        return self._state
+            return self._state
+        logger.info("GoalManager: goal for %s changed since load; dropped the stale write", self.session_id)
+        self._state, self._stored = _load_goal_raw(self.session_id)
+        raise _StaleGoalWrite()  # abort: nothing more of this evaluation may touch the new row
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1394,7 +1390,7 @@ class GoalManager:
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
         )
-        return self._save(force=True)
+        return self._save()
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""
@@ -1409,7 +1405,7 @@ class GoalManager:
         self._state.status = "paused"
         self._state.paused_reason = reason
         self._state.clear_wait()   # a wait barrier is meaningless once paused
-        return self._save(force=True)
+        return self._save()
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
@@ -1419,13 +1415,13 @@ class GoalManager:
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
-        return self._save(force=True)
+        return self._save()
 
     def clear(self) -> None:
         if self._state is None:
             return
         self._state.status = "cleared"
-        self._save(force=True)
+        self._save()
         self._state = None
 
     def mark_done(self, reason: str) -> None:
@@ -1704,7 +1700,7 @@ class GoalManager:
     def evaluate_after_turn(self, last_response: str, **kwargs: Any) -> Dict[str, Any]:
         """See ``_evaluate_after_turn``. A save that lost to a newer stored state (the user paused,
         cleared or replaced the goal while the judge ran) never continues on the stale copy."""
-        self.lost_write, self._evaluating = False, True
+        self._evaluating = True
         try:
             return self._evaluate_after_turn(last_response, **kwargs)
         except _StaleGoalWrite:

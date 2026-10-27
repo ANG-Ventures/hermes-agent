@@ -790,7 +790,6 @@ class GatewaySlashCommandsMixin(
             int(_persistent.invalidated_run_generation), int(_persistent.run_generation),
         )
         _persistent.run_generation += 1
-        self._cancel_post_turn_hooks(session_key)
         self._session_state(session_key).conversation.automatic_turns_paused = True
         queue_mgmt.hold_user_items(self, session_key, self._delivery_adapter_for(source))
         # Same contract as the busy path (run_agent_cache): a marker write failure must not abort
