@@ -312,10 +312,27 @@ def _sync_completion(conn, event, result, disposition=None):
     same_event = _same_completion_event(json.loads(row[0] or "null"), event)
     if result is None:
         result = json.loads(row[1]) if same_event and row[1] else None
-    if same_event and row[0] and _store.is_compacted_payload(event):
+    if _store.is_compacted_payload(event):
         # The canonical envelope was compacted after delivery (D5). The mirror's event_json is
         # the replay source if this row is ever pending again: keep its full body rather than
         # overwriting it with the identity-only stub.
+        if not (same_event and row[0]):
+            # No full body to keep: record the terminal state and disposition, but never reset
+            # the row to pending or store the stub as its replay source, or a later replay lacks
+            # summary/results (Prism 565b0259b9ff).
+            conn.execute(
+                "UPDATE async_delegations SET state=?, completed_at=?, updated_at=? WHERE delegation_id=?",
+                (event.get("status", "completed"), event.get("completed_at", now), now,
+                 event["delegation_id"]),
+            )
+            if disposition in {"delivered", "dropped", "parked"}:
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state=?,
+                       delivery_claim=NULL, delivery_claimed_at=NULL
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (disposition, event["delegation_id"]),
+                )
+            return
         event = json.loads(row[0])
     if not same_event:
         conn.execute(

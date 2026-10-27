@@ -213,6 +213,7 @@ def _load(
     allow_invalid_records: bool = False,
     private: bool = False,
     trusted_records: dict[str, tuple[str, bytes]] | None = None,
+    verify_content: bool = False,
 ) -> dict[str, Any]:
     """Load a registry; strict mode raises on the first invalid record, lenient quarantines.
 
@@ -220,6 +221,9 @@ def _load(
     Every result is a private copy nobody else holds; ``private`` is kept for call-site clarity.
     ``trusted_records`` (the records this process just wrote and hashed) forces a re-parse and
     skips re-hashing a record only when the parsed record is EQUAL to the one written.
+    ``verify_content`` confirms every cache hit by content hash: a read-modify-write never trusts
+    the stat stamp alone (SSHFS/SFTP synthesize ctime from mtime, so a stamp-preserving rewrite
+    would be overwritten with stale data; Prism babadae984f2).
     """
     key = str(path)
     try:
@@ -240,7 +244,8 @@ def _load(
             # rewrite in that tick would leave the stat key unchanged, so confirm by content.
             # Once a confirmed hit lands past the window, any later rewrite moves the ctime.
             changed = max(st.st_mtime_ns, st.st_ctime_ns) / 1e9
-            if _ctime_is_creation_time() or cached[2] - changed < _CACHE_HASH_WINDOW_SECONDS:
+            if (verify_content or _ctime_is_creation_time()
+                    or cached[2] - changed < _CACHE_HASH_WINDOW_SECONDS):
                 raw = handle.read()
             if raw is None or hashlib.sha256(raw).hexdigest() == cached[1]:
                 if raw is not None and now - changed >= _CACHE_HASH_WINDOW_SECONDS:
@@ -480,7 +485,7 @@ def locked_registry(
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"timed out acquiring {lpath}")
                     time.sleep(0.01)
-        registry = _load(path, allow_invalid_records=True, private=write)
+        registry = _load(path, allow_invalid_records=True, private=write, verify_content=write)
         yield registry
         if write:
             _write(path, registry)
@@ -687,7 +692,9 @@ def _backup_before_first_compaction(path: Path) -> bool:
     tmp: Path | None = None
     try:
         if any(path.parent.glob(f"{path.name}.pre-compact-*")):
-            return True
+            # A leftover name proves no durable directory entry (crash before the dir fsync, or a
+            # failed unlink on the EIO path): re-sync and require success (Prism 0bd3c496e10a).
+            return _fsync_directory(path.parent)
         if not path.exists():
             return False
         backup = path.with_name(f"{path.name}.pre-compact-{int(time.time())}")

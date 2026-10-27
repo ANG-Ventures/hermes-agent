@@ -649,3 +649,99 @@ def test_shared_read_still_copies_as_plain_mutable_json():
     deep.setdefault("outbox", []).append({"x": 1})
     assert store.read_registry()["records"]["deleg_00000000"]["state"] == "running"
     assert store.read_registry()["records"]["deleg_00000000"]["attempt"]["last_error"] is None
+
+
+# Prism 0bd3c496e10a / babadae984f2 / 565b0259b9ff ─────────────────────────────
+
+def test_leftover_backup_still_requires_a_successful_directory_fsync(monkeypatch):
+    """Prism 0bd3c496e10a: dir fsync EIO + backup unlink EIO leaves a ``.pre-compact-*`` file
+    behind. A second ``_compact`` under the same failures must not trust that leftover."""
+    import errno
+    import stat
+
+    now = time.time()
+    path, _ = _seed(now)
+    real_fsync, real_unlink = os.fsync, Path.unlink
+
+    def dir_eio(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_fsync(fd)
+
+    def unlink_eio(self, *a, **k):
+        if ".pre-compact-" in self.name and not self.name.startswith("."):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(store.os, "fsync", dir_eio)
+    monkeypatch.setattr(Path, "unlink", unlink_eio)
+    registry = store.read_registry()
+    assert store._compact(registry, now, path) == 0
+    assert list(path.parent.glob(f"{path.name}.pre-compact-*")), "repro precondition: leftover backup"
+    registry = store.read_registry()
+    assert store._compact(registry, now, path) == 0, \
+        "a leftover backup without a successful directory fsync must not unlock compaction"
+    assert not any(_compacted(e["payload"]) for r in registry["records"].values() for e in r["outbox"])
+
+
+def test_locked_write_never_serves_a_stamp_preserving_rewrite_from_cache(monkeypatch):
+    """Prism babadae984f2: on SSHFS/SFTP ctime is synthesized from mtime, so a same-size in-place
+    rewrite that restores mtime keeps the whole stamp. A locked read-modify-write must re-read the
+    file, or it overwrites the remote update with the stale cached registry."""
+    path, _ = _seed(time.time())
+    old = time.time() - 60
+    os.utime(path, (old, old))
+    _clear_cache()
+    real_fstat = os.fstat
+
+    class _SshfsStat:
+        def __init__(self, st):
+            self._st = st
+
+        def __getattr__(self, name):
+            return self._st.st_mtime_ns if name == "st_ctime_ns" else getattr(self._st, name)
+
+    monkeypatch.setattr(store.os, "fstat", lambda fd: _SshfsStat(real_fstat(fd)))
+    store.read_registry()
+    store.read_registry()  # a confirmed hit past the hash window: stamp-only from here on
+    st = path.stat()
+    raw = path.read_bytes()
+    data = json.loads(raw)
+    rid = "deleg_00000005"
+    record = data["records"][rid]
+    old_sum = record["integrity"]
+    record["profile"] = "remote1"  # same length as "default"
+    new_sum = store._record_checksum(record)
+    at = raw.index(f'"{rid}"'.encode())
+    forged = raw[:at] + raw[at:].replace(b'"profile": "default"', b'"profile": "remote1"', 1) \
+        .replace(old_sum.encode(), new_sum.encode(), 1)
+    assert len(forged) == len(raw) and forged != raw
+    with open(path, "r+b") as fh:  # remote in-place rewrite: same inode, same size
+        fh.write(forged)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # mtime restored -> (SSHFS) ctime too
+    with store.locked_registry() as registry:
+        registry["records"]["deleg_00000006"]["profile"] = "local01"
+    on_disk = json.loads(path.read_bytes())["records"]
+    assert on_disk["deleg_00000006"]["profile"] == "local01"
+    assert on_disk[rid]["profile"] == "remote1", "the locked write overwrote the remote update"
+
+
+def test_compacted_canonical_never_reopens_a_mirror_row_with_a_stub(monkeypatch):
+    """Prism 565b0259b9ff: ``_sync_completion`` with a delivered, compacted canonical payload onto a
+    mirror row whose event_json is NULL must not make the row pending with the identity-only stub."""
+    identifier, worker, _result = helpers.dispatch(monkeypatch)
+    worker()
+    event = helpers.process_registry.completion_queue.get_nowait()
+    claim = ad.claim_event_delivery(event, "renderer")
+    ad.complete_event_delivery(event, claim)
+    stub = helpers.registry_record(identifier)["outbox"][0]["payload"]
+    assert _compacted(stub) and "summary" not in stub and "results" not in stub
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET event_json=NULL WHERE delegation_id=?", (identifier,))
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ad._sync_completion(conn, stub, None)
+    row = helpers.row(identifier)
+    assert row["delivery_state"] != "pending", "a compacted stub must never become a pending replay source"
+    replay = json.loads(row["event_json"] or "null")
+    assert replay is None or not _compacted(replay), "the mirror's replay source was replaced by the stub"
