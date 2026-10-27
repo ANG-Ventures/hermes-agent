@@ -121,6 +121,8 @@ def record_response_usage(
         _note_usage_less = getattr(compressor, "note_usage_less_response", None)
         if callable(_note_usage_less):
             _note_usage_less()
+        # t_dd918516: a summing relay folds this request's prompt into the NEXT measured reading.
+        agent._usage_gap_pending = True
 
     # Commit per-call accounting for EVERY successful response, including one without a usage
     # payload: ``_canonical_usage_from_response`` yields an aggregate UNKNOWN (zeros + every flag),
@@ -161,6 +163,7 @@ def record_response_usage(
         _implausible_context_reading = implausible_prompt_reading(
             aggregator_usage.prompt_tokens, messages, getattr(agent, "_usage_anchor", None),
             context_length=getattr(compressor, "context_length", 0),
+            after_usage_gap=bool(getattr(agent, "_usage_gap_pending", False)),
         )
         if _implausible_context_reading:
             logger.warning(
@@ -181,6 +184,9 @@ def record_response_usage(
         # PRE-FOLD aggregator usage: advisor fan-out tokens were never part of this prompt and an
         # advisor with no payload makes every fold flag absorbing (r6 round-4 finding 2).
         _prompt_measured = not prompt_tokens_unknown(aggregator_usage)
+        # A measured reading (summed or not) closes the gap; an UNKNOWN prompt opens one, exactly
+        # like a reply with no usage payload at all.
+        agent._usage_gap_pending = not _prompt_measured
         if _prompt_measured and _implausible_context_reading:
             # A summed multi-request figure (t_dd918516) is a bill, not a context size: never
             # stamp it as occupancy. Consume a pending compaction verdict like a usage-less reply.

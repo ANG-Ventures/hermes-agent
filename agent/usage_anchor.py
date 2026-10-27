@@ -141,6 +141,7 @@ def implausible_prompt_reading(
     anchor: Optional[Dict[str, Any]],
     *,
     context_length: Any = 0,
+    after_usage_gap: bool = True,
 ) -> Optional[str]:
     """Why ``prompt_tokens`` cannot be the size of the request that priced ``messages``, else None.
 
@@ -155,6 +156,12 @@ def implausible_prompt_reading(
         return None
     if ctx > 0 and real > ctx:
         return f"exceeds_window prompt={real} context_length={ctx}"
+    # The anchor-multiple bound only applies right after a usage-less reply: that is the one shape a
+    # relay that sums usage since the turn mark produces (prompt N, then no usage, then N + N'). A
+    # big jump with no gap before it is real growth (a large tool result, a caller-forced jump)
+    # and must still drive compaction (tests/agent/test_in_place_preflight_rewind.py).
+    if not after_usage_gap:
+        return None
     expected = anchored_context_tokens(messages, anchor) if isinstance(anchor, dict) else None
     if expected and real > expected * _ANCHOR_IMPLAUSIBLE_RATIO + _ANCHOR_IMPLAUSIBLE_SLACK:
         return f"anchor_multiple prompt={real} anchored={expected} ratio={real / expected:.2f}"

@@ -108,6 +108,10 @@ def _resp(prompt, completion):
     return SimpleNamespace(usage=usage, id="chatcmpl-x", model="anthropic/claude-fable-5.1")
 
 
+def _no_usage():
+    return SimpleNamespace(usage=None, id="chatcmpl-nousage", model="anthropic/claude-fable-5.1")
+
+
 def _record(agent, resp, msgs, n):
     from agent import turn_usage
 
@@ -125,6 +129,9 @@ class TestRecordResponseUsage:
             good_anchor = a._usage_anchor
             msgs.append({"role": "assistant", "content": "reply 1"})
             _append_round(msgs, 1)
+            # API call #89 in=unknown: the reply that carried no usage; the relay folds its prompt
+            # into the next reading.
+            _record(a, _no_usage(), msgs, 2)
             _append_round(msgs, 2)
             caplog.set_level("WARNING", logger="agent.conversation_loop")
             _record(a, _resp(1_241_066, 1_616), msgs, 3)
@@ -132,7 +139,9 @@ class TestRecordResponseUsage:
             comp = a.context_compressor
             assert comp.last_prompt_tokens == 619_053, "summed figure stamped as occupancy"
             assert a._usage_anchor is good_anchor, "anchor re-captured from the summed figure"
-            assert a._last_prompt_size_tokens == 619_053
+            # Delegate headroom never takes the summed figure (the usage-less reply in between sets it
+            # the way fork/main already does for any usage-less reply; not this fix's concern).
+            assert a._last_prompt_size_tokens != 1_241_066
             # Same compressor fields feed the gateway footer/meter, the SessionEntry the hygiene
             # valve reads ("stored last_prompt_tokens ~1,241,066"), and its "actual (live)" figure.
             from gateway.runtime_footer import live_context_tokens
@@ -158,6 +167,37 @@ class TestRecordResponseUsage:
             _record(a, _resp(622_216, 812), msgs, 2)
             assert a.context_compressor.last_prompt_tokens == 622_216
             assert a._usage_anchor["prompt_tokens"] == 622_216
+        finally:
+            a.close()
+
+    def test_big_jump_without_a_usage_gap_is_adopted(self, tmp_path, monkeypatch):
+        """No usage-less reply before it, so the relay cannot have summed: a large real jump (a huge
+        tool result, or a caller forcing compaction as test_in_place_preflight_rewind does) must
+        still become the context size and drive compaction."""
+        a = _agent(tmp_path, monkeypatch)
+        try:
+            msgs = _history()
+            _record(a, _resp(100_000, 287), msgs, 1)
+            msgs.append({"role": "assistant", "content": "reply 1"})
+            _append_round(msgs, 1)
+            _record(a, _resp(600_000, 812), msgs, 2)
+            assert a.context_compressor.last_prompt_tokens == 600_000
+            assert a._usage_anchor["prompt_tokens"] == 600_000
+        finally:
+            a.close()
+
+    def test_gap_closes_after_one_measured_reading(self, tmp_path, monkeypatch):
+        """The gap is consumed by the next measured reading (summed or not): the reading after it is
+        single again and a later real jump is adopted."""
+        a = _agent(tmp_path, monkeypatch)
+        try:
+            msgs = _history()
+            _record(a, _resp(100_000, 287), msgs, 1)
+            _record(a, _no_usage(), msgs, 2)
+            _record(a, _resp(201_000, 300), msgs, 3)      # summed: ignored for context
+            assert a.context_compressor.last_prompt_tokens == 100_000
+            _record(a, _resp(400_000, 300), msgs, 4)      # no gap now: adopted
+            assert a.context_compressor.last_prompt_tokens == 400_000
         finally:
             a.close()
 
