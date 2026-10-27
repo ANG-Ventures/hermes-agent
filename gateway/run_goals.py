@@ -408,15 +408,16 @@ class GatewayGoalsMixin:
         if not decision.get("should_continue") or not prompt or source is None:
             return
         # A /goal pause, clear or replacement that landed during the status send wins: enqueue only onto
-        # the exact row this evaluation wrote (a re-set goal restarts its revision, so compare the text).
-        from hermes_cli.goals import _load_goal_raw
+        # the row this evaluation wrote, or a nonterminal edit of that same active goal (/subgoal during
+        # the send: nothing else re-arms the loop). Identity is goal text + created_at, not the revision.
+        from hermes_cli.goals import _load_goal_raw, same_active_goal
         try:
-            _, raw_now = await self._run_in_executor_with_context(
+            state_now, raw_now = await self._run_in_executor_with_context(
                 lambda: _load_goal_raw(mgr.session_id, strict=True))
         except Exception as exc:
             logger.warning("goal continuation for %s dropped: goal re-read failed: %s", _sid, exc)
             return
-        if raw_now is None or raw_now != mgr._stored:
+        if raw_now is None or (raw_now != mgr._stored and not same_active_goal(state_now, mgr.state)):
             logger.info("goal continuation for %s dropped: goal changed during the status send", _sid)
             return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.

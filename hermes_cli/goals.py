@@ -503,6 +503,12 @@ class GoalState:
     gates: List[GoalGate] = field(default_factory=list)
     # Bumped by every GoalManager save; GoalManager._save compares the stored row before writing.
     revision: int = 0
+    # Stamped by resume(): with goal + created_at it is the active goal's identity (same_active_goal), so a
+    # pause+resume (which enqueues its own continuation) is not mistaken for a nonterminal edit.
+    resumed_at: float = 0.0
+    # Bumped by every save an evaluate_after_turn makes: a row another evaluation advanced is not the row
+    # this one judged, so same_active_goal is false and the older evaluation never retries onto it.
+    evaluation_writes: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -511,8 +517,8 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision")}
-        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision", "evaluation_writes")}
+        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at", "resumed_at")}
         return cls(
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
@@ -1279,6 +1285,26 @@ _JUDGE_CONFIG_HINT = (
 
 
 _UNPINNED = object()  # evaluate_after_turn(baseline=...) not given
+_STALE_RETRIES = 2  # re-evaluations after a nonterminal edit to the same goal lost the CAS mid-judge
+
+
+def _row_state(raw: Optional[str]) -> Optional[GoalState]:
+    try:
+        return GoalState.from_json(raw) if raw else None
+    except Exception:
+        return None
+
+
+def same_active_goal(a: Optional[GoalState], b: Optional[GoalState]) -> bool:
+    """Both rows are the SAME activation of the same goal and both active: set() stamps created_at (a
+    replacement restarts it), resume() stamps resumed_at, every evaluation save bumps evaluation_writes.
+    A nonterminal edit (/subgoal, gate, contract, check-in interval) keeps this true; pause, clear, done,
+    resume, a replacement or another evaluation's write makes it false."""
+    return (
+        a is not None and b is not None and a.status == "active" and b.status == "active"
+        and a.goal == b.goal and a.created_at == b.created_at and a.resumed_at == b.resumed_at
+        and a.evaluation_writes == b.evaluation_writes
+    )
 
 
 class _StaleGoalWrite(Exception):
@@ -1351,6 +1377,8 @@ class GoalManager:
             save_goal(self.session_id, self._state)
             return self._state
         self._state.revision += 1
+        if self._evaluating:
+            self._state.evaluation_writes += 1
         raw = self._state.to_json()
         try:
             if self._evaluating:
@@ -1365,8 +1393,9 @@ class GoalManager:
             self._stored = raw
             return self._state
         logger.info("GoalManager: goal for %s changed since load; dropped the stale write", self.session_id)
+        lost_to = self._stored
         self._state, self._stored = _load_goal_raw(self.session_id)
-        raise _StaleGoalWrite()  # abort: nothing more of this evaluation may touch the new row
+        raise _StaleGoalWrite(lost_to)  # abort: nothing more of this evaluation may touch the new row
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1418,6 +1447,7 @@ class GoalManager:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        self._state.resumed_at = time.time()
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
@@ -1715,17 +1745,24 @@ class GoalManager:
                 now = (self._state, self._stored)
             if now[1] != self._stored:  # another manager wrote the row since our last load/save
                 self._state, self._stored = now
-        if baseline is not _UNPINNED and baseline != self._stored:
+        # A nonterminal edit to the same active goal (/subgoal during the send) is judged on the edited
+        # row; only a pause, clear, done or replacement skips (nothing else re-arms the loop then).
+        if baseline is not _UNPINNED and baseline != self._stored and not same_active_goal(_row_state(baseline), self._state):
             logger.info("GoalManager: goal for %s changed since the turn ended; skipped the evaluation", self.session_id)
             status = self._state.status if self._state else None
             return {**_decision(status, False, None, "stale", "goal changed since the turn ended", ""), "held": "stale"}
-        self._evaluating = True
-        try:
-            return self._evaluate_after_turn(last_response, **kwargs)
-        except _StaleGoalWrite:
-            pass
-        finally:
-            self._evaluating = False
+        for _attempt in range(_STALE_RETRIES + 1):
+            self._evaluating = True
+            try:
+                return self._evaluate_after_turn(last_response, **kwargs)
+            except _StaleGoalWrite as lost:
+                evaluated = _row_state(lost.args[0])  # the row the failed CAS expected; _save reloaded the newer one
+            finally:
+                self._evaluating = False
+            # Retry only a nonterminal edit; a row another evaluation advanced keeps the old abort.
+            if not same_active_goal(evaluated, self._state):
+                break
+            logger.info("GoalManager: goal for %s was edited while the judge ran; re-evaluating", self.session_id)
         status = self._state.status if self._state else None
         return {**_decision(status, False, None, "stale", "goal changed while the judge ran", ""), "held": "stale"}
 

@@ -489,3 +489,140 @@ async def test_failed_turn_end_pin_skips_the_deferred_judge(goal_db, monkeypatch
 def runner_goal_pin_failed():
     from gateway.run_goals import GOAL_PIN_FAILED
     return GOAL_PIN_FAILED
+
+
+def _continue_judge(monkeypatch, seen=None, during=None):
+    def judge(goal, _reply, subgoals=None, **_k):
+        if seen is not None:
+            seen.append(list(subgoals or []))
+        if during is not None and during:
+            during.pop()()
+        return ("continue", "more", False, None, False)
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+
+
+@pytest.mark.asyncio
+async def test_subgoal_during_the_final_send_still_judges_and_continues(goal_db, monkeypatch):
+    """Prism c768988ba6e0: /subgoal after the turn-end pin is a nonterminal edit of the same active goal.
+    It used to skip the judge (``should_continue=False``) and, with checkin_minutes 0, stall the goal."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner({"checkin_minutes": 0})
+    sid = entry.session_id
+    goals.GoalManager(sid).set("A")
+    pin = (goals._load_goal_raw(sid)[1],)  # turn end
+    goals.GoalManager(sid).add_subgoal("include tests")  # lands during the final send
+    seen = []
+    _continue_judge(monkeypatch, seen)
+    await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="ok", goal_pin=pin)
+    assert seen == [["include tests"]], "the edited goal was not judged"
+    stored = goals.load_goal(sid)
+    assert (stored.status, stored.turns_used, stored.subgoals) == ("active", 1, ["include tests"])
+    assert adapter._pending_messages, "no continuation queued: the goal stalls while reporting active"
+
+
+@pytest.mark.asyncio
+async def test_subgoal_during_the_status_send_keeps_the_continuation(goal_db, monkeypatch):
+    """Same class at the enqueue recheck: a nonterminal edit during the status notice keeps the loop going."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner({"checkin_minutes": 0})
+    sid = entry.session_id
+    goals.GoalManager(sid).set("A")
+    real_send = adapter.send
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        await asyncio.to_thread(lambda: goals.GoalManager(sid).add_subgoal("include tests"))
+        return await real_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    adapter.send = send
+    _continue_judge(monkeypatch)
+    await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="ok")
+    assert adapter.sends, "no status notice was sent"
+    assert goals.load_goal(sid).subgoals == ["include tests"]
+    assert adapter._pending_messages, "continuation dropped for a nonterminal edit"
+
+
+def test_subgoal_during_the_judge_reevaluates_the_edited_goal(goal_db, monkeypatch):
+    """Same class inside the CAS: an edit while the judge runs re-judges the edited row instead of stopping."""
+    goals.GoalManager("rj").set("A")
+    mgr, seen = goals.GoalManager("rj"), []
+    _continue_judge(monkeypatch, seen, during=[lambda: goals.GoalManager("rj").add_subgoal("include tests")])
+    decision = mgr.evaluate_after_turn("did a thing", made_tool_calls=True)
+    assert seen == [[], ["include tests"]]
+    assert decision["should_continue"] is True and decision["verdict"] != "stale"
+    stored = goals.load_goal("rj")
+    assert (stored.turns_used, stored.subgoals) == (1, ["include tests"])
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_during_the_send_is_not_a_nonterminal_edit(goal_db, monkeypatch):
+    """resume() queues its own continuation; the old reply's judge must not queue a second one."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner()
+    sid = entry.session_id
+    goals.GoalManager(sid).set("A")
+    pin = (goals._load_goal_raw(sid)[1],)
+    goals.GoalManager(sid).pause()
+    goals.GoalManager(sid).resume()
+    judged = []
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: judged.append(1) or ("continue", "more", False, None, False))
+    await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="ok", goal_pin=pin)
+    assert not judged and not adapter._pending_messages
+    assert goals.load_goal(sid).turns_used == 0
+
+
+def test_pause_and_resume_during_the_judge_stops_the_stale_evaluation(goal_db, monkeypatch):
+    goals.GoalManager("pr").set("A")
+    mgr, seen = goals.GoalManager("pr"), []
+
+    def flip():
+        goals.GoalManager("pr").pause()
+        goals.GoalManager("pr").resume()
+
+    _continue_judge(monkeypatch, seen, during=[flip])
+    decision = mgr.evaluate_after_turn("did a thing", made_tool_calls=True)
+    assert seen == [[]] and decision["should_continue"] is False and decision["verdict"] == "stale"
+
+
+def test_a_newer_evaluation_during_the_judge_stops_the_older_one(goal_db, monkeypatch):
+    """Prism 74493a4898d5: a competing evaluation keeps goal/created_at/resumed_at, so it must not be
+    retried like a /subgoal edit. Newer turn B saves ``continue`` while older turn A's judge runs; A's
+    ``done`` loses the CAS and stays lost instead of retrying onto B's row."""
+    goals.GoalManager("ce").set("A")
+    older = goals.GoalManager("ce")
+    calls = []
+
+    def judge(goal, reply, subgoals=None, **_k):
+        calls.append(reply)
+        if reply == "A":  # older turn's judge: the newer turn B is evaluated and saved meanwhile
+            goals.GoalManager("ce").evaluate_after_turn("B", made_tool_calls=True)
+            return ("done", "finished", False, None, False)
+        return ("continue", "unfinished", False, None, False)
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    decision = older.evaluate_after_turn("A", made_tool_calls=True)
+    assert calls == ["A", "B"], "the stale evaluation was retried"
+    assert decision["should_continue"] is False and decision["verdict"] == "stale"
+    stored = goals.load_goal("ce")
+    assert (stored.status, stored.last_verdict, stored.turns_used) == ("active", "continue", 1)
+
+
+@pytest.mark.asyncio
+async def test_a_newer_evaluation_after_the_pin_skips_the_older_judge(goal_db, monkeypatch):
+    """Same class at the turn-end pin: a row another evaluation advanced is not a nonterminal edit."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner({"checkin_minutes": 0})
+    sid = entry.session_id
+    goals.GoalManager(sid).set("A")
+    pin = (goals._load_goal_raw(sid)[1],)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "unfinished", False, None, False))
+    goals.GoalManager(sid).evaluate_after_turn("B", made_tool_calls=True)  # newer turn, already judged
+    judged = []
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: judged.append(1) or ("done", "x", False, None, False))
+    await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="A", goal_pin=pin)
+    assert not judged and not adapter._pending_messages
+    assert goals.load_goal(sid).status == "active"
