@@ -107,11 +107,15 @@ def floor_refusal(m: Measure) -> Optional[str]:
 # -- host names ---------------------------------------------------------------
 
 def _dispatcher_plan(kanban_cfg: dict):
-    """``(plan, fleet_dir)``: the pool plan the dispatcher's own builder makes
-    (``GateTickBuilder.build_pool_plan``, the call ``plan_pool`` makes once it
-    decided a plan is needed; that decision reads the Studio band, which is host
-    admission). ``plan`` is None when the pool refuses or has no hosts, or the
-    plan fails: the dispatcher then routes exactly as a tick with no plan."""
+    """``(plan, fleet_dir, pool_off)``: the pool plan the dispatcher's own builder
+    makes (``GateTickBuilder.build_pool_plan``, the call ``plan_pool`` makes once
+    it decided a plan is needed; that decision reads the Studio band, which is
+    host admission). ``plan`` is None when the pool refuses or has no hosts, or
+    the plan fails: the dispatcher then routes exactly as a tick with no plan.
+    ``pool_off`` is the tick's own reason when an operator pool off-switch holds
+    (``config_disabled`` / ``proc_paused``, ``pool_switch_refusal``), else None;
+    the gate is sampled first, as the tick does, so ``remote_allowed`` is real
+    (Prism ddce35a5f884)."""
     from gateway.kanban_gate_tick import live_boards, running_split, standalone_builder
     from hermes_cli import kanban_load_gate as klg
 
@@ -120,11 +124,16 @@ def _dispatcher_plan(kanban_cfg: dict):
     try:
         builder = standalone_builder(klg.gate_from_config({"kanban": cfg}), lambda: cfg)
         boards = live_boards()
-        _local, remote_by_host = running_split(builder._ledger(boards))
+        running_local, remote_by_host = running_split(builder._ledger(boards))
         builder._remote_by_host = dict(remote_by_host)
-        return builder.build_pool_plan(boards, remote_by_host, cfg), fleet_dir
+        gate = builder.gate
+        gate.admit_now(running=running_local if gate.enabled else None, cpu_block=0.25)
+        off = builder.pool_switch_refusal(cfg)
+        if off is not None:
+            return None, fleet_dir, off
+        return builder.build_pool_plan(boards, remote_by_host, cfg), fleet_dir, None
     except Exception:
-        return None, fleet_dir
+        return None, fleet_dir, None
 
 
 def canonical_host(word: str, pool, fleet_dir) -> str:
@@ -160,7 +169,11 @@ def _host_row(table, word: str, threads):
     path = pl.fleet_root() / pl.TABLE_REL
     try:
         if table is None:
-            if not path.exists():
+            try:
+                path.stat()
+            except FileNotFoundError:
+                # Only a truly absent table is "no reserve"; exists() would also
+                # say False on PermissionError (py3.14), Prism d16d6de8bc5b.
                 return threads, 0.0, None
             table = pl.load_hosts(path)
         hid = table.resolve(word)
@@ -278,8 +291,14 @@ def admit(task_id: str, host_word: str, reason: str, *, kanban_cfg: Optional[dic
     state = kb._operator_token_state()
     if state != "ok":
         raise AdmitRefused(f"kanban admit is operator-only: {kb.OPERATOR_TOKEN_ENV} {state.replace('_', ' ')}")
-    plan, fleet_dir = _dispatcher_plan(kanban_cfg)
+    plan, fleet_dir, *rest = _dispatcher_plan(kanban_cfg)
+    pool_off = rest[0] if rest else None
     host = canonical_host(host_word, plan.config if plan is not None else None, fleet_dir)
+    if pool_off is not None and host != LOCAL:
+        # The operator's pool off-switch: the tick plans nothing remote, so
+        # neither does admit; the reason is the tick's own (gate.pool).
+        raise AdmitRefused(f"{task_id}: worker pool is off ({pool_off}); "
+                           f"{host} is a pool host, admit places nothing remote")
     if measure_remote_fn is None:
         root = (kanban_cfg or {}).get("workspaces_root") if isinstance(kanban_cfg, dict) else None
         # The same root the gateway tick probes with (kanban_gate_tick.plan_pool).

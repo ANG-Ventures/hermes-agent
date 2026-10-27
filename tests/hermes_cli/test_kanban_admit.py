@@ -512,7 +512,7 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
     real_plan = ka._dispatcher_plan
 
     def plan_with_signal(cfg):
-        plan, fleet = real_plan(cfg)
+        plan, fleet, *_ = real_plan(cfg)
         plan.signal = signal
         return plan, fleet
 
@@ -541,6 +541,59 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
     assert ka.admit(tid, "ace-ai", "ruling", kanban_cfg={"workspaces_root": "/srv/ws"},
                     spawn_fn=_spawn)["host"] == "ace-ai"
     assert SPAWNS == [(tid, "ace-ai")]
+
+
+def test_pool_off_switch_refuses_a_remote_admit_with_the_ticks_own_reason(board, monkeypatch):
+    """Prism ddce35a5f884: ``worker_pool.enabled: false`` is the operator's pool
+    off-switch, not host admission. admit's plan goes through the same
+    ``pool_switch_refusal`` the tick's plan_pool applies, so a remote admit refuses
+    with the tick's own reason (config_disabled) and nothing spawns; the Studio
+    still admits."""
+    from gateway import kanban_gate_tick as kgt
+    from hermes_cli import kanban_load_gate as klg
+
+    _hot_local(monkeypatch, load1=10.0)
+    cfg = {"worker_pool": {"enabled": False}}
+    tick = kgt.standalone_builder(klg.gate_from_config({"kanban": cfg}), lambda: cfg)
+    assert tick.plan_pool([], {}) is None and tick.gate.pool["reason"] == "config_disabled"
+    assert tick.build_pool_plan([], {}, cfg) is None and tick.gate.pool["reason"] == "config_disabled"
+    tid = _card()
+    SPAWNS.clear()
+    with pytest.raises(ka.AdmitRefused, match="config_disabled"):
+        ka.admit(tid, "ace-ai", "ruling", kanban_cfg=cfg, spawn_fn=_spawn, measure_remote_fn=_remote())
+    assert SPAWNS == [] and _claim(tid) == ("ready", None) and not _events(tid)
+    assert ka.admit(tid, "studio", "ruling", kanban_cfg=cfg, spawn_fn=_spawn)["host"] == "studio"
+    assert SPAWNS == [(tid, None)]
+
+
+def test_placement_table_under_an_unsearchable_dir_is_nan_not_zero(board, monkeypatch):
+    """Prism d16d6de8bc5b: ``Path.exists()`` is False on PermissionError (py3.14),
+    so a table beneath a 0o000 directory read as "no reserve". Only a missing
+    file is absent; anything else is an unknown threshold that refuses, naming
+    the table."""
+    import math as _math
+    import os as _os
+
+    from hermes_cli import placement as pl
+
+    table = pl.fleet_root() / pl.TABLE_REL
+    table.parent.mkdir(parents=True, exist_ok=True)
+    table.write_text("{}")
+    parent = table.parent
+    parent.chmod(0o000)
+    try:
+        if _os.geteuid() == 0:
+            pytest.skip("root ignores directory permissions")
+        threads, reserve, err = ka._host_row(None, "local", 8)
+        assert _math.isnan(reserve) and err is not None and str(table) in err
+        m = ka.Measure("studio", 1.0, 8, 100.0, reserve, threshold_error=err)
+        refusal = ka.floor_refusal(m)
+        assert refusal is not None and str(table) in refusal
+    finally:
+        parent.chmod(0o755)
+    # A truly absent table stays "no reserve": 0 GB.
+    table.unlink()
+    assert ka._host_row(None, "local", 8) == (8, 0.0, None)
 
 
 # -- r7 (Apollo invariant): admit == the dispatcher's own route and refusal, host admission off --
@@ -926,7 +979,7 @@ def _site_triggers():
         real = ka._dispatcher_plan
 
         def full():
-            plan, _ = real({})
+            plan, *_ = real({})
             plan.slots = {"ace-ai": 0, "ace-media": 1}
             return plan
         ctx["plan_fn"] = full

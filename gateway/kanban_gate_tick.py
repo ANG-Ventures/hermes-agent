@@ -314,12 +314,7 @@ class GateTickBuilder:
         cfg = self._kanban_cfg() or {}
         pool_cfg = cfg.get("worker_pool")
         pool_cfg = pool_cfg if isinstance(pool_cfg, dict) else {}
-        if pool_cfg.get("enabled", True) is False:
-            gate.pool = {"planned": False, "reason": "config_disabled"}
-            self._log(logger.info, "kanban pool: disabled by config")
-            return None
-        if not gate.remote_allowed:
-            gate.pool = {"planned": False, "reason": "proc_paused"}
+        if self.pool_switch_refusal(cfg) is not None:
             return None
         # kanban.placement.default (spec v0.3 §3.1), read per tick: remote
         # offers every portable row to the pool first, so pins_only is off.
@@ -344,6 +339,24 @@ class GateTickBuilder:
             gate.pool = plan.snapshot()
         return plan
 
+    def pool_switch_refusal(self, cfg: dict) -> Optional[str]:
+        """The operator's pool off-switches, the ONE place they live: ``config_disabled``
+        (``kanban.worker_pool.enabled: false``) or ``proc_paused`` (the gate's
+        ``remote_allowed`` is off), recorded on ``gate.pool``; None when the pool may
+        plan. :meth:`plan_pool` and :meth:`build_pool_plan` both apply it, so a direct
+        ``build_pool_plan`` caller (``kanban admit``) honours them too (Prism ddce35a5f884)."""
+        gate = self.gate
+        pool_cfg = (cfg or {}).get("worker_pool")
+        pool_cfg = pool_cfg if isinstance(pool_cfg, dict) else {}
+        if pool_cfg.get("enabled", True) is False:
+            gate.pool = {"planned": False, "reason": "config_disabled"}
+            self._log(logger.info, "kanban pool: disabled by config")
+            return "config_disabled"
+        if not gate.remote_allowed:
+            gate.pool = {"planned": False, "reason": "proc_paused"}
+            return "proc_paused"
+        return None
+
     def build_pool_plan(self, boards, remote_by_host: Dict[str, int],
                         cfg: Optional[dict] = None) -> Optional[kwp.SpilloverPlan]:
         """The plan itself (pool files, signal, the real probe with
@@ -353,6 +366,8 @@ class GateTickBuilder:
         decision reads the Studio band, which is host admission (t_32e8796a)."""
         gate = self.gate
         cfg = (self._kanban_cfg() or {}) if cfg is None else cfg
+        if self.pool_switch_refusal(cfg) is not None:
+            return None
         default_remote = kwp.placement_default(cfg) == kwp.PLACEMENT_DEFAULT_REMOTE
         from hermes_cli import kanban_continuation as kc
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
