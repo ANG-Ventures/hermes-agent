@@ -1,5 +1,5 @@
 {
- "_doc": "Byte-identical copies of ANG-Ventures/hermes-home lints (Router Core spec v5 \u00a74.1/\u00a77.1, card t_8b05b16b). hermes-home is private, so CI here cannot fetch them: change the lint THERE, re-copy, re-pin. check_pin.py enforces the bytes. lib/scan_scope.py is lint-spawn-site.py's sibling import (scripts/lib/ at the source). Re-pinned to hermes-home main 1fd5ebb4 on 2026-10-26 (t_9c88555c, Prism 3df84d7ec4f9): carries #6549, #6582, #6526 (loop elements past the 64 cap), #6664, #6662.",
+ "_doc": "Byte-identical copies of ANG-Ventures/hermes-home lints (Router Core spec v5 \u00a74.1/\u00a77.1, card t_8b05b16b). hermes-home is private, so CI here cannot fetch them: change the lint THERE, re-copy, re-pin. check_pin.py enforces the bytes. lib/scan_scope.py is lint-spawn-site.py's sibling import (scripts/lib/ at the source). Re-pinned to hermes-home main 1fd5ebb4 on 2026-10-26 (t_9c88555c, Prism 3df84d7ec4f9): carries #6549, #6582, #6526 (loop elements past the 64 cap), #6664, #6662. lint-queue-loops.py re-pinned to hermes-home main 06acc6bfac on 2026-10-27 (t_42ee9298 / t_27a36cc7, hermes-home#7127, Prism 2e9888a37c28): a ready_rows loop counts as routing only if its body routes. lint-queue-loops.py re-pinned to hermes-home main ff5ac4722e on 2026-10-27 (t_3b70558e, hermes-home#7231, Prism 1d133dcecb68): _routes_ready counts only an unconditional route at the arm's own statement level; a guarded routing for-loop is red.",
  "source_repo": "ANG-Ventures/hermes-home",
  "files": {
   "lint-spawn-site.py": {
@@ -13,9 +13,9 @@
    "sha256": "40fb4cada99c6e537863047abc1eef5eebec52c07cd720a15d39fae2d20013b3"
   },
   "lint-queue-loops.py": {
-   "source_sha": "1fd5ebb4b9bc328bd0684e65c0e974ab5075a75a",
+   "source_sha": "ff5ac4722ea66ff1d1ec044a8d20746388de1e1b",
    "source_path": "scripts/lint-queue-loops.py",
-   "sha256": "b73386b7de502cbb48575206897f18a54ca47845051caad5f4042ed1e8cd543b"
+   "sha256": "33a6b1d690a6ecd6531aeb26000a6ad3c7d4d6b4feda43b98b205fe6b413eaaf"
   },
   "lib/scan_scope.py": {
    "source_sha": "1fd5ebb4b9bc328bd0684e65c0e974ab5075a75a",
