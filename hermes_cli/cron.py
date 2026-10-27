@@ -375,11 +375,24 @@ def _install_abandon_on_signal() -> Dict[int, Any]:
     previous: Dict[int, Any] = {}
     if threading.current_thread() is not threading.main_thread():
         return previous
+    fired = threading.Event()
 
     def _handler(signum, _frame):
-        _record_abandoned_cron_turns(signum)
-        sys.stdout.flush()
-        sys.stderr.flush()
+        # One-shot: a second signal (SIGHUP after SIGTERM) must not record twice.
+        if fired.is_set():
+            return
+        fired.set()
+        # Record on a helper thread with a bounded wait: the interrupted main thread may hold a
+        # non-reentrant lock the record path takes (``_live_cron_agents_lock`` at agent
+        # registration), and the handler must exit regardless.
+        recorder = threading.Thread(
+            target=_record_abandoned_cron_turns, args=(signum,), name="cron-abandon-record",
+            daemon=True)
+        recorder.start()
+        recorder.join(timeout=10.0)
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+            sys.stderr.flush()
         os._exit(128 + int(signum))
 
     for name in ("SIGTERM", "SIGHUP"):

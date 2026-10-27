@@ -43,9 +43,14 @@ _CHILD = textwrap.dedent(
         platform="cron", _blackbox_turn_calls=("cron_x:turn1", []),
     )
 
+    hold_lock = len(sys.argv) > 2 and sys.argv[2] == "hold-lock"
+
     def _fake_run_job_now(job_id, verbose=True):
         with sched._live_cron_agents_lock:
             sched._live_cron_agents[id(agent)] = agent
+            if hold_lock:  # signal lands while the main thread holds the registry lock
+                print("READY", flush=True)
+                time.sleep(60)
         print("READY", flush=True)
         time.sleep(60)
         return {"success": True, "job_id": job_id}
@@ -58,14 +63,13 @@ _CHILD = textwrap.dedent(
 )
 
 
-@pytest.mark.platforms("posix")
-def test_sigterm_during_cron_run_wait_records_abandoned_turn(tmp_path):
+def _run_and_sigterm(tmp_path, *extra):
     out = tmp_path / "hooks.json"
     env = dict(os.environ)
     env["HERMES_HOME"] = str(tmp_path / "home")
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.Popen(
-        [sys.executable, "-c", _CHILD, str(out)],
+        [sys.executable, "-c", _CHILD, str(out), *extra],
         cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
@@ -81,6 +85,21 @@ def test_sigterm_during_cron_run_wait_records_abandoned_turn(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+    return rc, out
+
+
+@pytest.mark.platforms("posix")
+def test_sigterm_during_cron_run_wait_records_abandoned_turn(tmp_path):
+    rc, out = _run_and_sigterm(tmp_path)
     assert rc == 128 + signal.SIGTERM
     calls = json.loads(out.read_text())
     assert calls == [{"hook": "on_turn_abandoned", "turn_id": "cron_x:turn1", "reason": "signal_15"}]
+
+
+@pytest.mark.platforms("posix")
+def test_sigterm_while_main_thread_holds_registry_lock_still_exits(tmp_path):
+    """The handler must not deadlock on a lock the interrupted main thread holds (Prism
+    08326117fdf2): the record is abandoned after its bounded wait and the process exits."""
+    rc, out = _run_and_sigterm(tmp_path, "hold-lock")
+    assert rc == 128 + signal.SIGTERM
+    assert not out.exists()
