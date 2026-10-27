@@ -137,6 +137,30 @@ class SessionMaintenanceMixin:
             return True
         return False
 
+    def end_orphaned_cron_sessions(
+        self, job_id: str, *, started_since: float, started_before: Optional[float] = None,
+        end_reason: str = "cron_orphaned",
+    ) -> List[str]:
+        """End the open ``cron_<job_id>_*`` rows started in ``[started_since, started_before)`` (epoch;
+        ``started_before=None`` is open-ended).
+
+        For a cron attempt whose owner died before ``_finalize_cron_session`` ran (kill, restart,
+        crash): the ledger row turns ``unknown`` but the session row kept ``ended_at IS NULL``
+        forever and read as a live model pin (t_fd68626f). A row a live turn lease still guards is
+        spared. ``end_session`` semantics: first reason wins, the row stays resumable."""
+        prefix = f"cron_{job_id}_"
+        rows = self._read_all(
+            "SELECT id FROM sessions WHERE ended_at IS NULL AND source = 'cron'"
+            " AND substr(id, 1, ?) = ? AND started_at >= ? AND (? IS NULL OR started_at < ?)",
+            (len(prefix), prefix, float(started_since), started_before, started_before))
+        ended = []
+        for sid in (str(row["id"]) for row in rows):
+            if self._execute_write(lambda conn, sid=sid: self._write_guards_reject(conn, sid)):
+                continue
+            self.end_session(sid, end_reason)
+            ended.append(sid)
+        return ended
+
     def sweep_orphaned_sessions(
         self, *, max_idle_seconds: float, sources: Tuple[str, ...] = ("tui", "desktop", "subagent"),
         exclude_ids: Tuple[str, ...] = (), exclude_pinned: bool = False,
