@@ -298,3 +298,35 @@ def test_prune_survives_and_keeps_a_non_utf8_line(store):
     assert lines[0] == _NON_UTF8.strip(), "the unparseable line must be kept verbatim"
     assert json.loads(lines[1])["job_id"] == "NEW"
     assert len(lines) == 2
+
+
+# ------------------------------------------------------- t_e6448717 (class)
+# The t_19a16be2 bytes readers split on b"\n" only; the text readers they replaced split on universal
+# newlines. A CR-delimited journal fused every record into one malformed line in EVERY reader.
+def _cr_record(job_id, event, at):
+    return json.dumps({"event": event, "job_id": job_id, "at": at}).encode() + b"\r"
+
+
+def test_cr_delimited_records_are_read_one_by_one(store):
+    now = journal._hermes_now().isoformat()
+    _journal(store).parent.mkdir(parents=True, exist_ok=True)
+    _journal(store).write_bytes(
+        _cr_record("A", "created", now) + _cr_record("B", "removed", now).replace(b"\r", b"\r\n"))
+
+    entries, malformed = journal.read_entries_with_health()
+
+    assert [(e["job_id"], e["_seq"]) for e in entries] == [("A", 0), ("B", 1)]
+    assert malformed == 0
+    assert journal.last_removed(["A", "B"]) == {"B"}
+
+
+def test_prune_splits_cr_delimited_records(store):
+    old = (journal._hermes_now() - timedelta(days=journal._RETENTION_DAYS + 1)).isoformat()
+    now = journal._hermes_now().isoformat()
+    _journal(store).parent.mkdir(parents=True, exist_ok=True)
+    _journal(store).write_bytes(_cr_record("OLD", "created", old) + _cr_record("NEW", "created", now))
+
+    assert journal.prune() == 1
+
+    lines = _journal(store).read_bytes().splitlines()
+    assert [json.loads(line)["job_id"] for line in lines] == ["NEW"]
