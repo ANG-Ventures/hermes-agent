@@ -699,7 +699,7 @@ def test_kanban_knob_turns_on_the_cross_process_file_layer_under_the_pinned_kanb
     assert file_state._lock_file_for(str(tmp_path / "f.txt")) is None
     monkeypatch.setattr(dtc, "_get_background_runtime", lambda: "kanban")
     pinned = tmp_path / "gateway-kanban-root"
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # the sandbox ignores the pin (spec AT-10)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — HERMES_KANBAN_HOME is pinned under tmp_path; the test exercises that pin (the sandbox ignores it, spec AT-10)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(pinned))
     lock = file_state._lock_file_for(str(tmp_path / "f.txt"))
     assert lock is not None and lock.parent == pinned / "state" / "file-locks"
@@ -1111,7 +1111,7 @@ def test_lock_and_writer_span_the_install_root_and_the_kanban_root(home, monkeyp
 
     monkeypatch.setattr(dtc, "_get_detached_background", lambda: True)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kroot"))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — HERMES_KANBAN_HOME is pinned under tmp_path; the test exercises that pin
     target = str(tmp_path / "f.txt")
     files = file_state._lock_files_for(target)
     assert len(files) == 2 and files[0].parent == tmp_path / "kroot" / "state" / "file-locks"
@@ -1186,7 +1186,7 @@ def test_a_symlinked_alias_of_the_kanban_root_takes_one_lock_and_never_hangs(hom
     alias = tmp_path / "kroot-alias"
     alias.symlink_to(home, target_is_directory=True)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(alias))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — HERMES_KANBAN_HOME is pinned under tmp_path; the test exercises that pin
     target = str(tmp_path / "f.txt")
     assert len(file_state._lock_files_for(target)) == 1
     done = threading.Event()
