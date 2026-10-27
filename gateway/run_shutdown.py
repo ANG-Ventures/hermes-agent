@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
+import contextvars
 from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -994,10 +995,13 @@ class GatewayShutdownMixin:
                         marked.append(_sk)
         finally:
             if _store is not None:
-                # FAIL-OPEN: a failed save is logged and never aborts the stop. A cancel that lands
-                # here still lets the worker thread finish the save (to_thread is not interruptible).
+                # FAIL-OPEN: a failed save is logged and never aborts the stop. The close is submitted
+                # synchronously and shielded (Prism 149729fd80f3): with to_thread, a cancel while the
+                # job is still QUEUED behind a busy executor cancels it, and the batch never closes.
+                _end = asyncio.get_running_loop().run_in_executor(
+                    None, contextvars.copy_context().run, _store.end_resume_mark_batch)  # to_thread parity
                 with _log_suppressed(logging.WARNING, "%s: batched sessions.json save failed: %s", log_prefix):
-                    await asyncio.to_thread(_store.end_resume_mark_batch)
+                    await asyncio.shield(_end)
             logger.info(
                 "Shutdown phase: %s marked %d session(s) in %.2fs", log_prefix, len(marked), time.monotonic() - _t0,
             )

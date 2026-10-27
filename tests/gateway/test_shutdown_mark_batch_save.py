@@ -158,3 +158,57 @@ def test_stalled_replay_alert_does_not_delay_the_durable_save(tmp_path, monkeypa
 
     asyncio.run(_scenario())
     assert durable_at_alert == [True], durable_at_alert
+
+
+def test_cancel_while_the_closing_save_is_queued_still_closes_the_batch(tmp_path, monkeypatch):
+    """Prism 149729fd80f3: the closing ``end_resume_mark_batch`` is queued behind a busy executor
+    when the stop task is cancelled. The cancel must not drop the queued close: the batch depth
+    returns to 0 and the deferred marks reach sessions.json once the executor frees up."""
+    import concurrent.futures
+    import threading
+    from gateway.run import GatewayRunner
+
+    runner, store, keys, _saves = _runner_with_sessions(tmp_path, monkeypatch, n=3)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    blocker_started = threading.Event()
+    release = threading.Event()
+
+    def _blocker():
+        blocker_started.set()
+        release.wait(10)
+
+    def _mark(sk, interrupted=False):
+        store.mark_resume_pending(sk, "restart_timeout")
+        if sk == keys[-1]:
+            pool.submit(_blocker)  # saturates the only worker; the closing end queues behind it
+        return True, "restart_timeout", False
+
+    runner._mark_resume_pending_for_shutdown = _mark
+
+    async def _scenario():
+        asyncio.get_running_loop().set_default_executor(pool)
+        task = asyncio.create_task(GatewayRunner._mark_running_sessions_resume_pending(runner, "mark"))
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if blocker_started.is_set():
+                break
+        await asyncio.sleep(0.05)  # the finally has queued end_resume_mark_batch behind the blocker
+        assert getattr(store, "_resume_mark_batch_depth", 0) == 1
+        task.cancel()  # the stop deadline
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if not getattr(store, "_resume_mark_batch_depth", 0):
+                break
+
+    try:
+        asyncio.run(_scenario())
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+    assert getattr(store, "_resume_mark_batch_depth", 0) == 0
+    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    reloaded._ensure_loaded()
+    assert all(reloaded._entries[k].resume_pending for k in keys)
