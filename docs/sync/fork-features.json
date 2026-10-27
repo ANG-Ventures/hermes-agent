@@ -1428,5 +1428,108 @@
       "gateway",
       "discord"
     ]
+  },
+  {
+    "feature": "async-delegation registry: stamp-keyed read cache (shared read-only object, private copy for writers) and compaction of DELIVERED terminal outbox bodies",
+    "tests": [
+      "tests/tools/test_async_delegation_compaction.py::test_compaction_shrinks_registry_and_preserves_pending_and_integrity",
+      "tests/tools/test_async_delegation_compaction.py::test_compaction_leaves_recent_terminal_bodies_alone",
+      "tests/tools/test_async_delegation_compaction.py::test_completion_delivered_then_compacted_still_renders_result",
+      "tests/tools/test_async_delegation_compaction.py::test_backup_directory_fsync_unsupported_is_tolerated",
+      "tests/tools/test_async_delegation_compaction.py::test_write_refresh_does_not_trust_value_equal_rewrite",
+      "tests/tools/test_async_delegation_compaction.py::test_failed_backup_leaves_no_artifact_and_blocks_compaction",
+      "tests/tools/test_async_delegation_compaction.py::test_acknowledge_backs_up_the_locked_registry_even_if_cwd_moves",
+      "tests/tools/test_async_delegation_compaction.py::test_compacted_resync_onto_empty_mirror_row_never_reopens_delivery",
+      "tests/tools/test_async_delegation_compaction.py::test_delivered_ack_backs_up_the_registry_it_locked_even_if_cwd_moves",
+      "tests/tools/test_async_delegation_compaction.py::test_caller_mutating_a_shared_read_never_corrupts_later_reads",
+      "tests/tools/test_async_delegation_compaction.py::test_leftover_backup_still_requires_a_successful_directory_fsync",
+      "tests/tools/test_async_delegation_compaction.py::test_compacted_canonical_never_reopens_a_mirror_row_with_a_stub",
+      "tests/tools/test_async_delegation_compaction.py::test_compacted_other_attempt_writes_its_result_without_reopening"
+    ],
+    "paths": [
+      "tools/async_delegation.py",
+      "tools/async_delegation_*.py"
+    ],
+    "why": "2026-10-26 Apollo gateway py-spy: state/async-delegations.json had grown to ~10 MB for ~150 records and every locked_registry() enter re-ran json.loads (24-81 ms) plus a per-record sha256 (claim_completion_delivery enters once per delivered event): 13% of gateway GIL samples. Fixed by hermes-agent#2323 (merge efabaac983b5, 2026-10-27): _load caches on (mtime_ns, size, ino, sha256) and skips parse+checksum on a hit (content-hash confirm inside 2 s of mtime), write=True callers get a private copy, delivered terminal outbox bodies are compacted with payload_sha256 (live copy 10.1 MB -> 2.8 MB, pending events byte-identical). Upstream has no tools/async_delegation_store.py (path absent in upstream/main): PR shape is a re-author against upstream's delegation store; repro = 100 read enters on a 10 MB registry -> 1 parse. Not registered: test_unchanged_registry_parses_and_checksums_once (the 100-enters = 1-parse guard) is RED on fork/main itself on macOS: the harness per-test RSS budget trips at 1.00-1.03 GiB grown (limit 1.00 GiB) before its assertion runs.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ],
+    "coverage_gap": "test_unchanged_registry_parses_and_checksums_once (read-cache parse count) fails on fork/main on macOS on the RSS-growth harness budget (measured 3/3 runs, 2026-10-27, Studio): needs @pytest.mark.big_memory or a smaller fixture before it can be registered; the registered set still goes red when the cache/compaction source is reverted."
+  },
+  {
+    "feature": "kanban dispatcher tick hot path: memoised git toplevel/remotes per workspace, stat-keyed board-home config parse, fork-free macOS _pid_alive, orphan sweep once per window",
+    "tests": [
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_unchanged_checkout_spawns_git_once_per_probe",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_walk_up_still_answers_not_toplevel_and_stays_cached",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_repeat_within_ttl_still_hits_the_cache",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_board_home_cfg_parses_an_unchanged_file_once",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_pid_alive_spawns_no_subprocess_per_pid",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_orphan_sweep_runs_once_per_window_per_board"
+    ],
+    "paths": [
+      "hermes_cli/kanban_db.py",
+      "hermes_cli/kanban_db_*.py",
+      "hermes_cli/kanban_pr_gate.py"
+    ],
+    "why": "2026-10-26 16:28 PT Apollo gateway (pid 4484) 40 s py-spy: 34% of all GIL samples in the kanban watcher tick (2 git forks per gated card per tick, board-home config.yaml re-parse, a `ps -o stat=` fork per pid on macOS, orphan sweep every tick). Fixed by hermes-agent#2358 (merge 52c3ec749c4c, 2026-10-27): stat-signature LRU memo for _is_repo_toplevel/_remotes_for, _board_home_config_raw cached on file_signature (deepcopy out), _pid_alive drops the darwin ps fork (psutil status already catches zombies), sweep_terminal_workspace_orphans throttled per board. Upstream still forks `ps -o stat=` in kanban_db_dispatch.py and has no _board_home_kanban_cfg / kanban_pr_gate.py (0 hits): PR shape is the _pid_alive + config-cache halves; repro = N ticks on an unchanged checkout -> 1 git spawn per probe.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ]
+  },
+  {
+    "feature": "cron runtime-mirror flush is single-flight per process and double-checked under _jobs_lock (no herd re-reading jobs.json)",
+    "tests": [
+      "tests/cron/test_mirror_flush_single_flight.py::test_due_flush_herd_coalesces_to_one_write_and_no_reread_chain",
+      "tests/cron/test_mirror_flush_single_flight.py::test_write_after_inflight_seq_read_stays_dirty_and_flushes_next_window",
+      "tests/cron/test_mirror_flush_single_flight.py::test_sibling_process_flushed_while_we_waited_skips_load_under_lock"
+    ],
+    "paths": [
+      "cron/jobs.py"
+    ],
+    "why": "2026-10-26 18:00 PT Apollo gateway (pid 4484) 12 py-spy dumps: 15-19 threads blocked on cron _jobs_lock in every dump, cron at 57% of GIL samples; the holder was always maybe_flush_runtime_mirror, and each queued thread re-ran load_jobs + _parse_jobs_file on the 1.36 MB jobs.json after the first flush had already written. Fixed by hermes-agent#2362 (merge 6c2250156a76, 2026-10-27): module _mirror_flush_gate taken non-blocking before _jobs_lock (force=True waits), then dirty_since + file stamp re-read under the lock before any load. Upstream has no maybe_flush_runtime_mirror / runtime_state.db (0 hits in upstream/main cron/): PR shape rides on an upstream port of #2287; repro = 8 threads leaving sections after the window -> 1 write, 0 re-reads.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron",
+      "gateway"
+    ]
+  },
+  {
+    "feature": "kanban PR-gate prefetch batches cache misses into one `gh api graphql` per repo per <=50 PRs (partial errors keep resolved nodes)",
+    "tests": [
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_forty_misses_in_one_repo_cost_one_gh_call",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_two_repos_cost_two_gh_calls",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_chunking_120_prs_cost_three_calls",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_per_tick_lookup_cap_still_applies",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_batch_normalization_matches_query_pr",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_whole_call_failure_is_none_for_all_and_never_cached",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_partial_errors_use_resolved_nodes",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_merged_cached_forever_open_requeried_after_ttl",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_out_of_range_number_never_enters_a_batch",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_errors_only_document_rejection_splits_so_valid_nodes_resolve",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_rate_limited_errors_only_is_not_split",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_replacing_query_prs_without_sandbox_is_refused",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_replacing_query_prs_with_sandbox_declared_is_allowed"
+    ],
+    "paths": [
+      "hermes_cli/kanban_pr_gate.py"
+    ],
+    "why": "2026-10-26 20:14 PT Apollo gateway (pid 19817) py-spy --gil: 9.6% of all samples in kanban_pr_gate.query_pr -> subprocess.run(gh api repos/<r>/pulls/<n>), one fork/exec of a multi-GB process per stale PR (up to 30/tick) every 300 s TTL expiry. Fixed by hermes-agent#2366 (merge 4628d149a8cf, 2026-10-27): query_prs() = one gh api graphql per repo per <=50 PRs normalised to query_pr's shape; whole-call failure -> None for the chunk (never cached), partial NOT_FOUND keeps resolved nodes; cap, cache keys and TTLs unchanged; injected query_fn keeps the per-PR path. hermes_cli/kanban_pr_gate.py is absent upstream (0 hits for query_prs): PR shape rides on upstreaming the PR gate itself; repro = 40 cache misses in one repo -> 1 gh call.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ]
   }
 ]
