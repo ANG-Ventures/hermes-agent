@@ -431,7 +431,7 @@ def test_transient_refresh_failure_keeps_the_loaded_goal(goal_db, monkeypatch):
     mgr = goals.GoalManager("locked")
     mgr.set("finish")
     db, fails = goals._get_session_db(), [1]
-    real_get = db.get_meta
+    real_get = db.get_meta_committed  # the evaluation refresh reads the WAL pool (#2377), not get_meta
 
     def flaky(key):
         if fails:
@@ -439,7 +439,7 @@ def test_transient_refresh_failure_keeps_the_loaded_goal(goal_db, monkeypatch):
             raise sqlite3.OperationalError("database is locked")
         return real_get(key)
 
-    monkeypatch.setattr(db, "get_meta", flaky)
+    monkeypatch.setattr(db, "get_meta_committed", flaky)
     monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "more", False, None, False))
     decision = mgr.evaluate_after_turn("did a thing", made_tool_calls=True)
     assert not fails, "the refresh read never ran"

@@ -77,3 +77,62 @@ def test_readout_percentiles_and_dominant_stage(tmp_path, capsys):
     assert summary["n"] == 3
     assert summary["p50_s"] == 14.0 and summary["p99_s"] == 25.9 and summary["max_s"] == 25.9
     assert summary["dominant_counts"] == {"persist": 1, "hooks": 1, "footer": 1}
+
+
+@pytest.mark.asyncio
+async def test_slow_pre_send_post_turn_hook_logs_post_handler_line(monkeypatch, tmp_path, caplog):
+    """The span after PHASE=delivery_stages ends and before the adapter sends (t_04b5d027): a slow
+    /loop completion there is named as post_turn, and nothing is booked to the delivery stages."""
+    rig = _Rig(monkeypatch, tmp_path)
+
+    async def slow_loop_completion(**_kwargs):
+        await asyncio.sleep(2)
+
+    rig.runner._post_turn_loop_completion = slow_loop_completion
+    caplog.set_level(logging.INFO)
+    await rig.adapter.handle_message(_msg("slow tail"))
+    await rig.settle(expect_calls=1, timeout=10)
+
+    assert rig.adapter.sent, "turn did not deliver"
+    assert _phase_lines(caplog) == []
+    lines = [r.getMessage() for r in caplog.records if "PHASE=post_handler_stages" in r.getMessage()]
+    assert len(lines) == 1, lines
+    fields = dict(kv.split("=", 1) for kv in lines[0].split() if "=" in kv)
+    parts = {k: float(fields[k]) for k in ("post_turn", "goal_pin", "unwind", "extract", "pre_send")}
+    assert max(parts, key=parts.get) == "post_turn"
+    assert float(fields["stages_end_to_send_s"]) >= parts["post_turn"] >= 2.0
+
+
+@pytest.mark.asyncio
+async def test_pre_send_post_turn_hook_makes_no_activity_write(monkeypatch, tmp_path):
+    """t_04b5d027: the pre-send /loop completion resolved the session with touch_activity=True, a
+    routing upsert (state.db write) that waited out a foreign writer's lock hold before the send."""
+    from gateway.run_goals import GatewayGoalsMixin
+
+    rig = _Rig(monkeypatch, tmp_path)
+    calls, in_hook = [], [False]
+    lookup = rig.runner.session_store.get_or_create_session
+
+    def _spy(*args, **kwargs):
+        if in_hook[0]:
+            calls.append((kwargs.get("touch_activity", True), any("user turn" in str(m) for m in rig.adapter.sent)))
+        return lookup(*args, **kwargs)
+
+    rig.runner.session_store.get_or_create_session = _spy
+    real = GatewayGoalsMixin._run_post_turn_hooks
+
+    async def _hooks(self, **kwargs):
+        in_hook[0] = True
+        try:
+            return await real(self, **kwargs)
+        finally:
+            in_hook[0] = False
+
+    monkeypatch.setattr(GatewayGoalsMixin, "_run_post_turn_hooks", _hooks)
+    await rig.adapter.handle_message(_msg("user turn"))
+    await rig.settle(expect_calls=1, timeout=10)
+
+    assert rig.adapter.sent, "turn did not deliver"
+    pre_send = [touch for touch, replied in calls if not replied]
+    assert pre_send, "the pre-send loop-completion hook should resolve the session"
+    assert not any(pre_send), calls

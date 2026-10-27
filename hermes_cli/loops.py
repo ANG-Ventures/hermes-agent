@@ -279,7 +279,7 @@ def load_loop(session_id: str) -> Optional[LoopState]:
     db = _get_session_db() if session_id else None
     if db is None:
         return None
-    raw = _db_op("get_meta", lambda: db.get_meta(_meta_key(session_id)))
+    raw = _db_op("get_meta", lambda: db.get_meta_committed(_meta_key(session_id)))
     return _parse_state(raw, session_id) if raw else None
 
 

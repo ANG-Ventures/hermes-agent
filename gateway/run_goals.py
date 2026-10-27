@@ -454,10 +454,15 @@ class GatewayGoalsMixin:
             return
         # /loop completion stays inline, before the send, while this turn still owns the session: deferred,
         # it would complete a wakeup tick fired during the send (bookkeeping, no LLM call). Only the judge waits.
+        _t0 = time.monotonic()
         try:  # the class method: an instance override of _run_post_turn_hooks stands for the deferred judge
-            await GatewayGoalsMixin._run_post_turn_hooks(self, **kwargs, parts=("loop completion",))
+            # is_internal=True: no routing touch before the send. That upsert is a state.db WRITE that waits out
+            # any foreign writer's hold (t_04b5d027: 4.05 s); the deferred judge's own lookup touches after it.
+            await GatewayGoalsMixin._run_post_turn_hooks(
+                self, **{**kwargs, "is_internal": True}, parts=("loop completion",))
         except Exception as exc:
             logger.debug("post-turn hook failed: %s", exc)
+        _t1 = time.monotonic()
         # Pin the goal row as of turn end: a /goal set during the send is not judged on this reply.
         try:
             from hermes_cli.goals import _load_goal_raw
@@ -468,6 +473,8 @@ class GatewayGoalsMixin:
         except Exception as exc:  # unpinned would judge a goal set during the send on this reply: skip
             logger.warning("goal pin for %s failed, deferred judge skipped: %s", session_key, exc)
             kwargs["goal_pin"] = GOAL_PIN_FAILED
+        if event is not None:  # pre-send share of this method: PHASE=post_handler_stages reads it
+            event._pre_send_post_turn_s = (_t1 - _t0, time.monotonic() - _t1)
 
         # The routed profile scope (home/secret/terminal contextvars) is left before the adapter fires the
         # callback; run the hooks in the context captured here so they read the routed profile's state.db.

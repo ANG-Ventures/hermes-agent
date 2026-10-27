@@ -106,19 +106,46 @@ async def test_idle_wake_scan_keeps_the_loop_responsive_while_another_thread_hol
 
 
 @pytest.mark.asyncio
+async def test_goal_load_does_not_queue_behind_a_writer_holding_the_db_lock(rig):
+    """t_04b5d027: the pre-send goal pin / loop load read state_meta on SessionDB._lock and waited out
+    every in-process writer's BEGIN IMMEDIATE retry while another process held the write lock (4.05 s
+    before a Discord send). Under WAL the committed read goes through the reader pool instead."""
+    await asyncio.to_thread(_due_goal)
+    db = await asyncio.to_thread(goals._get_session_db)
+    if not db._wal_active:
+        pytest.skip("reader pool needs WAL on this filesystem")
+    held, release = threading.Event(), threading.Event()
+
+    def _writer():
+        with db._lock:
+            held.set()
+            release.wait(5)
+
+    writer = threading.Thread(target=_writer, daemon=True)
+    writer.start()
+    assert held.wait(2)
+    try:
+        state, raw = await asyncio.wait_for(asyncio.to_thread(goals._load_goal_raw, "goal-sess", strict=True), 1)
+    finally:
+        release.set()
+        writer.join(2)
+    assert state is not None and raw
+
+
+@pytest.mark.asyncio
 async def test_idle_wake_scan_never_calls_get_meta_on_the_loop_thread(rig, monkeypatch):
     runner, adapter, received = rig
     await asyncio.to_thread(_due_goal)
     db = await asyncio.to_thread(goals._get_session_db)
     loop_thread = threading.get_ident()
     threads = []
-    real = type(db).get_meta
+    real = type(db).get_meta_committed
 
     def _spy(self, key):
         threads.append(threading.get_ident())
         return real(self, key)
 
-    monkeypatch.setattr(type(db), "get_meta", _spy)
+    monkeypatch.setattr(type(db), "get_meta_committed", _spy)
     await runner._goal_idle_wake_scan()
     for task in list(getattr(adapter, "_session_tasks", {}).values()):
         await asyncio.wait_for(task, 2)
