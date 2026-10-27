@@ -1137,8 +1137,9 @@ class TurnRunner:
             return 0
 
     def _announce_chat_pin_mismatch(self, model, provider, result, final_response) -> None:
-        """One durable notice per emitted reply, including cross-session wakes."""
-        from agent.chat_completion_helpers import format_chat_pin_notice
+        """One durable notice per emitted reply, including cross-session wakes; once per
+        fallback episode when the emitting session is the pinned one on its own fallback."""
+        from agent.chat_completion_helpers import chat_pin_own_fallback, format_chat_pin_notice
         from gateway.response_filters import is_intentional_silence_agent_result
         if not final_response or is_intentional_silence_agent_result(
             result, final_response, internal=self._ctx.persist_user_display_kind == "internal_notification",
@@ -1149,7 +1150,22 @@ class TurnRunner:
             return
         try:
             _, pin = store.lookup_chat_model_pin(self._ctx.source)
-            notice = format_chat_pin_notice(model, provider, pin, reason=result.get("failure_reason"))
+            agent = (self._ctx.agent_holder or [None])[0]
+            entry = store.entry_for(self._ctx.session_key) if hasattr(store, "entry_for") else None
+            own, label = chat_pin_own_fallback(
+                agent, pin, getattr(entry, "model_override_identity", None))
+            notice = format_chat_pin_notice(model, provider, pin, reason=result.get("failure_reason"),
+                                            own_fallback=own, fallback_label=label)
+            # The pinned session's own fallback: once per episode, the 🔄 line
+            # already announced it (t_40a9186f: 8 notices in one night).
+            episode = (provider, model, (pin or {}).get("provider"), (pin or {}).get("model"))
+            if agent is not None:
+                if not notice:
+                    agent._chat_pin_notice_episode = None
+                elif own and getattr(agent, "_chat_pin_notice_episode", None) == episode:
+                    return
+                elif own:
+                    agent._chat_pin_notice_episode = episode
             if notice:
                 self._status_callback_sync("info", notice)
         except Exception:

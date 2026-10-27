@@ -976,7 +976,9 @@ def token_fingerprint(bearer: Optional[str]) -> str:
 
 HOPS = ("client→relay", "relay", "relay→bridge", "bridge→anthropic",
         "client→proxy", "proxy→anthropic", "client→bridge",
-        "client→cli", "cli→anthropic")
+        "client→cli", "cli→anthropic",
+        # Our DPX content-alias layer, between the bridge and Anthropic (t_40a9186f).
+        "bridge→dpx")
 # Genuinely unknown fields (pooled lane, no relay attribution). Rendered as
 # words, never a bare "?" (t_246ce7d6: "hop ? on sub ?" was unreadable).
 HOP_UNKNOWN = "hop unknown"
@@ -1096,8 +1098,9 @@ def _lane_incapable_body(row: Mapping[str, Any], seat: str) -> str:
         # No machine code on the row: the hop is whatever the relay stated (or
         # unknown), rendered by the shared segment like every other class.
         return f"{_lane_incapable_cause(row)} {_hop_segment(normalize_hop(row.get('hop')), seat, st)}"
-    where = ("at the relay" if code == "mode_not_allowed"
-             else "at the DPX aliaser" if code.startswith("contentalias:") else "at the bridge")
+    from agent.fallback_capability import bridge_code_where
+
+    where = bridge_code_where(code)
     seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
     return (f"{_lane_incapable_cause(row)} — {st} {code} {where} "
             f"({LANE_INCAPABLE_NOT_ANTHROPIC}){seat_seg}")
@@ -1265,10 +1268,10 @@ def _refusal_body(row: Mapping[str, Any], seat_names: bool) -> str:
 
 
 def _bridge_code(row: Mapping[str, Any]) -> Optional[str]:
-    from agent.fallback_capability import BRIDGE_ERROR_CODES
+    from agent.fallback_capability import bridge_code_entry
 
     code = str(row.get("bridge_code") or "").strip().lower()
-    return code if code in BRIDGE_ERROR_CODES else None
+    return code if bridge_code_entry(code) else None
 
 
 def _bridge_code_body(row: Mapping[str, Any], seat: str, cause: str) -> str:
@@ -1276,15 +1279,16 @@ def _bridge_code_body(row: Mapping[str, Any], seat: str, cause: str) -> str:
     Anthropic) on sub-vps-23; this session's previous turn is still running``
     (t_5d79bfea). The body's machine code says the bridge wrote it, whatever
     hop the relay stamped."""
-    from agent.fallback_capability import BRIDGE_ERROR_CODES
+    from agent.fallback_capability import bridge_code_entry, bridge_code_where
 
     code = _bridge_code(row) or ""
-    entry = BRIDGE_ERROR_CODES[code]
+    entry = bridge_code_entry(code)
     st = row.get("http_status") or "error"
-    where = "at the relay" if code == "mode_not_allowed" else "at the bridge"
+    where = bridge_code_where(code)
     seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
     detail = f"; {entry.detail}" if entry.detail else ""
-    origin = LANE_INCAPABLE_NOT_ANTHROPIC if entry.ours else "reported by the bridge"
+    reporter = "the DPX alias layer" if code.startswith("contentalias:") else "the bridge"
+    origin = LANE_INCAPABLE_NOT_ANTHROPIC if entry.ours else f"reported by {reporter}"
     return (f"{cause} — {st} {code} {where} ({origin})"
             f"{seat_seg}{detail}{_pool_context(row)}")
 
@@ -1351,9 +1355,9 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
     t = str(row.get("err_head") or row.get("err_text") or "").lower()
     bcode = _bridge_code(row)
     if bcode:
-        from agent.fallback_capability import BRIDGE_ERROR_CODES
+        from agent.fallback_capability import bridge_code_entry
 
-        stated = BRIDGE_ERROR_CODES[bcode].cause
+        stated = bridge_code_entry(bcode).cause
         if stated:
             return stated
         if cls == LANE_INCAPABLE_CLASS:
@@ -1461,6 +1465,7 @@ def _hop_segment(hop: Optional[str], seat: str, status: Any) -> str:
             "client→bridge": "to the bridge (direct)",
             "client→cli": "to the CLI (direct)",
             "cli→anthropic": f"(Anthropic {st}) via the CLI",
+            "bridge→dpx": "at the DPX alias layer (ours, not Anthropic)",
         }.get(hop or "")
         return f"{known} ({SUB_UNKNOWN})" if known else _HOP_SUB_UNKNOWN_SEG
     return {
@@ -1473,6 +1478,7 @@ def _hop_segment(hop: Optional[str], seat: str, status: Any) -> str:
         "client→bridge": f"to {seat} bridge (direct)",
         "client→cli": f"to {seat} CLI (direct)",
         "cli→anthropic": f"(Anthropic {st}) via {seat} CLI",
+        "bridge→dpx": f"at the DPX alias layer (ours, not Anthropic) on {seat}",
     }.get(hop or "", f"on {seat} ({HOP_UNKNOWN})")
 
 
@@ -1832,16 +1838,16 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     if bcode:
         # The bridge's machine code names what happened; the status-derived
         # label (a 409 -> "bad request") does not (t_5d79bfea).
-        from agent.fallback_capability import BRIDGE_ERROR_CODES
+        from agent.fallback_capability import bridge_code_entry
 
-        head = BRIDGE_ERROR_CODES[bcode].head
-        if head:
-            return head
+        entry = bridge_code_entry(bcode)
+        if entry.head:
+            return entry.head
         # No head of its own: the label is the rider's cause, from the same
         # table row ("connection issue" over "relay box at session capacity",
         # t_94a2b0e4).
-        if BRIDGE_ERROR_CODES[bcode].cause:
-            return BRIDGE_ERROR_CODES[bcode].cause
+        if entry.cause:
+            return entry.cause
     windowed = (_window_cause(row, str(row.get("err_head") or "").lower())
                 if cls in ("quota_model", "quota_seat", "rate_upstream") else None)
     if cls == NO_FIRST_BYTE_BUDGET_CLASS:

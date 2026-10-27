@@ -58,7 +58,8 @@ LANE_INCAPABLE_CODES: Mapping[str, Optional[str]] = {
     "contentalias:history_tool": SHAPE_TOOLS,
 }
 # The aliaser's error family in message text (``contentalias:<reason>``); only
-# history_tool is a lane-shape refusal, the rest stay with their status class.
+# history_tool is a lane-shape refusal (walker skip); the rest are named by
+# CONTENTALIAS_ERROR_CODES below.
 _CONTENTALIAS_RE = re.compile(r"contentalias:([a-z_]+)")
 
 
@@ -138,24 +139,83 @@ BRIDGE_ERROR_CODES: Mapping[str, BridgeCode] = {
 }
 
 
-def bridge_error_code(body: Any) -> Optional[str]:
-    """The bridge machine code of an error body (one of :data:`BRIDGE_ERROR_CODES`),
-    else None. Same body shapes as :func:`body_lane_incapable_code`."""
+# The DPX content-alias layer (dpx-content-alias internal/contentalias, Go
+# ``Error.Error() = "contentalias:" + code``) sits between the bridge and
+# Anthropic. Its codes arrive as ``error.code`` (400 passthrough) or inside a
+# bridge ``tui_upstream_error`` message; the relay stamps ``bridge->upstream``
+# either way, which read "unclassified error (Anthropic 400)" (t_40a9186f:
+# 10 sentinel rows since 10-05). ONE table, same shape as BRIDGE_ERROR_CODES;
+# an unlisted code takes :data:`CONTENTALIAS_GENERIC`, never Anthropic.
+CONTENTALIAS_PREFIX = "contentalias:"
+_CA_HEAD = "content-alias refused"
+CONTENTALIAS_GENERIC = BridgeCode(_LANE, _CA_HEAD, "the DPX alias layer refused the turn")
+CONTENTALIAS_ERROR_CODES: Mapping[str, BridgeCode] = {
+    "unknown_tool": BridgeCode(_LANE, _CA_HEAD, "tool call outside this turn's alias map"),
+    "history_tool": BridgeCode(_LANE, _CA_HEAD, "lane cannot alias this transcript's tool history"),
+    "schema_changed": BridgeCode(_LANE, _CA_HEAD, "a tool schema changed under its alias"),
+    "ambiguous_schema": BridgeCode(_LANE, _CA_HEAD, "a tool schema the alias layer cannot map"),
+    "stream_json": BridgeCode(_LANE, _CA_HEAD, "streamed tool input the alias layer could not parse"),
+    "native_route_required": BridgeCode(_LANE, _CA_HEAD, "request not on the native route aliasing needs"),
+    # Upstream answered non-2xx; the alias layer drops that body (it can echo
+    # aliased input) and reports only this code, so the cause is upstream's.
+    "upstream_failure": BridgeCode(_LANE, "upstream error via content-alias",
+                                   "upstream error, body withheld by the alias layer", ours=False),
+}
+
+
+def contentalias_entry(code: str) -> Optional[BridgeCode]:
+    """The table row of a ``contentalias:<code>``: listed, else the generic row."""
+    c = str(code or "").strip().lower()
+    if not c.startswith(CONTENTALIAS_PREFIX):
+        return None
+    return CONTENTALIAS_ERROR_CODES.get(c[len(CONTENTALIAS_PREFIX):], CONTENTALIAS_GENERIC)
+
+
+def bridge_code_entry(code: Any) -> Optional[BridgeCode]:
+    """The :class:`BridgeCode` row of a bridge or content-alias machine code."""
+    c = str(code or "").strip().lower()
+    return BRIDGE_ERROR_CODES.get(c) or contentalias_entry(c)
+
+
+def bridge_error_code(body: Any, text: Any = None) -> Optional[str]:
+    """The machine code of an error body (one of :data:`BRIDGE_ERROR_CODES`, or a
+    ``contentalias:<code>``), else None. Same body shapes as
+    :func:`body_lane_incapable_code`. A ``contentalias:`` code named in the
+    message of a bridge ``tui_upstream_error`` wrapper beats the wrapper."""
     if not isinstance(body, dict):
         return None
+    found = None
     for obj in (body, body.get("error")):
         if isinstance(obj, dict):
             for key in ("code", "error_code"):
                 c = str(obj.get(key) or "").strip().lower()
-                if c in BRIDGE_ERROR_CODES:
-                    return c
-    return None
+                if c in BRIDGE_ERROR_CODES or c.startswith(CONTENTALIAS_PREFIX):
+                    found = found or c
+            text = text or obj.get("message")
+    if found is None or found == "tui_upstream_error":
+        m = _CONTENTALIAS_RE.search(str(text or ""))
+        if m:
+            return f"{CONTENTALIAS_PREFIX}{m.group(1)}"
+    return found
+
+
+CONTENTALIAS_HOP = "bridge→dpx"
 
 
 def bridge_code_hop(code: str) -> str:
-    """The hop that wrote a bridge-coded body: the relay for ``mode_not_allowed``,
-    else the bridge (``relay→bridge``)."""
-    return "relay" if code == "mode_not_allowed" else "relay→bridge"
+    """The hop that wrote a coded body: the relay for ``mode_not_allowed``, the
+    DPX alias layer for ``contentalias:*``, else the bridge (``relay→bridge``)."""
+    if code == "mode_not_allowed":
+        return "relay"
+    return CONTENTALIAS_HOP if str(code).startswith(CONTENTALIAS_PREFIX) else "relay→bridge"
+
+
+def bridge_code_where(code: str) -> str:
+    """``at the relay`` / ``at the DPX alias layer`` / ``at the bridge``."""
+    if code == "mode_not_allowed":
+        return "at the relay"
+    return ("at the DPX alias layer" if str(code).startswith(CONTENTALIAS_PREFIX)
+            else "at the bridge")
 
 _IMAGE_PART_TYPES = frozenset(("image_url", "input_image", "image"))
 
