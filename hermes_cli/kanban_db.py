@@ -13183,6 +13183,47 @@ def spawnable_reviewer_profiles() -> list[str]:
         return []
 
 
+# path -> (file_signature, parsed dict). The dispatcher reads the board home's
+# config several times per tick (pause hold, capability layer, review knobs);
+# re-parsing the YAML each time was ~7 % of the gateway's GIL samples
+# (2026-10-26). ``read_user_config_raw`` stays uncached for write-back callers.
+_BOARD_HOME_CFG_CACHE: dict[str, tuple] = {}
+_BOARD_HOME_CFG_LOCK = threading.Lock()
+
+
+def _board_home_config_raw(path: Path) -> dict:
+    """``read_user_config_raw(path)`` memoized on the file signature; returns a deepcopy.
+
+    Same contract: missing file -> ``{}``, non-mapping -> ``{}``, unparseable
+    YAML raises (and is never cached, so a fixed file is seen next call).
+    """
+    import copy
+
+    from utils import file_signature
+    from hermes_cli.config import read_user_config_raw
+
+    key = str(path)
+    try:
+        sig = file_signature(os.stat(path))
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return read_user_config_raw(path)
+    with _BOARD_HOME_CFG_LOCK:
+        entry = _BOARD_HOME_CFG_CACHE.get(key)
+    if entry is not None and entry[0] == sig:
+        return copy.deepcopy(entry[1])
+    data = read_user_config_raw(path)
+    try:
+        after = file_signature(os.stat(path))
+    except OSError:
+        after = None
+    if after == sig:  # the file did not change under the read
+        with _BOARD_HOME_CFG_LOCK:
+            _BOARD_HOME_CFG_CACHE[key] = (sig, copy.deepcopy(data))
+    return data
+
+
 def _board_home_kanban_cfg() -> dict:
     """The ``kanban`` section of ``kanban_home()/config.yaml`` — the board's owner.
 
@@ -13192,9 +13233,9 @@ def _board_home_kanban_cfg() -> dict:
     overlay are applied like the gateway's presence-sensitive bridges.
     Missing file -> ``{}``; unparseable YAML raises (callers fail closed).
     """
-    from hermes_cli.config import _expand_env_vars, read_user_config_raw
+    from hermes_cli.config import _expand_env_vars
 
-    cfg = _expand_env_vars(read_user_config_raw(kanban_home() / "config.yaml"))
+    cfg = _expand_env_vars(_board_home_config_raw(kanban_home() / "config.yaml"))
     if not isinstance(cfg, dict):
         cfg = {}
     try:
