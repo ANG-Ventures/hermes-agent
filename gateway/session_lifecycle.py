@@ -267,16 +267,17 @@ class SessionLifecycleMixin:
     def end_resume_mark_batch(self) -> int:
         """Close a batch; the outermost close persists the deferred marks with ONE ``_save()``.
         Returns the number of marks it persisted (0 = no save). A save error propagates to the
-        caller; the in-memory marks stand either way."""
+        caller; the in-memory marks stand either way, and the pending count is kept so the next
+        batch close retries the save (Prism ada9ec75ce70)."""
         with self._lock:
             depth = max(0, getattr(self, "_resume_mark_batch_depth", 0) - 1)
             self._resume_mark_batch_depth = depth
             if depth:
                 return 0
             pending = getattr(self, "_resume_mark_batch_pending", 0)
-            self._resume_mark_batch_pending = 0
             if pending:
                 self._save()
+                self._resume_mark_batch_pending = 0
             return pending
 
     def clear_resume_pending(self, session_key: str, **kw) -> bool:

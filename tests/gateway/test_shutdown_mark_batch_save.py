@@ -212,3 +212,34 @@ def test_cancel_while_the_closing_save_is_queued_still_closes_the_batch(tmp_path
     reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
     reloaded._ensure_loaded()
     assert all(reloaded._entries[k].resume_pending for k in keys)
+
+
+def test_failed_batch_save_is_retried_by_the_next_batch_close(tmp_path):
+    """Prism ada9ec75ce70: a failed closing save keeps the pending count, so a later batch with
+    no new marks (sessions already pending in memory) still persists them."""
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    keys = [store.get_or_create_session(
+        SessionSource(platform=Platform.TELEGRAM, chat_id=str(i), user_id="u1")).session_key
+        for i in (1, 2)]
+    real_save = store._save
+    fail = [True]
+
+    def _flaky(*a, **k):
+        if fail[0]:
+            fail[0] = False
+            raise OSError("transient")
+        return real_save(*a, **k)
+
+    store._save = _flaky
+    store.begin_resume_mark_batch()
+    for k in keys:
+        assert store.mark_resume_pending(k, reason="restart_timeout")
+    with pytest.raises(OSError):
+        store.end_resume_mark_batch()
+
+    store.begin_resume_mark_batch()
+    assert store.end_resume_mark_batch() == 2
+
+    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    reloaded._ensure_loaded()
+    assert all(reloaded._entries[k].resume_pending for k in keys)
