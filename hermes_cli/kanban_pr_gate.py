@@ -569,9 +569,20 @@ def _is_repo_toplevel(workspace_path: str) -> bool:
 # of every file their answers depend on. The dispatcher re-asks for every gated
 # card's workspace on every tick (2 git forks per card per tick, ~12 % of the
 # gateway's GIL samples on a 760-card board, 2026-10-26).
+#
+# The signature cannot see every input git reads (``GIT_CONFIG_GLOBAL``, the XDG
+# config, ``/etc/gitconfig``, nested includes), so every entry also expires
+# after ``_REPO_PROBE_TTL_SECONDS``: a change the signature misses is still
+# re-probed within that bound. Files named by ``[include]``/``[includeIf]`` in
+# the repo/global config are folded into the signature (best effort) so the
+# common case is seen at once.
 _REPO_PROBE_CACHE_MAX = 4096
+_REPO_PROBE_TTL_SECONDS = 120.0
 _REPO_PROBE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _REPO_PROBE_LOCK = threading.Lock()
+_repo_probe_clock: Callable[[], float] = time.monotonic
+_INCLUDE_SECTION_RE = re.compile(r"^\s*\[\s*include(?:if)?\b", re.IGNORECASE)
+_INCLUDE_PATH_RE = re.compile(r"^\s*path\s*=\s*(.*?)\s*$", re.IGNORECASE)
 
 
 def _stat_sig(path: str, *, full: bool = True) -> Optional[tuple]:
@@ -619,13 +630,55 @@ def _repo_probe_signature(workspace_path: str) -> Optional[tuple]:
                         common = os.path.join(gitdir, fh.read(4096).strip())
                 except FileNotFoundError:
                     pass
+        configs: list[str] = []
         if common is not None:
-            parts.append(_stat_sig(os.path.join(common, "config")))
-            parts.append(_stat_sig(os.path.join(gitdir, "config.worktree")))
-        parts.append(_stat_sig(os.path.expanduser("~/.gitconfig")))
+            configs.append(os.path.join(common, "config"))
+            configs.append(os.path.join(gitdir, "config.worktree"))
+        configs.append(os.path.expanduser("~/.gitconfig"))
+        for cfg in configs:
+            parts.append(_stat_sig(cfg))
+        for inc in _config_include_paths(configs):
+            parts.append(("inc", inc, _stat_sig(inc)))
         return tuple(parts)
     except (OSError, ValueError):
         return None
+
+
+def _config_include_paths(configs: Iterable[str]) -> list[str]:
+    """Paths named by ``[include]``/``[includeIf]`` ``path =`` in ``configs`` (one level).
+
+    Best effort: relative paths resolve against the including file's directory,
+    ``~`` is expanded, conditions are ignored (a superset only costs an extra
+    stat). Unreadable configs contribute nothing; the TTL is the backstop.
+    """
+    out: list[str] = []
+    for cfg in configs:
+        try:
+            with open(cfg, encoding="utf-8", errors="replace") as fh:
+                text = fh.read(1 << 20)
+        except OSError:
+            continue
+        if "include" not in text.lower():
+            continue
+        in_include = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("["):
+                in_include = bool(_INCLUDE_SECTION_RE.match(stripped))
+                continue
+            if not in_include:
+                continue
+            m = _INCLUDE_PATH_RE.match(line)
+            if not m:
+                continue
+            raw = m.group(1).strip().strip('"')
+            if not raw:
+                continue
+            raw = os.path.expanduser(raw)
+            if not os.path.isabs(raw):
+                raw = os.path.join(os.path.dirname(cfg), raw)
+            out.append(raw)
+    return out
 
 
 def _repo_probe_get(key: tuple, sig: Optional[tuple]):
@@ -635,6 +688,9 @@ def _repo_probe_get(key: tuple, sig: Optional[tuple]):
         entry = _REPO_PROBE_CACHE.get(key)
         if entry is None or entry[0] != sig:
             return None
+        if _repo_probe_clock() - entry[2] >= _REPO_PROBE_TTL_SECONDS:
+            del _REPO_PROBE_CACHE[key]
+            return None
         _REPO_PROBE_CACHE.move_to_end(key)
         return entry[1]
 
@@ -643,7 +699,7 @@ def _repo_probe_put(key: tuple, sig: Optional[tuple], value) -> None:
     if sig is None:
         return
     with _REPO_PROBE_LOCK:
-        _REPO_PROBE_CACHE[key] = (sig, value)
+        _REPO_PROBE_CACHE[key] = (sig, value, _repo_probe_clock())
         _REPO_PROBE_CACHE.move_to_end(key)
         while len(_REPO_PROBE_CACHE) > _REPO_PROBE_CACHE_MAX:
             _REPO_PROBE_CACHE.popitem(last=False)

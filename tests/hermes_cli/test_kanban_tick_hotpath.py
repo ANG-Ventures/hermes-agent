@@ -106,6 +106,67 @@ def test_walk_up_still_answers_not_toplevel_and_stays_cached(tmp_path, git_spawn
     assert prg._remotes_for(str(scratch)) == {"o/own"}
 
 
+class _Clock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+@pytest.fixture
+def probe_clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    clock = _Clock()
+    monkeypatch.setattr(prg, "_repo_probe_clock", clock, raising=False)
+    return clock
+
+
+def _git_init_with_include(tmp_path: Path) -> tuple[Path, Path]:
+    """Prism repro: .git/config defines no remote; an [include]d file defines origin."""
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    ext = tmp_path / "ext.gitconfig"
+    ext.write_text('[remote "origin"]\n\turl = https://github.com/acme/old.git\n')
+    with open(repo / ".git" / "config", "a", encoding="utf-8") as fh:
+        fh.write(f"[include]\n\tpath = {ext}\n")
+    return repo, ext
+
+
+def test_included_config_remote_change_is_seen_immediately(tmp_path, git_spawns, probe_clock):
+    repo, ext = _git_init_with_include(tmp_path)
+    assert prg._remotes_for(str(repo)) == {"acme/old"}
+    assert prg._remotes_for(str(repo)) == {"acme/old"}
+    ext.write_text('[remote "origin"]\n\turl = https://github.com/acme/brand-new.git\n')
+    # Same clock reading: only the include-aware signature can notice this.
+    assert prg._remotes_for(str(repo)) == {"acme/brand-new"}
+
+
+def test_invisible_config_dependency_is_reprobed_after_ttl(
+    tmp_path, git_spawns, probe_clock, monkeypatch: pytest.MonkeyPatch,
+):
+    """A dependency no signature can see (GIT_CONFIG_GLOBAL) is re-probed within the TTL."""
+    glob = tmp_path / "global.gitconfig"
+    glob.write_text('[remote "upstream"]\n\turl = https://github.com/acme/old.git\n')
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(glob))
+    repo = tmp_path / "wt"
+    _git_init(repo, "git@github.com:o/r.git")
+    assert prg._remotes_for(str(repo)) == {"o/r", "acme/old"}
+    glob.write_text('[remote "upstream"]\n\turl = https://github.com/acme/new.git\n')
+    ttl = getattr(prg, "_REPO_PROBE_TTL_SECONDS", 120)
+    probe_clock.t += ttl + 1
+    assert prg._remotes_for(str(repo)) == {"o/r", "acme/new"}
+
+
+def test_repeat_within_ttl_still_hits_the_cache(tmp_path, git_spawns, probe_clock):
+    repo, _ext = _git_init_with_include(tmp_path)
+    for _ in range(10):
+        assert prg._remotes_for(str(repo)) == {"acme/old"}
+        probe_clock.t += 5
+    assert len([c for c in git_spawns if c[-2:] == ["remote", "-v"]]) == 1
+    assert len([c for c in git_spawns if "--show-toplevel" in c]) == 1
+
+
 # --------------------------------------------------------------------------- 2
 
 
