@@ -7,11 +7,15 @@ Live events continue to use ``process_registry.completion_queue``.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import math
 import logging
+import marshal
 import os
+import sys
+import threading
 import time
 import traceback
 from contextlib import contextmanager
@@ -154,23 +158,122 @@ def empty_registry() -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "updated_at": 0.0, "records": {}}
 
 
-def _record_checksum(record: dict[str, Any]) -> str:
+def _canonical_record_bytes(record: dict[str, Any]) -> bytes:
     canonical = dict(record)
     canonical.pop("integrity", None)
-    raw = json.dumps(
+    return json.dumps(
         canonical,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
 
 
-def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
-    if not path.exists():
-        return empty_registry()
+def _record_checksum(record: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_record_bytes(record)).hexdigest()
+
+
+# Process-wide parse cache: {path: ((st_mtime_ns, st_size, st_ino, st_ctime_ns), content_sha256,
+# cached_at, registry, strict_error)}. st_ctime_ns is kernel-owned: any write, or an os.utime that
+# restores an old mtime, moves it, so a same-size in-place rewrite never keeps the stat key. The registry is the lenient (quarantining) parse; ``strict_error`` is
+# the RegistryError a strict load of the same bytes raises (None when every record is valid).
+# The cached object is NEVER handed out: every load returns a private marshal copy of it (~5 ms on
+# the 2.8 MB compacted live registry vs ~90 ms parse + checksums), so a caller that mutates what
+# it read cannot corrupt later reads (Prism 81679117ed4f). Integrity checksums are verified on every
+# miss (the first load after any change), so a corrupted file is still caught once it changes.
+_REGISTRY_CACHE: dict[str, tuple[tuple[int, int, int, int], str, float, dict[str, Any], str | None]] = {}
+_REGISTRY_CACHE_LOCK = threading.Lock()
+# A same-size rewrite inside one mtime tick keeps (mtime_ns, size, ino) equal on coarse
+# filesystems; inside this window a hit is confirmed against the content hash.
+_CACHE_HASH_WINDOW_SECONDS = 2.0
+
+
+def _ctime_is_creation_time() -> bool:
+    """On Windows ``st_ctime_ns`` is creation time, not the last metadata change: a same-size
+    in-place rewrite that restores the mtime keeps the whole stamp, so every hit is content-verified."""
+    return os.name == "nt" or sys.platform.startswith(("win", "cygwin"))
+
+
+def _invalidate_cache(path: Path) -> None:
+    with _REGISTRY_CACHE_LOCK:
+        _REGISTRY_CACHE.pop(str(path), None)
+
+
+def _copy_registry(registry: dict[str, Any]) -> dict[str, Any]:
+    """Private copy of a JSON-native registry (marshal round trip is ~3x faster than deepcopy)."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return marshal.loads(marshal.dumps(registry))
+    except (ValueError, TypeError):  # pragma: no cover - non-JSON-native value
+        return copy.deepcopy(registry)
+
+
+def _load(
+    path: Path,
+    *,
+    allow_invalid_records: bool = False,
+    private: bool = False,
+    trusted_records: dict[str, tuple[str, bytes]] | None = None,
+    verify_content: bool = False,
+) -> dict[str, Any]:
+    """Load a registry; strict mode raises on the first invalid record, lenient quarantines.
+
+    Served from ``_REGISTRY_CACHE`` while the file's (mtime_ns, size, inode, ctime_ns) is unchanged.
+    Every result is a private copy nobody else holds; ``private`` is kept for call-site clarity.
+    ``trusted_records`` (the records this process just wrote and hashed) forces a re-parse and
+    skips re-hashing a record only when the parsed record is EQUAL to the one written.
+    ``verify_content`` confirms every cache hit by content hash: a read-modify-write never trusts
+    the stat stamp alone (SSHFS/SFTP synthesize ctime from mtime, so a stamp-preserving rewrite
+    would be overwritten with stale data; Prism babadae984f2).
+    """
+    key = str(path)
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        _invalidate_cache(path)
+        return empty_registry()
+    with handle:
+        st = os.fstat(handle.fileno())  # the inode we read, even if the path is replaced meanwhile
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+        now = time.time()
+        with _REGISTRY_CACHE_LOCK:
+            cached = _REGISTRY_CACHE.get(key)
+        raw: bytes | None = None
+        if (trusted_records is None and cached is not None
+                and cached[0] == stamp):
+            # The entry was taken within one coarse mtime tick of the file's mtime: a same-size
+            # rewrite in that tick would leave the stat key unchanged, so confirm by content.
+            # Once a confirmed hit lands past the window, any later rewrite moves the ctime.
+            changed = max(st.st_mtime_ns, st.st_ctime_ns) / 1e9
+            if (verify_content or _ctime_is_creation_time()
+                    or cached[2] - changed < _CACHE_HASH_WINDOW_SECONDS):
+                raw = handle.read()
+            if raw is None or hashlib.sha256(raw).hexdigest() == cached[1]:
+                if raw is not None and now - changed >= _CACHE_HASH_WINDOW_SECONDS:
+                    with _REGISTRY_CACHE_LOCK:
+                        if _REGISTRY_CACHE.get(key) is cached:
+                            _REGISTRY_CACHE[key] = cached[:2] + (now,) + cached[3:]
+                registry, strict_error = cached[3], cached[4]
+                if strict_error is not None and not allow_invalid_records:
+                    raise RegistryError(strict_error)
+                return _copy_registry(registry)
+        if raw is None:
+            raw = handle.read()
+    data, strict_error = _parse_registry(raw, path, trusted_records=trusted_records)
+    with _REGISTRY_CACHE_LOCK:
+        _REGISTRY_CACHE[key] = (stamp, hashlib.sha256(raw).hexdigest(), now, data, strict_error)
+    if strict_error is not None and not allow_invalid_records:
+        raise RegistryError(strict_error)
+    return _copy_registry(data)
+
+
+def _parse_registry(
+    raw: bytes, path: Path, *, trusted_records: dict[str, tuple[str, bytes]] | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    """Lenient parse + per-record validation; also the strict error a strict load would raise."""
+    strict_error: str | None = None
+    trusted_records = trusted_records or {}
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
     except Exception as exc:
         logger.error("async_delegation_registry_invalid path=%s reason=%s", path, exc)
         raise RegistryError(f"invalid async-delegation registry: {exc}") from exc
@@ -183,8 +286,7 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
     invalid_record_ids: list[str] = []
     for delegation_id, record in data["records"].items():
         if not isinstance(record, dict):
-            if not allow_invalid_records:
-                raise RegistryError(f"record {delegation_id} must be an object")
+            strict_error = strict_error or f"record {delegation_id} must be an object"
             invalid_record_ids.append(str(delegation_id))
             logger.error(
                 "async_delegation_registry_invalid delegation_id=%s reason=record_not_object",
@@ -264,16 +366,19 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
                 or not _is_optional_number(terminal_field.get("completed_at"))
             )
         if invalid_state or invalid_identity or invalid_outbox or invalid_numeric:
-            if not allow_invalid_records:
-                raise RegistryError(f"record {delegation_id} has invalid state/identity/outbox structure")
+            strict_error = strict_error or f"record {delegation_id} has invalid state/identity/outbox structure"
             invalid_record_ids.append(str(delegation_id))
             logger.error("async_delegation_registry_invalid delegation_id=%s reason=structure",
                          delegation_id)
             continue
         expected = record.get("integrity")
+        trusted = trusted_records.get(delegation_id)
+        # Compare canonical bytes, never Python equality: True == 1 == 1.0 but they checksum
+        # differently, so a value-equal rewrite on disk must still fail integrity (Prism c74982e2a8ca).
+        if expected and trusted is not None and trusted == (expected, _canonical_record_bytes(record)):
+            continue  # exactly the bytes this process hashed while writing it
         if not expected or expected != _record_checksum(record):
-            if not allow_invalid_records:
-                raise RegistryError(f"record {delegation_id} failed integrity validation")
+            strict_error = strict_error or f"record {delegation_id} failed integrity validation"
             invalid_record_ids.append(str(delegation_id))
             logger.error(
                 "async_delegation_registry_invalid delegation_id=%s reason=integrity",
@@ -281,10 +386,11 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
             )
     if invalid_record_ids:
         data["_invalid_record_ids"] = invalid_record_ids
-    return data
+    return data, strict_error
 
 
 def read_registry(profile_home: Path | None = None) -> dict[str, Any]:
+    """The registry, as a private copy the caller may mutate freely."""
     return _load(registry_path(profile_home))
 
 
@@ -301,12 +407,26 @@ def _write(path: Path, registry: dict[str, Any]) -> None:
     registry["schema_version"] = SCHEMA_VERSION
     registry["updated_at"] = time.time()
     invalid_record_ids = set(registry.pop("_invalid_record_ids", []))
+    written: dict[str, tuple[str, bytes]] = {}
     for delegation_id, record in registry.get("records", {}).items():
         if str(delegation_id) in invalid_record_ids:
             continue
         if isinstance(record, dict):
-            record["integrity"] = _record_checksum(record)
-    atomic_json_write(path, registry, mode=0o600)
+            canonical = _canonical_record_bytes(record)
+            record["integrity"] = hashlib.sha256(canonical).hexdigest()
+            written[delegation_id] = (record["integrity"], canonical)
+    try:
+        atomic_json_write(path, registry, mode=0o600)
+    except BaseException:
+        _invalidate_cache(path)
+        raise
+    # Refresh the read cache from the bytes actually on disk (never this caller's object, which it
+    # may keep mutating). Records equal to what we just hashed are not re-hashed; anything else
+    # (quarantined records, a value that did not round-trip) is fully re-validated.
+    try:
+        _load(path, allow_invalid_records=True, trusted_records=written)
+    except Exception:
+        _invalidate_cache(path)
 
 
 @contextmanager
@@ -315,9 +435,19 @@ def locked_registry(
     *,
     timeout: float = 5.0,
     write: bool = True,
+    path: Path | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Lock, load, and optionally atomically persist one profile registry."""
-    path = registry_path(profile_home)
+    """Lock, load, and optionally atomically persist one profile registry.
+
+    ``write=False`` yields the process-wide cached registry: it is READ-ONLY (every in-tree
+    write=False caller only reads, or copies before handing data out). ``write=True`` yields a
+    private copy, so a writer can never mutate the cache in place. ``path`` (an already-resolved
+    registry path) lets a caller that needs the path again (backup) use the very file locked here.
+    """
+    if path is None:
+        path = registry_path(profile_home)
+    elif profile_home is not None:
+        raise ValueError("pass profile_home or path, not both")
     lpath = path.with_suffix(".lock")  # Same captured home, even if cwd/symlink changes.
     _prepare_directory(path)
     deadline = time.monotonic() + max(0.0, timeout)
@@ -355,7 +485,7 @@ def locked_registry(
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"timed out acquiring {lpath}")
                     time.sleep(0.01)
-        registry = _load(path, allow_invalid_records=True)
+        registry = _load(path, allow_invalid_records=True, private=write, verify_content=write)
         yield registry
         if write:
             _write(path, registry)
@@ -447,8 +577,188 @@ def _expire_admitted_unserved(registry: dict[str, Any], path: Path, now: float) 
                 )
 
 
+_TERMINAL_STATES = frozenset({"done", "failed", "cancelled"})
+# A settled terminal record's archived result keeps everything but the per-child tool traces
+# once it is this old (D5): nothing reads tool_trace back out of the registry or its mirror.
+COMPACT_TERMINAL_AFTER_SECONDS = 24 * 60 * 60
+# Body fields of a DELIVERED outbox payload that no reader consults after delivery. Every
+# identity/receipt field (event_id, type, delegation_id, attempt_id, attempt_generation, profile,
+# status, completed_at, routing ids) stays: canonical_terminal, _same_completion_event and the
+# SQLite mirror resync (_sync_completion) read those on every boot and every claim.
+_DELIVERED_PAYLOAD_BODY_FIELDS = ("results", "summary", "goals", "goal", "context", "toolsets")
+_TERMINAL_RESULT_CHILD_BODY_FIELDS = ("tool_trace",)
+
+
+def _canonical_sha256(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def is_compacted_payload(payload: Any) -> bool:
+    """The envelope's body was dropped at delivery (D5); only identity + ``payload_sha256`` remain."""
+    return isinstance(payload, dict) and isinstance(payload.get("payload_sha256"), str)
+
+
+def _compact_delivered_event(record: dict[str, Any], event: Any, *, dry_run: bool = False) -> bool:
+    """Drop the body of one DELIVERED event of a TERMINAL record, stamping ``payload_sha256``
+    (the canonical hash of the full envelope) into the payload so a consumer that needed the body
+    fails loudly rather than silently. Never touches a pending/admitted/dropped event or a
+    non-terminal record (I5)."""
+    if (record.get("state") not in _TERMINAL_STATES or not isinstance(event, dict)
+            or event.get("state") != "delivered"):
+        return False
+    payload = event.get("payload")
+    if (not isinstance(payload, dict) or is_compacted_payload(payload)
+            or not any(k in payload for k in _DELIVERED_PAYLOAD_BODY_FIELDS)):
+        return False
+    try:
+        digest = _canonical_sha256(payload)
+    except (TypeError, ValueError):
+        return False
+    if dry_run:
+        return True
+    for key in _DELIVERED_PAYLOAD_BODY_FIELDS:
+        payload.pop(key, None)
+    payload["payload_sha256"] = digest
+    return True
+
+
+def _compact_terminal_result(record: dict[str, Any], now: float, *, dry_run: bool = False) -> bool:
+    """Strip per-child tool traces from a settled terminal record older than 24 h.
+
+    The result text (``summary``), status, error and task identity stay: the SQLite mirror is
+    resynced from ``terminal.result`` and ``failed_delegations_for_session`` /
+    ``get_durable_delegation`` read those back."""
+    if record.get("state") not in _TERMINAL_STATES or _terminal_pending(record):
+        return False
+    updated = record.get("updated_at") or record.get("created_at") or 0.0
+    if not isinstance(updated, (int, float)) or now - updated < COMPACT_TERMINAL_AFTER_SECONDS:
+        return False
+    terminal = record.get("terminal")
+    result = terminal.get("result") if isinstance(terminal, dict) else None
+    children = result.get("results") if isinstance(result, dict) else None
+    if not isinstance(children, list):
+        return False
+    changed = False
+    for child in children:
+        if isinstance(child, dict):
+            for key in _TERMINAL_RESULT_CHILD_BODY_FIELDS:
+                if key in child:
+                    if dry_run:
+                        return True
+                    child.pop(key)
+                    changed = True
+    return changed
+
+
+# errnos meaning "this platform/filesystem cannot fsync a directory", not an I/O failure.
+_DIR_FSYNC_UNSUPPORTED = frozenset(
+    e for e in (getattr(errno, n, None) for n in ("EINVAL", "ENOTSUP", "EOPNOTSUPP", "EBADF"))
+    if e is not None)
+
+
+def _fsync_directory(directory: Path) -> bool:
+    """fsync ``directory`` so a rename inside it is durable. True when synced or when the platform
+    cannot fsync a directory at all (Windows, EINVAL/ENOTSUP); False on any real error (EIO...)."""
+    if os.name == "nt":
+        return True
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        if exc.errno in _DIR_FSYNC_UNSUPPORTED:
+            return True
+        logger.warning("could not open %s to fsync it", directory, exc_info=True)
+        return False
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        if exc.errno in _DIR_FSYNC_UNSUPPORTED:
+            return True
+        logger.warning("directory fsync failed for %s", directory, exc_info=True)
+        return False
+    finally:
+        os.close(dir_fd)
+    return True
+
+
+def _backup_before_first_compaction(path: Path) -> bool:
+    """One-time ``<registry>.pre-compact-<ts>`` copy (0600) of the file as it was on disk.
+
+    True only when a completed backup exists.
+    The copy is written and fsynced under a hidden temp name and only then renamed to its
+    ``pre-compact-*`` name, so a failed attempt (ENOSPC, EIO) never publishes a partial file that a
+    later run would mistake for the backup; the temp file is removed on failure. Callers compact
+    nothing unless this returns True."""
+    tmp: Path | None = None
+    try:
+        if any(path.parent.glob(f"{path.name}.pre-compact-*")):
+            # A leftover name proves no durable directory entry (crash before the dir fsync, or a
+            # failed unlink on the EIO path): re-sync and require success (Prism 0bd3c496e10a).
+            return _fsync_directory(path.parent)
+        if not path.exists():
+            return False
+        backup = path.with_name(f"{path.name}.pre-compact-{int(time.time())}")
+        tmp = path.with_name(f".{path.name}.pre-compact-tmp-{os.getpid()}-{threading.get_ident()}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(path.read_bytes())
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, backup)
+        tmp = None
+        if not _fsync_directory(path.parent):
+            # The rename is not durable: unpublish it so no later run trusts a backup that may
+            # vanish on crash, and compact nothing (Prism 101f4851d89a).
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+            return False
+        logger.info("async_delegation_registry_precompact_backup path=%s", backup)
+        return True
+    except OSError:
+        logger.warning("could not write the pre-compaction registry backup for %s; not compacting",
+                       path, exc_info=True)
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _compact(registry: dict[str, Any], now: float, path: Path) -> int:
+    """D5 compaction of every valid record; returns how many records changed.
+
+    Nothing is compacted until a complete pre-compaction backup exists on disk."""
+    invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+    candidates: list[dict[str, Any]] = []
+    for delegation_id, record in registry["records"].items():
+        if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
+            continue
+        outbox = record.get("outbox")
+        if ((isinstance(outbox, list)
+                and any(_compact_delivered_event(record, event, dry_run=True) for event in outbox))
+                or _compact_terminal_result(record, now, dry_run=True)):
+            candidates.append(record)
+    if not candidates or not _backup_before_first_compaction(path):
+        return 0
+    changed = 0
+    for record in candidates:
+        outbox = record.get("outbox")
+        hit = False
+        if isinstance(outbox, list):
+            hit = any([_compact_delivered_event(record, event) for event in outbox])
+        if _compact_terminal_result(record, now):
+            hit = True
+        changed += hit
+    return changed
+
+
 def _prune(registry: dict[str, Any], now: float, path: Path) -> None:
     _expire_admitted_unserved(registry, path, now)
+    _compact(registry, now, path)
     records = registry["records"]
     invalid_record_ids = set(registry.get("_invalid_record_ids", []))
     removable: list[tuple[float, str]] = []
@@ -591,7 +901,7 @@ def persist_dispatch(
     path = registry_path(profile_home)
     try:
         _assert_nonsecret_settings(durable_spec)
-        with locked_registry(profile_home) as registry:
+        with locked_registry(path=path) as registry:
             _prune(registry, now, path)
             if len(registry["records"]) >= record_limit:
                 logger.error(
@@ -2138,7 +2448,10 @@ def acknowledge(
         return admit(event_id, profile_home=profile_home, **(admission or {}))
     if outcome not in {"delivered", "dropped"}:
         raise ValueError("outcome must be delivered, dropped or admitted")
-    with locked_registry(profile_home) as registry:
+    # Resolve ONCE: the lock, the pre-compaction backup and the persist must all hit the same file
+    # even if a relative profile home's cwd changes mid-transaction (Prism f-0eee9075234c750b).
+    path = registry_path(profile_home)
+    with locked_registry(path=path) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
             if str(delegation_id) in invalid_record_ids:
@@ -2150,6 +2463,11 @@ def acknowledge(
                     event["state"] = outcome
                     event["delivered_at"] = time.time()
                     event["drop_reason"] = reason if outcome == "dropped" else None
+                    # D5: a delivered event's body is never read again (identity stays).
+                    # Never without a complete pre-compaction backup on disk first.
+                    if (_compact_delivered_event(record, event, dry_run=True)
+                            and _backup_before_first_compaction(path)):
+                        _compact_delivered_event(record, event)
                     logger.info(
                         "async_delegation_outbox_%s event_id=%s reason=%s",
                         outcome,
