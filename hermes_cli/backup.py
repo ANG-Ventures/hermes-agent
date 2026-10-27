@@ -1256,15 +1256,16 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
             on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
             on_vanished=lambda rel: vanished.append(str(rel)))
+        captured: dict = {}  # store identity -> home it was archived from (Prism dafc6732ca54)
         total_bytes += _zip_cron_pairs(zf, hermes_root, cron_homes, out_path,
-                                       lambda rel, exc: errors.append(f"{rel}: {exc}"))
+                                       lambda rel, exc: errors.append(f"{rel}: {exc}"), captured)
         late_added = 0
         if vanished:
             # A rename looks like a vanish here: the old path is gone and the new one was never
             # listed. Re-scan once and archive what the first scan did not list, so moved data
             # still lands and only a true deletion stays a WARN.
             listed = {str(rel) for _, rel in files_to_add}
-            late, _ = _split_cron_pairs(list(_iter_backup_files(hermes_root, out_path)))
+            late, late_homes = _split_cron_pairs(list(_iter_backup_files(hermes_root, out_path)))
             late = [(a, r) for a, r in late if str(r) not in listed]
             late_added = len(late)
             file_count += late_added
@@ -1273,6 +1274,14 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
                 on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
                 on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
                 on_vanished=lambda rel: vanished.append(str(rel)))
+            # Prism 3c9a7b0dc534: a store renamed with its profile is a pair the first pass never
+            # saw; archive it as one unit too, never drop it with the rescan's homes.
+            # Prism dafc6732ca54: a store renamed AFTER pass 1 archived it is skipped by identity
+            # (``captured``), else it would import as a second, independently ticked store.
+            total_bytes += _zip_cron_pairs(zf, hermes_root,
+                                           [h for h in late_homes if h not in cron_homes],
+                                           out_path, lambda rel, exc: errors.append(f"{rel}: {exc}"),
+                                           captured)
         # External memory-provider state never includes ``.db`` files in practice, so no
         # SQLite snapshot is needed; _write_zip_file still drops a failed partial member.
         for abs_path, arcname in external_to_add:
@@ -1608,7 +1617,9 @@ def run_import(args) -> Optional[int]:
             # (Prism dbf3e89fdfa5): a cron dir (or store home) linked outside hermes_root refuses.
             pair_dir = hermes_root.joinpath(*store_home, store_pair.CRON_DIR)
             try:
-                for target in (pair_dir, *(pair_dir / name for name in pair_members)):
+                # BOTH live members, not only those in the archive (Prism 4c71a06241bb): a
+                # json-only restore rewrites the live db too.
+                for target in (pair_dir, *(pair_dir / name for name in store_pair.PAIR_NAMES)):
                     target.resolve().relative_to(hermes_root.resolve())
             except ValueError:
                 errors.append(f"  {label}: path traversal blocked")
@@ -1824,16 +1835,42 @@ def _split_cron_pairs(files: List[Tuple[Path, Path]]) -> Tuple[List[Tuple[Path, 
     return others, homes
 
 
+def _store_identity(hermes_root: Path, home: Tuple[str, ...]) -> Optional[tuple]:
+    """``(st_dev, st_ino)`` of *home*'s cron DIRECTORY (``os.lstat``), or ``None`` when missing.
+    A profile rename keeps the directory inode, and atomic member saves (every jobs.json write
+    replaces the file, Prism 1ac2e940806c) do not touch it; two distinct stores always have
+    distinct cron dirs, even with hard-linked members (Prism fd3e5e76e488)."""
+    from cron import store_pair
+
+    try:
+        st = os.lstat(hermes_root.joinpath(*home, store_pair.CRON_DIR))
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[str, ...]],
-                    out_path: Path, on_error) -> int:
+                    out_path: Path, on_error, captured: Optional[dict] = None) -> int:
     """Capture each store's pair under its cron lock (``cron.store_pair.capture``) beside the
     output zip and archive both halves; return bytes archived. A refused capture is ONE error for
-    the whole pair: neither half is archived alone."""
+    the whole pair: neither half is archived alone. *captured*, when given, maps the
+    :func:`_store_identity` (cron directory) of every store archived in full to the home it was
+    archived from. A store is skipped only when its identity matches a captured store AND that
+    store's original home no longer holds it, i.e. the same store moved (Prism dafc6732ca54:
+    seen again under a renamed profile). A store still at its first path is a different store
+    and is archived (Prism fd3e5e76e488)."""
     from cron import store_pair
 
     total = 0
     for home in homes:
         rel_cron = Path(*home, store_pair.CRON_DIR)
+        idents = _store_identity(hermes_root, home) if captured is not None else None
+        first = captured.get(idents) if captured is not None and idents else None
+        if first is not None and first != home \
+                and _store_identity(hermes_root, first) != idents:
+            logger.info("backup: skipping cron store %s, already archived as %s (renamed during "
+                        "the backup)", rel_cron, Path(*first, store_pair.CRON_DIR))
+            continue
         with tempfile.TemporaryDirectory(prefix=".cron-pair-", dir=str(out_path.parent)) as tmp:
             try:
                 names = store_pair.capture(hermes_root.joinpath(*home), Path(tmp))
@@ -1847,6 +1884,9 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
             for name in names:
                 try:
                     _write_zip_file(zf, Path(tmp) / name, str(rel_cron / name))
+                    # Prism 7edcf5c778ea: counted the moment it is IN the zip, so a failure after
+                    # this point (the size stat) aborts instead of skipping a half-written pair.
+                    archived += 1
                     total += (Path(tmp) / name).stat().st_size
                 except (OSError, ValueError) as exc:
                     if archived:
@@ -1856,7 +1896,8 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
                         ) from exc
                     on_error(rel_cron / name, exc)
                     break
-                archived += 1
+            if captured is not None and names and archived == len(names) and idents:
+                captured.setdefault(idents, home)
     return total
 
 
@@ -2270,6 +2311,15 @@ def list_quick_snapshots(
     return results
 
 
+def _contained(path: Path, root: Path) -> bool:
+    """True when *path* resolves (links followed) inside *root*."""
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def _snapshot_cron_db_failed(meta: Any) -> bool:
     """True when the snapshot's runtime db was present but NOT captured (failed or skipped), as
     opposed to a json-only snapshot taken before #2287 (Prism 72fe227c70de)."""
@@ -2324,6 +2374,13 @@ def restore_quick_snapshot(
         # carries the runtime it was taken with, adopted on the next load.
         from cron import store_pair
         try:
+            # Same containment as the per-file restore below, for BOTH members on both sides,
+            # before the pair lock is taken (Prism dd8a638040cd); store_pair.restore then refuses
+            # any link in the live store or the source.
+            for member in (_CRON_JOBS_REL, _CRON_RUNTIME_REL):
+                if not (_contained(snap_dir / member, snap_dir)
+                        and _contained(home / member, home)):
+                    raise store_pair.PairRefused(f"{member}: path traversal blocked")
             restored += len(store_pair.restore(snap_dir / store_pair.CRON_DIR, home,
                                                db_failed=_snapshot_cron_db_failed(meta)))
         except (store_pair.PairRefused, OSError, RuntimeError) as exc:
@@ -2583,27 +2640,30 @@ def restore_cron_prompt_fields_if_degraded(
             snap_by_id[str(job.get("id", ""))] = job
 
     restored_ids: list[str] = []
-    live_jobs = _cron_jobs_list(live_doc)
-    for job in live_jobs:
-        if not isinstance(job, dict):
-            continue
-        snap_job = snap_by_id.get(str(job.get("id", "")))
-        if snap_job is None:
-            continue
-        if not _prompt_degraded(job):
-            continue
-        snap_prompt = snap_job.get("prompt")
-        if not isinstance(snap_prompt, str) or not snap_prompt.strip():
-            continue
-        job["prompt"] = snap_prompt
-        restored_ids.append(str(job.get("id", "")))
 
-    if not restored_ids:
-        return None
+    def _restore_prompts(live_jobs: list) -> bool:
+        # Runs under the store lock on the jobs loaded there (Prism 643fd504e41a): the unlocked
+        # read above only decides whether there is anything to do.
+        restored_ids.clear()
+        for job in live_jobs:
+            if not isinstance(job, dict):
+                continue
+            snap_job = snap_by_id.get(str(job.get("id", "")))
+            if snap_job is None:
+                continue
+            if not _prompt_degraded(job):
+                continue
+            snap_prompt = snap_job.get("prompt")
+            if not isinstance(snap_prompt, str) or not snap_prompt.strip():
+                continue
+            job["prompt"] = snap_prompt
+            restored_ids.append(str(job.get("id", "")))
+        return bool(restored_ids)
 
     try:
         from cron import store_pair
-        store_pair.publish_definitions(home, live_doc)
+        if not store_pair.publish_definitions(home, _restore_prompts):
+            return None
     except (OSError, ValueError, RuntimeError) as exc:
         logger.error(
             "Cron job prompts were degraded during update but auto-restore "
