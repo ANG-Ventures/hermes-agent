@@ -25,7 +25,8 @@ def test_del_skips_close_while_finalizing():
 
 
 def _lost_generation_writer(calls, pins, *, lost=True, pinned=False):
-    """A writable handle on a runtime without setconfig (< 3.12): the open-time retain is bound."""
+    """A writable handle whose retain was bound at open (< 3.12). The stand-in connection has no
+    setconfig, so the pin path runs on any runtime."""
     db = _orphan_handle(calls)
     db.__dict__.update(read_only=False, _db_wal_generation_lost=lost, _connection_pinned=pinned,
                        _retire_connection=pins.append, _ckpt_conn=None)
@@ -37,7 +38,7 @@ def test_del_pins_a_lost_generation_while_finalizing():
     calls, pins = [], []
     db = _lost_generation_writer(calls, pins)
     conn = db.__dict__["_conn"]
-    db.__del__(_finalizing=lambda: True, _no_ckpt_on_close=None)
+    db.__del__(_finalizing=lambda: True)
     assert pins == [conn] and pins[0] is conn
     assert db.__dict__["_connection_pinned"] is True
     assert calls == []
@@ -47,7 +48,7 @@ def test_del_pins_a_lost_generation_while_finalizing():
 def test_del_does_not_pin_without_a_recorded_loss_while_finalizing():
     calls, pins = [], []
     db = _lost_generation_writer(calls, pins, lost=False)
-    db.__del__(_finalizing=lambda: True, _no_ckpt_on_close=None)
+    db.__del__(_finalizing=lambda: True)
     assert pins == [] and calls == []
     db.__dict__["_conn"] = None
 
@@ -55,7 +56,7 @@ def test_del_does_not_pin_without_a_recorded_loss_while_finalizing():
 def test_del_does_not_pin_twice_while_finalizing():
     calls, pins = [], []
     db = _lost_generation_writer(calls, pins, pinned=True)
-    db.__del__(_finalizing=lambda: True, _no_ckpt_on_close=None)
+    db.__del__(_finalizing=lambda: True)
     assert pins == [] and calls == []
     db.__dict__["_conn"] = None
 
