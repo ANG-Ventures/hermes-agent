@@ -536,3 +536,325 @@ def test_zip_never_publishes_a_half_pair(home, tmp_path, monkeypatch, leg):
     else:
         assert backup._write_full_zip_backup(zpath, home) is None
     assert [p.name for p in out.iterdir() if p.suffix == ".zip"] == []
+
+
+# --- Prism post-merge review of #2331 @739fe4e9 (t_9d1a7eb0) -----------------------------------
+
+def test_interrupted_publish_rolls_back_both_halves(home, monkeypatch):
+    """Prism 21c9d75bea4a: an interrupt after ``_publish_jobs_json`` replaced jobs.json but before
+    ``_publish_jobs`` returned rolled back only the db, leaving the snapshot's definitions paired
+    with the live rows."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    jid = _job(cj, "snap", 3)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    cj.update_job(jid, {"name": "live"})
+    _job(cj, "live-only", 1)
+    for _ in range(4):
+        cj.mark_job_run(jid, True)
+    before_json = (home / "cron" / "jobs.json").read_bytes()
+    before_rows = _rows(home / "cron")
+    real, fired = cj._record_load_stamp, []
+
+    def interrupt(stamp):
+        if not fired:
+            fired.append(1)
+            raise KeyboardInterrupt
+        return real(stamp)
+
+    monkeypatch.setattr(cj, "_record_load_stamp", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        backup.restore_quick_snapshot(snap, hermes_home=home)
+    assert fired
+    assert (home / "cron" / "jobs.json").read_bytes() == before_json
+    assert _rows(home / "cron") == before_rows
+    monkeypatch.setattr(cj, "_record_load_stamp", real)
+    assert cj.get_job(jid)["name"] == "live"
+    assert cj.get_job(jid)["repeat"]["completed"] == 7
+
+
+def test_backup_rescan_archives_the_pair_of_a_renamed_profile(home, tmp_path, monkeypatch):
+    """Prism 3c9a7b0dc534: the rename-recovery rescan dropped the cron homes it found, so a profile
+    renamed during the backup lost its jobs.json + runtime_state.db from the archive."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    pa = home / "profiles" / "a"
+    (pa / "cron").mkdir(parents=True)
+    (pa / "config.yaml").write_text("model: x\n")
+    with cj.use_cron_store(pa):
+        _job(cj, "pj", 2)
+    real, renamed = backup._write_zip_entries, []
+
+    def write_entries(zf, files, *a, **kw):
+        if not renamed:
+            renamed.append(1)
+            (home / "profiles" / "a").rename(home / "profiles" / "b")
+        return real(zf, files, *a, **kw)
+
+    monkeypatch.setattr(backup, "_write_zip_entries", write_entries)
+    zpath = tmp_path / "out" / "b.zip"
+    zpath.parent.mkdir()
+    backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    assert "profiles/b/config.yaml" in names
+    assert {"profiles/b/cron/jobs.json", "profiles/b/cron/runtime_state.db"} <= names, names
+
+
+def test_backup_rescan_does_not_archive_an_already_captured_store_twice(home, tmp_path, monkeypatch):
+    """Prism dafc6732ca54: the rescan deduped homes by path only, so a profile renamed AFTER its
+    pair was archived was archived again at the new path; import then ran the same schedules in
+    two stores. An unrelated vanished file is what triggers the rescan."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    pa = home / "profiles" / "a"
+    (pa / "cron").mkdir(parents=True)
+    (pa / "config.yaml").write_text("model: x\n")
+    with cj.use_cron_store(pa):
+        _job(cj, "pj", 2)
+    tmpfile = home / "skills" / "temporary.md"
+    tmpfile.parent.mkdir(parents=True, exist_ok=True)
+    tmpfile.write_text("gone soon\n")
+    real_entries, real_pairs, calls = backup._write_zip_entries, backup._zip_cron_pairs, []
+
+    def write_entries(zf, files, *a, **kw):
+        tmpfile.unlink(missing_ok=True)  # vanishes before the first pass writes it
+        return real_entries(zf, files, *a, **kw)
+
+    def zip_pairs(*a, **kw):
+        out = real_pairs(*a, **kw)
+        if not calls:  # pass 1 archived profiles/a's pair; now the profile is renamed
+            pa.rename(home / "profiles" / "b")
+        calls.append(1)
+        return out
+
+    monkeypatch.setattr(backup, "_write_zip_entries", write_entries)
+    monkeypatch.setattr(backup, "_zip_cron_pairs", zip_pairs)
+    zpath = tmp_path / "out" / "b.zip"
+    zpath.parent.mkdir()
+    backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+    assert len(calls) == 2, "the rescan did not run"
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    profile_pairs = sorted(n for n in names if n.startswith("profiles/") and n.endswith("cron/jobs.json"))
+    assert profile_pairs == ["profiles/a/cron/jobs.json"], names
+
+
+def test_backup_rescan_skips_a_renamed_json_mode_store_edited_after_pass_1(home, tmp_path, monkeypatch):
+    """Prism 1ac2e940806c: in JSON-only mode (HERMES_CRON_RUNTIME_STATE=json) the only member
+    identity was jobs.json's inode, and every job save atomically REPLACES jobs.json. An edit after
+    pass 1 plus a rename made the rescan miss the match and archive the same schedules twice. A
+    store is identified by its cron DIRECTORY, which neither the rename nor the save replaces."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    pa = home / "profiles" / "a"
+    (pa / "cron").mkdir(parents=True)
+    (pa / "config.yaml").write_text("model: x\n")
+    with cj.use_cron_store(pa):
+        jid = _job(cj, "pj", 1)
+    assert not (pa / "cron" / "runtime_state.db").exists()
+    tmpfile = home / "skills" / "temporary.md"
+    tmpfile.parent.mkdir(parents=True, exist_ok=True)
+    tmpfile.write_text("gone soon\n")
+    real_entries, real_pairs, calls = backup._write_zip_entries, backup._zip_cron_pairs, []
+
+    def write_entries(zf, files, *a, **kw):
+        tmpfile.unlink(missing_ok=True)  # vanishes before the first pass writes it
+        return real_entries(zf, files, *a, **kw)
+
+    def zip_pairs(*a, **kw):
+        out = real_pairs(*a, **kw)
+        if not calls:  # pass 1 archived profiles/a; a job save replaces jobs.json, then a rename
+            ino = (pa / "cron" / "jobs.json").stat().st_ino
+            with cj.use_cron_store(pa):
+                cj.update_job(jid, {"name": "pj-edited"})
+            assert (pa / "cron" / "jobs.json").stat().st_ino != ino, "save did not replace jobs.json"
+            pa.rename(home / "profiles" / "b")
+        calls.append(1)
+        return out
+
+    monkeypatch.setattr(backup, "_write_zip_entries", write_entries)
+    monkeypatch.setattr(backup, "_zip_cron_pairs", zip_pairs)
+    zpath = tmp_path / "out" / "b.zip"
+    zpath.parent.mkdir()
+    backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+    assert len(calls) == 2, "the rescan did not run"
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    profile_pairs = sorted(n for n in names if n.startswith("profiles/") and n.endswith("cron/jobs.json"))
+    assert profile_pairs == ["profiles/a/cron/jobs.json"], names
+
+
+@pytest.mark.parametrize("linked", [("jobs.json",), ("jobs.json", "runtime_state.db")])
+def test_zip_pairs_archives_two_stores_sharing_a_hard_linked_jobs_json(home, tmp_path, linked):
+    """Prism fd3e5e76e488: the rename skip matched ONE shared member identity, so a second store
+    whose jobs.json is hard-linked to the first's (distinct runtime_state.db) was dropped from the
+    backup in the first pass, with both stores still in place and no error. Even when both members
+    are linked, the first store has not moved, so the second path is archived too."""
+    import os
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    for name in ("a", "b"):
+        (home / name / "cron").mkdir(parents=True)
+        with cj.use_cron_store(home / name):
+            _job(cj, f"j{name}", 1)
+    for member in linked:
+        (home / "b" / "cron" / member).unlink()
+        os.link(home / "a" / "cron" / member, home / "b" / "cron" / member)
+    errors, out = [], tmp_path / "out"
+    out.mkdir()
+    with zipfile.ZipFile(out / "p.zip", "w") as zf:
+        backup._zip_cron_pairs(zf, home, [("a",), ("b",)], out / "p.zip",
+                               lambda rel, exc: errors.append((rel, exc)), {})
+        names = set(zf.namelist())
+    assert not errors, errors
+    assert {"a/cron/jobs.json", "a/cron/runtime_state.db",
+            "b/cron/jobs.json", "b/cron/runtime_state.db"} <= names, names
+
+
+def _other_store(tmp_path):
+    """A populated cron store OUTSIDE the home under test: (cron dir, jobs bytes, rows)."""
+    from cron import jobs as cj
+
+    other = tmp_path / "other-home"
+    (other / "cron").mkdir(parents=True)
+    with cj.use_cron_store(other):
+        _job(cj, "outside", 5)
+    return other / "cron", (other / "cron" / "jobs.json").read_bytes(), _rows(other / "cron")
+
+
+def test_import_refuses_a_live_runtime_db_linked_outside_the_home(home, tmp_path, monkeypatch):
+    """Prism 4c71a06241bb: a JSON-only archive passed the containment check (only the members in
+    the archive were checked) and the json-only branch cleared the rows of the db the live
+    runtime_state.db symlink pointed at, in another home."""
+    import hermes_cli.gateway as gw
+    from hermes_cli.backup import run_import
+
+    monkeypatch.setattr(gw, "ensure_gateway_service", lambda **kw: True)
+    monkeypatch.setattr(gw, "_is_service_running", lambda: True)
+    ocron, ojson, orows = _other_store(tmp_path)
+    assert orows
+    for p in (home / "cron").glob("runtime_state.db*"):
+        p.unlink()
+    (home / "cron" / "runtime_state.db").symlink_to(ocron / "runtime_state.db")
+    _archive(tmp_path / "b.zip", {"config.yaml": "model: x\n",
+                                  "cron/jobs.json": json.dumps({"jobs": [{"id": "j", "name": "n"}]})})
+    rc = run_import(Namespace(zipfile=str(tmp_path / "b.zip"), force=True))
+    assert rc == 1
+    assert _rows(ocron) == orows
+    assert (ocron / "jobs.json").read_bytes() == ojson
+
+
+@pytest.mark.parametrize("leg", ["restore", "auto_restore"])
+@pytest.mark.parametrize("link", ["live_cron_dir", "live_db", "snapshot_member"])
+def test_snapshot_pair_restore_never_writes_through_a_link(home, tmp_path, leg, link):
+    """Prism dd8a638040cd / 4c71a06241bb: the quick-snapshot pair branch ran before the per-file
+    containment checks, so a live ``cron/`` (or member) symlinked outside the home was written
+    through, and a snapshot member linked outside the snapshot was read."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    a, b = _job(cj, "a", 2), _job(cj, "b", 3)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    sdir = backup._quick_snapshot_root(home) / snap
+    ocron, ojson, orows = _other_store(tmp_path)
+    if leg == "auto_restore":
+        cj.remove_job(b)
+    if link == "live_cron_dir":
+        (home / "cron").rename(home / "cron-real")
+        (home / "cron").symlink_to(ocron)
+    elif link == "live_db":
+        for p in (home / "cron").glob("runtime_state.db*"):
+            p.unlink()
+        (home / "cron" / "runtime_state.db").symlink_to(ocron / "runtime_state.db")
+    else:
+        (sdir / "cron" / "runtime_state.db").unlink()
+        (sdir / "cron" / "runtime_state.db").symlink_to(ocron / "runtime_state.db")
+    live_json = (home / "cron" / "jobs.json").read_bytes()
+
+    if leg == "restore":
+        backup.restore_quick_snapshot(snap, hermes_home=home)
+    else:
+        if link == "live_cron_dir":
+            # the live count is read through the link; make it lower than the snapshot's
+            (ocron / "jobs.json").write_bytes(json.dumps({"jobs": []}).encode())
+            ojson = (ocron / "jobs.json").read_bytes()
+        assert backup.restore_cron_jobs_if_emptied(snap, hermes_home=home) is None
+    assert (ocron / "jobs.json").read_bytes() == ojson
+    assert _rows(ocron) == orows
+    if link != "live_cron_dir":
+        assert (home / "cron" / "jobs.json").read_bytes() == live_json  # nothing half-restored
+
+
+@pytest.mark.parametrize("leg", ["hermes_backup", "automatic_full_backup"])
+def test_zip_stat_failure_after_a_written_member_aborts(home, tmp_path, monkeypatch, leg):
+    """Prism 7edcf5c778ea: the member count was bumped only after the size stat(), so a stat
+    failure after jobs.json was already WRITTEN into the zip took the first-member path (skip the
+    pair as one error) and published an archive holding jobs.json without its db."""
+    import pathlib
+
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    _job(cj, "a", 2)
+    real_write, real_stat, written = backup._write_zip_file, pathlib.Path.stat, []
+
+    def write_zip_file(zf, path, arcname):
+        real_write(zf, path, arcname)
+        if Path(arcname).parent.name == "cron" and Path(arcname).name in ("jobs.json",
+                                                                         "runtime_state.db"):
+            written.append(Path(path))
+
+    def stat(self, *a, **kw):
+        if written and self == written[0]:
+            raise OSError("simulated stat failure")
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(backup, "_write_zip_file", write_zip_file)
+    monkeypatch.setattr(pathlib.Path, "stat", stat)
+    out = tmp_path / "out"
+    out.mkdir()
+    zpath = out / "b.zip"
+    if leg == "hermes_backup":
+        with pytest.raises(SystemExit) as ei:
+            backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+        assert ei.value.code == 1
+    else:
+        assert backup._write_full_zip_backup(zpath, home) is None
+    assert written
+    assert [p.name for p in out.iterdir() if p.suffix == ".zip"] == []
+
+
+def test_prompt_restore_keeps_a_job_created_before_the_publish(home):
+    """Prism 643fd504e41a: restore_cron_prompt_fields_if_degraded read the live jobs.json outside
+    the store lock and published that stale document, dropping a job created in between."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    jid = _job(cj, "brief", 1)
+    snap = backup.create_quick_snapshot(hermes_home=home)
+    cj.update_job(jid, {"prompt": "brief"})  # degraded: prompt collapsed to the name
+    real, created = backup._load_cron_jobs_doc, []
+
+    def load(path):
+        doc = real(path)
+        if not created and backup._quick_snapshot_root(home) in Path(path).parents:
+            created.append(_job(cj, "late", 1))  # a sibling create between read and write
+        return doc
+
+    backup._load_cron_jobs_doc = load
+    try:
+        result = backup.restore_cron_prompt_fields_if_degraded(snap, hermes_home=home)
+    finally:
+        backup._load_cron_jobs_doc = real
+    assert created and result and result["prompts"] == 1
+    assert cj.get_job(jid)["prompt"] == "p"
+    assert cj.get_job(created[0]) is not None
+    on_disk = {j["id"] for j in json.loads((home / "cron" / "jobs.json").read_text())["jobs"]}
+    assert created[0] in on_disk

@@ -2588,12 +2588,26 @@ def _read_one_row(job_id: Any) -> Optional[Dict[str, Any]]:
 
 
 class _SingleJobScope:
-    """Marks a ``_with_job`` fast-path list so ``save_jobs`` records the save instead of writing."""
+    """Marks a ``_with_job`` fast-path list so ``save_jobs`` records the save instead of writing.
+    ``after_save`` holds journal appends made inside *fn*: they run only once the deferred save has
+    actually persisted (Prism 4d551ee5b115), never for a write that then refused or raised."""
 
     def __init__(self, jobs: List[Dict[str, Any]]):
         self.jobs = jobs
         self.saved = False
         self.removed: Optional[Collection[str]] = None
+        self.after_save: List[Callable[[], None]] = []
+
+
+def _after_store_write(call: Callable[[], None]) -> None:
+    """Run a journal append after the store write it describes has landed. Inside a ``_with_job``
+    fast-path callback the ``save_jobs`` there only marks the scope, so the append waits for the
+    scope's real persist; everywhere else the write already happened and it runs now."""
+    scope = getattr(_jobs_lock_state, "single_job_scope", None)
+    if scope is not None:
+        scope.after_save.append(call)
+    else:
+        call()
 
 
 def _folded_runtime_rows() -> Dict[str, Dict[str, Any]]:
@@ -2644,6 +2658,7 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
         with _shallow_baseline():
             full = [j for j in load_jobs() if str(j.get("id")) != str(job_id)] + list(jobs)
             save_jobs(full, removed_ids=scope.removed)
+        _flush_after_save(scope)
         return result
     new_def, new_runtime = _rs.split_job(jobs[0])
     if new_def != original_def:
@@ -2657,6 +2672,7 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
                     # own change. A new record: the loaded one is never edited in place.
                     full[i] = _reconcile_job_fields(jobs[0], existing, original_job)
             save_jobs(full)
+        _flush_after_save(scope)
         return result
     with _runtime_txn() as conn:
         disk = _rs.read_row(conn, str(job_id))
@@ -2672,10 +2688,17 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
         merged = _reconcile_job_fields(new_runtime, disk, base_runtime) if disk != base_runtime \
             else new_runtime
         _rs.upsert_rows(conn, {str(job_id): merged})
+    _flush_after_save(scope)
     return result
 
 
 _MISSING_FAST = object()
+
+
+def _flush_after_save(scope: _SingleJobScope) -> None:
+    """The scope's deferred save has persisted: append the journal records it describes."""
+    for call in scope.after_save:
+        call()
 
 
 def _fast_job_view(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -3406,13 +3429,17 @@ def _journal_toggled(before: Any, job: Dict[str, Any], reason: Optional[str] = N
     after = bool(job.get("enabled", True))
     if before is not None and bool(before) == after:
         return
-    try:
-        from cron.lifecycle_journal import record_toggled
+    job_id, name, why = str(job.get("id") or ""), job.get("name"), reason or job.get("paused_reason")
 
-        record_toggled(str(job.get("id") or ""), after, name=job.get("name"),
-                       reason=reason or job.get("paused_reason"))
-    except Exception:
-        logger.debug("cron lifecycle journal (toggle) unavailable", exc_info=True)
+    def append() -> None:
+        try:
+            from cron.lifecycle_journal import record_toggled
+
+            record_toggled(job_id, after, name=name, reason=why)
+        except Exception:
+            logger.debug("cron lifecycle journal (toggle) unavailable", exc_info=True)
+
+    _after_store_write(append)
 
 
 # Keys an edit journal record never carries: scheduler runtime (cron/runtime_state.py) and the toggle state the
@@ -3424,18 +3451,29 @@ def _journal_updated(before: Dict[str, Any], after: Dict[str, Any]) -> None:
     """Journal an API edit of a row's definition (t_71499bfa): one ``edits.jsonl`` record naming every
     changed key with its ``from``/``to``. Call INSIDE the jobs lock, after the save landed. Never raises."""
     try:
-        fields = {
+        # Membership as well as value (Prism fc51eed19617): adding or dropping a null-valued key is an
+        # edit too. Snapshot now: the record must name the write, not a later mutation of the dicts.
+        fields = copy.deepcopy({
             k: {"from": before.get(k), "to": after.get(k)}
             for k in sorted(set(before) | set(after))
-            if k not in _EDIT_JOURNAL_SKIP and before.get(k) != after.get(k)
-        }
+            if k not in _EDIT_JOURNAL_SKIP and ((k in before) != (k in after) or before.get(k) != after.get(k))
+        })
         if not fields:
             return
-        from cron.lifecycle_journal import record_updated
-
-        record_updated(str(after.get("id") or ""), fields, name=after.get("name"))
+        job_id, name = str(after.get("id") or ""), after.get("name")
     except Exception:
         logger.debug("cron lifecycle journal (update) unavailable", exc_info=True)
+        return
+
+    def append() -> None:
+        try:
+            from cron.lifecycle_journal import record_updated
+
+            record_updated(job_id, fields, name=name)
+        except Exception:
+            logger.debug("cron lifecycle journal (update) unavailable", exc_info=True)
+
+    _after_store_write(append)
 
 
 def _journal_removed(removed_ids: Optional[Collection[str]],

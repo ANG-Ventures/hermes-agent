@@ -20,7 +20,7 @@ copy/move/rename/open-for-write of either half outside this module and the store
                              db with an empty one: the restored file's runtime is adopted on the
                              next load, never mixed with the live rows.
   restore_members(...)       same, from archive members (``hermes import``).
-  publish_definitions(...)   a definition-only rewrite of the live jobs.json, under the lock.
+  publish_definitions(...)   a definition-only edit of the live jobs (read+edit+save, one lock).
   scrub(staged_root)         export/import rule for a STAGED tree: fold every cron db into its
                              jobs.json, then drop every ``runtime_state.db*`` (binary,
                              unscrubbable, or a foreign image); refuses when a fold cannot place
@@ -48,6 +48,8 @@ DB_NAME = _rs.DB_NAME
 CRON_DIR = "cron"
 JOBS_REL = f"{CRON_DIR}/{JOBS_NAME}"
 DB_REL = f"{CRON_DIR}/{DB_NAME}"
+PAIR_NAMES = (JOBS_NAME, DB_NAME)
+_DB_SIDECARS = ("-wal", "-shm", "-journal")
 # Keys of a jobs.json payload that describe a specific database (pending generation id, mirror
 # seq/epoch). A json-only restore drops them: the database they describe is not restored with it.
 _DB_BOUND_KEYS = ("runtime_gen", _rs.MIRROR_SEQ_KEY, _rs.MIRROR_EPOCH_KEY)
@@ -205,17 +207,61 @@ def capture_definitions(home: Path, dest: Path) -> bool:
     return True
 
 
-def _regular_member(path: Path) -> bool:
+def _regular_member(path: Path, verb: str = "capture") -> bool:
     """True for a regular, non-symlink file; False when absent; ``PairRefused`` for anything
-    else (a symlink, a directory, a device): the pair is never captured through a link."""
+    else (a symlink, a directory, a device): the pair is never handled through a link."""
     try:
         st = os.lstat(path)
     except FileNotFoundError:
         return False
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         raise PairRefused(f"{path} is not a regular file (symlink or special file); refusing to "
-                          "capture the cron store pair through it (nothing captured)")
+                          f"{verb} the cron store pair through it (nothing {verb}d)")
     return True
+
+
+def _refuse_linked_live_store(home: Path) -> None:
+    """``PairRefused`` unless *home*'s live ``cron/`` (when present) is a real directory inside
+    *home* and every live pair member (db sidecars included) is absent or a regular file: a
+    restore never writes, nor clears rows, through a link into another store."""
+    live = Path(home) / CRON_DIR
+    try:
+        st = os.lstat(live)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise PairRefused(f"{live} is not a real directory (symlink or special file); refusing "
+                          "to restore the cron store pair through it (nothing restored)")
+    try:
+        live.resolve().relative_to(Path(home).resolve())
+    except ValueError:
+        raise PairRefused(f"{live} resolves outside {home}; refusing to restore the cron store "
+                          "pair (nothing restored)") from None
+    for name in PAIR_NAMES + tuple(f"{DB_NAME}{s}" for s in _DB_SIDECARS):
+        _regular_member(live / name, "restore")
+
+
+def _roll_back(cj, jobs_file: Path, old_jobs: Optional[bytes], db_file: Path,
+               db_copy: Optional[Path], *, created_db: bool) -> None:
+    """Put BOTH halves back after a restore failed or was interrupted part-way (Prism
+    21c9d75bea4a): the db from its copy (or remove the db this attempt created), then jobs.json
+    to its previous bytes (or remove it when there was none). Best effort, every step tried."""
+    if db_copy is not None:
+        with contextlib.suppress(Exception):
+            _restore_db(db_copy, db_file)
+    elif created_db:
+        _unlink_created_db(db_file)
+    try:
+        current = jobs_file.read_bytes() if _regular_member(jobs_file, "restore") else None
+    except (OSError, PairRefused):
+        return
+    if current == old_jobs:
+        return
+    with contextlib.suppress(Exception):
+        if old_jobs is None:
+            jobs_file.unlink()
+        else:
+            _publish_jobs(cj, jobs_file, old_jobs)
 
 
 def _discard(dest: Path) -> None:
@@ -250,52 +296,57 @@ def restore(src: Path, home: Path, *, db_failed: bool = False) -> List[str]:
 
     src, home = Path(src), Path(home)
     jobs_src, db_src = src / JOBS_NAME, src / DB_NAME
-    if not jobs_src.is_file():
+    # Links (Prism 4c71a06241bb / dd8a638040cd): the pair is never read from, nor written
+    # through, a symlink, on either side, checked before the lock is taken or anything written.
+    _refuse_linked_live_store(home)
+    if not _regular_member(jobs_src, "restore"):
         raise PairRefused(f"{src} has no {JOBS_NAME}; refusing to restore runtime rows without "
                           "definitions (nothing restored)")
     raw = jobs_src.read_bytes()
     data = _parse_payload(raw, str(jobs_src))
-    has_db = db_src.is_file()
+    has_db = _regular_member(db_src, "restore")
     if not has_db:
         if isinstance(data, dict) and any(k in data for k in _DB_BOUND_KEYS):
             data = {k: v for k, v in data.items() if k not in _DB_BOUND_KEYS}
             raw = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
     live = home / CRON_DIR
     with lock(home), cj.use_cron_store(home):
+        _refuse_linked_live_store(home)  # again under the lock: nothing swapped in meanwhile
         live.mkdir(parents=True, exist_ok=True)
         jobs_file, db_file = live / JOBS_NAME, live / DB_NAME
-        with tempfile.TemporaryDirectory(prefix="hermes-cron-pair-") as tmp:
-            rollback = Path(tmp) / DB_NAME
-            had_db = db_file.exists()
-            touches_db = has_db or (had_db and not db_failed)
-            if had_db and touches_db and not _copy_db(db_file, rollback):
-                raise PairRefused(f"could not copy the live {db_file} aside before the restore; "
-                                  "nothing restored")
-            if has_db:
-                restored_db = (_restore_db(db_src, db_file) if had_db
-                               else _copy_db(db_src, db_file))
-                if not restored_db:
-                    if not had_db:
-                        _unlink_created_db(db_file)
-                    raise PairRefused(f"{db_src} failed its integrity check or could not be "
-                                      "restored; live store unchanged")
-            elif touches_db:
-                with cj._runtime_txn() as conn:
-                    conn.execute("DELETE FROM job_runtime")
-                    conn.execute("DELETE FROM pending_runtime")
-                    conn.execute("DELETE FROM mirror_state")
-            try:
-                _publish_jobs(cj, jobs_file, raw)
-            except BaseException:
-                if had_db and touches_db:
-                    _restore_db(rollback, db_file)
-                elif has_db:
-                    _unlink_created_db(db_file)
-                raise
-            if has_db:
-                cj._secure_runtime_db()
-        with cj._defs_cache_lock:
-            cj._defs_cache.clear()
+        try:
+            with tempfile.TemporaryDirectory(prefix="hermes-cron-pair-") as tmp:
+                rollback = Path(tmp) / DB_NAME
+                had_db = db_file.exists()
+                touches_db = has_db or (had_db and not db_failed)
+                if had_db and touches_db and not _copy_db(db_file, rollback):
+                    raise PairRefused(f"could not copy the live {db_file} aside before the "
+                                      "restore; nothing restored")
+                # Prism 21c9d75bea4a: BOTH halves are set aside before either is touched, and an
+                # interrupt anywhere after the first write puts BOTH back, never the db alone.
+                old_jobs = jobs_file.read_bytes() if _regular_member(jobs_file, "restore") else None
+                try:
+                    if has_db:
+                        restored_db = (_restore_db(db_src, db_file) if had_db
+                                       else _copy_db(db_src, db_file))
+                        if not restored_db:
+                            raise PairRefused(f"{db_src} failed its integrity check or could not "
+                                              "be restored; live store unchanged")
+                    elif touches_db:
+                        with cj._runtime_txn() as conn:
+                            conn.execute("DELETE FROM job_runtime")
+                            conn.execute("DELETE FROM pending_runtime")
+                            conn.execute("DELETE FROM mirror_state")
+                    _publish_jobs(cj, jobs_file, raw)
+                except BaseException:
+                    _roll_back(cj, jobs_file, old_jobs, db_file, rollback if had_db and touches_db
+                               else None, created_db=has_db and not had_db)
+                    raise
+                if has_db:
+                    cj._secure_runtime_db()
+        finally:
+            with cj._defs_cache_lock:
+                cj._defs_cache.clear()
     logger.warning("cron store pair restored into %s from %s (%s)", live, src,
                    "jobs.json + runtime_state.db" if has_db
                    else "jobs.json only; live rows kept (snapshot db capture failed)" if db_failed
@@ -365,18 +416,23 @@ def scrub(staged_root: Path, *, what: str = "export") -> None:
 
 # --- other legs ---------------------------------------------------------------------------
 
-def publish_definitions(home: Path, doc: object) -> None:
-    """Rewrite *home*'s live jobs.json with *doc* (a definition-only repair, e.g. the post-update
-    prompt-field net) under the store lock, through the store's own jobs.json choke point. The
-    db is not touched: its rows stay authoritative for runtime (a row always wins)."""
+def publish_definitions(home: Path, edit: Callable[[List[dict]], bool]) -> bool:
+    """A definition-only repair of *home*'s live jobs (e.g. the post-update prompt-field net):
+    under the store lock, load the live jobs, let *edit* change them in place, and save through
+    ``save_jobs`` (its shrink-merge) when *edit* returns True. Read, edit and write are one lock
+    section (Prism 643fd504e41a): a job created or edited by a sibling is never dropped by a
+    document read before the lock. The db rows stay authoritative for runtime. Returns whether
+    anything was saved."""
     from cron import jobs as cj
 
-    raw = json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8") + b"\n"
-    _parse_payload(raw, "definitions")
     with lock(home), cj.use_cron_store(home):
-        _publish_jobs(cj, Path(home) / CRON_DIR / JOBS_NAME, raw)
+        jobs = cj.load_jobs()
+        if not edit(jobs):
+            return False
+        cj.save_jobs(jobs)
         with cj._defs_cache_lock:
             cj._defs_cache.clear()
+    return True
 
 
 def read_definitions(jobs_src: Path) -> List[dict]:
