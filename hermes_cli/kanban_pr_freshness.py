@@ -146,6 +146,18 @@ def _ci_report(gh: GhFn, repo: str, sha: str) -> str:
     return "; ".join(parts)
 
 
+def _no_post_ready_ci(gh: GhFn, repo: str, sha: str) -> bool:
+    """True when ``sha`` has check-runs and every one concluded ``skipped`` (the draft-time shape).
+
+    Unreadable -> False: the normal CI report path already refuses or reports it."""
+    runs = gh(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")
+    items = (runs or {}).get("check_runs")
+    if not isinstance(items, list) or not items:
+        return False
+    return all(isinstance(r, dict) and r.get("status") == "completed"
+               and r.get("conclusion") == "skipped" for r in items)
+
+
 def _ci_green(gh: GhFn, repo: str, sha: str) -> bool:
     return _ci_report(gh, repo, sha) == ""
 
@@ -397,6 +409,13 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
                 entry["automerge"] = "not armed: flipped ready at handback, CI starts now"
         elif allow_arm and armable_keys is not None and key.lower() not in armable_keys:
             entry["automerge"] = "not armed: PR only mentioned, not this card's handoff PR"
+        elif (allow_arm and automerge_enabled() and _owns_draft(ref, pr, task_id)
+              and _no_post_ready_ci(gh, ref.repo, head)):
+            # Retry safety (Prism 982040536d15): a flip that persisted on GitHub before a later
+            # flip failed leaves no draft_flip marker on the retry. GitHub is the state: the
+            # worker's own PR whose head shows only draft-skipped check-runs has had no
+            # post-ready CI yet, so it is not armed until a real run appears.
+            entry["automerge"] = "not armed: own worker PR, no post-ready CI yet (only skipped runs)"
         elif allow_arm and automerge_enabled():
             ci = _ci_report(gh, ref.repo, head)
             if not ci:

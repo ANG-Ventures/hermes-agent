@@ -114,6 +114,52 @@ def test_mixed_own_and_foreign_draft_refuses_before_any_flip():
     assert ready == [] and sorted(exc.value.prs) == ["o/r#5", "o/r#6"]
 
 
+def _gh_two(drafts: dict, runs: list):
+    """PRs 5 and 6, both on this card's branch; ``drafts[n]`` is the draft flag, ``runs`` the head check-runs."""
+    def gh(*args):
+        path = args[-1]
+        if "/pulls/" in path:
+            n = path.rsplit("/", 1)[-1]
+            return {"draft": drafts[n], "head": {"sha": HEAD, "ref": "daedalus/t_c1ee61ae-x"},
+                    "base": {"ref": "main"}, "mergeable_state": "clean"}
+        if "/compare/" in path:
+            return {"behind_by": 0, "ahead_by": 1}
+        if path.endswith("check-runs?per_page=100"):
+            return {"check_runs": runs}
+        if path.endswith("/status"):
+            return {"state": "success", "total_count": 1}
+        return None
+    return gh
+
+
+SKIPPED = [{"status": "completed", "conclusion": "skipped"}]
+
+
+def test_retry_after_partial_flip_does_not_arm_already_flipped_pr():
+    """Prism 982040536d15: A flips (rc 0), B fails (rc 3) -> refused. On retry A is non-draft with
+    only draft-skipped runs and B flips: A must still not be armed."""
+    refs = op.extract_pr_refs(f"{PR_URL} https://github.com/o/r/pull/6")
+    rcs = {5: 0, 6: 3}
+    with pytest.raises(fr.DraftPrError) as exc:
+        fr.check(refs, task_id="t_c1ee61ae", allow_arm=True, gh=_gh_two({"5": True, "6": True}, SKIPPED),
+                 arm=lambda *a: None, ready=lambda r, n: rcs[n])
+    assert exc.value.prs == ["o/r#6"]
+    armed = []
+    rep = fr.check(refs, task_id="t_c1ee61ae", allow_arm=True, gh=_gh_two({"5": False, "6": True}, SKIPPED),
+                   arm=lambda *a: armed.append(a) or "log", ready=lambda r, n: 0)
+    assert armed == []
+    assert "no post-ready CI" in rep["prs"]["o/r#5"]["automerge"]
+    assert "flipped ready" in rep["prs"]["o/r#6"]["automerge"]
+
+
+def test_own_pr_with_post_ready_ci_is_armed():
+    armed = []
+    runs = SKIPPED + [{"status": "completed", "conclusion": "success"}]
+    rep = fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True,
+                   gh=_gh_two({"5": False}, runs), arm=lambda *a: armed.append(a) or "log")
+    assert len(armed) == 1 and "spawned" in rep["prs"]["o/r#5"]["automerge"]
+
+
 def test_default_ready_disabled_under_pytest():
     assert fr._default_ready() is None
 
