@@ -265,6 +265,97 @@ def _newer_coverage_gate(conn, task_id, comment_id, lib, authors, line_re, gate_
     return (f"comment {cid} is a newer operator review_coverage gate `{str(st.get('raw'))[:120]}` than {comment_id}")
 
 
+class ApproveStampRefused(ValueError):
+    """An operator APPROVE ``review_coverage`` stamp written by something other than THE writer."""
+
+
+# Single-writer contract for operator APPROVE stamps (t_f2eb71b3). The pre_tool_call hook
+# (hermes-home hooks/close_on_comment_policy.py, rule approve-stamp-writer) only sees agent tool
+# INPUT; on 2026-10-27 12:10 a stamp built with json.dumps inside a script file and posted through
+# the CLI (comment 153767 on t_e215d33f) never showed it a literal. This is the same rule at the
+# write itself, which the CLI verb, the kanban_comment tool and the dashboard all reach.
+APPROVE_WRITER_ENV = "OPERATOR_APPROVE_WRITER"
+APPROVE_STAMP_OFF = ("state", "approve-stamp-guard-off")   # the hook's marker, under the fleet root
+APPROVE_WRITER_CMD = ("python3 scripts/lib/operator_approve.py --card <c> --head <40hex> --pr <owner/repo#N> "
+                      "--by apollo/operator [--hold|--refresh]")
+
+
+def _approve_records(body: str):
+    """``review_coverage: {json}`` records in ``body``, in review_of_record.parse()'s line shape
+    (``splitlines`` + ``strip``, json after the first ``:``)."""
+    for line in str(body or "").splitlines():
+        s = line.strip()
+        if not s.startswith("review_coverage:"):
+            continue
+        try:
+            rec = json.loads(s.split(":", 1)[1].strip())
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            yield rec
+
+
+def _is_operator_author(author: str, ops: Optional[ModuleType]) -> bool:
+    """The posting identity is an operator: the kernel's operator labels, or the fleet's
+    ``operator_identity.is_human_operator`` when it loads. ``unverified:<name>`` is judged as ``<name>``
+    (the hook does the same with the session profile): an operator session whose ancestry the CLI could
+    not prove is still the operator writing a stamp by hand."""
+    from hermes_cli.kanban_identity import is_operator_label
+
+    a = str(author or "").strip().lower()
+    if a.startswith("unverified:"):
+        a = a.split(":", 1)[1].strip()
+    if not a:
+        return False
+    if is_operator_label(a):
+        return True
+    fn = getattr(ops, "is_human_operator", None)
+    if fn is not None:
+        try:
+            return bool(fn(a))
+        except Exception:  # noqa: BLE001 -- the kernel labels above already decided the common case
+            return False
+    return False
+
+
+def is_operator_approve_stamp(author: str, body: str) -> bool:
+    """True when ``author`` is an operator and ``body`` carries a ``review_coverage`` record whose verdict
+    review_of_record.is_approve reads as APPROVE/APPROVED. A comment review_of_record.parse() reads as a
+    prose send-back quoting records (``operator_identity.prose_overrides_records``) is not a stamp."""
+    if "review_coverage" not in str(body or ""):
+        return False
+    if not any(str(r.get("verdict", "")).strip().lower() in ("approve", "approved") for r in _approve_records(body)):
+        return False
+    ops = _load("operator_identity")
+    if not _is_operator_author(author, ops):
+        return False
+    overrides = getattr(ops, "prose_overrides_records", None)
+    if overrides is not None:
+        try:
+            if overrides(body):
+                return False
+        except Exception:  # noqa: BLE001 -- unreadable: treat as the record it carries
+            pass
+    return True
+
+
+def check_approve_stamp(author: str, body: str) -> None:
+    """Raise :class:`ApproveStampRefused` for an operator APPROVE stamp posted without the writer's
+    ``OPERATOR_APPROVE_WRITER=1``. Off-switch: ``<fleet root>/state/approve-stamp-guard-off``."""
+    if os.environ.get(APPROVE_WRITER_ENV) == "1":
+        return
+    if not is_operator_approve_stamp(author, body):
+        return
+    if os.path.exists(_fleet_root().joinpath(*APPROVE_STAMP_OFF)):
+        return
+    raise ApproveStampRefused(
+        "comment refused (approve-stamp-writer, t_f2eb71b3): an operator APPROVE review_coverage stamp "
+        f"is written only by the one writer, which also writes the release decision under the per-card lock: "
+        f"{APPROVE_WRITER_CMD}. A script that builds the record itself and calls `hermes kanban comment` "
+        "is refused here, at the write; nothing was posted."
+    )
+
+
 def refusal(author: str, body: str) -> Optional[str]:
     """:func:`check_comment` for writers that return ``(ok, reason)``: the message, or None."""
     try:
