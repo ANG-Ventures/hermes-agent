@@ -1315,5 +1315,118 @@
       "cli",
       "cron"
     ]
+  },
+  {
+    "feature": "cron claim heartbeats and fire_claim_fence ownership check run off _jobs_lock (sqlite mode)",
+    "tests": [
+      "tests/cron/test_claim_heartbeat_lock_free.py::test_heartbeats_and_fence_do_not_wait_on_jobs_lock",
+      "tests/cron/test_claim_heartbeat_lock_free.py::test_run_claim_heartbeat_does_not_wait_on_jobs_lock",
+      "tests/cron/test_claim_heartbeat_lock_free.py::test_json_mode_heartbeat_still_takes_the_locked_path",
+      "tests/cron/test_claim_heartbeat_lock_free.py::test_fence_revalidates_definition_after_unlocked_row_read"
+    ],
+    "paths": [
+      "cron/jobs.py"
+    ],
+    "why": "2026-10-26 Apollo gateway (pid 23958): after #2287 py-spy still showed 14-21 threads waiting on cron _jobs_lock (6x fire_claim_fence, 3x heartbeat_fire_claim per dump), stalling cron dispatch. Fixed by hermes-agent#2320 (merge 0a77dddc9c6c, 2026-10-26): heartbeat_fire_claim/heartbeat_run_claim -> _refresh_claim_unlocked (owner-guarded UPDATE in its own BEGIN IMMEDIATE), fire_claim_fence reads _fast_job_view, _cached_definition parses jobs.json once per stamp; json mode keeps the locked path. Upstream has no _refresh_claim_unlocked (0 hits in upstream/main cron/jobs.py) and no runtime_state.db (#2287): PR shape is a re-author on top of an upstream port of #2287; repro = hold _jobs_lock and assert a heartbeat completes.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron",
+      "gateway"
+    ]
+  },
+  {
+    "feature": "gateway GoalManager/LoopManager construction and get_meta never run on the event loop (executor hops in async defs)",
+    "tests": [
+      "tests/gateway/test_goal_loop_state_never_on_loop.py::test_goal_loop_state_is_never_touched_on_the_event_loop"
+    ],
+    "paths": [
+      "gateway/slash_commands_goals.py",
+      "gateway/run_goals.py"
+    ],
+    "why": "2026-10-19..26 Apollo gateway.error.log: 169 PHASE=event_loop_blocked stalls of 10-30 s with the loop parked in SessionDB.get_meta (124 from the 15 s goal idle-wake scan building GoalManager inline); every platform froze at once. Fixed by hermes-agent#2322 (merge 4e156d27ff89, 2026-10-26): goal/loop state loaders reached from async defs hop through _run_in_executor_with_context. The guard AST-walks every async def in gateway/run_goals.py and gateway/slash_commands_goals.py, so run_goals.py is listed although this PR only edited slash_commands_goals.py. Upstream has both files but still calls the loaders inline from async defs: PR shape is the six-call-site executor-hop patch plus the AST guard; repro = the guard test.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
+  },
+  {
+    "feature": "cron preflight caches primary-home profile_routes on the config files' stat signature",
+    "tests": [
+      "tests/cron/test_preflight_routes_cache.py::test_unchanged_files_parse_once"
+    ],
+    "paths": [
+      "cron/scheduler_preflight.py"
+    ],
+    "why": "2026-10-26 07:05 Apollo gateway (pid 23958) py-spy --gil: 6.5% of all GIL time was read_yaml_layers in _primary_profile_routes_for_current_home, re-parsing config.yaml + managed overlay on every cron run (24-32 concurrent runs of 702 jobs). Fixed by hermes-agent#2335 (merge dd4ac4ac6c4b, 2026-10-26): module cache keyed (primary_home, current_home), validated by utils.file_signature of every file read_yaml_layers reads, lock-guarded, exceptions not cached; sibling tests in the same file prove rewrite/touch/appear re-reads. Upstream has scheduler_preflight.py without file_signature caching: PR shape is a small cache patch in cron/scheduler_preflight.py; repro = 10 calls -> 1 parse.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron"
+    ]
+  },
+  {
+    "feature": "gateway_health._safe_profile caches the active profile name per home key (no realpath per heartbeat)",
+    "tests": [
+      "tests/monitoring/test_gateway_health_profile_cache.py::test_same_home_resolves_profile_once_across_transitions"
+    ],
+    "paths": [
+      "agent/monitoring/gateway_health.py",
+      "agent/monitoring/gateway_health_*.py"
+    ],
+    "why": "2026-10-26 19:05 Apollo gateway (pid 19817) PHASE=event_loop_blocked 10 s: api_server heartbeat -> emit_runtime_status_transition -> _safe_profile -> get_active_profile_name -> Path.resolve/realpath on the loop at load ~27. Fixed by hermes-agent#2363 (merge 1f04de005b9e, 2026-10-27): _profile_cache keyed on (get_hermes_home(), $HOME, $HERMES_DATA_DIR_SUFFIX) with no filesystem calls, recomputed on home change, failures fail open and are not cached. Upstream has gateway_health.py without _profile_cache (0 hits): PR shape is the cache in _safe_profile; repro = three transitions -> one resolve.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "global LogRecord factory resolves the hermes home once per raw path (lru_cache), not per log record",
+    "tests": [
+      "tests/test_log_record_factory_resolve_cache.py::test_same_home_is_resolved_once_across_records",
+      "tests/test_log_record_factory_resolve_cache.py::test_distinct_homes_resolve_separately"
+    ],
+    "paths": [
+      "hermes_logging.py"
+    ],
+    "why": "2026-10-26 20:04 Apollo gateway (pid 19817) PHASE=event_loop_blocked 10 s: kanban dispatcher watcher logging.info -> _session_record_factory -> get_hermes_home().resolve() -> realpath on the loop at host load 48. Fixed by hermes-agent#2364 (merge 92bea91ed238, 2026-10-27): _resolved_home_str lru_cache(64) keyed on the unresolved home string; per-profile homes resolve separately; resolve failures not cached. Upstream has _session_record_factory but no _resolved_home_str (0 hits): PR shape is the lru_cache helper in hermes_logging.py; repro = 20 records -> 1 Path.resolve.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "cron"
+    ]
+  },
+  {
+    "feature": "Discord admission reuses one process-wide PairingStore; split-dir pairing migration runs once per (home, active) per process",
+    "tests": [
+      "tests/gateway/test_pairing_store_hotpath.py::test_twenty_admission_checks_run_migration_once",
+      "tests/gateway/test_pairing_store_hotpath.py::test_second_construction_skips_migration_io"
+    ],
+    "paths": [
+      "gateway/pairing.py",
+      "plugins/platforms/discord/adapter.py",
+      "plugins/platforms/discord/adapter_*.py",
+      "gateway/platforms/yuanbao.py",
+      "gateway/platforms/yuanbao_*.py"
+    ],
+    "why": "2026-10-26 23:54 Apollo gateway (pid 95445) PHASE=event_loop_blocked 10 s: Discord on_message -> _discord_message_admission -> _is_pairing_approved_user -> PairingStore().__init__ -> _migrate_split_pairing_dirs (resolve/exists/mkdir/glob/json) on the loop for every admitted message. Fixed by hermes-agent#2368 (merge 6212a72bc961, 2026-10-27): migration latched per (home, active) only after success, new shared_pairing_store() keyed on the freshly resolved pairing dir, Discord admission + component auth and Yuanbao DM pairing switched to it; fail-closed unchanged. Upstream has gateway/pairing.py without shared_pairing_store (0 hits): PR shape is the pairing.py latch + shared store and the two adapter call sites; repro = 20 admission checks -> 1 migration.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord"
+    ]
   }
 ]
