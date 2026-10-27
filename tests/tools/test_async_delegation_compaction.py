@@ -745,3 +745,38 @@ def test_compacted_canonical_never_reopens_a_mirror_row_with_a_stub(monkeypatch)
     assert row["delivery_state"] != "pending", "a compacted stub must never become a pending replay source"
     replay = json.loads(row["event_json"] or "null")
     assert replay is None or not _compacted(replay), "the mirror's replay source was replaced by the stub"
+
+
+def test_compacted_other_attempt_writes_its_result_without_reopening(monkeypatch):
+    """Prism 781de1176bcd: a compacted completion for attempt B onto a mirror row holding attempt A's
+    event_json and result must store B's result, settle the row, and never reopen it to pending."""
+    identifier, worker, _result = helpers.dispatch(monkeypatch)
+    worker()
+    event = helpers.process_registry.completion_queue.get_nowait()
+    claim = ad.claim_event_delivery(event, "renderer")
+    ad.complete_event_delivery(event, claim)
+    stub = helpers.registry_record(identifier)["outbox"][0]["payload"]
+    assert _compacted(stub)
+    attempt_a = {**event, "event_id": "evt-attempt-a"}
+    with ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET event_json=?, result_json=?, state='running' WHERE delegation_id=?",
+            (json.dumps(attempt_a), json.dumps({"summary": "old"}), identifier))
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ad._sync_completion(conn, stub, {"summary": "new"}, disposition="delivered")
+    row = helpers.row(identifier)
+    assert json.loads(row["result_json"]) == {"summary": "new"}, "the previous attempt's result survived"
+    assert row["state"] == stub.get("status", "completed")
+    assert row["delivery_state"] != "pending"
+    replay = json.loads(row["event_json"] or "null")
+    assert replay is None or not _compacted(replay)
+
+    # No supplied result: the mismatched previous-attempt result is cleared, not kept.
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET event_json=?, result_json=? WHERE delegation_id=?",
+                     (json.dumps(attempt_a), json.dumps({"summary": "old"}), identifier))
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ad._sync_completion(conn, stub, None, disposition="delivered")
+    assert helpers.row(identifier)["result_json"] is None

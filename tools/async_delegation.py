@@ -319,11 +319,21 @@ def _sync_completion(conn, event, result, disposition=None):
         if not (same_event and row[0]):
             # No full body to keep: record the terminal state and disposition, but never reset
             # the row to pending or store the stub as its replay source, or a later replay lacks
-            # summary/results (Prism 565b0259b9ff).
+            # summary/results (Prism 565b0259b9ff). The result still belongs to this event: store
+            # the supplied one, or clear a different attempt's (Prism 781de1176bcd). With no stored
+            # event there is no evidence of a mismatch, so an unsupplied result keeps the mirror's.
+            archived = _store.exact_json_archive(result)
+            if archived is not None:
+                stored_result = json.dumps(archived)
+            elif row[0] or result is not None:
+                stored_result = None
+            else:
+                stored_result = row[1]
             conn.execute(
-                "UPDATE async_delegations SET state=?, completed_at=?, updated_at=? WHERE delegation_id=?",
+                """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                   result_json=? WHERE delegation_id=?""",
                 (event.get("status", "completed"), event.get("completed_at", now), now,
-                 event["delegation_id"]),
+                 stored_result, event["delegation_id"]),
             )
             if disposition in {"delivered", "dropped", "parked"}:
                 conn.execute(
