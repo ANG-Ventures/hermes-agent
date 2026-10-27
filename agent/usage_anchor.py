@@ -122,6 +122,45 @@ def anchored_context_tokens(messages: List[Dict[str, Any]], anchor: Optional[Dic
     return total
 
 
+# A context reading is one request's prompt. A relay that SUMS the prompts of several upstream
+# requests into one response (claude-bpx tui ``collectTurn``: every assistant message since the
+# turn mark, deduplicated by id) reports N x the context: measured 2026-10-12..27 on claude-dtlr,
+# the first measured response after a usage-less one read 2.0x the previous one (619,053 ->
+# 1,241,066 on a 1M window, t_dd918516). Bounds for "this cannot be one request's prompt":
+#   * above the model's context window, or
+#   * above _ANCHOR_IMPLAUSIBLE_RATIO x what the matching anchor predicts plus a fixed slack.
+# The anchor predicts exact prior usage + a rough delta; the rough estimator reads at most
+# ~1.6x LOW (_SKEW_SCALE_UP_MAX), so legitimate growth stays well inside the bound.
+_ANCHOR_IMPLAUSIBLE_RATIO = 1.5
+_ANCHOR_IMPLAUSIBLE_SLACK = 32_000
+
+
+def implausible_prompt_reading(
+    prompt_tokens: Any,
+    messages: Any,
+    anchor: Optional[Dict[str, Any]],
+    *,
+    context_length: Any = 0,
+) -> Optional[str]:
+    """Why ``prompt_tokens`` cannot be the size of the request that priced ``messages``, else None.
+
+    A non-None reason means the figure is not a per-request context measurement (it may still be
+    a correct BILL): context consumers (compressor, anchor, meter, hygiene) must not adopt it."""
+    try:
+        real = int(prompt_tokens or 0)
+        ctx = int(context_length or 0)
+    except (TypeError, ValueError):
+        return None
+    if real <= 0:
+        return None
+    if ctx > 0 and real > ctx:
+        return f"exceeds_window prompt={real} context_length={ctx}"
+    expected = anchored_context_tokens(messages, anchor) if isinstance(anchor, dict) else None
+    if expected and real > expected * _ANCHOR_IMPLAUSIBLE_RATIO + _ANCHOR_IMPLAUSIBLE_SLACK:
+        return f"anchor_multiple prompt={real} anchored={expected} ratio={real / expected:.2f}"
+    return None
+
+
 def _serialize(anchor: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(anchor, dict):
         return None
