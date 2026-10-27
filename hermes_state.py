@@ -1913,9 +1913,16 @@ class SessionDB(
         # retired unclosed keeps its recorded generation in the deleted-WAL registry.
         unregister_live_writer(self)
 
-    def __del__(self) -> None:
+    def __del__(self, _finalizing=sys.is_finalizing) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays
-        guarded: module teardown order is undefined."""
+        guarded: module teardown order is undefined.
+
+        Skipped during interpreter finalization: sys.modules is already being
+        torn down there, so close()'s lazy imports block forever on the import
+        lock (a gateway boot hung at exit this way, t_a29b8266). The OS closes
+        the fds and SQLite recovers the WAL on the next open."""
+        if _finalizing():
+            return
         if self.__dict__.get("_conn") is not None:
             try:
                 self.close()
