@@ -2680,6 +2680,7 @@ class GatewayTurnMixin:
             )
             _stages.lap("deliver")
             _stages.log_if_slow(session_key, getattr(event, "_delivery_pre_send_s", None))
+            event._delivery_stages_end = time.monotonic()  # PHASE=post_handler_stages starts here
             return _delivered
 
         except Exception as e:

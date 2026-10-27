@@ -341,6 +341,29 @@ def _thread_metadata_for_event(event) -> dict | None:
     return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
 
+_POST_HANDLER_FLOOR_S = 1.0
+
+
+def _log_post_handler_stages(event, session_key: str, handler_returned: float, extracted_at: float) -> None:
+    """One INFO line for the span PHASE=delivery_stages does not cover: the stage clock's end ->
+    the final send. ``post_turn``/``goal_pin`` are the pre-send part of the post-turn hooks
+    (/loop completion, the goal row pin); ``unwind`` is the rest of the handler's return path
+    (profile scope exit, finally); ``extract`` is media/path extraction here."""
+    stages_end = getattr(event, "_delivery_stages_end", None)
+    if stages_end is None:
+        return
+    now = time.monotonic()
+    if now - stages_end <= _POST_HANDLER_FLOOR_S:
+        return
+    post_turn, goal_pin = getattr(event, "_pre_send_post_turn_s", (0.0, 0.0))
+    logger.info(
+        "PHASE=post_handler_stages session=%s stages_end_to_send_s=%.2f post_turn=%.2f goal_pin=%.2f "
+        "unwind=%.2f extract=%.2f pre_send=%.2f",
+        session_key, now - stages_end, post_turn, goal_pin,
+        handler_returned - stages_end - post_turn - goal_pin, extracted_at - handler_returned, now - extracted_at,
+    )
+
+
 def _mark_notify_metadata(metadata: dict | None) -> dict:
     """Clone metadata and mark a user-visible reply as notify-worthy."""
     notify_metadata = dict(metadata) if metadata else {}
@@ -5549,6 +5572,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            _handler_returned = time.monotonic()
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -5568,6 +5592,7 @@ class BasePlatformAdapter(ABC):
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
+                _extracted_at = time.monotonic()
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
@@ -5600,6 +5625,7 @@ class BasePlatformAdapter(ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
+                    _log_post_handler_stages(event, session_key, _handler_returned, _extracted_at)
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery,
