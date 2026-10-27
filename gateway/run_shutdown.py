@@ -975,10 +975,6 @@ class GatewayShutdownMixin:
         # ONE sessions.json save per pass, not one per session (t_edfc146c: 10 per-mark rewrites of a
         # 1.5 MB file took 11.1 s of the 50 s stop budget). The batch only defers the save; the
         # per-session decision, PHASE=shutdown_mark line and replay alert are unchanged.
-        # Retry any marks an earlier pass's failed save left pending, even when this pass has nothing to
-        # mark (Prism de5ea0bdfab3). Off-loop, fail-open.
-        await asyncio.to_thread(
-            GatewayShutdownMixin._flush_pending_resume_marks, getattr(self, "session_store", None), log_prefix)
         _todo = [_sk for _sk, _agent in list(self._running_agents.items()) if _agent is not _AGENT_PENDING_SENTINEL]
         if not _todo:
             return marked
@@ -1911,22 +1907,6 @@ class GatewayShutdownMixin:
     # stop() phases. Invoked as ``GatewayRunner._stop_<phase>(self, ctx)`` so shutdown-path tests
     # can drive them from bare doubles that are not GatewayRunner instances.
     @staticmethod
-    def _flush_pending_resume_marks(store, label: str) -> int:
-        """Fail-open ``SessionStore.flush_pending_resume_marks``: retry marks a failed batched save
-        left pending (Prism de5ea0bdfab3). Returns the count persisted; a failure is logged."""
-        _flush = getattr(store, "flush_pending_resume_marks", None)
-        if _flush is None:
-            return 0
-        try:
-            flushed = _flush()
-        except Exception as _e:
-            logger.warning("%s: retry of pending resume marks failed: %s", label, _e)
-            return 0
-        if flushed:
-            logger.info("Shutdown phase: %s persisted %d previously unsaved resume mark(s)", label, flushed)
-        return flushed
-
-    @staticmethod
     def _quiet_step(label: str, fn: Callable[[], Any]) -> Any:
         """Run one best-effort teardown step; a failure is debug-logged as ``"<label>: <exc>"``."""
         try:
@@ -2421,11 +2401,6 @@ class GatewayShutdownMixin:
             0.0, min(_EXECUTOR_QUIESCE_TIMEOUT, resolve_shutdown_watchdog_delay(timeout) - ctx.elapsed() - 1.0),
         )
         _exec_live = GatewayRunner._shutdown_executor(self, drain_timeout=_exec_quiesce_budget)
-        # Final retry of resume marks a failed batched save left pending (Prism de5ea0bdfab3), whichever
-        # pass left them: the last point the store is guaranteed live, ahead of every SessionDB-close
-        # branch below (including the skip-the-close ones).
-        GatewayShutdownMixin._flush_pending_resume_marks(
-            getattr(self, "session_store", None), "pre-close mark_resume_pending")
         if _exec_live:
             # A live worker may be mid-write (the #101093 corruption sequence): skip the close and let
             # SQLite recover from its WAL on next open (at worst a transient "database is locked").

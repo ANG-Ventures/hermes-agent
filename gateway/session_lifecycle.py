@@ -249,8 +249,7 @@ class SessionLifecycleMixin:
                 resume_request_id=resume_request_id,
             ):
                 if getattr(self, "_resume_mark_batch_depth", 0):
-                    self._resume_mark_batch_pending = getattr(
-                        self, "_resume_mark_batch_pending", 0) + 1
+                    self._resume_mark_batch_dirty = True
                 else:
                     self._save()
                 return True
@@ -264,37 +263,32 @@ class SessionLifecycleMixin:
         with self._lock:
             self._resume_mark_batch_depth = getattr(self, "_resume_mark_batch_depth", 0) + 1
 
-    def end_resume_mark_batch(self) -> int:
+    def end_resume_mark_batch(self) -> bool:
         """Close a batch; the outermost close persists the deferred marks with ONE ``_save()``.
-        Returns the number of marks it persisted (0 = no save). A save error propagates to the
-        caller; the in-memory marks stand either way, and the pending count is kept so the next
-        flush retries the save (Prism ada9ec75ce70)."""
+
+        Returns True when it saved. A failed save is logged and retried ONCE; a second failure
+        propagates. No state survives the batch: parity with the pre-batch per-mark saves, where a
+        failed save was only covered by the next mark's full rewrite in the same pass. Each attempt
+        is its own ``with self._lock`` block because ``_StoreLock`` runs the disk/SQLite write on
+        release, so a deferred write failure surfaces (and is retried) here too.
+        """
         with self._lock:
             depth = max(0, getattr(self, "_resume_mark_batch_depth", 0) - 1)
             self._resume_mark_batch_depth = depth
             if depth:
-                return 0
-        return self.flush_pending_resume_marks()
-
-    def flush_pending_resume_marks(self) -> int:
-        """Persist batched marks a failed save left pending; returns the count persisted (0 = no-op).
-
-        The store owns the retry (Prism de5ea0bdfab3): any caller, with or without new marks, can
-        flush. No-op inside an open batch (its close saves). The count is acknowledged only after
-        the ``with self._lock`` exits, because ``_StoreLock`` runs the actual disk/SQLite write on
-        release and a deferred failure surfaces there; a raise leaves the count for the next flush.
-        """
-        with self._lock:
-            if getattr(self, "_resume_mark_batch_depth", 0):
-                return 0
-            pending = getattr(self, "_resume_mark_batch_pending", 0)
-            if not pending:
-                return 0
-            self._save()
-        with self._lock:  # persisted: acknowledge only what this save covered
-            self._resume_mark_batch_pending = max(
-                0, getattr(self, "_resume_mark_batch_pending", 0) - pending)
-        return pending
+                return False
+            dirty = getattr(self, "_resume_mark_batch_dirty", False)
+            self._resume_mark_batch_dirty = False
+        if not dirty:
+            return False
+        try:
+            with self._lock:
+                self._save()
+        except Exception as e:
+            logger.warning("batched resume-mark save failed, retrying once: %s", e)
+            with self._lock:
+                self._save()
+        return True
 
     def clear_resume_pending(self, session_key: str, **kw) -> bool:
         """Clear the resume-pending flag after a successful resumed turn; True if cleared.

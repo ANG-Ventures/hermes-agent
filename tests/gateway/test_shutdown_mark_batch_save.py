@@ -57,19 +57,75 @@ def test_one_save_per_pass(tmp_path, monkeypatch, caplog, interrupted):
                for m in msgs), msgs
 
 
-def test_failed_batched_save_does_not_abort_the_pass(tmp_path, monkeypatch):
+def test_both_batched_saves_failing_is_logged_and_the_pass_continues(tmp_path, monkeypatch, caplog):
     from gateway.run import GatewayRunner
 
     runner, store, keys, _saves = _runner_with_sessions(tmp_path, monkeypatch, n=3)
+    attempts = []
 
     def _boom(*a, **k):
+        attempts.append(1)
         raise OSError("disk full")
 
     monkeypatch.setattr(store, "_save", _boom)
-    marked = asyncio.run(GatewayRunner._mark_running_sessions_resume_pending(runner, "mark"))
+    with caplog.at_level(logging.WARNING):
+        marked = asyncio.run(GatewayRunner._mark_running_sessions_resume_pending(runner, "mark"))
     assert sorted(marked) == sorted(keys)
     assert all(store._entries[k].resume_pending for k in keys)
+    assert len(attempts) == 2, "one save plus ONE immediate retry"
     assert getattr(store, "_resume_mark_batch_depth", 0) == 0
+    assert not getattr(store, "_resume_mark_batch_dirty", False), "no state survives the batch"
+    assert any("batched sessions.json save failed" in r.getMessage() for r in caplog.records)
+
+
+def test_first_batched_save_failing_is_retried_in_the_same_close(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner, store, keys, saves = _runner_with_sessions(tmp_path, monkeypatch, n=N_SESSIONS)
+    counted = store._save
+    fail = [True]
+
+    def _flaky(*a, **k):
+        if fail[0]:
+            fail[0] = False
+            saves.append(1)
+            raise OSError("transient")
+        return counted(*a, **k)
+
+    monkeypatch.setattr(store, "_save", _flaky)
+    marked = asyncio.run(GatewayRunner._mark_running_sessions_resume_pending(runner, "mark"))
+    assert sorted(marked) == sorted(keys)
+    assert len(saves) == 2
+    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    reloaded._ensure_loaded()
+    assert all(reloaded._entries[k].resume_pending for k in keys)
+
+
+def test_deferred_write_failure_is_retried_in_the_same_close(tmp_path, monkeypatch):
+    """With the real ``_StoreLock`` the disk write runs on lock release; a failure there is retried
+    by the same close too."""
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._db = None
+    key = store.get_or_create_session(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="u1")).session_key
+    real_write = store._save_sessions_json
+    fail = [True]
+
+    def _flaky(*a, **k):
+        if fail[0]:
+            fail[0] = False
+            raise OSError("transient")
+        return real_write(*a, **k)
+
+    monkeypatch.setattr(store, "_save_sessions_json", _flaky)
+    store.begin_resume_mark_batch()
+    assert store.mark_resume_pending(key, reason="restart_timeout")
+    assert store.end_resume_mark_batch() is True
+    assert not fail[0]
+    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    reloaded._db = None
+    reloaded._ensure_loaded()
+    assert reloaded._entries[key].resume_pending
 
 
 def test_mark_outside_a_batch_still_saves_immediately(tmp_path):
@@ -212,134 +268,3 @@ def test_cancel_while_the_closing_save_is_queued_still_closes_the_batch(tmp_path
     reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
     reloaded._ensure_loaded()
     assert all(reloaded._entries[k].resume_pending for k in keys)
-
-
-def test_failed_batch_save_is_retried_by_the_next_batch_close(tmp_path):
-    """Prism ada9ec75ce70: a failed closing save keeps the pending count, so a later batch with
-    no new marks (sessions already pending in memory) still persists them."""
-    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
-    keys = [store.get_or_create_session(
-        SessionSource(platform=Platform.TELEGRAM, chat_id=str(i), user_id="u1")).session_key
-        for i in (1, 2)]
-    real_save = store._save
-    fail = [True]
-
-    def _flaky(*a, **k):
-        if fail[0]:
-            fail[0] = False
-            raise OSError("transient")
-        return real_save(*a, **k)
-
-    store._save = _flaky
-    store.begin_resume_mark_batch()
-    for k in keys:
-        assert store.mark_resume_pending(k, reason="restart_timeout")
-    with pytest.raises(OSError):
-        store.end_resume_mark_batch()
-
-    store.begin_resume_mark_batch()
-    assert store.end_resume_mark_batch() == 2
-
-    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
-    reloaded._ensure_loaded()
-    assert all(reloaded._entries[k].resume_pending for k in keys)
-
-
-def test_failed_save_is_retried_by_an_empty_next_pass(tmp_path, monkeypatch):
-    """Prism de5ea0bdfab3: the first pass's batched save fails, the agents are gone by the next pass
-    (nothing to mark), and that empty pass still persists the pending marks."""
-    from gateway.run import GatewayRunner
-
-    runner, store, keys, _saves = _runner_with_sessions(tmp_path, monkeypatch, n=2)
-    real_save = store._save
-    fail = [True]
-
-    def _flaky(*a, **k):
-        if fail[0]:
-            fail[0] = False
-            raise OSError("transient")
-        return real_save(*a, **k)
-
-    monkeypatch.setattr(store, "_save", _flaky)
-    marked = asyncio.run(GatewayRunner._mark_running_sessions_resume_pending(runner, "pre-drain"))
-    assert sorted(marked) == sorted(keys)
-    runner._running_agents.clear()
-    assert asyncio.run(GatewayRunner._mark_running_sessions_resume_pending(
-        runner, "post-drain", interrupted=True)) == []
-
-    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
-    reloaded._ensure_loaded()
-    assert all(reloaded._entries[k].resume_pending for k in keys)
-    assert store._resume_mark_batch_pending == 0
-
-
-def test_final_pre_close_flush_persists_marks_left_pending(tmp_path, monkeypatch):
-    """The stop path's last retry, right before the SessionDB close, persists marks a failed save
-    left pending even when no later mark pass runs."""
-    from gateway.run import GatewayRunner
-
-    runner, store, keys, _saves = _runner_with_sessions(tmp_path, monkeypatch, n=2)
-    real_save = store._save
-    fail = [True]
-
-    def _flaky(*a, **k):
-        if fail[0]:
-            fail[0] = False
-            raise OSError("transient")
-        return real_save(*a, **k)
-
-    monkeypatch.setattr(store, "_save", _flaky)
-    asyncio.run(GatewayRunner._mark_running_sessions_resume_pending(runner, "pre-drain"))
-    assert store._resume_mark_batch_pending == 2
-    runner._running_agents.clear()
-
-    class _Ctx:
-        api_live = 0
-
-        @staticmethod
-        def elapsed():
-            return 0.0
-
-        @staticmethod
-        def deferred_count():
-            return 0
-
-    monkeypatch.setattr(GatewayRunner, "_shutdown_executor", lambda self, drain_timeout: 0)
-    monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 0, raising=False)
-    monkeypatch.setattr(runner, "_active_api_worker_count", lambda: 0, raising=False)
-    GatewayRunner._stop_quiesce_and_close_session_dbs(runner, 10.0, _Ctx())
-
-    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
-    reloaded._ensure_loaded()
-    assert all(reloaded._entries[k].resume_pending for k in keys)
-    assert store._resume_mark_batch_pending == 0
-
-
-def test_flush_acknowledges_only_after_the_deferred_write_succeeds(tmp_path, monkeypatch):
-    """With the real ``_StoreLock`` the disk write runs on lock release; a failure there must keep
-    the pending count (the follow-up to Prism ada9ec75ce70)."""
-    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
-    store._db = None
-    key = store.get_or_create_session(
-        SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="u1")).session_key
-    real_write = store._save_sessions_json
-    fail = [True]
-
-    def _flaky(*a, **k):
-        if fail[0]:
-            fail[0] = False
-            raise OSError("transient")
-        return real_write(*a, **k)
-
-    monkeypatch.setattr(store, "_save_sessions_json", _flaky)
-    store.begin_resume_mark_batch()
-    assert store.mark_resume_pending(key, reason="restart_timeout")
-    with pytest.raises(OSError):
-        store.end_resume_mark_batch()
-    assert store._resume_mark_batch_pending == 1
-    assert store.flush_pending_resume_marks() == 1
-    assert store._resume_mark_batch_pending == 0
-    reloaded = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
-    reloaded._db = None
-    reloaded._ensure_loaded()
-    assert reloaded._entries[key].resume_pending
