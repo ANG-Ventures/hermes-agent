@@ -171,6 +171,46 @@ def _any_board(boards, connect, test) -> bool:
     return False
 
 
+_OUT_OF_TICK_SQL = (
+    "SELECT r.id, r.started_at, r.claim_lock FROM task_runs r WHERE r.started_at >= ? "
+    "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)")
+
+
+def out_of_tick_local_starts(boards, connect, since: float, own_claimer: str) -> list:
+    """``[(key, started_at)]`` of every LOCAL run (no worker_placed event)
+    started at/after ``since`` on any board that THIS process did not claim
+    (``task_runs.claim_lock`` != ``own_claimer``): a ``kanban admit``, a
+    one-shot ``kanban dispatch`` or another dispatcher's spawn (t_32e8796a).
+    The same rows ``kanban_ops._recent_local_starts`` books for the CLI path,
+    minus this process's own spawns, which ``finish_tick`` already booked.
+    ``key`` is ``(db path, run id)``. An unreadable board contributes nothing."""
+    from hermes_cli import kanban_db as _kb
+
+    out, seen = [], set()
+    for b in boards or ():
+        slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
+        conn = None
+        try:
+            path = str(_kb.kanban_db_path(slug).expanduser().resolve())
+            if path in seen:
+                continue
+            seen.add(path)
+            conn = connect(board=slug)
+            for rid, started, lock in conn.execute(
+                    _OUT_OF_TICK_SQL, (int(since), kwp.PLACED_EVENT)).fetchall():
+                if lock != own_claimer:
+                    out.append(((path, int(rid)), float(started)))
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return out
+
+
 class GateTickBuilder:
     """Builds the tick's ``GateTick``. Boards tick sequentially in ONE thread
     after this (PRD I-12): the shared plan's ledger is unlocked."""
@@ -189,6 +229,7 @@ class GateTickBuilder:
         self._signal: Optional[kwp.TargetSignal] = None
         self._boards = None                        # last build()'s boards (renewal)
         self._renewed_at: float = 0.0
+        self._seeded: Dict[tuple, float] = {}      # out-of-tick local runs already booked
 
     def _root(self):
         return self._fleet_dir().parent
@@ -222,6 +263,7 @@ class GateTickBuilder:
         self._remote_by_host = dict(remote_by_host)
         self._boards = boards
         self.running_local = running_local
+        self.seed_out_of_tick(boards)
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
         if gate.enabled and allowance is None and klg.loadavg_supported():
             # Enabled gate, load1 unreadable on a host that has the sampler:
@@ -231,6 +273,36 @@ class GateTickBuilder:
         plan = self.plan_pool(boards, remote_by_host)
         return GateTick(band=gate.band, spill_reason=gate.spill_reason,
                         local_allowance=allowance, spawn_paused=paused, remote_plan=plan)
+
+    def seed_out_of_tick(self, boards, *, now_wall: Optional[float] = None,
+                         now_mono: Optional[float] = None) -> int:
+        """Book every LOCAL run started inside ``admission.DEFAULT_SETTLE_S``
+        that this process did not spawn into the gate's ramp, once each, aged
+        by its ``started_at`` (as the CLI path does, kanban_ops
+        ``_cli_utilization_gate``). Without it a ``kanban admit`` on this host
+        is invisible to the next tick until its CPU shows (t_32e8796a)."""
+        gate = self.gate
+        if not getattr(gate, "enabled", False):
+            return 0
+        from hermes_cli import admission as _ad
+        from hermes_cli import kanban_db as _kb
+
+        now_wall = time.time() if now_wall is None else now_wall
+        now_mono = time.monotonic() if now_mono is None else now_mono
+        horizon = now_wall - _ad.DEFAULT_SETTLE_S
+        self._seeded = {k: t for k, t in self._seeded.items() if t >= horizon}
+        try:
+            rows = out_of_tick_local_starts(boards, self._connect, horizon, _kb._claimer_id())
+        except Exception:
+            return 0
+        n = 0
+        for key, started in rows:
+            if key in self._seeded:
+                continue
+            self._seeded[key] = started
+            gate.record_spawns(1, now=now_mono - max(0.0, now_wall - started))
+            n += 1
+        return n
 
     def plan_pool(self, boards, remote_by_host: Dict[str, int]) -> Optional[kwp.SpilloverPlan]:
         """The ONE pool plan for this tick, or None. Runs iff
@@ -242,12 +314,7 @@ class GateTickBuilder:
         cfg = self._kanban_cfg() or {}
         pool_cfg = cfg.get("worker_pool")
         pool_cfg = pool_cfg if isinstance(pool_cfg, dict) else {}
-        if pool_cfg.get("enabled", True) is False:
-            gate.pool = {"planned": False, "reason": "config_disabled"}
-            self._log(logger.info, "kanban pool: disabled by config")
-            return None
-        if not gate.remote_allowed:
-            gate.pool = {"planned": False, "reason": "proc_paused"}
+        if self.pool_switch_refusal(cfg) is not None:
             return None
         # kanban.placement.default (spec v0.3 §3.1), read per tick: remote
         # offers every portable row to the pool first, so pins_only is off.
@@ -266,6 +333,43 @@ class GateTickBuilder:
                                    kwp.pin_aliases(self._fleet_dir())))):
             gate.pool = {"planned": False, "reason": "not_needed"}
             return None
+        plan = self.build_pool_plan(boards, remote_by_host, cfg)
+        if plan is not None:
+            plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
+            gate.pool = plan.snapshot()
+        return plan
+
+    def pool_switch_refusal(self, cfg: dict) -> Optional[str]:
+        """The operator's pool off-switches, the ONE place they live: ``config_disabled``
+        (``kanban.worker_pool.enabled: false``) or ``proc_paused`` (the gate's
+        ``remote_allowed`` is off), recorded on ``gate.pool``; None when the pool may
+        plan. :meth:`plan_pool` and :meth:`build_pool_plan` both apply it, so a direct
+        ``build_pool_plan`` caller (``kanban admit``) honours them too (Prism ddce35a5f884)."""
+        gate = self.gate
+        pool_cfg = (cfg or {}).get("worker_pool")
+        pool_cfg = pool_cfg if isinstance(pool_cfg, dict) else {}
+        if pool_cfg.get("enabled", True) is False:
+            gate.pool = {"planned": False, "reason": "config_disabled"}
+            self._log(logger.info, "kanban pool: disabled by config")
+            return "config_disabled"
+        if not gate.remote_allowed:
+            gate.pool = {"planned": False, "reason": "proc_paused"}
+            return "proc_paused"
+        return None
+
+    def build_pool_plan(self, boards, remote_by_host: Dict[str, int],
+                        cfg: Optional[dict] = None) -> Optional[kwp.SpilloverPlan]:
+        """The plan itself (pool files, signal, the real probe with
+        ``kanban.workspaces_root``, continuation paths), None when the pool
+        refuses or has no hosts. :meth:`plan_pool` calls it once it decided a
+        plan is needed this tick; ``kanban admit`` calls it directly, since that
+        decision reads the Studio band, which is host admission (t_32e8796a)."""
+        gate = self.gate
+        cfg = (self._kanban_cfg() or {}) if cfg is None else cfg
+        if self.pool_switch_refusal(cfg) is not None:
+            return None
+        default_remote = kwp.placement_default(cfg) == kwp.PLACEMENT_DEFAULT_REMOTE
+        from hermes_cli import kanban_continuation as kc
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
         for warning in pool.warnings:
             self._log(logger.warning, warning)
@@ -296,9 +400,7 @@ class GateTickBuilder:
         plan = kwp.plan(list(pool.pool_hosts), remote_by_host, probe=probe,
                         disabled=pool.disabled, config=pool, signal=signal,
                         workspace_paths=paths)
-        plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
         plan.default_remote = default_remote
-        gate.pool = plan.snapshot()
         if signal is not None:
             # WARNING (one per message per 5 min): a host with no sampler reads
             # UNKNOWN and takes nothing; that must be visible, not info noise.

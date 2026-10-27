@@ -33,6 +33,7 @@ from hermes_cli.kanban_output import (
 # ``_fmt_task_line`` / ``_task_to_dict`` are defined below, not imported: the fork
 # versions carry the workspace-refusal flag, pin badge and home/pin/no_worker
 # fields the handlers here render (FOLLOWUP: port into kanban_output, then import).
+from hermes_cli.kanban_admit import cmd_admit as _cmd_admit
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
@@ -590,7 +591,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     # kanban_db.add_comment marks the author "(subagent)".
     "claim", "attach", "attach-rm", "complete", "edit", "update", "block",
     "schedule", "unblock", "requeue", "workspace", "reopen", "promote", "triage-resolve",
-    "archive", "dispatch", "daemon", "repair",
+    "archive", "dispatch", "admit", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -5024,7 +5025,7 @@ _HANDLERS = {
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "triage-resolve": _cmd_triage_resolve,
-    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch, "admit": _cmd_admit,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "home-index": _cmd_home_index, "session-closeout": _cmd_session_closeout,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat, "resource": _cmd_resource,

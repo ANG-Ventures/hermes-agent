@@ -867,6 +867,15 @@ _SPECS = [
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
         _json_flag(),
     ], help="One dispatcher pass: reclaim stale, promote ready, spawn workers"),
+    _cmd("admit", [
+        _TASK_ID,
+        _arg("--host", required=True,
+             help="The ONE host to spawn this card on (must be in the card's eligible set)"),
+        _arg("--reason", required=True,
+             help="Why (required; quote the ruling). Recorded on the admission_override event"),
+    ], help="Operator-only: spawn ONE ready card on ONE host now, skipping the load gate "
+            "and the host admission band (never the measured-danger floor or eligibility). "
+            "Needs KANBAN_OPERATOR_TOKEN; kill switch kanban.admin_admit.enabled"),
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),
