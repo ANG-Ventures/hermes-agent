@@ -62,6 +62,21 @@ async def test_message_arriving_mid_judge_is_queued_and_runs_after_it(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_message_queued_during_the_turn_waits_for_the_judge(monkeypatch, tmp_path):
+    """The in-band hand-off to a queued follow-up fires this turn's callback first."""
+    rig = _Rig(monkeypatch, tmp_path)
+    log = []
+    _slow_hooks(rig, 0.5, log)
+    gate = rig.hold_flush("first")
+    await rig.adapter.handle_message(_msg("first"))
+    await asyncio.wait_for(rig.flush_entered["first"].wait(), 5)
+    await rig.adapter.handle_message(_msg("second"))
+    gate.set()
+    await _wait_for(lambda: len(rig.calls) >= 2, "second turn", timeout=10)
+    assert [entry[:2] for entry in log[:2]] == [("start", "first"), ("end", "first")]
+
+
+@pytest.mark.asyncio
 async def test_stop_mid_judge_cancels_it(monkeypatch, tmp_path):
     rig = _Rig(monkeypatch, tmp_path)
     log = []
