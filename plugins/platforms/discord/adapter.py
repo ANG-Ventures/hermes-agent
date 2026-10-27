@@ -4947,8 +4947,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not user_id:
             return False
         try:
-            from gateway.pairing import PairingStore
-            return bool(PairingStore().is_approved("discord", user_id))
+            from gateway.pairing import shared_pairing_store
+            return bool(shared_pairing_store().is_approved("discord", user_id))
         except Exception:
             return False
 
@@ -8151,9 +8151,8 @@ def _component_check_auth(
     # Pairing store (mirrors ``authz_mixin._check_authorization``): paired users click without allowlist.
     if uid:
         try:
-            from gateway.pairing import PairingStore
-            store = PairingStore()
-            if store.is_approved("discord", uid):
+            from gateway.pairing import shared_pairing_store
+            if shared_pairing_store().is_approved("discord", uid):
                 return True
         except Exception:
             pass
