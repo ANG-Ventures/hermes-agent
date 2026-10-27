@@ -89,7 +89,10 @@ for suffix, fd in ((".out", 1), (".err", 2)):
     except OSError:
         pass
 if code < 0:
-    signal.signal(-code, signal.SIG_DFL)
+    try:
+        signal.signal(-code, signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass  # SIGKILL/SIGSTOP take no handler; already default
     os.kill(os.getpid(), -code)
 sys.exit(rc)
 """
@@ -409,6 +412,10 @@ def settle() -> int:
             if alive is None and (time.time() - float(meta.get("started_at") or 0)
                                   < _NO_SCRIPT_GRACE_SECONDS):
                 continue  # the shim may not have written its pid yet
+            # The shim may have published .rc and exited between the read above and the
+            # liveness check (Prism d2efbca992a8): re-read before treating it as killed.
+            rc = _read_rc(base)
+        if rc is None:
             logger.info(
                 "Job '%s': script run %s ended without an exit status (killed); left as restart "
                 "recovery recorded it", meta.get("job_id"), meta.get("execution_id"))

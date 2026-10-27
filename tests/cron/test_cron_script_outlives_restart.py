@@ -207,6 +207,43 @@ def test_signal_death_still_reported_as_negative_returncode(env):
     assert "exited with code -15" in out, out
 
 
+def test_sigkill_death_propagates_through_the_shim(env):
+    """Prism 9ee8fe887c81: SIGKILL takes no handler, so resetting it raised OSError and the shim
+    exited 1. The shim must still die by SIGKILL (Popen -9) and keep .rc = 137."""
+    from cron import script_outcome_records as rec
+
+    base = rec.begin("j9", "e9abc")
+    p = subprocess.run(rec.wrap_argv(base, ["/bin/sh", "-c", "kill -KILL $$"]),
+                       capture_output=True, timeout=30)
+    assert p.returncode == -signal.SIGKILL, (p.returncode, p.stderr)  # windows-footgun: ok — module is skipped off POSIX
+    assert Path(str(base) + ".rc").read_text(encoding="utf-8").strip() == "137"
+
+
+def test_rc_published_during_the_liveness_check_is_applied(env, monkeypatch):
+    """Prism d2efbca992a8: the shim publishes .rc and exits between settle's first .rc read and
+    its liveness check. settle must re-read .rc and grade the run, not discard the record."""
+    from cron import script_outcome_records as rec
+    from cron.jobs import get_job
+
+    job, _started, _release = _make_job(env, 0)
+    base = rec.begin(job["id"], "e7abc")
+    meta_path = Path(str(base) + ".json")
+    meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+    meta["owner_pid"] = 2 ** 22 - 7  # a pid that is not running
+    meta["owner_started_at"] = 1
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    Path(str(base) + ".out").write_text("late finish\n", encoding="utf-8")
+
+    def shim_finishes_then_dies(_meta, b):
+        Path(str(b) + ".rc").write_text("0\n", encoding="utf-8")
+        return False
+
+    monkeypatch.setattr(rec, "_script_alive", shim_finishes_then_dies)
+    assert rec.settle() == 1
+    assert get_job(job["id"])["last_status"] == "ok"
+    assert _records(env) == []
+
+
 def test_explicit_exit_143_is_not_a_signal_death(env):
     """Prism 2b28c5552d47: a script that EXITS 143 was not killed. The shim must keep it a normal
     exit (Popen 143), or the shutdown-kill re-queue would re-fire a run whose side effects ran."""
