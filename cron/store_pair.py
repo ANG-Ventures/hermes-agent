@@ -238,7 +238,27 @@ def _refuse_linked_live_store(home: Path) -> None:
         raise PairRefused(f"{live} resolves outside {home}; refusing to restore the cron store "
                           "pair (nothing restored)") from None
     for name in PAIR_NAMES + tuple(f"{DB_NAME}{s}" for s in _DB_SIDECARS):
-        _regular_member(live / name, "restore")
+        # Prism 6245695b492f: the db and its sidecars are written IN PLACE (page-level restore,
+        # row clear); a hard link is a regular file whose other name is another store's db.
+        if _regular_member(live / name, "restore") and name != JOBS_NAME \
+                and os.lstat(live / name).st_nlink != 1:
+            raise PairRefused(f"{live / name} is hard-linked ({os.lstat(live / name).st_nlink} "
+                              "names); refusing to restore the cron store pair in place through "
+                              "it (nothing restored)")
+
+
+def _refuse_linked_source(src: Path, root: Optional[Path]) -> None:
+    """``PairRefused`` when the source ``cron/`` DIRECTORY is a symlink or resolves outside
+    *root* (its snapshot root; ``src.parent`` when None). Prism 17c97989d85c: the member
+    lstat()s alone read another store's pair through a linked directory."""
+    root = Path(root) if root is not None else src.parent
+    try:
+        if os.path.islink(src):
+            raise ValueError
+        src.resolve().relative_to(root.resolve())
+    except ValueError:
+        raise PairRefused(f"{src} is a symlink or resolves outside {root}; refusing to restore "
+                          "the cron store pair from it (nothing restored)") from None
 
 
 def _roll_back(cj, jobs_file: Path, old_jobs: Optional[bytes], db_file: Path,
@@ -274,7 +294,8 @@ def _discard(dest: Path) -> None:
 
 # --- restore -------------------------------------------------------------------------------
 
-def restore(src: Path, home: Path, *, db_failed: bool = False) -> List[str]:
+def restore(src: Path, home: Path, *, db_failed: bool = False,
+            root: Optional[Path] = None) -> List[str]:
     """Restore the pair in directory *src* onto *home*'s live store as ONE unit, under the store
     lock, with nothing written unless every check passes first.
 
@@ -299,6 +320,7 @@ def restore(src: Path, home: Path, *, db_failed: bool = False) -> List[str]:
     # Links (Prism 4c71a06241bb / dd8a638040cd): the pair is never read from, nor written
     # through, a symlink, on either side, checked before the lock is taken or anything written.
     _refuse_linked_live_store(home)
+    _refuse_linked_source(src, root)
     if not _regular_member(jobs_src, "restore"):
         raise PairRefused(f"{src} has no {JOBS_NAME}; refusing to restore runtime rows without "
                           "definitions (nothing restored)")

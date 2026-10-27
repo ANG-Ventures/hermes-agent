@@ -280,15 +280,33 @@ def _save_json_file(path: Path, data: dict) -> None:
     atomic_json_write(path, data, mode=0o600)
 
 
+# (home, active) pairs whose split-dir migration already completed in this process. The migration does
+# several realpath/exists/glob/json syscalls; PairingStore() is built on gateway hot paths (Discord admission
+# ran it on the asyncio loop per message and stalled the loop 10 s under disk load), so run it once per pair.
+# Recorded only after a successful run, so a failing migration is retried on the next construction.
+_MIGRATED_PAIRING_DIRS: set = set()
+_MIGRATED_PAIRING_DIRS_LOCK = threading.Lock()
+
+
 def _migrate_split_pairing_dirs(*, home: Optional[Path] = None, active: Optional[Path] = None) -> None:
     """Merge split legacy (``pairing``) / new (``platforms/pairing``) data into the active dir.
 
     If both exist, approved users in the inactive location must not be silently
     ignored (they would be asked for a fresh code). Active data wins on key conflict.
+    Runs at most once per process per (home, active) pair (see ``_MIGRATED_PAIRING_DIRS``).
     """
     home = home or get_hermes_home()
-    old_dir = home / "pairing"
     active = active if active is not None else _default_pairing_dir()
+    key = (os.fspath(home), os.fspath(active))
+    with _MIGRATED_PAIRING_DIRS_LOCK:
+        if key in _MIGRATED_PAIRING_DIRS:
+            return
+        _merge_split_pairing_dirs(home, active)
+        _MIGRATED_PAIRING_DIRS.add(key)
+
+
+def _merge_split_pairing_dirs(home: Path, active: Path) -> None:
+    old_dir = home / "pairing"
     alternate = home / "platforms" / "pairing" if active.resolve() == old_dir.resolve() else old_dir
     if not alternate.exists() or active.resolve() == alternate.resolve():
         return
@@ -311,6 +329,27 @@ def _entry_created_at(info):
     """Numeric ``created_at`` of a pending entry, or None for malformed/legacy entries."""
     created_at = info.get("created_at") if isinstance(info, dict) else None
     return created_at if isinstance(created_at, (int, float)) else None
+
+
+_SHARED_STORES: dict = {}
+_SHARED_STORES_LOCK = threading.Lock()
+
+
+def shared_pairing_store() -> "PairingStore":
+    """Process-shared ``PairingStore`` for the current default pairing dir (hot-path read sites).
+
+    Keyed by the freshly resolved default dir, so a HERMES_HOME/profile override still lands on the right
+    store. Reads stay fresh: ``is_approved`` re-stats the approved file and reloads on signature change, so
+    approvals written by ``hermes pairing approve`` in another process are seen on the next call.
+    """
+    directory = _default_pairing_dir()
+    # Class identity is part of the key so a patched ``PairingStore`` (tests) never gets a stale instance.
+    key = (os.fspath(directory), PairingStore)
+    with _SHARED_STORES_LOCK:
+        store = _SHARED_STORES.get(key)
+        if store is None:
+            store = _SHARED_STORES[key] = PairingStore()
+        return store
 
 
 class PairingStore:
