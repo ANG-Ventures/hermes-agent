@@ -48,7 +48,7 @@ def candidates() -> list:
     if vh:
         out.append(Path(vh) / "fleet" / "placement-policy.json")
     here = Path(__file__).resolve()
-    for up in here.parents[:4]:
+    for up in list(here.parents)[:4]:  # Path.parents slicing is 3.10+; /usr/bin/python3 is 3.9
         out.append(up / "fleet" / "placement-policy.json")
     out.append(Path(HOST_POLICY))
     out.append(Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")) / "fleet" / "placement-policy.json")
