@@ -801,6 +801,91 @@ def query_pr(repo: str, number: int) -> Optional[dict]:
     }
 
 
+# At most this many PRs ride in one ``gh api graphql`` call. 50 aliased
+# ``pullRequest`` nodes cost ~1 GraphQL rate-limit point and keep the response
+# small; a larger set is split into several calls.
+_BATCH_CHUNK = 50
+# One batch replaces up to _BATCH_CHUNK five-second REST calls, so it gets a
+# proportionally longer (but still bounded) wall budget.
+_BATCH_TIMEOUT_SECONDS = _QUERY_TIMEOUT_SECONDS * 3
+
+_PR_NODE_FIELDS = "state mergedAt mergeCommit { oid }"
+
+
+def _query_pr_chunk(repo: str, numbers: list[int]) -> dict[int, Optional[dict]]:
+    """One ``gh api graphql`` call for ``numbers`` (<= _BATCH_CHUNK) in ``repo``.
+
+    Every number maps to the :func:`query_pr` shape or None. A failed call
+    (spawn error, timeout, unparseable output, no ``data``) is None for the
+    whole chunk. ``gh`` exits 1 when ANY node errors (a deleted/unknown PR is a
+    ``NOT_FOUND`` entry in ``errors``) while still printing the resolved nodes,
+    so the exit code alone is not treated as fatal: whatever ``data`` carries
+    is used and the rest are None. Otherwise one missing PR would blind the
+    gate to its 49 neighbours on every tick.
+    """
+    out: dict[int, Optional[dict]] = {n: None for n in numbers}
+    owner, _, name = repo.partition("/")
+    if not owner or not name or not numbers:
+        return out
+    aliases = " ".join(
+        f"p{n}: pullRequest(number: {int(n)}) {{ {_PR_NODE_FIELDS} }}"
+        for n in numbers
+    )
+    query = (
+        "query($owner: String!, $name: String!) { "
+        f"repository(owner: $owner, name: $name) {{ {aliases} }} }}"
+    )
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "graphql",
+             "-f", f"owner={owner}", "-f", f"name={name}",
+             "-f", f"query={query}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=_BATCH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return out
+    try:
+        payload = json.loads(proc.stdout or "")
+    except (TypeError, ValueError):
+        return out
+    data = payload.get("data") if isinstance(payload, dict) else None
+    repository = data.get("repository") if isinstance(data, dict) else None
+    if not isinstance(repository, dict):
+        return out
+    for n in numbers:
+        node = repository.get(f"p{n}")
+        if not isinstance(node, dict):
+            continue
+        merged_at = node.get("mergedAt")
+        state = str(node.get("state") or "").upper()
+        commit = node.get("mergeCommit")
+        sha = commit.get("oid") if isinstance(commit, dict) else None
+        out[n] = {
+            "state": "MERGED" if merged_at else state,
+            "mergedAt": merged_at,
+            "mergeCommitSha": sha,
+        }
+    return out
+
+
+def query_prs(repo: str, numbers: Iterable[int]) -> dict[int, Optional[dict]]:
+    """Batched :func:`query_pr`: one ``gh api graphql`` call per 50 PRs.
+
+    Same normalized shape and the same "None means cannot tell" contract,
+    per number. Used by the dispatcher prefetch so a tick forks one ``gh``
+    per repo instead of one per open PR.
+    """
+    ordered = list(dict.fromkeys(int(n) for n in numbers))
+    out: dict[int, Optional[dict]] = {}
+    for i in range(0, len(ordered), _BATCH_CHUNK):
+        out.update(_query_pr_chunk(repo, ordered[i:i + _BATCH_CHUNK]))
+    return out
+
+
 def repo_exists(slug: str) -> bool:
     """True only when ``gh api repos/<slug>`` names EXACTLY ``slug``.
 
@@ -1381,6 +1466,41 @@ def prefetch_pr_gate_states(
     payloads: dict[tuple[str, int], Optional[dict]] = {}
     errors: dict[tuple[str, int], str] = {}
     if not selected:
+        return _PrefetchResult(
+            payloads=payloads, capped=capped, now=now, errors=errors,
+            contexts=contexts,
+            deployed=_prefetch_deploys(deploy_checks, payloads, deploy_fn),
+        )
+
+    if query_fn is _REAL_QUERY_PR:
+        # Production oracle: one ``gh api graphql`` per repo per 50 PRs rather
+        # than one forked ``gh`` per PR (py-spy, Apollo 2026-10-26: the per-PR
+        # fork was 9.6 % of all gateway samples). An injected/monkeypatched
+        # query function is a test seam and keeps the per-PR path below.
+        by_repo: dict[str, list[tuple[str, int]]] = {}
+        for key in selected:
+            by_repo.setdefault(key[0], []).append(key)
+        jobs = [
+            (unique[keys_[0]].repo, keys_[i:i + _BATCH_CHUNK])
+            for keys_ in by_repo.values()
+            for i in range(0, len(keys_), _BATCH_CHUNK)
+        ]
+        workers = min(_PREFETCH_WORKERS, len(jobs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(query_prs, repo, [k[1] for k in chunk]): chunk
+                for repo, chunk in jobs
+            }
+            for future in concurrent.futures.as_completed(futures):
+                chunk = futures[future]
+                try:
+                    answers = future.result()
+                except Exception as exc:  # defensive: same as a raised lookup
+                    answers = {}
+                    for key in chunk:
+                        errors[key] = f"{type(exc).__name__}: {exc}"
+                for key in chunk:
+                    payloads[key] = answers.get(key[1])
         return _PrefetchResult(
             payloads=payloads, capped=capped, now=now, errors=errors,
             contexts=contexts,
