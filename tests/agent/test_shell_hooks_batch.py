@@ -98,12 +98,14 @@ def manager(monkeypatch, tmp_path: Path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     shell_hooks.reset_for_tests()
+    getattr(shell_hooks_batch, "close_dispatchers", lambda: None)()  # a warm one from another test
     mgr = plugins.PluginManager()
     mgr._discovered = True
     monkeypatch.setattr(plugins, "_plugin_manager", mgr)
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: mgr)
     yield mgr
     shell_hooks.reset_for_tests()
+    getattr(shell_hooks_batch, "close_dispatchers", lambda: None)()
 
 
 def _count_spawns(monkeypatch) -> list:
@@ -150,6 +152,71 @@ def test_batched_verdicts_equal_per_hook_spawns(manager, monkeypatch, hook_dir: 
     assert batched == per_hook
     assert {"action": "block", "message": "refused by policy"} in batched
     assert any("CRASHED" in r.get("message", "") for r in batched)
+
+
+def test_n_batches_start_one_warm_dispatcher(manager, monkeypatch, hook_dir: Path) -> None:
+    """t_e920d269: a dispatcher Popen per batch was ~57% of the gateway's hook GIL time (fork+exec of a
+    multi-GB process). N tool calls reuse ONE warm dispatcher, and every verdict stays the same."""
+    spawns = _count_spawns(monkeypatch)
+    _register(hook_dir, NAMES, batch=True)
+    first = _fire(manager)
+    for i in range(4):
+        assert manager.invoke_hook("pre_tool_call", tool_name="terminal", args={"command": "ls é"},
+                                   session_id="s", tool_call_id=f"c{i + 2}", turn_id="t1") == first
+    assert spawns == [shell_hooks_batch.DISPATCHER], spawns
+
+
+def test_dead_warm_dispatcher_is_replaced(manager, monkeypatch, hook_dir: Path) -> None:
+    spawns = _count_spawns(monkeypatch)
+    _register(hook_dir, ["block_json"], batch=True)
+    assert _fire(manager) == [{"action": "block", "message": "no é"}]
+    idle = shell_hooks_batch._idle_dispatchers()
+    assert len(idle) == 1
+    for d in idle:
+        d.proc.kill()
+        d.proc.wait()
+    assert _fire(manager) == [{"action": "block", "message": "no é"}]
+    assert spawns == [shell_hooks_batch.DISPATCHER, shell_hooks_batch.DISPATCHER], spawns
+
+
+def test_concurrent_batches_do_not_share_a_busy_dispatcher(manager, hook_dir: Path) -> None:
+    import threading
+    slow = hook_dir / "slow_ok.py"
+    slow.write_text('import json, sys, time\nsys.stdin.read()\ntime.sleep(1.0)\nprint(json.dumps({"x": 1}))\n',
+                    encoding="utf-8")
+    _register(hook_dir, ["slow_ok"], batch=True)
+    out: list = []
+    threads = [threading.Thread(target=lambda: out.append(_fire(manager))) for _ in range(3)]
+    import time as _t
+    t0 = _t.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert len(out) == 3 and _t.monotonic() - t0 < 2.8  # run side by side, not one after another
+
+
+def test_serve_mode_answers_several_requests_on_one_process(hook_dir: Path) -> None:
+    proc = subprocess.Popen([sys.executable, shell_hooks_batch.DISPATCHER, "--serve"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+    try:
+        for _ in range(3):
+            req = {"hooks": [{"script": str(hook_dir / "block_json.py"), "timeout": 30},
+                             {"script": str(hook_dir / "absent.py"), "timeout": 5}], "stdin": PAYLOAD}
+            proc.stdin.write((json.dumps(req) + "\n").encode())
+            proc.stdin.flush()
+            rows = []
+            while True:
+                row = json.loads(proc.stdout.readline())
+                if row.get("end"):
+                    break
+                rows.append(row)
+            by_i = {r["i"]: r for r in rows}
+            assert by_i[1] == {"i": 1, "missing": True}
+            assert json.loads(base64.b64decode(by_i[0]["out"])) == {"action": "block", "message": "no é"}
+    finally:
+        proc.stdin.close()
+        assert proc.wait(timeout=10) == 0
 
 
 def test_matcher_filters_before_any_process_starts(manager, monkeypatch, hook_dir: Path) -> None:
