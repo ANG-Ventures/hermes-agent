@@ -378,6 +378,73 @@ def test_in_place_rewrite_with_restored_mtime_is_not_served_stale():
         assert registry.get("_invalid_record_ids"), "the rewritten bytes must be re-read and re-validated"
 
 
+def test_backup_directory_fsync_eio_blocks_compaction(monkeypatch):
+    """Prism 101f4851d89a: the backup file fsyncs, but the parent-directory fsync that makes its
+    rename durable fails with EIO. That is a real I/O error, not "directory fsync unsupported":
+    compaction must not commit and no backup a later run would trust may be left behind."""
+    import errno
+    import stat
+
+    now = time.time()
+    path, _ = _seed(now)
+    real_fsync = os.fsync
+
+    def dir_eio(fd):
+        if (sys._getframe(1).f_code.co_name in {"_backup_before_first_compaction", "_fsync_directory"}
+                and stat.S_ISDIR(os.fstat(fd).st_mode)):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(store.os, "fsync", dir_eio)
+    with store.locked_registry() as registry:
+        store._prune(registry, now, path)
+    assert not list(path.parent.glob(f"{path.name}.pre-compact-*")), \
+        "a backup whose directory entry is not durable must not be trusted by a later run"
+    on_disk = store.read_registry()
+    assert not any(_compacted(e["payload"]) for r in on_disk["records"].values() for e in r["outbox"]), \
+        "without a durable backup nothing may be compacted"
+
+
+def test_backup_directory_fsync_unsupported_is_tolerated(monkeypatch):
+    """A platform that cannot fsync a directory (EINVAL) still gets its backup and compaction."""
+    import errno
+    import stat
+
+    now = time.time()
+    path, _ = _seed(now)
+    real_fsync = os.fsync
+
+    def dir_einval(fd):
+        if (sys._getframe(1).f_code.co_name in {"_backup_before_first_compaction", "_fsync_directory"}
+                and stat.S_ISDIR(os.fstat(fd).st_mode)):
+            raise OSError(errno.EINVAL, "Invalid argument")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(store.os, "fsync", dir_einval)
+    with store.locked_registry() as registry:
+        store._prune(registry, now, path)
+    assert len(list(path.parent.glob(f"{path.name}.pre-compact-*"))) == 1
+    on_disk = store.read_registry()
+    assert any(_compacted(e["payload"]) for r in on_disk["records"].values() for e in r["outbox"])
+
+
+def test_write_refresh_does_not_trust_value_equal_rewrite():
+    """Prism c74982e2a8ca: True == 1 == 1.0 in Python but they serialise (and checksum) differently.
+    A record rewritten on disk between our write and the cache-refresh reload (true -> 1, integrity
+    kept) must fail integrity, not be accepted because it compares equal to what we hashed."""
+    path = store.registry_path()
+    store._prepare_directory(path)
+    record = {"delegation_id": "deleg_eq", "flag": True}
+    written = {"deleg_eq": record}
+    record["integrity"] = store._record_checksum(record)
+    tampered = json.dumps({"schema_version": store.SCHEMA_VERSION, "updated_at": 0.0,
+                           "records": {"deleg_eq": dict(record, flag=1)}}).encode()
+    assert json.loads(tampered)["records"]["deleg_eq"] == record  # equal by value...
+    assert store._record_checksum(json.loads(tampered)["records"]["deleg_eq"]) != record["integrity"]
+    _, strict_error = store._parse_registry(tampered, path, trusted_records=written)
+    assert strict_error and "deleg_eq failed integrity" in strict_error
+
+
 def test_failed_backup_leaves_no_artifact_and_blocks_compaction(monkeypatch):
     now = time.time()
     path, _ = _seed(now)

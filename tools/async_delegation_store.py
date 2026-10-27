@@ -7,6 +7,7 @@ Live events continue to use ``process_registry.completion_queue``.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import math
@@ -157,16 +158,19 @@ def empty_registry() -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "updated_at": 0.0, "records": {}}
 
 
-def _record_checksum(record: dict[str, Any]) -> str:
+def _canonical_record_bytes(record: dict[str, Any]) -> bytes:
     canonical = dict(record)
     canonical.pop("integrity", None)
-    raw = json.dumps(
+    return json.dumps(
         canonical,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+
+
+def _record_checksum(record: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_record_bytes(record)).hexdigest()
 
 
 # Process-wide parse cache: {path: ((st_mtime_ns, st_size, st_ino, st_ctime_ns), content_sha256,
@@ -208,7 +212,7 @@ def _load(
     *,
     allow_invalid_records: bool = False,
     private: bool = False,
-    trusted_records: dict[str, Any] | None = None,
+    trusted_records: dict[str, tuple[str, bytes]] | None = None,
 ) -> dict[str, Any]:
     """Load a registry; strict mode raises on the first invalid record, lenient quarantines.
 
@@ -258,7 +262,7 @@ def _load(
 
 
 def _parse_registry(
-    raw: bytes, path: Path, *, trusted_records: dict[str, Any] | None = None,
+    raw: bytes, path: Path, *, trusted_records: dict[str, tuple[str, bytes]] | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Lenient parse + per-record validation; also the strict error a strict load would raise."""
     strict_error: str | None = None
@@ -363,8 +367,11 @@ def _parse_registry(
                          delegation_id)
             continue
         expected = record.get("integrity")
-        if expected and trusted_records.get(delegation_id) == record:
-            continue  # byte-for-value what this process hashed while writing it
+        trusted = trusted_records.get(delegation_id)
+        # Compare canonical bytes, never Python equality: True == 1 == 1.0 but they checksum
+        # differently, so a value-equal rewrite on disk must still fail integrity (Prism c74982e2a8ca).
+        if expected and trusted is not None and trusted == (expected, _canonical_record_bytes(record)):
+            continue  # exactly the bytes this process hashed while writing it
         if not expected or expected != _record_checksum(record):
             strict_error = strict_error or f"record {delegation_id} failed integrity validation"
             invalid_record_ids.append(str(delegation_id))
@@ -395,13 +402,14 @@ def _write(path: Path, registry: dict[str, Any]) -> None:
     registry["schema_version"] = SCHEMA_VERSION
     registry["updated_at"] = time.time()
     invalid_record_ids = set(registry.pop("_invalid_record_ids", []))
-    written: dict[str, Any] = {}
+    written: dict[str, tuple[str, bytes]] = {}
     for delegation_id, record in registry.get("records", {}).items():
         if str(delegation_id) in invalid_record_ids:
             continue
         if isinstance(record, dict):
-            record["integrity"] = _record_checksum(record)
-            written[delegation_id] = record
+            canonical = _canonical_record_bytes(record)
+            record["integrity"] = hashlib.sha256(canonical).hexdigest()
+            written[delegation_id] = (record["integrity"], canonical)
     try:
         atomic_json_write(path, registry, mode=0o600)
     except BaseException:
@@ -638,6 +646,36 @@ def _compact_terminal_result(record: dict[str, Any], now: float, *, dry_run: boo
     return changed
 
 
+# errnos meaning "this platform/filesystem cannot fsync a directory", not an I/O failure.
+_DIR_FSYNC_UNSUPPORTED = frozenset(
+    e for e in (getattr(errno, n, None) for n in ("EINVAL", "ENOTSUP", "EOPNOTSUPP", "EBADF"))
+    if e is not None)
+
+
+def _fsync_directory(directory: Path) -> bool:
+    """fsync ``directory`` so a rename inside it is durable. True when synced or when the platform
+    cannot fsync a directory at all (Windows, EINVAL/ENOTSUP); False on any real error (EIO...)."""
+    if os.name == "nt":
+        return True
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        if exc.errno in _DIR_FSYNC_UNSUPPORTED:
+            return True
+        logger.warning("could not open %s to fsync it", directory, exc_info=True)
+        return False
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        if exc.errno in _DIR_FSYNC_UNSUPPORTED:
+            return True
+        logger.warning("directory fsync failed for %s", directory, exc_info=True)
+        return False
+    finally:
+        os.close(dir_fd)
+    return True
+
+
 def _backup_before_first_compaction(path: Path) -> bool:
     """One-time ``<registry>.pre-compact-<ts>`` copy (0600) of the file as it was on disk.
 
@@ -661,14 +699,14 @@ def _backup_before_first_compaction(path: Path) -> bool:
             os.fsync(out.fileno())
         os.replace(tmp, backup)
         tmp = None
-        try:
-            dir_fd = os.open(path.parent, os.O_RDONLY)
+        if not _fsync_directory(path.parent):
+            # The rename is not durable: unpublish it so no later run trusts a backup that may
+            # vanish on crash, and compact nothing (Prism 101f4851d89a).
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+                backup.unlink()
+            except OSError:
+                pass
+            return False
         logger.info("async_delegation_registry_precompact_backup path=%s", backup)
         return True
     except OSError:
