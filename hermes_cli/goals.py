@@ -691,8 +691,9 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     return _load_goal_raw(session_id)[0]
 
 
-def _load_goal_raw(session_id: str) -> Tuple[Optional[GoalState], Optional[str]]:
-    """``(state, stored row text)``; the text is the revision GoalManager._save compares against."""
+def _load_goal_raw(session_id: str, *, strict: bool = False) -> Tuple[Optional[GoalState], Optional[str]]:
+    """``(state, stored row text)``; the text is the revision GoalManager._save compares against.
+    ``strict``: a failed read raises instead of reading as "no goal" (a locked DB is not a cleared goal)."""
     if not session_id:
         return None, None
     db = _get_session_db()
@@ -701,6 +702,8 @@ def _load_goal_raw(session_id: str) -> Tuple[Optional[GoalState], Optional[str]]
     try:
         raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
+        if strict:
+            raise
         logger.debug("GoalManager: get_meta failed: %s", exc)
         return None, None
     if not raw:
@@ -1705,7 +1708,11 @@ class GoalManager:
         cleared or replaced the goal while the judge ran) never continues on the stale copy.
         ``baseline``: the stored row when the turn ended; a different row now is a goal the turn never saw."""
         if _get_session_db() is not None:  # CAS baseline = the row as of evaluation start, not construction
-            now = _load_goal_raw(self.session_id)
+            try:
+                now = _load_goal_raw(self.session_id, strict=True)
+            except Exception as exc:  # keep the loaded state; the CAS still guards the write
+                logger.warning("GoalManager: goal refresh for %s failed, keeping loaded state: %s", self.session_id, exc)
+                now = (self._state, self._stored)
             if now[1] != self._stored:  # another manager wrote the row since our last load/save
                 self._state, self._stored = now
         if baseline is not _UNPINNED and baseline != self._stored:

@@ -99,13 +99,68 @@ async def test_loop_tick_settles_inside_the_callback(monkeypatch, tmp_path):
         await asyncio.sleep(0.3)
 
     async def loop_completion(**_kw):
-        order.append("loop" if sends else "loop-before-send")
+        order.append("loop-after-send" if sends else "loop")
 
     rig.runner._post_turn_goal_continuation = judge
     rig.runner._post_turn_loop_completion = loop_completion
     await rig.adapter.handle_message(_msg("first"))
-    await _wait_for(lambda: "loop" in order or "loop-before-send" in order, "loop completion")
-    assert order == ["judge", "loop"]
+    await _wait_for(lambda: "judge" in order, "judge")
+    assert order == ["loop", "judge"]
+
+
+@pytest.mark.asyncio
+async def test_loop_tick_fired_during_the_send_is_not_completed_by_this_turn(monkeypatch, tmp_path):
+    """Prism bdc3c452d1ec: /loop completion runs before the send, so a tick the wakeup watcher fires
+    during the send (session slot already released) is not completed by the previous user turn."""
+    rig = _Rig(monkeypatch, tmp_path)
+    tick, completed = {"awaiting": False}, []
+    real_send = rig.adapter.send
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        if "answer " in str(content):
+            tick["awaiting"] = True  # the watcher injects a due /loop wakeup now
+        return await real_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    async def loop_completion(**_kw):
+        if tick["awaiting"]:
+            completed.append("tick")
+
+    async def judge(**_kw):
+        completed.append("judge")
+
+    rig.adapter.send = send
+    del rig.runner._run_post_turn_hooks
+    rig.runner._post_turn_goal_continuation = judge
+    rig.runner._post_turn_loop_completion = loop_completion
+    await rig.adapter.handle_message(_msg("first"))
+    await _wait_for(lambda: "judge" in completed, "judge")
+    assert completed == ["judge"], "the user turn completed a tick fired during its send"
+
+
+@pytest.mark.asyncio
+async def test_stop_during_the_final_send_runs_no_hooks(monkeypatch, tmp_path):
+    """Prism a783c95639e5: the adapter's finally fires the callback after /stop; it must not run."""
+    rig = _Rig(monkeypatch, tmp_path)
+    log, held = [], asyncio.Event()
+    _slow_hooks(rig, 0.01, log)
+    real_send = rig.adapter.send
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        if "answer " in str(content):
+            held.set()
+            await asyncio.Event().wait()  # the final send hangs until /stop cancels it
+        return await real_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    async def no_reply(*_a, **_kw):
+        return None
+
+    rig.adapter.send = send
+    rig.adapter._dispatch_inline_reply = no_reply
+    await rig.adapter.handle_message(_msg("first"))
+    await asyncio.wait_for(held.wait(), 5)
+    await rig.adapter._dispatch_active_session_command(_msg("/stop"), KEY, "stop")
+    await asyncio.sleep(0.2)
+    assert log == [], "post-turn hooks ran after /stop"
 
 
 @pytest.mark.asyncio
@@ -336,3 +391,57 @@ async def test_pause_during_the_status_send_drops_the_continuation(goal_db, monk
     assert adapter.sends, "no status notice was sent"
     assert goals.load_goal(entry.session_id).status == "paused"
     assert not adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_replacement_goal_at_the_same_revision_gets_no_continuation(goal_db, monkeypatch):
+    """Prism f648365853c9: /goal clear + /goal set B + gates during the status send; B reaches A's
+    revision. Revision equality is not identity: A's continuation is not enqueued onto B."""
+    from tests.gateway.test_goal_continuation_turn_effect import _runner
+
+    runner, adapter, entry, src = _runner()
+    sid = entry.session_id
+    goals.GoalManager(sid).set("A")
+    real_send = adapter.send
+
+    def replace():
+        target = goals.load_goal(sid).revision  # what A's evaluation wrote
+        goals.GoalManager(sid).clear()
+        b = goals.GoalManager(sid)
+        b.set("B")
+        while b.state.revision < target:
+            b.add_gate("true")
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        await asyncio.to_thread(replace)
+        return await real_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    adapter.send = send
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "more", False, None, False))
+    await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="ok")
+    assert adapter.sends, "no status notice was sent"
+    assert goals.load_goal(sid).goal == "B"
+    assert not adapter._pending_messages
+
+
+def test_transient_refresh_failure_keeps_the_loaded_goal(goal_db, monkeypatch):
+    """Prism 338d8a0072da: a 'database is locked' at evaluation start is not 'no goal'."""
+    import sqlite3
+
+    mgr = goals.GoalManager("locked")
+    mgr.set("finish")
+    db, fails = goals._get_session_db(), [1]
+    real_get = db.get_meta
+
+    def flaky(key):
+        if fails:
+            fails.pop()
+            raise sqlite3.OperationalError("database is locked")
+        return real_get(key)
+
+    monkeypatch.setattr(db, "get_meta", flaky)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "more", False, None, False))
+    decision = mgr.evaluate_after_turn("did a thing", made_tool_calls=True)
+    assert not fails, "the refresh read never ran"
+    assert decision["should_continue"] is True
+    assert goals.load_goal("locked").status == "active"

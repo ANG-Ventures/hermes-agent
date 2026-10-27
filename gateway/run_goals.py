@@ -402,10 +402,16 @@ class GatewayGoalsMixin:
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
-        # A /goal pause or clear that landed during the status send wins: enqueue only onto the row we wrote.
+        # A /goal pause, clear or replacement that landed during the status send wins: enqueue only onto
+        # the exact row this evaluation wrote (a re-set goal restarts its revision, so compare the text).
         from hermes_cli.goals import _load_goal_raw
-        now, _ = await self._run_in_executor_with_context(_load_goal_raw, mgr.session_id)
-        if now is None or now.status != "active" or now.revision != mgr.state.revision:
+        try:
+            _, raw_now = await self._run_in_executor_with_context(
+                lambda: _load_goal_raw(mgr.session_id, strict=True))
+        except Exception as exc:
+            logger.warning("goal continuation for %s dropped: goal re-read failed: %s", _sid, exc)
+            return
+        if raw_now is None or raw_now != mgr._stored:
             logger.info("goal continuation for %s dropped: goal changed during the status send", _sid)
             return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
@@ -440,12 +446,19 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.debug("post-turn hook failed: %s", exc)
             return
+        # /loop completion stays inline, before the send, while this turn still owns the session: deferred,
+        # it would complete a wakeup tick fired during the send (bookkeeping, no LLM call). Only the judge waits.
+        try:  # the class method: an instance override of _run_post_turn_hooks stands for the deferred judge
+            await GatewayGoalsMixin._run_post_turn_hooks(self, **kwargs, parts=("loop completion",))
+        except Exception as exc:
+            logger.debug("post-turn hook failed: %s", exc)
         # Pin the goal row as of turn end: a /goal set during the send is not judged on this reply.
-        with suppress(Exception):
+        with suppress(Exception):  # a failed read leaves it unpinned, never pinned as "no goal"
             from hermes_cli.goals import _load_goal_raw
             sid = self.session_store.peek_session_id(session_key)
             if isinstance(sid, str) and sid:
-                kwargs["goal_pin"] = ((await self._run_in_executor_with_context(_load_goal_raw, sid))[1],)
+                kwargs["goal_pin"] = ((await self._run_in_executor_with_context(
+                    lambda: _load_goal_raw(sid, strict=True)))[1],)
 
         # The routed profile scope (home/secret/terminal contextvars) is left before the adapter fires the
         # callback; run the hooks in the context captured here so they read the routed profile's state.db.
@@ -453,9 +466,13 @@ class GatewayGoalsMixin:
 
         async def _run() -> None:
             _AFTER_DELIVERY.set(True)  # inside the task's copy of ctx only
-            await self._run_post_turn_hooks(**kwargs)
+            await self._run_post_turn_hooks(**kwargs, parts=("goal continuation",))
 
         async def _hooks() -> None:
+            task = asyncio.current_task()
+            if not self._is_session_run_current(session_key, generation) or (task is not None and task.cancelling()):
+                logger.info("post-turn hooks for %s skipped: turn was stopped before they ran", session_key)
+                return
             started = time.monotonic()
             try:
                 await asyncio.create_task(_run(), context=ctx)  # cancelling this await cancels the task
@@ -469,6 +486,7 @@ class GatewayGoalsMixin:
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None, goal_pin: Any = None,
+        parts: tuple = ("goal continuation", "loop completion"),
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
@@ -485,6 +503,8 @@ class GatewayGoalsMixin:
         if final_text.strip():
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
+            if label not in parts:
+                continue
             try:
                 extra = {"event": event, "goal_pin": goal_pin} if label == "goal continuation" else {}
                 await hook(session_entry=session_entry, source=source, final_response=final_text, **extra)
