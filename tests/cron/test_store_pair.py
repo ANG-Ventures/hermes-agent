@@ -643,6 +643,53 @@ def test_backup_rescan_does_not_archive_an_already_captured_store_twice(home, tm
     assert profile_pairs == ["profiles/a/cron/jobs.json"], names
 
 
+def test_backup_rescan_skips_a_renamed_json_mode_store_edited_after_pass_1(home, tmp_path, monkeypatch):
+    """Prism 1ac2e940806c: in JSON-only mode (HERMES_CRON_RUNTIME_STATE=json) the only member
+    identity was jobs.json's inode, and every job save atomically REPLACES jobs.json. An edit after
+    pass 1 plus a rename made the rescan miss the match and archive the same schedules twice. A
+    store is identified by its cron DIRECTORY, which neither the rename nor the save replaces."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    pa = home / "profiles" / "a"
+    (pa / "cron").mkdir(parents=True)
+    (pa / "config.yaml").write_text("model: x\n")
+    with cj.use_cron_store(pa):
+        jid = _job(cj, "pj", 1)
+    assert not (pa / "cron" / "runtime_state.db").exists()
+    tmpfile = home / "skills" / "temporary.md"
+    tmpfile.parent.mkdir(parents=True, exist_ok=True)
+    tmpfile.write_text("gone soon\n")
+    real_entries, real_pairs, calls = backup._write_zip_entries, backup._zip_cron_pairs, []
+
+    def write_entries(zf, files, *a, **kw):
+        tmpfile.unlink(missing_ok=True)  # vanishes before the first pass writes it
+        return real_entries(zf, files, *a, **kw)
+
+    def zip_pairs(*a, **kw):
+        out = real_pairs(*a, **kw)
+        if not calls:  # pass 1 archived profiles/a; a job save replaces jobs.json, then a rename
+            ino = (pa / "cron" / "jobs.json").stat().st_ino
+            with cj.use_cron_store(pa):
+                cj.update_job(jid, {"name": "pj-edited"})
+            assert (pa / "cron" / "jobs.json").stat().st_ino != ino, "save did not replace jobs.json"
+            pa.rename(home / "profiles" / "b")
+        calls.append(1)
+        return out
+
+    monkeypatch.setattr(backup, "_write_zip_entries", write_entries)
+    monkeypatch.setattr(backup, "_zip_cron_pairs", zip_pairs)
+    zpath = tmp_path / "out" / "b.zip"
+    zpath.parent.mkdir()
+    backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+    assert len(calls) == 2, "the rescan did not run"
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    profile_pairs = sorted(n for n in names if n.startswith("profiles/") and n.endswith("cron/jobs.json"))
+    assert profile_pairs == ["profiles/a/cron/jobs.json"], names
+
+
 @pytest.mark.parametrize("linked", [("jobs.json",), ("jobs.json", "runtime_state.db")])
 def test_zip_pairs_archives_two_stores_sharing_a_hard_linked_jobs_json(home, tmp_path, linked):
     """Prism fd3e5e76e488: the rename skip matched ONE shared member identity, so a second store

@@ -1835,22 +1835,18 @@ def _split_cron_pairs(files: List[Tuple[Path, Path]]) -> Tuple[List[Tuple[Path, 
     return others, homes
 
 
-def _pair_member_identities(hermes_root: Path, home: Tuple[str, ...]) -> tuple:
-    """``((st_dev, st_ino) | None, (st_dev, st_ino) | None)`` of *home*'s live jobs.json and
-    runtime_state.db, in that order (a rename keeps both inodes); a missing or unreadable member
-    is ``None``. The whole tuple identifies a store: one shared member (a hard-linked jobs.json
-    beside a distinct db) is not the same store (Prism fd3e5e76e488)."""
+def _store_identity(hermes_root: Path, home: Tuple[str, ...]) -> Optional[tuple]:
+    """``(st_dev, st_ino)`` of *home*'s cron DIRECTORY (``os.lstat``), or ``None`` when missing.
+    A profile rename keeps the directory inode, and atomic member saves (every jobs.json write
+    replaces the file, Prism 1ac2e940806c) do not touch it; two distinct stores always have
+    distinct cron dirs, even with hard-linked members (Prism fd3e5e76e488)."""
     from cron import store_pair
 
-    idents = []
-    for name in (store_pair.JOBS_NAME, store_pair.DB_NAME):
-        try:
-            st = os.lstat(hermes_root.joinpath(*home, store_pair.CRON_DIR, name))
-        except OSError:
-            idents.append(None)
-            continue
-        idents.append((st.st_dev, st.st_ino))
-    return tuple(idents)
+    try:
+        st = os.lstat(hermes_root.joinpath(*home, store_pair.CRON_DIR))
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
 
 
 def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[str, ...]],
@@ -1858,20 +1854,20 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
     """Capture each store's pair under its cron lock (``cron.store_pair.capture``) beside the
     output zip and archive both halves; return bytes archived. A refused capture is ONE error for
     the whole pair: neither half is archived alone. *captured*, when given, maps the
-    :func:`_pair_member_identities` of every store archived in full to the home it was archived
-    from. A store is skipped only when BOTH member identities match a captured store AND that
-    store's original home no longer holds them, i.e. the same store moved (Prism dafc6732ca54:
-    seen again under a renamed profile). One shared member, or a store still at its first path,
-    is a different store and is archived (Prism fd3e5e76e488)."""
+    :func:`_store_identity` (cron directory) of every store archived in full to the home it was
+    archived from. A store is skipped only when its identity matches a captured store AND that
+    store's original home no longer holds it, i.e. the same store moved (Prism dafc6732ca54:
+    seen again under a renamed profile). A store still at its first path is a different store
+    and is archived (Prism fd3e5e76e488)."""
     from cron import store_pair
 
     total = 0
     for home in homes:
         rel_cron = Path(*home, store_pair.CRON_DIR)
-        idents = _pair_member_identities(hermes_root, home) if captured is not None else None
-        first = captured.get(idents) if captured is not None and any(idents) else None
+        idents = _store_identity(hermes_root, home) if captured is not None else None
+        first = captured.get(idents) if captured is not None and idents else None
         if first is not None and first != home \
-                and _pair_member_identities(hermes_root, first) != idents:
+                and _store_identity(hermes_root, first) != idents:
             logger.info("backup: skipping cron store %s, already archived as %s (renamed during "
                         "the backup)", rel_cron, Path(*first, store_pair.CRON_DIR))
             continue
@@ -1900,7 +1896,7 @@ def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[st
                         ) from exc
                     on_error(rel_cron / name, exc)
                     break
-            if captured is not None and names and archived == len(names) and any(idents):
+            if captured is not None and names and archived == len(names) and idents:
                 captured.setdefault(idents, home)
     return total
 
