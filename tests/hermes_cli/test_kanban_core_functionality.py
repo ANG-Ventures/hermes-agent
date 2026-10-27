@@ -1041,11 +1041,13 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
     # One tick reaches the stop threshold: auto-decompose triage scan, the
-    # placement ledger, the pool plan's any_ready AND any_waking probes
-    # (placement is remote-first since #2148 / t_82b4db80, so any_waking always
-    # runs when nothing is ready), the demand probe, the dispatch connect, and
-    # the ready-work probe (ready + review share one connection). 7.
-    assert calls["connect"] == 7
+    # placement ledger, the out-of-tick local-start seed (GateTickBuilder.
+    # seed_out_of_tick, #2312 / t_32e8796a), the pool plan's any_ready AND
+    # any_waking probes (placement is remote-first since #2148 / t_82b4db80, so
+    # any_waking always runs when nothing is ready), the demand probe, the
+    # dispatch connect, and the ready-work probe (ready + review share one
+    # connection). 8.
+    assert calls["connect"] == 8
 
 
 # ---------------------------------------------------------------------------
