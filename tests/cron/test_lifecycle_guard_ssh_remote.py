@@ -44,3 +44,41 @@ def test_remote_lifecycle_command_is_allowed(command):
 ])
 def test_local_effect_stays_blocked(command):
     assert blocked(command), command
+
+
+# Numeric spellings the C resolver maps to loopback/unspecified but a text regex misses
+# (reported on upstream #123701). ssh resolves the host the same way, so these reach this machine.
+@pytest.mark.parametrize("host", [
+    "127.1",
+    "2130706433",
+    "127.0.2",
+    "0x7f000001",
+    "017700000001",
+    "0",
+    "::",
+    "[::]",
+    "::ffff:7f00:1",
+    "[::ffff:7f00:1]",
+    "0:0:0:0:0:ffff:7f00:1",
+    "::ffff:0.0.0.0",
+    "127.0.0.1.",
+    "0x7f.1",
+    "::127.0.0.1",
+    "LOCALHOST.",
+    "4294967296",
+])
+def test_numeric_loopback_spellings_stay_blocked(host):
+    assert blocked(f"ssh {host} {CMD}"), host
+    assert blocked(f"ssh user@{host} {CMD}"), host
+
+
+@pytest.mark.parametrize("host", ["999.1", "1.2.3.4.5", "::ffff:7f00:1:x", "box$x"])
+def test_unparseable_numeric_host_fails_closed(host):
+    assert blocked(f"ssh '{host}' {CMD}"), host
+
+
+@pytest.mark.parametrize("host", [
+    "box", "build-01.example.com", "0xbeef.example", "10.0.0.5", "192.168.1.20", "fe80::1", "[2001:db8::7]",
+])
+def test_real_remote_host_still_allowed(host):
+    assert not blocked(f"ssh {host} {CMD}"), host
