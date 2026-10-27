@@ -305,17 +305,6 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> str:
         if latest is None and already_counted:
             discard(base)
             return SKIPPED  # attempt pruned from the ledger and the job has run since
-        # The fence is held (re-entrant), so a False below means the job vanished: SKIPPED.
-        if already_counted:
-            # Replace the unknown/interrupted stamp; never count the run a second time
-            # (repeat, next_run_at and streaks were advanced by that first write).
-            applied = correct_counted_run_outcome(job_id, success, error,
-                                                  last_run_at=finished_iso)
-        else:
-            applied = mark_job_run(job_id, success, error)
-        if not applied:
-            discard(base)
-            return SKIPPED
         name = job.get("name") or job_id
         stdout = _tail(Path(str(base) + ".out"))
         stderr = _tail(Path(str(base) + ".err"))
@@ -329,10 +318,26 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> str:
             + (f"\n\nstderr:\n{stderr}" if stderr else "")
             + "\n"
         )
+        # Save the output BEFORE grading the run: with the owner dead the record holds the only
+        # copy, so a failed save keeps it and grades nothing; the next pass retries both
+        # (Prism 90a59cadf99a). Grading first would count the run twice on that retry.
         try:
             save_job_output(job_id, doc)
         except Exception:
-            logger.debug("Job '%s': could not save settled output", job_id, exc_info=True)
+            logger.warning("Job '%s': could not save settled output; script outcome %s kept for "
+                           "a later pass", job_id, execution_id, exc_info=True)
+            return RETRY
+        # The fence is held (re-entrant), so a False below means the job vanished: SKIPPED.
+        if already_counted:
+            # Replace the unknown/interrupted stamp; never count the run a second time
+            # (repeat, next_run_at and streaks were advanced by that first write).
+            applied = correct_counted_run_outcome(job_id, success, error,
+                                                  last_run_at=finished_iso)
+        else:
+            applied = mark_job_run(job_id, success, error)
+        if not applied:
+            discard(base)
+            return SKIPPED
         # Consumed: remove the record before the fence is released.
         discard(base)
     logger.warning(

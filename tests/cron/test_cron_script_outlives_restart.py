@@ -413,3 +413,39 @@ def test_concurrent_settlers_apply_the_record_once(env):
     assert after_b["last_status"] == "ok"
     assert sorted(p.name for p in out_dir.glob("*.md")) == docs_a
     assert not any("(no stdout)" in p.read_text(encoding="utf-8-sig") for p in out_dir.glob("*.md"))
+
+
+def test_failed_output_save_keeps_the_record_and_grades_nothing(env, monkeypatch):
+    """Prism 90a59cadf99a: with the owner dead the record holds the only copy of the output. A
+    save that fails keeps the record and leaves the run ungraded; the next pass saves and grades
+    it once."""
+    import cron.jobs as jobs
+    from cron.executions import recover_interrupted_executions
+    from cron.jobs import get_job
+    from cron.scheduler_provider import _settle_script_outcomes
+
+    job, started, release = _make_job(env, 0)
+    _gateway_dies_mid_run(env, job["id"], started)
+    release.touch()
+    _wait(lambda: any(n.endswith(".rc") for n in _records(env)), what="exit status")
+    assert recover_interrupted_executions() == 1
+    before = get_job(job["id"])
+
+    real = jobs.save_job_output
+
+    def unwritable(job_id, output):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(jobs, "save_job_output", unwritable)
+    assert _settle_script_outcomes() == 0
+    assert any(n.endswith(".out") for n in _records(env)), "captured stdout must survive"
+    assert any(n.endswith(".rc") for n in _records(env)), "record must survive a failed save"
+    assert get_job(job["id"])["last_status"] == before["last_status"]
+
+    monkeypatch.setattr(jobs, "save_job_output", real)
+    assert _settle_script_outcomes() == 1
+    assert get_job(job["id"])["last_status"] == "ok"
+    assert _records(env) == []
+    docs = list((env / "cron" / "output" / job["id"]).glob("*.md"))
+    assert len(docs) == 1
+    assert "bridge done; ledger 3737" in docs[0].read_text(encoding="utf-8-sig")
