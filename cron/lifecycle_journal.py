@@ -143,6 +143,21 @@ def _ends_with_newline(path: Path) -> bool:
         return True  # unreadable: the append below will fail loudly enough
 
 
+def _iter_raw_lines(f):
+    """Yield each record of a binary journal handle, split on universal newlines.
+
+    Every reader opens the journal in BINARY mode so one non-UTF-8 line is one malformed record
+    (t_19a16be2). Binary iteration splits on ``\\n`` only, though, while the text readers it replaced
+    split on ``\\n``, ``\\r`` and ``\\r\\n``: a CR-delimited journal then fused every record into one
+    unparseable line and ``last_removed`` lost all removal evidence (t_e6448717). ``bytes.splitlines``
+    splits on exactly those three terminators, and a ``\\r\\n`` pair never straddles two chunks
+    because binary iteration ends each chunk at ``\\n``. UTF-8 never encodes ``\\r``/``\\n`` inside a
+    multi-byte sequence, so splitting before decoding is safe.
+    """
+    for chunk in f:
+        yield from chunk.splitlines()
+
+
 def _append(record: Dict[str, Any], filename: str = JOURNAL_FILENAME) -> None:
     """Append one record. Best effort — never raises into a cron write."""
     try:
@@ -265,7 +280,7 @@ def read_entries_with_health(
     entries: List[Dict[str, Any]] = []
     malformed = 0
     with open(path, "rb") as f:
-        for seq, raw in enumerate(f):
+        for seq, raw in enumerate(_iter_raw_lines(f)):
             try:
                 # Per-line decode (t_19a16be2): a non-UTF-8 line is ONE malformed record, never an
                 # exception out of the file iterator that abandons the whole read.
@@ -317,7 +332,7 @@ def last_removed(job_ids) -> set:
         if not path.exists():
             return set()
         with open(path, "rb") as f:
-            for raw in f:
+            for raw in _iter_raw_lines(f):
                 try:
                     rec = json.loads(raw.decode("utf-8-sig"))
                 except ValueError:  # UnicodeDecodeError and JSONDecodeError are both ValueError
@@ -372,7 +387,7 @@ def _prune_locked(path: Path) -> int:
         # Bytes in, bytes out (t_19a16be2): a non-UTF-8 line is kept verbatim like any other
         # unparseable line, instead of raising out of the iterator and aborting every prune.
         with open(path, "rb") as f:
-            for raw in f:
+            for raw in _iter_raw_lines(f):
                 stripped_raw = raw.strip()
                 if not stripped_raw:
                     continue
