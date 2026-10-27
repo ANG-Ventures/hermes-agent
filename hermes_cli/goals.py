@@ -501,6 +501,8 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
+    # Bumped by every GoalManager save; GoalManager._save compares the stored row before writing.
+    revision: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -509,7 +511,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns", "revision")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at")}
         return cls(
             goal=data.get("goal", ""),
@@ -686,23 +688,31 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
 
 def load_goal(session_id: str) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
+    return _load_goal_raw(session_id)[0]
+
+
+def _load_goal_raw(session_id: str, *, strict: bool = False) -> Tuple[Optional[GoalState], Optional[str]]:
+    """``(state, stored row text)``; the text is the revision GoalManager._save compares against.
+    ``strict``: a failed read raises instead of reading as "no goal" (a locked DB is not a cleared goal)."""
     if not session_id:
-        return None
+        return None, None
     db = _get_session_db()
     if db is None:
-        return None
+        return None, None
     try:
         raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
+        if strict:
+            raise
         logger.debug("GoalManager: get_meta failed: %s", exc)
-        return None
+        return None, None
     if not raw:
-        return None
+        return None, None
     try:
-        return GoalState.from_json(raw)
+        return GoalState.from_json(raw), raw
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
-        return None
+        return None, raw
 
 
 def list_active_goal_session_ids() -> List[str]:
@@ -1268,6 +1278,13 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
+_UNPINNED = object()  # evaluate_after_turn(baseline=...) not given
+
+
+class _StaleGoalWrite(Exception):
+    """A save inside evaluate_after_turn lost the compare-and-set (internal control flow)."""
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -1279,7 +1296,8 @@ class GoalManager:
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._state, self._stored = _load_goal_raw(session_id)
+        self._evaluating = False
 
     # --- introspection ------------------------------------------------
 
@@ -1325,8 +1343,30 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
-        return self._state
+        """Inside ``evaluate_after_turn`` the write is compare-and-set against the row this manager
+        loaded: a judge holding a stale copy (the user ran /goal pause or clear meanwhile) drops its
+        write and aborts. Every other caller is a user verb or a fresh read-modify-write; it writes."""
+        db = _get_session_db() if self.session_id and self._state is not None else None
+        if db is None:  # not persisted (warned); _stored still mirrors the row as last seen
+            save_goal(self.session_id, self._state)
+            return self._state
+        self._state.revision += 1
+        raw = self._state.to_json()
+        try:
+            if self._evaluating:
+                written = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
+            else:
+                db.set_meta(_meta_key(self.session_id), raw)
+                written = True
+        except Exception as exc:
+            logger.debug("GoalManager: goal write failed: %s", exc)
+            return self._state
+        if written:
+            self._stored = raw
+            return self._state
+        logger.info("GoalManager: goal for %s changed since load; dropped the stale write", self.session_id)
+        self._state, self._stored = _load_goal_raw(self.session_id)
+        raise _StaleGoalWrite()  # abort: nothing more of this evaluation may touch the new row
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1663,7 +1703,33 @@ class GoalManager:
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
-    def evaluate_after_turn(
+    def evaluate_after_turn(self, last_response: str, *, baseline: Any = _UNPINNED, **kwargs: Any) -> Dict[str, Any]:
+        """See ``_evaluate_after_turn``. A save that lost to a newer stored state (the user paused,
+        cleared or replaced the goal while the judge ran) never continues on the stale copy.
+        ``baseline``: the stored row when the turn ended; a different row now is a goal the turn never saw."""
+        if _get_session_db() is not None:  # CAS baseline = the row as of evaluation start, not construction
+            try:
+                now = _load_goal_raw(self.session_id, strict=True)
+            except Exception as exc:  # keep the loaded state; the CAS still guards the write
+                logger.warning("GoalManager: goal refresh for %s failed, keeping loaded state: %s", self.session_id, exc)
+                now = (self._state, self._stored)
+            if now[1] != self._stored:  # another manager wrote the row since our last load/save
+                self._state, self._stored = now
+        if baseline is not _UNPINNED and baseline != self._stored:
+            logger.info("GoalManager: goal for %s changed since the turn ended; skipped the evaluation", self.session_id)
+            status = self._state.status if self._state else None
+            return {**_decision(status, False, None, "stale", "goal changed since the turn ended", ""), "held": "stale"}
+        self._evaluating = True
+        try:
+            return self._evaluate_after_turn(last_response, **kwargs)
+        except _StaleGoalWrite:
+            pass
+        finally:
+            self._evaluating = False
+        status = self._state.status if self._state else None
+        return {**_decision(status, False, None, "stale", "goal changed while the judge ran", ""), "held": "stale"}
+
+    def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0, real_event: bool = False, made_tool_calls: Optional[bool] = None,

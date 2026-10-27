@@ -1620,12 +1620,10 @@ class GatewayInboundMixin:
                     _quick_key, exc.session_id,
                 )
                 return self._hm_lease_rejection_reply(event, source, _quick_key)
-            try:
-                await self._run_post_turn_hooks(
-                    agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
-                )
-            except Exception as _goal_exc:
-                logger.debug("post-turn hook failed: %s", _goal_exc)
+            await self._post_turn_hooks_after_delivery(
+                _quick_key, _run_generation, agent_result=_agent_result, source=source,
+                is_internal=is_internal, event=event,
+            )
             return _agent_result
         finally:
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free

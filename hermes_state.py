@@ -2005,6 +2005,14 @@ class SessionDB(
         else:
             self._write_sql(sql, (key, value))
 
+    def compare_and_set_meta(self, key: str, expected: Optional[str], value: str) -> bool:
+        """Write state_meta[key] only while it still holds ``expected`` (None = no row); True if written."""
+        if expected is None:
+            sql, params = "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)", (key, value)
+        else:
+            sql, params = "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?", (value, key, expected)
+        return self._write_rowcount(sql, params) > 0
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces
         root; gated once per root via state_meta. Returns rows retagged."""
