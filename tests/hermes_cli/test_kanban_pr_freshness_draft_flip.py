@@ -144,12 +144,76 @@ def test_retry_after_partial_flip_does_not_arm_already_flipped_pr():
         fr.check(refs, task_id="t_c1ee61ae", allow_arm=True, gh=_gh_two({"5": True, "6": True}, SKIPPED),
                  arm=lambda *a: None, ready=lambda r, n: rcs[n])
     assert exc.value.prs == ["o/r#6"]
+    assert set(exc.value.flipped) == {"o/r#5"} and exc.value.flipped["o/r#5"]["head"] == HEAD
     armed = []
     rep = fr.check(refs, task_id="t_c1ee61ae", allow_arm=True, gh=_gh_two({"5": False, "6": True}, SKIPPED),
-                   arm=lambda *a: armed.append(a) or "log", ready=lambda r, n: 0)
+                   arm=lambda *a: armed.append(a) or "log", ready=lambda r, n: 0, flipped=exc.value.flipped)
     assert armed == []
-    assert "no post-ready CI" in rep["prs"]["o/r#5"]["automerge"]
+    assert "no CI started after the ready flip" in rep["prs"]["o/r#5"]["automerge"]
     assert "flipped ready" in rep["prs"]["o/r#6"]["automerge"]
+
+
+def _iso(epoch):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+FLIP_AT = 1_793_116_000
+PRE_READY_LINT = {"name": "lint", "status": "completed", "conclusion": "success",
+                  "started_at": _iso(FLIP_AT - 600)}
+SKIPPED_TESTS = {"name": "tests", "status": "completed", "conclusion": "skipped",
+                 "started_at": _iso(FLIP_AT - 600)}
+POST_READY_TESTS = {"name": "tests", "status": "completed", "conclusion": "success",
+                    "started_at": _iso(FLIP_AT + 30)}
+RECORD = {"o/r#5": {"head": HEAD, "at": FLIP_AT}}
+
+
+def test_prism_d34048_pre_ready_lint_success_does_not_arm_flipped_pr():
+    """Prism d34048d53f3c (a): a draft-time lint SUCCESS beside skipped tests is not post-ready CI.
+    The flipped PR is armed only once a non-skipped run started after the flip appears."""
+    armed = []
+    rep = fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True,
+                   gh=_gh_two({"5": False}, [PRE_READY_LINT, SKIPPED_TESTS]),
+                   arm=lambda *a: armed.append(a) or "log", flipped=RECORD)
+    assert armed == [] and "not armed" in rep["prs"]["o/r#5"]["automerge"]
+    rep = fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True,
+                   gh=_gh_two({"5": False}, [PRE_READY_LINT, POST_READY_TESTS]),
+                   arm=lambda *a: armed.append(a) or "log", flipped=RECORD)
+    assert len(armed) == 1 and "spawned" in rep["prs"]["o/r#5"]["automerge"]
+
+
+def test_prism_d34048_flip_record_also_binds_a_non_card_branch():
+    """The persisted record, not the branch name, is what binds: a recorded PR is gated even when
+    its branch would not read as this card's own."""
+    armed = []
+
+    def gh(*args):
+        out = _gh_two({"5": False}, [PRE_READY_LINT, SKIPPED_TESTS])(*args)
+        if out and "head" in out:
+            out["head"]["ref"] = "feature/x"
+        return out
+    fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True, gh=gh,
+             arm=lambda *a: armed.append(a) or "log", flipped=RECORD)
+    assert armed == []
+
+
+def test_prism_d34048_none_then_success_race_does_not_arm():
+    """Prism d34048d53f3c (b): the first check-runs read returns None, a second would succeed.
+    One snapshot decides: unreadable is not evidence, so nothing arms."""
+    reads = []
+    green = _gh_two({"5": False}, [PRE_READY_LINT, POST_READY_TESTS])
+
+    def gh(*args):
+        if args[-1].endswith("check-runs?per_page=100"):
+            reads.append(1)
+            if len(reads) == 1:
+                return None
+        return green(*args)
+    armed = []
+    rep = fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True, gh=gh,
+                   arm=lambda *a: armed.append(a) or "log", flipped=RECORD)
+    assert armed == [] and "unreadable" in rep["prs"]["o/r#5"]["automerge"]
+    assert len(reads) == 1
 
 
 def test_own_pr_with_post_ready_ci_is_armed():
@@ -227,3 +291,45 @@ def test_e2e_foreign_draft_still_refused(board, monkeypatch):
                              metadata={"pr_url": PR_URL}, expected_run_id=run)
         assert _status(conn, tid) == "running"
     assert ready == [] and armed == []
+
+
+def test_e2e_partial_flip_record_persists_across_handoffs(board, monkeypatch):
+    """Prism d34048d53f3c through complete_task: A flips, B rc 3 -> refused, A's flip recorded on the
+    card. Retry with A non-draft + pre-ready lint success: A NOT armed. Post-flip test run: armed."""
+    state = {"drafts": {"5": True, "6": True}, "runs": [PRE_READY_LINT, SKIPPED_TESTS], "tid": None}
+    rcs = {5: 0, 6: 3}
+
+    def gh(*args):
+        path = args[-1]
+        if "/pulls/" in path:
+            n = path.rsplit("/", 1)[-1]
+            return {"draft": state["drafts"][n], "head": {"sha": HEAD, "ref": f"daedalus/{state['tid']}-x"},
+                    "base": {"ref": "main"}, "mergeable_state": "clean"}
+        if "/compare/" in path:
+            return {"behind_by": 0, "ahead_by": 1}
+        if path.endswith("check-runs?per_page=100"):
+            return {"check_runs": state["runs"]}
+        if path.endswith("/status"):
+            return {"state": "success", "total_count": 1}
+        return None
+    armed = []
+    monkeypatch.setattr(fr, "_default_gh", lambda: gh)
+    monkeypatch.setattr(fr, "_default_ready", lambda: (lambda r, n: rcs[n]))
+    monkeypatch.setattr(fr, "spawn_arm", lambda *a: armed.append(a[1]) or "/tmp/log")
+    monkeypatch.setattr(fr.time, "time", lambda: FLIP_AT)
+    urls = f"{PR_URL} https://github.com/o/r/pull/6"
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        state["tid"] = tid
+        with pytest.raises(fr.DraftPrError):
+            kb.complete_task(conn, tid, summary=f"done {urls}", metadata={"pr_urls": urls.split()},
+                             expected_run_id=run)
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='handoff_draft_flipped'",
+                          (tid,)).fetchall()
+        assert [json.loads(r[0])["flipped"] for r in ev] == [{"o/r#5": {"head": HEAD, "at": FLIP_AT}}]
+        # Retry: A already ready on GitHub, B flips now; A carries only draft-time checks.
+        state["drafts"] = {"5": False, "6": True}
+        rcs[6] = 0
+        assert kb.complete_task(conn, tid, summary=f"done {urls}", metadata={"pr_urls": urls.split()},
+                                expected_run_id=run)
+        assert armed == []

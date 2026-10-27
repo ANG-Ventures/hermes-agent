@@ -10970,20 +10970,40 @@ def complete_task(
                 )
             }
             may_arm = not is_milestone_card(conn, task_id)
+            # Ready-flip evidence from earlier handoffs of this card (t_c1ee61ae, Prism
+            # d34048d53f3c): a PR flipped ready before is armed only on post-flip CI.
+            flip_records: dict = {}
+            for (payload,) in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'handoff_draft_flipped' "
+                "ORDER BY id", (task_id,),
+            ).fetchall():
+                try:
+                    flip_records.update((json.loads(payload) or {}).get("flipped") or {})
+                except (TypeError, ValueError, AttributeError):
+                    continue
+
+            def _record_flips(flipped):
+                if flipped:
+                    flip_records.update(flipped)
+                    with write_txn(conn):
+                        _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
 
             def _freshness_gate(refs, allow_arm):
                 try:
-                    return _fresh.check(
+                    out = _fresh.check(
                         refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
-                        draft_ok=draft_ok is not None,
+                        draft_ok=draft_ok is not None, flipped=dict(flip_records),
                     )
                 except _fresh.DraftPrError as draft_err:
+                    _record_flips(draft_err.flipped)
                     with write_txn(conn):
                         _append_event(
                             conn, task_id, "completion_blocked_draft_pr",
                             {"prs": draft_err.prs},
                         )
                     raise
+                _record_flips(out.get("draft_flipped_at"))
+                return out
 
             freshness = _freshness_gate(still_open, no_new is None and may_arm)
             overridden = freshness.get("draft_override") or []
