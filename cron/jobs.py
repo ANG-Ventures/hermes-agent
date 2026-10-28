@@ -4664,6 +4664,14 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     return not _claim_owner_is_dead(claim)
 
 
+def live_fire_claim_owner(job: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Owner of the job's fire_claim when it is a live run (fresh and owner not provably dead)."""
+    claim = job.get("fire_claim") if isinstance(job, dict) else None
+    if not isinstance(claim, dict) or not _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS):
+        return None
+    return str(claim.get("by") or "") or None
+
+
 _REARM_RECURRING_ERROR = (
     "Cannot re-arm recurring jobs: re-arm is one-shot-only; use plain resume or cron run."
 )
@@ -4889,6 +4897,7 @@ def mark_job_run(
     model_unreachable: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
+    defer_to_live_fire_claim: bool = False,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -4908,8 +4917,17 @@ def mark_job_run(
     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
     consumed fire when the provider reopens; manual runs retain the natural schedule
     (cron/quota_hold.py, #89376).
+
+    ``defer_to_live_fire_claim``: an unclaimed caller (``cron run --wait``) records nothing while
+    another owner holds a live fire_claim; the terminal write would clear that run's claim and
+    the scheduler would kill it as "lost its durable fire claim ownership" (x-feed-brief 10-27).
     """
     def apply(jobs, _i, job):
+        if defer_to_live_fire_claim and live_fire_claim_owner(job):
+            logger.warning(
+                "mark_job_run: job_id %s has a live fire claim (%s); not recording this "
+                "unclaimed run over it", job_id, job["fire_claim"].get("by"))
+            return False
         if expected_fire_owner is not None:
             claim = job.get("fire_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:

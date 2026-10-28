@@ -33,7 +33,7 @@ def _patch_pipeline(monkeypatch, *, success=True, final_response="done", output=
         calls["deliver_success"].append(success)
         return None  # no delivery error
 
-    def fake_mark(job_id, ok, err, delivery_error=None):
+    def fake_mark(job_id, ok, err, delivery_error=None, **_kw):
         calls["mark"].append((job_id, ok, err, delivery_error))
 
     monkeypatch.setattr(scheduler, "run_job", fake_run_job)
