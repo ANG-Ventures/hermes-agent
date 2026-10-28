@@ -234,6 +234,13 @@ class TurnFacadeMixin:
                     # Balance note_turn_started so the idle queue's live-turn count cannot leak.
                     with suppress(Exception):
                         _review_queue.note_turn_finished()
+                    # Signing grants minted for delegate children end with this turn, on EVERY exit
+                    # (finalize_turn, early returns such as a content_filter refusal, exceptions):
+                    # this finally is the one place they all pass (t_19c567a8, Prism d8077e51e319).
+                    if "_sign_grants" in self.__dict__:
+                        from tools.delegate_tool_sign_grant import revoke_turn_grants
+
+                        revoke_turn_grants(self)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """Final response string of one turn; ``stream_callback`` receives each text delta."""

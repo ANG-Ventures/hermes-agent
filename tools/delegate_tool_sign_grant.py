@@ -5,7 +5,7 @@ design). This module is the spawn half: it checks what only the parent process c
 holds ``by`` itself, it is not a dispatched worker or a delegate child, the child inherited
 its context and runs on its model), mints the board rows bound to the child's session, tells
 the child how to sign and ledgers the grant. The grant is revoked when the PARENT's turn ends
-(``agent/turn_finalizer.py`` -> :func:`revoke_turn_grants`) or at its expiry, whichever is first:
+(``agent/turn_facade.py``, the turn's outer finally -> :func:`revoke_turn_grants`) or at its expiry, whichever is first:
 a grant never outlives the parent turn, and its stamps are void from then on.
 """
 from __future__ import annotations
@@ -112,6 +112,9 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
     except ksg.GrantRefused as exc:
         raise SignGrantError(str(exc)) from exc
     grant["board"] = board
+    # The child carries its grants so a later model swap revokes them (revoke_on_model_drift).
+    child.__dict__.setdefault("_held_sign_grants", []).append(
+        {**grant, "child_session_ref": kb.derive_session_ref(child_sid)})
     task["goal"] = str(task.get("goal") or "") + _brief(grant)
     _ledger({"event": "sign_grant", "grant_id": grant["grant_id"], "child": grant.get("child_id"),
              "by": by, "board": board, "cards": len(cards), "verbs": grant["verbs"],
@@ -148,20 +151,45 @@ def revoke_turn_grants(agent: Any) -> None:
         revoke(held)
 
 
-def revoke(grants: List[Dict[str, Any]]) -> None:
-    """Revoke every grant in ``grants`` (the child's run ended). Never raises."""
+def revoke_on_model_drift(agent: Any, model: Any) -> None:
+    """Dispatch edge of a child's model call: a grant is minted for one model, so the first call
+    on any other model (fallback activation, primary restore, a middleware reroute) revokes it
+    before that model's output can sign anything (Prism 6b322f502e4d)."""
+    held = getattr(agent, "__dict__", {}).get("_held_sign_grants")
+    if not held:
+        return
+    from hermes_cli.kanban_sign_grants import _norm_model
+
+    drifted = [g for g in held if _norm_model(g.get("model")) != _norm_model(model)]
+    if not drifted:
+        return
+    logger.warning("child model is now %r; revoking sign grant(s) %s minted for another model",
+                   model, [g.get("grant_id") for g in drifted])
+    failed = revoke(drifted)
+    # A grant that failed to revoke stays held, so the next call tries again.
+    agent.__dict__["_held_sign_grants"] = [g for g in held if g not in drifted or str(g.get("grant_id")) in failed]
+    if failed:
+        # Fail closed: the other model must not run while a grant it was never given is live.
+        raise RuntimeError(f"sign grant(s) {failed} could not be revoked on a model change to {model!r}")
+
+
+def revoke(grants: List[Dict[str, Any]]) -> List[str]:
+    """Revoke every grant in ``grants``; returns the grant ids that could not be revoked. Never raises."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_sign_grants as ksg
 
+    failed: List[str] = []
     for g in grants or ():
         try:
             with kb.connect_closing(board=g["board"]) as conn:
-                ksg.revoke(conn, g["grant_id"])
+                ksg.revoke(conn, g["grant_id"], child_session_ref=g.get("child_session_ref"))
             _ledger({"event": "sign_grant_revoke", "grant_id": g["grant_id"], "at": int(time.time())})
         except Exception:
             # Expiry still bounds it; say so loudly.
             logger.warning("sign grant %s could not be revoked; it lapses at its expiry",
                            g.get("grant_id"), exc_info=True)
+            failed.append(str(g.get("grant_id")))
+    return failed
 
 
 def _ledger(event: Dict[str, Any]) -> None:

@@ -146,23 +146,106 @@ def test_delegate_task_grant_is_live_through_the_parent_turn_and_revoked_at_its_
     dsg.revoke_turn_grants(parent)  # idempotent: nothing left to revoke
 
 
-def test_parent_turn_end_revokes_its_grants(board, monkeypatch):
-    """agent/turn_finalizer.finalize_turn is what ends the grant (§5: never outlive the parent turn)."""
-    from agent.turn_finalizer import finalize_turn
-    from tests.agent.test_turn_finalizer_final_response_persistence import FakeAgent
+def _facade_agent():
+    from unittest.mock import MagicMock, patch
 
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    agent = FakeAgent()
+    from run_agent import AIAgent
+
+    with patch("model_tools.get_tool_definitions", return_value=[]), \
+            patch("run_agent.check_toolset_requirements", return_value={}), patch("run_agent.OpenAI"):
+        agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
+                        skip_context_files=True, skip_memory=True)
+    agent.client = MagicMock()
     agent.model, agent._delegate_depth = MODEL, 0
+    return agent
+
+
+@pytest.mark.parametrize("exit_kind", ["finalized", "content_filter", "raises"])
+def test_every_parent_turn_exit_revokes_its_grants(board, exit_kind):
+    """Prism d8077e51e319: the grant ends with the parent's turn on EVERY exit, not only the ones that
+    reach finalize_turn: the turn facade's outer finally is the one place a normal end, an early
+    return (content_filter refusal with no fallback) and an exception all pass."""
+    from unittest.mock import patch
+
+    agent = _facade_agent()
     _parent, child = _agents()
-    g = dsg.mint_for_child(_task(board), child, agent)
-    dsg.register_turn_grants(agent, [g])
+    seen = {}
+
+    def fake_loop(ag, *_a, **_kw):
+        g = dsg.mint_for_child(_task(board), child, ag)
+        dsg.register_turn_grants(ag, [g])
+        seen["g"] = g
+        assert len(_live_rows(g["grant_id"])) == 1
+        if exit_kind == "raises":
+            raise RuntimeError("provider exploded")
+        if exit_kind == "content_filter":
+            return {"final_response": "Response blocked by content_filter", "messages": [], "api_calls": 1,
+                    "completed": False, "failed": True, "error": "content_filter"}
+        return {"final_response": "done", "messages": [], "api_calls": 1, "completed": True}
+
+    with patch("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: []), \
+            patch("agent.conversation_loop.run_conversation", fake_loop):
+        try:
+            agent.run_conversation("go")
+        except RuntimeError:
+            assert exit_kind == "raises"
+    assert _live_rows(seen["g"]["grant_id"]) == []
+
+
+def test_a_child_model_change_revokes_its_grant_before_the_call(board):
+    """Prism 6b322f502e4d: a grant is bound to the model it was minted for. The child's first request
+    on another model (a fallback activation) revokes it at the dispatch edge, from inside the child's
+    read-only board fence, so the fallback model's granted verdict is refused; the same model keeps it."""
+    from agent.delegation_context import delegated_child_context
+
+    parent, child = _agents()
+    g = dsg.mint_for_child(_task(board), child, parent)
+    sref = kb.derive_session_ref("child-sid")
+    with delegated_child_context():
+        dsg.revoke_on_model_drift(child, MODEL.upper())  # same model, other spelling: still live
+        assert len(_live_rows(g["grant_id"])) == 1
+        dsg.revoke_on_model_drift(child, "claude-sonnet-5")  # try_activate_fallback moved it
+        assert _live_rows(g["grant_id"]) == []
+        with kb.connect_closing() as conn, pytest.raises(ksg.GrantRefused, match="revoked"):
+            kb.add_comment(conn, board, "apollo", "verdict: looks right", session_ref=sref, grant_id=g["grant_id"])
+        with kb.connect_closing() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 0
+
+
+def test_perform_api_call_revokes_on_the_model_it_actually_sends(board, monkeypatch):
+    """The dispatch edge reads the model in the outgoing request, so a fallback swap is caught on its first call."""
+    from types import SimpleNamespace as NS
+
+    from agent import turn_api_call
+
+    parent, child = _agents()
+    g = dsg.mint_for_child(_task(board), child, parent)
+    calls = []
+
+    class _Child:
+        pass
+
+    agent = _Child()
+    agent.__dict__.update(child.__dict__, provider="anthropic", base_url="", api_mode="anthropic_messages",
+                          platform="subagent", _disable_streaming=True, _has_stream_consumers=lambda: False,
+                          _interruptible_api_call=lambda kw: calls.append(kw["model"]) or NS(choices=[]),
+                          _has_pending_redirect=lambda: False)
+    monkeypatch.setattr("hermes_cli.middleware.run_llm_execution_middleware",
+                        lambda kw, fn, **_k: fn(kw))
+    monkeypatch.setattr("agent.relay_llm.execute", lambda kw, fn, **_k: fn(kw))
+    monkeypatch.setattr("agent.turn_body_budget.terminal_request_body", lambda _a, kw: kw)
+    monkeypatch.setattr("agent.agent_runtime_helpers.note_steer_consumed", lambda _a: None)
+
+    def _call(model):
+        return turn_api_call.perform_api_call(
+            agent, api_kwargs={"model": model}, _original_api_kwargs={"model": model}, _llm_middleware_trace=[],
+            _moa_prepared_request=None, _retry=None, thinking_spinner=None, retry_count=0, api_call_count=1,
+            api_request_id="r", effective_task_id="t", turn_id="turn", interrupted=False)
+
+    _call(MODEL)
     assert len(_live_rows(g["grant_id"])) == 1
-    finalize_turn(agent, final_response="done", api_call_count=1, interrupted=False, failed=False,
-                  messages=[{"role": "user", "content": "go"}, {"role": "assistant", "content": "done"}],
-                  conversation_history=[], effective_task_id="task", turn_id="turn", user_message="go",
-                  original_user_message="go", _should_review_memory=False, _turn_exit_reason="text_response")
-    assert _live_rows(g["grant_id"]) == []
+    _call("claude-sonnet-5")
+    assert _live_rows(g["grant_id"]) == [] and calls == [MODEL, "claude-sonnet-5"]
 
 
 def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):

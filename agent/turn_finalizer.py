@@ -682,9 +682,6 @@ def finalize_turn(
     # self-hosted endpoint with the main request (#117296) may go out now.
     from agent.turn_context import start_deferred_title_upgrade
     _guarded_cleanup("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger)
-    # Scoped signing grants minted for delegate children this turn end with it (t_19c567a8).
-    from tools.delegate_tool_sign_grant import revoke_turn_grants
-    _guarded_cleanup("revoke_sign_grants", lambda: revoke_turn_grants(agent), _cleanup_errors, logger)
     # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
     _guarded_cleanup(
         "save_trajectory",

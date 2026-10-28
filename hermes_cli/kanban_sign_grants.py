@@ -181,15 +181,31 @@ def mint(
             "child_id": child_id, "model": str(child_model)}
 
 
-def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None) -> int:
-    """Revoke every row of ``grant_id``; returns the rows changed. Voids its stamps."""
-    from hermes_cli.kanban_db import write_txn
+def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None,
+           child_session_ref: Optional[str] = None) -> int:
+    """Revoke every row of ``grant_id``; returns the rows changed. Voids its stamps.
+
+    From inside a delegate child (its board connection is read-only) this is the one other
+    write it may make, because it only narrows authority: the child revokes its OWN grant
+    (``child_session_ref`` required and matched) when its model moves away from the grant's.
+    """
+    from hermes_cli import kanban_db as kb
 
     now = int(time.time()) if now is None else int(now)
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE sign_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL", (now, grant_id))
-    return cur.rowcount
+    sql, args = "UPDATE sign_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL", [now, grant_id]
+    if not kb._is_delegated_child():
+        with kb.write_txn(conn):
+            return conn.execute(sql, args).rowcount
+    if not child_session_ref:
+        raise GrantRefused("a delegate child revokes only its own grant (child_session_ref required)")
+    lift = kb._DELEGATED_CHILD_COMMENT_GRANT.set(True)
+    conn.execute("PRAGMA query_only=OFF")
+    try:
+        with kb.write_txn(conn):
+            return conn.execute(sql + " AND child_session_ref = ?", (*args, child_session_ref)).rowcount
+    finally:
+        conn.execute("PRAGMA query_only=ON")
+        kb._DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
 
 
 def ungranted_comments_sql(conn: sqlite3.Connection) -> str:

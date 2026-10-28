@@ -4308,7 +4308,7 @@ def delegate_task(
         except SignGrantError as exc:
             _revoke_grants(sign_grants)
             return tool_error(f"sign_grant refused: {exc}")
-        # Live until the PARENT's turn ends (turn_finalizer revokes them) or expiry, whichever is first:
+        # Live until the PARENT's turn ends (the turn facade's finally revokes them) or expiry, whichever is first:
         # the parent may still run the merge gate over the child's stamp in this turn.
         register_turn_grants(parent_agent, sign_grants)
 
