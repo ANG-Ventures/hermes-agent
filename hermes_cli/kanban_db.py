@@ -10383,8 +10383,9 @@ class ExternalCloseError(ValueError):
 # Event kinds that take a card OUT of review (or end the review cycle). An ``assigned`` event while the latest
 # review cycle is open (after its ``review_requested``, before an exit, or after a resume back INTO review) is a
 # reviewer swap.
+# ``descendant_invalidated``: a reopened parent demotes the card to todo (Prism f696ae12d330).
 _REVIEW_EXIT_KINDS = ("dependency_wait", "changes_requested", "sendback", "blocked", "completed", "unblocked",
-                      "reopened", "requeued", "archived", "triage_resolved")
+                      "reopened", "requeued", "archived", "triage_resolved", "descendant_invalidated")
 # Of those, the kinds that can also put the card BACK in review: ``unblocked`` / ``promoted`` with
 # ``status: review`` (a parked or dependency-held review card resuming its review phase; Prism 2a08733c4d2a).
 _REVIEW_RESUME_KINDS = ("unblocked", "promoted")
@@ -10518,7 +10519,8 @@ def _owns_fleet_pr(metadata: Optional[dict], survivor_pr, reports=(), query_fn=N
     """True when EVERY failing report's checkout is backed by an own fleet PR that can receive its conflict
     sendback: a PR the handoff names, on one of the checkout's GitHub repos (bda9414a767d), read live as OPEN
     (47c7fe02343a, b570e340e7e7: a merged, closed or missing PR has no conflict producer), whose head branch is
-    the checkout's branch (an open PR of the same repo for other work does not carry this checkout).
+    the checkout's branch from a head repository that is one of the checkout's remotes (an open PR of the same
+    repo for other work, or from another fork's same-named branch, does not carry this checkout; 16462e5a9800).
     Anything unreadable is not provably backed: the guard refuses as before.
     """
     from hermes_cli import kanban_open_pr as _open_pr
@@ -10540,7 +10542,8 @@ def _owns_fleet_pr(metadata: Optional[dict], survivor_pr, reports=(), query_fn=N
                     continue
                 state = query(ref.repo, ref.number)
                 if (isinstance(state, dict) and str(state.get("state") or "").upper() == "OPEN"
-                        and str(state.get("head_ref") or "") == branch):
+                        and str(state.get("head_ref") or "") == branch
+                        and str(state.get("head_repo") or "").lower() in slugs):
                     backed = True
                     break
             if not backed:

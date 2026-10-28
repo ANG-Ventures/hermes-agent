@@ -248,12 +248,15 @@ def _checkout(tmp_path, name, url, branch="wt/feature"):
 
 
 def _prs(**states):
-    """query_fn stub: ``repo-a_7="OPEN"`` -> ANG-Ventures/repo-a#7 is OPEN from branch wt/feature."""
+    """query_fn stub: ``repo-a_7="OPEN"`` -> ANG-Ventures/repo-a#7 is OPEN from branch wt/feature of the same repo;
+    ``"OPEN@branch"`` names another head branch, ``"OPEN@branch@owner/repo"`` another head repository."""
     table = {}
     for k, v in states.items():
         repo, num = k.rsplit("_", 1)
-        state, _, head = v.partition("@")
-        table[(f"ang-ventures/{repo.replace('_', '-')}", int(num))] = {"state": state, "head_ref": head or "wt/feature"}
+        slug = f"ang-ventures/{repo.replace('_', '-')}"
+        state, _, rest = v.partition("@")
+        head, _, head_repo = rest.partition("@")
+        table[(slug, int(num))] = {"state": state, "head_ref": head or "wt/feature", "head_repo": head_repo or slug}
     return lambda repo, number: table.get((repo.lower(), number), {"state": "NOT_FOUND"})
 
 
@@ -329,6 +332,8 @@ def test_conflict_advisory_scrubs_inherited_git_dir(tmp_path, monkeypatch) -> No
 @pytest.mark.parametrize("state,backed", [
     ("OPEN", True),
     ("OPEN@other/branch", False),   # an open PR of the repo for other work does not carry this checkout
+    ("OPEN@wt/feature@other/repo-a", False),   # 16462e5a9800: another fork's same-named branch
+    ("OPEN@wt/feature@ANG-Ventures/repo-a", True),   # head repo compared case-insensitively
     ("MERGED", False),              # 47c7fe02343a: a merged PR cannot receive the conflict sendback
     ("CLOSED", False),
     ("NOT_FOUND", False),
@@ -419,3 +424,28 @@ def test_reviewer_swap_after_a_review_resume_counts(kanban_home: SimpleNamespace
         _tick(kanban_home)
         assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
         assert kb.get_task(conn, tid).assignee == "dev"
+
+
+def test_parent_reopen_demotion_ends_the_review_cycle(kanban_home: SimpleNamespace) -> None:
+    """Prism f696ae12d330: the REAL parent-reopen path (descendant_invalidated + legacy status, no review-exit kind
+    before this fix) demotes the review card; the operator then assigns the reviewer itself. That assignment came
+    after the card left review, so the sendback keeps it and provenance does not name it."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        tid = kb.create_task(conn, title="reopen demotes", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(conn, tid, summary="PR ready", reviewer="argus",
+                                 expected_run_id=claimed.current_run_id)
+        assert kb.get_task(conn, tid).status == "review"
+        out = kb.invalidate_descendants_for_parent_reopen(conn, parent, author="operator")
+        assert [e["id"] for e in out["invalidated"]] == [tid]
+        assert kb.get_task(conn, tid).status == "todo"
+        _tick(kanban_home)
+        assert kb.assign_task(conn, tid, "argus")              # the operator's explicit choice, out of review
+        assert kb._review_cycle_scan(conn, tid)[1] is False
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        assert kb.get_task(conn, tid).assignee == "argus"

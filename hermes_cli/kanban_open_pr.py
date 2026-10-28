@@ -118,6 +118,9 @@ def query_pr_state(repo: str, number: int) -> Optional[dict]:
     head = payload.get("head")
     if isinstance(head, dict) and head.get("ref"):
         out["head_ref"] = str(head["ref"])
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    if isinstance(head_repo, dict) and head_repo.get("full_name"):
+        out["head_repo"] = str(head_repo["full_name"])
     if out["state"] == "MERGED" and isinstance(head, dict) and head.get("sha"):
         out["head_sha"] = str(head["sha"])
     return out
