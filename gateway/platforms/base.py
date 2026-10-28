@@ -5424,7 +5424,19 @@ class BasePlatformAdapter(ABC):
         except Exception as notify_err:
             logger.error(
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
+        self._page_turn_error(event, e)
         return _thread_metadata
+
+    def _page_turn_error(self, event: MessageEvent, e: BaseException) -> None:
+        """Page #alerts once per room episode after the user's error notice (gateway.page_on_turn_error)."""
+        try:
+            from gateway import turn_error_pager
+            with self._media_delivery_scope(event.source):
+                enabled = bool(_config_section("gateway").get("page_on_turn_error", True))
+            if enabled and turn_error_pager.episode_key(event) is not None:
+                turn_error_pager.maybe_page(event, e, self._event_session_key(event))
+        except Exception:
+            logger.error("[%s] turn-error page not dispatched", self.name, exc_info=True)
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,

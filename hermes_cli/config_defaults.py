@@ -2983,6 +2983,11 @@ DEFAULT_CONFIG = {
         # host 127.0.0.1:7890"). Per-platform vars (DISCORD_PROXY, TELEGRAM_PROXY, ...) are still
         # honored.
         "trust_env": True,
+        # After a messaging user (matrix/discord/telegram/whatsapp/signal/imessage) gets the "Sorry, I
+        # encountered an error" notice, page the operator via <root>/scripts/lib/episode_pager.py:
+        # one page per room per episode, cleared after 30 min with no new error. Read per error
+        # (no restart to flip). No-op when the pager script is absent.
+        "page_on_turn_error": True,
         # Media delivery. False: any emitted file path is delivered natively unless under the
         # credential/system denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env, auth.json). True:
         # files must be under the Hermes cache, media_delivery_allow_dirs, or fresher than
