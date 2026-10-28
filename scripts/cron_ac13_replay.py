@@ -172,21 +172,37 @@ def build_store(src_jobs: list, durations: dict, home: Path, minute: datetime, t
             clean["script"] = name
         else:
             clean["script"] = None
+        kind = (job.get("schedule") or {}).get("kind")
         nxt = far
         fires = _fires(job, minute, minute + timedelta(seconds=window_s))
         if fires:
             offset = (fires[0] - minute).total_seconds()
-            nxt = (t0 + timedelta(seconds=offset)).isoformat()
+            at = t0 + timedelta(seconds=offset)
+            nxt = at.isoformat()
             in_window += 1
             if offset < 60:
                 due_at_t0.append(job["id"])
+            if kind == "cron":
+                # The due scan re-anchors a next_run_at that is not on the expr's lattice
+                # (expr_edit), so a shifted fire needs an expr whose lattice holds it: daily at
+                # the shifted UTC minute (the scratch home runs in UTC).
+                clean["schedule"] = {"kind": "cron", "expr": f"{at.minute} {at.hour} * * *",
+                                     "display": f"{at.minute} {at.hour} * * *"}
+        elif kind == "once":
+            continue  # a one-shot outside the window would only raise overdue notices
+        elif kind == "cron":
+            parked = t0 + timedelta(days=1)
+            clean["schedule"] = {"kind": "cron", "expr": f"{parked.minute} {parked.hour} * * *",
+                                 "display": f"{parked.minute} {parked.hour} * * *"}
+        if kind == "once":
+            clean["schedule"] = dict(job["schedule"], run_at=nxt)
         clean["next_run_at"] = nxt
         out_jobs.append(clean)
     (home / "cron" / "jobs.json").write_text(
         json.dumps({"jobs": out_jobs, "updated_at": datetime.now(timezone.utc).isoformat()},
                    indent=1), encoding="utf-8")
     (home / "config.yaml").write_text(
-        "cron:\n  oneshot_catchup_s: 0\n  script_runner:\n    enabled: true\n", encoding="utf-8")
+        "timezone: UTC\ncron:\n  oneshot_catchup_s: 0\n  script_runner:\n    enabled: true\n", encoding="utf-8")
     return {"jobs": len(out_jobs), "due_first_minute": len(due_at_t0), "in_window": in_window,
             "script_stubs": sum(1 for j in out_jobs if j.get("no_agent") is True)}
 
@@ -349,7 +365,8 @@ def one_run(args, src_jobs, durations, tz, run_dir: Path, *, control: bool) -> d
     home = run_dir / "home" / ".hermes"
     minute, _ids = busiest_minute(src_jobs, tz)
     warmup = 2.5 * cycle
-    t0 = datetime.now(timezone.utc) + timedelta(seconds=warmup)
+    t0 = (datetime.now(timezone.utc) + timedelta(seconds=warmup + 60)).replace(
+        second=0, microsecond=0)  # on a minute boundary: cron fires sit on the lattice
     manifest = build_store(src_jobs, durations, home, minute, t0, (args.cycles + 1) * 60.0)
     manifest.update(minute=minute.isoformat(), t0=t0.isoformat(), control=control,
                     cycle_s=cycle, thresholds=THRESHOLDS)
