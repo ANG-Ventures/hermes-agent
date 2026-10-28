@@ -536,13 +536,25 @@ class InProcessCronScheduler(CronScheduler):
     def start(
         self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None,
         profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
+        lane="all", heartbeat=True, startup_recovery=True, on_home_cycle=None, tick_hooks=None,
     ):
+        """``lane``/``heartbeat``/``startup_recovery``/``on_home_cycle``/``tick_hooks`` serve the
+        script runner (cron/script_runner.py, spec §5.4) and need ``profile_homes``.
+        ``heartbeat=False``: never write ``ticker_heartbeat``/``ticker_last_success``/
+        ``ticker_last_error`` (the gateway's signal). ``on_home_cycle(name, home, gated_in,
+        outcome)``: once per existing home per cycle, ``outcome`` = the ``TickOutcome`` the tick
+        reported, the exception it raised, or None when it did not tick. ``tick_hooks =
+        (on_tick_start(home), on_tick_end(home))`` wrap each ``tick()`` call."""
         from cron.scheduler import CronTickYielded
         from cron.scheduler import tick as cron_tick
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
         from hermes_constants import get_process_hermes_home
 
+        runner_hooks = (lane != "all" or not heartbeat or not startup_recovery
+                        or on_home_cycle is not None or tick_hooks is not None)
+        if runner_hooks and not (profile_homes is not None and (callable(profile_homes) or profile_homes)):
+            raise ValueError("lane/heartbeat/startup_recovery/on_home_cycle/tick_hooks need profile_homes")
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
 
         # Multiplex: tick EACH profile's store every cycle, heartbeats/recovery scoped per profile.
@@ -555,7 +567,9 @@ class InProcessCronScheduler(CronScheduler):
             self._start_multiplex(
                 stop_event, profile_homes=profile_homes, adapters=adapters, loop=loop,
                 interval=interval, can_dispatch=can_dispatch, profile_adapters=profile_adapters,
-                default_profile=default_profile, profile_gate=profile_gate,
+                default_profile=default_profile, profile_gate=profile_gate, lane=lane,
+                heartbeat=heartbeat, startup_recovery=startup_recovery,
+                on_home_cycle=on_home_cycle, tick_hooks=tick_hooks,
             )
             return
 
@@ -632,10 +646,11 @@ class InProcessCronScheduler(CronScheduler):
     def _start_multiplex(
         self, stop_event, *, profile_homes, adapters=None, loop=None, interval=60,
         can_dispatch=None, profile_adapters=None, default_profile=None, profile_gate=None,
+        lane="all", heartbeat=True, startup_recovery=True, on_home_cycle=None, tick_hooks=None,
     ):
         """Tick every profile's store, each scoped via ``_profile_cron_scope``. ``profile_gate(name,
         home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
-        heartbeated."""
+        heartbeated. The runner keywords are documented on ``start``."""
         from cron.scheduler import tick as cron_tick
         from cron.scheduler import CronTickYielded, _is_fd_exhaustion
         from cron.scheduler_preflight import (
@@ -667,21 +682,29 @@ class InProcessCronScheduler(CronScheduler):
         # Recovery + heartbeat per profile; one broken store must not abort startup for the others.
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
         # cron workspace via the heartbeat below (#47368).
-        for entry in initial_homes:
+        for entry in (initial_homes if startup_recovery or heartbeat else []):
             _, home = _profile_entry(entry)
             try:
                 with _profile_cron_scope(home):
-                    recovered = self.recover_interrupted()
-                    if recovered:
-                        logger.warning(
-                            "Marked %d interrupted cron execution(s) for profile at %s",
-                            recovered, home,
-                        )
-                    record_ticker_heartbeat()
+                    if startup_recovery:
+                        recovered = self.recover_interrupted()
+                        if recovered:
+                            logger.warning(
+                                "Marked %d interrupted cron execution(s) for profile at %s",
+                                recovered, home,
+                            )
+                    if heartbeat:
+                        record_ticker_heartbeat()
             except BaseException as e:
                 logger.error(
                     "Cron startup recovery error for profile at %s: %s", home, e, exc_info=True
                 )
+
+        # Runner-only tick arguments; the gateway's call stays byte-identical (lane "all").
+        tick_kwargs: dict = {}
+        if lane != "all":
+            tick_kwargs["lane"] = lane
+        _on_tick_start, _on_tick_end = tick_hooks if tick_hooks is not None else (None, None)
 
         consecutive_failures = 0
         next_tick = time.monotonic()
@@ -697,8 +720,11 @@ class InProcessCronScheduler(CronScheduler):
             # Publish the list only once the gate has filtered it: a partial assignment would
             # tick the ungated set — the exact stand-down the Desktop gate exists for (#100489).
             cycle_homes: list = []
+            all_homes: list = []
+            _outcomes: dict = {}
             try:
                 enumerated = [_profile_entry(e) for e in _existing_profile_homes(profile_homes)]
+                all_homes = enumerated
                 if profile_gate is not None:
                     enumerated = [(name, home) for name, home in enumerated if profile_gate(name, home)]
                 cycle_homes = enumerated
@@ -715,22 +741,34 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for _pname, home in cycle_homes:
+                        if on_home_cycle is not None:
+                            def _report(outcome, _key=str(home)):
+                                _outcomes[_key] = outcome
+                            tick_kwargs["report"] = _report
                         try:
                             with _profile_cron_scope(home):
-                                cron_tick(
-                                    verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
-                                    sync=False, can_dispatch=can_dispatch,
-                                )
+                                if _on_tick_start is not None:
+                                    _on_tick_start(home)
+                                try:
+                                    cron_tick(
+                                        verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
+                                        sync=False, can_dispatch=can_dispatch, **tick_kwargs,
+                                    )
+                                finally:
+                                    if _on_tick_end is not None:
+                                        _on_tick_end(home)
                         except CronTickYielded as e:
                             # Yield for THIS profile only; one fresh gateway must not stop others.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)
                             _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
+                            _outcomes[str(home)] = e
                         except BaseException as e:
                             # THIS profile only; BaseException as in the single-profile loop.
                             logger.error(
                                 "Cron tick error for profile at %s: %s", home, e, exc_info=True
                             )
                             _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
+                            _outcomes[str(home)] = e
                             if _cycle_exc is None or _is_fd_exhaustion(e):
                                 _cycle_exc = e
                     ok = not _profile_errors
@@ -742,7 +780,7 @@ class InProcessCronScheduler(CronScheduler):
                 # EMFILE: reclaim fds + exponential backoff (#87644).
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
             # Completed cycle: each profile's own outcome; aborted cycle: all beats unsuccessful.
-            for _, home in cycle_homes:
+            for _, home in (cycle_homes if heartbeat else []):
                 with _profile_cron_scope(home):
                     _home_ok = _tick_error is None and str(home) not in _profile_errors
                     _guarded_store_write(
@@ -760,6 +798,15 @@ class InProcessCronScheduler(CronScheduler):
                         _guarded_store_write(
                             record_ticker_error, "tick error", _tick_error
                         )
+            # Runner hook: every existing home, ticked or gated out, once per cycle. A tick that
+            # reported and then raised hands over the exception, never the earlier report.
+            if on_home_cycle is not None:
+                ticked = {str(home) for _n, home in cycle_homes}
+                for _pname, home in all_homes:
+                    try:
+                        on_home_cycle(_pname, home, str(home) in ticked, _outcomes.get(str(home)))
+                    except BaseException as e:  # noqa: BLE001 - a hook must not end the ticker
+                        logger.error("Cron home-cycle hook failed for %s: %s", home, e, exc_info=True)
             if ok:
                 consecutive_failures = 0
             wait_for = _backoff_wait_seconds(interval, consecutive_failures)

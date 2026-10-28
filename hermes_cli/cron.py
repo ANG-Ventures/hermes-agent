@@ -1143,6 +1143,15 @@ def cron_runtime_export(args) -> int:
     return 0
 
 
+def cron_runner(args) -> int:
+    """``hermes cron runner [rearm]`` (cron/script_runner.py)."""
+    from cron import script_runner
+
+    if getattr(args, "runner_action", None) == "rearm":
+        return script_runner.rearm()
+    return script_runner.main([])
+
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False), as_json=getattr(a, "json", False)) or 0,
@@ -1150,6 +1159,7 @@ _CRON_SUBCOMMANDS = {
     "doctor": lambda a: cron_doctor(),
     "runtime-export": lambda a: cron_runtime_export(a),
     "tick": lambda a: cron_tick(),
+    "runner": lambda a: cron_runner(a),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),
     "notepad": lambda a: cron_notepad(a),
