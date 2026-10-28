@@ -233,3 +233,44 @@ def test_lint_exit_2_when_runner_plist_missing(scratch):
     home, _vhome, env = scratch
     _write_gateway(home, env)
     assert crp.lint() == 2
+
+
+def test_install_writes_runner_plist_0600_under_permissive_umask(scratch):
+    """The runner plist carries the gateway env (maybe credentials): never world-readable (t_5a9e1629)."""
+    import os
+    import stat
+    home, _vhome, env = scratch
+    _write_gateway(home, env)
+    stale = _runner_path(home).with_suffix(".plist.tmp")
+    stale.write_bytes(b"old")
+    stale.chmod(0o644)
+    old = os.umask(0o022)
+    try:
+        assert crp.install(launchctl=FakeLaunchd().launchctl) == 0
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(_runner_path(home).stat().st_mode) == 0o600
+    assert not stale.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32" or not shutil.which("pgrep"), reason="needs pgrep")
+def test_runner_pids_finds_runner_after_setproctitle_rewrite():
+    """main._set_process_title() replaces argv; the uninstall probe must still see the runner (t_5a9e1629)."""
+    pytest.importorskip("setproctitle")
+    import os
+    import time
+    code = ("import sys; sys.argv = ['hermes_cli.main', 'cron', 'runner']; "
+            "from hermes_cli import main; main._set_process_title(); "
+            "print('titled', flush=True); import time; time.sleep(30)")
+    env = {k: v for k, v in os.environ.items() if k != "HERMES_KANBAN_TASK"}
+    proc = subprocess.Popen([sys.executable, "-c", code], cwd=str(crp.PROJECT_ROOT), env=env,
+                            stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "titled"
+        deadline = time.monotonic() + 10
+        while proc.pid not in crp._runner_pids() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert proc.pid in crp._runner_pids()
+    finally:
+        proc.kill()
+        proc.wait()

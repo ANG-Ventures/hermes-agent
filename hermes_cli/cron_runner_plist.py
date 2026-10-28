@@ -30,8 +30,9 @@ EXIT_CONFIG = 78  # same refusal code as the runner (I6)
 EXIT_SOURCE_MISSING = 2
 REFUSED_KEY = "HERMES_MACHINE_ID"
 _XPC = re.compile(r"^XPC_")
-# A runner started by this plist: `<python> ... hermes_cli.main ... cron runner` with nothing after it.
-_RUNNER_CMDLINE = r"hermes_cli[.]main.* cron runner$"
+# A runner started by this plist: `<python> ... hermes_cli.main ... cron runner` with nothing after it,
+# or `hermes cron runner` once main._set_process_title() rewrote argv via setproctitle.
+_RUNNER_CMDLINE = r"(hermes_cli[.]main.*|^hermes) cron runner$"
 
 
 class SourceMissing(Exception):
@@ -159,7 +160,11 @@ def install(*, dry_run: bool = False, launchctl: Callable = _run_launchctl) -> i
     domain = f"gui/{_uid()}"
     launchctl("bootout", f"{domain}/{LABEL}")  # re-install: unload the old definition first
     tmp = path.with_suffix(".plist.tmp")
-    tmp.write_bytes(body)
+    # 0600 regardless of umask: the env copied from the gateway plist may hold credentials.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        os.fchmod(fh.fileno(), 0o600)  # a stale tmp keeps its old mode through O_CREAT
+        fh.write(body)
     tmp.replace(path)
     res = launchctl("bootstrap", domain, str(path))
     if res.returncode != 0:
