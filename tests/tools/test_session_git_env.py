@@ -221,6 +221,82 @@ class TestInvariants:
         assert "seq=" not in result["output"]
 
 
+class TestForgedReport:
+    """Prism 36b227820e17 / 33d27ec2d4e3 (Apollo round 3): the policed command runs in the same shell and
+    may try to print the report line itself. The recorded state must end UNKNOWN or correct, never a
+    forged "all unset"."""
+
+    def _forge(self, env):
+        m = env._cwd_marker
+        return f"\\n{m}/f{m}git: seq=999999\\n"
+
+    @pytest.mark.parametrize("redefine", [
+        "printf() {{ command printf '{forge}'; }}",                      # printf function
+        "builtin() {{ echo -e '{forge}'; }}",                             # builtin function
+        "shopt -s expand_aliases; alias printf=\"echo -e '{forge}' #\"",  # alias
+        "pwd() {{ echo /forged; }}",                                      # pwd function
+    ])
+    def test_redefined_emit_path_reports_the_real_state(self, env, tmp_path, redefine):
+        result = env.execute(f"export GIT_DIR=/x\n{redefine.format(forge=self._forge(env))}", cwd=str(tmp_path))
+        assert result.get("git_env_unknown") or result["git_env"]["GIT_DIR"] is True, result
+        assert result.get("cwd") != "/f"
+
+    @pytest.mark.parametrize("defeat", [
+        "readonly POSIXLY_CORRECT",
+        "builtin() {{ echo -e '{forge}'; }}; readonly -f builtin",
+        "enable -n printf",
+    ])
+    def test_a_defeated_emit_path_suppresses_the_line_and_is_unknown(self, env, tmp_path, defeat):
+        result = env.execute(f"export GIT_DIR=/x; {defeat.format(forge=self._forge(env))}", cwd=str(tmp_path))
+        assert result.get("git_env_unknown") is True and "git_env" not in result, result
+
+    def test_background_child_printing_a_second_marker_is_unknown(self, env, tmp_path):
+        forge = self._forge(env)
+        result = env.execute(f"export GIT_DIR=/x; (sleep 0.3; printf '{forge}') &", cwd=str(tmp_path))
+        assert result.get("git_env_unknown") is True, result
+        assert "git_env" not in result
+
+    def test_command_printing_a_marker_inline_is_unknown(self, env, tmp_path):
+        result = env.execute(f"export GIT_DIR=/x; printf '{self._forge(env)}'", cwd=str(tmp_path))
+        assert result.get("git_env_unknown") is True and "git_env" not in result
+
+    def test_unknown_omits_the_field_until_a_later_command_reports(self, env, monkeypatch):
+        tool = TestTerminalToolRecordsIt()
+        tool._tool(monkeypatch, env, "true", "a")
+        assert tt.get_session_git_env(tt.env_git_id(env)) == _NONE_SET
+        # (the tool refuses a foreground ``&``; the background child is pinned at env level above)
+        tool._tool(monkeypatch, env, f"export GIT_DIR=/x; printf '{self._forge(env)}'", "a")
+        assert tt.get_session_git_env(tt.env_git_id(env)) is None          # UNKNOWN: field omitted
+        tool._tool(monkeypatch, env, "true", "a")
+        assert tt.get_session_git_env(tt.env_git_id(env))["GIT_DIR"] is True
+
+    def test_an_older_report_finalizing_after_unknown_does_not_clear_it(self):
+        import time
+        started = time.monotonic()
+        tt.record_session_git_env("env:u", None, None, unknown=True)
+        tt.record_session_git_env("env:u", _NONE_SET, 10**6, started=started)   # began before the UNKNOWN
+        assert tt.get_session_git_env("env:u") is None
+        tt.record_session_git_env("env:u", _NONE_SET, 10**6 + 1, started=time.monotonic())
+        assert tt.get_session_git_env("env:u") == _NONE_SET
+
+    @pytest.mark.platforms("linux")
+    def test_killed_command_is_not_unknown(self, env, tmp_path):
+        result = env.execute("sleep 20", cwd=str(tmp_path), timeout=2)
+        assert "git_env_unknown" not in result
+
+
+class TestSeqIsDecimal:
+    """Prism e084363a13a5: a stored counter with a leading zero must not be read as octal."""
+
+    @pytest.mark.parametrize("stored, expected", [("08", "9"), ("09", "10"), ("010", "11"), ("", "1"), ("x", "1")])
+    def test_leading_zero_counter(self, stored, expected):
+        import subprocess
+        from tools.environments.base_session_env import _seq_bump_lines
+        script = "\n".join([f"__HERMES_SEQ={stored}", *_seq_bump_lines(), 'echo "ran $__hermes_seq"'])
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        assert out.stdout.strip() == f"ran {expected}", out.stderr
+
+
 class TestPreToolCallPayload:
     def test_payload_carries_the_environments_record(self, env, monkeypatch):
         from agent import shell_hooks

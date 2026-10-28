@@ -60,10 +60,27 @@ def _cwd_marker_printf(marker: str) -> str:
     the shell (``${NAME+x}``: set, exported or not) when the command finished; ``_split_git_env`` reads it.
     It sits on the marker line, so the model never sees it. `` seq=N`` leads the section: the shell's
     command counter (``_seq_bump_lines``; 0 in the bootstrap), so a late-finalizing older snapshot can be
-    told from a newer one (``terminal_tool.record_session_git_env``)."""
+    told from a newer one (``terminal_tool.record_session_git_env``).
+
+    The command ran in this same shell and may have redefined anything it can reach (Prism 36b227820e17):
+    a ``printf``/``pwd``/``builtin`` function, an alias (even on ``{`` or ``case``). So the line is emitted
+    in POSIX mode, where the special builtin ``unset`` is found before any function: drop those functions
+    and every alias (a separate line, since aliases expand when a line is parsed), then print with
+    ``\\builtin printf`` behind a ``[[`` (a reserved word, nothing can redefine it once aliases are gone)
+    that checks both steps took. Every value is a parameter expansion of this shell or the readonly counter.
+    Anything that defeats a step (readonly POSIXLY_CORRECT, ``readonly -f builtin``, ``enable -n printf``)
+    suppresses the line, and a missing line from a command nobody killed makes the record UNKNOWN
+    (``BaseEnvironment._extract_cwd_from_output``). Residual, not closable from inside the shell: a command
+    that disables the ``unset`` builtin (``enable -n unset``) AND defines ``unset``/``builtin`` functions, or
+    that prints its own line and exits before this epilogue, can still forge one well-formed line."""
     flags = "".join(f"${{{name}+ {name}=1}}" for name in SESSION_GIT_ENV_NAMES)
-    return (f"printf '\\n{marker}%s{marker}{_GIT_ENV_TAG} seq=%s%s\\n' \"$(pwd -P)\" "
-            f"\"${{{_SEQ_NOW}-0}}\" \"{flags}\"")
+    return "\n".join([
+        "POSIXLY_CORRECT=y 2>/dev/null",
+        "\\unset -f builtin printf pwd unalias 2>/dev/null && \\unalias -a 2>/dev/null && __hermes_mk=1 "
+        "|| __hermes_mk=0",
+        f"[[ $__hermes_mk == 1 && :$SHELLOPTS: == *:posix:* ]] && "
+        f"\\builtin printf '\\n{marker}%s{marker}{_GIT_ENV_TAG} seq=%s%s\\n' \"$(\\builtin pwd -P)\" "
+        f"\"${{{_SEQ_NOW}-0}}\" \"{flags}\""])
 
 
 # The environment's command counter (card t_20695198): persisted in the snapshot as _SEQ_VAR, bumped into
@@ -77,7 +94,8 @@ def _seq_bump_lines() -> list[str]:
     return [
         f'case "${{{_SEQ_VAR}-}}" in \'\'|*[!0-9]*|?????????????????*) {_SEQ_NOW}=0 ;; '
         f'*) {_SEQ_NOW}=${_SEQ_VAR} ;; esac',
-        f"readonly {_SEQ_NOW}=$(({_SEQ_NOW} + 1)) 2>/dev/null || true"]
+        # 10#: a stored "08" is decimal, not an invalid octal that aborts the wrapper (Prism e084363a13a5).
+        f"readonly {_SEQ_NOW}=$((10#${_SEQ_NOW} + 1)) 2>/dev/null || true"]
 
 
 def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:

@@ -228,8 +228,11 @@ def finalize_foreground_result(
         record_session_cwd(session_key, observed_cwd)
     # The shell's GIT_* state persists past a per-command workdir, so it is recorded either way; a
     # command that emitted no marker carries no ``git_env`` and the previous record stands. It is keyed by
-    # the ENVIRONMENT (shared by sessions) and ordered by the shell's command counter (t_20695198).
-    record_session_git_env(env_git_id(env), (result or {}).get("git_env"), (result or {}).get("git_env_seq"))
+    # the ENVIRONMENT (shared by sessions) and ordered by the shell's command counter (t_20695198). A forged or
+    # suppressed report makes the state UNKNOWN (``git_env_unknown``).
+    res = result or {}
+    record_session_git_env(env_git_id(env), res.get("git_env"), res.get("git_env_seq"),
+                           unknown=bool(res.get("git_env_unknown")), started=res.get("git_env_started"))
 
     output = result.get("output", "")
     returncode = result.get("returncode", 0)

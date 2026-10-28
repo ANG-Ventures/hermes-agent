@@ -358,6 +358,11 @@ def clear_session_cwd(session_key: str) -> None:
 # the environment's command counter; an older report that finalizes late can only ADD set names, never
 # clear a newer report's (Prism 917169c9298d / 0d61df4027d6 / 7fc5cadf95a1 / d88ecfb9edb5).
 _env_git_env: Dict[str, Tuple[int, Dict[str, bool]]] = {}
+# Environments whose last report could not be trusted (forged / suppressed marker, Prism 36b227820e17 /
+# 33d27ec2d4e3): env id -> monotonic time the UNKNOWN report finalized. While present the record reads as
+# None (the payload omits ``session_git_env`` and the hook falls back to its text taint). Only a valid report
+# from a command that STARTED after that time clears it; an older command finalizing late cannot.
+_env_git_unknown: Dict[str, float] = {}
 
 
 def env_git_id(env: Any) -> Optional[str]:
@@ -369,16 +374,32 @@ def env_git_id(env: Any) -> Optional[str]:
 
 
 def record_session_git_env(env_id: Optional[str], git_env: Optional[Dict[str, bool]],
-                           seq: Optional[int] = None) -> None:
+                           seq: Optional[int] = None, *, unknown: bool = False,
+                           started: Optional[float] = None) -> None:
     """Record *git_env* (``{name: set}``) reported at command *seq* as environment *env_id*'s state.
     A report with ``seq`` above the stored one replaces it; any other report (equal, older, or without a
     seq) is OR-merged, so it can mark a name set but never clear one. A non-dict (a killed command emitted
-    no marker) or a missing env id changes nothing."""
-    if not env_id or not isinstance(git_env, dict):
+    no marker) or a missing env id changes nothing.
+
+    ``unknown=True`` (the command's report could not be trusted) makes the environment's state UNKNOWN
+    until a valid report from a command whose ``started`` (``time.monotonic()``) is after this call."""
+    if not env_id:
+        return
+    if unknown:
+        with _session_cwd_lock:
+            _env_git_unknown[env_id] = time.monotonic()
+        return
+    if not isinstance(git_env, dict):
         return
     snapshot = {str(name): bool(value) for name, value in git_env.items()}
     order = seq if isinstance(seq, int) and not isinstance(seq, bool) else -1
     with _session_cwd_lock:
+        unknown_at = _env_git_unknown.get(env_id)
+        if unknown_at is not None:
+            if not isinstance(started, (int, float)) or started <= unknown_at:
+                return
+            del _env_git_unknown[env_id]
+            _env_git_env.pop(env_id, None)
         prev = _env_git_env.get(env_id)
         if prev is None or order > prev[0]:
             _env_git_env[env_id] = (order, snapshot)
@@ -389,10 +410,13 @@ def record_session_git_env(env_id: Optional[str], git_env: Optional[Dict[str, bo
 
 
 def get_session_git_env(env_id: Optional[str]) -> Optional[Dict[str, bool]]:
-    """Copy of environment *env_id*'s recorded GIT_* state, or None when nothing is recorded."""
+    """Copy of environment *env_id*'s recorded GIT_* state, or None when nothing is recorded or the
+    state is UNKNOWN."""
     if not env_id:
         return None
     with _session_cwd_lock:
+        if env_id in _env_git_unknown:
+            return None
         recorded = _env_git_env.get(env_id)
         return dict(recorded[1]) if recorded is not None else None
 
