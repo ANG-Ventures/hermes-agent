@@ -1861,11 +1861,14 @@ def _get_hermes_home() -> Path:
     return _hermes_home or get_hermes_home()
 
 
-def _get_lock_paths() -> tuple[Path, Path]:
-    """Resolve cron lock paths at call time so profile/env changes are honored."""
+def _get_lock_paths(lane: str = "agent") -> tuple[Path, Path]:
+    """Resolve cron lock paths at call time so profile/env changes are honored. ``lane`` picks the
+    per-lane tick lock (``.tick.lock`` for agent, ``.tick-script.lock`` for script; cron/lanes.py)."""
+    from cron.lanes import tick_lock_name
+
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
-    return lock_dir, lock_dir / ".tick.lock"
+    return lock_dir, lock_dir / tick_lock_name(lane)
 
 
 # Errnos that mean "another ticker (or manual tick) holds the tick lock", as opposed to a real failure

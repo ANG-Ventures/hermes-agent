@@ -1,0 +1,529 @@
+{
+ "ledger": [
+  {
+   "delivery_outcome": "suppressed",
+   "job_id": "<a0>",
+   "scheduled_instant": "2026-03-01T00:05:00+00:00",
+   "source": "builtin",
+   "status": "completed"
+  },
+  {
+   "delivery_outcome": "suppressed",
+   "job_id": "<a1>",
+   "scheduled_instant": "2026-03-01T00:05:00+00:00",
+   "source": "builtin",
+   "status": "completed"
+  },
+  {
+   "delivery_outcome": "suppressed",
+   "job_id": "<a2>",
+   "scheduled_instant": "2026-03-01T00:05:00+00:00",
+   "source": "builtin",
+   "status": "completed"
+  },
+  {
+   "delivery_outcome": "suppressed",
+   "job_id": "<once>",
+   "scheduled_instant": "2026-03-01T00:03:00+00:00",
+   "source": "builtin",
+   "status": "completed"
+  },
+  {
+   "delivery_outcome": "suppressed",
+   "job_id": "<s0>",
+   "scheduled_instant": "2026-03-01T00:05:00+00:00",
+   "source": "builtin",
+   "status": "completed"
+  },
+  {
+   "delivery_outcome": "suppressed",
+   "job_id": "<s1>",
+   "scheduled_instant": "2026-03-01T00:05:00+00:00",
+   "source": "builtin",
+   "status": "completed"
+  },
+  {
+   "delivery_outcome": "suppressed",
+   "job_id": "<s2>",
+   "scheduled_instant": "2026-03-01T00:05:00+00:00",
+   "source": "builtin",
+   "status": "completed"
+  }
+ ],
+ "results": [
+  0,
+  0,
+  1,
+  0,
+  6,
+  0,
+  0
+ ],
+ "runs": [
+  {
+   "event": "end",
+   "fired_at": 1772323380.0,
+   "instant": "2026-03-01T00:03:00+00:00",
+   "name": "once"
+  },
+  {
+   "event": "end",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "a0"
+  },
+  {
+   "event": "end",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "a1"
+  },
+  {
+   "event": "end",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "a2"
+  },
+  {
+   "event": "end",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "s0"
+  },
+  {
+   "event": "end",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "s1"
+  },
+  {
+   "event": "end",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "s2"
+  },
+  {
+   "event": "start",
+   "fired_at": 1772323380.0,
+   "instant": "2026-03-01T00:03:00+00:00",
+   "name": "once"
+  },
+  {
+   "event": "start",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "a0"
+  },
+  {
+   "event": "start",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "a1"
+  },
+  {
+   "event": "start",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "a2"
+  },
+  {
+   "event": "start",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "s0"
+  },
+  {
+   "event": "start",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "s1"
+  },
+  {
+   "event": "start",
+   "fired_at": 1772323500.0,
+   "instant": "2026-03-01T00:05:00+00:00",
+   "name": "s2"
+  }
+ ],
+ "store": [
+  {
+   "base_url": null,
+   "context_from": null,
+   "deliver": "local",
+   "enabled": true,
+   "enabled_toolsets": null,
+   "error_repeat_streak": 0,
+   "failure_streak": 0,
+   "fire_claim": null,
+   "id": "<a0>",
+   "last_delivery_error": null,
+   "last_delivery_unverified": null,
+   "last_dispatch": {
+    "dispatched_at": "2026-03-01T00:05:00+00:00",
+    "kind": "on_time",
+    "lateness_seconds": 0.0,
+    "scheduled_at": "2026-03-01T00:05:00+00:00"
+   },
+   "last_error": null,
+   "last_run_at": "2026-03-01T00:05:00+00:00",
+   "last_status": "ok",
+   "model": null,
+   "monitor_script": null,
+   "monitor_state": null,
+   "monitor_url": null,
+   "name": "a0",
+   "next_run_at": "2026-03-01T00:10:00+00:00",
+   "no_agent": false,
+   "origin": null,
+   "paused_at": null,
+   "paused_reason": null,
+   "prompt": "agent a0",
+   "provider": null,
+   "repeat": {
+    "completed": 1,
+    "times": null
+   },
+   "schedule": {
+    "display": "every 5m",
+    "kind": "interval",
+    "minutes": 5
+   },
+   "schedule_display": "every 5m",
+   "script": null,
+   "skill": null,
+   "skills": [],
+   "state": "scheduled",
+   "workdir": null
+  },
+  {
+   "base_url": null,
+   "context_from": null,
+   "deliver": "local",
+   "enabled": true,
+   "enabled_toolsets": null,
+   "error_repeat_streak": 0,
+   "failure_streak": 0,
+   "fire_claim": null,
+   "id": "<a1>",
+   "last_delivery_error": null,
+   "last_delivery_unverified": null,
+   "last_dispatch": {
+    "dispatched_at": "2026-03-01T00:05:00+00:00",
+    "kind": "on_time",
+    "lateness_seconds": 0.0,
+    "scheduled_at": "2026-03-01T00:05:00+00:00"
+   },
+   "last_error": null,
+   "last_run_at": "2026-03-01T00:05:00+00:00",
+   "last_status": "ok",
+   "model": null,
+   "monitor_script": null,
+   "monitor_state": null,
+   "monitor_url": null,
+   "name": "a1",
+   "next_run_at": "2026-03-01T00:10:00+00:00",
+   "no_agent": false,
+   "origin": null,
+   "paused_at": null,
+   "paused_reason": null,
+   "prompt": "agent a1",
+   "provider": null,
+   "repeat": {
+    "completed": 1,
+    "times": null
+   },
+   "schedule": {
+    "display": "every 5m",
+    "kind": "interval",
+    "minutes": 5
+   },
+   "schedule_display": "every 5m",
+   "script": null,
+   "skill": null,
+   "skills": [],
+   "state": "scheduled",
+   "workdir": null
+  },
+  {
+   "base_url": null,
+   "context_from": null,
+   "deliver": "local",
+   "enabled": true,
+   "enabled_toolsets": null,
+   "error_repeat_streak": 0,
+   "failure_streak": 0,
+   "fire_claim": null,
+   "id": "<a2>",
+   "last_delivery_error": null,
+   "last_delivery_unverified": null,
+   "last_dispatch": {
+    "dispatched_at": "2026-03-01T00:05:00+00:00",
+    "kind": "on_time",
+    "lateness_seconds": 0.0,
+    "scheduled_at": "2026-03-01T00:05:00+00:00"
+   },
+   "last_error": null,
+   "last_run_at": "2026-03-01T00:05:00+00:00",
+   "last_status": "ok",
+   "model": null,
+   "monitor_script": null,
+   "monitor_state": null,
+   "monitor_url": null,
+   "name": "a2",
+   "next_run_at": "2026-03-01T00:10:00+00:00",
+   "no_agent": false,
+   "origin": null,
+   "paused_at": null,
+   "paused_reason": null,
+   "prompt": "agent a2",
+   "provider": null,
+   "repeat": {
+    "completed": 1,
+    "times": null
+   },
+   "schedule": {
+    "display": "every 5m",
+    "kind": "interval",
+    "minutes": 5
+   },
+   "schedule_display": "every 5m",
+   "script": null,
+   "skill": null,
+   "skills": [],
+   "state": "scheduled",
+   "workdir": null
+  },
+  {
+   "base_url": null,
+   "context_from": null,
+   "deliver": "local",
+   "enabled": false,
+   "enabled_toolsets": null,
+   "error_repeat_streak": 0,
+   "failure_streak": 0,
+   "fire_claim": null,
+   "id": "<once>",
+   "last_delivery_error": null,
+   "last_delivery_unverified": null,
+   "last_error": null,
+   "last_run_at": "2026-03-01T00:03:00+00:00",
+   "last_status": "ok",
+   "model": null,
+   "monitor_script": null,
+   "monitor_state": null,
+   "monitor_url": null,
+   "name": "once",
+   "next_run_at": null,
+   "no_agent": false,
+   "origin": null,
+   "paused_at": null,
+   "paused_reason": null,
+   "prompt": "o",
+   "provider": null,
+   "repeat": {
+    "completed": 1,
+    "times": 1
+   },
+   "run_claim": null,
+   "schedule": {
+    "display": "once at 2026-03-01 00:03",
+    "kind": "once",
+    "run_at": "2026-03-01T00:03:00+00:00"
+   },
+   "schedule_display": "once at 2026-03-01 00:03",
+   "script": null,
+   "skill": null,
+   "skills": [],
+   "state": "completed",
+   "workdir": null
+  },
+  {
+   "base_url": null,
+   "context_from": null,
+   "deliver": "local",
+   "enabled": false,
+   "enabled_toolsets": null,
+   "failure_streak": 0,
+   "id": "<paused>",
+   "last_delivery_error": null,
+   "last_delivery_unverified": null,
+   "last_error": null,
+   "last_run_at": null,
+   "last_status": null,
+   "model": null,
+   "monitor_script": null,
+   "monitor_state": null,
+   "monitor_url": null,
+   "name": "paused",
+   "next_run_at": "2026-03-01T00:05:00+00:00",
+   "no_agent": false,
+   "origin": null,
+   "paused_at": "2026-03-01T00:00:00+00:00",
+   "paused_reason": "auto-disabled: enabled+paused contradiction",
+   "prompt": "agent paused",
+   "provider": null,
+   "repeat": {
+    "completed": 0,
+    "times": null
+   },
+   "schedule": {
+    "display": "every 5m",
+    "kind": "interval",
+    "minutes": 5
+   },
+   "schedule_display": "every 5m",
+   "script": null,
+   "skill": null,
+   "skills": [],
+   "state": "paused",
+   "workdir": null
+  },
+  {
+   "base_url": null,
+   "context_from": null,
+   "deliver": "local",
+   "enabled": true,
+   "enabled_toolsets": null,
+   "error_repeat_streak": 0,
+   "failure_streak": 0,
+   "fire_claim": null,
+   "id": "<s0>",
+   "last_delivery_error": null,
+   "last_delivery_unverified": null,
+   "last_dispatch": {
+    "dispatched_at": "2026-03-01T00:05:00+00:00",
+    "kind": "on_time",
+    "lateness_seconds": 0.0,
+    "scheduled_at": "2026-03-01T00:05:00+00:00"
+   },
+   "last_error": null,
+   "last_run_at": "2026-03-01T00:05:00+00:00",
+   "last_status": "ok",
+   "model": null,
+   "monitor_script": null,
+   "monitor_state": null,
+   "monitor_url": null,
+   "name": "s0",
+   "next_run_at": "2026-03-01T00:10:00+00:00",
+   "no_agent": true,
+   "origin": null,
+   "paused_at": null,
+   "paused_reason": null,
+   "prompt": "",
+   "provider": null,
+   "repeat": {
+    "completed": 1,
+    "times": null
+   },
+   "schedule": {
+    "display": "every 5m",
+    "kind": "interval",
+    "minutes": 5
+   },
+   "schedule_display": "every 5m",
+   "script": "ok.sh",
+   "skill": null,
+   "skills": [],
+   "state": "scheduled",
+   "workdir": null
+  },
+  {
+   "base_url": null,
+   "context_from": null,
+   "deliver": "local",
+   "enabled": true,
+   "enabled_toolsets": null,
+   "error_repeat_streak": 0,
+   "failure_streak": 0,
+   "fire_claim": null,
+   "id": "<s1>",
+   "last_delivery_error": null,
+   "last_delivery_unverified": null,
+   "last_dispatch": {
+    "dispatched_at": "2026-03-01T00:05:00+00:00",
+    "kind": "on_time",
+    "lateness_seconds": 0.0,
+    "scheduled_at": "2026-03-01T00:05:00+00:00"
+   },
+   "last_error": null,
+   "last_run_at": "2026-03-01T00:05:00+00:00",
+   "last_status": "ok",
+   "model": null,
+   "monitor_script": null,
+   "monitor_state": null,
+   "monitor_url": null,
+   "name": "s1",
+   "next_run_at": "2026-03-01T00:10:00+00:00",
+   "no_agent": true,
+   "origin": null,
+   "paused_at": null,
+   "paused_reason": null,
+   "prompt": "",
+   "provider": null,
+   "repeat": {
+    "completed": 1,
+    "times": null
+   },
+   "schedule": {
+    "display": "every 5m",
+    "kind": "interval",
+    "minutes": 5
+   },
+   "schedule_display": "every 5m",
+   "script": "ok.sh",
+   "skill": null,
+   "skills": [],
+   "state": "scheduled",
+   "workdir": null
+  },
+  {
+   "base_url": null,
+   "context_from": null,
+   "deliver": "local",
+   "enabled": true,
+   "enabled_toolsets": null,
+   "error_repeat_streak": 0,
+   "failure_streak": 0,
+   "fire_claim": null,
+   "id": "<s2>",
+   "last_delivery_error": null,
+   "last_delivery_unverified": null,
+   "last_dispatch": {
+    "dispatched_at": "2026-03-01T00:05:00+00:00",
+    "kind": "on_time",
+    "lateness_seconds": 0.0,
+    "scheduled_at": "2026-03-01T00:05:00+00:00"
+   },
+   "last_error": null,
+   "last_run_at": "2026-03-01T00:05:00+00:00",
+   "last_status": "ok",
+   "model": null,
+   "monitor_script": null,
+   "monitor_state": null,
+   "monitor_url": null,
+   "name": "s2",
+   "next_run_at": "2026-03-01T00:10:00+00:00",
+   "no_agent": true,
+   "origin": null,
+   "paused_at": null,
+   "paused_reason": null,
+   "prompt": "",
+   "provider": null,
+   "repeat": {
+    "completed": 1,
+    "times": null
+   },
+   "schedule": {
+    "display": "every 5m",
+    "kind": "interval",
+    "minutes": 5
+   },
+   "schedule_display": "every 5m",
+   "script": "ok.sh",
+   "skill": null,
+   "skills": [],
+   "state": "scheduled",
+   "workdir": null
+  }
+ ]
+}

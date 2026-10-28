@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -402,6 +403,7 @@ def _jobs_lock():
             _jobs_lock_state.depth -= 1
         return
 
+    _lock_wait_started = time.monotonic()
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
@@ -440,6 +442,13 @@ def _jobs_lock():
             # sibling may be writing; refuse) from "this platform has no flock backend" (nothing
             # to take; the #80624 shrink-merge is the only cross-process guard and stays in force).
             _jobs_lock_state.no_backend = acquired is None
+            # §5.2 wait probe (cron script runner S1): how long this section waited for both
+            # locks, labelled by the function that entered it. Never raises.
+            with contextlib.suppress(Exception):
+                from cron.lanes import caller_section_label, record_lock_wait
+
+                record_lock_wait(caller_section_label(sys._getframe(1)),
+                                 time.monotonic() - _lock_wait_started)
             try:
                 yield
             finally:
@@ -5505,7 +5514,7 @@ def _sweep_completed_oneshots(
 
 # --- Due scan ---
 
-def get_due_jobs() -> List[Dict[str, Any]]:
+def get_due_jobs(lane: str = "all") -> List[Dict[str, Any]]:
     """Return all jobs due now. A recurring job more than one period stale (gateway down, or a run
     overran the interval) has its backlog collapsed — next_run_at fast-forwards so nothing
     burst-fires — but still fires ONCE now (via mark_job_run, consuming one ``repeat.times`` run),
@@ -5513,9 +5522,14 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
     This prevents the perpetual-defer loop (#33315) where a job whose runtime exceeds ``interval + grace``
     would be skipped forever.
+
+    ``lane`` (``"all"`` | ``"agent"`` | ``"script"``, cron/lanes.py) limits the scan to one lane's
+    jobs; records of the other lane are left untouched (no claim, no re-anchor, no requeue).
     """
+    if lane not in ("all", "agent", "script"):
+        raise ValueError(f"unknown cron lane {lane!r}")
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        return _get_due_jobs_locked(lane)
 
 
 @dataclass
@@ -6008,8 +6022,10 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     return True
 
 
-def _get_due_jobs_locked() -> List[Dict[str, Any]]:
+def _get_due_jobs_locked(lane: str = "all") -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
+    from cron.lanes import job_lane
+
     raw_jobs = load_jobs()
     scan = _DueScan(raw_jobs, _hermes_now())
     scan.needs_save = _normalize_due_scan_records(raw_jobs)
@@ -6024,6 +6040,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     if _sweep_completed_oneshots(raw_jobs, scan.now, removed_ids=scan.removed):
         scan.needs_save = True
         jobs = [j for j in jobs if scan.find(j.get("id")) is not None]
+    # Lane scope (cron/lanes.py): drop the other lane's jobs BEFORE anything below can persist a
+    # claim, a requeue or a re-anchored next_run_at on them. Store-wide hygiene above runs in both.
+    if lane != "all":
+        jobs = [j for j in jobs if job_lane(j) == lane]
 
     due = []
     requeue_fired: List[Any] = []
@@ -6052,7 +6072,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     _warn_overdue_oneshots_not_due(jobs, due, scan.removed, scan.now)
     from cron.occurrences import REWOUND_BURST_MARKER, rewound_burst_payload
 
-    burst = rewound_burst_payload(scan.rewound, scan.now.isoformat())
+    rewound = scan.rewound
+    if lane != "all":
+        # The burst threshold counts one rewound store, not one lane's half of it: union this
+        # lane's ids with the other lane's from the last RUNNER_CYCLE_S (AC-16).
+        from cron.lanes import merge_rewound_lanes
+
+        rewound = merge_rewound_lanes(
+            _current_cron_store().cron_dir, lane, scan.rewound, scan.now)
+    burst = rewound_burst_payload(rewound, scan.now.isoformat())
     if burst:
         _write_marker(REWOUND_BURST_MARKER, json.dumps(burst) + "\n", ".rewound_burst_")
 
