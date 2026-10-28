@@ -10443,37 +10443,55 @@ def _stale_base_is_conflict_only(reports) -> bool:
         for r in failing)
 
 
-_GITHUB_SLUG_RE = re.compile(r"github\.com[:/]+([^/\s]+/[^/\s]+?)(?:\.git)?/?$", re.IGNORECASE)
+# The HOST must be github.com (Prism e0b806db9787): ``https://[user@]github.com[:port]/o/r``, ``ssh://git@github.com/o/r``
+# or SCP-style ``git@github.com:o/r``. An unanchored match took ``https://git.example.org/github.com/o/r`` for o/r.
+_GITHUB_SLUG_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^@/\s]+@)?github\.com(?::\d+)?[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE)
 
 
 def _checkout_github_slugs(path) -> set:
-    """Lower-cased ``owner/repo`` of every GitHub remote of the checkout at *path* (fork remotes included)."""
+    """Lower-cased ``owner/repo`` of every GitHub remote of the checkout at *path* (fork remotes included).
+
+    Runs through :func:`kanban_branch_base._git`, which scrubs ``GIT_DIR``/``GIT_WORK_TREE``/... (Prism
+    92574423ea6e): an inherited ``GIT_DIR`` overrides ``-C`` and would report another checkout's remotes."""
+    from hermes_cli import kanban_branch_base as _bb
     try:
-        proc = subprocess.run(["git", "-C", str(path), "remote", "-v"], capture_output=True, text=True,
-                              timeout=10, check=False)
+        proc = _bb._git(Path(str(path)), "remote", "-v", timeout=10)
     except (OSError, subprocess.SubprocessError):
         return set()
     out = set()
     for line in (proc.stdout or "").splitlines() if proc.returncode == 0 else ():
         parts = line.split()
         if len(parts) >= 2:
-            m = _GITHUB_SLUG_RE.search(parts[1])
+            m = _GITHUB_SLUG_RE.match(parts[1])
             if m:
                 out.add(m.group(1).lower())
     return out
 
 
-def _owns_fleet_pr(metadata: Optional[dict], survivor_pr, reports=()) -> bool:
-    """True when the handoff names an own fleet PR on the repository of EVERY failing report (Prism
-    bda9414a767d): a conflict in a checkout with no PR of its own has no conflict producer to send it back."""
+def _owns_fleet_pr(metadata: Optional[dict], survivor_pr, reports=(), query_fn=None) -> bool:
+    """True when the handoff names an OPEN own fleet PR on the repository of EVERY failing report (Prism
+    bda9414a767d): a conflict in a checkout with no PR of its own has no conflict producer to send it back.
+
+    OPEN is read from GitHub (Prism 47c7fe02343a, b570e340e7e7): a MERGED PR (tied or not), a CLOSED one or a ref
+    that names no PR cannot receive a sendback, so it backs nothing. No oracle (pytest without a stub) or a lookup
+    that cannot tell = not provably backed: the guard refuses as before."""
     from hermes_cli import kanban_open_pr as _open_pr
     try:
-        own = {str(r.repo).lower() for r in
-               _open_pr.split_fleet(_open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]}
-        if not own:
-            return False
+        own = _open_pr.split_fleet(_open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
         failing = [r for r in reports if getattr(r, "failures", None)]
-        return bool(failing) and all(_checkout_github_slugs(r.repo) & own for r in failing)
+        if not own or not failing:
+            return False
+        query = _open_pr.memo_query(query_fn)
+        if query is None:
+            return False
+        live = set()
+        for ref in own:
+            state = query(ref.repo, ref.number)
+            if isinstance(state, dict) and str(state.get("state") or "").upper() == "OPEN":
+                live.add(str(ref.repo).lower())
+        return bool(live) and all(_checkout_github_slugs(r.repo) & live for r in failing)
     except Exception:  # noqa: BLE001 -- unreadable = not provably PR-backed: the guard refuses as before
         return False
 

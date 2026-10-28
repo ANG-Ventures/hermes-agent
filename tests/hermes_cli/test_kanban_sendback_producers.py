@@ -251,11 +251,63 @@ def test_conflict_advisory_needs_a_pr_on_every_failing_repo(tmp_path) -> None:
     b = _checkout(tmp_path, "b", "git@github.com:ANG-Ventures/repo-b.git")
     rep = lambda path: SimpleNamespace(repo=str(path), failures=["does not merge cleanly"], conflicts=["x"])
     md = {"pr_url": "https://github.com/ANG-Ventures/repo-a/pull/7"}
-    assert kb._owns_fleet_pr(md, None, [rep(a)]) is True
-    assert kb._owns_fleet_pr(md, None, [rep(a), rep(b)]) is False
+    q = _oracle()
+    assert kb._owns_fleet_pr(md, None, [rep(a)], query_fn=q) is True
+    assert kb._owns_fleet_pr(md, None, [rep(a), rep(b)], query_fn=q) is False
     md2 = {"pr_url": ["https://github.com/ANG-Ventures/repo-a/pull/7", "https://github.com/ANG-Ventures/repo-b/pull/9"]}
-    assert kb._owns_fleet_pr(md2, None, [rep(a), rep(b)]) is True
-    assert kb._owns_fleet_pr(md, None, []) is False
+    assert kb._owns_fleet_pr(md2, None, [rep(a), rep(b)], query_fn=q) is True
+    assert kb._owns_fleet_pr(md, None, [], query_fn=q) is False
+    assert kb._owns_fleet_pr(md, None, [rep(a)]) is False     # no oracle (pytest): not provably backed
+
+
+def _oracle(**states):
+    """PR-state stub: ``repo-a_7="MERGED"`` etc.; default OPEN."""
+    return lambda repo, n: {"state": states.get(f"{repo.split('/')[-1].replace('-', '_')}_{n}", "OPEN")}
+
+
+def _conflict(path):
+    return SimpleNamespace(repo=str(path), failures=["does not merge cleanly"], conflicts=["x"])
+
+
+@pytest.mark.parametrize("url", [
+    "https://git.example.org/github.com/ANG-Ventures/repo-a.git",
+    "https://github.com.evil.org/ANG-Ventures/repo-a.git",
+    "git@git.example.org:github.com/ANG-Ventures/repo-a.git",
+])
+def test_conflict_advisory_needs_a_github_host(tmp_path, url) -> None:
+    """Prism e0b806db9787: `github.com` in a path or a look-alike host is not a GitHub remote."""
+    a = _checkout(tmp_path, "a", url)
+    md = {"pr_url": "https://github.com/ANG-Ventures/repo-a/pull/7"}
+    assert kb._checkout_github_slugs(a) == set()
+    assert kb._owns_fleet_pr(md, None, [_conflict(a)], query_fn=_oracle()) is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/ANG-Ventures/repo-a.git", "https://x-token@github.com/ANG-Ventures/repo-a",
+    "git@github.com:ANG-Ventures/repo-a.git", "ssh://git@github.com:22/ANG-Ventures/repo-a.git",
+])
+def test_github_remote_forms_still_parse(tmp_path, url) -> None:
+    assert kb._checkout_github_slugs(_checkout(tmp_path, "a", url)) == {"ang-ventures/repo-a"}
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED", "NOT_FOUND", None])
+def test_conflict_advisory_needs_an_open_pr(tmp_path, state) -> None:
+    """Prism 47c7fe02343a / b570e340e7e7: a merged (incl. untied), closed, missing or unreadable PR cannot receive a
+    conflict sendback, so it does not make the stale base advisory."""
+    a = _checkout(tmp_path, "a", "https://github.com/ANG-Ventures/repo-a.git")
+    md = {"pr_url": "https://github.com/ANG-Ventures/repo-a/pull/7"}
+    q = (lambda r, n: None) if state is None else _oracle(repo_a_7=state)
+    assert kb._owns_fleet_pr(md, None, [_conflict(a)], query_fn=q) is False
+
+
+def test_conflict_advisory_ignores_an_inherited_git_dir(tmp_path, monkeypatch) -> None:
+    """Prism 92574423ea6e: GIT_DIR pointing at checkout B must not lend B's remote to checkout A."""
+    a = _checkout(tmp_path, "a", "https://github.com/ANG-Ventures/repo-a.git")
+    b = _checkout(tmp_path, "b", "https://github.com/ANG-Ventures/repo-b.git")
+    monkeypatch.setenv("GIT_DIR", str(b / ".git"))
+    md = {"pr_url": "https://github.com/ANG-Ventures/repo-b/pull/9"}
+    assert kb._checkout_github_slugs(a) == {"ang-ventures/repo-a"}
+    assert kb._owns_fleet_pr(md, None, [_conflict(a)], query_fn=_oracle()) is False
 
 
 def test_sendback_keeps_an_operator_assignment_of_a_former_reviewer(kanban_home: SimpleNamespace) -> None:
