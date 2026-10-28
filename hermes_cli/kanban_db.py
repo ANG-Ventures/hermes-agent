@@ -8062,6 +8062,7 @@ def add_comment(
     if grant_id is not None:
         return _add_granted_comment(
             conn, task_id, author, body, run_id, session_ref, now, grant_id,
+            if_latest_release,
         )
     if _is_delegated_child():
         # The one write a delegate_task child may make (t_70fcc2c3). Append-only
@@ -8094,6 +8095,7 @@ def _add_granted_comment(
     session_ref: Optional[str],
     now: int,
     grant_id: str,
+    if_latest_release: Optional[int] = None,
 ) -> int:
     """A comment signed under a scoped grant (t_19c567a8); see :func:`add_comment`.
 
@@ -8106,7 +8108,8 @@ def _add_granted_comment(
     lift = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
     conn.execute("PRAGMA query_only=OFF")
     try:
-        return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now, grant_id=grant_id)
+        return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now,
+                                if_latest_release=if_latest_release, grant_id=grant_id)
     finally:
         conn.execute("PRAGMA query_only=ON")
         _DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
@@ -8204,6 +8207,7 @@ def _add_comment_txn(
                     "created_at": now,
                     "comment_id": int(cur.lastrowid or 0),
                     **({"claimed_author": claimed_author} if claimed_author else {}),
+                    **({"grant_id": grant_id} if grant_id else {}),
                 },
                 actor=author.strip(),
                 run_id=run_id,

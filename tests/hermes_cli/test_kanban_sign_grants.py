@@ -174,3 +174,40 @@ def test_cli_comment_grant_from_a_child_process(board, tmp_path):
     assert refused.returncode == 3 and "refused" in refused.stderr
     assert [(r["author"], r["grant_id"]) for r in _rows(a)] == [("apollo", g["grant_id"])]
     assert _rows(b) == []
+
+
+def test_unquoted_yaml_on_enables_grants(board):
+    """`sign_grants: on` (YAML 1.1 bool True) is the documented spelling and must enable the feature."""
+    home, a, _b = board
+    (home / "config.yaml").write_text("kanban:\n  sign_grants: on\n")
+    assert ksg.enabled()
+    (home / "config.yaml").write_text("kanban:\n  sign_grants: off\n")
+    assert not ksg.enabled()
+
+
+def test_granted_release_honours_if_latest_release(board):
+    """--if-latest-release keeps its compare-and-append guard on the granted path."""
+    from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
+
+    _home, a, _b = board
+    g = _mint(a, verbs=["release"])
+    with kb.connect_closing() as conn:
+        first = kb.add_comment(conn, a, "apollo", "close-on: manual: held for review")
+        kb.add_comment(conn, a, "apollo", "close-on: manual: newer hold")
+    with delegated_child_context(), kb.connect_closing() as conn, pytest.raises(ReleaseSuperseded):
+        kb.add_comment(conn, a, "apollo", "close-on: merged", session_ref=kb.derive_session_ref(CHILD_SID),
+                       grant_id=g["grant_id"], if_latest_release=first)
+    assert [r["grant_id"] for r in _rows(a)] == [None, None]
+
+
+def test_journal_carries_grant_id(board, monkeypatch):
+    """A restore must keep a granted row granted (voidable), never turn it into a plain operator comment."""
+    from hermes_cli import kanban_journal
+
+    _home, a, _b = board
+    seen = []
+    monkeypatch.setattr(kanban_journal, "append", lambda *args, **kw: seen.append(args) or True)
+    g = _mint(a)
+    _child_comment(a, _approve(), g["grant_id"])
+    bodies = [p for (_b2, _t, kind, p) in seen if kind == "comment_body"]
+    assert bodies and bodies[-1]["grant_id"] == g["grant_id"]

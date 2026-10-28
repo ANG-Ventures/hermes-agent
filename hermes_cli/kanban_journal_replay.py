@@ -167,10 +167,13 @@ def replay_into(
                 if dupe:
                     result.comments_already_present += 1
                     continue
+                # grant_id survives the restore (t_19c567a8): sign_grants rows are
+                # not journaled, so a restored granted row has no live grant and
+                # every operator reader voids it, never a plain operator comment.
                 conn.execute(
                     "INSERT INTO task_comments "
-                    "(task_id, author, body, run_id, session_ref, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(task_id, author, body, run_id, session_ref, created_at, grant_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         task_id,
                         author,
@@ -178,6 +181,7 @@ def replay_into(
                         record.get("run_id"),
                         payload.get("session_ref"),
                         created,
+                        payload.get("grant_id"),
                     ),
                 )
                 result.comments_restored += 1

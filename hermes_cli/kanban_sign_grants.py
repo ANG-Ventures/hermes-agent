@@ -63,7 +63,8 @@ def enabled() -> bool:
         value, _source = _kanban_review_setting("sign_grants", "off")
     except Exception:
         return False
-    return str(value).strip().lower() == "on"
+    # YAML 1.1 reads a bare `on` as True: accept it, so the documented `sign_grants: on` works.
+    return value is True or str(value).strip().lower() == "on"
 
 
 def _norm_model(model: Optional[str]) -> str:

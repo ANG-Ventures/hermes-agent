@@ -2974,9 +2974,12 @@ def _granted_comment(args: argparse.Namespace, body: str, grant_id: str) -> int:
     _run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
         try:
-            kb.add_comment(conn, args.task_id, author, body, session_ref=session_ref, grant_id=grant_id)
+            kb.add_comment(conn, args.task_id, author, body, session_ref=session_ref, grant_id=grant_id,
+                           if_latest_release=getattr(args, "if_latest_release", None))
         except GrantRefused as exc:
             return _err(f"kanban: granted comment refused, nothing posted: {exc}", 3)
+        except ReleaseSuperseded as exc:
+            return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
     print(f"Comment added to {args.task_id} (as {author} via grant {grant_id})")
     return 0
 
