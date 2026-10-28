@@ -5375,18 +5375,23 @@ _last_worktree_maintenance_at: Optional[float] = None
 _worktree_maintenance_lock = threading.Lock()
 
 
-def _deliver_missed_oneshot_notices(adapters=None, loop=None, lane: str = "all") -> int:
+def _deliver_missed_oneshot_notices(adapters=None, loop=None, lane: str = "all",
+                                    notices=None) -> int:
     """Deliver queued MISSED notices for one-shots the due-scan retired.
 
     The due-scan runs under the jobs lock and only queues them; delivery is
     framed as a failure (success=False) to the job's own deliver target so a
     one-shot that never ran is loud, not a success-looking line in
     cron/output. Best-effort: delivery errors are logged, never raised.
+    ``notices``: an already-drained batch (the tick drains under its lock and
+    delivers off it); None drains ``lane`` here.
     """
     from cron.jobs import drain_missed_oneshot_notices
 
+    if notices is None:
+        notices = drain_missed_oneshot_notices(lane)
     delivered = 0
-    for notice in drain_missed_oneshot_notices(lane):
+    for notice in notices:
         job = notice.get("job") or {}
         try:
             err = _deliver_result(

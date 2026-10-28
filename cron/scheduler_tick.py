@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import contextlib
+import contextvars
 import time
 
 
@@ -56,6 +57,26 @@ def _acquire_lane_locks(_sched, lane: str) -> dict:
             _sched._release_tick_lock(lock_fd)
         raise
     return held
+
+
+def _submit_missed_oneshot_notices(_sched, adapters, loop, lane: str):
+    """Drain ``lane``'s queued MISSED one-shot notices and deliver them on the profile's parallel
+    pool, under the tick's context (profile scope). Returns the future, or None when nothing was
+    queued or the submit failed (logged; the notice text is already in cron/output)."""
+    from cron.jobs import drain_missed_oneshot_notices
+
+    notices = drain_missed_oneshot_notices(lane)
+    if not notices:
+        return None
+    ctx = contextvars.copy_context()
+    try:
+        pool = _sched._get_parallel_pool(_sched._resolve_max_parallel_workers())
+        return pool.submit(ctx.run, _sched._deliver_missed_oneshot_notices,
+                           adapters=adapters, loop=loop, notices=notices)
+    except Exception as exc:
+        _sched.logger.error("MISSED one-shot notices for %s not dispatched: %s",
+                            [(n.get("job") or {}).get("id", "?") for n in notices], exc)
+        return None
 
 
 def _tick_admitted(
@@ -138,7 +159,11 @@ def _tick_admitted(
         # LOUD missed one-shot notices (fork #1087): a one-shot past its grace window is reported
         # to its delivery target instead of silently expiring.
         # Only the scanned lane's notices: a script tick must not send an agent job's notice.
-        _sched._deliver_missed_oneshot_notices(adapters=adapters, loop=loop, lane=scan_lane)
+        # Drained here (at-most-once, as before) but delivered on the pool: one send can wait out a
+        # 429 for ~30 s, and the tick (and its lock) must not (spec §5.5, t_d6c50b48).
+        notice_fut = _submit_missed_oneshot_notices(_sched, adapters, loop, scan_lane)
+        if sync and notice_fut is not None:
+            concurrent.futures.wait([notice_fut])
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
         if not due_jobs:

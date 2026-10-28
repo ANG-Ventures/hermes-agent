@@ -421,6 +421,47 @@ def test_missed_oneshot_notices_follow_the_scanned_lane(home, vclock, monkeypatc
     assert sorted(sent) == ["agent-1", "script-1"]
 
 
+def test_missed_oneshot_notice_is_delivered_off_the_tick_and_its_lock(home, vclock, monkeypatch):
+    """t_d6c50b48 (spec §5.5): a MISSED notice send that waits out a 429 (~30 s) must not run inside
+    tick(): the runner's tick watchdog would trip on a healthy runner. tick() returns at once with
+    the lane lock free; the pool delivers the notice exactly once; a delivery that never finishes
+    is not re-sent by the next tick (at-most-once, drained before dispatch)."""
+    import threading
+
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+
+    release = threading.Event()
+    sent: list = []
+
+    def slow_send(job, _text, **_kw):
+        release.wait(40)  # the 429 wait, bounded so a failure cannot hang the suite
+        sent.append(job["id"])
+
+    monkeypatch.setattr(sched, "_deliver_result", slow_send)
+    jobs.drain_missed_oneshot_notices()
+    with jobs._missed_oneshot_notices_lock:
+        jobs._missed_oneshot_notices.append(
+            {"job": {"id": "script-1", "no_agent": True, "script": "ok.sh"}, "text": "MISSED s"})
+
+    started = time.monotonic()
+    sched.tick(verbose=False, sync=False, lane="script")
+    assert time.monotonic() - started < 2
+    fd = sched._acquire_tick_lock(sched._get_lock_paths("script")[1])
+    assert fd is not None, "tick returned holding .tick-script.lock"
+    sched._release_tick_lock(fd)
+    assert sent == []
+    # The worker is still "in the 429": the next tick must not send the notice again.
+    sched.tick(verbose=False, sync=False, lane="script")
+    release.set()
+    deadline = time.monotonic() + 10
+    while not sent and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.2)
+    assert sent == ["script-1"]
+    assert jobs.drain_missed_oneshot_notices() == []
+
+
 def test_script_lane_skips_bot_chat_drain_and_dead_owner_reap(home, vclock, monkeypatch):
     """Prism P1 8b668b9ca91b: the bot-chat drain and the dead-owner reap were serialized by the
     single .tick.lock; they run only on ticks that took it (agent, all)."""
