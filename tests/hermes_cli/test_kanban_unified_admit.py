@@ -26,13 +26,13 @@ from types import SimpleNamespace
 import pytest
 
 from gateway import kanban_gate_tick as kgt
-from hermes_cli import admission as ad
-from hermes_cli import admission_demand as dmd
+from hermes_cli.fleet_placement import admission as ad
+from hermes_cli.fleet_placement import admission_demand as dmd
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 from hermes_cli import placement_policy as pp
 
 POLICY = pp.PlacementPolicy()

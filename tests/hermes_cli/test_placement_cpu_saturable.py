@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 
 NOW = 10_000.0
 DOC = {

@@ -1,13 +1,5 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ 408fd1c6d6 (hermes-home main ffbc4bf6 + #7576: alias-booked leases resolve, Prism c6568e9a9850), t_3694ab3c; sha256 cf37948e12aa9a5c526b19acd70045b8968f4d56f0af04af8e0c522b69b03fde;
-earlier re-vendors t_4ee9c117, t_82e15796, t_da6f84f7, t_39a267cb; first vendored @ 2fe117cbcb, hermes-home#4462) for the kanban
-dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY
-local changes are ``fleet_root()`` (the shared kanban root) and the fork's encodings (reads ``utf-8-sig``,
-``encoding="utf-8"`` on the ``open()``/``fdopen()`` writes: the Windows-footgun lint);
-``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical file
-(PLACEMENT_CANONICAL, wired in CI from the runners' hermes-home mirror).
-
 Card t_499e107f (Ace 2026-10-12 16:34: "ace ai doesn't need to be last pick, we just need load balancing
 instead"). PR #3925 made ace-ai the last pick for remote test-gate runs and the allocation handoff
 (plans/2026-10-12_fleet-work-allocation-handoff.md, mechanism 4) proposed ci-box > ace-media > ace-ai.
@@ -157,9 +149,7 @@ def fleet_root() -> Path:
     env = os.environ.get("PLACEMENT_HOME")
     if env:
         return Path(env)
-    # VENDORED: the shared kanban root (<root>/config/fleet-hosts.json, <root>/var/placement/), at call time.
-    from hermes_cli import kanban_db
-    return kanban_db.kanban_home()
+    return Path(__file__).resolve().parents[2]
 
 
 def _num(v) -> bool:
@@ -485,7 +475,7 @@ def read_inventory(path) -> Dict[str, dict]:
     if path is None:
         return {}
     try:
-        doc = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     hosts = doc.get("hosts") if isinstance(doc, dict) else None
@@ -530,7 +520,7 @@ def read_host_speed(path=None) -> Dict[str, dict]:
     capacity seed is the ruled default, so a bad speed file must not close the fleet."""
     p = Path(path) if path is not None else fleet_root() / SPEED_REL
     try:
-        doc = json.loads(p.read_text(encoding="utf-8-sig"))
+        doc = json.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
@@ -572,7 +562,7 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     compares both)."""
     p = Path(path) if path is not None else fleet_root() / TABLE_REL
     try:
-        doc = json.loads(p.read_text(encoding="utf-8-sig"))
+        doc = json.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise PlacementError(f"{p}: missing") from exc
     except (OSError, ValueError) as exc:
@@ -640,7 +630,7 @@ def read_exclusions(path=None, *, now: float) -> Dict[str, str]:
     now = _now(now)
     p = Path(path) if path is not None else fleet_root() / EXCLUSIONS_REL
     try:
-        text = p.read_text(encoding="utf-8-sig")
+        text = p.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
     except OSError as exc:
@@ -1180,7 +1170,7 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
         return False, refused
     if samples is None:
         try:
-            doc = json.loads((base / PRESSURE_REL).read_text(encoding="utf-8-sig"))
+            doc = json.loads((base / PRESSURE_REL).read_text(encoding="utf-8"))
             samples = samples_from_pressure(doc, now=now, stale_after_s=stale_after_s) if isinstance(doc, dict) else {}
         except (OSError, ValueError, PlacementError):
             samples = {}
@@ -1669,7 +1659,7 @@ def admission_mode(path=None) -> str:
     if hit and hit[0] == sig:
         return hit[1]
     try:
-        mode = _parse_admission(p.read_text(encoding="utf-8-sig"), str(p))
+        mode = _parse_admission(p.read_text(encoding="utf-8"), str(p))
     except ValueError as exc:   # undecodable bytes: a parse failure, as loud as a YAMLError (t_bc197d33)
         sys.stderr.write(f"placement: kanban.admission reads legacy: {p} does not parse ({exc})\n")
         mode = "legacy"
@@ -1732,7 +1722,7 @@ def _locked(path: Path, timeout_s: Optional[float] = None):
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path) + ".lock", "a+", encoding="utf-8") as fh:  # windows-footgun: ok — append-mode lock file, not a read
+    with open(str(path) + ".lock", "a+") as fh:
         if timeout_s is None:
             fcntl.flock(fh, fcntl.LOCK_EX)
         else:
@@ -1755,7 +1745,7 @@ def _read_ledger(path: Path) -> dict:
     """The ledger document. A MISSING file is an empty ledger; anything else that fails is LedgerError (a
     reserve()/release() must never replace a ledger it could not read: that drops live reservations)."""
     try:
-        text = path.read_text(encoding="utf-8-sig")
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {"schema": SCHEMA, "rows": []}
     except OSError as exc:
@@ -1803,7 +1793,7 @@ def _write_ledger(path: Path, doc: dict) -> None:
     loss right after a remote job launched cannot forget the reservation it was launched on (Prism 9da46cee)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    with os.fdopen(fd, "w") as fh:
         json.dump(doc, fh, sort_keys=True)
         fh.flush()
         os.fsync(fh.fileno())
@@ -1848,7 +1838,7 @@ def _append_admissions(ap: Path, lines: List[dict]) -> None:
         return
     try:
         ap.parent.mkdir(parents=True, exist_ok=True)
-        with open(ap, "a", encoding="utf-8") as fh:
+        with open(ap, "a") as fh:
             fh.write("".join(json.dumps(x, sort_keys=True) + "\n" for x in lines))
             fh.flush()
             os.fsync(fh.fileno())

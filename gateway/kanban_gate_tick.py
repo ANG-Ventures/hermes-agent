@@ -244,7 +244,7 @@ class GateTickBuilder:
         root = self._root()
         cost = getattr(self.gate, "cost", None)
         from hermes_cli import kanban_headroom as kh
-        from hermes_cli import placement
+        from hermes_cli.fleet_placement import placement
 
         return kwp.TargetSignal(
             policy=ppolicy.load(self._fleet_dir()),
@@ -312,7 +312,7 @@ class GateTickBuilder:
         gate = self.gate
         if not getattr(gate, "enabled", False):
             return 0
-        from hermes_cli import admission as _ad
+        from hermes_cli.fleet_placement import admission as _ad
         from hermes_cli import kanban_db as _kb
 
         now_wall = time.time() if now_wall is None else now_wall
@@ -485,7 +485,7 @@ class GateTickBuilder:
         the last ``build()`` read. A lapsed row of a live run is logged as a
         leak. None = not due / nothing to renew (no build yet, no table)."""
         from hermes_cli import kanban_headroom as kh
-        from hermes_cli import placement
+        from hermes_cli.fleet_placement import placement
 
         now = time.time() if now is None else now
         if self._boards is None or now - self._renewed_at < kh.RENEW_EVERY_S:

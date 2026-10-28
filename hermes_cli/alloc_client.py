@@ -1,7 +1,7 @@
 # SCHEDULE: manual   (a library consumers import; never scheduled; card t_552773f1)
 # VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 2fe117cbcb (hermes-home#4462 merge, t_dc9a0f9a + t_314b3ea5;
 # sha256 fbbd8a806628a79acc2d0ff981d75c29b48d3eb5c9f2333a51efa88519971cb3) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code. The ONLY
-# local change is the placement import (hermes_cli.placement, not sys.path + import placement); tests/hermes_cli/test_kanban_allocd_route.py checks
+# local change is the placement import (hermes_cli.fleet_placement.placement, not sys.path + import placement); tests/hermes_cli/test_kanban_allocd_route.py checks
 # the rest against the canonical file (ALLOC_CLIENT_CANONICAL).
 """alloc_client -- the thin library every work generator calls to get a host (Router Core Card A, t_552773f1).
 
@@ -70,7 +70,7 @@ import uuid
 from pathlib import Path
 from typing import Mapping, Optional
 
-from hermes_cli import placement  # VENDORED: the fork's placement copy (hermes-home: sys.path + import placement)
+from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy (hermes-home: sys.path + import placement)
 
 DEFAULT_URL = "http://127.0.0.1:18850"
 TIMEOUT_S = 2.0                      # spec §6: a client-side 2 s timeout fires only when allocd is wedged

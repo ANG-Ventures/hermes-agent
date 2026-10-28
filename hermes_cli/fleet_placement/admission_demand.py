@@ -2,11 +2,6 @@
 """admission_demand: the I/O half of the ONE admission rule (t_e5124426). admission.admit_class() is pure; this module
 reads its two inputs from disk and gives every caller the same kill switch.
 
-VENDORED from hermes-home ``scripts/lib/admission_demand.py`` @ e2977a2b5f (hermes-home#7172, t_3694ab3c) for the kanban
-dispatcher's unified admission (placement.may_start imports it). The ONLY local changes are ``_root()`` (the shared
-kanban root, like placement.fleet_root()) and utf-8-sig reads; tests/hermes_cli/test_kanban_unified_admit.py checks
-the rest against the canonical file (ADMISSION_DEMAND_CANONICAL).
-
   load_priority(path=None) -> admission.Priority     fleet/admission-priority.json (order, line, holdback_units)
   publish(workload, queued, unit, hosts=None, root=None, now=None)
                                                      a class publishes its queue: var/placement/demand/<workload>.json
@@ -48,11 +43,7 @@ def _root(root=None) -> Path:
     if root is not None:
         return Path(root)
     env = os.environ.get("PLACEMENT_HOME")
-    if env:
-        return Path(env)
-    # VENDORED: the shared kanban root (placement.fleet_root()), at call time, never this file's checkout.
-    from hermes_cli import kanban_db
-    return kanban_db.kanban_home()
+    return Path(env) if env else Path(__file__).resolve().parents[2]
 
 
 def _say(key: str, msg: str) -> None:
@@ -67,7 +58,7 @@ def _num(v) -> bool:
 
 def _read_policy(path: Path) -> dict:
     try:
-        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+        doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         _say(f"policy:{path}", f"{path} unreadable ({exc}); built-in priority defaults")
         return {}
@@ -170,7 +161,7 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
         return out
     for p in names:
         try:
-            doc = json.loads(p.read_text(encoding="utf-8-sig"))
+            doc = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             _say(f"demand:{p}", f"{p} unreadable: holds nothing back")
             continue

@@ -28,7 +28,10 @@ _CHILD = textwrap.dedent(
     import hermes_cli.lifecycle as lifecycle
     calls = []
 
+    hook_delay = float(dict(a.split("=", 1) for a in sys.argv[2:] if "=" in a).get("delay", 0))
+
     def _record(name, **kw):
+        time.sleep(hook_delay)  # a slow blackbox write (contended SQLite, busy disk)
         calls.append({"hook": name, "turn_id": kw.get("turn_id"), "reason": kw.get("reason")})
         with open(out, "w") as fh:
             json.dump(calls, fh)
@@ -43,7 +46,7 @@ _CHILD = textwrap.dedent(
         platform="cron", _blackbox_turn_calls=("cron_x:turn1", []),
     )
 
-    hold_lock = len(sys.argv) > 2 and sys.argv[2] == "hold-lock"
+    hold_lock = "hold-lock" in sys.argv[2:]
 
     def _fake_run_job_now(job_id, verbose=True):
         with sched._live_cron_agents_lock:
@@ -63,10 +66,14 @@ _CHILD = textwrap.dedent(
 )
 
 
-def _run_and_sigterm(tmp_path, *extra):
+def _run_and_sigterm(tmp_path, *extra, hook_callback_timeout=None, wait_s=30):
     out = tmp_path / "hooks.json"
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    if hook_callback_timeout is not None:
+        (home / "config.yaml").write_text(f"plugins:\n  hook_callback_timeout: {hook_callback_timeout}\n")
     env = dict(os.environ)
-    env["HERMES_HOME"] = str(tmp_path / "home")
+    env["HERMES_HOME"] = str(home)
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.Popen(
         [sys.executable, "-c", _CHILD, str(out), *extra],
@@ -80,26 +87,49 @@ def _run_and_sigterm(tmp_path, *extra):
             if "READY" in line or not line:
                 break
         assert "READY" in line, proc.stderr.read()
+        sent = time.monotonic()
         proc.send_signal(signal.SIGTERM)
-        rc = proc.wait(timeout=30)
+        rc = proc.wait(timeout=wait_s)
+        elapsed = time.monotonic() - sent
     finally:
         if proc.poll() is None:
             proc.kill()
-    return rc, out
+    return rc, out, elapsed
 
 
 @pytest.mark.platforms("posix")
 def test_sigterm_during_cron_run_wait_records_abandoned_turn(tmp_path):
-    rc, out = _run_and_sigterm(tmp_path)
+    rc, out, _ = _run_and_sigterm(tmp_path)
     assert rc == 128 + signal.SIGTERM
     calls = json.loads(out.read_text())
     assert calls == [{"hook": "on_turn_abandoned", "turn_id": "cron_x:turn1", "reason": "signal_15"}]
 
 
 @pytest.mark.platforms("posix")
+def test_slow_record_within_hook_budget_lands_before_exit(tmp_path):
+    """A recorder that takes 15 s (inside the 30 s default hook budget) still writes its row
+    before the process exits (Prism 33a31a0e74cc: a literal 10 s wait killed it first)."""
+    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=15", wait_s=60)
+    assert rc == 128 + signal.SIGTERM
+    assert out.exists(), f"record cut before it landed (exit after {elapsed:.1f}s)"
+    calls = json.loads(out.read_text())
+    assert calls == [{"hook": "on_turn_abandoned", "turn_id": "cron_x:turn1", "reason": "signal_15"}]
+
+
+@pytest.mark.platforms("posix")
+def test_record_wait_follows_configured_hook_budget(tmp_path):
+    """The wait is the configured hook budget plus a margin, not a constant: with a 1 s budget a
+    15 s recorder is abandoned and the process exits well before the record would land."""
+    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=15", hook_callback_timeout=1, wait_s=60)
+    assert rc == 128 + signal.SIGTERM
+    assert not out.exists()
+    assert elapsed < 15
+
+
+@pytest.mark.platforms("posix")
 def test_sigterm_while_main_thread_holds_registry_lock_still_exits(tmp_path):
     """The handler must not deadlock on a lock the interrupted main thread holds (Prism
     08326117fdf2): the record is abandoned after its bounded wait and the process exits."""
-    rc, out = _run_and_sigterm(tmp_path, "hold-lock")
+    rc, out, _ = _run_and_sigterm(tmp_path, "hold-lock", hook_callback_timeout=1)
     assert rc == 128 + signal.SIGTERM
     assert not out.exists()

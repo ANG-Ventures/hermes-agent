@@ -288,7 +288,7 @@ def test_a_stale_remote_pressure_sample_is_unmeasured_memory(monkeypatch):
 
 
 def test_an_unreadable_local_placement_table_refuses_instead_of_a_zero_reserve(board, monkeypatch):
-    from hermes_cli import placement as pl
+    from hermes_cli.fleet_placement import placement as pl
 
     _hot_local(monkeypatch, load1=10.0)
     table = pl.fleet_root() / pl.TABLE_REL
@@ -303,7 +303,7 @@ def test_an_invalid_remote_placement_table_refuses_instead_of_a_zero_reserve(boa
     too; the remote floor must not read that as a 0 GB reserve."""
     from types import SimpleNamespace
 
-    from hermes_cli import placement as pl
+    from hermes_cli.fleet_placement import placement as pl
 
     table = pl.fleet_root() / pl.TABLE_REL
     table.parent.mkdir(parents=True, exist_ok=True)
@@ -574,7 +574,7 @@ def test_placement_table_under_an_unsearchable_dir_is_nan_not_zero(board, monkey
     import math as _math
     import os as _os
 
-    from hermes_cli import placement as pl
+    from hermes_cli.fleet_placement import placement as pl
 
     table = pl.fleet_root() / pl.TABLE_REL
     table.parent.mkdir(parents=True, exist_ok=True)

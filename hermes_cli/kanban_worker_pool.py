@@ -1524,7 +1524,7 @@ def _kanban_unified_admit(signal: Any = None) -> bool:
     KANBAN_UNIFIED_ADMIT on, a placement table on the signal, and ``kanban.admission: utilization``, i.e. exactly
     when kanban_headroom.unified_filter runs for every take (pinned ones included). Anywhere else the cap binds."""
     from hermes_cli import kanban_load_gate as _klg
-    from hermes_cli import placement as _pl
+    from hermes_cli.fleet_placement import placement as _pl
     return (_klg.unified_admit() and signal is not None and getattr(signal, "placement_table", None) is not None
             and _pl.admission_mode() == "utilization")
 
@@ -1741,7 +1741,7 @@ class SpilloverPlan:
             return {}
         if sig.placement_live is not None:
             return sig.placement_live
-        from hermes_cli import placement as _placement
+        from hermes_cli.fleet_placement import placement as _placement
         # A corrupt ledger raises LedgerError: take() refuses (never reads it as empty).
         return _placement.live_reservations(sig.placement_reservations, now=sig.clock(),
                                             table=sig.placement_table)
@@ -1843,7 +1843,7 @@ class SpilloverPlan:
                     self._simulated[pin] = self._simulated.get(pin, 0) + 1
                 else:
                     from hermes_cli import kanban_headroom as _kh
-                    from hermes_cli import placement as _placement
+                    from hermes_cli.fleet_placement import placement as _placement
                     try:
                         rid = _kh.book_pin(self, pin, job_id, job)
                     except _placement.PlacementError as exc:  # corrupt ledger: fail closed
@@ -1914,7 +1914,7 @@ class SpilloverPlan:
         """The in-process scorer take (kanban.placement.allocd off / shadow): one
         locked ``placement.admit`` (``choose`` on a dry run) over ``names``."""
         from hermes_cli import kanban_headroom as _kh
-        from hermes_cli import placement as _placement
+        from hermes_cli.fleet_placement import placement as _placement
         rid = None
         try:
             if self.dry_run:
