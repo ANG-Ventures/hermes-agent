@@ -5354,7 +5354,7 @@ _last_worktree_maintenance_at: Optional[float] = None
 _worktree_maintenance_lock = threading.Lock()
 
 
-def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
+def _deliver_missed_oneshot_notices(adapters=None, loop=None, lane: str = "all") -> int:
     """Deliver queued MISSED notices for one-shots the due-scan retired.
 
     The due-scan runs under the jobs lock and only queues them; delivery is
@@ -5365,7 +5365,7 @@ def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
     from cron.jobs import drain_missed_oneshot_notices
 
     delivered = 0
-    for notice in drain_missed_oneshot_notices():
+    for notice in drain_missed_oneshot_notices(lane):
         job = notice.get("job") or {}
         try:
             err = _deliver_result(

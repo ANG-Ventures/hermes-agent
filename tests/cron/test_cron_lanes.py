@@ -9,6 +9,9 @@ AC -> test:
   S1 (b) / AC-1 test_ac1_script_lane_scan_leaves_agent_records_identical
   S1 (c) / AC-2 test_ac2_default_tick_equals_main_golden
   S1 (d)        test_lane_locks_are_independent, test_quiescent_home_holds_both_tick_locks
+  Prism P1 8b668b9ca91b test_missed_oneshot_notices_follow_the_scanned_lane,
+                test_script_lane_skips_bot_chat_drain_and_dead_owner_reap
+  Prism P0 5ad49755d8a2 test_module_imports_without_fcntl
   S1 (e)        test_tick_reports_one_outcome_per_return_path
   S1 (f) / AC-12 test_ac12_cross_process_reap_exemption
   S1 (g) / AC-14 test_ac14_knob_reads_process_home
@@ -29,7 +32,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import fcntl
 import json
 import os
 import random
@@ -152,6 +154,8 @@ def _set_due(job_id, when_iso):
 
 def _hold_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
+    import fcntl  # POSIX-only; a top-level import breaks Windows collection (Prism P0 5ad49755d8a2)
+
     fd = open(path, "w", encoding="utf-8")  # noqa: SIM115
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     return fd
@@ -385,6 +389,74 @@ def test_quiescent_home_holds_both_tick_locks(home, vclock, monkeypatch):
     plan = plan_data_removal(home, home.parent / "project")
     assert home / "cron" / ".tick-script.lock" not in plan.remove
     assert home / "cron" / ".tick.lock" not in plan.remove
+
+
+def test_missed_oneshot_notices_follow_the_scanned_lane(home, vclock, monkeypatch):
+    """Prism P1 8b668b9ca91b: a script-lane tick must not send or consume an AGENT job's queued
+    MISSED notice (and vice versa); "all" delivers both."""
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+
+    sent: list = []
+    monkeypatch.setattr(sched, "_deliver_result",
+                        lambda job, _text, **_kw: sent.append(job["id"]) and None)
+
+    def queue():
+        jobs.drain_missed_oneshot_notices()
+        with jobs._missed_oneshot_notices_lock:
+            jobs._missed_oneshot_notices.extend([
+                {"job": {"id": "agent-1", "prompt": "p"}, "text": "MISSED a"},
+                {"job": {"id": "script-1", "no_agent": True, "script": "ok.sh"}, "text": "MISSED s"},
+            ])
+
+    queue()
+    sched.tick(verbose=False, sync=True, lane="script")
+    assert sent == ["script-1"]
+    sched.tick(verbose=False, sync=True, lane="agent")
+    assert sent == ["script-1", "agent-1"]
+    assert jobs.drain_missed_oneshot_notices() == []
+    sent.clear()
+    queue()
+    sched.tick(verbose=False, sync=True)
+    assert sorted(sent) == ["agent-1", "script-1"]
+
+
+def test_script_lane_skips_bot_chat_drain_and_dead_owner_reap(home, vclock, monkeypatch):
+    """Prism P1 8b668b9ca91b: the bot-chat drain and the dead-owner reap were serialized by the
+    single .tick.lock; they run only on ticks that took it (agent, all)."""
+    import cron.bot_chat_delivery as bcd
+    import cron.scheduler as sched
+
+    calls: list = []
+    monkeypatch.setattr(bcd, "drain", lambda *a, **k: calls.append("drain"))
+    monkeypatch.setattr(bcd, "drain_in_background", lambda *a, **k: calls.append("drain_bg"))
+    monkeypatch.setattr(sched, "_maybe_reap_dead_owners", lambda: calls.append("reap"))
+    for lane, sync in (("script", True), ("script", False)):
+        sched.tick(verbose=False, sync=sync, lane=lane)
+    assert calls == []
+    sched.tick(verbose=False, sync=True, lane="agent")
+    assert calls == ["drain", "reap"]
+    calls.clear()
+    sched.tick(verbose=False, sync=False)
+    assert calls == ["drain_bg", "reap"]
+    calls.clear()
+    held = _hold_lock(sched._get_lock_paths("script")[1])
+    try:  # "all" narrowed to agent by a busy script lock still owns .tick.lock
+        sched.tick(verbose=False, sync=True)
+    finally:
+        held.close()
+    assert calls == ["drain", "reap"]
+
+
+def test_module_imports_without_fcntl():
+    """Prism P0 5ad49755d8a2: on Windows ``fcntl`` is absent; importing this module (pytest
+    collection) must not raise before the skipif mark applies."""
+    code = ("import sys, importlib.util; sys.modules['fcntl'] = None; "
+            "s = importlib.util.spec_from_file_location('lanes_probe', sys.argv[1]); "
+            "s.loader.exec_module(importlib.util.module_from_spec(s))")
+    proc = subprocess.run([sys.executable, "-c", code, __file__], cwd=REPO_ROOT,
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr[-2000:]
 
 
 # --- S1 (e) -------------------------------------------------------------------------------------

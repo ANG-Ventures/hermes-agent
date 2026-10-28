@@ -117,12 +117,15 @@ def _tick_admitted(
                 report(TickOutcome.ADMISSION_HOLD)
                 return 0
 
-        from cron.bot_chat_delivery import drain, drain_in_background
-        if sync:
-            drain()
-        else:
-            drain_in_background()
-        _sched._maybe_reap_dead_owners()
+        # Bot-chat drain and dead-owner reap were serialized by the one .tick.lock before lanes;
+        # they run only on ticks that hold it (agent, all), never on the script lane.
+        if "agent" in held:
+            from cron.bot_chat_delivery import drain, drain_in_background
+            if sync:
+                drain()
+            else:
+                drain_in_background()
+            _sched._maybe_reap_dead_owners()
         # Periodic worktree GC (6h, threaded) — the only sweep gateway-only boxes get.
         if agent_chores:
             try:
@@ -134,7 +137,8 @@ def _tick_admitted(
         report(TickOutcome.ADMITTED)
         # LOUD missed one-shot notices (fork #1087): a one-shot past its grace window is reported
         # to its delivery target instead of silently expiring.
-        _sched._deliver_missed_oneshot_notices(adapters=adapters, loop=loop)
+        # Only the scanned lane's notices: a script tick must not send an agent job's notice.
+        _sched._deliver_missed_oneshot_notices(adapters=adapters, loop=loop, lane=scan_lane)
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 
         if not due_jobs:

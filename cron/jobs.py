@@ -155,11 +155,16 @@ _missed_oneshot_notices: List[Dict[str, Any]] = []
 _missed_oneshot_notices_lock = threading.Lock()
 
 
-def drain_missed_oneshot_notices() -> List[Dict[str, Any]]:
-    """Pop every queued missed-one-shot notice (``{"job": ..., "text": ...}``)."""
+def drain_missed_oneshot_notices(lane: str = "all") -> List[Dict[str, Any]]:
+    """Pop the queued missed-one-shot notices (``{"job": ..., "text": ...}``) of ``lane``
+    (cron/lanes.py; ``"all"`` = every notice). Other lanes' notices stay queued for their tick."""
+    from cron.lanes import job_lane
+
     with _missed_oneshot_notices_lock:
-        drained = list(_missed_oneshot_notices)
-        _missed_oneshot_notices.clear()
+        drained, kept = [], []
+        for n in _missed_oneshot_notices:
+            (drained if lane == "all" or job_lane(n.get("job") or {}) == lane else kept).append(n)
+        _missed_oneshot_notices[:] = kept
     return drained
 
 
