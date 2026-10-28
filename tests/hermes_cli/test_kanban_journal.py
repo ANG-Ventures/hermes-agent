@@ -340,3 +340,32 @@ def test_replay_of_a_granted_comment_matches_the_target_schema(journal_env, tmp_
 
     again = kanban_journal_replay.replay_into("b5", out, tmp_path / "out2.db")
     assert again.comments_restored == 0 and again.comments_already_present == 1, again.as_dict()
+
+
+def test_replay_keeps_a_granted_and_an_identical_ungranted_record(journal_env, tmp_path):
+    """grant_id is part of the dedupe key (Prism 3ee6a1868ab2): an operator's own
+    record and a granted child's byte-identical record are two comments, and the
+    ungranted (durable) one must not be lost to the granted one."""
+    kanban_journal, _ = journal_env
+    from hermes_cli import kanban_journal_replay
+
+    snapshot = tmp_path / "snap.db"
+    conn = _make_board_db(snapshot)
+    conn.execute("ALTER TABLE task_comments ADD COLUMN grant_id TEXT")
+    base = int(time.time()) - 300
+    conn.execute("INSERT INTO tasks VALUES (?,?,?,?)", ("t_d", "t", "running", base))
+    conn.commit()
+    conn.close()
+    same = {"author": "apollo", "body": "APPROVE", "created_at": base + 20}
+    kanban_journal.append("b6", "t_d", "comment_body", {**same, "grant_id": "g-0123456789abcdef"})
+    kanban_journal.append("b6", "t_d", "comment_body", dict(same))
+
+    out = tmp_path / "out.db"
+    result = kanban_journal_replay.replay_into("b6", snapshot, out)
+    assert result.comments_restored == 2, result.as_dict()
+    rc = sqlite3.connect(str(out))
+    grants = sorted(r[0] or "" for r in rc.execute("SELECT grant_id FROM task_comments"))
+    rc.close()
+    assert grants == ["", "g-0123456789abcdef"]
+    again = kanban_journal_replay.replay_into("b6", out, tmp_path / "out2.db")
+    assert again.comments_restored == 0 and again.comments_already_present == 2, again.as_dict()

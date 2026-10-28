@@ -182,11 +182,17 @@ def replay_into(
 
                     if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
                         author = author.strip() + SUBAGENT_AUTHOR_MARKER
-                dupe = conn.execute(
-                    "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
-                    "AND body = ? AND created_at = ?",
-                    (task_id, author, body, created),
-                ).fetchone()
+                # grant_id is part of the row's identity: a granted record and an
+                # identical ungranted operator record are two comments, and
+                # collapsing them would lose the durable one (Prism 3ee6a1868ab2).
+                # Into a pre-migration board the marked author already separates them.
+                dupe_sql = ("SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
+                            "AND body = ? AND created_at = ?")
+                dupe_args = [task_id, author, body, created]
+                if has_grant_col:
+                    dupe_sql += " AND grant_id IS ?"
+                    dupe_args.append(grant_id)
+                dupe = conn.execute(dupe_sql, dupe_args).fetchone()
                 if dupe:
                     result.comments_already_present += 1
                     continue
