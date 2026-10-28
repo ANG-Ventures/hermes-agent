@@ -1341,10 +1341,11 @@ def unified_inputs(host: str) -> "tuple[list, Any]":
         return [], _ad.Priority()
 
 
-def publish_ready_demand(queued: int, root=None) -> None:
+def publish_ready_demand(queued: int, root=None) -> Optional[str]:
     """Kanban's queue for the ONE rule (t_3694ab3c): var/placement/demand/kanban.json, hosts null (a portable card
     may run on any pool host or here). Unit = the table's kanban footprint (the prior work_estimate seeds from).
-    Best effort: a demand file is advisory."""
+    A demand file is advisory, so a failed write never stops the tick: it returns the error text (None = written)
+    for the caller to log, and the next tick writes again (Prism 8397e82995e1)."""
     from hermes_cli import admission as _ad
     from hermes_cli import admission_demand as _dmd
     from hermes_cli import placement as _pl
@@ -1358,7 +1359,8 @@ def publish_ready_demand(queued: int, root=None) -> None:
     try:
         _dmd.publish(UNIFIED_WORKLOAD, int(queued), unit, root=root)
     except Exception as exc:
-        _log.debug("kanban load gate: demand publish failed: %s", exc)
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 def utilization_context() -> dict:

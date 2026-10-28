@@ -1237,7 +1237,7 @@ def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: s
             ctx = admit_context(consumer, fp, now=_now(now), held={spec.name: reserved} if reserved else None,
                                 root=root)
         return _band_utilization(spec, sample, fp, consumer=consumer, closed_when=closed_when, ctx=ctx,
-                                 reserved=reserved)
+                                 reserved=reserved, now=_now(now), root=root)
     req = tuple(a for a in require_axes if a not in spec.unmeasurable_axes)
     measured = tuple(a for a in req if _num(getattr(sample, a, None)))
     missing = [f"{a} unmeasured" for a in req if a not in measured]
@@ -1300,14 +1300,41 @@ def band_basis(mode: Optional[str] = None, root=None) -> str:
     return "legacy" if basis == "load1" else "utilization"
 
 
+def _band_class_rule(spec: HostSpec, sample: Sample, consumer: str, leases, *, now: Optional[float], root=None):
+    """The check may_start() runs for ``consumer`` on this host, as a function of the job's estimate, or None while
+    the class's kill switch (``<WORKLOAD>_UNIFIED_ADMIT=0``) keeps its old rule (admit(), which headroom() runs).
+    Same sample row, limits, leases, ``root`` demand and priority as may_start() (Prism b22e585970ce)."""
+    try:                             # noqa: PLC0415  (imported as may_start() does)
+        from . import admission_demand as dmd
+    except ImportError:
+        import admission_demand as dmd
+    workload = dmd.workload_of(consumer)
+    if not dmd.unified(workload):
+        return None
+    names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
+    # may_start() resolves demand ``hosts`` through table.resolve; this host's own aliases are the match it needs
+    demand = dmd.read_demand(spec.name, root=root, now=_now(now),
+                             resolve=lambda h: spec.name if str(h).lower() in names else h)
+    priority = dmd.load_priority(root=root)
+    row, lim = _sample_row(spec, sample), _limits(spec)
+
+    def verdict(need):
+        return admission.admit_class(row, workload, need, leases, demand=demand, priority=priority, limits=lim,
+                                     host=spec.name)
+    return verdict
+
+
 def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer: str,
                       closed_when: Mapping[str, float], ctx: AdmitContext,
-                      reserved: Optional[Footprint] = None) -> tuple:
-    """The band over admission.admit() on the admitter's context: hot = it refuses one job of this class, warm = one
-    fits but not two (the estimate AND the footprint doubled, so scratch is checked for two), ok = two fit. A
-    measured refusal is hot even when another axis is unmeasured (admit() reports saturation before unmeasured).
+                      reserved: Optional[Footprint] = None, now: Optional[float] = None, root=None) -> tuple:
+    """The band over the admitter's own verdict on the admitter's context: hot = it refuses one job of this class,
+    warm = one fits but not two (the estimate AND the footprint doubled, so scratch is checked for two), ok = two fit.
+    A measured refusal is hot even when another axis is unmeasured (admit() reports saturation before unmeasured).
     The 10-25 Studio read hot ("headroom cpu -12.0 cores", 24 runnable threads vs 24 - 10 reserve) at cpu_busy
-    0.47 while the admitter, on this formula, admitted (t_f64c6d34)."""
+    0.47 while the admitter, on this formula, admitted (t_f64c6d34). While the class runs the ONE rule
+    (``<WORKLOAD>_UNIFIED_ADMIT`` not 0) the admitter is may_start(): admission.admit_class() with the fleet line and
+    the queued demand of every higher class (read from ``root``), so a host held back for Prism reads hot, not ok
+    (Prism b22e585970ce)."""
     names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
     leases = [le if le.host == spec.name or le.host.lower() not in names else dataclasses.replace(le, host=spec.name)
               for le in ctx.leases]          # a ledger row booked under an alias is this host's (as table.resolve)
@@ -1321,6 +1348,10 @@ def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer
     busy = f"cpu_busy {sample.cpu_busy:g}" if _num(sample.cpu_busy) else "cpu_busy ?"
     one = headroom(spec, sample, fp, consumer=consumer, closed_when=closed_when, mode="utilization", need=need,
                    leases=leases, reserved=reserved)
+    rule = _band_class_rule(spec, sample, consumer, leases, now=now, root=root)
+    v1 = rule(need) if rule else None
+    if v1 is not None and not v1.ok and not v1.reason.startswith("unmeasured"):
+        return "hot", [f"{v1.reason} ({busy}, utilization, admit_class)"]
     if not one.eligible:
         if one.reason.startswith("closed:unmeasured") or one.reason.startswith("closed:stale"):
             return None, [one.reason]
@@ -1328,6 +1359,11 @@ def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer
     two = headroom(spec, sample, fp.plus(fp), consumer=consumer, closed_when=closed_when, mode="utilization",
                    need=need.plus(need), leases=leases, reserved=reserved)
     room = f"headroom {one.mem_gb:.1f} GB / {one.cores:.1f} cpus after one job ({busy}, utilization)"
+    if v1 is not None and not v1.ok:                 # the class rule cannot measure an axis: unknown, as headroom()
+        return None, [f"closed:{v1.reason}"]
+    v2 = rule(need.plus(need)) if rule else None
+    if v2 is not None and not v2.ok:
+        return "warm", [f"room for one {consumer} job, not two: {v2.reason} ({busy}, utilization, admit_class)"]
     if not two.eligible:
         return "warm", [f"room for one {consumer} job: {room}"]
     return "ok", [room]
