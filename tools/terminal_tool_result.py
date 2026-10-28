@@ -213,7 +213,7 @@ def finalize_foreground_result(
     workdir: Optional[str], command_cwd: Optional[str], approval_note: Optional[str],
 ) -> str:
     """Turn a raw ``env.execute`` result into the tool's JSON result string."""
-    from tools.terminal_tool import record_session_cwd
+    from tools.terminal_tool import record_session_cwd, record_session_git_env
 
     # Record the cwd this command finished in as THIS session's durable cwd —
     # only when the command actually reported it (an interrupted/killed command
@@ -226,6 +226,9 @@ def finalize_foreground_result(
         observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
     if not workdir and observed_cwd:
         record_session_cwd(session_key, observed_cwd)
+    # The shell's GIT_* state persists past a per-command workdir, so it is recorded either way; a
+    # command that emitted no marker carries no ``git_env`` and the previous record stands.
+    record_session_git_env(session_key, (result or {}).get("git_env"))
 
     output = result.get("output", "")
     returncode = result.get("returncode", 0)

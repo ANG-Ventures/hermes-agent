@@ -27,7 +27,7 @@ from tools.environments.base_output import (  # noqa: F401 (_BoundedOutputCollec
 )
 from tools.environments.base_session_env import (  # noqa: F401 (snapshot-exclusion names: fork test seam)
     _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _SNAPSHOT_EXCLUDED_ENV_REGEX, _cwd_marker,
-    _export_dump_excluding_session_vars, _snapshot_bootstrap_script, _split_cwd_marker,
+    _export_dump_excluding_session_vars, _snapshot_bootstrap_script, _split_cwd_marker, _split_git_env,
     _wrap_command_script,
 )
 from tools.environments.base_wait import _WaitTrace
@@ -576,10 +576,17 @@ class BaseEnvironment(ABC):
         ``self.cwd`` and strip the marker line. ``result["cwd_observed"]``/``["cwd"]`` are set
         only when THIS command emitted a marker: a killed/timed-out command emits none and
         ``self.cwd`` keeps the previous value. The environment is shared across sessions, so
-        concurrent callers must read ``result["cwd"]`` rather than ``self.cwd``."""
-        split = _split_cwd_marker(result.get("output", ""), self._cwd_marker)
+        concurrent callers must read ``result["cwd"]`` rather than ``self.cwd``.
+
+        The same marker line carries the session shell's GIT_* repository variables (card t_20695198):
+        ``result["git_env"]`` is set only when this command emitted the line, like ``cwd_observed``."""
+        output = result.get("output", "")
+        split = _split_cwd_marker(output, self._cwd_marker)
         if split is None:
             return
+        git_env = _split_git_env(output, self._cwd_marker)
+        if git_env is not None:
+            result["git_env"] = git_env
         cwd_path, cleaned = split
         if cwd_path:
             self.cwd = cwd_path

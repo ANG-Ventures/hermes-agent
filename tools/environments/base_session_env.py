@@ -47,10 +47,20 @@ def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
 
 
+# Repository-selecting git variables whose presence in the session shell a policy hook cannot see from
+# the command text (card t_20695198). The marker line reports which are SET after each command.
+SESSION_GIT_ENV_NAMES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+_GIT_ENV_TAG = "git:"
+
+
 def _cwd_marker_printf(marker: str) -> str:
     """Emit the CWD marker on its own line (leading ``\\n`` guards against a
-    command whose output lacks a trailing newline; ``_split_cwd_marker`` strips it)."""
-    return f"printf '\\n{marker}%s{marker}\\n' \"$(pwd -P)\""
+    command whose output lacks a trailing newline; ``_split_cwd_marker`` strips it).
+    After the closing marker, ``git:`` lists `` NAME=1`` for each SESSION_GIT_ENV_NAMES variable set in
+    the shell (``${NAME+x}``: set, exported or not) when the command finished; ``_split_git_env`` reads it.
+    It sits on the marker line, so the model never sees it."""
+    flags = "".join(f"${{{name}+ {name}=1}}" for name in SESSION_GIT_ENV_NAMES)
+    return f"printf '\\n{marker}%s{marker}{_GIT_ENV_TAG}%s\\n' \"$(pwd -P)\" \"{flags}\""
 
 
 def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
@@ -196,3 +206,18 @@ def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None
     line_end = output.find("\n", last + len(marker))
     line_end = line_end + 1 if line_end != -1 else len(output)
     return cwd_path, output[:line_start] + output[line_end:]
+
+
+def _split_git_env(output: str, marker: str) -> dict[str, bool] | None:
+    """The ``git:`` section after the last complete ``marker<path>marker`` pair: ``{name: set}`` for every
+    SESSION_GIT_ENV_NAMES variable, or ``None`` when there is no complete pair or no ``git:`` section
+    (a killed command; a wrapper without the section)."""
+    last = output.rfind(marker)
+    if last == -1 or output.rfind(marker, max(0, last - 4096), last) == -1:
+        return None
+    tail = output[last + len(marker):]
+    tail = tail.split("\n", 1)[0].rstrip("\r")
+    if not tail.startswith(_GIT_ENV_TAG):
+        return None
+    present = {word.partition("=")[0] for word in tail[len(_GIT_ENV_TAG):].split() if word.endswith("=1")}
+    return {name: name in present for name in SESSION_GIT_ENV_NAMES}

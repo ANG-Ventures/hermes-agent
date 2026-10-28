@@ -345,9 +345,33 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
 
 
 def clear_session_cwd(session_key: str) -> None:
-    """Drop a session's cwd record (session teardown)."""
+    """Drop a session's cwd and GIT_* env records (session teardown)."""
     with _session_cwd_lock:
         _session_cwd.pop(_qualify_task_key(session_key), None)
+        _session_git_env.pop(_qualify_task_key(session_key), None)
+
+
+# Per-session GIT_* repository variables (GIT_DIR, GIT_WORK_TREE, ...) set in the session shell when its
+# last command finished, as the shell itself reported them on the cwd marker line. Keyed like
+# ``_session_cwd``; shell_hooks ships it to pre_tool_call hooks as ``session_git_env`` (card t_20695198).
+_session_git_env: Dict[str, Dict[str, bool]] = {}
+
+
+def record_session_git_env(session_key: Optional[str], git_env: Optional[Dict[str, bool]]) -> None:
+    """Record *git_env* (``{name: set}``) for *session_key*. A non-dict is ignored, so a command that
+    emitted no marker (killed / timed out) keeps the previous record, as for cwd."""
+    if not isinstance(git_env, dict):
+        return
+    key = _qualify_task_key(str(session_key or "default"))
+    with _session_cwd_lock:
+        _session_git_env[key] = {str(name): bool(value) for name, value in git_env.items()}
+
+
+def get_session_git_env(session_key: Optional[str]) -> Optional[Dict[str, bool]]:
+    """Copy of *session_key*'s recorded GIT_* state, or None when no command has reported one."""
+    with _session_cwd_lock:
+        recorded = _session_git_env.get(_qualify_task_key(str(session_key or "default")))
+        return dict(recorded) if recorded is not None else None
 
 
 def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
