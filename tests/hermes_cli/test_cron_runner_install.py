@@ -118,12 +118,18 @@ def test_install_bootstraps_into_gui_domain(scratch):
     assert (vhome / "logs").is_dir()
 
 
-def test_install_never_touches_the_gateway_plist(scratch):
-    home, _vhome, env = scratch
+def test_install_never_touches_the_gateway_plist_or_config(scratch):
+    """§5.7 + cutover: the installer never edits the gateway plist or flips cron.script_runner.enabled."""
+    home, vhome, env = scratch
     gw = _write_gateway(home, env)
-    before = gw.read_bytes()
-    assert crp.install(launchctl=FakeLaunchd().launchctl) == 0
+    cfg = vhome / "config.yaml"
+    cfg.write_text("cron:\n  script_runner:\n    enabled: false\n")
+    before, cfg_before = gw.read_bytes(), cfg.read_bytes()
+    fake = FakeLaunchd()
+    assert crp.install(launchctl=fake.launchctl) == 0
+    assert crp.uninstall(launchctl=fake.launchctl, pgrep=fake.pgrep, wait_s=0) == 0
     assert gw.read_bytes() == before
+    assert cfg.read_bytes() == cfg_before
 
 
 def test_uninstall_boots_out_removes_plist_and_confirms_process_gone(scratch):
