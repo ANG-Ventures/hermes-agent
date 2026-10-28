@@ -501,3 +501,133 @@ def test_if_latest_release_restate_must_restate_on_every_close_on_line(fleet, ca
     rc, err = _cli_args(tid, body, capsys, "--if-latest-release", str(c1))
     assert rc == 3, err
     assert _comments(tid) == ["close-on: merged", gate]
+
+
+# --- approve-stamp-writer at the write path (t_f2eb71b3) -------------------------------------------------------
+# 2026-10-27 12:10 comment 153767 on t_e215d33f: a script built the stamp with json.dumps and shelled to the CLI,
+# so the pre_tool_call hook never saw a literal. The write itself refuses it now.
+HEAD40 = "a" * 40
+STAMP = "review_coverage: " + json.dumps({"verdict": "APPROVE", "head_sha": HEAD40, "reviewer": "apollo",
+                                          "by": "apollo/operator", "findings": 0})
+
+
+@pytest.fixture
+def operator_cli(fleet, monkeypatch):
+    """The CLI as the operator: --author apollo with the operator token, as operator_approve.py posts."""
+    home, tid = fleet
+    kb.operator_token_path().parent.mkdir(parents=True, exist_ok=True)
+    kb.operator_token_path().write_text("tok\n", encoding="utf-8")
+    monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, "tok")
+    assert kb._operator_token_state() == "ok"
+    monkeypatch.delenv(guard.APPROVE_WRITER_ENV, raising=False)
+    return home, tid
+
+
+def test_runtime_built_stamp_through_the_cli_is_refused(operator_cli, tmp_path, capsys):
+    """The 153767 shape: a script file builds the body at runtime and calls the CLI with --body-file."""
+    _, tid = operator_cli
+    body = "apollo manual: APPROVE @ aaaaaaa\n" + "review_coverage: " + json.dumps(
+        {"verdict": "approve".upper(), "head_sha": HEAD40})
+    f = tmp_path / "stamp.md"
+    f.write_text(body, encoding="utf-8")
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    rc = kc.kanban_command(top.parse_args(["kanban", "comment", tid, "--author", "apollo", "--body-file", str(f)]))
+    err = capsys.readouterr().err
+    assert rc != 0 and "operator_approve.py" in err, err
+    assert _comments(tid) == []
+
+
+@pytest.mark.parametrize("author", ["apollo", "default", "human:ace", "unverified:apollo", "Apollo"])
+def test_operator_stamp_is_refused_at_add_comment(fleet, author, monkeypatch):
+    _, tid = fleet
+    monkeypatch.delenv(guard.APPROVE_WRITER_ENV, raising=False)
+    with pytest.raises(guard.ApproveStampRefused):
+        _post(tid, author, STAMP)
+    assert _comments(tid) == []
+
+
+def test_kanban_comment_tool_reaches_the_same_refusal(fleet, monkeypatch):
+    _, tid = fleet
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.delenv(guard.APPROVE_WRITER_ENV, raising=False)
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
+    out = _tool(tid, STAMP)
+    assert "ok" not in out and "operator_approve.py" in json.dumps(out)
+    assert _comments(tid) == []
+
+
+def test_the_one_writer_passes(fleet, monkeypatch):
+    """operator_approve._post_env sets OPERATOR_APPROVE_WRITER=1 on the CLI child it spawns."""
+    _, tid = fleet
+    monkeypatch.setenv(guard.APPROVE_WRITER_ENV, "1")
+    body = f"apollo manual: APPROVE @ aaaaaaa\n{STAMP}\nclose-on: merged"
+    _post(tid, "apollo", body)
+    assert _comments(tid) == [body]
+
+
+@pytest.mark.parametrize("body", [
+    "review_coverage: " + json.dumps({"verdict": "CHANGES_REQUESTED", "head_sha": HEAD40}),
+    "review_coverage: " + json.dumps({"verdict": "REQUEST_CHANGES", "head_sha": HEAD40}),
+    "APPROVE in prose, no record",
+    "review_coverage: {not json APPROVE}",
+])
+def test_non_approve_records_pass_for_an_operator(fleet, body, monkeypatch):
+    _, tid = fleet
+    monkeypatch.delenv(guard.APPROVE_WRITER_ENV, raising=False)
+    _post(tid, "apollo", body)
+    assert _comments(tid) == [body]
+
+
+@pytest.mark.parametrize("author", ["daedalus", "argus", "land-autopilot", "main-train", "dispatcher"])
+def test_non_operator_approve_records_pass(fleet, author, monkeypatch):
+    _, tid = fleet
+    monkeypatch.delenv(guard.APPROVE_WRITER_ENV, raising=False)
+    _post(tid, author, STAMP)
+    assert _comments(tid) == [STAMP]
+
+
+def test_writer_marker_must_be_exactly_one(fleet, monkeypatch):
+    _, tid = fleet
+    monkeypatch.setenv(guard.APPROVE_WRITER_ENV, "true")
+    with pytest.raises(guard.ApproveStampRefused):
+        _post(tid, "apollo", STAMP)
+
+
+def test_approve_stamp_off_switch(fleet, monkeypatch):
+    home, tid = fleet
+    monkeypatch.delenv(guard.APPROVE_WRITER_ENV, raising=False)
+    (home / "state").mkdir(exist_ok=True)
+    (home / "state" / "approve-stamp-guard-off").write_text("", encoding="utf-8")
+    _post(tid, "apollo", STAMP)
+    assert _comments(tid) == [STAMP]
+
+
+def test_reviewer_complete_approval_record_is_not_refused(fleet, monkeypatch):
+    """complete_task's own APPROVE record (a reviewer run closing with head_sha) is the kernel's write, even when
+    the card's assignee is an operator profile."""
+    _, tid = fleet
+    monkeypatch.delenv(guard.APPROVE_WRITER_ENV, raising=False)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET assignee='default' WHERE id=?", (tid,))
+    with kb.connect_closing() as conn:
+        impl = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="ready", reviewer="argus",
+                                 expected_run_id=impl.current_run_id)
+        assert kb.claim_review_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="LGTM", metadata={"head_sha": HEAD40})
+    assert any('"verdict": "approve"' in b for b in _comments(tid))
+
+
+def test_cli_with_operator_token_and_writer_marker_posts(operator_cli, capsys, monkeypatch):
+    """operator_approve.py's actual post: hermes kanban comment --author apollo --body TEXT, token + marker."""
+    _, tid = operator_cli
+    monkeypatch.setenv(guard.APPROVE_WRITER_ENV, "1")
+    body = f"apollo manual: APPROVE @ aaaaaaa\n{STAMP}\nclose-on: merged"
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    rc = kc.kanban_command(top.parse_args(["kanban", "comment", tid, "--author", "apollo", "--body", body]))
+    assert rc == 0, capsys.readouterr().err
+    assert _comments(tid) == [body]

@@ -7987,6 +7987,7 @@ def add_comment(
     session_ref: Optional[str] = None,
     claimed_author: Optional[str] = None,
     if_latest_release: Optional[int] = None,
+    _kernel_approve: bool = False,
 ) -> int:
     """Append a comment, recording who wrote it and from which run/session.
 
@@ -8005,15 +8006,23 @@ def add_comment(
     checked in the same write transaction, else
     :class:`~hermes_cli.kanban_close_on_guard.ReleaseSuperseded` and nothing
     is written (Prism 3406ba8bbfd9 / f3498875f176).
+
+    An operator APPROVE ``review_coverage`` stamp is refused unless the process
+    is the one writer (``OPERATOR_APPROVE_WRITER=1``, set by hermes-home
+    scripts/lib/operator_approve.py; t_f2eb71b3). ``_kernel_approve`` is the
+    kernel's own reviewer-approval record in :func:`complete_task`, never a
+    caller's.
     """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     # The one place every comment writer shares, so the body is exact (t_ebc8eb87).
-    from hermes_cli.kanban_close_on_guard import check_comment
+    from hermes_cli.kanban_close_on_guard import check_approve_stamp, check_comment
 
     check_comment(author, body)
+    if not _kernel_approve:
+        check_approve_stamp(author, body)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")
@@ -11295,6 +11304,7 @@ def complete_task(
                     {"verdict": "approve", "head_sha": approve_head_sha}
                 ),
                 run_id=int(candidate.current_run_id),
+                _kernel_approve=True,
             )
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
