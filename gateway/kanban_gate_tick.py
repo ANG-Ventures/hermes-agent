@@ -281,7 +281,8 @@ class GateTickBuilder:
     def publish_demand(self, boards) -> Optional[int]:
         """Kanban's queue for the ONE admission rule (t_3694ab3c): the ready, unclaimed cards on every board ->
         <root>/var/placement/demand/kanban.json, so a lower class (ci, test-gate, batch) leaves kanban room while
-        it waits. Off under KANBAN_UNIFIED_ADMIT=0. Returns the count published, or None."""
+        it waits. Off under KANBAN_UNIFIED_ADMIT=0. Returns the count published, or None (off, or the write failed:
+        logged, and the next tick publishes again; Prism 8397e82995e1)."""
         if not klg.unified_admit():
             return None
         n = 0
@@ -291,7 +292,9 @@ class GateTickBuilder:
             try:
                 conn = self._connect(board=slug)
                 n += int(conn.execute(_READY_COUNT_SQL).fetchone()[0] or 0)
-            except Exception:
+            except Exception as exc:
+                self._log(logger.warning, f"kanban demand: board {slug} unreadable, its ready cards not counted: "
+                                          f"{type(exc).__name__}")
                 continue
             finally:
                 if conn is not None:
@@ -299,7 +302,10 @@ class GateTickBuilder:
                         conn.close()
                     except Exception:
                         pass
-        klg.publish_ready_demand(n, root=self._root())
+        err = klg.publish_ready_demand(n, root=self._root())
+        if err:
+            self._log(logger.warning, f"kanban demand: publish of {n} ready card(s) failed, retried next tick: {err}")
+            return None
         return n
 
     def seed_out_of_tick(self, boards, *, now_wall: Optional[float] = None,
