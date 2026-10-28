@@ -627,14 +627,14 @@ def _repo_probe_signature(workspace_path: str) -> Optional[tuple]:
             if fsig is None:
                 gitdir = common = None
             else:
-                with open(dotgit, encoding="utf-8", errors="replace") as fh:
+                with open(dotgit, encoding="utf-8-sig", errors="replace") as fh:
                     head = fh.read(4096).strip()
                 if not head.startswith("gitdir:"):
                     return None
                 gitdir = os.path.join(workspace_path, head[len("gitdir:"):].strip())
                 common = gitdir
                 try:
-                    with open(os.path.join(gitdir, "commondir"), encoding="utf-8",
+                    with open(os.path.join(gitdir, "commondir"), encoding="utf-8-sig",
                               errors="replace") as fh:
                         common = os.path.join(gitdir, fh.read(4096).strip())
                 except FileNotFoundError:
@@ -673,7 +673,7 @@ def _config_include_paths(configs: Iterable[str]) -> list[str]:
     out: list[str] = []
     for cfg in configs:
         try:
-            with open(cfg, encoding="utf-8", errors="replace") as fh:
+            with open(cfg, encoding="utf-8-sig", errors="replace") as fh:
                 text = fh.read(1 << 20)
         except OSError:
             continue
