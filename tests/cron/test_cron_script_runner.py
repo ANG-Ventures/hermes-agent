@@ -620,6 +620,30 @@ def test_i_rearm_and_knob_toggle_clear_the_trip(root, capsys):
     assert r.profile_gate("default", root) is True
 
 
+def test_recovery_runs_once_per_home_only_when_gated_in(root, monkeypatch):
+    """Prism df257f6b181d: startup recovery touches only homes the runner owns (gated in), once
+    each, never a home that is knob-off, tripped or held by a non-delegating gateway."""
+    from cron import script_runner
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    prof = _make_profile(root, "p1")
+    seen = []
+    monkeypatch.setattr(InProcessCronScheduler, "recover_interrupted",
+                        lambda self: seen.append(__import__("hermes_constants").get_hermes_home()) or 0)
+    gate = {"default": "knob_disabled", "p1": "home_gateway_not_delegating"}
+    monkeypatch.setattr(script_runner, "runner_gate_reason", lambda name, home: gate[name])
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root), ("p1", prof)])
+    for _ in range(2):
+        for name, home in r.enumerate_homes():
+            r.profile_gate(name, home)
+    assert seen == []
+    gate["default"] = None
+    for _ in range(3):
+        for name, home in r.enumerate_homes():
+            r.profile_gate(name, home)
+    assert [Path(h) for h in seen] == [root]
+
+
 # --- S2 (d): code skew -----------------------------------------------------------------------------
 
 def test_d_code_skew_drains_then_exits_0(root, monkeypatch):

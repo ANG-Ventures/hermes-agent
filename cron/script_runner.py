@@ -151,7 +151,7 @@ class ScriptRunner:
         self._tick_started: Dict[str, str] = {}
         self._last_homes: List[tuple] = []
         self._warned: Dict[str, tuple] = {}
-        self._recovered = False
+        self._recovered: set = set()
         self._timer: Optional[threading.Timer] = None
         self._deadline: Optional[threading.Timer] = None
         self._pid = os.getpid()
@@ -195,7 +195,7 @@ class ScriptRunner:
 
     def enumerate_homes(self) -> list:
         """The provider's ``profile_homes`` callable: run the cycle-level checks (code skew and
-        drain, knob-off re-arm, trip marker, host precondition, first-pass recovery) and return
+        drain, knob-off re-arm, trip marker, host precondition) and return
         the homes to consider."""
         homes = list(self._profile_homes())
         from cron.scheduler_provider import _existing_profile_homes, _profile_entry
@@ -214,8 +214,6 @@ class ScriptRunner:
             self._warn_hourly("tripped", True, "script runner standby: watchdog tripped (%s); "
                               "run 'hermes cron runner rearm'", trip_marker_path())
         self._check_host()
-        if not self.host_failing and not self._recovered:
-            self._recover(self._last_homes)
         return homes
 
     def _check_skew(self) -> None:
@@ -242,17 +240,20 @@ class ScriptRunner:
             self._warn_hourly("host", tuple(names),
                               "script runner standby: host precondition: %s", "; ".join(names))
 
-    def _recover(self, homes) -> None:
+    def _recover(self, home) -> None:
+        """Startup recovery for one home, once, the first cycle the runner gates it in: never a
+        home the runner does not own (knob off, tripped, host standby, a non-delegating gateway)."""
         from cron.scheduler_provider import InProcessCronScheduler, _profile_cron_scope
 
-        self._recovered = True
-        provider = InProcessCronScheduler()
-        for _name, home in homes:
-            try:
-                with _profile_cron_scope(home):
-                    provider.recover_interrupted()
-            except Exception:
-                logger.error("script runner startup recovery failed for %s", home, exc_info=True)
+        key = str(home)
+        if key in self._recovered:
+            return
+        self._recovered.add(key)
+        try:
+            with _profile_cron_scope(home):
+                InProcessCronScheduler().recover_interrupted()
+        except Exception:
+            logger.error("script runner startup recovery failed for %s", home, exc_info=True)
 
     def profile_gate(self, name: str, home) -> bool:
         if self.draining or self.sigterm:
@@ -264,6 +265,8 @@ class ScriptRunner:
         else:
             reason = runner_gate_reason(name, home)
         self._reasons[str(home)] = reason
+        if reason is None:
+            self._recover(home)
         return reason is None
 
     def can_dispatch(self) -> bool:
