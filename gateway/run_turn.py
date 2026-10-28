@@ -3480,8 +3480,13 @@ class GatewayTurnMixin:
             _platform_config_key,
         )
         from agent.secret_scope import get_secret
-        from gateway.display_config import resolve_display_setting, resolve_tool_progress
+        import functools
+        from gateway.display_config import display_scope, resolve_display_setting as _resolve_platform_display
+        from gateway.display_config import resolve_tool_progress
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
+        # Every turn-scoped read sees the display.channels tier for this chat (thread -> parent channel).
+        _scope = display_scope(source)
+        resolve_display_setting = functools.partial(_resolve_platform_display, **_scope)
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
@@ -3500,7 +3505,7 @@ class GatewayTurnMixin:
         # A raw os.getenv here reads whichever profile's env loaded last under multiplexing
         # (#116898); get_secret resolves through the active profile's scope instead.
         progress_mode, _tool_progress_explicit = resolve_tool_progress(
-            user_config, platform_key, get_secret("HERMES_TOOL_PROGRESS_MODE"),
+            user_config, platform_key, get_secret("HERMES_TOOL_PROGRESS_MODE"), **_scope,
         )
         # "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"

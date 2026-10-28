@@ -1,6 +1,6 @@
 """Delivery policy for engine diagnostics, never assistant or command responses."""
 
-from gateway.display_config import resolve_display_setting
+from gateway.display_config import display_scope, resolve_display_setting
 
 
 class DiagnosticText(str):
@@ -62,14 +62,14 @@ def diagnostic_wake_muted(event, user_config=None) -> bool:
         getattr(event, "metadata", None), event.source.platform, user_config)
 
 
-def render_notification(render, *, platform, diagnostic=True, user_config=None) -> bool:
+def render_notification(render, *, platform, diagnostic=True, user_config=None, source=None) -> bool:
     """Invoke a synchronous UI renderer only when its classified content is visible.
 
     Return whether the renderer ran, not whether a transport delivered anything.
     Call only at a presentation sink, never around producer callbacks or persistence.
     The caller supplies the owning scope/turn snapshot; exceptions remain its policy.
     """
-    if diagnostic and not warning_notifications_enabled(platform, user_config):
+    if diagnostic and not warning_notifications_enabled(platform, user_config, **display_scope(source)):
         return False
     render()
     return True
@@ -87,8 +87,10 @@ async def present_notification(present, *, platform, diagnostic=True, user_confi
     return True
 
 
-def warning_notifications_enabled(platform, user_config=None) -> bool:
+def warning_notifications_enabled(platform, user_config=None, *, chat_id=None, thread_id=None, parent_id=None) -> bool:
     """Use the turn snapshot when supplied, otherwise the active profile's effective config.
+
+    ``chat_id``/``thread_id``/``parent_id`` select the ``display.channels`` tier when known.
 
     No surface exemption: direct command/API outcomes are not notifications.
     Unknown values never opt in; null inherits via the canonical display resolver.
@@ -98,4 +100,5 @@ def warning_notifications_enabled(platform, user_config=None) -> bool:
     elif not isinstance(user_config, dict):
         user_config = {}
     platform_key = getattr(platform, "value", platform)
-    return not resolve_display_setting(user_config, platform_key, "suppress_warning_notifications", False)
+    return not resolve_display_setting(user_config, platform_key, "suppress_warning_notifications", False,
+                                       chat_id=chat_id, thread_id=thread_id, parent_id=parent_id)
