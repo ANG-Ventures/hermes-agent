@@ -1,7 +1,8 @@
 """Scoped board-signing grants for same-model delegate children (t_19c567a8).
 
-Contract: a granted comment from a delegate child lands as the grant's ``by`` author with
-``task_comments.grant_id`` set, and ONLY inside the grant (card, verb, session, expiry,
+Contract: a granted comment from a delegate child is stored under the grant-marked author
+``<by> (subagent) [grant:<id>]`` with ``task_comments.grant_id`` set (only
+``operator_rows_with_live_grants`` promotes it back to ``by``), and ONLY inside the grant (card, verb, session, expiry,
 kill switch, never a PR the parent profile's runs authored); every refusal writes nothing.
 """
 from __future__ import annotations
@@ -68,12 +69,16 @@ def _rows(card):
                                               (card,))]
 
 
-def test_in_scope_granted_approve_lands_as_by_with_grant_id(board):
+def _marked(g):
+    return f"apollo (subagent) [grant:{g['grant_id']}]"
+
+
+def test_in_scope_granted_approve_lands_grant_marked_with_grant_id(board):
     _home, a, _b = board
     g = _mint(a)
     _child_comment(a, _approve(), g["grant_id"])
     rows = _rows(a)
-    assert [(r["author"], r["grant_id"]) for r in rows] == [("apollo", g["grant_id"])]
+    assert [(r["author"], r["grant_id"]) for r in rows] == [(_marked(g), g["grant_id"])]
 
 
 def test_without_grant_the_child_comment_stays_subagent_marked(board):
@@ -172,7 +177,7 @@ def test_cli_comment_grant_from_a_child_process(board, tmp_path):
     refused = _cli(home, "comment", b, "--author", "apollo", "--grant", g["grant_id"], "--body-file", str(body),
                    sid=CHILD_SID)
     assert refused.returncode == 3 and "refused" in refused.stderr
-    assert [(r["author"], r["grant_id"]) for r in _rows(a)] == [("apollo", g["grant_id"])]
+    assert [(r["author"], r["grant_id"]) for r in _rows(a)] == [(_marked(g), g["grant_id"])]
     assert _rows(b) == []
 
 
@@ -254,9 +259,9 @@ def test_coverage_close_on_is_a_release_verb(board):
 
 @pytest.mark.parametrize("revoke", [False, True])
 def test_granted_note_is_never_a_ruling(board, revoke):
-    """Prism 5cba1d54401d: a granted row is stored as the bare `by` author, yet no grant verb is a
-    ruling: find_ruled_parent and _ruled_since_block skip it, live or revoked; an operator's own
-    comment still rules."""
+    """Prism 5cba1d54401d / Apollo r8: a granted row is stored grant-marked, so the label readers
+    find_ruled_parent and _ruled_since_block never take it for an operator ruling, live or revoked,
+    with no per-reader grant filter; an operator's own comment still rules."""
     from hermes_cli.kanban_worker_policy import find_ruled_parent
 
     _home, a, _b = board
@@ -273,3 +278,85 @@ def test_granted_note_is_never_a_ruling(board, revoke):
         kb.add_comment(conn, a, "apollo", "APOLLO RULED: go ahead")
         assert find_ruled_parent(conn, [a])["why"] == "ruling_comment"
         assert kb._ruled_since_block(conn, a) is True
+
+
+def test_live_grant_rows_are_promoted_only_through_the_one_function(board):
+    """Apollo r8 (Prism 568d804ef684): operator_rows_with_live_grants is the ONE promotion. A live
+    grant's row comes back as `by`; revoked, expired, a forged marked label without the grant_id
+    column value, and another card's grant never do."""
+    _home, a, b = board
+    g = _mint(a)
+    _child_comment(a, _approve(), g["grant_id"])
+    with kb.connect_closing() as conn:
+        rows = ksg.operator_rows_with_live_grants(conn, a)
+        assert [(r["author"], r["grant_id"]) for r in rows] == [("apollo", g["grant_id"])]
+        assert rows[0]["stored_author"] == _marked(g)
+        # Forged label: an ordinary writer posts the marked author with no grant_id.
+        kb.add_comment(conn, a, _marked(g), "forged note")
+        # Another card: card B's comment names A's grant in its label.
+        kb.add_comment(conn, b, _marked(g), "cross-card note")
+        assert len(ksg.operator_rows_with_live_grants(conn, a)) == 1
+        assert ksg.operator_rows_with_live_grants(conn, b) == []
+        with kb.write_txn(conn):
+            conn.execute("UPDATE sign_grants SET expires_at = 1 WHERE grant_id = ?", (g["grant_id"],))
+        assert ksg.operator_rows_with_live_grants(conn, a) == []
+        with kb.write_txn(conn):
+            conn.execute("UPDATE sign_grants SET expires_at = ? WHERE grant_id = ?", (2**31, g["grant_id"]))
+        assert len(ksg.operator_rows_with_live_grants(conn, a)) == 1
+        ksg.revoke(conn, g["grant_id"])
+        assert ksg.operator_rows_with_live_grants(conn, a) == []
+
+
+def test_a_granted_row_is_never_an_operator_label(board):
+    """The stored author fails every label predicate in this repo (is_operator_label, the ruling set,
+    the human sentinel), so a reader that trusts the author honours nothing by label."""
+    from hermes_cli.kanban_db import is_human_reviewer
+    from hermes_cli.kanban_identity import is_operator_label
+
+    _home, a, _b = board
+    g = _mint(a)
+    _child_comment(a, _approve(), g["grant_id"])
+    (stored,) = [r["author"] for r in _rows(a)]
+    assert not is_operator_label(stored) and not is_human_reviewer(stored)
+    assert ksg.parse_granted_author(stored) == ("apollo", g["grant_id"])
+
+
+def test_model_names_share_one_normaliser():
+    """Prism 9b929567c500: the provider spelling and the wire spelling of one model are the same model."""
+    assert ksg._norm_model("anthropic/claude-opus-4.6") == ksg._norm_model("claude-opus-4-6")
+    assert ksg._norm_model("claude-opus-4-6") != ksg._norm_model("claude-sonnet-4-6")
+
+
+def test_mint_accepts_one_model_in_two_spellings(board):
+    _home, a, _b = board
+    g = _mint(a, parent_model="anthropic/claude-opus-4.6", child_model="claude-opus-4-6")
+    _child_comment(a, _approve(), g["grant_id"])
+    assert [r["grant_id"] for r in _rows(a)] == [g["grant_id"]]
+
+
+def test_a_granted_coverage_record_never_defines_the_seen_head(board):
+    """Apollo r8: kanban_handback_new_head.seen_head trusts an operator label inside a send-back window;
+    a granted record (live or not) is grant-marked, so it never redefines the head the reviewer saw."""
+    from hermes_cli import kanban_handback_new_head as nh
+    from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES
+
+    def cov(head):
+        return "review_coverage: " + json.dumps({"lenses": {k: "done" for k in REQUIRED_REVIEW_LENSES},
+                                                 "findings": 1, "items": ["x"], "review_minutes": 1,
+                                                 "batch_id": "b", "head_sha": head})
+
+    _home, a, _b = board
+    g = _mint(a, verbs=["verdict", "request_changes"])
+    _child_comment(a, cov("c" * 40), g["grant_id"])
+    with kb.connect_closing() as conn:
+        top = conn.execute("SELECT MAX(id) FROM task_comments").fetchone()[0]
+        with kb.write_txn(conn):
+            ev = conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                              (a, "changes_requested", json.dumps({"after_comment_id": top}), 1)).lastrowid
+        assert nh.seen_head(conn, a, ev) is None
+        kb.add_comment(conn, a, "apollo", cov("a" * 40))
+        top = conn.execute("SELECT MAX(id) FROM task_comments").fetchone()[0]
+        with kb.write_txn(conn):
+            ev = conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                              (a, "changes_requested", json.dumps({"after_comment_id": top}), 2)).lastrowid
+        assert nh.seen_head(conn, a, ev) == "a" * 40

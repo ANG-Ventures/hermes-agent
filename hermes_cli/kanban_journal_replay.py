@@ -170,22 +170,19 @@ def replay_into(
                 if not body:
                     continue
                 grant_id = payload.get("grant_id")
-                # A snapshot older than the additive migration has no grant_id
-                # column, and replay does not migrate (the board's connect does).
-                # Writing the granted row as plain ``apollo`` with no grant_id
-                # would make it a real operator comment forever, past the grant's
-                # revoke/expiry. Mark it as a child's comment instead, the shape
-                # an ungranted child comment already has, so no operator reader
-                # honours it (t_19c567a8, Prism 4f220d2636c1).
-                if grant_id and not has_grant_col:
-                    from hermes_cli.kanban_db import SUBAGENT_AUTHOR_MARKER
+                # A granted comment is journaled under its grant-marked author
+                # (``by (subagent) [grant:<id>]``) and replay keeps it, so a restore
+                # never turns it into a plain operator comment, column or no column
+                # (Apollo r8 ruling). A line carrying a grant_id under an unmarked
+                # author is marked the same way here.
+                if grant_id:
+                    from hermes_cli import kanban_sign_grants as ksg
 
-                    if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
-                        author = author.strip() + SUBAGENT_AUTHOR_MARKER
+                    if ksg.parse_granted_author(author) is None:
+                        author = ksg.granted_author(author, grant_id)
                 # grant_id is part of the row's identity: a granted record and an
                 # identical ungranted operator record are two comments, and
                 # collapsing them would lose the durable one (Prism 3ee6a1868ab2).
-                # Into a pre-migration board the marked author already separates them.
                 dupe_sql = ("SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
                             "AND body = ? AND created_at = ?")
                 dupe_args = [task_id, author, body, created]
@@ -196,10 +193,8 @@ def replay_into(
                 if dupe:
                     result.comments_already_present += 1
                     continue
-                # grant_id survives the restore into a migrated board
-                # (t_19c567a8); the readers honour it only while the grant
-                # validates. Into a pre-migration board the row is written with
-                # the subagent-marked author above and the dropped grant reported.
+                # grant_id survives the restore into a migrated board; into a
+                # pre-migration board the marked author still carries the grant id.
                 cols = ["task_id", "author", "body", "run_id", "session_ref", "created_at"]
                 vals = [task_id, author, body, record.get("run_id"),
                         payload.get("session_ref"), created]

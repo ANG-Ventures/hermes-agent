@@ -263,3 +263,70 @@ def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
         AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g"}]})
     assert [kw["background"] for kw in seen] == [False, False, True]
     assert seen[1]["sign_grant"] == {"cards": [board]}
+
+
+def test_provider_spelling_of_the_same_model_is_not_drift(board):
+    """Prism 9b929567c500: minted on the provider spelling, called on the wire spelling: no drift."""
+    parent = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="parent-sid", _delegate_depth=0)
+    child = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="child-sid", _subagent_id="sa-0-abc")
+    g = dsg.mint_for_child(_task(board), child, parent)
+    dsg.revoke_on_model_drift(child, "claude-opus-4-6")
+    assert len(_live_rows(g["grant_id"])) == 1
+    dsg.revoke_on_model_drift(child, "claude-sonnet-4-6")
+    assert _live_rows(g["grant_id"]) == []
+
+
+@pytest.mark.parametrize("fails", [1, 99])
+def test_turn_end_keeps_unrevoked_grants_registered(board, monkeypatch, fails):
+    """Prism 53347c16a468: a grant leaves the turn registry only once revoked. One failure is retried;
+    a persistent failure keeps it registered and raises, so the turn ends loud."""
+    parent, child = _agents()
+    g = dsg.mint_for_child(_task(board), child, parent)
+    dsg.register_turn_grants(parent, [g])
+    real, calls = dsg.revoke, []
+
+    def flaky(grants):
+        calls.append(len(grants))
+        return [str(x["grant_id"]) for x in grants] if len(calls) <= fails else real(grants)
+
+    monkeypatch.setattr(dsg, "revoke", flaky)
+    if fails == 1:
+        dsg.revoke_turn_grants(parent)
+        assert "_sign_grants" not in parent.__dict__ and _live_rows(g["grant_id"]) == []
+    else:
+        with pytest.raises(RuntimeError, match="could not be revoked"):
+            dsg.revoke_turn_grants(parent)
+        assert parent.__dict__["_sign_grants"] == [g] and len(_live_rows(g["grant_id"])) == 1
+
+
+@pytest.mark.parametrize("where", ["second_child", "after_mint"])
+def test_a_failed_multi_child_mint_revokes_what_it_minted(board, monkeypatch, where):
+    """Prism cd87b39be0ea: any exception during the mint (not only SignGrantError) revokes every grant
+    already minted before it propagates."""
+    parent, child = _agents()
+    _p2, child2 = _agents()
+    child2.session_id = "child-sid-2"
+    minted = []
+    real_mint = dsg.mint_for_child
+
+    if where == "second_child":
+        def mint(t, c, p, **kw):
+            if c is child2:
+                raise KeyboardInterrupt
+            g = real_mint(t, c, p, **kw)
+            minted.append(g)
+            return g
+
+        monkeypatch.setattr(dsg, "mint_for_child", mint)
+    else:
+        def ledger(event):
+            minted.append(event)
+            raise RuntimeError("ledger down")
+
+        monkeypatch.setattr(dsg, "_ledger", ledger)
+    with pytest.raises((KeyboardInterrupt, RuntimeError)):
+        dsg.mint_for_children([(0, _task(board), child), (1, _task(board), child2)], parent)
+    with kb.connect_closing() as conn:
+        live = conn.execute("SELECT COUNT(*) FROM sign_grants WHERE revoked_at IS NULL").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM sign_grants").fetchone()[0]
+    assert total >= 1 and live == 0

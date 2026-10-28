@@ -5644,18 +5644,10 @@ def _ruled_since_block(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone()[0]
     if not n:
         return False
-    from .kanban_sign_grants import ungranted_comments_sql
-
-    # Only the newest N rows are the post-block window, so a granted row is skipped in the loop
-    # (not filtered in SQL, which would widen the window past the block).
-    has_grant = bool(ungranted_comments_sql(conn))
     for r in conn.execute(
-        "SELECT author, body, run_id" + (", grant_id" if has_grant else ", NULL AS grant_id")
-        + " FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+        "SELECT author, body, run_id FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
         (task_id, int(n)),
     ):
-        if r["grant_id"] is not None:
-            continue  # a granted child note is never an operator ruling (Prism 5cba1d54401d)
         author = (r["author"] or "").strip()
         if author.endswith(SUBAGENT_AUTHOR_MARKER.strip()) or author.lower() not in RULING_AUTHORS:
             continue
@@ -8153,6 +8145,13 @@ def _add_comment_txn(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        signer = author.strip()
+        if grant_id is not None:
+            from hermes_cli import kanban_sign_grants as ksg
+
+            # Stored under a grant-marked author no label reader honours; only
+            # ksg.operator_rows_with_live_grants promotes it (Apollo r8 ruling).
+            author = ksg.granted_author(signer, grant_id)
         if if_latest_release is not None:
             from hermes_cli.kanban_close_on_guard import (
                 ReleaseSuperseded, newer_release_comment,
@@ -8162,9 +8161,7 @@ def _add_comment_txn(
             if why:
                 raise ReleaseSuperseded(why)
         if grant_id is not None:
-            from hermes_cli import kanban_sign_grants as ksg
-
-            ksg.validate_comment(conn, grant_id, task_id, author.strip(), body,
+            ksg.validate_comment(conn, grant_id, task_id, signer, body,
                                  caller_session_ref=session_ref, now=now)
             cur = conn.execute(
                 "INSERT INTO task_comments "

@@ -112,14 +112,34 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
     except ksg.GrantRefused as exc:
         raise SignGrantError(str(exc)) from exc
     grant["board"] = board
-    # The child carries its grants so a later model swap revokes them (revoke_on_model_drift).
-    child.__dict__.setdefault("_held_sign_grants", []).append(
-        {**grant, "child_session_ref": kb.derive_session_ref(child_sid)})
-    task["goal"] = str(task.get("goal") or "") + _brief(grant)
-    _ledger({"event": "sign_grant", "grant_id": grant["grant_id"], "child": grant.get("child_id"),
-             "by": by, "board": board, "cards": len(cards), "verbs": grant["verbs"],
-             "expires_at": grant["expires_at"], "at": int(time.time())})
+    try:
+        # The child carries its grants so a later model swap revokes them (revoke_on_model_drift).
+        child.__dict__.setdefault("_held_sign_grants", []).append(
+            {**grant, "child_session_ref": kb.derive_session_ref(child_sid)})
+        task["goal"] = str(task.get("goal") or "") + _brief(grant)
+        _ledger({"event": "sign_grant", "grant_id": grant["grant_id"], "child": grant.get("child_id"),
+                 "by": by, "board": board, "cards": len(cards), "verbs": grant["verbs"],
+                 "expires_at": grant["expires_at"], "at": int(time.time())})
+    except BaseException:
+        revoke([grant])   # minted but never handed back: nothing may hold it live
+        raise
     return grant
+
+
+def mint_for_children(children: List[Any], parent_agent: Any, *, inherit_context: Any = None,
+                      inherit_mode: Any = None) -> List[Dict[str, Any]]:
+    """Mint every child's grant, all or nothing: on ANY exception (a refusal, an error, an
+    interrupt) the grants already minted are revoked before it propagates (Prism cd87b39be0ea)."""
+    minted: List[Dict[str, Any]] = []
+    try:
+        for _i, t, child in children:
+            g = mint_for_child(t, child, parent_agent, inherit_context=inherit_context, inherit_mode=inherit_mode)
+            if g:
+                minted.append(g)
+    except BaseException:
+        revoke(minted)
+        raise
+    return minted
 
 
 def _brief(grant: Dict[str, Any]) -> str:
@@ -145,10 +165,24 @@ def register_turn_grants(parent_agent: Any, grants: List[Dict[str, Any]]) -> Non
 
 
 def revoke_turn_grants(agent: Any) -> None:
-    """Turn end: revoke every grant this agent minted during the turn."""
-    held = getattr(agent, "__dict__", {}).pop("_sign_grants", None)
-    if held:
-        revoke(held)
+    """Turn end: revoke every grant this agent minted during the turn.
+
+    A grant leaves the registry only once revoked: a failed set is retried once, and whatever
+    still fails stays registered (the next turn end retries it) and raises, so the turn ends
+    loud instead of silently leaving a live grant (Prism 53347c16a468)."""
+    d = getattr(agent, "__dict__", None)
+    held = d.get("_sign_grants") if d is not None else None
+    if not held:
+        return
+    failed = set(revoke(held))
+    if failed:
+        failed = set(revoke([g for g in held if str(g.get("grant_id")) in failed]))
+    remaining = [g for g in held if str(g.get("grant_id")) in failed]
+    if remaining:
+        d["_sign_grants"] = remaining
+        raise RuntimeError(f"sign grant(s) {sorted(failed)} could not be revoked at turn end; "
+                           "they stay registered and lapse at their expiry at the latest")
+    d.pop("_sign_grants", None)
 
 
 def revoke_on_model_drift(agent: Any, model: Any) -> None:

@@ -631,3 +631,32 @@ def test_cli_with_operator_token_and_writer_marker_posts(operator_cli, capsys, m
     rc = kc.kanban_command(top.parse_args(["kanban", "comment", tid, "--author", "apollo", "--body", body]))
     assert rc == 0, capsys.readouterr().err
     assert _comments(tid) == [body]
+
+
+def _granted_post(home, tid, body):
+    """A delegate child's comment signed as `apollo` under a live grant (t_19c567a8)."""
+    from agent.delegation_context import delegated_child_context
+    from hermes_cli import kanban_sign_grants as ksg
+
+    (home / "config.yaml").write_text("kanban:\n  sign_grants: 'on'\n")
+    with kb.connect_closing() as conn:
+        g = ksg.mint(conn, cards=[tid], verbs=["verdict", "approve", "release"], by="apollo",
+                     child_session_ref=kb.derive_session_ref("child"), parent_model="m", child_model="m",
+                     parent_profiles=["default", "apollo"])
+    with delegated_child_context(), kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "apollo", body, session_ref=kb.derive_session_ref("child"), grant_id=g["grant_id"])
+    return g
+
+
+@pytest.mark.parametrize("granted", ["close-on: merged", _coverage({"verdict": "APPROVE", "close_on": "pr-merged o/r#9"})])
+def test_a_granted_row_is_never_a_newer_gate_by_label(fleet, granted):
+    """Apollo r8 / Prism 568d804ef684: a granted row is stored grant-marked, so neither the newer-release scan
+    nor the coverage-gate check (_newer_coverage_gate) reads it as an operator's gate, and it is never an anchor."""
+    home, tid = fleet
+    c1 = _post(tid, "apollo", HOLD)
+    _granted_post(home, tid, granted)
+    with kb.connect_closing() as conn:
+        granted_id = conn.execute("SELECT MAX(id) FROM task_comments").fetchone()[0]
+        assert guard.newer_release_comment(conn, tid, c1, "close-on: merged", "apollo") is None
+        assert "not a release-bearing" in guard.newer_release_comment(conn, tid, granted_id, "close-on: merged",
+                                                                      "apollo")

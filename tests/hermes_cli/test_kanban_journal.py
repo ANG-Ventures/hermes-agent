@@ -294,15 +294,18 @@ def test_replay_skips_entries_already_in_the_snapshot(journal_env, tmp_path):
     assert n == 1
 
 
+GID = "g-0123456789abcdef"
+
+
 @pytest.mark.parametrize("migrated", [False, True])
 def test_replay_of_a_granted_comment_matches_the_target_schema(journal_env, tmp_path, migrated):
     """A granted comment replays into a pre-grant snapshot and into a migrated one (t_19c567a8).
 
-    Pre-migration: no crash, the comment comes back without grant_id and with a
-    subagent-marked author, so no operator reader takes it for a real operator
-    comment past the grant's revoke/expiry (Prism 4f220d2636c1); the loss is
-    counted and a second replay inserts nothing. Migrated: grant_id and the
-    author are restored as written.
+    Either way the comment comes back under the grant-marked author
+    (``apollo (subagent) [grant:<id>]``), so no label reader takes it for a real
+    operator comment past the grant's revoke/expiry (Prism 4f220d2636c1, Apollo
+    r8). Pre-migration: no crash, the grant_id column loss is counted and a
+    second replay inserts nothing. Migrated: grant_id is restored too.
     """
     kanban_journal, _ = journal_env
     from hermes_cli import kanban_journal_replay
@@ -319,7 +322,7 @@ def test_replay_of_a_granted_comment_matches_the_target_schema(journal_env, tmp_
     kanban_journal.append(
         "b5", "t_g", "comment_body",
         {"author": "apollo", "body": "granted APPROVE", "created_at": base + 20,
-         "grant_id": "g_1234"},
+         "grant_id": GID},
     )
     out = tmp_path / "out.db"
     result = kanban_journal_replay.replay_into("b5", snapshot, out)
@@ -331,11 +334,9 @@ def test_replay_of_a_granted_comment_matches_the_target_schema(journal_env, tmp_
     assert ("grant_id" in cols) == migrated, "replay must not migrate the snapshot"
     if migrated:
         row = rc.execute("SELECT body, grant_id FROM task_comments").fetchone()
-        assert row == ("granted APPROVE", "g_1234")
-        assert rc.execute("SELECT author FROM task_comments").fetchone() == ("apollo",)
-    else:
-        row = rc.execute("SELECT author, body FROM task_comments").fetchone()
-        assert row == ("apollo (subagent)", "granted APPROVE")
+        assert row == ("granted APPROVE", GID)
+    row = rc.execute("SELECT author, body FROM task_comments").fetchone()
+    assert row == (f"apollo (subagent) [grant:{GID}]", "granted APPROVE")
     rc.close()
 
     again = kanban_journal_replay.replay_into("b5", out, tmp_path / "out2.db")

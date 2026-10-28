@@ -13,12 +13,12 @@ expiring piece of its signing authority instead of its identity:
 * one ``sign_grants`` row per card, on the board holding the cards, carrying the
   verbs, the expiry, the child's session fingerprint and the PRs the grant may
   never cover (the parent run's own PRs);
-* a granted comment is written as ``by`` (never ``by (subagent)``) with
-  ``task_comments.grant_id`` set, after :func:`validate_comment` passed inside
-  the insert's transaction;
-* merge-policy readers (hermes-home ``scripts/lib/sign_grant.py``) honour a
-  granted row only while its grant is live: a revoked or expired grant voids the
-  stamp the way a head move does.
+* a granted comment is stored as ``by (subagent) [grant:<id>]`` (:func:`granted_author`)
+  with ``task_comments.grant_id`` set, after :func:`validate_comment` passed inside
+  the insert's transaction, so no reader that trusts an author label honours it;
+* the ONE promotion is :func:`operator_rows_with_live_grants`: a reader meant to
+  honour live grants reads the rows it returns (author = ``by``) and nothing else;
+  a revoked or expired grant's rows drop out, the way a head move voids a stamp.
 
 Kill switch: ``kanban.sign_grants`` (board-home config first, then the profile);
 anything but ``on`` refuses every mint and every granted write.
@@ -68,7 +68,67 @@ def enabled() -> bool:
 
 
 def _norm_model(model: Optional[str]) -> str:
-    return str(model or "").strip().lower()
+    """One normaliser for the grant model and the wire model, at mint and at every check, so a
+    provider spelling (``anthropic/claude-opus-4.6`` vs ``claude-opus-4-6``) is not drift (Prism 9b929567c500)."""
+    from agent.anthropic_message_convert import normalize_model_name
+
+    return normalize_model_name(str(model or "").strip()).lower()
+
+
+#: ``<by> (subagent) [grant:<id>]``: how a granted comment is STORED. The `` (subagent)`` marker makes
+#: every label-trusting reader (this repo's and hermes-home's) treat it as a child's comment; only
+#: :func:`operator_rows_with_live_grants` promotes it back to ``by``, and only while the grant is live.
+_GRANTED_AUTHOR_RE = re.compile(r"^(?P<by>.+?) \(subagent\) \[grant:(?P<gid>g-[0-9a-f]{16})\]$")
+
+
+def granted_author(by: str, grant_id: str) -> str:
+    """The stored author of a comment ``by`` signed under ``grant_id``."""
+    from hermes_cli.kanban_db import SUBAGENT_AUTHOR_MARKER
+
+    return f"{str(by).strip()}{SUBAGENT_AUTHOR_MARKER} [grant:{grant_id}]"
+
+
+def parse_granted_author(author: Optional[str]) -> Optional[tuple]:
+    """``(by, grant_id)`` for a grant-marked author, else None."""
+    m = _GRANTED_AUTHOR_RE.match(str(author or "").strip())
+    return (m.group("by"), m.group("gid")) if m else None
+
+
+def _grant_live(row: Optional[sqlite3.Row], by: str, now: int) -> bool:
+    return (row is not None and row["revoked_at"] is None and int(row["expires_at"]) > now
+            and str(row["by_author"]).strip().lower() == str(by).strip().lower()
+            and _norm_model(row["parent_model"]) == _norm_model(row["child_model"]))
+
+
+def operator_rows_with_live_grants(conn: sqlite3.Connection, task_id: str, *,
+                                   now: Optional[int] = None) -> list:
+    """THE one promotion of granted comments (Apollo r8 ruling, Prism 568d804ef684).
+
+    The ``task_comments`` rows of ``task_id`` stored under a grant-marked author whose grant
+    :func:`get` reads live now (exists for this card, signs as that author, not revoked, not
+    expired, same model), oldest first, each a dict with ``author`` set to the grant's ``by``
+    and ``stored_author`` the marked label. A revoked/expired/unknown grant's rows are absent.
+    A reader that is meant to honour live grants reads these; every other reader sees the
+    marked author and honours nothing.
+    """
+    now = int(time.time()) if now is None else int(now)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(task_comments)").fetchall()}
+    sel = "id, author, body, run_id, session_ref, created_at" + (", grant_id" if "grant_id" in cols else "")
+    out = []
+    for r in conn.execute(f"SELECT {sel} FROM task_comments WHERE task_id = ? AND author LIKE ? ORDER BY id",
+                          (task_id, "% (subagent) [grant:g-%]")):
+        parsed = parse_granted_author(r["author"])
+        if parsed is None:
+            continue
+        by, gid = parsed
+        if "grant_id" in cols and r["grant_id"] != gid:
+            continue
+        if not _grant_live(get(conn, gid, task_id), by, now):
+            continue
+        row = {k: r[k] for k in r.keys()}
+        row.update(author=by, stored_author=r["author"], grant_id=gid)
+        out.append(row)
+    return out
 
 
 def _pr_keys(texts: Iterable[str]) -> set:
@@ -206,18 +266,6 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
     finally:
         conn.execute("PRAGMA query_only=ON")
         kb._DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
-
-
-def ungranted_comments_sql(conn: sqlite3.Connection) -> str:
-    """`` AND grant_id IS NULL`` for a ``task_comments`` query, or ``""`` on a board without the column.
-
-    For author-trust readers that are NOT grant-aware (a recorded ruling, a block answer): a
-    granted row is stored as the bare ``by`` author, but no grant verb is a ruling, so it never
-    counts as one, live or void (Prism 5cba1d54401d). A board without the column holds no
-    granted rows.
-    """
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(task_comments)").fetchall()}
-    return " AND grant_id IS NULL" if "grant_id" in cols else ""
 
 
 def get(conn: sqlite3.Connection, grant_id: str, task_id: str) -> Optional[sqlite3.Row]:

@@ -4293,20 +4293,15 @@ def delegate_task(
     # child's session and model, and revoked when the children's run ends.
     sign_grants: List[Dict[str, Any]] = []
     if any(isinstance(t, dict) and t.get("sign_grant") for _i, t, _c in children):
-        from tools.delegate_tool_sign_grant import (
-            SignGrantError, mint_for_child, register_turn_grants, revoke as _revoke_grants,
-        )
+        from tools.delegate_tool_sign_grant import SignGrantError, mint_for_children, register_turn_grants
 
         if background:
             return tool_error("sign_grant needs background=false: a grant ends with this turn")
         try:
-            for _i, t, child in children:
-                g = mint_for_child(t, child, parent_agent, inherit_context=inherit_context,
-                                   inherit_mode=inherit_mode)
-                if g:
-                    sign_grants.append(g)
+            # All or nothing: any exception revokes what was already minted.
+            sign_grants = mint_for_children(children, parent_agent, inherit_context=inherit_context,
+                                            inherit_mode=inherit_mode)
         except SignGrantError as exc:
-            _revoke_grants(sign_grants)
             return tool_error(f"sign_grant refused: {exc}")
         # Live until the PARENT's turn ends (the turn facade's finally revokes them) or expiry, whichever is first:
         # the parent may still run the merge gate over the child's stamp in this turn.
