@@ -452,12 +452,13 @@ def rearm() -> int:
 
 
 def _bootstrap_env() -> None:
-    """Load the process home's ``.env`` the way the gateway does at import. S4 replaces this with
-    ``bootstrap_cron_parent_env(role="runner")`` (spec §5.6)."""
-    from hermes_cli.env_loader import load_hermes_dotenv
+    """The gateway's child-visible start-path env (spec §5.6): ``.env``, the config bridge, the
+    platform env bridges, ``HERMES_EXEC_ASK``/``TERMINAL_CWD`` and ``HERMES_QUIET``. ``_HERMES_GATEWAY``
+    goes into each script child's env only, never this process's."""
+    from hermes_cli.process_bootstrap import bootstrap_cron_parent_env
     from hermes_constants import get_process_hermes_home
 
-    load_hermes_dotenv(hermes_home=get_process_hermes_home())
+    bootstrap_cron_parent_env(get_process_hermes_home() / "config.yaml", role="runner")
 
 
 def _setup_logging() -> None:

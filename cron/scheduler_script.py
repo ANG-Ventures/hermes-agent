@@ -550,6 +550,9 @@ def _run_job_script(
         # record which job minted a card (the orphan watch maps it to the
         # job's deliver chat).
         env["HERMES_CRON_JOB_ID"] = str(job_id or job_name or path.name)
+        # Runner role only: the _HERMES_GATEWAY marker a gateway-started script inherits (§5.6).
+        from hermes_cli.process_bootstrap import apply_child_env
+        apply_child_env(env)
         env.update(env_overlay)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
