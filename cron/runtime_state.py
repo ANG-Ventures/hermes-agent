@@ -25,6 +25,14 @@ rewrites the file at most once per ``HERMES_CRON_MIRROR_INTERVAL_S`` (default 30
 from the scheduler tick and after a write section; ``0`` = flush on every touch (the pre-split I/O
 shape, for debugging). Definition saves write the merged view at once and clear the flag.
 
+Definitions-only mode (default; ``HERMES_CRON_DEFINITIONS_ONLY=0`` restores the above, t_3c8fa4d6):
+the coalesced flush writes the merged view to the UNTRACKED ``<cron dir>/jobs.runtime.json`` instead,
+and ``jobs.json`` is written only by definition saves, with RUNTIME_FIELDS, ``repeat.completed`` and
+FILE_RUNTIME_KEYS stripped, so it is byte-stable across scheduler ticks (no git churn). A legacy
+merged ``jobs.json`` is stripped once by the first flush whose rows cover its runtime. Any merged
+write to ``jobs.json`` (switch off, json mode, runtime-export) removes ``jobs.runtime.json`` so an
+out-of-process reader falls back to ``jobs.json`` instead of a stale mirror.
+
 DO NOT REMOVE THE MIRROR as an optimisation. These consumers read runtime fields (last_run_at,
 next_run_at, last_status, last_error, ...) straight out of jobs.json with json.load, and would see
 every job as never-run without it (hermes-home, census 2026-10-24, PR #2287 review):
@@ -115,9 +123,17 @@ CREATE TABLE IF NOT EXISTS mirror_state (
 # of the row snapshot it reflects, and the database epoch that seq belongs to.
 MIRROR_EPOCH_KEY = "_mirror_epoch"
 MIRROR_SEQ_KEY = "_mirror_seq"
+# Top-level keys only a merged/mirror write carries (hermes-home scripts/lib/cron_runtime_fields.py
+# FILE_RUNTIME_KEYS, same set): a definitions-only jobs.json never holds them.
+FILE_RUNTIME_KEYS = frozenset({"updated_at", MIRROR_EPOCH_KEY, MIRROR_SEQ_KEY})
 # Fixed temp name ``fold_staged_copy`` writes next to a staged jobs.json (profile export refuses a
 # symlink at it).
 FOLD_TMP_NAME = "jobs.json.fold-tmp"
+# Definitions-only mode (t_3c8fa4d6, LTWC A): the coalesced merged view goes to this UNTRACKED file
+# next to jobs.json, and jobs.json carries definitions only (byte-stable across scheduler ticks).
+# ``HERMES_CRON_DEFINITIONS_ONLY=0`` restores the merged write to jobs.json.
+RUNTIME_MIRROR_NAME = "jobs.runtime.json"
+ENV_DEFINITIONS_ONLY = "HERMES_CRON_DEFINITIONS_ONLY"
 
 # Statement counter for tests/bench (done-when 1): one per row INSERT/UPDATE that changed a row.
 UPSERT_COUNT = 0
@@ -134,6 +150,26 @@ def mode() -> str:
 
 def enabled() -> bool:
     return mode() == "sqlite"
+
+
+def definitions_only() -> bool:
+    """sqlite mode and ``HERMES_CRON_DEFINITIONS_ONLY`` not ``0`` (default on): jobs.json holds
+    definitions only and the merged view is mirrored to ``RUNTIME_MIRROR_NAME``. json mode keeps
+    runtime in jobs.json, so it is never definitions-only."""
+    from cron.env_settings import cron_env_setting
+
+    return enabled() and cron_env_setting(ENV_DEFINITIONS_ONLY).strip() != "0"
+
+
+def file_has_runtime(data: Any) -> bool:
+    """True when a parsed jobs.json payload carries any runtime key (top-level or per job)."""
+    if isinstance(data, dict):
+        if any(key in FILE_RUNTIME_KEYS for key in data):
+            return True
+        jobs = data.get("jobs")
+    else:
+        jobs = data
+    return isinstance(jobs, list) and any(isinstance(j, dict) and has_runtime(j) for j in jobs)
 
 
 def mirror_interval() -> float:
@@ -180,6 +216,13 @@ def mark_dirty(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO mirror_state(k, v) VALUES ('seq', 1) "
                  "ON CONFLICT(k) DO UPDATE SET v = v + 1")
     conn.execute("INSERT OR IGNORE INTO mirror_state(k, v) VALUES ('dirty_since', ?)", (_now(),))
+
+
+def mark_due(conn: sqlite3.Connection) -> None:
+    """The mirror lags AND its coalescing window is already over (a definitions-only save: the
+    runtime mirror must pick the new definitions up on the next flush, not 30 s later)."""
+    mark_dirty(conn)
+    conn.execute("INSERT OR REPLACE INTO mirror_state(k, v) VALUES ('dirty_since', 0)")
 
 
 def mirror_seq(conn: sqlite3.Connection) -> float:

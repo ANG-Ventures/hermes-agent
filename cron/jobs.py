@@ -1814,6 +1814,10 @@ def load_jobs() -> List[Dict[str, Any]]:
         rows = _read_runtime_rows(file_gen)
         adopt = [j for j in jobs if str(j.get("id") or "") and str(j.get("id")) not in rows
                  and _rs.has_runtime(j)]
+        if _rs.definitions_only() and not rows:
+            # t_3c8fa4d6: jobs.json carries no runtime any more. With NO rows at all (database
+            # lost or recreated) the untracked merged mirror is the only runtime copy: adopt it.
+            adopt += _runtime_from_mirror(jobs, rows)
         if adopt and not locked:
             with _jobs_lock():
                 return load_jobs()
@@ -1907,6 +1911,32 @@ def _note_kill_switch_orphans_only() -> None:
                        sum(1 for jid in rows if jid in defined), _rs.DB_NAME)
         return
     _KILL_SWITCH_ORPHANS_ONLY[str(path)] = ident
+
+
+def _runtime_from_mirror(jobs: List[Dict[str, Any]],
+                         rows: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Definitions-only mode (t_3c8fa4d6): every row-less, runtime-free job of *jobs* for which the
+    untracked mirror holds runtime, as the record to adopt (its definition + that runtime). A
+    missing or unreadable mirror adopts nothing, as a fresh store would."""
+    mirror: Dict[str, Dict[str, Any]] = {}
+    try:
+        data, _ = _parse_jobs_file(_runtime_mirror_file())
+        listed = data.get("jobs") if isinstance(data, dict) else None
+        if isinstance(listed, list):
+            mirror = {str(m["id"]): m for m in listed if isinstance(m, dict) and m.get("id")}
+    except (OSError, ValueError):
+        return []
+    out = []
+    for job in jobs:
+        jid = str(job.get("id") or "")
+        if not jid or jid in rows or _rs.has_runtime(job) or jid not in mirror:
+            continue
+        runtime = _rs.split_job(mirror[jid])[1]
+        if runtime:
+            record = copy.deepcopy(job)
+            _rs.apply_runtime(record, runtime)
+            out.append(record)
+    return out
 
 
 def _runtime_db_path() -> Path:
@@ -2258,7 +2288,8 @@ def maybe_flush_runtime_mirror(*, force: bool = False) -> bool:
             return False
         since = _rs.dirty_since(conn)
         known = _known_mirror_stamp(conn)
-    replaced = known is not None and _mirror_stamp(store.jobs_file) != known
+    replaced = (known is not None and _mirror_stamp(store.jobs_file) != known) \
+        or _runtime_mirror_out_of_mode()
     if since is None and not replaced:
         return False
     interval = _rs.mirror_interval()
@@ -2294,35 +2325,75 @@ def _flush_runtime_mirror_locked(store) -> bool:
             # mean nothing to do: skip the full load and parse of jobs.json.
             since = _rs.dirty_since(conn)
             known = _known_mirror_stamp(conn)
-        if since is None and not (known is not None
-                                  and _mirror_stamp(store.jobs_file) != known):
+        defs_only = _rs.definitions_only()
+        if since is None and not _runtime_mirror_out_of_mode() and not (
+                known is not None and _mirror_stamp(store.jobs_file) != known):
             return False
         jobs = load_jobs()  # merged view; recovers a pending generation under the lock
         try:
             data, _ = _parse_jobs_file(store.jobs_file)
         except Exception:
             data = None
-        current = data.get("jobs") if isinstance(data, dict) else None
-        wrote = not (isinstance(current, list) and current == jobs
-                     and "runtime_gen" not in data)
-        if wrote:
-            rows = _rs.read_all(store.cron_dir)
+        rows = _rs.read_all(store.cron_dir)
 
-            def to_mirror(payload: List[Any]) -> List[Any]:
-                # After the shrink-merge (a degraded-lock sibling's create is kept): every job
-                # with a row shows exactly its row, never a runtime value merged from disk.
-                return [_rs.overlay_row(j, rows[str(j.get("id"))])
-                        if isinstance(j, dict) and str(j.get("id")) in rows else j
-                        for j in payload]
+        def to_mirror(payload: List[Any]) -> List[Any]:
+            # After the shrink-merge (a degraded-lock sibling's create is kept): every job
+            # with a row shows exactly its row, never a runtime value merged from disk.
+            return [_rs.overlay_row(j, rows[str(j.get("id"))])
+                    if isinstance(j, dict) and str(j.get("id")) in rows else j
+                    for j in payload]
 
-            mark = (epoch, seq) if epoch is not None else None
-            if not _save_jobs_unlocked(jobs, overlay=to_mirror, mirror_mark=mark,
-                                       mirror_only=True):
-                return False  # a newer mirror is on disk: stays dirty (Prism e5b0da3eb246)
+        mark = (epoch, seq) if epoch is not None else None
+        if defs_only:
+            # t_3c8fa4d6: the merged view goes to the untracked jobs.runtime.json; jobs.json is
+            # rewritten only to strip a legacy merged file (once: after this it never carries
+            # runtime, so later flushes leave its bytes alone).
+            if not _publish_runtime_mirror(to_mirror(jobs), mark):
+                return False  # a newer mirror is on disk: stays dirty
+            wrote = True
             _rs.MIRROR_WRITES += 1
+            if data is None or _rs.file_has_runtime(data) or (
+                    isinstance(data, dict) and "runtime_gen" in data):
+                _save_jobs_unlocked(jobs, overlay=_strip_runtime_list, definitions_only=True)
+            else:
+                # jobs.json is not a mirror any more: certify the definitions file as it is, so an
+                # out-of-band replacement (git level) is detected once, not on every call.
+                _jobs_lock_state.published_stamp = _mirror_stamp(store.jobs_file)
+        else:
+            current = data.get("jobs") if isinstance(data, dict) else None
+            wrote = not (isinstance(current, list) and current == jobs
+                         and "runtime_gen" not in data)
+            if not wrote:
+                _unlink_quiet(str(_runtime_mirror_file()))  # switched off: no stale mirror (I5)
+            if wrote:
+                if not _save_jobs_unlocked(jobs, overlay=to_mirror, mirror_mark=mark,
+                                           mirror_only=True):
+                    return False  # a newer mirror is on disk: stays dirty (Prism e5b0da3eb246)
+                _rs.MIRROR_WRITES += 1
         with _runtime_txn() as conn:
             _record_mirror_written(conn, seq)
     return wrote
+
+
+def _strip_runtime_list(payload: List[Any]) -> List[Any]:
+    """Definitions-only view of a jobs list (overlay for a definitions-only jobs.json write; runs
+    under ``_jobs_lock`` BEFORE the rename). Runtime that a job with NO row still carries here (the
+    shrink-merge read it from a legacy merged file, or an old-code sibling wrote it) is adopted into
+    a row first, as ``load_jobs`` would, so stripping it from the file never loses it (I1)."""
+    pulled = {str(j["id"]): _rs.split_job(j)[1] for j in payload
+              if isinstance(j, dict) and j.get("id") and _rs.has_runtime(j)}
+    if pulled:
+        with _runtime_txn() as conn:
+            existing = _rs._rows_of(conn)
+            _rs.upsert_rows(conn, {jid: r for jid, r in pulled.items() if jid not in existing})
+    return [_rs.strip_runtime(j) if isinstance(j, dict) else j for j in payload]
+
+
+def _runtime_mirror_out_of_mode() -> bool:
+    """t_3c8fa4d6: the untracked mirror's presence disagrees with the mode. On and missing (first
+    flush after deploy, or deleted): publish it. Off and present (switched back): the flush writes
+    jobs.json merged, and that publish removes the stale mirror."""
+    return _rs.definitions_only() != _runtime_mirror_file().exists()
 
 
 def _mirror_after_section() -> None:
@@ -3133,18 +3204,23 @@ def _unlink_quiet(path: Optional[str]) -> None:
 def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]],
                         runtime_gen: Optional[str] = None,
                         overlay: Optional[Callable[[List[Any]], List[Any]]] = None,
-                        mirror_mark: Optional[Tuple[float, float]] = None) -> str:
+                        mirror_mark: Optional[Tuple[float, float]] = None,
+                        definitions_only: bool = False) -> str:
     """Serialize the store payload to a fsynced temp file next to *jobs_file*; return its path.
     ``runtime_gen`` (sqlite mode) names the pending runtime generation this definitions write
     pairs with (see ``cron.runtime_state.stage_pending``); ``overlay`` (sqlite mode) turns the
     merged definitions into the mirror's merged view just before serialization; ``mirror_mark``
-    ``(epoch, seq)`` is embedded FIRST so ``_file_mirror_mark`` reads it from a short prefix."""
+    ``(epoch, seq)`` is embedded FIRST so ``_file_mirror_mark`` reads it from a short prefix.
+    ``definitions_only`` (t_3c8fa4d6): no ``updated_at`` (a FILE_RUNTIME_KEY), so equal definitions
+    serialize to equal bytes."""
     if overlay is not None:
         jobs = overlay(jobs)
     payload: Dict[str, Any] = {}
     if mirror_mark is not None:
         payload[_rs.MIRROR_EPOCH_KEY], payload[_rs.MIRROR_SEQ_KEY] = mirror_mark
-    payload.update({"jobs": jobs, "updated_at": _hermes_now().isoformat()})
+    payload["jobs"] = jobs
+    if not definitions_only:
+        payload["updated_at"] = _hermes_now().isoformat()
     if runtime_gen:
         payload["runtime_gen"] = runtime_gen
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_")
@@ -3167,6 +3243,7 @@ def _save_jobs_unlocked(
     replace: bool = False, runtime_gen: Optional[str] = None,
     overlay: Optional[Callable[[List[Any]], List[Any]]] = None,
     mirror_mark: Optional[Tuple[float, float]] = None, mirror_only: bool = False,
+    definitions_only: bool = False,
 ) -> bool:
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
@@ -3190,7 +3267,8 @@ def _save_jobs_unlocked(
         for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
             if not replace:
                 jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-            tmp_path = _stage_jobs_payload(jobs_file, jobs, runtime_gen, overlay, mirror_mark)
+            tmp_path = _stage_jobs_payload(jobs_file, jobs, runtime_gen, overlay, mirror_mark,
+                                           definitions_only)
             # Verify-after-stage: a sibling landing during serialization forces another merge round.
             if (
                 not replace
@@ -3347,10 +3425,17 @@ def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, ba
     if base_defs is not None:
         # The shrink-merge reconciles DEFINITIONS against disk; give it a definitions view.
         _jobs_lock_state.load_baseline = base_defs
+    defs_only = _rs.definitions_only()
     try:
-        _save_jobs_unlocked(defs, removed_ids=removed_ids, replace=replace, runtime_gen=gen,
-                            overlay=to_mirror,
-                            mirror_mark=(epoch, seq) if epoch is not None else None)
+        if defs_only:
+            # t_3c8fa4d6: jobs.json gets definitions only (the shrink-merge may pull runtime back in
+            # from a legacy merged file: strip after it); the merged view is the runtime mirror's.
+            _save_jobs_unlocked(defs, removed_ids=removed_ids, replace=replace, runtime_gen=gen,
+                                overlay=_strip_runtime_list, definitions_only=True)
+        else:
+            _save_jobs_unlocked(defs, removed_ids=removed_ids, replace=replace, runtime_gen=gen,
+                                overlay=to_mirror,
+                                mirror_mark=(epoch, seq) if epoch is not None else None)
     except BaseException:
         if gen is not None:
             with contextlib.suppress(Exception), _runtime_txn() as conn:
@@ -3371,7 +3456,17 @@ def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, ba
     with _runtime_txn() as conn:
         if gen is not None:
             _rs.apply_pending(conn, gen)
-        _record_mirror_written(conn, seq)
+        if defs_only:
+            # The runtime mirror does not carry these definitions yet: certify the jobs.json we
+            # published (identity only, the mirror is not flushed) and make the mirror due NOW, so
+            # the section-exit flush republishes the merged view at once, as a merged save did.
+            published = getattr(_jobs_lock_state, "published_stamp", None)
+            _jobs_lock_state.published_stamp = None
+            if published is not None and _mirror_stamp(_current_cron_store().jobs_file) == published:
+                _store_mirror_stamp(conn, published)
+            _rs.mark_due(conn)
+        else:
+            _record_mirror_written(conn, seq)
 
 
 _MIRROR_MARK_RE = re.compile(
@@ -3429,7 +3524,45 @@ def _publish_jobs_json(tmp_path: str, jobs_file: Path, *, own_gen: Optional[str]
     # Prism 82966426a22c: remember the identity of the file WE publish (inode, size and mtime
     # survive the rename) so certification can bind to it, never to a later occupant of the path.
     _jobs_lock_state.published_stamp = _mirror_stamp(Path(tmp_path))
-    return Path(atomic_replace(tmp_path, jobs_file))
+    landed = Path(atomic_replace(tmp_path, jobs_file))
+    if not _rs.definitions_only():
+        # t_3c8fa4d6: jobs.json carries the merged view again (switch off / json mode / export):
+        # drop the untracked mirror so an out-of-process reader falls back to jobs.json (I5)
+        # instead of reading runtime the scheduler no longer refreshes.
+        _unlink_quiet(str(_runtime_mirror_file()))
+    return landed
+
+
+def _runtime_mirror_file() -> Path:
+    return _current_cron_store().cron_dir / _rs.RUNTIME_MIRROR_NAME
+
+
+def _publish_runtime_mirror(jobs: List[Any], mirror_mark: Optional[Tuple[float, float]]) -> bool:
+    """Atomic tmp+rename of the merged view *jobs* to ``jobs.runtime.json`` (definitions-only mode,
+    t_3c8fa4d6; caller holds ``_jobs_lock``). Same payload shape the merged jobs.json had (mark
+    first, ``jobs``, ``updated_at``). Returns False, writing nothing, when the file already carries
+    a NEWER seq of the same epoch (a degraded-lock sibling flushed a later snapshot)."""
+    path = _runtime_mirror_file()
+    _refuse_write_if_degraded(path.name)
+    if mirror_mark is not None:
+        on_disk = _file_mirror_mark(path)
+        if on_disk is not None and on_disk[0] == mirror_mark[0] and on_disk[1] > mirror_mark[1]:
+            return False
+    stat_before = None
+    for probe in (path, path.parent):
+        with contextlib.suppress(OSError):
+            stat_before = os.stat(probe)
+            break
+    tmp_path = _stage_jobs_payload(path, jobs, mirror_mark=mirror_mark)
+    try:
+        replaced = Path(atomic_replace(tmp_path, path))
+    except BaseException:
+        _unlink_quiet(tmp_path)
+        raise
+    fsync_directory(replaced.parent)
+    _secure_file(path)
+    _preserve_file_ownership(path, stat_before)
+    return True
 
 
 def _roll_forward_published_sibling(own_gen: Optional[str]) -> None:

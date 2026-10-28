@@ -20,6 +20,9 @@ def temp_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_CRON_RUNTIME_STATE", raising=False)
     monkeypatch.delenv("HERMES_CRON_MIRROR_INTERVAL_S", raising=False)
+    # These tests pin the MERGED jobs.json mirror contract, i.e. the switch-off arm of
+    # HERMES_CRON_DEFINITIONS_ONLY (t_3c8fa4d6); test_cron_definitions_only.py covers on.
+    monkeypatch.setenv("HERMES_CRON_DEFINITIONS_ONLY", "0")
     (tmp_path / "cron").mkdir()
     return tmp_path
 
@@ -1427,8 +1430,8 @@ def test_save_rolls_forward_sibling_generation_published_before_our_rename(temp_
     gen_b = "b" * 32
     fired = []
 
-    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None, mirror_mark=None):
-        out = real(jobs_file, jobs, runtime_gen, overlay, mirror_mark)
+    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None, mirror_mark=None, *rest):
+        out = real(jobs_file, jobs, runtime_gen, overlay, mirror_mark, *rest)
         if not fired:
             fired.append(1)
             with rs.transaction(temp_home / "cron") as conn:
@@ -1569,8 +1572,8 @@ def test_mirror_flush_rolls_forward_sibling_generation_published_before_its_rena
     gen_b = "c" * 32
     fired = []
 
-    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None, mirror_mark=None):
-        out = real(jobs_file, jobs, runtime_gen, overlay, mirror_mark)
+    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None, mirror_mark=None, *rest):
+        out = real(jobs_file, jobs, runtime_gen, overlay, mirror_mark, *rest)
         if not fired:
             fired.append(1)
             with rs.transaction(temp_home / "cron") as conn:
