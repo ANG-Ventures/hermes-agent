@@ -247,3 +247,126 @@ def test_dispatch_tick_records_route_for_each_spawn(kanban_home, monkeypatch):
     assert result.spawn_routes == {
         task_id: "openai-codex/gpt-5.6-sol-900k",
     }
+
+
+# --- assignee profile default route (t_9e7ba884) ---------------------------
+# The assignee IS a route choice: a profile whose model.default is a flagship
+# must need the same --allow-flagship reason as an explicit --model.
+
+
+def _profile(kanban_home, name: str, model: str) -> None:
+    profile = kanban_home / "profiles" / name
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "config.yaml").write_text(
+        f"model:\n  default: {model}\n  provider: claude-apr\n", encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def flagship_profiles(kanban_home):
+    _profile(kanban_home, "daedalus-fable", "claude-fable-5-1")
+    _profile(kanban_home, "daedalus-astra", "gpt-6-astra-900k")
+    _profile(kanban_home, "daedalus-opus", "claude-opus-5-5")
+    _profile(kanban_home, "daedalus-sonnet", "claude-sonnet-5")
+    _profile(kanban_home, "daedalus-luna", "gpt-5.6-luna")
+    return kanban_home
+
+
+@pytest.mark.parametrize("assignee", ["daedalus-fable", "daedalus-astra"])
+def test_create_refuses_flagship_profile_assignee_without_reason(
+    flagship_profiles, assignee,
+):
+    output = kc.run_slash(f"create 'GATE-PROBE' --assignee {assignee}")
+    assert "--allow-flagship" in output, output
+    assert "assignee profile default" in output, output
+    with kb.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_create_accepts_flagship_profile_assignee_with_reason_and_audits(
+    flagship_profiles,
+):
+    reason = "delicate infra: dispatcher lock rewrite"
+    output = kc.run_slash(
+        f"create 'GATE-PROBE' --assignee daedalus-fable --allow-flagship '{reason}'"
+    )
+    task_id = _created_id(output)
+    with kb.connect() as conn:
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert bodies == [f"flagship override: {reason}"], bodies
+    assert task_id not in res.flagship_refused
+
+
+@pytest.mark.parametrize(
+    "assignee", ["daedalus-opus", "daedalus-sonnet", "daedalus-luna", "worker"],
+)
+def test_non_flagship_profile_assignees_unaffected(flagship_profiles, assignee):
+    output = kc.run_slash(f"create 'plain' --assignee {assignee}")
+    task_id = _created_id(output)
+    with kb.connect() as conn:
+        assert kb.list_comments(conn, task_id) == []
+        res = kbd.dispatch_once(conn, dry_run=True)
+        other = kb.create_task(conn, title="o", assignee="daedalus-fable",
+                               flagship_override_reason="seed")
+    assert task_id not in res.flagship_refused
+    assert kc.run_slash(f"reassign {other} {assignee}").startswith("Reassigned")
+
+
+def test_card_pin_on_flagship_profile_is_the_route(flagship_profiles):
+    """A non-flagship --model pin replaces the profile default: no reason needed."""
+    output = kc.run_slash(
+        "create 'pinned' --assignee daedalus-fable --model claude-opus-5-5"
+    )
+    task_id = _created_id(output)
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+
+
+@pytest.mark.parametrize("verb", ["reassign", "assign"])
+def test_reassign_to_flagship_profile_refuses_without_reason(flagship_profiles, verb):
+    task_id = _created_id(kc.run_slash("create 'plain' --assignee daedalus-opus"))
+    output = kc.run_slash(f"{verb} {task_id} daedalus-fable")
+    assert "assignee profile default" in output, output
+    assert "--allow-flagship" in output, output
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).assignee == "daedalus-opus"
+        assert kb.list_comments(conn, task_id) == []
+
+
+@pytest.mark.parametrize("verb", ["reassign", "assign"])
+def test_reassign_to_flagship_profile_with_reason_audits(flagship_profiles, verb):
+    task_id = _created_id(kc.run_slash("create 'plain' --assignee daedalus-opus"))
+    output = kc.run_slash(
+        f"{verb} {task_id} daedalus-fable --allow-flagship 'lock rewrite'"
+    )
+    assert "daedalus-fable" in output, output
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).assignee == "daedalus-fable"
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert bodies == ["flagship override: lock rewrite"], bodies
+    assert task_id not in res.flagship_refused
+
+
+def test_dispatch_refuses_flagship_profile_default_without_override(
+    flagship_profiles,
+):
+    """A card that reached ready on a flagship profile by another path (an
+    older card, a raw row write) is refused at dispatch, same comment prefix."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy", assignee="daedalus-opus")
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-fable' WHERE id = ?",
+                     (task_id,))
+        conn.commit()
+        res = kbd.dispatch_once(conn, spawn_fn=lambda _t, _w: 12345,
+                                reconcile_orphans=False)
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+        task = kb.get_task(conn, task_id)
+    assert task_id in res.flagship_refused
+    assert task.status == "ready"
+    assert any(
+        b.startswith("flagship dispatch refused:") and "assignee profile default" in b
+        and "claude-fable-5-1" in b
+        for b in bodies
+    ), bodies
