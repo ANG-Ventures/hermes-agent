@@ -44,9 +44,13 @@ def test_vendored_pin_is_not_rotting():
 
 def test_adapter_binds_the_state_root_to_the_kanban_root(tmp_path, monkeypatch):
     """The one fork-side difference: no PLACEMENT_HOME -> the shared kanban root, for placement AND demand."""
+    from hermes_cli import kanban_db
+
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
-    assert fp.placement.fleet_root() == tmp_path
-    assert fp.admission_demand._root() == tmp_path
+    root = kanban_db.kanban_home()
+    assert root != Path(fp.placement.__file__).resolve().parents[2]   # not hermes-home's checkout default
+    assert fp.placement.fleet_root() == root
+    assert fp.admission_demand._root() == root
     monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path / "p"))
     assert fp.admission_demand._root() == tmp_path / "p"
