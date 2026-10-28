@@ -5644,10 +5644,18 @@ def _ruled_since_block(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone()[0]
     if not n:
         return False
+    from .kanban_sign_grants import ungranted_comments_sql
+
+    # Only the newest N rows are the post-block window, so a granted row is skipped in the loop
+    # (not filtered in SQL, which would widen the window past the block).
+    has_grant = bool(ungranted_comments_sql(conn))
     for r in conn.execute(
-        "SELECT author, body, run_id FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+        "SELECT author, body, run_id" + (", grant_id" if has_grant else ", NULL AS grant_id")
+        + " FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
         (task_id, int(n)),
     ):
+        if r["grant_id"] is not None:
+            continue  # a granted child note is never an operator ruling (Prism 5cba1d54401d)
         author = (r["author"] or "").strip()
         if author.endswith(SUBAGENT_AUTHOR_MARKER.strip()) or author.lower() not in RULING_AUTHORS:
             continue

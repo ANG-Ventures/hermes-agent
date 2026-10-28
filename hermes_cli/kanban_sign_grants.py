@@ -192,6 +192,18 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
     return cur.rowcount
 
 
+def ungranted_comments_sql(conn: sqlite3.Connection) -> str:
+    """`` AND grant_id IS NULL`` for a ``task_comments`` query, or ``""`` on a board without the column.
+
+    For author-trust readers that are NOT grant-aware (a recorded ruling, a block answer): a
+    granted row is stored as the bare ``by`` author, but no grant verb is a ruling, so it never
+    counts as one, live or void (Prism 5cba1d54401d). A board without the column holds no
+    granted rows.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(task_comments)").fetchall()}
+    return " AND grant_id IS NULL" if "grant_id" in cols else ""
+
+
 def get(conn: sqlite3.Connection, grant_id: str, task_id: str) -> Optional[sqlite3.Row]:
     try:
         return conn.execute(
@@ -224,6 +236,10 @@ def body_verbs(body: str) -> set:
     for rec in _coverage_verdicts(body):
         v = str(rec.get("verdict") or "").strip().upper().replace("-", "_").replace(" ", "_")
         verbs.add("approve" if v in _APPROVE else "request_changes" if v in _HOLD else "verdict")
+        if rec.get("close_on"):
+            # A record's close_on is a release gate to close_on.release / latest, the same
+            # authority as a `close-on:` line (Prism 1654e8f04fd7).
+            verbs.add("release")
     if _PRISM_VERDICT_RE.search(body or ""):
         verbs.add("verdict")
     if _CLOSE_ON_RE.search(body or ""):

@@ -236,8 +236,11 @@ def find_ruled_parent(conn, parents) -> Optional[dict]:
        dispatch to one generation per human ruling (the 2026-09-22 fan-out
        brake stays intact for recursive worker trees).
     """
+    from hermes_cli.kanban_sign_grants import ungranted_comments_sql
+
     worker = (os.environ.get(WORKER_ENV_MARKER) or "").strip()
     authors = sorted(RULING_AUTHORS)
+    ungranted = ungranted_comments_sql(conn)
     for pid in parents or ():
         row = conn.execute(
             "SELECT id, status, assignee FROM tasks WHERE id = ?", (pid,),
@@ -246,8 +249,8 @@ def find_ruled_parent(conn, parents) -> Optional[dict]:
             continue
         ruling = conn.execute(
             "SELECT id, author FROM task_comments WHERE task_id = ? AND "
-            "lower(author) IN (" + ",".join("?" * len(authors)) + ") "
-            "ORDER BY id LIMIT 1",
+            "lower(author) IN (" + ",".join("?" * len(authors)) + ")" + ungranted
+            + " ORDER BY id LIMIT 1",
             (pid, *authors),
         ).fetchone()
         base = {"parent": row["id"], "parent_status": row["status"],

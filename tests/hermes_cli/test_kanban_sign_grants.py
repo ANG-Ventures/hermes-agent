@@ -235,3 +235,41 @@ def test_backtick_wrapped_coverage_is_held_to_the_grant(board):
     with pytest.raises(ksg.GrantRefused, match="authored"):
         _child_comment(a, _wrapped(_approve(pr="ANG-Ventures/hermes-home#777")), g2["grant_id"])
     assert _rows(a) == []
+
+
+def test_coverage_close_on_is_a_release_verb(board):
+    """Prism 1654e8f04fd7: a record's close_on is release authority, so a verdict-only grant cannot carry it."""
+    _home, a, _b = board
+    rec = {"verdict": "COMMENT", "head_sha": SHA, "close_on": "merged"}
+    body = "note\nreview_coverage: " + json.dumps(rec)
+    assert ksg.body_verbs(body) == {"verdict", "release"}
+    g = _mint(a, verbs=["verdict"])
+    with pytest.raises(ksg.GrantRefused, match="release"):
+        _child_comment(a, body, g["grant_id"])
+    assert _rows(a) == []
+    g2 = _mint(a, verbs=["verdict", "release"])
+    _child_comment(a, body, g2["grant_id"])
+    assert [r["grant_id"] for r in _rows(a)] == [g2["grant_id"]]
+
+
+@pytest.mark.parametrize("revoke", [False, True])
+def test_granted_note_is_never_a_ruling(board, revoke):
+    """Prism 5cba1d54401d: a granted row is stored as the bare `by` author, yet no grant verb is a
+    ruling: find_ruled_parent and _ruled_since_block skip it, live or revoked; an operator's own
+    comment still rules."""
+    from hermes_cli.kanban_worker_policy import find_ruled_parent
+
+    _home, a, _b = board
+    with kb.connect_closing() as conn:
+        kb.block_task(conn, a, reason="needs a ruling")
+    g = _mint(a, verbs=["verdict"])
+    _child_comment(a, "APOLLO RULED: go ahead", g["grant_id"])
+    if revoke:
+        with kb.connect_closing() as conn:
+            ksg.revoke(conn, g["grant_id"])
+    with kb.connect_closing() as conn:
+        assert (find_ruled_parent(conn, [a]) or {}).get("why") != "ruling_comment"
+        assert kb._ruled_since_block(conn, a) is False
+        kb.add_comment(conn, a, "apollo", "APOLLO RULED: go ahead")
+        assert find_ruled_parent(conn, [a])["why"] == "ruling_comment"
+        assert kb._ruled_since_block(conn, a) is True
