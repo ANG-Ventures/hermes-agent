@@ -14,6 +14,8 @@ def _defaults(monkeypatch, policy):
     monkeypatch.setenv("LOAD_LINES_POLICY", str(policy))
     monkeypatch.setenv("LOAD_LINES_HOST", "hx")
     monkeypatch.setenv("HERMES_HOME", str(policy.parent / "nohome"))
+    # The host-synced copy (/usr/local/lib/placement/..., present on ci-box since 10-28) must not leak in.
+    monkeypatch.setattr(load_lines, "HOST_POLICY", str(policy.parent / "no-host-policy.json"))
     load_lines._cache.clear()
     from hermes_cli import config_defaults as cd
     return cd._kanban_cpu_lines()

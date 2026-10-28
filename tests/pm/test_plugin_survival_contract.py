@@ -164,6 +164,10 @@ def admission_env(tmp_path, monkeypatch):
     monkeypatch.setattr(ws.paths, "repo_root", lambda: core)
     monkeypatch.setattr(ensure, "lazy_installs_allowed", lambda: True)
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
+    # uv inherits the harness's 6 GiB RLIMIT_AS (tests/_fixtures/bounds.py). On a 128-core/256-thread
+    # host (ci-box) its per-CPU threads each reserve a 64 MiB glibc malloc arena, so `uv sync` aborts
+    # with "memory allocation of 10 bytes failed" / rayon EAGAIN. Two arenas keep it under the cap.
+    monkeypatch.setenv("MALLOC_ARENA_MAX", "2")
     # Exercise the real dependency transaction in-process so the local uv
     # fixture owns provisioning; worker transport is covered separately. The
     # facade's project_root selects a foreign checkout for the worker; this
