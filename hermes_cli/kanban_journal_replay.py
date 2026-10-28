@@ -169,6 +169,19 @@ def replay_into(
                 body = payload.get("body") or ""
                 if not body:
                     continue
+                grant_id = payload.get("grant_id")
+                # A snapshot older than the additive migration has no grant_id
+                # column, and replay does not migrate (the board's connect does).
+                # Writing the granted row as plain ``apollo`` with no grant_id
+                # would make it a real operator comment forever, past the grant's
+                # revoke/expiry. Mark it as a child's comment instead, the shape
+                # an ungranted child comment already has, so no operator reader
+                # honours it (t_19c567a8, Prism 4f220d2636c1).
+                if grant_id and not has_grant_col:
+                    from hermes_cli.kanban_db import SUBAGENT_AUTHOR_MARKER
+
+                    if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+                        author = author.strip() + SUBAGENT_AUTHOR_MARKER
                 dupe = conn.execute(
                     "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
                     "AND body = ? AND created_at = ?",
@@ -177,16 +190,13 @@ def replay_into(
                 if dupe:
                     result.comments_already_present += 1
                     continue
-                # grant_id survives the restore (t_19c567a8): sign_grants rows are
-                # not journaled, so a restored granted row has no live grant and
-                # every operator reader voids it, never a plain operator comment.
-                # A snapshot older than the additive migration has no grant_id
-                # column; replay does not migrate (the board's connect does), so
-                # it writes the legacy shape and reports the dropped grant.
+                # grant_id survives the restore into a migrated board
+                # (t_19c567a8); the readers honour it only while the grant
+                # validates. Into a pre-migration board the row is written with
+                # the subagent-marked author above and the dropped grant reported.
                 cols = ["task_id", "author", "body", "run_id", "session_ref", "created_at"]
                 vals = [task_id, author, body, record.get("run_id"),
                         payload.get("session_ref"), created]
-                grant_id = payload.get("grant_id")
                 if has_grant_col:
                     cols.append("grant_id")
                     vals.append(grant_id)
