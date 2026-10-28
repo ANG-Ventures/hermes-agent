@@ -37,7 +37,7 @@ def board(tmp_path, monkeypatch):
 
 
 def _agents(child_model=MODEL):
-    parent = SimpleNamespace(model=MODEL, session_id="parent-sid", _delegate_depth=0)
+    parent = SimpleNamespace(model=MODEL, session_id="parent-sid", _delegate_depth=0, _dispatched_model=MODEL)
     child = SimpleNamespace(model=child_model, session_id="child-sid", _subagent_id="sa-0-abc",
                             _context_inherited="summary")
     return parent, child
@@ -109,7 +109,7 @@ def test_delegate_task_grant_is_live_through_the_parent_turn_and_revoked_at_its_
     from tests.tools.test_delegate import _make_mock_parent
 
     parent = _make_mock_parent()
-    parent.model = MODEL
+    parent.model = parent._dispatched_model = MODEL
     parent.session_id = "parent-sid"
     seen = {}
 
@@ -157,7 +157,8 @@ def _facade_agent():
         agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
                         skip_context_files=True, skip_memory=True)
     agent.client = MagicMock()
-    agent.model, agent._delegate_depth = MODEL, 0
+    agent.model = agent._dispatched_model = MODEL
+    agent._delegate_depth = 0
     return agent
 
 
@@ -275,6 +276,52 @@ def test_perform_api_call_revokes_on_the_model_it_actually_sends(board, monkeypa
     assert _live_rows(g["grant_id"]) == [] and calls == [MODEL, "claude-sonnet-5"]
 
 
+@pytest.mark.parametrize("sent", [MODEL, "claude-sonnet-5"])
+def test_mint_binds_the_model_the_parent_actually_dispatched(board, monkeypatch, sent):
+    """Prism c37b9eed0ae3: middleware may send another model (next_api_kwargs["model"]) while
+    agent.model stays the configured one. The grant binds the model the delegating call was
+    DISPATCHED on, so a child on the configured model is refused when the parent ran another."""
+    from types import SimpleNamespace as NS
+
+    from agent import turn_api_call
+
+    _p, child = _agents()
+
+    class _Parent:
+        pass
+
+    parent = _Parent()
+    parent.__dict__.update(model=MODEL, session_id="parent-sid", _delegate_depth=0, provider="anthropic",
+                           base_url="", api_mode="anthropic_messages", platform="cli", _disable_streaming=True,
+                           _has_stream_consumers=lambda: False, _has_pending_redirect=lambda: False,
+                           _interruptible_api_call=lambda kw: NS(choices=[]))
+    monkeypatch.setattr("hermes_cli.middleware.run_llm_execution_middleware",
+                        lambda kw, fn, **_k: fn({**kw, "model": sent}))
+    monkeypatch.setattr("agent.relay_llm.execute", lambda kw, fn, **_k: fn(kw))
+    monkeypatch.setattr("agent.turn_body_budget.terminal_request_body", lambda _a, kw: kw)
+    monkeypatch.setattr("agent.agent_runtime_helpers.note_steer_consumed", lambda _a: None)
+    turn_api_call.perform_api_call(
+        parent, api_kwargs={"model": MODEL}, _original_api_kwargs={"model": MODEL}, _llm_middleware_trace=[],
+        _moa_prepared_request=None, _retry=None, thinking_spinner=None, retry_count=0, api_call_count=1,
+        api_request_id="r", effective_task_id="t", turn_id="turn", interrupted=False)
+    assert parent.model == MODEL
+    if sent == MODEL:
+        assert dsg.mint_for_child(_task(board), child, parent)
+        return
+    with pytest.raises(dsg.SignGrantError, match="claude-sonnet-5"):
+        dsg.mint_for_child(_task(board), child, parent)
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sign_grants").fetchone()[0] == 0
+
+
+def test_mint_refuses_when_no_dispatched_model_is_known(board):
+    """No dispatch stamp on the parent: the model that produced the delegation cannot be established."""
+    parent, child = _agents()
+    del parent._dispatched_model
+    with pytest.raises(dsg.SignGrantError, match="dispatched"):
+        dsg.mint_for_child(_task(board), child, parent)
+
+
 def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
     """The LIVE model path (AIAgent._dispatch_delegate_task) forwards sign_grant and does not background it, so a
     top-level session can actually mint; an ungranted top-level call keeps backgrounding."""
@@ -294,7 +341,8 @@ def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
 
 def test_provider_spelling_of_the_same_model_is_not_drift(board):
     """Prism 9b929567c500: minted on the provider spelling, called on the wire spelling: no drift."""
-    parent = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="parent-sid", _delegate_depth=0)
+    parent = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="parent-sid", _delegate_depth=0,
+                             _dispatched_model="anthropic/claude-opus-4.6")
     child = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="child-sid", _subagent_id="sa-0-abc",
                             _context_inherited="summary")
     g = dsg.mint_for_child(_task(board), child, parent)

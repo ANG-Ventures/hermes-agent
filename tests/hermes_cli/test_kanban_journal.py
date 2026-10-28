@@ -370,3 +370,33 @@ def test_replay_keeps_a_granted_and_an_identical_ungranted_record(journal_env, t
     assert grants == ["", "g-0123456789abcdef"]
     again = kanban_journal_replay.replay_into("b6", out, tmp_path / "out2.db")
     assert again.comments_restored == 0 and again.comments_already_present == 2, again.as_dict()
+
+
+def test_rereplay_after_migration_backfills_the_grant_id_instead_of_duplicating(journal_env, tmp_path):
+    """Prism 39c9e9e4455a: replay into a pre-migration snapshot keeps the grant-marked author and drops
+    grant_id; once the board is migrated a re-replay with since=0 must backfill that NULL-grant_id row
+    (its author marker names the same grant) rather than insert a second copy."""
+    kanban_journal, _ = journal_env
+    from hermes_cli import kanban_journal_replay
+
+    snapshot = tmp_path / "snap.db"
+    conn = _make_board_db(snapshot)
+    base = int(time.time()) - 300
+    conn.execute("INSERT INTO tasks VALUES (?,?,?,?)", ("t_m", "t", "running", base))
+    conn.commit()
+    conn.close()
+    kanban_journal.append("b7", "t_m", "comment_body",
+                          {"author": "apollo", "body": "granted APPROVE", "created_at": base + 20, "grant_id": GID})
+    first = tmp_path / "first.db"
+    assert kanban_journal_replay.replay_into("b7", snapshot, first).grant_ids_dropped == 1
+
+    mc = sqlite3.connect(str(first))
+    mc.execute("ALTER TABLE task_comments ADD COLUMN grant_id TEXT")
+    mc.commit()
+    mc.close()
+    again = kanban_journal_replay.replay_into("b7", first, tmp_path / "second.db", since=0)
+    assert again.comments_restored == 0 and again.comments_already_present == 1, again.as_dict()
+    rc = sqlite3.connect(str(tmp_path / "second.db"))
+    rows = rc.execute("SELECT author, grant_id FROM task_comments").fetchall()
+    rc.close()
+    assert rows == [(f"[grant:{GID}] apollo (subagent)", GID)]
