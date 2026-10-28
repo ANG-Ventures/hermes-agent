@@ -92,22 +92,93 @@ def _mkdir_mode(host: PoolHost) -> str:
     return f"-m {WORKSPACE_MODE} " if host.name != LOCAL_HOST_NAME else ""
 
 
+class WorkerGitIdentityRefused(RuntimeError):
+    """The pool host's worker shell would commit as an identity the fleet's
+    pr-commit-identity policy refuses (t_db46f06b): a HOST fault, never the
+    card's. 10-27 23:04 ace-media's kanbanw ~/.gitconfig turned into
+    ``ci <ci@example.invalid>`` and every worker placed there produced a PR that
+    could never land (hermes-home#7516, #7520), found 40 min later in CI."""
+
+    def __init__(self, host: str, board: Optional[str], email: str):
+        super().__init__(f"worker host {host}: git identity {email or 'UNSET'} is not admitted by "
+                         f"identity-policy.sh; refusing to start a worker there "
+                         f"(fix: fleet-host onboard {host} --fix, column K29)")
+        self.host, self.board, self.email = host, board, email
+
+
+# The fleet policy (hermes-home scripts/git-hooks/identity-policy.sh) under the running root. Absent = no policy on
+# this install: the identity read is skipped, so a non-fleet install never refuses a host.
+IDENTITY_POLICY_REL = os.path.join("scripts", "git-hooks", "identity-policy.sh")
+_IDENT_MARK = "@@hermes-git-ident"
+# The worker's terminal is a login shell (the ssh backend snapshots `bash -l`), so the identity it commits with is
+# `git var` in a login shell: worker-git-identity.sh's exported env beats ~/.gitconfig. Bounded so a slow profile
+# never fails the mkdir it rides on; an unread identity never refuses (only a READ, unadmitted one does). The
+# shell's rc is printed: 128 is git itself refusing (no identity configured: a read), anything else is unread.
+_IDENT_CMD = (f"printf '%s\\n' {_IDENT_MARK}; timeout 10 bash -lc 'cd /tmp && git var GIT_AUTHOR_IDENT && "
+              "git var GIT_COMMITTER_IDENT' </dev/null 2>/dev/null; echo \"RC=$?\"")
+_IDENT_TIMEOUT_SECONDS = 25
+_allowed_cache: Dict[tuple, bool] = {}
+
+
+def identity_policy_path() -> Optional[str]:
+    try:
+        from hermes_constants import get_default_hermes_root
+        path = os.path.join(str(get_default_hermes_root()), IDENTITY_POLICY_REL)
+    except Exception:
+        return None
+    return path if os.path.isfile(path) else None
+
+
+def identity_email_allowed(policy: str, email: str) -> bool:
+    """``identity_email_allowed`` from the policy file itself (one list, no copy). Fails closed."""
+    key = (policy, email)
+    if key not in _allowed_cache:
+        try:
+            rc = subprocess.run(["bash", "-c", '. "$1" && identity_email_allowed "$2"', "_", policy, email],
+                                capture_output=True, timeout=10, stdin=subprocess.DEVNULL).returncode
+        except (OSError, subprocess.SubprocessError):
+            return False
+        _allowed_cache[key] = rc == 0
+    return _allowed_cache[key]
+
+
+def _ident_emails(stdout: str) -> Optional[list]:
+    """Author + committer emails after the marker; None when the identity was not read. A read with no
+    identity (git var refused: no user.email) is [""], which nothing admits."""
+    _pre, sep, tail = (stdout or "").partition(_IDENT_MARK + "\n")
+    if not sep:
+        return None
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    rc = lines[-1][3:] if lines and lines[-1].startswith("RC=") else None
+    if rc == "128":
+        return [""]                        # git: "Author identity unknown" -- it would refuse (or mint user@host)
+    if rc != "0":
+        return None                        # timeout, no bash, a broken profile, a truncated read: proves nothing
+    import re
+    emails = [m.group(1) for ln in lines[:-1] for m in [re.search(r"<([^>]*)>\s+\d+\s+[-+]\d{4}$", ln)] if m]
+    return emails if len(emails) == 2 else None
+
+
 def prepare_remote_workspace(host: PoolHost, workspace: str,
                              runner: Callable = subprocess.run, *,
                              board: Optional[str] = None) -> None:
-    """Create the card's workspace at the same absolute path on the host."""
+    """Create the card's workspace at the same absolute path on the host and,
+    on a pool host under the fleet identity policy, refuse one whose worker
+    shell would commit as an unadmitted identity (t_db46f06b)."""
     # rc _BOARD_ROOT_RC only when the BOARD root itself is unusable (missing,
     # unwritable): a card-specific failure (its path exists as a file) stays a
     # card failure and is charged (Prism d72c091b628d).
     w, b = shlex.quote(workspace), shlex.quote(os.path.dirname(workspace.rstrip("/")) or "/")
+    policy = identity_policy_path() if host.name != LOCAL_HOST_NAME else None
+    ok_tail = f"{{ {_IDENT_CMD}; exit 0; }}" if policy else "exit 0"
     proc = runner(
         # The root is proven by CREATING under it (ENOSPC / inodes / quota pass
         # an access test; Prism d762ee26a639), then the probe dir is removed.
-        _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && exit 0; "
+        _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && {ok_tail}; "
                         f"t=$(mktemp -d {b}/.hermes-root-probe.XXXXXX 2>/dev/null) && "
                         f"{{ rmdir -- \"$t\"; exit 1; }}; exit {_BOARD_ROOT_RC}"),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=_PROBE_TIMEOUT_SECONDS,
+        timeout=_IDENT_TIMEOUT_SECONDS if policy else _PROBE_TIMEOUT_SECONDS,
         stdin=subprocess.DEVNULL,
     )
     rc = getattr(proc, "returncode", 1)
@@ -117,6 +188,39 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
         if rc != _BOARD_ROOT_RC or not board:
             raise RuntimeError(msg)  # ssh failed, a card-path fault, or no pool board: not a board fact
         raise RemoteWorkspaceUnavailable(host.name, board, msg)
+    if policy:
+        emails = _ident_emails(getattr(proc, "stdout", "") or "")
+        if emails is None:
+            _log.warning("kanban pool: %s worker git identity not read; not refusing", host.name)
+            return
+        bad = next((e for e in emails if not identity_email_allowed(policy, e)), None)
+        if bad is not None:
+            raise WorkerGitIdentityRefused(host.name, board, bad)
+
+
+_identity_paged: Dict[str, float] = {}
+
+
+def note_identity_fault(host: str, board: Optional[str], why: str) -> bool:
+    """Route placement around the host (per board, ``BOARD_FAULT_SECONDS``) and page ONCE per host per
+    quarantine window (#alerts, warn). True when a page was sent."""
+    import time as _time
+    from hermes_cli import kanban_worker_pool as _kwp
+
+    if board:
+        _kwp.mark_board_fault(host, board, why[:200])
+    _log.warning("kanban pool: %s refused (no retry charged): %s", host, why)
+    now = _time.monotonic()
+    if now < _identity_paged.get(host, 0.0):
+        return False
+    _identity_paged[host] = now + _kwp.BOARD_FAULT_SECONDS
+    from hermes_cli import kanban_budget as _kbudget
+
+    script = _kbudget._notify_script_path()
+    if script is None:
+        return False  # a hermetic home never pages
+    import sys
+    return _kbudget._run_notify([sys.executable, script, "--sev", "warn", "--send", f"🪪 {why[:300]}"]) is not False
 
 
 def note_board_fault(host: str, board: Optional[str], why: str) -> bool:

@@ -2729,6 +2729,9 @@ def _host_fault(exc: BaseException) -> Optional[dict]:
     if isinstance(exc, _kb._kwh.RemoteWorkspaceUnavailable):
         _kb._kwh.note_board_fault(exc.host, exc.board, str(exc))
         return {"board_fault": {"host": exc.host, "board": exc.board}}
+    if isinstance(exc, _kb._kwh.WorkerGitIdentityRefused):  # t_db46f06b: a bad host identity, never the card
+        _kb._kwh.note_identity_fault(exc.host, exc.board, str(exc))
+        return {"board_fault": {"host": exc.host, "board": exc.board}, "git_identity_refused": exc.email}
     return None
 
 
