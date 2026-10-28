@@ -17,7 +17,9 @@ pair cannot loop.
 With ``group_sessions_per_user`` true the group routes are per member, and all of them map onto the
 one per-room dm key. A group -> dm fold therefore takes only the DM counterpart's own route (the
 sender); other members' rows are kept, unused while the room is a DM, and they resume if the member
-rejoins. dm -> group needs no filter: the dm route maps onto the sender's per-user key only.
+rejoins. The filter applies only to participant-isolated routes (an ``@user`` in the key); a shared
+thread route folds whichever member continues it. dm -> group needs no filter: the dm route maps
+onto the sender's per-user key only.
 
 The same fold retires per-user group rows once ``matrix.group_sessions_per_user`` is false (one
 shared conversation per room): at load when that is conflict-free, else on the room's next message.
@@ -52,13 +54,10 @@ def _matrix_ids(tail: str) -> list:
     return ids
 
 
-def _route_user(key: str, entry: Optional["SessionEntry"]) -> str:
-    """The member a route belongs to: the ``@user`` in its key, else its origin's sender."""
-    user = next((i for i in _matrix_ids(key.split(":", 4)[4])[1:] if i.startswith("@")), None)
-    origin = getattr(entry, "origin", None)
-    if user is None and origin is not None:
-        user = getattr(origin, "user_id_alt", None) or getattr(origin, "user_id", None)
-    return str(user or "")
+def _route_user(key: str) -> Optional[str]:
+    """The member a PARTICIPANT-ISOLATED route belongs to (the ``@user`` in its key), else None:
+    a shared route (room or thread) belongs to no one member, whoever started it."""
+    return next((i for i in _matrix_ids(key.split(":", 4)[4])[1:] if i.startswith("@")), None)
 
 
 class SessionRoomShapeMixin:
@@ -115,7 +114,9 @@ class SessionRoomShapeMixin:
         # Per-user group routes all map onto the one per-room dm key. Only the DM counterpart's
         # own route may fold, or the newest member's private conversation becomes the DM
         # (Prism 6d9b29e49ed6 / 2db1e68ff399 on #2406). Other members' rows stay as they are:
-        # dead while the room is a DM, and continued again if they rejoin.
+        # dead while the room is a DM, and continued again if they rejoin. A SHARED route (no
+        # @user in its key: a thread under thread_sessions_per_user=false) folds whoever
+        # continues it, or the dm write collides with it (Prism 44378641bb9a on #2408).
         counterpart = None
         if parts[3] == "dm" and session_isolation_flags(self.config, Platform.MATRIX)[0]:
             from gateway.session import _canonical_participant
@@ -127,7 +128,7 @@ class SessionRoomShapeMixin:
                 (key, entry) for key, entry in self._entries.items()
                 if key != session_key and key.startswith(lane) and key.count(":") >= 4
                 and _matrix_ids(key.split(":", 4)[4])[0] == room
-                and (counterpart is None or _route_user(key, entry) == counterpart)
+                and (counterpart is None or _route_user(key) in (None, counterpart))
                 and self._matrix_route_key_as(key, entry, parts[3]) == session_key
             ]
             if not aliases:
