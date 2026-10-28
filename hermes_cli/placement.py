@@ -1,6 +1,6 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ e2977a2b5f, hermes-home main after #7172, t_3694ab3c; sha256 489e94bc9b8ce5f278323a49f1dd4d23630bbdd15a2a3ee81ab4bf52c3b2bdea;
+VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ 65b3d8dad2 (hermes-home main c6f5abf9 + #7332), t_3694ab3c; sha256 785fd57aed32a693af1e35a7daa82ec65d40fd72c9485f7470bd32b8de344812;
 earlier re-vendors t_4ee9c117, t_82e15796, t_da6f84f7, t_39a267cb; first vendored @ 2fe117cbcb, hermes-home#4462) for the kanban
 dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY
 local changes are ``fleet_root()`` (the shared kanban root) and the fork's encodings (reads ``utf-8-sig``,
@@ -1025,8 +1025,8 @@ def speed_alpha(job: Optional["Job"]) -> float:
 
 def _sample_row(spec: HostSpec, sample: Sample) -> dict:
     row = {k: getattr(sample, k) for k in ("at", "os", "ncpu", "cpu_busy", "mem_available_gb", "mem_total_gb",
-                                            "psi_cpu_some10", "psi_mem_some10", "psi_io_some10", "procs", "maxproc",
-                                            "gpu_free_mib", "slo_breach")}
+                                            "psi_cpu_some10", "psi_cpu_some60", "psi_mem_some10", "psi_io_some10",
+                                            "procs", "maxproc", "gpu_free_mib", "slo_breach")}
     row["host"] = spec.name
     if row["mem_total_gb"] is None:
         row["mem_total_gb"] = spec.mem_total_gb
@@ -1034,7 +1034,10 @@ def _sample_row(spec: HostSpec, sample: Sample) -> dict:
 
 
 def _limits(spec: HostSpec) -> "admission.Limits":
-    return admission.Limits(mem_reserve_gb=spec.mem_reserve_gb, cpu_saturable=spec.cpu_saturable,
+    # cpu_saturable is scorer v1 ONLY (fleet-hosts.json scorer_v1._doc: "R2c retires it"): under v2 a Linux host's
+    # PSI cpu avg10 >= 40 / avg60 >= 25 and a saturated cpu axis REFUSE (FWA F1, t_d456e9cd). scorer v1 restores it.
+    return admission.Limits(mem_reserve_gb=spec.mem_reserve_gb,
+                            cpu_saturable=spec.cpu_saturable and spec.scorer == "v1",
                             unmeasurable=tuple(a for a in spec.unmeasurable_axes if a.startswith("psi_")))
 
 
@@ -1090,6 +1093,11 @@ def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footp
     need = need or need_of(fp)
     row, lim = _sample_row(spec, sample), _limits(spec)
     leases = list(leases or ())
+    if spec.scorer == "v2":
+        # R2c denominators on every utilization line too, a closed host's included (doctrine rule 2; FWA F1)
+        h.psi_cpu_some10, h.psi_cpu_some60 = sample.psi_cpu_some10, sample.psi_cpu_some60
+        h.occupancy, h.occupancy_src = sample.occupancy
+        h.capacity = spec.cpu_capacity
     v = admission.admit(row, need, leases, host=spec.name, limits=lim)
     h.need, h.cpu_busy, h.binding = need, sample.cpu_busy, v.binding
     if "mem_gb" in v.free and "cpu" in v.free and _num(sample.ncpu):
@@ -1109,6 +1117,8 @@ def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footp
         h.reason = f"closed:{v.reason}"
         return h
     h.score = admission.score(row, need, leases, host=spec.name, limits=lim)
+    if spec.scorer == "v2":
+        h.fraction = h.score            # choose() multiplies it by st_speed^alpha among the eligible (R2c, D2)
     h.eligible = True
     return h
 
@@ -1516,7 +1526,9 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
                              require_axes=require_axes, admitted=used.get(hid, 0.0),
                              now=now, stale_after_s=stale_after_s))
     eligible = [r for r in rows if r.eligible]
-    v2 = table.scorer == "v2" and not util     # utilization replaces the scorer's cpu axis (admission.score ranks)
+    # speed enters the CHOICE on both paths (R2c, D2; FWA F1 t_d456e9cd): under utilization the fraction is
+    # admission.score()'s binding fraction, under legacy the v2 headroom fraction
+    v2 = table.scorer == "v2"
 
     def done(d: Decision) -> Decision:
         d.scorer, d.mode = table.scorer, mode

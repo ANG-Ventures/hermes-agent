@@ -70,6 +70,7 @@ class Limits:
     cpu_busy_max: float = 0.90         # fraction of all CPUs busy after this job
     mem_reserve_gb: float = 0.0        # held back for residents (the host table's mem_reserve_gb)
     psi_cpu_max: float = 40.0          # PSI some avg10 %, a refusal unless cpu_saturable
+    psi_cpu60_max: float = 25.0        # PSI cpu some avg60 % (FWA R2c), a refusal when MEASURED, unless cpu_saturable
     psi_mem_max: float = 20.0          # 14:33 readback: refuse at PSI mem some > 20 % even at low CPU
     psi_io_max: float = 30.0
     procs_frac_max: float = 0.85       # procs / maxproc
@@ -158,6 +159,9 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
             missing(axis)
             continue
         free[axis] = lim - float(sample[axis])
+    # R2c avg60 stall closure (t_d456e9cd): read when the sampler pushed it; a pre-avg60 sample is not refused for it
+    if not {"psi_cpu_some10", "psi_cpu_some60"} & unmeasurable and _num(sample.get("psi_cpu_some60")):
+        free["psi_cpu_some60"] = limits.psi_cpu60_max - float(sample["psi_cpu_some60"])
     if _num(sample.get("procs")) and _num(sample.get("maxproc")) and sample["maxproc"] > 0:
         free["procs"] = limits.procs_frac_max - float(sample["procs"]) / float(sample["maxproc"])
     if need.gpu_mib > 0:
@@ -168,11 +172,13 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
 
     if sample.get("slo_breach") is True:
         return Verdict(False, "slo", "saturated:slo (latency guard breached)", free)
-    order = ("slice_mem_gb", "mem_gb", "psi_mem_some10", "psi_io_some10", "procs", "gpu_mib", "psi_cpu_some10", "cpu")
+    order = ("slice_mem_gb", "mem_gb", "psi_mem_some10", "psi_io_some10", "procs", "gpu_mib", "psi_cpu_some10",
+             "psi_cpu_some60", "cpu")
     for axis in order:
-        if axis not in free or free[axis] >= 0:
+        # PSI cpu closes AT its line (R2c: avg10 >= 40 OR avg60 >= 25, as closed_when does on the legacy path)
+        if axis not in free or free[axis] > 0 or (free[axis] == 0 and axis not in ("psi_cpu_some10", "psi_cpu_some60")):
             continue
-        if axis in ("cpu", "psi_cpu_some10") and limits.cpu_saturable:
+        if axis in ("cpu", "psi_cpu_some10", "psi_cpu_some60") and limits.cpu_saturable:
             continue                       # a score penalty on a saturable host (score() reads it), never a refusal
         return Verdict(False, axis, f"saturated:{axis} {free[axis]:+.2f}", free)
     if unmeasured:                         # nothing measured refuses: fail closed on the first unmeasured axis
@@ -187,7 +193,7 @@ def _fractions(free: Mapping[str, float], sample: Mapping, limits: Limits):
     tot = sample.get("mem_total_gb")
     out.append(("mem_gb", free["mem_gb"] / float(tot) if _num(tot) and tot > 0 else free["mem_gb"] / 100.0))
     for axis, lim in (("psi_mem_some10", limits.psi_mem_max), ("psi_io_some10", limits.psi_io_max),
-                      ("psi_cpu_some10", limits.psi_cpu_max)):
+                      ("psi_cpu_some10", limits.psi_cpu_max), ("psi_cpu_some60", limits.psi_cpu60_max)):
         if axis in free and lim > 0:
             out.append((axis, free[axis] / lim))
     if "procs" in free:
@@ -286,7 +292,7 @@ _GB = float(1 << 30)
 def _cg_bytes(path: Path) -> Optional[float]:
     """A cgroup v2 memory file: a byte count, or None for "max" / absent / unreadable."""
     try:
-        raw = path.read_text(encoding="utf-8").strip()
+        raw = path.read_text(encoding="utf-8-sig").strip()
     except OSError:
         return None
     if not raw or raw == "max":
@@ -348,7 +354,7 @@ def read_history(path, *, since: Optional[float] = None) -> List[dict]:
     """Rows of the history ledger; a torn last line or a foreign row is skipped (append-only, never fatal)."""
     out: List[dict] = []
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()   # a BOM-prefixed ledger keeps its 1st row
     except FileNotFoundError:
         return out
     for ln in lines:
@@ -372,10 +378,20 @@ def _history_row(ln) -> Optional[dict]:
     return r if isinstance(r, dict) and r.get("schema") == SCHEMA else None
 
 
-# path -> [open binary file, bytes consumed, rows parsed so far]   (read_history_cached; t_c9fd9c5e)
+# path -> [open binary file, bytes consumed, rows parsed so far, checkpoint]   (read_history_cached; t_c9fd9c5e)
+# checkpoint = the last CHECKPOINT_BYTES consumed bytes: re-read before reusing the rows, so a truncate + refill to the
+# old size or past it (same inode, never smaller at a read) resets the cache instead of replaying the old generation.
 # The file stays OPEN while its rows are cached, so its inode cannot be recycled by an unlink + recreate (Prism e2ace455c12a).
 _HISTORY_CACHE: dict = {}
 _HISTORY_LOCK = threading.Lock()
+CHECKPOINT_BYTES = 256
+
+
+def _checkpoint_ok(fh, consumed: int, want: bytes) -> bool:
+    if consumed <= 0 or not want:
+        return True
+    fh.seek(consumed - len(want))
+    return fh.read(len(want)) == want
 
 
 def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
@@ -402,22 +418,26 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
                 hit[0].close()
                 _HISTORY_CACHE.pop(key, None)
                 hit = None
-            elif held.st_size < hit[1]:            # shrunk in place: start over on the same descriptor
-                hit[1], hit[2] = 0, []
+            elif held.st_size < hit[1] or not _checkpoint_ok(hit[0], hit[1], hit[3]):
+                hit[1], hit[2], hit[3] = 0, [], b""   # shrunk or rewritten in place: start over on the same descriptor
         if hit is None:
             try:
-                hit = [p.open("rb"), 0, []]
+                hit = [p.open("rb"), 0, [], b""]
             except FileNotFoundError:
                 return []
         fh = hit[0]
         fh.seek(hit[1])
         chunk = fh.read()
         end = chunk.rfind(b"\n") + 1               # only whole lines; a torn tail is read again next call
-        for ln in chunk[:end].decode("utf-8", errors="replace").splitlines():
+        # utf-8-sig strips a BOM at byte 0 only: a BOM-prefixed ledger keeps its first row (Prism 5799d4eb7009)
+        text = chunk[:end].decode("utf-8-sig" if hit[1] == 0 else "utf-8", errors="replace")
+        for ln in text.splitlines():
             r = _history_row(ln)
             if r is not None:
                 hit[2].append(r)
         hit[1] += end
+        if end:
+            hit[3] = (hit[3] + chunk[:end])[-CHECKPOINT_BYTES:]
         _HISTORY_CACHE[str(p)] = hit
         rows = list(hit[2])
     if since is None:
