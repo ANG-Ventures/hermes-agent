@@ -90,6 +90,20 @@ def test_d8_lower_class_demand_never_holds_kanban(studio):
     assert a == 4 and why is None, (a, why)                         # max_spawn_per_tick, nothing held back
 
 
+def test_d8_prism_queue_restricted_by_alias_holds_kanban_back(studio, monkeypatch):
+    """Prism f6d8d4445d4c: unified_inputs read demand with no resolver, so a Prism queue published for the alias
+    "studio" never matched "mac-studio" and kanban took the room Prism is queued for. The table's resolver folds it."""
+    (studio / "config").mkdir()
+    (studio / "config" / "fleet-hosts.json").write_text(json.dumps({
+        "schema": 1, "default_first": "mac-studio", "saturate_to": 1.0, "footprints": {"kanban": {"ram_gb": 3, "threads": 2}},
+        "hosts": {"mac-studio": {"cores": 24, "threads": 32, "mem_total_gb": 512, "mem_reserve_gb": 128,
+                                 "cores_reserve": 4, "consumers": {}, "aliases": ["studio", "local"]}}}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(studio))
+    dmd.publish("prism", 64, PRISM_UNIT, hosts=["studio"], root=studio)
+    a, why = _gate().admit(5.0, now=1000.0, running=0, cpu_busy=0.86)
+    assert a == 0 and "held_back:kanban for prism 64 queued" in (why or ""), (a, why)
+
+
 def test_d8_the_line_is_the_fleet_line_not_cpu_saturable(studio, monkeypatch):
     c = klg.utilization_context()
     c["limits"] = ad.Limits(mem_reserve_gb=128.0, cpu_saturable=True)   # a saturable row may not escape the line
@@ -121,11 +135,13 @@ class Fleet:
         self.ncpu = {"ci-box": 256, "ace-ai": 32, "ace-media": 32}
         self.mem = {"ci-box": 181.0, "ace-ai": 75.0, "ace-media": 77.0}
         self.age = 5.0
+        self.gpu = {}
 
     def text(self, h):
         return json.dumps({"host": h, "at": self.t0 - self.age, "load_ratio": 0.1, "band": {"kanban": "ok"},
                            "mem_available_gb": self.mem[h], "psi_cpu_some10": 1.0, "psi_mem_some10": 0.0,
-                           "psi_io_some10": 0.5, "os": "linux", "ncpu": self.ncpu[h], "cpu_busy": self.busy[h]})
+                           "psi_io_some10": 0.5, "os": "linux", "ncpu": self.ncpu[h], "cpu_busy": self.busy[h],
+                           **({"gpu_free_mib": self.gpu[h]} if h in self.gpu else {})})
 
     def runner(self, argv, **kw):
         h = argv[-2].split("@", 1)[1]
@@ -279,6 +295,21 @@ def test_d7_pinned_take_passes_the_one_rule_too(home):
     assert plan.take("alpha", pin="ace-ai").name == "ace-ai"     # a host with room: the pin still wins
 
 
+def test_d7_pinned_gpu_take_reads_the_targets_free_gpu(home):
+    """Prism 85f2492e610e: sample_fields / sample_from_detail dropped gpu_free_mib, so a GPU card's pinned take read
+    unmeasured:gpu_free_mib on a host reporting free VRAM and was refused in utilization mode."""
+    f = Fleet(time.time())
+    f.gpu["ace-ai"] = 8192.0
+    plan = _plan(home, f)
+    got = plan.take("alpha", pin="ace-ai", job=placement.Job(footprint={"gpu_mb": 1024}))
+    assert got is not None and got.name == "ace-ai", plan.refusal
+    f2 = Fleet(time.time())
+    f2.gpu["ace-ai"] = 512.0                                      # measured and too small: refused on the gpu axis
+    plan = _plan(home, f2)
+    assert plan.take("alpha", pin="ace-ai", job=placement.Job(footprint={"gpu_mb": 1024})) is None
+    assert "gpu" in plan.refusal and "unmeasured" not in plan.refusal, plan.refusal
+
+
 # ---------------------------------------------------------------------------------- demand publication
 
 def test_tick_publishes_ready_demand(home):
@@ -292,6 +323,20 @@ def test_tick_publishes_ready_demand(home):
     doc = json.loads((home / "var" / "placement" / "demand" / "kanban.json").read_text(encoding="utf-8"))
     assert doc["workload"] == "kanban" and doc["queued"] == 3 and doc["hosts"] is None
     assert doc["unit"] == {"cpus": 2.0, "ram_gb": 3.0, "gpu_mib": 0.0}
+
+
+def test_tick_demand_skips_operator_only_cards(home):
+    """Prism 8d48747ae751: no_worker=1 cards are dropped before spawn; publishing them reserved kanban capacity on
+    every host for work that never runs."""
+    with kb.connect_closing() as conn:
+        ids = [kb.create_task(conn, title=f"c{i}", assignee="alpha") for i in range(3)]
+        for tid in ids[:2]:
+            conn.execute("UPDATE tasks SET no_worker = 1 WHERE id = ?", (tid,))
+        conn.commit()
+    gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None, cost=2.0)
+    b = kgt.GateTickBuilder(gate, fleet_dir=lambda: home / "fleet", kanban_cfg=lambda: {},
+                            ledger=lambda boards: {}, connect=lambda board=None: kb.connect())
+    assert b.publish_demand([{"slug": "default"}]) == 1
 
 
 def test_tick_publishes_nothing_under_the_kill_switch(home, monkeypatch):

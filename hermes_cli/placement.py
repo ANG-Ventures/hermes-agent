@@ -1,6 +1,6 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ a523e87bc9 (hermes-home main dc356eb5 + #7553: caller-owned stale_after_s, Prism 5113510bdb9a), t_3694ab3c; sha256 82347bc83cddc5745f64805f03bf4942057e2ddf1f2f1f843346cf9d572fbbdc;
+VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ 408fd1c6d6 (hermes-home main ffbc4bf6 + #7576: alias-booked leases resolve, Prism c6568e9a9850), t_3694ab3c; sha256 cf37948e12aa9a5c526b19acd70045b8968f4d56f0af04af8e0c522b69b03fde;
 earlier re-vendors t_4ee9c117, t_82e15796, t_da6f84f7, t_39a267cb; first vendored @ 2fe117cbcb, hermes-home#4462) for the kanban
 dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY
 local changes are ``fleet_root()`` (the shared kanban root) and the fork's encodings (reads ``utf-8-sig``,
@@ -1080,7 +1080,9 @@ def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Jo
     hist = history if history is not None else admission.read_history_cached(
         class_usage_path(Path(root) / CLASS_USAGE_REL if root is not None else None), since=now - CLASS_USAGE_WINDOW_S)
     ledger = Path(root) / RESERVATIONS_REL if root is not None else None
-    base = list(leases) if leases is not None else ledger_leases(ledger, now=now, table=table)
+    # caller-supplied leases are canonicalised like the ledger's: one booked under an alias counts on its host (c6568e9a9850)
+    base = ([dataclasses.replace(le, host=table.resolve(le.host) or le.host) if table else le for le in leases]
+            if leases is not None else ledger_leases(ledger, now=now, table=table))
     # caller-supplied leases (admit() under its lock, tests) bring their own ledger: scratch only on the default read
     scratch = () if leases is not None else tuple(
         (h, f.scratch_gb) for h, f in live_reservations(ledger, now=now, table=table).items() if f.scratch_gb > 0)

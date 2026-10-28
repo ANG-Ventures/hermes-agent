@@ -111,7 +111,7 @@ V2_FIELDS = ("d_threads", "runnable_ewma", "procs_running", "psi_cpu_some60")
 # kanban.admission: utilization axes (admission.admit; Prism a864560114d1). Absent = None = ``unmeasured:<axis>``.
 # ``ncpu`` is carried only when the pressure row has it: it is the denominator of that row's ``cpu_busy`` and,
 # when absent, the probe's own getconf count already in the detail row stands (never overwritten with None).
-UTIL_FIELDS = ("cpu_busy", "psi_io_some10")
+UTIL_FIELDS = ("cpu_busy", "psi_io_some10", "gpu_free_mib")   # gpu_free_mib: a GPU card is measured, not unmeasured (85f2492e610e)
 
 
 def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str, *,

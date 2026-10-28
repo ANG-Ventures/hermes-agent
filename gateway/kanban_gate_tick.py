@@ -33,7 +33,9 @@ _ORIGIN_SQL = ("SELECT 1 FROM tasks WHERE origin_host IS NOT NULL "
 _ORIGIN_PATHS_SQL = ("SELECT DISTINCT origin_host, workspace_path FROM tasks "
                      "WHERE origin_host IS NOT NULL AND status NOT IN ('done','archived')")
 _READY_SQL = "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1"
-_READY_COUNT_SQL = "SELECT COUNT(*) FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"
+# no_worker=1 (operator-only) cards are dropped before spawn: never published as demand (Prism 8d48747ae751)
+_READY_COUNT_SQL = ("SELECT COUNT(*) FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"
+                    " AND COALESCE(no_worker, 0) = 0")
 # Cards dispatch_once itself makes ready this tick, before its ready loop: a
 # timed wake that is due (wake_due_scheduled) and a todo card whose blocks
 # parents are all terminal (recompute_ready). An open ``after-merge`` parent

@@ -1327,9 +1327,15 @@ def unified_inputs(host: str) -> "tuple[list, Any]":
     the built-in default (said once by admission_demand); an unreadable demand dir holds nothing back."""
     from hermes_cli import admission as _ad
     from hermes_cli import admission_demand as _dmd
+    from hermes_cli import placement as _pl
 
     try:
-        return _dmd.read_demand(host), _dmd.load_priority()
+        # resolve folds aliases on both sides of a demand's ``hosts`` restriction, as may_start does (Prism f6d8d4445d4c)
+        try:
+            resolve = _pl.load_hosts().resolve
+        except Exception:  # no table: string match only, as before
+            resolve = None
+        return _dmd.read_demand(host, resolve=resolve), _dmd.load_priority()
     except Exception as exc:  # never a crash in the tick: no demand, the default line
         _log.warning("kanban load gate: unified admission inputs unreadable (%s); no holdback this tick", exc)
         return [], _ad.Priority()
