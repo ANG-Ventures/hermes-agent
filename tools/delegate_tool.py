@@ -4738,7 +4738,7 @@ def delegate_task(
                 _kanban = {"profile": _durable_spec.get("profile") or "default", "cwd": _unit_cwd,
                            "session_id": _parent_session_id, "on_spawned": _on_kanban_spawned}
             else:
-                logger.debug("delegate_task: kanban runtime not used (%s)", _why_not)
+                _akb.log_ineligible(_why_not, live_deleg_id)
         # Detached mode (docs/dev/delegate-detached-background.md): a durable unit runs its children in
         # its own process so a gateway restart neither kills nor re-runs it. Only on a restart-safe spawn.
         _detached = None
