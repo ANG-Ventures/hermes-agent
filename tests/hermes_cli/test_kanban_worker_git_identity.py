@@ -260,6 +260,9 @@ def test_default_spawn_creates_the_log_dir_before_the_probe(tmp_path, monkeypatc
     monkeypatch.setattr(kwh, "prepare_remote_workspace", lambda *a, **k: None)
     monkeypatch.setattr(kwh, "check_worker_identity", probe)
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    # venue-independent: under a systemd unit (INVOCATION_ID set, the Linux test hosts) the restart-safe scope
+    # policy refuses a spawn for a task with no run id BEFORE the probe; this test is about ordering, not topology
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
     assert not kb.worker_logs_dir(board=None).exists()
     _REAL_DEFAULT_SPAWN(task, str(ws), placement=_host())
     assert seen == {"log_dir_existed": True, "cwd": str(ws)}
