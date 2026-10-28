@@ -119,6 +119,20 @@ def test_comment_only_cas_never_lifts_a_card_reparked_from_blocked(kanban_home):
         assert row[0] == "scheduled" and row[1] is not None
 
 
+def test_wake_reset_after_the_read_invalidates_the_scheduled_cas(kanban_home):   # Prism 503b929774f2 r2
+    with kb.connect() as conn:
+        t, ev, cm = _deferred(conn)
+        later = int(time.time()) + 7 * 86400
+        ok, why = kb.set_schedule_wake(conn, t, wake_at=later, actor="apollo")
+        assert ok, why
+        assert not kb.unblock_task(conn, t, expect_block_event=ev, expect_last_comment=cm)
+        row = conn.execute("SELECT status, next_eligible_at FROM tasks WHERE id=?", (t,)).fetchone()
+        assert row[0] == "scheduled" and row[1] == later
+        rev = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='schedule_wake_set'",
+                           (t,)).fetchone()[0]
+        assert kb.unblock_task(conn, t, expect_block_event=rev, expect_last_comment=cm)   # a fresh read still flips
+
+
 def test_cli_flags_reach_the_cas(kanban_home, capsys):
     with kb.connect() as conn:
         t = _blocked(conn)

@@ -15097,9 +15097,14 @@ def _unblock_expectation_holds(
     if status == "scheduled" and expect_block_event is None:
         return False
     if expect_block_event is not None:
+        # A scheduled card's revision also moves on a wake reset (`kanban schedule
+        # --at`), which writes `schedule_wake_set` and no `scheduled` event: a CAS
+        # read before the reset must not cancel it (Prism 503b929774f2, round 2).
+        kinds = ("scheduled", "schedule_wake_set") if status == "scheduled" else ("blocked",)
         row = conn.execute(
-            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = ?",
-            (task_id, status),
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN (%s)"
+            % ",".join("?" * len(kinds)),
+            (task_id, *kinds),
         ).fetchone()
         if status == "scheduled" and row[0] is None:   # no park event to pin: no CAS
             return False
@@ -15135,7 +15140,7 @@ def unblock_task(
     compare-and-swap for a caller that decided from an EARLIER read (the
     hermes-home unblock_when sweep, t_12d49eb5): the card must still be
     ``blocked`` with that latest ``blocked`` event id (or ``scheduled`` with
-    that latest ``scheduled`` event id, t_7f670c57) and that latest comment
+    that latest ``scheduled``/``schedule_wake_set`` event id, t_7f670c57) and that latest comment
     id (0 = none), checked inside the same IMMEDIATE txn as the flip. A card
     re-blocked or re-pointed in between returns False and is left alone.
 
