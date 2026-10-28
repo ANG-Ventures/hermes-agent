@@ -336,6 +336,11 @@ def finish_execution(
             return None
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
+    # The attempt is durably recorded: a no_agent script's outcome record is no longer the only
+    # evidence of how it ended (cron/script_outcome_records.py, t_854cd586).
+    from cron.script_outcome_records import discard_execution
+
+    discard_execution(execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record

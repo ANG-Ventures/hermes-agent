@@ -212,6 +212,7 @@ class CronScheduler(ABC):
                     "jobs.json reconciliation after execution recovery failed",
                     exc_info=True,
                 )
+        _settle_script_outcomes()
         return recovered
 
     @staticmethod
@@ -768,3 +769,17 @@ class InProcessCronScheduler(CronScheduler):
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
             stop_event.wait(max(0.0, next_tick - now))
+
+
+def _settle_script_outcomes() -> int:
+    """Grade no_agent runs that outlived their scheduler by the script's own exit status
+    (t_854cd586). Runs after the ``unknown`` reconciliation so a real outcome replaces it."""
+    try:
+        from cron.script_outcome_records import settle
+
+        return settle()
+    except Exception:  # never let bookkeeping break scheduler startup or the tick
+        import logging
+        logging.getLogger("cron.scheduler_provider").warning(
+            "settling cron script outcome records failed", exc_info=True)
+        return 0
