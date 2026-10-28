@@ -186,3 +186,88 @@ def test_mirror_file_is_private(temp_home):
     cj.maybe_flush_runtime_mirror(force=True)
     if os.name == "posix":
         assert (os.stat(_mirror(temp_home)).st_mode & 0o777) == 0o600
+
+
+def test_stale_mirror_publication_is_dropped_after_staging(temp_home, monkeypatch):
+    """Prism 39036b443c1f: writer A at seq 10 stages; B publishes seq 11 while A serializes; A
+    resumes -> jobs.runtime.json still carries 11 (A re-reads the mark after staging)."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    _claimed(cj, "race")
+    cj.maybe_flush_runtime_mirror(force=True)
+    path = _mirror(temp_home)
+    epoch = _load(path)[rs.MIRROR_EPOCH_KEY]
+    newer = json.dumps({rs.MIRROR_EPOCH_KEY: epoch, rs.MIRROR_SEQ_KEY: 11.0,
+                        "jobs": [{"id": "b", "last_status": "ok"}], "updated_at": "B"})
+    path.write_text(json.dumps({rs.MIRROR_EPOCH_KEY: epoch, rs.MIRROR_SEQ_KEY: 9.0,
+                                "jobs": [], "updated_at": "old"}), encoding="utf-8")
+    real_stage = cj._stage_jobs_payload
+
+    def stage_then_sibling_publishes(*a, **kw):
+        tmp = real_stage(*a, **kw)
+        path.write_text(newer, encoding="utf-8")  # B lands between A's stage and A's rename
+        return tmp
+
+    monkeypatch.setattr(cj, "_stage_jobs_payload", stage_then_sibling_publishes)
+    with cj._jobs_lock():
+        assert cj._publish_runtime_mirror([{"id": "a", "last_status": "error"}],
+                                          (epoch, 10.0)) is False
+    assert path.read_text(encoding="utf-8") == newer
+    assert not [p for p in path.parent.iterdir() if p.name.startswith(".jobs_")], "tmp leaked"
+
+
+def test_switch_off_with_mirror_deleted_and_clean_rows_restores_merged_jobs_json(
+        temp_home, monkeypatch):
+    """Prism 3af0ec297c1c: definitions-only flush, mirror deleted, switch set to 0, no dirty rows:
+    the next flush must still write jobs.json merged (mode read from the persisted payload)."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    jid, owner = _claimed(cj, "transition")
+    assert cj.mark_job_run(jid, True, expected_fire_owner=owner) is True
+    cj.maybe_flush_runtime_mirror(force=True)
+    _assert_definitions_only(_load(_jobs(temp_home)))
+    with rs.connect(temp_home / "cron", create=False) as conn:
+        assert rs.dirty_since(conn) is None, "precondition: rows are clean"
+    _mirror(temp_home).unlink()
+    monkeypatch.setenv("HERMES_CRON_DEFINITIONS_ONLY", "0")
+
+    assert cj.maybe_flush_runtime_mirror() is True
+    data = _load(_jobs(temp_home))
+    assert rs.file_has_runtime(data)
+    assert data["jobs"][0]["last_status"] == "ok"
+    assert not _mirror(temp_home).exists()
+    # converged: nothing more to do
+    assert cj.maybe_flush_runtime_mirror() is False
+
+
+def test_lost_database_with_one_fresh_row_recovers_every_other_job(temp_home):
+    """Prism 1885b4c72bf2: 3 jobs in the mirror; the recreated database already holds 1 fresh row
+    (single-job fast path) -> load gives all 3 with runtime, the fresh row wins for its id."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    ids = []
+    for name in ("one", "two", "three"):
+        jid, owner = _claimed(cj, name)
+        assert cj.mark_job_run(jid, True, expected_fire_owner=owner) is True
+        ids.append(jid)
+    cj.maybe_flush_runtime_mirror(force=True)
+    mirrored = {j["id"]: j for j in _load(_mirror(temp_home))["jobs"]}
+    assert all(mirrored[i]["last_status"] == "ok" for i in ids)
+
+    rs.drop_database(temp_home / "cron")
+    fresh = {"last_status": "error", "last_error": "fresh",
+             "last_run_at": "2099-01-01T00:00:00+00:00"}
+    rs.write_rows(temp_home / "cron", {ids[0]: fresh})
+
+    got = {j["id"]: j for j in cj.load_jobs()}
+    assert set(got) == set(ids)
+    assert (got[ids[0]]["last_status"], got[ids[0]]["last_error"]) == ("error", "fresh")
+    for jid in ids[1:]:
+        assert got[jid]["last_status"] == "ok"
+        assert got[jid]["last_run_at"] == mirrored[jid]["last_run_at"]
+        assert got[jid]["repeat"]["completed"] == 1
+    rows = rs.read_all(temp_home / "cron")
+    assert set(rows) == set(ids) and rows[ids[0]]["last_error"] == "fresh"

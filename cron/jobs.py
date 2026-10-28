@@ -1814,9 +1814,11 @@ def load_jobs() -> List[Dict[str, Any]]:
         rows = _read_runtime_rows(file_gen)
         adopt = [j for j in jobs if str(j.get("id") or "") and str(j.get("id")) not in rows
                  and _rs.has_runtime(j)]
-        if _rs.definitions_only() and not rows:
-            # t_3c8fa4d6: jobs.json carries no runtime any more. With NO rows at all (database
-            # lost or recreated) the untracked merged mirror is the only runtime copy: adopt it.
+        if _rs.definitions_only():
+            # t_3c8fa4d6: jobs.json carries no runtime any more, so the untracked merged mirror is
+            # the only runtime copy outside the database. Recovery is per job id (Prism
+            # 1885b4c72bf2): every job with NO row adopts its mirror runtime, so a lost database
+            # that already holds one fresh row (single-job fast path) still recovers the rest.
             adopt += _runtime_from_mirror(jobs, rows)
         if adopt and not locked:
             with _jobs_lock():
@@ -1918,25 +1920,48 @@ def _runtime_from_mirror(jobs: List[Dict[str, Any]],
     """Definitions-only mode (t_3c8fa4d6): every row-less, runtime-free job of *jobs* for which the
     untracked mirror holds runtime, as the record to adopt (its definition + that runtime). A
     missing or unreadable mirror adopts nothing, as a fresh store would."""
-    mirror: Dict[str, Dict[str, Any]] = {}
-    try:
-        data, _ = _parse_jobs_file(_runtime_mirror_file())
-        listed = data.get("jobs") if isinstance(data, dict) else None
-        if isinstance(listed, list):
-            mirror = {str(m["id"]): m for m in listed if isinstance(m, dict) and m.get("id")}
-    except (OSError, ValueError):
+    candidates = [j for j in jobs if str(j.get("id") or "") and str(j.get("id")) not in rows
+                  and not _rs.has_runtime(j)]
+    if not candidates:
         return []
+    mirror = _mirror_runtime_by_id()
     out = []
-    for job in jobs:
-        jid = str(job.get("id") or "")
-        if not jid or jid in rows or _rs.has_runtime(job) or jid not in mirror:
-            continue
-        runtime = _rs.split_job(mirror[jid])[1]
+    for job in candidates:
+        runtime = mirror.get(str(job.get("id")))
         if runtime:
             record = copy.deepcopy(job)
-            _rs.apply_runtime(record, runtime)
+            _rs.apply_runtime(record, copy.deepcopy(runtime))
             out.append(record)
     return out
+
+
+# ``(path, stamp) -> {job_id: runtime}`` of the last parsed jobs.runtime.json: a job that never
+# gets a row (no runtime at all) makes every load consult the mirror; parse it once per version.
+_MIRROR_RUNTIME_CACHE: Dict[str, Any] = {}
+
+
+def _mirror_runtime_by_id() -> Dict[str, Dict[str, Any]]:
+    path = _runtime_mirror_file()
+    stamp = _mirror_stamp(path)
+    if stamp is None:
+        return {}
+    key = (str(path), stamp)
+    if _MIRROR_RUNTIME_CACHE.get("key") == key:
+        return _MIRROR_RUNTIME_CACHE["value"]
+    value: Dict[str, Dict[str, Any]] = {}
+    try:
+        data, _ = _parse_jobs_file(path)
+        listed = data.get("jobs") if isinstance(data, dict) else None
+        if isinstance(listed, list):
+            for m in listed:
+                if isinstance(m, dict) and m.get("id"):
+                    runtime = _rs.split_job(m)[1]
+                    if runtime:
+                        value[str(m["id"])] = runtime
+    except (OSError, ValueError):
+        return {}
+    _MIRROR_RUNTIME_CACHE.update(key=key, value=value)
+    return value
 
 
 def _runtime_db_path() -> Path:
@@ -2362,7 +2387,7 @@ def _flush_runtime_mirror_locked(store) -> bool:
         else:
             current = data.get("jobs") if isinstance(data, dict) else None
             wrote = not (isinstance(current, list) and current == jobs
-                         and "runtime_gen" not in data)
+                         and "runtime_gen" not in data and _rs.file_has_runtime(data))
             if not wrote:
                 _unlink_quiet(str(_runtime_mirror_file()))  # switched off: no stale mirror (I5)
             if wrote:
@@ -2390,10 +2415,40 @@ def _strip_runtime_list(payload: List[Any]) -> List[Any]:
 
 
 def _runtime_mirror_out_of_mode() -> bool:
-    """t_3c8fa4d6: the untracked mirror's presence disagrees with the mode. On and missing (first
-    flush after deploy, or deleted): publish it. Off and present (switched back): the flush writes
-    jobs.json merged, and that publish removes the stale mirror."""
-    return _rs.definitions_only() != _runtime_mirror_file().exists()
+    """t_3c8fa4d6: the PERSISTED files disagree with the mode (Prism 3af0ec297c1c: the shape of
+    jobs.json decides, not only whether the mirror exists). On: jobs.json still carries runtime
+    (legacy merged file) or the mirror is missing: publish/strip. Off: jobs.json is
+    definitions-only or a stale mirror is present: the flush writes jobs.json merged, and that
+    publish removes the mirror. A missing or unparsable jobs.json is never out of mode by shape."""
+    merged = _jobs_file_carries_runtime()
+    if _rs.definitions_only():
+        return merged is True or not _runtime_mirror_file().exists()
+    return merged is False or _runtime_mirror_file().exists()
+
+
+_TOP_UPDATED_AT_RE = re.compile(
+    r'"updated_at"\s*:\s*"[^"]*"\s*(?:,\s*"runtime_gen"\s*:\s*"[^"]*"\s*)?\}\s*$')
+
+
+def _jobs_file_carries_runtime() -> Optional[bool]:
+    """Shape of the PERSISTED jobs.json, from a short prefix and suffix (never a full parse: this
+    runs on every flush check, under the lock too): True when it carries a merged write's
+    top-level keys (the leading mirror mark, or the trailing top-level ``updated_at`` every merged
+    save writes and a definitions-only save never does), False when it has neither, None when
+    missing. A hand-made merged file with neither is caught by the full parse of the next real
+    flush (``_rs.file_has_runtime``)."""
+    path = _current_cron_store().jobs_file
+    if _file_mirror_mark(path) is not None:
+        return True
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 512))
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    return bool(_TOP_UPDATED_AT_RE.search(tail))
 
 
 def _mirror_after_section() -> None:
@@ -3554,6 +3609,15 @@ def _publish_runtime_mirror(jobs: List[Any], mirror_mark: Optional[Tuple[float, 
             stat_before = os.stat(probe)
             break
     tmp_path = _stage_jobs_payload(path, jobs, mirror_mark=mirror_mark)
+    if mirror_mark is not None:
+        # Prism 39036b443c1f: a sibling may have published a newer seq while we serialized.
+        # Re-read right before the rename and drop our stale staged file.
+        on_disk = _file_mirror_mark(path)
+        if on_disk is not None and on_disk[0] == mirror_mark[0] and on_disk[1] > mirror_mark[1]:
+            _unlink_quiet(tmp_path)
+            logger.info("cron runtime-state: skipped a stale %s (seq %s < %s on disk)",
+                        path.name, mirror_mark[1], on_disk[1])
+            return False
     try:
         replaced = Path(atomic_replace(tmp_path, path))
     except BaseException:
