@@ -245,6 +245,30 @@ def test_candidate_query_keeps_an_indeterminate_ambient_read(kanban_home, tmp_pa
     assert calls.exists()
 
 
+def test_candidate_query_keeps_a_definite_ambient_404_when_the_assignee_read_fails(kanban_home, tmp_path,
+                                                                                  monkeypatch):
+    """Prism 3a5427313c61 (df6d7581): the assignee has no login of its own, so its read is None (gh 'not logged
+    in'), and the ambient read is a definite 404. That is base behaviour (the ref names no PR): the card completes.
+    Before, the None from the assignee read made the ref indeterminate and completion failed closed on every retry."""
+    seen = []
+
+    def fake_query(repo, number, env=None):
+        seen.append(env is not None)
+        return None if env is not None else {"state": op.NOT_FOUND}
+
+    monkeypatch.setattr(op, "query_pr_state", fake_query)
+    monkeypatch.setattr(op, "_default_query", lambda: op.query_pr_state)
+    monkeypatch.setattr(kb, "_assignee_gh_env", lambda who: (True, {"GH_CONFIG_DIR": str(tmp_path / "empty")}))
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)
+    calls = _stub(tmp_path, monkeypatch, 1)
+    with kb.connect() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, summary="shipped", survivor_pr="o/r#999") is True
+        assert "completion_blocked_pre_pr" not in _kinds(conn, tid)
+    assert seen[:2] == [True, False], seen
+    assert not calls.exists()
+
+
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("answers_for", ["daedalus-token", "launch-token"])
 def test_candidate_query_runs_as_the_assignee(kanban_home, tmp_path, monkeypatch, answers_for):

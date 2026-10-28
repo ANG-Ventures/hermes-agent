@@ -10948,14 +10948,11 @@ def complete_task(
                 mine = _open_pr.query_pr_state(repo, number, env=env)
                 if mine and mine.get("state") != _open_pr.NOT_FOUND:
                     return mine
-                ambient = _open_pr.query_pr_state(repo, number)
-                if ambient and ambient.get("state") != _open_pr.NOT_FOUND:
-                    return ambient
-                # Neither read found it. None = indeterminate (timeout, rate limit): completion stays fail-closed
-                # on it, as it did before this change. NOT_FOUND only when BOTH reads say so (Prism 3a5427313c61).
-                if mine is None or ambient is None:
-                    return None
-                return mine
+                # The assignee did not find it: the ambient read decides, exactly as before this change. None
+                # (timeout, rate limit) stays fail-closed (Prism 3a5427313c61); a definite 404 stays NOT_FOUND even
+                # when the assignee read failed, e.g. a routed profile with no login of its own (Prism 3a5427313c61
+                # at df6d7581).
+                return _open_pr.query_pr_state(repo, number)
         _pr_query = _open_pr.memo_query(_base_query)
         unowned_prs: list = []
         branch_owned_prs: list = []
