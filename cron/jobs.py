@@ -1814,12 +1814,15 @@ def load_jobs() -> List[Dict[str, Any]]:
         rows = _read_runtime_rows(file_gen)
         adopt = [j for j in jobs if str(j.get("id") or "") and str(j.get("id")) not in rows
                  and _rs.has_runtime(j)]
-        if _rs.definitions_only():
-            # t_3c8fa4d6: jobs.json carries no runtime any more, so the untracked merged mirror is
-            # the only runtime copy outside the database. Recovery is per job id (Prism
-            # 1885b4c72bf2): every job with NO row adopts its mirror runtime, so a lost database
-            # that already holds one fresh row (single-job fast path) still recovers the rest.
-            adopt += _runtime_from_mirror(jobs, rows)
+        # t_3c8fa4d6: a definitions-only jobs.json carries no runtime, so the untracked merged
+        # mirror is the only runtime copy outside the database. Recovery is per job id (Prism
+        # 1885b4c72bf2): every job with NO row adopts its mirror runtime, so a lost database
+        # that already holds one fresh row (single-job fast path) still recovers the rest. Not
+        # gated on the switch (t_64841549): with HERMES_CRON_DEFINITIONS_ONLY=0 the persisted
+        # files can still be definitions-only, and the merged flush that follows removes the
+        # mirror, so it must be adopted here first. A merged jobs.json leaves no candidates
+        # (runtime-carrying jobs adopt from the file above), and a missing mirror adopts nothing.
+        adopt += _runtime_from_mirror(jobs, rows)
         if adopt and not locked:
             with _jobs_lock():
                 return load_jobs()

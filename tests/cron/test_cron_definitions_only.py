@@ -271,3 +271,32 @@ def test_lost_database_with_one_fresh_row_recovers_every_other_job(temp_home):
         assert got[jid]["repeat"]["completed"] == 1
     rows = rs.read_all(temp_home / "cron")
     assert set(rows) == set(ids) and rows[ids[0]]["last_error"] == "fresh"
+
+
+def test_switch_off_with_lost_database_recovers_from_mirror_before_dropping_it(
+        temp_home, monkeypatch):
+    """Prism 1885b4c72bf2 (switch-off arm): definitions-only jobs.json + jobs.runtime.json, the
+    database lost, HERMES_CRON_DEFINITIONS_ONLY=0 -> load_jobs adopts the mirror runtime, and the
+    merged flush that removes the mirror writes that runtime into jobs.json (nothing lost)."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    jid, owner = _claimed(cj, "switch-and-loss")
+    assert cj.mark_job_run(jid, True, expected_fire_owner=owner) is True
+    cj.maybe_flush_runtime_mirror(force=True)
+    _assert_definitions_only(_load(_jobs(temp_home)))
+    expected = next(j for j in _load(_mirror(temp_home))["jobs"] if j["id"] == jid)
+    assert expected["last_status"] == "ok"
+
+    rs.drop_database(temp_home / "cron")
+    monkeypatch.setenv("HERMES_CRON_DEFINITIONS_ONLY", "0")
+
+    got = next(j for j in cj.load_jobs() if j["id"] == jid)
+    assert (got["last_status"], got["last_run_at"], got["repeat"]["completed"]) == (
+        "ok", expected["last_run_at"], 1)
+    assert rs.read_all(temp_home / "cron")[jid]["last_status"] == "ok"
+
+    cj.maybe_flush_runtime_mirror(force=True)
+    assert not _mirror(temp_home).exists()
+    rec = next(j for j in _load(_jobs(temp_home))["jobs"] if j["id"] == jid)
+    assert (rec["last_status"], rec["last_run_at"]) == ("ok", expected["last_run_at"])
