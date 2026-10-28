@@ -1913,21 +1913,61 @@ class SessionDB(
         # retired unclosed keeps its recorded generation in the deleted-WAL registry.
         unregister_live_writer(self)
 
-    def __del__(self, _finalizing=sys.is_finalizing) -> None:
+    def __del__(self, _finalizing=sys.is_finalizing,
+                _no_ckpt_on_close=getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays
         guarded: module teardown order is undefined.
 
         Skipped during interpreter finalization: sys.modules is already being
         torn down there, so close()'s lazy imports block forever on the import
-        lock (a gateway boot hung at exit this way, t_a29b8266). The OS closes
-        the fds and SQLite recovers the WAL on the next open."""
+        lock (a gateway boot hung at exit this way, t_a29b8266). The connections
+        are still finalized afterwards, and sqlite3's destructor would run the
+        last-connection checkpoint that writes a lost generation's frames over
+        the newer database, so retire them here instead, import-free."""
         if _finalizing():
+            self._retire_connections_at_finalization(_no_ckpt_on_close)
             return
         if self.__dict__.get("_conn") is not None:
             try:
                 self.close()
             except Exception:
                 pass
+
+    def _retire_connections_at_finalization(self, no_ckpt_on_close) -> None:
+        """Keep a writer's teardown finalization from checkpointing stale frames (Prism 24f888f2a0c1).
+
+        Import-free and lock-free, reading only ``__dict__`` (teardown order is undefined): the
+        flag arrives bound at definition time and the pin callable (ctypes Py_IncRef) at __init__.
+
+        - 3.12+ (setconfig): SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE on the writer and checkpoint
+          connections. A healthy WAL left behind is replayed by the next open.
+        - < 3.12: when the handle already recorded a lost WAL generation, pin the exact writer
+          connection once, as close() does. Retained unclosed, it keeps the process from ever being
+          the last connection, so no close-time checkpoint runs. The durable capture
+          (_settle_lost_generation_locked / _capture_retired_generation) is NOT attempted here: it
+          imports, logs and writes files. That capture is lost for this exit; the pin is what
+          prevents the corruption. A loss not yet detected (flag still False) is not probed for:
+          no stat calls in a finalizer."""
+        d = self.__dict__
+        if d.get("read_only", True):
+            return
+        if no_ckpt_on_close is not None:
+            for name in ("_conn", "_ckpt_conn"):
+                setconfig = getattr(d.get(name), "setconfig", None)
+                if setconfig is not None:
+                    try:
+                        setconfig(no_ckpt_on_close, True)
+                    except BaseException:
+                        pass
+        conn, retire = d.get("_conn"), d.get("_retire_connection")
+        if (conn is None or retire is None or d.get("_connection_pinned")
+                or not d.get("_db_wal_generation_lost")):
+            return
+        try:
+            retire(conn)
+            d["_connection_pinned"] = True
+        except BaseException:
+            pass
 
     # ── Async token accounting (SessionUsageMixin) ──
     # queue_token_counts() is a deque append; a single-writer thread applies deltas in
