@@ -29,8 +29,11 @@ LANES = ("all", "agent", "script")
 RUNNER_CYCLE_S = 60
 # Q1-dependent: the value under option A (spec §10). Option B changes this one line.
 RUNNER_PROGRESS_STALE_S = 180
-# DRAFT until P0-5 measures healthy script-lane tick durations (D15); S3 writes the real value.
-RUNNER_TICK_WATCHDOG_S = 120
+# D15: max(30, ceil(4 x T_max)). P0-5 (t_0d495b7a, AC-13 replay of the 09:00 busiest minute, 172
+# script jobs, 10 repeats x 3 cycles, two processes): n=30, p50 0.58 s, p99 = T_max 1.78 s ->
+# ceil(7.12) = 8 -> the 30 s floor. Delivery runs in pool workers after tick() returns (sync=False),
+# except missed one-shot notices (scheduler_tick.py), which the replay does not exercise.
+RUNNER_TICK_WATCHDOG_S = 30
 # Watchdog tree-kill grace (§5.5 step 5). ``terminate_running_scripts`` has no named grace, so this
 # is the spec's own value.
 RUNNER_WATCHDOG_KILL_GRACE_S = 3
