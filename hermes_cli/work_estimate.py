@@ -7,7 +7,7 @@ accordingly"). admission.admit() takes the Estimate this module returns; no cons
 Classes (one name per work kind, a ``:<discriminator>`` suffix where the consumer knows one):
     kanban worker   kanban-worker-llm-wait[:<profile>]        (consumer kanban / athena; Job.profile)
     CI job          ci-suite-shard[:<suite or label>]         (consumer ci; Job.job_class)
-    Prism review    prism-seat[:pr-xs|s|m|l|xl]              (consumer prism; prism_class(<changed lines>))
+    Prism review    prism-review[:pr-xs|s|m|l|xl]            (consumer prism; prism_class(<changed lines>))
     test-gate run   test-gate-run[:files-1|2-10|11-50|51+]    (consumer test-gate; test_gate_class(<test files>))
 
 Seed: the declared class footprint in config/fleet-hosts.json (``footprints.<consumer>`` / ``.profiles.<profile>``,
@@ -48,9 +48,12 @@ FLOOR = {"cpus": 0.1, "ram_gb": 0.25, "gpu_mib": 0.0}   # never below (a measure
 CLASS_USAGE_REL = Path("var") / "placement" / "class-usage.jsonl"
 CLASS_USAGE_WINDOW_S = 14 * 86400.0
 
-# consumer -> its base class (the ledger key the consumers have written since t_da6f84f7; unchanged so history stays)
+# consumer -> its base class (the ledger key the consumers have written since t_da6f84f7; unchanged so history stays).
+# prism is prism-review (t_e3260e9f): one allocd lease = one REVIEW on one member host, and prism-router's fwa gate
+# estimates and /release records under that same key (the Studio had no class-usage ledger yet on 10-20, so no
+# prism-seat history is orphaned).
 CONSUMER_CLASS = {"kanban": "kanban-worker-llm-wait", "athena": "kanban-worker-llm-wait", "test-gate": "test-gate-run",
-                  "prism": "prism-seat", "ci": "ci-suite-shard"}
+                  "prism": "prism-review", "ci": "ci-suite-shard"}
 PROFILE_CONSUMERS = ("kanban", "athena")   # a Job.profile names a sub-class here (footprints.kanban.profiles)
 
 
@@ -129,7 +132,7 @@ def _axis(rows: Sequence[Mapping], key: str, p: float) -> Optional[float]:
 def estimate(klass: str, host: str, history: Iterable[Mapping], seed: Optional[Estimate] = None, *,
              p: float = P, window: int = WINDOW, min_rows: int = MIN_ROWS) -> Estimate:
     """p75 per axis over the last ``window`` recorded runs of ``klass`` on ``host``; too few rows there -> the class
-    across every host; then the same two for the base class (``prism-seat`` for ``prism-seat:pr-m``: the ledger kept
+    across every host; then the same two for the base class (``prism-review`` for ``prism-review:pr-m``: the ledger kept
     before sub-classes existed keeps counting); too few anywhere -> ``seed``. Every axis is floored at FLOOR.
     ``history`` rows: {class, host, cpus, ram_gb, gpu_mib, at, [cpu_s, wall_s]} (admission.read_history())."""
     history = list(history)
@@ -164,7 +167,7 @@ def read_history(root: Optional[Path] = None, *, now: Optional[float] = None, pa
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="fleet-host estimate",
                                  description="What admission will reserve for one job of a class (read-only).")
-    ap.add_argument("klass", help="a class (kanban-worker-llm-wait:daedalus, prism-seat:pr-m, ...) or a consumer")
+    ap.add_argument("klass", help="a class (kanban-worker-llm-wait:daedalus, prism-review:pr-m, ...) or a consumer")
     ap.add_argument("--host", action="append", default=None, help="host id (repeatable; default: every table host)")
     ap.add_argument("--profile", default=None, help="kanban profile (same as <base>:<profile>)")
     ap.add_argument("--table", default=None, help="config/fleet-hosts.json (default: the fleet root's)")
