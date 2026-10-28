@@ -1490,6 +1490,7 @@ def _prepare_runtime_status_update(
     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     multiplex_standalone_reason: Any = _UNSET,
+    cron_script_lane_delegation: Any = _UNSET, cron_script_lane_last_outcome: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None, drop_stale_platforms: bool = False,
@@ -1557,6 +1558,12 @@ def _prepare_runtime_status_update(
             ("active_work", active_work, lambda v: list(v) if v else None),
             ("served_profiles", served_profiles, lambda v: list(v or [])),
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
+            # Cron script-lane handoff (cron/lanes.py, spec §5.3): the knob of THIS process
+            # home, read by the script runner; the last script-lane outcome per ticked home,
+            # read by ``hermes cron status``. Absent (an old gateway) reads as 0 / unknown.
+            ("cron_script_lane_delegation", cron_script_lane_delegation, lambda v: 1 if v else 0),
+            ("cron_script_lane_last_outcome", cron_script_lane_last_outcome,
+             lambda v: dict(v) if isinstance(v, dict) else {}),
             ("session_store", session_store, _coerce_session_store),
         ))
         if platform is not _UNSET:
