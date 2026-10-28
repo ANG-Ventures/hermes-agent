@@ -120,9 +120,10 @@ class Fleet:
         self.busy = {"ci-box": 0.40, "ace-ai": 0.30, "ace-media": 0.30}
         self.ncpu = {"ci-box": 256, "ace-ai": 32, "ace-media": 32}
         self.mem = {"ci-box": 181.0, "ace-ai": 75.0, "ace-media": 77.0}
+        self.age = 5.0
 
     def text(self, h):
-        return json.dumps({"host": h, "at": self.t0 - 5, "load_ratio": 0.1, "band": {"kanban": "ok"},
+        return json.dumps({"host": h, "at": self.t0 - self.age, "load_ratio": 0.1, "band": {"kanban": "ok"},
                            "mem_available_gb": self.mem[h], "psi_cpu_some10": 1.0, "psi_mem_some10": 0.0,
                            "psi_io_some10": 0.5, "os": "linux", "ncpu": self.ncpu[h], "cpu_busy": self.busy[h]})
 
@@ -211,6 +212,22 @@ def test_d7_legacy_admission_mode_is_unchanged(home):
     plan = _plan(home, Fleet(time.time()))
     keep, held = kh.unified_filter(plan, list(HOSTS), None)
     assert keep == list(HOSTS) and held == {}
+
+
+@pytest.mark.parametrize("age,admitted", [(90.0, True), (130.0, False)])
+def test_d7_staleness_is_the_kanban_policys_not_a_shared_60s(home, age, admitted):
+    """Prism 5113510bdb9a: may_start hardcoded 60 s while the kanban policy (stale_after_s 120) and its scorer call a
+    90 s-old push fresh, so unified_filter dropped the host closed:stale. unified_filter now passes the policy's bound:
+    a 90 s-old sample is admitted, a 130 s-old one is refused."""
+    assert POLICY.stale_after_s == 120.0
+    f = Fleet(time.time())
+    f.age = age
+    plan = _plan(home, f)
+    keep, held = kh.unified_filter(plan, ["ace-ai"], None)
+    if admitted:
+        assert keep == ["ace-ai"] and held == {}, held
+    else:
+        assert keep == [] and "stale" in held["ace-ai"], held
 
 
 # ------------------------------------------------------------------------------- D9: the 6 GB/worker cap

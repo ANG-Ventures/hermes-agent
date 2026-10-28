@@ -360,14 +360,17 @@ def unified_filter(plan, names, job: Optional[placement.Job]) -> Tuple[List[str]
     table = sig.placement_table
     root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
     now = sig.clock()
+    stale = float(sig.policy.stale_after_s)
     keep: List[str] = []
     refused: Dict[str, str] = {}
     for n in names:
         hid = table.resolve(n) or n
         s = sample_from_detail(plan.detail.get(n) or {})
         try:
+            # the freshness bound the scorer uses (choose(stale_after_s=...) above), never a shared default:
+            # a 60-120 s-old push the kanban policy calls fresh must not read closed:stale here (Prism 5113510bdb9a)
             ok, why = placement.may_start(hid, CONSUMER, job=job, table=table, now=now, root=root,
-                                          samples={hid: s} if s is not None else {})
+                                          samples={hid: s} if s is not None else {}, stale_after_s=stale)
         except placement.PlacementError as exc:      # corrupt ledger / table row: fail closed for that host
             ok, why = False, f"closed:{type(exc).__name__}: {exc}"
         if ok:

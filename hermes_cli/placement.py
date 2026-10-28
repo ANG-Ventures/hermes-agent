@@ -1,6 +1,6 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ 65b3d8dad2 (hermes-home main c6f5abf9 + #7332), t_3694ab3c; sha256 785fd57aed32a693af1e35a7daa82ec65d40fd72c9485f7470bd32b8de344812;
+VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ a523e87bc9 (hermes-home main dc356eb5 + #7553: caller-owned stale_after_s, Prism 5113510bdb9a), t_3694ab3c; sha256 82347bc83cddc5745f64805f03bf4942057e2ddf1f2f1f843346cf9d572fbbdc;
 earlier re-vendors t_4ee9c117, t_82e15796, t_da6f84f7, t_39a267cb; first vendored @ 2fe117cbcb, hermes-home#4462) for the kanban
 dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY
 local changes are ``fleet_root()`` (the shared kanban root) and the fork's encodings (reads ``utf-8-sig``,
@@ -1131,7 +1131,7 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
               now: Optional[float] = None, root=None, leases: Optional[Iterable["admission.Lease"]] = None,
               history: Optional[List[dict]] = None, demand: Optional[Iterable["admission.Demand"]] = None,
               priority: Optional["admission.Priority"] = None, exclusions_path=None,
-              admitted: Optional[float] = None) -> tuple:
+              admitted: Optional[float] = None, stale_after_s: float) -> tuple:
     """THE "may this work start on host H now" question, for EVERY workload class (t_e5124426): CI runner, Prism
     review, kanban worker, test-gate run, batch. -> (ok, why). One predicate (admission.admit_class) over the SAME
     measured inputs for every class: the host's pushed sample (cpu_busy, PSI cpu/mem/io, MemAvailable, procs), the
@@ -1144,11 +1144,18 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     ``exclusions_path`` overrides the exclusions file only. ``admitted`` = this consumer's live admissions on the host
     (default: counted from the reservation ledger, as admit() counts them for choose()); a positive
     ``consumers.<c>.ceiling`` caps it (Prism f88f81bb2e24). Demand ``hosts`` restrictions resolve through the same
-    HostTable, so a queue restricted to an alias holds work back on its host (Prism 364936434c3d)."""
+    HostTable, so a queue restricted to an alias holds work back on its host (Prism 364936434c3d).
+    ``stale_after_s`` (REQUIRED, no default): the CALLER's freshness policy for the host sample, so may_start never
+    refuses a sample its own caller's scorer calls fresh (Prism 5113510bdb9a: a hardcoded 60 s here dropped kanban
+    hosts its 120 s policy admitted). Kanban passes placement_policy.stale_after_s; CI, batch and test-gate pass theirs.
+    It also overrides the pressure doc's own ``stale_after_s`` when the samples are read here."""
     try:                             # noqa: PLC0415  (imported like admission / work_estimate above)
         from . import admission_demand as dmd
     except ImportError:
         import admission_demand as dmd
+    if _stale_after(stale_after_s) is None:
+        raise PlacementError("may_start: stale_after_s is required (the caller's sample freshness policy)")
+    stale_after_s = float(stale_after_s)
     now = _now(now)
     base = Path(root) if root is not None else fleet_root()
     table = table if table is not None else load_hosts(base / TABLE_REL)
@@ -1172,7 +1179,7 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     if samples is None:
         try:
             doc = json.loads((base / PRESSURE_REL).read_text(encoding="utf-8-sig"))
-            samples = samples_from_pressure(doc, now=now) if isinstance(doc, dict) else {}
+            samples = samples_from_pressure(doc, now=now, stale_after_s=stale_after_s) if isinstance(doc, dict) else {}
         except (OSError, ValueError, PlacementError):
             samples = {}
     sample = None
@@ -1184,8 +1191,8 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
         return False, "closed:no sample"
     if sample.status != "fresh":
         return False, f"closed:{sample.status}" + (f" ({sample.note})" if sample.note else "")
-    if not _num(sample.at) or now - float(sample.at) > DEFAULT_STALE_AFTER_S:
-        return False, "closed:stale (sample time missing or older than %gs)" % DEFAULT_STALE_AFTER_S
+    if not _num(sample.at) or now - float(sample.at) > stale_after_s:
+        return False, "closed:stale (sample time missing or older than %gs)" % stale_after_s
     spec = table.hosts[hid]
     fp = table.footprint(consumer, footprint if footprint is not None else (job.footprint if job else None),
                          profile=job.profile if job else None)
