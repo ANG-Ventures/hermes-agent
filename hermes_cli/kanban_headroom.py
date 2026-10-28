@@ -343,6 +343,40 @@ def _job_kw(job: Optional[placement.Job]) -> Dict[str, Any]:
     return {} if job is None else {k: v for k, v in dataclasses.asdict(job).items() if v is not None}
 
 
+def unified_filter(plan, names, job: Optional[placement.Job]) -> Tuple[List[str], Dict[str, str]]:
+    """Inventory D7 (t_3694ab3c, KANBAN_UNIFIED_ADMIT): every unpinned candidate must pass the ONE rule,
+    ``placement.may_start(host, "kanban")`` (admit_class over the plan's own probe sample, the measured estimate,
+    the ledger's leases, the fleet line and the queued demand of every class above kanban), BEFORE the scorer or
+    allocd picks among them. Read-only: the take still books through placement.admit / alloc_client.
+    -> (names that may start, {name: refusal}). ``KANBAN_UNIFIED_ADMIT=0`` = every name, unchanged. Only on the
+    utilization path (``kanban.admission: utilization``, the live mode): may_start reads cpu_busy, which a legacy
+    probe row need not carry, so ``legacy`` keeps today's scorer unchanged."""
+    from hermes_cli import kanban_load_gate as _klg
+
+    sig = plan.signal
+    if (sig is None or sig.placement_table is None or not _klg.unified_admit()
+            or placement.admission_mode() != "utilization"):
+        return list(names), {}
+    table = sig.placement_table
+    root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
+    now = sig.clock()
+    keep: List[str] = []
+    refused: Dict[str, str] = {}
+    for n in names:
+        hid = table.resolve(n) or n
+        s = sample_from_detail(plan.detail.get(n) or {})
+        try:
+            ok, why = placement.may_start(hid, CONSUMER, job=job, table=table, now=now, root=root,
+                                          samples={hid: s} if s is not None else {})
+        except placement.PlacementError as exc:      # corrupt ledger / table row: fail closed for that host
+            ok, why = False, f"closed:{type(exc).__name__}: {exc}"
+        if ok:
+            keep.append(n)
+        else:
+            refused[n] = why
+    return keep, refused
+
+
 def allocd_request(plan, names, job: Optional[placement.Job]) -> Dict[str, Any]:
     """The admit fields every allocd ask carries (on and shadow alike): the
     filtered candidates as table ids, the Job overrides, the hysteresis pick."""

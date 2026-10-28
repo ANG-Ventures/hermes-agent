@@ -1519,6 +1519,11 @@ BAND_OK, BAND_WARM, BAND_HOT, BAND_UNKNOWN = "ok", "warm", "hot", "unknown"
 TARGET_STATE_FILE = "kanban-target-state.json"
 
 
+def _kanban_unified_admit() -> bool:
+    from hermes_cli import kanban_load_gate as _klg
+    return _klg.unified_admit()
+
+
 @dataclass
 class TargetSignal:
     """What ``plan()`` needs to read target pressure (read_signal = true)."""
@@ -1857,6 +1862,11 @@ class SpilloverPlan:
             if not names:
                 self.refusal = "pool_full"
                 return None
+            names, held = _kh.unified_filter(self, names, job)
+            if not names:
+                self.refusal = "unified_admission (" + "; ".join(
+                    f"{n}: {w}" for n, w in sorted(held.items())) + ")"
+                return None
             mode = _kh.plan_allocd_mode(self)
             if mode == _kh.ALLOCD_ON:
                 return self._take_allocd(names, job, job_id)
@@ -2177,7 +2187,9 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             limit, cap_why = r["cap"]
             if limit is not None and limit < free:
                 admission[h.name] = f"cap {limit} < free {free}: {cap_why}"
-                if signal.admit_on_memory:
+                # D9 (t_3694ab3c): under KANBAN_UNIFIED_ADMIT the memory axis is admit_class's (measured estimate,
+                # not 6 GB per worker); the cap is still computed and reported, never enforced
+                if signal.admit_on_memory and not _kanban_unified_admit():
                     free = limit
                     if free == 0:
                         why = f"admission: {cap_why}"

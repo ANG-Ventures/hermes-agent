@@ -33,6 +33,7 @@ _ORIGIN_SQL = ("SELECT 1 FROM tasks WHERE origin_host IS NOT NULL "
 _ORIGIN_PATHS_SQL = ("SELECT DISTINCT origin_host, workspace_path FROM tasks "
                      "WHERE origin_host IS NOT NULL AND status NOT IN ('done','archived')")
 _READY_SQL = "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1"
+_READY_COUNT_SQL = "SELECT COUNT(*) FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"
 # Cards dispatch_once itself makes ready this tick, before its ready loop: a
 # timed wake that is due (wake_due_scheduled) and a todo card whose blocks
 # parents are all terminal (recompute_ready). An open ``after-merge`` parent
@@ -264,6 +265,7 @@ class GateTickBuilder:
         self._boards = boards
         self.running_local = running_local
         self.seed_out_of_tick(boards)
+        self.publish_demand(boards)
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
         if gate.enabled and allowance is None and klg.loadavg_supported():
             # Enabled gate, load1 unreadable on a host that has the sampler:
@@ -273,6 +275,30 @@ class GateTickBuilder:
         plan = self.plan_pool(boards, remote_by_host)
         return GateTick(band=gate.band, spill_reason=gate.spill_reason,
                         local_allowance=allowance, spawn_paused=paused, remote_plan=plan)
+
+    def publish_demand(self, boards) -> Optional[int]:
+        """Kanban's queue for the ONE admission rule (t_3694ab3c): the ready, unclaimed cards on every board ->
+        <root>/var/placement/demand/kanban.json, so a lower class (ci, test-gate, batch) leaves kanban room while
+        it waits. Off under KANBAN_UNIFIED_ADMIT=0. Returns the count published, or None."""
+        if not klg.unified_admit():
+            return None
+        n = 0
+        for b in boards:
+            slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
+            conn = None
+            try:
+                conn = self._connect(board=slug)
+                n += int(conn.execute(_READY_COUNT_SQL).fetchone()[0] or 0)
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        klg.publish_ready_demand(n, root=self._root())
+        return n
 
     def seed_out_of_tick(self, boards, *, now_wall: Optional[float] = None,
                          now_mono: Optional[float] = None) -> int:
@@ -409,7 +435,8 @@ class GateTickBuilder:
                     self._log(logger.warning, f"kanban pool: {name} refused: {d['pressure']}")
             # Saturation 4.2 readback (t_31350981): every tick that caps a
             # host, dry or enforcing; an all-clear line at most every 5 min.
-            line = kadm.readback_line(plan.admission, enforcing=signal.admit_on_memory,
+            # D9 (t_3694ab3c): under KANBAN_UNIFIED_ADMIT the cap is reported, never enforced (admit_class owns memory)
+            line = kadm.readback_line(plan.admission, enforcing=signal.admit_on_memory and not klg.unified_admit(),
                                       reservation=signal.reservation_gb)
             if plan.admission:
                 logger.info("%s", line)
