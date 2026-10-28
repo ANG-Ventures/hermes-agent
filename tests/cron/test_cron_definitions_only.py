@@ -1,9 +1,11 @@
 """t_3c8fa4d6 (LTWC phase A): definitions-only ``cron/jobs.json`` + untracked ``jobs.runtime.json``.
 
-With ``HERMES_CRON_DEFINITIONS_ONLY`` unset (default on) a runtime touch never changes jobs.json's
-bytes; the coalesced flush writes the merged view to ``jobs.runtime.json``; a definition save writes
-jobs.json with every runtime key stripped. ``=0`` restores the merged write to jobs.json and removes
-the untracked mirror. Real store under a temp HERMES_HOME; no mocks of the store code.
+The switch is OFF by default (Apollo ruling, Prism 652540f2640c: the operator arms it once the
+hermes-home reader lib is live). With ``HERMES_CRON_DEFINITIONS_ONLY=1`` a runtime touch never
+changes jobs.json's bytes; the coalesced flush writes the merged view to ``jobs.runtime.json``; a
+definition save writes jobs.json with every runtime key stripped. Unset/``0`` restores the merged
+write to jobs.json and removes the untracked mirror. Real store under a temp HERMES_HOME; no mocks
+of the store code.
 """
 
 import json
@@ -16,7 +18,7 @@ import pytest
 def temp_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_CRON_RUNTIME_STATE", raising=False)
-    monkeypatch.delenv("HERMES_CRON_DEFINITIONS_ONLY", raising=False)
+    monkeypatch.setenv("HERMES_CRON_DEFINITIONS_ONLY", "1")  # armed: the default is off
     monkeypatch.setenv("HERMES_CRON_MIRROR_INTERVAL_S", "0")  # flush on every touch
     (tmp_path / "cron").mkdir()
     return tmp_path
@@ -142,7 +144,7 @@ def test_switch_zero_restores_merged_write_and_drops_mirror(temp_home, monkeypat
     assert not _mirror(temp_home).exists(), "stale jobs.runtime.json left behind with switch off"
 
     # and back on: jobs.json is stripped again, the mirror republished
-    monkeypatch.delenv("HERMES_CRON_DEFINITIONS_ONLY")
+    monkeypatch.setenv("HERMES_CRON_DEFINITIONS_ONLY", "1")
     cj.maybe_flush_runtime_mirror(force=True)
     _assert_definitions_only(_load(_jobs(temp_home)))
     assert _load(_mirror(temp_home))["jobs"][0]["last_status"] == "ok"
@@ -300,3 +302,67 @@ def test_switch_off_with_lost_database_recovers_from_mirror_before_dropping_it(
     assert not _mirror(temp_home).exists()
     rec = next(j for j in _load(_jobs(temp_home))["jobs"] if j["id"] == jid)
     assert (rec["last_status"], rec["last_run_at"]) == ("ok", expected["last_run_at"])
+
+
+def test_switch_is_off_by_default(temp_home, monkeypatch):
+    """Prism 652540f2640c (ruled): unset = the merged jobs.json write, no jobs.runtime.json, so
+    out-of-process readers see no change at deploy; only an explicit truthy value arms it."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    monkeypatch.delenv("HERMES_CRON_DEFINITIONS_ONLY")
+    assert rs.definitions_only() is False
+    jid, owner = _claimed(cj, "default-off")
+    assert cj.mark_job_run(jid, True, expected_fire_owner=owner) is True
+    cj.maybe_flush_runtime_mirror(force=True)
+    data = _load(_jobs(temp_home))
+    assert rs.file_has_runtime(data) and data["jobs"][0]["last_status"] == "ok"
+    assert not _mirror(temp_home).exists()
+    for armed in ("1", "true", "on"):
+        monkeypatch.setenv("HERMES_CRON_DEFINITIONS_ONLY", armed)
+        assert rs.definitions_only() is True
+    for off in ("0", "", "no"):
+        monkeypatch.setenv("HERMES_CRON_DEFINITIONS_ONLY", off)
+        assert rs.definitions_only() is False
+
+
+def test_definitions_replaced_during_publish_is_not_certified(temp_home, monkeypatch):
+    """Prism 39cce804d9e4: jobs.json is replaced with {"jobs": []} while the flush publishes the
+    mirror built from the OLD definitions. The new file's identity must NOT be recorded, and the
+    next flush regenerates the mirror from the new definitions."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    jid, owner = _claimed(cj, "replaced")
+    cj.maybe_flush_runtime_mirror(force=True)
+    _assert_definitions_only(_load(_jobs(temp_home)))
+    monkeypatch.setenv("HERMES_CRON_MIRROR_INTERVAL_S", "3600")  # the section exit leaves it dirty
+    assert cj.mark_job_run(jid, True, expected_fire_owner=owner) is True
+    with rs.connect(temp_home / "cron", create=False) as conn:
+        assert rs.dirty_since(conn) is not None, "precondition: rows dirty"
+
+    real_publish = cj._publish_runtime_mirror
+    swapped = []
+
+    def publish_then_replace(*a, **kw):
+        ok = real_publish(*a, **kw)
+        if not swapped:
+            swapped.append(1)
+            tmp = _jobs(temp_home).with_name("jobs.json.swap")
+            tmp.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+            os.replace(tmp, _jobs(temp_home))  # out-of-band replacement (git level)
+        return ok
+
+    monkeypatch.setattr(cj, "_publish_runtime_mirror", publish_then_replace)
+    cj.maybe_flush_runtime_mirror(force=True)
+    assert swapped
+    assert [j["id"] for j in _load(_mirror(temp_home))["jobs"]] == [jid], "built from old defs"
+    with rs.connect(temp_home / "cron", create=False) as conn:
+        assert cj._known_mirror_stamp(conn) != cj._mirror_stamp(_jobs(temp_home)), \
+            "certified the replacement file the mirror was not built from"
+
+    monkeypatch.setenv("HERMES_CRON_MIRROR_INTERVAL_S", "0")
+    assert cj.maybe_flush_runtime_mirror() is True, "next flush must regenerate"
+    assert _load(_mirror(temp_home))["jobs"] == []
+    # converged: the new file is certified now, nothing more to do
+    assert cj.maybe_flush_runtime_mirror() is False

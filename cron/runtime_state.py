@@ -25,13 +25,17 @@ rewrites the file at most once per ``HERMES_CRON_MIRROR_INTERVAL_S`` (default 30
 from the scheduler tick and after a write section; ``0`` = flush on every touch (the pre-split I/O
 shape, for debugging). Definition saves write the merged view at once and clear the flag.
 
-Definitions-only mode (default; ``HERMES_CRON_DEFINITIONS_ONLY=0`` restores the above, t_3c8fa4d6):
+Definitions-only mode (OFF by default; ``HERMES_CRON_DEFINITIONS_ONLY=1`` arms it, t_3c8fa4d6):
 the coalesced flush writes the merged view to the UNTRACKED ``<cron dir>/jobs.runtime.json`` instead,
 and ``jobs.json`` is written only by definition saves, with RUNTIME_FIELDS, ``repeat.completed`` and
 FILE_RUNTIME_KEYS stripped, so it is byte-stable across scheduler ticks (no git churn). A legacy
 merged ``jobs.json`` is stripped once by the first flush whose rows cover its runtime. Any merged
 write to ``jobs.json`` (switch off, json mode, runtime-export) removes ``jobs.runtime.json`` so an
 out-of-process reader falls back to ``jobs.json`` instead of a stale mirror.
+Arming is an operator step, not a deploy side effect (Apollo ruling, Prism 652540f2640c): the
+operator sets the env on a gateway only once the hermes-home reader lib (B1, t_9bb92ff0) is live on
+every host that reads that profile's jobs.json; the kill switch is unsetting it (the next flush
+writes jobs.json merged again and removes the mirror).
 
 DO NOT REMOVE THE MIRROR as an optimisation. These consumers read runtime fields (last_run_at,
 next_run_at, last_status, last_error, ...) straight out of jobs.json with json.load, and would see
@@ -131,7 +135,7 @@ FILE_RUNTIME_KEYS = frozenset({"updated_at", MIRROR_EPOCH_KEY, MIRROR_SEQ_KEY})
 FOLD_TMP_NAME = "jobs.json.fold-tmp"
 # Definitions-only mode (t_3c8fa4d6, LTWC A): the coalesced merged view goes to this UNTRACKED file
 # next to jobs.json, and jobs.json carries definitions only (byte-stable across scheduler ticks).
-# ``HERMES_CRON_DEFINITIONS_ONLY=0`` restores the merged write to jobs.json.
+# Off unless ``HERMES_CRON_DEFINITIONS_ONLY`` is set truthy; unset/``0`` = the merged write to jobs.json.
 RUNTIME_MIRROR_NAME = "jobs.runtime.json"
 ENV_DEFINITIONS_ONLY = "HERMES_CRON_DEFINITIONS_ONLY"
 
@@ -153,12 +157,14 @@ def enabled() -> bool:
 
 
 def definitions_only() -> bool:
-    """sqlite mode and ``HERMES_CRON_DEFINITIONS_ONLY`` not ``0`` (default on): jobs.json holds
-    definitions only and the merged view is mirrored to ``RUNTIME_MIRROR_NAME``. json mode keeps
-    runtime in jobs.json, so it is never definitions-only."""
+    """sqlite mode and ``HERMES_CRON_DEFINITIONS_ONLY`` set truthy (``1``/``true``/``yes``/``on``;
+    OFF when unset, see the module docstring for who arms it): jobs.json holds definitions only and
+    the merged view is mirrored to ``RUNTIME_MIRROR_NAME``. json mode keeps runtime in jobs.json, so
+    it is never definitions-only."""
     from cron.env_settings import cron_env_setting
 
-    return enabled() and cron_env_setting(ENV_DEFINITIONS_ONLY).strip() != "0"
+    return enabled() and cron_env_setting(ENV_DEFINITIONS_ONLY).strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def file_has_runtime(data: Any) -> bool:

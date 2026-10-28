@@ -2357,6 +2357,10 @@ def _flush_runtime_mirror_locked(store) -> bool:
         if since is None and not _runtime_mirror_out_of_mode() and not (
                 known is not None and _mirror_stamp(store.jobs_file) != known):
             return False
+        # Prism 39cce804d9e4: the identity of the definitions file the snapshot is BUILT from,
+        # sampled before load_jobs reads it. Certification binds to these bytes, never to
+        # whatever occupies the path after the publish.
+        defs_stamp = _mirror_stamp(store.jobs_file)
         jobs = load_jobs()  # merged view; recovers a pending generation under the lock
         try:
             data, _ = _parse_jobs_file(store.jobs_file)
@@ -2384,9 +2388,17 @@ def _flush_runtime_mirror_locked(store) -> bool:
                     isinstance(data, dict) and "runtime_gen" in data):
                 _save_jobs_unlocked(jobs, overlay=_strip_runtime_list, definitions_only=True)
             else:
-                # jobs.json is not a mirror any more: certify the definitions file as it is, so an
-                # out-of-band replacement (git level) is detected once, not on every call.
-                _jobs_lock_state.published_stamp = _mirror_stamp(store.jobs_file)
+                # jobs.json is not a mirror any more: certify the definitions file the mirror was
+                # built from, so an out-of-band replacement (git level) is detected once, not on
+                # every call. If it was replaced while we published (Prism 39cce804d9e4), the
+                # mirror carries the OLD definitions: record nothing and leave the mirror due, so
+                # the next flush rebuilds it from the new file.
+                if defs_stamp is None or _mirror_stamp(store.jobs_file) != defs_stamp:
+                    _jobs_lock_state.published_stamp = None
+                    with _runtime_txn() as conn:
+                        _rs.mark_due(conn)
+                    return wrote
+                _jobs_lock_state.published_stamp = defs_stamp
         else:
             current = data.get("jobs") if isinstance(data, dict) else None
             wrote = not (isinstance(current, list) and current == jobs
