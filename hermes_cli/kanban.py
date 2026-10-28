@@ -1604,8 +1604,10 @@ def _cmd_assign(args: argparse.Namespace) -> int:
                 request_changes_reason=getattr(args, "request_changes", None),
                 operator=_profile_author(),
                 worker_ok=bool(getattr(args, "worker_ok", False)),
+                flagship_override_reason=getattr(args, "allow_flagship", None),
             )
-        except (kb.ReviewHoldRequired, kb.NoWorkerFlagSet) as exc:
+        except (kb.ReviewHoldRequired, kb.NoWorkerFlagSet,
+                kb.FlagshipAssigneeRefused) as exc:
             return _err(str(exc))
     rc = _ok_or_err(ok, f"no such task: {args.task_id}",
                     f"Assigned {args.task_id} to {profile or '(unassigned)'}")
@@ -2592,8 +2594,9 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
                 request_changes_reason=getattr(args, "request_changes", None),
                 operator=_profile_author(),
                 worker_ok=bool(getattr(args, "worker_ok", False)),
+                flagship_override_reason=getattr(args, "allow_flagship", None),
             )
-        except kb.NoWorkerFlagSet as exc:
+        except (kb.NoWorkerFlagSet, kb.FlagshipAssigneeRefused) as exc:
             print(str(exc), file=sys.stderr)
             return 1
     reclaimed = bool(receipt.get("reclaimed"))

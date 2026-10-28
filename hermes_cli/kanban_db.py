@@ -6129,6 +6129,7 @@ def create_task(
     validate_route_provider(model_override, provider_override, pin_sub_reason=pin_sub_reason)
     from hermes_cli.model_policy import validate_worker_model
 
+    _raw_flagship_reason = flagship_override_reason
     flagship_override_reason = validate_worker_model(
         model_override,
         allow_flagship_reason=flagship_override_reason,
@@ -6137,6 +6138,16 @@ def create_task(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
     assignee = _canonical_assignee(assignee)
+    if not flagship_override_reason:
+        # The assignee is a route choice too (t_9e7ba884): an unpinned card on
+        # a flagship-default profile needs the same --allow-flagship reason.
+        from hermes_cli.model_policy import validate_assignee_route
+
+        flagship_override_reason = validate_assignee_route(
+            assignee,
+            model_override=model_override,
+            allow_flagship_reason=_raw_flagship_reason,
+        )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -7003,6 +7014,58 @@ def _no_worker_refusal(
     )
 
 
+class FlagshipAssigneeRefused(RuntimeError):
+    """A reassign onto a flagship-default profile had no --allow-flagship reason."""
+
+
+def _assignee_flagship_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    reason: Optional[str],
+) -> Optional[str]:
+    """Flagship gate for a reassign (t_9e7ba884). Returns the reason to audit.
+
+    The route only changes when the assignee does and the card has no model
+    pin. A card already carrying a ``flagship override:`` comment is admitted,
+    exactly as the dispatcher's gate admits it. Raises
+    :class:`FlagshipAssigneeRefused` for an unauthorized flagship route.
+    """
+    from hermes_cli.model_policy import (
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+        validate_assignee_route,
+    )
+
+    row = conn.execute(
+        "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["assignee"] == profile:
+        return None
+    try:
+        allowed = validate_assignee_route(
+            profile, model_override=row["model_override"],
+            allow_flagship_reason=reason,
+        )
+    except ValueError as exc:
+        authorized = conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? "
+            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
+            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
+        ).fetchone()
+        if authorized:
+            return None
+        raise FlagshipAssigneeRefused(f"cannot reassign {task_id}: {exc}") from None
+    return allowed
+
+
+def _add_flagship_override_comment(
+    conn: sqlite3.Connection, task_id: str, author: Optional[str], reason: str,
+) -> None:
+    from hermes_cli.model_policy import override_comment
+
+    add_comment(conn, task_id, author or "operator", override_comment(reason))
+
+
 def _set_no_worker_locked(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7088,8 +7151,14 @@ def assign_task(
     operator: Optional[str] = None,
     pr_query=None,
     worker_ok: bool = False,
+    flagship_override_reason: Optional[str] = None,
 ) -> bool:
     """Assign or reassign a task.  Returns True on success.
+
+    A new ``profile`` whose ``model.default`` is a flagship route, on a card
+    with no model pin, needs ``flagship_override_reason`` (``--allow-flagship``),
+    recorded as the ``flagship override:`` comment the dispatcher accepts;
+    without it :class:`FlagshipAssigneeRefused` is raised (t_9e7ba884).
 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
@@ -7109,6 +7178,9 @@ def assign_task(
     if refusal and not worker_ok:
         raise NoWorkerFlagSet(refusal)
     clear_no_worker = bool(refusal)
+    flagship_reason = _assignee_flagship_reason(
+        conn, task_id, profile, flagship_override_reason,
+    )
     changes_reason = str(request_changes_reason or "").strip()
     if not changes_reason:
         held = review_hold_open_prs(conn, task_id, query_fn=pr_query)
@@ -7124,11 +7196,16 @@ def assign_task(
             conn, task_id, profile, changes_reason, operator,
         )
         if implementer == profile:
-            if clear_no_worker:
+            if clear_no_worker or flagship_reason:
                 with write_txn(conn):
-                    _set_no_worker_locked(
-                        conn, task_id, False, source="worker_ok", operator=operator,
-                    )
+                    if clear_no_worker:
+                        _set_no_worker_locked(
+                            conn, task_id, False, source="worker_ok", operator=operator,
+                        )
+                    if flagship_reason:
+                        _add_flagship_override_comment(
+                            conn, task_id, operator, flagship_reason,
+                        )
             notify_task_updated(conn, task_id, ("assignee", "status"))
             return True
     with write_txn(conn):
@@ -7154,6 +7231,10 @@ def assign_task(
             _set_no_worker_locked(
                 conn, task_id, False, source="worker_ok", operator=operator,
             )
+        if flagship_reason:
+            # Same txn as the assignee write: never a flagship route without
+            # the comment the dispatcher's gate authorizes on.
+            _add_flagship_override_comment(conn, task_id, operator, flagship_reason)
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
         # a no-op re-assign or an unassign, which must not lift ``active_pr``.
         _append_event(
@@ -10142,6 +10223,7 @@ def reassign_task(
     operator: Optional[str] = None,
     pr_query=None,
     worker_ok: bool = False,
+    flagship_override_reason: Optional[str] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -10177,6 +10259,11 @@ def reassign_task(
         refusal = _no_worker_refusal(conn, task_id, _canonical_assignee(profile))
         if refusal:
             raise NoWorkerFlagSet(refusal)
+    # Flagship assignee gate BEFORE the reclaim, for the same reason: a refused
+    # reassign must never signal a live worker (t_9e7ba884).
+    _assignee_flagship_reason(
+        conn, task_id, _canonical_assignee(profile), flagship_override_reason,
+    )
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         try:
@@ -10200,6 +10287,7 @@ def reassign_task(
         return assign_task(
             conn, task_id, profile, request_changes_reason=request_changes_reason,
             operator=operator, pr_query=pr_query, worker_ok=worker_ok,
+            flagship_override_reason=flagship_override_reason,
         )
     except ReviewHoldRequired as exc:
         if receipt is None:

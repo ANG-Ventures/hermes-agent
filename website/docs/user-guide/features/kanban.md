@@ -453,6 +453,17 @@ as a `flagship override:` task comment. The dispatcher independently refuses
 direct database bypasses and records a `flagship dispatch refused:` comment,
 leaving the card queued until an explicit override comment is present.
 
+The assignee is a route choice too. On a card with no `--model` pin and no
+lane override, the route is the assignee profile's `model.default`, and the
+same ban applies to it: `create --assignee <profile>` and `assign`/`reassign
+<id> <profile>` refuse a profile whose default matches the banned list
+("assignee profile default of '<profile>' is a flagship route: ...") unless
+`--allow-flagship "<reason>"` is given. The reason is written as the same
+`flagship override:` comment. The dispatcher applies the check to the profile
+route when there is no pin or lane, so a card that reached `ready` by another
+path gets a `flagship dispatch refused:` comment naming the profile. A
+non-flagship `--model` pin replaces the profile route and needs no reason.
+
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
 start` directly, or wire the gateway up as a systemd user unit (see the

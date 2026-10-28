@@ -90,6 +90,60 @@ def override_comment(reason: str) -> str:
     return f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} {reason.strip()}"
 
 
+def assignee_default_model(assignee: Optional[str]) -> Optional[str]:
+    """The assignee profile's ``model.default`` (fail-soft ``None``).
+
+    Same read as ``kanban_db.effective_worker_route``: the profile the
+    dispatcher activates for this assignee. A missing profile or the human
+    sentinel resolves to ``None`` (no route to gate).
+    """
+    name = str(assignee or "").strip()
+    if not name or name == "human" or name.startswith("human:"):
+        return None
+    try:
+        from pathlib import Path
+
+        from hermes_cli.profiles import _read_config_model, resolve_profile_env
+
+        model, _provider = _read_config_model(Path(resolve_profile_env(name)))
+    except Exception:
+        return None
+    return (str(model).strip() or None) if model else None
+
+
+def assignee_flagship_error(assignee: str, model: str) -> str:
+    return (
+        f"assignee profile default of '{assignee}' is a flagship route: "
+        f"{flagship_model_error(model)}"
+    )
+
+
+def validate_assignee_route(
+    assignee: Optional[str],
+    *,
+    model_override: Optional[str] = None,
+    allow_flagship_reason: Optional[str] = None,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Flagship gate for the route an ASSIGNEE implies (t_9e7ba884).
+
+    A card pin replaces the profile route, so with ``model_override`` set
+    this is a no-op (the pin goes through :func:`validate_worker_model`).
+    Otherwise the assignee's profile default is held to the same ban as
+    ``--model``: returns the normalized reason, ``None`` when the route is not
+    flagship, or raises ``ValueError`` when a flagship route has no reason.
+    """
+    if str(model_override or "").strip():
+        return None
+    model = assignee_default_model(assignee)
+    if not flagship_model_match(model, config):
+        return None
+    reason = (allow_flagship_reason or "").strip()
+    if not reason:
+        raise ValueError(assignee_flagship_error(str(assignee), str(model)))
+    return reason
+
+
 # ---------------------------------------------------------------------------
 # Single-sub pin refusal (t_141135aa, Ace 2026-09-25) + deliberate opt-in
 # (t_957ca870, Ace 2026-09-27).  Kanban routes ride the POOLS (claude-bpr /

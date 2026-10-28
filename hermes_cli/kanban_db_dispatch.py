@@ -6796,12 +6796,16 @@ def _dispatch_once_locked(
         tightened after ``lane-model set`` cannot be walked around by the lane
         the old policy admitted. A lane route is authorized by the lane's own
         ``--allow-flagship``/``--firepower`` reason, or by the card's
-        ``flagship override:`` comment. Profile defaults are out of scope, as
-        on main: they are standing config, not a dispatch-time override.
+        ``flagship override:`` comment. With neither, the route is the
+        assignee profile's ``model.default`` (t_9e7ba884): the assignee is a
+        route choice, so a flagship-default profile needs the card's
+        ``flagship override:`` comment too (create/reassign write it with
+        ``--allow-flagship``).
         """
         from hermes_cli.model_policy import (
             FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
             FLAGSHIP_REFUSAL_COMMENT_PREFIX,
+            assignee_default_model,
             flagship_model_match,
             is_firepower_model,
         )
@@ -6810,17 +6814,24 @@ def _dispatch_once_locked(
         if task is None:
             return False
         lane: Optional[_kb.LaneModelOverride] = None
+        profile_route = False
         if task.model_override:
             model = task.model_override
             if not flagship_model_match(model, _model_policy_config):
                 return False
         else:
             lane = _lane_override_for(assignee or task.assignee)
-            model = lane.model if lane is not None else None
-            if not is_firepower_model(model, _model_policy_config):
-                return False
-            if (lane.firepower or "").strip():
-                return False
+            if lane is not None:
+                model = lane.model
+                if not is_firepower_model(model, _model_policy_config):
+                    return False
+                if (lane.firepower or "").strip():
+                    return False
+            else:
+                profile_route = True
+                model = assignee_default_model(assignee or task.assignee)
+                if not flagship_model_match(model, _model_policy_config):
+                    return False
         override = conn.execute(
             "SELECT 1 FROM task_comments WHERE task_id = ? "
             "AND lower(ltrim(body)) LIKE ? LIMIT 1",
@@ -6832,7 +6843,15 @@ def _dispatch_once_locked(
         result.flagship_refused.append(task_id)
         if dry_run:
             return True
-        if lane is None:
+        if profile_route:
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model {model!r} from the "
+                f"assignee profile default of {assignee or task.assignee} is "
+                f"orchestrator-only; reassign to a non-flagship profile, pin "
+                f"--model, or add '{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' "
+                f"to this card."
+            )
+        elif lane is None:
             body = (
                 f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model "
                 f"{model!r} is orchestrator-only; add "
@@ -6856,7 +6875,8 @@ def _dispatch_once_locked(
                 "PHASE=kanban_flagship_refused task=%s model=%s source=%s",
                 task_id,
                 model,
-                "card-override" if lane is None else "lane-override",
+                "profile-default" if profile_route
+                else "card-override" if lane is None else "lane-override",
             )
         return True
 
