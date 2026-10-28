@@ -97,14 +97,15 @@ class SessionRecoveryMixin:
         """Session key for *source* (profile from *source*; key from *key_source* if given).
         ``source_resolver`` (the gateway's adapter-derived canonicalization) runs first so direct
         store writers key the chat the way the platform does."""
+        from gateway.config import session_isolation_flags
         from gateway.session import build_session_key
         resolver = getattr(self, "source_resolver", None)
         if resolver is not None:
             resolver(source)
+        keyed = key_source if key_source is not None else source
+        group_per_user, thread_per_user = session_isolation_flags(self.config, keyed.platform)
         return build_session_key(
-            key_source if key_source is not None else source,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            keyed, group_sessions_per_user=group_per_user, thread_sessions_per_user=thread_per_user,
             profile=self._resolve_profile_for_key(source))
 
     def _legacy_slack_session_key(self, source: SessionSource) -> Optional[str]:
