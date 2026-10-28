@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from hermes_cli import admission, placement, work_estimate
+from hermes_cli.fleet_placement import admission, placement, work_estimate
 
 NOW = 10_000.0
 DOC = {

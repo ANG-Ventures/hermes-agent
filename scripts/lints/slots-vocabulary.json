@@ -1,21 +1,23 @@
 {
-  "_doc": "slots-vocabulary-lint config (t_21a7ace3; Ace 2026-10-20 05:0x voice msg 1562070136125394945: the word slots leaves the fleet-work-allocation vocabulary). paths = the kanban allocation code paths graded; allow = files under paths whose slot words mean something else (never graded); baseline = hits that existed when the lint landed, per file, only shrinks (CI grades it against the PR base copy). Lower a row with `python scripts/lints/slots-vocabulary-lint.py --print-counts`; drop it at 0. hermes_cli/placement.py + admission.py are byte-vendored from hermes-home: their rows drop when the re-vendor card (t_82e15796) carries hermes-home's ceiling rename.",
+  "_doc": "slots-vocabulary-lint config (t_21a7ace3; Ace 2026-10-20 05:0x voice msg 1562070136125394945: the word slots leaves the fleet-work-allocation vocabulary). paths = the kanban allocation code paths graded; allow = files under paths whose slot words mean something else (never graded); baseline = hits that existed when the lint landed, per file, only shrinks (CI grades it against the PR base copy). Lower a row with `python scripts/lints/slots-vocabulary-lint.py --print-counts`; drop it at 0. hermes_cli/fleet_placement/*.py are byte copies of hermes-home (t_29403e19): allowed here, graded at the source.",
   "paths": [
-    "hermes_cli/admission.py",
     "hermes_cli/alloc_client.py",
-    "hermes_cli/placement.py",
+    "hermes_cli/fleet_placement/*.py",
     "hermes_cli/placement_ledger.py",
     "hermes_cli/placement_policy.py",
-    "hermes_cli/work_estimate.py",
     "hermes_cli/kanban_admission.py",
     "hermes_cli/kanban_headroom.py",
     "hermes_cli/kanban_load_gate.py",
     "hermes_cli/kanban_placement_*.py",
     "hermes_cli/kanban_worker_pool.py"
   ],
-  "allow": [],
+  "allow": [
+    {
+      "path": "hermes_cli/fleet_placement/*.py",
+      "why": "byte copies of hermes-home scripts/lib (pinned by hermes_cli/fleet_placement/VENDORED.json, t_29403e19); their slot words are graded in hermes-home, and editing a copy here breaks the pin"
+    }
+  ],
   "baseline": {
-    "hermes_cli/admission.py": 1,
     "hermes_cli/kanban_admission.py": 2,
     "hermes_cli/kanban_headroom.py": 12,
     "hermes_cli/kanban_load_gate.py": 9,
@@ -23,9 +25,8 @@
     "hermes_cli/kanban_placement_reasons.py": 1,
     "hermes_cli/kanban_placement_view.py": 10,
     "hermes_cli/kanban_worker_pool.py": 64,
-    "hermes_cli/placement.py": 55,
     "hermes_cli/placement_ledger.py": 3,
     "hermes_cli/placement_policy.py": 9
   },
-  "_baseline_doc": "Grandfathered at t_21a7ace3. placement.py/admission.py: hermes-home byte copies (re-vendor t_82e15796 carries the ceiling rename). kanban_worker_pool/kanban_headroom/kanban_placement_*/kanban_load_gate: the legacy kanban-pool.json roles slot count + the SpawnPlan free-count shape, dead once kanban is utilization-only end to end; their own burn-down card. placement_ledger/placement_policy: the max_slots I-7 clamp (hermes-home placement-policy.json carries no max_slots row today)."
+  "_baseline_doc": "Grandfathered at t_21a7ace3. kanban_worker_pool/kanban_headroom/kanban_placement_*/kanban_load_gate: the legacy kanban-pool.json roles slot count + the SpawnPlan free-count shape, dead once kanban is utilization-only end to end; their own burn-down card. placement_ledger/placement_policy: the max_slots I-7 clamp (hermes-home placement-policy.json carries no max_slots row today)."
 }

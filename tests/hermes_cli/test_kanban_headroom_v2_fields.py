@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 
 from hermes_cli import kanban_headroom as kh
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 
 T0 = 1_792_400_000.0
 

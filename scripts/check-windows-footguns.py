@@ -118,6 +118,13 @@ EXCLUDED_SUFFIXES = {
 EXCLUDED_FILES = {
     "scripts/check-windows-footguns.py",
     "CONTRIBUTING.md",
+    # Byte copies of hermes-home scripts/lib, sha256-pinned by hermes_cli/fleet_placement/VENDORED.json
+    # (t_29403e19): an edit here breaks the pin, so encoding fixes land at the source and are re-vendored.
+    # Every write in them is json.dumps (ASCII), so the platform default encoding cannot garble a byte.
+    "hermes_cli/fleet_placement/admission.py",
+    "hermes_cli/fleet_placement/admission_demand.py",
+    "hermes_cli/fleet_placement/placement.py",
+    "hermes_cli/fleet_placement/work_estimate.py",
 }
 
 

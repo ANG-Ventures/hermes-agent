@@ -33,6 +33,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import os
+import threading
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, Sequence
 
@@ -120,45 +122,53 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
     leases = list(leases)
     held = live_leases(leases, host, sample.get("at"), settle_s=settle_s)
     free: dict = {}
+    # an unmeasured axis is noted and the rest still computed: a MEASURED saturation names the refusal ahead of it,
+    # so the band reads hot, not unknown, when memory refuses and cpu_busy is missing (t_f64c6d34, Prism d60feae165ed)
+    unmeasured: list = []
     if slice_mem is not None:
         if not (_num(slice_mem.limit_gb) and _num(slice_mem.current_gb)):
-            return Verdict(False, "slice_mem_gb", f"unmeasured:slice_mem_gb ({slice_mem.name})", free)
-        inside = [le for le in leases if any(le.job_class.startswith(c) for c in slice_mem.classes)]
-        held_slice = live_leases(inside, host, sample.get("at"), settle_s=settle_s)
-        free["slice_mem_gb"] = (float(slice_mem.limit_gb) - float(slice_mem.current_gb)
-                                - held_slice.ram_gb - need.ram_gb)
+            unmeasured.append(("slice_mem_gb", f"unmeasured:slice_mem_gb ({slice_mem.name})"))
+        else:
+            inside = [le for le in leases if any(le.job_class.startswith(c) for c in slice_mem.classes)]
+            held_slice = live_leases(inside, host, sample.get("at"), settle_s=settle_s)
+            free["slice_mem_gb"] = (float(slice_mem.limit_gb) - float(slice_mem.current_gb)
+                                    - held_slice.ram_gb - need.ram_gb)
 
     def missing(axis):
-        return Verdict(False, axis, f"unmeasured:{axis}", free)
+        unmeasured.append((axis, f"unmeasured:{axis}"))
 
     # memory: available - residents' reserve - live leases - this job
     if not _num(sample.get("mem_available_gb")):
-        return missing("mem_available_gb")
-    free["mem_gb"] = float(sample["mem_available_gb"]) - limits.mem_reserve_gb - held.ram_gb - need.ram_gb
+        missing("mem_available_gb")
+    else:
+        free["mem_gb"] = float(sample["mem_available_gb"]) - limits.mem_reserve_gb - held.ram_gb - need.ram_gb
     # cpu: measured busy fraction + leases + this job, over all CPUs (never load1, never a core count)
     ncpu = sample.get("ncpu")
     if not _num(ncpu) or ncpu <= 0:
-        return missing("ncpu")
-    if not _num(sample.get("cpu_busy")):
-        return missing("cpu_busy")
-    busy_after = float(sample["cpu_busy"]) + (held.cpus + need.cpus) / float(ncpu)
-    free["cpu"] = limits.cpu_busy_max - busy_after
+        missing("ncpu")
+    elif not _num(sample.get("cpu_busy")):
+        missing("cpu_busy")
+    else:
+        busy_after = float(sample["cpu_busy"]) + (held.cpus + need.cpus) / float(ncpu)
+        free["cpu"] = limits.cpu_busy_max - busy_after
     for axis, lim in (("psi_mem_some10", limits.psi_mem_max), ("psi_io_some10", limits.psi_io_max),
                       ("psi_cpu_some10", limits.psi_cpu_max)):
         if axis in unmeasurable:
             continue
         if not _num(sample.get(axis)):
-            return missing(axis)
+            missing(axis)
+            continue
         free[axis] = lim - float(sample[axis])
     # R2c avg60 stall closure (t_d456e9cd): read when the sampler pushed it; a pre-avg60 sample is not refused for it
-    if "psi_cpu_some10" not in unmeasurable and _num(sample.get("psi_cpu_some60")):
+    if not {"psi_cpu_some10", "psi_cpu_some60"} & unmeasurable and _num(sample.get("psi_cpu_some60")):
         free["psi_cpu_some60"] = limits.psi_cpu60_max - float(sample["psi_cpu_some60"])
     if _num(sample.get("procs")) and _num(sample.get("maxproc")) and sample["maxproc"] > 0:
         free["procs"] = limits.procs_frac_max - float(sample["procs"]) / float(sample["maxproc"])
     if need.gpu_mib > 0:
         if not _num(sample.get("gpu_free_mib")):
-            return missing("gpu_free_mib")
-        free["gpu_mib"] = float(sample["gpu_free_mib"]) - held.gpu_mib - need.gpu_mib
+            missing("gpu_free_mib")
+        else:
+            free["gpu_mib"] = float(sample["gpu_free_mib"]) - held.gpu_mib - need.gpu_mib
 
     if sample.get("slo_breach") is True:
         return Verdict(False, "slo", "saturated:slo (latency guard breached)", free)
@@ -171,6 +181,8 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
         if axis in ("cpu", "psi_cpu_some10", "psi_cpu_some60") and limits.cpu_saturable:
             continue                       # a score penalty on a saturable host (score() reads it), never a refusal
         return Verdict(False, axis, f"saturated:{axis} {free[axis]:+.2f}", free)
+    if unmeasured:                         # nothing measured refuses: fail closed on the first unmeasured axis
+        return Verdict(False, unmeasured[0][0], unmeasured[0][1], free)
     binding = min(_fractions(free, sample, limits), key=lambda kv: kv[1])[0]
     return Verdict(True, binding, "", free)
 
@@ -200,6 +212,78 @@ def score(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
     if not v.ok:
         return None
     return min(f for _, f in _fractions(v.free, sample, limits))
+
+
+# ── ONE rule for every workload class: one line, priority by demand (t_e5124426; Ace 2026-10-27 02:5x) ───────────
+# "It shouldn't just be one admission rule for both. It should be one admission rule for everything ... also combine
+# workers as well and any other kind of workers." Every class (CI runner, Prism review, kanban worker, test-gate run,
+# batch) is admitted by admit_class() on the SAME measured axes against the SAME host line; no class gets a private
+# metric (load1, procs_running x yield) or a cpu_saturable escape. Higher-priority DEMAND, not a reserved lane or a
+# floor (Ace 10-25/10-26), is what holds lower classes back: while a higher class has queued work for this host, each
+# lower class sees that queue's next few units as a lease, so it stops short of the line and leaves them room.
+HOST_LINE = 0.90             # Ace standing ruling: no host above 90 % busy, whatever the mix
+DEFAULT_ORDER = ("main", "prism", "interactive", "kanban", "ci", "test-gate", "batch")
+DEFAULT_HOLDBACK_UNITS = 2   # "a few units": per higher class with queued demand, at most this many of its units
+
+
+@dataclasses.dataclass(frozen=True)
+class Priority:
+    order: tuple = DEFAULT_ORDER       # highest first; a class not named here ranks below every named one
+    line: float = HOST_LINE            # cpu_busy_max for every class
+    holdback_units: int = DEFAULT_HOLDBACK_UNITS
+
+    def rank(self, workload: str) -> int:
+        try:
+            return self.order.index(workload)
+        except ValueError:
+            return len(self.order)
+
+
+@dataclasses.dataclass(frozen=True)
+class Demand:
+    """Queued (not yet started) work of one class that could run on this host, and one unit's estimate there."""
+    workload: str
+    queued: int
+    unit: Estimate
+
+
+def holdback(workload: str, demand: Iterable[Demand], priority: Priority, host: str) -> List[Lease]:
+    """Leases standing in for the queued work of every class that outranks ``workload``. They never settle (at=inf):
+    queued work is not in any sample. An idle higher class (queued 0) holds nothing back."""
+    mine, out = priority.rank(workload), []
+    for d in demand:
+        if d.queued <= 0 or priority.rank(d.workload) >= mine or priority.holdback_units <= 0:
+            continue
+        n = min(int(d.queued), priority.holdback_units)
+        u = d.unit
+        out.append(Lease(host, f"holdback:{d.workload}",
+                         Estimate(u.cpus * n, u.ram_gb * n, u.gpu_mib * n, f"holdback {d.workload} x{n}"),
+                         at=math.inf, job_id=f"queued:{d.workload}:{int(d.queued)}"))
+    return out
+
+
+def admit_class(sample: Mapping, workload: str, need: Estimate, leases: Iterable[Lease] = (), *,
+                demand: Iterable[Demand] = (), priority: Priority = Priority(), limits: Limits = Limits(),
+                host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S,
+                slice_mem: Optional[SliceMem] = None) -> Verdict:
+    """THE admission decision for any workload class on any host. ``limits`` supplies the host's own facts
+    (mem_reserve_gb, unmeasurable axes); the CPU line is ``priority.line`` and the CPU / PSI cpu axes always refuse
+    (cpu_saturable is ignored: a class that can run past the line is how one decider starves the others).
+    A refusal caused only by higher-priority demand reads ``held_back:<class> ...`` with binding ``priority``."""
+    host = host or str(sample.get("host") or "")
+    lim = dataclasses.replace(limits, cpu_busy_max=priority.line, cpu_saturable=False)
+    leases = list(leases)
+    demand = list(demand)
+    held = holdback(workload, demand, priority, host)
+    v = admit(sample, need, leases + held, host=host, limits=lim, settle_s=settle_s, slice_mem=slice_mem)
+    if v.ok or not held:
+        return v
+    bare = admit(sample, need, leases, host=host, limits=lim, settle_s=settle_s, slice_mem=slice_mem)
+    if not bare.ok:
+        return v
+    who = ", ".join(f"{d.workload} {d.queued} queued" for d in demand
+                    if d.queued > 0 and priority.rank(d.workload) < priority.rank(workload))
+    return Verdict(False, "priority", f"held_back:{workload} for {who} ({v.reason})", v.free)
 
 
 _GB = float(1 << 30)
@@ -270,7 +354,7 @@ def read_history(path, *, since: Optional[float] = None) -> List[dict]:
     """Rows of the history ledger; a torn last line or a foreign row is skipped (append-only, never fatal)."""
     out: List[dict] = []
     try:
-        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()   # a BOM-prefixed ledger keeps its 1st row
     except FileNotFoundError:
         return out
     for ln in lines:
@@ -282,5 +366,88 @@ def read_history(path, *, since: Optional[float] = None) -> List[dict]:
                 continue
         except (ValueError, TypeError):
             continue                       # torn line or a bad `at` (Prism feea7aeecbda): skip the row, never fatal
+        out.append(r)
+    return out
+
+
+def _history_row(ln) -> Optional[dict]:
+    try:
+        r = json.loads(ln)
+    except (ValueError, TypeError):
+        return None
+    return r if isinstance(r, dict) and r.get("schema") == SCHEMA else None
+
+
+# path -> [open binary file, bytes consumed, rows parsed so far, checkpoint]   (read_history_cached; t_c9fd9c5e)
+# checkpoint = the last CHECKPOINT_BYTES consumed bytes: re-read before reusing the rows, so a truncate + refill to the
+# old size or past it (same inode, never smaller at a read) resets the cache instead of replaying the old generation.
+# The file stays OPEN while its rows are cached, so its inode cannot be recycled by an unlink + recreate (Prism e2ace455c12a).
+_HISTORY_CACHE: dict = {}
+_HISTORY_LOCK = threading.Lock()
+CHECKPOINT_BYTES = 256
+
+
+def _checkpoint_ok(fh, consumed: int, want: bytes) -> bool:
+    if consumed <= 0 or not want:
+        return True
+    fh.seek(consumed - len(want))
+    return fh.read(len(want)) == want
+
+
+def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
+    """read_history() for a long-lived reader of an APPEND-ONLY ledger: each call parses only the bytes appended since
+    the previous call (t_c9fd9c5e). allocd ran read_history() on the whole 14-day class-usage.jsonl inside every
+    utilization admit, i.e. under the reservation-ledger flock; at 100k rows that is ~0.7 s of flock per admit, so
+    renews queued behind admits past alloc_client's 2 s timeout (allocd_unreachable) and the fallback then lost the
+    flock race (allocd_wedged_lock). Same rows and filters as read_history(); an incomplete last line waits for its
+    newline. A replaced (new inode) or shrunk file is re-read from byte 0. The cached descriptor is held open, so the
+    inode it names cannot be reused while cached; each call compares stat(path) with fstat() of that descriptor, and
+    a mismatch closes it and reads the path afresh from byte 0 (Prism e2ace455c12a). Reads always come from the held
+    descriptor, so a rotation after the stat() returns the old file's rows once, never the old offset in a new file."""
+    p = Path(path)
+    key = str(p)
+    with _HISTORY_LOCK:
+        hit = _HISTORY_CACHE.get(key)
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            st = None
+        if hit is not None:
+            held = os.fstat(hit[0].fileno())
+            if st is None or (st.st_dev, st.st_ino) != (held.st_dev, held.st_ino):
+                hit[0].close()
+                _HISTORY_CACHE.pop(key, None)
+                hit = None
+            elif held.st_size < hit[1] or not _checkpoint_ok(hit[0], hit[1], hit[3]):
+                hit[1], hit[2], hit[3] = 0, [], b""   # shrunk or rewritten in place: start over on the same descriptor
+        if hit is None:
+            try:
+                hit = [p.open("rb"), 0, [], b""]
+            except FileNotFoundError:
+                return []
+        fh = hit[0]
+        fh.seek(hit[1])
+        chunk = fh.read()
+        end = chunk.rfind(b"\n") + 1               # only whole lines; a torn tail is read again next call
+        # utf-8-sig strips a BOM at byte 0 only: a BOM-prefixed ledger keeps its first row (Prism 5799d4eb7009)
+        text = chunk[:end].decode("utf-8-sig" if hit[1] == 0 else "utf-8", errors="replace")
+        for ln in text.splitlines():
+            r = _history_row(ln)
+            if r is not None:
+                hit[2].append(r)
+        hit[1] += end
+        if end:
+            hit[3] = (hit[3] + chunk[:end])[-CHECKPOINT_BYTES:]
+        _HISTORY_CACHE[str(p)] = hit
+        rows = list(hit[2])
+    if since is None:
+        return rows
+    out: List[dict] = []
+    for r in rows:
+        try:
+            if float(r.get("at") or 0) < since:
+                continue
+        except (ValueError, TypeError):
+            continue
         out.append(r)
     return out

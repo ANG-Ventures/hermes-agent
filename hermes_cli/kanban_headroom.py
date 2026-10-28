@@ -50,7 +50,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 
 _log = logging.getLogger(__name__)
 

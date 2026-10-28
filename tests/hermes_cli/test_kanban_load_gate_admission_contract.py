@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from hermes_cli import admission, work_estimate
+from hermes_cli.fleet_placement import admission, work_estimate
 from hermes_cli import kanban_load_gate as klg
 
 TABLE = {
