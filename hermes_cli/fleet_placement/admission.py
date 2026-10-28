@@ -78,6 +78,8 @@ class Limits:
     procs_frac_max: float = 0.85       # procs / maxproc
     cpu_saturable: bool = False        # CPU over the line = score penalty, never a refusal
     unmeasurable: tuple = ()           # axes this host's OS cannot report (never required)
+    r2c: bool = False                  # scorer v2 (FWA R2c) only: the avg60 axis + PSI cpu closing AT its line; False =
+                                       # the pre-R2c predicate byte for byte (the v1 kill switch, Prism 78da7ab3e3d9)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,7 +164,7 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
             continue
         free[axis] = lim - float(sample[axis])
     # R2c avg60 stall closure (t_d456e9cd): read when the sampler pushed it; a pre-avg60 sample is not refused for it
-    if not {"psi_cpu_some10", "psi_cpu_some60"} & unmeasurable and _num(sample.get("psi_cpu_some60")):
+    if limits.r2c and not {"psi_cpu_some10", "psi_cpu_some60"} & unmeasurable and _num(sample.get("psi_cpu_some60")):
         free["psi_cpu_some60"] = limits.psi_cpu60_max - float(sample["psi_cpu_some60"])
     if _num(sample.get("procs")) and _num(sample.get("maxproc")) and sample["maxproc"] > 0:
         free["procs"] = limits.procs_frac_max - float(sample["procs"]) / float(sample["maxproc"])
@@ -176,9 +178,10 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
         return Verdict(False, "slo", "saturated:slo (latency guard breached)", free)
     order = ("slice_mem_gb", "mem_gb", "psi_mem_some10", "psi_io_some10", "procs", "gpu_mib", "psi_cpu_some10",
              "psi_cpu_some60", "cpu")
+    at_line = ("psi_cpu_some10", "psi_cpu_some60") if limits.r2c else ()
     for axis in order:
-        # PSI cpu closes AT its line (R2c: avg10 >= 40 OR avg60 >= 25, as closed_when does on the legacy path)
-        if axis not in free or free[axis] > 0 or (free[axis] == 0 and axis not in ("psi_cpu_some10", "psi_cpu_some60")):
+        # R2c only: PSI cpu closes AT its line (avg10 >= 40 OR avg60 >= 25, as closed_when does on the legacy path)
+        if axis not in free or free[axis] > 0 or (free[axis] == 0 and axis not in at_line):
             continue
         if axis in ("cpu", "psi_cpu_some10", "psi_cpu_some60") and limits.cpu_saturable:
             continue                       # a score penalty on a saturable host (score() reads it), never a refusal
