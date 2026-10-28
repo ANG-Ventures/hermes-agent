@@ -1131,7 +1131,7 @@ class GatewayNotificationsMixin:
             await present_notification(
                 lambda: self._send_home_channel_message(
                     platform, home, transport, message, "state.db warning notification failed for %s:%s: %s"),
-                platform=platform, chat_id=home.chat_id, thread_id=getattr(home, "thread_id", None))
+                platform=platform, chat_id=getattr(home, "chat_id", None), thread_id=getattr(home, "thread_id", None))
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.

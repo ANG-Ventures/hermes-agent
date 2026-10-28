@@ -212,3 +212,41 @@ class TestChannelScopedPolicyGates:
         assert await present_notification(send, platform="discord", user_config=self._CFG, chat_id=ALERTS) is True
         assert await present_notification(send, platform="discord", user_config=self._CFG, chat_id=HOME) is False
         assert sent == [1]
+
+
+class TestChannelScopedFinalReasoning:
+    """The final-reply reasoning block reads the destination's channel tier (Prism a04da1512e2c, a9fb3409374e)."""
+
+    def _prepend(self, monkeypatch, cfg, source):
+        gateway_run = importlib.import_module("gateway.run")
+        from gateway.run_turn import GatewayTurnMixin
+
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda *a, **k: cfg)
+        runner = types.SimpleNamespace(_show_reasoning=False,
+                                       _REASONING_QUOTE_STYLES=GatewayTurnMixin._REASONING_QUOTE_STYLES)
+        return GatewayTurnMixin._hmwa_prepend_reasoning(
+            runner, {"last_reasoning": "private notes"}, "answer", source, False)
+
+    def test_channel_suppresses_platform_reasoning(self, monkeypatch):
+        cfg = {"display": {"platforms": {"discord": {"show_reasoning": True}},
+                           "channels": {"discord": {ALERTS: {"show_reasoning": False}}}}}
+        alerts = SessionSource(platform=Platform.DISCORD, chat_id=ALERTS, chat_type="group")
+        thread = SessionSource(platform=Platform.DISCORD, chat_id="thread-9", chat_type="thread",
+                               parent_chat_id=ALERTS)
+        home = SessionSource(platform=Platform.DISCORD, chat_id=HOME, chat_type="group")
+        assert self._prepend(monkeypatch, cfg, alerts) == "answer"
+        assert self._prepend(monkeypatch, cfg, thread) == "answer"
+        assert "private notes" in self._prepend(monkeypatch, cfg, home)
+
+    def test_channel_opt_in_and_style(self, monkeypatch):
+        cfg = {"display": {"channels": {"discord": {ALERTS: {"show_reasoning": True, "reasoning_style": "blockquote"}}}}}
+        alerts = SessionSource(platform=Platform.DISCORD, chat_id=ALERTS, chat_type="group")
+        home = SessionSource(platform=Platform.DISCORD, chat_id=HOME, chat_type="group")
+        assert "> private notes" in self._prepend(monkeypatch, cfg, alerts)
+        assert self._prepend(monkeypatch, cfg, home) == "answer"
+
+    def test_mattermost_still_needs_platform_opt_in(self, monkeypatch):
+        cfg = {"display": {"show_reasoning": True,
+                           "channels": {"mattermost": {"c": {"show_reasoning": True}}}}}
+        src = SessionSource(platform=Platform.MATTERMOST, chat_id="c", chat_type="group")
+        assert self._prepend(monkeypatch, cfg, src) == "answer"

@@ -1817,12 +1817,13 @@ class GatewayTurnMixin:
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
         requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
+        from gateway.display_config import display_scope
         from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
         try:
             _show_reasoning_effective = _resolve_gateway_display_bool(
                 _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
-                require_platform_override_for={Platform.MATTERMOST},
+                require_platform_override_for={Platform.MATTERMOST}, **display_scope(source),
             )
         except Exception:
             _show_reasoning_effective = (
@@ -1843,6 +1844,7 @@ class GatewayTurnMixin:
             from gateway.display_config import resolve_display_setting
             _reasoning_style = resolve_display_setting(
                 _load_gateway_config(), _platform_config_key(source.platform), "reasoning_style", "code",
+                **display_scope(source),
             )
         except Exception:
             _reasoning_style = "code"

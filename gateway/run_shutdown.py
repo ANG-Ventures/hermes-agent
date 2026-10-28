@@ -1263,7 +1263,7 @@ class GatewayShutdownMixin:
             # present_notification reads the ACTIVE profile's display settings: bind the served one's.
             profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
             async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
-                await present_notification(_send_home, platform=platform, chat_id=home.chat_id, thread_id=home.thread_id)
+                await present_notification(_send_home, platform=platform, chat_id=getattr(home, "chat_id", None), thread_id=getattr(home, "thread_id", None))
 
     # Agent finalization / resource cleanup
     @staticmethod
