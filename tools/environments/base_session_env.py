@@ -58,9 +58,26 @@ def _cwd_marker_printf(marker: str) -> str:
     command whose output lacks a trailing newline; ``_split_cwd_marker`` strips it).
     After the closing marker, ``git:`` lists `` NAME=1`` for each SESSION_GIT_ENV_NAMES variable set in
     the shell (``${NAME+x}``: set, exported or not) when the command finished; ``_split_git_env`` reads it.
-    It sits on the marker line, so the model never sees it."""
+    It sits on the marker line, so the model never sees it. `` seq=N`` leads the section: the shell's
+    command counter (``_seq_bump_lines``; 0 in the bootstrap), so a late-finalizing older snapshot can be
+    told from a newer one (``terminal_tool.record_session_git_env``)."""
     flags = "".join(f"${{{name}+ {name}=1}}" for name in SESSION_GIT_ENV_NAMES)
-    return f"printf '\\n{marker}%s{marker}{_GIT_ENV_TAG}%s\\n' \"$(pwd -P)\" \"{flags}\""
+    return (f"printf '\\n{marker}%s{marker}{_GIT_ENV_TAG} seq=%s%s\\n' \"$(pwd -P)\" "
+            f"\"${{{_SEQ_NOW}-0}}\" \"{flags}\"")
+
+
+# The environment's command counter (card t_20695198): persisted in the snapshot as _SEQ_VAR, bumped into
+# the READONLY _SEQ_NOW before the user's command runs (so the command cannot rewrite the number its own
+# marker reports), and written back after it. A non-numeric / oversized stored value restarts at 0.
+_SEQ_VAR = "__HERMES_SEQ"
+_SEQ_NOW = "__hermes_seq"
+
+
+def _seq_bump_lines() -> list[str]:
+    return [
+        f'case "${{{_SEQ_VAR}-}}" in \'\'|*[!0-9]*|?????????????????*) {_SEQ_NOW}=0 ;; '
+        f'*) {_SEQ_NOW}=${_SEQ_VAR} ;; esac',
+        f"readonly {_SEQ_NOW}=$(({_SEQ_NOW} + 1)) 2>/dev/null || true"]
 
 
 def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
@@ -173,9 +190,11 @@ def _wrap_command_script(
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
+        *_seq_bump_lines(),
         f"builtin cd -- {quoted_cwd} || exit 126",
         f"eval '{escaped}'",
         "__hermes_ec=$?",
+        f"export {_SEQ_VAR}=\"${_SEQ_NOW}\" 2>/dev/null || true",
         "umask 077"]
     if snapshot_ready:
         parts.append(
@@ -221,3 +240,18 @@ def _split_git_env(output: str, marker: str) -> dict[str, bool] | None:
         return None
     present = {word.partition("=")[0] for word in tail[len(_GIT_ENV_TAG):].split() if word.endswith("=1")}
     return {name: name in present for name in SESSION_GIT_ENV_NAMES}
+
+
+def _split_git_seq(output: str, marker: str) -> int | None:
+    """The `` seq=N`` of the ``git:`` section ``_split_git_env`` reads, or None (no section / no seq)."""
+    last = output.rfind(marker)
+    if last == -1 or output.rfind(marker, max(0, last - 4096), last) == -1:
+        return None
+    tail = output[last + len(marker):].split("\n", 1)[0].rstrip("\r")
+    if not tail.startswith(_GIT_ENV_TAG):
+        return None
+    for word in tail[len(_GIT_ENV_TAG):].split():
+        name, _, value = word.partition("=")
+        if name == "seq" and value.isdigit():
+            return int(value)
+    return None

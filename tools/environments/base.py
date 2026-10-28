@@ -28,6 +28,7 @@ from tools.environments.base_output import (  # noqa: F401 (_BoundedOutputCollec
 from tools.environments.base_session_env import (  # noqa: F401 (snapshot-exclusion names: fork test seam)
     _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _SNAPSHOT_EXCLUDED_ENV_REGEX, _cwd_marker,
     _export_dump_excluding_session_vars, _snapshot_bootstrap_script, _split_cwd_marker, _split_git_env,
+    _split_git_seq,
     _wrap_command_script,
 )
 from tools.environments.base_wait import _WaitTrace
@@ -579,7 +580,8 @@ class BaseEnvironment(ABC):
         concurrent callers must read ``result["cwd"]`` rather than ``self.cwd``.
 
         The same marker line carries the session shell's GIT_* repository variables (card t_20695198):
-        ``result["git_env"]`` is set only when this command emitted the line, like ``cwd_observed``."""
+        ``result["git_env"]`` (+ ``["git_env_seq"]``, the shell's command counter) is set only when this
+        command emitted the line, like ``cwd_observed``."""
         output = result.get("output", "")
         split = _split_cwd_marker(output, self._cwd_marker)
         if split is None:
@@ -587,6 +589,7 @@ class BaseEnvironment(ABC):
         git_env = _split_git_env(output, self._cwd_marker)
         if git_env is not None:
             result["git_env"] = git_env
+            result["git_env_seq"] = _split_git_seq(output, self._cwd_marker)
         cwd_path, cleaned = split
         if cwd_path:
             self.cwd = cwd_path

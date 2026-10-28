@@ -27,7 +27,7 @@ import time
 import threading
 import atexit
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -345,44 +345,68 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
 
 
 def clear_session_cwd(session_key: str) -> None:
-    """Drop a session's cwd and GIT_* env records (session teardown)."""
+    """Drop a session's cwd record (session teardown)."""
     with _session_cwd_lock:
         _session_cwd.pop(_qualify_task_key(session_key), None)
-        _session_shell.pop(_qualify_task_key(session_key), None)
 
 
-# GIT_* repository variables (GIT_DIR, GIT_WORK_TREE, ...) set in a terminal SHELL when its last command
+# GIT_* repository variables (GIT_DIR, GIT_WORK_TREE, ...) set in an ENVIRONMENT's shell when a command
 # finished, as the shell itself reported them on the cwd marker line (card t_20695198). The state belongs
-# to the shell, not the session: one environment's snapshot is re-dumped after every command and sourced
-# by the next command of ANY session on it (sessions and delegate children share environments), so an
-# export by session A is live in session B's next command. Hence two maps: shell id -> last reported
-# state, and session -> the shell its last reported command ran in. shell_hooks ships the state of the
-# caller's shell as ``session_git_env``.
-_shell_git_env: Dict[str, Dict[str, bool]] = {}
-_session_shell: Dict[str, str] = {}
+# to the environment, not the session: its snapshot is re-dumped after every command and sourced by the
+# next command of ANY session on it, so the record is keyed by environment (``env_git_id``) and a session
+# reads the record of the environment it would run in NOW (``current_env_git_id``). Each report carries
+# the environment's command counter; an older report that finalizes late can only ADD set names, never
+# clear a newer report's (Prism 917169c9298d / 0d61df4027d6 / 7fc5cadf95a1 / d88ecfb9edb5).
+_env_git_env: Dict[str, Tuple[int, Dict[str, bool]]] = {}
 
 
-def record_session_git_env(session_key: Optional[str], git_env: Optional[Dict[str, bool]],
-                           shell_id: Optional[str] = None) -> None:
-    """Record *git_env* (``{name: set}``) as the state of shell *shell_id* (default: one private to the
-    session) and bind *session_key* to that shell. A non-dict is ignored, so a command that emitted no
-    marker (killed / timed out) changes nothing, as for cwd."""
-    if not isinstance(git_env, dict):
+def env_git_id(env: Any) -> Optional[str]:
+    """Stable record key for *env*'s shell (its snapshot id), or None for no env."""
+    if env is None:
+        return None
+    shell_id = getattr(env, "_session_id", None)
+    return f"env:{shell_id}" if shell_id else f"env-obj:{id(env)}"
+
+
+def record_session_git_env(env_id: Optional[str], git_env: Optional[Dict[str, bool]],
+                           seq: Optional[int] = None) -> None:
+    """Record *git_env* (``{name: set}``) reported at command *seq* as environment *env_id*'s state.
+    A report with ``seq`` above the stored one replaces it; any other report (equal, older, or without a
+    seq) is OR-merged, so it can mark a name set but never clear one. A non-dict (a killed command emitted
+    no marker) or a missing env id changes nothing."""
+    if not env_id or not isinstance(git_env, dict):
         return
-    key = _qualify_task_key(str(session_key or "default"))
-    shell = str(shell_id) if shell_id else "session:" + key
+    snapshot = {str(name): bool(value) for name, value in git_env.items()}
+    order = seq if isinstance(seq, int) and not isinstance(seq, bool) else -1
     with _session_cwd_lock:
-        _shell_git_env[shell] = {str(name): bool(value) for name, value in git_env.items()}
-        _session_shell[key] = shell
+        prev = _env_git_env.get(env_id)
+        if prev is None or order > prev[0]:
+            _env_git_env[env_id] = (order, snapshot)
+        else:
+            merged = {name: prev[1].get(name, False) or snapshot.get(name, False)
+                      for name in {*prev[1], *snapshot}}
+            _env_git_env[env_id] = (prev[0], merged)
 
 
-def get_session_git_env(session_key: Optional[str]) -> Optional[Dict[str, bool]]:
-    """Copy of the GIT_* state most recently reported by the shell *session_key* last ran in (by any
-    session on that shell), or None when no command of this session has reported one."""
+def get_session_git_env(env_id: Optional[str]) -> Optional[Dict[str, bool]]:
+    """Copy of environment *env_id*'s recorded GIT_* state, or None when nothing is recorded."""
+    if not env_id:
+        return None
     with _session_cwd_lock:
-        shell = _session_shell.get(_qualify_task_key(str(session_key or "default")))
-        recorded = _shell_git_env.get(shell) if shell is not None else None
-        return dict(recorded) if recorded is not None else None
+        recorded = _env_git_env.get(env_id)
+        return dict(recorded[1]) if recorded is not None else None
+
+
+def current_env_git_id(task_id: Optional[str]) -> Optional[str]:
+    """``env_git_id`` of the cached environment a terminal call with *task_id* would run in now (same
+    lookup as ``_acquire_env``), or None when there is none yet or the key cannot be resolved."""
+    try:
+        eff = _resolve_container_task_id(task_id)
+    except Exception:
+        return None
+    with _env_lock:
+        env = _active_environments.get(eff) or (_active_environments.get(task_id) if task_id else None)
+    return env_git_id(env)
 
 
 def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:

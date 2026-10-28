@@ -5,7 +5,8 @@ shell's env: ``export GIT_DIR=<live>/.git`` in one call arms every later ``git c
 session, whatever directory it runs from. Inferring that from command text never converged (any
 spelling of the name is a new bypass). The cwd marker line already reports the shell's own state
 after each command; it now also reports which of the five GIT_* names are SET, the terminal tool
-records that per session beside cwd, and shell_hooks ships it as ``session_git_env``.
+records it per ENVIRONMENT (shared by sessions), ordered by the shell's own command counter, and
+shell_hooks ships the record of the environment the call would run in as ``session_git_env``.
 
 Mirrors the cwd tests (test_interrupted_command_cwd.py, test_shell_hooks.py): a killed command emits
 no marker and keeps the previous record; the model-visible output never carries the report.
@@ -17,7 +18,7 @@ import pytest
 
 import tools.terminal_tool as tt
 from tools.environments.base_session_env import (
-    SESSION_GIT_ENV_NAMES, _cwd_marker, _cwd_marker_printf, _split_cwd_marker, _split_git_env)
+    SESSION_GIT_ENV_NAMES, _cwd_marker, _cwd_marker_printf, _split_cwd_marker, _split_git_env, _split_git_seq)
 from tools.environments.local import LocalEnvironment
 
 _NONE_SET = {name: False for name in SESSION_GIT_ENV_NAMES}
@@ -27,8 +28,7 @@ _SCRUB = "unset " + " ".join(SESSION_GIT_ENV_NAMES)
 @pytest.fixture(autouse=True)
 def _clean_store(monkeypatch):
     monkeypatch.setattr(tt, "_session_cwd", {})
-    monkeypatch.setattr(tt, "_shell_git_env", {})
-    monkeypatch.setattr(tt, "_session_shell", {})
+    monkeypatch.setattr(tt, "_env_git_env", {})
     monkeypatch.setattr(tt, "_task_env_overrides", {})
     monkeypatch.delenv("TERMINAL_ENV", raising=False)
     for name in SESSION_GIT_ENV_NAMES:
@@ -47,8 +47,9 @@ class TestMarkerParse:
     M = _cwd_marker("abc123")
 
     def test_report_parses_and_line_is_stripped(self):
-        out = f"hello\n\n{self.M}/tmp/x{self.M}git: GIT_DIR=1 GIT_INDEX_FILE=1\n"
+        out = f"hello\n\n{self.M}/tmp/x{self.M}git: seq=7 GIT_DIR=1 GIT_INDEX_FILE=1\n"
         assert _split_git_env(out, self.M) == {**_NONE_SET, "GIT_DIR": True, "GIT_INDEX_FILE": True}
+        assert _split_git_seq(out, self.M) == 7
         cwd, cleaned = _split_cwd_marker(out, self.M)
         assert cwd == "/tmp/x"                       # the git section never leaks into the cwd
         assert cleaned == "hello\n"
@@ -128,35 +129,38 @@ class TestTerminalToolRecordsIt:
         monkeypatch.setattr(tt, "_check_all_guards", lambda command, env_type, **kwargs: {"approved": True})
         return json.loads(tt.terminal_tool(command=command, task_id=task_id, timeout=timeout, workdir=workdir))
 
+    @staticmethod
+    def _rec(env):
+        return tt.get_session_git_env(tt.env_git_id(env))
+
     def test_record_follows_the_shell(self, env, monkeypatch, tmp_path):
-        assert tt.get_session_git_env("mine") is None
+        assert self._rec(env) is None
         result = self._tool(monkeypatch, env, "export GIT_DIR=/x/.git; echo ok", "mine")
         assert result["output"] == "ok"
-        assert tt.get_session_git_env("mine") == {**_NONE_SET, "GIT_DIR": True}
+        assert self._rec(env) == {**_NONE_SET, "GIT_DIR": True}
         self._tool(monkeypatch, env, _SCRUB, "mine")
-        assert tt.get_session_git_env("mine") == _NONE_SET
+        assert self._rec(env) == _NONE_SET
 
     def test_workdir_command_still_records(self, env, monkeypatch, tmp_path):
         self._tool(monkeypatch, env, "export GIT_DIR=/x/.git", "mine", workdir=str(tmp_path))
-        assert tt.get_session_git_env("mine")["GIT_DIR"] is True
+        assert self._rec(env)["GIT_DIR"] is True
 
     @pytest.mark.platforms("linux")
     def test_interrupt_keeps_the_previous_record(self, env, monkeypatch, tmp_path):
         self._tool(monkeypatch, env, "export GIT_DIR=/x/.git", "mine")
         self._tool(monkeypatch, env, "unset GIT_DIR; sleep 20", "mine", timeout=2)
-        assert tt.get_session_git_env("mine")["GIT_DIR"] is True
+        assert self._rec(env)["GIT_DIR"] is True
 
     def test_export_by_one_session_reaches_every_session_on_the_shell(self, env, monkeypatch):
         """Prism 8cf2a5f81e5c / 7fc5cadf95a1 / 985402e3796a: the snapshot is shared by every session on the
-        environment, so B's record must follow A's export, and A's unset must clear it for B too."""
+        environment, so B sees A's export, and A's unset clears it for B too."""
         self._tool(monkeypatch, env, "true", "b")
-        assert tt.get_session_git_env("b") == _NONE_SET
         self._tool(monkeypatch, env, "export GIT_DIR=/live/.git GIT_WORK_TREE=/live", "a")
-        assert tt.get_session_git_env("b") == {**_NONE_SET, "GIT_DIR": True, "GIT_WORK_TREE": True}
+        assert self._rec(env) == {**_NONE_SET, "GIT_DIR": True, "GIT_WORK_TREE": True}
         # ... and the shell really does carry it into B's next command (the premise of the finding).
         assert self._tool(monkeypatch, env, 'printf %s "$GIT_DIR"', "b")["output"] == "/live/.git"
         self._tool(monkeypatch, env, _SCRUB, "a")
-        assert tt.get_session_git_env("b") == _NONE_SET
+        assert self._rec(env) == _NONE_SET
 
     def test_a_different_shell_does_not_leak(self, env, monkeypatch, tmp_path):
         other = LocalEnvironment(cwd=str(tmp_path), timeout=30)
@@ -164,32 +168,71 @@ class TestTerminalToolRecordsIt:
         try:
             self._tool(monkeypatch, other, "true", "b")
             self._tool(monkeypatch, env, "export GIT_DIR=/live/.git", "a")
-            assert tt.get_session_git_env("b") == _NONE_SET
-            assert tt.get_session_git_env("a")["GIT_DIR"] is True
+            assert self._rec(other) == _NONE_SET
+            assert self._rec(env)["GIT_DIR"] is True
         finally:
             other.cleanup()
 
-    def test_clear_session_cwd_drops_it(self):
-        tt.record_session_git_env("gone", {**_NONE_SET, "GIT_DIR": True})
-        tt.clear_session_cwd("gone")
-        assert tt.get_session_git_env("gone") is None
+    def test_non_dict_or_no_env_is_ignored(self):
+        tt.record_session_git_env("env:s", {**_NONE_SET, "GIT_DIR": True}, 1)
+        tt.record_session_git_env("env:s", None, 2)
+        tt.record_session_git_env(None, _NONE_SET, 3)
+        assert tt.get_session_git_env("env:s")["GIT_DIR"] is True
+        assert tt.get_session_git_env(None) is None
 
-    def test_non_dict_is_ignored(self):
-        tt.record_session_git_env("s", {**_NONE_SET, "GIT_DIR": True})
-        tt.record_session_git_env("s", None)
-        assert tt.get_session_git_env("s")["GIT_DIR"] is True
+
+class TestInvariants:
+    """Apollo design ruling on #2416 (09:1x): one test per invariant, each red on feb6c8a8/ce8f2fb2."""
+
+    def test_1_keyed_on_environment_fresh_session_inherits(self, env, monkeypatch):
+        """d88ecfb9edb5: a session that never ran a command on the environment still gets its record."""
+        TestTerminalToolRecordsIt()._tool(monkeypatch, env, "export GIT_DIR=/live/.git", "a")
+        from agent import shell_hooks
+        kwargs = {"tool_name": "terminal", "args": {"command": "git checkout -- x"}, "task_id": "fresh-b"}
+        payload = json.loads(shell_hooks._serialize_payload("pre_tool_call", kwargs))
+        assert payload["session_git_env"] == {"GIT_DIR": True}
+
+    def test_2_older_snapshot_finalizing_late_cannot_clear_a_newer_one(self):
+        """917169c9298d / 0d61df4027d6 / 7fc5cadf95a1: A(unset, seq 5) finalizes after B(export, seq 6)."""
+        tt.record_session_git_env("env:e", {**_NONE_SET, "GIT_DIR": True}, 6)
+        tt.record_session_git_env("env:e", _NONE_SET, 5)
+        assert tt.get_session_git_env("env:e")["GIT_DIR"] is True
+        tt.record_session_git_env("env:e", _NONE_SET, 6)          # same base, unordered: can only add
+        assert tt.get_session_git_env("env:e")["GIT_DIR"] is True
+        tt.record_session_git_env("env:e", _NONE_SET, 7)          # genuinely newer: clears
+        assert tt.get_session_git_env("env:e") == _NONE_SET
+
+    def test_2_shell_counter_is_monotonic_and_tamper_proof(self, env, tmp_path):
+        seqs = [env.execute(cmd, cwd=str(tmp_path))["git_env_seq"]
+                for cmd in ("true", "__HERMES_SEQ=1; __hermes_seq=1", "unset __HERMES_SEQ", "true")]
+        assert seqs == sorted(seqs) and len(set(seqs)) == 4, seqs
+
+    def test_3_no_record_omits_the_field(self, env):
+        from agent import shell_hooks
+        kwargs = {"tool_name": "terminal", "args": {"command": "git status"}, "task_id": "nobody"}
+        assert "session_git_env" not in json.loads(shell_hooks._serialize_payload("pre_tool_call", kwargs))
+
+    def test_4_one_marker_line_carries_cwd_seq_and_git(self, env, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        result = env.execute(f"cd {sub}; export GIT_DIR=/x", cwd=str(tmp_path))
+        assert result["cwd"] == str(sub.resolve()) or env.cwd == str(sub.resolve())
+        assert result["git_env"]["GIT_DIR"] is True and isinstance(result["git_env_seq"], int)
+        assert "seq=" not in result["output"]
 
 
 class TestPreToolCallPayload:
-    def test_payload_carries_session_git_env(self):
+    def test_payload_carries_the_environments_record(self, env, monkeypatch):
         from agent import shell_hooks
 
         task = "t20695198-hook"
+        monkeypatch.setattr(tt, "_active_environments", {"default": env})
         kwargs = {"tool_name": "terminal", "args": {"command": "git status"}, "task_id": task}
         assert "session_git_env" not in json.loads(shell_hooks._serialize_payload("pre_tool_call", kwargs))
-        tt.record_session_git_env(task, _NONE_SET)
+        eid = tt.env_git_id(env)
+        tt.record_session_git_env(eid, _NONE_SET, 1)
         assert json.loads(shell_hooks._serialize_payload("pre_tool_call", kwargs))["session_git_env"] == {}
-        tt.record_session_git_env(task, {**_NONE_SET, "GIT_DIR": True, "GIT_WORK_TREE": True})
+        tt.record_session_git_env(eid, {**_NONE_SET, "GIT_DIR": True, "GIT_WORK_TREE": True}, 2)
         payload = json.loads(shell_hooks._serialize_payload("pre_tool_call", kwargs))
         assert payload["session_git_env"] == {"GIT_DIR": True, "GIT_WORK_TREE": True}
         other = json.loads(shell_hooks._serialize_payload(

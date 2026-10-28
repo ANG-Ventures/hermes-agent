@@ -656,13 +656,13 @@ def _terminal_session_cwd(kwargs: Dict[str, Any]) -> Optional[str]:
 
 
 def _terminal_session_git_env(kwargs: Dict[str, Any]) -> Optional[Dict[str, bool]]:
-    """The calling session's recorded GIT_* state (``{"GIT_DIR": True}``: set in the session shell when
-    its last command finished), keyed like :func:`_terminal_session_cwd`. None when nothing is recorded."""
+    """GIT_* state (``{"GIT_DIR": True}``: set in the shell when its last reported command finished) of
+    the environment this terminal call would run in NOW, whichever session's command reported it.
+    None when the terminal tool is not loaded, there is no environment yet, or it has no record."""
     terminal_tool = sys.modules.get("tools.terminal_tool")
-    if terminal_tool is None or not hasattr(terminal_tool, "get_session_git_env"):
+    if terminal_tool is None or not hasattr(terminal_tool, "current_env_git_id"):
         return None
-    from tools.approval_context import get_current_session_key
-    return terminal_tool.get_session_git_env(get_current_session_key(default="") or kwargs.get("task_id") or "")
+    return terminal_tool.get_session_git_env(terminal_tool.current_env_git_id(kwargs.get("task_id")))
 
 
 def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:

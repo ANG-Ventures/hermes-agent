@@ -213,7 +213,7 @@ def finalize_foreground_result(
     workdir: Optional[str], command_cwd: Optional[str], approval_note: Optional[str],
 ) -> str:
     """Turn a raw ``env.execute`` result into the tool's JSON result string."""
-    from tools.terminal_tool import record_session_cwd, record_session_git_env
+    from tools.terminal_tool import env_git_id, record_session_cwd, record_session_git_env
 
     # Record the cwd this command finished in as THIS session's durable cwd —
     # only when the command actually reported it (an interrupted/killed command
@@ -228,10 +228,8 @@ def finalize_foreground_result(
         record_session_cwd(session_key, observed_cwd)
     # The shell's GIT_* state persists past a per-command workdir, so it is recorded either way; a
     # command that emitted no marker carries no ``git_env`` and the previous record stands. It is keyed by
-    # the environment's shell (its snapshot id), which other sessions share (Prism 8cf2a5f81e5c).
-    shell_id = getattr(env, "_session_id", None)
-    record_session_git_env(session_key, (result or {}).get("git_env"),
-                           shell_id=f"env:{shell_id}" if shell_id else f"env-obj:{id(env)}")
+    # the ENVIRONMENT (shared by sessions) and ordered by the shell's command counter (t_20695198).
+    record_session_git_env(env_git_id(env), (result or {}).get("git_env"), (result or {}).get("git_env_seq"))
 
     output = result.get("output", "")
     returncode = result.get("returncode", 0)
