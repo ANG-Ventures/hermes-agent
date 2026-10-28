@@ -15081,14 +15081,23 @@ def _unblock_expectation_holds(
     conn: sqlite3.Connection, task_id: str,
     expect_block_event: Optional[int], expect_last_comment: Optional[int],
 ) -> bool:
-    """The CAS read for :func:`unblock_task`; call inside its write txn."""
-    if _task_status(conn, task_id) != "blocked":
+    """The CAS read for :func:`unblock_task`; call inside its write txn.
+
+    A ``scheduled`` card (a ``block --kind deferred`` park) is compared on its
+    latest ``scheduled`` event, which is the park's own event: the sweep may
+    lift a deferral whose ``unblock_when`` predicate cleared before the date
+    (hermes-home t_7f670c57). Event ids share one sequence, so a card moved
+    between blocked and scheduled after the read never matches."""
+    status = _task_status(conn, task_id)
+    if status not in ("blocked", "scheduled"):
         return False
     if expect_block_event is not None:
         row = conn.execute(
-            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
-            (task_id,),
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = ?",
+            (task_id, status),
         ).fetchone()
+        if status == "scheduled" and row[0] is None:   # no park event to pin: no CAS
+            return False
         if (row[0] or 0) != expect_block_event:
             return False
     if expect_last_comment is not None:
@@ -15120,7 +15129,8 @@ def unblock_task(
     ``expect_block_event`` / ``expect_last_comment`` make the unblock a
     compare-and-swap for a caller that decided from an EARLIER read (the
     hermes-home unblock_when sweep, t_12d49eb5): the card must still be
-    ``blocked`` with that latest ``blocked`` event id and that latest comment
+    ``blocked`` with that latest ``blocked`` event id (or ``scheduled`` with
+    that latest ``scheduled`` event id, t_7f670c57) and that latest comment
     id (0 = none), checked inside the same IMMEDIATE txn as the flip. A card
     re-blocked or re-pointed in between returns False and is left alone.
 
