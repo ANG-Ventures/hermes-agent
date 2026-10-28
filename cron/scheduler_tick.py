@@ -37,8 +37,10 @@ def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None
 
 
 def _acquire_lane_locks(_sched, lane: str) -> dict:
-    """Take each requested lane's tick lock independently (non-blocking). Returns ``{lane: fd}``
-    for the locks acquired; a raise releases what was already taken."""
+    """Take the requested lane tick locks (non-blocking). Returns ``{lane: fd}`` for the locks
+    acquired; a raise releases what was already taken. ``"all"`` takes ``.tick.lock`` first and
+    gets nothing when it is busy: a ``.tick.lock`` holder (data-wipe quiesce, pre-S1 code) excludes
+    the whole home, as before lanes. Only a busy ``.tick-script.lock`` narrows ``"all"`` to agent."""
     held: dict = {}
     try:
         for name in (("agent", "script") if lane == "all" else (lane,)):
@@ -47,6 +49,8 @@ def _acquire_lane_locks(_sched, lane: str) -> dict:
             lock_fd = _sched._acquire_tick_lock(lock_file)
             if lock_fd is not None:
                 held[name] = lock_fd
+            elif lane == "all" and name == "agent":
+                break
     except BaseException:
         for lock_fd in held.values():
             _sched._release_tick_lock(lock_fd)

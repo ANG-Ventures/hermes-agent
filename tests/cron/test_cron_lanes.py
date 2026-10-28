@@ -8,7 +8,7 @@ AC -> test:
   S1 (a) / I2   test_i2_partition_total_and_disjoint, test_i2_due_scan_partition
   S1 (b) / AC-1 test_ac1_script_lane_scan_leaves_agent_records_identical
   S1 (c) / AC-2 test_ac2_default_tick_equals_main_golden
-  S1 (d)        test_lane_locks_are_independent
+  S1 (d)        test_lane_locks_are_independent, test_quiescent_home_holds_both_tick_locks
   S1 (e)        test_tick_reports_one_outcome_per_return_path
   S1 (f) / AC-12 test_ac12_cross_process_reap_exemption
   S1 (g) / AC-14 test_ac14_knob_reads_process_home
@@ -335,24 +335,56 @@ def test_lane_locks_are_independent(home, vclock):
         assert tick(verbose=False, sync=True, lane="agent", report=out.append) == 0
         assert out == [TickOutcome.LOCK_BUSY]
         out.clear()
-        # "all" with the agent lock held ticks the script lane it acquired, and only that lane.
-        assert tick(verbose=False, sync=True, report=out.append) == 1
-        assert out == [TickOutcome.ADMITTED]
+        # Prism P1 ef5bf5094f61: a .tick.lock holder (quiesce, pre-S1 code) excludes the whole
+        # home from an "all" tick, as on main. "all" never narrows to the script lane.
+        assert tick(verbose=False, sync=True, report=out.append) == 0
+        assert out == [TickOutcome.LOCK_BUSY]
     finally:
         held.close()
-    started = [json.loads(x)["name"] for x in control.runs.read_text().splitlines()
-               if json.loads(x)["event"] == "start"]
-    assert started == ["s"]
+    assert not control.runs.exists() or not [
+        x for x in control.runs.read_text().splitlines() if json.loads(x)["event"] == "start"]
     held = _hold_lock(script_lock)
     try:
         out.clear()
         assert tick(verbose=False, sync=True, lane="script", report=out.append) == 0
         assert out == [TickOutcome.LOCK_BUSY]
         out.clear()
-        assert tick(verbose=False, sync=True, lane="agent", report=out.append) == 1
+        # "all" with only the script lock busy (a runner mid-tick) ticks the agent lane alone.
+        assert tick(verbose=False, sync=True, report=out.append) == 1
         assert out == [TickOutcome.ADMITTED]
     finally:
         held.close()
+    started = [json.loads(x)["name"] for x in control.runs.read_text().splitlines()
+               if json.loads(x)["event"] == "start"]
+    assert started == ["a"]
+
+
+def test_quiescent_home_holds_both_tick_locks(home, vclock, monkeypatch):
+    """Prism P1 ef5bf5094f61: the data-wipe quiesce excludes every lane's tick, and the plan
+    never deletes either lane's lock inode."""
+    import hermes_cli.data_cleanup_holders as holders
+    from cron.lanes import TickOutcome
+    from cron.scheduler import _get_lock_paths, tick
+    from hermes_cli.data_cleanup import plan_data_removal
+
+    clock, control = vclock
+    _script_job("s")
+    _agent_job("a")
+    clock.advance(301)
+    for name in ("_refuse_backend_writers", "_refuse_multiplexer", "_drain_manual_gateway"):
+        monkeypatch.setattr(holders, name, lambda _home: None)
+    out: list = []
+    with holders.quiescent_home(home):
+        for lane in ("all", "agent", "script"):
+            out.clear()
+            assert tick(verbose=False, sync=True, lane=lane, report=out.append) == 0, lane
+            assert out == [TickOutcome.LOCK_BUSY], lane
+    assert not control.runs.exists() or not control.runs.read_text().strip()
+    for lane in ("agent", "script"):
+        _get_lock_paths(lane)[1].touch()
+    plan = plan_data_removal(home, home.parent / "project")
+    assert home / "cron" / ".tick-script.lock" not in plan.remove
+    assert home / "cron" / ".tick.lock" not in plan.remove
 
 
 # --- S1 (e) -------------------------------------------------------------------------------------
