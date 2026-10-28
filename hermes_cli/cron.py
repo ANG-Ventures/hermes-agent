@@ -343,6 +343,77 @@ def cron_tick():
     return 0
 
 
+def _record_abandoned_cron_turns(signum: int) -> int:
+    """Record the in-flight cron turns this process is about to die with.
+
+    ``cron run --wait`` is usually wrapped in ``timeout(1)`` (digest-job-runner),
+    whose SIGTERM used to kill the CLI with Python's default action: the turn's
+    ``turn_api_calls`` rows stayed with no ``turns`` row (t_4e9dd8d5, x-feed-brief
+    and morning-digest attempts at rc=124). Same provisional ``on_turn_abandoned``
+    row the gateway writes at shutdown. Never raises.
+    """
+    try:
+        from agent.turn_finalizer import emit_abandoned_session_ends
+        from cron.scheduler import live_cron_agents
+
+        agents = live_cron_agents()
+        return emit_abandoned_session_ends(agents, f"signal_{int(signum)}") if agents else 0
+    except Exception:
+        return 0
+
+
+def _install_abandon_on_signal() -> Dict[int, Any]:
+    """SIGTERM/SIGHUP: record in-flight cron turns, then exit 128+signum.
+
+    Only from the main thread (``signal.signal`` raises elsewhere); returns the
+    handlers it replaced so the caller can restore them.
+    """
+    import os
+    import signal
+    import threading
+
+    previous: Dict[int, Any] = {}
+    if threading.current_thread() is not threading.main_thread():
+        return previous
+    fired = threading.Event()
+
+    def _handler(signum, _frame):
+        # One-shot: a second signal (SIGHUP after SIGTERM) must not record twice.
+        if fired.is_set():
+            return
+        fired.set()
+        # Record on a helper thread with a bounded wait: the interrupted main thread may hold a
+        # non-reentrant lock the record path takes (``_live_cron_agents_lock`` at agent
+        # registration), and the handler must exit regardless.
+        recorder = threading.Thread(
+            target=_record_abandoned_cron_turns, args=(signum,), name="cron-abandon-record",
+            daemon=True)
+        recorder.start()
+        recorder.join(timeout=10.0)
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os._exit(128 + int(signum))
+
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous[signum] = signal.signal(signum, _handler)
+        except (OSError, RuntimeError, ValueError):
+            previous.pop(signum, None)
+    return previous
+
+
+def _restore_signal_handlers(previous: Dict[int, Any]) -> None:
+    import signal
+
+    for signum, handler in previous.items():
+        with contextlib.suppress(OSError, RuntimeError, ValueError, TypeError):
+            signal.signal(signum, handler)
+
+
 def cron_run_now(job_id: str) -> int:
     """Run a single job synchronously to completion and report the outcome.
 
@@ -353,7 +424,11 @@ def cron_run_now(job_id: str) -> int:
     from cron.scheduler import run_job_now
 
     print(color(f"Running job {job_id} now (synchronous, streaming to logs)…", Colors.CYAN))
-    result = run_job_now(job_id, verbose=True)
+    previous = _install_abandon_on_signal()
+    try:
+        result = run_job_now(job_id, verbose=True)
+    finally:
+        _restore_signal_handlers(previous)
 
     job_id = result.get("job_id", job_id)
     if result.get("deferred_to"):
