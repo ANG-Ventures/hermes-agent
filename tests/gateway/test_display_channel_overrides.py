@@ -176,3 +176,39 @@ async def test_other_channel_keeps_progress_interim_and_diagnostic(monkeypatch, 
     assert "pwd" in text or "terminal" in text
     assert "checking the queue first" in text
     assert "still waiting for a first reply" in text
+
+
+class TestChannelScopedPolicyGates:
+    """Wake muting and async notices read the destination's channel tier too (Prism bb57d1fdac5c)."""
+
+    _CFG = {"display": {"suppress_warning_notifications": True,
+                        "channels": {"discord": {ALERTS: {"suppress_warning_notifications": False}}}}}
+
+    def _wake(self, chat_id, parent_id=None):
+        source = SessionSource(platform=Platform.DISCORD, chat_id=chat_id, chat_type="group",
+                               parent_chat_id=parent_id)
+        return types.SimpleNamespace(internal=True, source=source,
+                                     metadata={"notification_category": "diagnostic"})
+
+    def test_channel_opt_in_unmutes_diagnostic_wake_reply(self):
+        from gateway.warning_notifications import diagnostic_turn_muted, diagnostic_wake_muted
+
+        assert diagnostic_wake_muted(self._wake(ALERTS), self._CFG) is False
+        assert diagnostic_wake_muted(self._wake("thread-9", parent_id=ALERTS), self._CFG) is False
+        assert diagnostic_wake_muted(self._wake(HOME), self._CFG) is True
+        meta = {"notification_category": "diagnostic"}
+        assert diagnostic_turn_muted(meta, Platform.DISCORD, self._CFG, source=self._wake(ALERTS).source) is False
+        assert diagnostic_turn_muted(meta, Platform.DISCORD, self._CFG) is True
+
+    @pytest.mark.asyncio
+    async def test_async_present_reads_channel_tier(self):
+        from gateway.warning_notifications import present_notification
+
+        sent = []
+
+        async def send():
+            sent.append(1)
+
+        assert await present_notification(send, platform="discord", user_config=self._CFG, chat_id=ALERTS) is True
+        assert await present_notification(send, platform="discord", user_config=self._CFG, chat_id=HOME) is False
+        assert sent == [1]

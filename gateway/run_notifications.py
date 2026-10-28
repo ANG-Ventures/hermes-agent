@@ -1131,7 +1131,7 @@ class GatewayNotificationsMixin:
             await present_notification(
                 lambda: self._send_home_channel_message(
                     platform, home, transport, message, "state.db warning notification failed for %s:%s: %s"),
-                platform=platform)
+                platform=platform, chat_id=home.chat_id, thread_id=getattr(home, "thread_id", None))
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
@@ -2405,7 +2405,8 @@ class GatewayNotificationsMixin:
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                         await present_notification(
                             lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
-                            platform=platform_name, diagnostic=session.exit_code not in {0, None})
+                            platform=platform_name, diagnostic=session.exit_code not in {0, None},
+                            chat_id=chat_id, thread_id=thread_id)
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers

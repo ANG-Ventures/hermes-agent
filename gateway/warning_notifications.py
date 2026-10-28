@@ -46,11 +46,12 @@ def effective_user_config() -> dict:
     return config if isinstance(config, dict) else {}
 
 
-def diagnostic_turn_muted(display_metadata, platform, user_config=None) -> bool:
+def diagnostic_turn_muted(display_metadata, platform, user_config=None, *, source=None) -> bool:
     """One admission rule for every surface: a diagnostic-category wake mutes its turn's
-    presentation only when the owning policy hides diagnostics. Human content never mutes."""
+    presentation only when the owning policy hides diagnostics. Human content never mutes.
+    ``source`` (the destination) selects the ``display.channels`` tier."""
     return ((display_metadata or {}).get("notification_category") == "diagnostic"
-            and not warning_notifications_enabled(platform, user_config))
+            and not warning_notifications_enabled(platform, user_config, **display_scope(source)))
 
 
 def diagnostic_wake_muted(event, user_config=None) -> bool:
@@ -59,7 +60,7 @@ def diagnostic_wake_muted(event, user_config=None) -> bool:
     if isinstance(snapshot, bool):
         return snapshot
     return bool(getattr(event, "internal", False)) and diagnostic_turn_muted(
-        getattr(event, "metadata", None), event.source.platform, user_config)
+        getattr(event, "metadata", None), event.source.platform, user_config, source=event.source)
 
 
 def render_notification(render, *, platform, diagnostic=True, user_config=None, source=None) -> bool:
@@ -75,13 +76,16 @@ def render_notification(render, *, platform, diagnostic=True, user_config=None, 
     return True
 
 
-async def present_notification(present, *, platform, diagnostic=True, user_config=None) -> bool:
+async def present_notification(present, *, platform, diagnostic=True, user_config=None,
+                               chat_id=None, thread_id=None, parent_id=None) -> bool:
     """Async twin of :func:`render_notification` for lifecycle emitters that await a send.
 
     Return whether the presenter ran; its own receipt/exception is the caller's to interpret.
-    The caller binds the owning profile scope BEFORE calling (watchers/shutdown fan-outs).
+    The caller binds the owning profile scope BEFORE calling (watchers/shutdown fan-outs) and names
+    the destination (``chat_id``/``thread_id``/``parent_id``) so ``display.channels`` applies.
     """
-    if diagnostic and not warning_notifications_enabled(platform, user_config):
+    if diagnostic and not warning_notifications_enabled(
+            platform, user_config, chat_id=chat_id, thread_id=thread_id, parent_id=parent_id):
         return False
     await present()
     return True

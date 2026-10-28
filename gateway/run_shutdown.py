@@ -1097,7 +1097,7 @@ class GatewayShutdownMixin:
                         ):
                             notified.add(dedup_key)
                     from gateway.warning_notifications import present_notification
-                    await present_notification(send_notice, platform=platform)
+                    await present_notification(send_notice, platform=platform, chat_id=chat_id, thread_id=thread_id)
         if notified:
             logger.info("Shutdown: delivered %d interrupted-cron-job notice(s)", len(notified))
         return len(notified)
@@ -1212,7 +1212,9 @@ class GatewayShutdownMixin:
             scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
                      if source is not None else nullcontext())
             async with scope:
-                presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key)
+                presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key,
+                                                       chat_id=chat_id, thread_id=thread_id,
+                                                       parent_id=getattr(source, "parent_chat_id", None))
             if not presented:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
         if self._restart_requested and restart_source is not None:
@@ -1261,7 +1263,7 @@ class GatewayShutdownMixin:
             # present_notification reads the ACTIVE profile's display settings: bind the served one's.
             profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
             async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
-                await present_notification(_send_home, platform=platform)
+                await present_notification(_send_home, platform=platform, chat_id=home.chat_id, thread_id=home.thread_id)
 
     # Agent finalization / resource cleanup
     @staticmethod
