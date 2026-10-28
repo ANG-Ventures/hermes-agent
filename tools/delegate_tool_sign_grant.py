@@ -120,6 +120,12 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
     if len(boards) != 1:
         raise SignGrantError(f"sign_grant cards span boards {sorted(boards)}; one grant covers one board")
     board = boards.pop()
+    # The model the parent's delegating call was DISPATCHED on (stamped at the dispatch edge, the
+    # source revoke_on_model_drift reads), not agent.model: middleware can send another model
+    # without changing it (Prism c37b9eed0ae3). Unknown means unbindable: refuse.
+    parent_model = str(getattr(parent_agent, "_dispatched_model", "") or "")
+    if not parent_model:
+        raise SignGrantError("the parent's dispatched model is unknown; a grant binds the model that ran the delegation")
     child_sid = str(getattr(child, "session_id", "") or "")
     parent_sid = str(getattr(parent_agent, "session_id", "") or "")
     profiles = {current_profile_name("default") or "default", by}
@@ -129,7 +135,7 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
                 conn, cards=cards, verbs=spec.get("verbs") or (), by=by,
                 child_session_ref=kb.derive_session_ref(child_sid) or "",
                 parent_session_ref=kb.derive_session_ref(parent_sid),
-                parent_model=str(getattr(parent_agent, "model", "") or ""),
+                parent_model=parent_model,
                 child_model=str(getattr(child, "model", "") or ""),
                 child_id=getattr(child, "_subagent_id", None),
                 expires_in_min=spec.get("expires_in_min"),

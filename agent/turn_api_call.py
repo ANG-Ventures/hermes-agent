@@ -114,6 +114,9 @@ def perform_api_call(
         _sent_model = next_api_kwargs.get("model") if isinstance(next_api_kwargs, dict) else None
         if isinstance(_sent_model, str) and _sent_model:
             _call_route["model"] = _sent_model
+        # The model this call is actually sent on (middleware may differ from agent.model): a
+        # delegation this response produces mints its sign grant against it (Prism c37b9eed0ae3).
+        agent._dispatched_model = _call_route["model"]
         if "_held_sign_grants" in getattr(agent, "__dict__", {}):
             # A signing grant is bound to the model it was minted for: any call on another model
             # revokes it first (t_19c567a8, Prism 6b322f502e4d).

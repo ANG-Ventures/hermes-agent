@@ -193,6 +193,19 @@ def replay_into(
                 if dupe:
                     result.comments_already_present += 1
                     continue
+                if has_grant_col and grant_id and (ksg.parse_granted_author(author) or (None, None))[1] == grant_id:
+                    # The same comment restored earlier into a pre-migration board: its author marker
+                    # carries this grant id but its grant_id column is NULL. Backfill it instead of
+                    # inserting a second copy (Prism 39c9e9e4455a).
+                    backfilled = conn.execute(
+                        "UPDATE task_comments SET grant_id = ? WHERE id = (SELECT id FROM task_comments "
+                        "WHERE task_id = ? AND author = ? AND body = ? AND created_at = ? AND grant_id IS NULL "
+                        "ORDER BY id LIMIT 1)",
+                        (grant_id, task_id, author, body, created),
+                    ).rowcount
+                    if backfilled:
+                        result.comments_already_present += 1
+                        continue
                 # grant_id survives the restore into a migrated board; into a
                 # pre-migration board the marked author still carries the grant id.
                 cols = ["task_id", "author", "body", "run_id", "session_ref", "created_at"]
