@@ -13,7 +13,7 @@ expiring piece of its signing authority instead of its identity:
 * one ``sign_grants`` row per card, on the board holding the cards, carrying the
   verbs, the expiry, the child's session fingerprint and the PRs the grant may
   never cover (the parent run's own PRs);
-* a granted comment is stored as ``by (subagent) [grant:<id>]`` (:func:`granted_author`)
+* a granted comment is stored as ``[grant:<id>] by (subagent)`` (:func:`granted_author`)
   with ``task_comments.grant_id`` set, after :func:`validate_comment` passed inside
   the insert's transaction, so no reader that trusts an author label honours it;
 * the ONE promotion is :func:`operator_rows_with_live_grants`: a reader meant to
@@ -75,17 +75,21 @@ def _norm_model(model: Optional[str]) -> str:
     return normalize_model_name(str(model or "").strip()).lower()
 
 
-#: ``<by> (subagent) [grant:<id>]``: how a granted comment is STORED. The `` (subagent)`` marker makes
-#: every label-trusting reader (this repo's and hermes-home's) treat it as a child's comment; only
-#: :func:`operator_rows_with_live_grants` promotes it back to ``by``, and only while the grant is live.
-_GRANTED_AUTHOR_RE = re.compile(r"^(?P<by>.+?) \(subagent\) \[grant:(?P<gid>g-[0-9a-f]{16})\]$")
+#: ``[grant:<id>] <by> (subagent)``: how a granted comment is STORED. The grant marker is a PREFIX, so
+#: the label never starts with an operator scheme: a suffix left ``human:apollo (subagent) [grant:..]``
+#: inside the ``human:`` namespace that ``is_operator_label`` and the close-on ``gate_setter`` trust by
+#: ``startswith`` (Prism 779afdc7e72e). The `` (subagent)`` suffix stays, so readers keyed on it still
+#: see a child's comment. Only :func:`operator_rows_with_live_grants` promotes it back to ``by``, and
+#: only while the grant is live.
+_GRANTED_AUTHOR_RE = re.compile(r"^\[grant:(?P<gid>g-[0-9a-f]{16})\] (?P<by>.+?) \(subagent\)$")
+_GRANTED_AUTHOR_LIKE = "[grant:g-%] % (subagent)"
 
 
 def granted_author(by: str, grant_id: str) -> str:
     """The stored author of a comment ``by`` signed under ``grant_id``."""
     from hermes_cli.kanban_db import SUBAGENT_AUTHOR_MARKER
 
-    return f"{str(by).strip()}{SUBAGENT_AUTHOR_MARKER} [grant:{grant_id}]"
+    return f"[grant:{grant_id}] {str(by).strip()}{SUBAGENT_AUTHOR_MARKER}"
 
 
 def parse_granted_author(author: Optional[str]) -> Optional[tuple]:
@@ -116,7 +120,7 @@ def operator_rows_with_live_grants(conn: sqlite3.Connection, task_id: str, *,
     sel = "id, author, body, run_id, session_ref, created_at" + (", grant_id" if "grant_id" in cols else "")
     out = []
     for r in conn.execute(f"SELECT {sel} FROM task_comments WHERE task_id = ? AND author LIKE ? ORDER BY id",
-                          (task_id, "% (subagent) [grant:g-%]")):
+                          (task_id, _GRANTED_AUTHOR_LIKE)):
         parsed = parse_granted_author(r["author"])
         if parsed is None:
             continue
@@ -312,8 +316,13 @@ def body_verbs(body: str) -> set:
 
 
 def body_pr_keys(body: str) -> set:
-    """PRs a coverage record in the body names (its ``pr`` field)."""
-    return _pr_keys(str(rec.get("pr") or "") for rec in _coverage_verdicts(body))
+    """PRs the body's release authority could reach: a coverage record's ``pr`` and ``close_on``
+    fields, and every ``close-on:`` line. A standalone release line naming the parent's own PR
+    (recorded on another card) is an own-PR release too (Prism 6bfefb466a37)."""
+    recs = _coverage_verdicts(body)
+    texts = [str(rec.get(f) or "") for rec in recs for f in ("pr", "close_on")]
+    texts += [line for line in str(body or "").splitlines() if _CLOSE_ON_RE.search(line)]
+    return _pr_keys(texts)
 
 
 def validate_comment(

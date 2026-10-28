@@ -1,7 +1,7 @@
 """Scoped board-signing grants for same-model delegate children (t_19c567a8).
 
 Contract: a granted comment from a delegate child is stored under the grant-marked author
-``<by> (subagent) [grant:<id>]`` with ``task_comments.grant_id`` set (only
+``[grant:<id>] <by> (subagent)`` with ``task_comments.grant_id`` set (only
 ``operator_rows_with_live_grants`` promotes it back to ``by``), and ONLY inside the grant (card, verb, session, expiry,
 kill switch, never a PR the parent profile's runs authored); every refusal writes nothing.
 """
@@ -70,7 +70,7 @@ def _rows(card):
 
 
 def _marked(g):
-    return f"apollo (subagent) [grant:{g['grant_id']}]"
+    return f"[grant:{g['grant_id']}] apollo (subagent)"
 
 
 def test_in_scope_granted_approve_lands_grant_marked_with_grant_id(board):
@@ -360,3 +360,40 @@ def test_a_granted_coverage_record_never_defines_the_seen_head(board):
             ev = conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
                               (a, "changes_requested", json.dumps({"after_comment_id": top}), 2)).lastrowid
         assert nh.seen_head(conn, a, ev) == "a" * 40
+
+
+def test_a_human_scheme_grant_never_stores_an_operator_label(board):
+    """Prism 779afdc7e72e: a `human:` by stays out of the `human:` namespace once stored, so the
+    startswith("human:") readers (is_operator_label, the close-on gate_setter) honour nothing; the
+    one promotion restores the full `by`."""
+    from hermes_cli import kanban_close_on_guard as guard
+    from hermes_cli.kanban_identity import is_operator_label
+
+    _home, a, _b = board
+    g = _mint(a, by="human:apollo")
+    _child_comment(a, _approve(), g["grant_id"], author="human:apollo")
+    (stored,) = [r["author"] for r in _rows(a)]
+    assert not stored.lower().startswith("human:")
+    assert not is_operator_label(stored)
+    from types import SimpleNamespace as NS
+
+    setter = guard.gate_setter_from(NS(is_ours=lambda a: False, is_machine=lambda b: False),
+                                    NS(is_operator=lambda a: False))
+    assert setter("human:apollo", "x") and not setter(stored, _approve())
+    with kb.connect_closing() as conn:
+        assert [r["author"] for r in ksg.operator_rows_with_live_grants(conn, a)] == ["human:apollo"]
+
+
+def test_a_release_line_naming_an_own_pr_is_refused(board):
+    """Prism 6bfefb466a37: the parent's PR is recorded on card A; a release grant on unrelated card B
+    must not release it through a standalone close-on line."""
+    _home, a, b = board
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",
+                     (a, "default", "done", 1, json.dumps({"pr_url": "https://github.com/acme/repo/pull/7"})))
+    g = _mint(b, verbs=["verdict", "release"])
+    with pytest.raises(ksg.GrantRefused, match="authored"):
+        _child_comment(b, "close-on: https://github.com/acme/repo/pull/7", g["grant_id"])
+    assert _rows(b) == []
+    _child_comment(b, "close-on: https://github.com/acme/repo/pull/8", g["grant_id"])
+    assert len(_rows(b)) == 1

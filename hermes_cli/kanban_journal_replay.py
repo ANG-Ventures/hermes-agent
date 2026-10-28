@@ -171,7 +171,7 @@ def replay_into(
                     continue
                 grant_id = payload.get("grant_id")
                 # A granted comment is journaled under its grant-marked author
-                # (``by (subagent) [grant:<id>]``) and replay keeps it, so a restore
+                # (``[grant:<id>] by (subagent)``) and replay keeps it, so a restore
                 # never turns it into a plain operator comment, column or no column
                 # (Apollo r8 ruling). A line carrying a grant_id under an unmarked
                 # author is marked the same way here.

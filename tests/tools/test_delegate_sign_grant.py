@@ -330,3 +330,22 @@ def test_a_failed_multi_child_mint_revokes_what_it_minted(board, monkeypatch, wh
         live = conn.execute("SELECT COUNT(*) FROM sign_grants WHERE revoked_at IS NULL").fetchone()[0]
         total = conn.execute("SELECT COUNT(*) FROM sign_grants").fetchone()[0]
     assert total >= 1 and live == 0
+
+
+@pytest.mark.parametrize("profile,token,minted", [("daedalus", False, False), ("default", False, True),
+                                                   ("daedalus", True, True)])
+def test_only_the_sessions_own_identity_may_be_granted(board, monkeypatch, profile, token, minted):
+    """Prism 08a8789d8e59: operator_label_proven passes for every profile the multiplexer serves (it
+    is process-scoped, and the stub here stands in for that), so a depth-0 daedalus session must not
+    mint apollo authority. The session's own profile decides; only the operator token speaks for another."""
+    monkeypatch.setattr("hermes_cli.profiles.current_profile_name", lambda default=None: profile)
+    monkeypatch.setattr(kb, "_operator_token_state", lambda: "ok" if token else "absent")
+    parent, child = _agents()
+    task = _task(board)
+    if minted:
+        assert dsg.mint_for_child(task, child, parent)["by"] == "apollo"
+        return
+    with pytest.raises(dsg.SignGrantError, match="daedalus"):
+        dsg.mint_for_child(task, child, parent)
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT count(*) FROM sign_grants").fetchone()[0] == 0

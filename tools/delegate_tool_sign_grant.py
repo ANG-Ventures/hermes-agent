@@ -51,8 +51,30 @@ def _caller_may_grant(by: str) -> None:
         raise SignGrantError("a dispatched kanban worker cannot mint a signing grant")
     if not is_operator_label(by):
         raise SignGrantError(f"sign_grant.by {by!r} is not an operator identity")
+    # operator_label_proven's gateway-ancestry arm is PROCESS-scoped: under the multiplexer every
+    # served profile's session descends from the gateway that serves default, so it would let a
+    # daedalus session mint apollo authority (Prism 08a8789d8e59). The identity a session may hand
+    # on is its OWN profile's, resolved per session; only a presented operator token speaks for any.
+    from hermes_cli import kanban_db as kb
+
+    if kb._operator_token_state() != "ok":
+        own = _session_identities()
+        if by.lower() not in own:
+            raise SignGrantError(f"sign_grant.by {by!r} is not this session's identity (profile "
+                                 f"{sorted(own)[0] if own else '?'!r}); only the operator token signs for another")
     if not operator_label_proven(by):
         raise SignGrantError(f"this process cannot prove it is {by!r} (operator token or its gateway)")
+
+
+def _session_identities() -> frozenset:
+    """Labels the CURRENT session's profile signs as: its profile name, and for the root profile
+    (Apollo runs as ``default``) both root labels. ``current_profile_name`` reads the per-session
+    HERMES_HOME override first, so a served profile answers for itself, never for the host."""
+    from hermes_cli.kanban_identity import _ROOT_PROFILE_LABELS
+    from hermes_cli.profiles import current_profile_name
+
+    own = str(current_profile_name("default") or "default").strip().lower()
+    return _ROOT_PROFILE_LABELS if own in _ROOT_PROFILE_LABELS else frozenset({own})
 
 
 def _session_inherited(task: Dict[str, Any], inherit_context: Any, inherit_mode: Any) -> bool:
