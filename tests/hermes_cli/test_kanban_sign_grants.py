@@ -211,3 +211,27 @@ def test_journal_carries_grant_id(board, monkeypatch):
     _child_comment(a, _approve(), g["grant_id"])
     bodies = [p for (_b2, _t, kind, p) in seen if kind == "comment_body"]
     assert bodies and bodies[-1]["grant_id"] == g["grant_id"]
+
+
+def _wrapped(body):
+    """The inline-code form kanban_db._review_coverage_payload also accepts."""
+    return "\n".join(f"`{ln}`" if ln.startswith("review_coverage:") else ln for ln in body.splitlines())
+
+
+def test_backtick_wrapped_coverage_is_held_to_the_grant(board):
+    """Prism 9e7e6653e13e: a backticked record is the same record to the kernel, so the grant reads it too."""
+    _home, a, b = board
+    assert ksg.body_verbs(_wrapped(_approve())) == {"approve"}
+    assert ksg.body_pr_keys(_wrapped(_approve())) == {"ang-ventures/hermes-home#9001"}
+    g = _mint(a, verbs=["verdict"])
+    with pytest.raises(ksg.GrantRefused):
+        _child_comment(a, _wrapped(_approve()), g["grant_id"])
+    assert _rows(a) == []
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",
+                     (b, "default", "done", 1,
+                      json.dumps({"pr_url": "https://github.com/ANG-Ventures/hermes-home/pull/777"})))
+    g2 = _mint(a)
+    with pytest.raises(ksg.GrantRefused, match="authored"):
+        _child_comment(a, _wrapped(_approve(pr="ANG-Ventures/hermes-home#777")), g2["grant_id"])
+    assert _rows(a) == []

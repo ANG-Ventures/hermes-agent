@@ -201,13 +201,17 @@ def get(conn: sqlite3.Connection, grant_id: str, task_id: str) -> Optional[sqlit
 
 
 def _coverage_verdicts(body: str) -> list:
+    # The kernel's one coverage parser: a record the board's readers honour (bare or
+    # backtick-wrapped) is the same record the grant is checked against (Prism 9e7e6653e13e).
+    from hermes_cli.kanban_db import _review_coverage_payload
+
     out = []
     for line in str(body or "").splitlines():
-        s = line.strip()
-        if not s.startswith("review_coverage:"):
+        payload = _review_coverage_payload(line)
+        if payload is None:
             continue
         try:
-            rec = json.loads(s.split(":", 1)[1].strip())
+            rec = json.loads(payload)
         except ValueError:
             rec = None
         out.append(rec if isinstance(rec, dict) else {})
