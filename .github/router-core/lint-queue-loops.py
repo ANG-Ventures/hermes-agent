@@ -170,18 +170,11 @@ def _reraises(st) -> bool:
         for h in st.handlers)
 
 
-def _plain_with(st) -> bool:
-    """A with / async with whose EVERY context manager is a bare name or attribute (`with lk:`, `with self._lock:`).
-    A call such as `contextlib.suppress(...)` may swallow an exception and cut the body short (Prism 67a939c59339)."""
-    return isinstance(st, (ast.With, ast.AsyncWith)) and all(
-        isinstance(i.context_expr, (ast.Name, ast.Attribute)) for i in st.items)
-
-
 def _always_runs(st):
-    """The statements of a compound `st` that run every time `st` completes: a plain with / async with body
-    (_plain_with, t_f87e058c (b)), or the body, else and finally of a re-raising try (_reraises). None otherwise."""
-    if _plain_with(st):
-        return st.body
+    """The statements of a compound `st` that run every time `st` completes: the body, else and finally of a
+    re-raising try (_reraises). None otherwise. A with / async with is a guard: its context manager may suppress an
+    exception and cut the body short, and its syntax cannot prove it does not (Prism 67a939c59339, 22735492b6aa;
+    exemption dropped under the t_f87e058c third-hole rule, t_3d948a66)."""
     if _reraises(st):
         return st.body + st.orelse + st.finalbody
     return None
@@ -214,7 +207,7 @@ def _conditional_inside(node, call) -> bool:
 
 
 def _unconditional_in_loop(loop) -> bool:
-    """_route_row runs on every iteration: it is in a TOP-LEVEL simple statement of the loop body (or of a with /
+    """_route_row runs on every iteration: it is in a TOP-LEVEL simple statement of the loop body (or of a
     re-raising try body there), not under a condition, and no earlier statement can skip it (continue / break /
     return anywhere in it)."""
     return _route_first(loop.body) is True
@@ -244,10 +237,10 @@ COMPOUND = tuple(t for t in (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, 
 
 
 # compound statements whose body runs on some ticks only; a plain `if` is handled with its both-arms / plan-guard
-# exemptions, and a nested def / lambda / class is skipped by _walk_eager (Prism 84d48881bad3). A plain with body
-# always runs (a non-plain with is a guard, Prism 67a939c59339), and a re-raising try guards only its handlers
-# (_always_runs, t_f87e058c).
-GUARDS = tuple(t for t in (ast.While, ast.Try, getattr(ast, "TryStar", None), ast.For,
+# exemptions, and a nested def / lambda / class is skipped by _walk_eager (Prism 84d48881bad3). A with / async with
+# is a guard (Prism 22735492b6aa, t_3d948a66), and a re-raising try guards only its handlers (_always_runs,
+# t_f87e058c).
+GUARDS = tuple(t for t in (ast.While, ast.Try, getattr(ast, "TryStar", None), ast.With, ast.AsyncWith, ast.For,
                            ast.AsyncFor, getattr(ast, "Match", None)) if t is not None)
 
 
@@ -327,52 +320,6 @@ def _loop_routes_every_row(loop) -> bool:
     """A loop over the ready rows routes every row only if its body routes on every iteration (_block_routes).
     Prism 2e9888a37c28 (`for r in ready_rows: pass`) and 1d133dcecb68 (`if r["ok"]: row_route[...] = ...`)."""
     return _block_routes(loop.body)
-
-
-def _bindings(fn, name: str) -> int:
-    """How many times `name` is bound anywhere under `fn` (nested scopes included: conservative)."""
-    n = 0
-    for x in ast.walk(fn):
-        if x is fn:
-            continue
-        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            n += x.name == name
-        elif isinstance(x, ast.Name):
-            n += x.id == name and isinstance(x.ctx, (ast.Store, ast.Del))
-        elif isinstance(x, ast.alias):
-            n += (x.asname or x.name.split(".")[0]) == name
-        elif isinstance(x, (ast.Global, ast.Nonlocal)):
-            n += name in x.names
-        elif isinstance(x, ast.ExceptHandler):
-            n += x.name == name
-    return n
-
-
-def _called_helpers(fn, guarded: set) -> list:
-    """Eager nodes of each nested def in `fn` that `fn` calls with no arguments, unconditionally: the call is in
-    eager code, not under a guard, an IfExp / BoolOp or a comprehension. Only the helper's statements up to the
-    first one that can return or raise count (the code after it may not run)."""
-    # Prism 75ebb57d741f: calling an async def or a generator runs none of its body, and a name bound more than
-    # once in fn (assign, loop target, walrus, with-as, import, global/nonlocal, except-as, another def) may no
-    # longer be the def at the call
-    # Prism a8f5e5d182f8: _walk_eager yields its root, so a nested def / class / lambda statement in the helper
-    # body is skipped before the walk (its body runs only if called)
-    def eager(body):
-        return [b for b in body if not isinstance(b, DEFERRED)
-                and not (isinstance(b, ast.Expr) and isinstance(b.value, ast.Lambda))]
-    defs = {st.name: st for st in fn.body if isinstance(st, ast.FunctionDef)
-            and _bindings(fn, st.name) == 1
-            and not any(isinstance(x, (ast.Yield, ast.YieldFrom)) for b in eager(st.body) for x in _walk_eager(b))}
-    out = []
-    for c in _walk_eager(fn):
-        if (isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in defs and not c.args
-                and not c.keywords and id(c) not in guarded and not _conditional_inside(fn, c)):
-            d = defs.pop(c.func.id)
-            for st in eager(d.body):
-                out += list(_walk_eager(st))
-                if any(isinstance(n, (ast.Return, ast.Raise)) for n in _walk_eager(st)):
-                    break
-    return out
 
 
 def check_dispatcher(root: Path) -> list[str]:
@@ -473,8 +420,7 @@ def check_dispatcher(root: Path) -> list[str]:
             for inner in ast.walk(st):
                 if inner is not st:
                     guarded.add(id(inner))
-        elif ((isinstance(st, GUARDS) or (isinstance(st, (ast.With, ast.AsyncWith)) and not _plain_with(st)))
-              and not _match_routes_every_case(st)):
+        elif isinstance(st, GUARDS) and not _match_routes_every_case(st):
             # a loop over anything but the ready rows may run 0 times, a for/while else clause, an except /
             # except* handler and a match case run only on some ticks (Prism 84d48881bad3). A for's iterable and
             # a match subject are evaluated every time the statement runs, so they are not under its guard.
@@ -488,10 +434,10 @@ def check_dispatcher(root: Path) -> list[str]:
                     for inner in ast.walk(c):
                         guarded.add(id(inner))
     # D1: _route_row presented for every ready row (eager code only: a comprehension inside a nested def or
-    # lambda runs only if something calls it, so a helper def counts only where the function calls it
-    # unconditionally, `x = helper()` at an unguarded spot: t_f87e058c X5)
+    # lambda runs only if something calls it, and a called helper is not credited: nothing proves it routes the
+    # same ready_rows binding, Prism fad33a0d9cd4, t_3d948a66)
     d1 = False
-    for n in [*_walk_eager(fn), *_called_helpers(fn, guarded)]:
+    for n in _walk_eager(fn):
         if isinstance(n, (ast.DictComp, ast.ListComp, ast.SetComp, ast.GeneratorExp)):
             calls = _route_calls(n)
             gens = n.generators
@@ -807,7 +753,7 @@ DISPATCH_ROUTE_IN_FOR_ITER = DISPATCH_OK.replace(_COMP, (
     '    row_route = {}\n    for rid, rt in [(r["id"], _route_row(conn, r)) for r in ready_rows]:\n'
     '        row_route[rid] = rt\n'), 1)
 # t_f87e058c: pre-existing strictness shapes. (a) a try whose every handler ends in a bare `raise` aborts the tick
-# on failure, so routing in its body is not skipped while the spawn loop runs; (b) a with body always runs
+# on failure, so routing in its body is not skipped while the spawn loop runs; (b) a with is a guard (t_3d948a66)
 _TRY_BODY_FOR = _ROUTE_FOR.replace('        ', '            ')
 DISPATCH_TRY_RERAISE_FOR = DISPATCH_OK.replace(_COMP, (
     '    row_route = {}\n    try:\n') + _TRY_BODY_FOR + '    except Exception:\n        log()\n        raise\n', 1)
@@ -820,8 +766,6 @@ DISPATCH_TRY_RERAISE_ONE_HANDLER_SWALLOWS = DISPATCH_TRY_RERAISE_FOR.replace(
 DISPATCH_TRY_RAISE_OTHER = DISPATCH_TRY_RERAISE_FOR.replace("        raise\n", "        raise RuntimeError()\n", 1)
 DISPATCH_WITH_FOR = DISPATCH_OK.replace(_COMP, '    row_route = {}\n    with lk:\n' + _ROUTE_FOR, 1)
 DISPATCH_WITH_COMP = DISPATCH_OK.replace(_COMP, '    with lk:\n    ' + _COMP, 1)
-DISPATCH_WITH_IF_FOR = DISPATCH_OK.replace(_COMP, (
-    '    row_route = {}\n    with lk:\n        if cond:\n') + _TRY_BODY_FOR, 1)
 DISPATCH_ELSE_LOOP_WITH_ROUTE = DISPATCH_OK.replace(_COMP, _PLANNED + _ELSE_LOOP + (
     '            with lk:\n                row_route[r["id"]] = ("wait", "pool_unavailable")\n'), 1)
 DISPATCH_LOOP_WITH_ROUTE = DISPATCH_OK.replace(_COMP, (
@@ -837,7 +781,7 @@ DISPATCH_IF_ARM_WITH_COMP = DISPATCH_OK.replace(_COMP, (
     '    if planned:\n        with lk:\n            row_route = {r["id"]: _route_row(conn, r) for r in ready_rows}\n'
     + _ELSE_ROUTE_CALL), 1)
 # (c) X3: an inner loop's else clause runs in the routing loop's iteration, so its break ends the routing loop;
-# X4: a raise after the route ends the routing loop; X5: a helper def'd then called unconditionally routes
+# X4: a raise after the route ends the routing loop; a helper def'd then called is not credited (t_3d948a66)
 DISPATCH_LOOP_ROUTE_INNER_ELSE_BREAK = DISPATCH_OK.replace(_COMP, (
     '    row_route = {}\n    for r in ready_rows:\n        row_route[r["id"]] = _route_row(conn, r)\n'
     '        for d in r["deps"]:\n            pass\n        else:\n            break\n'), 1)
@@ -861,10 +805,6 @@ DISPATCH_ELSE_CAUGHT_RAISE_THEN_ROUTE = DISPATCH_BOTH_ARMS.replace(
     + _ELSE_ROUTE, 1)
 DISPATCH_HELPER_CALLED = DISPATCH_HELPER_UNDER_IF.replace('    if cond:\n        row_route = _route_all()\n',
                                                           '    row_route = _route_all()\n', 1)
-DISPATCH_HELPER_CALLED_IFEXP = DISPATCH_HELPER_UNDER_IF.replace('    if cond:\n        row_route = _route_all()\n',
-                                                                '    row_route = _route_all() if cond else {}\n', 1)
-DISPATCH_HELPER_EARLY_RETURN = DISPATCH_HELPER_CALLED.replace(
-    '    def _route_all():\n', '    def _route_all():\n        if cond:\n            return {}\n', 1)
 # (d) Na2: a plan-guard body if/else where only ONE arm passes the plan (the other routes without it); M12r: the
 # plan reaches _route_row only in an uncalled nested def in the guard body
 DISPATCH_PLAN_GUARD_NESTED_IF_ELSE_NO_PLAN_ARM = DISPATCH_PLAN_GUARD_NESTED_IF_ELSE.replace(
@@ -873,24 +813,12 @@ DISPATCH_PLAN_GUARD_PLAN_ONLY_IN_DEF = DISPATCH_PLAN_GUARD_NOT_AN_ARG.replace(
     '        row_route = {r["id"]: _route_row(conn, r) for r in ready_rows}\n',
     '        def later():\n            return {r["id"]: _route_row(conn, r, plan) for r in ready_rows}\n'
     '        row_route = {r["id"]: _route_row(conn, r) for r in ready_rows}\n', 1)
-# Prism 67a939c59339: a with whose manager is a call (contextlib.suppress) may swallow an error mid-routing
-DISPATCH_WITH_SUPPRESS_FOR = DISPATCH_WITH_FOR.replace("    with lk:\n", "    with contextlib.suppress(Exception):\n", 1)
-DISPATCH_WITH_SUPPRESS_COMP = DISPATCH_WITH_COMP.replace("    with lk:\n", "    with suppress(Exception):\n", 1)
-DISPATCH_WITH_LK_SUPPRESS_FOR = DISPATCH_WITH_FOR.replace("    with lk:\n", "    with lk, suppress(Exception):\n", 1)
-DISPATCH_LOOP_WITH_SUPPRESS_ROUTE = DISPATCH_LOOP_WITH_ROUTE.replace("        with lk:\n",
-                                                                     "        with suppress(Exception):\n", 1)
-# Prism 75ebb57d741f: calling an async def / generator runs none of its body; a rebound name is not the def
-DISPATCH_HELPER_ASYNC = DISPATCH_HELPER_CALLED.replace("    def _route_all():\n", "    async def _route_all():\n", 1)
-DISPATCH_HELPER_YIELD = DISPATCH_HELPER_CALLED.replace("        return {r[\"id\"]", "        yield {r[\"id\"]", 1)
-_HELPER_CALL = "    row_route = _route_all()\n"
-DISPATCH_HELPER_REBOUND_LAMBDA = DISPATCH_HELPER_CALLED.replace(_HELPER_CALL, "    _route_all = lambda: {}\n" + _HELPER_CALL, 1)
-DISPATCH_HELPER_REBOUND_NAME = DISPATCH_HELPER_CALLED.replace(_HELPER_CALL, "    _route_all = noop\n" + _HELPER_CALL, 1)
-DISPATCH_HELPER_REBOUND_FOR = DISPATCH_HELPER_CALLED.replace(
-    _HELPER_CALL, "    for _route_all in hooks:\n        pass\n" + _HELPER_CALL, 1)
-DISPATCH_HELPER_REBOUND_IMPORT = DISPATCH_HELPER_CALLED.replace(
-    _HELPER_CALL, "    from x import noop as _route_all\n" + _HELPER_CALL, 1)
-DISPATCH_HELPER_REBOUND_WALRUS = DISPATCH_HELPER_CALLED.replace(
-    _HELPER_CALL, "    if (_route_all := noop):\n        pass\n" + _HELPER_CALL, 1)
+# Prism 22735492b6aa: a plain name can still be a suppressor; Prism fad33a0d9cd4: the helper's `ready_rows` is its
+# own (empty) parameter, not the dispatcher's queue
+DISPATCH_WITH_BOUND_SUPPRESS_FOR = DISPATCH_WITH_FOR.replace(
+    "    with lk:\n", "    lk = contextlib.suppress(Exception)\n    with lk:\n", 1)
+DISPATCH_HELPER_SHADOWS_READY = DISPATCH_HELPER_CALLED.replace(
+    "    def _route_all():\n", "    def _route_all(ready_rows=()):\n", 1)
 # Prism 34a70a667291: a finally that continues / returns discards the handlers' re-raise, so the tick goes on
 DISPATCH_LOOP_TRY_RERAISE_FINALLY_CONTINUE = DISPATCH_LOOP_TRY_RERAISE_ROUTE.replace(
     '        except Exception:\n            raise\n',
@@ -899,10 +827,6 @@ DISPATCH_TRY_RERAISE_FINALLY_RETURN = DISPATCH_TRY_RERAISE_FOR.replace(
     "        raise\n", "        raise\n    finally:\n        return\n", 1)
 DISPATCH_TRY_RERAISE_FINALLY_LOG = DISPATCH_TRY_RERAISE_FOR.replace(
     "        raise\n", "        raise\n    finally:\n        log()\n", 1)
-# Prism a8f5e5d182f8: a nested def in the called helper's body routes nothing unless something calls it
-DISPATCH_HELPER_NESTED_DEF_ONLY = DISPATCH_HELPER_CALLED.replace(
-    '        return {r["id"]: _route_row(conn, r) for r in ready_rows}\n',
-    '        def later():\n            return {r["id"]: _route_row(conn, r) for r in ready_rows}\n        return {}\n', 1)
 POOL_OK = '''#!/usr/bin/env bash
 while true; do
   i=1
@@ -1084,22 +1008,20 @@ def selftest() -> int:
          {D: DISPATCH_TRY_RERAISE_ONE_HANDLER_SWALLOWS}, ["dispatcher"], 1),
         ("dispatcher: try body routes, handler raises a NEW exception (not bare raise), is RED (t_f87e058c a)",
          {D: DISPATCH_TRY_RAISE_OTHER}, ["dispatcher"], 1),
-        ("dispatcher: routing for-loop under `with lk:` is GREEN (t_f87e058c b, probe3 S1)",
-         {D: DISPATCH_WITH_FOR}, ["dispatcher"], 0),
-        ("dispatcher: routing comprehension under `with lk:` is GREEN (t_f87e058c b, probe3 G6)",
-         {D: DISPATCH_WITH_COMP}, ["dispatcher"], 0),
-        ("dispatcher: `with lk:` holding `if cond:` around the routing loop is RED (t_f87e058c b)",
-         {D: DISPATCH_WITH_IF_FOR}, ["dispatcher"], 1),
-        ("dispatcher: else-arm loop routing inside `with lk:` is GREEN (t_f87e058c b)",
-         {D: DISPATCH_ELSE_LOOP_WITH_ROUTE}, ["dispatcher"], 0),
-        ("dispatcher: _route_row in a `with lk:` inside the routing loop is GREEN (t_f87e058c b)",
-         {D: DISPATCH_LOOP_WITH_ROUTE}, ["dispatcher"], 0),
+        ("dispatcher: routing for-loop under `with lk:` is RED (with is a guard, t_3d948a66)",
+         {D: DISPATCH_WITH_FOR}, ["dispatcher"], 1),
+        ("dispatcher: routing comprehension under `with lk:` is RED (with is a guard, t_3d948a66)",
+         {D: DISPATCH_WITH_COMP}, ["dispatcher"], 1),
+        ("dispatcher: else-arm loop routing inside `with lk:` is RED (with is a guard, t_3d948a66)",
+         {D: DISPATCH_ELSE_LOOP_WITH_ROUTE}, ["dispatcher"], 1),
+        ("dispatcher: _route_row in a `with lk:` inside the routing loop is RED (with is a guard, t_3d948a66)",
+         {D: DISPATCH_LOOP_WITH_ROUTE}, ["dispatcher"], 1),
         ("dispatcher: _route_row in a re-raising try inside the routing loop is GREEN (t_f87e058c a)",
          {D: DISPATCH_LOOP_TRY_RERAISE_ROUTE}, ["dispatcher"], 0),
         ("dispatcher: routing loop try whose handler may `continue` before the raise is RED (t_f87e058c a)",
          {D: DISPATCH_LOOP_TRY_CONTINUE_THEN_RAISE}, ["dispatcher"], 1),
-        ("dispatcher: if arm routing under `with lk:`, else routes, is GREEN (t_f87e058c b)",
-         {D: DISPATCH_IF_ARM_WITH_COMP}, ["dispatcher"], 0),
+        ("dispatcher: if arm routing under `with lk:`, else routes, is RED (with is a guard, t_3d948a66)",
+         {D: DISPATCH_IF_ARM_WITH_COMP}, ["dispatcher"], 1),
         ("dispatcher: routing loop, then an inner loop whose else clause breaks, is RED (t_f87e058c X3)",
          {D: DISPATCH_LOOP_ROUTE_INNER_ELSE_BREAK}, ["dispatcher"], 1),
         ("dispatcher: routing loop routes then `raise` is RED (t_f87e058c X4)",
@@ -1118,46 +1040,22 @@ def selftest() -> int:
          {D: DISPATCH_ELSE_RERAISE_TRY_THEN_ROUTE}, ["dispatcher"], 0),
         ("dispatcher: else-arm loop, a raise caught by its own try before the route, is GREEN (t_f87e058c X4)",
          {D: DISPATCH_ELSE_CAUGHT_RAISE_THEN_ROUTE}, ["dispatcher"], 0),
-        ("dispatcher: routing helper def'd then called unconditionally is GREEN (t_f87e058c X5)",
-         {D: DISPATCH_HELPER_CALLED}, ["dispatcher"], 0),
-        ("dispatcher: routing helper called only behind an IfExp is RED (t_f87e058c X5)",
-         {D: DISPATCH_HELPER_CALLED_IFEXP}, ["dispatcher"], 1),
-        ("dispatcher: called routing helper that may return before routing is RED (t_f87e058c X5)",
-         {D: DISPATCH_HELPER_EARLY_RETURN}, ["dispatcher"], 1),
+        ("dispatcher: routing helper def'd then called unconditionally is RED (helper not credited, t_3d948a66)",
+         {D: DISPATCH_HELPER_CALLED}, ["dispatcher"], 1),
+        ("dispatcher: routing loop under `with lk:` where lk = contextlib.suppress(...) is RED (Prism 22735492b6aa)",
+         {D: DISPATCH_WITH_BOUND_SUPPRESS_FOR}, ["dispatcher"], 1),
+        ("dispatcher: called helper whose ready_rows is its own `=()` parameter is RED (Prism fad33a0d9cd4)",
+         {D: DISPATCH_HELPER_SHADOWS_READY}, ["dispatcher"], 1),
         ("dispatcher: plan guard body if/else where one arm routes WITHOUT the plan is RED (t_f87e058c Na2)",
          {D: DISPATCH_PLAN_GUARD_NESTED_IF_ELSE_NO_PLAN_ARM}, ["dispatcher"], 1),
         ("dispatcher: plan guard where the plan reaches _route_row only in an uncalled def is RED (t_f87e058c M12r)",
          {D: DISPATCH_PLAN_GUARD_PLAN_ONLY_IN_DEF}, ["dispatcher"], 1),
-        ("dispatcher: routing for-loop under `with contextlib.suppress(Exception):` is RED (Prism 67a939c59339)",
-         {D: DISPATCH_WITH_SUPPRESS_FOR}, ["dispatcher"], 1),
-        ("dispatcher: routing comprehension under `with suppress(Exception):` is RED (Prism 67a939c59339)",
-         {D: DISPATCH_WITH_SUPPRESS_COMP}, ["dispatcher"], 1),
-        ("dispatcher: routing loop under `with lk, suppress(Exception):` is RED (Prism 67a939c59339)",
-         {D: DISPATCH_WITH_LK_SUPPRESS_FOR}, ["dispatcher"], 1),
-        ("dispatcher: _route_row in a `with suppress(Exception):` inside the routing loop is RED (Prism 67a939c59339)",
-         {D: DISPATCH_LOOP_WITH_SUPPRESS_ROUTE}, ["dispatcher"], 1),
-        ("dispatcher: called routing helper that is an async def is RED (Prism 75ebb57d741f)",
-         {D: DISPATCH_HELPER_ASYNC}, ["dispatcher"], 1),
-        ("dispatcher: called routing helper that yields is RED (Prism 75ebb57d741f)",
-         {D: DISPATCH_HELPER_YIELD}, ["dispatcher"], 1),
-        ("dispatcher: helper rebound to a lambda before the call is RED (Prism 75ebb57d741f)",
-         {D: DISPATCH_HELPER_REBOUND_LAMBDA}, ["dispatcher"], 1),
-        ("dispatcher: helper rebound to another name before the call is RED (Prism 75ebb57d741f)",
-         {D: DISPATCH_HELPER_REBOUND_NAME}, ["dispatcher"], 1),
-        ("dispatcher: helper rebound as a for target before the call is RED (Prism 75ebb57d741f)",
-         {D: DISPATCH_HELPER_REBOUND_FOR}, ["dispatcher"], 1),
-        ("dispatcher: helper rebound by an import alias before the call is RED (Prism 75ebb57d741f)",
-         {D: DISPATCH_HELPER_REBOUND_IMPORT}, ["dispatcher"], 1),
-        ("dispatcher: helper rebound by a walrus before the call is RED (Prism 75ebb57d741f)",
-         {D: DISPATCH_HELPER_REBOUND_WALRUS}, ["dispatcher"], 1),
         ("dispatcher: routing loop re-raising try whose `finally: continue` is RED (Prism 34a70a667291)",
          {D: DISPATCH_LOOP_TRY_RERAISE_FINALLY_CONTINUE}, ["dispatcher"], 1),
         ("dispatcher: try body routes, re-raising handler, `finally: return` is RED (Prism 34a70a667291)",
          {D: DISPATCH_TRY_RERAISE_FINALLY_RETURN}, ["dispatcher"], 1),
         ("dispatcher: try body routes, re-raising handler, `finally: log()` is GREEN (Prism 34a70a667291)",
          {D: DISPATCH_TRY_RERAISE_FINALLY_LOG}, ["dispatcher"], 0),
-        ("dispatcher: called helper that only defines a routing def and returns {} is RED (Prism a8f5e5d182f8)",
-         {D: DISPATCH_HELPER_NESTED_DEF_ONLY}, ["dispatcher"], 1),
         ("dispatcher: no _route_row over ready_rows is RED", {D: DISPATCH_NO_ROUTE}, ["dispatcher"], 1),
         ("dispatcher: _route_row under `if` in a for loop is RED", {D: DISPATCH_COND_ROUTE}, ["dispatcher"], 1),
         ("dispatcher: unconditional _route_row in a for loop is GREEN", {D: DISPATCH_LOOP_ROUTE}, ["dispatcher"], 0),
