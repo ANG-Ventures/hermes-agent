@@ -3891,7 +3891,9 @@ class BasePlatformAdapter(ABC):
     def warning_notifications_enabled(self, logical_platform=None, *, chat_id=None, metadata=None) -> bool:
         """Presentation policy under the caller's owning profile; old plugins inherit it."""
         from gateway.warning_notifications import warning_notifications_enabled
-        return warning_notifications_enabled(logical_platform or self.platform)
+        return warning_notifications_enabled(
+            logical_platform or self.platform, chat_id=chat_id,
+            thread_id=(metadata or {}).get("thread_id") if isinstance(metadata, dict) else None)
 
     def prepare_tts_text(self, text: str) -> str:
         """Chat Markdown -> transcript-like spoken script (reasoning blocks removed,
