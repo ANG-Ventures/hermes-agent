@@ -14,6 +14,11 @@ private 1:1 (no sender attribution, DM gating), which misdescribes the room to t
 that drops back to 2 members folds back the same way; there is only ever one live route, so the
 pair cannot loop.
 
+With ``group_sessions_per_user`` true the group routes are per member, and all of them map onto the
+one per-room dm key. A group -> dm fold therefore takes only the DM counterpart's own route (the
+sender); other members' rows are kept, unused while the room is a DM, and they resume if the member
+rejoins. dm -> group needs no filter: the dm route maps onto the sender's per-user key only.
+
 The same fold retires per-user group rows once ``matrix.group_sessions_per_user`` is false (one
 shared conversation per room): at load when that is conflict-free, else on the room's next message.
 Mixin split out of ``gateway/session.py``; bound onto ``SessionStore`` via the MRO.
@@ -45,6 +50,15 @@ def _matrix_ids(tail: str) -> list:
         else:
             ids[-1] += ":" + token
     return ids
+
+
+def _route_user(key: str, entry: Optional["SessionEntry"]) -> str:
+    """The member a route belongs to: the ``@user`` in its key, else its origin's sender."""
+    user = next((i for i in _matrix_ids(key.split(":", 4)[4])[1:] if i.startswith("@")), None)
+    origin = getattr(entry, "origin", None)
+    if user is None and origin is not None:
+        user = getattr(origin, "user_id_alt", None) or getattr(origin, "user_id", None)
+    return str(user or "")
 
 
 class SessionRoomShapeMixin:
@@ -98,12 +112,22 @@ class SessionRoomShapeMixin:
             return 0
         room = _matrix_ids(parts[4])[0]
         lane = ":".join(parts[:3]) + ":"  # same namespace + platform; other profiles never fold
+        # Per-user group routes all map onto the one per-room dm key. Only the DM counterpart's
+        # own route may fold, or the newest member's private conversation becomes the DM
+        # (Prism 6d9b29e49ed6 / 2db1e68ff399 on #2406). Other members' rows stay as they are:
+        # dead while the room is a DM, and continued again if they rejoin.
+        counterpart = None
+        if parts[3] == "dm" and session_isolation_flags(self.config, Platform.MATRIX)[0]:
+            from gateway.session import _canonical_participant
+
+            counterpart = _canonical_participant(source) or ""
         with self._lock:
             self._ensure_loaded_locked()
             aliases = [
                 (key, entry) for key, entry in self._entries.items()
                 if key != session_key and key.startswith(lane) and key.count(":") >= 4
                 and _matrix_ids(key.split(":", 4)[4])[0] == room
+                and (counterpart is None or _route_user(key, entry) == counterpart)
                 and self._matrix_route_key_as(key, entry, parts[3]) == session_key
             ]
             if not aliases:

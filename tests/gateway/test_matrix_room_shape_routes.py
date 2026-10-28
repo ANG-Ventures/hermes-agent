@@ -241,3 +241,65 @@ async def test_runner_answers_a_dm_that_gains_a_member_under_one_key(tmp_path, m
     assert from_drew.session_key == from_nick.session_key == GROUP_KEY
     assert from_drew.session_id == from_nick.session_id == first.session_id
     assert {e.session_key for e in store.snapshot_entries()} == {GROUP_KEY}
+
+
+# --- per-user isolation ON: a room fold never hands one member another member's session ---------
+# Prism 6d9b29e49ed6 / 2db1e68ff399 on #2406 (card t_a6a4c21b).
+
+ALICE, BOB = NICK, DREW
+
+
+def _per_user_rows(tmp_path, backend="sqlite"):
+    now = datetime.now()
+    alice = SessionEntry(session_key=f"{GROUP_KEY}:{ALICE}", session_id="alice-group", created_at=now,
+                         updated_at=now, origin=_src("group", ALICE))
+    # Bob's row is the NEWEST: an unfiltered fold would make it the DM's primary.
+    bob = SessionEntry(session_key=f"{GROUP_KEY}:{BOB}", session_id="bob-group", created_at=now,
+                       updated_at=now + timedelta(hours=1), origin=_src("group", BOB))
+    return _seed(tmp_path, [alice, bob], backend, config=_config(True))
+
+
+@pytest.mark.parametrize("backend", ["json", "sqlite"])
+def test_group_to_dm_per_user_folds_only_the_dm_counterparts_route(tmp_path, backend):
+    store = _per_user_rows(tmp_path, backend)
+    alerts = []
+    store.on_session_key_conflict = alerts.append
+
+    # Bob left: bot + Alice, the adapter now labels the room ``dm``.
+    entry = store.get_or_create_session(_src("dm", ALICE))
+
+    assert (entry.session_key, entry.session_id) == (DM_KEY, "alice-group")
+    # Bob's private route is left in place (dead while the room is a DM), never merged.
+    assert {e.session_key: e.session_id for e in store.snapshot_entries()} == {
+        DM_KEY: "alice-group", f"{GROUP_KEY}:{BOB}": "bob-group"}
+    assert alerts == []
+    assert store.get_or_create_session(_src("dm", ALICE)).session_id == "alice-group"  # stable
+
+    # Bob rejoins: the room is a group again; each member continues their own conversation.
+    assert store.get_or_create_session(_src("group", BOB)).session_id == "bob-group"
+    back = store.get_or_create_session(_src("group", ALICE))
+    assert (back.session_key, back.session_id) == (f"{GROUP_KEY}:{ALICE}", "alice-group")
+    assert {e.session_key: e.session_id for e in store.snapshot_entries()} == {
+        f"{GROUP_KEY}:{ALICE}": "alice-group", f"{GROUP_KEY}:{BOB}": "bob-group"}
+
+
+def test_group_to_dm_per_user_without_a_counterpart_row_starts_fresh(tmp_path):
+    now = datetime.now()
+    bob = SessionEntry(session_key=f"{GROUP_KEY}:{BOB}", session_id="bob-group", created_at=now,
+                       updated_at=now, origin=_src("group", BOB))
+    store = _seed(tmp_path, [bob], config=_config(True))
+    entry = store.get_or_create_session(_src("dm", ALICE))
+    assert entry.session_key == DM_KEY and entry.session_id != "bob-group"
+    assert {e.session_key for e in store.snapshot_entries()} == {DM_KEY, f"{GROUP_KEY}:{BOB}"}
+
+
+def test_dm_to_group_per_user_creates_the_senders_own_group_row(tmp_path):
+    store = _store(tmp_path, _config(True))
+    sid = store.get_or_create_session(_src("dm", ALICE)).session_id
+    # Bob joins and speaks first: he must NOT inherit Alice's DM.
+    from_bob = store.get_or_create_session(_src("group", BOB))
+    assert from_bob.session_key == f"{GROUP_KEY}:{BOB}" and from_bob.session_id != sid
+    from_alice = store.get_or_create_session(_src("group", ALICE))
+    assert (from_alice.session_key, from_alice.session_id) == (f"{GROUP_KEY}:{ALICE}", sid)
+    assert {e.session_key for e in store.snapshot_entries()} == {
+        f"{GROUP_KEY}:{ALICE}", f"{GROUP_KEY}:{BOB}"}
