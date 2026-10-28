@@ -15091,6 +15091,11 @@ def _unblock_expectation_holds(
     status = _task_status(conn, task_id)
     if status not in ("blocked", "scheduled"):
         return False
+    # A scheduled card is accepted only with its park event pinned: a comment-only
+    # CAS would pass on a card re-parked from blocked after the read (deferred
+    # writes no comment) and release a deliberate time park (Prism 503b929774f2).
+    if status == "scheduled" and expect_block_event is None:
+        return False
     if expect_block_event is not None:
         row = conn.execute(
             "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = ?",

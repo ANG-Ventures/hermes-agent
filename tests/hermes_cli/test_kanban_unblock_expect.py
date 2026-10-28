@@ -108,6 +108,17 @@ def test_deferred_card_reparked_or_repointed_is_left_alone(kanban_home):   # t_7
         assert kb.get_task(conn, t2).status == "scheduled"
 
 
+def test_comment_only_cas_never_lifts_a_card_reparked_from_blocked(kanban_home):   # Prism 503b929774f2
+    with kb.connect() as conn:
+        t = _blocked(conn)
+        _ev, cm = _latest(conn, t)
+        assert kb.block_task(conn, t, reason="later", kind="deferred", until=int(time.time()) + 3600)
+        assert kb.get_task(conn, t).status == "scheduled"
+        assert not kb.unblock_task(conn, t, expect_last_comment=cm)
+        row = conn.execute("SELECT status, next_eligible_at FROM tasks WHERE id=?", (t,)).fetchone()
+        assert row[0] == "scheduled" and row[1] is not None
+
+
 def test_cli_flags_reach_the_cas(kanban_home, capsys):
     with kb.connect() as conn:
         t = _blocked(conn)
