@@ -1243,10 +1243,18 @@ def cron_runtime_export(args) -> int:
 
 
 def cron_runner(args) -> int:
-    """``hermes cron runner [rearm]`` (cron/script_runner.py)."""
+    """``hermes cron runner [rearm|install|uninstall|lint]`` (cron/script_runner.py,
+    hermes_cli/cron_runner_plist.py)."""
+    action = getattr(args, "runner_action", None)
+    if action in ("install", "uninstall", "lint"):
+        # Imported before (and without) cron/*: uninstall must work ahead of an S1 revert (§12).
+        from hermes_cli import cron_runner_plist
+        if action == "install":
+            return cron_runner_plist.install(dry_run=bool(getattr(args, "runner_dry_run", False)))
+        return getattr(cron_runner_plist, action)()
     from cron import script_runner
 
-    if getattr(args, "runner_action", None) == "rearm":
+    if action == "rearm":
         return script_runner.rearm()
     return script_runner.main([])
 
