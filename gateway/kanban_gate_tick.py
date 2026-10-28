@@ -436,7 +436,7 @@ class GateTickBuilder:
             # Saturation 4.2 readback (t_31350981): every tick that caps a
             # host, dry or enforcing; an all-clear line at most every 5 min.
             # D9 (t_3694ab3c): under KANBAN_UNIFIED_ADMIT the cap is reported, never enforced (admit_class owns memory)
-            line = kadm.readback_line(plan.admission, enforcing=signal.admit_on_memory and not klg.unified_admit(),
+            line = kadm.readback_line(plan.admission, enforcing=signal.admit_on_memory and not kwp._kanban_unified_admit(signal),
                                       reservation=signal.reservation_gb)
             if plan.admission:
                 logger.info("%s", line)

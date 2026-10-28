@@ -1519,9 +1519,14 @@ BAND_OK, BAND_WARM, BAND_HOT, BAND_UNKNOWN = "ok", "warm", "hot", "unknown"
 TARGET_STATE_FILE = "kanban-target-state.json"
 
 
-def _kanban_unified_admit() -> bool:
+def _kanban_unified_admit(signal: Any = None) -> bool:
+    """True only where the ONE rule actually replaces the 6 GB/worker cap (D9, t_3694ab3c; Prism f4d9c1273272):
+    KANBAN_UNIFIED_ADMIT on, a placement table on the signal, and ``kanban.admission: utilization``, i.e. exactly
+    when kanban_headroom.unified_filter runs for every take (pinned ones included). Anywhere else the cap binds."""
     from hermes_cli import kanban_load_gate as _klg
-    return _klg.unified_admit()
+    from hermes_cli import placement as _pl
+    return (_klg.unified_admit() and signal is not None and getattr(signal, "placement_table", None) is not None
+            and _pl.admission_mode() == "utilization")
 
 
 @dataclass
@@ -1822,6 +1827,14 @@ class SpilloverPlan:
             if why is not None:
                 self.refusal = f"pin_host_board_unhostable ({pin}: {board} {why})"
                 return None
+            if not skip_admission and _kanban_unified_admit(self.signal):
+                # a pin keeps its precedence, not an exemption from the ONE rule (Prism f4d9c1273272: with the
+                # memory cap folded into admit_class, a pinned take must pass may_start too)
+                from hermes_cli import kanban_headroom as _kh
+                _keep, held = _kh.unified_filter(self, [pin], job)
+                if pin in held:
+                    self.refusal = f"pin_host_unified_admission ({pin}: {held[pin]})"
+                    return None
             if self.signal is not None and self.signal.placement_table is not None:
                 # A pin keeps its precedence but its footprint is booked like any
                 # take, so later admissions see it (Prism 4609a040ad20 / b8c13f6c2e7a).
@@ -2189,7 +2202,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
                 admission[h.name] = f"cap {limit} < free {free}: {cap_why}"
                 # D9 (t_3694ab3c): under KANBAN_UNIFIED_ADMIT the memory axis is admit_class's (measured estimate,
                 # not 6 GB per worker); the cap is still computed and reported, never enforced
-                if signal.admit_on_memory and not _kanban_unified_admit():
+                if signal.admit_on_memory and not _kanban_unified_admit(signal):
                     free = limit
                     if free == 0:
                         why = f"admission: {cap_why}"

@@ -240,6 +240,28 @@ def test_d9_kill_switch_enforces_the_cap(home, monkeypatch):
     assert plan.slots["ace-ai"] == 1                              # today's floor(7 / 6)
 
 
+def test_d9_cap_still_binds_where_unified_filter_does_not_run(home):
+    """Prism f4d9c1273272: legacy admission mode (unified_filter inert) keeps the 6 GB/worker cap enforced even with
+    KANBAN_UNIFIED_ADMIT on, so no path loses its memory check."""
+    (home / "config.yaml").write_text("kanban:\n  admission: legacy\n", encoding="utf-8")
+    f = Fleet(time.time())
+    f.mem["ace-ai"] = 7.0
+    plan = _plan_cfg(home, f, {"placement": {"admit_on_memory": True}})
+    assert plan.slots["ace-ai"] == 1
+
+
+def test_d7_pinned_take_passes_the_one_rule_too(home):
+    """Prism f4d9c1273272: a pin keeps precedence, not an exemption: held back for Prism, the pinned take refuses."""
+    t0 = time.time()
+    f = Fleet(t0)
+    f.busy["ci-box"] = 0.885
+    dmd.publish("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
+    plan = _plan(home, f)
+    assert plan.take("alpha", pin="ci-box") is None
+    assert plan.refusal.startswith("pin_host_unified_admission (ci-box: held_back:kanban for prism 64 queued")
+    assert plan.take("alpha", pin="ace-ai").name == "ace-ai"     # a host with room: the pin still wins
+
+
 # ---------------------------------------------------------------------------------- demand publication
 
 def test_tick_publishes_ready_demand(home):
