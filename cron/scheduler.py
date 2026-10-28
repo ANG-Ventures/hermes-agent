@@ -1861,11 +1861,14 @@ def _get_hermes_home() -> Path:
     return _hermes_home or get_hermes_home()
 
 
-def _get_lock_paths() -> tuple[Path, Path]:
-    """Resolve cron lock paths at call time so profile/env changes are honored."""
+def _get_lock_paths(lane: str = "agent") -> tuple[Path, Path]:
+    """Resolve cron lock paths at call time so profile/env changes are honored. ``lane`` picks the
+    per-lane tick lock (``.tick.lock`` for agent, ``.tick-script.lock`` for script; cron/lanes.py)."""
+    from cron.lanes import tick_lock_name
+
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
-    return lock_dir, lock_dir / ".tick.lock"
+    return lock_dir, lock_dir / tick_lock_name(lane)
 
 
 # Errnos that mean "another ticker (or manual tick) holds the tick lock", as opposed to a real failure
@@ -5372,7 +5375,7 @@ _last_worktree_maintenance_at: Optional[float] = None
 _worktree_maintenance_lock = threading.Lock()
 
 
-def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
+def _deliver_missed_oneshot_notices(adapters=None, loop=None, lane: str = "all") -> int:
     """Deliver queued MISSED notices for one-shots the due-scan retired.
 
     The due-scan runs under the jobs lock and only queues them; delivery is
@@ -5383,7 +5386,7 @@ def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
     from cron.jobs import drain_missed_oneshot_notices
 
     delivered = 0
-    for notice in drain_missed_oneshot_notices():
+    for notice in drain_missed_oneshot_notices(lane):
         job = notice.get("job") or {}
         try:
             err = _deliver_result(

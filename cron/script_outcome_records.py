@@ -37,6 +37,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from hermes_time import now as _hermes_now
+
 logger = logging.getLogger("cron.scheduler")
 
 RECORDS_DIRNAME = "script-runs"
@@ -206,13 +208,13 @@ def _script_alive(meta: Dict[str, Any], base: Path) -> Optional[bool]:
     from cron.executions import _owner_is_live, _process_start_time
 
     script_pid = meta.get("script_pid")
-    if script_pid:
+    if script_pid and meta.get("script_started_at") is not None:
         return _owner_is_live(int(script_pid), meta.get("script_started_at"))
-    shim_pid = _read_int(base, ".pid")
+    # No start fingerprint for the script (owner died before note_pid, or note_pid could not
+    # read it): _owner_is_live(pid, None) means "is it me", which would call a running shim dead.
+    shim_pid = int(script_pid) if script_pid else _read_int(base, ".pid")
     if not shim_pid:
         return None
-    # The shim wrote its own pid; no start time was persisted, so a live pid counts only when
-    # that process started after begin() (a recycled pid is older than the record).
     try:
         from gateway.status import _pid_exists
 
@@ -221,32 +223,46 @@ def _script_alive(meta: Dict[str, Any], base: Path) -> Optional[bool]:
     except Exception:
         return True
     started = _process_start_time(shim_pid)
-    if started is None:
+    owner_started = meta.get("owner_started_at")
+    if started is None or owner_started is None:
         return True  # cannot compare -> cannot prove death
-    begun = float(meta.get("started_at") or 0)
-    # get_process_start_time is not always epoch seconds (Linux: clock ticks since boot);
-    # compare only when it looks like an epoch value, else treat the live pid as the shim.
-    if started > 10**9 and started + 2 < begun:
-        return False
-    return True
+    # A recycled pid is a process older than the owner that spawned the shim. Compare with the
+    # owner's fingerprint, which has the same units (Linux: clock ticks since boot, not epoch
+    # seconds, so wall time is never a valid reference; Prism 27d6882547f7).
+    from gateway.status import START_TIME_DRIFT_TOLERANCE
+
+    return int(started) + START_TIME_DRIFT_TOLERANCE >= int(owner_started)
 
 
 def _tail(path: Path) -> str:
+    # Redact the whole capture BEFORE cutting the tail: a cut can drop the context the redactor
+    # keys on (``SERVICE_TOKEN=``) and keep the value (Prism 63cb77dd5537). The normal run path
+    # redacts its whole in-memory output too, so this costs no more than that path.
     try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - _OUTPUT_TAIL_BYTES))
-            data = fh.read()
+        data = path.read_bytes()
     except OSError:
         return ""
     text = data.decode("utf-8", errors="replace").strip()
     try:
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(text)
+        text = redact_sensitive_text(text)
     except Exception:
         return "[REDACTED - redaction failed]" if text else ""
+    tail = text.encode("utf-8")[-_OUTPUT_TAIL_BYTES:]
+    return tail.decode("utf-8", errors="ignore").strip()
+
+
+# What restart recovery / the shutdown mark write for a run they could not observe: reconcile's
+# ``unknown``, or an error whose text is one of the interruption reasons.
+_RECOVERY_ERROR_PREFIXES = ("Interrupted", "Gateway shutdown (")
+
+
+def _is_recovery_stamp(job: Dict[str, Any]) -> bool:
+    if job.get("last_status") == "unknown":
+        return True
+    return job.get("last_status") == "error" and str(job.get("last_error") or "").startswith(
+        _RECOVERY_ERROR_PREFIXES)
 
 
 def _newer_run_recorded(job: Dict[str, Any], meta: Dict[str, Any]) -> bool:
@@ -257,6 +273,28 @@ def _newer_run_recorded(job: Dict[str, Any], meta: Dict[str, Any]) -> bool:
         return datetime.fromisoformat(str(last_run)).timestamp() > float(meta.get("started_at") or 0)
     except (TypeError, ValueError):
         return False
+
+
+def _newer_attempt(latest: Optional[Dict[str, Any]], execution_id: str,
+                   meta: Dict[str, Any]) -> bool:
+    """Is ``latest`` a genuinely newer attempt than this record's?
+
+    A different id is not proof: recovery leaves this attempt ``unknown``, retention may prune it
+    while its script still runs, and the ledger then returns an OLDER kept row (the rewind proof)
+    as the job's latest (Prism e4ebf4ae5d41). While this attempt's row exists, newest-first order
+    decides; once it is pruned, the latest row is newer only if it was claimed after this run began.
+    """
+    from cron.executions import get_execution
+
+    if latest is None or latest.get("id") == execution_id:
+        return False
+    if get_execution(execution_id) is not None:
+        return True
+    try:
+        claimed = datetime.fromisoformat(str(latest.get("claimed_at"))).timestamp()
+        return claimed > float(meta.get("started_at") or 0)
+    except (TypeError, ValueError):
+        return True  # unreadable stamp: keep the old answer, never overwrite
 
 
 APPLIED, SKIPPED, RETRY = "applied", "skipped", "retry"
@@ -298,14 +336,16 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> str:
             logger.info("Job '%s': script outcome record %s already consumed; not applied",
                         job_id, execution_id)
             return SKIPPED
-        finished_iso = datetime.fromtimestamp(finished).astimezone().isoformat()
+        # The profile's configured zone, like every other cron stamp (hermes_time.now()), so the
+        # reconcile/claimed_at comparisons see one zone (Prism 2146c280fe76 / a73e1cb4acd6).
+        finished_iso = datetime.fromtimestamp(finished, tz=_hermes_now().tzinfo).isoformat()
         success = rc == 0
         error = None
         if not success:
             error = (f"Script exited with code {rc} (read from the script's own exit status "
                      "after the scheduler restarted mid-run)")
         latest = latest_execution(job_id)
-        if latest is not None and latest.get("id") != execution_id:
+        if _newer_attempt(latest, execution_id, meta):
             # A newer attempt exists (an interval job fired again, or someone ran it by hand):
             # its own result is the current one.
             logger.info(
@@ -321,9 +361,14 @@ def _record_outcome(meta: Dict[str, Any], base: Path, rc: int) -> str:
         # counted this run via mark_job_run. With the attempt still the newest, that write is
         # about THIS run.
         already_counted = _newer_run_recorded(job, meta)
-        if latest is None and already_counted:
+        if already_counted and not _is_recovery_stamp(job):
+            # The run was recorded by its owner (it finished after the reap had marked its row
+            # unknown, or died between mark_job_run and finish_execution) or by a newer run: that
+            # outcome is what was observed and must not be replaced (Prism f917ad4f14b8).
+            logger.info("Job '%s': run %s already recorded as %s; script outcome not applied",
+                        job_id, execution_id, job.get("last_status"))
             discard(base)
-            return SKIPPED  # attempt pruned from the ledger and the job has run since
+            return SKIPPED
         name = job.get("name") or job_id
         stdout = _tail(Path(str(base) + ".out"))
         stderr = _tail(Path(str(base) + ".err"))
