@@ -439,3 +439,41 @@ async def test_standby_retry_interval_is_finite_and_has_a_floor(harness, monkeyp
     finally:
         await cancel(task, b)
         watchers._release_singleton_lock(owner)
+
+
+@pytest.mark.asyncio
+async def test_only_the_leader_beats_and_its_release_clears_the_beat(harness):
+    """§5.1.5 (t_3646c28e): other gateways on the host read this beat to send background units here."""
+    import json
+
+    h = harness
+    beat = h.path.with_name(".dispatcher.heartbeat")
+    owner, state = watchers._acquire_singleton_lock(h.path)
+    assert state == "held"
+    b = runner()
+    task = asyncio.create_task(b._kanban_dispatcher_watcher())
+    try:
+        _, resume = await h.clock.paused(task)
+        assert not beat.exists()  # a standby never beats
+        watchers._release_singleton_lock(owner)
+        owner = None
+        resume.set_result(None)
+        for _ in range(4):
+            delay, resume = await h.clock.paused(task)
+            if b._owns_kanban_dispatcher_lock():
+                break
+            resume.set_result(None)
+        else:
+            pytest.fail("standby did not acquire the released lock")
+        assert json.loads(beat.read_text())["pid"] == os.getpid()  # beats on acquire
+        beat.unlink()
+        resume.set_result(None)
+        await h.clock.paused(task)  # first completed dispatch tick
+        assert json.loads(beat.read_text())["pid"] == os.getpid()  # and on every tick
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert not beat.exists()
+    finally:
+        await cancel(task, b)
+        watchers._release_singleton_lock(owner)

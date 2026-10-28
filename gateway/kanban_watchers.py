@@ -1873,8 +1873,9 @@ class GatewayKanbanWatchersMixin:
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
         try:
-            from tools.async_delegation_kanban import set_dispatcher_active
+            from tools.async_delegation_kanban import clear_dispatcher_heartbeat, set_dispatcher_active
             set_dispatcher_active(False)
+            clear_dispatcher_heartbeat()
         except Exception:
             pass
         _release_singleton_lock(handle)
@@ -3803,9 +3804,11 @@ class GatewayKanbanWatchersMixin:
         else:
             return
         self._kanban_dispatcher_lock_handle = _lock_handle
+        write_dispatcher_heartbeat = lambda _interval: None  # noqa: E731 - bound if the import fails
         try:
-            from tools.async_delegation_kanban import set_dispatcher_active
-            set_dispatcher_active(True)  # §5.1.5: a dispatcher now reaps this process's unit workers
+            from tools.async_delegation_kanban import set_dispatcher_active, write_dispatcher_heartbeat
+            set_dispatcher_active(True)  # §5.1.5: a dispatcher now reaps this host's unit workers
+            write_dispatcher_heartbeat(interval)
         except Exception:
             logger.debug("kanban dispatcher: could not flag the delegations runtime", exc_info=True)
         if waiting_logged or unavailable_logged:
@@ -4676,6 +4679,8 @@ class GatewayKanbanWatchersMixin:
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
+            # §5.1.5: other gateways on this host send background units here while this beats.
+            write_dispatcher_heartbeat(interval)
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.

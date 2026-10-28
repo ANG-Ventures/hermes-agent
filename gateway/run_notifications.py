@@ -2090,6 +2090,11 @@ class GatewayNotificationsMixin:
         """Card-end watcher (§5.4): drain each served profile's ended kanban units under its scope."""
         from gateway.run import _profile_runtime_scope
         from tools.async_delegation_kanban import drain_profile
+        from hermes_cli.kanban_db_dispatch import reap_worker_zombies
+        # A unit runner is this process's child even when another gateway holds the dispatcher lock
+        # (§5.1.5): wait on our own exited runners here, nobody else can.
+        with _log_suppressed(logging.DEBUG, "Kanban unit zombie reap failed: %s"):
+            reap_worker_zombies()
         boot_id = self._current_boot_id()
         for profile_name, profile_home in self._kanban_drain_homes():
             try:
