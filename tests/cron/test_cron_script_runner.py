@@ -118,8 +118,14 @@ def _rows(home: Path, where="") -> list:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
     try:
         conn.row_factory = sqlite3.Row
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM executions" + (f" WHERE {where}" if where else ""))]
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM executions" + (f" WHERE {where}" if where else ""))]
+        except sqlite3.OperationalError as exc:
+            # The runner creates the file before the table; that window reads as "no rows yet".
+            if "no such table" in str(exc):
+                return []
+            raise
     finally:
         conn.close()
 
@@ -819,6 +825,14 @@ def test_g_ac4e_watchdog_tree_kill_one_strike(root, tmp_path, procs):
 
 
 # --- E2E + S2 (c): the runner against a scratch home ------------------------------------------------
+
+def test_rows_treats_a_tableless_executions_db_as_empty(tmp_path):
+    """The runner creates executions.db before its table: a poll in that window reads [], not raises."""
+    (tmp_path / "cron").mkdir()
+    (tmp_path / "cron" / "executions.db").write_bytes(b"")
+    assert _rows(tmp_path) == []
+    assert _rows(tmp_path, "status = 'completed'") == []
+
 
 @pytest.mark.slow_test(180, reason="real runner subprocess")
 def test_e2e_runner_fires_echo_job(root, tmp_path, procs):
