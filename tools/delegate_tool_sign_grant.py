@@ -136,8 +136,7 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
     grant["board"] = board
     try:
         # The child carries its grants so a later model swap revokes them (revoke_on_model_drift).
-        child.__dict__.setdefault("_held_sign_grants", []).append(
-            {**grant, "child_session_ref": kb.derive_session_ref(child_sid)})
+        child.__dict__.setdefault("_held_sign_grants", []).append(dict(grant))
         task["goal"] = str(task.get("goal") or "") + _brief(grant)
         _ledger({"event": "sign_grant", "grant_id": grant["grant_id"], "child": grant.get("child_id"),
                  "by": by, "board": board, "cards": len(cards), "verbs": grant["verbs"],
@@ -187,11 +186,13 @@ def register_turn_grants(parent_agent: Any, grants: List[Dict[str, Any]]) -> Non
 
 
 def revoke_turn_grants(agent: Any) -> None:
-    """Turn end: revoke every grant this agent minted during the turn.
+    """Turn end: revoke every grant this agent minted during the turn. Never raises.
 
-    A grant leaves the registry only once revoked: a failed set is retried once, and whatever
-    still fails stays registered (the next turn end retries it) and raises, so the turn ends
-    loud instead of silently leaving a live grant (Prism 53347c16a468)."""
+    It runs from the turn's outer finally, so raising there would replace a finished turn's
+    result or mask its exception (Prism 9c5349bddc34). A grant leaves the registry only once
+    revoked: a failed set is retried once, and whatever still fails is logged (one line naming
+    the ids), marked ``revoke_failed`` and stays registered so the next turn end retries it
+    (Prism 53347c16a468). Its expiry bounds it meanwhile: a shortened-TTL leak, not new authority."""
     d = getattr(agent, "__dict__", None)
     held = d.get("_sign_grants") if d is not None else None
     if not held:
@@ -200,11 +201,14 @@ def revoke_turn_grants(agent: Any) -> None:
     if failed:
         failed = set(revoke([g for g in held if str(g.get("grant_id")) in failed]))
     remaining = [g for g in held if str(g.get("grant_id")) in failed]
-    if remaining:
-        d["_sign_grants"] = remaining
-        raise RuntimeError(f"sign grant(s) {sorted(failed)} could not be revoked at turn end; "
-                           "they stay registered and lapse at their expiry at the latest")
-    d.pop("_sign_grants", None)
+    if not remaining:
+        d.pop("_sign_grants", None)
+        return
+    for g in remaining:
+        g["revoke_failed"] = True
+    d["_sign_grants"] = remaining
+    logger.error("sign grant(s) %s could not be revoked at turn end; marked revoke_failed, the next turn end "
+                 "retries them and they lapse at their expiry at the latest", sorted(failed))
 
 
 def revoke_on_model_drift(agent: Any, model: Any) -> None:
@@ -238,7 +242,7 @@ def revoke(grants: List[Dict[str, Any]]) -> List[str]:
     for g in grants or ():
         try:
             with kb.connect_closing(board=g["board"]) as conn:
-                ksg.revoke(conn, g["grant_id"], child_session_ref=g.get("child_session_ref"))
+                ksg.revoke(conn, g["grant_id"])
             _ledger({"event": "sign_grant_revoke", "grant_id": g["grant_id"], "at": int(time.time())})
         except Exception:
             # Expiry still bounds it; say so loudly.

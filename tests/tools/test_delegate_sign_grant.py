@@ -192,6 +192,32 @@ def test_every_parent_turn_exit_revokes_its_grants(board, exit_kind):
     assert _live_rows(seen["g"]["grant_id"]) == []
 
 
+def test_a_failing_turn_end_revoke_never_replaces_the_turn_result(board, monkeypatch, caplog):
+    """Prism 9c5349bddc34: the revoke runs from the turn's outer finally, so it must never raise there. A turn
+    that produced a result returns it even when every revoke fails; the failure is logged naming the grant."""
+    import logging
+    from unittest.mock import patch
+
+    agent = _facade_agent()
+    _parent, child = _agents()
+    seen = {}
+
+    def fake_loop(ag, *_a, **_kw):
+        g = dsg.mint_for_child(_task(board), child, ag)
+        dsg.register_turn_grants(ag, [g])
+        seen["g"] = g
+        return {"final_response": "done", "messages": [], "api_calls": 1, "completed": True}
+
+    monkeypatch.setattr(dsg, "revoke", lambda grants: [str(x["grant_id"]) for x in grants])
+    with patch("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: []), \
+            patch("agent.conversation_loop.run_conversation", fake_loop), \
+            caplog.at_level(logging.ERROR, logger=dsg.logger.name):
+        result = agent.run_conversation("go")
+    assert result["final_response"] == "done"
+    assert seen["g"]["grant_id"] in caplog.text and "revoke_failed" in caplog.text
+    assert agent.__dict__["_sign_grants"][0]["revoke_failed"] is True
+
+
 def test_a_child_model_change_revokes_its_grant_before_the_call(board):
     """Prism 6b322f502e4d: a grant is bound to the model it was minted for. The child's first request
     on another model (a fallback activation) revokes it at the dispatch edge, from inside the child's
@@ -201,7 +227,7 @@ def test_a_child_model_change_revokes_its_grant_before_the_call(board):
     parent, child = _agents()
     g = dsg.mint_for_child(_task(board), child, parent)
     sref = kb.derive_session_ref("child-sid")
-    with delegated_child_context():
+    with delegated_child_context("child-sid"):
         dsg.revoke_on_model_drift(child, MODEL.upper())  # same model, other spelling: still live
         assert len(_live_rows(g["grant_id"])) == 1
         dsg.revoke_on_model_drift(child, "claude-sonnet-5")  # try_activate_fallback moved it
@@ -279,7 +305,7 @@ def test_provider_spelling_of_the_same_model_is_not_drift(board):
 @pytest.mark.parametrize("fails", [1, 99])
 def test_turn_end_keeps_unrevoked_grants_registered(board, monkeypatch, fails):
     """Prism 53347c16a468: a grant leaves the turn registry only once revoked. One failure is retried;
-    a persistent failure keeps it registered and raises, so the turn ends loud."""
+    a persistent failure keeps it registered, marked revoke_failed, for the next turn end."""
     parent, child = _agents()
     g = dsg.mint_for_child(_task(board), child, parent)
     dsg.register_turn_grants(parent, [g])
@@ -294,9 +320,10 @@ def test_turn_end_keeps_unrevoked_grants_registered(board, monkeypatch, fails):
         dsg.revoke_turn_grants(parent)
         assert "_sign_grants" not in parent.__dict__ and _live_rows(g["grant_id"]) == []
     else:
-        with pytest.raises(RuntimeError, match="could not be revoked"):
-            dsg.revoke_turn_grants(parent)
-        assert parent.__dict__["_sign_grants"] == [g] and len(_live_rows(g["grant_id"])) == 1
+        dsg.revoke_turn_grants(parent)  # never raises: it runs from the turn's outer finally (Prism 9c5349bddc34)
+        held = parent.__dict__["_sign_grants"]
+        assert [x["grant_id"] for x in held] == [g["grant_id"]] and held[0]["revoke_failed"] is True
+        assert len(_live_rows(g["grant_id"])) == 1
 
 
 @pytest.mark.parametrize("where", ["second_child", "after_mint"])

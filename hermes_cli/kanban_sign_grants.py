@@ -245,13 +245,14 @@ def mint(
             "child_id": child_id, "model": str(child_model)}
 
 
-def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None,
-           child_session_ref: Optional[str] = None) -> int:
+def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None) -> int:
     """Revoke every row of ``grant_id``; returns the rows changed. Voids its stamps.
 
     From inside a delegate child (its board connection is read-only) this is the one other
     write it may make, because it only narrows authority: the child revokes its OWN grant
-    (``child_session_ref`` required and matched) when its model moves away from the grant's.
+    when its model moves away from the grant's. "Own" is the session executing this call, the
+    same per-session identity :func:`mint` bound; never a caller-supplied ref, which a sibling
+    child could copy off another child's row (Prism 27c3b03d5260).
     """
     from hermes_cli import kanban_db as kb
 
@@ -260,13 +261,19 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
     if not kb._is_delegated_child():
         with kb.write_txn(conn):
             return conn.execute(sql, args).rowcount
-    if not child_session_ref:
-        raise GrantRefused("a delegate child revokes only its own grant (child_session_ref required)")
+    from hermes_cli.kanban_identity import _resolve_current_session_id
+
+    own_ref = kb.derive_session_ref(_resolve_current_session_id())
+    if not own_ref:
+        raise GrantRefused("a delegate child revokes only its own grant (no session bound)")
+    if not conn.execute("SELECT 1 FROM sign_grants WHERE grant_id = ? AND child_session_ref = ?",
+                        (grant_id, own_ref)).fetchone():
+        raise GrantRefused(f"grant {grant_id} belongs to another session; a child revokes only its own")
     lift = kb._DELEGATED_CHILD_COMMENT_GRANT.set(True)
     conn.execute("PRAGMA query_only=OFF")
     try:
         with kb.write_txn(conn):
-            return conn.execute(sql + " AND child_session_ref = ?", (*args, child_session_ref)).rowcount
+            return conn.execute(sql + " AND child_session_ref = ?", (*args, own_ref)).rowcount
     finally:
         conn.execute("PRAGMA query_only=ON")
         kb._DELEGATED_CHILD_COMMENT_GRANT.reset(lift)

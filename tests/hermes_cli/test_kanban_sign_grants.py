@@ -397,3 +397,19 @@ def test_a_release_line_naming_an_own_pr_is_refused(board):
     assert _rows(b) == []
     _child_comment(b, "close-on: https://github.com/acme/repo/pull/8", g["grant_id"])
     assert len(_rows(b)) == 1
+
+
+def test_a_child_revokes_only_its_own_grant_by_its_executing_session(board):
+    """Prism 27c3b03d5260: inside a delegate child, revoke() takes "own" from the session executing the call,
+    never from an argument a sibling could copy off another child's row. Child B is refused A's grant; A
+    revokes its own."""
+    _home, a, _b = board
+    g = _mint(a)
+    with delegated_child_context("sibling-child-sid"):
+        with kb.connect_closing() as conn, pytest.raises(ksg.GrantRefused, match="another session"):
+            ksg.revoke(conn, g["grant_id"])
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT revoked_at FROM sign_grants WHERE grant_id=?", (g["grant_id"],)).fetchone()[0] is None
+    with delegated_child_context(CHILD_SID):
+        with kb.connect_closing() as conn:
+            assert ksg.revoke(conn, g["grant_id"]) == 1
