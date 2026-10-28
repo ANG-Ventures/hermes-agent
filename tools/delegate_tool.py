@@ -2061,6 +2061,8 @@ def _build_child_agent(
     # Default path (inherit_context False) is byte-identical: keep the historical
     # boot-attr forward (INV-5).
     child_prefill_messages: Any = getattr(parent_agent, "prefill_messages", None)
+    # Which inheritance construction ACTUALLY delivered (None = none): a sign grant needs it (Prism 8283ee6dbefe).
+    context_inherited: Optional[str] = None
     if materialized_prefill_messages is not None:
         child_prefill_messages = copy.deepcopy(materialized_prefill_messages)
     elif mode == "summary":
@@ -2088,6 +2090,7 @@ def _build_child_agent(
             _folded = _fold_conversation_history_to_context(_parent_history, _max_tokens)
             if _folded is not None:
                 child_prefill_messages = [_folded]
+                context_inherited = "summary"
         except Exception as _inh_exc:
             logger.warning("boomerang inherit_context fold failed (continuing without): %s", _inh_exc)
     # Fork: the parent's ephemeral prompt / prefill / request_overrides, not the slim child build (INV-2).
@@ -2123,6 +2126,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._context_inherited = context_inherited
     if mode == "fork":
         # _apply_child_cache_ttl and _regate_inherited_child_tier are SKIPPED: both rewrite request bytes.
         _fork.apply_fork_overlay(child, parent_agent)
@@ -2138,6 +2142,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             return _build_child_agent(**{**_call_args, "inherit_mode": "summary", "inherit_context": True})
         _arm_first_request_pin(child, parent_agent, "fork")
+        child._context_inherited = "fork"
         child._boomerang_fork_log_pending = True   # one `boomerang.fork served_by=…` line
     else:
         _apply_child_cache_ttl(child)

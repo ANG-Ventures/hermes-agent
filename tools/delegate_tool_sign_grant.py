@@ -104,6 +104,10 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
     _caller_may_grant(by)
     if not _session_inherited(task, inherit_context, inherit_mode):
         raise SignGrantError("a signing grant needs inherit_context=true (the child must carry the rulings)")
+    if not getattr(child, "_context_inherited", None):
+        # Requested is not delivered: a failed or empty summary fold builds the child without the transcript.
+        raise SignGrantError("inherit_context was requested but the child was built without the parent's "
+                             "transcript (summary fold failed or empty; see the 'inherit_context fold' log)")
     if getattr(parent_agent, "_delegate_depth", 0) > 0:
         raise SignGrantError("only a top-level session may mint a signing grant")
     cards = [str(c).strip() for c in spec.get("cards") or () if str(c).strip()]
