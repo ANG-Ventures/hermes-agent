@@ -170,10 +170,11 @@ def _brief(grant: Dict[str, Any]) -> str:
         f"card(s) {cards} (board {grant['board']}) for verbs {', '.join(grant['verbs'])}, until "
         f"{time.strftime('%H:%M %Z', time.localtime(grant['expires_at']))}. Sign with: "
         f"`hermes kanban --board {grant['board']} comment <card> --author {grant['by']} "
-        f"--grant {grant['grant_id']} --body-file <file>`; an APPROVE stamp goes through the one writer: "
-        f"`python3 scripts/lib/operator_approve.py --card <card> --head <40hex> --pr <owner/repo#N> "
-        f"--by {grant['by']} --grant {grant['grant_id']}` (needs verbs approve + release). Any other card, verb, or a PR "
-        "your parent's runs authored is refused; the grant ends with your parent's turn."
+        f"--grant {grant['grant_id']} --body-file <file>`. A verdict or APPROVE is that same command with a body "
+        f"carrying a `review_coverage: {{...}}` line (verdict, head_sha, pr, by={grant['by']}); APPROVE needs verb "
+        "approve, and a close-on line or close_on field needs verb release. The merge-gate readers that honour a live "
+        "granted row live in hermes-home (home#7376, home#7570). Any other card, verb, or a PR your parent's runs "
+        "authored is refused, and so is a write from any session but yours; the grant ends with your parent's turn."
     )
 
 

@@ -643,7 +643,7 @@ def _granted_post(home, tid, body):
         g = ksg.mint(conn, cards=[tid], verbs=["verdict", "approve", "release"], by="apollo",
                      child_session_ref=kb.derive_session_ref("child"), parent_model="m", child_model="m",
                      parent_profiles=["default", "apollo"])
-    with delegated_child_context(), kb.connect_closing() as conn:
+    with delegated_child_context("child"), kb.connect_closing() as conn:
         kb.add_comment(conn, tid, "apollo", body, session_ref=kb.derive_session_ref("child"), grant_id=g["grant_id"])
     return g
 

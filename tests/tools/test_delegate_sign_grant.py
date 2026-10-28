@@ -93,7 +93,7 @@ def test_revoked_grant_refuses_the_child_write(board):
     parent, child = _agents()
     g = dsg.mint_for_child(_task(board), child, parent)
     dsg.revoke([g])
-    with delegated_child_context(), kb.connect_closing() as conn, pytest.raises(ksg.GrantRefused, match="revoked"):
+    with delegated_child_context("child-sid"), kb.connect_closing() as conn, pytest.raises(ksg.GrantRefused, match="revoked"):
         kb.add_comment(conn, board, "apollo", "looks right", session_ref=kb.derive_session_ref("child-sid"),
                        grant_id=g["grant_id"])
 

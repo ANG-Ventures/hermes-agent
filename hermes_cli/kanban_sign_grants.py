@@ -261,22 +261,25 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
     if not kb._is_delegated_child():
         with kb.write_txn(conn):
             return conn.execute(sql, args).rowcount
-    from hermes_cli.kanban_identity import _resolve_current_session_id
-
-    own_ref = kb.derive_session_ref(_resolve_current_session_id())
+    own_ref = executing_session_ref()
     if not own_ref:
         raise GrantRefused("a delegate child revokes only its own grant (no session bound)")
     if not conn.execute("SELECT 1 FROM sign_grants WHERE grant_id = ? AND child_session_ref = ?",
                         (grant_id, own_ref)).fetchone():
         raise GrantRefused(f"grant {grant_id} belongs to another session; a child revokes only its own")
-    lift = kb._DELEGATED_CHILD_COMMENT_GRANT.set(True)
-    conn.execute("PRAGMA query_only=OFF")
-    try:
+    with kb.delegated_child_write(conn):
         with kb.write_txn(conn):
             return conn.execute(sql + " AND child_session_ref = ?", (*args, own_ref)).rowcount
-    finally:
-        conn.execute("PRAGMA query_only=ON")
-        kb._DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
+
+
+def executing_session_ref() -> Optional[str]:
+    """The board fingerprint of the session executing this call: the per-session identity
+    ``delegated_child_context(child.session_id)`` binds and :func:`mint` stored. Grant ownership
+    is judged against this, never a caller-supplied ref a sibling could copy off a readable row."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_identity import _resolve_current_session_id
+
+    return kb.derive_session_ref(_resolve_current_session_id())
 
 
 def get(conn: sqlite3.Connection, grant_id: str, task_id: str) -> Optional[sqlite3.Row]:
@@ -357,8 +360,13 @@ def validate_comment(
         raise GrantRefused(f"grant {grant_id} expired")
     if _norm_model(row["parent_model"]) != _norm_model(row["child_model"]):
         raise GrantRefused(f"grant {grant_id}: child model != parent model")
-    if not caller_session_ref or caller_session_ref != row["child_session_ref"]:
+    # Prism 28bafed528a0: ownership is the EXECUTING session's, as in revoke(); the caller's
+    # ``session_ref`` is only shape-checked upstream, so a mismatching one is refused, never trusted.
+    own_ref = executing_session_ref()
+    if not own_ref or own_ref != row["child_session_ref"]:
         raise GrantRefused(f"grant {grant_id} belongs to another session")
+    if caller_session_ref and caller_session_ref != own_ref:
+        raise GrantRefused(f"grant {grant_id}: session_ref is not the executing session's; it belongs to another session")
     if str(author or "").strip().lower() != str(row["by_author"]).strip().lower():
         raise GrantRefused(f"grant {grant_id} signs as {row['by_author']!r}, not {author!r}")
     allowed = set(json.loads(row["verbs"] or "[]"))

@@ -8070,16 +8070,11 @@ def add_comment(
         # explicit ``--author`` cannot pass a child's words off as the parent's.
         if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
             author = author.strip() + SUBAGENT_AUTHOR_MARKER
-        grant = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
-        conn.execute("PRAGMA query_only=OFF")
-        try:
+        with delegated_child_write(conn):
             return _add_comment_txn(
                 conn, task_id, author, body, run_id, session_ref, now,
                 claimed_author, if_latest_release,
             )
-        finally:
-            conn.execute("PRAGMA query_only=ON")
-            _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
     return _add_comment_txn(
         conn, task_id, author, body, run_id, session_ref, now, claimed_author,
         if_latest_release,
@@ -8105,14 +8100,30 @@ def _add_granted_comment(
         from hermes_cli.kanban_sign_grants import GrantRefused
 
         raise GrantRefused("a signing grant is used only from inside the delegate child it was minted for")
-    lift = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
-    conn.execute("PRAGMA query_only=OFF")
-    try:
+    with delegated_child_write(conn):
         return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now,
                                 if_latest_release=if_latest_release, grant_id=grant_id)
+
+
+@contextlib.contextmanager
+def delegated_child_write(conn: sqlite3.Connection):
+    """Lift a delegate child's read-only fence for exactly one write.
+
+    The capability token is reset on EVERY exit, including a PRAGMA that raises on a
+    closed connection (Prism 87255cd0399f): it is set inside the outer try and reset
+    in the outermost finally, after the fence is restored.
+    """
+    lift = None
+    try:
+        lift = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
+        conn.execute("PRAGMA query_only=OFF")
+        try:
+            yield
+        finally:
+            conn.execute("PRAGMA query_only=ON")
     finally:
-        conn.execute("PRAGMA query_only=ON")
-        _DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
+        if lift is not None:
+            _DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:

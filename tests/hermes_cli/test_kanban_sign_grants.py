@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -58,7 +59,7 @@ def _mint(card, **kw):
 
 
 def _child_comment(card, body, grant_id, *, sid=CHILD_SID, author="apollo"):
-    with delegated_child_context():
+    with delegated_child_context(sid):
         with kb.connect_closing() as conn:
             return kb.add_comment(conn, card, author, body, session_ref=kb.derive_session_ref(sid), grant_id=grant_id)
 
@@ -199,7 +200,7 @@ def test_granted_release_honours_if_latest_release(board):
     with kb.connect_closing() as conn:
         first = kb.add_comment(conn, a, "apollo", "close-on: manual: held for review")
         kb.add_comment(conn, a, "apollo", "close-on: manual: newer hold")
-    with delegated_child_context(), kb.connect_closing() as conn, pytest.raises(ReleaseSuperseded):
+    with delegated_child_context(CHILD_SID), kb.connect_closing() as conn, pytest.raises(ReleaseSuperseded):
         kb.add_comment(conn, a, "apollo", "close-on: merged", session_ref=kb.derive_session_ref(CHILD_SID),
                        grant_id=g["grant_id"], if_latest_release=first)
     assert [r["grant_id"] for r in _rows(a)] == [None, None]
@@ -413,3 +414,38 @@ def test_a_child_revokes_only_its_own_grant_by_its_executing_session(board):
     with delegated_child_context(CHILD_SID):
         with kb.connect_closing() as conn:
             assert ksg.revoke(conn, g["grant_id"]) == 1
+
+
+def test_a_sibling_child_cannot_sign_with_another_childs_grant_and_session_ref(board):
+    """Prism 28bafed528a0: a granted write is owned by the session EXECUTING it, never by the caller's
+    ``session_ref`` (readable off A's row). Child B presenting A's grant id + A's ref is refused and nothing
+    is written; A, in its own session, signs."""
+    _home, a, _b = board
+    g = _mint(a)
+    a_ref = kb.derive_session_ref(CHILD_SID)
+    with delegated_child_context("sibling-child-sid"):
+        with kb.connect_closing() as conn, pytest.raises(ksg.GrantRefused, match="another session"):
+            kb.add_comment(conn, a, "apollo", _approve(), session_ref=a_ref, grant_id=g["grant_id"])
+    assert _rows(a) == []
+    with delegated_child_context(CHILD_SID):
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, a, "apollo", _approve(), session_ref=a_ref, grant_id=g["grant_id"])
+    assert [(r["author"], r["grant_id"]) for r in _rows(a)] == [(_marked(g), g["grant_id"])]
+
+
+def test_the_delegated_write_capability_is_reset_even_when_the_pragma_raises(board):
+    """Prism 87255cd0399f: the lifted write capability ends with the call on every path. A PRAGMA that raises
+    (closed connection) must not leave _DELEGATED_CHILD_COMMENT_GRANT lifted in the caller's context."""
+    _home, a, _b = board
+    g = _mint(a)
+    for kwargs in ({"grant_id": g["grant_id"]}, {}):
+        conn = kb.connect()
+        conn.close()
+        with delegated_child_context(CHILD_SID), pytest.raises(sqlite3.ProgrammingError):
+            kb.add_comment(conn, a, "apollo", _approve(), session_ref=kb.derive_session_ref(CHILD_SID), **kwargs)
+        assert kb._DELEGATED_CHILD_COMMENT_GRANT.get() is False
+    conn = kb.connect()
+    conn.close()
+    with delegated_child_context(CHILD_SID), pytest.raises(sqlite3.ProgrammingError):
+        ksg.revoke(conn, g["grant_id"])
+    assert kb._DELEGATED_CHILD_COMMENT_GRANT.get() is False
