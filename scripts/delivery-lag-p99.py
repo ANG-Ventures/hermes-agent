@@ -85,7 +85,7 @@ def main(argv=None) -> int:
     lo = a.since if a.since is not None else time.time() - a.window
     hi = lo + a.window
     try:
-        with open(a.log, encoding="utf-8", errors="replace") as fh:
+        with open(a.log, encoding="utf-8-sig", errors="replace") as fh:
             rows = [r for r in samples(fh) if lo <= r[0] < hi]
     except OSError as exc:
         print(json.dumps({"verdict": "BLIND", "error": str(exc), "log": a.log}))
