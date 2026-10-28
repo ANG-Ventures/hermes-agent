@@ -1549,6 +1549,9 @@ def _run_foreground(
             return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
 
     if result.get("yielded_session_id"):  # handed to the background: no exit status yet
+        # The command keeps running in the shell with no report yet: its GIT_* state is UNKNOWN until a
+        # later command reports (Prism 867a5a0fdd64).
+        record_session_git_env(env_git_id(env), None, unknown=True)
         return json.dumps({
             "output": result.get("output", ""), "exit_code": None, "error": None,
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],

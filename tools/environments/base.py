@@ -584,19 +584,20 @@ class BaseEnvironment(ABC):
         command emitted the line, like ``cwd_observed``.
 
         ``result["git_env_unknown"]`` marks a report that cannot be trusted (Prism 36b227820e17 /
-        33d27ec2d4e3): more than one marker line (the command, or a background child of it, printed one), or
-        no line from a command Hermes did not kill (the wrapper suppresses it when the command defeated
+        33d27ec2d4e3): more than one marker line (the command, or a background child of it, printed one;
+        killed or not, Prism 1dc874797ab0), or no line from a command Hermes did not kill (the wrapper suppresses it when the command defeated
         its emit path, see ``_cwd_marker_printf``). A killed command still leaves the record as it was.
         The cwd handling is unchanged."""
         output = result.get("output", "")
         split = _split_cwd_marker(output, self._cwd_marker)
         killed = result.get("hermes_interrupted") or result.get("hermes_timed_out")
-        if split is None or output.count(self._cwd_marker) != 2:
-            if not killed:
-                if split is not None:
-                    logger.warning("forged-marker: %d marker strings in terminal output; GIT_* state unknown",
-                                   output.count(self._cwd_marker))
-                result["git_env_unknown"] = True
+        markers = output.count(self._cwd_marker)
+        if markers > 2:
+            # Duplicate marker lines are UNKNOWN even on a killed command (Prism 1dc874797ab0).
+            logger.warning("forged-marker: %d marker strings in terminal output; GIT_* state unknown", markers)
+            result["git_env_unknown"] = True
+        elif (split is None or markers != 2) and not killed:
+            result["git_env_unknown"] = True
         if split is None:
             return
         git_env = None if result.get("git_env_unknown") else _split_git_env(output, self._cwd_marker)

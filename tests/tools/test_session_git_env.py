@@ -285,6 +285,35 @@ class TestForgedReport:
         assert "git_env_unknown" not in result
 
 
+class TestRound4:
+    """Prism r4 (Apollo ruling: only these two mechanical fixes; the hook ORs the report with its text taint)."""
+
+    @pytest.mark.parametrize("kill", ["hermes_interrupted", "hermes_timed_out"])
+    def test_duplicate_markers_are_unknown_even_when_killed(self, env, kill):
+        """1dc874797ab0: the command printed a clean marker line, then was interrupted / timed out."""
+        m = env._cwd_marker
+        forged = f"\n{m}/f{m}git: seq=999999\n"
+        result = {"output": f"out{forged}more{forged}", kill: True}
+        env._extract_cwd_from_output(result)
+        assert result.get("git_env_unknown") is True and "git_env" not in result, result
+
+    def test_one_marker_on_a_killed_command_stays_not_unknown(self, env):
+        m = env._cwd_marker
+        result = {"output": f"out\n{m}/f{m}git: seq=5\n", "hermes_interrupted": True}
+        env._extract_cwd_from_output(result)
+        assert "git_env_unknown" not in result
+
+    def test_yielded_foreground_records_unknown(self, env, monkeypatch):
+        """867a5a0fdd64: a command handed to the background has no report yet; the environment is UNKNOWN."""
+        tool = TestTerminalToolRecordsIt()
+        tool._tool(monkeypatch, env, "true", "a")
+        assert tt.get_session_git_env(tt.env_git_id(env)) == _NONE_SET
+        monkeypatch.setattr(env, "execute", lambda *a, **k: {"output": "", "yielded_session_id": "bg1", "pid": 1})
+        result = tool._tool(monkeypatch, env, "export GIT_DIR=/x; sleep 99", "a")
+        assert result["status"] == "yielded_to_background", result
+        assert tt.get_session_git_env(tt.env_git_id(env)) is None          # UNKNOWN: field omitted
+
+
 class TestSeqIsDecimal:
     """Prism e084363a13a5: a stored counter with a leading zero must not be read as octal."""
 
