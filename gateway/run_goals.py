@@ -30,6 +30,10 @@ _AFTER_DELIVERY: contextvars.ContextVar[bool] = contextvars.ContextVar("post_tur
 # goal_pin sentinel: the turn-end goal row could not be read, so the deferred judge is skipped (the idle
 # check-in re-evaluates later); judging unpinned could score a goal set during the send on this reply.
 GOAL_PIN_FAILED = ("<goal pin failed>",)
+# A list while /loop completion runs inline before the send: a tick with --until settles there without
+# its judge (an aux-LLM call, t_d81971a0) and parks (mgr, pending, reply, source) here for the
+# post-delivery callback, which judges after the reply is sent.
+_LOOP_JUDGE_DEFER: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar("loop_judge_defer", default=None)
 
 
 class GatewayGoalsMixin:
@@ -453,8 +457,12 @@ class GatewayGoalsMixin:
                 logger.debug("post-turn hook failed: %s", exc)
             return
         # /loop completion stays inline, before the send, while this turn still owns the session: deferred,
-        # it would complete a wakeup tick fired during the send (bookkeeping, no LLM call). Only the judge waits.
+        # it would complete a wakeup tick fired during the send. It settles the tick (marker, caps, next
+        # schedule) without the --until judge; the judge runs after the send, like the /goal judge, and its
+        # verdict applies only to the tick it judged (LoopManager.apply_until_verdict).
         _t0 = time.monotonic()
+        loop_judges: list = []
+        _defer_token = _LOOP_JUDGE_DEFER.set(loop_judges)
         try:  # the class method: an instance override of _run_post_turn_hooks stands for the deferred judge
             # is_internal=True: no routing touch before the send. That upsert is a state.db WRITE that waits out
             # any foreign writer's hold (t_04b5d027: 4.05 s); the deferred judge's own lookup touches after it.
@@ -462,6 +470,8 @@ class GatewayGoalsMixin:
                 self, **{**kwargs, "is_internal": True}, parts=("loop completion",))
         except Exception as exc:
             logger.debug("post-turn hook failed: %s", exc)
+        finally:
+            _LOOP_JUDGE_DEFER.reset(_defer_token)
         _t1 = time.monotonic()
         # Pin the goal row as of turn end: a /goal set during the send is not judged on this reply.
         try:
@@ -482,6 +492,11 @@ class GatewayGoalsMixin:
 
         async def _run() -> None:
             _AFTER_DELIVERY.set(True)  # inside the task's copy of ctx only
+            for args in loop_judges:
+                try:
+                    await self._post_turn_loop_judge(*args)
+                except Exception as exc:
+                    logger.debug("loop --until judge failed: %s", exc)
             await self._run_post_turn_hooks(**kwargs, parts=("goal continuation",))
 
         async def _hooks() -> None:
@@ -558,7 +573,21 @@ class GatewayGoalsMixin:
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
-        decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        deferred = _LOOP_JUDGE_DEFER.get()
+        decision = await self._run_in_executor_with_context(
+            lambda: mgr.complete_tick(final_response or "", defer_judge=deferred is not None))
+        if deferred is not None and decision.get("judge_pending"):
+            deferred.append((mgr, decision["judge_pending"], final_response or "", source))
+        msg = decision.get("message") or ""
+        if msg and source is not None:
+            await self._defer_goal_status_notice_after_delivery(source, msg)
+
+    async def _post_turn_loop_judge(self, mgr: Any, pending: tuple, final_response: str, source: Any) -> None:
+        """The --until judge for a tick settled before the send, run after it (t_d81971a0)."""
+        from hermes_cli.loops import judge_until
+
+        verdict, reason = await self._run_in_executor_with_context(judge_until, pending[0], final_response)
+        decision = await self._run_in_executor_with_context(mgr.apply_until_verdict, pending, verdict, reason)
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
