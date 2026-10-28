@@ -303,3 +303,42 @@ def test_dm_to_group_per_user_creates_the_senders_own_group_row(tmp_path):
     assert (from_alice.session_key, from_alice.session_id) == (f"{GROUP_KEY}:{ALICE}", sid)
     assert {e.session_key for e in store.snapshot_entries()} == {
         f"{GROUP_KEY}:{ALICE}", f"{GROUP_KEY}:{BOB}"}
+
+
+# --- a SHARED route (no @user in its key) folds whoever continues it ------------------------------
+# Prism 44378641bb9a on #2408 (card t_00029e29): the counterpart filter fell back to the shared
+# route's origin sender, so the DM write collided with it (SessionKeyConflict group vs dm).
+
+THREAD = "$t1:angventures.io"
+
+
+def _thread_config(thread_per_user):
+    extra = {"group_sessions_per_user": True, "thread_sessions_per_user": thread_per_user}
+    return GatewayConfig(platforms={Platform.MATRIX: PlatformConfig(enabled=True, token="t", extra=extra)})
+
+
+def _thread_src(chat_type, user):
+    return SessionSource(platform=Platform.MATRIX, chat_id=ROOM, chat_type=chat_type, user_id=user,
+                         thread_id=THREAD)
+
+
+@pytest.mark.parametrize("backend", ["json", "sqlite"])
+def test_group_to_dm_shared_thread_route_folds_for_another_member(tmp_path, backend):
+    store = _store(tmp_path, _thread_config(False), backend)
+    started = store.get_or_create_session(_thread_src("group", BOB))
+    assert started.session_key == f"{GROUP_KEY}:{THREAD}"  # shared: no @user in the key
+    # Bob left; Alice continues the thread in what is now a DM.
+    entry = store.get_or_create_session(_thread_src("dm", ALICE))
+    assert (entry.session_key, entry.session_id) == (f"{DM_KEY}:{THREAD}", started.session_id)
+    assert {e.session_key for e in store.snapshot_entries()} == {f"{DM_KEY}:{THREAD}"}
+
+
+@pytest.mark.parametrize("backend", ["json", "sqlite"])
+def test_group_to_dm_per_user_thread_route_keeps_the_counterpart_filter(tmp_path, backend):
+    store = _store(tmp_path, _thread_config(True), backend)
+    bob = store.get_or_create_session(_thread_src("group", BOB))
+    assert bob.session_key == f"{GROUP_KEY}:{THREAD}:{BOB}"
+    entry = store.get_or_create_session(_thread_src("dm", ALICE))
+    assert entry.session_key == f"{DM_KEY}:{THREAD}" and entry.session_id != bob.session_id
+    assert {e.session_key: e.session_id for e in store.snapshot_entries()} == {
+        f"{DM_KEY}:{THREAD}": entry.session_id, f"{GROUP_KEY}:{THREAD}:{BOB}": bob.session_id}
