@@ -448,6 +448,35 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://openrouter.ai/moonshotai/kimi-k3",
         pricing_version="openrouter-kimi-k3-2026-09-27",
     ),
+    # ── Moonshot Kimi K3.1 Pro (2026-10-23) ──────────────────────────────
+    # OpenRouter moonshotai/kimi-k3.1-pro models API 2026-10-28: $2/M in,
+    # $10/M out, $0.20/M cache read (K3's $3/$15 cut by a third). Served on the
+    # Kimi membership via cpa (notional, status "estimated").
+    (
+        "moonshotai",
+        "kimi-k3.1-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k3.1-pro",
+        pricing_version="openrouter-kimi-k3.1-pro-2026-10-28",
+    ),
+    # Highspeed: Moonshot API list $4/M in, $20/M out (2x Pro; not on
+    # OpenRouter 2026-10-28). Cache read not published for this id: 10% of
+    # input, the ratio every K3/K3.1 row carries.
+    (
+        "moonshotai",
+        "kimi-k3.1-pro-highspeed",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("4.00"),
+        output_cost_per_million=Decimal("20.00"),
+        cache_read_cost_per_million=Decimal("0.40"),
+        source="official_docs_snapshot",
+        source_url="https://platform.kimi.ai/",
+        pricing_version="moonshot-kimi-k3.1-pro-highspeed-2026-10-28",
+    ),
     # ── Moonshot Kimi K2.x (membership ids the cpa proxy serves) ──────────
     # Notional list prices so these turns read "estimated", not "unknown"
     # (t_a9b4f1ad). Membership cash cost stays $0. Source: models.dev
@@ -1940,6 +1969,19 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://openrouter.ai/moonshotai/kimi-k3",
         pricing_version="openrouter-pricing-2026-09",
+    ),
+    # Source: https://openrouter.ai/moonshotai/kimi-k3.1-pro (models API 2026-10-28:
+    # prompt $2/M, completion $10/M, input_cache_read $0.20/M)
+    (
+        "openrouter",
+        "moonshotai/kimi-k3.1-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/moonshotai/kimi-k3.1-pro",
+        pricing_version="openrouter-pricing-2026-10",
     ),
 }
 
