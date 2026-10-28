@@ -68,6 +68,7 @@ class Limits:
     cpu_busy_max: float = 0.90         # fraction of all CPUs busy after this job
     mem_reserve_gb: float = 0.0        # held back for residents (the host table's mem_reserve_gb)
     psi_cpu_max: float = 40.0          # PSI some avg10 %, a refusal unless cpu_saturable
+    psi_cpu60_max: float = 25.0        # PSI cpu some avg60 % (FWA R2c), a refusal when MEASURED, unless cpu_saturable
     psi_mem_max: float = 20.0          # 14:33 readback: refuse at PSI mem some > 20 % even at low CPU
     psi_io_max: float = 30.0
     procs_frac_max: float = 0.85       # procs / maxproc
@@ -149,6 +150,9 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
         if not _num(sample.get(axis)):
             return missing(axis)
         free[axis] = lim - float(sample[axis])
+    # R2c avg60 stall closure (t_d456e9cd): read when the sampler pushed it; a pre-avg60 sample is not refused for it
+    if "psi_cpu_some10" not in unmeasurable and _num(sample.get("psi_cpu_some60")):
+        free["psi_cpu_some60"] = limits.psi_cpu60_max - float(sample["psi_cpu_some60"])
     if _num(sample.get("procs")) and _num(sample.get("maxproc")) and sample["maxproc"] > 0:
         free["procs"] = limits.procs_frac_max - float(sample["procs"]) / float(sample["maxproc"])
     if need.gpu_mib > 0:
@@ -158,11 +162,13 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
 
     if sample.get("slo_breach") is True:
         return Verdict(False, "slo", "saturated:slo (latency guard breached)", free)
-    order = ("slice_mem_gb", "mem_gb", "psi_mem_some10", "psi_io_some10", "procs", "gpu_mib", "psi_cpu_some10", "cpu")
+    order = ("slice_mem_gb", "mem_gb", "psi_mem_some10", "psi_io_some10", "procs", "gpu_mib", "psi_cpu_some10",
+             "psi_cpu_some60", "cpu")
     for axis in order:
-        if axis not in free or free[axis] >= 0:
+        # PSI cpu closes AT its line (R2c: avg10 >= 40 OR avg60 >= 25, as closed_when does on the legacy path)
+        if axis not in free or free[axis] > 0 or (free[axis] == 0 and axis not in ("psi_cpu_some10", "psi_cpu_some60")):
             continue
-        if axis in ("cpu", "psi_cpu_some10") and limits.cpu_saturable:
+        if axis in ("cpu", "psi_cpu_some10", "psi_cpu_some60") and limits.cpu_saturable:
             continue                       # a score penalty on a saturable host (score() reads it), never a refusal
         return Verdict(False, axis, f"saturated:{axis} {free[axis]:+.2f}", free)
     binding = min(_fractions(free, sample, limits), key=lambda kv: kv[1])[0]
@@ -175,7 +181,7 @@ def _fractions(free: Mapping[str, float], sample: Mapping, limits: Limits):
     tot = sample.get("mem_total_gb")
     out.append(("mem_gb", free["mem_gb"] / float(tot) if _num(tot) and tot > 0 else free["mem_gb"] / 100.0))
     for axis, lim in (("psi_mem_some10", limits.psi_mem_max), ("psi_io_some10", limits.psi_io_max),
-                      ("psi_cpu_some10", limits.psi_cpu_max)):
+                      ("psi_cpu_some10", limits.psi_cpu_max), ("psi_cpu_some60", limits.psi_cpu60_max)):
         if axis in free and lim > 0:
             out.append((axis, free[axis] / lim))
     if "procs" in free:
