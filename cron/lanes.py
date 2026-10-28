@@ -144,7 +144,7 @@ def merge_rewound_lanes(cron_dir: Path, lane: str, ids: List[str], now: datetime
     path = Path(cron_dir) / REWOUND_LANES_NAME
     ids = [str(i) for i in ids]
     try:
-        stored = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        stored = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
         if not isinstance(stored, dict):
             stored = {}
     except (OSError, ValueError):
@@ -186,7 +186,7 @@ def _heartbeat_path(home) -> Path:
 def read_runner_heartbeat(home) -> Optional[Dict[str, Any]]:
     """The runner heartbeat for *home*, or None when absent or unreadable."""
     try:
-        data = json.loads(_heartbeat_path(home).read_text(encoding="utf-8"))
+        data = json.loads(_heartbeat_path(home).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
@@ -291,7 +291,7 @@ def host_gateways(root=None) -> List[GatewayEntry]:
     out: List[GatewayEntry] = []
     for path in paths:
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
             pid = int(record["pid"])
         except (OSError, ValueError, TypeError, KeyError):
             continue
