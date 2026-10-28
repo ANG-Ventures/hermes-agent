@@ -8166,6 +8166,21 @@ def _worker_profile_scope(hermes_home: str, *, bind_home: bool = True):
             reset_hermes_home_override(home_token)
 
 
+def _worker_git_env(profile_home: Optional[str], env: dict):
+    """The identity vars the worker's ssh terminal will forward / unset, resolved under the assignee's profile
+    (config passthrough + process_env_files + .env), so the spawn identity probe sees the worker's effective
+    environment (Prism 63185217be5e). Any failure is ``None``: the probe then reads the host's own identity."""
+    if not profile_home or _kb._kwh.identity_policy_path() is None:
+        return None
+    try:
+        from hermes_cli.config import load_config
+        with _worker_profile_scope(profile_home):
+            return _kb._kwh.worker_git_env(env, load_config())
+    except Exception:
+        _kb._log.debug("kanban dispatch: worker git passthrough not resolved", exc_info=True)
+        return None
+
+
 def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
@@ -8586,7 +8601,8 @@ def _default_spawn(
     except Exception:
         env[_khc.CAPS_ENV] = _khc.env_value(_khc.WARN, ())
     if placement is not None:
-        _kb._kwh.prepare_remote_workspace(placement, workspace, board=pool_board)
+        _kb._kwh.prepare_remote_workspace(placement, workspace, board=pool_board,
+                                          git_env=_worker_git_env(profile_home, env))
         _kb._kwh.apply_placement(
             env, placement, workspace, run_id=task.current_run_id,
             log_file=str(_kb.worker_log_path(task.id, board=board)))

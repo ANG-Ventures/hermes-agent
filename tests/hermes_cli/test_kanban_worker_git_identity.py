@@ -67,6 +67,10 @@ def _runner(home, calls=None):
         if calls is not None:
             calls.append(argv[-1])
         env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1"}
+        # sshd with AcceptEnv: a SendEnv name reaches the remote shell with the CLIENT env's value.
+        sent = [a.split("=", 1)[1] for a in argv if a.startswith("SendEnv=")]
+        client = kw.get("env") or {}
+        env.update({n: client[n] for n in sent if n in client})
         return subprocess.run(["sh", "-c", argv[-1]], capture_output=True, text=True, env=env, timeout=60)
     return run
 
@@ -171,6 +175,78 @@ def test_identity_fault_quarantines_the_host_board_and_pages_once(monkeypatch):
     assert kwh.note_identity_fault("ace-media", "house-voice", why) is False   # one page per HOST
     assert kwp.board_fault("ace-media", "default") and kwp.board_fault("ace-media", "house-voice")
     assert len(sent) == 1 and "ace-media" in sent[0][-1] and "ci@example.invalid" in sent[0][-1]
+
+
+def _passthrough(email):
+    return {"GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_EMAIL": email}, set()
+
+
+def test_forwarded_passthrough_identity_is_what_is_probed(tmp_path, policy):
+    """Prism 63185217be5e: the worker's terminal forwards terminal.env_passthrough with SendEnv, so a forwarded
+    admitted identity over a clobbered ~/.gitconfig is fine, and the value never rides the remote command text."""
+    home = _worker_home(tmp_path, gitconfig_email="t@example.invalid")
+    (tmp_path / "board").mkdir()
+    calls = []
+    kwh.prepare_remote_workspace(_host(), str(tmp_path / "board" / "t_x"), runner=_runner(home, calls),
+                                 board="default", git_env=_passthrough(BOT))
+    assert BOT not in calls[0]
+    with pytest.raises(kwh.WorkerGitIdentityRefused):    # the same host without the passthrough is refused
+        kwh.prepare_remote_workspace(_host(), str(tmp_path / "board" / "t_y"), runner=_runner(home), board="default")
+
+
+def test_forwarded_bad_identity_is_refused_over_a_good_file(tmp_path, policy):
+    home = _worker_home(tmp_path, gitconfig_email=BOT)
+    (tmp_path / "board").mkdir()
+    with pytest.raises(kwh.WorkerGitIdentityRefused) as ei:
+        kwh.prepare_remote_workspace(_host(), str(tmp_path / "board" / "t_x"), runner=_runner(home),
+                                     board="default", git_env=_passthrough("ci@example.invalid"))
+    assert ei.value.email == "ci@example.invalid"
+
+
+def test_scoped_unset_runs_after_the_login_profile(tmp_path, policy):
+    """A scoped name the worker's terminal unsets is unset AFTER the profile exported it, as prepend_unset does."""
+    home = _worker_home(tmp_path, gitconfig_email="t@example.invalid", profile_email=BOT)
+    (tmp_path / "board").mkdir()
+    with pytest.raises(kwh.WorkerGitIdentityRefused) as ei:
+        kwh.prepare_remote_workspace(_host(), str(tmp_path / "board" / "t_x"), runner=_runner(home),
+                                     board="default", git_env=({}, {"GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"}))
+    assert ei.value.email == "t@example.invalid"
+
+
+def test_worker_git_env_resolves_like_the_worker(tmp_path, monkeypatch):
+    """Only git identity names from the passthrough list; worker env (+ process_env_files overlay) beats .env."""
+    from agent import secret_scope
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: False)
+    overlay = tmp_path / "ident.sh"
+    overlay.write_text(f"export GIT_COMMITTER_EMAIL='{BOT}'\n")
+    cfg = {"agent": {"process_env_files": [str(overlay)]}}
+    vals, unset = kwh.worker_git_env({"GIT_AUTHOR_EMAIL": "a@x", "PATH": "/usr/bin:/bin"}, cfg,
+                                     dotenv={"GIT_AUTHOR_EMAIL": "dotenv@x", "EMAIL": "e@x"},
+                                     passthrough=["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "EMAIL", "GITHUB_TOKEN"])
+    assert vals == {"GIT_AUTHOR_EMAIL": "a@x", "GIT_COMMITTER_EMAIL": BOT, "EMAIL": "e@x"} and unset == set()
+    assert kwh.worker_git_env({}, None, dotenv={}, passthrough=["GITHUB_TOKEN"]) == ({}, set())
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: True)
+    assert kwh.worker_git_env({}, None, dotenv={}, passthrough=["GIT_AUTHOR_EMAIL"]) == ({}, {"GIT_AUTHOR_EMAIL"})
+
+
+def test_dispatch_resolves_git_env_under_the_assignee_profile(tmp_path, policy, monkeypatch):
+    """_default_spawn's helper: the profile's passthrough + overlay + .env, inside the assignee scope; None when off."""
+    import contextlib
+    from agent import secret_scope
+    from hermes_cli import config as vconfig
+    from tools import env_passthrough
+    scopes = []
+    monkeypatch.setattr(kbd, "_worker_profile_scope", lambda home, **k: scopes.append(home) or contextlib.nullcontext())
+    monkeypatch.setattr(vconfig, "load_config", lambda: {})
+    monkeypatch.setattr(vconfig, "load_env", lambda: {"GIT_AUTHOR_EMAIL": "dot@x"})
+    monkeypatch.setattr(env_passthrough, "get_all_passthrough", lambda: frozenset({"GIT_AUTHOR_EMAIL", "GITHUB_TOKEN"}))
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: False)
+    assert kbd._worker_git_env("/p/alpha", {"PATH": "/usr/bin"}) == ({"GIT_AUTHOR_EMAIL": "dot@x"}, set())
+    assert kbd._worker_git_env("/p/alpha", {"GIT_AUTHOR_EMAIL": "env@x"}) == ({"GIT_AUTHOR_EMAIL": "env@x"}, set())
+    assert scopes == ["/p/alpha", "/p/alpha"]
+    assert kbd._worker_git_env(None, {}) is None
+    monkeypatch.setattr(kwh, "identity_policy_path", lambda: None)
+    assert kbd._worker_git_env("/p/alpha", {}) is None
 
 
 @pytest.fixture

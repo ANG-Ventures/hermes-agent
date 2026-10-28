@@ -21,7 +21,8 @@ import logging
 import os
 import shlex
 import subprocess
-from typing import Callable, Dict, MutableMapping, Optional
+import re
+from typing import Callable, Dict, Iterable, Mapping, MutableMapping, Optional, Set, Tuple
 
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
 
@@ -114,9 +115,75 @@ _IDENT_MARK = "@@hermes-git-ident"
 # `git var` in a login shell: worker-git-identity.sh's exported env beats ~/.gitconfig. Bounded so a slow profile
 # never fails the mkdir it rides on; an unread identity never refuses (only a READ, unadmitted one does). The
 # shell's rc is printed: 128 is git itself refusing (no identity configured: a read), anything else is unread.
-_IDENT_CMD = (f"printf '%s\\n' {_IDENT_MARK}; timeout 10 bash -lc 'cd /tmp && git var GIT_AUTHOR_IDENT && "
-              "git var GIT_COMMITTER_IDENT' </dev/null 2>/dev/null; echo \"RC=$?\"")
 _IDENT_TIMEOUT_SECONDS = 25
+# The names that can change what `git var` prints. Only these ride the probe (Prism 63185217be5e): the worker's ssh
+# terminal forwards its ``terminal.env_passthrough`` names with SendEnv and unsets the scoped ones it lacks, and a
+# forwarded GIT_AUTHOR_EMAIL beats the host's ~/.gitconfig exactly as it will in the worker's shell.
+_GIT_ENV_RE = re.compile(r"(GIT_[A-Z0-9_]+|EMAIL)")
+
+
+def _ident_cmd(unset_names=()) -> str:
+    # The unset runs INSIDE the login shell, after the profile, as SSHEnvironment._run_bash's prepend_unset does.
+    unset = f"unset {' '.join(sorted(unset_names))} 2>/dev/null; " if unset_names else ""
+    inner = shlex.quote(f"{unset}cd /tmp && git var GIT_AUTHOR_IDENT && git var GIT_COMMITTER_IDENT")
+    return (f"printf '%s\\n' {_IDENT_MARK}; timeout 10 bash -lc {inner} </dev/null 2>/dev/null; "
+            "echo \"RC=$?\"")
+
+
+_IDENT_CMD = _ident_cmd()
+
+
+def worker_git_env(worker_env: Mapping[str, str], profile_cfg: Optional[dict] = None,
+                   dotenv: Optional[Mapping[str, str]] = None,
+                   passthrough: Optional[Iterable[str]] = None) -> Tuple[Dict[str, str], Set[str]]:
+    """The git-identity part of what the worker's ssh terminal will forward (values) and unset (names).
+
+    Call inside the assignee's profile scope (``_worker_profile_scope``): ``terminal.env_passthrough`` is read from
+    the profile's config there, as the worker process (HERMES_HOME = profile home) reads it. A value is what the
+    worker's own ``os.environ`` will hold -- its spawn env plus the ``agent.process_env_files`` overlay it applies
+    at boot -- else the profile ``.env`` (``resolve_passthrough_env``'s ``os.getenv(k) or .env`` order). A name is
+    unset only where the worker's resolver would unset it (multiplex scope, no value); a dispatched worker is a
+    single-profile process, so in practice that set is empty. Skill-registered passthrough is a worker-runtime
+    fact the dispatcher cannot see and is not modelled."""
+    from tools.environments.local_env_policy import _is_provider_env_blocklisted, _is_hermes_internal_secret
+    if passthrough is None:
+        try:
+            from tools.env_passthrough import get_all_passthrough
+            passthrough = get_all_passthrough()
+        except Exception:
+            passthrough = ()
+    names = sorted(n for n in passthrough if _GIT_ENV_RE.fullmatch(n)
+                   and not _is_hermes_internal_secret(n) and not _is_provider_env_blocklisted(n))
+    if not names:
+        return {}, set()
+    env = dict(worker_env)
+    if profile_cfg is not None:
+        from hermes_cli.process_env_files import compute_overlay, configured_files
+        for k, (_old, new) in compute_overlay(configured_files(profile_cfg), env).items():
+            if new is None:
+                env.pop(k, None)
+            else:
+                env[k] = new
+    if dotenv is None:
+        try:
+            from hermes_cli.config import load_env
+            dotenv = load_env()
+        except Exception:
+            dotenv = {}
+    try:
+        from agent.secret_scope import _is_global_env, is_multiplex_active
+        multiplex = is_multiplex_active()
+    except Exception:
+        multiplex, _is_global_env = False, (lambda _n: True)
+    values: Dict[str, str] = {}
+    unset: Set[str] = set()
+    for n in names:
+        v = env.get(n) or dotenv.get(n)
+        if v is not None:
+            values[n] = v
+        elif multiplex and not _is_global_env(n):
+            unset.add(n)
+    return values, unset
 
 
 def identity_policy_path() -> Optional[str]:
@@ -151,32 +218,40 @@ def _ident_emails(stdout: str) -> Optional[list]:
         return [""]                        # git: "Author identity unknown" -- it would refuse (or mint user@host)
     if rc != "0":
         return None                        # timeout, no bash, a broken profile, a truncated read: proves nothing
-    import re
     emails = [m.group(1) for ln in lines[:-1] for m in [re.search(r"<([^>]*)>\s+\d+\s+[-+]\d{4}$", ln)] if m]
     return emails if len(emails) == 2 else None
 
 
 def prepare_remote_workspace(host: PoolHost, workspace: str,
                              runner: Callable = subprocess.run, *,
-                             board: Optional[str] = None) -> None:
+                             board: Optional[str] = None,
+                             git_env: Optional[Tuple[Dict[str, str], Set[str]]] = None) -> None:
     """Create the card's workspace at the same absolute path on the host and,
     on a pool host under the fleet identity policy, refuse one whose worker
-    shell would commit as an unadmitted identity (t_db46f06b)."""
+    shell would commit as an unadmitted identity (t_db46f06b). ``git_env`` is
+    ``worker_git_env()``: the identity vars the worker's terminal forwards
+    (SendEnv, values in the client env as SSHEnvironment does) and unsets."""
     # rc _BOARD_ROOT_RC only when the BOARD root itself is unusable (missing,
     # unwritable): a card-specific failure (its path exists as a file) stays a
     # card failure and is charged (Prism d72c091b628d).
     w, b = shlex.quote(workspace), shlex.quote(os.path.dirname(workspace.rstrip("/")) or "/")
     policy = identity_policy_path() if host.name != LOCAL_HOST_NAME else None
-    ok_tail = f"{{ {_IDENT_CMD}; exit 0; }}" if policy else "exit 0"
+    send, unset = (git_env or ({}, set())) if policy else ({}, set())
+    ok_tail = f"{{ {_ident_cmd(unset)}; exit 0; }}" if policy else "exit 0"
+    # The root is proven by CREATING under it (ENOSPC / inodes / quota pass
+    # an access test; Prism d762ee26a639), then the probe dir is removed.
+    argv = _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && {ok_tail}; "
+                           f"t=$(mktemp -d {b}/.hermes-root-probe.XXXXXX 2>/dev/null) && "
+                           f"{{ rmdir -- \"$t\"; exit 1; }}; exit {_BOARD_ROOT_RC}")
+    kw = {}
+    if send:  # names on the argv, values in the client env: never in the remote command text
+        argv = argv[:1] + [a for n in sorted(send) for a in ("-o", f"SendEnv={n}")] + argv[1:]
+        kw["env"] = {**os.environ, **send}
     proc = runner(
-        # The root is proven by CREATING under it (ENOSPC / inodes / quota pass
-        # an access test; Prism d762ee26a639), then the probe dir is removed.
-        _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && {ok_tail}; "
-                        f"t=$(mktemp -d {b}/.hermes-root-probe.XXXXXX 2>/dev/null) && "
-                        f"{{ rmdir -- \"$t\"; exit 1; }}; exit {_BOARD_ROOT_RC}"),
+        argv,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=_IDENT_TIMEOUT_SECONDS if policy else _PROBE_TIMEOUT_SECONDS,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, **kw,
     )
     rc = getattr(proc, "returncode", 1)
     if rc != 0:
