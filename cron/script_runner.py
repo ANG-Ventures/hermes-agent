@@ -454,7 +454,7 @@ def rearm() -> int:
 def _bootstrap_env() -> None:
     """The gateway's child-visible start-path env (spec §5.6): ``.env``, the config bridge, the
     platform env bridges, ``HERMES_EXEC_ASK``/``TERMINAL_CWD`` and ``HERMES_QUIET``. ``_HERMES_GATEWAY``
-    goes into each script child's env only, never this process's."""
+    goes into each script child's env only (``process_bootstrap.apply_child_env``)."""
     from hermes_cli.process_bootstrap import bootstrap_cron_parent_env
     from hermes_constants import get_process_hermes_home
 
