@@ -10384,11 +10384,14 @@ class ExternalCloseError(ValueError):
 # review cycle is open (after its ``review_requested``, before an exit, or after a resume back INTO review) is a
 # reviewer swap.
 # ``descendant_invalidated``: a reopened parent demotes the card to todo (Prism f696ae12d330).
+# ``gave_up``: the failure breaker blocks the card, untyped path without a ``blocked`` event (f696ae12d330).
 _REVIEW_EXIT_KINDS = ("dependency_wait", "changes_requested", "sendback", "blocked", "completed", "unblocked",
-                      "reopened", "requeued", "archived", "triage_resolved", "descendant_invalidated")
-# Of those, the kinds that can also put the card BACK in review: ``unblocked`` / ``promoted`` with
-# ``status: review`` (a parked or dependency-held review card resuming its review phase; Prism 2a08733c4d2a).
-_REVIEW_RESUME_KINDS = ("unblocked", "promoted")
+                      "reopened", "requeued", "archived", "triage_resolved", "descendant_invalidated", "gave_up")
+# Of those, the kinds that can also put the card BACK in review, and the payload key naming the destination:
+# ``unblocked`` / ``promoted`` with ``status: review`` (a parked or dependency-held review card resuming its review
+# phase; Prism 2a08733c4d2a); ``reopened`` with ``to_status: review`` (``reopen_task(to_status="review")``, no new
+# ``review_requested``; Prism 3ad3e981f866).
+_REVIEW_RESUME_KINDS = {"unblocked": "status", "promoted": "status", "reopened": "to_status"}
 
 
 def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
@@ -10396,7 +10399,8 @@ def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
     field, so a reassignment written by any version counts; Prism 1953ce5049b5).
 
     ``swaps``: assignees of ``assigned`` events made while the card was in review, oldest first. A review phase
-    resumed by ``unblocked``/``promoted`` with ``status: review`` counts as in review again (2a08733c4d2a).
+    resumed by ``unblocked``/``promoted`` with ``status: review`` or ``reopened`` with ``to_status: review`` counts
+    as in review again (2a08733c4d2a, 3ad3e981f866).
     ``last_assignment_in_review``: False when the newest ``assigned`` event of the cycle was made while the card
     was OUT of review -- an operator's explicit choice (4509b37e638c); True otherwise (none, or made in review).
     ``(None, True)`` when the card was never reviewed."""
@@ -10405,7 +10409,7 @@ def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
     ).fetchone()[0]
     if rr is None:
         return None, True
-    kinds = ("assigned", *_REVIEW_EXIT_KINDS, *_REVIEW_RESUME_KINDS)
+    kinds = tuple(dict.fromkeys(("assigned", *_REVIEW_EXIT_KINDS, *_REVIEW_RESUME_KINDS)))
     marks = ",".join("?" for _ in kinds)
     swaps: list = []
     in_review = True
@@ -10421,7 +10425,8 @@ def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
             if in_review and _nonblank_str(a):
                 swaps.append(a)
             continue
-        if kind in _REVIEW_RESUME_KINDS and _json_dict(row["payload"]).get("status") == "review":
+        resume_key = _REVIEW_RESUME_KINDS.get(kind)
+        if resume_key and _json_dict(row["payload"]).get(resume_key) == "review":
             in_review = True
         elif kind in _REVIEW_EXIT_KINDS:
             in_review = False
@@ -10432,125 +10437,6 @@ def _review_swaps(conn: sqlite3.Connection, task_id: str) -> list:
     """Assignees of the ``assigned`` events made while the latest review cycle was open, oldest first
     (:func:`_review_cycle_scan`)."""
     return _review_cycle_scan(conn, task_id)[0] or []
-
-
-def _stale_base_is_conflict_only(reports) -> bool:
-    """True when every failing branch-base report fails ONLY on merge conflicts (no foreign commits, no
-    out-of-scope edits, no other failure line)."""
-    failing = [r for r in reports if getattr(r, "failures", None)]
-    return bool(failing) and all(
-        getattr(r, "conflicts", None) and not getattr(r, "foreign_commits", None)
-        and not getattr(r, "out_of_scope", None) and len(r.failures) == 1
-        for r in failing)
-
-
-_GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
-_SCP_REMOTE_RE = re.compile(r"^(?:[^@/:\s]+@)?(?P<host>[^/:\s]+):(?P<path>[^\s]+)$")
-
-
-def _github_remote_slug(url) -> Optional[str]:
-    """Lower-cased ``owner/repo`` when *url* is a GitHub remote, else None (Prism e0b806db9787).
-
-    The HOST is parsed and must be GitHub itself: ``https://git.example.org/github.com/o/r.git`` is not a GitHub
-    remote. Shapes: ``https://[user@]github.com/o/r[.git][/]``, ``ssh://git@github.com[:port]/o/r[.git]``,
-    ``git://github.com/o/r`` and Git's SCP form ``[user@]github.com:o/r[.git]``. A local path is never one.
-    """
-    from urllib.parse import urlsplit
-
-    raw = str(url or "").strip()
-    if not raw:
-        return None
-    if "://" in raw:
-        try:
-            parts = urlsplit(raw)
-            host = (parts.hostname or "").lower()
-        except ValueError:
-            return None
-        if parts.scheme.lower() not in ("https", "http", "ssh", "git", "git+ssh", "ssh+git"):
-            return None
-        path = parts.path
-    else:
-        m = _SCP_REMOTE_RE.match(raw)
-        if not m:
-            return None
-        host, path = m.group("host").lower(), m.group("path")
-    if host not in _GITHUB_HOSTS:
-        return None
-    path = path.strip("/")
-    if path.lower().endswith(".git"):
-        path = path[:-4]
-    segs = path.split("/")
-    if len(segs) != 2 or not all(segs) or any(s in (".", "..") for s in segs):
-        return None
-    return "/".join(segs).lower()
-
-
-def _checkout_pr_identity(path) -> tuple:
-    """``(github_slugs, branch)`` of the checkout at *path*: the ``owner/repo`` of every GitHub remote (fork
-    remotes included) and its current branch (None when detached or unreadable).
-
-    The ONE place the stale-base advisory resolves checkout ownership. Git runs with every inherited ``GIT_*``
-    variable removed (Prism 92574423ea6e; superset of ``kanban_branch_base._SCRUB_ENV``): an inherited
-    ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_CEILING_DIRECTORIES`` / ``GIT_CONFIG_*`` would answer for another
-    repository than ``-C <path>``.
-    """
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-
-    def _run(*args):
-        try:
-            proc = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=10, check=False, env=env)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        return proc.stdout if proc.returncode == 0 else None
-
-    slugs = set()
-    for line in (_run("remote", "-v") or "").splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            slug = _github_remote_slug(parts[1])
-            if slug:
-                slugs.add(slug)
-    branch = (_run("symbolic-ref", "-q", "--short", "HEAD") or "").strip() or None
-    return slugs, branch
-
-
-def _owns_fleet_pr(metadata: Optional[dict], survivor_pr, reports=(), query_fn=None) -> bool:
-    """True when EVERY failing report's checkout is backed by an own fleet PR that can receive its conflict
-    sendback: a PR the handoff names, on one of the checkout's GitHub repos (bda9414a767d), read live as OPEN
-    (47c7fe02343a, b570e340e7e7: a merged, closed or missing PR has no conflict producer), whose head branch is
-    the checkout's branch from a head repository that is one of the checkout's remotes (an open PR of the same
-    repo for other work, or from another fork's same-named branch, does not carry this checkout; 16462e5a9800).
-    Anything unreadable is not provably backed: the guard refuses as before.
-    """
-    from hermes_cli import kanban_open_pr as _open_pr
-    try:
-        own = _open_pr.split_fleet(_open_pr.extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
-        failing = [r for r in reports if getattr(r, "failures", None)]
-        if not own or not failing:
-            return False
-        query = _open_pr.memo_query(query_fn)
-        if query is None:
-            return False
-        for rep in failing:
-            slugs, branch = _checkout_pr_identity(rep.repo)
-            if not slugs or not branch:
-                return False
-            backed = False
-            for ref in own:
-                if str(ref.repo).lower() not in slugs:
-                    continue
-                state = query(ref.repo, ref.number)
-                if (isinstance(state, dict) and str(state.get("state") or "").upper() == "OPEN"
-                        and str(state.get("head_ref") or "") == branch
-                        and str(state.get("head_repo") or "").lower() in slugs):
-                    backed = True
-                    break
-            if not backed:
-                return False
-        return True
-    except Exception:  # noqa: BLE001 -- unreadable = not provably PR-backed: the guard refuses as before
-        return False
 
 
 def landing_policy_knob(name: str) -> Optional[str]:
@@ -10743,22 +10629,11 @@ def _enforce_branch_base(
         payload = {"failures": failures}
         if untied:
             payload["survivor_merged_untied"] = untied
-        # Forge L0 §2.4 "Also changed" (SB-P): with the sendback producers on, a stale base is ADVISORY. The
-        # event is still recorded (now with advisory=true) and the handoff proceeds; the conflict reaches the
-        # worker as a `sendback(source=conflict)` from the PR. Only that case (Prism 1172e7254787): every failing
-        # report is a merge conflict and nothing else (foreign commits / out-of-scope edits still refuse), and
-        # EVERY failing checkout is backed by an OPEN own fleet PR from its branch (bda9414a767d, 47c7fe02343a;
-        # no live PR = nothing a conflict producer can send back on).
-        advisory = (landing_policy_knob("sendback") == "on"
-                    and not untied   # b570e340e7e7: a merged PR not tied to the checkout never excuses it
-                    and _stale_base_is_conflict_only(err.reports)
-                    and _owns_fleet_pr(metadata, survivor_pr, err.reports))
-        if advisory:
-            payload["advisory"] = True
+        # Forge L0 §2.4 "Also changed" (SB-P): the stale-base advisory under `sendback: on` is OFF by the
+        # operator's round-4 cut rule (t_cb6e1433, Prism 16462e5a9800): the guard always takes the strict path.
+        # The own-fleet-PR exception goes to FLIP-SB (t_5820b99b).
         with write_txn(conn):
             _append_event(conn, task.id, "completion_blocked_stale_base", payload)
-        if advisory:
-            return
         raise
     except Exception as exc:  # the guard must never break a handoff by crashing
         _log.warning("branch-base guard skipped for %s: %s", task.id, exc)
