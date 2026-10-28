@@ -151,6 +151,19 @@ IDENTITY_POLICY_REL = os.path.join("scripts", "git-hooks", "identity-policy.sh")
 _IDENT_PROBE_TIMEOUT_SECONDS = 60
 
 
+class WorkerIdentityProbeError(RuntimeError):
+    """The probe booted but its ssh terminal could not launch (Prism f7be64ebab1a: ``ssh -E <log>`` with no log dir
+    fails before the remote command runs). The worker's terminal would fail the same way, so the spawn is refused
+    with the reason, never admitted as "unread"."""
+
+
+def worker_spawn_cwd(workspace: str) -> Optional[str]:
+    """The cwd a worker (and its identity probe) is launched in: the workspace when it exists, else inherited.
+    ONE selection for both launches (Prism a924d74cd9c0): ``agent.process_env_files`` resolves relative paths
+    against cwd, so a probe in another cwd can read a different overlay than the worker loads."""
+    return workspace if os.path.isdir(workspace) else None
+
+
 def identity_policy_path() -> Optional[str]:
     try:
         from hermes_constants import get_default_hermes_root
@@ -186,7 +199,8 @@ def _run_ident_probe(profile: str, workspace: str, env: Mapping[str, str], *, wi
     child_env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
         proc = runner(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                      timeout=_IDENT_PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL, env=child_env)
+                      timeout=_IDENT_PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL, env=child_env,
+                      cwd=worker_spawn_cwd(workspace))
     except (OSError, subprocess.SubprocessError):
         _log.warning("kanban pool: identity probe for %s did not run", profile, exc_info=True)
         return None
@@ -213,6 +227,9 @@ def check_worker_identity(host: PoolHost, workspace: str, env: Mapping[str, str]
     if policy is None:
         return
     first = _run_ident_probe(profile, workspace, env, without_profile_git=False, runner=runner)
+    if (first or {}).get("error"):
+        raise WorkerIdentityProbeError(f"worker host {host.name}: identity probe error, refusing to start a "
+                                       f"worker: {first['error']}")
     emails = (first or {}).get("emails")
     if emails is None:
         _log.warning("kanban pool: %s worker git identity not read; not refusing", host.name)

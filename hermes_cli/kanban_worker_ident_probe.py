@@ -19,6 +19,7 @@ import argparse
 import json
 import re
 import sys
+import uuid
 
 MARK = "@@hermes-ident-probe "
 # The names that can change what `git var` prints.
@@ -71,6 +72,9 @@ def main(argv=None) -> int:
     from tools.terminal_tool_backends import _create_environment, _ssh_config_from_config
 
     cfg = _get_env_config()
+    # An instance-private ControlMaster (Prism 0aac8d745a32): the inherited ``run<id>`` scope is board-local, so
+    # another board's live worker on this host can own it, and cleanup() below sends `-O exit` to its scope.
+    cfg["ssh_control_scope"] = f"ident-probe-{uuid.uuid4().hex}"
     out = {"env_type": cfg["env_type"], "emails": None, "forwarded": {}}
     if cfg["env_type"] == "ssh":
         values, _unset = resolve_passthrough_env(explicit_forward=_ssh._placed_lease_env_names(),
@@ -83,7 +87,14 @@ def main(argv=None) -> int:
             res = env.execute(_SCRIPT, cwd=a.workspace, timeout=a.timeout)
         finally:
             env.cleanup()
-        out["emails"] = parse_output(res.get("output") or "")
+        output = res.get("output") or ""
+        out["emails"] = parse_output(output)
+        if res.get("returncode") != 124 and not any(ln.strip().startswith("@@RC=") for ln in output.splitlines()):
+            # The remote script never ran and it was not our timeout: ssh itself failed to launch (e.g. `-E <log>`
+            # with no log dir, Prism f7be64ebab1a). The worker's terminal would fail the same way; that is an
+            # ERROR, never "unread". A timeout stays unread (fail-open).
+            out["error"] = (f"ssh launch failed (rc={res.get('returncode')}): "
+                            f"{' '.join(output.split())[-300:] or 'no output'}")
     print(MARK + json.dumps(out, sort_keys=True), flush=True)
     return 0
 

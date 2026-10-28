@@ -24,6 +24,8 @@ from hermes_cli import kanban_worker_hosts as kwh
 from hermes_cli import kanban_worker_ident_probe as kwip
 from hermes_cli import kanban_worker_pool as kwp
 
+_REAL_DEFAULT_SPAWN = kbd._default_spawn
+
 BOT = "333956806+ang-fleet-workers[bot]@users.noreply.github.com"
 POLICY = ("identity_email_allowed() {\n  case \"$1\" in\n"
           f"    '9063726+Kyzcreig@users.noreply.github.com'|'{BOT}') return 0 ;;\n    *) return 1 ;;\n  esac\n}}\n")
@@ -87,15 +89,17 @@ class Rig:
             "terminal:\n  env_passthrough: [" + ", ".join(names) + "]\n")
         (self.profile / ".env").write_text(f"GIT_AUTHOR_EMAIL={author_email}\n")
 
-    def env(self, host=None):
+    def env(self, host=None, log_file=None):
         """The env the dispatcher hands the worker: profile home bound, placement applied."""
         env = {"PATH": f"{self.bin}:/usr/bin:/bin", "HOME": str(self.root / "studio-home"),
-               "HERMES_HOME": str(self.profile), "FAKE_SSH_HOME": str(self.remote), "TMPDIR": str(self.root)}
-        kwh.apply_placement(env, host or _host(), str(self.ws), run_id=7)
+               "HERMES_HOME": str(self.profile), "FAKE_SSH_HOME": str(self.remote), "TMPDIR": str(self.root),
+               "FAKE_SSH_CONTROL_LOG": str(self.root / "ssh-control.log")}
+        kwh.apply_placement(env, host or _host(), str(self.ws), run_id=7, log_file=log_file)
         return env
 
-    def check(self, *, host=None, board="default", runner=subprocess.run):
-        kwh.check_worker_identity(host or _host(), str(self.ws), self.env(host), "alpha", board=board, runner=runner)
+    def check(self, *, host=None, board="default", runner=subprocess.run, log_file=None):
+        kwh.check_worker_identity(host or _host(), str(self.ws), self.env(host, log_file), "alpha", board=board,
+                                  runner=runner)
 
 
 @pytest.fixture
@@ -200,6 +204,86 @@ def test_bad_host_under_a_bad_profile_is_still_the_host(rig, policy):
     with pytest.raises(kwh.WorkerGitIdentityRefused) as ei:
         rig.check()
     assert kbd._host_fault(ei.value) is not None and kwp.board_fault("ace-media", "default")
+
+
+def test_workspace_relative_overlay_is_what_is_probed(rig, policy):
+    """Prism a924d74cd9c0: the worker is launched with cwd=workspace and ``agent.process_env_files`` resolves a
+    relative path against cwd. An overlay reachable only from the workspace forwards a refused author: the probe,
+    launched in the same cwd, sees it and refuses (a profile fault: the host alone is admitted)."""
+    rig.gitconfig(BOT)
+    (rig.profile / "config.yaml").write_text("agent:\n  process_env_files: [overlay.sh]\n"
+                                             "terminal:\n  env_passthrough: [GIT_AUTHOR_EMAIL]\n")
+    (rig.ws / "overlay.sh").write_text("export GIT_AUTHOR_EMAIL=daedalus@fleet\n")
+    assert kwh.worker_spawn_cwd(str(rig.ws)) == str(rig.ws)
+    assert kwh.worker_spawn_cwd(str(rig.root / "absent")) is None
+    with pytest.raises(kwh.WorkerGitIdentityProfileRefused) as ei:
+        rig.check()
+    assert (ei.value.email, ei.value.variable) == ("daedalus@fleet", "GIT_AUTHOR_EMAIL")
+
+
+def test_ssh_log_launch_failure_is_a_probe_error_not_unread(rig, policy):
+    """Prism f7be64ebab1a: ``ssh -E <log>`` with no log dir fails before the remote command runs. That is a probe
+    ERROR that refuses the spawn with the reason, never an unread identity that admits a refused host."""
+    rig.gitconfig("t@example.invalid")
+    with pytest.raises(kwh.WorkerIdentityProbeError) as ei:
+        rig.check(log_file=str(rig.root / "no-such-logs" / "t_x.log"))
+    assert "ace-media" in str(ei.value) and "logfile" in str(ei.value)
+    (rig.root / "logs").mkdir()
+    with pytest.raises(kwh.WorkerGitIdentityRefused):                  # log dir present: the identity is read
+        rig.check(log_file=str(rig.root / "logs" / "t_x.log"))
+
+
+def test_default_spawn_creates_the_log_dir_before_the_probe(tmp_path, monkeypatch):
+    """f7be64ebab1a at the spawn: the real ``_default_spawn`` makes the board's log dir BEFORE the identity probe,
+    which gets that log path as ``TERMINAL_SSH_LOG_FILE``; the worker and the probe share one cwd selection."""
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "alpha").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, kb.create_task(conn, title="card", assignee="alpha"))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    seen = {}
+
+    def probe(placement, workspace, env, profile, *, board=None):
+        log = Path(env["TERMINAL_SSH_LOG_FILE"])
+        seen["log_dir_existed"] = log.parent.is_dir()
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *a, **kw):
+        seen["cwd"] = kw.get("cwd")
+        return FakeProc()
+    monkeypatch.setattr(kwh, "prepare_remote_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(kwh, "check_worker_identity", probe)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    assert not kb.worker_logs_dir(board=None).exists()
+    _REAL_DEFAULT_SPAWN(task, str(ws), placement=_host())
+    assert seen == {"log_dir_existed": True, "cwd": str(ws)}
+
+
+def test_probe_cleanup_never_closes_another_scopes_master(rig, policy):
+    """Prism 0aac8d745a32: run ids are board-local, so the worker's ``run<id>`` ControlMaster scope can belong to
+    ANOTHER board's live worker on this host. The probe runs on an instance-private scope and its cleanup sends
+    ``-O exit`` to nothing else: the other scope's master (and its SendEnv sibling) are untouched."""
+    import hashlib
+    import tempfile
+    rig.gitconfig(BOT)
+    rig.profile_git(BOT)                                                 # a SendEnv sibling socket in play too
+    ctl = rig.root / "hermes-ssh"
+    ctl.mkdir()
+    sid = hashlib.sha256(b"kanbanw@ace-media:22:run7").hexdigest()[:16]
+    other = [ctl / f"{sid}.sock", ctl / f"{sid[:8]}deadbeef.sock"]
+    for s in other:
+        s.write_text("")
+    assert tempfile.gettempdir() != str(rig.root)                        # the probe child gets TMPDIR=rig.root
+    rig.check()
+    assert all(s.exists() for s in other)
+    log = rig.root / "ssh-control.log"
+    assert not log.exists() or not any(str(s) in log.read_text() for s in other), log.read_text()
 
 
 def test_admitted_identity_is_probed_once(rig, policy):
