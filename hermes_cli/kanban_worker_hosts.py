@@ -21,7 +21,7 @@ import logging
 import os
 import shlex
 import subprocess
-from typing import Callable, Dict, MutableMapping, Optional
+from typing import Callable, Dict, Mapping, MutableMapping, Optional
 
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
 
@@ -117,6 +117,164 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
         if rc != _BOARD_ROOT_RC or not board:
             raise RuntimeError(msg)  # ssh failed, a card-path fault, or no pool board: not a board fact
         raise RemoteWorkspaceUnavailable(host.name, board, msg)
+
+
+class WorkerGitIdentityRefused(RuntimeError):
+    """The pool host's worker shell would commit as an identity the fleet's pr-commit-identity policy refuses, and
+    the host ALONE resolves a refused one (t_db46f06b): a HOST fault. 10-27 23:04 ace-media's kanbanw ~/.gitconfig
+    turned into ``ci <ci@example.invalid>`` and every worker placed there produced a PR that could never land
+    (hermes-home#7516, #7520), found 40 min later in CI."""
+
+    def __init__(self, host: str, board: Optional[str], email: str):
+        super().__init__(f"worker host {host}: git identity {email or 'UNSET'} is not admitted by "
+                         f"identity-policy.sh; refusing to start a worker there "
+                         f"(fix: fleet-host onboard {host} --fix, column K29)")
+        self.host, self.board, self.email = host, board, email
+
+
+class WorkerGitIdentityProfileRefused(RuntimeError):
+    """The refused identity is the assignee PROFILE's: the same worker shell without the profile's forwarded git
+    names is admitted (Prism f57827c258e9 / 39ff2e41e51a / b381c849ec78). A CARD fault: the retry is charged and
+    no host is quarantined or paged, so one bad profile .env cannot fence every pool host off the board."""
+
+    def __init__(self, host: str, board: Optional[str], email: str, profile: Optional[str], variable: str):
+        super().__init__(f"worker profile {profile or '?'}: forwarded {variable}={email or 'UNSET'} is not admitted "
+                         f"by identity-policy.sh (host {host}'s own identity is admitted); refusing to start the "
+                         f"worker (fix: {variable} in profile {profile or '?'}'s env / .env / process_env_files)")
+        self.host, self.board, self.email, self.profile, self.variable = host, board, email, profile, variable
+
+
+# The fleet policy (hermes-home scripts/git-hooks/identity-policy.sh) under the running root. Absent = no policy on
+# this install: the identity probe is skipped, so a non-fleet install never refuses a host.
+IDENTITY_POLICY_REL = os.path.join("scripts", "git-hooks", "identity-policy.sh")
+# One child boot (~2-3 s) + the ssh terminal's connect + login-shell snapshot + git var.
+_IDENT_PROBE_TIMEOUT_SECONDS = 60
+
+
+class WorkerIdentityProbeError(RuntimeError):
+    """The probe booted but its ssh terminal could not launch (Prism f7be64ebab1a: ``ssh -E <log>`` with no log dir
+    fails before the remote command runs). The worker's terminal would fail the same way, so the spawn is refused
+    with the reason, never admitted as "unread"."""
+
+
+def worker_spawn_cwd(workspace: str) -> Optional[str]:
+    """The cwd a worker (and its identity probe) is launched in: the workspace when it exists, else inherited.
+    ONE selection for both launches (Prism a924d74cd9c0): ``agent.process_env_files`` resolves relative paths
+    against cwd, so a probe in another cwd can read a different overlay than the worker loads."""
+    return workspace if os.path.isdir(workspace) else None
+
+
+def identity_policy_path() -> Optional[str]:
+    try:
+        from hermes_constants import get_default_hermes_root
+        path = os.path.join(str(get_default_hermes_root()), IDENTITY_POLICY_REL)
+    except Exception:
+        return None
+    return path if os.path.isfile(path) else None
+
+
+def identity_email_allowed(policy: str, email: str) -> bool:
+    """``identity_email_allowed`` from the policy file itself (one list, no copy). Fails closed. Not cached: a
+    policy edit takes effect on the next spawn in a running dispatcher, both ways (Prism 583e98241dfc)."""
+    try:
+        rc = subprocess.run(["bash", "-c", '. "$1" && identity_email_allowed "$2"', "_", policy, email],
+                            capture_output=True, timeout=10, stdin=subprocess.DEVNULL).returncode
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return rc == 0
+
+
+def _run_ident_probe(profile: str, workspace: str, env: Mapping[str, str], *, without_profile_git: bool,
+                     runner: Callable) -> Optional[dict]:
+    """The worker's own terminal, booted as the worker boots, prints its commit identity (kanban_worker_ident_probe).
+    None when the probe itself did not answer (boot failure, timeout): that proves nothing about the identity."""
+    import sys
+    from hermes_cli import kanban_worker_ident_probe as _probe
+    argv = [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_ident_probe", "--profile", profile,
+            "--workspace", workspace]
+    if without_profile_git:
+        argv.append("--without-profile-git")
+    child_env = dict(env)
+    # The code that decides is the code that probes: pin the child to this dispatcher's tree.
+    child_env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        proc = runner(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                      timeout=_IDENT_PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL, env=child_env,
+                      cwd=worker_spawn_cwd(workspace))
+    except (OSError, subprocess.SubprocessError):
+        _log.warning("kanban pool: identity probe for %s did not run", profile, exc_info=True)
+        return None
+    for line in reversed((getattr(proc, "stdout", "") or "").splitlines()):
+        if line.startswith(_probe.MARK):
+            try:
+                return json.loads(line[len(_probe.MARK):])
+            except ValueError:
+                return None
+    _log.warning("kanban pool: identity probe for %s answered nothing (rc=%s): %s", profile,
+                 getattr(proc, "returncode", None), (getattr(proc, "stderr", "") or "").strip()[-300:])
+    return None
+
+
+def check_worker_identity(host: PoolHost, workspace: str, env: Mapping[str, str], profile: str, *,
+                          board: Optional[str] = None, runner: Callable = subprocess.run) -> None:
+    """Refuse a spawn whose worker would commit as an identity the fleet policy refuses (t_db46f06b).
+
+    ``env`` is the env the worker is about to be launched with, placement applied. The probe launches the worker's
+    real terminal from it (no model of the worker's environment); a refusal is re-probed WITHOUT the profile's
+    forwarded git names: refused there too = the host's fault, admitted there = the profile's. An unread identity
+    never refuses."""
+    policy = identity_policy_path() if host.name != LOCAL_HOST_NAME else None
+    if policy is None:
+        return
+    first = _run_ident_probe(profile, workspace, env, without_profile_git=False, runner=runner)
+    if (first or {}).get("error"):
+        raise WorkerIdentityProbeError(f"worker host {host.name}: identity probe error, refusing to start a "
+                                       f"worker: {first['error']}")
+    emails = (first or {}).get("emails")
+    if emails is None:
+        _log.warning("kanban pool: %s worker git identity not read; not refusing", host.name)
+        return
+    bad = next((e for e in emails if not identity_email_allowed(policy, e)), None)
+    if bad is None:
+        return
+    forwarded = (first or {}).get("forwarded") or {}
+    if forwarded:
+        host_only = _run_ident_probe(profile, workspace, env, without_profile_git=True, runner=runner)
+        host_emails = (host_only or {}).get("emails")
+        if host_emails is not None and all(identity_email_allowed(policy, e) for e in host_emails):
+            var = next((n for n in sorted(forwarded) if forwarded[n] == bad), None) or "/".join(sorted(forwarded))
+            raise WorkerGitIdentityProfileRefused(host.name, board, bad, profile, var)
+    raise WorkerGitIdentityRefused(host.name, board, bad)
+
+
+_identity_paged: Dict[str, float] = {}
+
+
+def note_identity_fault(host: str, board: Optional[str], why: str) -> bool:
+    """Route placement around the host (per board, ``BOARD_FAULT_SECONDS``) and page ONCE per host per
+    quarantine window (#alerts, warn). True when a page was sent. The once-latch is set only by a page that
+    went out (Prism 5a786096bb00): a failed send is retried on the next refusal, never silently swallowed."""
+    import time as _time
+    from hermes_cli import kanban_worker_pool as _kwp
+
+    if board:
+        _kwp.mark_board_fault(host, board, why[:200])
+    _log.warning("kanban pool: %s refused (no retry charged): %s", host, why)
+    now = _time.monotonic()
+    if now < _identity_paged.get(host, 0.0):
+        return False
+    from hermes_cli import kanban_budget as _kbudget
+
+    script = _kbudget._notify_script_path()
+    if script is None:
+        return False  # a hermetic home never pages
+    import sys
+    sent = _kbudget._run_notify([sys.executable, script, "--sev", "warn", "--send", f"🪪 {why[:300]}"]) is not False
+    if sent:
+        _identity_paged[host] = now + _kwp.BOARD_FAULT_SECONDS
+    else:
+        _log.error("kanban pool: identity page for %s NOT sent; will retry on the next refusal: %s", host, why)
+    return sent
 
 
 def note_board_fault(host: str, board: Optional[str], why: str) -> bool:

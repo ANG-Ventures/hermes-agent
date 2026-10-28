@@ -2729,6 +2729,15 @@ def _host_fault(exc: BaseException) -> Optional[dict]:
     if isinstance(exc, _kb._kwh.RemoteWorkspaceUnavailable):
         _kb._kwh.note_board_fault(exc.host, exc.board, str(exc))
         return {"board_fault": {"host": exc.host, "board": exc.board}}
+    # t_db46f06b: a bad HOST identity, never the card. WorkerGitIdentityProfileRefused (the assignee profile's
+    # forwarded identity) is not matched: a card fault, charged, no host quarantined (Prism f57827c258e9). A refusal
+    # with no board has no pair to quarantine, so it is paged and charged like a card fault: never a free retry
+    # every tick (f57827c258e9 at 09a573b1).
+    if isinstance(exc, _kb._kwh.WorkerGitIdentityRefused):
+        _kb._kwh.note_identity_fault(exc.host, exc.board, str(exc))
+        if not exc.board:
+            return None
+        return {"board_fault": {"host": exc.host, "board": exc.board}, "git_identity_refused": exc.email}
     return None
 
 
@@ -8582,11 +8591,21 @@ def _default_spawn(
         env[_khc.CAPS_ENV] = _khc.spawn_env(_kb.kanban_home() / "fleet", _root_kanban_cfg())
     except Exception:
         env[_khc.CAPS_ENV] = _khc.env_value(_khc.WARN, ())
+    # Redirect output to a per-task log under <board-root>/logs/.
+    # Anchored at the board root (not the shared kanban root), so
+    # `hermes kanban log` on a specific board reads its own file and
+    # logs don't collide across boards that happen to share task ids.
+    # Created BEFORE the identity probe: a placed terminal passes this log to
+    # `ssh -E`, which fails with no parent dir (Prism f7be64ebab1a).
+    log_dir = _kb.worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
     if placement is not None:
         _kb._kwh.prepare_remote_workspace(placement, workspace, board=pool_board)
         _kb._kwh.apply_placement(
             env, placement, workspace, run_id=task.current_run_id,
             log_file=str(_kb.worker_log_path(task.id, board=board)))
+        # t_db46f06b: the worker's own terminal, from this exact env, prints the identity it will commit with.
+        _kb._kwh.check_worker_identity(placement, workspace, env, profile_arg, board=pool_board)
         # Layer 0 inputs (t_ecfd5591, F1): the card's hard requirements and the
         # route hash, so the worker can tell a stale route at boot.
         try:
@@ -8695,12 +8714,6 @@ def _default_spawn(
         # chose the native path is the code that runs it. The runner drops it
         # again before it starts the lane.
         env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
-    # Redirect output to a per-task log under <board-root>/logs/.
-    # Anchored at the board root (not the shared kanban root), so
-    # `hermes kanban log` on a specific board reads its own file and
-    # logs don't collide across boards that happen to share task ids.
-    log_dir = _kb.worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
@@ -8754,7 +8767,7 @@ def _default_spawn(
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             spawn_cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=_kb._kwh.worker_spawn_cwd(workspace),
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
