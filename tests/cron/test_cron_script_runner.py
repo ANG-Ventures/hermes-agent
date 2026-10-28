@@ -150,10 +150,12 @@ def procs():
     started: list = []
     yield started
     for p in started:
-        with contextlib.suppress(Exception):
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        with contextlib.suppress(Exception):
-            p.kill()
+        # Only a child we have not reaped: a reaped pid may already name an unrelated process.
+        if p.poll() is None:
+            with contextlib.suppress(Exception):
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)  # windows-footgun: ok — skipped on win32
+            with contextlib.suppress(Exception):
+                p.kill()
         with contextlib.suppress(Exception):
             p.wait(timeout=10)
 
@@ -694,6 +696,43 @@ def test_g_watchdog_snapshot_survives_a_held_procs_lock(root, monkeypatch, procs
     marker = json.loads(script_runner.trip_marker_path().read_text(encoding="utf-8"))
     assert marker["home"] == str(root) and marker["pid"] == os.getpid()
     assert (_hb(root)["state"], _hb(root)["standby_reason"]) == ("standby", "watchdog_tripped")
+
+
+def test_g_watchdog_kills_a_group_whose_leader_already_exited(root, monkeypatch, tmp_path):
+    """Prism d9f3c814a2c6: the script leader exited but a background child keeps the output pipe,
+    so ``communicate()`` has not reaped it yet (a zombie). The watchdog still kills the group; a
+    ``poll()`` that reaps the leader must not make it skip the survivors."""
+    import cron.scheduler as sched
+    from cron import lanes, script_runner
+
+    monkeypatch.setattr(lanes, "RUNNER_WATCHDOG_KILL_GRACE_S", 1)
+    pidfile = tmp_path / "bg.pid"
+    leader = subprocess.Popen(["sh", "-c", f"sleep 300 & echo $! > {pidfile}; exit 0"],
+                              start_new_session=True, stdout=subprocess.PIPE)
+    try:
+        int(_wait_for(lambda: pidfile.exists() and pidfile.read_text().strip(), 10, what="bg"))
+
+        def zombie():
+            with contextlib.suppress(OSError):
+                return Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z"
+            return False
+
+        if sys.platform.startswith("linux"):
+            _wait_for(zombie, 10, what="leader exited, unreaped")
+        else:
+            time.sleep(0.5)
+        assert leader.returncode is None and not _group_gone(leader.pid)
+        monkeypatch.setitem(sched._active_script_procs, id(leader), leader)
+        r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)],
+                                       exit_fn=lambda _c: None)
+        r._tree_kill(1.0)
+        leader.poll()
+        assert _wait_for(lambda: _group_gone(leader.pid), 3, what="background child gone")
+    finally:
+        with contextlib.suppress(Exception):
+            os.killpg(leader.pid, signal.SIGKILL)  # windows-footgun: ok — skipped on win32
+        with contextlib.suppress(Exception):
+            leader.communicate(timeout=10)
 
 
 @pytest.mark.slow_test(150, reason="real runner subprocess, a trip and a restart")

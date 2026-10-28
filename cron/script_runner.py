@@ -376,21 +376,24 @@ class ScriptRunner:
 
     def _tree_kill(self, grace: float) -> None:
         """SIGTERM every registered script's process group, wait ≤ ``grace``, SIGKILL the rest."""
+        # Scripts start with start_new_session=True, so each group id is its leader's pid. The group
+        # is resolved WITHOUT poll() first: a leader that exited while a background child keeps its
+        # pipes is an unreaped zombie, its pid (= the pgid) cannot be reused, and the survivors
+        # must still be signalled. Only a leader already reaped (returncode set) is skipped: its
+        # pid may now name an unrelated process.
         groups = []
         for proc in self._snapshot_script_procs():
             try:
-                if proc.poll() is not None:
+                if proc.returncode is not None:
                     continue
-                pgid = os.getpgid(proc.pid)
+                pgid = proc.pid
                 os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
                 groups.append((proc, pgid))
             except Exception:
                 logger.debug("watchdog SIGTERM failed", exc_info=True)
 
         def alive(item) -> bool:
-            proc, pgid = item
-            with contextlib.suppress(Exception):
-                proc.poll()  # reap our own child so its group can empty
+            _proc, pgid = item
             try:
                 os.killpg(pgid, 0)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
             except ProcessLookupError:
