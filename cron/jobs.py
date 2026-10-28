@@ -2316,8 +2316,11 @@ def maybe_flush_runtime_mirror(*, force: bool = False) -> bool:
             return False
         since = _rs.dirty_since(conn)
         known = _known_mirror_stamp(conn)
+    # A mode mismatch makes CLEAN rows due (Prism 3af0ec297c1c) but never skips the coalescing
+    # window for dirty ones: their pending flush repairs the mode anyway, and bypassing the window
+    # loads the whole registry on the first fire after every restart (t_14b3fa1d guard).
     replaced = (known is not None and _mirror_stamp(store.jobs_file) != known) \
-        or _runtime_mirror_out_of_mode()
+        or (since is None and _runtime_mirror_out_of_mode())
     if since is None and not replaced:
         return False
     interval = _rs.mirror_interval()
