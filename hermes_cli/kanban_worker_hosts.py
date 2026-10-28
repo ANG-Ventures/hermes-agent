@@ -117,7 +117,6 @@ _IDENT_MARK = "@@hermes-git-ident"
 _IDENT_CMD = (f"printf '%s\\n' {_IDENT_MARK}; timeout 10 bash -lc 'cd /tmp && git var GIT_AUTHOR_IDENT && "
               "git var GIT_COMMITTER_IDENT' </dev/null 2>/dev/null; echo \"RC=$?\"")
 _IDENT_TIMEOUT_SECONDS = 25
-_allowed_cache: Dict[tuple, bool] = {}
 
 
 def identity_policy_path() -> Optional[str]:
@@ -130,16 +129,14 @@ def identity_policy_path() -> Optional[str]:
 
 
 def identity_email_allowed(policy: str, email: str) -> bool:
-    """``identity_email_allowed`` from the policy file itself (one list, no copy). Fails closed."""
-    key = (policy, email)
-    if key not in _allowed_cache:
-        try:
-            rc = subprocess.run(["bash", "-c", '. "$1" && identity_email_allowed "$2"', "_", policy, email],
-                                capture_output=True, timeout=10, stdin=subprocess.DEVNULL).returncode
-        except (OSError, subprocess.SubprocessError):
-            return False
-        _allowed_cache[key] = rc == 0
-    return _allowed_cache[key]
+    """``identity_email_allowed`` from the policy file itself (one list, no copy). Fails closed. Not cached: a
+    policy edit must take effect on the next spawn in a running dispatcher, both ways (Prism 583e98241dfc)."""
+    try:
+        rc = subprocess.run(["bash", "-c", '. "$1" && identity_email_allowed "$2"', "_", policy, email],
+                            capture_output=True, timeout=10, stdin=subprocess.DEVNULL).returncode
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return rc == 0
 
 
 def _ident_emails(stdout: str) -> Optional[list]:

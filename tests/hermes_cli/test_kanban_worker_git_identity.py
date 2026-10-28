@@ -30,7 +30,6 @@ POLICY = ("identity_email_allowed() {\n  case \"$1\" in\n"
 def _clean(monkeypatch):
     kwp._board_faults.clear()
     kwh._identity_paged.clear()
-    kwh._allowed_cache.clear()
     monkeypatch.setattr(kbd, "_default_spawn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("real spawn")))
     yield
     kwp._board_faults.clear()
@@ -151,6 +150,15 @@ def test_policy_is_read_from_the_file_and_fails_closed(tmp_path):
     p.write_text('identity_email_allowed() { [ "$1" = only@x ]; }\n')
     assert kwh.identity_email_allowed(str(p), "only@x") and not kwh.identity_email_allowed(str(p), BOT)
     assert not kwh.identity_email_allowed(str(tmp_path / "missing.sh"), BOT)
+
+
+def test_policy_edit_takes_effect_without_restart(tmp_path):
+    """Prism 583e98241dfc: an admission must not outlive the policy that granted it (nor a denial)."""
+    p = tmp_path / "p.sh"
+    p.write_text('identity_email_allowed() { [ "$1" = only@x ]; }\n')
+    assert kwh.identity_email_allowed(str(p), "only@x") and not kwh.identity_email_allowed(str(p), BOT)
+    p.write_text(f'identity_email_allowed() {{ [ "$1" = "{BOT}" ]; }}\n')
+    assert not kwh.identity_email_allowed(str(p), "only@x") and kwh.identity_email_allowed(str(p), BOT)
 
 
 def test_identity_fault_quarantines_the_host_board_and_pages_once(monkeypatch):
