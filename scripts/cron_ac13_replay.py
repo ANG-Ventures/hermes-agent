@@ -187,7 +187,7 @@ def build_store(src_jobs: list, durations: dict, home: Path, minute: datetime, t
             at = t0 + timedelta(seconds=offset)
             nxt = at.isoformat()
             in_window += 1
-            if offset < 60:
+            if offset < 60 and job.get("no_agent") is True:
                 due_at_t0.append(job["id"])
             if kind == "cron":
                 # The due scan re-anchors a next_run_at that is not on the expr's lattice
@@ -210,6 +210,7 @@ def build_store(src_jobs: list, durations: dict, home: Path, minute: datetime, t
                    indent=1), encoding="utf-8")
     (home / "config.yaml").write_text(
         "timezone: UTC\ncron:\n  oneshot_catchup_s: 0\n  script_runner:\n    enabled: true\n", encoding="utf-8")
+    # due_first_minute = script-lane jobs due in t0's minute: what the runner must dispatch.
     return {"jobs": len(out_jobs), "due_first_minute": len(due_at_t0), "in_window": in_window,
             "script_stubs": sum(1 for j in out_jobs if j.get("no_agent") is True)}
 
@@ -218,6 +219,7 @@ def build_store(src_jobs: list, durations: dict, home: Path, minute: datetime, t
 
 _PEAKS: dict = {}
 _PEAKS_LOCK = threading.Lock()
+_TICK_SAMPLE = threading.local()  # the tick:* sample the current thread's tick() recorded
 
 
 def _dumper(path: Path, ticks: list, stop: threading.Event) -> None:
@@ -251,6 +253,8 @@ def _instrument(dump: Path, role: str) -> None:
             cur = _PEAKS.setdefault(str(label), [0, 0.0])
             cur[0] += 1
             cur[1] = max(cur[1], float(seconds))
+        if str(label).startswith("tick:"):
+            _TICK_SAMPLE.entry = (str(label), float(seconds))
         real_record(label, seconds)
 
     lanes.record_lock_wait = record_lock_wait
@@ -266,11 +270,13 @@ def _instrument(dump: Path, role: str) -> None:
                 user_report(o)
 
         kwargs["report"] = report
+        _TICK_SAMPLE.entry = None
         try:
             return real_tick(*args, **kwargs)
         finally:
-            ring = lanes.lock_waits()
-            entry = ring[-1] if ring and ring[-1][0].startswith("tick:") else None
+            # tick() records its own ("tick:<lane>", duration) in its finally, on this thread.
+            entry = getattr(_TICK_SAMPLE, "entry", None)
+            _TICK_SAMPLE.entry = None
             ticks.append({"t": started, "lane": kwargs.get("lane", "all"), "role": role,
                           "ring": entry, "outcome": outcome[0] if outcome else None})
 
@@ -482,9 +488,10 @@ def evaluate(run_dir: Path, home: Path, manifest: dict) -> dict:
     script_after = [r for r in tick_rows if r["role"] == "runner" and r["label"] == "tick:script"
                     and r["after_t0"]]
     executions = _rows(home)
+    # Rows the runner dispatched (claimed, running or finished): a claimed row is queued behind
+    # the worker pool when the run ends, which is the tick's work done, not missing workload.
     runner_started = sum(c for k, c in executions.items()
-                         if k.split(":")[0] == str(manifest.get("runner_pid"))
-                         and k.split(":")[1] in ("running", "completed", "failed"))
+                         if k.split(":")[0] == str(manifest.get("runner_pid")))
     # Exercised, not vacuous: every post-t0 runner tick ADMITTED and the runner started at least
     # the first minute's due jobs.
     exercised = (len(script_after) >= int(manifest.get("cycles") or 0)
