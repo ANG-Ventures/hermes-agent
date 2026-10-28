@@ -599,6 +599,23 @@ def _record_label_outcome(record, label: str):
     return entry if isinstance(entry, dict) and entry.get("at") else None
 
 
+def _serving_gateway_delegation(records) -> Optional[bool]:
+    """``cron_script_lane_delegation == 1`` of the first record whose pid is alive; a live record
+    without the field (pre-S3 code) reads False. None when no record names a live pid."""
+    import gateway.status as status
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            alive = status._pid_exists(int(rec["pid"]))
+        except Exception:
+            continue
+        if alive:
+            return rec.get("cron_script_lane_delegation") == 1
+    return None
+
+
 def script_lane_owner_line(home=None, *, now=None) -> str:
     """Who ticks ``home``'s cron script lane (spec §5.3), as one ``script lane: ...`` line. Never
     names the gateway while the gateway's last tick for the home found the lane lock-skipped."""
@@ -635,7 +652,15 @@ def script_lane_owner_line(home=None, *, now=None) -> str:
             holder = (f"runner pid {hb.get('pid')}" if isinstance(hb, dict) and hb.get("tick_started_at")
                       else "unknown")
             return f"script lane: LOCK-SKIPPED by {holder} (gateway did not tick it, last {skipped} s)"
-    if not lanes.knob_enabled():
+    # The knob that decides delegation is the SERVING gateway's (its process home), not this CLI
+    # process home's: read the live gateway's published cron_script_lane_delegation (the home's
+    # own gateway first, then the root gateway that multiplexes it); the process-home knob only
+    # when no live gateway record exists.
+    knob_on = _serving_gateway_delegation(
+        (own_record, record(get_default_hermes_root() / "gateway_state.json")))
+    if knob_on is None:
+        knob_on = lanes.knob_enabled()
+    if not knob_on:
         return "script lane: gateway (cron.script_runner.enabled=false)"
     marker = script_runner.trip_marker_path()
     if marker.exists():
@@ -644,7 +669,7 @@ def script_lane_owner_line(home=None, *, now=None) -> str:
                 f"{trip.get('home', '?')}; run 'hermes cron runner rearm')")
     if not isinstance(hb, dict):
         return "script lane: gateway (no runner heartbeat)"
-    if lanes.delegate(home):
+    if lanes.runner_progressing(home):
         return f"script lane: runner pid {hb.get('pid')} (active, ok {age(hb.get('last_ok_at'))} s ago)"
     reason = hb.get("standby_reason") if hb.get("state") == "standby" else None
     if reason == "host_precondition":

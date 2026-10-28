@@ -122,6 +122,13 @@ def _fires(job: dict, start: datetime, end: datetime) -> list:
             if t >= end:
                 break
             out.append(t)
+    elif kind == "once":
+        t = _parse(sched.get("run_at") or job.get("next_run_at"))
+        if t is not None:
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=start.tzinfo)
+            if start <= t < end:
+                out.append(t)
     elif kind == "interval" and sched.get("minutes"):
         step = timedelta(minutes=float(sched["minutes"]))
         t = _parse(job.get("next_run_at")) or start
@@ -141,7 +148,7 @@ def busiest_minute(jobs: list, tz) -> tuple:
     end = start + timedelta(days=1)
     counts: dict = {}
     for job in jobs:
-        if job.get("no_agent") is not True:
+        if job.get("no_agent") is not True or not job.get("enabled", True):
             continue
         for t in _fires(job, start, end):
             key = t.replace(second=0, microsecond=0)
@@ -209,11 +216,18 @@ def build_store(src_jobs: list, durations: dict, home: Path, minute: datetime, t
 
 # --- child roles -----------------------------------------------------------------------------------
 
+_PEAKS: dict = {}
+_PEAKS_LOCK = threading.Lock()
+
+
 def _dumper(path: Path, ticks: list, stop: threading.Event) -> None:
     from cron import lanes
 
     while True:
-        data = {"pid": os.getpid(), "lock_waits": lanes.lock_waits(), "ticks": list(ticks)}
+        with _PEAKS_LOCK:
+            peaks = {k: list(v) for k, v in _PEAKS.items()}
+        data = {"pid": os.getpid(), "lock_waits": lanes.lock_waits(), "peaks": peaks,
+                "ticks": list(ticks)}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
         os.replace(tmp, path)
@@ -228,6 +242,18 @@ def _instrument(dump: Path, role: str) -> None:
 
     ticks: list = []
     real_tick = sched.tick
+    real_record = lanes.record_lock_wait
+
+    def record_lock_wait(label, seconds):
+        # Every caller imports record_lock_wait from cron.lanes at call time, so this sees every
+        # sample; the ring is bounded (10,000) and a peak must not be evicted before the dump.
+        with _PEAKS_LOCK:
+            cur = _PEAKS.setdefault(str(label), [0, 0.0])
+            cur[0] += 1
+            cur[1] = max(cur[1], float(seconds))
+        real_record(label, seconds)
+
+    lanes.record_lock_wait = record_lock_wait
 
     def logged_tick(*args, **kwargs):
         started = time.time()
@@ -302,7 +328,7 @@ def _env(home: Path) -> dict:
            if not (k.endswith("_API_KEY") or k.startswith("PYTEST_") or k in (
                "HERMES_MACHINE_ID", "_HERMES_CRON_EXTERNAL_WORKER", "INVOCATION_ID"))}
     env.update(PYTHONPATH=str(REPO_ROOT), HERMES_HOME=str(home), HOME=str(home.parent),
-               PYTHONUNBUFFERED="1")
+               PYTHONUNBUFFERED="1", HERMES_TIMEZONE="UTC")
     return env
 
 
@@ -318,6 +344,8 @@ def _spawn(argv: list, home: Path, log: Path) -> subprocess.Popen:
 
 def _kill(procs: list) -> None:
     for p in procs:
+        if p.poll() is not None:
+            continue  # reaped: its pid (and pgid) may already belong to someone else
         with contextlib.suppress(Exception):
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
     for p in procs:
@@ -369,6 +397,7 @@ def one_run(args, src_jobs, durations, tz, run_dir: Path, *, control: bool) -> d
         second=0, microsecond=0)  # on a minute boundary: cron fires sit on the lattice
     manifest = build_store(src_jobs, durations, home, minute, t0, (args.cycles + 1) * 60.0)
     manifest.update(minute=minute.isoformat(), t0=t0.isoformat(), control=control,
+                    cycles=args.cycles,
                     cycle_s=cycle, thresholds=THRESHOLDS)
     procs: list = []
     started = time.monotonic()
@@ -411,7 +440,9 @@ def one_run(args, src_jobs, durations, tz, run_dir: Path, *, control: bool) -> d
                 procs.append(control_proc)
             post = [t for t in _load_dump(run_dir / "runner.json")["ticks"]
                     if t["t"] >= t0_epoch - 1.0 and t["lane"] == "script"]
-            if len(post) >= args.cycles and (control_proc is None or control_proc.poll() is not None):
+            control_done = (not control) or (control_proc is not None
+                                             and control_proc.poll() is not None)
+            if len(post) >= args.cycles and control_done:
                 time.sleep(2.0)
                 break
             for p in (runner, gateway):
@@ -431,13 +462,10 @@ def evaluate(run_dir: Path, home: Path, manifest: dict) -> dict:
     tick_rows = []
     for role in ("runner", "gateway"):
         dump = _load_dump(run_dir / f"{role}.json")
-        for label, wait in dump["lock_waits"]:
+        for label, (n, peak) in (dump.get("peaks") or {}).items():
             if label.startswith("tick:"):
                 continue
-            key = f"{role}:{label}"
-            cur = sections.setdefault(key, {"n": 0, "max_s": 0.0})
-            cur["n"] += 1
-            cur["max_s"] = max(cur["max_s"], float(wait))
+            sections[f"{role}:{label}"] = {"n": n, "max_s": float(peak)}
         for t in dump["ticks"]:
             if t.get("ring"):
                 tick_rows.append({"role": role, "t": t["t"], "after_t0": t["t"] >= t0_epoch - 1.0,
@@ -451,22 +479,34 @@ def evaluate(run_dir: Path, home: Path, manifest: dict) -> dict:
         "lock_timeouts_30s": logs.count("waiting for the cron jobs lock"),
         "ac3_duplicates": len(_ac3(home)),
     }
-    passed = (measured["max_section_wait_s"] < THRESHOLDS["max_section_wait_s"]
-              and measured["cron_lock_degraded"] == 0 and measured["lock_timeouts_30s"] == 0
-              and measured["ac3_duplicates"] == 0 and not manifest.get("aborted"))
     script_after = [r for r in tick_rows if r["role"] == "runner" and r["label"] == "tick:script"
                     and r["after_t0"]]
+    executions = _rows(home)
+    runner_started = sum(c for k, c in executions.items()
+                         if k.split(":")[0] == str(manifest.get("runner_pid"))
+                         and k.split(":")[1] in ("running", "completed", "failed"))
+    # Exercised, not vacuous: every post-t0 runner tick ADMITTED and the runner started at least
+    # the first minute's due jobs.
+    exercised = (len(script_after) >= int(manifest.get("cycles") or 0)
+                 and all(r["outcome"] == "ADMITTED" for r in script_after)
+                 and runner_started >= int(manifest.get("due_first_minute") or 0) > 0)
+    passed = (measured["max_section_wait_s"] < THRESHOLDS["max_section_wait_s"]
+              and measured["cron_lock_degraded"] == 0 and measured["lock_timeouts_30s"] == 0
+              and measured["ac3_duplicates"] == 0 and not manifest.get("aborted") and exercised)
     result = dict(manifest, measured=measured, thresholds_pass=passed, sections=sections,
-                  ticks=tick_rows, executions=_rows(home), script_ticks_after_t0=len(script_after),
+                  ticks=tick_rows, executions=executions, runner_started=runner_started,
+                  exercised=exercised, script_ticks_after_t0=len(script_after),
                   admitted_after_t0=sum(1 for r in script_after if r["outcome"] == "ADMITTED"))
     if manifest.get("control"):
         # A probe wait cannot exceed the hold (the helper takes the lock first, so every waiter
         # arrives after it), so the spec's literal "max >= 6 s" for a 6 s hold is unreachable;
         # the control proves the probe trips the < 5 s threshold, and that the section that
         # tripped it overlapped the hold (reported, spec ambiguity flagged on the card).
-        result["control_pass"] = measured["max_section_wait_s"] >= THRESHOLDS["max_section_wait_s"]
         with contextlib.suppress(OSError, ValueError):
             result["control_hold"] = json.loads((run_dir / "control.json").read_text())
+        result["control_pass"] = (
+            "released_at" in (result.get("control_hold") or {})
+            and measured["max_section_wait_s"] >= THRESHOLDS["max_section_wait_s"])
     (run_dir / "result.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
     return result
 
@@ -529,7 +569,7 @@ def main(argv=None) -> int:
     for i, res in enumerate(results):
         summary["runs"].append({k: res.get(k) for k in (
             "measured", "thresholds_pass", "script_ticks_after_t0", "admitted_after_t0",
-            "runner_pid", "aborted", "executions")})
+            "runner_pid", "aborted", "executions", "runner_started", "exercised")})
         print(f"run {i + 1}: pass={res['thresholds_pass']} {res['measured']} "
               f"script_ticks={res['script_ticks_after_t0']} admitted={res['admitted_after_t0']}",
               flush=True)
@@ -555,6 +595,9 @@ def main(argv=None) -> int:
                            "watchdog_s": max(30, math.ceil(4 * t_max)) if durs else None}
         if args.p05_out:
             p = Path(args.p05_out).expanduser()
+            if not valid:  # contended data never lands at the path a watchdog is derived from
+                p = p.with_name(p.stem + ".INVALID" + p.suffix)
+            summary["p0_5"]["jsonl"] = str(p)
             p.parent.mkdir(parents=True, exist_ok=True)
             with open(p, "w", encoding="utf-8") as fh:
                 for s in samples:

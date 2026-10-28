@@ -795,6 +795,12 @@ class InProcessCronScheduler(CronScheduler):
                         if delegate_script_lane:
                             lane_kwargs, _finish = _gateway_lane_tick_kwargs(home)
                             call_kwargs = {**tick_kwargs, **lane_kwargs}
+                            if "report" in tick_kwargs:
+                                # Chain, never replace: on_home_cycle's report must still fire.
+                                def _both(outcome, _a=tick_kwargs["report"], _b=lane_kwargs["report"]):
+                                    _a(outcome)
+                                    _b(outcome)
+                                call_kwargs["report"] = _both
                         try:
                             with _profile_cron_scope(home):
                                 if _on_tick_start is not None:

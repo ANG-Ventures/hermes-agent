@@ -328,6 +328,33 @@ def test_loops_record_the_script_lane_outcome(root, monkeypatch):
     assert out["p1"]["outcome"] == "LOCK_BUSY"
 
 
+def test_delegation_keeps_the_on_home_cycle_report(root, monkeypatch):
+    """Prism 619b39593013: with both ``delegate_script_lane`` and ``on_home_cycle`` the lane
+    ``report`` must not replace the one that feeds ``on_home_cycle``."""
+    import cron.scheduler as sched
+    from cron import lanes
+    from cron.lanes import TickOutcome
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    seen = []
+    stop = threading.Event()
+
+    def fake_tick(**kwargs):
+        kwargs["report"](TickOutcome.ADMITTED)
+        stop.set()
+        return 0
+
+    monkeypatch.setattr(sched, "tick", fake_tick)
+    monkeypatch.setattr(lanes, "delegate", lambda _h: False)
+    InProcessCronScheduler().start(
+        stop, interval=0, startup_recovery=True, profile_homes=lambda: [("default", root)],
+        delegate_script_lane=True,
+        on_home_cycle=lambda name, home, gated_in, outcome: seen.append(outcome))
+    assert seen == [TickOutcome.ADMITTED]
+    out = lanes.gateway_lane_status_fields()["cron_script_lane_last_outcome"]
+    assert out["default"]["outcome"] == "ADMITTED"
+
+
 # --- hermes cron status: the script-lane owner line -------------------------------------------
 
 def _lock_hold(path: Path):
@@ -403,6 +430,32 @@ def test_status_lines(root, clock, monkeypatch):
     # No runner at all.
     (root / "cron" / lanes.HEARTBEAT_NAME).unlink()
     assert script_lane_owner_line(root) == "script lane: gateway (no runner heartbeat)"
+
+
+def test_status_reads_the_serving_gateways_knob(root, clock, monkeypatch):
+    """Prism c506f9815d57: a profile multiplexed by the root gateway is delegated on the ROOT
+    gateway's knob, so ``hermes cron status`` run with the profile's home reads the serving
+    gateway's published ``cron_script_lane_delegation``, not the CLI process home's knob."""
+    from cron import lanes
+    from hermes_cli.cron import script_lane_owner_line
+
+    prof = _make_profile(root, "p1")  # its config.yaml has no script_runner key
+    (root / "gateway_state.json").write_text(json.dumps(
+        {"pid": os.getpid(), "cron_script_lane_delegation": 1}), encoding="utf-8")
+    _hb(prof, last_ok_s=12)
+    monkeypatch.setenv("HERMES_HOME", str(prof))
+    lanes._knob_cache.clear()
+    assert lanes.knob_enabled() is False  # the CLI process home's own knob
+    assert script_lane_owner_line(prof) == (
+        f"script lane: runner pid {os.getpid()} (active, ok 12 s ago)")
+    # The serving gateway publishes 0: the profile's script lane is the gateway's.
+    (root / "gateway_state.json").write_text(json.dumps(
+        {"pid": os.getpid(), "cron_script_lane_delegation": 0}), encoding="utf-8")
+    assert script_lane_owner_line(prof) == "script lane: gateway (cron.script_runner.enabled=false)"
+    # The profile's own live gateway outranks the root record.
+    (prof / "gateway_state.json").write_text(json.dumps(
+        {"pid": os.getpid(), "cron_script_lane_delegation": 1}), encoding="utf-8")
+    assert script_lane_owner_line(prof).startswith("script lane: runner pid")
 
 
 def test_cron_status_prints_the_owner_line(root, clock, monkeypatch, capsys):

@@ -286,6 +286,15 @@ def delegate(home) -> bool:
     try:
         if not knob_enabled():
             return False
+        return runner_progressing(home)
+    except Exception:
+        return False
+
+
+def runner_progressing(home) -> bool:
+    """The heartbeat half of ``delegate``: ``active``, ``last_ok_at`` within
+    ``RUNNER_PROGRESS_STALE_S``, pid alive with a matching start time. Fails toward False."""
+    try:
         hb = read_runner_heartbeat(home)
         if hb is None or hb.get("state") != "active":
             return False
