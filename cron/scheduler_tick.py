@@ -6,10 +6,12 @@ import time
 
 
 def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None, lane="all",
-         report=None):
+         report=None, scan_report=None):
     """``lane`` (cron/lanes.py): ``"all"`` (default, both lanes), ``"agent"`` or ``"script"``.
     ``report``: optional callable that receives exactly one ``cron.lanes.TickOutcome`` per call
-    that returns. The int return is unchanged."""
+    that returns. ``scan_report``: optional callable that receives the lane this tick holds the
+    locks for, once the locks are taken (``"agent"`` for an ``"all"`` tick whose
+    ``.tick-script.lock`` was busy). The int return is unchanged."""
     from hermes_cli.backend_retirement import retirement
     from cron.lanes import LANES, TickOutcome, record_lock_wait
 
@@ -31,7 +33,7 @@ def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None
                 return 0
             return _tick_admitted(
                 verbose, adapters, loop, sync, can_dispatch=can_dispatch, lane=lane,
-                report=_report)
+                report=_report, scan_report=scan_report)
     finally:
         record_lock_wait(f"tick:{lane}", time.monotonic() - started)
 
@@ -60,7 +62,7 @@ def _acquire_lane_locks(_sched, lane: str) -> dict:
 
 def _tick_admitted(
     verbose: bool = True, adapters=None, loop=None, sync: bool = True, *, can_dispatch=None,
-    lane: str = "all", report=lambda _outcome: None):
+    lane: str = "all", report=lambda _outcome: None, scan_report=None):
     """Check and run all due jobs. File-locked so only one tick runs at a time (gateway ticker vs
     standalone daemon / manual tick). ``can_dispatch``: optional gate; false leaves due jobs for the
     next allowed tick. Returns the number of jobs executed (0 if another tick holds the lock)."""
@@ -81,6 +83,9 @@ def _tick_admitted(
         report(TickOutcome.LOCK_BUSY)
         return 0
     scan_lane = lane if lane != "all" or len(held) == 2 else next(iter(held))
+    if scan_report is not None:
+        with contextlib.suppress(Exception):
+            scan_report(scan_lane)
     # Worktree GC and MCP orphan sweeps belong to the agent lane.
     agent_chores = scan_lane != "script"
 

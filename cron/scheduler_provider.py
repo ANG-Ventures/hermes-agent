@@ -66,6 +66,35 @@ def _guarded_store_write(action, description, *args, **kwargs):
         logger.warning("Cron %s write failed: %s", description, e, exc_info=True)
 
 
+def _gateway_lane_tick_kwargs(home) -> tuple:
+    """The gateway's per-home tick arguments under script-lane delegation (spec §5.3): ``lane=
+    "agent"`` only while ``cron.lanes.delegate(home)`` holds, else no ``lane`` (``"all"``), plus the
+    ``report``/``scan_report`` callbacks that capture what happened to the script lane. Returns
+    ``(kwargs, finish)``; ``finish(raised=None)`` records the outcome for ``hermes cron status``.
+    Any failure deciding delegation ticks ``"all"``."""
+    from cron import lanes
+
+    try:
+        delegated = lanes.delegate(home)
+    except Exception:
+        delegated = False
+    seen: dict = {}
+    kwargs: dict = {"report": lambda o: seen.__setitem__("outcome", o),
+                    "scan_report": lambda lane: seen.__setitem__("scan", lane)}
+    if delegated:
+        kwargs["lane"] = "agent"
+
+    def finish(raised=None) -> None:
+        try:
+            outcome = raised if raised is not None else seen.get("outcome")
+            lanes.record_gateway_script_outcome(home, lanes.gateway_script_outcome(
+                outcome, None if delegated else seen.get("scan"), delegated=delegated))
+        except Exception:
+            logger.debug("recording the script-lane outcome failed for %s", home, exc_info=True)
+
+    return kwargs, finish
+
+
 def _profile_entry(entry) -> tuple:
     """Normalize a ``profile_homes`` entry (``(name, home)`` tuple or bare home) to ``(name,
     home)``."""
@@ -537,8 +566,12 @@ class InProcessCronScheduler(CronScheduler):
         self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None,
         profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
         lane="all", heartbeat=True, startup_recovery=True, on_home_cycle=None, tick_hooks=None,
+        delegate_script_lane=False,
     ):
-        """``lane``/``heartbeat``/``startup_recovery``/``on_home_cycle``/``tick_hooks`` serve the
+        """``delegate_script_lane`` (the gateway, spec §5.3): per cycle and per home, tick
+        ``lane="agent"`` while ``cron.lanes.delegate(home)`` holds (the script runner owns the
+        script lane), else ``"all"``; the script-lane outcome is recorded for ``hermes cron
+        status``. ``lane``/``heartbeat``/``startup_recovery``/``on_home_cycle``/``tick_hooks`` serve the
         script runner (cron/script_runner.py, spec §5.4) and need ``profile_homes``.
         ``heartbeat=False``: never write ``ticker_heartbeat``/``ticker_last_success``/
         ``ticker_last_error`` (the gateway's signal). ``on_home_cycle(name, home, gated_in,
@@ -570,6 +603,7 @@ class InProcessCronScheduler(CronScheduler):
                 default_profile=default_profile, profile_gate=profile_gate, lane=lane,
                 heartbeat=heartbeat, startup_recovery=startup_recovery,
                 on_home_cycle=on_home_cycle, tick_hooks=tick_hooks,
+                delegate_script_lane=delegate_script_lane,
             )
             return
 
@@ -601,6 +635,17 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                elif delegate_script_lane:
+                    lane_kwargs, finish = _gateway_lane_tick_kwargs(get_process_hermes_home())
+                    try:
+                        cron_tick(
+                            verbose=False, adapters=adapters, loop=loop, sync=False,
+                            can_dispatch=can_dispatch, **lane_kwargs,
+                        )
+                    except BaseException as e:
+                        finish(e)
+                        raise
+                    finish()
                 else:
                     cron_tick(
                         verbose=False, adapters=adapters, loop=loop, sync=False,
@@ -647,6 +692,7 @@ class InProcessCronScheduler(CronScheduler):
         self, stop_event, *, profile_homes, adapters=None, loop=None, interval=60,
         can_dispatch=None, profile_adapters=None, default_profile=None, profile_gate=None,
         lane="all", heartbeat=True, startup_recovery=True, on_home_cycle=None, tick_hooks=None,
+        delegate_script_lane=False,
     ):
         """Tick every profile's store, each scoped via ``_profile_cron_scope``. ``profile_gate(name,
         home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
@@ -745,6 +791,16 @@ class InProcessCronScheduler(CronScheduler):
                             def _report(outcome, _key=str(home)):
                                 _outcomes[_key] = outcome
                             tick_kwargs["report"] = _report
+                        call_kwargs, _finish = tick_kwargs, None
+                        if delegate_script_lane:
+                            lane_kwargs, _finish = _gateway_lane_tick_kwargs(home)
+                            call_kwargs = {**tick_kwargs, **lane_kwargs}
+                            if "report" in tick_kwargs:
+                                # Chain, never replace: on_home_cycle's report must still fire.
+                                def _both(outcome, _a=tick_kwargs["report"], _b=lane_kwargs["report"]):
+                                    _a(outcome)
+                                    _b(outcome)
+                                call_kwargs["report"] = _both
                         try:
                             with _profile_cron_scope(home):
                                 if _on_tick_start is not None:
@@ -752,11 +808,18 @@ class InProcessCronScheduler(CronScheduler):
                                 try:
                                     cron_tick(
                                         verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
-                                        sync=False, can_dispatch=can_dispatch, **tick_kwargs,
+                                        sync=False, can_dispatch=can_dispatch, **call_kwargs,
                                     )
+                                except BaseException as e:
+                                    if _finish is not None:
+                                        _finish(e)
+                                        _finish = None
+                                    raise
                                 finally:
                                     if _on_tick_end is not None:
                                         _on_tick_end(home)
+                                if _finish is not None:
+                                    _finish()
                         except CronTickYielded as e:
                             # Yield for THIS profile only; one fresh gateway must not stop others.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)

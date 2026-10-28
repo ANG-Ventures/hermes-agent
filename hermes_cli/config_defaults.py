@@ -2204,6 +2204,11 @@ DEFAULT_CONFIG = {
         # due by at most this much; beyond it the job is removed and a loud
         # MISSED notice is delivered. 0 = the old 120s grace only. Default 6h.
         "oneshot_catchup_s": 21600,
+        # Cron script runner (`hermes cron runner`, cron/script_runner.py): when true in the
+        # process home's config, the gateway hands each home's plain-script (no_agent) lane to the
+        # runner while the runner progresses, and ticks it itself otherwise. Only a YAML boolean
+        # true enables it. Off = the gateway ticks every lane, as before.
+        "script_runner": {"enabled": False},
         "script_timeout_seconds": 3600,
         # Timeout (seconds) for SessionDB() init inside cron jobs: state.db open/migrate has no
         # timeout of its own against a wedged sqlite3.connect, and an unbounded hang wedges the

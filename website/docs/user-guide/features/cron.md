@@ -1132,6 +1132,16 @@ cron:
   oneshot_catchup_s: 21600    # 6h; 0 keeps only the 120s grace
 ```
 
+### Script jobs outside the gateway (`hermes cron runner`)
+
+`hermes cron runner` ticks only the plain-script (`no_agent`) jobs, from the same job list. With `cron.script_runner.enabled: true` in the root home's `config.yaml`, the gateway ticks only the agent jobs of a home while the runner is making progress on that home (its last good tick is under 180 s old and its process is alive). Otherwise the gateway ticks every job, as it does when the knob is off (the default). `hermes cron status` prints who owns the script lane, e.g. `script lane: runner pid 4242 (active, ok 12 s ago)`.
+
+```yaml
+cron:
+  script_runner:
+    enabled: false   # only a YAML boolean true hands the script lane to the runner
+```
+
 ## Schedule formats
 
 The agent's final response is automatically delivered to the job's `deliver:` target — the agent no longer fires messages itself, so the user-facing content simply goes in the final response. To deliver to **additional or different** targets, list multiple `deliver:` targets on the cron job (comma-separated, e.g. `deliver: "telegram,discord"`) rather than having the agent send them.

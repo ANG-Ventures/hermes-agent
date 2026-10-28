@@ -29,8 +29,11 @@ LANES = ("all", "agent", "script")
 RUNNER_CYCLE_S = 60
 # Q1-dependent: the value under option A (spec §10). Option B changes this one line.
 RUNNER_PROGRESS_STALE_S = 180
-# DRAFT until P0-5 measures healthy script-lane tick durations (D15); S3 writes the real value.
-RUNNER_TICK_WATCHDOG_S = 120
+# D15: max(30, ceil(4 x T_max)). P0-5 (t_0d495b7a, AC-13 replay of the 09:00 busiest minute, 172
+# script jobs, 10 repeats x 3 cycles, two processes): n=30, p50 0.58 s, p99 = T_max 1.78 s ->
+# ceil(7.12) = 8 -> the 30 s floor. Delivery runs in pool workers after tick() returns (sync=False),
+# except missed one-shot notices (scheduler_tick.py), which the replay does not exercise.
+RUNNER_TICK_WATCHDOG_S = 30
 # Watchdog tree-kill grace (§5.5 step 5). ``terminate_running_scripts`` has no named grace, so this
 # is the spec's own value.
 RUNNER_WATCHDOG_KILL_GRACE_S = 3
@@ -267,6 +270,88 @@ def lane_peer(pid, pid_start, home) -> bool:
         return False
     except Exception:
         return False
+
+
+# --- gateway side: who owns a home's script lane (§5.3, S3) --------------------------------------
+
+def _progress_age_s(hb: Dict[str, Any], now) -> Optional[float]:
+    try:
+        return _age_s(hb["last_ok_at"], now)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def delegate(home) -> bool:
+    """True when this gateway hands *home*'s script lane to the runner: the knob is on, the
+    runner heartbeat is ``active``, ``last_ok_at`` (progress, not liveness) is within
+    ``RUNNER_PROGRESS_STALE_S`` and the heartbeat pid is alive with a matching start time. Fails
+    toward False (the gateway ticks ``"all"``)."""
+    try:
+        if not knob_enabled():
+            return False
+        return runner_progressing(home)
+    except Exception:
+        return False
+
+
+def runner_progressing(home) -> bool:
+    """The heartbeat half of ``delegate``: ``active``, ``last_ok_at`` within
+    ``RUNNER_PROGRESS_STALE_S``, pid alive with a matching start time. Fails toward False."""
+    try:
+        hb = read_runner_heartbeat(home)
+        if hb is None or hb.get("state") != "active":
+            return False
+        age = _progress_age_s(hb, _now())
+        if age is None or age > RUNNER_PROGRESS_STALE_S:
+            return False
+        return runner_pid_alive(hb.get("pid"), hb.get("pid_start"))
+    except Exception:
+        return False
+
+
+def home_label(home) -> str:
+    """``<name>`` for ``<root>/profiles/<name>``, else ``"default"`` (keys of the published
+    ``cron_script_lane_last_outcome`` map)."""
+    home = Path(home)
+    return home.name if home.parent.name == "profiles" else "default"
+
+
+# Last script-lane outcome per home this gateway process ticked, published into its
+# ``gateway_state.json`` by the housekeeping heartbeat: ``{home_label: {"outcome", "at"}}``.
+_gateway_outcomes: Dict[str, Dict[str, str]] = {}
+_gateway_outcomes_lock = threading.Lock()
+DELEGATED = "DELEGATED"
+
+
+def gateway_script_outcome(outcome, scanned_lane: Optional[str], *, delegated: bool = False) -> str:
+    """What happened to the script lane on one gateway tick. ``DELEGATED``: the gateway ticked
+    ``"agent"`` on purpose. ``LOCK_BUSY``: an ``"all"`` tick was narrowed to the agent lane because
+    ``.tick-script.lock`` was held, or the whole tick was lock-skipped. Otherwise the reported
+    ``TickOutcome`` name, or the raised exception's type name."""
+    if delegated:
+        return DELEGATED
+    if scanned_lane == "agent":
+        return TickOutcome.LOCK_BUSY.value
+    if isinstance(outcome, TickOutcome):
+        return outcome.value
+    if isinstance(outcome, BaseException):
+        return type(outcome).__name__
+    return "UNKNOWN"
+
+
+def record_gateway_script_outcome(home, outcome: str) -> None:
+    with _gateway_outcomes_lock:
+        _gateway_outcomes[home_label(home)] = {"outcome": str(outcome), "at": _now().isoformat()}
+
+
+def gateway_lane_status_fields() -> Dict[str, Any]:
+    """The two ``gateway_state.json`` fields each housekeeping cycle publishes:
+    ``cron_script_lane_delegation = int(knob_enabled())`` (this process home's knob) and
+    ``cron_script_lane_last_outcome``."""
+    with _gateway_outcomes_lock:
+        outcomes = {k: dict(v) for k, v in _gateway_outcomes.items()}
+    return {"cron_script_lane_delegation": int(knob_enabled()),
+            "cron_script_lane_last_outcome": outcomes}
 
 
 class GatewayEntry(NamedTuple):

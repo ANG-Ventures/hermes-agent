@@ -592,6 +592,103 @@ def _print_ticker_health(pids: list, restart_command: str = "hermes gateway rest
             print(f"  Ticker heartbeat: {int(hb_age)}s ago")
 
 
+def _record_label_outcome(record, label: str):
+    if not isinstance(record, dict):
+        return None
+    entry = (record.get("cron_script_lane_last_outcome") or {}).get(label)
+    return entry if isinstance(entry, dict) and entry.get("at") else None
+
+
+def _serving_gateway_delegation(records) -> Optional[bool]:
+    """``cron_script_lane_delegation == 1`` of the first record whose pid is alive; a live record
+    without the field (pre-S3 code) reads False. None when no record names a live pid."""
+    import gateway.status as status
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            alive = status._pid_exists(int(rec["pid"]))
+        except Exception:
+            continue
+        if alive:
+            return rec.get("cron_script_lane_delegation") == 1
+    return None
+
+
+def script_lane_owner_line(home=None, *, now=None) -> str:
+    """Who ticks ``home``'s cron script lane (spec §5.3), as one ``script lane: ...`` line. Never
+    names the gateway while the gateway's last tick for the home found the lane lock-skipped."""
+    from cron import lanes, script_runner
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    home = Path(home) if home is not None else Path(get_hermes_home())
+    now = now if now is not None else lanes._now()
+    label = lanes.home_label(home)
+    hb = lanes.read_runner_heartbeat(home)
+
+    def age(stamp) -> Optional[int]:
+        try:
+            return int(round(lanes._age_s(stamp, now)))
+        except (TypeError, ValueError):
+            return None
+
+    def record(path: Path):
+        with contextlib.suppress(OSError, ValueError):
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            return data if isinstance(data, dict) else None
+        return None
+
+    # The gateway's own report of its last tick for this home: the home's own gateway record, or
+    # the host gateway's (root) record that multiplexes it. The newest entry wins.
+    own_record = record(home / "gateway_state.json")
+    entries = [e for e in (_record_label_outcome(own_record, label),
+                           _record_label_outcome(record(get_default_hermes_root() / "gateway_state.json"), label))
+               if e is not None]
+    last = max(entries, key=lambda e: str(e.get("at"))) if entries else None
+    if last is not None and last.get("outcome") == lanes.TickOutcome.LOCK_BUSY.value:
+        skipped = age(last.get("at"))
+        if skipped is not None and skipped <= 3 * lanes.RUNNER_CYCLE_S:
+            holder = (f"runner pid {hb.get('pid')}" if isinstance(hb, dict) and hb.get("tick_started_at")
+                      else "unknown")
+            return f"script lane: LOCK-SKIPPED by {holder} (gateway did not tick it, last {skipped} s)"
+    # The knob that decides delegation is the SERVING gateway's (its process home), not this CLI
+    # process home's: read the live gateway's published cron_script_lane_delegation (the home's
+    # own gateway first, then the root gateway that multiplexes it); the process-home knob only
+    # when no live gateway record exists.
+    knob_on = _serving_gateway_delegation(
+        (own_record, record(get_default_hermes_root() / "gateway_state.json")))
+    if knob_on is None:
+        knob_on = lanes.knob_enabled()
+    if not knob_on:
+        return "script lane: gateway (cron.script_runner.enabled=false)"
+    marker = script_runner.trip_marker_path()
+    if marker.exists():
+        trip = record(marker) or {}
+        return (f"script lane: gateway (runner standby: watchdog tripped {trip.get('at', '?')} on "
+                f"{trip.get('home', '?')}; run 'hermes cron runner rearm')")
+    if not isinstance(hb, dict):
+        return "script lane: gateway (no runner heartbeat)"
+    if lanes.runner_progressing(home):
+        return f"script lane: runner pid {hb.get('pid')} (active, ok {age(hb.get('last_ok_at'))} s ago)"
+    reason = hb.get("standby_reason") if hb.get("state") == "standby" else None
+    if reason == "host_precondition":
+        failing = []
+        with contextlib.suppress(Exception):
+            failing = [e for e in lanes.host_gateways() if not lanes.code_contains_s1(e.code_sha)]
+        names = "; ".join(f"{lanes.home_label(e.home)} pid {e.pid} on {(e.code_sha or 'none')[:12]}"
+                          for e in failing) or "a gateway on pre-S1 code"
+        return f"script lane: runner standby (host precondition: {names})"
+    if reason == "home_gateway_not_delegating":
+        pid = (own_record or {}).get("pid", "?")
+        return f"script lane: profile gateway pid {pid} (runner standby: home gateway does not delegate)"
+    ok = age(hb.get("last_ok_at"))
+    if ok is not None:
+        return f"script lane: gateway (runner last ok {ok} s ago)"
+    state = hb.get("state") or "unknown"
+    return f"script lane: gateway (runner {state}{': ' + reason if reason else ''}, never ok)"
+
+
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import list_jobs
@@ -684,6 +781,8 @@ def cron_status():
                       "      hermes --profile default gateway migrate --multiplex --dry-run\n"
                       "      hermes --profile default gateway migrate --multiplex\n"
                       "  Check: hermes cron status from this profile should show its ticker heartbeat.\n")
+        with contextlib.suppress(Exception):
+            print(f"  {script_lane_owner_line()}")
 
     print()
     _print_active_jobs_summary(list_jobs(include_disabled=False))

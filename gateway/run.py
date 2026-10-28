@@ -3700,6 +3700,21 @@ def _write_runtime_status_quiet(**fields: Any) -> None:
         pass
 
 
+def _write_runtime_heartbeat() -> None:
+    """Housekeeping "Runtime heartbeat": re-stamp ``gateway_state.json`` and publish the cron
+    script-lane fields (spec §5.3): ``cron_script_lane_delegation = int(knob_enabled())`` read from
+    THIS process home's config, and ``cron_script_lane_last_outcome`` per ticked home. A failure
+    reading them still re-stamps the heartbeat."""
+    fields: dict = {}
+    try:
+        from cron.lanes import gateway_lane_status_fields
+
+        fields = gateway_lane_status_fields()
+    except Exception:
+        logger.debug("cron script-lane status fields unavailable", exc_info=True)
+    _write_runtime_status_quiet(**fields)
+
+
 def _command_origin_for_source(source: Any) -> Optional[dict]:
     """Delivery origin for a shared CLI/gateway command so its job replies to this chat/thread."""
     try:
@@ -10403,7 +10418,7 @@ def _start_gateway_housekeeping(
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
         # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
         # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
-        (1, "Runtime heartbeat", _write_runtime_status_quiet)]
+        (1, "Runtime heartbeat", _write_runtime_heartbeat)]
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
@@ -11367,6 +11382,8 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = _CronDispatchGate(runner)
+        # Hand each home's script lane to the cron script runner while it progresses (§5.3).
+        cron_start_kwargs["delegate_script_lane"] = True
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(
