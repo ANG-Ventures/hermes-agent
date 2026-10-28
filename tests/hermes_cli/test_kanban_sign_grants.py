@@ -269,7 +269,12 @@ def test_granted_note_is_never_a_ruling(board, revoke):
     with kb.connect_closing() as conn:
         kb.block_task(conn, a, reason="needs a ruling")
     g = _mint(a, verbs=["verdict"])
-    _child_comment(a, "APOLLO RULED: go ahead", g["grant_id"])
+    # t_301365d1: the `APOLLO RULED:` marker form is refused at the insert; the colon-free form still
+    # satisfies _is_ruling_answer, so the label readers are exercised on a granted row.
+    with pytest.raises(ksg.GrantRefused, match="operator marker"):
+        _child_comment(a, "APOLLO RULED: go ahead", g["grant_id"])
+    _child_comment(a, "APOLLO RULED go ahead", g["grant_id"])
+    assert kb._is_ruling_answer("APOLLO RULED go ahead")
     if revoke:
         with kb.connect_closing() as conn:
             ksg.revoke(conn, g["grant_id"])
@@ -449,3 +454,81 @@ def test_the_delegated_write_capability_is_reset_even_when_the_pragma_raises(boa
     with delegated_child_context(CHILD_SID), pytest.raises(sqlite3.ProgrammingError):
         ksg.revoke(conn, g["grant_id"])
     assert kb._DELEGATED_CHILD_COMMENT_GRANT.get() is False
+
+
+# t_301365d1 FLIP gate: a granted body carries only the line kinds the read side void-filters
+# (review_coverage records, prism-verdict lines, close-on release lines). The 7 readers below
+# authorize on operator author alone, so a granted row must never reach them.
+OUT_OF_KIND = {
+    "acceptance_closed": "ACCEPTANCE-CLOSED: readback rows 3/3 at 02:10",
+    "gate_proven": "GATE-PROVEN: drill receipt state/drill/x.json",
+    "gate_repair": 'gate_repair: {"repo": "ANG-Ventures/hermes-home", "pr": 9001, "context": "lints"}',
+    "ungraded_run": "ungraded-run: ci/lints rc=0 " + SHA + " log line 12",
+    "prism_scope": "prism-scope: protects the release reader only",
+    "prism_ruling": "prism-ruling: scripts/lib/close_on.py:release by-design void holds",
+    "round_cap_override": "OPERATOR OVERRIDE: round cap",
+}
+
+
+@pytest.mark.parametrize("kind", sorted(OUT_OF_KIND))
+def test_granted_body_with_an_out_of_kind_line_is_refused_and_writes_nothing(board, kind):
+    _home, a, _b = board
+    g = _mint(a, verbs=sorted(ksg.VALID_VERBS))
+    line = OUT_OF_KIND[kind]
+    with pytest.raises(ksg.GrantRefused) as exc:
+        _child_comment(a, "review note\n" + line, g["grant_id"])
+    assert line[:20] in str(exc.value) and "verdict" in str(exc.value)
+    assert _rows(a) == []
+
+
+@pytest.mark.parametrize("kind", sorted(OUT_OF_KIND))
+def test_out_of_kind_line_inside_a_coverage_record_or_formatted_is_refused(board, kind):
+    """Readers like close_contract match anywhere in the body, so an embedded or decorated line is refused too."""
+    _home, a, _b = board
+    g = _mint(a, verbs=sorted(ksg.VALID_VERBS))
+    rec = {"verdict": "COMMENT", "head_sha": SHA, "items": [OUT_OF_KIND[kind]]}
+    for body in ("review_coverage: " + json.dumps(rec), "> **" + OUT_OF_KIND[kind].replace(":", "**:", 1)):
+        with pytest.raises(ksg.GrantRefused):
+            _child_comment(a, body, g["grant_id"])
+    assert _rows(a) == []
+
+
+def test_granted_prism_verdict_only_under_a_verdict_grant_is_accepted(board):
+    _home, a, _b = board
+    g = _mint(a, verbs=["verdict"])
+    _child_comment(a, "prism-verdict: 9e7e6653e13e fixed " + SHA, g["grant_id"])
+    assert [r["grant_id"] for r in _rows(a)] == [g["grant_id"]]
+
+
+def test_granted_coverage_and_release_lines_are_accepted(board):
+    _home, a, _b = board
+    g = _mint(a, verbs=["verdict", "approve", "release"])
+    _child_comment(a, _approve() + "\nclose-on: merged", g["grant_id"])
+    assert len(_rows(a)) == 1
+
+
+@pytest.mark.parametrize("kind", sorted(OUT_OF_KIND))
+def test_operator_without_a_grant_still_writes_every_line_kind(board, kind):
+    _home, a, _b = board
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, a, "apollo", OUT_OF_KIND[kind])
+    assert [(r["author"], r["grant_id"], r["body"]) for r in _rows(a)] == [("apollo", None, OUT_OF_KIND[kind])]
+
+
+@pytest.mark.parametrize("line", ["CHANGES-CLOSED: x", "deadman: hold 2026-10-28T09:00:00-07:00",
+                                  "fixes-main-red: lints/x", "**SOME NEW-MARKER**: y"])
+def test_granted_body_with_an_unknown_marker_shaped_line_fails_closed(board, line):
+    _home, a, _b = board
+    g = _mint(a, verbs=sorted(ksg.VALID_VERBS))
+    with pytest.raises(ksg.GrantRefused, match="operator marker"):
+        _child_comment(a, line, g["grant_id"])
+    assert _rows(a) == []
+
+
+def test_granted_review_prose_with_single_word_labels_is_accepted(board):
+    _home, a, _b = board
+    g = _mint(a)
+    body = ("apollo manual: APPROVE @ aaaaaaa\nP1: the release reader holds\nNOTE: mutants red\n"
+            "Fix: none needed\n" + _approve().splitlines()[1])
+    _child_comment(a, body, g["grant_id"])
+    assert len(_rows(a)) == 1

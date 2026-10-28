@@ -308,6 +308,50 @@ def _coverage_verdicts(body: str) -> list:
     return out
 
 
+# t_301365d1 (FLIP gate): the read side void-filters only review_coverage records, prism-verdict lines and
+# close-on release lines. Every other operator line grammar is honoured on author alone, so a granted body may
+# never carry one. Named grammars mirror their hermes-home readers, matched at least as broadly (anywhere in
+# the body, through markdown decoration), so an out-of-kind line is refused at the insert, never read later.
+_DECOR = r"[ \t>*_`#~+\-]*"
+_OUT_OF_KIND = (
+    ("ACCEPTANCE-CLOSED", re.compile(r"(?<![\w-])ACCEPTANCE-(?:CLOSED|OPEN)[*_`]*[ \t]*:")),  # acceptance_marker
+    ("GATE-PROVEN", re.compile(r"(?<![\w-])GATE-PROVEN[*_`]*[ \t]*:")),                     # close_contract
+    ("gate_repair", re.compile(r"(?<![\w-])gate_repair[*_`]*[ \t]*:", re.I)),               # gate_repair
+    ("ungraded-run", re.compile(r"(?<![\w-])ungraded-run[*_`]*[ \t]*:", re.I)),             # new_red_gate
+    ("prism-scope", re.compile(r"(?<![\w-])prism-scope[*_`]*[ \t]*:", re.I)),               # prism-findings-route
+    ("prism-ruling", re.compile(r"(?<![\w-])prism-ruling[*_`]*[ \t]*:", re.I)),             # prism_ruling
+    ("OPERATOR OVERRIDE / CUT RULING",                                                      # round_cap_override,
+     re.compile(r"(?<![\w-])OPERATOR (?:CUT RULING|OVERRIDE)\b")),                          # prism-findings-route
+)
+# Any other marker-shaped line leading a line: a multi-word `UPPER-TOKEN:` / `UPPER TOKEN:` (the shape of every
+# operator marker above) or a `kebab-key:` / `snake_key:` (fixes-main-red:, ...), plus `deadman:`. Fail closed: a
+# granted body is a review note, not a new grammar. Single-word prose labels (`P1:`, `NOTE:`, `Fix:`) stay allowed.
+_GENERIC_MARKER = re.compile(r"^" + _DECOR + r"(?:[A-Z][A-Z0-9]*(?:[- ][A-Z][A-Z0-9]*)+|[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+)"
+                             r"[*_`]*[ \t]*:")
+_ALLOWED_LINE = re.compile(r"^" + _DECOR + r"(?:prism-verdict|close-on)[*_`]*[ \t]*:", re.I)
+_DEADMAN = re.compile(r"^" + _DECOR + r"deadman[*_`]*[ \t]*:", re.I | re.M)
+
+
+def out_of_kind_line(body: str) -> Optional[tuple]:
+    """``(kind, line)`` for the first line a granted body may not carry, else None.
+
+    Allowed: review_coverage records (bare or backticked, the kernel's parser), ``prism-verdict:`` and
+    ``close-on:`` lines, and prose. A named operator grammar is refused anywhere in the body, including
+    inside an allowed line (``GATE-PROVEN:`` is matched unanchored by its reader).
+    """
+    from hermes_cli.kanban_db import _review_coverage_payload
+
+    for line in str(body or "").splitlines():
+        for kind, rx in _OUT_OF_KIND:
+            if rx.search(line):
+                return kind, line.strip()
+        if _review_coverage_payload(line) is not None or _ALLOWED_LINE.match(line):
+            continue
+        if _DEADMAN.match(line) or _GENERIC_MARKER.match(line):
+            return "operator marker", line.strip()
+    return None
+
+
 def body_verbs(body: str) -> set:
     """The verbs a comment body exercises (see :data:`VALID_VERBS`)."""
     verbs = set()
@@ -370,6 +414,11 @@ def validate_comment(
     if str(author or "").strip().lower() != str(row["by_author"]).strip().lower():
         raise GrantRefused(f"grant {grant_id} signs as {row['by_author']!r}, not {author!r}")
     allowed = set(json.loads(row["verbs"] or "[]"))
+    bad = out_of_kind_line(body)
+    if bad:
+        verbs = ",".join(sorted(body_verbs(body)))
+        raise GrantRefused(f"grant {grant_id} (verb {verbs}) may carry only review_coverage, prism-verdict and "
+                           f"close-on lines; refused {bad[0]} line: {bad[1][:120]!r}")
     missing = body_verbs(body) - allowed
     if missing:
         raise GrantRefused(f"grant {grant_id} does not carry verb(s) {sorted(missing)} (has {sorted(allowed)})")
