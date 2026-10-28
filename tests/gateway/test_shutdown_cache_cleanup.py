@@ -77,6 +77,10 @@ class _FakeGateway:
     def _update_runtime_status(self, *_a, **_kw):
         pass
 
+    # stop()'s shutdown mark pass opens a sessions.json batch through self (#2353). The real helper
+    # returns None here (this fake has no session_store), so the pass saves per mark.
+    _open_resume_mark_batch = gw_mod.GatewayRunner._open_resume_mark_batch
+
     def _clear_plugin_message_injector(self):
         pass
 
