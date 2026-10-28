@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -241,7 +242,7 @@ class CronScheduler(ABC):
             if job is None:
                 continue
             last_run = job.get("last_run_at") or ""
-            if last_run >= claimed_at:
+            if _stamp_not_before(last_run, claimed_at):
                 continue  # the job already recorded this run (or a newer one)
             mark_job_run(
                 job_id, False,
@@ -769,6 +770,17 @@ class InProcessCronScheduler(CronScheduler):
                 # burst-firing zero-length sleep cycles (#114467).
                 next_tick = now + wait_for
             stop_event.wait(max(0.0, next_tick - now))
+
+
+def _stamp_not_before(last_run: str, claimed_at: str) -> bool:
+    """``last_run >= claimed_at`` as instants: the two stamps may carry different offsets (a
+    settled run, a DST change, a timezone edit), so text order is not time order."""
+    if not last_run:
+        return False
+    try:
+        return datetime.fromisoformat(last_run) >= datetime.fromisoformat(claimed_at)
+    except (TypeError, ValueError):
+        return last_run >= claimed_at
 
 
 def _settle_script_outcomes() -> int:

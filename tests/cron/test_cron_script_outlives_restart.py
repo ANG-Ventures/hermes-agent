@@ -516,3 +516,203 @@ def test_failed_output_save_keeps_the_record_and_grades_nothing(env, monkeypatch
     docs = list((env / "cron" / "output" / job["id"]).glob("*.md"))
     assert len(docs) == 1
     assert "bridge done; ledger 3737" in docs[0].read_text(encoding="utf-8-sig")
+
+
+# --- t_b82b0a6d: Prism residue of #2371 -------------------------------------------------------
+
+_DEAD_PID = 2 ** 22 - 7  # a pid that is not running
+
+
+def _orphan_record(job_id: str, execution_id: str, *, rc=None, out=None, **meta_extra) -> Path:
+    """A record whose owner is dead, optionally with a published exit status and stdout."""
+    from cron import script_outcome_records as rec
+
+    base = rec.begin(job_id, execution_id)
+    meta_path = Path(str(base) + ".json")
+    meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+    meta.update(owner_pid=_DEAD_PID, owner_started_at=1, **meta_extra)
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    if out is not None:
+        Path(str(base) + ".out").write_text(out, encoding="utf-8")
+    if rc is not None:
+        Path(str(base) + ".rc").write_text(f"{rc}\n", encoding="utf-8")
+    return base
+
+
+def _recovery_counts_it(job_id: str):
+    """What reconcile writes for a run it could not observe."""
+    from cron.jobs import mark_job_run
+
+    time.sleep(0.01)
+    mark_job_run(job_id, False, "Interrupted: the scheduler process exited", status="unknown")
+
+
+def test_settled_stamp_uses_the_profile_timezone_and_is_not_recounted(env, monkeypatch):
+    """Prism 2146c280fe76 / a73e1cb4acd6: profile timezone Asia/Tokyo on a UTC host. The settled
+    last_run_at must carry the profile zone, and a later reconcile must not count the run again."""
+    import hermes_time
+    from cron.executions import recover_interrupted_executions
+    from cron.jobs import get_job
+    from cron.scheduler_provider import InProcessCronScheduler, _settle_script_outcomes
+
+    monkeypatch.setenv("TZ", "UTC")
+    monkeypatch.setenv("HERMES_TIMEZONE", "Asia/Tokyo")
+    hermes_time.reset_cache()
+    try:
+        job, started, release = _make_job(env, 0, repeat=3)
+        _gateway_dies_mid_run(env, job["id"], started)
+        release.touch()
+        _wait(lambda: any(n.endswith(".rc") for n in _records(env)), what="exit status")
+        assert recover_interrupted_executions() == 1
+        InProcessCronScheduler._reconcile_jobs_after_recovery()
+        assert _settle_script_outcomes() == 1
+        settled = get_job(job["id"])
+        assert settled["last_status"] == "ok"
+        assert settled["last_run_at"].endswith("+09:00"), settled["last_run_at"]
+
+        # The next restart reconciles again; the settled run is the job's newest and stays unknown
+        # in the ledger. It must read as already recorded.
+        assert InProcessCronScheduler._reconcile_jobs_after_recovery() == 0
+        final = get_job(job["id"])
+        assert final["last_status"] == "ok", final
+        assert final["repeat"]["completed"] == settled["repeat"]["completed"]
+    finally:
+        hermes_time.reset_cache()
+
+
+def test_reconcile_compares_stamps_as_instants():
+    """Prism a73e1cb4acd6: 03:05 UTC is after 12:00 +09:00 (03:00 UTC) although it sorts before."""
+    from cron.scheduler_provider import _stamp_not_before
+
+    assert _stamp_not_before("2026-10-27T03:05:00+00:00", "2026-10-27T12:00:00+09:00")
+    assert not _stamp_not_before("2026-10-27T02:55:00+00:00", "2026-10-27T12:00:00+09:00")
+    assert not _stamp_not_before("", "2026-10-27T12:00:00+09:00")
+
+
+def test_pruned_attempt_is_not_mistaken_for_a_newer_one(env):
+    """Prism e4ebf4ae5d41: the orphan's unknown row was pruned; the ledger's latest row is an OLDER
+    kept completion. The orphan's real outcome must still be applied."""
+    from cron.executions import create_execution, finish_execution, get_execution
+    from cron.jobs import get_job
+    from cron import script_outcome_records as rec
+
+    job, _s, _r = _make_job(env, 0)
+    old = create_execution(job["id"], source="scheduled")
+    assert finish_execution(old["id"], success=True) is not None
+    time.sleep(0.01)
+    _orphan_record(job["id"], "e10abc", rc=0, out="late finish\n")
+    _recovery_counts_it(job["id"])
+    assert get_execution("e10abc") is None  # pruned
+    assert rec.settle() == 1
+    final = get_job(job["id"])
+    assert final["last_status"] == "ok", final
+    assert _records(env) == []
+
+
+def test_pruned_attempt_still_yields_to_a_genuinely_newer_one(env):
+    """The other side of e4ebf4ae5d41: a row claimed after the orphan began IS newer."""
+    from cron.executions import create_execution, finish_execution
+    from cron.jobs import get_job, mark_job_run
+    from cron import script_outcome_records as rec
+
+    job, _s, _r = _make_job(env, 3)
+    _orphan_record(job["id"], "e11abc", rc=3)
+    time.sleep(0.01)
+    newer = create_execution(job["id"], source="manual")
+    mark_job_run(job["id"], True, None)
+    finish_execution(newer["id"], success=True)
+    assert rec.settle() == 0
+    assert get_job(job["id"])["last_status"] == "ok"
+    assert _records(env) == []
+
+
+def test_settled_output_tail_keeps_redaction_context(env):
+    """Prism 63cb77dd5537: a 16 KiB tail cut right after ``SERVICE_TOKEN=`` kept the value
+    without its key, so it went unredacted into the output doc."""
+    from cron import script_outcome_records as rec
+
+    job, _s, _r = _make_job(env, 0)
+    token = "q" * 32
+    _orphan_record(job["id"], "e12abc", rc=0, out="SERVICE_TOKEN=" + token + "\n" + "." * 16351)
+    assert rec.settle() == 1
+    docs = [p.read_text(encoding="utf-8-sig")
+            for p in (env / "cron" / "output" / job["id"]).glob("*.md")]
+    assert len(docs) == 1
+    assert token not in docs[0]
+
+
+def test_outcome_the_owner_recorded_is_not_overwritten(env):
+    """Prism f917ad4f14b8: the reap marked a live external worker's row unknown; the owner then
+    finished and recorded delivery_failed, and finish_execution matched nothing, so the record
+    stayed. settle must not replace the owner's observed outcome."""
+    from cron.executions import create_execution
+    from cron.jobs import get_job, mark_job_run
+    from cron import script_outcome_records as rec
+
+    job, _s, _r = _make_job(env, 0)
+    row = create_execution(job["id"], source="scheduled")
+    _orphan_record(job["id"], row["id"], rc=0)
+    time.sleep(0.01)
+    mark_job_run(job["id"], True, None, delivery_error="discord 503")
+    before = get_job(job["id"])
+    assert before["last_status"] == "delivery_failed"
+    out_dir = env / "cron" / "output" / job["id"]
+    docs_before = sorted(out_dir.glob("*.md")) if out_dir.exists() else []
+    from cron.executions import _transaction
+    with _transaction() as conn:
+        conn.execute("UPDATE executions SET status='unknown' WHERE id=?", (row["id"],))
+
+    assert rec.settle() == 0
+    final = get_job(job["id"])
+    assert final["last_status"] == "delivery_failed", final
+    assert final["last_run_at"] == before["last_run_at"]
+    assert (sorted(out_dir.glob("*.md")) if out_dir.exists() else []) == docs_before
+    assert _records(env) == []
+
+
+def test_live_shim_with_linux_tick_fingerprint_is_not_called_dead(env, monkeypatch):
+    """Prism 27d6882547f7: Linux start fingerprints are clock ticks since boot (~1.296e9 after
+    150 days at USER_HZ=100), never epoch seconds. A live shim must not be judged by wall time."""
+    import cron.executions as ex
+    from cron import script_outcome_records as rec
+
+    shim = subprocess.Popen(["/bin/sh", "-c", "sleep 30"])
+    try:
+        base = _orphan_record("j13", "e13abc", started_at=1790000000.0)
+        meta_path = Path(str(base) + ".json")
+        meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+        meta["owner_started_at"] = 1295990000  # ticks: the owner started before the shim
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        Path(str(base) + ".pid").write_text(f"{shim.pid}\n", encoding="utf-8")
+        real = ex._process_start_time
+        monkeypatch.setattr(ex, "_process_start_time",
+                            lambda pid: 1296000000 if pid == shim.pid else real(pid))
+        assert rec.settle() == 0
+        assert "e13abc.json" in _records(env), "a live shim's record must be kept"
+    finally:
+        shim.kill()
+        shim.wait(10)
+
+
+def test_live_shim_noted_without_start_time_is_not_called_dead(env):
+    """Prism 5cd3861095c5 (the window d2efbca992a8 left): note_pid recorded the shim pid but no
+    start time. ``_owner_is_live(pid, None)`` means "is it this process", so a running shim was
+    judged dead and its record discarded before its .rc could land."""
+    from cron import script_outcome_records as rec
+
+    release = env / "release14"
+    base = _orphan_record("j14", "e14abc", started_at=time.time() - 120)
+    shim = subprocess.Popen(rec.wrap_argv(base, ["/bin/sh", "-c",
+                            f'while [ ! -f "{release}" ]; do sleep 0.05; done']),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        meta_path = Path(str(base) + ".json")
+        meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+        meta.update(script_pid=shim.pid, script_started_at=None)
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        assert rec.settle() == 0
+        assert "e14abc.json" in _records(env), "a live shim's record must be kept"
+    finally:
+        release.touch()
+        shim.wait(10)
+    assert "e14abc.rc" in _records(env)
