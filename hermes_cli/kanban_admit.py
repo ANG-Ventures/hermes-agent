@@ -164,7 +164,7 @@ def _host_row(table, word: str, threads):
     ``table`` None is re-read from the file: a table that exists but cannot be
     read is an unknown threshold, never "no reserve", so the reserve is NaN and
     the floor refuses naming the table (Prism a6c5f61c871f, 6e8b5b41758b)."""
-    from hermes_cli import placement as pl
+    from hermes_cli.fleet_placement import placement as pl
 
     path = pl.fleet_root() / pl.TABLE_REL
     try:

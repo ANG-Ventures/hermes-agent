@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 
 DOC = {
     "schema": 1, "default_first": "ci-box", "saturate_to": 1.0,

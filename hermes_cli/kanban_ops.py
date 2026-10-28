@@ -239,7 +239,7 @@ def _cli_utilization_gate(conn, args, gate, out, emit, load1):
     + running_split: every board's remote placements out of every board's total)
     under the host's kanban ceiling."""
     from gateway.kanban_gate_tick import live_boards, running_split
-    from hermes_cli import admission as _ad
+    from hermes_cli.fleet_placement import admission as _ad
     from hermes_cli import kanban_load_gate as _klg
 
     now_wall, now_mono = time.time(), time.monotonic()

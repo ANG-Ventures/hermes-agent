@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +21,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_worker_pool as kwp
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 from hermes_cli import placement_policy as pp
 
 POLICY = pp.PlacementPolicy()
@@ -261,50 +260,18 @@ def test_utilization_take_places_on_a_measured_pool_host(home):
 # -- vendored copy stays the canonical scorer -------------------------------
 
 def test_vendored_placement_matches_canonical():
-    """Cross-repo contract (like scripts/tests/test_ci_placement_ledger_adapter.py): the
-    vendored module equals hermes-home's scripts/lib/placement.py except the VENDORED header
-    paragraph, fleet_root() and the fork's encodings (utf-8-sig reads, encoding= on writes, the
-    footgun marker). PLACEMENT_CANONICAL names the canonical file; CI's tests.yml sets it from the
-    runners' hermes-home mirror. Skipped where neither exists (hosted runners, a bare dev box)."""
+    """Cross-repo contract: the vendored module is a BYTE copy of hermes-home's
+    scripts/lib/placement.py (t_29403e19; fork-side differences live in
+    hermes_cli/fleet_placement/__init__.py). PLACEMENT_CANONICAL names the canonical file;
+    CI's tests.yml sets it from the runners' hermes-home mirror. Skipped where neither exists
+    (hosted runners, a bare dev box); the sha256 pin in VENDORED.json is checked everywhere."""
     # The suite's home-io guard forbids reading the real ~/.hermes, so the canonical
     # file is named explicitly: PLACEMENT_CANONICAL=<hermes-home>/scripts/lib/placement.py.
     env = os.environ.get("PLACEMENT_CANONICAL")
     if not env:
         pytest.skip("PLACEMENT_CANONICAL not set (no hermes-home checkout to cross-read)")
-    src = Path(env)
-    ours = Path(placement.__file__).read_text(encoding="utf-8")
-    theirs = src.read_text(encoding="utf-8")
-    assert "\nVENDORED from hermes-home" in ours and "\nVENDORED from" not in theirs
-    assert _parity_body(ours) == _parity_body(theirs)
-
-
-def _parity_body(text: str) -> str:
-    """Normalise a placement.py for the parity test. utf-8-sig is tolerated on READS only
-    (``read_text(encoding="utf-8-sig")``): a WRITE with utf-8-sig emits a BOM that
-    hermes-home's strict utf-8 reader refuses, so it must stay a difference (t_9d6298ff)."""
-    head, sep, rest = text.partition("\nVENDORED from hermes-home")
-    if sep:                                       # drop the header paragraph (up to its blank line)
-        text = head + rest[rest.index("\n\n") + 1:]
-    start, end = text.index("def fleet_root()"), text.index("def _num(")
-    text = text[:start] + text[end:]
-    text = re.sub(r"  # windows-footgun: ok\b.*", "", text)
-    text = text.replace('read_text(encoding="utf-8-sig")', 'read_text(encoding="utf-8")')
-    return text.replace(', encoding="utf-8")', ")")
-
-
-def test_parity_normaliser_keeps_a_bom_write_and_tolerates_a_bom_read():
-    """Negative arm of the parity test, runnable without PLACEMENT_CANONICAL: a vendored copy
-    whose ledger write gains utf-8-sig (desk t_4ee9c117 mut2) must NOT normalise equal, while
-    the fork's utf-8-sig read stays tolerated."""
-    ours = Path(placement.__file__).read_text(encoding="utf-8")
-    write = 'with os.fdopen(fd, "w", encoding="utf-8") as fh:'
-    assert ours.count(write) == 1
-    mut2 = ours.replace(write, 'with os.fdopen(fd, "w", encoding="utf-8-sig") as fh:')
-    assert _parity_body(mut2) != _parity_body(ours)
-    read = 'read_text(encoding="utf-8-sig")'
-    assert read in ours
-    plain_reads = ours.replace(read, 'read_text(encoding="utf-8")')
-    assert _parity_body(plain_reads) == _parity_body(ours)
+    assert Path(placement.__file__).read_bytes() == Path(env).read_bytes(), (
+        "hermes_cli/fleet_placement/placement.py differs from hermes-home main: re-vendor and update VENDORED.json")
 
 
 # -- Prism round 1 on #1941 --------------------------------------------------

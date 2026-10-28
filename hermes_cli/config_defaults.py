@@ -2471,7 +2471,7 @@ DEFAULT_CONFIG = {
                       # picks and books; release/renew go through alloc_client.
                       "allocd": "off"},
         # Admission predicate (t_da6f84f7, read per tick by the gateway gate, `kanban dispatch` and the shared
-        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/admission.py admit() over the
+        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/fleet_placement/admission.py admit() over the
         # host's measured cpu_busy / memory / PSI / procs with one measured-estimate lease per recent spawn. In
         # utilization the dispatch_load_gate load/CPU keys are inert (procs pause and max_spawn_per_tick still apply).
         "admission": "legacy",
