@@ -31,6 +31,7 @@ second pass inserts nothing.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import sqlite3
 from pathlib import Path
@@ -39,6 +40,8 @@ from typing import Optional
 from hermes_cli import kanban_journal
 
 __all__ = ["replay_into", "ReplayResult"]
+
+logger = logging.getLogger(__name__)
 
 
 class ReplayResult:
@@ -51,6 +54,7 @@ class ReplayResult:
         self.events_restored = 0
         self.orphan_events = 0
         self.orphan_task_ids: set = set()
+        self.grant_ids_dropped = 0
         self.snapshot_ts: float = 0.0
 
     def as_dict(self) -> dict:
@@ -61,6 +65,7 @@ class ReplayResult:
             "events_restored": self.events_restored,
             "orphan_events": self.orphan_events,
             "orphan_task_ids": sorted(self.orphan_task_ids),
+            "grant_ids_dropped": self.grant_ids_dropped,
             "snapshot_ts": self.snapshot_ts,
         }
 
@@ -126,6 +131,11 @@ def replay_into(
         watermark = _snapshot_watermark(conn) if since is None else float(since)
         result.snapshot_ts = watermark
 
+        has_grant_col = any(
+            r[1] == "grant_id"
+            for r in conn.execute("PRAGMA table_info(task_comments)").fetchall()
+        )
+
         known = {
             str(r[0]) for r in conn.execute("SELECT id FROM tasks").fetchall()
         }
@@ -170,19 +180,27 @@ def replay_into(
                 # grant_id survives the restore (t_19c567a8): sign_grants rows are
                 # not journaled, so a restored granted row has no live grant and
                 # every operator reader voids it, never a plain operator comment.
+                # A snapshot older than the additive migration has no grant_id
+                # column; replay does not migrate (the board's connect does), so
+                # it writes the legacy shape and reports the dropped grant.
+                cols = ["task_id", "author", "body", "run_id", "session_ref", "created_at"]
+                vals = [task_id, author, body, record.get("run_id"),
+                        payload.get("session_ref"), created]
+                grant_id = payload.get("grant_id")
+                if has_grant_col:
+                    cols.append("grant_id")
+                    vals.append(grant_id)
+                elif grant_id:
+                    result.grant_ids_dropped += 1
+                    logger.warning(
+                        "journal replay: %s comment by %s at %s lost grant_id %s "
+                        "(snapshot predates task_comments.grant_id)",
+                        task_id, author, created, grant_id,
+                    )
                 conn.execute(
-                    "INSERT INTO task_comments "
-                    "(task_id, author, body, run_id, session_ref, created_at, grant_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        task_id,
-                        author,
-                        body,
-                        record.get("run_id"),
-                        payload.get("session_ref"),
-                        created,
-                        payload.get("grant_id"),
-                    ),
+                    "INSERT INTO task_comments (" + ", ".join(cols) + ") VALUES ("
+                    + ", ".join("?" * len(cols)) + ")",
+                    vals,
                 )
                 result.comments_restored += 1
                 continue
