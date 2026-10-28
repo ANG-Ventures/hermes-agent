@@ -382,7 +382,7 @@ class ScriptRunner:
                 if proc.poll() is not None:
                     continue
                 pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
+                os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
                 groups.append((proc, pgid))
             except Exception:
                 logger.debug("watchdog SIGTERM failed", exc_info=True)
@@ -392,7 +392,7 @@ class ScriptRunner:
             with contextlib.suppress(Exception):
                 proc.poll()  # reap our own child so its group can empty
             try:
-                os.killpg(pgid, 0)
+                os.killpg(pgid, 0)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
             except ProcessLookupError:
                 return False
             except Exception:
@@ -406,7 +406,7 @@ class ScriptRunner:
                 time.sleep(0.05)
         for _proc, pgid in groups:
             with contextlib.suppress(Exception):
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
 
     # --- SIGTERM shutdown (§5.4) -----------------------------------------------------------
 
@@ -436,7 +436,7 @@ def rearm() -> int:
     """``hermes cron runner rearm``: delete the trip marker and print its content."""
     marker = trip_marker_path()
     try:
-        content = marker.read_text(encoding="utf-8")
+        content = marker.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         print("cron script runner: not tripped (no marker)")
         return 0
