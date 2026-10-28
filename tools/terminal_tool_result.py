@@ -227,8 +227,11 @@ def finalize_foreground_result(
     if not workdir and observed_cwd:
         record_session_cwd(session_key, observed_cwd)
     # The shell's GIT_* state persists past a per-command workdir, so it is recorded either way; a
-    # command that emitted no marker carries no ``git_env`` and the previous record stands.
-    record_session_git_env(session_key, (result or {}).get("git_env"))
+    # command that emitted no marker carries no ``git_env`` and the previous record stands. It is keyed by
+    # the environment's shell (its snapshot id), which other sessions share (Prism 8cf2a5f81e5c).
+    shell_id = getattr(env, "_session_id", None)
+    record_session_git_env(session_key, (result or {}).get("git_env"),
+                           shell_id=f"env:{shell_id}" if shell_id else f"env-obj:{id(env)}")
 
     output = result.get("output", "")
     returncode = result.get("returncode", 0)

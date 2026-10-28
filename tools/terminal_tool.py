@@ -348,29 +348,40 @@ def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd and GIT_* env records (session teardown)."""
     with _session_cwd_lock:
         _session_cwd.pop(_qualify_task_key(session_key), None)
-        _session_git_env.pop(_qualify_task_key(session_key), None)
+        _session_shell.pop(_qualify_task_key(session_key), None)
 
 
-# Per-session GIT_* repository variables (GIT_DIR, GIT_WORK_TREE, ...) set in the session shell when its
-# last command finished, as the shell itself reported them on the cwd marker line. Keyed like
-# ``_session_cwd``; shell_hooks ships it to pre_tool_call hooks as ``session_git_env`` (card t_20695198).
-_session_git_env: Dict[str, Dict[str, bool]] = {}
+# GIT_* repository variables (GIT_DIR, GIT_WORK_TREE, ...) set in a terminal SHELL when its last command
+# finished, as the shell itself reported them on the cwd marker line (card t_20695198). The state belongs
+# to the shell, not the session: one environment's snapshot is re-dumped after every command and sourced
+# by the next command of ANY session on it (sessions and delegate children share environments), so an
+# export by session A is live in session B's next command. Hence two maps: shell id -> last reported
+# state, and session -> the shell its last reported command ran in. shell_hooks ships the state of the
+# caller's shell as ``session_git_env``.
+_shell_git_env: Dict[str, Dict[str, bool]] = {}
+_session_shell: Dict[str, str] = {}
 
 
-def record_session_git_env(session_key: Optional[str], git_env: Optional[Dict[str, bool]]) -> None:
-    """Record *git_env* (``{name: set}``) for *session_key*. A non-dict is ignored, so a command that
-    emitted no marker (killed / timed out) keeps the previous record, as for cwd."""
+def record_session_git_env(session_key: Optional[str], git_env: Optional[Dict[str, bool]],
+                           shell_id: Optional[str] = None) -> None:
+    """Record *git_env* (``{name: set}``) as the state of shell *shell_id* (default: one private to the
+    session) and bind *session_key* to that shell. A non-dict is ignored, so a command that emitted no
+    marker (killed / timed out) changes nothing, as for cwd."""
     if not isinstance(git_env, dict):
         return
     key = _qualify_task_key(str(session_key or "default"))
+    shell = str(shell_id) if shell_id else "session:" + key
     with _session_cwd_lock:
-        _session_git_env[key] = {str(name): bool(value) for name, value in git_env.items()}
+        _shell_git_env[shell] = {str(name): bool(value) for name, value in git_env.items()}
+        _session_shell[key] = shell
 
 
 def get_session_git_env(session_key: Optional[str]) -> Optional[Dict[str, bool]]:
-    """Copy of *session_key*'s recorded GIT_* state, or None when no command has reported one."""
+    """Copy of the GIT_* state most recently reported by the shell *session_key* last ran in (by any
+    session on that shell), or None when no command of this session has reported one."""
     with _session_cwd_lock:
-        recorded = _session_git_env.get(_qualify_task_key(str(session_key or "default")))
+        shell = _session_shell.get(_qualify_task_key(str(session_key or "default")))
+        recorded = _shell_git_env.get(shell) if shell is not None else None
         return dict(recorded) if recorded is not None else None
 
 

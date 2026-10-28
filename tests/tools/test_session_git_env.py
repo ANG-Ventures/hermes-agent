@@ -27,7 +27,8 @@ _SCRUB = "unset " + " ".join(SESSION_GIT_ENV_NAMES)
 @pytest.fixture(autouse=True)
 def _clean_store(monkeypatch):
     monkeypatch.setattr(tt, "_session_cwd", {})
-    monkeypatch.setattr(tt, "_session_git_env", {})
+    monkeypatch.setattr(tt, "_shell_git_env", {})
+    monkeypatch.setattr(tt, "_session_shell", {})
     monkeypatch.setattr(tt, "_task_env_overrides", {})
     monkeypatch.delenv("TERMINAL_ENV", raising=False)
     for name in SESSION_GIT_ENV_NAMES:
@@ -144,6 +145,29 @@ class TestTerminalToolRecordsIt:
         self._tool(monkeypatch, env, "export GIT_DIR=/x/.git", "mine")
         self._tool(monkeypatch, env, "unset GIT_DIR; sleep 20", "mine", timeout=2)
         assert tt.get_session_git_env("mine")["GIT_DIR"] is True
+
+    def test_export_by_one_session_reaches_every_session_on_the_shell(self, env, monkeypatch):
+        """Prism 8cf2a5f81e5c / 7fc5cadf95a1 / 985402e3796a: the snapshot is shared by every session on the
+        environment, so B's record must follow A's export, and A's unset must clear it for B too."""
+        self._tool(monkeypatch, env, "true", "b")
+        assert tt.get_session_git_env("b") == _NONE_SET
+        self._tool(monkeypatch, env, "export GIT_DIR=/live/.git GIT_WORK_TREE=/live", "a")
+        assert tt.get_session_git_env("b") == {**_NONE_SET, "GIT_DIR": True, "GIT_WORK_TREE": True}
+        # ... and the shell really does carry it into B's next command (the premise of the finding).
+        assert self._tool(monkeypatch, env, 'printf %s "$GIT_DIR"', "b")["output"] == "/live/.git"
+        self._tool(monkeypatch, env, _SCRUB, "a")
+        assert tt.get_session_git_env("b") == _NONE_SET
+
+    def test_a_different_shell_does_not_leak(self, env, monkeypatch, tmp_path):
+        other = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+        other.init_session()
+        try:
+            self._tool(monkeypatch, other, "true", "b")
+            self._tool(monkeypatch, env, "export GIT_DIR=/live/.git", "a")
+            assert tt.get_session_git_env("b") == _NONE_SET
+            assert tt.get_session_git_env("a")["GIT_DIR"] is True
+        finally:
+            other.cleanup()
 
     def test_clear_session_cwd_drops_it(self):
         tt.record_session_git_env("gone", {**_NONE_SET, "GIT_DIR": True})
