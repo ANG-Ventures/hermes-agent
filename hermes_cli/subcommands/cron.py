@@ -229,5 +229,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
+    cron_runner = cron_subparsers.add_parser(
+        "runner", help="Run the cron script runner (plain-script jobs outside the gateway)")
+    cron_runner.add_argument(
+        "runner_action", nargs="?", choices=["rearm"],
+        help="rearm: clear a watchdog trip so the runner ticks again")
     add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)

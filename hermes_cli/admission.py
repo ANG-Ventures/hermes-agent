@@ -223,7 +223,7 @@ def score(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
 # lower class sees that queue's next few units as a lease, so it stops short of the line and leaves them room.
 HOST_LINE = 0.90             # Ace standing ruling: no host above 90 % busy, whatever the mix
 DEFAULT_ORDER = ("main", "prism", "interactive", "kanban", "ci", "test-gate", "batch")
-DEFAULT_HOLDBACK_UNITS = 2   # "a few slots": per higher class with queued demand, at most this many of its units
+DEFAULT_HOLDBACK_UNITS = 2   # "a few units": per higher class with queued demand, at most this many of its units
 
 
 @dataclasses.dataclass(frozen=True)

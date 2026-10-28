@@ -1861,11 +1861,14 @@ def _get_hermes_home() -> Path:
     return _hermes_home or get_hermes_home()
 
 
-def _get_lock_paths() -> tuple[Path, Path]:
-    """Resolve cron lock paths at call time so profile/env changes are honored."""
+def _get_lock_paths(lane: str = "agent") -> tuple[Path, Path]:
+    """Resolve cron lock paths at call time so profile/env changes are honored. ``lane`` picks the
+    per-lane tick lock (``.tick.lock`` for agent, ``.tick-script.lock`` for script; cron/lanes.py)."""
+    from cron.lanes import tick_lock_name
+
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
-    return lock_dir, lock_dir / ".tick.lock"
+    return lock_dir, lock_dir / tick_lock_name(lane)
 
 
 # Errnos that mean "another ticker (or manual tick) holds the tick lock", as opposed to a real failure
@@ -5372,18 +5375,23 @@ _last_worktree_maintenance_at: Optional[float] = None
 _worktree_maintenance_lock = threading.Lock()
 
 
-def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
+def _deliver_missed_oneshot_notices(adapters=None, loop=None, lane: str = "all",
+                                    notices=None) -> int:
     """Deliver queued MISSED notices for one-shots the due-scan retired.
 
     The due-scan runs under the jobs lock and only queues them; delivery is
     framed as a failure (success=False) to the job's own deliver target so a
     one-shot that never ran is loud, not a success-looking line in
     cron/output. Best-effort: delivery errors are logged, never raised.
+    ``notices``: an already-drained batch (the tick drains under its lock and
+    delivers off it); None drains ``lane`` here.
     """
     from cron.jobs import drain_missed_oneshot_notices
 
+    if notices is None:
+        notices = drain_missed_oneshot_notices(lane)
     delivered = 0
-    for notice in drain_missed_oneshot_notices():
+    for notice in notices:
         job = notice.get("job") or {}
         try:
             err = _deliver_result(
@@ -5543,6 +5551,10 @@ def _maybe_reap_dead_owners() -> None:
                 "Reclaimed %d cron execution(s) whose owner process died "
                 "before reaching a terminal state (marked unknown)",
                 _reclaimed)
+        # A no_agent script left running by a dead scheduler is graded once it exits (t_854cd586).
+        from cron.scheduler_provider import _settle_script_outcomes
+
+        _settle_script_outcomes()
     except Exception as _reap_exc:
         logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 

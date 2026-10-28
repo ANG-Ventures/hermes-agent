@@ -5,6 +5,8 @@ so test patches keep working."""
 
 import contextvars as _ctxvars
 import logging
+import os
+import re
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -259,6 +261,105 @@ def _background_review_read_before_write_guard(
         f"skill_view(name, file_path=...) for a supporting file, then retry the write using the "
         f"content just returned.",
         _read_before_write_required=True)
+
+
+_CARRY_MIN_LINE = 16  # shorter normalized lines ("## Usage", rules, fences) are not distinctive
+_CARRY_MAX_BYTES = 2_000_000
+_CARRY_SHOWN = 5
+_MD_HEADING = re.compile(r"#{1,6} +")
+
+
+def _carry_lines(data: bytes) -> set:
+    # Stray non-UTF-8 bytes (one cp1252 quote) must not exempt prose from the check: decode with
+    # replacement, identically on both sides. A heading is a line like any other (a constraint
+    # stated only as a heading is still content); its level is dropped so a fold that demotes it
+    # still carries it.
+    text = data.decode("utf-8", errors="replace").lstrip("\ufeff")
+    lines = (_MD_HEADING.sub("", " ".join(raw.split()), count=1) for raw in text.splitlines())
+    return {ln for ln in lines if len(ln) >= _CARRY_MIN_LINE and sum(c.isalnum() for c in ln) >= 8}
+
+
+def _carry_candidates(target: Path):
+    """Every other file under the skills roots, same-basename files first (the usual move)."""
+    from agent.skill_utils import get_all_skills_dirs
+    seen, same, rest = {_resolved_str(target)}, [], []
+    for root in get_all_skills_dirs():
+        # Prune while walking: .archive/.curator_backups hold most of the bytes and are not live.
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames
+                                 if not d.startswith(".") and d not in {"__pycache__", "node_modules"})
+            for fname in sorted(filenames):
+                path = Path(dirpath) / fname
+                if fname.startswith(".") or (key := _resolved_str(path)) in seen:
+                    continue
+                seen.add(key)
+                (same if fname == target.name else rest).append(path)
+    return same + rest
+
+
+def _read_carrier(path: Path) -> Optional[bytes]:
+    """A carrier's bytes, or None when it cannot count (unreadable or too big): fails closed."""
+    with suppress(OSError):
+        if path.stat().st_size <= _CARRY_MAX_BYTES:
+            return path.read_bytes()
+    return None
+
+
+def _uncarried_lines(target: Path) -> list:
+    """Why removing *target* would lose content: its distinctive lines found in no other file under
+    the skills roots, or one named ``<...>`` reason when that cannot be verified. Empty = carried.
+    Every failure to inspect the source refuses; nothing here may read as "nothing uncarried"."""
+    try:
+        if target.stat().st_size > _CARRY_MAX_BYTES:
+            return [f"<file exceeds the {_CARRY_MAX_BYTES}-byte carry check; move it whole>"]
+        data = target.read_bytes()
+    except OSError as e:
+        return [f"<source could not be read for the carry check ({type(e).__name__}: {e}); refusing>"]
+    if b"\0" in data:  # provably binary: no prose lines, so only a byte-identical copy carries it
+        for other in _carry_candidates(target):
+            if _read_carrier(other) == data:
+                return []
+        return ["<binary file with no byte-identical copy under the skills roots; move it whole>"]
+    missing = _carry_lines(data)
+    for other in _carry_candidates(target):
+        if not missing:
+            break
+        if (other_data := _read_carrier(other)) is not None:
+            missing -= _carry_lines(other_data)
+    return sorted(missing)
+
+
+def _curator_remove_file_carry_guard(
+    name: str, skill_dir: Path, target: Path, file_path: str) -> Optional[Dict[str, Any]]:
+    """Background curator remove_file only after the file's content is carried elsewhere.
+
+    A fold that condenses a reference and then removes the original deletes every line the
+    condensation dropped (10 files on one weekly run). Refuse unless every distinctive line exists
+    in another file under the skills roots (a byte-identical move passes trivially), and refuse
+    while the skill's own SKILL.md still links the path (the stub would dangle). Foreground,
+    user-directed removes are not gated."""
+    if not _is_background_review():
+        return None
+    skill_md = skill_dir / "SKILL.md"
+    # Own-relative link only (`references/x.md`, `./references/x.md`); a repointed
+    # `../umbrella/references/x.md` names the new home and must not match.
+    own_link = re.compile(r"(?<![\w/.-])(?:\./)?" + re.escape(file_path) + r"(?![\w/.-])")
+    with suppress(OSError):
+        if own_link.search(skill_md.read_bytes().decode("utf-8", errors="replace")):
+            return _refusal(
+                f"Refusing background curator remove_file of '{file_path}' in skill '{name}': "
+                f"SKILL.md still links it. Repoint the link to the file's new home first, then retry.",
+                _content_not_carried=True)
+    if not (missing := _uncarried_lines(target)):
+        return None
+    shown = "\n".join(f"  - {ln[:160]}" for ln in missing[:_CARRY_SHOWN])
+    return _refusal(
+        f"Refusing background curator remove_file of '{file_path}' in skill '{name}': "
+        f"{len(missing)} distinctive line(s) exist in no other skill file, so removing it loses "
+        f"content. Move the file WHOLE instead: write_file it byte-identical into the umbrella's "
+        f"references/ (same content, any topical name), repoint every link to the new path, then "
+        f"retry remove_file. Uncarried lines include:\n{shown}",
+        _content_not_carried=True, uncarried_line_count=len(missing))
 
 
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:

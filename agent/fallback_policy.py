@@ -348,6 +348,32 @@ def lane_class(trigger_class: str, provider: Optional[str],
     return trigger_class, window
 
 
+# x-relay-quota-window (claude-pool) -> the ceiling window it implies.
+_RELAY_WINDOW_CEILING = {
+    "five_hour": "5h", "5h": "5h",
+    "seven_day": "7d", "7d": "7d",
+    "seven_day_overage_included": "7d", "7d_oi": "7d",
+    "seven_day_sonnet": "7d", "7d_sonnet": "7d",
+}
+
+
+def ceiling_window(window: Optional[str],
+                   headers: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """The window that clamps a stated reset: the text-derived one when known,
+    else the relay's ``x-relay-quota-window`` (t_aa698edc).
+
+    A relay ``quota_model`` for a model capped on every seat (Fable 7d_oi)
+    carries a reset hours away in ``Retry-After`` while its text never says
+    "weekly"; without the header window the 6 h ceiling cut the bench short
+    and the harness re-probed the capped model every few hours."""
+    if window:
+        return window
+    if not isinstance(headers, Mapping):
+        return None
+    raw = headers.get("x-relay-quota-window")
+    return _RELAY_WINDOW_CEILING.get(str(raw or "").strip().lower())
+
+
 # ── §4.1 cooldown math ────────────────────────────────────────────────────
 
 def compute_cooldown_s(cls: str, n: int, *,

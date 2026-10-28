@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -154,11 +155,16 @@ _missed_oneshot_notices: List[Dict[str, Any]] = []
 _missed_oneshot_notices_lock = threading.Lock()
 
 
-def drain_missed_oneshot_notices() -> List[Dict[str, Any]]:
-    """Pop every queued missed-one-shot notice (``{"job": ..., "text": ...}``)."""
+def drain_missed_oneshot_notices(lane: str = "all") -> List[Dict[str, Any]]:
+    """Pop the queued missed-one-shot notices (``{"job": ..., "text": ...}``) of ``lane``
+    (cron/lanes.py; ``"all"`` = every notice). Other lanes' notices stay queued for their tick."""
+    from cron.lanes import job_lane
+
     with _missed_oneshot_notices_lock:
-        drained = list(_missed_oneshot_notices)
-        _missed_oneshot_notices.clear()
+        drained, kept = [], []
+        for n in _missed_oneshot_notices:
+            (drained if lane == "all" or job_lane(n.get("job") or {}) == lane else kept).append(n)
+        _missed_oneshot_notices[:] = kept
     return drained
 
 
@@ -402,6 +408,7 @@ def _jobs_lock():
             _jobs_lock_state.depth -= 1
         return
 
+    _lock_wait_started = time.monotonic()
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
@@ -440,6 +447,13 @@ def _jobs_lock():
             # sibling may be writing; refuse) from "this platform has no flock backend" (nothing
             # to take; the #80624 shrink-merge is the only cross-process guard and stays in force).
             _jobs_lock_state.no_backend = acquired is None
+            # §5.2 wait probe (cron script runner S1): how long this section waited for both
+            # locks, labelled by the function that entered it. Never raises.
+            with contextlib.suppress(Exception):
+                from cron.lanes import caller_section_label, record_lock_wait
+
+                record_lock_wait(caller_section_label(sys._getframe(1)),
+                                 time.monotonic() - _lock_wait_started)
             try:
                 yield
             finally:
@@ -4963,6 +4977,39 @@ def mark_job_run(
     return _under_fire_fence(job_id, locked, timeout=lock_timeout)
 
 
+def correct_counted_run_outcome(
+    job_id: str, success: bool, error: Optional[str], *, last_run_at: str,
+) -> bool:
+    """Replace the outcome of a run ``mark_job_run`` ALREADY counted (restart recovery wrote it as
+    ``unknown``/interrupted) with the run's real outcome (t_854cd586). Only status, error and
+    streak fields change: ``repeat.completed``, ``next_run_at`` and the claims were advanced by
+    that first call and must not advance twice. The failure the first call counted is undone."""
+    def apply(jobs, _i, job):
+        prior_failure = job.get("last_status") not in ("ok", "delivery_failed")
+        streak = int(job.get("failure_streak") or 0)
+        if prior_failure and streak > 0:
+            streak -= 1
+        job["last_run_at"] = last_run_at
+        job["last_status"] = "ok" if success else "error"
+        job["last_error"] = None if success else error
+        job["error_repeat_streak"] = 0 if success else 1
+        if success:
+            job.pop("preflight_alerted", None)
+            job.pop("last_fire_error", None)
+            job.pop(RESTART_REQUEUE_COUNT_KEY, None)
+            job["failure_streak"] = 0
+        else:
+            job["failure_streak"] = streak + 1
+        save_jobs(jobs)
+        return True
+
+    def locked():
+        found = _with_job(job_id, apply, missing=_MISSING)
+        return False if found is _MISSING else found
+
+    return _under_fire_fence(job_id, locked)
+
+
 def _write_oneshot_diagnostic(job: Dict[str, Any], text: str, what: str) -> bool:
     """Best-effort operator-visible trace in the job's output dir; never breaks the caller."""
     try:
@@ -5523,7 +5570,7 @@ def _sweep_completed_oneshots(
 
 # --- Due scan ---
 
-def get_due_jobs() -> List[Dict[str, Any]]:
+def get_due_jobs(lane: str = "all") -> List[Dict[str, Any]]:
     """Return all jobs due now. A recurring job more than one period stale (gateway down, or a run
     overran the interval) has its backlog collapsed — next_run_at fast-forwards so nothing
     burst-fires — but still fires ONCE now (via mark_job_run, consuming one ``repeat.times`` run),
@@ -5531,9 +5578,14 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
     This prevents the perpetual-defer loop (#33315) where a job whose runtime exceeds ``interval + grace``
     would be skipped forever.
+
+    ``lane`` (``"all"`` | ``"agent"`` | ``"script"``, cron/lanes.py) limits the scan to one lane's
+    jobs; records of the other lane are left untouched (no claim, no re-anchor, no requeue).
     """
+    if lane not in ("all", "agent", "script"):
+        raise ValueError(f"unknown cron lane {lane!r}")
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        return _get_due_jobs_locked(lane)
 
 
 @dataclass
@@ -6026,8 +6078,10 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     return True
 
 
-def _get_due_jobs_locked() -> List[Dict[str, Any]]:
+def _get_due_jobs_locked(lane: str = "all") -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
+    from cron.lanes import job_lane
+
     raw_jobs = load_jobs()
     scan = _DueScan(raw_jobs, _hermes_now())
     scan.needs_save = _normalize_due_scan_records(raw_jobs)
@@ -6042,6 +6096,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     if _sweep_completed_oneshots(raw_jobs, scan.now, removed_ids=scan.removed):
         scan.needs_save = True
         jobs = [j for j in jobs if scan.find(j.get("id")) is not None]
+    # Lane scope (cron/lanes.py): drop the other lane's jobs BEFORE anything below can persist a
+    # claim, a requeue or a re-anchored next_run_at on them. Store-wide hygiene above runs in both.
+    if lane != "all":
+        jobs = [j for j in jobs if job_lane(j) == lane]
 
     due = []
     requeue_fired: List[Any] = []
@@ -6070,7 +6128,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     _warn_overdue_oneshots_not_due(jobs, due, scan.removed, scan.now)
     from cron.occurrences import REWOUND_BURST_MARKER, rewound_burst_payload
 
-    burst = rewound_burst_payload(scan.rewound, scan.now.isoformat())
+    rewound = scan.rewound
+    if lane != "all":
+        # The burst threshold counts one rewound store, not one lane's half of it: union this
+        # lane's ids with the other lane's from the last RUNNER_CYCLE_S (AC-16).
+        from cron.lanes import merge_rewound_lanes
+
+        rewound = merge_rewound_lanes(
+            _current_cron_store().cron_dir, lane, scan.rewound, scan.now)
+    burst = rewound_burst_payload(rewound, scan.now.isoformat())
     if burst:
         _write_marker(REWOUND_BURST_MARKER, json.dumps(burst) + "\n", ".rewound_burst_")
 

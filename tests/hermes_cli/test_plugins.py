@@ -1559,6 +1559,36 @@ class TestForceReloadSymmetry:
         assert "blocker" in caplog.text and "abandoned worker(s) still running" in caplog.text
         hold.set()
 
+    def test_on_session_end_timeout_does_not_drop_next_turns(self, monkeypatch):
+        """A slow on_session_end must not skip the NEXT turns' on_session_end: each skip is a
+        lost blackbox turns row (t_4e9dd8d5). Other bounded hooks keep their cooldown."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+        hold = threading.Event()
+        seen = []
+
+        def recorder(turn_id="", **_kwargs):
+            seen.append(turn_id)
+            if turn_id == "t1":
+                hold.wait(timeout=10.0)  # the first turn's write is slow
+
+        mgr = PluginManager()
+        mgr._hook_timeout_suppression_seconds = 60.0
+        mgr._hooks["on_session_end"] = [recorder]
+        mgr._hooks["post_tool_call"] = [recorder]
+        try:
+            mgr.invoke_hook("on_session_end", turn_id="t1")  # times out
+            mgr.invoke_hook("on_session_end", turn_id="t2")
+            mgr.invoke_hook("on_session_end", turn_id="t3")
+            assert seen == ["t1", "t2", "t3"]
+
+            mgr.invoke_hook("post_tool_call", turn_id="t1")  # times out -> cooldown applies
+            mgr.invoke_hook("post_tool_call", turn_id="t4")
+            assert seen == ["t1", "t2", "t3", "t1"]
+        finally:
+            hold.set()
+
     def test_hung_worker_does_not_fail_closed_forever(self, monkeypatch):
         """One never-returning pre_tool_call guard must not block every later tool call until
         restart: after the suppression window a fresh call id runs a new worker, so a callback

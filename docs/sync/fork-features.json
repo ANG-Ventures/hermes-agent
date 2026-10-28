@@ -246,7 +246,7 @@
       "tests/gateway/test_restart_config_bridge_call_site.py::test_effect",
       "tests/gateway/test_restart_config_bridge_call_site.py::test_restart_breadcrumb_frozen_contract_is_consumed"
     ],
-    "call_site": "gateway/run.py::_bridge_config_to_env",
+    "call_site": "hermes_cli/process_bootstrap.py::_bridge_config_to_env",
     "call_site_tests": [
       "tests/gateway/test_restart_config_bridge_call_site.py::test_every_fork_only_key_has_a_call_site_pair",
       "tests/gateway/test_restart_config_bridge_call_site.py::test_call_site_passes_the_agent_section_to_the_fork_helper",
@@ -1530,6 +1530,85 @@
     "surfaces": [
       "gateway",
       "cli"
+    ]
+  },
+  {
+    "feature": "a relay-summed prompt reading right after a usage-less reply is billed but never adopted as the context size (compressor, usage anchor, meter)",
+    "tests": [
+      "tests/agent/test_summed_usage_reading.py::TestRecordResponseUsage::test_gap_closes_after_one_measured_reading",
+      "tests/agent/test_summed_usage_reading.py::TestRecordResponseUsage::test_first_reading_over_window_is_rejected"
+    ],
+    "paths": [
+      "agent/turn_usage.py",
+      "agent/usage_anchor.py"
+    ],
+    "why": "2026-10-26 03:41 aegis on claude-dtlr: the first measured usage after a usage-less reply summed every assistant message since the turn mark (619,053 -> unknown -> 1,241,066 on a 1M window); record_response_usage stamped it as last_prompt_tokens and captured the usage anchor from it, so preflight compaction fired at a real ~622k (threshold 650k) and the footer meter, hygiene valve and delegate headroom read 2x. 24 of 383 post-usage-less claude-dtlr readings were 2.0x (2026-10-12..27). Fixed by hermes-agent#2385 (merge 77a98b9e2821, 2026-10-27): implausible_prompt_reading() rejects a figure above the window, or above 1.5x the anchor prediction + 32k only right after a usage-less reply; a rejected figure still counts for billing. Upstream has agent/turn_usage.py and agent/usage_anchor.py without the bound: PR shape is the bound + its record_response_usage call site; repro = the incident sequence 619,053 -> None -> 1,241,066.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ],
+    "coverage_gap": "test_summed_reading_does_not_become_context also goes RED on the pre-fix source, but on the Studio it fails on fork/main too: its first openai import trips tests/home_io_guard.py on the venv's editable pytest-hermeticity-guard path under the real home (local venv artifact, measured 2026-10-27). Register it once it is green on the canary host."
+  },
+  {
+    "feature": "shell-hook batches reuse a warm --serve dispatcher (up to 4 idle per interpreter/cwd/env) instead of a fork+exec of the gateway per tool call",
+    "tests": [
+      "tests/agent/test_shell_hooks_batch.py::test_n_batches_start_one_warm_dispatcher",
+      "tests/agent/test_shell_hooks_batch.py::test_dead_warm_dispatcher_is_replaced",
+      "tests/agent/test_shell_hooks_batch.py::test_serve_mode_answers_several_requests_on_one_process"
+    ],
+    "paths": [
+      "agent/shell_hook_dispatcher.py",
+      "agent/shell_hooks_batch.py"
+    ],
+    "why": "2026-10-26 20:13 PT Apollo gateway (pid 19817) 30 s py-spy --gil: 90 of 159 hook samples were shell_hooks_batch._start_dispatcher -> subprocess.Popen, one fork+exec of the multi-GB gateway plus a fresh interpreter on every tool call. Fixed by hermes-agent#2386 (merge d229eb63b1f8, 2026-10-27): shell_hook_dispatcher.py --serve answers one request per stdin line; shell_hooks_batch keeps up to 4 idle dispatchers and never reuses a killed or crashed one; per-hook fork, timeout and process-group kill unchanged. Upstream has no agent/shell_hook_dispatcher.py or agent/shell_hooks_batch.py (absent in upstream/main): PR shape rides on upstreaming the batched shell-hook runner; repro = 5 tool calls -> 1 dispatcher start.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ]
+  },
+  {
+    "feature": "gateway sends the reply before post-turn hooks (/goal judge, loop tick) run; a goal stopped, paused, replaced or re-evaluated during the send or judge gets no stale continuation",
+    "tests": [
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_reply_is_sent_before_the_goal_judge_starts",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_loop_tick_settles_inside_the_callback",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_stop_during_the_final_send_runs_no_hooks",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_stale_evaluator_save_is_dropped_and_never_continues",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_stale_evaluation_aborts_before_touching_the_replacement_goal",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_goal_set_during_the_send_is_not_judged_on_the_old_reply",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_pause_during_the_status_send_drops_the_continuation",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_replacement_goal_at_the_same_revision_gets_no_continuation",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_transient_refresh_failure_keeps_the_loaded_goal",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_unbounded_goal_hook_does_not_unbound_a_chained_callback",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_failed_turn_end_pin_skips_the_deferred_judge",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_subgoal_during_the_final_send_still_judges_and_continues",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_subgoal_during_the_judge_reevaluates_the_edited_goal",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_pause_and_resume_during_the_send_is_not_a_nonterminal_edit",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_pause_and_resume_during_the_judge_stops_the_stale_evaluation",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_a_newer_evaluation_during_the_judge_stops_the_older_one",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_a_newer_evaluation_after_the_pin_skips_the_older_judge"
+    ],
+    "paths": [
+      "gateway/platforms/base.py",
+      "gateway/platforms/base_*.py",
+      "gateway/run_goals.py",
+      "gateway/run_inbound.py",
+      "gateway/run_inbound_*.py",
+      "hermes_cli/goals.py",
+      "hermes_state.py",
+      "hermes_state_*.py"
+    ],
+    "why": "2026-10-26 Apollo: a turn with an active /goal held its finished reply until the goal judge (a second model call) returned, so the human saw nothing for the judge's whole duration. Fixed by hermes-agent#2351 (merge 6871aa27ebd1, 2026-10-27): post-turn hooks run from a callback after the final send, pinned to the goal revision at turn end, so a stop, pause, replacement goal or newer evaluation during the send or the judge drops the stale continuation. Upstream has all five files and runs the judge before delivery: PR shape is the after-send callback + revision pin; repro = test_reply_is_sent_before_the_goal_judge_starts.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
     ]
   }
 ]
