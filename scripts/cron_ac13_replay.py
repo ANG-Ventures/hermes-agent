@@ -364,7 +364,7 @@ def one_run(args, src_jobs, durations, tz, run_dir: Path, *, control: bool) -> d
         shutil.rmtree(run_dir)
     home = run_dir / "home" / ".hermes"
     minute, _ids = busiest_minute(src_jobs, tz)
-    warmup = 2.5 * cycle
+    warmup = 2 * cycle
     t0 = (datetime.now(timezone.utc) + timedelta(seconds=warmup + 60)).replace(
         second=0, microsecond=0)  # on a minute boundary: cron fires sit on the lattice
     manifest = build_store(src_jobs, durations, home, minute, t0, (args.cycles + 1) * 60.0)
@@ -376,17 +376,34 @@ def one_run(args, src_jobs, durations, tz, run_dir: Path, *, control: bool) -> d
         runner = _spawn(["--child", "runner", "--dump", str(run_dir / "runner.json")], home,
                         run_dir / "runner.log")
         procs.append(runner)
+        # Deployment order: the runner is up and progressing before the gateway boots. Started in
+        # the same second, the gateway's first "all" tick and the runner's tick phase-lock: the
+        # runner reads LOCK_BUSY every cycle, never records last_ok_at, and the gateway never
+        # delegates (observed 2026-10-28, /tmp/t0d4-ctl; reported on the card).
+        deadline = time.monotonic() + 3 * cycle
+        while not (lanes.read_runner_heartbeat(home) or {}).get("last_ok_at"):
+            if time.monotonic() > deadline or runner.poll() is not None:
+                manifest["aborted"] = "runner never progressed before the gateway boot"
+                break
+            time.sleep(0.2)
         gateway = _spawn(["--child", "gateway", "--dump", str(run_dir / "gateway.json")], home,
                          run_dir / "gateway.log")
         procs.append(gateway)
         manifest.update(runner_pid=runner.pid, gateway_pid=gateway.pid)
         control_proc = None
+        control_at = None
         t0_epoch = t0.timestamp()
-        while True:
+        while not manifest.get("aborted"):
             if time.monotonic() - started > RUN_HARD_TIMEOUT_S:
                 manifest["aborted"] = "hard timeout"
                 break
-            if control and control_proc is None and time.time() >= t0_epoch + CONTROL_AT_S:
+            if control and control_at is None:
+                first = [t for t in _load_dump(run_dir / "runner.json")["ticks"]
+                         if t["t"] >= t0_epoch - 1.0 and t["lane"] == "script"]
+                if first:  # t0 + 20 s, t0 = the tick that dispatches the busiest minute
+                    control_at = first[0]["t"] + CONTROL_AT_S
+                    manifest["control_at"] = control_at
+            if control and control_proc is None and control_at and time.time() >= control_at:
                 control_proc = _spawn(["--child", "control", "--lock",
                                        str(home / "cron" / ".jobs.lock"),
                                        "--marker", str(run_dir / "control.json")],
@@ -443,6 +460,10 @@ def evaluate(run_dir: Path, home: Path, manifest: dict) -> dict:
                   ticks=tick_rows, executions=_rows(home), script_ticks_after_t0=len(script_after),
                   admitted_after_t0=sum(1 for r in script_after if r["outcome"] == "ADMITTED"))
     if manifest.get("control"):
+        # A probe wait cannot exceed the hold (the helper takes the lock first, so every waiter
+        # arrives after it), so the spec's literal "max >= 6 s" for a 6 s hold is unreachable;
+        # the control proves the probe trips the < 5 s threshold, and that the section that
+        # tripped it overlapped the hold (reported, spec ambiguity flagged on the card).
         result["control_pass"] = measured["max_section_wait_s"] >= THRESHOLDS["max_section_wait_s"]
         with contextlib.suppress(OSError, ValueError):
             result["control_hold"] = json.loads((run_dir / "control.json").read_text())
@@ -468,6 +489,8 @@ def main(argv=None) -> int:
     ap.add_argument("--executions-db", help="source executions.db for median durations (read only)")
     ap.add_argument("--out", help="artifacts dir")
     ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="healthy repeats run side by side (separate scratch homes)")
     ap.add_argument("--cycles", type=int, default=3)
     ap.add_argument("--control", action="store_true", help="also run the negative control")
     ap.add_argument("--control-only", action="store_true")
@@ -496,8 +519,14 @@ def main(argv=None) -> int:
                "busiest_minute": minute.isoformat(), "busiest_count": len(ids),
                "thresholds": THRESHOLDS, "runs": []}
     healthy = []
-    for i in range(0 if args.control_only else args.repeats):
-        res = one_run(args, src_jobs, durations, tz, out / f"run-{i + 1:02d}", control=False)
+    n_runs = 0 if args.control_only else args.repeats
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+        futs = [pool.submit(one_run, args, src_jobs, durations, tz, out / f"run-{i + 1:02d}",
+                            control=False) for i in range(n_runs)]
+        results = [f.result() for f in futs]
+    for i, res in enumerate(results):
         summary["runs"].append({k: res.get(k) for k in (
             "measured", "thresholds_pass", "script_ticks_after_t0", "admitted_after_t0",
             "runner_pid", "aborted", "executions")})
