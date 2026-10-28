@@ -263,19 +263,24 @@ def _background_review_read_before_write_guard(
         _read_before_write_required=True)
 
 
-_CARRY_MIN_LINE = 16  # shorter normalized lines (headings, rules, fences) are not distinctive
+_CARRY_MIN_LINE = 16  # shorter normalized lines ("## Usage", rules, fences) are not distinctive
 _CARRY_MAX_BYTES = 2_000_000
 _CARRY_SHOWN = 5
-_MD_HEADING = re.compile(r"#{1,6} ")
+_MD_HEADING = re.compile(r"#{1,6} +")
 
 
-def _carry_lines(text: str) -> set:
-    lines = (" ".join(raw.split()) for raw in text.splitlines())
+def _carry_lines(data: bytes) -> set:
+    # Stray non-UTF-8 bytes (one cp1252 quote) must not exempt prose from the check: decode with
+    # replacement, identically on both sides. A heading is a line like any other (a constraint
+    # stated only as a heading is still content); its level is dropped so a fold that demotes it
+    # still carries it.
+    text = data.decode("utf-8", errors="replace").lstrip("\ufeff")
+    lines = (_MD_HEADING.sub("", " ".join(raw.split()), count=1) for raw in text.splitlines())
     return {ln for ln in lines if len(ln) >= _CARRY_MIN_LINE and sum(c.isalnum() for c in ln) >= 8}
 
 
 def _carry_candidates(target: Path):
-    """Every other text file under the skills roots, same-basename files first (the usual move)."""
+    """Every other file under the skills roots, same-basename files first (the usual move)."""
     from agent.skill_utils import get_all_skills_dirs
     seen, same, rest = {_resolved_str(target)}, [], []
     for root in get_all_skills_dirs():
@@ -292,22 +297,35 @@ def _carry_candidates(target: Path):
     return same + rest
 
 
+def _read_carrier(path: Path) -> Optional[bytes]:
+    """A carrier's bytes, or None when it cannot count (unreadable or too big): fails closed."""
+    with suppress(OSError):
+        if path.stat().st_size <= _CARRY_MAX_BYTES:
+            return path.read_bytes()
+    return None
+
+
 def _uncarried_lines(target: Path) -> list:
-    """Distinctive lines of *target* that appear in no other file under the skills roots."""
+    """Why removing *target* would lose content: its distinctive lines found in no other file under
+    the skills roots, or one named ``<...>`` reason when that cannot be verified. Empty = carried.
+    Every failure to inspect the source refuses; nothing here may read as "nothing uncarried"."""
     try:
-        if target.stat().st_size > _CARRY_MAX_BYTES:  # unverifiable: fail closed, never skip
+        if target.stat().st_size > _CARRY_MAX_BYTES:
             return [f"<file exceeds the {_CARRY_MAX_BYTES}-byte carry check; move it whole>"]
-        missing = _carry_lines(target.read_text(encoding="utf-8"))
-        if target.suffix.lower() in {".md", ".markdown"}:  # a merge retitles; headings carry no facts
-            missing = {ln for ln in missing if not _MD_HEADING.match(ln)}
-    except (OSError, UnicodeDecodeError):
-        return []  # binary/unreadable support file: not prose, nothing to carry line by line
+        data = target.read_bytes()
+    except OSError as e:
+        return [f"<source could not be read for the carry check ({type(e).__name__}: {e}); refusing>"]
+    if b"\0" in data:  # provably binary: no prose lines, so only a byte-identical copy carries it
+        for other in _carry_candidates(target):
+            if _read_carrier(other) == data:
+                return []
+        return ["<binary file with no byte-identical copy under the skills roots; move it whole>"]
+    missing = _carry_lines(data)
     for other in _carry_candidates(target):
         if not missing:
             break
-        with suppress(OSError, UnicodeDecodeError):
-            if other.stat().st_size <= _CARRY_MAX_BYTES:
-                missing -= _carry_lines(other.read_text(encoding="utf-8"))
+        if (other_data := _read_carrier(other)) is not None:
+            missing -= _carry_lines(other_data)
     return sorted(missing)
 
 
@@ -326,8 +344,8 @@ def _curator_remove_file_carry_guard(
     # Own-relative link only (`references/x.md`, `./references/x.md`); a repointed
     # `../umbrella/references/x.md` names the new home and must not match.
     own_link = re.compile(r"(?<![\w/.-])(?:\./)?" + re.escape(file_path) + r"(?![\w/.-])")
-    with suppress(OSError, UnicodeDecodeError):
-        if own_link.search(skill_md.read_text(encoding="utf-8")):
+    with suppress(OSError):
+        if own_link.search(skill_md.read_bytes().decode("utf-8", errors="replace")):
             return _refusal(
                 f"Refusing background curator remove_file of '{file_path}' in skill '{name}': "
                 f"SKILL.md still links it. Repoint the link to the file's new home first, then retry.",
