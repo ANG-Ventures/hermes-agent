@@ -97,9 +97,9 @@ class TestTickYieldGate:
         called = []
         real = scheduler_mod._get_lock_paths
 
-        def _spy():
+        def _spy(*args):
             called.append(1)
-            return real()
+            return real(*args)
 
         monkeypatch.setattr(scheduler_mod, "_get_lock_paths", _spy)
         assert scheduler_mod.tick(verbose=False) == 0  # empty store: no jobs

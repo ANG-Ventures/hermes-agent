@@ -30,7 +30,7 @@ def plan_data_removal(home: Path, project: Path, userdata: Path | None = None) -
         installs_root().resolve(), machine / "tools", machine / "bin", machine / "cache",
         machine / "spawn-ledger.json", home / "gateway.lock", home / ".backup.lock",
         home / "runtime" / "active_sessions.lock", home / "cron" / ".tick.lock",
-        store_lock_path(home / "checkpoints"),
+        home / "cron" / ".tick-script.lock", store_lock_path(home / "checkpoints"),
     }
     if home == machine:
         protected.add(machine / "profiles")

@@ -146,6 +146,17 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return start_time_fingerprints_match(started_at, current)
 
 
+def _lane_peer(pid: int, started_at: Optional[int]) -> bool:
+    """``cron.lanes.lane_peer`` for the home that owns this ledger; any failure is False."""
+    try:
+        from cron.lanes import lane_peer
+
+        path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+        return lane_peer(pid, started_at, Path(path).parent.parent)
+    except Exception:
+        return False
+
+
 def _live_owner_stale_after_seconds() -> Optional[float]:
     """Age past which a claimed/running row with a LIVE owner is treated as wedged.
 
@@ -380,6 +391,11 @@ def recover_interrupted_executions() -> int:
                 continue
             reason = _OWNER_GONE_REASON
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                # A progressing script runner of this home owns the row: its run may legitimately
+                # reach the script timeout and then deliver (cron/lanes.py ``lane_peer``, spec
+                # §5.2a). Gateway-owned rows keep the bound below.
+                if _lane_peer(int(row["pid"]), row["process_started_at"]):
+                    continue
                 # A live owner is normally a legitimately running job. A worker permanently
                 # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
                 # this check, so a claim older than the derived bound is treated as wedged
