@@ -2093,3 +2093,31 @@ def test_attach_path_rejects_invalid_supplied_digest(worker_env, tmp_path, monke
         assert kb.list_attachments(conn, worker_env) == []
     finally:
         conn.close()
+
+
+def test_create_flagship_profile_assignee_needs_allow_flagship(worker_env):
+    """kanban_create on a flagship-default profile is gated like --model (t_9e7ba884)."""
+    import os
+    from pathlib import Path as _Path
+
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    prof = _Path(os.environ["HERMES_HOME"]) / "profiles" / "daedalus-fable"
+    prof.mkdir(parents=True)
+    (prof / "config.yaml").write_text("model:\n  default: claude-fable-5-1\n", encoding="utf-8")
+    refused = json.loads(kt._handle_create({
+        "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
+    }))
+    assert "assignee profile default" in refused.get("error", ""), refused
+    ok = json.loads(kt._handle_create({
+        "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
+        "allow_flagship": "delicate infra",
+    }))
+    assert ok["ok"] is True, ok
+    conn = kb.connect()
+    try:
+        bodies = [c.body for c in kb.list_comments(conn, ok["task_id"])]
+    finally:
+        conn.close()
+    assert "flagship override: delicate infra" in bodies, bodies

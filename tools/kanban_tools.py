@@ -1472,6 +1472,9 @@ def _handle_create(args: dict, **kw) -> str:
     until_raw = args.get("until")
     force_model = args.get("force_model")
     _check(force_model is None or isinstance(force_model, str), "force_model must be a reason string")
+    allow_flagship = args.get("allow_flagship")
+    _check(allow_flagship is None or isinstance(allow_flagship, str),
+           "allow_flagship must be a reason string")
     from hermes_cli import kanban_worker_policy as _worker_policy
     with _board(args.get("board")) as (kb, conn):
         until = None
@@ -1515,6 +1518,8 @@ def _handle_create(args: dict, **kw) -> str:
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             force_model_reason=force_model,
+            flagship_override_reason=allow_flagship,
+            flagship_override_author=_persisted_identity(),
             reasoning_effort=reasoning_effort,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
