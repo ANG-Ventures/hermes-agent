@@ -7039,22 +7039,29 @@ def _assignee_flagship_reason(
     row = conn.execute(
         "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
-    if row is None or row["assignee"] == profile:
+    # An unchanged assignee is not a new route, but an explicit reason on it
+    # still authorizes a legacy flagship card (Prism 70a0613a6b24).
+    if row is None or (row["assignee"] == profile and not (reason or "").strip()):
         return None
+
+    def _authorized() -> bool:
+        return conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? "
+            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
+            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
+        ).fetchone() is not None
+
     try:
         allowed = validate_assignee_route(
             profile, model_override=row["model_override"],
             allow_flagship_reason=reason,
         )
     except ValueError as exc:
-        authorized = conn.execute(
-            "SELECT 1 FROM task_comments WHERE task_id = ? "
-            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
-            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
-        ).fetchone()
-        if authorized:
+        if _authorized():
             return None
         raise FlagshipAssigneeRefused(f"cannot reassign {task_id}: {exc}") from None
+    if allowed and row["assignee"] == profile and _authorized():
+        return None
     return allowed
 
 

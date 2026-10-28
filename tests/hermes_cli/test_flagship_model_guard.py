@@ -370,3 +370,26 @@ def test_dispatch_refuses_flagship_profile_default_without_override(
         and "claude-fable-5-1" in b
         for b in bodies
     ), bodies
+
+
+def test_assign_same_flagship_profile_with_reason_authorizes_legacy_card(
+    flagship_profiles,
+):
+    """Prism 70a0613a6b24: re-assigning a legacy flagship card to its own
+    profile with --allow-flagship must record the override, not drop it."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy", assignee="daedalus-opus")
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-fable' WHERE id = ?",
+                     (task_id,))
+        conn.commit()
+    out = kc.run_slash(f"assign {task_id} daedalus-fable --allow-flagship 'approved'")
+    assert "Assigned" in out, out
+    with kb.connect() as conn:
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert bodies == ["flagship override: approved"], bodies
+    assert task_id not in res.flagship_refused
+    # A second identical call does not stack duplicate overrides.
+    kc.run_slash(f"assign {task_id} daedalus-fable --allow-flagship 'approved'")
+    with kb.connect() as conn:
+        assert len(kb.list_comments(conn, task_id)) == 1
