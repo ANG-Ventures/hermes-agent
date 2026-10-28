@@ -31,8 +31,12 @@ RUNNER_CYCLE_S = 60
 RUNNER_PROGRESS_STALE_S = 180
 # DRAFT until P0-5 measures healthy script-lane tick durations (D15); S3 writes the real value.
 RUNNER_TICK_WATCHDOG_S = 120
-# Written by the S2 PR once S1 has merged; None means no gateway can satisfy the precondition.
-S1_MERGE_SHA: Optional[str] = None
+# Watchdog tree-kill grace (§5.5 step 5). ``terminate_running_scripts`` has no named grace, so this
+# is the spec's own value.
+RUNNER_WATCHDOG_KILL_GRACE_S = 3
+# hermes-agent#2396 (S1) merge commit: a gateway whose boot code_sha descends from it takes both
+# lane locks, so the runner may tick (host precondition, §5.4).
+S1_MERGE_SHA: Optional[str] = "410f6d65af5af9045ee1c0d24c56090cf715d4ff"
 
 TICK_LOCK_NAMES = {"agent": ".tick.lock", "script": ".tick-script.lock"}
 HEARTBEAT_NAME = "script_runner_heartbeat"

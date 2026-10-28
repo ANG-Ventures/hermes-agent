@@ -1,0 +1,516 @@
+"""The cron script runner: ticks the ``script`` lane (``no_agent`` jobs) outside the gateway.
+
+Spec: Obsidian ``AI/Hermes Agent/Cron Script Runner Out Of Gateway — Spec (2026-10-27).md`` v1.0,
+§5.4 (the runner process) and §5.5 (tick watchdog, one strike, code skew, drain). Entry:
+``hermes cron runner``; re-arm after a watchdog trip: ``hermes cron runner rearm``.
+
+The runner reuses ``InProcessCronScheduler`` with ``lane="script"``, no adapters (standalone
+delivery), ``heartbeat=False`` (``ticker_heartbeat``/``ticker_last_success`` stay the gateway's
+signal) and its own per-home heartbeat ``<home>/cron/script_runner_heartbeat``. It ticks a home only
+when:
+
+* every live gateway on the host booted on code that contains S1 (host precondition, D7);
+* no watchdog trip marker exists (one strike, D12);
+* ``cron.script_runner.enabled`` is a YAML ``true`` in the process home's config;
+* that home's own gateway is absent, or live and publishing ``cron_script_lane_delegation == 1``.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+import signal
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from cron import lanes
+
+logger = logging.getLogger(__name__)
+
+TRIP_MARKER_NAME = "script_runner_tripped"
+EXIT_CONFIG = 78
+EXIT_WATCHDOG = 70
+_SHUTDOWN_WAIT_S = 20.0
+_WARN_EVERY_S = 3600.0
+_REFUSED_ENV = ("HERMES_MACHINE_ID", "_HERMES_CRON_EXTERNAL_WORKER")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def trip_marker_path() -> Path:
+    """``<process home>/cron/script_runner_tripped`` (the process home, never a tick scope)."""
+    from hermes_constants import get_process_hermes_home
+
+    return get_process_hermes_home() / "cron" / TRIP_MARKER_NAME
+
+
+def _home_label(home: Path) -> str:
+    home = Path(home)
+    return home.name if home.parent.name == "profiles" else "default"
+
+
+def _detect_code_skew():
+    try:
+        from gateway.code_skew import detect_code_skew
+
+        return detect_code_skew()
+    except Exception:
+        return None
+
+
+def _inflight_count() -> int:
+    from cron.scheduler import get_running_job_ids
+
+    return len(get_running_job_ids())
+
+
+def _boot_code_sha() -> Optional[str]:
+    try:
+        from gateway.code_skew import current_code_sha
+
+        return current_code_sha()
+    except Exception:
+        return None
+
+
+def _gateway_record(home: Path, liveness) -> Optional[dict]:
+    if liveness.source == "multiplexer":
+        return liveness.runtime if isinstance(liveness.runtime, dict) else None
+    try:
+        data = json.loads((Path(home) / "gateway_state.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def runner_gate_reason(name: str, home) -> Optional[str]:
+    """None when the runner may tick ``home``, else the standby reason. Checks the knob, the trip
+    marker, then the home's own gateway: absent → tick; live → tick only when its record names the
+    liveness holder, is fresh and carries ``cron_script_lane_delegation == 1``. Any exception →
+    standby (``probe_error``)."""
+    if not lanes.knob_enabled():
+        return "knob_disabled"
+    if trip_marker_path().exists():
+        return "watchdog_tripped"
+    try:
+        import gateway.status as status
+
+        liveness = status.resolve_gateway_liveness(
+            profile_dir=Path(home), use_cache=False,
+            pid_probe=lambda p: status.get_running_pid(p, cleanup_stale=False))
+        if not liveness.running:
+            return None
+        record = _gateway_record(Path(home), liveness)
+        if (isinstance(record, dict) and liveness.pid is not None
+                and int(record.get("pid") or -1) == int(liveness.pid)
+                and not status.runtime_status_is_stale(record)
+                and record.get("cron_script_lane_delegation") == 1):
+            return None
+        return "home_gateway_not_delegating"
+    except Exception:
+        logger.debug("runner gate probe failed for %s", name, exc_info=True)
+        return "probe_error"
+
+
+def runner_may_tick(name: str, home) -> bool:
+    """The §5.4 per-home gate (after the host precondition)."""
+    return runner_gate_reason(name, home) is None
+
+
+class ScriptRunner:
+    """Per-process runner state: the gate, the heartbeat writer, the tick watchdog and drain."""
+
+    def __init__(self, *, profile_homes: Optional[Callable[[], list]] = None,
+                 interval: Optional[float] = None, exit_fn: Callable[[int], Any] = os._exit,
+                 root: Optional[Path] = None):
+        if profile_homes is None:
+            from cron.scheduler_ownership import cron_tick_profile_homes
+
+            profile_homes = lambda: cron_tick_profile_homes(None)  # noqa: E731
+        self._profile_homes = profile_homes
+        self.interval = float(interval if interval is not None else lanes.RUNNER_CYCLE_S)
+        self._exit_fn = exit_fn
+        self._root = root
+        self._stop: Optional[threading.Event] = None
+        self.exit_code = 0
+        self.host_failing: List[lanes.GatewayEntry] = []
+        self.tripped = False
+        self.draining = False
+        self.draining_since: Optional[str] = None
+        self.sigterm = False
+        self._reasons: Dict[str, Optional[str]] = {}
+        self._last_ok: Dict[str, str] = {}
+        self._tick_started: Dict[str, str] = {}
+        self._last_homes: List[tuple] = []
+        self._warned: Dict[str, tuple] = {}
+        self._recovered = False
+        self._timer: Optional[threading.Timer] = None
+        self._deadline: Optional[threading.Timer] = None
+        self._pid = os.getpid()
+        self._pid_start = self._own_start_time()
+        self._code_sha = _boot_code_sha()
+
+    @staticmethod
+    def _own_start_time():
+        try:
+            from gateway.status import get_process_start_time
+
+            return get_process_start_time(os.getpid())
+        except Exception:
+            return None
+
+    # --- wiring ----------------------------------------------------------------------------
+
+    def attach_stop(self, stop: threading.Event) -> None:
+        self._stop = stop
+
+    def start_kwargs(self, stop: threading.Event) -> dict:
+        """Keyword arguments for ``InProcessCronScheduler.start`` (spec §5.4 entry)."""
+        self.attach_stop(stop)
+        return {
+            "adapters": None, "loop": None, "interval": self.interval,
+            "profile_homes": self.enumerate_homes, "profile_gate": self.profile_gate,
+            "can_dispatch": self.can_dispatch, "lane": "script", "heartbeat": False,
+            "startup_recovery": False, "on_home_cycle": self.on_home_cycle,
+            "tick_hooks": (self.on_tick_start, self.on_tick_end),
+        }
+
+    def _warn_hourly(self, key: str, signature, message: str, *args) -> None:
+        last = self._warned.get(key)
+        now = time.monotonic()
+        if last is not None and last[0] == signature and now - last[1] < _WARN_EVERY_S:
+            return
+        self._warned[key] = (signature, now)
+        logger.warning(message, *args)
+
+    # --- per-cycle checks (run once per cycle, before any home's gate) ----------------------
+
+    def enumerate_homes(self) -> list:
+        """The provider's ``profile_homes`` callable: run the cycle-level checks (code skew and
+        drain, knob-off re-arm, trip marker, host precondition, first-pass recovery) and return
+        the homes to consider."""
+        homes = list(self._profile_homes())
+        from cron.scheduler_provider import _existing_profile_homes, _profile_entry
+
+        self._last_homes = [_profile_entry(e) for e in _existing_profile_homes(homes)]
+        self._check_skew()
+        if not lanes.knob_enabled():
+            marker = trip_marker_path()
+            if marker.exists():
+                with contextlib.suppress(OSError):
+                    marker.unlink()
+                    logger.warning("script runner re-armed: cron.script_runner.enabled is false; "
+                                   "trip marker removed")
+        self.tripped = trip_marker_path().exists()
+        if self.tripped:
+            self._warn_hourly("tripped", True, "script runner standby: watchdog tripped (%s); "
+                              "run 'hermes cron runner rearm'", trip_marker_path())
+        self._check_host()
+        if not self.host_failing and not self._recovered:
+            self._recover(self._last_homes)
+        return homes
+
+    def _check_skew(self) -> None:
+        if not self.draining and _detect_code_skew() is not None:
+            self.draining = True
+            self.draining_since = _now_iso()
+            logger.warning("script runner draining: code skew; exiting 0 once in-flight scripts end")
+        if self.draining and _inflight_count() == 0:
+            self.exit_code = 0
+            if self._stop is not None:
+                self._stop.set()
+
+    def _check_host(self) -> None:
+        try:
+            entries = lanes.host_gateways(self._root)
+        except Exception:
+            logger.warning("script runner: host gateway enumeration failed", exc_info=True)
+            self.host_failing = [lanes.GatewayEntry(Path("?"), -1, None, None, True)]
+            return
+        self.host_failing = [e for e in entries if not lanes.code_contains_s1(e.code_sha)]
+        if self.host_failing:
+            names = sorted(f"{_home_label(e.home)} pid {e.pid} on {(e.code_sha or 'none')[:12]}"
+                           for e in self.host_failing)
+            self._warn_hourly("host", tuple(names),
+                              "script runner standby: host precondition: %s", "; ".join(names))
+
+    def _recover(self, homes) -> None:
+        from cron.scheduler_provider import InProcessCronScheduler, _profile_cron_scope
+
+        self._recovered = True
+        provider = InProcessCronScheduler()
+        for _name, home in homes:
+            try:
+                with _profile_cron_scope(home):
+                    provider.recover_interrupted()
+            except Exception:
+                logger.error("script runner startup recovery failed for %s", home, exc_info=True)
+
+    def profile_gate(self, name: str, home) -> bool:
+        if self.draining or self.sigterm:
+            reason = "draining"
+        elif self.tripped:
+            reason = "watchdog_tripped"
+        elif self.host_failing:
+            reason = "host_precondition"
+        else:
+            reason = runner_gate_reason(name, home)
+        self._reasons[str(home)] = reason
+        return reason is None
+
+    def can_dispatch(self) -> bool:
+        return not (self.draining or self.sigterm or self.tripped)
+
+    # --- heartbeat --------------------------------------------------------------------------
+
+    def _write(self, home, state: str, reason: Optional[str] = None, outcome=None) -> None:
+        key = str(home)
+        lanes.write_runner_heartbeat(home, {
+            "at": _now_iso(), "pid": self._pid, "pid_start": self._pid_start, "state": state,
+            "standby_reason": reason if state == "standby" else None,
+            "draining_since": self.draining_since if state == "draining" else None,
+            "tick_started_at": self._tick_started.get(key),
+            "last_ok_at": self._last_ok.get(key), "last_outcome": outcome,
+            "code_sha": self._code_sha,
+        })
+
+    def on_home_cycle(self, name: str, home, gated_in: bool, outcome) -> None:
+        """Once per existing home per cycle. ``last_ok_at`` advances only on a non-raising tick
+        that reported ``ADMITTED``; every other outcome carries it forward."""
+        key = str(home)
+        if isinstance(outcome, lanes.TickOutcome):
+            label = outcome.value
+            if gated_in and outcome is lanes.TickOutcome.ADMITTED:
+                self._last_ok[key] = _now_iso()
+        elif isinstance(outcome, BaseException):
+            label = type(outcome).__name__
+        else:
+            label = None
+        if self.draining or self.sigterm:
+            self._write(home, "draining", outcome=label)
+        elif gated_in:
+            self._write(home, "active", outcome=label)
+        else:
+            self._write(home, "standby", self._reasons.get(key) or "gated", outcome=label)
+
+    # --- tick watchdog (§5.5) --------------------------------------------------------------
+
+    def on_tick_start(self, home) -> None:
+        started = _now_iso()
+        self._tick_started[str(home)] = started
+        self._write(home, "active")
+        timer = threading.Timer(float(lanes.RUNNER_TICK_WATCHDOG_S), self._watchdog_fire,
+                                args=(home, started))
+        timer.daemon = True
+        timer.name = "cron-runner-watchdog"
+        self._timer = timer
+        timer.start()
+
+    def on_tick_end(self, home) -> None:
+        timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
+        self._tick_started.pop(str(home), None)
+
+    def cancel_deadline(self) -> None:
+        if self._deadline is not None:
+            self._deadline.cancel()
+
+    def _watchdog_fire(self, home, tick_started_at) -> None:
+        grace = float(lanes.RUNNER_WATCHDOG_KILL_GRACE_S)
+        # 1. Hard deadline: the exit happens even if a step below blocks.
+        self._deadline = threading.Timer(grace + 2, self._exit_fn, args=(EXIT_WATCHDOG,))
+        self._deadline.daemon = True
+        self._deadline.start()
+        try:
+            logger.critical("script runner tick exceeded %s s on %s; tripping (one strike) and "
+                            "exiting %d", lanes.RUNNER_TICK_WATCHDOG_S, home, EXIT_WATCHDOG)
+            self.tripped = True
+            self._write_trip_marker(home, tick_started_at)
+            for _name, h in self._last_homes or [(None, home)]:
+                with contextlib.suppress(Exception):
+                    self._write(h, "standby", "watchdog_tripped")
+            self._tree_kill(grace)
+            for handler in logging.getLogger().handlers:
+                with contextlib.suppress(Exception):
+                    handler.flush()
+        finally:
+            self._exit_fn(EXIT_WATCHDOG)
+
+    def _write_trip_marker(self, home, tick_started_at) -> None:
+        from utils import atomic_write_text
+
+        try:
+            atomic_write_text(trip_marker_path(), json.dumps({
+                "at": _now_iso(), "home": str(home), "pid": self._pid,
+                "code_sha": self._code_sha, "tick_started_at": tick_started_at,
+            }, sort_keys=True) + "\n", tmp_prefix=".script_runner_tripped_", mode=0o600)
+        except Exception:
+            logger.error("script runner: trip marker write failed; the restart will be armed",
+                         exc_info=True)
+
+    @staticmethod
+    def _snapshot_script_procs() -> list:
+        import cron.scheduler as sched
+
+        got = sched._script_procs_lock.acquire(blocking=False)
+        try:
+            if got:
+                return list(sched._active_script_procs.values())
+            logger.warning("script runner watchdog: procs lock busy; snapshotting unlocked")
+            try:
+                return list(sched._active_script_procs.values())
+            except RuntimeError:
+                return list(sched._active_script_procs.values())
+        finally:
+            if got:
+                sched._script_procs_lock.release()
+
+    def _tree_kill(self, grace: float) -> None:
+        """SIGTERM every registered script's process group, wait ≤ ``grace``, SIGKILL the rest."""
+        groups = []
+        for proc in self._snapshot_script_procs():
+            try:
+                if proc.poll() is not None:
+                    continue
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                groups.append((proc, pgid))
+            except Exception:
+                logger.debug("watchdog SIGTERM failed", exc_info=True)
+
+        def alive(item) -> bool:
+            proc, pgid = item
+            with contextlib.suppress(Exception):
+                proc.poll()  # reap our own child so its group can empty
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return False
+            except Exception:
+                return True
+            return True
+
+        deadline = time.monotonic() + grace
+        while groups and time.monotonic() < deadline:
+            groups = [g for g in groups if alive(g)]
+            if groups:
+                time.sleep(0.05)
+        for _proc, pgid in groups:
+            with contextlib.suppress(Exception):
+                os.killpg(pgid, signal.SIGKILL)
+
+    # --- SIGTERM shutdown (§5.4) -----------------------------------------------------------
+
+    def request_shutdown(self) -> None:
+        self.sigterm = True
+        if self._stop is not None:
+            self._stop.set()
+
+    def shutdown(self) -> int:
+        """Heartbeat ``draining`` → ``signal_shutdown`` → ``terminate_running_scripts`` → wait ≤ 20 s
+        for in-flight runs to record (and request their one re-fire) → 0."""
+        import cron.scheduler as sched
+
+        self.draining_since = self.draining_since or _now_iso()
+        for _name, home in self._last_homes:
+            with contextlib.suppress(Exception):
+                self._write(home, "draining")
+        sched.signal_shutdown("cron script runner SIGTERM")
+        sched.terminate_running_scripts("cron script runner SIGTERM")
+        deadline = time.monotonic() + _SHUTDOWN_WAIT_S
+        while _inflight_count() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        return 0
+
+
+def rearm() -> int:
+    """``hermes cron runner rearm``: delete the trip marker and print its content."""
+    marker = trip_marker_path()
+    try:
+        content = marker.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print("cron script runner: not tripped (no marker)")
+        return 0
+    marker.unlink(missing_ok=True)
+    print(f"cron script runner re-armed; removed {marker}:\n{content.rstrip()}")
+    return 0
+
+
+def _bootstrap_env() -> None:
+    """Load the process home's ``.env`` the way the gateway does at import. S4 replaces this with
+    ``bootstrap_cron_parent_env(role="runner")`` (spec §5.6)."""
+    from hermes_cli.env_loader import load_hermes_dotenv
+    from hermes_constants import get_process_hermes_home
+
+    load_hermes_dotenv(hermes_home=get_process_hermes_home())
+
+
+def _setup_logging() -> None:
+    from hermes_constants import get_process_hermes_home
+    from hermes_logging import setup_logging
+
+    setup_logging(hermes_home=get_process_hermes_home(), mode="cron")
+    # launchd captures stderr into ~/.hermes/logs/cron-script-runner.log.
+    stream = logging.StreamHandler(sys.stderr)
+    stream.setLevel(logging.WARNING)
+    stream.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(stream)
+
+
+def main(argv: Optional[list] = None) -> int:
+    """``hermes cron runner``. Exit 78: config refusal; 70: watchdog trip; 0: SIGTERM or skew."""
+    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
+
+    _setup_logging()
+    _bootstrap_env()
+    for key in _REFUSED_ENV:
+        if key in os.environ:
+            logger.error("cron script runner refusing to start: %s is set (I6: no outbox, no "
+                         "shared claim identity)", key)
+            return EXIT_CONFIG
+    if not isinstance(resolve_cron_scheduler(), InProcessCronScheduler):
+        logger.error("cron script runner refusing to start: cron.provider is not the built-in "
+                     "in-process scheduler")
+        return EXIT_CONFIG
+    with contextlib.suppress(Exception):
+        from gateway.code_skew import record_boot_fingerprint
+
+        record_boot_fingerprint()
+    runner = ScriptRunner()
+    stop = threading.Event()
+    kwargs = runner.start_kwargs(stop)
+    signal.signal(signal.SIGTERM, lambda *_a: runner.request_shutdown())
+    homes = list(runner._profile_homes())
+    with contextlib.suppress(Exception):
+        from hermes_logging import enable_profile_log_routing
+
+        enable_profile_log_routing([home for _name, home in homes])
+    logger.warning(
+        "cron script runner started: pid %d, lane script, %d home(s) %s, knob=%s, "
+        "precondition S1=%s, tripped=%s", os.getpid(), len(homes),
+        [name for name, _home in homes], lanes.knob_enabled(), (lanes.S1_MERGE_SHA or "")[:12],
+        trip_marker_path().exists())
+    thread = threading.Thread(target=InProcessCronScheduler().start, args=(stop,), kwargs=kwargs,
+                              name="cron-script-runner", daemon=True)
+    thread.start()
+    while not stop.wait(0.5):
+        if not thread.is_alive():
+            logger.error("cron script runner ticker thread exited; exiting 1")
+            return 1
+    if runner.sigterm:
+        return runner.shutdown()
+    thread.join(timeout=_SHUTDOWN_WAIT_S)
+    return runner.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
