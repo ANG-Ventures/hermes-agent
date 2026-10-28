@@ -1491,15 +1491,18 @@ class AIAgent(
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch; new DELEGATE_TASK_SCHEMA fields are added only here."""
-        from tools.delegate_tool import _strip_model_hidden_task_fields, delegate_task as _delegate_task
+        from tools.delegate_tool import (
+            _model_background_value, _strip_model_hidden_task_fields, delegate_task as _delegate_task,
+        )
         # Top-level MODEL delegations always run in the background (handle returned, results re-enter as
         # messages). An ORCHESTRATOR SUBAGENT (depth > 0) stays synchronous — it needs results in-turn and
-        # owns no gateway session. The schema-level `background` param is intentionally ignored.
+        # owns no gateway session; so does a delegation carrying a sign_grant (it ends with this turn).
+        # The schema-level `background` param is intentionally ignored.
         return _delegate_task(
             goal=function_args.get("goal"), context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
-            background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
+            background=_model_background_value(function_args, self), images=function_args.get("images"),
             inherit_context=function_args.get("inherit_context"),
             inherit_mode=function_args.get("inherit_mode"),
             skills=function_args.get("skills"),
@@ -1508,6 +1511,7 @@ class AIAgent(
             allow_flagship_reason=function_args.get("allow_flagship_reason"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
+            sign_grant=function_args.get("sign_grant"),
         )
 
     _invoke_tool = _forward("agent.agent_runtime_helpers", "invoke_tool")

@@ -585,6 +585,9 @@ _SPECS = [
              help="Read the comment body from PATH ('-' = stdin). Use this for "
                   "text with backticks or $(...): the shell never sees it."),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
+        _arg("--grant", metavar="GRANT_ID",
+             help="Sign as --author under a scoped signing grant this delegate child was given "
+                  "(kanban.sign_grants: on); refused outside its cards, verbs, expiry or session"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
         _arg("--if-latest-release", type=int, metavar="COMMENT_ID",
              help="Append only while COMMENT_ID is still the card's newest release-bearing "

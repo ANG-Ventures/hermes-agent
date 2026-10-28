@@ -1078,6 +1078,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "task_comments", "session_ref", "session_ref TEXT"
             )
+        if "grant_id" not in cm_cols:
+            # Scoped signing grant the comment was written under (t_19c567a8).
+            _add_column_if_missing(
+                conn, "task_comments", "grant_id", "grant_id TEXT"
+            )
 
     # task_links gained a ``kind`` column (blocks | derived-from). Every
     # pre-existing edge was created under the single gating semantics, so the
@@ -1315,7 +1320,7 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
         " run_id INTEGER, session_ref TEXT,"
-        " created_at INTEGER NOT NULL)",
+        " created_at INTEGER NOT NULL, grant_id TEXT)",
         ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
     ),
     "task_runs": (

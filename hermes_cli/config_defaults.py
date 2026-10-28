@@ -2600,6 +2600,11 @@ DEFAULT_CONFIG = {
         # A present-but-unknown/empty value fails to "none" (never "all")
         # and logs review_policy_invalid.
         "review_policy": "all",
+        # Scoped board-signing grants for same-model delegate children
+        # (hermes_cli/kanban_sign_grants.py): "on" lets an operator session
+        # pass delegate_task(sign_grant=...) and the child sign comments under
+        # it; anything else refuses every mint and every granted write.
+        "sign_grants": "off",
         # Default reviewer profile for request_review. None/blank = no
         # default: a review request with no reviewer is refused rather than
         # leaving the implementer as its own reviewer.

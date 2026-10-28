@@ -3872,6 +3872,7 @@ def delegate_task(
     parent_agent=None,
     _recovery_spec: Optional[Dict[str, Any]] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    sign_grant: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -4092,6 +4093,10 @@ def delegate_task(
 
     if not task_list:
         return tool_error("No tasks provided.")
+    if sign_grant:
+        # Top-level grant: every task without its own gets one (each bound to its own child).
+        task_list = [dict(t, sign_grant=t.get("sign_grant") or sign_grant) if isinstance(t, dict) else t
+                     for t in task_list]
 
     # Validate each task has a goal
     for i, task in enumerate(task_list):
@@ -4283,6 +4288,24 @@ def delegate_task(
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    # Scoped board-signing grants (t_19c567a8): minted only now, bound to each built
+    # child's session and model, and revoked when the children's run ends.
+    sign_grants: List[Dict[str, Any]] = []
+    if any(isinstance(t, dict) and t.get("sign_grant") for _i, t, _c in children):
+        from tools.delegate_tool_sign_grant import SignGrantError, mint_for_children, register_turn_grants
+
+        if background:
+            return tool_error("sign_grant needs background=false: a grant ends with this turn")
+        try:
+            # All or nothing: any exception revokes what was already minted.
+            sign_grants = mint_for_children(children, parent_agent, inherit_context=inherit_context,
+                                            inherit_mode=inherit_mode)
+        except SignGrantError as exc:
+            return tool_error(f"sign_grant refused: {exc}")
+        # Live until the PARENT's turn ends (the turn facade's finally revokes them) or expiry, whichever is first:
+        # the parent may still run the merge gate over the child's stamp in this turn.
+        register_turn_grants(parent_agent, sign_grants)
 
     # Record an accepted override only after task validation and child construction.
     # A rejected or unbuildable request must not leave a success-shaped audit.
@@ -5088,6 +5111,13 @@ DELEGATE_TASK_SCHEMA = {
                         "role": _p(
                             "string", "Per-task role; overrides the top-level 'role'.", enum=["leaf", "orchestrator"],
                         ),
+                        "sign_grant": _p(
+                            "object",
+                            "Optional scoped board-signing grant (needs kanban.sign_grants: on, inherit_context, "
+                            "background=false, and an operator session): {cards: [t_...], verbs: [verdict, approve, "
+                            "request_changes, release], expires_in_min: <=120 (default 45), by: 'apollo'}. The child "
+                            "may sign comments as `by` on those cards only; the grant is revoked when its run ends.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -5117,6 +5147,9 @@ DELEGATE_TASK_SCHEMA = {
                 items={"type": "string"},
             ),
             "role": _p("string", _ROLE_PARAM_DESCRIPTION, enum=["leaf", "orchestrator"]),
+            "sign_grant": _p(
+                "object", "Scoped board-signing grant for every task without its own; see tasks[].sign_grant.",
+            ),
             "model": _p("string", "Optional per-call model override. Flagship models require allow_flagship_reason."),
             "provider": _p("string", "Provider for per-call model override; requires model."),
             "allow_flagship_reason": _p(
@@ -5159,7 +5192,9 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
     within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
     the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0
+    from tools.delegate_tool_sign_grant import carries_sign_grant
+
+    return not getattr(parent_agent, "_delegate_depth", 0) > 0 and not carries_sign_grant(args)
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 
@@ -5190,7 +5225,7 @@ registry.register(
         inherit_mode=args.get("inherit_mode"),
         model=args.get("model"), provider=args.get("provider"), allow_flagship_reason=args.get("allow_flagship_reason"),
         force_model=args.get("force_model"), images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        parent_agent=kw.get("parent_agent"),
+        parent_agent=kw.get("parent_agent"), sign_grant=args.get("sign_grant"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

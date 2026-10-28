@@ -2925,6 +2925,9 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
+    grant_id = (getattr(args, "grant", None) or "").strip() or None
+    if grant_id is not None:
+        return _granted_comment(args, body, grant_id)
     author, claimed = _comment_author(args.author)
     from hermes_cli.kanban_identity import is_operator_label
 
@@ -2957,6 +2960,27 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         except ReleaseSuperseded as exc:
             return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
     print(f"Comment added to {args.task_id}")
+    return 0
+
+
+def _granted_comment(args: argparse.Namespace, body: str, grant_id: str) -> int:
+    """``comment --grant``: the grant row, not the caller's profile, authorizes ``--author``
+    (``kanban_db.add_comment`` validates it inside the insert's transaction)."""
+    from hermes_cli.kanban_sign_grants import GrantRefused
+
+    author = (args.author or "").strip()
+    if not author:
+        return _err("kanban: --grant needs --author <the grant's by identity>", 2)
+    _run_id, session_ref = safe_comment_provenance(args.task_id)
+    with kb.connect_closing() as conn:
+        try:
+            kb.add_comment(conn, args.task_id, author, body, session_ref=session_ref, grant_id=grant_id,
+                           if_latest_release=getattr(args, "if_latest_release", None))
+        except GrantRefused as exc:
+            return _err(f"kanban: granted comment refused, nothing posted: {exc}", 3)
+        except ReleaseSuperseded as exc:
+            return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
+    print(f"Comment added to {args.task_id} (as {author} via grant {grant_id})")
     return 0
 
 

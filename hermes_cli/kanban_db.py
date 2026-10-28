@@ -2924,7 +2924,10 @@ CREATE TABLE IF NOT EXISTS task_comments (
     -- reads as attributed.
     run_id      INTEGER,
     session_ref TEXT,
-    created_at  INTEGER NOT NULL
+    created_at  INTEGER NOT NULL,
+    -- Scoped signing grant (kanban_sign_grants) the comment was written
+    -- under; NULL for every ordinary comment.
+    grant_id    TEXT
 );
 
 -- Retained across config rollback so old volatile paths stay fenced.
@@ -3058,6 +3061,24 @@ CREATE TABLE IF NOT EXISTS lane_model_overrides (
     expires_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lane_model_expires ON lane_model_overrides(expires_at);
+
+-- Scoped board-signing grants for delegate children (hermes_cli/kanban_sign_grants.py).
+CREATE TABLE IF NOT EXISTS sign_grants (
+    grant_id           TEXT NOT NULL,
+    task_id            TEXT NOT NULL,
+    verbs              TEXT NOT NULL,      -- JSON list, subset of VALID_VERBS
+    by_author          TEXT NOT NULL,      -- the identity the child writes as
+    parent_session_ref TEXT,
+    child_id           TEXT,               -- delegate subagent id (sa-...)
+    child_session_ref  TEXT NOT NULL,      -- derive_session_ref(child session id)
+    parent_model       TEXT NOT NULL,
+    child_model        TEXT NOT NULL,
+    parent_profiles    TEXT NOT NULL DEFAULT '[]',  -- JSON: profiles whose runs' PRs are never covered
+    created_at         INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    revoked_at         INTEGER,
+    PRIMARY KEY (grant_id, task_id)
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -7988,6 +8009,7 @@ def add_comment(
     claimed_author: Optional[str] = None,
     if_latest_release: Optional[int] = None,
     _kernel_approve: bool = False,
+    grant_id: Optional[str] = None,
 ) -> int:
     """Append a comment, recording who wrote it and from which run/session.
 
@@ -8012,6 +8034,12 @@ def add_comment(
     scripts/lib/operator_approve.py; t_f2eb71b3). ``_kernel_approve`` is the
     kernel's own reviewer-approval record in :func:`complete_task`, never a
     caller's.
+
+    ``grant_id`` names a scoped signing grant (``kanban_sign_grants``): the
+    comment is written as ``author`` with no ``(subagent)`` marker and with
+    ``task_comments.grant_id`` set, only after the grant validated for this
+    card, author, verb and session inside the insert's transaction; else
+    :class:`~hermes_cli.kanban_sign_grants.GrantRefused` and nothing is written.
     """
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -8031,26 +8059,71 @@ def add_comment(
         claimed_author = claimed_author.strip()
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
+    if grant_id is not None:
+        return _add_granted_comment(
+            conn, task_id, author, body, run_id, session_ref, now, grant_id,
+            if_latest_release,
+        )
     if _is_delegated_child():
         # The one write a delegate_task child may make (t_70fcc2c3). Append-only
         # and attributed: the marker is added here, not by the caller, so an
         # explicit ``--author`` cannot pass a child's words off as the parent's.
         if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
             author = author.strip() + SUBAGENT_AUTHOR_MARKER
-        grant = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
-        conn.execute("PRAGMA query_only=OFF")
-        try:
+        with delegated_child_write(conn):
             return _add_comment_txn(
                 conn, task_id, author, body, run_id, session_ref, now,
                 claimed_author, if_latest_release,
             )
-        finally:
-            conn.execute("PRAGMA query_only=ON")
-            _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
     return _add_comment_txn(
         conn, task_id, author, body, run_id, session_ref, now, claimed_author,
         if_latest_release,
     )
+
+
+def _add_granted_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    run_id: Optional[int],
+    session_ref: Optional[str],
+    now: int,
+    grant_id: str,
+    if_latest_release: Optional[int] = None,
+) -> int:
+    """A comment signed under a scoped grant (t_19c567a8); see :func:`add_comment`.
+
+    Only a delegate child signs under a grant: the parent signs as itself.
+    """
+    if not _is_delegated_child():
+        from hermes_cli.kanban_sign_grants import GrantRefused
+
+        raise GrantRefused("a signing grant is used only from inside the delegate child it was minted for")
+    with delegated_child_write(conn):
+        return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now,
+                                if_latest_release=if_latest_release, grant_id=grant_id)
+
+
+@contextlib.contextmanager
+def delegated_child_write(conn: sqlite3.Connection):
+    """Lift a delegate child's read-only fence for exactly one write.
+
+    The capability token is reset on EVERY exit, including a PRAGMA that raises on a
+    closed connection (Prism 87255cd0399f): it is set inside the outer try and reset
+    in the outermost finally, after the fence is restored.
+    """
+    lift = None
+    try:
+        lift = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
+        conn.execute("PRAGMA query_only=OFF")
+        try:
+            yield
+        finally:
+            conn.execute("PRAGMA query_only=ON")
+    finally:
+        if lift is not None:
+            _DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8074,6 +8147,7 @@ def _add_comment_txn(
     now: int,
     claimed_author: Optional[str] = None,
     if_latest_release: Optional[int] = None,
+    grant_id: Optional[str] = None,
 ) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -8082,6 +8156,13 @@ def _add_comment_txn(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        signer = author.strip()
+        if grant_id is not None:
+            from hermes_cli import kanban_sign_grants as ksg
+
+            # Stored under a grant-marked author no label reader honours; only
+            # ksg.operator_rows_with_live_grants promotes it (Apollo r8 ruling).
+            author = ksg.granted_author(signer, grant_id)
         if if_latest_release is not None:
             from hermes_cli.kanban_close_on_guard import (
                 ReleaseSuperseded, newer_release_comment,
@@ -8090,12 +8171,22 @@ def _add_comment_txn(
             why = newer_release_comment(conn, task_id, if_latest_release, body, author, now)
             if why:
                 raise ReleaseSuperseded(why)
-        cur = conn.execute(
-            "INSERT INTO task_comments "
-            "(task_id, author, body, run_id, session_ref, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), run_id, session_ref, now),
-        )
+        if grant_id is not None:
+            ksg.validate_comment(conn, grant_id, task_id, signer, body,
+                                 caller_session_ref=session_ref, now=now)
+            cur = conn.execute(
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at, grant_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, author.strip(), body.strip(), run_id, session_ref, now, grant_id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, author.strip(), body.strip(), run_id, session_ref, now),
+            )
         _append_event(
             conn,
             task_id,
@@ -8107,6 +8198,7 @@ def _add_comment_txn(
                 # attributable even if a comment row is later pruned.
                 **({"session_ref": session_ref} if session_ref else {}),
                 **({"claimed_author": claimed_author} if claimed_author else {}),
+                **({"grant_id": grant_id} if grant_id else {}),
             },
             run_id=run_id,
         )
@@ -8131,6 +8223,7 @@ def _add_comment_txn(
                     "created_at": now,
                     "comment_id": int(cur.lastrowid or 0),
                     **({"claimed_author": claimed_author} if claimed_author else {}),
+                    **({"grant_id": grant_id} if grant_id else {}),
                 },
                 actor=author.strip(),
                 run_id=run_id,
