@@ -1708,9 +1708,10 @@ class GatewayInboundMixin:
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
         """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
+        from gateway.config import session_isolation_flags
+        group_per_user, thread_per_user = session_isolation_flags(self.config, source.platform)
         _is_shared_multi_user = is_shared_multi_user_session(
-            source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            source, group_sessions_per_user=group_per_user, thread_sessions_per_user=thread_per_user,
         )
         # Fork: synthetic gateway events (boot auto-resume, queued continuations, internal re-prompts)
         # must never impersonate the user — stamping "[<user>] " onto an EMPTY internal event turned it

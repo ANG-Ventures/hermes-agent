@@ -611,6 +611,21 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
 }
 
 
+def session_isolation_flags(config: Any, platform: Any) -> tuple:
+    """``(group_sessions_per_user, thread_sessions_per_user)`` for *platform*: the platform's
+    ``extra`` wins over the global value, exactly like the adapter-side key
+    (``BasePlatformAdapter._source_session_key``). Every store/runner key or shared-session
+    reader goes through this so the two never key the same chat differently."""
+    group = getattr(config, "group_sessions_per_user", True)
+    thread = getattr(config, "thread_sessions_per_user", False)
+    platforms = getattr(config, "platforms", None)
+    extra = getattr(platforms.get(platform), "extra", None) if isinstance(platforms, dict) else None
+    if isinstance(extra, dict):
+        group = extra.get("group_sessions_per_user", group)
+        thread = extra.get("thread_sessions_per_user", thread)
+    return group, thread
+
+
 # Top-level bool-ish keys read verbatim (no nested ``gateway.`` fallback) with their defaults.
 _TOPLEVEL_BOOL_DEFAULTS = {
     "write_sessions_json": True, "always_log_local": True, "filter_silence_narration": True,

@@ -5102,9 +5102,10 @@ class GatewayRunner(
                     _profile = get_active_profile_name() or "default"
                 except Exception:
                     _profile = None
+        from gateway.config import session_isolation_flags
+        group_per_user, thread_per_user = session_isolation_flags(config, source.platform)
         return build_session_key(
-            source, group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            source, group_sessions_per_user=group_per_user, thread_sessions_per_user=thread_per_user,
             profile=_profile)
 
     # Telegram General topic in forum-enabled private chats: clients omit message_thread_id or send "1"; both = root.
