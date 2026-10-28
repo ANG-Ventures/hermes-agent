@@ -168,7 +168,9 @@ class TestConcurrentWriters:
 
         persisted = _by_id(_read_store(tmp_cron_dir), "J")
         assert "drift_alerted" not in persisted, "a deleted field came back"
-        assert persisted["last_run_at"] == "2026-09-20T16:07:28+00:00"
+        # The sibling's runtime value survives: in the merged view every reader sees (jobs.json
+        # holds definitions only by default, t_3c8fa4d6; the value lives in its row).
+        assert _by_id(load_jobs(), "J")["last_run_at"] == "2026-09-20T16:07:28+00:00"
 
     def test_intentional_removal_still_removes(self, tmp_cron_dir, degraded_lock):
         """The merge must never resurrect a declared deletion."""
