@@ -163,3 +163,20 @@ def test_parent_turn_end_revokes_its_grants(board, monkeypatch):
                   conversation_history=[], effective_task_id="task", turn_id="turn", user_message="go",
                   original_user_message="go", _should_review_memory=False, _turn_exit_reason="text_response")
     assert _live_rows(g["grant_id"]) == []
+
+
+def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
+    """The LIVE model path (AIAgent._dispatch_delegate_task) forwards sign_grant and does not background it, so a
+    top-level session can actually mint; an ungranted top-level call keeps backgrounding."""
+    from unittest.mock import patch
+
+    from run_agent import AIAgent
+
+    agent = SimpleNamespace(_delegate_depth=0)
+    seen = []
+    with patch("tools.delegate_tool.delegate_task", side_effect=lambda **kw: seen.append(kw) or "{}"):
+        AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g", "sign_grant": {"cards": [board]}}]})
+        AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g"}], "sign_grant": {"cards": [board]}})
+        AIAgent._dispatch_delegate_task(agent, {"tasks": [{"goal": "g"}]})
+    assert [kw["background"] for kw in seen] == [False, False, True]
+    assert seen[1]["sign_grant"] == {"cards": [board]}

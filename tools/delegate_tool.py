@@ -5197,7 +5197,9 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
     within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
     the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0
+    from tools.delegate_tool_sign_grant import carries_sign_grant
+
+    return not getattr(parent_agent, "_delegate_depth", 0) > 0 and not carries_sign_grant(args)
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 

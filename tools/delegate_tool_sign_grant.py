@@ -22,6 +22,17 @@ class SignGrantError(ValueError):
     """The spawn's ``sign_grant`` was refused; no child is started."""
 
 
+def carries_sign_grant(args: Any) -> bool:
+    """A model-issued delegate_task with a top-level or per-task ``sign_grant``. Such a call runs SYNCHRONOUSLY on
+    the model dispatch paths: the grant ends with the parent's turn, so the child must finish inside it."""
+    if not isinstance(args, dict):
+        return False
+    if args.get("sign_grant"):
+        return True
+    tasks = args.get("tasks")
+    return isinstance(tasks, list) and any(isinstance(t, dict) and t.get("sign_grant") for t in tasks)
+
+
 def _spec(raw: Any) -> Optional[Dict[str, Any]]:
     if raw in (None, {}, ""):
         return None
