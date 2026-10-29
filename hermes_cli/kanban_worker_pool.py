@@ -1827,9 +1827,10 @@ class SpilloverPlan:
             if why is not None:
                 self.refusal = f"pin_host_board_unhostable ({pin}: {board} {why})"
                 return None
-            if not skip_admission and _kanban_unified_admit(self.signal):
-                # a pin keeps its precedence, not an exemption from the ONE rule (Prism f4d9c1273272: with the
-                # memory cap folded into admit_class, a pinned take must pass may_start too)
+            # a pin keeps its precedence, not an exemption from the ONE rule (Prism f4d9c1273272: with the
+            # memory cap folded into admit_class, a pinned take must pass may_start too)
+            unified = not skip_admission and _kanban_unified_admit(self.signal)
+            if unified and self.dry_run:          # a dry run books nothing: the read-only verdict is its answer
                 from hermes_cli import kanban_headroom as _kh
                 _keep, held = _kh.unified_filter(self, [pin], job)
                 if pin in held:
@@ -1845,7 +1846,12 @@ class SpilloverPlan:
                     from hermes_cli import kanban_headroom as _kh
                     from hermes_cli.fleet_placement import placement as _placement
                     try:
-                        rid = _kh.book_pin(self, pin, job_id, job)
+                        # unified: may_start under the ledger lock, booking what it admitted on
+                        # (Prism c8d0343d7fb6 / 8e0e895ec5d4)
+                        rid = _kh.book_pin(self, pin, job_id, job, check=unified)
+                    except _kh.ClassRefusal as exc:
+                        self.refusal = f"pin_host_unified_admission ({pin}: {exc})"
+                        return None
                     except _placement.PlacementError as exc:  # corrupt ledger: fail closed
                         self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
                         return None
@@ -1931,6 +1937,8 @@ class SpilloverPlan:
             self.refusal = f"pool_unavailable ({d.reason or 'no_slot'}: " + "; ".join(
                 f"{r.host} {r.reason}" for r in d.rows if not r.eligible) + ")"
             return None
+        if self._class_refused(key, job, rid, release=lambda: _kh.release_id(self.signal, rid)):
+            return None
         self.last_reservation = rid
         self._rids.setdefault(key, []).append(rid)
         if self.dry_run:
@@ -1963,6 +1971,8 @@ class SpilloverPlan:
             _kh.release_alloc(r.reservation_id)
             self.refusal = f"pool_unavailable (allocd picked {r.host}, not a candidate)"
             return None
+        if self._class_refused(key, job, r.reservation_id, release=lambda: _kh.release_alloc(r.reservation_id)):
+            return None
         debit = self.slots.get(key, 0) > 0
         if debit:
             self.slots[key] -= 1
@@ -1972,6 +1982,21 @@ class SpilloverPlan:
         self.taken[key] = self.taken.get(key, 0) + 1
         self.last_pick = key
         return self.hosts[key]
+
+    def _class_refused(self, key: str, job: Any, rid: Optional[str], *, release) -> bool:
+        """The ONE rule's verdict for a take the old locked rule just booked, UNDER the ledger lock (Prism
+        c8d0343d7fb6): refused = the row is already dropped, ``release`` clears the booker's own state, refusal
+        set. An unreadable ledger fails closed the same way. False = admitted (or the rule is off)."""
+        from hermes_cli import kanban_headroom as _kh
+        try:
+            why = _kh.confirm_class(self, key, job, rid)
+        except Exception as exc:  # LedgerError / lock fault: fail closed
+            why = f"closed:{type(exc).__name__}: {exc}"
+        if why is None:
+            return False
+        release()
+        self.refusal = f"unified_admission ({key}: {why})"
+        return True
 
     def reservation_via(self, rid: Optional[str]) -> Optional[str]:
         """``alloc_client`` when ``rid`` was booked by :meth:`_take_allocd`, else None."""

@@ -310,6 +310,92 @@ def test_d7_pinned_gpu_take_reads_the_targets_free_gpu(home):
     assert "gpu" in plan.refusal and "unmeasured" not in plan.refusal, plan.refusal
 
 
+# ------------------------------------------- round 7: the class verdict is the locked ledger's; booked = admitted
+
+def _kanban_rows(home):
+    p = home / placement.RESERVATIONS_REL
+    rows = json.loads(p.read_text(encoding="utf-8"))["rows"] if p.exists() else []
+    return [r for r in rows if r.get("consumer") == "kanban"]
+
+
+def _plan_mode(home, fleet, allocd, monkeypatch):
+    if allocd == "on":       # alloc_client's in-process fallback (router-off): the same ledger, allocd's own path
+        from hermes_cli import alloc_client
+        (home / "var" / "alloc").mkdir(parents=True, exist_ok=True)
+        (home / "var" / "alloc" / "router-off").write_text("", encoding="utf-8")
+        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: True)
+        # the fallback scores on the collector's document, not the plan's probe: the same fleet, written there
+        (home / "var" / "fleet-pressure.json").write_text(json.dumps({"at": fleet.t0, "hosts": {
+            h: {**json.loads(fleet.text(h)), "age_s": fleet.age, "load1": 10.0, "load5": 10.0} for h in HOSTS}}),
+            encoding="utf-8")
+    gate = SimpleNamespace(band="spilling", spill_reason="load", remote_allowed=True, pool=None, cost=2.0)
+    b = kgt.GateTickBuilder(gate, fleet_dir=lambda: home / "fleet",
+                            kanban_cfg=lambda: {"placement": {"allocd": allocd}},
+                            ledger=lambda boards: {}, connect=lambda board=None: None,
+                            probe=lambda h: kwp.probe_host(h, runner=fleet.runner, pressure_path=POLICY.pressure_path))
+    plan = b.plan_pool([], {})
+    plan.signal.clock = lambda: fleet.t0
+    return plan
+
+
+@pytest.mark.parametrize("allocd", ["off", "on"])
+@pytest.mark.parametrize("unified", ["1", "0"])
+def test_two_concurrent_takes_where_only_one_fits_the_class_rule_admit_exactly_one(home, monkeypatch, allocd,
+                                                                                   unified):
+    """Prism c8d0343d7fb6: unified_filter ran BEFORE the ledger lock, so dispatcher A passed the class rule, B booked,
+    and A's locked admit() (today's rule, no holdback) booked too: two kanban leases where the holdback leaves room
+    for one. ci-box at 0.880 with Prism queued: 1 kanban = 0.880 + 2/256 + 2 held = 0.8956 fits, 2 = 0.9034 does not;
+    today's admit() (no holdback) fits both (0.8956). Unified: exactly one admitted. Kill switch: both (today)."""
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", unified)
+    t0 = time.time()
+    f = Fleet(t0)
+    f.busy["ci-box"] = 0.880
+    dmd.publish("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
+    a, b = _plan_mode(home, f, allocd, monkeypatch), _plan_mode(home, f, allocd, monkeypatch)
+    real, raced = kh.unified_filter, []
+
+    def racing(plan, names, job):
+        out = real(plan, names, job)
+        if plan is a and not raced:          # A has passed the class rule; B takes before A books
+            raced.append(b.take("alpha", only=["ci-box"], job_id="t_b"))
+        return out
+
+    monkeypatch.setattr(kh, "unified_filter", racing)
+    got_a = a.take("alpha", only=["ci-box"], job_id="t_a")
+    assert raced, "the race never ran"
+    admitted = [h for h in (got_a, raced[0]) if h is not None]
+    rows = _kanban_rows(home)
+    if unified == "1":
+        assert len(admitted) == 1, (a.refusal, b.refusal)
+        assert len(rows) == 1, rows                         # the refused take left no lease behind
+        assert "held_back:kanban for prism" in (a.refusal or b.refusal), (a.refusal, b.refusal)
+    else:
+        assert len(admitted) == 2 and len(rows) == 2, (a.refusal, b.refusal)
+
+
+@pytest.mark.parametrize("unified,booked", [("1", (6.0, 12.0)), ("0", (2.0, 3.0))])
+def test_pinned_take_books_the_learned_estimate_it_was_admitted_on(home, monkeypatch, unified, booked):
+    """Prism 8e0e895ec5d4: a pin passed may_start on the LEARNED estimate (6 CPUs / 12 GB from class usage) but
+    book_pin reserved the table's declared footprint (2 threads / 3 GB), so the next take over-admitted. Under the
+    one rule the pin books what it was admitted on; the kill switch keeps today's declared booking."""
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", unified)
+    t0 = time.time()
+    hist = home / placement.CLASS_USAGE_REL
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    for i in range(6):
+        ad.record_actual(hist, job_class="kanban-worker-llm-wait", host="ace-ai", cpus=6.0, ram_gb=12.0,
+                         at=t0 - 600 + i, job_id=f"t_h{i}")
+    plan = _plan(home, Fleet(t0))
+    assert plan.take("alpha", pin="ace-ai", job_id="t_pin") is not None, plan.refusal
+    (row,) = _kanban_rows(home)
+    assert (row["threads"], row["ram_gb"]) == booked, row
+    if unified == "1":
+        need = placement.admit_context("kanban", plan.signal.placement_table.footprint("kanban"), now=t0,
+                                       table=plan.signal.placement_table, root=home).need("ace-ai")
+        assert (need.cpus, need.ram_gb) == booked              # the number may_start admitted on
+        assert row.get("job_class") == "kanban-worker-llm-wait"
+
+
 # ---------------------------------------------------------------------------------- demand publication
 
 def test_tick_publishes_ready_demand(home):
