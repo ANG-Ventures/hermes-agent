@@ -254,6 +254,9 @@ def test_coverage_close_on_is_a_release_verb(board):
         _child_comment(a, body, g["grant_id"])
     assert _rows(a) == []
     g2 = _mint(a, verbs=["verdict", "release"])
+    with kb.connect_closing() as conn, kb.write_txn(conn):   # the release lands the card's own (non-parent) PR
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",
+                     (a, "daedalus", "done", 1, json.dumps({"pr_url": "https://github.com/acme/repo/pull/8"})))
     _child_comment(a, body, g2["grant_id"])
     assert [r["grant_id"] for r in _rows(a)] == [g2["grant_id"]]
 

@@ -55,6 +55,7 @@ class ReplayResult:
         self.orphan_events = 0
         self.orphan_task_ids: set = set()
         self.grant_ids_dropped = 0
+        self.grants_revoked = 0
         self.snapshot_ts: float = 0.0
 
     def as_dict(self) -> dict:
@@ -66,6 +67,7 @@ class ReplayResult:
             "orphan_events": self.orphan_events,
             "orphan_task_ids": sorted(self.orphan_task_ids),
             "grant_ids_dropped": self.grant_ids_dropped,
+            "grants_revoked": self.grants_revoked,
             "snapshot_ts": self.snapshot_ts,
         }
 
@@ -196,12 +198,15 @@ def replay_into(
                 if has_grant_col and grant_id and (ksg.parse_granted_author(author) or (None, None))[1] == grant_id:
                     # The same comment restored earlier into a pre-migration board: its author marker
                     # carries this grant id but its grant_id column is NULL. Backfill it instead of
-                    # inserting a second copy (Prism 39c9e9e4455a).
+                    # inserting a second copy (Prism 39c9e9e4455a). Only that restored row qualifies: it
+                    # carries this record's run_id and session_ref too, so an ordinary comment whose author
+                    # merely carries the marker is never collapsed into the granted one (Prism af6b6e94038c).
                     backfilled = conn.execute(
                         "UPDATE task_comments SET grant_id = ? WHERE id = (SELECT id FROM task_comments "
                         "WHERE task_id = ? AND author = ? AND body = ? AND created_at = ? AND grant_id IS NULL "
-                        "ORDER BY id LIMIT 1)",
-                        (grant_id, task_id, author, body, created),
+                        "AND run_id IS ? AND session_ref IS ? ORDER BY id LIMIT 1)",
+                        (grant_id, task_id, author, body, created, record.get("run_id"),
+                         payload.get("session_ref")),
                     ).rowcount
                     if backfilled:
                         result.comments_already_present += 1
@@ -227,6 +232,20 @@ def replay_into(
                     vals,
                 )
                 result.comments_restored += 1
+                continue
+
+            if kind == "sign_grant_revoked":
+                # A grant live in the snapshot and revoked after it must come back revoked, never
+                # live (Prism a35d26840b79). A grant the snapshot lacks stays absent.
+                if task_id and payload.get("grant_id"):
+                    try:
+                        result.grants_revoked += conn.execute(
+                            "UPDATE sign_grants SET revoked_at = ? WHERE grant_id = ? AND task_id = ? "
+                            "AND revoked_at IS NULL",
+                            (int(payload.get("revoked_at") or ts), payload["grant_id"], task_id),
+                        ).rowcount
+                    except sqlite3.OperationalError:   # pre-grant snapshot: no table, no grant to revive
+                        pass
                 continue
 
             # Every other kind is a lifecycle event: replay it so the audit
