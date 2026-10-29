@@ -745,3 +745,45 @@ def test_an_implicit_release_is_checked_against_the_cards_own_prs(board):
     g2 = _mint(c, verbs=["verdict", "release"])
     _child_comment(c, "close-on: merged", g2["grant_id"])
     assert [r["grant_id"] for r in _rows(c)] == [g2["grant_id"]]
+
+
+def _record_run(card, profile, *, metadata=None, summary=None):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata, summary) "
+                     "VALUES (?,?,?,?,?,?)",
+                     (card, profile, "done", 1, json.dumps(metadata) if metadata is not None else None, summary))
+
+
+def test_an_implicit_release_refuses_a_parent_pr_named_only_in_a_handoff_summary(board):
+    """Prism 2120e3fcb716: the release reader (kanban_session_closeout.card_prs) also takes a metadata-less
+    run's summary, so a parent-authored PR named only there must be an own-PR candidate too."""
+    _home, a, b = board
+    _record_pr(a, "default", "https://github.com/acme/repo/pull/7")          # parent run authored Y
+    _record_run(b, "daedalus", metadata={"pr_url": "https://github.com/acme/repo/pull/8"})   # X
+    _record_run(b, "daedalus", summary="handoff: landed acme/repo#7")       # Y, summary only
+    g = _mint(b, verbs=["verdict", "release"])
+    with pytest.raises(ksg.GrantRefused, match="authored"):
+        _child_comment(b, "close-on: merged", g["grant_id"])
+    assert _rows(b) == []
+
+
+def test_card_pr_keys_is_the_release_readers_pr_set(board):
+    """One resolver: the grant check's PR set equals what the bare merged release fires on."""
+    from hermes_cli.kanban_session_closeout import card_prs
+
+    _home, a, b = board
+    with kb.connect_closing() as conn:
+        c = kb.create_task(conn, title="result-only card")
+    _record_run(a, "daedalus", metadata={"pr_url": "https://github.com/acme/repo/pull/1"})
+    _record_run(a, "daedalus", summary="see acme/repo#2")
+    _record_run(b, "daedalus", summary="handoff names Acme/Repo#3")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET result = ? WHERE id = ?", ("merged acme/repo#4", c))
+    for card in (a, b, c):
+        with kb.connect_closing() as conn:
+            result = conn.execute("SELECT result FROM tasks WHERE id = ?", (card,)).fetchone()[0]
+            runs = [{"summary": s, "metadata": m} for s, m in conn.execute(
+                "SELECT summary, metadata FROM task_runs WHERE task_id = ? ORDER BY id", (card,))]
+            got = ksg.card_pr_keys(conn, card)
+        want = {f"{r.lower()}#{n}" for r, n in card_prs({"result": result, "runs": runs})}
+        assert want and got == want, (card, got, want)

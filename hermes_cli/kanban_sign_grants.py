@@ -156,11 +156,16 @@ def _run_meta_pr_keys(meta_text) -> set:
 
 
 def card_pr_keys(conn: sqlite3.Connection, task_id: str) -> set:
-    """PRs any run on ``task_id`` recorded as the card's own (``owner/repo#N``)."""
-    out: set = set()
-    for (meta,) in conn.execute("SELECT metadata FROM task_runs WHERE task_id = ?", (task_id,)):
-        out |= _run_meta_pr_keys(meta)
-    return out
+    """The card's own PRs (``owner/repo#N``), resolved by the SAME reader a bare merged release fires on
+    (``kanban_session_closeout.card_prs``: run metadata, a metadata-less run's summary, then the result),
+    so the own-PR check can never validate a narrower set than the release acts on (Prism 2120e3fcb716)."""
+    from hermes_cli.kanban_session_closeout import card_prs
+
+    row = conn.execute("SELECT result FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    runs = [{"summary": s, "metadata": m} for s, m in conn.execute(
+        "SELECT summary, metadata FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,))]
+    card = {"result": row[0] if row else None, "runs": runs}
+    return {f"{repo.lower()}#{number}" for repo, number in card_prs(card)}
 
 
 def authored_pr_keys(conn: sqlite3.Connection, profiles: Iterable[str], *, task_id: Optional[str] = None,
