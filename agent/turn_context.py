@@ -26,6 +26,8 @@ from agent.message_content import flatten_message_text
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.message_sanitization import is_interrupt_close_row, provider_owns_transcript
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
+from agent.route_identity import ROUTE_NOTE_DISPLAY_KIND
+from agent.route_note_ingest import relabel_route_note_content, relabel_route_note_text
 from agent.tool_dispatch_helpers import _degrade_prior_turn_multimodal_messages
 from agent.turn_handoff import consume_handoff_context
 from agent.image_token_cost import bind_image_token_cost
@@ -120,7 +122,7 @@ def compose_multimodal_context_part(
     a multimodal (list) turn carries it as a durable text part (#71998)."""
     fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
     injections = [part for part in (fenced, plugin_user_context) if part]
-    return "\n\n".join(injections) if injections else None
+    return relabel_route_note_text("\n\n".join(injections)) if injections else None
 
 
 def compose_user_api_content(
@@ -731,7 +733,7 @@ def _stage_turn_user_message(
     )
     if (
         isinstance(pending_cli_message, dict)
-        and pending_cli_message.get("content") == expected_persist_content
+        and relabel_route_note_content(pending_cli_message.get("content")) == expected_persist_content
     ):
         user_msg = pending_cli_message
         # CLI-staged value is the clean text; restore the API-facing variant (e.g. voice
@@ -1152,6 +1154,11 @@ def build_turn_context(
         user_message = sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
+    # E11: received text never carries the harness's route-note marker (the harness adds its own
+    # note later, per call, so it is never relabelled here).
+    if persist_user_display_kind != ROUTE_NOTE_DISPLAY_KIND:
+        user_message = relabel_route_note_content(user_message)
+        persist_user_message = relabel_route_note_content(persist_user_message)
 
     # Turn identity is bound BEFORE the primary restore: its recovery /
     # restore_refused ledger rows belong to THIS turn (C7 k73).

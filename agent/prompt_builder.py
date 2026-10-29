@@ -573,6 +573,7 @@ STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 CONTROL_FRAME_OPENERS = (
     "/?OUT-OF-BAND USER MESSAGE", "CONTEXT COMPACTION", "CONTEXT SUMMARY]", "PRIOR CONTEXT", "Runtime note:",
     "System note:", "System:", "SYSTEM]", "IMPORTANT:", "Planning state preserved", "ASYNC DELEGATION",
+    "Route note:",
 )
 
 

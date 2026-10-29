@@ -16,6 +16,7 @@ from functools import partial
 from typing import Any, Literal
 
 from agent.prompt_builder import CONTROL_FRAME_OPENERS
+from agent.route_note_ingest import control_frame_re
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms
 from gateway import hosted_rooms_common as common
@@ -41,11 +42,8 @@ _MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9._:-]*)", re.IGNORECASE)
 # republished to every peer inside a role=user prompt, so a reply reproducing one of these reads as harness
 # input to the peers; the opener is relabelled visibly (the words stay, the exact trusted shape does not).
 # Genuine user lines are never touched. Keep in sync with apps/desktop hermes-bots/group-round-prompt.ts.
-_MEMBER_CONTROL_FRAME_RE = re.compile(
-    r"\[(?=" + "|".join(opener.replace("]", r"\]") for opener in CONTROL_FRAME_OPENERS) + ")",
-    re.IGNORECASE,
-)
-_MEMBER_CONTROL_FRAME_RELABEL = "[member-quoted "
+_MEMBER_CONTROL_FRAME_RE = control_frame_re(CONTROL_FRAME_OPENERS)
+_MEMBER_CONTROL_FRAME_RELABEL = r"[member-quoted \g<opener>"
 _TURN_ID_RE = re.compile(
     r"^d(?P<source>[1-9][0-9]*)\.r(?P<round>[0-2])\."
     r"p(?P<position>[0-5])\.s(?P<seen>[1-9][0-9]*)\."
