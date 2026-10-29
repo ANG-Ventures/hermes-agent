@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
+import contextvars
 from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -374,8 +375,10 @@ class GatewayShutdownMixin:
         ):
             return True
         def _delegations_active() -> bool:
-            from tools.async_delegation import active_count
-            return active_count() > 0
+            # A kanban-runtime unit's process is not the gateway's and the next boot observes it:
+            # it must not keep the gateway awake (spec §5.4 Boot, scale-to-zero).
+            from tools.async_delegation import in_process_active_count
+            return in_process_active_count() > 0
 
         def _processes_active() -> bool:
             from tools.process_registry import process_registry
@@ -917,6 +920,42 @@ class GatewayShutdownMixin:
         from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
+    async def _open_resume_mark_batch(self, log_prefix: str):
+        """Open the store's resume-mark batch off-loop; returns the store, or None to save per mark.
+
+        Cancellation-safe: ``begin`` runs in a worker thread that a cancel cannot stop, so a cancel
+        that lands while it waits for the store lock (or after it returned) is answered by closing
+        the batch from that thread / the executor. Every completed begin gets exactly one end.
+        """
+        store = getattr(self, "session_store", None)
+        if store is None or not hasattr(store, "begin_resume_mark_batch"):
+            return None
+        gate = threading.Lock()
+        state = {"cancelled": False, "opened": False}
+
+        def _begin() -> bool:
+            store.begin_resume_mark_batch()
+            with gate:
+                if not state["cancelled"]:
+                    state["opened"] = True
+                    return True
+            store.end_resume_mark_batch()  # cancelled before we got here: nothing marked, close it
+            return False
+
+        try:
+            return store if await asyncio.to_thread(_begin) else None
+        except asyncio.CancelledError:
+            with gate:
+                state["cancelled"] = True
+                close_now = state["opened"]
+            if close_now:
+                # begin finished but its result never reached us; close off-loop, do not block the loop.
+                asyncio.get_running_loop().run_in_executor(None, store.end_resume_mark_batch)
+            raise
+        except Exception as e:
+            logger.warning("%s: could not open the mark batch: %s", log_prefix, e)
+            return None
+
     async def _mark_running_sessions_resume_pending(self, log_prefix: str, *, interrupted: bool = False) -> list:
         """Mark every non-pending running session resume_pending; returns the keys marked.
 
@@ -933,19 +972,44 @@ class GatewayShutdownMixin:
         # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service
         # manager during the drain, the durable marker is already written so the next gateway boot can
         # recover in-flight sessions (#27856).
-        for _sk, _agent in list(self._running_agents.items()):
-            if _agent is _AGENT_PENDING_SENTINEL:
-                continue
-            with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
-                if callable(_mark_fork):
-                    _marked, _reason, _alert = await asyncio.to_thread(_mark_fork, _sk, interrupted=interrupted)
-                    if _marked:
+        # ONE sessions.json save per pass, not one per session (t_edfc146c: 10 per-mark rewrites of a
+        # 1.5 MB file took 11.1 s of the 50 s stop budget). The batch only defers the save; the
+        # per-session decision, PHASE=shutdown_mark line and replay alert are unchanged.
+        _todo = [_sk for _sk, _agent in list(self._running_agents.items()) if _agent is not _AGENT_PENDING_SENTINEL]
+        if not _todo:
+            return marked
+        _t0 = time.monotonic()
+        _store = await self._open_resume_mark_batch(log_prefix)
+        _alerts: list[str] = []
+        try:
+            for _sk in _todo:
+                with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
+                    if callable(_mark_fork):
+                        _marked, _reason, _alert = await asyncio.to_thread(_mark_fork, _sk, interrupted=interrupted)
+                        if _marked:
+                            marked.append(_sk)
+                        if _alert and callable(_notify_suspended):
+                            _alerts.append(_sk)
+                    else:
+                        await self.async_session_store.mark_resume_pending(_sk, reason)
                         marked.append(_sk)
-                    if _alert and callable(_notify_suspended):
-                        await _notify_suspended(_sk)
-                else:
-                    await self.async_session_store.mark_resume_pending(_sk, reason)
-                    marked.append(_sk)
+        finally:
+            if _store is not None:
+                # FAIL-OPEN: a failed save is logged and never aborts the stop. The close is submitted
+                # synchronously and shielded (Prism 149729fd80f3): with to_thread, a cancel while the
+                # job is still QUEUED behind a busy executor cancels it, and the batch never closes.
+                _end = asyncio.get_running_loop().run_in_executor(
+                    None, contextvars.copy_context().run, _store.end_resume_mark_batch)  # to_thread parity
+                with _log_suppressed(logging.WARNING, "%s: batched sessions.json save failed: %s", log_prefix):
+                    await asyncio.shield(_end)
+            logger.info(
+                "Shutdown phase: %s marked %d session(s) in %.2fs", log_prefix, len(marked), time.monotonic() - _t0,
+            )
+        # Replay alerts go out only AFTER the batched save: a stalled notification must never keep a
+        # mark from becoming durable before the service manager kills the process.
+        for _sk in _alerts:
+            with _log_suppressed(logging.DEBUG, "%s replay alert failed for %s: %s", log_prefix, _sk):
+                await _notify_suspended(_sk)
         return marked
 
     def _restart_notification_allowed(self, platform: Platform) -> bool:
@@ -1033,7 +1097,7 @@ class GatewayShutdownMixin:
                         ):
                             notified.add(dedup_key)
                     from gateway.warning_notifications import present_notification
-                    await present_notification(send_notice, platform=platform)
+                    await present_notification(send_notice, platform=platform, chat_id=chat_id, thread_id=thread_id)
         if notified:
             logger.info("Shutdown: delivered %d interrupted-cron-job notice(s)", len(notified))
         return len(notified)
@@ -1104,6 +1168,9 @@ class GatewayShutdownMixin:
                     restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
         notified: set[tuple[str, str, Optional[str]]] = set()
+        from gateway.response_filters import lifecycle_notice_muted
+        from gateway.warning_notifications import effective_user_config
+        lifecycle_cfg = effective_user_config()
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1123,6 +1190,12 @@ class GatewayShutdownMixin:
                 if not adapter:
                     continue
                 if not self._notice_allowed(platform, "active session"):
+                    continue
+                # A page channel does not take the shutdown notice (t_75a91ccc). The requester's own
+                # chat on an in-chat /restart still does: there it is the command's answer.
+                if restart_key != dedup_key and lifecycle_notice_muted(platform, chat_id, lifecycle_cfg):
+                    logger.info("Shutdown notice not posted to page channel %s:%s", platform_str, chat_id)
+                    notified.add(dedup_key)  # latch: the home-channel pass must not re-target it
                     continue
                 reply_to_message_id = getattr(source, "message_id", None)
                 if reply_to_message_id is None and restart_key == dedup_key:
@@ -1148,7 +1221,9 @@ class GatewayShutdownMixin:
             scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
                      if source is not None else nullcontext())
             async with scope:
-                presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key)
+                presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key,
+                                                       chat_id=chat_id, thread_id=thread_id,
+                                                       parent_id=getattr(source, "parent_chat_id", None))
             if not presented:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
         if self._restart_requested and restart_source is not None:
@@ -1180,6 +1255,9 @@ class GatewayShutdownMixin:
             dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
             if dedup_key in notified:
                 continue
+            if lifecycle_notice_muted(platform, home.chat_id, lifecycle_cfg):
+                logger.info("Shutdown notice not posted to page channel %s:%s (home)", platform.value, home.chat_id)
+                continue
             try:
                 metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=adapter)
             except Exception as e:
@@ -1197,7 +1275,7 @@ class GatewayShutdownMixin:
             # present_notification reads the ACTIVE profile's display settings: bind the served one's.
             profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
             async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
-                await present_notification(_send_home, platform=platform)
+                await present_notification(_send_home, platform=platform, chat_id=getattr(home, "chat_id", None), thread_id=getattr(home, "thread_id", None))
 
     # Agent finalization / resource cleanup
     @staticmethod
@@ -1994,6 +2072,18 @@ class GatewayShutdownMixin:
         # Notify all chats with active agents BEFORE draining — adapters are still connected here.
         await self._notify_active_sessions_of_shutdown()
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
+        # Fork: spool /stop-held /queue items NOW, before the drain. They are idle by definition
+        # (no turn consumes them), and the late sweep in _stop_release_runtime_state never runs
+        # when the shutdown watchdog force-exits a wedged drain; an unspooled held item is then
+        # re-injected by the restart backfill as a fresh turn (2026-10-26 03:11).
+        _spool_held = getattr(self, "_spool_held_queues_for_restart", None)
+        if callable(_spool_held):
+            try:
+                _held_n = await _spool_held()
+                if _held_n:
+                    logger.info("Shutdown phase: spooled %d held /queue item(s) before drain", _held_n)
+            except Exception:
+                logger.warning("early held-queue spool failed; late sweep will retry", exc_info=True)
         # Fork: cancel boot auto-resumes that were SCHEDULED but whose turn never started, and
         # re-mark them resumable. BEFORE the drain wait: a pending sentinel still counts in
         # ``len(self._running_agents)``, so leaving these in place makes the drain wait out its full

@@ -129,9 +129,25 @@ All of:
    host's, not something owned by the gateway process; with I5 the local case is the same uid).
    Docker, modal, daytona, singularity and any plugin backend stay in-process. This is the answer
    to 49a7ba3407bb.
-5. A dispatcher serves the delegations board in this process
+5. A live dispatcher serves the delegations board on this host, and no estop is engaged
    (`gateway/kanban_watchers_common.py::_kanban_dispatch_allowed()` true). Without one nothing
-   would reap a crashed worker.
+   would reap a crashed worker. *Amended 2026-10-28 (t_3646c28e, ruling B):* the original text
+   said "in this process", which only the ONE gateway holding the machine-global
+   `kanban_home()/kanban/.dispatcher.lock` can satisfy, so the knob was a no-op on every other
+   gateway (the daedalus canary fell back with `no_dispatcher` on every session shape). One
+   dispatcher per host is the kanban model already: kanban workers of every profile are claimed and
+   reaped by the lock holder, whose crash, stale-claim and terminal-worker passes are host-scoped
+   (claim prefix `<host>:`), not claimer-scoped. So `dispatcher_live_on_host()` is true in the lock
+   holder itself, and elsewhere when the holder's heartbeat `kanban_home()/kanban/.dispatcher.heartbeat`
+   (rewritten on acquire and every tick, removed on release) names this host, a live pid, and is no
+   older than `max(3 x dispatch interval, 180 s)`. The check is read-only; unknown is false (I6).
+   Ownership is unchanged: the ORIGINATING gateway creates and `spawn_now`s the card, keeps the
+   record (parent session key, outbox, card-end drain, cancel) and delivers through the existing
+   outbox; the lock holder's dispatcher only owns the card's lifecycle (crash sweep, stale
+   heartbeat, terminal-worker reap). The originating gateway waits on its own exited runner children
+   (`reap_worker_zombies` in its card-end watcher), since the lock holder is not their parent. A dead
+   originating gateway is handled by the §5.4 boot rules, not by the dispatcher. The `delegations`
+   board is created on first use by `launch_unit` (`create_board` is idempotent); nothing pre-creates it.
 6. The session's terminal cwd is an absolute existing directory.
 
 ### 5.2 Dispatch (gateway, tool thread)

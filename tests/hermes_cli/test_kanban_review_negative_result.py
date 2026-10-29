@@ -94,6 +94,28 @@ def test_negative_handoff_routes_to_human_review(kanban_home, monkeypatch, polic
         assert len(_events(conn, tid, "review_requested")) == 1
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("human:apollo", "human:apollo"), (None, "human"), ("argus", "human")],
+)
+def test_negative_handoff_resolves_configured_human_lane(
+    kanban_home, monkeypatch, configured, expected,
+):
+    """The negative-result route lands on the board's named human lane, not the
+    bare sentinel (t_626f68ea: 57/89 bare-human review cards came from here)."""
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "milestone_only")
+    monkeypatch.setattr(kb, "configured_review_assignee", lambda: configured)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="slice: close-on soak", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="Close-on read: NOT met.",
+                                 expected_run_id=claimed.current_run_id) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "review" and task.assignee == expected
+        neg = _events(conn, tid, "review_negative_result")
+        assert neg and neg[0]["reviewer"] == expected and neg[0]["match"] == "NOT met"
+
+
 def test_positive_handoff_still_completes_in_place(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "configured_review_policy", lambda: "milestone_only")
     with kb.connect() as conn:

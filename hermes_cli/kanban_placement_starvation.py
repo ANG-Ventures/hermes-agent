@@ -13,16 +13,24 @@ placement_wait rows with the same code in it, a ready card with priority >=
 one-line body fix, plus a ``placement_starved`` event that latches it. The latch
 lives on the board (the event), so a gateway restart never re-posts; a new
 episode (claimed, blocked, edited and requeued, ...) can be reported again.
+
+Below the priority floor a hold is still reported once it repeats
+``STARVED_REPEAT_EVENTS`` placement_wait rows with the same code (t_250a7fc5:
+t_041ad167, p2..45, sat 20 h on ``not_portable:linked`` with nobody told).
+Every report also sends ONE #logs line.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from typing import Mapping, Optional
 
 STARVED_WAIT_SECONDS = 30 * 60
 STARVED_WAIT_EVENTS = 3
 STARVED_MIN_PRIORITY = 50
+# Any priority: this many same-code rows (~1 h at the 900 s refresh) reports.
+STARVED_REPEAT_EVENTS = 4
 STARVED_EVENT = "placement_starved"
 COMMENT_AUTHOR = "kanban-dispatcher"
 
@@ -42,6 +50,10 @@ _FIXES = (
     ("requires:",
      "the capability the card requires is on no pool host it may use. Fix: correct the "
      "`requires:` line, or pin the host that serves it."),
+    ("not_portable:linked",
+     "a link to a live card (named in the detail) holds it off the pool, so its `host:` pin "
+     "is not honoured while that edge is live. Fix: drop the pin, or relink the edge "
+     "`--kind derived-from` if it is lineage only."),
     ("not_portable:",
      "a placement rule keeps it off every host that has room. Fix: read `kanban placement <id>` "
      "and correct the body line that rule names."),
@@ -64,10 +76,12 @@ def _code(payload: Mapping) -> Optional[str]:
 def starved_holds(conn, waits: Mapping[str, str], now: int, *,
                   min_seconds: int = STARVED_WAIT_SECONDS,
                   min_events: int = STARVED_WAIT_EVENTS,
-                  min_priority: int = STARVED_MIN_PRIORITY) -> list[dict]:
+                  min_priority: int = STARVED_MIN_PRIORITY,
+                  repeat_events: int = STARVED_REPEAT_EVENTS) -> list[dict]:
     """``[{task_id, code, since, waited, events, fix}]``: held cards to report
-    this tick. One indexed read per structurally-held ready card at or above
-    ``min_priority``; capacity waits cost nothing."""
+    this tick. One indexed read per structurally-held ready card; below
+    ``min_priority`` only ``repeat_events`` same-code rows report it.
+    Capacity waits cost nothing."""
     from hermes_cli import kanban_placement_reasons as _pr
 
     ends = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
@@ -78,8 +92,9 @@ def starved_holds(conn, waits: Mapping[str, str], now: int, *,
         if fix is None:
             continue
         row = conn.execute("SELECT status, priority FROM tasks WHERE id = ?", (tid,)).fetchone()
-        if row is None or row[0] != "ready" or int(row[1] or 0) < min_priority:
+        if row is None or row[0] != "ready":
             continue
+        high = int(row[1] or 0) >= min_priority
         count, start, latched = 0, None, False
         for kind, created, raw in conn.execute(
             "SELECT kind, created_at, payload FROM task_events WHERE task_id = ? "
@@ -105,7 +120,7 @@ def starved_holds(conn, waits: Mapping[str, str], now: int, *,
         if latched or start is None:
             continue
         waited = now - start
-        if waited >= min_seconds or count >= min_events:
+        if (high and (waited >= min_seconds or count >= min_events)) or count >= repeat_events:
             hits.append({"task_id": tid, "code": code, "since": start, "waited": waited,
                          "events": count, "fix": fix})
     return hits
@@ -133,5 +148,22 @@ def notify_starved_holds(conn, waits: Mapping[str, str], now: int) -> list[dict]
             continue
         _kb._log.warning("PHASE=kanban_placement_starved %s held %s %d min",
                          h["task_id"], h["code"], h["waited"] // 60)
+        _logs_line(h)
         posted.append(h)
     return posted
+
+
+def _logs_line(hit: Mapping) -> None:
+    """ONE #logs line per report (t_250a7fc5). The board event already latched
+    the episode, so a failed send is not retried. A hermetic home has no
+    notify.py and sends nothing."""
+    from hermes_cli import kanban_budget as _kbudget
+
+    script = _kbudget._notify_script_path()
+    if script is None:
+        return
+    body = (f"⏳ kanban placement: {hit['task_id']} held `{hit['code']}` "
+            f"{hit['waited'] // 60} min ({hit['events']} placement_wait events); "
+            f"will not clear on its own, fix named on the card.")
+    _kbudget._run_notify([sys.executable, script, "--channel", "discord",
+                          "--target", _kbudget.RECOVERY_TARGET, "--send", body])

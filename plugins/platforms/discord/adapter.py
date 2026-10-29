@@ -4947,8 +4947,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not user_id:
             return False
         try:
-            from gateway.pairing import PairingStore
-            return bool(PairingStore().is_approved("discord", user_id))
+            from gateway.pairing import shared_pairing_store
+            return bool(shared_pairing_store().is_approved("discord", user_id))
         except Exception:
             return False
 
@@ -8151,9 +8151,8 @@ def _component_check_auth(
     # Pairing store (mirrors ``authz_mixin._check_authorization``): paired users click without allowlist.
     if uid:
         try:
-            from gateway.pairing import PairingStore
-            store = PairingStore()
-            if store.is_approved("discord", uid):
+            from gateway.pairing import shared_pairing_store
+            if shared_pairing_store().is_approved("discord", uid):
                 return True
         except Exception:
             pass
@@ -8952,6 +8951,7 @@ async def _standalone_send(
     if not token:
         return send_error("Discord standalone send: DISCORD_BOT_TOKEN is not set")
     try:
+        from plugins.platforms.discord.standalone_rate_limit import post_json_or_error as _rl_post
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
@@ -8983,30 +8983,35 @@ async def _standalone_send(
                         ]
                         starter_message = {"content": (caption or message), "attachments": attachments_meta}
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
-                        form = aiohttp.FormData()
-                        form.add_field("payload_json", payload_json, content_type="application/json")
-                        try:
+
+                        def _forum_form():
+                            form = aiohttp.FormData()
+                            form.add_field("payload_json", payload_json, content_type="application/json")
                             for idx, media_path in enumerate(valid_media):
                                 with open(media_path, "rb") as fh:
                                     form.add_field(
                                         f"files[{idx}]", fh.read(),
                                         filename=os.path.basename(media_path),
                                     )
-                            async with session.post(thread_url, headers=auth_headers, data=form, **_req_kw) as resp:
-                                data, err = await _standalone_response_json_or_error(resp, "Discord forum thread creation error")
-                                if err:
-                                    return err
+                            return {"headers": auth_headers, "data": form, **_req_kw}
+                        try:
+                            data, err = await _rl_post(
+                                session, thread_url, _forum_form, "Discord forum thread creation error", chat_id,
+                            )
+                            if err:
+                                return err
                         except Exception as e:
                             return send_error(f"Discord forum thread upload failed: {e}")
                     else:
                         # No media: JSON POST creates the thread with the text starter.
-                        async with session.post(
-                            thread_url, headers=json_headers,
-                            json={"name": thread_name, "message": {"content": message}}, **_req_kw,
-                        ) as resp:
-                            data, err = await _standalone_response_json_or_error(resp, "Discord forum thread creation error")
-                            if err:
-                                return err
+                        data, err = await _rl_post(
+                            session, thread_url,
+                            lambda: {"headers": json_headers,
+                                     "json": {"name": thread_name, "message": {"content": message}}, **_req_kw},
+                            "Discord forum thread creation error", chat_id,
+                        )
+                        if err:
+                            return err
                 thread_id_created = data.get("id")
                 starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
                 result = {
@@ -9017,12 +9022,15 @@ async def _standalone_send(
                     result["warnings"] = warnings
                 return result
             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
+        target = thread_id or chat_id
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
-                    last_data, err = await _standalone_response_json_or_error(resp, "Discord API error")
-                    if err:
-                        return err
+                last_data, err = await _rl_post(
+                    session, url, lambda: {"headers": json_headers, "json": {"content": message}, **_req_kw},
+                    "Discord API error", target,
+                )
+                if err:
+                    return err
             # One multipart upload per file; a MEDIA:<path> caption rides as the attachment message's
             # content, and caption_pending makes a missing file fall back to a plain message.
             caption_pending = bool(caption)
@@ -9043,24 +9051,27 @@ async def _standalone_send(
                             logger.warning("Discord caption-fallback send failed for missing media")
                     continue
                 try:
-                    form = aiohttp.FormData()
                     filename = os.path.basename(media_path)
-                    if caption_pending:
-                        form.add_field(
-                            "payload_json", json.dumps({"content": caption}),
-                            content_type="application/json",
-                        )
-                        caption_pending = False
-                    with open(media_path, "rb") as f:
-                        form.add_field("files[0]", f, filename=filename)
-                        async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
-                            data, err = await _standalone_response_json_or_error(resp, "Discord API error")
-                            if err:
-                                warning = send_error(f"Failed to send media {media_path}: {err['error']}")["error"]
-                                logger.error(warning)
-                                warnings.append(warning)
-                                continue
-                            last_data = data
+                    media_caption = caption if caption_pending else None
+                    caption_pending = False
+
+                    def _media_form(media_path=media_path, filename=filename, media_caption=media_caption):
+                        form = aiohttp.FormData()
+                        if media_caption:
+                            form.add_field(
+                                "payload_json", json.dumps({"content": media_caption}),
+                                content_type="application/json",
+                            )
+                        with open(media_path, "rb") as f:
+                            form.add_field("files[0]", f.read(), filename=filename)
+                        return {"headers": auth_headers, "data": form, **_req_kw}
+                    data, err = await _rl_post(session, url, _media_form, "Discord API error", target)
+                    if err:
+                        warning = send_error(f"Failed to send media {media_path}: {err['error']}")["error"]
+                        logger.error(warning)
+                        warnings.append(warning)
+                        continue
+                    last_data = data
                 except Exception as e:
                     warning = send_error(f"Failed to send media {media_path}: {e}")["error"]
                     logger.error(warning)

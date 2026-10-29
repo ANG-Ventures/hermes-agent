@@ -3957,6 +3957,27 @@ def test_requeue_ready_card_overrides_active_pr(kanban_home, monkeypatch):
         assert kbd.check_respawn_guard(conn, task_id) is None
 
 
+@pytest.mark.parametrize("origin", [None, "ace-media"])
+def test_requeue_drop_origin_promotes_a_blocked_card_only_when_an_origin_dropped(kanban_home, origin):
+    """Prism 954a3633bcc2 (t_8a8aad55): no origin to drop = the block stands and the verb errors."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="blocked on input", assignee="worker")
+        conn.execute("UPDATE tasks SET status='blocked', origin_host=?, workspace_path=NULL WHERE id=?",
+                     (origin, tid))
+        conn.commit()
+        ok, err = kb.requeue_task(conn, tid, actor="operator", reason="start fresh", drop_origin=True)
+        row = conn.execute("SELECT status, origin_host FROM tasks WHERE id=?", (tid,)).fetchone()
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        if origin is None:
+            assert ok is False and "stays blocked" in err and "no origin" in err
+            assert row["status"] == "blocked"
+            assert "requeued" not in kinds
+        else:
+            assert (ok, err) == (True, None)
+            assert row["status"] == "ready" and row["origin_host"] is None
+            assert "origin_dropped" in kinds and kinds[-1] == "requeued"
+
+
 @pytest.mark.parametrize("later_pr_second", [False, True])
 def test_requeue_intent_preceding_new_pr_is_not_reused(kanban_home, monkeypatch, later_pr_second):
     now = int(time.time())

@@ -57,12 +57,23 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
+    before = _kb._path_identity(path)
     conn = connect_tracked(
         path,
         connect_fn=sqlite3.connect,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
+    try:
+        # The (dev, ino) of the file this connection has OPEN, for board_for_conn: the path can be
+        # re-pointed later while the fd stays on the old file (Prism 1cb3ded18c44). sqlite opens the
+        # main file inside connect(), so an identity unchanged across it is the opened file's. A swap
+        # during the open records nothing and board_for_conn falls back to the path.
+        after = _kb._path_identity(path)
+        if after is not None and before in (None, after):
+            conn._hermes_open_identity = after
+    except AttributeError:
+        pass
     try:
         # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
         # survives wrapper changes; PRAGMA assignments can't bind parameters.
@@ -1078,6 +1089,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "task_comments", "session_ref", "session_ref TEXT"
             )
+        if "grant_id" not in cm_cols:
+            # Scoped signing grant the comment was written under (t_19c567a8).
+            _add_column_if_missing(
+                conn, "task_comments", "grant_id", "grant_id TEXT"
+            )
 
     # task_links gained a ``kind`` column (blocks | derived-from). Every
     # pre-existing edge was created under the single gating semantics, so the
@@ -1315,7 +1331,7 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
         " run_id INTEGER, session_ref TEXT,"
-        " created_at INTEGER NOT NULL)",
+        " created_at INTEGER NOT NULL, grant_id TEXT)",
         ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
     ),
     "task_runs": (

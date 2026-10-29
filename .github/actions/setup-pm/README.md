@@ -57,6 +57,10 @@ exact hits are not saved again. Only dependency-carrying callers
 dependency operation, so letting it save would freeze an empty cache under
 the production key, where an immutable exact hit blocks real saves forever.
 PM re-verifies restored tools before use.
+Self-hosted runners restore and never save (their upload is slow enough to
+outlive `timeout-minutes`), unless the caller sets `save-on-self-hosted: 'true'`.
+Only the top-level `warm-selfhosted-cache.yml` workflow does that (outside
+reusable `tests.yml`, so its result never rolls up into the CI gate).
 Dependency caches never contain `node_modules` or virtual environments.
 Keep an installed-tree cache in the caller if that job needs one.
 

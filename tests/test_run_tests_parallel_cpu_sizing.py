@@ -134,8 +134,8 @@ def test_unreadable_cgroup_files_do_not_raise(runner, tmp_path, monkeypatch):
 
 
 def test_requested_above_ceiling_is_clamped(runner):
-    """The bug: HERMES_TEST_WORKERS=12 on a 2-CPU container -> 4, not 12."""
-    assert runner.resolve_worker_count(requested=12, effective_cpus=2) == 4
+    """The bug: HERMES_TEST_WORKERS=12 on a 2-CPU container -> 2, not 12."""
+    assert runner.resolve_worker_count(requested=12, effective_cpus=2) == 2
 
 
 def test_requested_below_ceiling_is_honoured(runner):
@@ -144,7 +144,27 @@ def test_requested_below_ceiling_is_honoured(runner):
 
 
 def test_no_request_uses_the_ceiling_as_the_default(runner):
-    assert runner.resolve_worker_count(requested=None, effective_cpus=4) == 8
+    assert runner.resolve_worker_count(requested=None, effective_cpus=4) == 4
+
+
+def test_four_cpu_cgroup_runner_gets_one_worker_per_cpu(runner, tmp_path):
+    """The hermes-agent-ci mirror shape (t_58979a5e).
+
+    ci-runner-pool containers run with CPU_LIMIT=4 (NanoCpus=4e9), so
+    cpu.max reads ``400000 100000``. tests.yml asks for 12. At 2x the quota
+    the runner started 8 workers on 4 CPUs, and 26 slice tests that take
+    9-20 s on the Studio blew their 60/90/105 s per-test walls. One worker
+    per CPU is the default and the ceiling.
+    """
+    root = _cgroup_v2(tmp_path, "400000 100000\n")
+    cpus, source = runner.effective_cpu_count(root)
+    assert (cpus, source) == (4, "cgroup-v2")
+    assert runner.resolve_worker_count(requested=12, effective_cpus=cpus) == cpus
+    assert runner.resolve_worker_count(requested=None, effective_cpus=cpus) == cpus
+    # One worker per CPU means no oversubscription, so the default per-file
+    # backstop is not stretched either.
+    workers = runner.resolve_worker_count(requested=12, effective_cpus=cpus)
+    assert runner.scaled_file_timeout(1800.0, workers, cpus) == 1800.0
 
 
 def test_single_cpu_still_gets_two_workers(runner):
@@ -159,7 +179,7 @@ def test_force_bypasses_the_ceiling(runner):
 
 
 def test_force_without_a_request_still_uses_the_default(runner):
-    assert runner.resolve_worker_count(requested=None, effective_cpus=2, force=True) == 4
+    assert runner.resolve_worker_count(requested=None, effective_cpus=2, force=True) == 2
 
 
 # ── startup log line ─────────────────────────────────────────────────────────
@@ -174,9 +194,9 @@ def test_startup_log_line_names_every_input(runner):
 
 def test_startup_log_line_reports_no_request_as_none(runner):
     line = runner.format_worker_sizing_log(
-        workers=8, effective_cpus=4, requested=None, source="affinity"
+        workers=4, effective_cpus=4, requested=None, source="affinity"
     )
-    assert line == "workers=8 (effective_cpus=4, requested=none, source=affinity)"
+    assert line == "workers=4 (effective_cpus=4, requested=none, source=affinity)"
 
 
 def test_generate_slices_stdout_stays_pure_json(tmp_path):

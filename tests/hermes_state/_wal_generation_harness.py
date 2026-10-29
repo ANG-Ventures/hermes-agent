@@ -120,6 +120,9 @@ _GATEWAY_CHILD = textwrap.dedent(
     repo, hermes_home, db_path = sys.argv[1], sys.argv[2], sys.argv[3]
     sys.path.insert(0, repo)
     os.environ["HERMES_HOME"] = hermes_home
+    if os.environ.get("HERMES_TEST_NO_WAL_LOCKGUARD"):  # the OFD guard masks a close-time checkpoint
+        import hermes_state_lockguard
+        hermes_state_lockguard._F_OFD_SETLK = None
     import hermes_state_wal
     if hermes_state_wal.is_sqlite_wal_reset_vulnerable():
         hermes_state_wal.is_sqlite_wal_reset_vulnerable = lambda version_info=None: False
@@ -224,10 +227,12 @@ class GatewayWriter:
 
 
 @contextlib.contextmanager
-def gateway_writer(tmp_path: Path):
+def gateway_writer(tmp_path: Path, *, lockguard: bool = True):
     """Spawn the gateway writer child on ``tmp_path / "state.db"`` and yield a :class:`GatewayWriter`.
 
-    The child is torn down (stdin closed, then wait → terminate → kill) on exit from the block."""
+    ``lockguard=False`` disables the OFD WAL lock guard in the child (it otherwise refuses SQLite's
+    close-time checkpoint by itself, hiding whether retirement does). The child is torn down
+    (stdin closed, then wait → terminate → kill) on exit from the block."""
     repo_root = os.path.dirname(os.path.abspath(hermes_state.__file__))
     hermes_home = tmp_path / "home"
     hermes_home.mkdir()
@@ -238,7 +243,8 @@ def gateway_writer(tmp_path: Path):
             [sys.executable, "-c", _GATEWAY_CHILD, repo_root, str(hermes_home), str(path)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
             text=True, encoding="utf-8", bufsize=1,
-            env={**os.environ, "HERMES_STATE_DB_GUARD_BYPASS": "1"},
+            env={**os.environ, "HERMES_STATE_DB_GUARD_BYPASS": "1",
+                 **({} if lockguard else {"HERMES_TEST_NO_WAL_LOCKGUARD": "1"})},
         )
         gw = GatewayWriter(proc, path, stderr_path)
         try:

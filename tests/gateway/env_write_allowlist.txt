@@ -1,0 +1,33 @@
+# os.environ write sites in gateway/ outside hermes_cli/process_bootstrap.py (spec §5.6, AC-17).
+# Format: `<path>::<qualname>::<op> <key-expr>  # <class>: <reason>`. Linted by
+# tests/gateway/test_env_write_sites.py: a write site missing here, or a row with no site, is RED.
+#
+# Class (a) = child-visible start-path write. The function stays where it is, but it is reached only from
+# hermes_cli/process_bootstrap.py:bootstrap_cron_parent_env, so the gateway and the cron script runner
+# both run it (AC-7). Class (b) = not a child-visible start-path write.
+
+# (a) config.yaml -> env bridges called by the bootstrap
+gateway/fork_ext/restart_policy.py::_bridge_agent_config_to_env::set _env_var  # (a): agent.* restart-policy bridge, called by process_bootstrap._bridge_config_to_env
+gateway/media_policy.py::_set_env_default::set env  # (a): media-policy bridge (apply_media_policy_env), called by process_bootstrap._bridge_config_to_env
+gateway/config_loader.py::bridge_core_env_settings::set 'GATEWAY_ALLOW_ALL_USERS'  # (a): load_gateway_config(); the runner bootstrap calls load_gateway_config(). Also dropped from children by the subprocess env scrub
+gateway/config_loader.py::bridge_core_env_settings::pop 'GATEWAY_ALLOW_ALL_USERS'  # (a): same bridge, the config-flipped-to-false clear
+gateway/config_loader.py::bridge_core_env_settings::set 'TELEGRAM_REQUIRE_MENTION'  # (a): load_gateway_config(), run by both start paths
+gateway/config_loader.py::bridge_core_env_settings::set 'SIGNAL_REQUIRE_MENTION'  # (a): load_gateway_config(), run by both start paths
+gateway/platforms/_shared.py::yaml_env_setter.set_env::set name  # (a): platform plugins' apply_yaml_config_fn hooks inside load_gateway_config(), run by both start paths
+
+# (b) not child-visible start-path writes
+gateway/run.py::_ensure_windows_gateway_venv_imports::set 'VIRTUAL_ENV'  # (b): win32 only (the runner is macOS-only, spec §2); VIRTUAL_ENV is also scrubbed from children
+gateway/run.py::_ensure_windows_gateway_venv_imports::set 'PYTHONPATH'  # (b): win32 only (the runner is macOS-only, spec §2)
+gateway/run.py::main::setdefault 'AI_AGENT'  # (b): popped from every cron script child env (cron/scheduler_script.py, t_7fee0f83)
+gateway/run.py::main::setdefault 'HERMES_AGENT'  # (b): popped from every cron script child env (cron/scheduler_script.py, t_7fee0f83)
+gateway/session_context.py::set_current_session_id::set 'HERMES_SESSION_ID'  # (b): guarded by _HERMES_GATEWAY != 1, so never written in a gateway; per-turn, not start-path
+gateway/kanban_watchers.py::GatewayKanbanWatchersMixin._run_kanban_dispatcher._auto_decompose_tick::set 'HERMES_KANBAN_BOARD'  # (b): transient board pin around one kanban auto-decompose call, restored in finally; runtime, not start-path
+gateway/kanban_watchers.py::GatewayKanbanWatchersMixin._run_kanban_dispatcher._auto_decompose_tick::pop 'HERMES_KANBAN_BOARD'  # (b): the restore of the pin above
+gateway/kanban_watchers.py::GatewayKanbanWatchersMixin._run_kanban_dispatcher._auto_decompose_tick::set 'HERMES_KANBAN_BOARD'  # (b): the restore of the pin above
+gateway/kanban_watchers_dispatcher.py::_KanbanDispatcher.auto_decompose_tick::set 'HERMES_KANBAN_BOARD'  # (b): transient board pin around one kanban auto-decompose call, restored in finally; runtime, not start-path
+gateway/kanban_watchers_dispatcher.py::_KanbanDispatcher.auto_decompose_tick::pop 'HERMES_KANBAN_BOARD'  # (b): the restore of the pin above
+gateway/kanban_watchers_dispatcher.py::_KanbanDispatcher.auto_decompose_tick::set 'HERMES_KANBAN_BOARD'  # (b): the restore of the pin above
+gateway/platforms/yuanbao.py::AutoSetHomeMiddleware._persist_home::set 'YUANBAO_HOME_CHANNEL'  # (b): written on an inbound Yuanbao message (live adapter); the runner has no adapters
+gateway/relay/__init__.py::self_provision_relay::set 'GATEWAY_RELAY_ID'  # (b): relay self-provisioning at adapter start; GATEWAY_RELAY_* are scrubbed from children
+gateway/relay/__init__.py::self_provision_relay::set 'GATEWAY_RELAY_SECRET'  # (b): relay self-provisioning at adapter start; GATEWAY_RELAY_* are scrubbed from children
+gateway/relay/__init__.py::self_provision_relay::set 'GATEWAY_RELAY_DELIVERY_KEY'  # (b): relay self-provisioning at adapter start; GATEWAY_RELAY_* are scrubbed from children

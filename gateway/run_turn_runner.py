@@ -215,7 +215,7 @@ class TurnRunner:
                 )
                 render_notification(
                     lambda: self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error"),
-                    platform=ctx.source.platform, user_config=ctx.user_config)
+                    platform=ctx.source.platform, user_config=ctx.user_config, source=ctx.source)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
 
@@ -996,6 +996,23 @@ class TurnRunner:
         if ctx.mute_notification_reply:
             _warn_route_drop("muted")
             return dropped
+        if is_route_change:
+            from gateway.response_filters import route_notice_muted
+            if route_notice_muted(ctx.source, ctx.user_config):
+                # Not a drop: a page channel does not take route telemetry (t_733b4104). INFO, and
+                # never queued for redelivery.
+                logger.info("route-change status not posted to page channel %s: %s",
+                            ctx._status_chat_id,
+                            _redact_gateway_user_facing_secrets(str(message or ""))[:160])
+                return False
+        else:
+            from gateway.response_filters import is_compaction_announce, lifecycle_notice_muted
+            if is_compaction_announce(message) and lifecycle_notice_muted(
+                    ctx.source.platform, ctx.source.chat_id, ctx.user_config):
+                # Not a lost send: None tells _emit_compaction_announce the boundary was handled
+                # (no STATUS_CALLBACK_FAILED, no re-announce). t_75a91ccc.
+                logger.info("COMPACTION_ANNOUNCE_MUTED in-turn page_channel=%s", ctx._status_chat_id)
+                return None
         resolver = ctx._current_status_adapter
         try:
             adapter = resolver() if callable(resolver) else None
@@ -1039,6 +1056,14 @@ class TurnRunner:
                 self._queue_undelivered_route_notice(event_type, prepared)
                 return
             if is_route_change:
+                # The delivered leg is logged like the dropped/muted ones, so gateway.log alone
+                # answers "did chat X get the 🔄 line" (t_f1f73872: its absence read as a miss).
+                logger.info(
+                    "route-change status delivered: platform=%s chat=%s message=%s",
+                    getattr(ctx.source.platform, "value", ctx.source.platform) or "unknown",
+                    ctx._status_chat_id,
+                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+                )
                 # The platform is reachable again: flush anything queued.
                 self._flush_route_notice_outbox()
                 return  # route announcements are durable messages, not temporary progress
@@ -1061,7 +1086,7 @@ class TurnRunner:
                 fut.add_done_callback(_track_status_result)
             if is_route_change:
                 outcome[0] = True
-        render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
+        render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config, source=ctx.source,
                             diagnostic=is_warning_status(event_type, message))
         return outcome[0]
 
@@ -1128,8 +1153,9 @@ class TurnRunner:
             return 0
 
     def _announce_chat_pin_mismatch(self, model, provider, result, final_response) -> None:
-        """One durable notice per emitted reply, including cross-session wakes."""
-        from agent.chat_completion_helpers import format_chat_pin_notice
+        """One durable notice per emitted reply, including cross-session wakes; once per
+        fallback episode when the emitting session is the pinned one on its own fallback."""
+        from agent.chat_completion_helpers import chat_pin_own_fallback, format_chat_pin_notice
         from gateway.response_filters import is_intentional_silence_agent_result
         if not final_response or is_intentional_silence_agent_result(
             result, final_response, internal=self._ctx.persist_user_display_kind == "internal_notification",
@@ -1140,7 +1166,22 @@ class TurnRunner:
             return
         try:
             _, pin = store.lookup_chat_model_pin(self._ctx.source)
-            notice = format_chat_pin_notice(model, provider, pin, reason=result.get("failure_reason"))
+            agent = (self._ctx.agent_holder or [None])[0]
+            entry = store.entry_for(self._ctx.session_key) if hasattr(store, "entry_for") else None
+            own, label = chat_pin_own_fallback(
+                agent, pin, getattr(entry, "model_override_identity", None))
+            notice = format_chat_pin_notice(model, provider, pin, reason=result.get("failure_reason"),
+                                            own_fallback=own, fallback_label=label)
+            # The pinned session's own fallback: once per episode, the 🔄 line
+            # already announced it (t_40a9186f: 8 notices in one night).
+            episode = (provider, model, (pin or {}).get("provider"), (pin or {}).get("model"))
+            if agent is not None:
+                if not notice:
+                    agent._chat_pin_notice_episode = None
+                elif own and getattr(agent, "_chat_pin_notice_episode", None) == episode:
+                    return
+                elif own:
+                    agent._chat_pin_notice_episode = episode
             if notice:
                 self._status_callback_sync("info", notice)
         except Exception:
@@ -1442,7 +1483,7 @@ class TurnRunner:
             if line:
                 self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
-                            user_config=self._ctx.user_config, diagnostic=diagnostic)
+                            user_config=self._ctx.user_config, diagnostic=diagnostic, source=self._ctx.source)
 
     def _bg_review_chat_muted(self) -> bool:
         """True when this turn's chat is an act-now page channel: the review receipt ("💾
@@ -2389,6 +2430,9 @@ class TurnRunner:
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
+            # Split or in-place compaction during this run: `messages` lost the turn boundary, so the
+            # /goal turn-effect classifier must not trust a slice of it (it reads this as unknown).
+            "compacted_during_turn": compacted_in_place or effective_session_id != ctx.session_id,
             **usage,
         }
         self._announce_chat_pin_mismatch(resolved_model, resolved_provider, result, final_response)

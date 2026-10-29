@@ -869,7 +869,7 @@ def _has_platform_display_override(user_config: dict, platform_key: str, setting
 
 def _resolve_gateway_display_bool(
     user_config: dict, platform_key: str, setting: str, *, default: bool = False,
-    platform: Any = None, require_platform_override_for: set[Any] | None = None) -> bool:
+    platform: Any = None, require_platform_override_for: set[Any] | None = None, **scope: Any) -> bool:
     """Resolve a boolean display setting with optional platform-only opt-in.
 
     Scratch-text is too noisy for threaded surfaces (Mattermost): they need an explicit per-platform override.
@@ -883,7 +883,7 @@ def _resolve_gateway_display_bool(
 
     from gateway.display_config import resolve_display_setting
 
-    value = resolve_display_setting(user_config, platform_key, setting, default)
+    value = resolve_display_setting(user_config, platform_key, setting, default, **scope)
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -1652,9 +1652,6 @@ def _planned_restart_notification_pending() -> bool:
     return _planned_restart_notification_path().exists()
 
 
-# Gateway marker so a lazily imported cli.py load_cli_config() doesn't clobber TERMINAL_CWD.
-os.environ["_HERMES_GATEWAY"] = "1"
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home, get_hermes_home_override, get_process_hermes_home
@@ -1681,11 +1678,20 @@ def _state_home() -> Path:
     return get_hermes_home()
 
 
-# Load ~/.hermes/.env first: user-managed env files must override stale shell exports on restart.
+# Every child-visible start-path env write (spec §5.6): the _HERMES_GATEWAY marker, ~/.hermes/.env +
+# project .env, the turn-lease seed and the config.yaml -> env bridge. The cron script runner runs the same
+# function, so a script sees one env whichever process starts it. AC-17 forbids raw os.environ writes here.
 from dotenv import load_dotenv  # noqa: F401  # fork tests monkeypatch gateway.run.load_dotenv
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.process_bootstrap import (  # noqa: F401  # re-exported: callers and tests use these names
+    _AGENT_ENV_BRIDGE, _DISPLAY_ENV_BRIDGE, _SESSIONS_ENV_BRIDGE, _bridge_auxiliary_config_to_env,
+    _bridge_config_to_env, _bridge_max_turns_to_env, _bridge_section_to_env, _bridge_terminal_config_to_env,
+    _load_bridge_config, apply_start_env as _apply_start_env, bootstrap_cron_parent_env,
+    set_quiet as _set_quiet)
 _env_path = _hermes_home / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+_config_path = _hermes_home / 'config.yaml'
+_cfg: dict = bootstrap_cron_parent_env(
+    _config_path, role="gateway", project_env=Path(__file__).resolve().parents[1] / '.env')
 
 
 def _reload_runtime_env_preserving_config_authority() -> None:
@@ -1796,22 +1802,9 @@ def _recover_pending_flushes(runner) -> int:
     return recovered
 
 
-def _cron_tick_profile_homes(config: object) -> list[tuple[str, "Path"]]:
-    """Profile homes the in-process ticker visits: the served set PLUS the process-active
-    profile: ``profiles_to_serve`` lists default + every live named profile, but a ``--profile
-    <name>`` gateway's own profile may sit outside ``profiles/`` (custom HERMES_HOME). One host
-    process ticks all of them regardless of ``gateway.multiplex_profiles``. Adapter startup
-    already skips ``active``."""
-    from hermes_cli.profiles import get_active_profile_name, get_profile_dir
-
-    homes = _multiplex_profile_homes(config)
-    active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
-    if any(name == active for name, _home in homes):
-        return homes
-    try:
-        return homes + [(active, get_profile_dir(active))]
-    except Exception:
-        return homes
+# Moved to cron/scheduler_ownership.py so the cron script runner (cron/script_runner.py) ticks the
+# same homes without importing the gateway.
+from cron.scheduler_ownership import cron_tick_profile_homes as _cron_tick_profile_homes  # noqa: E402
 
 
 def _cron_profile_gate(name: str, home: "Path") -> bool:
@@ -2080,202 +2073,7 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
-# Internal bridge, not a config source: seed from the canonical default after dotenv so an ambient
-# process/.env value can never control lease safety.
 from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
-os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(_DEFAULT_CONFIG["agent"]["gateway_turn_lease_timeout"])
-
-# Bridge config.yaml values into env so os.getenv() picks them up. config.yaml unconditionally wins
-# over .env for these keys; a `not in os.environ` guard would let stale .env entries shadow config.
-_AGENT_ENV_BRIDGE = {
-    "gateway_timeout": "HERMES_AGENT_TIMEOUT",
-    "gateway_turn_lease_timeout": "HERMES_TURN_LEASE_TIMEOUT",
-    "gateway_timeout_warning": "HERMES_AGENT_TIMEOUT_WARNING",
-    "gateway_notify_interval": "HERMES_AGENT_NOTIFY_INTERVAL",
-    "session_stall_timeout": "HERMES_SESSION_STALL_TIMEOUT",
-    "restart_drain_timeout": "HERMES_RESTART_DRAIN_TIMEOUT",
-    "cron_drain_timeout": "HERMES_CRON_DRAIN_TIMEOUT",
-    "gateway_auto_continue_freshness": "HERMES_AUTO_CONTINUE_FRESHNESS",
-    "gateway_startup_restore_drain_timeout": "HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT",
-    "gateway_startup_warmup_timeout": "HERMES_STARTUP_WARMUP_TIMEOUT"}
-# config-authoritative knobs for the session-search index (env stays the cross-process carrier).
-_SESSIONS_ENV_BRIDGE = {"cjk_fts": "HERMES_CJK_FTS", "search_slow_ms": "HERMES_SEARCH_SLOW_MS"}
-_DISPLAY_ENV_BRIDGE = {
-    "busy_input_mode": "HERMES_GATEWAY_BUSY_INPUT_MODE",
-    "busy_text_mode": "HERMES_GATEWAY_BUSY_TEXT_MODE",
-    "busy_ack_enabled": "HERMES_GATEWAY_BUSY_ACK_ENABLED"}
-
-
-def _bridge_section_to_env(section: Any, mapping: Dict[str, str]) -> None:
-    """Export every present ``mapping`` key of a config section as ``str(value)``."""
-    if isinstance(section, dict):
-        for cfg_key, env_var in mapping.items():
-            if cfg_key in section:
-                os.environ[env_var] = str(section[cfg_key])
-
-
-def _bridge_max_turns_to_env(agent_cfg: Any) -> None:
-    """Bridge ``agent.max_turns`` preserving its raw spelling ("none", "unlimited", "120"); Python None
-    (`null` / bare `key:`) clears a stale bridge instead, since str(None) -> "None" would map to the
-    unlimited sentinel rather than "absent = default"."""
-    if not isinstance(agent_cfg, dict) or "max_turns" not in agent_cfg:
-        return
-    raw = agent_cfg["max_turns"]
-    if raw is not None:
-        os.environ["HERMES_MAX_ITERATIONS"] = str(raw)
-    elif "HERMES_MAX_ITERATIONS" in os.environ:
-        del os.environ["HERMES_MAX_ITERATIONS"]
-
-
-def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
-    """Bridge nested ``terminal.*`` config to TERMINAL_* env vars (config.yaml overrides .env here)."""
-    _terminal_backend = str(
-        _terminal_cfg.get("backend") or os.environ.get("TERMINAL_ENV") or "").strip().lower()
-    _terminal_env_map = {
-        "backend": "TERMINAL_ENV",
-        "degraded_mode": "TERMINAL_DEGRADED_MODE",
-        "cwd": "TERMINAL_CWD",
-        "timeout": "TERMINAL_TIMEOUT",
-        "home_mode": "TERMINAL_HOME_MODE",
-        "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
-        "docker_image": "TERMINAL_DOCKER_IMAGE",
-        "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
-        "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
-        "modal_image": "TERMINAL_MODAL_IMAGE",
-        "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-        "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
-        "vercel_image": "TERMINAL_VERCEL_IMAGE",
-        "ssh_host": "TERMINAL_SSH_HOST",
-        "ssh_user": "TERMINAL_SSH_USER",
-        "ssh_port": "TERMINAL_SSH_PORT",
-        "ssh_key": "TERMINAL_SSH_KEY",
-        "container_cpu": "TERMINAL_CONTAINER_CPU",
-        "container_memory": "TERMINAL_CONTAINER_MEMORY",
-        "container_disk": "TERMINAL_CONTAINER_DISK",
-        "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
-        "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
-        "docker_env": "TERMINAL_DOCKER_ENV",
-        "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
-        "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
-        "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
-        "docker_network": "TERMINAL_DOCKER_NETWORK",
-        "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
-        "docker_snap_compat": "TERMINAL_DOCKER_SNAP_COMPAT",
-        "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
-        "docker_shared_container_key": "TERMINAL_DOCKER_SHARED_CONTAINER_KEY",
-        "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
-        "sandbox_dir": "TERMINAL_SANDBOX_DIR",
-        "persistent_shell": "TERMINAL_PERSISTENT_SHELL"}
-    for _cfg_key, _env_var in _terminal_env_map.items():
-        if _cfg_key not in _terminal_cfg:
-            continue
-        _val = _terminal_cfg[_cfg_key]
-        if _cfg_key == "cwd":
-            # Placeholders (".", "auto", "cwd") resolve to Path.home() later; only explicit paths bridge.
-            if str(_val) in {".", "auto", "cwd"}:
-                continue
-            # Expand "~" for local/container cwd so Popen never gets a literal "~/" (kernel rejects it);
-            # SSH cwd is interpreted by the remote shell: keep "~". Predicate shared w/ terminal_tool.
-            if isinstance(_val, str) and not _is_ssh_remote_tilde_cwd(_terminal_backend, _val.strip()):
-                _val = os.path.expanduser(_val)
-        os.environ[_env_var] = json.dumps(_val) if isinstance(_val, (list, dict)) else str(_val)
-
-
-def _bridge_auxiliary_config_to_env(_auxiliary_cfg: dict) -> None:
-    """Bridge auxiliary model/endpoint overrides (vision, approval, plugins); compression reads yaml."""
-    _aux_bridged_keys = {"vision", "approval"}
-    try:
-        from hermes_cli.plugins import get_plugin_auxiliary_tasks
-        for _entry in get_plugin_auxiliary_tasks():
-            _aux_bridged_keys.add(_entry["key"])
-    except Exception:
-        pass  # plugin discovery failure must not break startup; built-in bridging stays intact
-    for _task_key in _aux_bridged_keys:
-        _task_cfg = _auxiliary_cfg.get(_task_key, {})
-        if not isinstance(_task_cfg, dict):
-            continue
-        _upper = _task_key.upper()
-        _prov = str(_task_cfg.get("provider", "")).strip()
-        if _prov and _prov != "auto":
-            os.environ[f"AUXILIARY_{_upper}_PROVIDER"] = _prov
-        for _field, _suffix in (("model", "MODEL"), ("base_url", "BASE_URL"), ("api_key", "API_KEY")):
-            _value = str(_task_cfg.get(_field, "")).strip()
-            if _value:
-                os.environ[f"AUXILIARY_{_upper}_{_suffix}"] = _value
-
-
-def _bridge_config_to_env(_cfg: dict) -> None:
-    """Export config.yaml settings to the env vars os.getenv() consumers read."""
-    for _key, _val in _cfg.items():  # top-level scalars: fallback only, never override .env
-        if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
-            os.environ[_key] = str(_val)
-    _terminal_cfg = _cfg.get("terminal", {})
-    if _terminal_cfg and isinstance(_terminal_cfg, dict):
-        _bridge_terminal_config_to_env(_terminal_cfg)
-    _auxiliary_cfg = _cfg.get("auxiliary", {})
-    if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
-        _bridge_auxiliary_config_to_env(_auxiliary_cfg)
-    # config.yaml is the documented, authoritative source for these settings — it unconditionally wins over
-    # .env values. Previously the guards below read `if X not in os.environ` and let stale .env entries
-    # (e.g. HERMES_MAX_ITERATIONS=60 written by an old `hermes setup` run) silently shadow the user's
-    # current config. See PR #18413 / the 60-vs-500 max_turns incident.
-    _agent_cfg = _cfg.get("agent", {})
-    # Fork restart/resume knobs (restart_policy._AGENT_CONFIG_ENV_BRIDGE: resume_flag_stale_clear,
-    # resume_interrupted_turns, restart_loop_*, auto_resume_max_attempts, ...) bridge through the
-    # same config-wins rule; the funnel's str(None) max_turns is corrected by _bridge_max_turns_to_env.
-    from gateway.fork_ext.restart_policy import _bridge_agent_config_to_env
-    _bridge_agent_config_to_env(_agent_cfg)
-    _bridge_max_turns_to_env(_agent_cfg)
-    _bridge_section_to_env(_agent_cfg, _AGENT_ENV_BRIDGE)
-    _bridge_section_to_env(_cfg.get("sessions", {}), _SESSIONS_ENV_BRIDGE)
-    _display_cfg = _cfg.get("display", {})
-    _bridge_section_to_env(_display_cfg, _DISPLAY_ENV_BRIDGE)
-    # Documented service-manager override: env wins when set (other display bridges stay config-first).
-    if (isinstance(_display_cfg, dict) and "busy_steer_ack_enabled" in _display_cfg
-            and "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED" not in os.environ):
-        os.environ["HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED"] = str(_display_cfg["busy_steer_ack_enabled"])
-    _tz_cfg = _cfg.get("timezone", "")
-    if _tz_cfg and isinstance(_tz_cfg, str):
-        os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
-    _security_cfg = _cfg.get("security", {})
-    if isinstance(_security_cfg, dict) and _security_cfg.get("redact_secrets") is not None:
-        os.environ["HERMES_REDACT_SECRETS"] = str(_security_cfg["redact_secrets"]).lower()
-    # Media policy uses the shared bridge so standalone entrypoints (`hermes cron run`) match.
-    _gateway_cfg = _cfg.get("gateway", {})
-    if isinstance(_gateway_cfg, dict):
-        from gateway.media_policy import apply_media_policy_env
-        apply_media_policy_env(_cfg)
-        _trust_recent_seconds = _gateway_cfg.get("trust_recent_files_seconds")
-        if _trust_recent_seconds is not None:
-            os.environ["HERMES_MEDIA_TRUST_RECENT_SECONDS"] = str(_trust_recent_seconds)
-        # platform_connect_timeout is an escape hatch, unlike the bridges above: env WINS if already set.
-        if ("platform_connect_timeout" in _gateway_cfg
-                and not os.environ.get("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()):
-            os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] = str(_gateway_cfg["platform_connect_timeout"])
-
-
-def _load_bridge_config(config_path: Path) -> dict:
-    """Effective USER config (no defaults) for the presence-sensitive env bridge: only keys the user
-    or the managed layer wrote get bridged, else all of DEFAULT_CONFIG would be exported."""
-    from hermes_cli.config_effective import load_user_config_effective
-    return load_user_config_effective(config_path)
-
-
-_config_path = _hermes_home / 'config.yaml'
-_cfg: dict = {}
-if _config_path.exists():
-    try:
-        _cfg = _load_bridge_config(_config_path)
-        _bridge_config_to_env(_cfg)
-    except Exception as _bridge_err:
-        # stderr, not logger: the module logger is not initialized yet at import time.
-        print(
-            f"  Warning: config.yaml → env bridge failed: {type(_bridge_err).__name__}: {_bridge_err}",
-            file=sys.stderr)
-        print(
-            "  Gateway will fall back to .env values, which may not match "
-            "your current config.yaml. Run `hermes doctor` to investigate.",
-            file=sys.stderr)
 
 # IPv4 preference must apply before any HTTP clients are created.
 try:
@@ -2298,7 +2096,7 @@ try:
 except Exception as _bootstrap_exc:
     print(f"  Warning: deprecation check failed: {_bootstrap_exc}", file=sys.stderr)
 
-os.environ["HERMES_QUIET"] = "1"  # gateway runs quiet: no debug output, cwd used directly
+_set_quiet()  # gateway runs quiet: no debug output, cwd used directly
 
 # HERMES_EXEC_ASK is set in start_gateway(), NOT at import: CLI tools importing this module must not
 # flip interactive sessions into ask-mode (approval prompts would become silent pending_approval).
@@ -3713,6 +3511,21 @@ def _write_runtime_status_quiet(**fields: Any) -> None:
         pass
 
 
+def _write_runtime_heartbeat() -> None:
+    """Housekeeping "Runtime heartbeat": re-stamp ``gateway_state.json`` and publish the cron
+    script-lane fields (spec §5.3): ``cron_script_lane_delegation = int(knob_enabled())`` read from
+    THIS process home's config, and ``cron_script_lane_last_outcome`` per ticked home. A failure
+    reading them still re-stamps the heartbeat."""
+    fields: dict = {}
+    try:
+        from cron.lanes import gateway_lane_status_fields
+
+        fields = gateway_lane_status_fields()
+    except Exception:
+        logger.debug("cron script-lane status fields unavailable", exc_info=True)
+    _write_runtime_status_quiet(**fields)
+
+
 def _command_origin_for_source(source: Any) -> Optional[dict]:
     """Delivery origin for a shared CLI/gateway command so its job replies to this chat/thread."""
     try:
@@ -4710,8 +4523,11 @@ class GatewayRunner(
         self._turn_leases = SessionTurnLeaseRegistry(
             # Lets acquire() tell a genuinely-live alias-key holder apart from a /stop'd turn still
             # draining a tool call; without it the registry blames alias routing keys for every wait
-            # and the zombie case is invisible (2026-09-20 incident).
+            # and the zombie case is invisible (2026-09-20 incident). Staleness is INVALIDATION
+            # (/stop, /new, reset, eviction), not mere non-currency: a holder superseded by a later
+            # inbound's generation bump is a live turn still flushing (t_d659b247, 2026-10-24).
             is_generation_current=self._is_session_run_current,
+            is_generation_invalidated=self._is_session_run_invalidated,
             stale_wait=_float_env("HERMES_STALE_LEASE_WAIT", DEFAULT_STALE_LEASE_WAIT),
         )
         # Stall-notified keys clear when pending clears / activity resumes / conversation boundary.
@@ -4784,6 +4600,9 @@ class GatewayRunner(
         # Value: (AIAgent, config_signature); LRU cap in _enforce_agent_cache_cap, TTL in expiry watcher.
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = threading.Lock()
+        with suppress(Exception):  # lcm_db_fds gauge denominator (t_0d987578)
+            from gateway.status import set_cached_agents_source
+            set_cached_agents_source(self._cached_agent_count)
         # Launch-time identity of the profile that owns ``self.adapters``; ``_authorization_adapter``
         # compares against this rather than the per-turn ``_active_profile_name()``. A multiplex
         # host's primary map is always the default profile, even when a named profile launched
@@ -5096,9 +4915,10 @@ class GatewayRunner(
                     _profile = get_active_profile_name() or "default"
                 except Exception:
                     _profile = None
+        from gateway.config import session_isolation_flags
+        group_per_user, thread_per_user = session_isolation_flags(config, source.platform)
         return build_session_key(
-            source, group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            source, group_sessions_per_user=group_per_user, thread_sessions_per_user=thread_per_user,
             profile=_profile)
 
     # Telegram General topic in forum-enabled private chats: clients omit message_thread_id or send "1"; both = root.
@@ -6015,6 +5835,10 @@ class GatewayRunner(
                         current_boot_id=boot_id,
                         profile_home=profile_home,
                     )
+                    # Kanban-runtime units outlive the gateway: observe each running one so
+                    # active_count / has_live_for_session / /stop see it (spec §5.4 Boot).
+                    from tools.async_delegation_kanban import observe_running
+                    observe_running(profile_home, boot_id)
             except Exception:
                 logger.error(
                     "Async delegation recovery failed for profile=%s home=%s",
@@ -6181,6 +6005,11 @@ class GatewayRunner(
             )
             if not line:
                 return  # gating said skip (noop/idle/etc.) — nothing to deliver
+            from gateway.response_filters import lifecycle_notice_muted
+            if lifecycle_notice_muted(source.platform, source.chat_id, _cfg if isinstance(_cfg, dict) else {}):
+                logger.info("COMPACTION_ANNOUNCE_MUTED reason=%s session=%s page_channel=%s",
+                            trigger_reason, new_session_id, source.chat_id)
+                return
 
             _adapter = self.adapters.get(source.platform)
             if not (_adapter and source.chat_id):
@@ -7382,6 +7211,17 @@ class GatewayRunner(
             message = format_restart_notice(verdict)
             if not message:
                 return
+            if verdict.planned:
+                # A restart we requested is not a page: keep it out of an act-now channel
+                # (t_75a91ccc). An UNPLANNED one still posts.
+                from gateway.response_filters import lifecycle_notice_muted
+                from gateway.warning_notifications import effective_user_config
+                _src = getattr(event, "source", None)
+                if _src is not None and lifecycle_notice_muted(
+                        _src.platform, _src.chat_id, effective_user_config()):
+                    logger.info("PHASE=restart_notice_muted key=%s by=%s page_channel=%s",
+                                session_key, verdict.planned_by or "-", _src.chat_id)
+                    return
             # Idempotent per (boot, session): a re-scheduled resume or a crash
             # loop must not spam the channel. The claim does an atomic rename,
             # so it goes OFF-LOOP — a blocking os.replace on the loop thread is
@@ -9598,8 +9438,23 @@ class GatewayRunner(
                     seen.add(id(event))
                     if await self._preserve_followup_across_restart(key, event, None):
                         spooled += 1
-        # Held /queue items (after /stop) restore as HELD on the next boot, never as a turn
-        # (spec 2026-10-12 D22/I13). Removed only once durably spooled.
+        spooled += await self._spool_held_queues_for_restart(seen)
+        return spooled
+
+    async def _spool_held_queues_for_restart(self, seen: Optional[set] = None) -> int:
+        """Spool /stop-held /queue items so the next boot restores them as HELD, never as a turn
+        (spec 2026-10-12 D22/I13). Removed only once durably spooled, so a second call is a no-op.
+
+        Called EARLY in stop() (before the drain) as well as from the late sweep: the late sweep
+        never runs when the shutdown watchdog force-exits a wedged drain, and an unspooled held
+        item is then re-injected by the platform's restart backfill as a fresh turn (a /stop-held
+        voice note answered twice, 2026-10-26 03:11).
+        """
+        from collections.abc import Mapping as _Mapping
+
+        if seen is None:
+            seen = set()
+        spooled = 0
         held_by_session = getattr(self, "_held_queues", None)
         if isinstance(held_by_session, _Mapping):
             for key, events in list(held_by_session.items()):
@@ -10390,7 +10245,7 @@ def _start_gateway_housekeeping(
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
         # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
         # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
-        (1, "Runtime heartbeat", _write_runtime_status_quiet)]
+        (1, "Runtime heartbeat", _write_runtime_heartbeat)]
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
@@ -11354,6 +11209,8 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = _CronDispatchGate(runner)
+        # Hand each home's script lane to the cron script runner while it progresses (§5.3).
+        cron_start_kwargs["delegate_script_lane"] = True
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(
@@ -11443,24 +11300,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all."""
-    # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
-    os.environ["HERMES_EXEC_ASK"] = "1"
-
-    # Messaging-only defaults belong to startup, not incidental imports by the TUI.
-    configured_cwd = os.environ.get("TERMINAL_CWD", "")
-    if not configured_cwd or configured_cwd in CWD_PLACEHOLDERS:
-        resolved_cwd = resolve_placeholder_terminal_cwd(
-            configured_cwd=configured_cwd,
-            terminal_backend=os.environ.get("TERMINAL_ENV", ""),
-            messaging_cwd=os.getenv("MESSAGING_CWD"),
-            docker_mount_cwd_to_workspace=os.getenv(
-                "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower()
-            in {"true", "1", "yes"},
-            home_fallback=str(Path.home()))
-        if resolved_cwd is None:
-            os.environ.pop("TERMINAL_CWD", None)
-        else:
-            os.environ["TERMINAL_CWD"] = resolved_cwd
+    # HERMES_EXEC_ASK + the messaging TERMINAL_CWD default: set here (not at import) so incidental
+    # gateway.run imports from CLI code don't poison them. Shared with the cron script runner (§5.6).
+    _apply_start_env()
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
     apply_nofile_soft_limit()

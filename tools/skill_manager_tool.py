@@ -10,7 +10,7 @@ existing skills (bundled, hub, user) are modified in place. Layout:
 import contextvars as _ctxvars
 import hashlib
 import json
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, nullcontext, suppress
 import logging
 import re
 import shutil
@@ -30,7 +30,8 @@ from agent.skill_utils import (
     SKILL_PROMPT_DESC_LIMIT)
 from tools.skill_manager_guards import (
     _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
-    _containing_skills_root, _curator_consolidation_delete_guard, _is_path_redirect, _maybe_auto_propose_org_edit,
+    _containing_skills_root, _curator_consolidation_delete_guard, _curator_remove_file_carry_guard,
+    _is_path_redirect, _maybe_auto_propose_org_edit,
     _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import (
     _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
@@ -104,6 +105,14 @@ def _skill_mutation_locks(names):
     for lock_path in sorted({_skill_lock_path(n) for n in names}):
         stack.enter_context(skill_file_lock(lock_path))
     return stack
+
+
+def _remove_file_carry_fence():
+    """Skills-root-wide lock for background curator remove_file (no-op in the foreground)."""
+    if not _is_background_review():
+        return nullcontext()
+    from tools.skill_usage import skill_file_lock
+    return skill_file_lock(_skills_dir() / ".locks" / "remove-file-carry.lock")
 
 
 MAX_NAME_LENGTH = 64
@@ -872,7 +881,12 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return _err(f"File '{file_path}' not found in skill '{name}'.", available_files=available or None)
     if read_guard := _background_review_read_before_write_guard(name, target, "remove_file", file_path):
         return read_guard
-    target.unlink()
+    # One fence across ALL skills for background removes, held from the carry check through the
+    # unlink: two reviews removing identical copies must not each count the other's as the carrier.
+    with _remove_file_carry_fence():
+        if carry_guard := _curator_remove_file_carry_guard(name, skill_dir, target, file_path):
+            return carry_guard
+        target.unlink()
     _rmdir_if_empty(target.parent, skill_dir)
     return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
 

@@ -138,7 +138,7 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
     signal = None
     if signal_on:
         from hermes_cli import kanban_headroom as kh
-        from hermes_cli import placement
+        from hermes_cli.fleet_placement import placement
 
         table = kh.load_table(root)
         rpath = root / placement.RESERVATIONS_REL

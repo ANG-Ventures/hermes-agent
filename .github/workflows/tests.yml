@@ -351,6 +351,14 @@ jobs:
         # matrix job via --files. Previously each job re-discovered files and
         # re-ran LPT independently — redundant N times.
         run: |
+          # Cross-repo vendoring contract (t_4ee9c117): the fleet runners mount the private
+          # hermes-home mirror read-only at /opt/git-mirror/2; hand its main placement.py to
+          # test_vendored_placement_matches_canonical. Hosted runners have no mirror: it skips.
+          if git -c safe.directory='*' --git-dir=/opt/git-mirror/2 show main:scripts/lib/placement.py \
+               > "$RUNNER_TEMP/placement_canonical.py" 2>/dev/null; then
+            export PLACEMENT_CANONICAL="$RUNNER_TEMP/placement_canonical.py"
+            echo "PLACEMENT_CANONICAL from hermes-home mirror main $(git -c safe.directory='*' --git-dir=/opt/git-mirror/2 rev-parse --short main)"
+          fi
           # Verbose pytest output lets timeout verdicts name the last test reached.
           scripts/run_tests.sh --files '${{ matrix.slice.files }}' \
             --junit-dir ci-junit --result-file ci-junit/slice-result.json -- -v
@@ -363,9 +371,10 @@ jobs:
           # Subprocess-per-file is import/IO-bound, not CPU-bound: workers spend
           # most of their wall time in interpreter boot + module import, not
           # computing. This is a CEILING, not an absolute — run_tests_parallel.py
-          # clamps it to max(2, effective_cpus*2) where effective_cpus comes from
-          # the cgroup CPU quota, not nproc. So a 4-vCPU hosted runner still gets
-          # 8, while a --cpus=2 self-hosted container gets 4 instead of 12.
+          # clamps it to max(2, effective_cpus) where effective_cpus comes from
+          # the cgroup CPU quota, not nproc. So a 4-vCPU runner gets 4 and a
+          # --cpus=2 self-hosted container gets 2 instead of 12 (2x the quota
+          # blew per-test walls on the 4-CPU mirror pool, t_58979a5e).
           # (12 on 2 CPUs was 6x oversubscription: CFS throttling blew wall-clock
           # windows and sqlite busy-timeouts, ejecting merge-queue entries.)
           # HERMES_TEST_WORKERS_FORCE=1 bypasses the clamp.
@@ -382,7 +391,10 @@ jobs:
           name: ci-slice-result-${{ matrix.slice.index }}-a${{ github.run_attempt }}
           path: ci-junit/
           if-no-files-found: warn
-          retention-days: 3  # was 14 (t_82cb42f5: org artifact-storage quota hit 2026-10-17); nothing reads these past the run
+          # 14 days on evidence events: flake_quarantine.py / flake_ledger.py read these
+          # junits back EVIDENCE_WINDOW_DAYS=14 for push/merge_group/schedule runs only.
+          # PR runs are never evidence, so they keep the t_82cb42f5 3-day cut.
+          retention-days: ${{ contains(fromJSON('["push", "merge_group", "schedule"]'), github.event_name) && 14 || 3 }}
 
       - name: Slice verdict (flake quarantine, base-ref list)
         # Green iff the suite passed, or every failure is a test that is

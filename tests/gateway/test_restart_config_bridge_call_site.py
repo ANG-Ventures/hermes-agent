@@ -4,7 +4,7 @@ docs/sync/fork-call-site-coverage.md).
 ``tests/gateway/test_fork_ext_restart_policy.py`` and ``test_stale_lease_wait_config.py`` call
 ``gateway.fork_ext.restart_policy._bridge_agent_config_to_env`` directly. That proves the helper,
 not the upstream call site that feeds it: a parity merge that drops or re-wires the call in
-``gateway/run.py::_bridge_config_to_env`` keeps both files green. Every test here drives the REAL
+``hermes_cli/process_bootstrap.py::_bridge_config_to_env`` (re-exported by ``gateway/run.py``) keeps both files green. Every test here drives the REAL
 startup function ``_bridge_config_to_env`` with a config dict and reads the result through the
 live reader the gateway uses.
 
@@ -33,7 +33,7 @@ import gateway.fork_ext.restart_policy as rp
 import gateway.run as gw_run
 from gateway.config import GatewayConfig
 
-_WHERE = "call site = gateway/run.py::_bridge_config_to_env"
+_WHERE = "call site = hermes_cli/process_bootstrap.py::_bridge_config_to_env"
 
 
 class _Store:

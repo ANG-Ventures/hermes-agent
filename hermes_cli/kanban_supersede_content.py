@@ -158,6 +158,17 @@ def _keys(node, prefix=()) -> dict:
     return {prefix: _plain(node)}
 
 
+def _has_path(node, path) -> bool:
+    """Is there a node, scalar OR container, at ``path`` in the loaded mapping ``node``?"""
+    for seg in path:
+        if not isinstance(node, dict):
+            return False
+        node = next((v for k, v in node.items() if _plain(k) == seg), _MISSING)
+        if node is _MISSING:
+            return False
+    return True
+
+
 def frontmatter_carries(mb: dict, head: dict, cand: dict) -> bool:
     """Every key path whose value differs between merge-base and PR head holds the head value on the
     candidate (deep equality; a key the PR removed must be absent). Paths the PR did not change may
@@ -169,16 +180,35 @@ def frontmatter_carries(mb: dict, head: dict, cand: dict) -> bool:
             continue
         got = have.get(path, _MISSING)
         if want is _MISSING:
-            if got is not _MISSING:  # a key path the PR removed must be absent on the candidate
+            # A key the PR removed must be absent from the candidate MAPPING, not just its leaves: a
+            # mapping left under it is still the key (Prism d3b02265e3bf). A path the head turned
+            # into a container is not removed; its new leaves are checked as their own paths.
+            if any(p[:len(path)] == path for p in new):
+                continue
+            if _has_path(cand, path):
                 return False
         elif got is _MISSING or got != want:  # plain, type-tagged trees: typed deep equality
             return False
     return True
 
 
-def _is_subsequence(needle, haystack) -> bool:
-    it = iter(haystack)
-    return all(any(line == h for h in it) for line in needle)
+def _in_scope_subsequence(needle, haystack, anchors) -> bool:
+    """``needle`` appears in ``haystack`` in order, and no gap between two matched lines holds an
+    ``anchors`` line (an unchanged head line): crossing one means the match left the block's scope
+    (Prism 86fbd795f101: `run()` added to `a()` matched inside `b()`). Every start position is tried;
+    a gap of lines that are not head context (a later edit on main) is fine."""
+    for start in (i for i, h in enumerate(haystack) if h == needle[0]):
+        pos, ok = start + 1, True
+        for line in needle[1:]:
+            while pos < len(haystack) and haystack[pos] != line and haystack[pos] not in anchors:
+                pos += 1
+            if pos >= len(haystack) or haystack[pos] != line:
+                ok = False
+                break
+            pos += 1
+        if ok:
+            return True
+    return False
 
 
 def _order_carried(mb_lines, head_lines, cand_lines) -> bool:
@@ -187,18 +217,20 @@ def _order_carried(mb_lines, head_lines, cand_lines) -> bool:
 
     Blank lines are ignored. ``difflib`` marks the head lines the PR inserted or replaced; each maximal
     run of them, with the nearest unchanged head line before and after it, must appear on the candidate
-    as a subsequence (in that order, with anything in between: a later newer edit on main is fine).
-    Each block is checked on its own, so unrelated later edits elsewhere never refuse."""
+    in that order. Lines a later edit on main put in between are fine, but an unchanged head line in
+    between is not: the match would cross into another scope, so it refuses (fails closed). Each block
+    is checked on its own, so unrelated later edits elsewhere never refuse."""
     import difflib
     mb = [line for line in mb_lines if line.strip()]
     head = [line for line in head_lines if line.strip()]
     cand = [line for line in cand_lines if line.strip()]
     ops = difflib.SequenceMatcher(None, mb, head, autojunk=False).get_opcodes()
+    anchors = {line for tag, _i1, _i2, j1, j2 in ops if tag == "equal" for line in head[j1:j2]}
     for tag, _i1, _i2, j1, j2 in ops:
         if tag not in ("insert", "replace"):
             continue
         block = head[max(j1 - 1, 0):j2 + 1]
-        if not _is_subsequence(block, cand):
+        if not _in_scope_subsequence(block, cand, anchors):
             return False
     return True
 

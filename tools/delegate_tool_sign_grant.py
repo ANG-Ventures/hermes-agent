@@ -1,0 +1,276 @@
+"""``delegate_task(sign_grant=...)``: mint a scoped board-signing grant for a child (t_19c567a8).
+
+The parent delegates a GRANT, not its identity (hermes_cli/kanban_sign_grants.py has the
+design). This module is the spawn half: it checks what only the parent process can see (it
+holds ``by`` itself, it is not a dispatched worker or a delegate child, the child inherited
+its context and runs on its model), mints the board rows bound to the child's session, tells
+the child how to sign and ledgers the grant. The grant is revoked when the PARENT's turn ends
+(``agent/turn_facade.py``, the turn's outer finally -> :func:`revoke_turn_grants`) or at its expiry, whichever is first:
+a grant never outlives the parent turn, and its stamps are void from then on.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class SignGrantError(ValueError):
+    """The spawn's ``sign_grant`` was refused; no child is started."""
+
+
+def carries_sign_grant(args: Any) -> bool:
+    """A model-issued delegate_task with a top-level or per-task ``sign_grant``. Such a call runs SYNCHRONOUSLY on
+    the model dispatch paths: the grant ends with the parent's turn, so the child must finish inside it."""
+    if not isinstance(args, dict):
+        return False
+    if args.get("sign_grant"):
+        return True
+    tasks = args.get("tasks")
+    return isinstance(tasks, list) and any(isinstance(t, dict) and t.get("sign_grant") for t in tasks)
+
+
+def _spec(raw: Any) -> Optional[Dict[str, Any]]:
+    if raw in (None, {}, ""):
+        return None
+    if not isinstance(raw, dict):
+        raise SignGrantError("sign_grant must be an object {cards, verbs, expires_in_min?, by?}")
+    return raw
+
+
+def _caller_may_grant(by: str) -> None:
+    from agent.delegation_context import is_delegated_child_process_context
+    from hermes_cli.kanban_identity import is_operator_label, operator_label_proven, worker_ancestor_profile
+
+    if is_delegated_child_process_context():
+        raise SignGrantError("a delegate child cannot pass on a signing grant")
+    if os.environ.get("HERMES_KANBAN_TASK") or worker_ancestor_profile():
+        raise SignGrantError("a dispatched kanban worker cannot mint a signing grant")
+    if not is_operator_label(by):
+        raise SignGrantError(f"sign_grant.by {by!r} is not an operator identity")
+    # operator_label_proven's gateway-ancestry arm is PROCESS-scoped: under the multiplexer every
+    # served profile's session descends from the gateway that serves default, so it would let a
+    # daedalus session mint apollo authority (Prism 08a8789d8e59). The identity a session may hand
+    # on is its OWN profile's, resolved per session; only a presented operator token speaks for any.
+    from hermes_cli import kanban_db as kb
+
+    if kb._operator_token_state() != "ok":
+        own = _session_identities()
+        if by.lower() not in own:
+            raise SignGrantError(f"sign_grant.by {by!r} is not this session's identity (profile "
+                                 f"{sorted(own)[0] if own else '?'!r}); only the operator token signs for another")
+    if not operator_label_proven(by):
+        raise SignGrantError(f"this process cannot prove it is {by!r} (operator token or its gateway)")
+
+
+def _session_identities() -> frozenset:
+    """Labels the CURRENT session's profile signs as: its profile name, and for the root profile
+    (Apollo runs as ``default``) both root labels. ``current_profile_name`` reads the per-session
+    HERMES_HOME override first, so a served profile answers for itself, never for the host."""
+    from hermes_cli.kanban_identity import _ROOT_PROFILE_LABELS
+    from hermes_cli.profiles import current_profile_name
+
+    own = str(current_profile_name("default") or "default").strip().lower()
+    return _ROOT_PROFILE_LABELS if own in _ROOT_PROFILE_LABELS else frozenset({own})
+
+
+def _session_inherited(task: Dict[str, Any], inherit_context: Any, inherit_mode: Any) -> bool:
+    from tools.delegate_tool_fork import resolve_inherit_mode
+
+    ic = task.get("inherit_context") if "inherit_context" in task else inherit_context
+    im = task.get("inherit_mode") if "inherit_mode" in task else inherit_mode
+    return resolve_inherit_mode(ic, im) is not None
+
+
+def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
+                   inherit_context: Any = None, inherit_mode: Any = None) -> Optional[Dict[str, Any]]:
+    """Mint ``task['sign_grant']`` for ``child``; append the signing brief to ``task['goal']``.
+
+    Returns the grant dict (``grant_id``, ``board``, ``cards`` ...) or None when the task
+    carries no grant. Raises :class:`SignGrantError` on any refusal.
+    """
+    spec = _spec(task.get("sign_grant"))
+    if spec is None:
+        return None
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_sign_grants as ksg
+    from hermes_cli.kanban_db_board_registry import board_of_task
+    from hermes_cli.profiles import current_profile_name
+
+    by = str(spec.get("by") or "apollo").strip()
+    _caller_may_grant(by)
+    if not _session_inherited(task, inherit_context, inherit_mode):
+        raise SignGrantError("a signing grant needs inherit_context=true (the child must carry the rulings)")
+    if not getattr(child, "_context_inherited", None):
+        # Requested is not delivered: a failed or empty summary fold builds the child without the transcript.
+        raise SignGrantError("inherit_context was requested but the child was built without the parent's "
+                             "transcript (summary fold failed or empty; see the 'inherit_context fold' log)")
+    if getattr(parent_agent, "_delegate_depth", 0) > 0:
+        raise SignGrantError("only a top-level session may mint a signing grant")
+    cards = [str(c).strip() for c in spec.get("cards") or () if str(c).strip()]
+    if not cards:
+        raise SignGrantError("sign_grant.cards is empty")
+    try:
+        boards = {board_of_task(c) for c in cards}
+    except Exception as exc:
+        raise SignGrantError(f"sign_grant cards: {exc}") from exc
+    if len(boards) != 1:
+        raise SignGrantError(f"sign_grant cards span boards {sorted(boards)}; one grant covers one board")
+    board = boards.pop()
+    # The model the parent's delegating call was DISPATCHED on (stamped at the dispatch edge, the
+    # source revoke_on_model_drift reads), not agent.model: middleware can send another model
+    # without changing it (Prism c37b9eed0ae3). Unknown means unbindable: refuse.
+    parent_model = str(getattr(parent_agent, "_dispatched_model", "") or "")
+    if not parent_model:
+        raise SignGrantError("the parent's dispatched model is unknown; a grant binds the model that ran the delegation")
+    child_sid = str(getattr(child, "session_id", "") or "")
+    parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+    profiles = {current_profile_name("default") or "default", by}
+    try:
+        with kb.connect_closing(board=board) as conn:
+            grant = ksg.mint(
+                conn, cards=cards, verbs=spec.get("verbs") or (), by=by,
+                child_session_ref=kb.derive_session_ref(child_sid) or "",
+                parent_session_ref=kb.derive_session_ref(parent_sid),
+                parent_model=parent_model,
+                child_model=str(getattr(child, "model", "") or ""),
+                child_id=getattr(child, "_subagent_id", None),
+                expires_in_min=spec.get("expires_in_min"),
+                parent_profiles=profiles,
+            )
+    except ksg.GrantRefused as exc:
+        raise SignGrantError(str(exc)) from exc
+    grant["board"] = board
+    try:
+        # The child carries its grants so a later model swap revokes them (revoke_on_model_drift).
+        child.__dict__.setdefault("_held_sign_grants", []).append(dict(grant))
+        task["goal"] = str(task.get("goal") or "") + _brief(grant)
+        _ledger({"event": "sign_grant", "grant_id": grant["grant_id"], "child": grant.get("child_id"),
+                 "by": by, "board": board, "cards": len(cards), "verbs": grant["verbs"],
+                 "expires_at": grant["expires_at"], "at": int(time.time())})
+    except BaseException:
+        # Minted but never handed back: nothing may hold it live. A failed revoke goes to the parent's
+        # turn registry so revoke_turn_grants retries it (Prism 9c236305da52).
+        if revoke([grant]):
+            register_turn_grants(parent_agent, [grant])
+        raise
+    return grant
+
+
+def mint_for_children(children: List[Any], parent_agent: Any, *, inherit_context: Any = None,
+                      inherit_mode: Any = None) -> List[Dict[str, Any]]:
+    """Mint every child's grant, all or nothing: on ANY exception (a refusal, an error, an
+    interrupt) the grants already minted are revoked before it propagates (Prism cd87b39be0ea)."""
+    minted: List[Dict[str, Any]] = []
+    try:
+        for _i, t, child in children:
+            g = mint_for_child(t, child, parent_agent, inherit_context=inherit_context, inherit_mode=inherit_mode)
+            if g:
+                minted.append(g)
+    except BaseException:
+        failed = set(revoke(minted))
+        register_turn_grants(parent_agent, [g for g in minted if str(g.get("grant_id")) in failed])
+        raise
+    return minted
+
+
+def _brief(grant: Dict[str, Any]) -> str:
+    cards = " ".join(grant["cards"])
+    return (
+        f"\n\n[signing grant {grant['grant_id']}] You may sign board comments as `{grant['by']}` on "
+        f"card(s) {cards} (board {grant['board']}) for verbs {', '.join(grant['verbs'])}, until "
+        f"{time.strftime('%H:%M %Z', time.localtime(grant['expires_at']))}. Sign with: "
+        f"`hermes kanban --board {grant['board']} comment <card> --author {grant['by']} "
+        f"--grant {grant['grant_id']} --body-file <file>`. A verdict or APPROVE is that same command with a body "
+        f"carrying a `review_coverage: {{...}}` line (verdict, head_sha, pr, by={grant['by']}); APPROVE needs verb "
+        "approve, and a close-on line or close_on field needs verb release. The merge-gate readers that honour a live "
+        "granted row live in hermes-home (home#7376, home#7570). Any other card, verb, or a PR your parent's runs "
+        "authored is refused, and so is a write from any session but yours; the grant ends with your parent's turn."
+    )
+
+
+def register_turn_grants(parent_agent: Any, grants: List[Dict[str, Any]]) -> None:
+    """Hand ``grants`` to the parent agent so its turn end revokes them."""
+    if not grants:
+        return
+    held = parent_agent.__dict__.setdefault("_sign_grants", [])
+    held.extend(grants)
+
+
+def revoke_turn_grants(agent: Any) -> None:
+    """Turn end: revoke every grant this agent minted during the turn. Never raises.
+
+    It runs from the turn's outer finally, so raising there would replace a finished turn's
+    result or mask its exception (Prism 9c5349bddc34). A grant leaves the registry only once
+    revoked: a failed set is retried once, and whatever still fails is logged (one line naming
+    the ids), marked ``revoke_failed`` and stays registered so the next turn end retries it
+    (Prism 53347c16a468). Its expiry bounds it meanwhile: a shortened-TTL leak, not new authority."""
+    d = getattr(agent, "__dict__", None)
+    held = d.get("_sign_grants") if d is not None else None
+    if not held:
+        return
+    failed = set(revoke(held))
+    if failed:
+        failed = set(revoke([g for g in held if str(g.get("grant_id")) in failed]))
+    remaining = [g for g in held if str(g.get("grant_id")) in failed]
+    if not remaining:
+        d.pop("_sign_grants", None)
+        return
+    for g in remaining:
+        g["revoke_failed"] = True
+    d["_sign_grants"] = remaining
+    logger.error("sign grant(s) %s could not be revoked at turn end; marked revoke_failed, the next turn end "
+                 "retries them and they lapse at their expiry at the latest", sorted(failed))
+
+
+def revoke_on_model_drift(agent: Any, model: Any) -> None:
+    """Dispatch edge of a child's model call: a grant is minted for one model, so the first call
+    on any other model (fallback activation, primary restore, a middleware reroute) revokes it
+    before that model's output can sign anything (Prism 6b322f502e4d)."""
+    held = getattr(agent, "__dict__", {}).get("_held_sign_grants")
+    if not held:
+        return
+    from hermes_cli.kanban_sign_grants import _norm_model
+
+    drifted = [g for g in held if _norm_model(g.get("model")) != _norm_model(model)]
+    if not drifted:
+        return
+    logger.warning("child model is now %r; revoking sign grant(s) %s minted for another model",
+                   model, [g.get("grant_id") for g in drifted])
+    failed = revoke(drifted)
+    # A grant that failed to revoke stays held, so the next call tries again.
+    agent.__dict__["_held_sign_grants"] = [g for g in held if g not in drifted or str(g.get("grant_id")) in failed]
+    if failed:
+        # Fail closed: the other model must not run while a grant it was never given is live.
+        raise RuntimeError(f"sign grant(s) {failed} could not be revoked on a model change to {model!r}")
+
+
+def revoke(grants: List[Dict[str, Any]]) -> List[str]:
+    """Revoke every grant in ``grants``; returns the grant ids that could not be revoked. Never raises."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_sign_grants as ksg
+
+    failed: List[str] = []
+    for g in grants or ():
+        try:
+            with kb.connect_closing(board=g["board"]) as conn:
+                ksg.revoke(conn, g["grant_id"])
+            _ledger({"event": "sign_grant_revoke", "grant_id": g["grant_id"], "at": int(time.time())})
+        except Exception:
+            # Expiry still bounds it; say so loudly.
+            logger.warning("sign grant %s could not be revoked; it lapses at its expiry",
+                           g.get("grant_id"), exc_info=True)
+            failed.append(str(g.get("grant_id")))
+    return failed
+
+
+def _ledger(event: Dict[str, Any]) -> None:
+    try:
+        from gateway.kanban_boomerang_wake import ledger_append
+
+        ledger_append(event)
+    except Exception:
+        logger.debug("sign grant ledger append failed", exc_info=True)

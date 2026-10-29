@@ -18,15 +18,31 @@ def scheduled_instant(value):
         return None
 
 
+class LedgerUnavailable(Exception):
+    """The executions ledger could not be read, so it proves nothing either way.
+
+    Distinct from "this slot never ran": 2026-10-23 an EMFILE made every ledger open fail, the
+    gate read that as not-completed, and nine completed one-shots were retired as MISSED and
+    paged (t_9b3b6e4b). Callers decide per kind: a recurring job may still fire (a duplicate
+    beats a silent skip); a one-shot must neither fire nor be retired."""
+
+
 def completed_occurrence(job, instant):
     """True when *instant* itself completed. Unknown/failed/pruned attempts cannot prove completion:
     keep them eligible. A store rewound past a completed LATER occurrence is
-    ``rewound_watermark``'s job, not this one's."""
+    ``rewound_watermark``'s job, not this one's. Raises ``LedgerUnavailable`` when the ledger
+    cannot be read."""
+    return completed_occurrence_at(job, instant) is not None
+
+
+def completed_occurrence_at(job, instant):
+    """``completed_occurrence`` returning the proving row's finish stamp (or the slot when the row
+    carries none) instead of True; None when the slot is not proven completed."""
     from cron.executions import _transaction
 
     instant = scheduled_instant(instant)
     if instant is None:
-        return False
+        return None
     try:
         with _transaction() as conn:
             rows = conn.execute(
@@ -43,11 +59,11 @@ def completed_occurrence(job, instant):
                     "%s (finished %s); skipping the due slot without a new run",
                     job.get("name", job.get("id")), job.get("id"), instant, row["id"],
                     row["finished_at"] or row["claimed_at"])
-                return True
-        return False
-    except Exception:
+                return row["finished_at"] or row["claimed_at"] or instant
+        return None
+    except Exception as exc:
         logger.warning("Cannot check completed occurrence for job %s", job['id'], exc_info=True)
-        return False
+        raise LedgerUnavailable(str(exc)) from exc
 
 
 def proves_slot(completed_at, slot):
@@ -85,9 +101,9 @@ def rewound_watermark(job, instant):
                 "AND julianday(scheduled_instant) > julianday(?) "
                 "ORDER BY julianday(scheduled_instant) DESC", (str(job['id']), instant)
             ).fetchall()
-    except Exception:
+    except Exception as exc:
         logger.warning("Cannot check rewound schedule for job %s", job['id'], exc_info=True)
-        return None
+        raise LedgerUnavailable(str(exc)) from exc
     for row in rows:
         slot = scheduled_instant(row["scheduled_instant"])
         if slot is None or not proves_slot(row["finished_at"] or row["claimed_at"], slot):

@@ -18,6 +18,8 @@ override so the test path runs on fakes:
   BV2_STOP_FILE      boomerang-wake stop file, or a dir of stage<N>.disabled markers (fake)
   BV2_WIRELOG_DIR    relay wire capture root              (default: ~/.claude-wirelog)
   BV2_ACK_FILE       ack file Apollo appends to           (default: <scratch>/bv2-smoke.ack)
+  BV2_WAKE_STATE     boomerang-wake state file (step 4 fallback arm pre-spends the card's retry here)
+                     (default: <root>/gateway/kanban_boomerang_wake.json)
   BV2_ACK_CMD        scripted acker argv prefix: run as `<cmd> <token>`, does the action, exit 0
                      (isolated scratch gateway lane; see puppet-lane bv2-smoke-lane.sh)
   BV2_SYNC_TIMEOUT   seconds allowed for plan.commands.wirelog_sync (default 600)
@@ -29,8 +31,9 @@ once, whole. --live runs the commands against the scratch board, reads the gatew
 its current end and polls until each expectation is met or its window closes.
 
 The harness never edits config, never restarts anything and never writes to a board whose
-slug does not start with "bv2-smoke". Steps that need Apollo print the exact action and wait
-for a line in the ack file (see README.md).
+slug does not start with "bv2-smoke". Its one other write is step 4's fallback arm: retries[<card>]=1
+into BV2_WAKE_STATE (required live, never defaulted), so the restart finds the D-13 retry spent.
+Steps that need Apollo print the exact action and wait for a line in the ack file (see README.md).
 
 Exit: 0 every check PASS; 1 any FAIL; 3 no FAIL but something INCOMPLETE/SKIP; 2 usage.
 """
@@ -448,6 +451,7 @@ class Ctx:
         evidence reads the same as a human ack; any other exit is a FAIL (never a silent pass).
         This is how an isolated scratch gateway (puppet-lane) drives steps 2 and 4 with no human.
         """
+        baseline = self._ack_count(token) if self.live else 0
         banner = (f"\n>>> APOLLO ACTION ({rep.title}):\n    {instruction}\n"
                   f">>> then: echo {shlex.quote(token)} >> {self.ack}\n")
         print(banner, flush=True)
@@ -458,7 +462,7 @@ class Ctx:
             shown = "$ " + shlex.join(argv)
             print(shown, flush=True)
             try:
-                proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.args.ack_timeout)
+                proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.args.ack_timeout, stdin=subprocess.DEVNULL)
                 rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
             except (OSError, subprocess.TimeoutExpired) as exc:
                 rc, out = 127, f"{type(exc).__name__}: {exc}"
@@ -473,16 +477,20 @@ class Ctx:
                 return None
 
         def seen() -> float | None:
-            if not self.ack.exists():
-                return None
-            if token in {ln.strip() for ln in self.ack.read_text(encoding="utf-8-sig").splitlines()}:
-                return now()
-            return None
+            # Live: a NEW line since this request (step 4 asks for `restart` once per arm, so an
+            # earlier arm's ack must not answer the next one). Dry-run: the fixture holds the token.
+            return now() if self._ack_count(token) > baseline else None
 
         got = self.poll(seen, self.args.ack_timeout)
         rep.check(f"ack `{token}` received", PASS if got else FAIL,
                   f"{self.ack}" if got else f"no `{token}` line in {self.ack} within {self.args.ack_timeout:.0f}s")
         return got  # type: ignore[return-value]
+
+
+    def _ack_count(self, token: str) -> int:
+        if not self.ack.exists():
+            return 0
+        return sum(1 for ln in self.ack.read_text(encoding="utf-8-sig").splitlines() if ln.strip() == token)
 
 
 class StepAbort(Exception):
@@ -505,8 +513,10 @@ def _parse_card_id(stdout: str) -> str | None:
 
 # --- search helpers ----------------------------------------------------------------------------
 
-def find_chat(chat, pattern: re.Pattern) -> ChatMessage | None:
+def find_chat(chat, pattern: re.Pattern, after_ts: float | None = None) -> ChatMessage | None:
     for msg in chat.messages():
+        if after_ts is not None and msg.ts is not None and msg.ts < after_ts:
+            continue
         for line in msg.content.splitlines() or [msg.content]:
             if pattern.search(line):
                 return ChatMessage(msg.ts, line.strip())
@@ -978,7 +988,7 @@ def _sync_seat(ctx: Ctx, rep: StepReport, seat: str | None, what: str) -> str | 
         # hard 600 s. A timeout is recorded as a non-zero exit, never swallowed.
         budget = float(os.environ.get("BV2_SYNC_TIMEOUT") or 600)
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=budget)
+            proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=budget, stdin=subprocess.DEVNULL)
             rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired as exc:
             rc, out = 124, f"wirelog_sync timed out after {budget:.0f}s (BV2_SYNC_TIMEOUT): {exc}"
@@ -1081,18 +1091,83 @@ def _boot_id(path: Path) -> str | None:
         return None
 
 
-def step4(ctx: Ctx) -> StepReport:
-    rep = StepReport(4, "restart drill observer: reconciler re-surfaces within one tick (AC-11, 5.7)", ctx.mode)
-    log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
-    chat = make_chat(ctx.live, rep.started)
-    pid_path = Path(os.environ.get("BV2_GATEWAY_PID") or (
-        hermes_root() / "gateway.pid" if ctx.live else FIXTURES / "fake_gateway.pid"))
-    boot_before = _boot_id(pid_path)
-    rep.notes.append(f"the harness never restarts anything; gateway pid file `{pid_path}` boot_id before: "
-                     f"`{boot_before}`")
-    re_restart = re.compile(ctx.plan["expect"]["restart_log_regex"])
+def wake_state_path(live: bool) -> Path | None:
+    """The scratch gateway's boomerang-wake state file (claims + D-13 ``retries``). Live it must be
+    named explicitly: the fallback arm WRITES it, and a default would be the fleet gateway's own."""
+    spec = os.environ.get("BV2_WAKE_STATE", "").strip()
+    if spec:
+        return Path(spec).expanduser()
+    return None if live else FIXTURES / "fake_boomerang_wake.json"  # dry-run: shown, never written
 
-    card = ctx.make_card(rep, "s4_restart", "bv2 smoke s4: child in flight across a gateway restart")
+
+def _claim_running(path: Path, card: str) -> dict | None:
+    """The card's open claim once its child is running (``state: running``), else None."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    for entry in (doc.get("claims") or {}).values() if isinstance(doc, dict) else ():
+        # child_session is the gateway's LAST claim write before the child finishes
+        # (kanban_boomerang_wake._note_child_session): after it the state file is quiet.
+        if (isinstance(entry, dict) and entry.get("task_id") == card and entry.get("state") == "running"
+                and entry.get("child_session")):
+            return entry
+    return None
+
+
+def _prespend_retry(ctx: Ctx, rep: StepReport, card: str) -> bool:
+    """Fallback arm: spend the card's D-13 retry (``retries[card]=1``) in the scratch state file
+    while its child is running, so the reconciler must refuse the redispatch (`retry spent`).
+    Same write shape as the gateway's own (temp + os.replace); unknown keys are kept."""
+    path = wake_state_path(ctx.live)
+    if path is None:
+        rep.check(f"retries[{card}] pre-spent", SKIP, "live needs BV2_WAKE_STATE (the SCRATCH gateway's "
+                  "<home>/gateway/kanban_boomerang_wake.json); never defaulted to the fleet's")
+        return False
+    shown = f"# write retries[{card}]=1 into {path}"
+    if not ctx.live:
+        rep.commands.append(shown + "   # dry-run: not written")
+        return True
+    running = ctx.poll(lambda: _claim_running(path, card), ctx.timeout)
+    rep.check(f"claim for {card} is `running` with its child session recorded before the retry is pre-spent", PASS if running else FAIL,
+              f"delegation {running.get('delegation_id')}" if running else f"no running claim in {path}")
+    if not running:
+        return False
+    # The gateway's writer lock is in-process (threading.Lock), so this cannot share it. Compare-and-swap
+    # instead: build from one snapshot, re-read the bytes just before os.replace and start over if the
+    # gateway wrote in between (Prism 1c04b69ce0b6). The claim being quiet (above) keeps the window empty.
+    for _attempt in range(20):
+        before = path.read_bytes()
+        doc = json.loads(before.decode("utf-8-sig"))
+        retries = doc.get("retries") if isinstance(doc.get("retries"), dict) else {}
+        retries[card] = 1
+        doc["retries"] = retries
+        fd, tmp = tempfile.mkstemp(prefix=".bv2-prespend-", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, sort_keys=True)
+        if path.read_bytes() != before:
+            os.unlink(tmp)
+            time.sleep(0.2)
+            continue
+        os.replace(tmp, path)
+        break
+    else:
+        rep.check(f"retries[{card}] pre-spent", FAIL, f"{path} kept changing under the compare-and-swap")
+        return False
+    after = json.loads(path.read_text(encoding="utf-8-sig"))
+    readback = after.get("retries", {}).get(card)
+    if set(after.get("claims") or {}) != set(doc.get("claims") or {}):
+        readback = f"claims changed across the write: {sorted(set(after.get('claims') or {}) ^ set(doc.get('claims') or {}))}"
+    rep.commands.append(shown + f"   # readback retries[{card}]={readback}")
+    rep.check(f"retries[{card}] pre-spent", PASS if readback == 1 else FAIL, f"readback {readback!r}")
+    return readback == 1
+
+
+def _s4_cut_child(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path: Path, role: str, title: str,
+                  arm: str, prespend: bool) -> tuple[str, float | None, str] | None:
+    """Mint a card, get its boomerang-wake child running, have the gateway restarted under it.
+    Returns (card, restart_ts, original delegation) once the restart provably cut a live child."""
+    card = ctx.make_card(rep, role, title)
     if "s4_hold" in ctx.plan.get("commands", {}):
         # The drill needs a child that is STILL RUNNING when the restart lands. A forced completion is
         # accepted in ~40 s, faster than safe-restart's drain + relaunch (~70 s live, 2026-10-19 18:58),
@@ -1100,70 +1175,152 @@ def step4(ctx: Ctx) -> StepReport:
         ctx.force(rep, "s4_hold", card=card)
     ctx.force(rep, "complete", card=card)
     dispatched = ctx.poll(lambda: _auto_disp(find_log(log, re_notifier_line(card)), card), ctx.timeout)
-    rep.check(f"boomerang-wake child dispatched for {card} (disposition=auto)", PASS if dispatched else FAIL,
-              dispatched or f"absent after {ctx.timeout:.0f}s")
+    rep.check(f"{arm}: boomerang-wake child dispatched for {card} (disposition=auto)",
+              PASS if dispatched else FAIL, dispatched or f"absent after {ctx.timeout:.0f}s")
     if not dispatched:
-        return rep
-    rep.raw.append(f"--- log match\n{dispatched}")
+        return None
+    rep.raw.append(f"--- log match ({arm})\n{dispatched}")
+    m = re.search(r"delegation=(\S+)", dispatched)
+    first_delegation = m.group(1) if m else ""
+    if prespend and not _prespend_retry(ctx, rep, card):
+        return None
 
+    boot_before = _boot_id(pid_path)
     instr = ("restart the gateway NOW via safe-gateway-restart (single-use approval), while the "
              f"boomerang-wake child for {card} is still running")
     rep.commands.append(f"# APOLLO (manual): {instr}   ack: restart")
     if not ctx.wait_ack(rep, "restart", instr):
-        return rep
-
-    early = find_chat(chat, re_boomerang_wake_line(card))
+        return None
     dispatch_ts = log_line_ts(dispatched)  # a boot line BEFORE the dispatch is not this restart
-    restart_line = ctx.poll(lambda: find_log(log, re_restart, after_ts=dispatch_ts), ctx.timeout)
-    rep.check("gateway restart observed in the log", PASS if restart_line else FAIL,
-              restart_line or f"no line matching /{re_restart.pattern}/")
+    restart_line = ctx.poll(lambda: find_log(log, re.compile(ctx.plan["expect"]["restart_log_regex"]),
+                                             after_ts=dispatch_ts), ctx.timeout)
+    rep.check(f"{arm}: gateway restart observed in the log", PASS if restart_line else FAIL,
+              restart_line or f"no line matching /{ctx.plan['expect']['restart_log_regex']}/")
     if not restart_line:
-        return rep
-    rep.raw.append(f"--- log match\n{restart_line}")
+        return None
+    rep.raw.append(f"--- log match ({arm})\n{restart_line}")
     boot_after = _boot_id(pid_path)
     if ctx.live:
-        rep.check("gateway boot_id changed", PASS if boot_after and boot_after != boot_before else FAIL,
+        rep.check(f"{arm}: gateway boot_id changed", PASS if boot_after and boot_after != boot_before else FAIL,
                   f"{boot_before} -> {boot_after}")
     restart_ts = log_line_ts(restart_line)
-    if early and (early.ts is None or restart_ts is None or early.ts < restart_ts):
-        rep.check("child was still in flight at restart", INCOMPLETE,
+    early = find_chat(chat, re_boomerang_wake_line(card))
+    if ctx.live and early and (early.ts is None or restart_ts is None or early.ts < restart_ts):
+        rep.check(f"{arm}: child was still in flight at restart", INCOMPLETE,
                   f"`[boomerang-wake] {card}` posted before the restart; the drill did not cut a live child, re-run")
-        return rep
+        return None
+    return card, restart_ts, first_delegation
 
-    re_resurface = re.compile(ctx.plan["expect"]["resurface_log_regex"].format(card=re.escape(card)))
+
+def _first_tick(ctx: Ctx) -> float:
     # §5.7: the reconciler runs at the END of the first notifier tick after boot. That tick starts
     # after the watcher wiring + the notifier's 5 s initial delay and, on a loaded host, one full tick
     # over every subscription takes tens of seconds (live 2026-10-20 00:05: line at +27.5 s, load ~70).
     # The window is "the first tick after startup", bounded by --first-tick-seconds, not one idle tick.
-    first_tick = ctx.first_tick if ctx.live else ctx.tick_window + ctx.tick
-    resurf = ctx.poll(lambda: find_log(log, re_resurface, after_ts=restart_ts if ctx.live else None),
-                      first_tick)
-    rep.check(f"reconciler re-surfaced the wake for {card}", PASS if resurf else FAIL,
+    return ctx.first_tick if ctx.live else ctx.tick_window + ctx.tick
+
+
+def _lag_check(ctx: Ctx, rep: StepReport, what: str, line: str, restart_ts: float | None) -> None:
+    rts = log_line_ts(line)
+    if ctx.live and rts is not None and restart_ts is not None:
+        lag = rts - restart_ts
+        rep.check(f"{what} on the first notifier tick after the restart", PASS if lag <= _first_tick(ctx) else FAIL,
+                  f"{lag:.1f}s after the boot line (limit {_first_tick(ctx):.0f}s = wiring + 5 s initial delay "
+                  f"+ one full notifier tick, --first-tick-seconds)")
+
+
+def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path: Path) -> None:
+    """Primary (t_870c1fba): the restart-killed child is redispatched quietly, once, and the second
+    child finishes the card. One INFO line, zero `lost` lines in the origin chat."""
+    arm = "redispatch arm"
+    cut = _s4_cut_child(ctx, rep, log, chat, pid_path, "s4_restart",
+                        "bv2 smoke s4: child in flight across a gateway restart (redispatch)", arm, prespend=False)
+    if not cut:
+        return
+    card, restart_ts, first = cut
+    after = restart_ts if ctx.live else None
+    re_redis = re.compile(ctx.plan["expect"]["redispatch_log_regex"].format(card=re.escape(card)))
+    redis = ctx.poll(lambda: find_log(log, re_redis, after_ts=after), _first_tick(ctx))
+    rep.check(f"{arm}: gateway.log INFO `kanban boomerang-wake: {card} redispatched after gateway restart`",
+              PASS if redis else FAIL, redis or f"no line matching /{re_redis.pattern}/")
+    if not redis:
+        return
+    rep.raw.append(f"--- log match ({arm})\n{redis}")
+    _lag_check(ctx, rep, f"{arm}: redispatch", redis, restart_ts)
+    second = re_redis.search(redis).groupdict().get("delegation") or ""
+    rep.check(f"{arm}: the redispatch is a NEW child", PASS if second and second != first else FAIL,
+              f"first delegation {first or '?'} -> redispatched {second or '?'}")
+    re_handled = re.compile(ctx.plan["expect"]["handled_log_regex"].format(card=re.escape(card)))
+    handled = ctx.poll(lambda: find_log(log, re_handled, after_ts=after,
+                                        pred=lambda m: m.groupdict().get("delegation") == second), ctx.timeout)
+    rep.check(f"{arm}: the second child handled the card (delegation {second or '?'})",
+              PASS if handled else FAIL, handled or f"no line matching /{re_handled.pattern}/ for {second}")
+    if handled:
+        rep.raw.append(f"--- log match ({arm})\n{handled}")
+    done = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card), after_ts=after), ctx.timeout)
+    rep.check(f"{arm}: origin chat `[boomerang-wake] {card} - <Outcome>` after the restart",
+              PASS if done else FAIL, done.content if done else "absent")
+    if done:
+        rep.raw.append(f"--- chat match ({arm})\n{done.content}")
+    lost = ctx.poll(lambda: find_chat(chat, re_lost_line(card)), ctx.tick_window)
+    rep.check(f"{arm}: ZERO `warning boomerang-wake lost {card}` lines in the origin chat",
+              FAIL if lost else PASS, lost.content if lost else f"none ({ctx.window_label()})")
+
+
+def _s4_fallback_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path: Path) -> None:
+    """Fallback: the card's D-13 retry is already spent, so the reconciler re-surfaces the wake and
+    posts `lost ... (reason: gateway restart, retry spent)`; no redispatch, no late completion."""
+    arm = "fallback arm"
+    cut = _s4_cut_child(ctx, rep, log, chat, pid_path, "s4_fallback",
+                        "bv2 smoke s4: child in flight across a gateway restart (retry spent)", arm, prespend=True)
+    if not cut:
+        return
+    card, restart_ts, _first = cut
+    after = restart_ts if ctx.live else None
+    re_resurface = re.compile(ctx.plan["expect"]["resurface_log_regex"].format(card=re.escape(card)))
+    resurf = ctx.poll(lambda: find_log(log, re_resurface, after_ts=after), _first_tick(ctx))
+    rep.check(f"{arm}: reconciler re-surfaced the wake for {card} (retry spent)", PASS if resurf else FAIL,
               resurf or f"no line matching /{re_resurface.pattern}/")
     if resurf:
-        rep.raw.append(f"--- log match\n{resurf}")
-        rts = log_line_ts(resurf)
-        if ctx.live and rts is not None and restart_ts is not None:
-            lag = rts - restart_ts
-            limit = first_tick
-            rep.check("re-surface on the first notifier tick after the restart", PASS if lag <= limit else FAIL,
-                      f"{lag:.1f}s after `{restart_line[:19]}` (limit {limit:.0f}s = wiring + 5 s initial delay "
-                      f"+ one full notifier tick, --first-tick-seconds)")
+        rep.raw.append(f"--- log match ({arm})\n{resurf}")
+        _lag_check(ctx, rep, f"{arm}: re-surface", resurf, restart_ts)
+        delivered = re_resurface.search(resurf).groupdict().get("delivered")
+        rep.check(f"{arm}: resurfaced delivered=True", PASS if delivered == "True" else FAIL,
+                  f"delivered={delivered}")
     lost = ctx.poll(lambda: find_chat(chat, re_lost_line(card)), ctx.tick_window + ctx.tick)
-    rep.check(f"origin chat: `warning boomerang-wake lost {card} (reason: gateway restart)`",
-              PASS if lost else FAIL, lost.content if lost else "absent")
+    rest = lost.content if lost else ""
+    rep.check(f"{arm}: origin chat `warning boomerang-wake lost {card} (reason: gateway restart, retry spent)`",
+              PASS if lost and "(reason: gateway restart, retry spent)" in rest else FAIL, rest or "absent")
+    re_redis = re.compile(ctx.plan["expect"]["redispatch_log_regex"].format(card=re.escape(card)))
+    redis = find_log(log, re_redis, after_ts=after)
+    rep.check(f"{arm}: no redispatch for {card}", FAIL if redis else PASS, redis or "none")
     # Prism b2a4a7e824f7: watch for a stale child's late completion for a FULL tick window after the
     # lost-warning, not a single read; a post one second after the last read must still fail the drill.
     late = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.tick_window)
-    rep.check(f"no late `[boomerang-wake] {card}` within {ctx.window_label()} after the re-surface",
+    rep.check(f"{arm}: no late `[boomerang-wake] {card}` within {ctx.window_label()} after the re-surface",
               FAIL if late else PASS, late.content if late else "none")
+
+
+def step4(ctx: Ctx) -> StepReport:
+    rep = StepReport(4, "restart drill: a cut child is redispatched once; a spent retry re-surfaces (AC-11, 5.7)",
+                     ctx.mode)
+    log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
+    chat = make_chat(ctx.live, rep.started)
+    pid_path = Path(os.environ.get("BV2_GATEWAY_PID") or (
+        hermes_root() / "gateway.pid" if ctx.live else FIXTURES / "fake_gateway.pid"))
+    rep.notes.append(f"the harness never restarts anything; gateway pid file `{pid_path}` boot_id at start: "
+                     f"`{_boot_id(pid_path)}`; wake state `{wake_state_path(ctx.live)}`")
+    rep.notes.append("arm 1 (redispatch): retry unspent -> quiet redispatch, second child finishes the card")
+    rep.notes.append("arm 2 (fallback): retries[card]=1 written before the restart -> lost (retry spent) + re-surface")
+    _s4_redispatch_arm(ctx, rep, log, chat, pid_path)
+    _s4_fallback_arm(ctx, rep, log, chat, pid_path)
     return rep
 
 
 # --- entry point -------------------------------------------------------------------------------
 
 STEPS = {1: step1, 2: step2, 3: step3, 4: step4}
-APOLLO_STEPS = {2: "config flips (3 acks)", 4: "gateway restart (1 ack)"}
+APOLLO_STEPS = {2: "config flips (3 acks)", 4: "gateway restarts (2 acks, one per arm)"}
 
 
 def build_parser() -> argparse.ArgumentParser:

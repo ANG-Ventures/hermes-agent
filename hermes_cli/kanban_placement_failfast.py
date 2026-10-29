@@ -518,6 +518,19 @@ def skill_gate(name: str) -> Optional[str]:
     """The ABSENT line for a mid-run ``skill_view`` of a skill whose enforced
     capability this placed worker's host lacks; None otherwise (never for
     an unplaced worker, a delegate child, or an interactive session)."""
+    return _midrun_gate(lambda cmap: hard_requirements(cmap, "", [name]))
+
+
+def capability_gate(cap: str) -> Optional[str]:
+    """Layer 1b (D1b-undeclared, t_f813a42f): the ABSENT line for a tool call that itself
+    needs ``cap`` (``browser-session`` for a browser_* call) on a placed worker whose host
+    lacks it, declared on the card or not; None otherwise, under the same scope as
+    :func:`skill_gate`."""
+    return _midrun_gate(lambda _cmap: [cap])
+
+
+def _midrun_gate(requirements) -> Optional[str]:
+    """The shared mid-run decision: ``requirements(cmap)`` against the placed host's row."""
     try:
         from agent.delegation_context import owned_kanban_task
         if not owned_kanban_task():
@@ -540,9 +553,9 @@ def skill_gate(name: str) -> Optional[str]:
         # admits THAT attempt only (the layer is off for it).
         try:
             cmap = snapshot_map(snapshot)
-            return decide(cmap, host, hard_requirements(cmap, "", [name]), modes)
+            return decide(cmap, host, requirements(cmap), modes)
         except Exception:
-            _log.debug("skill_view placement gate attempt failed open", exc_info=True)
+            _log.debug("mid-run placement gate attempt failed open", exc_info=True)
         return None
 
     # Outside every except: the exhaustion refusal can never be swallowed back into None.
@@ -553,4 +566,5 @@ def skill_gate(name: str) -> Optional[str]:
 __all__: List[Any] = [
     "ABSENT_RE", "REROUTE_EVENT", "absent_line", "parse_absent", "reroute_or_park",
     "worker_exit_on_absent", "attached_skill_gap", "placement_record", "boot_check", "skill_gate",
+    "capability_gate",
 ]

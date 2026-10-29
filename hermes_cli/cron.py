@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import math
 import re
 import sys
 from datetime import timezone
@@ -343,6 +344,106 @@ def cron_tick():
     return 0
 
 
+def _record_abandoned_cron_turns(signum: int) -> int:
+    """Record the in-flight cron turns this process is about to die with.
+
+    ``cron run --wait`` is usually wrapped in ``timeout(1)`` (digest-job-runner),
+    whose SIGTERM used to kill the CLI with Python's default action: the turn's
+    ``turn_api_calls`` rows stayed with no ``turns`` row (t_4e9dd8d5, x-feed-brief
+    and morning-digest attempts at rc=124). Same provisional ``on_turn_abandoned``
+    row the gateway writes at shutdown. Never raises.
+    """
+    try:
+        from agent.turn_finalizer import emit_abandoned_session_ends
+        from cron.scheduler import live_cron_agents
+
+        agents = live_cron_agents()
+        return emit_abandoned_session_ends(agents, f"signal_{int(signum)}") if agents else 0
+    except Exception:
+        return 0
+
+
+# Slack past the hook budget for the record path's own work (ledger read, lock hand-off).
+_ABANDON_RECORD_MARGIN_SECS = 5.0
+
+
+def _abandon_record_wait_secs() -> float:
+    """How long the signal handler waits for the abandoned-turn record before ``os._exit``.
+
+    Derived from ``plugins.hook_callback_timeout`` (Prism 33a31a0e74cc): a literal 10 s killed a
+    blackbox write the hook budget still allowed, leaving ``turn_api_calls`` with no ``turns`` row.
+    ``<= 0`` (bounding disabled) falls back to the default budget so the exit stays bounded.
+    Resolved at install time, never in the handler: the config read takes locks the interrupted
+    main thread may hold. The only supervisor of ``cron run --wait`` is ``timeout(1)`` without
+    ``-k`` (digest-job-runner), which never follows SIGTERM with SIGKILL, so this wait is not cut.
+    """
+    from hermes_cli.plugins import _resolve_hook_callback_timeout
+    from hermes_cli.plugins_dispatch import _HOOK_CALLBACK_TIMEOUT_SECS
+
+    try:
+        budget = float(_resolve_hook_callback_timeout())
+    except Exception:
+        budget = _HOOK_CALLBACK_TIMEOUT_SECS
+    # Non-finite too (Prism f094fa505f02): ``.nan`` passes the resolver's range checks, and
+    # ``Thread.join(timeout=nan)`` raises in the handler before ``os._exit`` runs.
+    if not math.isfinite(budget) or budget <= 0:
+        budget = _HOOK_CALLBACK_TIMEOUT_SECS
+    return budget + _ABANDON_RECORD_MARGIN_SECS
+
+
+def _install_abandon_on_signal() -> Dict[int, Any]:
+    """SIGTERM/SIGHUP: record in-flight cron turns, then exit 128+signum.
+
+    Only from the main thread (``signal.signal`` raises elsewhere); returns the
+    handlers it replaced so the caller can restore them.
+    """
+    import os
+    import signal
+    import threading
+
+    previous: Dict[int, Any] = {}
+    if threading.current_thread() is not threading.main_thread():
+        return previous
+    fired = threading.Event()
+    record_wait = _abandon_record_wait_secs()
+
+    def _handler(signum, _frame):
+        # One-shot: a second signal (SIGHUP after SIGTERM) must not record twice.
+        if fired.is_set():
+            return
+        fired.set()
+        # Record on a helper thread with a bounded wait: the interrupted main thread may hold a
+        # non-reentrant lock the record path takes (``_live_cron_agents_lock`` at agent
+        # registration), and the handler must exit regardless.
+        recorder = threading.Thread(
+            target=_record_abandoned_cron_turns, args=(signum,), name="cron-abandon-record",
+            daemon=True)
+        recorder.start()
+        recorder.join(timeout=record_wait)
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os._exit(128 + int(signum))
+
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous[signum] = signal.signal(signum, _handler)
+        except (OSError, RuntimeError, ValueError):
+            previous.pop(signum, None)
+    return previous
+
+
+def _restore_signal_handlers(previous: Dict[int, Any]) -> None:
+    import signal
+
+    for signum, handler in previous.items():
+        with contextlib.suppress(OSError, RuntimeError, ValueError, TypeError):
+            signal.signal(signum, handler)
+
+
 def cron_run_now(job_id: str) -> int:
     """Run a single job synchronously to completion and report the outcome.
 
@@ -353,9 +454,16 @@ def cron_run_now(job_id: str) -> int:
     from cron.scheduler import run_job_now
 
     print(color(f"Running job {job_id} now (synchronous, streaming to logs)…", Colors.CYAN))
-    result = run_job_now(job_id, verbose=True)
+    previous = _install_abandon_on_signal()
+    try:
+        result = run_job_now(job_id, verbose=True)
+    finally:
+        _restore_signal_handlers(previous)
 
     job_id = result.get("job_id", job_id)
+    if result.get("deferred_to"):
+        print(color(f"⏸ Job {job_id} not started: {result['error']}", Colors.YELLOW))
+        return 1
     if result.get("success"):
         print(color(f"✓ Job {job_id} completed", Colors.GREEN))
         if result.get("output_file"):
@@ -514,6 +622,103 @@ def _print_ticker_health(pids: list, restart_command: str = "hermes gateway rest
             print(f"  Ticker heartbeat: {int(hb_age)}s ago")
 
 
+def _record_label_outcome(record, label: str):
+    if not isinstance(record, dict):
+        return None
+    entry = (record.get("cron_script_lane_last_outcome") or {}).get(label)
+    return entry if isinstance(entry, dict) and entry.get("at") else None
+
+
+def _serving_gateway_delegation(records) -> Optional[bool]:
+    """``cron_script_lane_delegation == 1`` of the first record whose pid is alive; a live record
+    without the field (pre-S3 code) reads False. None when no record names a live pid."""
+    import gateway.status as status
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            alive = status._pid_exists(int(rec["pid"]))
+        except Exception:
+            continue
+        if alive:
+            return rec.get("cron_script_lane_delegation") == 1
+    return None
+
+
+def script_lane_owner_line(home=None, *, now=None) -> str:
+    """Who ticks ``home``'s cron script lane (spec §5.3), as one ``script lane: ...`` line. Never
+    names the gateway while the gateway's last tick for the home found the lane lock-skipped."""
+    from cron import lanes, script_runner
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    home = Path(home) if home is not None else Path(get_hermes_home())
+    now = now if now is not None else lanes._now()
+    label = lanes.home_label(home)
+    hb = lanes.read_runner_heartbeat(home)
+
+    def age(stamp) -> Optional[int]:
+        try:
+            return int(round(lanes._age_s(stamp, now)))
+        except (TypeError, ValueError):
+            return None
+
+    def record(path: Path):
+        with contextlib.suppress(OSError, ValueError):
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            return data if isinstance(data, dict) else None
+        return None
+
+    # The gateway's own report of its last tick for this home: the home's own gateway record, or
+    # the host gateway's (root) record that multiplexes it. The newest entry wins.
+    own_record = record(home / "gateway_state.json")
+    entries = [e for e in (_record_label_outcome(own_record, label),
+                           _record_label_outcome(record(get_default_hermes_root() / "gateway_state.json"), label))
+               if e is not None]
+    last = max(entries, key=lambda e: str(e.get("at"))) if entries else None
+    if last is not None and last.get("outcome") == lanes.TickOutcome.LOCK_BUSY.value:
+        skipped = age(last.get("at"))
+        if skipped is not None and skipped <= 3 * lanes.RUNNER_CYCLE_S:
+            holder = (f"runner pid {hb.get('pid')}" if isinstance(hb, dict) and hb.get("tick_started_at")
+                      else "unknown")
+            return f"script lane: LOCK-SKIPPED by {holder} (gateway did not tick it, last {skipped} s)"
+    # The knob that decides delegation is the SERVING gateway's (its process home), not this CLI
+    # process home's: read the live gateway's published cron_script_lane_delegation (the home's
+    # own gateway first, then the root gateway that multiplexes it); the process-home knob only
+    # when no live gateway record exists.
+    knob_on = _serving_gateway_delegation(
+        (own_record, record(get_default_hermes_root() / "gateway_state.json")))
+    if knob_on is None:
+        knob_on = lanes.knob_enabled()
+    if not knob_on:
+        return "script lane: gateway (cron.script_runner.enabled=false)"
+    marker = script_runner.trip_marker_path()
+    if marker.exists():
+        trip = record(marker) or {}
+        return (f"script lane: gateway (runner standby: watchdog tripped {trip.get('at', '?')} on "
+                f"{trip.get('home', '?')}; run 'hermes cron runner rearm')")
+    if not isinstance(hb, dict):
+        return "script lane: gateway (no runner heartbeat)"
+    if lanes.runner_progressing(home):
+        return f"script lane: runner pid {hb.get('pid')} (active, ok {age(hb.get('last_ok_at'))} s ago)"
+    reason = hb.get("standby_reason") if hb.get("state") == "standby" else None
+    if reason == "host_precondition":
+        failing = []
+        with contextlib.suppress(Exception):
+            failing = [e for e in lanes.host_gateways() if not lanes.code_contains_s1(e.code_sha)]
+        names = "; ".join(f"{lanes.home_label(e.home)} pid {e.pid} on {(e.code_sha or 'none')[:12]}"
+                          for e in failing) or "a gateway on pre-S1 code"
+        return f"script lane: runner standby (host precondition: {names})"
+    if reason == "home_gateway_not_delegating":
+        pid = (own_record or {}).get("pid", "?")
+        return f"script lane: profile gateway pid {pid} (runner standby: home gateway does not delegate)"
+    ok = age(hb.get("last_ok_at"))
+    if ok is not None:
+        return f"script lane: gateway (runner last ok {ok} s ago)"
+    state = hb.get("state") or "unknown"
+    return f"script lane: gateway (runner {state}{': ' + reason if reason else ''}, never ok)"
+
+
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import list_jobs
@@ -606,6 +811,8 @@ def cron_status():
                       "      hermes --profile default gateway migrate --multiplex --dry-run\n"
                       "      hermes --profile default gateway migrate --multiplex\n"
                       "  Check: hermes cron status from this profile should show its ticker heartbeat.\n")
+        with contextlib.suppress(Exception):
+            print(f"  {script_lane_owner_line()}")
 
     print()
     _print_active_jobs_summary(list_jobs(include_disabled=False))
@@ -1033,12 +1240,63 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_runtime_export(args) -> int:
+    """``hermes cron runtime-export --to-json [--retire [--drop-orphans]]`` (t_94e91559): fold
+    runtime_state.db back into jobs.json; ``--retire`` also removes the database (kill switch) and
+    refuses (rc 2) while rows without a definition exist unless ``--drop-orphans``, and whenever the
+    jobs lock is degraded. Orphan row ids are listed; without ``--retire`` they stay in the
+    database. Idempotent (no db = 0 jobs)."""
+    from cron import store_pair
+    from cron.jobs import CronLockDegraded, RuntimeExportNotWritten, RuntimeRetireRefused
+
+    retire = bool(getattr(args, "retire", False))
+    try:
+        # I4 (t_82c613d9): the fold (and --retire's db drop) is one pair operation.
+        count = store_pair.export_to_json(
+            retire=retire, drop_orphans=bool(getattr(args, "drop_orphans", False)))
+    except RuntimeRetireRefused as exc:  # orphans, or a degraded jobs lock
+        print(color(f"runtime-export refused: {exc}", Colors.RED))
+        return 2
+    except RuntimeExportNotWritten as exc:  # degraded lock without --retire: print, write nothing
+        print(color(f"runtime-export: {exc}", Colors.RED))
+        print(json.dumps({"jobs": exc.jobs}, indent=2, ensure_ascii=False))
+        return 2
+    except CronLockDegraded as exc:  # R4: any other write under a degraded lock
+        print(color(f"runtime-export: lock degraded: not written ({exc})", Colors.RED))
+        return 2
+    except Exception as exc:
+        print(color(f"runtime-export failed: {exc}", Colors.RED))
+        return 1
+    print(f"runtime-export: wrote runtime fields of {count} job(s) back into jobs.json"
+          + ("; removed runtime_state.db" if retire else ""))
+    return 0
+
+
+def cron_runner(args) -> int:
+    """``hermes cron runner [rearm|install|uninstall|lint]`` (cron/script_runner.py,
+    hermes_cli/cron_runner_plist.py)."""
+    action = getattr(args, "runner_action", None)
+    if action in ("install", "uninstall", "lint"):
+        # Imported before (and without) cron/*: uninstall must work ahead of an S1 revert (§12).
+        from hermes_cli import cron_runner_plist
+        if action == "install":
+            return cron_runner_plist.install(dry_run=bool(getattr(args, "runner_dry_run", False)))
+        return getattr(cron_runner_plist, action)()
+    from cron import script_runner
+
+    if action == "rearm":
+        return script_runner.rearm()
+    return script_runner.main([])
+
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False), as_json=getattr(a, "json", False)) or 0,
     "status": lambda a: cron_status() or 0,
     "doctor": lambda a: cron_doctor(),
+    "runtime-export": lambda a: cron_runtime_export(a),
     "tick": lambda a: cron_tick(),
+    "runner": lambda a: cron_runner(a),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),
     "notepad": lambda a: cron_notepad(a),

@@ -3,7 +3,9 @@
 The gateway contract here is deliberately narrower than exactly-once: one live
 GatewayRunner suppresses concurrent/replayed copies after successful adapter
 injection, failed injection remains retryable, and durable async-delegation
-state is acknowledged in the producer's JSON outbox and legacy SQLite ledger.
+state is acknowledged in the producer's JSON outbox and legacy SQLite ledger. A push-adapter wake
+is only queued at acceptance, so its JSON outbox reads ``admitted`` (not ``delivered``) until the
+consumption sweep finds it in the transcript (t_97a879af); ``admitted`` is never replayed at boot.
 """
 
 import asyncio
@@ -145,7 +147,7 @@ def test_json_outbox_delivery_is_not_replayed_after_restart(
     runner = _runner(adapter)
     assert asyncio.run(runner._deliver_completion_notification("finished", queued)) is True
     adapter.handle_message.assert_awaited_once()
-    assert _json_outbox_states(tmp_path) == ["delivered"]
+    assert _json_outbox_states(tmp_path) == ["admitted"]
     assert ad.enqueue_pending_outbox(current_boot_id="boot-two", profile_home=tmp_path) == 0
     assert isolated_registry.completion_queue.empty()
 
@@ -160,7 +162,7 @@ def test_coalesced_json_outbox_siblings_are_all_acknowledged(tmp_path, isolated_
     adapter.handle_message.assert_awaited_once()
     delivered = adapter.handle_message.call_args.args[0].text
     assert "deleg_primary" in delivered and "deleg_sibling" in delivered
-    assert _json_outbox_states(tmp_path) == ["delivered", "delivered"]
+    assert _json_outbox_states(tmp_path) == ["admitted", "admitted"]
     assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path) == 0
 
 
@@ -173,7 +175,7 @@ def test_json_outbox_temporary_failure_remains_retryable(tmp_path):
     assert _json_outbox_states(tmp_path) == ["pending"]
     assert asyncio.run(runner._deliver_completion_notification("finished", event)) is True
     assert adapter.handle_message.await_count == 2
-    assert _json_outbox_states(tmp_path) == ["delivered"]
+    assert _json_outbox_states(tmp_path) == ["admitted"]
 
 
 @pytest.mark.parametrize("event_type", ["async_delegation", "async_delegation_restarted"])
@@ -219,7 +221,7 @@ def test_json_outbox_transient_pinned_lookup_failure_retries(tmp_path, monkeypat
     assert _json_outbox_states(tmp_path) == ["pending"]
     assert asyncio.run(runner._deliver_completion_notification("done", event)) is True
     adapter.handle_message.assert_awaited_once()
-    assert _json_outbox_states(tmp_path) == ["delivered"]
+    assert _json_outbox_states(tmp_path) == ["admitted"]
 
 
 @pytest.mark.parametrize("persistent", [False, True])
@@ -245,7 +247,7 @@ def test_accepted_completion_retries_receipt_without_reinjection(tmp_path, monke
     assert asyncio.run(runner._deliver_completion_notification("done", event)) is None
     adapter.handle_message.assert_awaited_once()
     assert len(attempts) == (3 if persistent else 2)
-    assert _json_outbox_states(tmp_path) == ["pending" if persistent else "delivered"]
+    assert _json_outbox_states(tmp_path) == ["pending" if persistent else "admitted"]
     assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path) == int(persistent)
     assert "receipt" in caplog.text.lower()
 
@@ -324,7 +326,7 @@ def test_completion_dedup_keeps_profiles_and_generations_distinct(tmp_path):
         event = dict(_async_event(), event_id=f"deleg_duplicate:terminal:g{generation}", attempt_generation=generation)
         _seed_json_outbox([event], home)
         assert asyncio.run(runner._deliver_completion_notification("done", event)) is True
-        assert _json_outbox_states(home) == ["delivered"]
+        assert _json_outbox_states(home) == ["admitted"]
     assert adapter.handle_message.await_count == 3
 
 
@@ -385,7 +387,7 @@ def test_coalesced_receipt_failures_are_independent(tmp_path, monkeypatch, caplo
     assert asyncio.run(runner._deliver_async_delegation_group(events)) is None
     adapter.handle_message.assert_awaited_once()
     assert [attempts[event["event_id"]] for event in events] == [2, 3, 2]
-    assert _json_outbox_states(tmp_path) == ["delivered", "pending", "delivered"]
+    assert _json_outbox_states(tmp_path) == ["admitted", "pending", "admitted"]
     assert "receipt" in caplog.text.lower()
 
 
@@ -431,7 +433,7 @@ def test_cancelling_receipt_wait_does_not_undo_accepted_delivery(tmp_path, monke
 
     asyncio.run(exercise())
     adapter.handle_message.assert_awaited_once()
-    assert _json_outbox_states(secondary) == ["delivered"]
+    assert _json_outbox_states(secondary) == ["admitted"]
     assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=secondary) == 0
 
 

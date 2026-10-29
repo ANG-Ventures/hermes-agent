@@ -169,6 +169,38 @@
    "count": 1,
    "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
    "expires": "2027-01-15"
+  },
+  {
+   "path": "hermes_cli/kanban_worker_hosts.py",
+   "scope": "prepare_remote_workspace",
+   "kind": "ssh",
+   "count": 1,
+   "reason": "grandfathered at the hermes-home #6501 re-pin (t_6b4d3881): pre-existing site the pinned lint could not see (injected runner= callable); Card B cutover inventory: route it through alloc_client.admit / placement.admit, then delete",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": "hermes_cli/kanban_worker_hosts.py",
+   "scope": "remote_workspace_has_content",
+   "kind": "ssh",
+   "count": 1,
+   "reason": "grandfathered at the hermes-home #6501 re-pin (t_6b4d3881): pre-existing site the pinned lint could not see (injected runner= callable); Card B cutover inventory: route it through alloc_client.admit / placement.admit, then delete",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": "hermes_cli/kanban_worker_pool.py",
+   "scope": "probe_host",
+   "kind": "ssh",
+   "count": 1,
+   "reason": "grandfathered at the hermes-home #6501 re-pin (t_6b4d3881): pre-existing site the pinned lint could not see (injected runner= callable); Card B cutover inventory: route it through alloc_client.admit / placement.admit, then delete",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": "hermes_cli/kanban_worktree_port.py",
+   "scope": "clone_on_host",
+   "kind": "ssh",
+   "count": 1,
+   "reason": "grandfathered at the hermes-home #6501 re-pin (t_6b4d3881): pre-existing site the pinned lint could not see (injected runner= callable); Card B cutover inventory: route it through alloc_client.admit / placement.admit, then delete",
+   "expires": "2027-01-15"
   }
  ]
 }

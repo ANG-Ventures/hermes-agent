@@ -101,7 +101,7 @@ def test_ledger_and_rider_for_the_aliaser_502():
            "from_provider": "claude-dtlr", "attempts": 1, "first_err_ts": _ts(13, 27, 47)}
     rider = fp.format_cause_rider(row, tz=_dt.timezone.utc)
     assert rider.startswith("lane cannot alias this transcript's tool history")
-    assert "502 contentalias:history_tool at the DPX aliaser" in rider
+    assert "502 contentalias:history_tool at the DPX alias layer" in rider
     assert "not Anthropic" in rider and "on sub-vps-21" in rider and "(Anthropic 502)" not in rider
 
 

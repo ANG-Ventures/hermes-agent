@@ -50,7 +50,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 
 _log = logging.getLogger(__name__)
 
@@ -252,14 +252,14 @@ def choose(plan, names, job: Optional[placement.Job]) -> placement.Decision:
     # Slot use is read even when the footprints come from a fixed placement_live
     # snapshot, so --placement never shows eligible where admit() refuses (Prism 404998a66d0e).
     if sig.placement_reservations is not None:
-        for h, k in placement.live_slots(CONSUMER, sig.placement_reservations, now=now, table=table).items():
+        for h, k in placement.live_admissions(CONSUMER, sig.placement_reservations, now=now, table=table).items():
             used[h] = used.get(h, 0.0) + k
     for n, k in plan._simulated.items():
         if k:
             c = table.resolve(n) or n
             _add(resv, c, placement.Footprint(k * fp.ram_gb, k * fp.threads))
             used[c] = used.get(c, 0.0) + k
-    return placement.choose(table, CONSUMER, samples, job=job, reservations=resv, slots_used=used,
+    return placement.choose(table, CONSUMER, samples, job=job, reservations=resv, admitted=used,
                             now=now, **kw)
 
 

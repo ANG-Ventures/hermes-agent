@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -220,14 +221,30 @@ def build_gateway_health_snapshot(
     return GatewayHealthSnapshot(metrics=metrics, events=events)
 
 
+# (hermes-home, HOME, data-dir suffix) -> profile name. get_active_profile_name() resolve()s three
+# paths (lstat walks); it runs on the gateway event loop under every runtime-status write, and a busy
+# disk stalled that loop for 10 s. The key is built from unresolved strings, so a changed home
+# (tests, a context-local override) is recomputed; failures are never cached.
+_profile_cache: dict[tuple[str, str, str], str] = {}
+
+
 def _safe_profile() -> str:
     try:
+        from hermes_constants import get_hermes_home
+        key = (str(get_hermes_home()), os.environ.get("HOME", ""), os.environ.get("HERMES_DATA_DIR_SUFFIX", ""))
+        cached = _profile_cache.get(key)
+        if cached is not None:
+            return cached
         from hermes_cli.profiles import get_active_profile_name
-        return str(get_active_profile_name() or "default")
+        name = str(get_active_profile_name() or "default")
+        _profile_cache[key] = name
+        return name
     except Exception:
         return "default"
 
 
+# get_version_info() memoises its own result in a module global, so this does no I/O after the
+# first call and needs no cache here.
 def _safe_version() -> str:
     try:
         from hermes_cli.version_info import get_version_info

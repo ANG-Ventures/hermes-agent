@@ -25,6 +25,15 @@ def _expected_jobs(
     return {
         "tests": (python, "detect.outputs.python == 'true'"),
         "lint": (python, "detect.outputs.python == 'true'"),
+        # The only macOS/Windows coverage: a mis-gated `if:` must not drop it silently.
+        "tests-os": (
+            python and detect.get("hosted_os") == "true",
+            "detect.outputs.python == 'true' and detect.outputs.hosted_os == 'true'",
+        ),
+        "bootstrap-installer": (
+            detect.get("bootstrap") == "true",
+            "detect.outputs.bootstrap == 'true'",
+        ),
         "js-tests": (frontend, "detect.outputs.frontend == 'true'"),
         # e2e-desktop is DELIBERATELY DISABLED in ci.yml (upstream #76627 — the
         # mock-backend Electron window never gets a title, so every spec fails

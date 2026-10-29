@@ -246,6 +246,8 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
+        # The history the first turn is given: the only rows recovery may treat as already durable.
+        _turn_input_history = list(cli.conversation_history or [])
         try:
             result = cli.agent.run_conversation(
                 user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
@@ -265,6 +267,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         # live run/claim proof live in agent/kanban_turn_recovery.py. Runs BEFORE the turn
         # report so everything downstream — report, follow-ups, response, goal gate, exit —
         # sees the post-recovery disposition.
+        from agent.kanban_turn_recovery import persist_pending_transcript as _persist_pending
         from agent.kanban_turn_recovery import recover_failed_kanban_turns as _recover_turns
 
         def _quiet_recover_turn(nudge):
@@ -281,6 +284,9 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             _quiet_recover_turn,
             lambda: result,
             emit=lambda msg: print(msg, file=sys.stderr, flush=True),
+            persist_pending=lambda: _persist_pending(
+                cli.agent, result.get("messages") if isinstance(result, dict) else None, _turn_input_history,
+            ),
         )
         # The turn is over and persisted: the one-shot exit linger that follows protects nested
         # notify_on_complete replies and is NOT part of the spawner's delivery (#113608). The
@@ -644,6 +650,8 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         if _query_label:
             cli.console.print(f"[bold blue]{t('cli.single_query.query_label')}[/] {_query_label}")
         cli._show_security_advisories()
+        # The history the first turn is given: the only rows recovery may treat as already durable.
+        _turn_input_history = list(getattr(cli, "conversation_history", None) or [])
         response = cli.chat(query, images=single_query_images or None)
         # Kanban worker: a failed-silently turn used to end the run as rc=0 with no
         # terminal kanban call, so the dispatcher booked a protocol violation and
@@ -651,7 +659,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # (see agent/kanban_turn_recovery.py) and CARRY THE RECOVERED RESPONSE: the
         # goal judge below must evaluate the deliverable of the latest settled turn,
         # never the stale provider error of the turn recovery replaced (re-review P2).
-        from agent.kanban_turn_recovery import recover_failed_kanban_turns
+        from agent.kanban_turn_recovery import persist_pending_transcript, recover_failed_kanban_turns
 
         def _nonquiet_recover_turn(nudge):
             nonlocal response
@@ -662,6 +670,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             _nonquiet_recover_turn,
             lambda: getattr(cli, "_last_turn_result", None),
             emit=lambda msg: print(msg, file=sys.stderr, flush=True),
+            # cli.chat() hands the failed turn's messages (cli.conversation_history) to the next turn.
+            persist_pending=lambda: persist_pending_transcript(
+                cli.agent, getattr(cli, "conversation_history", None), _turn_input_history,
+            ),
         )
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher

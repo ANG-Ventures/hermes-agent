@@ -10,13 +10,24 @@ name: Bootstrap installer
 
 on:
   workflow_call:
+    inputs:
+      hosted_os:
+        description: >-
+          Run the hosted windows-latest install.ps1 job. The caller passes
+          detect.outputs.hosted_os (off when vars.CI_HOSTED_OS_JOBS=off, the
+          private mirror with no hosted billing). A caller that passes nothing gets it.
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
 
+# push:main keys by run_id and never cancels: under CI_MAIN_GROUP_PER_SHA two
+# main runs are live at once and a shared ref group would cancel one's child.
 concurrency:
-  group: bootstrap-installer-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  group: bootstrap-installer-${{ (github.ref_type == 'tag' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != 'refs/heads/main' }}
 
 jobs:
   posix:
@@ -130,6 +141,7 @@ jobs:
 
   windows:
     name: install.ps1 protocol surface
+    if: inputs.hosted_os
     runs-on: windows-latest
     timeout-minutes: 10
     steps:

@@ -27,7 +27,7 @@ import time
 import threading
 import atexit
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +348,89 @@ def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd record (session teardown)."""
     with _session_cwd_lock:
         _session_cwd.pop(_qualify_task_key(session_key), None)
+
+
+# GIT_* repository variables (GIT_DIR, GIT_WORK_TREE, ...) set in an ENVIRONMENT's shell when a command
+# finished, as the shell itself reported them on the cwd marker line (card t_20695198). The state belongs
+# to the environment, not the session: its snapshot is re-dumped after every command and sourced by the
+# next command of ANY session on it, so the record is keyed by environment (``env_git_id``) and a session
+# reads the record of the environment it would run in NOW (``current_env_git_id``). Each report carries
+# the environment's command counter; an older report that finalizes late can only ADD set names, never
+# clear a newer report's (Prism 917169c9298d / 0d61df4027d6 / 7fc5cadf95a1 / d88ecfb9edb5).
+_env_git_env: Dict[str, Tuple[int, Dict[str, bool]]] = {}
+# Environments whose last report could not be trusted (forged / suppressed marker, Prism 36b227820e17 /
+# 33d27ec2d4e3): env id -> monotonic time the UNKNOWN report finalized. While present the record reads as
+# None (the payload omits ``session_git_env`` and the hook falls back to its text taint). Only a valid report
+# from a command that STARTED after that time clears it; an older command finalizing late cannot.
+_env_git_unknown: Dict[str, float] = {}
+
+
+def env_git_id(env: Any) -> Optional[str]:
+    """Stable record key for *env*'s shell (its snapshot id), or None for no env."""
+    if env is None:
+        return None
+    shell_id = getattr(env, "_session_id", None)
+    return f"env:{shell_id}" if shell_id else f"env-obj:{id(env)}"
+
+
+def record_session_git_env(env_id: Optional[str], git_env: Optional[Dict[str, bool]],
+                           seq: Optional[int] = None, *, unknown: bool = False,
+                           started: Optional[float] = None) -> None:
+    """Record *git_env* (``{name: set}``) reported at command *seq* as environment *env_id*'s state.
+    A report with ``seq`` above the stored one replaces it; any other report (equal, older, or without a
+    seq) is OR-merged, so it can mark a name set but never clear one. A non-dict (a killed command emitted
+    no marker) or a missing env id changes nothing.
+
+    ``unknown=True`` (the command's report could not be trusted) makes the environment's state UNKNOWN
+    until a valid report from a command whose ``started`` (``time.monotonic()``) is after this call."""
+    if not env_id:
+        return
+    if unknown:
+        with _session_cwd_lock:
+            _env_git_unknown[env_id] = time.monotonic()
+        return
+    if not isinstance(git_env, dict):
+        return
+    snapshot = {str(name): bool(value) for name, value in git_env.items()}
+    order = seq if isinstance(seq, int) and not isinstance(seq, bool) else -1
+    with _session_cwd_lock:
+        unknown_at = _env_git_unknown.get(env_id)
+        if unknown_at is not None:
+            if not isinstance(started, (int, float)) or started <= unknown_at:
+                return
+            del _env_git_unknown[env_id]
+            _env_git_env.pop(env_id, None)
+        prev = _env_git_env.get(env_id)
+        if prev is None or order > prev[0]:
+            _env_git_env[env_id] = (order, snapshot)
+        else:
+            merged = {name: prev[1].get(name, False) or snapshot.get(name, False)
+                      for name in {*prev[1], *snapshot}}
+            _env_git_env[env_id] = (prev[0], merged)
+
+
+def get_session_git_env(env_id: Optional[str]) -> Optional[Dict[str, bool]]:
+    """Copy of environment *env_id*'s recorded GIT_* state, or None when nothing is recorded or the
+    state is UNKNOWN."""
+    if not env_id:
+        return None
+    with _session_cwd_lock:
+        if env_id in _env_git_unknown:
+            return None
+        recorded = _env_git_env.get(env_id)
+        return dict(recorded[1]) if recorded is not None else None
+
+
+def current_env_git_id(task_id: Optional[str]) -> Optional[str]:
+    """``env_git_id`` of the cached environment a terminal call with *task_id* would run in now (same
+    lookup as ``_acquire_env``), or None when there is none yet or the key cannot be resolved."""
+    try:
+        eff = _resolve_container_task_id(task_id)
+    except Exception:
+        return None
+    with _env_lock:
+        env = _active_environments.get(eff) or (_active_environments.get(task_id) if task_id else None)
+    return env_git_id(env)
 
 
 def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
@@ -1466,6 +1549,9 @@ def _run_foreground(
             return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
 
     if result.get("yielded_session_id"):  # handed to the background: no exit status yet
+        # The command keeps running in the shell with no report yet: its GIT_* state is UNKNOWN until a
+        # later command reports (Prism 867a5a0fdd64).
+        record_session_git_env(env_git_id(env), None, unknown=True)
         return json.dumps({
             "output": result.get("output", ""), "exit_code": None, "error": None,
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],

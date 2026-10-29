@@ -225,6 +225,12 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     import hermes_cli.session_lost_and_found as laf
 
     monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    # The stub must also stand for the refusal it implies: the module-level
+    # HAVE_SQLITE3_CLI probe already ran the real find_sqlite3_cli(), and on a
+    # host whose sqlite3 is .recover-capable but WAL-reset-vulnerable (Debian's
+    # 3.46.1 on ci/ace-ai) it left reason=wal_reset_vulnerable behind, which
+    # routes the refusal to the "not safe" message instead (t_a29b8266).
+    monkeypatch.setattr(laf, "_last_cli_refusal", {"reason": "missing"})
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
             source,

@@ -1,6 +1,6 @@
 """Delivery policy for engine diagnostics, never assistant or command responses."""
 
-from gateway.display_config import resolve_display_setting
+from gateway.display_config import display_scope, resolve_display_setting
 
 
 class DiagnosticText(str):
@@ -46,11 +46,12 @@ def effective_user_config() -> dict:
     return config if isinstance(config, dict) else {}
 
 
-def diagnostic_turn_muted(display_metadata, platform, user_config=None) -> bool:
+def diagnostic_turn_muted(display_metadata, platform, user_config=None, *, source=None) -> bool:
     """One admission rule for every surface: a diagnostic-category wake mutes its turn's
-    presentation only when the owning policy hides diagnostics. Human content never mutes."""
+    presentation only when the owning policy hides diagnostics. Human content never mutes.
+    ``source`` (the destination) selects the ``display.channels`` tier."""
     return ((display_metadata or {}).get("notification_category") == "diagnostic"
-            and not warning_notifications_enabled(platform, user_config))
+            and not warning_notifications_enabled(platform, user_config, **display_scope(source)))
 
 
 def diagnostic_wake_muted(event, user_config=None) -> bool:
@@ -59,36 +60,41 @@ def diagnostic_wake_muted(event, user_config=None) -> bool:
     if isinstance(snapshot, bool):
         return snapshot
     return bool(getattr(event, "internal", False)) and diagnostic_turn_muted(
-        getattr(event, "metadata", None), event.source.platform, user_config)
+        getattr(event, "metadata", None), event.source.platform, user_config, source=event.source)
 
 
-def render_notification(render, *, platform, diagnostic=True, user_config=None) -> bool:
+def render_notification(render, *, platform, diagnostic=True, user_config=None, source=None) -> bool:
     """Invoke a synchronous UI renderer only when its classified content is visible.
 
     Return whether the renderer ran, not whether a transport delivered anything.
     Call only at a presentation sink, never around producer callbacks or persistence.
     The caller supplies the owning scope/turn snapshot; exceptions remain its policy.
     """
-    if diagnostic and not warning_notifications_enabled(platform, user_config):
+    if diagnostic and not warning_notifications_enabled(platform, user_config, **display_scope(source)):
         return False
     render()
     return True
 
 
-async def present_notification(present, *, platform, diagnostic=True, user_config=None) -> bool:
+async def present_notification(present, *, platform, diagnostic=True, user_config=None,
+                               chat_id=None, thread_id=None, parent_id=None) -> bool:
     """Async twin of :func:`render_notification` for lifecycle emitters that await a send.
 
     Return whether the presenter ran; its own receipt/exception is the caller's to interpret.
-    The caller binds the owning profile scope BEFORE calling (watchers/shutdown fan-outs).
+    The caller binds the owning profile scope BEFORE calling (watchers/shutdown fan-outs) and names
+    the destination (``chat_id``/``thread_id``/``parent_id``) so ``display.channels`` applies.
     """
-    if diagnostic and not warning_notifications_enabled(platform, user_config):
+    if diagnostic and not warning_notifications_enabled(
+            platform, user_config, chat_id=chat_id, thread_id=thread_id, parent_id=parent_id):
         return False
     await present()
     return True
 
 
-def warning_notifications_enabled(platform, user_config=None) -> bool:
+def warning_notifications_enabled(platform, user_config=None, *, chat_id=None, thread_id=None, parent_id=None) -> bool:
     """Use the turn snapshot when supplied, otherwise the active profile's effective config.
+
+    ``chat_id``/``thread_id``/``parent_id`` select the ``display.channels`` tier when known.
 
     No surface exemption: direct command/API outcomes are not notifications.
     Unknown values never opt in; null inherits via the canonical display resolver.
@@ -98,4 +104,5 @@ def warning_notifications_enabled(platform, user_config=None) -> bool:
     elif not isinstance(user_config, dict):
         user_config = {}
     platform_key = getattr(platform, "value", platform)
-    return not resolve_display_setting(user_config, platform_key, "suppress_warning_notifications", False)
+    return not resolve_display_setting(user_config, platform_key, "suppress_warning_notifications", False,
+                                       chat_id=chat_id, thread_id=thread_id, parent_id=parent_id)

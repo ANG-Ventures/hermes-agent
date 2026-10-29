@@ -33,7 +33,6 @@ def home(tmp_path, monkeypatch):
                 "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
         monkeypatch.delenv(var, raising=False)
     kb._INITIALIZED_PATHS.clear()
-    reg._PINNED_BOARD_MEMO.clear()
     reg._PINNED_BOARD_ERRORS.clear()
     return h
 
@@ -46,7 +45,6 @@ def _pin(monkeypatch, path: Path) -> None:
     """A dispatched worker's DB pin. The sandbox flag would neutralise it, so drop that."""
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — the pin under test is what the sandbox neutralises; HERMES_KANBAN_DB points at a tmp_path DB
     monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
-    reg._PINNED_BOARD_MEMO.clear()
 
 
 def _card(board: str, title: str = "t") -> str:
@@ -190,9 +188,9 @@ def test_pinned_board_error_clears_once_the_pin_is_named(home, monkeypatch):
 
 
 def test_retargeted_symlink_pin_changes_the_answer_in_process(home, monkeypatch, tmp_path):
-    """Prism 69c969208e42 (C1a #2202): the memo key carries the pin's resolved identity, so a
-    symlink pin retargeted from board a's DB to board b's names b in the same process.
-    Mutation: key on the raw pin string only -> the second answer stays ``alpha``."""
+    """Prism 69c969208e42 (C1a #2202): a symlink pin retargeted from board a's DB to board b's
+    names b in the same process. Mutation: memoise on the raw pin string -> the second answer
+    stays ``alpha``."""
     kb.create_board("alpha")
     kb.create_board("beta")
     tid_a, tid_b = _card("alpha"), _card("beta")
@@ -206,8 +204,9 @@ def test_retargeted_symlink_pin_changes_the_answer_in_process(home, monkeypatch,
     assert kb.pinned_board() == "beta"
 
 
-def test_pinned_board_cost_is_paid_once_per_pin(home, monkeypatch):
-    """RC-11 cost: memoised on (pin, root, boards/ mtime); a second call does not rescan."""
+def test_pinned_board_rescans_on_every_call(home, monkeypatch):
+    """Prism fde771bf9eaa: naming the pin is about which file it names NOW, so it is never memoised; a
+    second call rescans the layout (one iterdir + one stat a board)."""
     kb.create_board("subs-ace")
     _pin(monkeypatch, kb.board_dir("subs-ace") / "kanban.db")
     calls = []
@@ -215,7 +214,7 @@ def test_pinned_board_cost_is_paid_once_per_pin(home, monkeypatch):
     monkeypatch.setattr(reg, "board_db_layout", lambda: calls.append(1) or real())
     assert kb.pinned_board() == "subs-ace"
     assert kb.pinned_board() == "subs-ace"
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 # --- D3: board_of_task never guesses -----------------------------------------------------------

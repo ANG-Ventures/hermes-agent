@@ -140,7 +140,7 @@ def quiescent_home(home: Path):
         if sessions:
             pids = sorted({entry["pid"] for entry in sessions})
             raise RuntimeError(f"live chat sessions still own {home} (PIDs {pids}); close them before retrying")
-        for path in (home / ".backup.lock", home / "cron" / ".tick.lock"):
+        for path in (home / ".backup.lock", home / "cron" / ".tick.lock", home / "cron" / ".tick-script.lock"):
             path.parent.mkdir(parents=True, exist_ok=True)
             handle = stack.enter_context(path.open("a+b"))
             if not _lock(handle.fileno(), wait=False):

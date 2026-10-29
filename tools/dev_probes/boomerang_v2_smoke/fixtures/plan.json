@@ -10,8 +10,9 @@
     "  Never rehome the card (edit --session <bogus>): that proves only the warning half ('no live home').",
     "s1_fault_hold (optional): a --body that keeps the failure card's child busy so the fault lands first.",
     "wirelog_sync: run after the step-3 canary when a remote seat served it ({sub} = the bare seat number).",
-    "expect.*: the restart line is today's real boot line; the re-surface regex is NOT in the spec contract",
-    "  (5.7 names deliver_wake + the origin-chat 'boomerang-wake lost' line, not a log line). Tune it once P3 lands."
+    "expect.*: the restart line is today's real boot line; the step-4 regexes are the reconciler's own INFO lines",
+    "  (gateway/kanban_boomerang_wake.py: _lost, _restart_redispatch_or_lost, run_entry 'handled'). Step 4 arm 1",
+    "  expects the redispatch (t_870c1fba); arm 2 pre-spends the card's retry (BV2_WAKE_STATE) and expects the re-surface."
   ],
   "board": "bv2-smoke",
   "commands": {
@@ -30,7 +31,9 @@
   },
   "expect": {
     "restart_log_regex": "Gateway running with \\d+ platform",
-    "resurface_log_regex": "re-?surfac\\w*\\b.*{card}",
+    "resurface_log_regex": "kanban boomerang-wake: {card} lost reason=gateway restart, retry spent resurfaced delivered=(?P<delivered>\\w+)",
+    "redispatch_log_regex": "kanban boomerang-wake: {card} redispatched after gateway restart \\(retry \\d+/\\d+\\) delegation=(?P<delegation>\\S+)",
+    "handled_log_regex": "kanban boomerang-wake: {card} handled action=\\S+ delegation=(?P<delegation>\\S+)",
     "fault_reason_regex": "state moved",
     "resurface_wake_log_regex": "inbound message: .*msg=.\\[kanban\\] Task {card}\\b"
   },
@@ -44,6 +47,7 @@
     "s2_fork_off": "t_5m0ce004",
     "s2_auto_off": "t_5m0ce005",
     "s3_fork": "t_5m0ce006",
-    "s4_restart": "t_5m0ce007"
+    "s4_restart": "t_5m0ce007",
+    "s4_fallback": "t_5m0ce008"
   }
 }

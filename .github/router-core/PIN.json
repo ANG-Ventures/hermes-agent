@@ -1,21 +1,26 @@
 {
- "_doc": "Byte-identical copies of ANG-Ventures/hermes-home lints (Router Core spec v5 \u00a74.1/\u00a77.1, card t_8b05b16b). hermes-home is private, so CI here cannot fetch them: change the lint THERE, re-copy, re-pin. check_pin.py enforces the bytes. Re-pinned to hermes-home main cafd2a9b6714 on 2026-10-16 (t_8b05b16b): #4308, #4319 and #4330 (spawn-site precision, 8 review rounds) merged.",
+ "_doc": "Byte-identical copies of ANG-Ventures/hermes-home lints (Router Core spec v5 \u00a74.1/\u00a77.1, card t_8b05b16b). hermes-home is private, so CI here cannot fetch them: change the lint THERE, re-copy, re-pin. check_pin.py enforces the bytes. lib/scan_scope.py is lint-spawn-site.py's sibling import (scripts/lib/ at the source). Re-pinned to hermes-home main 1fd5ebb4 on 2026-10-26 (t_9c88555c, Prism 3df84d7ec4f9): carries #6549, #6582, #6526 (loop elements past the 64 cap), #6664, #6662. lint-queue-loops.py re-pinned to hermes-home main 06acc6bfac on 2026-10-27 (t_42ee9298 / t_27a36cc7, hermes-home#7127, Prism 2e9888a37c28): a ready_rows loop counts as routing only if its body routes. lint-queue-loops.py re-pinned to hermes-home main ff5ac4722e on 2026-10-27 (t_3b70558e, hermes-home#7231, Prism 1d133dcecb68): _routes_ready counts only an unconditional route at the arm's own statement level; a guarded routing for-loop is red. lint-queue-loops.py re-pinned to hermes-home main 2aee023097 on 2026-10-27 (t_0266053d, hermes-home#7256, Prism 19377e67cb32/b89a0617821b/d75c20691309): trailing break/return after a route is red, an if-skip else arm is guarded, both-arms-route and plan= kwarg are green, inner-scope plan rebinding is red. lint-queue-loops.py re-pinned to hermes-home main 33b1c5a4dc on 2026-10-27 (t_7031f1a9 / t_aa9f4314, hermes-home#7265, Prism 84d48881bad3): a routing loop under for/async-for/for-else/match/except* is red; an exhaustive match is exempt. lint-queue-loops.py re-pinned to hermes-home main 3a1ebbe786 on 2026-10-27 (t_f87e058c / t_aa9f4314, hermes-home#7287, Prism 84d48881bad3): a try whose every handler bare-re-raises and a with body count as unconditional; for-else break and raise in the routing loop are red; a called nested helper routes. lint-queue-loops.py re-pinned to hermes-home main 444a14b888 on 2026-10-27 (t_3d948a66, hermes-home#7302, Prism 22735492b6aa/fad33a0d9cd4): the with-body and called-helper exemptions are dropped; a routing loop under with/async with is red again and a called helper's routing is not credited.",
  "source_repo": "ANG-Ventures/hermes-home",
  "files": {
   "lint-spawn-site.py": {
-   "source_sha": "cafd2a9b671476b83e45f3954d0c8b59434ff642",
+   "source_sha": "1fd5ebb4b9bc328bd0684e65c0e974ab5075a75a",
    "source_path": "scripts/lint-spawn-site.py",
-   "sha256": "14c0d09c884a7ce588f551de6666513a3c213ea3766f78e49ac7c834f095dfd8"
+   "sha256": "25c60f5783f44678d8532b75b335e676c0492a6ba88ed9fad97c7ab595dbb155"
   },
   "p0-label-lint.py": {
-   "source_sha": "d638cc56f62f62c548629b1b46a71c486796fb3d",
+   "source_sha": "1fd5ebb4b9bc328bd0684e65c0e974ab5075a75a",
    "source_path": "scripts/p0-label-lint.py",
-   "sha256": "6b9df1cbdea7faff2b12882d6a55f74467bebfeac4928dad5b0ec670323a56eb"
+   "sha256": "40fb4cada99c6e537863047abc1eef5eebec52c07cd720a15d39fae2d20013b3"
   },
   "lint-queue-loops.py": {
-   "source_sha": "d638cc56f62f62c548629b1b46a71c486796fb3d",
+   "source_sha": "444a14b8889ca4c7c4b185a8c2eec45608dfa902",
    "source_path": "scripts/lint-queue-loops.py",
-   "sha256": "c7207721e1a6ab3b832bec033324d07ba989823e99a01517c6bcfcf3c9d16976"
+   "sha256": "7a8064b2adecbe3ff3a604eb0fa86cfab2d24aacc7d24a26776b91ae26c5b29f"
+  },
+  "lib/scan_scope.py": {
+   "source_sha": "1fd5ebb4b9bc328bd0684e65c0e974ab5075a75a",
+   "source_path": "scripts/lib/scan_scope.py",
+   "sha256": "10bc6c0faae3eaa7977626775e0c3efd218bf2f0030e672b956fffa1aa427505"
   }
  }
 }

@@ -1072,6 +1072,22 @@ class AIAgent(
         # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
         _quietly(self._close_codex_session)
+        # The context engine is per-agent too (init_agent re-selects it on rebuild) and a plugin engine such as
+        # LCM holds ~5 sqlite connections per instance. Eviction without this leaked them for the gateway's
+        # life: 2026-10-23 Apollo hit 1,996 open handles on lcm.db and the 4,096 fd ceiling (EMFILE) after
+        # ~175 idle-TTL evictions, and every file open — state.db included — failed until a restart.
+        _quietly(lambda: self._shutdown_context_engine())
+
+    def _shutdown_context_engine(self) -> None:
+        """Release the per-agent context engine's resources (idempotent). Engines without ``shutdown()``
+        (the built-in compressor) just get dropped; a rebuilt agent gets a fresh engine from init_agent."""
+        engine = getattr(self, "context_compressor", None)
+        if engine is None:
+            return
+        self.context_compressor = None
+        shutdown = getattr(engine, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
 
     def close(self) -> None:
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
@@ -1085,6 +1101,7 @@ class AIAgent(
         _quietly(self._drop_shared_client, lambda c: self._close_openai_client(c, reason="agent_close", shared=True))
         self._close_request_clients("agent_close")
         _quietly(self._close_codex_session)
+        _quietly(lambda: self._shutdown_context_engine())
         # Free conversation history proactively: callers may still hold the closed agent. The DB-flush
         # settled-prefix snapshot and the streamed-text accumulator are shadow copies of the same transcript;
         # on a closed delegate child they were the only remaining owners, pinning its history in the parent heap.
@@ -1474,15 +1491,18 @@ class AIAgent(
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch; new DELEGATE_TASK_SCHEMA fields are added only here."""
-        from tools.delegate_tool import _strip_model_hidden_task_fields, delegate_task as _delegate_task
+        from tools.delegate_tool import (
+            _model_background_value, _strip_model_hidden_task_fields, delegate_task as _delegate_task,
+        )
         # Top-level MODEL delegations always run in the background (handle returned, results re-enter as
         # messages). An ORCHESTRATOR SUBAGENT (depth > 0) stays synchronous — it needs results in-turn and
-        # owns no gateway session. The schema-level `background` param is intentionally ignored.
+        # owns no gateway session; so does a delegation carrying a sign_grant (it ends with this turn).
+        # The schema-level `background` param is intentionally ignored.
         return _delegate_task(
             goal=function_args.get("goal"), context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
-            background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
+            background=_model_background_value(function_args, self), images=function_args.get("images"),
             inherit_context=function_args.get("inherit_context"),
             inherit_mode=function_args.get("inherit_mode"),
             skills=function_args.get("skills"),
@@ -1491,6 +1511,7 @@ class AIAgent(
             allow_flagship_reason=function_args.get("allow_flagship_reason"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
+            sign_grant=function_args.get("sign_grant"),
         )
 
     _invoke_tool = _forward("agent.agent_runtime_helpers", "invoke_tool")

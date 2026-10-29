@@ -244,6 +244,46 @@ def test_midrun_skill_view_returns_the_token_and_records_it(board, monkeypatch, 
     assert rp.take_rail_absent() == out["error"]
 
 
+def test_undeclared_browser_navigate_on_ci_box_returns_the_token_and_records_it(board, monkeypatch):
+    # Layer 1b, D1b-undeclared (t_f813a42f): no requires: line and no skill on the card, so
+    # boot, dispatch and skill_view all pass; the browser tool itself must refuse up front.
+    from tools import rail_preflight as rp
+    from tools.registry import registry
+    import model_tools  # noqa: F401
+    rp._emitted.clear()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="host: ci-box\nopen example.com")
+    _placed_env(monkeypatch, tid, 1, host="ci-box")
+    assert pff.boot_check(tid) is None                       # the declared-need gates see nothing
+    out = json.loads(registry.dispatch("browser_navigate", {"url": "https://example.com"}, task_id="t"))
+    assert out["success"] is False
+    assert out["error"].startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ci-box")
+    assert rp.take_rail_absent() == out["error"]
+    assert pff.parse_absent(out["error"])[:2] == ("BROWSER_RAIL_ABSENT", "browser-session")
+    # A background-review fork shares the worker's task env but is never the card's work.
+    import tools.skill_provenance as sp
+    monkeypatch.setattr(sp, "is_background_review", lambda: True)
+    assert rp.browser_capability_error() is None
+    assert rp.take_rail_absent() is None
+
+
+def test_capability_gate_is_inert_on_a_capable_host_unplaced_or_warn(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1, host="studio")
+    assert pff.capability_gate("browser-session") is None
+    _placed_env(monkeypatch, tid, 1, host="ci-box", caps=json.dumps({"*": "warn"}))
+    assert pff.capability_gate("browser-session") is None
+    _placed_env(monkeypatch, tid, 1, host="studio-local")
+    assert pff.capability_gate("browser-session") is None
+    monkeypatch.delenv(kwh.PLACEMENT_ENV)
+    monkeypatch.setenv(khc.CAPS_ENV, ENFORCE_BROWSER)
+    assert pff.capability_gate("browser-session") is None
+    _placed_env(monkeypatch, tid, 1, host="ci-box")
+    monkeypatch.delenv("HERMES_KANBAN_TASK")                # not the owning worker: never gated
+    assert pff.capability_gate("browser-session") is None
+
+
 def test_preload_is_never_gated(board, monkeypatch, tmp_path):
     # F14: the preload calls skill_view() directly. A gate there would make the skill
     # "missing" and cli.py would continue WITHOUT it. The preload must still load it;

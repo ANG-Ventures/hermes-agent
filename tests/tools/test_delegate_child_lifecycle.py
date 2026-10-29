@@ -575,7 +575,7 @@ def _real_agent_methods(agent):
     for name in (
         "shutdown_memory_provider", "_close_task_resources", "_drop_shared_client",
         "_close_request_clients", "_close_codex_session", "_trim_process_memory",
-        "_finalize_owned_session_row",
+        "_finalize_owned_session_row", "_shutdown_context_engine",
     ):
         setattr(agent, name, lambda *a, **k: None)
     return agent

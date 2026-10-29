@@ -100,6 +100,7 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
 
     running_agent = MagicMock()
     running_agent.steer.return_value = True
+    steer = running_agent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
     runner._running_agents[sk] = running_agent
 
     result = await runner._handle_message(_make_event("/steer also check auth.log"))
@@ -108,8 +109,8 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
     assert result is not None
     assert "steer" in result.lower() or "queued" in result.lower()
     # The agent's steer() was called with the payload (prefix stripped)
-    running_agent.steer.assert_called_once()
-    injected = running_agent.steer.call_args.args[0]
+    steer.assert_called_once()
+    injected = steer.call_args.args[0]
     assert injected.endswith("\n\nalso check auth.log")
     assert '"chat_id": "c1"' in injected
     # Critically: interrupt was NOT called
@@ -134,14 +135,15 @@ async def test_steer_reaches_ancient_turn_via_fresh_timestamp_fallback(
         "last_activity_at": time.time() - 3,
         "last_activity_desc": "receiving stream response",
     }
+    steer = running_agent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
     runner._running_agents[sk] = running_agent
     runner._running_agents_ts[sk] = time.time() - 31_471
     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "1800")
 
     result = await runner._handle_message(_make_event("/steer pause safely"))
 
-    running_agent.steer.assert_called_once()
-    injected = running_agent.steer.call_args.args[0]
+    steer.assert_called_once()
+    injected = steer.call_args.args[0]
     assert injected.endswith("\n\npause safely")
     assert '"chat_id": "c1"' in injected
     assert runner._running_agents[sk] is running_agent

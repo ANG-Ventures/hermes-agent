@@ -932,18 +932,26 @@ def finding_text(entry: dict, result: dict, header: str) -> str:
     return "\n".join(lines) + "\n---\n" + str(entry.get("wake_text") or "")
 
 
+def _surfaced_summary(kb: Any, conn: Any, task_id: str, delegation_id: str) -> Optional[str]:
+    """The summary of this delegation's executor ``surfaced:`` comment, None when there is none."""
+    head, tag = f"{MARKER} surfaced:", f"(delegation {delegation_id})"
+    for c in kb.list_comments(conn, task_id):
+        if c.author == AUTHOR and c.body.startswith(head) and c.body.endswith(tag):
+            return c.body[len(head):-len(tag)].strip()
+    return None
+
+
 def record_surface(entry: dict, summary: str) -> bool:
     """One executor-authored ``surfaced:`` comment per claim (keyed by delegation id)."""
     from hermes_cli import kanban_db as kb
 
-    tag = f"(delegation {entry['delegation_id']})"
     conn = kb.connect(board=entry.get("board"))
     try:
-        if any(c.author == AUTHOR and c.body.startswith(f"{MARKER} surfaced:") and c.body.endswith(tag)
-               for c in kb.list_comments(conn, entry["task_id"])):
+        if _surfaced_summary(kb, conn, entry["task_id"], entry["delegation_id"]) is not None:
             return False
         with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
-            kb.add_comment(conn, entry["task_id"], AUTHOR, f"{MARKER} surfaced: {summary or 'no summary'} {tag}")
+            kb.add_comment(conn, entry["task_id"], AUTHOR,
+                           f"{MARKER} surfaced: {summary or 'no summary'} (delegation {entry['delegation_id']})")
         return True
     finally:
         conn.close()
@@ -1007,12 +1015,15 @@ def _live_agent(runner: Any, session_key: str) -> tuple:
 def _db_parent(runner: Any, home: Any) -> Any:
     """Summary-mode parent when no idle live agent exists: an AIAgent on the gateway's runtime
     whose transcript is the session DB's (the v1 fold reads ``_session_messages``)."""
-    from gateway.run import _resolve_runtime_agent_kwargs
+    from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
     from run_agent import AIAgent
 
     kw = dict(_resolve_runtime_agent_kwargs())
     kw.pop("_fallback_notice", None)
     kw.pop("capabilities", None)
+    # The runtime kwargs carry no model unless a fallback route chose one; without it the child's
+    # every turn sent model="" (400, puppet lane 2026-10-24). Same precedence as a gateway turn.
+    kw["model"] = kw.get("model") or _resolve_gateway_model()
     agent = AIAgent(**kw, session_id=getattr(home, "session_id", None), quiet_mode=True,
                     skip_memory=True, skip_context_files=True)
     agent._session_messages = runner.session_store.load_transcript(home.session_id)
@@ -1154,17 +1165,19 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
 
 async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: int, kind: str, event_ts: Any,
                    disposition: Any, wake_text: str, home_sid: Optional[str], route: dict, path: str,
-                   state: Optional[BoomerangWakeState] = None) -> bool:
+                   state: Optional[BoomerangWakeState] = None, key: Optional[str] = None) -> bool:
     """Claim ``(board, task, event)`` and start its child.
 
     True: accepted, the caller withholds the wake and may advance its cursor. False: another
     path already owns the event, the caller does nothing. Raises when the dispatch itself
-    fails; the caller then posts the warning line and surfaces the wake (INV-6)."""
+    fails; the caller then posts the warning line and surfaces the wake (INV-6).
+    ``key`` overrides the claim key (the restart redispatch, which already spent the retry)."""
     if disposition.verdict != "auto":   # explicit equality ONLY (pass-3 RC-B)
         raise ValueError(f"not an auto disposition: {disposition.verdict!r}")
     state = state or BoomerangWakeState()
     task_id = _field(task, "id")
-    key = claim_key(board, task_id, event_id)
+    redispatch = key is not None
+    key = key or claim_key(board, task_id, event_id)
     if await asyncio.to_thread(state.has_claim, key):
         return False
     snap = await asyncio.to_thread(card_snapshot, board, task_id)
@@ -1187,7 +1200,7 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
             "event": "dispatch", "delegation_id": entry["delegation_id"],
             "task_summary": f"boomerang-wake {task_id} {kind}"[:120], "dispatched_at": _now_iso(),
             "expected_artifacts": [], "max_minutes": MAX_MINUTES, "pgrep_pattern": None})
-        if disposition.row == "crash_first_occurrence":
+        if disposition.row == "crash_first_occurrence" and not redispatch:
             await asyncio.to_thread(state.bump_retry, task_id)   # D-13: one automatic retry
         _INFLIGHT[key] = asyncio.ensure_future(run_entry(runner, entry, state))
         logger.info("kanban notifier: boomerang-wake %s disposition=auto row=%s path=%s delegation=%s",
@@ -1358,9 +1371,19 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
         return 0
     now = _time.time() if now is None else now
     handled = 0
-    for key, entry in (await asyncio.to_thread(state.claims)).items():
+    claims = await asyncio.to_thread(state.claims)
+    for key, entry in claims.items():
         st = entry.get("state")
         if st not in OPEN_STATES or entry.get("resurfaced"):
+            continue
+        successor = _restart_successor(key, claims)
+        if successor:
+            # The gateway stopped between persisting the restart redispatch and closing this claim
+            # (Prism P1 4623a20b225a): the successor owns the wake, so close this one quietly.
+            await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="redispatched_after_restart",
+                                    redispatched_as=successor, finished_at=_time.time())
+            logger.info("kanban boomerang-wake: %s claim %s closed, superseded by restart redispatch %s",
+                        entry.get("task_id"), key, successor)
             continue
         if _alive(key):
             if st == STATE_CANCELLED:
@@ -1377,6 +1400,123 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
                 board_has_receipt, entry.get("board"), entry["task_id"], entry["delegation_id"]):
             await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome=entry.get("action"))
             continue
-        await _lost(runner, entry, "gateway restart", state)
+        if not await _superseded_by_terminal(runner, entry, "gateway restart", state):
+            await _restart_redispatch_or_lost(runner, entry, state, now)
         handled += 1
     return handled
+
+
+# A completion verification whose verdict was DELIVERED (executor receipt) on a card that is still
+# closed lost nothing when a restart killed its claim: a ⚠️ line + re-surface replays a stale notice
+# as new (5 false lines on the 2026-10-24 restart). A ``surfaced:`` comment is NOT delivery proof:
+# run_entry writes it before resurface() reaches the owner (Prism 925507fa098b), so that claim gets
+# the surfaced finding delivered once, quietly. No verdict at all = the verification did not finish;
+# that claim takes the redispatch path below.
+_CLOSED_STATUSES = frozenset({"done", "archived"})
+_CLOSED_NOTICE_KINDS = frozenset({"completed", "archived"})
+
+
+def _closed_verdict(entry: dict) -> Optional[tuple]:
+    """``(status, "receipt", None)`` / ``(status, "surfaced", summary)`` when the card is closed and
+    this delegation's verdict is on the board, else None."""
+    from hermes_cli import kanban_db as kb
+
+    conn = _readonly(kb, entry.get("board"))
+    try:
+        status = getattr(kb.get_task(conn, entry["task_id"]), "status", None)
+        if status not in _CLOSED_STATUSES:
+            return None
+        if _receipt_exists(conn, entry["task_id"], entry["delegation_id"]):
+            return status, "receipt", None
+        summary = _surfaced_summary(kb, conn, entry["task_id"], entry["delegation_id"])
+        return (status, "surfaced", summary) if summary is not None else None
+    finally:
+        conn.close()
+
+
+async def _superseded_by_terminal(runner: Any, entry: dict, reason: str, state: BoomerangWakeState) -> bool:
+    """True = the claim was closed without a ⚠️ line (verdict on the board); False = take the
+    redispatch/lost path."""
+    if entry.get("kind") not in _CLOSED_NOTICE_KINDS or not entry.get("delegation_id"):
+        return False
+    try:
+        found = await asyncio.to_thread(_closed_verdict, entry)
+    except Exception as exc:   # unreadable board: keep today's visible path
+        logger.debug("kanban boomerang-wake: verdict read for %s failed (%s)", entry["task_id"], exc)
+        return False
+    if found is None:
+        return False
+    status, how, summary = found
+    if how == "surfaced":
+        # verdict known, delivery unconfirmed: deliver the child's finding once (never redispatch)
+        ok = await resurface(runner, entry, finding_text(entry, {"summary": summary}, "child surfaced"))
+        logger.info("kanban boomerang-wake: %s lost reason=%s surfaced finding re-delivered=%s status=%s "
+                    "delegation=%s (no lost line)", entry["task_id"], reason, ok, status, entry.get("delegation_id"))
+        if not ok:   # fail visible, as _lost does (Prism af30fe379f6c): the finding must not vanish
+            await post_line(runner, entry, f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason}); "
+                                           f"child surfaced: {str(summary)[:300]}")
+        await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="surfaced",
+                                reason=reason, resurfaced=True, resurface_delivered=ok, finished_at=_time.time())
+        return True
+    logger.info("kanban boomerang-wake: %s lost reason=%s superseded-by-terminal status=%s kind=%s "
+                "delegation=%s (receipt on board; no line, no re-surface)", entry["task_id"], reason, status,
+                entry.get("kind"), entry.get("delegation_id"))
+    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                            outcome="superseded-by-terminal", reason=reason, card_status=status,
+                            finished_at=_time.time())
+    return True
+
+
+def _restart_refusal(entry: dict, state: BoomerangWakeState, now: float) -> Optional[str]:
+    """Why a claim whose child a restart killed may NOT be redispatched (None = it may):
+    the D-13 retry is spent, the card left the claim-time status, or the claim's budget ran out."""
+    from gateway.kanban_wake_disposition import MAX_AUTO_RETRIES
+
+    budget = float(entry.get("max_minutes") or MAX_MINUTES) * 60
+    if entry.get("state") == STATE_CANCELLED or now - float(entry.get("claimed_at") or 0) > budget:
+        return "budget expired"
+    if state.retries(entry["task_id"]) >= MAX_AUTO_RETRIES:
+        return "retry spent"
+    if not entry.get("status") or card_snapshot(entry.get("board"), entry["task_id"])["status"] != entry["status"]:
+        return "card moved"
+    return None
+
+
+def _restart_successor(key: str, claims: dict) -> Optional[str]:
+    """The ``<key>#restartN`` claim a restart redispatch created for ``key``, if any (newest N)."""
+    prefix = f"{key}#restart"
+    found = [k for k in claims if k.startswith(prefix) and k[len(prefix):].isdigit()]
+    return max(found, key=lambda k: int(k[len(prefix):])) if found else None
+
+
+async def _restart_redispatch_or_lost(runner: Any, entry: dict, state: BoomerangWakeState, now: float) -> None:
+    """A restart killed this claim's child: spend the card's D-13 retry on a fresh child for the
+    same card and wake (quiet: one INFO line), else today's ``_lost`` with the reason why not."""
+    from gateway.kanban_wake_disposition import AUTO, MAX_AUTO_RETRIES, Disposition
+
+    try:
+        why = await asyncio.to_thread(_restart_refusal, entry, state, now)
+    except Exception as exc:
+        why = f"card unread ({type(exc).__name__})"
+    if why:
+        await _lost(runner, entry, f"gateway restart, {why}", state)
+        return
+    spent = await asyncio.to_thread(state.bump_retry, entry["task_id"])
+    new_key = f"{entry['key']}#restart{spent}"
+    try:
+        await dispatch(runner, board=entry.get("board"), key=new_key,
+                       task={"id": entry["task_id"], "title": entry.get("title")},
+                       event_id=entry["event_id"], kind=str(entry.get("kind") or ""), event_ts=entry.get("event_ts"),
+                       disposition=Disposition(AUTO, entry.get("mode") or "fork", 0, str(entry.get("row") or "")),
+                       wake_text=str(entry.get("wake_text") or ""), home_sid=entry.get("home_sid"),
+                       route=entry.get("route") or {}, path=f"{entry.get('path') or 'reconcile'}+restart",
+                       state=state)
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: %s redispatch after restart failed: %s", entry["task_id"], exc)
+        await _lost(runner, entry, "gateway restart, redispatch failed", state)
+        return
+    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                            outcome="redispatched_after_restart", redispatched_as=new_key, finished_at=_time.time())
+    new = await asyncio.to_thread(state.get_claim, new_key) or {}
+    logger.info("kanban boomerang-wake: %s redispatched after gateway restart (retry %d/%d) delegation=%s",
+                entry["task_id"], spent, MAX_AUTO_RETRIES, new.get("delegation_id"))

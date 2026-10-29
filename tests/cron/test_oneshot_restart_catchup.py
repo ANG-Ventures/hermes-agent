@@ -216,7 +216,7 @@ class TestTickCarriesLateStamp:
             return True
 
         monkeypatch.setattr(sched, "run_one_job", _fake_run_one_job)
-        monkeypatch.setattr(sched, "_get_lock_paths", lambda: (cron_store / "lk", cron_store / "lk" / ".tick.lock"))
+        monkeypatch.setattr(sched, "_get_lock_paths", lambda lane="agent": (cron_store / "lk", cron_store / "lk" / f".tick-{lane}.lock"))
         sched.tick(verbose=False, sync=True)
 
         assert [j["id"] for j in seen] == ["late"]

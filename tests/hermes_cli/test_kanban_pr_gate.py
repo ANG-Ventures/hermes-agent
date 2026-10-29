@@ -1252,6 +1252,30 @@ def test_merged_state_is_cached_permanently(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _gql_completed(argv, repo: str, nodes: dict) -> subprocess.CompletedProcess:
+    """Answer a batched ``gh api graphql`` PR lookup from ``{number: node}``.
+
+    Asserts the call targets ``repo``; numbers absent from ``nodes`` come back
+    null with a NOT_FOUND error and rc=1, exactly as ``gh`` reports them.
+    """
+    import re as _re
+
+    fields = dict(x.split("=", 1) for x in argv[3:] if not x.startswith("-"))
+    assert f"{fields['owner']}/{fields['name']}".lower() == repo.lower()
+    repository, errors = {}, []
+    for alias in _re.findall(r"(p\d+): pullRequest\(number: \d+\)", fields["query"]):
+        node = nodes.get(int(alias[1:]))
+        repository[alias] = node
+        if node is None:
+            errors.append({"type": "NOT_FOUND", "path": ["repository", alias]})
+    body: dict = {"data": {"repository": repository}}
+    if errors:
+        body["errors"] = errors
+    return subprocess.CompletedProcess(
+        argv, 1 if errors else 0, stdout=json.dumps(body), stderr="",
+    )
+
+
 def test_dispatch_tick_resolves_a_satisfied_gate(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1261,6 +1285,11 @@ def test_dispatch_tick_resolves_a_satisfied_gate(
     def fake_run(argv, **kwargs):
         calls.append(argv)
         assert argv[:2] == ["gh", "api"]
+        if argv[2] == "graphql":  # the dispatcher prefetch batches lookups
+            return _gql_completed(argv, "o/r", {7: {
+                "state": "MERGED", "mergedAt": "2099-01-01T00:00:00Z",
+                "mergeCommit": {"oid": "deadbeefcafebabe"},
+            }})
         assert argv[2] == "repos/o/r/pulls/7"
         return subprocess.CompletedProcess(
             argv, 0,
@@ -2425,6 +2454,12 @@ def test_t213f5d63_replay_through_dispatch_spawns_nothing(
     gh_calls: list = []
 
     def fake_run(argv, **kwargs):
+        if argv[:3] == ["gh", "api", "graphql"]:  # batched dispatcher prefetch
+            gh_calls.append(argv)
+            return _gql_completed(argv, _PCV, {401: {
+                "state": "MERGED", "mergedAt": "2026-09-25T11:17:05Z",
+                "mergeCommit": {"oid": "822d1dc9" + "0" * 32},
+            }})
         if argv[:2] == ["gh", "api"] and argv[2] == f"repos/{_PCV}/pulls/401":
             gh_calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({

@@ -2430,6 +2430,21 @@ Signal is listed as a valid platform key because the setting can be saved per pl
 
 `interim_assistant_messages` is gateway-only. When enabled, Hermes sends completed mid-turn assistant updates as separate chat messages. This is independent from `tool_progress` and does not require gateway streaming.
 
+### Per-channel display overrides
+
+`display.channels.<platform>.<chat_id>.<key>` sits above `display.platforms`, so one channel can differ from the rest of its platform. A Discord thread inherits its parent channel's entry unless it has its own. Only the per-platform display keys are accepted; unknown keys are ignored with one warning. `/verbose` still writes the platform tier.
+
+```yaml
+display:
+  channels:
+    discord:
+      "1480000000000000001":   # a decision channel: final replies only
+        tool_progress: off
+        interim_assistant_messages: false
+        long_running_notifications: false
+        suppress_warning_notifications: true
+```
+
 `show_commentary` (default `true`) controls Codex Responses models' commentary channel — the polished progress narration these models produce alongside their private reasoning. When enabled, each completed commentary message is delivered as a visible mid-turn update (on the gateway this also requires `interim_assistant_messages`). Set it to `false` if the extra narration annoys you: commentary then falls back to the reasoning channel and is only shown when `show_reasoning` is enabled.
 
 ## Privacy

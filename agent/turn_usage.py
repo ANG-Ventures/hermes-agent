@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.image_token_cost import calibrate_from_usage
-from agent.usage_anchor import set_usage_anchor
+from agent.usage_anchor import implausible_prompt_reading, set_usage_anchor
 from agent.usage_pricing import (
     USAGE_UNKNOWN_FIELDS, cache_stats_line, estimate_usage_cost, prompt_tokens_unknown,
     verbose_token_usage_log_args, with_served_service_tier,
@@ -121,6 +121,8 @@ def record_response_usage(
         _note_usage_less = getattr(compressor, "note_usage_less_response", None)
         if callable(_note_usage_less):
             _note_usage_less()
+        # t_dd918516: a summing relay folds this request's prompt into the NEXT measured reading.
+        agent._usage_gap_pending = True
 
     # Commit per-call accounting for EVERY successful response, including one without a usage
     # payload: ``_canonical_usage_from_response`` yields an aggregate UNKNOWN (zeros + every flag),
@@ -153,6 +155,22 @@ def record_response_usage(
         "cache_write_tokens": canonical_usage.cache_write_tokens,
         "reasoning_tokens": canonical_usage.reasoning_tokens,
     }
+    # t_dd918516: a relay that sums several upstream requests' prompts into one usage payload
+    # reports N x the context. Bills keep the figure; context consumers (compressor, anchor, meter,
+    # hygiene, rearm) must not adopt it.
+    _implausible_context_reading = None
+    if has_usage:
+        _implausible_context_reading = implausible_prompt_reading(
+            aggregator_usage.prompt_tokens, messages, getattr(agent, "_usage_anchor", None),
+            context_length=getattr(compressor, "context_length", 0),
+            after_usage_gap=bool(getattr(agent, "_usage_gap_pending", False)),
+        )
+        if _implausible_context_reading:
+            logger.warning(
+                "Usage reading is not one request's context size; kept for billing, ignored for "
+                "context accounting (%s provider=%s model=%s)",
+                _implausible_context_reading, agent.provider, agent.model,
+            )
     # Capture the boundary latch before update_from_response() consumes it: only the real
     # prompt count right after a compaction rearms the budget.
     _completed_compaction_pending = bool(
@@ -166,7 +184,15 @@ def record_response_usage(
         # PRE-FOLD aggregator usage: advisor fan-out tokens were never part of this prompt and an
         # advisor with no payload makes every fold flag absorbing (r6 round-4 finding 2).
         _prompt_measured = not prompt_tokens_unknown(aggregator_usage)
-        if _prompt_measured:
+        # A measured reading (summed or not) closes the gap; an UNKNOWN prompt opens one, exactly
+        # like a reply with no usage payload at all.
+        agent._usage_gap_pending = not _prompt_measured
+        if _prompt_measured and _implausible_context_reading:
+            # A summed multi-request figure (t_dd918516) is a bill, not a context size: never
+            # stamp it as occupancy. Consume a pending compaction verdict like a usage-less reply.
+            if getattr(compressor, "awaiting_real_usage_after_compression", False):
+                compressor.update_from_response({})
+        elif _prompt_measured:
             compressor.update_from_response(
                 usage_dict if aggregator_usage is canonical_usage
                 else _loop._compressor_usage_dict(aggregator_usage)
@@ -184,15 +210,18 @@ def record_response_usage(
     # prompt_tokens with replayed thinking. Display-only; compression math uses real usage.
     # The provider just priced this request exactly: if the delta since the previous anchor
     # introduced images, the residual is their real per-image cost (learned before re-anchoring).
-    if has_usage:
+    if has_usage and not _implausible_context_reading:
         calibrate_from_usage(agent, messages, aggregator_usage.prompt_tokens)
     # An anchor is exact only when BOTH prompt and completion are measured: installing an UNKNOWN
     # placeholder as zero would make anchored_context_tokens skip the reply as "already counted".
-    _new_anchor = _loop._capture_measured_usage_anchor(aggregator_usage, messages)
+    _new_anchor = (
+        None if _implausible_context_reading
+        else _loop._capture_measured_usage_anchor(aggregator_usage, messages)
+    )
     if _new_anchor is not None:
         set_usage_anchor(agent, _new_anchor, turn_base=api_call_count == 1)
     _compression_threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
-    if has_usage and _loop._should_rearm_compression_budget(
+    if has_usage and not _implausible_context_reading and _loop._should_rearm_compression_budget(
         compression_attempts, completed_compaction_pending=_completed_compaction_pending,
         prompt_tokens=prompt_tokens, threshold_tokens=_compression_threshold,
     ):
@@ -213,7 +242,8 @@ def record_response_usage(
     agent._last_turn_usage = dict(usage_dict)
     # The parent's CURRENT prompt size for headroom math (delegate summary budgets): the
     # aggregator's own prompt, never the MoA-folded total (advisor prompts are not in this context).
-    agent._last_prompt_size_tokens = int(aggregator_usage.prompt_tokens or 0)
+    if not _implausible_context_reading:
+        agent._last_prompt_size_tokens = int(aggregator_usage.prompt_tokens or 0)
 
     # Persist only provider-confirmed context lengths, not probe tiers.
     if has_usage and getattr(compressor, "_context_probed", False):

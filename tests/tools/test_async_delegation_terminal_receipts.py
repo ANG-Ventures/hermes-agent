@@ -424,7 +424,7 @@ def test_mixed_corruption_both_replay_rails(monkeypatch, rail, caplog):
     adapter.handle_message.assert_awaited_once()
     for identifier in (good, sibling):
         assert row(identifier)["delivery_state"] == "delivered"
-        assert registry_record(identifier)["outbox"][0]["state"] == "delivered"
+        assert registry_record(identifier)["outbox"][0]["state"] == "admitted"
     with pytest.raises(ad._store.RegistryError):
         ad.claim_event_delivery(bad_event, "invalid")
 

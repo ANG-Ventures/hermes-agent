@@ -15,7 +15,10 @@ placement) are refused up front off the dispatcher host, while ``browser_cdp`` (
 the dispatcher process itself) only gets the liveness probe. The agent's own Chromium and the
 computer_use desktop are not operator rails: a placed worker keeps both wherever the pool host can
 host them, and only when that placement fails is the failure reported as this rail
-(``placed_browser_rail_error`` / ``screen_rail_error``). Only a rail error returned by an active
+(``placed_browser_rail_error`` / ``screen_rail_error``). Exception, Layer 1b (t_f813a42f): while
+``browser-session`` is ENFORCED, a browser_* call on a placed host that lacks it is refused up
+front (``browser_capability_error``), so the card re-routes to the Studio instead of failing
+slowly in a pool host's CDP. Only a rail error returned by an active
 model tool call is recorded (background cleanup, ``background_cleanup``, never is), under the owning task, so that worker's
 turn loop, and only it, parks the card ``needs_input`` with the message verbatim
 (``take_rail_absent``).
@@ -177,6 +180,20 @@ def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str
     if not _endpoint_answers(cdp_url):
         return _emit(task, rail_absent_message("browser", socket.gethostname()))
     return None
+
+
+def browser_capability_error() -> Optional[str]:
+    """Layer 1b (D1b-undeclared, t_f813a42f): a browser_* call from a placed worker whose host
+    lacks an ENFORCED ``browser-session`` gets the placement ABSENT line at once, recorded like
+    the mid-run skill_view gate, whether or not the card declared the need. Without it the call
+    passes every declared-need gate and fails slowly inside CDP on the pool host."""
+    if not _owned_task():   # background-review fork / delegate child / interactive: never gated
+        return None
+    from hermes_cli.kanban_placement_failfast import capability_gate
+    absent = capability_gate("browser-session")
+    if absent is not None:
+        record_absent(absent)
+    return absent
 
 
 def placed_browser_rail_error() -> Optional[str]:

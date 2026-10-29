@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 
 from hermes_cli import kanban_headroom as kh
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 
 T0 = 1_792_400_000.0
 
@@ -38,7 +38,7 @@ def test_probe_without_the_fields_is_unmeasured_not_zero():
 
 def test_v2_scorer_closes_on_psi_avg60_from_the_probe():
     spec = placement.HostSpec(name="h", cores=16, threads=32, mem_total_gb=121, mem_reserve_gb=0, cores_reserve=0,
-                              slots={"kanban": 4}, aliases=(), scorer="v2", mt_yield=1.3)
+                              ceilings={"kanban": 4}, aliases=(), scorer="v2", mt_yield=1.3)
     fp = placement.Footprint(ram_gb=3, threads=2)
     hot = kh.sample_from_detail(_detail(procs_running=5, psi_cpu_some60=30.0))
     h = placement.headroom(spec, hot, fp, consumer="kanban", closed_when={"psi_cpu_some10": 40.0})

@@ -556,6 +556,71 @@
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
    "where": "hermes_cli/kanban_worktree_port.py:73 read_mirrors"
+  },
+  "hermes_cli/kanban_db.py::complete_task::fold::repo::own_keys = {(r.repo.lower(), r.number) for r in _open_pr.split_fleet(_open_pr.extract_pr_refs(": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_db.py:10921 complete_task (pre-PR verifier own-PR filter, t_7ff229a7)"
+  },
+  "hermes_cli/kanban_db.py::complete_task::fold::repo::own_keys |= {(r.repo.lower(), r.number) for r in branch_owned_prs}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_db.py:10923 complete_task (pre-PR verifier own-PR filter, t_7ff229a7)"
+  },
+  "hermes_cli/kanban_db.py::complete_task::fold::repo::[r for r in still_open if (r.repo.lower(), r.number) in own_keys],": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_db.py:10925 complete_task (pre-PR verifier own-PR filter, t_7ff229a7)"
+  },
+  "hermes_cli/kanban_handback_new_head.py::seen_head::sql::body LIKE::\"SELECT body, run_id, id, author FROM task_comments WHERE task_id = ? AND body LIKE '%review_coverage:%' \"": {
+   "verdict": "kept",
+   "why": "LIKE is a substring prefilter for the `review_coverage:` marker in free-text comment bodies, not a compare of two identifier keys; task_id is matched with `=` and the one parser (_latest_review_coverage) validates each candidate.",
+   "where": "hermes_cli/kanban_handback_new_head.py:65 seen_head (no-op handback, t_f716021d)"
+  },
+  "hermes_cli/kanban_handback_new_head.py::seen_head::fold::head_sha::head = str(record.get(\"head_sha\") or \"\").strip().lower()": {
+   "verdict": "kept",
+   "why": "git object ids are hex and case-insensitive; lowercasing canonicalizes the reviewer-typed head_sha before the _SHA_RE check and the compare against GitHub's lowercase sha, so byte-exact would split one commit in two.",
+   "where": "hermes_cli/kanban_handback_new_head.py:71 seen_head (no-op handback, t_f716021d)"
+  },
+  "hermes_cli/kanban_handback_new_head.py::content::fold::sha::sha = str(f.get(\"sha\") or \"\").lower()": {
+   "verdict": "kept",
+   "why": "git blob ids are hex and case-insensitive; lowercasing canonicalizes the GitHub files-API blob sha before _SHA_RE and equality, so byte-exact would split one blob in two.",
+   "where": "hermes_cli/kanban_handback_new_head.py:88 content (no-op handback, t_f716021d)"
+  },
+  "hermes_cli/kanban_handback_new_head.py::_resolve::fold::sha::full = str((commit or {}).get(\"sha\") or \"\").lower() if isinstance(commit, dict) else \"\"": {
+   "verdict": "kept",
+   "why": "git object ids are hex and case-insensitive; lowercasing canonicalizes GitHub's resolved commit sha before the full-40-hex check and the exact == compare against the PR head, so byte-exact would split one commit in two.",
+   "where": "hermes_cli/kanban_handback_new_head.py:185 _resolve (no-op handback, Prism c804beeb6820, t_f716021d)"
+  },
+  "hermes_cli/kanban_handback_new_head.py::read_view::fold::sha::head = str((pr.get(\"head\") or {}).get(\"sha\") or \"\").lower()": {
+   "verdict": "kept",
+   "why": "git object ids are hex and case-insensitive; lowercasing canonicalizes the PR head sha before the exact == compare against the resolved seen sha, so byte-exact would split one commit in two.",
+   "where": "hermes_cli/kanban_handback_new_head.py:195 read_view (no-op handback, t_f716021d)"
+  },
+  "hermes_cli/kanban_pr_freshness.py::_owns_draft::fold::repo::return branch_names_card(head_ref, task_id) and ref.repo.casefold() in worker_draft_repos()": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and worker_draft_repos() folds its set the same way, so the folded repo IS the canonical key; byte-exact would miss a worker-draft repo written in another case.",
+   "where": "hermes_cli/kanban_pr_freshness.py:309 _owns_draft"
+  },
+  "hermes_cli/kanban_sign_grants.py::operator_rows_with_live_grants::sql::author LIKE::for r in conn.execute(f\"SELECT {sel} FROM task_comments WHERE task_id = ? AND author LIKE ? ORDER BY id\",": {
+   "verdict": "kept",
+   "why": "prefilter on the constant granted-author shape `[grant:g-%] % (subagent)` (no identifier key bound into the pattern); every matched row is re-parsed by parse_granted_author and its grant fetched by exact id (get(conn, gid, task_id)) before it counts, so the LIKE cannot admit a wrong grant.",
+   "where": "hermes_cli/kanban_sign_grants.py:125 operator_rows_with_live_grants"
+  },
+  "hermes_cli/kanban_sign_grants.py::_pr_keys::fold::repo::return {f\"{r.repo.lower()}#{r.number}\" for t in texts for r in parse_pr_refs(str(t or \"\"), default_repo=None)}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_sign_grants.py:145 _pr_keys"
+  },
+  "hermes_cli/kanban_sign_grants.py::card_pr_keys::fold::repo::return {f\"{repo.lower()}#{number}\" for repo, number in card_prs(card)}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_sign_grants.py:168 card_pr_keys"
+  },
+  "hermes_cli/kanban_sign_grants.py::authored_pr_keys::sql::metadata LIKE::f\"SELECT metadata FROM task_runs WHERE profile IN ({marks}) AND metadata LIKE ?\",": {
+   "verdict": "kept",
+   "why": "`%<number>%` is a candidate prefilter on run-metadata JSON; each matched row is re-parsed by _run_meta_pr_keys and intersected with the exact `owner/repo#N` key, so the LIKE cannot admit a wrong PR.",
+   "where": "hermes_cli/kanban_sign_grants.py:188 authored_pr_keys"
   }
  }
 }

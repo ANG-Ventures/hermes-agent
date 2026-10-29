@@ -31,6 +31,7 @@ second pass inserts nothing.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import sqlite3
 from pathlib import Path
@@ -39,6 +40,8 @@ from typing import Optional
 from hermes_cli import kanban_journal
 
 __all__ = ["replay_into", "ReplayResult"]
+
+logger = logging.getLogger(__name__)
 
 
 class ReplayResult:
@@ -51,6 +54,8 @@ class ReplayResult:
         self.events_restored = 0
         self.orphan_events = 0
         self.orphan_task_ids: set = set()
+        self.grant_ids_dropped = 0
+        self.grants_revoked = 0
         self.snapshot_ts: float = 0.0
 
     def as_dict(self) -> dict:
@@ -61,6 +66,8 @@ class ReplayResult:
             "events_restored": self.events_restored,
             "orphan_events": self.orphan_events,
             "orphan_task_ids": sorted(self.orphan_task_ids),
+            "grant_ids_dropped": self.grant_ids_dropped,
+            "grants_revoked": self.grants_revoked,
             "snapshot_ts": self.snapshot_ts,
         }
 
@@ -126,6 +133,15 @@ def replay_into(
         watermark = _snapshot_watermark(conn) if since is None else float(since)
         result.snapshot_ts = watermark
 
+        has_grant_col = any(
+            r[1] == "grant_id"
+            for r in conn.execute("PRAGMA table_info(task_comments)").fetchall()
+        )
+
+        has_grants_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sign_grants'"
+        ).fetchone() is not None
+
         known = {
             str(r[0]) for r in conn.execute("SELECT id FROM tasks").fetchall()
         }
@@ -159,28 +175,82 @@ def replay_into(
                 body = payload.get("body") or ""
                 if not body:
                     continue
-                dupe = conn.execute(
-                    "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
-                    "AND body = ? AND created_at = ?",
-                    (task_id, author, body, created),
-                ).fetchone()
+                grant_id = payload.get("grant_id")
+                # A granted comment is journaled under its grant-marked author
+                # (``[grant:<id>] by (subagent)``) and replay keeps it, so a restore
+                # never turns it into a plain operator comment, column or no column
+                # (Apollo r8 ruling). A line carrying a grant_id under an unmarked
+                # author is marked the same way here.
+                if grant_id:
+                    from hermes_cli import kanban_sign_grants as ksg
+
+                    if ksg.parse_granted_author(author) is None:
+                        author = ksg.granted_author(author, grant_id)
+                # grant_id is part of the row's identity: a granted record and an
+                # identical ungranted operator record are two comments, and
+                # collapsing them would lose the durable one (Prism 3ee6a1868ab2).
+                dupe_sql = ("SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
+                            "AND body = ? AND created_at = ?")
+                dupe_args = [task_id, author, body, created]
+                if has_grant_col:
+                    dupe_sql += " AND grant_id IS ?"
+                    dupe_args.append(grant_id)
+                dupe = conn.execute(dupe_sql, dupe_args).fetchone()
                 if dupe:
                     result.comments_already_present += 1
                     continue
+                if has_grant_col and grant_id and (ksg.parse_granted_author(author) or (None, None))[1] == grant_id:
+                    # The same comment restored earlier into a pre-migration board: its author marker
+                    # carries this grant id but its grant_id column is NULL. Backfill it instead of
+                    # inserting a second copy (Prism 39c9e9e4455a). Only that restored row qualifies: it
+                    # carries this record's run_id and session_ref too, so an ordinary comment whose author
+                    # merely carries the marker is never collapsed into the granted one (Prism af6b6e94038c).
+                    backfilled = conn.execute(
+                        "UPDATE task_comments SET grant_id = ? WHERE id = (SELECT id FROM task_comments "
+                        "WHERE task_id = ? AND author = ? AND body = ? AND created_at = ? AND grant_id IS NULL "
+                        "AND run_id IS ? AND session_ref IS ? ORDER BY id LIMIT 1)",
+                        (grant_id, task_id, author, body, created, record.get("run_id"),
+                         payload.get("session_ref")),
+                    ).rowcount
+                    if backfilled:
+                        result.comments_already_present += 1
+                        continue
+                # grant_id survives the restore into a migrated board; into a
+                # pre-migration board the marked author still carries the grant id.
+                cols = ["task_id", "author", "body", "run_id", "session_ref", "created_at"]
+                vals = [task_id, author, body, record.get("run_id"),
+                        payload.get("session_ref"), created]
+                if has_grant_col:
+                    cols.append("grant_id")
+                    vals.append(grant_id)
+                elif grant_id:
+                    result.grant_ids_dropped += 1
+                    logger.warning(
+                        "journal replay: %s comment by %s at %s lost grant_id %s "
+                        "(snapshot predates task_comments.grant_id)",
+                        task_id, author, created, grant_id,
+                    )
                 conn.execute(
-                    "INSERT INTO task_comments "
-                    "(task_id, author, body, run_id, session_ref, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        task_id,
-                        author,
-                        body,
-                        record.get("run_id"),
-                        payload.get("session_ref"),
-                        created,
-                    ),
+                    "INSERT INTO task_comments (" + ", ".join(cols) + ") VALUES ("
+                    + ", ".join("?" * len(cols)) + ")",
+                    vals,
                 )
                 result.comments_restored += 1
+                continue
+
+            if kind == "sign_grant_revoked":
+                # A grant live in the snapshot and revoked after it must come back revoked, never
+                # live (Prism a35d26840b79). A grant the snapshot lacks stays absent.
+                # Only a pre-grant snapshot (no table, no grant to revive) skips it; any other failure
+                # propagates, so a revocation that did not land never reads as a clean restore
+                # (Prism da22ed097c63).
+                if task_id and payload.get("grant_id") and has_grants_table:
+                    revoked_at = payload.get("revoked_at")
+                    result.grants_revoked += conn.execute(
+                        "UPDATE sign_grants SET revoked_at = ? WHERE grant_id = ? AND task_id = ? "
+                        "AND revoked_at IS NULL",
+                        (int(ts if revoked_at is None else revoked_at), payload["grant_id"], task_id),
+                    ).rowcount
                 continue
 
             # Every other kind is a lifecycle event: replay it so the audit

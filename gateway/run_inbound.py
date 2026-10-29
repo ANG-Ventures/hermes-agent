@@ -724,7 +724,8 @@ class GatewayInboundMixin:
         steered = False
         if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
             try:
-                steered = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
+                steered = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event),
+                                                    internal=bool(getattr(event, "internal", False)))
             except Exception as exc:
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
         if steered:
@@ -758,6 +759,65 @@ class GatewayInboundMixin:
         # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
         # — that copy was never consumed and grew unbounded.
         running_agent.interrupt(_interrupt_text)
+
+    async def _hm_queue_during_lease_flush(
+        self, event: "MessageEvent", source: SessionSource, _quick_key: str, is_internal: bool
+    ) -> Optional[Tuple[Optional[str]]]:
+        """Queue an inbound that lands in the slot-released / lease-held window (t_d659b247).
+
+        Returns ``None`` when the message must proceed (no held lease, or a slash command: /stop,
+        /new, /status and friends keep working against a flushing turn exactly as against an idle
+        one), else a 1-tuple carrying the reply for ``_handle_message`` to return. A user message
+        gets the same "Queued for the next turn" ack as the busy queue path; an internal wake is
+        queued silently. Both land in the adapter slot / overflow FIFO that the holder's end-of-task
+        drain (or the adapter's requeue back-off) dispatches once the lease is released, so the
+        queued item runs AFTER the flush, in arrival order, and never contends for the lease.
+        Fail-open: any error here lets the message proceed on the pre-fix path.
+        """
+        try:
+            if not self._holds_unreleased_turn_lease(_quick_key):
+                return None
+            if event.get_command():
+                return None
+            adapter = self._delivery_adapter_for(source)
+            if adapter is None or not isinstance(getattr(adapter, "_pending_messages", None), dict):
+                return None
+            depth_before = self._queue_depth(_quick_key, adapter=adapter)
+            self._queue_or_replace_pending_event(_quick_key, event)
+            if self._queue_depth(_quick_key, adapter=adapter) <= depth_before:
+                # Depth cap refused it (logged there); nothing queued, so do not ack a queue.
+                return None
+            # One INFO line per flush window (30 s), DEBUG for the requeue laps after it.
+            _turn = self._session_state(_quick_key).turn
+            _log_now = time.time()
+            _level = logging.INFO if _log_now - _turn.flush_log_ts >= 30 else logging.DEBUG
+            if _level == logging.INFO:
+                _turn.flush_log_ts = _log_now
+            logger.log(
+                _level,
+                "PHASE=lease_flush_queued session=%s internal=%s depth=%d: previous turn still holds "
+                "the turn lease (persist/deliver); queued instead of dispatching a fresh turn",
+                _quick_key, bool(is_internal), self._queue_depth(_quick_key, adapter=adapter),
+            )
+            if is_internal:
+                return (None,)
+            # Same 30 s debounce as the busy ack: a message queued on a DIFFERENT adapter object
+            # than the holder's (kanban notifier vs. the chat's intake adapter) is re-dispatched by
+            # that adapter's requeue back-off (<=1 s) until the lease frees; ack it once, not per lap.
+            _ack_state = self._session_state(_quick_key).turn
+            _now = time.time()
+            if (os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
+                    and _now - (_ack_state.busy_ack_ts or 0) >= 30):
+                _ack_state.busy_ack_ts = _now
+                message = t(
+                    "gateway.busy.ack", head=t("gateway.busy.queued_head"), detail="",
+                    tail=t("gateway.busy.queued_tail"),
+                )
+                await self._send_busy_ack_reply(event, adapter, message)
+            return (None,)
+        except Exception:
+            logger.debug("lease-flush queue gate failed for %s; dispatching", _quick_key, exc_info=True)
+            return None
 
     async def _hm_handle_running_session_message(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -1470,6 +1530,14 @@ class GatewayInboundMixin:
             await asyncio.to_thread(self._hm_evict_reaped_agent, _quick_key)
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
+        # Flush window (t_d659b247): ``_run_agent``'s finally released the SLOT, but the previous
+        # turn still holds the turn LEASE while it persists + delivers (released in this method's
+        # finally, below). Dispatching now would bump the generation, make the registry read the
+        # live holder as "stopped and draining", and bounce this message after the short stale wait
+        # (14:45 2026-10-24). Queue it instead; the holder's end-of-task drain runs it next.
+        _flush_reply = await self._hm_queue_during_lease_flush(event, source, _quick_key, is_internal)
+        if _flush_reply is not None:
+            return _flush_reply[0]
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
@@ -1551,13 +1619,11 @@ class GatewayInboundMixin:
                     "the user must resend",
                     _quick_key, exc.session_id,
                 )
-                return t("gateway.busy.another_turn_running")
-            try:
-                await self._run_post_turn_hooks(
-                    agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
-                )
-            except Exception as _goal_exc:
-                logger.debug("post-turn hook failed: %s", _goal_exc)
+                return self._hm_lease_rejection_reply(event, source, _quick_key)
+            await self._post_turn_hooks_after_delivery(
+                _quick_key, _run_generation, agent_result=_agent_result, source=source,
+                is_internal=is_internal, event=event,
+            )
             return _agent_result
         finally:
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
@@ -1589,6 +1655,36 @@ class GatewayInboundMixin:
                     if _checkout_ticket is not None:
                         _checkout_ticket.release()
 
+    def _hm_lease_rejection_reply(self, event: "MessageEvent", source: SessionSource, _quick_key: str) -> str:
+        """The fail-closed turn-lease rejection reply (``gateway.busy.another_turn_running``), after
+        moving every USER item queued behind the rejected generation into the held store.
+
+        While the rejected turn held the pending sentinel, same-key messages were queued behind it
+        (slot / overflow). Returning the bounce and letting the adapter drain dispatch them would
+        send each one into the same held lease and bounce it too; dropping them violates the queue
+        ruling (queued prompts are never dropped silently). So they are HELD, and the bounce names the
+        count (``/queue run`` releases them). Internal wakes are left in the active store as before.
+        Fail-open: a hold failure still returns the plain bounce (t_d659b247 D-3)."""
+        reply = t("gateway.busy.another_turn_running")
+        try:
+            from gateway import queue_mgmt
+            adapter = self._delivery_adapter_for(source)
+            if adapter is None:
+                return reply
+            before = len(queue_mgmt.held_list(self, _quick_key) or [])
+            held = queue_mgmt.hold_user_items(self, _quick_key, adapter)
+            moved = held - before
+            if moved > 0:
+                logger.info(
+                    "PHASE=lease_reject_hold session=%s held=%d: queued user prompt(s) behind the "
+                    "rejected turn moved to the held store instead of being dropped",
+                    _quick_key, moved,
+                )
+                reply = reply + "\n" + t("gateway.stop.queue_held", count=held)
+        except Exception:
+            logger.warning("queue hold skipped on lease rejection for %s", _quick_key, exc_info=True)
+        return reply
+
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
 
@@ -1612,9 +1708,10 @@ class GatewayInboundMixin:
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
         """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
+        from gateway.config import session_isolation_flags
+        group_per_user, thread_per_user = session_isolation_flags(self.config, source.platform)
         _is_shared_multi_user = is_shared_multi_user_session(
-            source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            source, group_sessions_per_user=group_per_user, thread_sessions_per_user=thread_per_user,
         )
         # Fork: synthetic gateway events (boot auto-resume, queued continuations, internal re-prompts)
         # must never impersonate the user — stamping "[<user>] " onto an EMPTY internal event turned it
@@ -2134,7 +2231,10 @@ class GatewayInboundMixin:
             )
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
-        if "@" in message_text:
+        # An internal event (async-delegation wake, steered leftover) carries already-rendered text:
+        # an ``@file:`` in a child's result is data, never a fresh injection request, and an
+        # over-budget expansion would return None and strand the wake (Prism 5723164466ce).
+        if "@" in message_text and not getattr(event, "internal", False):
             message_text = await self._expand_inbound_context_references(source, session_key, message_text)
             if message_text is None:
                 return None

@@ -4,6 +4,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -93,6 +94,9 @@ _EXCLUDED_DIRS = {
     ".venv", "venv", "site-packages",
     # Tool / build caches — all regeneratable.
     ".cache", ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    # Private per-reader SQLite snapshots (fleet scripts/live_sqlite_snapshot.py) next to their source DB, removed
+    # on close: a copy of a DB that is itself archived. The 10-25 tree held a 9.6 GiB one at the root (t_7da95544).
+    ".sqlite-snapshots",
 }
 
 # Path-anchored excludes: a dir name that is only Apple-IP (or otherwise droppable)
@@ -195,13 +199,158 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     # off-box copy is the weekly forensics lane (forensics-weekly-archive.sh -> NAS tank/backups/forensics,
     # forensics-archive-deadman.py), not this zip tier.
     ("forensics-archive",),                 # carried by the weekly forensics -> NAS lane
+    # 2026-10-25 (t_7da95544): the 10-25 full would have carried 1,432,791 files / 367.3 GiB and was killed at the
+    # 3600 s ceiling (~34 MB/s measured on the 09-27 and 10-04 fulls, so the ceiling carries ~115 GiB). Bytes rows:
+    ("state", "backup", "*"),               # the backup's OWN staging + August pre-restart state.db copies (13.7 GiB);
+                                            # heartbeat/receipt files directly in state/backup/ stay in
+    ("profiles", "*", "incidents"),         # profile incident captures (aegis: one 09-12 sqlite case, 82 GiB)
+    ("profiles", "*", "sessions"),          # per-profile session transcripts (restic machine lane, nightly)
+    ("var", "lcm-dedup-*"),                 # September LCM dedup/replay one-off pre/post copies (24 GiB)
+    ("var", "lcm-prune-*"),                 # September LCM prune one-off pre-prune copy (10 GiB)
+    ("state", "blackbox-backfill-bak-*"),   # 09-24 blackbox backfill rollback copies (3.3 GiB)
+    ("var", "work-delivery-drift-cache"),   # bare git mirrors work-delivery-drift.py re-fetches (6.3 GiB)
+    ("var", "ledger-snap"),                 # restic lane's integrity-checked COPY of var/ledger/ledger.db (4 GiB)
+    ("blackbox", "pre-*"),                  # blackbox pre-repair/pre-backfill rollback copies (4.4 GiB)
+    ("profiles", "*", "blackbox"),          # per-profile turn telemetry (daedalus 5.5 GiB); restic excludes it too
+    ("var", "detached"),                    # detached-run.py run dirs + logs, self-pruned at 7 days (54 k files)
+    # 2026-10-26 (t_87fd92a8): still 680 k files after the bytes cut against a 400 k target. File-count rows, each
+    # a derived index, an API cache or a git mirror whose source of record is elsewhere:
+    ("var", "prism", "index"),              # one json per Prism finding key (56 k); rebuilt from the signed record
+                                            # mirror + route ledger by `prism-findings-route.py --index-backfill`
+    ("state", "ci-job-durations", "jobs"),  # per-run GitHub Actions jobs cache (22 k), re-read from the API; the
+                                            # measurement itself (var/ci-job-durations.json) stays in
+    ("var", "pr-git-mirror"),               # bare GitHub mirrors for PR git facts (16 k), same class as mirrors/
+    ("var", "mirror-ci"),                   # bare hermes-agent mirror for CI (8.7 k), same class as mirrors/
 )
+
+# ROOT-anchored FILE globs: one fnmatch pattern per path component and the same length as the path, so
+# ``var/oneshot/*.tgz`` matches only files directly in var/oneshot/. 2026-10-25 (t_7da95544):
+_EXCLUDED_ROOT_FILE_PATH_GLOBS = (
+    ("var", "oneshot", "*.tgz"),            # land-home-pr.sh `git archive` exports shipped to ACE-AI (~190 MB each,
+                                            # 176 of them = 28 GiB); regenerable from the PR ref
+    ("state", "gitconfig-watch", "*.ndjson"),  # gcw_es / backstop_poller append-only event logs (22 GiB); the
+                                            # restic machine lane excludes them for the same reason
+    ("var", "ledger", "*.db.bak*"),         # ledger.db rollback copies left by repair cards (3.3 GiB)
+    ("recovery", "*", "*-repair", "*.db"),  # incident repair workdirs' pre-apply/dry-run state.db copies (7.6 GiB);
+                                            # the incident's reports and evidence next to them stay in
+    # Per-profile hot SQLite stores (daedalus 23 GiB, daedalus-opus 14 GiB). The quick tier snapshots the
+    # ROOT's state.db (and aegis's); a worker profile's own session/LCM history is transcript state, and the
+    # nightly restic machine lane carries profiles/*/ off-box.
+    ("profiles", "*", "state.db"),
+    ("profiles", "*", "lcm.db"),
+    ("profiles", "*", "lcm-archive.db"),
+    # var/land-requests/<ulid>.done.json + .result.json pairs are NOT a path rule: see _is_stale_land_pair.
+)
+
+# 2026-10-26 (t_87fd92a8, Prism cc81fb1d8a06): one <ulid>.done.json + <ulid>.result.json pair per land request
+# (26 k files). A done pair is NOT always history: a result whose status is ARMED/QUEUED is a live auto-merge
+# intent, and readers decide current state from the pair files themselves, not from state/merge-ledger.jsonl:
+# kanban_terminal_pending (6 h, extends an approved card's claim), apollo-land-autopilot re-arm (72 h),
+# fleet-merge-horizon-watch (72 h), mq_eviction_watch (48 h). So only pairs whose NEWER half is older than every
+# such horizon are pruned, both halves together, and a pair with a half missing or a <ulid>.parked.json (park()
+# finishes the request but it stays live until .unparked.json) is kept. Queue files are never pruned.
+_LAND_REQUEST_DIR = ("var", "land-requests")
+_LAND_PAIR_SUFFIXES = (".done.json", ".result.json")
+_LAND_PAIR_KEEP_S = 7 * 86400
+
+
+def _is_stale_land_pair(hermes_root: Path, rel_path: Path, now: Optional[float] = None) -> bool:
+    """True when *rel_path* is half of a finished land-request pair that no live reader can still need."""
+    parts = rel_path.parts
+    if len(parts) != 3 or parts[:2] != _LAND_REQUEST_DIR:
+        return False
+    sfx = next((s for s in _LAND_PAIR_SUFFIXES if parts[2].endswith(s)), None)
+    uid = parts[2][: -len(sfx)] if sfx else ""
+    if not uid:
+        return False
+    d = hermes_root.joinpath(*_LAND_REQUEST_DIR)
+    if (d / f"{uid}.parked.json").exists() and not (d / f"{uid}.unparked.json").exists():
+        return False
+    try:
+        newest = max((d / f"{uid}{s}").stat().st_mtime for s in _LAND_PAIR_SUFFIXES)
+    except OSError:
+        return False  # a half is missing: not provably a finished pair
+    return (time.time() if now is None else now) - newest > _LAND_PAIR_KEEP_S
+
+# Git checkouts below the root (any dir holding a ``.git`` file or dir, the root's own checkout excluded) carry
+# only what exists nowhere else: tracked files that differ from HEAD plus every untracked file (t_e95deca8's
+# unique work). Their tracked, unmodified files are in the repository and on its remotes. 2026-10-25
+# (t_7da95544): root wt/ + worktrees/ alone were 549 k of the 1.43 M files the full tier listed. A checkout
+# qualifies when its HEAD is reachable from a remote-tracking ref, or when it is a linked worktree directly
+# under _DIRTY_ONLY_WORKTREE_ROOTS (its unpushed commits ride as a bundle, _WORKTREE_BUNDLE_ROOTS). Any other
+# checkout, and any checkout git cannot answer for, is walked whole as before, so a git failure never drops work.
+_DIRTY_ONLY_WORKTREE_ROOTS = ("wt", "worktrees")
 
 # Root-level rollback copies of a DB (`kanban.db.bak-notify-sweep-<ts>`, `state.db.bak-<tag>`, ...). Pre-change
 # rollback points written by sweeps and repair recipes, not state: the DB itself is in the archive (sqlite backup)
 # and kanban.db has its own hourly tier. 2026-10-18: 68 of them at the root, 4.7 GB. Root-only, so a profile's own
 # files are untouched; fnmatch on the basename.
-_EXCLUDED_ROOT_FILE_GLOBS = ("*.db.bak*", "*.db.*.bak", "*.sqlite.bak*")
+_EXCLUDED_ROOT_FILE_GLOBS = ("*.db.bak*", "*.db.*.bak", "*.sqlite.bak*",
+                             # t_7da95544: same class, other spellings (lcm.db.pre-replay-dedup-20260925 6.2 GB,
+                             # state.db.broken-20260919-171433 3.7 GB + its -wal)
+                             "*.db.pre-*", "*.db.broken-*")
+
+# --- Generic exclude CLASSES (t_98bb8096). Each names where the data's other copy lives. ---
+# Class 1, rollback copies of a SQLite DB at ANY depth (`<x>.db.bak*`, `<x>.db.<tag>.bak`, `<x>.sqlite.bak*`,
+# `<x>.db.pre-*`, `<x>.db.broken-*`, `<x>.db-bak-*`). Second copy: the live sibling `<x>.db` in the same dir, which
+# the archive carries via sqlite backup. Dropped ONLY while that sibling exists (_is_db_rollback_copy, walker-side),
+# so a lone renamed DB is never lost. The root-only _EXCLUDED_ROOT_FILE_GLOBS above stays unconditional.
+_DB_ROLLBACK_RE = re.compile(
+    r"^(?P<db>.+?\.db)(?:\.bak.*|\..+\.bak|\.pre-.*|\.broken-.*|-bak-.*)$|^(?P<sq>.+?\.sqlite)\.bak.*$")
+
+# Class 2, rollback DIRS directly under state/ or var/ (depth 2, root-anchored; see _EXCLUDED_ROOT_PATH_GLOBS).
+# Second copy: the live tree they were copied from, itself in the archive.
+_ROLLBACK_DIR_GLOBS = ("*-bak-[0-9]*", "*.pre-*", "*.broken-*")
+
+# Class 3, incident/forensics capture DIRS at depth <= 3 (dir component index 0..2). Second copy: the weekly
+# forensics -> NAS lane (forensics-weekly-archive.sh -> tank/backups/forensics), as for root forensics-archive/.
+# Skill trees are user content, never captures, so a skill dir that merely shares the prefix is kept.
+_CAPTURE_DIR_GLOBS = ("forensic-*", "forensics-*", "incident-capture-*")
+_CAPTURE_DIR_MAX_DEPTH = 3
+_CAPTURE_EXEMPT_ROOTS = frozenset({"skills", "skills-shared", "optional-skills"})
+
+# Class 4, staging/export artifacts at any depth under state/ or var/: `*.partial` files (interrupted downloads/
+# copies), `*-staging/` dirs and `export-*.tgz|.tar|.zip` files. Second copy: the source they were staged or
+# exported from (the export is a re-runnable snapshot of it; a .partial is an incomplete duplicate).
+_STAGING_ROOTS = frozenset({"state", "var"})
+_STAGING_DIR_GLOB = "*-staging"
+_STAGING_FILE_GLOBS = ("*.partial", "export-*.tgz", "export-*.tar", "export-*.zip")
+# Append-only logs are NOT a class here: they are bounded at the writer (t_db7f0a2e), and hermes-home's weekly
+# scripts/lints/backup-exclude-classes-lint.py reports regrowth.
+
+
+def _is_db_rollback_copy(hermes_root: Path, rel_path: Path) -> bool:
+    """True when *rel_path* is a class-1 rollback copy whose live sibling DB exists in the same dir."""
+    m = _DB_ROLLBACK_RE.match(rel_path.name)
+    if not m:
+        return False
+    live = m.group("db") or m.group("sq")
+    try:
+        return (hermes_root / rel_path.parent / live).is_file()
+    except OSError:
+        return False
+
+
+def _matches_class_dir(parts: tuple[str, ...]) -> bool:
+    """Classes 2-4 on ANCESTOR components only (same discipline as _matches_path_glob): a FILE is never
+    dropped because its own name looks like a rollback/capture/staging dir."""
+    ancestors = parts[:-1]
+    if len(ancestors) >= 2 and ancestors[0] in _STAGING_ROOTS and any(
+            fnmatch.fnmatchcase(ancestors[1], g) for g in _ROLLBACK_DIR_GLOBS):
+        return True
+    if ancestors and ancestors[0] in _STAGING_ROOTS and any(
+            fnmatch.fnmatchcase(a, _STAGING_DIR_GLOB) for a in ancestors[1:]):
+        return True
+    if ancestors and ancestors[0] not in _CAPTURE_EXEMPT_ROOTS and any(
+            fnmatch.fnmatchcase(a, g) for a in ancestors[:_CAPTURE_DIR_MAX_DEPTH] for g in _CAPTURE_DIR_GLOBS):
+        return True
+    return False
+
+
+def _is_staging_file(parts: tuple[str, ...]) -> bool:
+    """Class 4 file rule: a staging/export artifact file anywhere under state/ or var/."""
+    return len(parts) >= 2 and parts[0] in _STAGING_ROOTS and any(
+        fnmatch.fnmatchcase(parts[-1], g) for g in _STAGING_FILE_GLOBS)
 
 # Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE
 # scratch root (tool caches, telemetry cuts, per-incident capture dirs) — not agent
@@ -549,8 +698,13 @@ def _should_exclude(rel_path: Path) -> bool:
         return True
     if _matches_path_glob(parts) or _is_excluded_cache_path(parts):
         return True
+    if _matches_class_dir(parts) or _is_staging_file(parts):
+        return True
     name = rel_path.name
     if len(parts) == 1 and any(fnmatch.fnmatchcase(name, g) for g in _EXCLUDED_ROOT_FILE_GLOBS):
+        return True
+    if any(len(parts) == len(pattern) and all(fnmatch.fnmatchcase(p, g) for p, g in zip(parts, pattern))
+           for pattern in _EXCLUDED_ROOT_FILE_PATH_GLOBS):
         return True
     return name in _EXCLUDED_NAMES or name.startswith(_EXCLUDED_PREFIXES) or name.endswith(_EXCLUDED_SUFFIXES)
 
@@ -562,9 +716,16 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
     excluded tree, the root-only ``hermes-agent`` carve-out, root runtime trees, per-file rules),
     shared by ``hermes backup`` and the pre-update path so they can never drift.
     """
+    # Innermost enclosing git checkout of the current dir: (its rel parts, clean tracked paths or None).
+    checkouts: List[tuple] = []
     for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
         rel_dir = Path(dirpath).relative_to(hermes_root)
         is_root = rel_dir == Path(".")
+        while checkouts and rel_dir.parts[:len(checkouts[-1][0])] != checkouts[-1][0]:
+            checkouts.pop()
+        if not is_root and (".git" in dirnames or ".git" in filenames):
+            checkouts.append((rel_dir.parts, _checkout_clean_tracked(Path(dirpath), rel_dir.parts)))
+        co_parts, clean = checkouts[-1] if checkouts else ((), None)
         kept = [
             d for d in dirnames
             if (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
@@ -572,7 +733,8 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             and not d.startswith(_EXCLUDED_DIR_PREFIXES)
             and not any(rel_dir.name == parent and d == child for parent, child in _EXCLUDED_PARENT_CHILD)
             and not _matches_path_glob((*(rel_dir / d).parts, "_"))
-            and not _is_excluded_cache_path((*(rel_dir / d).parts, "_"))]
+            and not _is_excluded_cache_path((*(rel_dir / d).parts, "_"))
+            and not _matches_class_dir((*(rel_dir / d).parts, "_"))]
         if skipped_dirs is not None:
             skipped_dirs.update(str(rel_dir / d) for d in set(dirnames) - set(kept))
         # No walk may follow a junction.
@@ -583,14 +745,52 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             # zipfile.write() follows file symlinks, so skip links before any archive write can
             # copy data from outside HERMES_HOME; never archive the output zip into itself, neither
             # published nor as its open staging file (a re-scan runs while that file is growing).
-            if _should_exclude(rel):
+            if (_should_exclude(rel) or _is_stale_land_pair(hermes_root, rel)
+                    or _is_db_rollback_copy(hermes_root, rel)):
                 continue
+            if clean and Path(*rel.parts[len(co_parts):]).as_posix() in clean:
+                continue  # tracked + unmodified in a git checkout: the repository and its remotes have it
             if _is_non_regular_path(fpath):
                 continue
             with suppress(OSError, ValueError):
                 if fpath.resolve() == out_path.resolve() or _is_staging_of(fpath, out_path):
                     continue
             yield fpath, rel
+
+
+def _checkout_clean_tracked(checkout: Path, rel_parts: tuple) -> Optional[frozenset]:
+    """Tracked paths of a git checkout that match HEAD (posix, checkout-relative); None = walk it whole.
+
+    Qualifies (see _DIRTY_ONLY_WORKTREE_ROOTS): HEAD reachable from a remote-tracking ref, or a linked worktree
+    directly under a dirty-only root (its unpushed commits are bundled). None otherwise, and on any git failure.
+    """
+    try:
+        bundled = (len(rel_parts) == 2 and rel_parts[0] in _DIRTY_ONLY_WORKTREE_ROOTS
+                   and (checkout / ".git").is_file())
+        if not bundled:
+            ahead = _worktree_git(checkout, "rev-list", "--count", "HEAD", "--not", "--remotes")
+            if ahead.returncode != 0 or ahead.stdout.strip() != "0":
+                return None
+            # `--not --remotes` with no remote-tracking refs at all counts every commit, so "0" means HEAD is on one
+        # -v prefixes each path with its index flag: `h` assume-unchanged, `S` skip-worktree, `s` both. `git diff HEAD`
+        # does not report working-tree edits to those files, so only a plain `H` entry is ever "clean": every other
+        # flag is carried like any modified file (Prism a5c80df2341e, 5cdbb59d31bc; the live tree pins cron/jobs.json
+        # skip-worktree).
+        tracked = _worktree_git(checkout, "ls-files", "-v", "-z")
+        changed = _worktree_git(checkout, "diff", "-z", "--name-only", "--no-renames", "HEAD")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if tracked.returncode != 0 or changed.returncode != 0:
+        return None
+    clean = set()
+    for row in tracked.stdout.split("\0"):
+        if len(row) < 3 or row[1] != " ":
+            continue
+        flag, path = row[0], row[2:]
+        if flag != "H":
+            continue
+        clean.add(path)
+    return frozenset(clean) - {p for p in changed.stdout.split("\0") if p}
 
 
 # --- SQLite safe copy ---
@@ -976,6 +1176,9 @@ def run_backup(args) -> bool:
     except BackupInProgressError as exc:
         print(f"Error: {exc}")
         raise SystemExit(2) from exc
+    except _PairArchiveError as exc:  # the partial zip was discarded; nothing published
+        print(f"Error: {exc}. No archive written.")
+        raise SystemExit(1) from exc
 
 
 def _census_gate(files_to_add, census_out: str, gate_cmd: Optional[str]) -> None:
@@ -1045,6 +1248,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         print(f"  {i}/{file_count} files ...")
         logger.info("backup phase=archive status=progress completed=%d total=%d", i, file_count)
 
+    files_to_add, cron_homes = _split_cron_pairs(files_to_add)
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
             archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         total_bytes = _write_zip_entries(
@@ -1052,13 +1256,17 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
             on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
             on_vanished=lambda rel: vanished.append(str(rel)))
+        captured: dict = {}  # store identity -> home it was archived from (Prism dafc6732ca54)
+        total_bytes += _zip_cron_pairs(zf, hermes_root, cron_homes, out_path,
+                                       lambda rel, exc: errors.append(f"{rel}: {exc}"), captured)
         late_added = 0
         if vanished:
             # A rename looks like a vanish here: the old path is gone and the new one was never
             # listed. Re-scan once and archive what the first scan did not list, so moved data
             # still lands and only a true deletion stays a WARN.
             listed = {str(rel) for _, rel in files_to_add}
-            late = [(a, r) for a, r in _iter_backup_files(hermes_root, out_path) if str(r) not in listed]
+            late, late_homes = _split_cron_pairs(list(_iter_backup_files(hermes_root, out_path)))
+            late = [(a, r) for a, r in late if str(r) not in listed]
             late_added = len(late)
             file_count += late_added
             total_bytes += _write_zip_entries(
@@ -1066,6 +1274,14 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
                 on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
                 on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
                 on_vanished=lambda rel: vanished.append(str(rel)))
+            # Prism 3c9a7b0dc534: a store renamed with its profile is a pair the first pass never
+            # saw; archive it as one unit too, never drop it with the rescan's homes.
+            # Prism dafc6732ca54: a store renamed AFTER pass 1 archived it is skipped by identity
+            # (``captured``), else it would import as a second, independently ticked store.
+            total_bytes += _zip_cron_pairs(zf, hermes_root,
+                                           [h for h in late_homes if h not in cron_homes],
+                                           out_path, lambda rel, exc: errors.append(f"{rel}: {exc}"),
+                                           captured)
         # External memory-provider state never includes ``.db`` files in practice, so no
         # SQLite snapshot is needed; _write_zip_file still drops a failed partial member.
         for abs_path, arcname in external_to_add:
@@ -1273,6 +1489,9 @@ def run_import(args) -> Optional[int]:
         # import replaced with one holding fewer rows. A restore is allowed to
         # do that — it just must not do it silently (issue #100960).
         db_shrunk: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+        from cron import store_pair
+        from cron.store_pair import pair_home
+        cron_pairs: Dict[Tuple[str, ...], Dict[str, str]] = {}
         home_dir = Path.home().resolve()
         # Resolved once: every member is published via a temp file, and mkstemp
         # would otherwise create newly restored files as 0600.
@@ -1352,6 +1571,16 @@ def run_import(args) -> Optional[int]:
                 skipped_runtime.append(rel)
                 continue
 
+            # I4 (t_82c613d9): a cron store pair is restored as ONE unit after the loop, under
+            # that store's lock. A stray ``runtime_state.db.*`` copy is never installed.
+            store_home = pair_home(parts)
+            if store_home is not None:
+                if parts[-1] in (store_pair.JOBS_NAME, store_pair.DB_NAME):
+                    cron_pairs.setdefault(store_home, {})[parts[-1]] = member
+                else:
+                    skipped_runtime.append(rel)
+                continue
+
             target = hermes_root.joinpath(*parts)
 
             # Security: reject absolute paths and traversals
@@ -1381,6 +1610,27 @@ def run_import(args) -> Optional[int]:
 
             if restored % 500 == 0:
                 print(f"  {restored}/{file_count} files ...")
+
+        for store_home, pair_members in cron_pairs.items():
+            label = "/".join((*store_home, store_pair.CRON_DIR))
+            # Same destination containment as the per-file path, BEFORE anything is written
+            # (Prism dbf3e89fdfa5): a cron dir (or store home) linked outside hermes_root refuses.
+            pair_dir = hermes_root.joinpath(*store_home, store_pair.CRON_DIR)
+            try:
+                # BOTH live members, not only those in the archive (Prism 4c71a06241bb): a
+                # json-only restore rewrites the live db too.
+                for target in (pair_dir, *(pair_dir / name for name in store_pair.PAIR_NAMES)):
+                    target.resolve().relative_to(hermes_root.resolve())
+            except ValueError:
+                errors.append(f"  {label}: path traversal blocked")
+                continue
+            try:  # refuses a db with no jobs.json (rows without definitions), store untouched
+                hermes_root.joinpath(*store_home).mkdir(parents=True, exist_ok=True)
+                restored += len(store_pair.restore_members(
+                    {name: (lambda m=m: zf.open(m)) for name, m in pair_members.items()},
+                    hermes_root.joinpath(*store_home)))
+            except (OSError, ValueError, RuntimeError, *_ZIP_MEMBER_READ_ERRORS) as exc:
+                errors.append(f"  {label}: {exc}")
 
         elapsed = time.monotonic() - t0
 
@@ -1530,6 +1780,7 @@ def run_import(args) -> Optional[int]:
 # outside state.db, so it is listed explicitly — ``hermes update`` snapshots this set (#15733).
 _QUICK_STATE_FILES = (
     "state.db", "config.yaml", ".env", "auth.json", "cron/jobs.json", "cron/executions.db",
+    "cron/runtime_state.db",  # cron runtime fields (t_94e91559): jobs.json is definitions-only
     "gateway_state.json", "channel_directory.json", "channel_aliases.json", "processes.json",
     "gateway/discord_message_recovery.db",  # Discord reconnect replay ledger
     # Per-profile user stores, destroyed if the update flow replaces the file and the post-update
@@ -1563,6 +1814,101 @@ def _newest_first(root: Path, keep_entry) -> List[Path]:
 
 # Kept in sync with ``_QUICK_STATE_FILES`` and ``cron/jobs.py``'s ``JOBS_FILE``.
 _CRON_JOBS_REL = "cron/jobs.json"
+_CRON_RUNTIME_REL = "cron/runtime_state.db"
+
+
+def _split_cron_pairs(files: List[Tuple[Path, Path]]) -> Tuple[List[Tuple[Path, Path]], List[Tuple[str, ...]]]:
+    """Take every cron store pair member (``[profiles/<n>/]cron/jobs.json`` and
+    ``runtime_state.db*``) out of a full-backup file list; return ``(others, store_homes)``.
+    The pairs are archived by :func:`_zip_cron_pairs` as one unit each (invariant I4,
+    t_82c613d9: Prism 30138fa3c582 and duplicates)."""
+    from cron.store_pair import pair_home
+
+    others: List[Tuple[Path, Path]] = []
+    homes: List[Tuple[str, ...]] = []
+    for abs_path, rel_path in files:
+        home = pair_home(tuple(Path(rel_path).parts))
+        if home is None:
+            others.append((abs_path, rel_path))
+        elif home not in homes:
+            homes.append(home)
+    return others, homes
+
+
+def _store_identity(hermes_root: Path, home: Tuple[str, ...]) -> Optional[tuple]:
+    """``(st_dev, st_ino)`` of *home*'s cron DIRECTORY (``os.lstat``), or ``None`` when missing.
+    A profile rename keeps the directory inode, and atomic member saves (every jobs.json write
+    replaces the file, Prism 1ac2e940806c) do not touch it; two distinct stores always have
+    distinct cron dirs, even with hard-linked members (Prism fd3e5e76e488)."""
+    from cron import store_pair
+
+    try:
+        st = os.lstat(hermes_root.joinpath(*home, store_pair.CRON_DIR))
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _zip_cron_pairs(zf: zipfile.ZipFile, hermes_root: Path, homes: List[Tuple[str, ...]],
+                    out_path: Path, on_error, captured: Optional[dict] = None) -> int:
+    """Capture each store's pair under its cron lock (``cron.store_pair.capture``) beside the
+    output zip and archive both halves; return bytes archived. A refused capture is ONE error for
+    the whole pair: neither half is archived alone. *captured*, when given, maps the
+    :func:`_store_identity` (cron directory) of every store archived in full to the home it was
+    archived from. A store is skipped only when its identity matches a captured store AND that
+    store's original home no longer holds it, i.e. the same store moved (Prism dafc6732ca54:
+    seen again under a renamed profile). A store still at its first path is a different store
+    and is archived (Prism fd3e5e76e488)."""
+    from cron import store_pair
+
+    total = 0
+    for home in homes:
+        rel_cron = Path(*home, store_pair.CRON_DIR)
+        idents = _store_identity(hermes_root, home) if captured is not None else None
+        first = captured.get(idents) if captured is not None and idents else None
+        if first is not None and first != home \
+                and _store_identity(hermes_root, first) != idents:
+            logger.info("backup: skipping cron store %s, already archived as %s (renamed during "
+                        "the backup)", rel_cron, Path(*first, store_pair.CRON_DIR))
+            continue
+        with tempfile.TemporaryDirectory(prefix=".cron-pair-", dir=str(out_path.parent)) as tmp:
+            read_from: List[tuple] = []
+            try:
+                names = store_pair.capture(hermes_root.joinpath(*home), Path(tmp),
+                                           identity=read_from)
+            except (OSError, ValueError, RuntimeError) as exc:
+                on_error(rel_cron / store_pair.JOBS_NAME, exc)  # neither half archived
+                continue
+            # Prism 077416e0ccaf: a write failure AFTER the first half landed would leave a
+            # half pair in the zip. That aborts the archive; a failure on the first half (which
+            # _write_zip_file already dropped) skips the pair as one error.
+            archived = 0
+            for name in names:
+                try:
+                    _write_zip_file(zf, Path(tmp) / name, str(rel_cron / name))
+                    # Prism 7edcf5c778ea: counted the moment it is IN the zip, so a failure after
+                    # this point (the size stat) aborts instead of skipping a half-written pair.
+                    archived += 1
+                    total += (Path(tmp) / name).stat().st_size
+                except (OSError, ValueError) as exc:
+                    if archived:
+                        raise _PairArchiveError(
+                            f"{rel_cron}: archiving {name} failed after {archived} pair member(s) "
+                            f"were written ({exc}); refusing to publish a half cron store pair"
+                        ) from exc
+                    on_error(rel_cron / name, exc)
+                    break
+            if captured is not None and names and archived == len(names) and read_from:
+                # Prism 268968d0f1f5 / a398ca30beda: record the identity of the cron directory
+                # capture() actually read under its lock. The pre-capture sample can name a store
+                # moved away before the lock, and a re-read of the path now can name a store that
+                # replaced it while the members were zipped; either would skip an unarchived store.
+                captured.setdefault(read_from[0], home)
+    return total
+
+
+class _PairArchiveError(OSError):
+    """A cron store pair was half written into a zip: the archive must not be published."""
 
 
 # Config paths the update flow must never change (#64160): model routing and the MoA section are
@@ -1755,6 +2101,27 @@ def _create_quick_snapshot_locked(
     oversized_skipped: list[str] = []
 
     for rel in _QUICK_STATE_FILES:
+        if rel == _CRON_RUNTIME_REL:
+            continue  # captured with jobs.json, below
+        if rel == _CRON_JOBS_REL:
+            # I4 (t_82c613d9): the pair is captured as ONE unit under the cron store lock.
+            from cron import store_pair
+            try:
+                for name in store_pair.capture(home, staging_dir / store_pair.CRON_DIR):
+                    pair_rel = f"{store_pair.CRON_DIR}/{name}"
+                    manifest[pair_rel] = (staging_dir / pair_rel).stat().st_size
+            except (store_pair.PairRefused, OSError, RuntimeError) as exc:
+                # Prism 5aa2d785f5af: keep jobs.json (restore_cron_jobs_if_emptied depends on
+                # it) and name the db as failed, so a restore keeps the live rows instead of
+                # reading this as a json-only snapshot (72fe227c70de).
+                failed_dbs.append(_CRON_RUNTIME_REL)
+                print(f"  ⚠ Snapshot: cron runtime db NOT captured (jobs.json only): {exc}")
+                try:
+                    if store_pair.capture_definitions(home, staging_dir / store_pair.CRON_DIR):
+                        manifest[_CRON_JOBS_REL] = (staging_dir / _CRON_JOBS_REL).stat().st_size
+                except (store_pair.PairRefused, OSError, RuntimeError) as exc2:
+                    logger.warning("Could not snapshot %s: %s", _CRON_JOBS_REL, exc2)
+            continue
         src = home / rel
         if not src.exists():
             continue
@@ -1950,6 +2317,24 @@ def list_quick_snapshots(
     return results
 
 
+def _contained(path: Path, root: Path) -> bool:
+    """True when *path* resolves (links followed) inside *root*."""
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _snapshot_cron_db_failed(meta: Any) -> bool:
+    """True when the snapshot's runtime db was present but NOT captured (failed or skipped), as
+    opposed to a json-only snapshot taken before #2287 (Prism 72fe227c70de)."""
+    if not isinstance(meta, dict):
+        return False
+    return any(_CRON_RUNTIME_REL in (meta.get(k) or ())
+               for k in ("failed_dbs", "oversized_skipped"))
+
+
 def restore_quick_snapshot(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
@@ -1988,7 +2373,28 @@ def restore_quick_snapshot(
         meta = json.load(f)
 
     restored = 0
-    for rel in meta.get("files", {}):
+    files = meta.get("files", {})
+    if _CRON_JOBS_REL in files or _CRON_RUNTIME_REL in files:
+        # I4 (t_82c613d9): the pair is restored as ONE unit under the cron store lock. A snapshot
+        # without runtime_state.db (taken before #2287) clears the live rows: its jobs.json
+        # carries the runtime it was taken with, adopted on the next load.
+        from cron import store_pair
+        try:
+            # Same containment as the per-file restore below, for BOTH members on both sides,
+            # before the pair lock is taken (Prism dd8a638040cd); store_pair.restore then refuses
+            # any link in the live store or the source.
+            for member in (_CRON_JOBS_REL, _CRON_RUNTIME_REL):
+                if not (_contained(snap_dir / member, snap_dir)
+                        and _contained(home / member, home)):
+                    raise store_pair.PairRefused(f"{member}: path traversal blocked")
+            restored += len(store_pair.restore(snap_dir / store_pair.CRON_DIR, home,
+                                               db_failed=_snapshot_cron_db_failed(meta),
+                                               root=snap_dir))
+        except (store_pair.PairRefused, OSError, RuntimeError) as exc:
+            logger.error("Failed to restore the cron store pair from %s: %s", snapshot_id, exc)
+    for rel in files:
+        if rel in (_CRON_JOBS_REL, _CRON_RUNTIME_REL):
+            continue
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
         try:
@@ -2118,9 +2524,15 @@ def restore_cron_jobs_if_emptied(
         return None
 
     try:
-        live_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snap_path, live_path)
-    except (OSError, PermissionError) as exc:
+        # I4 (t_82c613d9, Prism 10c3c30e47f6): the snapshot's PAIR, never jobs.json alone.
+        from cron import store_pair
+        meta: Dict[str, Any] = {}
+        with suppress(OSError, ValueError):
+            meta = json.loads((snap_path.parent.parent / "manifest.json").read_text(
+                encoding="utf-8-sig"))
+        store_pair.restore(snap_path.parent, home, db_failed=_snapshot_cron_db_failed(meta),
+                           root=_quick_snapshot_root(home) / snapshot_id)
+    except (OSError, ValueError, RuntimeError) as exc:
         logger.error(
             "Cron jobs were emptied during update but auto-restore failed: %s", exc
         )
@@ -2236,31 +2648,31 @@ def restore_cron_prompt_fields_if_degraded(
             snap_by_id[str(job.get("id", ""))] = job
 
     restored_ids: list[str] = []
-    live_jobs = _cron_jobs_list(live_doc)
-    for job in live_jobs:
-        if not isinstance(job, dict):
-            continue
-        snap_job = snap_by_id.get(str(job.get("id", "")))
-        if snap_job is None:
-            continue
-        if not _prompt_degraded(job):
-            continue
-        snap_prompt = snap_job.get("prompt")
-        if not isinstance(snap_prompt, str) or not snap_prompt.strip():
-            continue
-        job["prompt"] = snap_prompt
-        restored_ids.append(str(job.get("id", "")))
 
-    if not restored_ids:
-        return None
+    def _restore_prompts(live_jobs: list) -> bool:
+        # Runs under the store lock on the jobs loaded there (Prism 643fd504e41a): the unlocked
+        # read above only decides whether there is anything to do.
+        restored_ids.clear()
+        for job in live_jobs:
+            if not isinstance(job, dict):
+                continue
+            snap_job = snap_by_id.get(str(job.get("id", "")))
+            if snap_job is None:
+                continue
+            if not _prompt_degraded(job):
+                continue
+            snap_prompt = snap_job.get("prompt")
+            if not isinstance(snap_prompt, str) or not snap_prompt.strip():
+                continue
+            job["prompt"] = snap_prompt
+            restored_ids.append(str(job.get("id", "")))
+        return bool(restored_ids)
 
     try:
-        live_path.parent.mkdir(parents=True, exist_ok=True)
-        with _atomic_output_path(live_path) as tmp_path:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(live_doc, f, indent=2)
-                f.write("\n")
-    except (OSError, PermissionError) as exc:
+        from cron import store_pair
+        if not store_pair.publish_definitions(home, _restore_prompts):
+            return None
+    except (OSError, ValueError, RuntimeError) as exc:
         logger.error(
             "Cron job prompts were degraded during update but auto-restore "
             "failed: %s",
@@ -2687,14 +3099,17 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         return published
 
     archive_started = time.monotonic()
+    plain_files, cron_homes = _split_cron_pairs(files_to_add)
     try:
         with _atomic_output_path(out_path, _publish_path) as archive_path, zipfile.ZipFile(
                 archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             _write_zip_entries(
-                zf, files_to_add, out_path, on_db_failure=_db_failure, track_bytes=False,
+                zf, plain_files, out_path, on_db_failure=_db_failure, track_bytes=False,
                 on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
                 on_progress=lambda i: logger.info(
                     "automatic backup phase=archive status=progress completed=%d total=%d", i, len(files_to_add)))
+            _zip_cron_pairs(zf, hermes_root, cron_homes, out_path,
+                            lambda rel, exc: errors.append(f"{rel}: {exc}"))
     except (OSError, _SQLiteSnapshotError) as exc:
         # The hidden partial is already gone; ``out_path`` may be a previous valid backup: keep it.
         logger.warning("Full-zip backup: zip write failed: %s", exc)

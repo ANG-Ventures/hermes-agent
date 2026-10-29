@@ -1,0 +1,26 @@
+{
+  "_doc": "Byte copies of hermes-home files (card t_29403e19). Never edit the copies; re-vendor and update this pin. tests/hermes_cli/test_fleet_placement_vendored.py checks each sha256 and fails once vendored_at is older than max_age_days. Fork-side differences live in __init__.py (the state root), never in a copy.",
+  "source_repo": "ANG-Ventures/hermes-home",
+  "source_ref": "00f1b35cff7f64aea75fe86dcc691ce085cc4d09",
+  "source_note": "hermes-home main 2026-10-28 (carries #6716 admit_class/admission_demand and #6894 FWA F1).",
+  "vendored_at": "2026-10-28",
+  "max_age_days": 21,
+  "files": {
+    "placement.py": {
+      "source_path": "scripts/lib/placement.py",
+      "sha256": "785fd57aed32a693af1e35a7daa82ec65d40fd72c9485f7470bd32b8de344812"
+    },
+    "admission.py": {
+      "source_path": "scripts/lib/admission.py",
+      "sha256": "3720a8ce13c0673cc287681f7444c48f4dc1ed769cb59ed29c3a4f3d1cf6915b"
+    },
+    "work_estimate.py": {
+      "source_path": "scripts/lib/work_estimate.py",
+      "sha256": "3cc2ade89f55c1ef8bda29c3f82029cfd9f4bf4814f722f0dc6fa6f6ef1a2311"
+    },
+    "admission_demand.py": {
+      "source_path": "scripts/lib/admission_demand.py",
+      "sha256": "e6d1f068633002eb580f91d14cb1c042631bcd73b6861761e86563fa0250f547"
+    }
+  }
+}

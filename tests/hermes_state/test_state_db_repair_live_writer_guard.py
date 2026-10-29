@@ -18,6 +18,7 @@ live-writer guard.)
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import select
 import sqlite3
@@ -395,6 +396,72 @@ conn.close()
         except subprocess.TimeoutExpired:
             holder.kill()
             holder.wait(timeout=10)
+
+
+_UNINSPECTABLE_HERMES = """
+import ctypes, os, sys, select
+ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE=0: /proc/<pid>/fd links -> EACCES
+if sys.argv[1] == "detach" and os.fork():
+    os._exit(0)  # orphan the child: it is no longer a descendant of the test
+print(os.getpid(), flush=True)
+select.select([sys.stdin], [], [], 60)  # exits on stdin EOF (the test closes it), else after 60 s
+"""
+
+
+def _spawn_uninspectable_hermes(mode):
+    """A process whose argv[0] is ``hermes`` and whose fds cannot be read (t_9b59804a).
+
+    Returns ``(proc, pid)``; closing ``proc.stdin`` ends it. A detached one is outside this
+    test's process tree, so it is never signalled (the live-system guard refuses that).
+    """
+    import os
+
+    proc = subprocess.Popen(
+        ["hermes", "-c", _UNINSPECTABLE_HERMES, mode],
+        executable=sys.executable, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    readable, _, _ = select.select([proc.stdout], [], [], 10)
+    assert readable, "uninspectable holder did not start"
+    pid = int(proc.stdout.readline())
+    try:
+        os.readlink(f"/proc/{pid}/fd/0")
+    except PermissionError:
+        return proc, pid
+    except OSError:
+        pass
+    _stop_uninspectable_hermes(proc)
+    pytest.skip("this host can read a non-dumpable process's fds (root?)")
+
+
+def _stop_uninspectable_hermes(proc):
+    with contextlib.suppress(OSError, ValueError):
+        proc.stdin.close()
+    proc.stdout.close()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=10)
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize(("mode", "counted"), (("detach", False), ("child", True)))
+def test_holder_scan_suspects_only_this_tests_processes(tmp_path, mode, counted):
+    """Unrelated uninspectable Hermes processes on a shared host do not hold a tmp state.db.
+
+    On ace-media other jobs' ``python -m hermes_cli`` children are uninspectable to this
+    uid; the fail-closed scan counted them as holders of every test's private state.db
+    (0/3/6/6/8 failures across identical runs). The conftest scopes the scan's suspects to
+    this pytest process's descendants; a descendant must still be counted (fail closed).
+    """
+    db = tmp_path / "state.db"
+    db.touch()
+    proc, pid = _spawn_uninspectable_hermes(mode)
+    try:
+        holders = hermes_state_holders.foreign_state_db_holders(db)
+        assert any(h_pid == pid for h_pid, _ in holders) is counted, holders
+    finally:
+        _stop_uninspectable_hermes(proc)
 
 
 def test_repair_proceeds_once_the_database_is_quiescent(tmp_path):

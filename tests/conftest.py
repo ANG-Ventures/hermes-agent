@@ -457,6 +457,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # create cards without a session predate that. The refusal's own tests
     # (test_kanban_operator_home.py) unset this.
     monkeypatch.setenv("HERMES_KANBAN_ALLOW_UNHOMED_CREATE", "1")
+    # t_f2eb71b3: add_comment refuses an operator APPROVE review_coverage stamp
+    # unless the one writer (hermes-home operator_approve.py) set this; fixtures
+    # that seed operator APPROVE records predate that. The refusal's own tests
+    # (test_kanban_close_on_guard.py) unset it.
+    monkeypatch.setenv("OPERATOR_APPROVE_WRITER", "1")
     # And never let a developer-shell (or leaked child) bypass disarm the
     # guard for in-process code under test.
     monkeypatch.delenv("HERMES_STATE_DB_GUARD_BYPASS", raising=False)
@@ -670,6 +675,20 @@ def _isolate_fallback_sticky_store():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_wall_budget_registry():
+    """Fresh process-global cross-session wait registry per test (t_78b5a5bb): a wait
+    armed in one test must not read as a sibling session in the next."""
+    try:
+        from agent import fallback_wall_budget as _wb
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    _wb.clear_registry()
+    yield
+    _wb.clear_registry()
+
+
+@pytest.fixture(autouse=True)
 def _refuse_real_detached_delegation_child(request, monkeypatch):
     """A background delegate_task in a gateway-bound session spawns a REAL ``python -m
     tools.delegate_detached`` process by default (``delegation.detached_background``). It never runs
@@ -828,6 +847,24 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(_subprocess_compat, "_user_safe_directories", lambda base_env: [], raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_owning_install_retarget(request, monkeypatch):
+    """Keep ``cmd_update`` from re-running itself in the checkout whose venv runs the suite.
+
+    Update tests point ``PROJECT_ROOT`` at a fake tree; under a checkout's in-tree ``.venv``
+    ``retarget_to_owning_install`` correctly reads that as a redirected install and re-execs
+    the real updater with pytest's argv (SystemExit 2). Tests of the repair itself opt in with
+    ``@pytest.mark.real_owning_install``.
+    """
+    if request.node.get_closest_marker("real_owning_install"):
+        return
+    try:
+        from hermes_cli import update_owning_install
+    except Exception:
+        return
+    monkeypatch.setattr(update_owning_install, "retarget_to_owning_install", lambda *_: None)
 
 
 @pytest.fixture(autouse=True)
@@ -1186,6 +1223,53 @@ def _state_db_write_guard(request, monkeypatch):
     monkeypatch.setattr(
         _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
     )
+    yield
+
+
+# ── state.db holder scan: only this test's own processes are suspects ───────
+# ``hermes_state_holders.foreign_state_db_holders`` walks the WHOLE host's
+# /proc and, by design, counts a process it cannot inspect (fd readlink/listdir
+# EACCES) as a holder of ANY state.db when its argv looks like Hermes. On a
+# shared CI/worker host other jobs' ``python -m hermes_cli`` children (runner
+# containers, other users) are exactly that, so a test's private tmp state.db
+# read as "held" whenever one happened to be alive: 0/3/6/6/8 failures across
+# identical runs on ace-media (t_9b59804a). A process the test did not spawn
+# cannot hold a fresh tmp_path DB, so its argv is withheld from the scan
+# (``None`` = "not identifiable", the scan's own answer for an unreadable
+# cmdline). Descendants of this pytest process — the real holders the tests
+# spawn — keep the production fail-closed path. Readable-fd inode matches are
+# untouched. A test that patches ``_read_proc_argv`` itself overrides this.
+
+
+def _pid_descends_from(pid: int, ancestor: int) -> bool:
+    for _ in range(64):
+        if pid == ancestor:
+            return True
+        if pid <= 1:
+            return False
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                pid = int(handle.read().rsplit(b")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _holder_scan_ignores_unrelated_host_processes(monkeypatch):
+    holders = sys.modules.get("hermes_state_holders")
+    if holders is None or not sys.platform.startswith("linux"):
+        yield
+        return
+    real_read_proc_argv = holders._read_proc_argv
+    test_pid = os.getpid()
+
+    def _read_proc_argv(pid):
+        if not _pid_descends_from(pid, test_pid):
+            return None
+        return real_read_proc_argv(pid)
+
+    monkeypatch.setattr(holders, "_read_proc_argv", _read_proc_argv)
     yield
 
 
@@ -1615,6 +1699,9 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers", "real_release_channels: keep the real R2 channel reader (no local source-branch stub)."
+    )
+    config.addinivalue_line(
+        "markers", "real_owning_install: keep the real cmd_update owning-install retarget (no autouse stub)."
     )
     config.addinivalue_line(
         "markers",

@@ -2172,6 +2172,41 @@ def _scrub_export_secrets(staged: Path) -> None:
         path.write_text(redacted, encoding="utf-8")
 
 
+def _staged_cron_dir(staged: Path) -> Path:
+    """``staged/cron``, refused (ValueError) when it or a file the fold rewrites/removes (the fold
+    temp name included, Prism 5a6d55ddbf83) is a symlink or resolves outside the staging root: copytree keeps symlinks, so a symlinked ``cron``
+    would point the fold and the db removals below at the LIVE store (Prism d8715e0ffdf8)."""
+    from cron.runtime_state import DB_NAME, FOLD_TMP_NAME, SIDECAR_SUFFIXES
+
+    staged_cron = staged / "cron"
+    root = os.path.realpath(staged)
+    for name in ("", "jobs.json", FOLD_TMP_NAME, *(DB_NAME + s for s in SIDECAR_SUFFIXES)):
+        path = staged_cron / name if name else staged_cron
+        if not (path.exists() or path.is_symlink()):
+            continue
+        real = os.path.realpath(path)
+        if path.is_symlink() or os.path.commonpath([root, real]) != root:
+            raise ValueError(f"refusing export: staged cron path {path.name} is a symlink or "
+                             f"resolves outside the staging dir ({real})")
+    return staged_cron
+
+
+def _capture_cron_pair(profile_dir: Path, staged_cron: Path) -> None:
+    """I4 (t_82c613d9): replace copytree's two-moment copy of the cron pair with ONE capture of
+    the live pair under the profile's cron store lock (``cron.store_pair.capture``). The export
+    folds it (``store_pair.scrub``) after ``extra_files`` are applied, so an explicit
+    cron/jobs.json override is folded with the live rows (Prism 13e40ddef8fa). Raises ValueError
+    when the live pair cannot be captured. Only the STAGED copy is touched."""
+    from cron import store_pair
+
+    if not staged_cron.is_dir():
+        return
+    try:
+        store_pair.capture(profile_dir, staged_cron)
+    except store_pair.PairRefused as exc:
+        raise ValueError(f"refusing export: {exc}") from exc
+
+
 def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, str]] = None) -> Path:
     """Export a profile to a tar.gz archive; credential files are excluded and staged text is
     force-redacted first. Returns the output file path."""
@@ -2194,10 +2229,23 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
         shutil.copytree(profile_dir, staged, symlinks=True, ignore=ignore)
+        # Cron runtime fields (prompts, errors) live in cron/runtime_state.db since t_94e91559: fold
+        # them back into the staged jobs.json so the text scrubber below sees them, and drop the
+        # binary db + sidecars from the archive (the scrubber skips binaries). A db the fold
+        # refused (no definitions to fold into) would ship unscrubbed: refuse the export instead.
+        # The live pair is captured BEFORE extra_files, so an explicit cron/jobs.json override
+        # wins over the captured copy (Prism 13e40ddef8fa).
+        from cron import store_pair
+        _capture_cron_pair(profile_dir, _staged_cron_dir(staged))
         for rel, content in (extra_files or {}).items():
             target = staged.joinpath(*normalize_archive_parts(rel))
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
+        _staged_cron_dir(staged)
+        # Every runtime_state.db* left anywhere in the staged tree (an extra_files cron dir, a
+        # stray *.pre-restore copy, a nested profile store) is folded or dropped: the scrubber
+        # below skips binaries (Prism 0191332b0702).
+        store_pair.scrub(staged)
         _scrub_export_secrets(staged)
         return Path(make_targz(base, tmpdir, canon))
 
@@ -2250,6 +2298,11 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
                 else:
                     child.unlink()
         drop_profile_role(final_source)
+        # I4 (t_82c613d9): an archive's cron store arrives as one jobs.json (exports fold the db
+        # into it). A db copy in a hand-built or older archive is folded or dropped, never
+        # installed beside a jobs.json from another moment.
+        from cron import store_pair
+        store_pair.scrub(final_source, what="import")
         shutil.move(str(final_source), str(profile_dir))
     return profile_dir
 

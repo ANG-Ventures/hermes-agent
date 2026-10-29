@@ -5,16 +5,21 @@ against a published ancestor, or a self-contained bundle when none survives.
 """
 from __future__ import annotations
 
+import concurrent.futures
+import contextvars
 import hashlib
+import itertools
 import json
 import logging
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from urllib.parse import unquote, urlsplit
 
@@ -69,17 +74,22 @@ def _git_env(env=None, *, lazy_fetch=False):
     return base
 
 
-def _git(repo, *args, env=None, check=True, input=None, timeout=30, lazy_fetch=False):
+def _git(repo, *args, env=None, check=True, input=None, timeout=30, lazy_fetch=False,
+         network=False):
     # ``-C`` names the repository; ``cwd`` is pinned to a neutral directory so
     # nothing about the CALLER's cwd (a scratch workspace under the tripwire
     # gitfile, Argus r1 F1) can influence discovery. The path is made absolute
     # against the process cwd first, so a relative ``repo`` keeps its meaning.
-    result = subprocess.run(
-        ["git", "-C", os.path.abspath(str(repo)), *args],
-        stdin=subprocess.DEVNULL if input is None else None,
-        input=input, cwd=_ext.neutral_cwd(),
-        capture_output=True, timeout=timeout, env=_git_env(env, lazy_fetch=lazy_fetch),
-    )
+    argv = ["git", "-C", os.path.abspath(str(repo)), *args]
+    git_env = _git_env(env, lazy_fetch=lazy_fetch)
+    if network:
+        result = _run_network(argv, input=input, timeout=timeout, env=git_env)
+    else:
+        result = subprocess.run(
+            argv, stdin=subprocess.DEVNULL if input is None else None,
+            input=input, cwd=_ext.neutral_cwd(),
+            capture_output=True, timeout=timeout, env=git_env,
+        )
     if check and result.returncode:
         # Git stderr can contain credential-bearing remote URLs, so it is never
         # persisted. The subcommand and returncode are safe to include in the
@@ -100,6 +110,137 @@ def _git(repo, *args, env=None, check=True, input=None, timeout=30, lazy_fetch=F
             f"survivor_unavailable: git {args[0] if args else '?'} failed (rc={result.returncode})"
         )
     return result
+
+
+class _ProbeGroup:
+    """Network git processes started for one batch of live probes.
+
+    `stop` kills every one (and any started later) so abandoned probes end
+    now instead of at their own timeout.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._procs = set()
+        self.stopped = False
+
+    def add(self, proc):
+        with self._lock:
+            if not self.stopped:
+                self._procs.add(proc)
+                return True
+        _kill_group(proc)
+        return False
+
+    def discard(self, proc):
+        with self._lock:
+            self._procs.discard(proc)
+
+    def stop(self):
+        with self._lock:
+            self.stopped = True
+            procs, self._procs = list(self._procs), set()
+        for proc in procs:
+            _kill_group(proc)
+
+
+_probe_group = contextvars.ContextVar("kanban_survivor_probe_group", default=None)
+
+# POSIX contains a probe in its own session (killpg); Windows in a Job Object.
+_POSIX_GROUPS = hasattr(os, "killpg")
+
+
+def _kill_group(proc):
+    """SIGKILL ``proc``'s whole process group: git's transport helper
+    (`git remote-https`, `remote-ext`) is a grandchild that a plain
+    ``proc.kill()`` orphans to init with its socket open. The group is killed
+    even after git itself has exited: a descendant can outlive it holding
+    git's stderr pipe, and nothing else would ever end it.
+
+    Windows has no process groups: closing the probe's Job Object
+    (KILL_ON_JOB_CLOSE) ends every process in it, ssh / remote-https included,
+    whatever their parent. ``proc.kill()`` alone would end git only."""
+    job = getattr(proc, "_kanban_job", None)
+    if job is not None:
+        try:
+            job.close()
+        except OSError:
+            pass
+    try:
+        if _POSIX_GROUPS:
+            os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        elif proc.poll() is None:
+            proc.kill()
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+# Windows: how long `_reap` waits for the reader threads after the job is gone.
+_REAP_DRAIN = 2.0
+
+
+def _reap(proc):
+    """Wait for a killed ``proc`` without an unbounded read of its pipes: a
+    descendant that left the group could still hold them open, so
+    ``communicate()`` here could block forever (``subprocess.run`` does the
+    same on POSIX).
+
+    On Windows a timed-out ``communicate()`` leaves reader threads blocked in
+    ``read()``, and closing a pipe they hold waits on that read. The job close
+    has ended every writer, so a bounded ``communicate`` joins them; if one is
+    still blocked the pipes are abandoned rather than waited on."""
+    proc.wait()
+    if getattr(proc, "_kanban_job", None) is not None:
+        try:
+            proc.communicate(timeout=_REAP_DRAIN)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            pipe.close()
+
+
+def _spawn_network(argv, *, cwd, **kwargs):
+    """POSIX: a new session, so `_kill_group` can killpg it. Windows: a Job
+    Object, assigned while the child is still suspended, so nothing it starts
+    can escape `_kill_group`. `cwd` is required: the survivor path never runs
+    a subprocess in the caller's cwd."""
+    if _POSIX_GROUPS:
+        return subprocess.Popen(argv, start_new_session=True, cwd=cwd, **kwargs)
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from hermes_cli.local_runtime.processes import spawn_server
+
+    proc, job = spawn_server(argv, creationflags=windows_hide_flags(), cwd=cwd, **kwargs)
+    proc._kanban_job = job
+    return proc
+
+
+def _run_network(argv, *, input, timeout, env):
+    """`subprocess.run` for a git command that talks to a remote, in its own
+    session so a timeout (or an abandoned probe) kills the transport helper too."""
+    group = _probe_group.get()
+    if group is not None and group.stopped:
+        raise subprocess.TimeoutExpired(argv, 0)
+    proc = _spawn_network(
+        argv, stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=_ext.neutral_cwd(), env=env,
+    )
+    if group is not None:
+        group.add(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(input, timeout=timeout)
+        except BaseException:
+            _kill_group(proc)
+            _reap(proc)
+            raise
+    finally:
+        if group is not None:
+            group.discard(proc)
+    job = getattr(proc, "_kanban_job", None)
+    if job is not None:
+        job.close()     # anything git left behind goes with the job
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 def _alternates(repo):
@@ -955,6 +1096,10 @@ def _state(conn, task_id):
 
 def record_baseline(conn, task_id, workspace):
     """Record once, before dispatch; retries must not reset the task's base."""
+    from hermes_cli.kanban_delegations_board import conn_is_delegations
+
+    if conn_is_delegations(conn):
+        return  # a background unit's dir is the session's cwd: not its output, never captured
     if conn.execute("SELECT 1 FROM task_workspace_survivors WHERE task_id = ?", (task_id,)).fetchone():
         return
     bases, held, survivor = _state(conn, task_id)
@@ -1141,8 +1286,14 @@ def _published_refs(repo, workspace, storage_cache=None):
     for remote in remotes:
         if not _durable_remote(repo, remote, workspace, storage_cache):
             continue
+        timeout = _probe_timeout(30)
+        if timeout <= 0:
+            # The `preserve()` probe budget is spent: an unlisted remote only
+            # loses the cheaper survivor forms, never the captured bytes.
+            continue
         try:
-            advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
+            advertised = _git(repo, "ls-remote", "--heads", remote, check=False, timeout=timeout,
+                              network=True)
         except subprocess.TimeoutExpired:
             continue
         if advertised.returncode:
@@ -1439,12 +1590,15 @@ def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
                 return None
             url = _git(repo, "remote", "get-url", ref["remote"]).stdout.decode().strip()
             fetch_env = dict(env, KANBAN_FETCH_URL=url)
+            timeout = _probe_timeout(120)
+            if timeout <= 0:
+                return None
             try:
                 fetched = _git(
                     probe, "--config-env=remote.candidate.url=KANBAN_FETCH_URL",
                     "fetch", "--no-tags", "--depth", str(_CONTENT_SCAN_DEPTH + 1),
                     "candidate", f"+refs/heads/{ref['branch']}:refs/heads/candidate",
-                    env=fetch_env, check=False, timeout=120,
+                    env=fetch_env, check=False, timeout=timeout, network=True,
                 )
             except subprocess.TimeoutExpired:
                 continue
@@ -1683,21 +1837,191 @@ def _recorded_base(repo, recorded, published, base):
     # branch can reach it. Prove reachability from the live tip instead.
     # Network only here, after every cheap local check passed; one fetch per
     # matched branch (normally one), never per published head, and ONE
-    # overall budget: a hung remote must not cost 120 s per matched branch.
-    deadline = time.monotonic() + _LIVE_BASE_TIMEOUT
-    for ref in sorted(matched):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        remote, branch = advertised[ref]
-        if _reachable_from_live(repo, remote, branch, recorded, timeout=remaining):
-            return recorded
+    # overall budget: a hung remote must not cost 120 s per matched branch,
+    # nor starve a healthy branch behind it (`_first_live`).
+    if _first_live(repo, [advertised[ref] for ref in matched], recorded):
+        return recorded
     return base
 
 
-#: TOTAL budget for proving the recorded base against live branches. A timeout just
-#: keeps the older published base: a larger patch, never a lost one.
+def _borrow_shallow(repo, bare):
+    """Give ``bare`` the shallow grafts of ``repo`` when ``repo`` is shallow.
+
+    GIT_ALTERNATE_OBJECT_DIRECTORIES lends objects, not the `shallow` file, so a
+    walk in ``bare`` from a shallow clone's HEAD goes past the boundary into
+    parents that were never fetched and dies rc=128 ("Failed to traverse
+    parents of commit ...", t_b15005c7).
+    """
+    shallow = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "shallow",
+                   check=False)
+    if shallow.returncode:
+        return
+    source = Path(shallow.stdout.decode().strip())
+    if source.is_file():
+        shutil.copyfile(source, Path(bare) / "shallow")
+
+
+def _explain_shallow(repo, key, reason):
+    """Re-raise a failed capture in a shallow clone with the remedy named."""
+    probe = _git(repo, "rev-parse", "--is-shallow-repository", check=False)
+    if probe.returncode or probe.stdout.strip() != b"true":
+        return
+    where = "." if key == "." else f"./{key}"
+    raise SurvivorUnavailable(
+        f"{reason} in shallow clone {where} -- the history behind its shallow boundary was "
+        f"never fetched; run `git -C {where} fetch --unshallow` (or push the work) and retry"
+    )
+
+
+def _live_ancestor_survivor(repo, head, published):
+    """A published ref whose LIVE tip contains ``head``, or None.
+
+    `_remote_survivor` only sees advertised tips present locally. When the
+    remote has moved past this checkout (always, for a stale `--depth 1`
+    clone) the new tip is absent, yet HEAD is still on the branch. A local
+    tracking ref containing HEAD nominates the branch; `_reachable_from_live`
+    proves it against the live tip, as `_recorded_base` does.
+    """
+    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": ref for ref in published}
+    if not advertised:
+        return None
+    listed = _git(repo, "for-each-ref", "--contains", head, "--format=%(refname)",
+                  "refs/remotes", check=False)
+    if listed.returncode:
+        return None
+    matched = set(advertised).intersection(listed.stdout.decode("utf-8", "replace").splitlines())
+    names = {(advertised[name]["remote"], advertised[name]["branch"]): name for name in matched}
+    found = _first_live(repo, names, head)
+    return dict(advertised[names[found]], head=head, matched_by="live-ancestor") if found else None
+
+
+#: TOTAL budget for one site's live-tip probes (`_recorded_base`,
+#: `_live_ancestor_survivor`, `_require_live_boundary`). A timeout just keeps
+#: the older published base: a larger patch, never a lost one.
 _LIVE_BASE_TIMEOUT = 120
+#: Live-tip probes run concurrently, at most this many at once, so a hung
+#: first candidate cannot starve a healthy one behind it (Prism dbe35c381e8f).
+_LIVE_PROBE_WORKERS = 4
+#: A probe's cap is never below 1/this of the site budget: past that many
+#: waves a share is too short to finish a fetch, so the tail goes unprobed.
+_LIVE_PROBE_MAX_WAVES = 8
+#: ONE network budget per `preserve()` call, threaded through every live probe
+#: (`ls-remote`, live-tip fetch, content-advisory fetch) of every repository.
+#: Without it one repo could spend 3 x 120 s of probes + 30 s ls-remote per
+#: remote + 300 s `_snapshot`, past the 420 s `kanban_complete` tool ceiling.
+#: 90 s + `_SNAPSHOT_TIMEOUT` keeps the network share of a call under it.
+#: ``HERMES_KANBAN_SURVIVOR_PROBE_BUDGET`` overrides it, capped at
+#: `_PROBE_BUDGET_MAX` (420 - 300 s snapshot, minus 10 s for local git work).
+_PROBE_BUDGET = 90
+_PROBE_BUDGET_MAX = 110
+_probe_deadline = contextvars.ContextVar("kanban_survivor_probe_deadline", default=None)
+#: The one live-probe thread pool of a `preserve()` call, joined when it returns.
+_probe_pool = contextvars.ContextVar("kanban_survivor_probe_pool", default=None)
+
+
+def _probe_budget():
+    """`_PROBE_BUDGET`, or the env override in (0, `_PROBE_BUDGET_MAX`]; invalid values are ignored."""
+    raw = os.environ.get("HERMES_KANBAN_SURVIVOR_PROBE_BUDGET", "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return min(parsed, _PROBE_BUDGET_MAX)
+    return _PROBE_BUDGET
+
+
+def _probe_end(budget):
+    """Monotonic end of a ``budget``-second probe, clamped to the `preserve()` deadline."""
+    end = time.monotonic() + budget
+    overall = _probe_deadline.get()
+    return end if overall is None else min(end, overall)
+
+
+def _probe_timeout(default):
+    """``default`` seconds clamped to the `preserve()` probe deadline; <= 0 means skip."""
+    return _probe_end(default) - time.monotonic()
+
+
+def _first_live(repo, candidates, sha):
+    """The first ``(remote, branch)`` whose LIVE tip contains ``sha``, else None.
+
+    One wall-clock site budget (`_LIVE_BASE_TIMEOUT`, clamped to the
+    `preserve()` deadline) covers every candidate, at most
+    `_LIVE_PROBE_WORKERS` probes at a time. Scheduling, so no healthy
+    candidate starves behind hung ones (Prism dbe35c381e8f, bf66bcf399d2):
+
+    - a free slot goes first to a branch of a remote that already ANSWERED
+      (finished before its own cap), then to an untried remote, then to a
+      remote whose probe is still in flight;
+    - each probe is capped at ``remaining / ceil(outstanding / workers)``
+      (floored at 1/`_LIVE_PROBE_MAX_WAVES` of the site budget), so queued candidates keep a
+      share of the budget even when every running probe hangs.
+
+    The first proof wins. Probes still in flight are killed (process group)
+    on return, so nothing outlives the call.
+    """
+    pending = sorted(set(candidates))
+    if not pending:
+        return None
+    end = _probe_end(_LIVE_BASE_TIMEOUT)
+    floor = (end - time.monotonic()) / _LIVE_PROBE_MAX_WAVES
+    workers = _LIVE_PROBE_WORKERS
+    shared = _probe_pool.get()
+    pool = shared or concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="kanban-live-probe")
+    group = _ProbeGroup()
+    inflight, answered, touched = {}, set(), set()
+
+    def run(pair, cap):
+        # The deadline is read when the probe STARTS, not when it was queued.
+        remaining = min(cap, end) - time.monotonic()
+        if remaining <= 0:
+            return False
+        token = _probe_group.set(group)
+        try:
+            return _reachable_from_live(repo, pair[0], pair[1], sha, timeout=remaining)
+        finally:
+            _probe_group.reset(token)
+
+    def pick():
+        for preferred in (lambda r: r in answered, lambda r: r not in touched):
+            for pair in pending:
+                if preferred(pair[0]):
+                    return pair
+        return pending[0]
+
+    try:
+        while pending or inflight:
+            while pending and len(inflight) < workers:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                pair = pick()
+                pending.remove(pair)
+                waves = -(-(len(pending) + len(inflight) + 1) // workers)
+                cap = time.monotonic() + min(left, max(left / waves, floor))
+                inflight[pool.submit(run, pair, cap)] = (pair, cap)
+                touched.add(pair[0])
+            left = end - time.monotonic()
+            if not inflight or left <= 0:
+                break
+            done, _ = concurrent.futures.wait(
+                inflight, timeout=left, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                pair, cap = inflight.pop(future)
+                if future.exception() is None and future.result():
+                    return pair
+                if future.exception() is None and time.monotonic() < cap:
+                    answered.add(pair[0])
+        return None
+    finally:
+        group.stop()
+        for future in inflight:
+            future.cancel()
+        if shared is None:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOUT):
@@ -1723,6 +2047,7 @@ def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOU
         try:
             _git(repo, "init", "-q", "--bare",
                  f"--object-format={fmt.stdout.decode().strip()}", str(probe))
+            _borrow_shallow(repo, probe)
             if _git(probe, "update-ref", "refs/heads/recorded", sha, env=env,
                     check=False).returncode:
                 return False
@@ -1731,7 +2056,7 @@ def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOU
                 "fetch", "-q", "--no-tags", "candidate",
                 f"+refs/heads/{branch}:refs/heads/candidate",
                 env=dict(env, KANBAN_FETCH_URL=url.stdout.decode().strip()),
-                check=False, timeout=timeout,
+                check=False, timeout=timeout, network=True,
             )
             if fetched.returncode:
                 return False
@@ -1777,12 +2102,27 @@ def _snapshot(repo, base, prefix, *, irreversible_delete=False):
             commit = _git(repo, "commit-tree", tree, *parents, "-m", "Kanban workspace recovery", env=identity).stdout.decode().strip()
             recovery = Path(tmp) / "recovery.git"
             _git(repo, "init", "--bare", str(recovery))
+            _borrow_shallow(repo, recovery)
             objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects").stdout.decode().strip()
             bundle_env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects)
             _git(recovery, "update-ref", "refs/heads/implementation", commit, env=bundle_env)
             _git(recovery, "symbolic-ref", "HEAD", "refs/heads/implementation", env=bundle_env)
             bundle = Path(tmp) / "implementation.bundle"
-            _git(recovery, "bundle", "create", str(bundle), "--all", env=bundle_env, lazy_fetch=True)
+            # A shallow bundle omits everything behind the boundary. Excluding the
+            # boundary commits makes the header declare them as prerequisites, so
+            # an empty repo refuses it at `verify` instead of calling it complete
+            # and then dying "Failed to traverse parents" on clone/fetch.
+            # A stale line naming an absent object is no boundary, and as `^<sha>`
+            # it would kill `bundle create` with "bad object"; drop it.
+            grafts = recovery / "shallow"
+            boundary = grafts.read_bytes().split() if grafts.is_file() else []
+            if boundary:
+                present = _git(recovery, "cat-file", "--batch-check=%(objectname)",
+                               env=bundle_env, input=b"\n".join(boundary) + b"\n")
+                boundary = [line for line in present.stdout.split(b"\n")
+                            if line and not line.endswith(b" missing")]
+            _git(recovery, "bundle", "create", str(bundle), "--all", "--stdin", env=bundle_env,
+                 input=b"".join(b"^" + sha + b"\n" for sha in boundary), lazy_fetch=True)
             return bundle.read_bytes()
         return _git(
             repo, "diff", "--cached", "--relative", "--binary", "--full-index", "--no-ext-diff",
@@ -1815,7 +2155,8 @@ def _capture(repo, key, workspace, recorded=None):
         # LIVE CANONICAL TREE the workspace was cloned from — never a patch-id
         # hit, which is diff identity only.
         ref = (_remote_survivor(repo, sha, published)
-               or _canonical_survivor(repo, sha, workspace, storage_cache))
+               or _canonical_survivor(repo, sha, workspace, storage_cache)
+               or _live_ancestor_survivor(repo, sha, published))
         if ref and ref.get("matched_by") == "canonical":
             hint = _content_advisory(repo, sha, published)
             if hint:
@@ -1826,8 +2167,52 @@ def _capture(repo, key, workspace, recorded=None):
         if ref:
             return ref, None, None
     base = _recorded_base(repo, recorded, published, _base(repo, published))
+    if base is None:
+        _require_live_boundary(repo, published)
     prefix = "" if key == "." else key + "/"
     return None, base, _snapshot(repo, base, prefix)
+
+
+def _require_live_boundary(repo, published):
+    """Refuse a shallow bundle whose boundary no durable remote still holds.
+
+    A bundle cut in a shallow clone declares the boundary commits as
+    prerequisites and omits their trees and every unchanged blob, so it
+    restores only into a repository that already has them. Local presence
+    proves nothing about that: if the upstream was deleted or force-pushed
+    away, the bundle is unrestorable and deleting the workspace loses the
+    work (Prism d722f02857e3). Each boundary commit must be an ancestor of a
+    durable remote's LIVE branch tip (`_reachable_from_live`), nominated by a
+    local tracking ref that contains it, as `_live_ancestor_survivor` does.
+    """
+    shallow = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "shallow",
+                   check=False)
+    path = Path(shallow.stdout.decode().strip()) if shallow.returncode == 0 else None
+    if path is None or not path.is_file():
+        return
+    # Same filter as `_snapshot`: a stale line naming an absent object is no boundary.
+    boundary = _present_commits(repo, sorted(set(path.read_text(encoding="ascii").split())))
+    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": (ref["remote"], ref["branch"])
+                  for ref in published}
+    for sha in boundary:
+        listed = _git(repo, "for-each-ref", "--contains", sha, "--format=%(refname)",
+                      "refs/remotes", check=False)
+        matched = (set(advertised).intersection(listed.stdout.decode("utf-8", "replace").splitlines())
+                   if listed.returncode == 0 else set())
+        # `_first_live`: a hung first candidate must not starve a healthy one
+        # into a false refusal (Prism dbe35c381e8f).
+        if not _first_live(repo, [advertised[name] for name in matched], sha):
+            spent = (" (the live-probe budget of this complete ran out, so a slow remote may be why)"
+                     if _probe_timeout(_LIVE_BASE_TIMEOUT) <= 0 else "")
+            raise _BoundaryUnproven(
+                f"shallow boundary {sha} is not reachable from any durable remote{spent}, so a bundle "
+                f"(which omits the boundary tree) could never restore; push the work to a "
+                f"durable remote, or add a remote whose live branch still contains {sha}, and retry"
+            )
+
+
+class _BoundaryUnproven(SurvivorUnavailable):
+    """`_require_live_boundary` refused; its message already names the remedy."""
 
 
 _QUALIFIER = re.compile(r"[^:?#=]+=")
@@ -2861,7 +3246,44 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
     ``content_survivor`` is a ref :func:`kanban_supersede_content.verify` already
     proved: the card's own PR content is on the default branch (t_8035c8af). It
     stands in for an operator ``--survivor-ref`` when none is given.
+
+    Every live network probe of the call shares ONE deadline (`_PROBE_BUDGET`),
+    so a complete stays under the 420 s tool ceiling however many repositories
+    and remotes the workspace holds. A nested call keeps the outer deadline.
     """
+    end = time.monotonic() + _probe_budget()
+    outer = _probe_deadline.get()
+    token = _probe_deadline.set(end if outer is None else min(end, outer))
+    # One live-probe pool per call, joined on exit: an abandoned probe thread
+    # must not hold a CLI `complete` open after the call returned.
+    pool = None
+    if _probe_pool.get() is None:
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_LIVE_PROBE_WORKERS, thread_name_prefix="kanban-live-probe")
+    pool_token = _probe_pool.set(pool) if pool is not None else None
+    try:
+        return _preserve(conn, task_id, metadata, cleanup=cleanup, workspace=workspace,
+                         survivor_ref=survivor_ref, survivor_pr=survivor_pr,
+                         survivor_unbound=survivor_unbound, evidence=evidence,
+                         survivor_none=survivor_none, survivor_reason=survivor_reason,
+                         content_survivor=content_survivor)
+    finally:
+        if pool is not None:
+            _probe_pool.reset(pool_token)
+            pool.shutdown(wait=True, cancel_futures=True)
+        _probe_deadline.reset(token)
+
+
+def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
+              survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
+              survivor_none=False, survivor_reason=None, content_survivor=None):
+    """`preserve`'s body, run inside its probe deadline."""
+    from hermes_cli.kanban_delegations_board import conn_is_delegations
+
+    if conn_is_delegations(conn) and not cleanup:
+        # A background unit's card works IN the session's cwd (a user's tree, often a home dir);
+        # its output is the delegation registry record, never the directory's bytes.
+        return None
     try:
         bases, held, previous = _state(conn, task_id)
         if not isinstance(bases, dict) or not (previous is None or isinstance(previous, dict)):
@@ -3214,7 +3636,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                     data = _snapshot(repo, base, "" if key == "." else key + "/",
                                      irreversible_delete=True)
                     irreversible = True
-            except SurvivorUnavailable:
+            except SurvivorUnavailable as exc:
                 # Every object-reading step above (`status`, `diff`, and
                 # `_snapshot`'s `git bundle` inside pack-objects) raises the
                 # bare constant. Classify it before it escapes: if this repo's
@@ -3222,6 +3644,9 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # Anything else re-raises unchanged.
                 _explain_dead_worktree_stub(repo, key, bases)
                 _explain_broken_object_store(repo, key, workspace, bases)
+                if not isinstance(exc, _BoundaryUnproven):
+                    # `fetch --unshallow` cannot restore a boundary the remote lost.
+                    _explain_shallow(repo, key, str(exc))
                 raise
             if ref:
                 refs.append(dict(ref, repository=key))

@@ -6,6 +6,32 @@ docs of config.yaml.
 
 
 from hermes_cli.lazy_registry import LazyFilledDict
+from hermes_cli import load_lines as _load_lines
+
+
+def _kanban_cpu_lines() -> dict:
+    """The kanban dispatch_load_gate CPU keys from the fleet CPU-line registry (Ace 2026-10-26 04:40: "one central
+    registry that controls all of this for all the devices"): hermes-home ``fleet/placement-policy.json``
+    ``cpu_lines``, lane ``kanban``, this host, found via $HERMES_HOME and read by the vendored stdlib reader
+    ``hermes_cli/load_lines.py`` (byte-identical to hermes-home ``scripts/lib/load_lines.py``).
+    Registry present -> cpu_busy_pause + the four spill keys (a SET the gate validates). Registry absent (any
+    install without hermes-home) -> cpu_busy_pause 0.90 only (== the registry default), spill stays unarmed, and
+    nothing is printed (this module is imported by every CLI call). config.yaml
+    ``kanban.dispatch_load_gate.<key>`` stays an explicit override. The gateway builds its LoadGate at boot, so a
+    registry change is live at the next gateway restart."""
+    try:
+        block, _src = _load_lines.load()
+    except Exception:  # noqa: BLE001 -- a broken registry must never break config import
+        block = None
+    if block is None:
+        return {"cpu_busy_pause": 0.90}  # load-lines: fallback (== cpu_lines.default.admit)
+    h = _load_lines.host_id()
+    line = lambda kind: _load_lines.resolve(h, "kanban", kind)[0]  # noqa: E731
+    return {"cpu_busy_pause": line("admit"), "cpu_spill": line("spill"), "spill_fraction": line("spill"),
+            "cpu_spill_resume": line("resume"), "cpu_pause": line("hot")}
+
+
+_KANBAN_CPU = _kanban_cpu_lines()
 
 
 #: Image every container terminal backend (docker/modal/daytona/singularity) uses unless the
@@ -1651,6 +1677,10 @@ DEFAULT_CONFIG = {
         # Durable background units run in their own process and survive a gateway restart
         # (docs/dev/delegate-detached-background.md). false = in-gateway threads (kill switch).
         "detached_background": False,  # default OFF (Ace ruling option B, t_7ccdc21b); the replacement is t_414b4d92
+        # Where a restart-durable gateway background unit runs: "in_process" (gateway threads) or
+        # "kanban" (one card on the internal `delegations` board, its own process; survives a gateway
+        # restart, docs/dev/delegate-background-on-kanban-runtime.md). "in_process" is the kill switch.
+        "background_runtime": "in_process",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
@@ -2174,6 +2204,11 @@ DEFAULT_CONFIG = {
         # due by at most this much; beyond it the job is removed and a loud
         # MISSED notice is delivered. 0 = the old 120s grace only. Default 6h.
         "oneshot_catchup_s": 21600,
+        # Cron script runner (`hermes cron runner`, cron/script_runner.py): when true in the
+        # process home's config, the gateway hands each home's plain-script (no_agent) lane to the
+        # runner while the runner progresses, and ticks it itself otherwise. Only a YAML boolean
+        # true enables it. Off = the gateway ticks every lane, as before.
+        "script_runner": {"enabled": False},
         "script_timeout_seconds": 3600,
         # Timeout (seconds) for SessionDB() init inside cron jobs: state.db open/migrate has no
         # timeout of its own against a wedged sqlite3.connect, and an unbounded hang wedges the
@@ -2436,7 +2471,7 @@ DEFAULT_CONFIG = {
                       # picks and books; release/renew go through alloc_client.
                       "allocd": "off"},
         # Admission predicate (t_da6f84f7, read per tick by the gateway gate, `kanban dispatch` and the shared
-        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/admission.py admit() over the
+        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/fleet_placement/admission.py admit() over the
         # host's measured cpu_busy / memory / PSI / procs with one measured-estimate lease per recent spawn. In
         # utilization the dispatch_load_gate load/CPU keys are inert (procs pause and max_spawn_per_tick still apply).
         "admission": "legacy",
@@ -2458,7 +2493,9 @@ DEFAULT_CONFIG = {
             "worker_load_cost_max": 4.0,
             "slope_window_seconds": 600,
             "cpu_corroborate": True,
-            "cpu_busy_pause": 0.70,
+            # CPU lines: the fleet registry (cpu_lines lane kanban; _kanban_cpu_lines above). The four spill
+            # keys (present only when the registry is found) are validated as a SET by the gate.
+            **_KANBAN_CPU,
             "worker_cpu_cost": 1.0,
             # t_a7978f86: E-core band saturation (Apple silicon) at or above
             # ecore_busy_pause is no local CPU headroom. off | report (log
@@ -2563,6 +2600,11 @@ DEFAULT_CONFIG = {
         # A present-but-unknown/empty value fails to "none" (never "all")
         # and logs review_policy_invalid.
         "review_policy": "all",
+        # Scoped board-signing grants for same-model delegate children
+        # (hermes_cli/kanban_sign_grants.py): "on" lets an operator session
+        # pass delegate_task(sign_grant=...) and the child sign comments under
+        # it; anything else refuses every mint and every granted write.
+        "sign_grants": "off",
         # Default reviewer profile for request_review. None/blank = no
         # default: a review request with no reviewer is refused rather than
         # leaving the implementer as its own reviewer.
@@ -2946,6 +2988,11 @@ DEFAULT_CONFIG = {
         # host 127.0.0.1:7890"). Per-platform vars (DISCORD_PROXY, TELEGRAM_PROXY, ...) are still
         # honored.
         "trust_env": True,
+        # After a messaging user (matrix/discord/telegram/whatsapp/signal/imessage) gets the "Sorry, I
+        # encountered an error" notice, page the operator via <root>/scripts/lib/episode_pager.py:
+        # one page per room per episode, cleared after 30 min with no new error. Read per error
+        # (no restart to flip). No-op when the pager script is absent.
+        "page_on_turn_error": True,
         # Media delivery. False: any emitted file path is delivered natively unless under the
         # credential/system denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env, auth.json). True:
         # files must be under the Hermes cache, media_delivery_allow_dirs, or fresher than

@@ -93,6 +93,7 @@ def _assert_collected(sb: I.Sandbox, what: str, result) -> None:
         + P.diagnostics(sb, cp))
 
 
+@pytest.mark.slow_test(300, reason="two dependency-rebuilding updates plus two real turns: 80 s call on 8 ACE-AI cores")
 def test_repeated_updates_collect_superseded_generations(home, provider):
     sb = home["sb"]
     results = []

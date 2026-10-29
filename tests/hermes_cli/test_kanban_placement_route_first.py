@@ -513,6 +513,74 @@ def test_paused_tick_with_no_plan_still_records_holds(kanban_home):
         assert res.placement_waits == {t: "local_full" for t in ids}
 
 
+# -- local_full binding cause (t_f73c65a8) -------------------------------------
+
+def _local_full_events(conn, ids):
+    return [e for t in ids for e in _events(conn, t, "placement_wait") if e.get("code") == "local_full"]
+
+
+def test_local_full_bound_by_the_paused_gate_says_gate(kanban_home):
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 2)
+        _tick(conn, spillover=None, spawn_limit=0, spawn_paused="paused: load1 90 > 64")
+        evs = _local_full_events(conn, ids)
+        assert len(evs) == 2
+        assert {(e["binding"], e["binding_detail"]) for e in evs} == {("gate", "paused: load1 90 > 64")}
+
+
+def test_local_full_with_gate_allowance_zero_says_gate(kanban_home):
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 1)
+        _tick(conn, spillover=None, spawn_limit=0)
+        (ev,) = _local_full_events(conn, ids)
+        assert ev["binding"] == "gate"
+
+
+def test_local_full_after_the_board_spent_its_allowance_says_quota(kanban_home):
+    """The gate had room (allowance 1); this board's own spawn used it: the row behind waits on quota."""
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 2)
+        res, spawned = _tick(conn, spillover=None, spawn_limit=1)
+        assert len(spawned) == 1
+        (ev,) = _local_full_events(conn, ids)
+        assert ev["binding"] == "quota" and ev["binding_detail"] == "1/1 local spawns this tick"
+
+
+def test_local_full_when_other_boards_spent_the_split_says_quota(kanban_home):
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 1)
+        _tick(conn, spillover=None, spawn_limit=0,
+              spawn_paused=f"{pr.QUOTA_SPENT_PREFIX}3 spawn(s) is used by other boards")
+        (ev,) = _local_full_events(conn, ids)
+        assert ev["binding"] == "quota"
+
+
+def test_binding_is_not_part_of_the_dedup_key(kanban_home):
+    """gate -> quota on an unchanged local_full hold inside the refresh window writes no new row."""
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 1)
+        _tick(conn, spillover=None, spawn_limit=0, spawn_paused="paused")
+        _tick(conn, spillover=None, spawn_limit=0,
+              spawn_paused=f"{pr.QUOTA_SPENT_PREFIX}3 spawn(s) is used by other boards")
+        assert len(_local_full_events(conn, ids)) == 1
+
+
+def test_local_full_binding_counts_the_review_reservation():
+    assert pr.local_full_binding(None, None, None, 0) is None
+    assert pr.local_full_binding(None, 3, 2, 2) == {
+        "binding": "quota", "binding_detail": "2/3 local spawns this tick (1 held for review)"}
+
+
+def test_only_local_full_rows_carry_a_binding(kanban_home):
+    plan = _plan(free=2, band="admitting")
+    plan.pins_only = True
+    with kb.connect_closing() as conn:
+        (pin,) = _make(conn, 1, body="host: ace-media", priority=1)
+        _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="paused")
+        evs = _events(conn, pin, "placement_wait")
+        assert evs and all("binding" not in e for e in evs if e.get("code") != "local_full")
+
+
 # -- wait-episode boundaries (Prism P2 residue of #1907, t_74441abc) ----------
 
 def test_cleared_wait_ends_the_episode_for_flap_detection(kanban_home, monkeypatch):

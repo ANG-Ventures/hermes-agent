@@ -242,18 +242,24 @@ def census_worker_trees(
     table: dict[int, tuple[Optional[int], int, Optional[float]]] = {}
     sid_hits: list[tuple[int, int, str]] = []
     profile_hits: dict[int, tuple[tuple[str, str], str]] = {}
-    for proc in psutil.process_iter(["pid", "ppid", "uids", "name", "create_time"]):
+    # uid first: name/create_time cost a /proc/<pid>/stat read (+ boot_time) per process, and
+    # on a shared 12.8k-process host reading them for every uid took ~22 s per pass (ci-box).
+    for proc in psutil.process_iter(["pid", "ppid", "uids"]):
         info = proc.info
         pid = info.get("pid") or 0
         uids = info.get("uids")
         if pid <= 1 or pid == me or uids is None or uids.real != uid:
             continue
+        try:  # process_iter(attrs) semantics: gone -> skip, unreadable -> None
+            proc.info.update(proc.as_dict(["name", "create_time"], ad_value=None))
+        except psutil.NoSuchProcess:
+            continue
+        name, born = proc.info.get("name") or "?", proc.info.get("create_time")
         try:
             sid: Optional[int] = os.getsid(pid)
         except OSError:
             sid = None
-        table[pid] = (sid, info.get("ppid") or 0, info.get("create_time"))
-        name = info.get("name") or "?"
+        table[pid] = (sid, info.get("ppid") or 0, born)
         if sid in by_sid:
             sid_hits.append((pid, sid, name))
             continue

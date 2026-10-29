@@ -94,7 +94,7 @@ Intel) have no E-core sample and the knob is inert there.
 2026-10-18 (t_da6f84f7, Ace 14:33 / 15:5x, ruling t_0b33557c): ``kanban.admission:
 utilization`` (read per tick; absent or ``legacy`` = everything above, byte for
 byte) replaces the load1 pause, the CPU-headroom row and ``worker_cpu_cost``
-with the ONE fleet predicate, ``hermes_cli.admission.admit()``, over this
+with the ONE fleet predicate, ``hermes_cli.fleet_placement.admission.admit()``, over this
 host's own sample: cpu_busy (psutil cpu_times delta), MemAvailable after the
 host table's ``mem_reserve_gb``, procs / RLIMIT_NPROC (PSI is not measured on
 darwin and is not required). Each worker spawned within ``admission.
@@ -168,7 +168,7 @@ def missing_contract() -> list[str]:
 
     out = []
     for mod, names in VENDORED_CONTRACT.items():
-        m = importlib.import_module(f"hermes_cli.{mod}")
+        m = importlib.import_module(f"hermes_cli.fleet_placement.{mod}")
         out.extend(f"{mod}.{n}" for n in names if not hasattr(m, n))
     return out
 
@@ -626,7 +626,7 @@ class LoadGate:
         """``kanban.admission: utilization``: admission.admit() over this host's
         sample, one lease per spawn the sample cannot show yet, under the host
         table's kanban ceiling. load1 and the interim CPU keys are not read."""
-        from hermes_cli import admission as _ad
+        from hermes_cli.fleet_placement import admission as _ad
 
         try:
             self.running = int(running) if running is not None else None
@@ -1307,9 +1307,9 @@ def utilization_context() -> dict:
     """This host's inputs for the utilization path: its row of the placement
     table (via the ``local`` alias), the kanban ceiling + reason, memory from
     psutil, and the measured estimate for a kanban worker here."""
-    from hermes_cli import admission as _ad
-    from hermes_cli import placement as _pl
-    from hermes_cli import work_estimate as _we
+    from hermes_cli.fleet_placement import admission as _ad
+    from hermes_cli.fleet_placement import placement as _pl
+    from hermes_cli.fleet_placement import work_estimate as _we
 
     host, spec, ceiling, reason, prior = "local", None, None, "", _ad.Estimate(cpus=1.0, ram_gb=3.0)
     try:
@@ -1317,7 +1317,7 @@ def utilization_context() -> dict:
         hid = table.resolve(UTIL_HOST_ALIAS)
         if hid:
             host, spec = hid, table.hosts[hid]
-            ceiling = spec.slots_for("kanban")
+            ceiling = spec.ceiling_for("kanban")
             reason = str(((json.loads(table.path.read_text(encoding="utf-8-sig"))["hosts"][hid].get("consumers") or {})
                           .get("kanban") or {}).get("_ceiling_reason") or "")
         prior = _pl.need_of(table.footprint("kanban"))

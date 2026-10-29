@@ -207,3 +207,112 @@ def test_nested_create_survives_outer_stale_save(hermes_env):
     ids = {j["id"] for j in load_jobs()}
     assert created["id"] in ids, "nested create was clobbered by outer stale save"
     assert seed["id"] in ids
+
+
+def test_stale_save_does_not_resurrect_a_sibling_api_removal(hermes_env):
+    """t_0cae2938 (Studio 10-26, ffe40c023e7f): a writer loads, a sibling removes a job through the API
+    (journaled `removed`), the writer saves its stale payload. The row must stay gone: written back it
+    runs again with no `created` event, and the journal no longer describes the store."""
+    import cron.jobs as jobs
+    from cron.jobs import create_job, load_jobs
+    from cron.lifecycle_journal import JOURNAL_FILENAME, record_removed
+
+    keep = create_job(prompt="keep", schedule="every 5m", name="keep", deliver="local")
+    gone = create_job(prompt="gone", schedule="every 5m", name="gone", deliver="local")
+    jobs_file = jobs._current_cron_store().jobs_file
+
+    with jobs._jobs_lock():
+        stale = jobs.load_jobs()
+        # the sibling's API removal, under a degraded lock: row off disk, `removed` journaled
+        data = json.loads(jobs_file.read_text(encoding="utf-8"))
+        data["jobs"] = [j for j in data["jobs"] if j["id"] != gone["id"]]
+        jobs_file.write_text(json.dumps(data), encoding="utf-8")
+        record_removed(gone["id"])
+        for j in stale:
+            if j["id"] == keep["id"]:
+                j["name"] = "keep-renamed"   # this writer's own edit still lands
+        jobs._save_jobs_unlocked(stale)
+
+    by_id = {j["id"]: j for j in load_jobs()}
+    assert gone["id"] not in by_id, "stale save resurrected a job the API removed"
+    assert by_id[keep["id"]]["name"] == "keep-renamed"
+    events = [json.loads(ln)["event"] for ln in (hermes_env / "cron" / JOURNAL_FILENAME).read_text().splitlines()
+              if json.loads(ln)["job_id"] == gone["id"]]
+    assert events == ["created", "removed"]
+
+
+def test_stale_save_keeps_a_row_the_journal_does_not_say_was_removed(hermes_env):
+    """The guard reads the journal, not mere absence: a row missing from disk with no `removed` event (a
+    non-API writer dropped it) is written back as before (#80624's lost-write repair)."""
+    import cron.jobs as jobs
+    from cron.jobs import create_job, load_jobs
+
+    lost = create_job(prompt="lost", schedule="every 5m", name="lost", deliver="local")
+    jobs_file = jobs._current_cron_store().jobs_file
+    with jobs._jobs_lock():
+        stale = jobs.load_jobs()
+        jobs_file.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+        jobs._save_jobs_unlocked(stale)
+    assert lost["id"] in {j["id"] for j in load_jobs()}
+
+
+@pytest.mark.parametrize("bad_line", [
+    b'{"job_id": [], "event": "created"}',        # unhashable job_id: TypeError on `in wanted`
+    b'{"job_id": {"a": 1}, "event": "removed"}',  # unhashable job_id (dict)
+    b'{"job_id": "JID", "event": []}',            # unhashable event on a wanted id: TypeError on `in EVENTS`
+    b'\xff\xfe not utf-8 \x80',                   # undecodable bytes: UnicodeDecodeError from the iterator
+    b'[1, 2, 3]',                                 # valid JSON, not an object
+])
+def test_malformed_journal_line_does_not_discard_removal_evidence(hermes_env, bad_line):
+    """t_19a16be2 (Prism 66ed29e2672d on #2337): ONE malformed journal line made last_removed() raise
+    into its outer handler and return an empty set, so a stale save resurrected an API-removed job.
+    A bad line is skipped on its own; the valid `removed` evidence around it still counts."""
+    import cron.jobs as jobs
+    from cron.jobs import create_job, load_jobs
+    from cron.lifecycle_journal import JOURNAL_FILENAME, last_removed, record_removed
+
+    gone = create_job(prompt="gone", schedule="every 5m", name="gone", deliver="local")
+    jobs_file = jobs._current_cron_store().jobs_file
+    journal = hermes_env / "cron" / JOURNAL_FILENAME
+
+    with jobs._jobs_lock():
+        stale = jobs.load_jobs()
+        data = json.loads(jobs_file.read_text(encoding="utf-8"))
+        data["jobs"] = [j for j in data["jobs"] if j["id"] != gone["id"]]
+        jobs_file.write_text(json.dumps(data), encoding="utf-8")
+        record_removed(gone["id"])
+        with open(journal, "ab") as f:
+            f.write(bad_line.replace(b"JID", gone["id"].encode()) + b"\n")
+        assert last_removed([gone["id"]]) == {gone["id"]}
+        jobs._save_jobs_unlocked(stale)
+
+    assert gone["id"] not in {j["id"] for j in load_jobs()}, "malformed line let a stale save resurrect a removed job"
+
+
+@pytest.mark.parametrize("terminator", [b"\r", b"\r\n", b"\n"])
+def test_cr_delimited_journal_keeps_removal_evidence(hermes_env, terminator):
+    """t_e6448717 (Prism 699c883ef2fd on #2349): the binary reader split on b"\\n" only, so a
+    CR-delimited journal fused every record into one unparseable line, last_removed() returned an
+    empty set, and a stale save resurrected the removed job. The text reader it replaced split on
+    universal newlines; every terminator it accepted must still separate records."""
+    import cron.jobs as jobs
+    from cron.jobs import create_job, load_jobs
+    from cron.lifecycle_journal import JOURNAL_FILENAME, last_removed
+
+    gone = create_job(prompt="gone", schedule="every 5m", name="gone", deliver="local")
+    jobs_file = jobs._current_cron_store().jobs_file
+    journal = hermes_env / "cron" / JOURNAL_FILENAME
+    jid = gone["id"].encode()
+
+    with jobs._jobs_lock():
+        stale = jobs.load_jobs()
+        data = json.loads(jobs_file.read_text(encoding="utf-8"))
+        data["jobs"] = [j for j in data["jobs"] if j["id"] != gone["id"]]
+        jobs_file.write_text(json.dumps(data), encoding="utf-8")
+        journal.write_bytes(
+            b'{"job_id":"' + jid + b'","event":"created"}' + terminator
+            + b'{"job_id":"' + jid + b'","event":"removed"}' + terminator)
+        assert last_removed([gone["id"]]) == {gone["id"]}
+        jobs._save_jobs_unlocked(stale)
+
+    assert gone["id"] not in {j["id"] for j in load_jobs()}, "CR-delimited journal let a stale save resurrect a removed job"

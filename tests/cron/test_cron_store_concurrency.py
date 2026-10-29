@@ -89,7 +89,7 @@ class TestConcurrentWriters:
         assert ids == {"OURS", "SIBLING"}, "a concurrent create was clobbered"
 
     def test_concurrent_run_state_update_is_not_reverted(
-        self, tmp_cron_dir, degraded_lock
+        self, tmp_cron_dir, degraded_lock, monkeypatch
     ):
         """Instance-3 shape: the job survives but its run state reverts.
 
@@ -97,6 +97,11 @@ class TestConcurrentWriters:
         and the pre-existing id-presence merge sees both sides holding the id,
         so without field-level reconciliation the stale copy wins outright.
         """
+        # The sibling writes run state INTO jobs.json: that is the json store (t_94e91559 kill
+        # switch). In sqlite mode run state lives in runtime_state.db and jobs.json is a mirror
+        # the row always wins over; the sqlite twin of this test is
+        # test_runtime_state_split.py::test_stale_definition_save_keeps_sibling_row_run_state.
+        monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
         _write_store_directly(tmp_cron_dir, [{
             "id": "RAN", "name": "oneshot", "schedule": {"kind": "once"},
             "last_run_at": None, "last_status": None, "state": "scheduled",
@@ -163,7 +168,9 @@ class TestConcurrentWriters:
 
         persisted = _by_id(_read_store(tmp_cron_dir), "J")
         assert "drift_alerted" not in persisted, "a deleted field came back"
-        assert persisted["last_run_at"] == "2026-09-20T16:07:28+00:00"
+        # The sibling's runtime value survives: in the merged view every reader sees (jobs.json
+        # holds definitions only by default, t_3c8fa4d6; the value lives in its row).
+        assert _by_id(load_jobs(), "J")["last_run_at"] == "2026-09-20T16:07:28+00:00"
 
     def test_intentional_removal_still_removes(self, tmp_cron_dir, degraded_lock):
         """The merge must never resurrect a declared deletion."""
@@ -268,6 +275,44 @@ class TestVanishedJobGuard:
         remaining = journal.read_text()
         assert "ANCIENT" not in remaining
         assert "recent" in remaining
+
+
+class TestToggleJournal:
+    """t_3436a10c: pause/resume are journalled, so a NON-API writer that flips `enabled` (the 10-24
+    jobs.json union that laid origin's paused rows over three resumed Tiresias crons) is detectable."""
+
+    def _events(self, jid):
+        return [(e["event"], e.get("enabled")) for e in read_entries() if e["job_id"] == jid]
+
+    def test_pause_resume_and_create_record_the_toggle(self, tmp_cron_dir):
+        from cron.jobs import pause_job, resume_job
+
+        job = create_job(prompt="a", schedule="every 1h", name="tiresias-daily")
+        pause_job(job["id"], reason="dormant")
+        resume_job(job["id"])
+        assert self._events(job["id"]) == [("created", True), ("paused", None), ("resumed", None)]
+        paused = [e for e in read_entries() if e["event"] == "paused"]
+        assert paused[0]["reason"] == "dormant"
+
+    def test_an_edit_that_keeps_enabled_journals_nothing(self, tmp_cron_dir):
+        from cron.jobs import update_job
+
+        job = create_job(prompt="a", schedule="every 1h", name="quiet")
+        update_job(job["id"], {"prompt": "b"})
+        assert self._events(job["id"]) == [("created", True)]
+
+    def test_created_paused_records_enabled_false(self, tmp_cron_dir):
+        job = create_job(prompt="a", schedule="every 1h", name="dormant", paused=True)
+        assert self._events(job["id"]) == [("created", False)]
+
+    def test_toggle_events_do_not_make_the_vanished_guard_unavailable(self, tmp_cron_dir):
+        from cron.jobs import pause_job
+
+        job = create_job(prompt="a", schedule="every 1h", name="x")
+        pause_job(job["id"], reason="r")
+        _, malformed = read_entries_with_health()
+        assert malformed == 0
+        assert check_vanished_jobs().status == STATUS_OK
 
 
 class TestCronStatusSurface:

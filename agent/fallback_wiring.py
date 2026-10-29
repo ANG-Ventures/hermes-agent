@@ -321,6 +321,12 @@ def pre_failover(agent: Any, reason: Any,
         reset = fp.stated_reset_from_context(error_context, now)
         if reset is None:
             reset = fp.parse_stated_reset_s(pend.get("text"), now)
+        window = fp.ceiling_window(window, pend.get("headers"))
+        if (reset is None and cls == "quota_model" and ra and ra > 0
+                and (pend.get("headers") or {}).get("x-relay-error-class") == "quota_model"):
+            # t_aa698edc: the relay's quota_model Retry-After IS the model's
+            # earliest real reset (claude-pool spec D2); bench until then.
+            reset = ra
         # §4.1 plumbing: apply_quota_gate AND the legacy arm block are gated
         # on class; only quota_model / rate_upstream / refusal / unclassified
         # reach their old behaviour.

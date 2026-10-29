@@ -719,6 +719,50 @@ def test_gate_lanes_never_skips_os_tests_outside_a_pull_request(
     assert lanes["os_tests"] == expected
 
 
+@pytest.mark.parametrize("orchestrator", [".github/workflows/ci.yaml", ".github/workflows/ci-local.yaml"])
+@pytest.mark.parametrize(
+    "event,release,toggle,expected",
+    [
+        ("push", "false", "", "true"),
+        ("push", "false", "on", "true"),
+        ("push", "false", "off", "false"),
+        ("merge_group", "false", "off", "false"),
+        ("pull_request", "false", "off", "false"),
+        ("workflow_dispatch", "true", "off", "true"),
+    ],
+)
+def test_gate_lanes_hosted_os_follows_the_repo_var_except_on_release(
+    orchestrator, event, release, toggle, expected, tmp_path
+):
+    """CI_HOSTED_OS_JOBS=off skips the hosted macOS/Windows jobs; a release run still forces them."""
+    out = tmp_path / "out"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "RELEASE": release,
+        "EVENT_NAME": event,
+        "DESKTOP_JOBS": "",
+        "PR_OS_TESTS": "",
+        "HOSTED_OS_JOBS": toggle,
+        "CLASSIFIED": json.dumps({"python": "true", "os_tests": "true"}),
+        "GITHUB_OUTPUT": str(out),
+    }
+    subprocess.run([sys.executable, "-c", _gate_lanes_script(orchestrator)], env=env, check=True)
+    lanes = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
+    assert lanes["hosted_os"] == expected
+
+
+def test_hosted_os_lane_reaches_every_hosted_os_job():
+    """detect.hosted_os gates tests-os and the windows-latest bootstrap job, in both orchestrators."""
+    boot = _yaml(".github/workflows/bootstrap-installer.yml")
+    assert boot["jobs"]["windows"]["if"] == "inputs.hosted_os"
+    assert "hosted_os" in (boot.get("on") or boot.get(True))["workflow_call"]["inputs"]
+    for rel in (".github/workflows/ci.yaml", ".github/workflows/ci-local.yaml"):
+        ci = _yaml(rel)
+        assert "hosted_os" in ci["jobs"]["detect"]["outputs"]
+        assert "needs.detect.outputs.hosted_os == 'true'" in ci["jobs"]["tests-os"]["if"]
+        assert "needs.detect.outputs.hosted_os" in ci["jobs"]["bootstrap-installer"]["with"]["hosted_os"]
+
+
 def test_os_tests_lane_reaches_the_os_unit_jobs():
     """detect.os_tests must be what tests-os.yml's os-tests job gates on, in both orchestrators."""
     tests_os = _yaml(".github/workflows/tests-os.yml")

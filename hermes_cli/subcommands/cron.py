@@ -213,7 +213,30 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_subparsers.add_parser("doctor", help="Check scheduled jobs for common health issues")
 
+    cron_rt_export = cron_subparsers.add_parser(
+        "runtime-export",
+        help="Fold cron/runtime_state.db back into jobs.json (kill switch: run with --retire "
+             "before setting HERMES_CRON_RUNTIME_STATE=json)")
+    cron_rt_export.add_argument(
+        "--to-json", action="store_true", required=True,
+        help="Write runtime fields back into jobs.json (the only supported target)")
+    cron_rt_export.add_argument(
+        "--retire", action="store_true",
+        help="Also remove runtime_state.db; refuses while rows without a definition exist")
+    cron_rt_export.add_argument(
+        "--drop-orphans", action="store_true",
+        help="With --retire: discard rows whose job is not in jobs.json")
+
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
+    cron_runner = cron_subparsers.add_parser(
+        "runner", help="Run the cron script runner (plain-script jobs outside the gateway)")
+    cron_runner.add_argument(
+        "runner_action", nargs="?", choices=["rearm", "install", "uninstall", "lint"],
+        help="rearm: clear a watchdog trip so the runner ticks again; install/uninstall: the "
+             "ai.hermes.cron-script-runner LaunchAgent; lint: its env vs the gateway plist")
+    cron_runner.add_argument(
+        "--dry-run", action="store_true", dest="runner_dry_run",
+        help="With install: print the plist, write and load nothing")
     add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)

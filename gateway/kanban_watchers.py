@@ -16,6 +16,7 @@ refusal paging) as the loop bodies ``GatewayRunner`` runs.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 import os
 import sqlite3
@@ -233,22 +234,117 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     return format_home_line(sid, row)
 
 
+class _SessionOriginReader:
+    """One reused SessionDB per state.db path for the notifier's origin lookups (t_69e10010).
+
+    Constructing a SessionDB runs the full writable open path (fd-table scans under the startup
+    lock); the notifier used to do that once per actor per subscription per tick. The handle comes
+    from ``hermes_state_registry.acquire``, the process-wide registry the gateway's session store
+    also opens through, so in a gateway it is the runner's own writer and nothing new is opened.
+    The path is resolved per call (``_default_db_path`` follows the context-local HERMES_HOME),
+    the handle is dropped when the file at the path was replaced or a read fails, and ``close()``
+    returns every reference when the watcher stops.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._dbs: dict[str, Any] = {}
+        # Prism c1643c48add2: set by close(). A ``_collect`` worker that is still running when the
+        # watcher's ``finally`` closes the reader must not park a fresh registry reference here
+        # where nothing would release it; after close, get_session() takes and returns one per call.
+        self._closed = False
+
+    def _handle(self, key: str):
+        """``(db, owned)``: the cached handle (``owned`` False), or, after ``close()``, a fresh
+        reference the caller must release (``owned`` True)."""
+        from hermes_state_common import stat_db_file_identity
+
+        with self._lock:
+            db = self._dbs.get(key)
+        if db is not None and getattr(db, "_db_file_identity", None) == stat_db_file_identity(Path(key)):
+            return db, False
+        if db is not None:
+            self._drop(key, db)
+        from hermes_state_registry import acquire
+
+        db = acquire(Path(key))
+        with self._lock:
+            other = None if self._closed else self._dbs.setdefault(key, db)
+        if other is None:  # closed: the caller owns this reference and releases it itself
+            return db, True
+        if other is not db:
+            self._release(db)
+        return other, False
+
+    def _drop(self, key: str, db) -> None:
+        with self._lock:
+            if self._dbs.get(key) is db:
+                del self._dbs[key]
+            else:
+                return
+        self._release(db)
+
+    @staticmethod
+    def _release(db) -> None:
+        try:
+            from hermes_state_registry import release_or_close
+
+            release_or_close(db)
+        except Exception:
+            logger.debug("kanban notifier: origin reader release failed", exc_info=True)
+
+    def get_session(self, session_id: str):
+        from hermes_state import _default_db_path
+
+        key = str(_default_db_path())
+        db, owned = self._handle(key)
+        try:
+            return db.get_session(session_id)
+        except Exception:
+            if not owned:
+                self._drop(key, db)
+            raise
+        finally:
+            if owned:  # taken after close(): nothing else will return it
+                self._release(db)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            dbs, self._dbs = list(self._dbs.values()), {}
+        for db in dbs:
+            self._release(db)
+
+
+# Set by the notifier watcher for its lifetime; ``asyncio.to_thread`` copies it into ``_collect``.
+_ORIGIN_READER: "contextvars.ContextVar[Optional[_SessionOriginReader]]" = contextvars.ContextVar(
+    "kanban_notifier_origin_reader", default=None,
+)
+
+
 def _session_origin(session_id: str) -> Optional[dict]:
     """The ``origin_json`` dict a session was opened from, or None.
 
-    Blocking state.db lookup; call from a worker thread only.
+    Blocking state.db lookup; call from a worker thread only. Inside the notifier watcher the
+    lookup reuses its ``_SessionOriginReader``; elsewhere it opens (and closes) one SessionDB.
     """
     row = None
     try:
-        from hermes_state import SessionDB
+        reader = _ORIGIN_READER.get()
+        if reader is not None:
+            row = reader.get_session(session_id)
+        else:
+            from hermes_state import SessionDB
 
-        db = SessionDB()
-        try:
-            row = db.get_session(session_id)
-        finally:
-            close = getattr(db, "close", None)
-            if callable(close):
-                close()
+            db = SessionDB()
+            try:
+                row = db.get_session(session_id)
+            finally:
+                close = getattr(db, "close", None)
+                if callable(close):
+                    close()
     except Exception:
         return None
     raw = (row or {}).get("origin_json")
@@ -1233,10 +1329,23 @@ class _NeedsInputPager(_GuardStuckNotifier):
         digest = hashlib.sha1(str(item.get("reason") or "").encode("utf-8")).hexdigest()[:12]
         return "|".join((str(board), str(item["task_id"]), digest))
 
+    # The p>=200 #alerts mirror has its own ledger entry, set only when the
+    # mirror send itself returned True (t_d36da044 r1, Prism 560c78346c1a): a
+    # mirror lost to a transient failure is retried on the next page, and a
+    # delivered one is never repeated.
+    _MIRROR_SUFFIX = "|alerts-mirror"
+    # Same pattern for a card homed in #alerts (t_d36da044 r2, Prism
+    # 7dfa6f11a80d): set only when a page to #alerts itself returned True. A
+    # card whose earlier pages went to #logs (below the floor) and is later
+    # raised over it still gets its first #alerts page.
+    _ALERTS_FIRST_SUFFIX = "|alerts-first"
+
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
         deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
+        current |= {key + suffix for key in current
+                    for suffix in (self._MIRROR_SUFFIX, self._ALERTS_FIRST_SUFFIX)}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
         before = dict(self._sent)
@@ -1264,9 +1373,17 @@ class _NeedsInputPager(_GuardStuckNotifier):
                 continue
             if time.monotonic() >= deadline:
                 break
-            if send(board, item, last is not None):
+            mirror_key = key + self._MIRROR_SUFFIX
+            first_key = key + self._ALERTS_FIRST_SUFFIX
+            page = dict(item, alerts_mirror_due=mirror_key not in self._sent,
+                        alerts_first_due=first_key not in self._sent)
+            if send(board, page, last is not None):
                 self._sent[key] = now
                 delivered += 1
+            if page.get("alerts_mirror_delivered"):
+                self._sent[mirror_key] = now
+            if page.get("alerts_first_delivered"):
+                self._sent[first_key] = now
         if self._sent != before:
             self._save()
         return delivered
@@ -1304,7 +1421,13 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
     #alerts gets ONE page per (card, reason) from a card homed there or with no
     home (t_081bb603): its "still waiting" re-page goes to #logs instead (a
     standing wait is a report, not a page), and a card whose origin IS #alerts
-    is not mirrored there a second time."""
+    is not mirrored there a second time.
+
+    t_d36da044 (13 #alerts lines/day vs a budget of 3): the p>=200 mirror
+    fires on the first page only, never on a "still waiting" re-page; and a
+    card homed in #alerts below the pager's own floor
+    (``NEEDS_INPUT_PAGE_MIN_PRIORITY``) posts to #logs, because it pages only
+    for having #alerts as its home, not for its priority."""
     script = _alert_notify_script()
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; needs-input page not delivered")
@@ -1322,13 +1445,35 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
     if channel is not None and not str(channel).isdigit():
         channel = None  # numeric channel ids only
     alerts_ch, logs_ch = _needs_input_channels()
-    if channel and still_waiting and str(channel) == alerts_ch:
-        return _notify_send(script, message, ["--target", logs_ch])
+    from hermes_cli.kanban_db import NEEDS_INPUT_PAGE_MIN_PRIORITY
+
+    try:
+        below_floor = int(item.get("priority") or 0) < NEEDS_INPUT_PAGE_MIN_PRIORITY
+    except (TypeError, ValueError):
+        below_floor = True
+    if channel and str(channel) == alerts_ch:
+        # #alerts gets the card's first page once it is at or above the floor,
+        # whatever still_waiting says: the pager sets ``alerts_first_due`` from
+        # its own ledger entry and reads back ``alerts_first_delivered``. A
+        # direct caller without the flag keeps the first-page-only rule.
+        first_due = item.get("alerts_first_due", not still_waiting)
+        if below_floor or not first_due:
+            return _notify_send(script, message, ["--target", logs_ch])
+        ok = _notify_send(script, message, ["--target", alerts_ch])
+        if ok:
+            item["alerts_first_delivered"] = True
+        return ok
     if channel:
         ok = _notify_send(script, message, ["--target", str(channel)])
-        if (item.get("alerts") and str(channel) != alerts_ch
-                and not _notify_send(script, message, ["--sev", "error"])):
-            logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
+        # The pager sets ``alerts_mirror_due`` from its own mirror ledger entry
+        # and reads back ``alerts_mirror_delivered``; a direct caller without
+        # the flag mirrors on the first page only.
+        mirror_due = item.get("alerts_mirror_due", not still_waiting)
+        if item.get("alerts") and mirror_due and str(channel) != alerts_ch:
+            if _notify_send(script, message, ["--sev", "error"]):
+                item["alerts_mirror_delivered"] = True
+            else:
+                logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
         return ok
     if still_waiting:
         return _notify_send(script, message, ["--target", logs_ch])
@@ -1777,6 +1922,12 @@ class GatewayKanbanWatchersMixin:
         """Clear notifier-visible ownership before releasing the OS lock."""
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
+        try:
+            from tools.async_delegation_kanban import clear_dispatcher_heartbeat, set_dispatcher_active
+            set_dispatcher_active(False)
+            clear_dispatcher_heartbeat()
+        except Exception:
+            pass
         _release_singleton_lock(handle)
     async def _sleep_between_ticks(self, interval: float) -> None:
         """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
@@ -1787,6 +1938,19 @@ class GatewayKanbanWatchersMixin:
             slept += 1.0
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Run the notifier loop with ONE reused state.db reader for origin lookups (t_69e10010):
+        ``_session_origin`` used to construct a SessionDB per actor per tick; the reader is set
+        for this task's context (``asyncio.to_thread`` carries it into ``_collect``) and every
+        reference it took is returned when the watcher stops."""
+        reader = _SessionOriginReader()
+        token = _ORIGIN_READER.set(reader)
+        try:
+            await self._kanban_notifier_watcher_loop(interval)
+        finally:
+            _ORIGIN_READER.reset(token)
+            reader.close()
+
+    async def _kanban_notifier_watcher_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
@@ -3690,6 +3854,13 @@ class GatewayKanbanWatchersMixin:
         else:
             return
         self._kanban_dispatcher_lock_handle = _lock_handle
+        write_dispatcher_heartbeat = lambda _interval: None  # noqa: E731 - bound if the import fails
+        try:
+            from tools.async_delegation_kanban import set_dispatcher_active, write_dispatcher_heartbeat
+            set_dispatcher_active(True)  # §5.1.5: a dispatcher now reaps this host's unit workers
+            write_dispatcher_heartbeat(interval)
+        except Exception:
+            logger.debug("kanban dispatcher: could not flag the delegations runtime", exc_info=True)
         if waiting_logged or unavailable_logged:
             logger.warning("kanban dispatcher: assumed leadership after standby (%s)", _lock_path)
         else:
@@ -3896,6 +4067,7 @@ class GatewayKanbanWatchersMixin:
         # wall-clock start of each board's current zero-spawn streak while
         # the gate had allowance (published to `hermes kanban diagnostics`).
         from hermes_cli import kanban_load_gate as _klg
+        from hermes_cli import kanban_placement_reasons as _kpr
         _board_rr = {"tick": 0}
         _board_starved_since: dict[str, float] = {}
 
@@ -4156,7 +4328,7 @@ class GatewayKanbanWatchersMixin:
                 _paused = _spawn_paused
                 if _paused is None and _limit is not None and _limit <= 0:
                     _paused = (
-                        f"load gate: this tick's allowance of {_allowance} "
+                        f"{_kpr.QUOTA_SPENT_PREFIX}{_allowance} "
                         f"spawn(s) is used by other boards"
                     )
                 # spawn_limit is an int whenever the gate is enabled (0 when
@@ -4552,6 +4724,8 @@ class GatewayKanbanWatchersMixin:
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
+            # §5.1.5: other gateways on this host send background units here while this beats.
+            write_dispatcher_heartbeat(interval)
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.

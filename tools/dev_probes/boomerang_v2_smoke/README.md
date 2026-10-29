@@ -16,10 +16,11 @@ tool: `tools/dev_probes/` has no `__init__.py`, so tool discovery never imports 
 | 1 | AC-7, INV-5, INV-6 | Mints 3 cards on the scratch board (level `boomerang wake`, origin chat subscribed `notify+wake`, set by `edit --boomerang-wake`), forces `completed` / `blocked --kind needs_input` / (optional) a forced child failure through the kanban CLI, then reads the origin chat and gateway log for `[boomerang-wake] <card> - <Outcome>`, `kanban notifier: boomerang-wake <card> disposition=auto`, no boomerang wake on the needs_input card, and `warning boomerang-wake failed <card>: <reason>`. | no |
 | 2 | AC-8, INV-7 | Kill switches. Precondition: no `<root>/state/boomerang-wake.disabled` stop file and `fork_enabled: true` (or unset). Prints the one-line change, waits for the ack, re-reads config / the stop file, forces an event, asserts `boomerang.fork_ineligible reason=fork_enabled` (fork off) and no boomerang wake within one tick (stop file present). Then asks for the restore. | **yes: 3 changes** (`fork_enabled=false`, `boomerang_wake=disabled` = touch the stop file, `restore`) |
 | 3 | AC-9, INV-8 | Sends a canary request (positive control, below), forces one fork turn (or observes one with `--no-trigger`), waits for `boomerang.fork served_by=<seat>`, then scans the relay wire capture (relay-wire-forensics JSONL, `req.headers` / `req.headerOrder`) for any `x-hermes-*` header. Zero captured records is INCOMPLETE, never PASS. | no |
-| 4 | AC-11, 5.7 | Restart drill observer. Forces an event, waits for the boomerang-wake dispatch, asks Apollo to restart, then waits for a fresh boot line after the dispatch, the reconciler's re-surface line within startup + one tick, `warning boomerang-wake lost <card> (reason: gateway restart)` in the origin chat, and no late `[boomerang-wake]` line. It never restarts anything. | **yes: 1 gateway restart** (`restart`) |
+| 4 | AC-11, 5.7 | Restart drill observer, two arms, one gateway restart each. **Redispatch arm** (retry unspent, t_870c1fba): forces an event, waits for the boomerang-wake dispatch, asks for the restart, then waits for a fresh boot line after the dispatch, the INFO `kanban boomerang-wake: <card> redispatched after gateway restart (retry 1/1) delegation=<new>` line within the first-tick window, a `handled ... delegation=<new>` line (the SECOND child finished the card), `[boomerang-wake] <card> - <Outcome>` after the restart, and ZERO `warning boomerang-wake lost <card>` lines. **Fallback arm** (retry pre-spent: the harness writes `retries[<card>]=1` into `BV2_WAKE_STATE` once the child is `running`): `lost reason=gateway restart, retry spent resurfaced delivered=True` in the log within the first tick, `warning boomerang-wake lost <card> (reason: gateway restart, retry spent)` in the origin chat, no redispatch, no late `[boomerang-wake]` line. It never restarts anything. | **yes: 2 gateway restarts** (`restart`, once per arm) |
 
 The harness never edits config or the stop file, never restarts the gateway, and refuses any board whose slug
-does not match `^bv2-smoke`.
+does not match `^bv2-smoke`. Its one state write is step 4's fallback arm: `retries[<card>]=1` into
+`BV2_WAKE_STATE` (required live; never defaulted, so it cannot touch a fleet gateway's file).
 
 ## Ack mechanism
 
@@ -35,8 +36,8 @@ Apollo makes the change (config via the normal config writer; restart via `safe-
 with its single-use approval), then appends the token as a whole line to the ack file. The
 harness polls the file (default `$TMPDIR/bv2-smoke.ack`, override `BV2_ACK_FILE`,
 `--ack-timeout` default 1800 s). Tokens, in order: `fork_enabled=false`,
-`boomerang_wake=disabled`, `restore` (step 2), `restart` (step 4). Start each smoke run with an
-empty ack file: a stale token from an earlier run acks immediately.
+`boomerang_wake=disabled`, `restore` (step 2), `restart` twice (step 4). Live, an ack counts only
+when it is a NEW line since the request, so arm 1's `restart` never answers arm 2.
 
 **Scripted operator (`BV2_ACK_CMD`).** On an ISOLATED scratch gateway (the puppet-lane
 `bv2-smoke-lane.sh`, hermes-home) there is no Apollo to ack: set `BV2_ACK_CMD` to an argv prefix
@@ -56,6 +57,7 @@ A non-zero exit is a FAIL for that ack, never a pass. Dry-run ignores it.
 | `BV2_GATEWAY_LOG` | gateway log | `<root>/logs/gateway.log` |
 | `BV2_GATEWAY_ENV` | `.env` holding the bot token | `<root>/.env` |
 | `BV2_GATEWAY_PID` | gateway pid file (boot_id before/after, step 4) | `<root>/gateway.pid` |
+| `BV2_WAKE_STATE` | the scratch gateway's `gateway/kanban_boomerang_wake.json`; step 4's fallback arm writes `retries[<card>]=1` here | required live for the fallback arm (SKIP without it) |
 | `BV2_CONFIG` | config.yaml read by step 2 | `<root>/config.yaml` |
 | `BV2_STOP_FILE` | boomerang-wake stop file read by step 2 | `<root>/state/boomerang-wake.disabled` |
 | `BV2_WIRELOG_DIR` | wire capture root (step 3) | `~/.claude-wirelog` |

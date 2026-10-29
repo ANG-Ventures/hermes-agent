@@ -488,7 +488,10 @@ def test_renamed_wal_generation_survives_close_and_clean_process_exit(tmp_path):
 
 
 @pytest.mark.platforms("linux")  # deleted-WAL /proc scan is Linux-only
-def test_refuse_helper_raises_while_deleted_wal_held(tmp_path, force_wal):
+def test_refuse_helper_raises_while_deleted_wal_held(tmp_path, force_wal, monkeypatch):
+    # A raw sqlite3 connection is not a registered SessionDB writer: the DEFAULT mode must
+    # still refuse it through the cross-process scan (t_69e10010 keeps that contract).
+    monkeypatch.delenv("HERMES_STATE_DELETED_WAL_CHECK", raising=False)
     path = tmp_path / "state.db"
     raw = sqlite3.connect(str(path))
     try:
