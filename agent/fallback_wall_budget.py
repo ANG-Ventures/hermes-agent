@@ -37,6 +37,7 @@ p90 168 s / max 275 s on 2026-10-11): it ends dead air, not slow turns.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Optional
 
@@ -328,6 +329,10 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
         # a lane that just failed is not a healthy turn in progress).
         return (f"⏳ still waiting for a first reply: {int(waited)}s on {route}{tried}; "
                 f"{failed}, retrying{_ahead_suffix(agent)}")
+    stage = _relay_stage_phrase(agent)
+    if stage:
+        return (f"⏳ {stage}: {int(waited)}s elapsed; cut at {int(st['budget_s'])}s"
+                f"{_ahead_suffix(agent)}")
     if _buffering_lane(agent):
         return (f"⏳ turn in progress on {route} (buffering lane, first byte not visible until "
                 f"the turn ends): {int(waited)}s elapsed; long outputs run 2–4 min; "
@@ -346,6 +351,36 @@ def _cut_suffix(agent: Any, st: dict, waited: float) -> str:
     if budget <= 0 or st.get("fired") or waited >= budget or not _lane_ahead(agent):
         return ""
     return f"; cut to next lane at {int(budget)}s"
+
+
+def _relay_stage_phrase(agent: Any) -> Optional[str]:
+    """Which hop a pool-relay wait is on, in plain words (t_9a635fbd), else None.
+
+    2026-10-28 17:00-20:00 PT the relay's upload to the box (our uplink) ran 80-117 s
+    p90 while the provider's ttfb stayed 13-19 s, and the notice could not say so.
+    The relay's ``GET /inflight`` is read once per notice (<= 300 ms). Stages that
+    say nothing new (streaming, a buffered body read, unknown) keep today's wording."""
+    from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS, fetch_relay_stage
+    if (getattr(agent, "provider", "") or "").strip().lower() not in _POOL_CAPABILITY_PROVIDERS:
+        return None
+    info = fetch_relay_stage(getattr(agent, "base_url", "") or "",
+                             getattr(agent, "session_id", None))
+    if not info:
+        return None
+    seat = info.get("seat") if isinstance(info.get("seat"), str) and info.get("seat") else None
+    since_ms = info.get("since_ms")
+    # json.loads accepts NaN/Infinity; int() of those raises in the monitor thread.
+    in_stage = (f" for {int(since_ms // 1000)}s"
+                if isinstance(since_ms, (int, float)) and not isinstance(since_ms, bool)
+                and math.isfinite(since_ms) else "")
+    stage = info.get("stage")
+    if stage == "relay_send":
+        return f"request still uploading to {seat or 'the pool seat'} (our uplink){in_stage}"
+    if stage in ("box_headers", "upstream_ttfb"):
+        return f"{seat or 'the pool seat'} connected, provider has not sent a first token{in_stage}"
+    if stage == "queued":
+        return f"queued on {seat}{in_stage}" if seat else f"queued in the relay pool{in_stage}"
+    return None
 
 
 def _buffering_lane(agent: Any) -> bool:

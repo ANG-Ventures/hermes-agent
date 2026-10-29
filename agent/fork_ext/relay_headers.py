@@ -151,6 +151,37 @@ def reset_relay_streaming() -> None:
     _RELAY_STREAMING.clear()
 
 
+# t_9a635fbd: the relay's in-flight stage for this session (claude-pool
+# GET /inflight?call=<key>, loopback only). Read by the wall-budget notice so it
+# can say WHICH hop is slow (2026-10-28: our uplink, not the provider). Best
+# effort: any failure, a non-loopback relay, or a 404 is None.
+RELAY_STAGE_TIMEOUT_S = 0.3
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def fetch_relay_stage(base_url, key, *, timeout: float = RELAY_STAGE_TIMEOUT_S,
+                      opener=None):
+    """``{stage, seat, since_ms, ...}`` for ``key`` on the relay at ``base_url``, else None."""
+    if not key or not isinstance(key, str):
+        return None
+    try:
+        import json
+        import urllib.parse
+        import urllib.request
+        u = urlsplit(str(base_url))
+        if (u.hostname or "").lower() not in _LOOPBACK_HOSTS or u.scheme not in ("http", "https"):
+            return None
+        url = urllib.parse.urlunsplit((u.scheme, u.netloc, "/inflight",
+                                       urllib.parse.urlencode({"call": key}), ""))
+        with (opener or urllib.request.urlopen)(url, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, dict) and isinstance(data.get("stage"), str) else None
+    except Exception:
+        return None
+
+
 def _pool_capability_headers(agent) -> dict:
     """Per-request capability negotiation for the claude pool relays.
 
