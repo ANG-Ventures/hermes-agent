@@ -482,31 +482,50 @@ def _is_test_pass_counter(m) -> bool:
     )
 
 
-# ``PASS`` followed by a part that makes it a word (``MERGE_PASS_CARD_EVENT=0``, a review
-# "pass", ``PASS_THROUGH``) is not a password: masking it rewrote the agent's own stored
-# turns and broke prompt-cache replay (t_b924fb6d). ALLOWLIST, not denylist: an unknown
-# qualifier (``DB_PASS_PROD``, ``ROOT_PASS_OLD``, ``MYSQL_PASS_2``, ``USER_PASS_HASH``) is a
-# password and keeps masking, since a short value matches no other pattern.
-_PASS_NON_SECRET_NEXT_PARTS = frozenset({
-    "CARD", "COUNT", "COUNTS", "COUNTER", "NUM", "NUMBER", "INDEX", "IDX", "TOTAL",
-    "RATE", "STATUS", "RESULT", "RESULTS", "EVENT", "EVENTS", "ROUND", "STAGE", "STEP",
-    "ENABLED", "DISABLED", "THROUGH", "THRU",
+# Fleet env names whose ``PASS`` is a merge/review "pass", not a password. Masking
+# ``MERGE_PASS_CARD_EVENT=0`` rewrote the agent's own stored turns and broke prompt-cache replay
+# (t_b924fb6d). EXACT names only, each found in fleet text: a word list guessed which qualifiers
+# can never name a credential and leaked DB_PASS_STAGE / DB_PASS_CARD. Any other name masks as
+# before; a missed counter costs one cache reseed, a leaked password is the thing to avoid.
+# Paths: ~/.hermes/scripts/ (hermes-home) unless marked hermes-agent.
+_PASS_WORD_ENV_NAMES = frozenset({
+    "AE_PASS_REL",                        # fleet-config-lint.py
+    "EVENT_PASS_CLOSE",                   # kanban-review-merge-pass.py
+    "GH_WEBHOOK_MERGE_PASS_DEBOUNCE",     # gh-webhook-consumer.py
+    "GH_WEBHOOK_MERGE_PASS_MAX_LIVE",     # gh-webhook-consumer.py
+    "GH_WEBHOOK_MERGE_PASS_PY",           # gh-webhook-consumer.py
+    "MERGE_PASS_BOARD_HOLD_FIRST",        # kanban-review-merge-pass.py
+    "MERGE_PASS_CARD_EVENT",              # gh-webhook-consumer.py
+    "MERGE_PASS_CARD_EVENT_CURSOR",       # lib/card_event_trigger.py
+    "MERGE_PASS_CARD_EVENT_DEFERRED",     # lib/card_event_trigger.py
+    "MERGE_PASS_CARD_EVENT_TRIGGERS",     # lib/card_event_trigger.py
+    "MERGE_PASS_CARD_PARK_S",             # kanban-review-merge-pass.py
+    "MERGE_PASS_DEBOUNCE",                # gh-webhook-consumer.py
+    "MERGE_PASS_FR_DRIFT_GRACE_S",        # kanban-review-merge-pass.py
+    "MERGE_PASS_FR_DRIFT_SWEEP_S",        # kanban-review-merge-pass.py
+    "MERGE_PASS_FR_PENDING_RECHECK_S",    # kanban-review-merge-pass.py
+    "MERGE_PASS_FR_PENDING_SKIP",         # kanban-review-merge-pass.py
+    "MERGE_PASS_GREEN_V2",                # gh-webhook-consumer.py, kanban-review-merge-pass.py
+    "MERGE_PASS_LOCK_DIR",                # kanban-review-merge-pass.py
+    "MERGE_PASS_LOG",                     # gh-webhook-consumer.py
+    "MERGE_PASS_LOST_GREEN_GRACE_S",      # lib/ci_settled.py
+    "MERGE_PASS_LOST_GREEN_WINDOW_S",     # lib/ci_settled.py
+    "MERGE_PASS_MAX_LIVE",                # gh-webhook-consumer.py, lib/card_event_trigger.py
+    "MERGE_PASS_PR_DEBOUNCE_S",           # kanban-review-merge-pass.py
+    "MERGE_PASS_PY",                      # gh-webhook-consumer.py
+    "MERGE_PASS_SCRIPT",                  # tests/test_merge_pass_remote_tree_hold.py
+    "MERGE_PASS_SHAPES",                  # kanban-review-merge-pass.py, live_evidence_gate.py
+    "MERGE_PASS_SUMMARY",                 # hermes-agent tests/gateway/test_kanban_notify_suppress_closer_stamp.py
+    "MERGE_PASS_SWEEP_FR_REFUSED_SKIP",   # kanban-review-merge-pass.py
+    "MERGE_PASS_SWEEP_RECHECK_S",         # kanban-review-merge-pass.py
+    "PRISM_PASS_S",                       # replays/l0_a4.py
+    "PRISM_PASS_SCORE",                   # lib/land_evaluator.py
+    "PRISM_RECORD_PASS_PY",               # lib/prism_record_trigger.py
+    "PRISM_RECORD_PASS_SCRIPT",           # lib/prism_record_trigger.py
+    "PR_PASS_DEBOUNCE_S",                 # kanban-review-merge-pass.py
+    "PR_PASS_STATE",                      # kanban-review-merge-pass.py
+    "WIRELOG_NIGHTLY_PASS_BUDGET_S",      # wirelog-fleet-nightly-sync.py
 })
-
-
-def _is_inner_pass_part(key: str, m) -> bool:
-    if m.group(0).lower() != "pass" or key[m.end():m.end() + 1] != "_":
-        return False
-    # Prism e565ccfc9b25: EVERY part after PASS must be a known non-secret word, not only the
-    # first one (DB_PASS_CARD_PROD=x is a password: PROD is not on the list, so it masks).
-    rest = key[m.end() + 1:].split("_")
-    return bool(rest) and all(p and p.upper() in _PASS_NON_SECRET_NEXT_PARTS for p in rest)
-
-
-def _env_key_has_secret_keyword(key: str) -> bool:
-    """ENV-pass key validator: _key_has_secret_keyword minus an inner ``PASS`` part."""
-    return any(_is_word_start(key, m.start()) and _is_word_end(key, m.end()) and not _is_inner_pass_part(key, m)
-               for m in _KEY_KEYWORD_RE.finditer(key))
 
 
 def _key_has_secret_keyword(key: str) -> bool:
@@ -1045,7 +1064,7 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
             # ``PASS=174 FAIL=0`` test summary, not a password (fork #1025).
             if _is_test_pass_counter(m):
                 return m.group(0)
-            if not _env_key_has_secret_keyword(name):
+            if _bare in _PASS_WORD_ENV_NAMES:
                 return m.group(0)
             if not _should_redact_assignment(name, value, check_keyword=True):
                 return m.group(0)
