@@ -1,8 +1,12 @@
 """``hermes update`` from a PM environment's workspace goes to the checkout that owns it (#122627)."""
 import sys
 
+import pytest
+
 from hermes_cli.update_owning_install import owning_install_root
 from pm.environments import install_key
+
+pytestmark = pytest.mark.real_owning_install
 
 
 def test_pm_generation_venv_is_owned_by_the_checkout_its_install_key_names(tmp_path, monkeypatch):
