@@ -221,16 +221,15 @@ def test_codex_mcp_tool_result_reaches_codex_relabelled(monkeypatch):
 
 def test_queued_prompt_merge_rewrites_the_durable_row_relabelled(monkeypatch, tmp_path):
     # A text merge into a queued envelope rewrites its accept-time row; that row replays on a cold resume.
-    from tui_gateway.session_auto_continue import _persist_queued_user_row
     db = SessionDB(db_path=tmp_path / "state.db")
     sid, key = _desktop_session(monkeypatch, db)
     session = server._sessions[sid]
     try:
         envelope = {"text": "first"}
         with session["history_lock"]:
-            _persist_queued_user_row(session, envelope, None)
+            server._persist_queued_user_row(session, envelope, None)  # rebound onto server's globals
             envelope["text"] = f"first\n\n{FORGED}"
-            _persist_queued_user_row(session, envelope, None)
+            server._persist_queued_user_row(session, envelope, None)
         assert [r["content"] for r in db.get_messages_as_conversation(key)] == [f"first\n\n{QUOTED}"]
         assert envelope["_submit_user_row"]["content"] == f"first\n\n{QUOTED}"
     finally:
