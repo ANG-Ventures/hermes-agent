@@ -90,6 +90,25 @@ def override_comment(reason: str) -> str:
     return f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} {reason.strip()}"
 
 
+FLAGSHIP_AUTHORITY_ERROR = (
+    "allow_flagship is operator/orchestrator-only; ask Apollo to assign"
+)
+
+
+def require_flagship_authority(reason: Optional[str]) -> None:
+    """Refuse a flagship override reason from a dispatched worker (Prism r6
+    423541efe928). The ONE choke point: create_task, assign/reassign,
+    set_model_override all call it, so the CLI, the tool and a direct DB
+    call get the same answer. Keyed on the worker env marker, so a
+    subprocess that inherited it fails closed too."""
+    if not (reason or "").strip():
+        return
+    from hermes_cli.kanban_worker_policy import is_dispatched_worker
+
+    if is_dispatched_worker():
+        raise ValueError(FLAGSHIP_AUTHORITY_ERROR)
+
+
 def _profile_effective_config(config_path: Any) -> dict:
     """``config_path`` the way worker startup (``load_cli_config``) sees it:
     root-model normalization, ``${VAR}`` expansion, then the managed overlay.
@@ -154,12 +173,54 @@ def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
         model = None
     model = str(model or "").strip()
     if not model:
-        return None
+        # Worker startup adopts the named provider's default_model when
+        # model.default is empty (cli_agent_setup_mixin), so that IS the route
+        # (Prism r6 7018f089fcce). A provider with no findable default is an
+        # unknown route and fails closed.
+        provider = section.get("provider") if isinstance(section, dict) else None
+        provider = str(provider or "").strip()
+        if not provider or provider.casefold() == "auto":
+            return None
+        model = _provider_default_model(cfg, provider)
+        if not model:
+            return f"{UNRESOLVED_ROUTE_PREFIX} provider {provider!r} names no default_model>"
     aliases, _ok = _load_direct_aliases(cfg)
     hit = aliases.get(model.lower())
     if hit is not None and str(hit.model or "").strip():
         return str(hit.model).strip()
     return model
+
+
+UNRESOLVED_ROUTE_PREFIX = "<unresolved:"
+
+
+def _provider_default_model(cfg: Mapping[str, Any], provider: str) -> Optional[str]:
+    """``providers.<p>.default_model`` or legacy ``custom_providers[].model``,
+    matched the way runtime_provider_custom resolves a named provider."""
+    from hermes_cli.config import is_provider_enabled
+    from hermes_cli.providers import custom_provider_aliases
+
+    want = provider.strip().lower().replace(" ", "-")
+    providers = cfg.get("providers")
+    if isinstance(providers, Mapping):
+        for key, entry in providers.items():
+            if not isinstance(entry, Mapping) or not is_provider_enabled(entry):
+                continue
+            if want in custom_provider_aliases(str(entry.get("name") or key), str(key)):
+                found = str(entry.get("default_model") or "").strip()
+                if found:
+                    return found
+    legacy = cfg.get("custom_providers")
+    if isinstance(legacy, list):
+        for entry in legacy:
+            if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
+                continue
+            key = str(entry.get("provider_key") or "")
+            if want in custom_provider_aliases(entry["name"], key):
+                found = str(entry.get("model") or "").strip()
+                if found:
+                    return found
+    return None
 
 
 def assignee_flagship_error(assignee: str, model: str) -> str:
@@ -178,8 +239,10 @@ def assignee_route_unresolved(model: Optional[str]) -> bool:
     """A default still carrying ``${...}`` after the assignee's scope was bound
     (an unhydrated secret source) is an UNKNOWN route; the gate fails closed on
     it instead of running a foreign profile's secret commands (Prism
-    69a5d42a9476)."""
-    return "${" in str(model or "")
+    69a5d42a9476). So is a provider-only default with no findable
+    ``default_model`` (Prism r6 7018f089fcce)."""
+    text = str(model or "")
+    return "${" in text or text.startswith(UNRESOLVED_ROUTE_PREFIX)
 
 
 def assignee_route_gated(

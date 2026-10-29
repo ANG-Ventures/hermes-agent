@@ -521,19 +521,17 @@ def worker_remap(flagship_profiles, monkeypatch):
     return parent, _set_default
 
 
-def test_placeholder_remapped_to_flagship_profile_keeps_the_reason(worker_remap):
+def test_placeholder_remapped_to_flagship_profile_with_worker_reason_refuses(worker_remap):
+    # r3 kept a worker's reason here; r6 (423541efe928) makes a worker's reason
+    # itself the refusal: flagship authority is orchestrator-only.
     parent, set_default = worker_remap
     set_default("daedalus-fable")
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="child", assignee="human", parents=[parent],
-                                 flagship_override_reason="approved infra")
-        assert kb.get_task(conn, task_id).assignee == "daedalus-fable"
-        bodies = [c.body for c in kb.list_comments(conn, task_id)]
-        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
-        conn.commit()
-        res = kbd.dispatch_once(conn, dry_run=True)
-    assert "flagship override: approved infra" in bodies, bodies
-    assert task_id not in res.flagship_refused
+        before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="operator/orchestrator-only"):
+            kb.create_task(conn, title="child", assignee="human", parents=[parent],
+                           flagship_override_reason="approved infra")
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
 
 
 def test_placeholder_remapped_to_flagship_profile_without_reason_refuses(worker_remap):
@@ -684,3 +682,122 @@ def test_unresolved_env_default_fails_closed(flagship_profiles, monkeypatch):
         "create 'x' --assignee worker-unres --allow-flagship 'known lane'"))
     with kb.connect() as conn:
         assert [c.body for c in kb.list_comments(conn, ok)] == ["flagship override: known lane"]
+
+
+# ---- Prism r6 -----------------------------------------------------------------
+# 423541efe928: a dispatched worker's --allow-flagship is refused at the DB layer,
+#               so the CLI and a direct kb call get the tool's answer.
+# 7018f089fcce: an empty model.default adopts the named provider's default_model.
+
+@pytest.fixture
+def worker_env(flagship_profiles, monkeypatch):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="daedalus-opus")
+        target = kb.create_task(conn, title="target", assignee="daedalus-opus")
+        pinned = kb.create_task(conn, title="pinned", assignee="daedalus-opus",
+                                model_override="claude-opus-5-5")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+    return parent, target, pinned
+
+
+def _card_count() -> int:
+    with kb.connect() as conn:
+        return conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+
+
+def test_worker_cli_create_allow_flagship_is_refused(worker_env):
+    parent, _target, _pinned = worker_env
+    before = _card_count()
+    out = kc.run_slash(f"create 'child' --assignee daedalus-fable --parent {parent} "
+                       "--allow-flagship 'self approved'")
+    assert "operator/orchestrator-only" in out, out
+    assert _card_count() == before
+    out = kc.run_slash(f"create 'child' --model claude-fable-5-1 --parent {parent} "
+                       "--allow-flagship 'self approved'")
+    assert "operator/orchestrator-only" in out, out
+    assert _card_count() == before
+
+
+def test_worker_db_create_task_with_reason_is_refused(worker_env):
+    parent, _target, _pinned = worker_env
+    before = _card_count()
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="operator/orchestrator-only"):
+            kb.create_task(conn, title="c", assignee="daedalus-fable", parents=[parent],
+                           flagship_override_reason="self approved")
+    assert _card_count() == before
+
+
+@pytest.mark.parametrize("verb", ["reassign", "assign"])
+def test_worker_cli_assign_allow_flagship_is_refused(worker_env, verb):
+    _parent, target, _pinned = worker_env
+    out = kc.run_slash(f"{verb} {target} daedalus-fable --allow-flagship 'self approved'")
+    assert "operator/orchestrator-only" in out, out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, target).assignee == "daedalus-opus"
+        assert kb.list_comments(conn, target) == []
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="operator/orchestrator-only"):
+            kb.reassign_task(conn, target, "daedalus-fable",
+                             flagship_override_reason="self approved")
+        assert kb.get_task(conn, target).assignee == "daedalus-opus"
+
+
+def test_worker_set_model_allow_flagship_is_refused(worker_env):
+    _parent, _target, pinned = worker_env
+    out = kc.run_slash(f"set-model {pinned} claude-fable-5-1 --allow-flagship 'self approved'")
+    assert "operator/orchestrator-only" in out, out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, pinned).model_override == "claude-opus-5-5"
+        with pytest.raises(ValueError, match="operator/orchestrator-only"):
+            kb.set_model_override(conn, pinned, "claude-fable-5-1",
+                                  flagship_override_reason="self approved")
+        assert kb.get_task(conn, pinned).model_override == "claude-opus-5-5"
+        assert kb.list_comments(conn, pinned) == []
+
+
+def test_worker_verbs_without_a_reason_are_unchanged(worker_env):
+    parent, target, pinned = worker_env
+    out = kc.run_slash(f"create 'child' --assignee daedalus-opus --parent {parent}")
+    assert _created_id(out)
+    assert kc.run_slash(f"reassign {target} daedalus-sonnet").startswith("Reassigned")
+    with kb.connect() as conn:
+        assert kb.set_model_override(conn, pinned, "claude-sonnet-5")
+        assert kb.get_task(conn, pinned).model_override == "claude-sonnet-5"
+
+
+_FLEET_PROVIDER = (
+    "model:\n  provider: fleet\n"
+    "providers:\n  fleet:\n    base_url: http://127.0.0.1:9/v1\n"
+    "    default_model: {model}\n"
+)
+
+
+@pytest.mark.parametrize("body", [
+    _FLEET_PROVIDER.format(model="claude-fable-5-1"),
+    "model:\n  provider: fleet\ncustom_providers:\n"
+    "  - name: fleet\n    base_url: http://127.0.0.1:9/v1\n    model: claude-fable-5-1\n",
+])
+def test_provider_default_model_is_the_gated_route(flagship_profiles, body):
+    _raw_profile(flagship_profiles, "worker-prov", body)
+    _assert_gated("worker-prov")
+
+
+def test_provider_default_model_non_flagship_is_not_gated(flagship_profiles):
+    _raw_profile(flagship_profiles, "worker-prov",
+                 _FLEET_PROVIDER.format(model="claude-opus-5-5"))
+    task_id = _created_id(kc.run_slash("create 'plain' --assignee worker-prov"))
+    with kb.connect() as conn:
+        assert kb.list_comments(conn, task_id) == []
+        assert task_id not in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+
+
+def test_provider_without_a_findable_default_fails_closed(flagship_profiles):
+    _raw_profile(flagship_profiles, "worker-prov", "model:\n  provider: fleet\n")
+    out = kc.run_slash("create 'GATE-PROBE' --assignee worker-prov")
+    assert "cannot resolve worker-prov model default" in out, out
+    assert _card_count() == 0
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = 'worker-prov' WHERE id = ?", (task_id,))
+        conn.commit()
+        assert task_id in kbd.dispatch_once(conn, dry_run=True).flagship_refused

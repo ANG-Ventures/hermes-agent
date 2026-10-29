@@ -6133,8 +6133,9 @@ def create_task(
         model_override, provider_override
     )
     validate_route_provider(model_override, provider_override, pin_sub_reason=pin_sub_reason)
-    from hermes_cli.model_policy import validate_worker_model
+    from hermes_cli.model_policy import require_flagship_authority, validate_worker_model
 
+    require_flagship_authority(flagship_override_reason)
     _raw_flagship_reason = flagship_override_reason
     flagship_override_reason = validate_worker_model(
         model_override,
@@ -7043,8 +7044,13 @@ def _assignee_flagship_reason(
     exactly as the dispatcher's gate admits it. Raises
     :class:`FlagshipAssigneeRefused` for an unauthorized flagship route.
     """
-    from hermes_cli.model_policy import validate_assignee_route
+    from hermes_cli.model_policy import require_flagship_authority, validate_assignee_route
 
+    # assign_task and reassign_task both reach here before any write/reclaim.
+    try:
+        require_flagship_authority(reason)
+    except ValueError as exc:
+        raise FlagshipAssigneeRefused(f"cannot reassign {task_id}: {exc}") from None
     row = conn.execute(
         "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -7340,6 +7346,9 @@ def set_model_override(
     ``--allow-flagship``) is translated into the ``flagship override:``
     comment the dispatcher's flagship gate looks for. Returns True on success.
     """
+    from hermes_cli.model_policy import require_flagship_authority
+
+    require_flagship_authority(flagship_override_reason)
     audit_comment_author, audit_comment_body = _flagship_reason_to_audit(
         model, provider,
         audit_comment_author=audit_comment_author,
@@ -7445,10 +7454,15 @@ def _validate_model_override_args(
         FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
         flagship_model_error,
         is_firepower_model,
+        require_flagship_authority,
     )
 
+    body = (audit_comment_body or "").lstrip().casefold()
+    if body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
+        # The set-model batch (apply_batch_route_writes) writes the override
+        # comment through here, not via set_model_override (Prism r6 423541efe928).
+        require_flagship_authority(audit_comment_body)
     if is_firepower_model(model):
-        body = (audit_comment_body or "").lstrip().casefold()
         if not body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
             raise ValueError(flagship_model_error(str(model)))
     _require_known_model(model, provider, force_model_reason=force_model_reason)
