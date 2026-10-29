@@ -57,12 +57,23 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
+    before = _kb._path_identity(path)
     conn = connect_tracked(
         path,
         connect_fn=sqlite3.connect,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
+    try:
+        # The (dev, ino) of the file this connection has OPEN, for board_for_conn: the path can be
+        # re-pointed later while the fd stays on the old file (Prism 1cb3ded18c44). sqlite opens the
+        # main file inside connect(), so an identity unchanged across it is the opened file's. A swap
+        # during the open records nothing and board_for_conn falls back to the path.
+        after = _kb._path_identity(path)
+        if after is not None and before in (None, after):
+            conn._hermes_open_identity = after
+    except AttributeError:
+        pass
     try:
         # Explicit PRAGMA (besides connect(timeout=)) so it is observable and
         # survives wrapper changes; PRAGMA assignments can't bind parameters.
