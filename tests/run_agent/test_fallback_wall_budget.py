@@ -26,6 +26,19 @@ CHAIN = [
     {"provider": "claude-bpr", "model": FABLE},
     {"provider": "cpa", "model": "gpt-6.1-sol"},
 ]
+from agent.fork_ext import relay_headers as _relay_headers
+
+_REAL_FETCH_RELAY_STAGE = _relay_headers.fetch_relay_stage
+
+
+@pytest.fixture(autouse=True)
+def _no_live_relay_stage_read(monkeypatch):
+    """Several agents here point at 127.0.0.1:18810, the live apr relay's port on the
+    Studio. The t_9a635fbd stage read must never reach it from a test; the stage tests
+    below put the real function back against their own loopback stub."""
+    monkeypatch.setattr(_relay_headers, "fetch_relay_stage", lambda *a, **k: None)
+
+
 # Relay 504 after per_attempt_timeout_s (bytes verbatim, see test_relay_stall_capacity_fallback).
 STALL_504 = {"error": "upstream attempt timed out"}
 
@@ -621,3 +634,118 @@ def test_r1_silent_wait_never_says_upstream():
             text = wb.notice_due(a, now=121.0)
     assert text.startswith("⏳ still waiting for a first reply: 121s"), text
     assert "upstream" not in text and "Anthropic" not in text, text
+
+
+# ── t_9a635fbd: the notice names the slow hop from the relay's GET /inflight ──
+
+
+def _inflight_relay(reply=None, *, status=200, delay_s=0.0):
+    """A loopback 'relay' answering GET /inflight. Returns (base_url, seen_paths, stop)."""
+    import json
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen: list = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen.append(self.path)
+            time.sleep(delay_s)
+            body = json.dumps(reply if status == 200 else {"error": "x"}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def stop():
+        srv.shutdown()
+        srv.server_close()
+    return f"http://127.0.0.1:{srv.server_address[1]}/v1", seen, stop
+
+
+_STAGE_CFG = {"fallback": {"still_waiting_notice_seconds": 120, "no_first_byte_budget_seconds": 600}}
+
+
+def _stage_notice(base_url, provider="claude-alr", session="sess-abc"):
+    from agent import fallback_wall_budget as wb
+    a = _bare(index=0)
+    a.provider, a.base_url, a.session_id = provider, base_url, session
+    with patch("hermes_cli.config.load_config_readonly", return_value=_STAGE_CFG), \
+         patch.object(_relay_headers, "fetch_relay_stage", _REAL_FETCH_RELAY_STAGE):
+        wb.arm(a, now=0.0)
+        return wb.notice_due(a, now=121.0)
+
+
+@pytest.mark.parametrize("stage,want", [
+    ("relay_send", "⏳ request still uploading to sub-vps-7 (our uplink) for 95s: 121s elapsed; cut at 600s"),
+    ("box_headers", "⏳ sub-vps-7 connected, provider has not sent a first token for 95s: 121s elapsed; cut at 600s"),
+    ("upstream_ttfb", "⏳ sub-vps-7 connected, provider has not sent a first token for 95s: 121s elapsed; cut at 600s"),
+    ("queued", "⏳ queued on sub-vps-7 for 95s: 121s elapsed; cut at 600s"),
+])
+def test_relay_stage_notice_names_the_hop(stage, want):
+    base, seen, stop = _inflight_relay({"call": "sess-abc", "stage": stage, "seat": "sub-vps-7",
+                                        "since_ms": 95_400.0, "attempt_ms": 96_000.0})
+    try:
+        text = _stage_notice(base)
+    finally:
+        stop()
+    assert text == want
+    assert seen == ["/inflight?call=sess-abc"], "keyed by the session the request carries"
+
+
+_OLD_RELAY_WORDING = (
+    "⏳ turn in progress on claude-alr/claude-fable-5-1 (buffering lane, first byte not "
+    "visible until the turn ends): 121s elapsed; long outputs run 2–4 min; cut at 600s")
+
+
+@pytest.mark.parametrize("stage", ["streaming", "box_body", "box_done", "something-new"])
+def test_stage_that_says_nothing_new_keeps_todays_wording(stage):
+    base, _seen, stop = _inflight_relay({"stage": stage, "seat": "sub-vps-7", "since_ms": 1.0})
+    try:
+        assert _stage_notice(base) == _OLD_RELAY_WORDING
+    finally:
+        stop()
+
+
+def test_stage_read_failure_keeps_todays_wording():
+    """404 (nothing in flight), a relay slower than 300 ms, a dead port, garbage: all
+    fall back to the exact pre-change line, and none costs more than the 300 ms budget."""
+    import socket
+    import time
+    base404, _s, stop404 = _inflight_relay(status=404)
+    slow, _s2, stop_slow = _inflight_relay({"stage": "relay_send", "seat": "s"}, delay_s=1.5)
+    junk, _s3, stop_junk = _inflight_relay({"no": "stage"})
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    dead = f"http://127.0.0.1:{sock.getsockname()[1]}/v1"
+    sock.close()
+    try:
+        for base in (base404, junk, dead):
+            assert _stage_notice(base) == _OLD_RELAY_WORDING, base
+        t0 = time.monotonic()
+        assert _stage_notice(slow) == _OLD_RELAY_WORDING
+        assert time.monotonic() - t0 < 1.0, "the stage read is bounded at 300 ms"
+    finally:
+        stop404()
+        stop_slow()
+        stop_junk()
+
+
+def test_stage_is_never_read_off_a_non_relay_or_non_loopback_lane():
+    base, seen, stop = _inflight_relay({"stage": "relay_send", "seat": "s", "since_ms": 1.0})
+    try:
+        text = _stage_notice(base, provider="cpa")
+        assert text and text.startswith("⏳ still waiting for a first reply")
+        assert seen == []
+    finally:
+        stop()
+    opened: list = []
+    assert _REAL_FETCH_RELAY_STAGE("https://api.example.com/v1", "s", opener=opened.append) is None
+    assert opened == []
