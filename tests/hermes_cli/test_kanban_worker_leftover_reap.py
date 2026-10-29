@@ -93,6 +93,19 @@ def conn(tmp_path, monkeypatch):
 _STARTED: list[int] = []
 
 
+@pytest.fixture
+def own_processes_only(monkeypatch):
+    """The sweep scans every process on the host; scope it to the ones this test started.
+
+    A real init-parented process of the same uid (ACE-AI: one with its cwd under
+    ``~/.hermes/var``) otherwise reaches ``realpath`` of a real-home path, and its
+    outcome depends on the host instead of the test.
+    """
+    real = kb.psutil.process_iter
+    monkeypatch.setattr(kb.psutil, "process_iter",
+                        lambda *a, **k: (p for p in real(*a, **k) if p.pid in _STARTED))
+
+
 def _gone(pid: int, timeout: float = 15.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -165,7 +178,7 @@ def _spawn_orphan(cwd: Path) -> int:
     return pid
 
 
-def test_orphan_sweep_reaps_terminal_card_only(conn, tmp_path):
+def test_orphan_sweep_reaps_terminal_card_only(conn, tmp_path, own_processes_only):
     root = tmp_path / "ws"
     done_id = kb.create_task(conn, title="done card", assignee="worker")
     run_id = kb.create_task(conn, title="running card", assignee="worker")
@@ -197,7 +210,7 @@ def test_orphan_sweep_reaps_terminal_card_only(conn, tmp_path):
         conn, root=root, min_terminal_age=0, notify=False) == {}
 
 
-def test_orphan_sweep_sends_one_logs_line_only_when_it_reaped(conn, tmp_path, monkeypatch):
+def test_orphan_sweep_sends_one_logs_line_only_when_it_reaped(conn, tmp_path, monkeypatch, own_processes_only):
     sent: list[str] = []
     monkeypatch.setattr(kb, "_notify_orphan_sweep", lambda board, reaped: sent.append(reaped))
     root = tmp_path / "ws"
