@@ -66,3 +66,32 @@ def test_sink_writes_when_the_session_is_unchanged(store):
     agent = _bind(store, entry.session_key)
     agent._route_known_sink({"intended": {"model": "m"}})
     assert store._entries[entry.session_key].route_known == {"intended": {"model": "m"}}
+
+
+def test_bind_is_fail_open_without_a_session_store():
+    """Operator round 4 on #2456: ``run_turn_runner`` calls the bind on every turn, and runners built
+    without ``session_store`` (gateway rigs, some construction paths) must still complete the turn.
+    No store -> no sink -> Known stays None (the note is simply re-sent; designed degraded mode)."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    assert not hasattr(runner, "session_store")
+    agent = SimpleNamespace()
+    runner._bind_route_known(agent, "agent:main:telegram:dm:u1")  # must not raise
+    assert agent._route_known is None
+    assert agent._route_known_sink is None
+
+
+def test_bind_is_fail_open_when_the_store_raises():
+    from gateway.run import GatewayRunner
+
+    class _Broken:
+        @property
+        def _entries(self):
+            raise RuntimeError("store exploded")
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = _Broken()
+    agent = SimpleNamespace()
+    runner._bind_route_known(agent, "k")
+    assert agent._route_known is None and agent._route_known_sink is None

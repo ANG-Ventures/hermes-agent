@@ -7516,22 +7516,34 @@ class GatewayRunner(
         on failure, so the agent never advances past what survives a restart."""
         if agent is None:
             return
-        from agent.route_identity import seed_known
-        store = self.session_store
-        entry = None
-        if session_key:
+        # Fail-open bookkeeping: a runner without a session store (or any error here) must never
+        # cost the turn. With no sink, Known is never advanced and the note is simply re-sent next
+        # call, which is the designed degraded mode.
+        try:
+            from agent.route_identity import seed_known
+            store = getattr(self, "session_store", None)
+            entry = None
+            if store is not None and session_key:
+                with suppress(Exception):
+                    entry = store._entries.get(session_key)
+            if entry is None:
+                seed_known(agent, None, None)
+                return
+
+            # Captured at bind time: a commit that lands after /new or /reset rotated this key must
+            # not write the old conversation's Known into the new one (update_session has the same guard).
+            bound_session_id = getattr(entry, "session_id", None)
+
+            def _sink(known: dict) -> None:
+                if not store.set_route_known(session_key, known, expected_session_id=bound_session_id):
+                    raise RuntimeError("route_known: session entry vanished or was reset")
+
+            seed_known(agent, getattr(entry, "route_known", None), _sink)
+        except Exception:
+            logger.warning("route_known: bind failed; Known will not advance this turn", exc_info=True)
             with suppress(Exception):
-                entry = store._entries.get(session_key)
-
-        # Captured at bind time: a commit that lands after /new or /reset rotated this key must
-        # not write the old conversation's Known into the new one (update_session has the same guard).
-        bound_session_id = getattr(entry, "session_id", None) if entry is not None else None
-
-        def _sink(known: dict) -> None:
-            if not store.set_route_known(session_key, known, expected_session_id=bound_session_id):
-                raise RuntimeError("route_known: session entry vanished or was reset")
-
-        seed_known(agent, getattr(entry, "route_known", None), _sink if entry is not None else None)
+                agent._route_known = None
+                agent._route_known_sink = None
 
     def _announce_and_persist_served_route(
         self,
