@@ -30,7 +30,6 @@ _log = logging.getLogger(__name__)
 # scripts/kanban_board_resolve.py ``'override'`` (S7 D1, RC-7).
 PINNED_SLUG = "override"
 
-_PINNED_BOARD_MEMO: dict[tuple, str] = {}
 _PINNED_BOARD_ERROR_LOGGED: set[str] = set()
 # raw pin -> why naming it failed. Not memoised (the next call retries); the surface reads it to
 # refuse the verb with the next command instead of acting under a pin it could not name (RC-11).
@@ -119,20 +118,12 @@ def board_named_by_pin(raw: str) -> str:
 
     Spelling-blind inverse of ``_board_db_path_ignoring_pin`` (RC-7): compared through
     ``_pin_file_agrees``, the contradiction guard's own predicate, so a firmlink / symlinked /
-    case-variant spelling of a board's DB names that board. Memoised on (pin, root, boards/
-    mtime): a new board dir changes the mtime, so a process pays one scan per pin.
+    case-variant spelling of a board's DB names that board. Not memoised (Prism fde771bf9eaa):
+    the answer is about which file the pin names NOW, and a pin alias swapped from a hard link of
+    a board to an independent snapshot changes that without moving any cheap key.
     """
     _kb = _facade()
     try:
-        root = _kb.boards_root()
-        try:
-            stamp = root.stat().st_mtime_ns
-        except FileNotFoundError:
-            stamp = None
-        key = (raw, str(_kb.kanban_home()), stamp)
-        hit = _PINNED_BOARD_MEMO.get(key)
-        if hit is not None:
-            return hit
         pin = Path(raw).expanduser()
         found = PINNED_SLUG
         with _kb.enumerating_boards():
@@ -140,9 +131,6 @@ def board_named_by_pin(raw: str) -> str:
                 if _kb._pin_file_agrees(path, pin):
                     found = slug
                     break
-        if len(_PINNED_BOARD_MEMO) > 256:
-            _PINNED_BOARD_MEMO.clear()
-        _PINNED_BOARD_MEMO[key] = found
         _PINNED_BOARD_ERRORS.pop(raw, None)
         return found
     except Exception as exc:  # RC-11: total; the pin still routes every open.
@@ -152,9 +140,6 @@ def board_named_by_pin(raw: str) -> str:
             _log.warning("kanban: could not name the board HERMES_KANBAN_DB=%s pins (%s: %s); "
                          "using %r", raw, type(exc).__name__, exc, PINNED_SLUG)
         return PINNED_SLUG
-
-
-_BOARD_FOR_CONN_MEMO: dict[tuple, Optional[str]] = {}
 
 
 def _conn_main_file(conn: sqlite3.Connection) -> str:
@@ -172,29 +157,18 @@ def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
     file names :func:`board_named_by_pin` (``PINNED_SLUG`` off-layout). Anything else (a
     snapshot, a forensics copy, ``:memory:``) is ``None``: journaling it under the ambient board
     would replay its writes into the live one (Prism 77b7e56c0d2c). Compared by filesystem
-    identity, memoised on (file, its identity, home, boards/ mtime, pin, its identity). Never raises.
+    identity on every call, never memoised (Prism 25e888cf0c09, fde771bf9eaa): a retargeted board
+    symlink or a swapped pin alias changes the answer without moving any cheap key. Never raises.
     """
     _kb = _facade()
     try:
         actual = _conn_main_file(conn)
         if not actual:
             return None
-        root = _kb.boards_root()
-        try:
-            stamp = root.stat().st_mtime_ns
-        except FileNotFoundError:
-            stamp = None
         raw = raw_db_pin()
         here = Path(actual)
-        ident = _kb._path_identity(here)
-        if ident is None:
+        if _kb._path_identity(here) is None:
             return None
-        # The FILE's identity is in the key, not just its name: a path re-pointed at another
-        # file (os.replace of a hard-link alias with a snapshot) must miss (Prism 2bfd9f8c68d9).
-        pin_ident = _kb._path_identity(Path(raw).expanduser()) if raw else None
-        key = (actual, ident, str(_kb.kanban_home()), stamp, raw, pin_ident)
-        if key in _BOARD_FOR_CONN_MEMO:
-            return _BOARD_FOR_CONN_MEMO[key]
         found: Optional[str] = None
         with _kb.enumerating_boards():
             for slug, path in board_db_layout():
@@ -203,9 +177,6 @@ def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
                     break
         if found is None and raw and _kb._same_path(here, Path(raw).expanduser()):
             found = board_named_by_pin(raw)
-        if len(_BOARD_FOR_CONN_MEMO) > 256:
-            _BOARD_FOR_CONN_MEMO.clear()
-        _BOARD_FOR_CONN_MEMO[key] = found
         return found
     except Exception:
         return None

@@ -749,6 +749,69 @@ def test_board_for_conn_does_not_reuse_a_cached_slug_after_the_path_is_replaced(
         c2.close()
 
 
+def test_board_for_conn_does_not_reuse_a_cached_slug_after_a_layout_symlink_is_retargeted(board, tmp_path):
+    """Prism 25e888cf0c09: a board's kanban.db is a symlink. Retarget it inside the board's directory (the
+    boards/ root mtime does not move); a connection to the OLD target is no longer that board's file."""
+    import shutil
+
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    kb.create_board("other")
+    link = kb.board_dir("other") / "kanban.db"
+    with kb.connect_closing(board="other"):
+        pass
+    old = kb.board_dir("other") / "old.db"
+    new = kb.board_dir("other") / "new.db"
+    os.replace(str(link), str(old))
+    shutil.copyfile(str(old), str(new))
+    os.symlink("old.db", str(link))
+    c1 = sqlite3.connect(str(old))
+    try:
+        assert kbr.board_for_conn(c1) == "other"
+    finally:
+        c1.close()
+    tmp_link = kb.board_dir("other") / "kanban.db.tmp"
+    os.symlink("new.db", str(tmp_link))
+    os.replace(str(tmp_link), str(link))
+    c2 = sqlite3.connect(str(old))
+    try:
+        assert kbr.board_for_conn(c2) is None
+    finally:
+        c2.close()
+
+
+def test_board_for_conn_pin_alias_replaced_by_a_snapshot_is_the_pinned_board_not_the_old_layout_slug(
+        board, tmp_path, monkeypatch):
+    """Prism fde771bf9eaa: a HERMES_KANBAN_DB pin that hard-links a layout board names that board; once the
+    pin path is os.replace'd with an independent snapshot it names no layout board, so it is ``override``."""
+    import shutil
+
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    kb.create_board("other")
+    with kb.connect_closing(board="other"):
+        pass
+    live = kb.board_dir("other") / "kanban.db"
+    pin = tmp_path / "pin.db"
+    os.link(str(live), str(pin))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    c1 = sqlite3.connect(str(pin))
+    try:
+        assert kbr.board_for_conn(c1) == "other"
+    finally:
+        c1.close()
+    assert kbr.board_named_by_pin(str(pin)) == "other"
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(live), str(snap))
+    os.replace(str(snap), str(pin))
+    assert kbr.board_named_by_pin(str(pin)) == kbr.PINNED_SLUG
+    c2 = sqlite3.connect(str(pin))
+    try:
+        assert kbr.board_for_conn(c2) == kbr.PINNED_SLUG
+    finally:
+        c2.close()
+
+
 def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
     import shutil
     import time as _time
