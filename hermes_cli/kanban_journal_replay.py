@@ -138,6 +138,10 @@ def replay_into(
             for r in conn.execute("PRAGMA table_info(task_comments)").fetchall()
         )
 
+        has_grants_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sign_grants'"
+        ).fetchone() is not None
+
         known = {
             str(r[0]) for r in conn.execute("SELECT id FROM tasks").fetchall()
         }
@@ -237,15 +241,16 @@ def replay_into(
             if kind == "sign_grant_revoked":
                 # A grant live in the snapshot and revoked after it must come back revoked, never
                 # live (Prism a35d26840b79). A grant the snapshot lacks stays absent.
-                if task_id and payload.get("grant_id"):
-                    try:
-                        result.grants_revoked += conn.execute(
-                            "UPDATE sign_grants SET revoked_at = ? WHERE grant_id = ? AND task_id = ? "
-                            "AND revoked_at IS NULL",
-                            (int(payload.get("revoked_at") or ts), payload["grant_id"], task_id),
-                        ).rowcount
-                    except sqlite3.OperationalError:   # pre-grant snapshot: no table, no grant to revive
-                        pass
+                # Only a pre-grant snapshot (no table, no grant to revive) skips it; any other failure
+                # propagates, so a revocation that did not land never reads as a clean restore
+                # (Prism da22ed097c63).
+                if task_id and payload.get("grant_id") and has_grants_table:
+                    revoked_at = payload.get("revoked_at")
+                    result.grants_revoked += conn.execute(
+                        "UPDATE sign_grants SET revoked_at = ? WHERE grant_id = ? AND task_id = ? "
+                        "AND revoked_at IS NULL",
+                        (int(ts if revoked_at is None else revoked_at), payload["grant_id"], task_id),
+                    ).rowcount
                 continue
 
             # Every other kind is a lifecycle event: replay it so the audit

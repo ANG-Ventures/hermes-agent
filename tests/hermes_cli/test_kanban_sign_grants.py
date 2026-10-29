@@ -638,6 +638,55 @@ def test_a_revoke_on_another_board_is_journaled_to_that_board(board, tmp_path, m
     assert len(rows) == 1 and rows[0][0] is not None, rows
 
 
+def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
+    import shutil
+    import time as _time
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    g = _mint(a)
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(kb.kanban_db_path()), str(snap))
+    since = _time.time() - 0.001
+    with kb.connect_closing() as conn:
+        assert ksg.revoke(conn, g["grant_id"], now=now) == 1
+    return g, snap, since
+
+
+def test_a_failed_revocation_replay_raises_instead_of_restoring_the_grant_live(board, tmp_path, monkeypatch):
+    """Prism da22ed097c63: only a snapshot with no sign_grants table skips the revocation; any other
+    OperationalError on the UPDATE (disk full, a broken schema) fails the replay, never returns success."""
+    from hermes_cli import kanban_journal_replay
+
+    _home, a, _b = board
+    g, snap, since = _snapshot_then_revoke(a, tmp_path, monkeypatch)
+    sc = sqlite3.connect(str(snap))
+    sc.execute("CREATE TRIGGER t_fail BEFORE UPDATE ON sign_grants BEGIN SELECT no_such_fn_t73276888(); END")
+    sc.commit()
+    sc.close()
+    with pytest.raises(sqlite3.OperationalError):
+        kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, tmp_path / "restored.db", since=since)
+    sc = sqlite3.connect(str(snap))
+    sc.execute("DROP TABLE sign_grants")   # a pre-grant snapshot: nothing to revive, the replay succeeds
+    sc.commit()
+    sc.close()
+    res = kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, tmp_path / "pre.db", since=since)
+    assert res.grants_revoked == 0
+
+
+def test_a_revocation_at_time_zero_replays_as_zero(board, tmp_path, monkeypatch):
+    """Prism 0f1918273a42: an explicit revoked_at=0 is restored as 0, not swapped for the journal ts."""
+    from hermes_cli import kanban_journal_replay
+
+    _home, a, _b = board
+    g, snap, since = _snapshot_then_revoke(a, tmp_path, monkeypatch, now=0)
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    rc.close()
+    assert rows == [(0,)], rows
+
+
 def _record_pr(card, profile, pr):
     with kb.connect_closing() as conn, kb.write_txn(conn):
         conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",
