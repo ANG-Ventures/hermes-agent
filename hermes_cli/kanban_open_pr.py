@@ -769,9 +769,11 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
             terminal_record_fn = _default_terminal_record()
         abandoned = _terminally_closed(uncovered, terminal_record_fn)
         uncovered = [c for c in uncovered if c not in abandoned]
+        # Recorded as soon as they are exempted (Prism e100e3d33ea7): another closed PR may still pass
+        # below via the merged-survivor path. A refusal discards the list along with the completion.
+        if abandoned_out is not None:
+            abandoned_out.extend(abandoned)
         if not uncovered:
-            if abandoned_out is not None:
-                abandoned_out.extend(abandoned)
             return closed
     # A merged survivor + the PR's own close record (t_9aff2951). ``done`` takes the survivor from
     # ``--survivor-pr``; ``archive`` has no flag, so any of the card's own PRs that merged qualifies.

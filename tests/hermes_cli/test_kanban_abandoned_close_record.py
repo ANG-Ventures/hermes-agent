@@ -97,6 +97,23 @@ def test_terminal_record_read_is_pinned_to_github_com(monkeypatch):
     assert seen and seen[0][:4] == ["gh", "api", "--hostname", "github.com"]
 
 
+def test_abandoned_out_kept_when_another_pr_passes_via_merged_survivor():
+    # Prism e100e3d33ea7: #5 exempted by its ABANDONED record, #6 by a merged survivor #9 + its close record.
+    two = [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]
+    states = {5: "CLOSED", 6: "CLOSED", 9: "MERGED"}
+
+    def query(repo, n):
+        return {"state": states.get(n, op.NOT_FOUND), "merge_commit_sha": "abc9def" if n == 9 else None}
+    abandoned: list = []
+    out = op.enforce_not_closed_unmerged(
+        "t_x", "done", recorded=two, survivor_pr="https://github.com/ANG-Ventures/r/pull/9",
+        query_fn=query, sha_check=lambda r, s: s == "abc9def",
+        close_record_fn=lambda r, n: n == 6,
+        abandon_reason="#5 abandoned", terminal_record_fn=lambda r, n: n == 5, abandoned_out=abandoned)
+    assert sorted(r.number for r in out) == [5, 6]
+    assert [r.number for r in abandoned] == [5]
+
+
 def test_abandoned_out_lists_only_terminal_record_refs():
     # Prism 36dde7c631ff: #5 is covered by a merged SUPERSEDED-BY token, #6 by its ABANDONED record.
     two = [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]
