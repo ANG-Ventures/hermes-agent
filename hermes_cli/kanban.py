@@ -2381,19 +2381,23 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         return 2
     now = int(time.time())
     with kb.connect_closing() as conn:
-        override = kb.set_lane_model_override(
-            conn,
-            provider=provider,
-            model=model,
-            expires_at=now + ttl_seconds,
-            reasoning_effort=reasoning_effort,
-            reason=reason,
-            assignee=assignee,
-            firepower=firepower_reason,
-            created_by=_profile_author(),
-            now=now,
-            pin_sub_reason=pin_sub_reason,
-        )
+        try:
+            override = kb.set_lane_model_override(
+                conn,
+                provider=provider,
+                model=model,
+                expires_at=now + ttl_seconds,
+                reasoning_effort=reasoning_effort,
+                reason=reason,
+                assignee=assignee,
+                firepower=firepower_reason,
+                created_by=_profile_author(),
+                now=now,
+                pin_sub_reason=pin_sub_reason,
+            )
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
     scope = f"assignee={assignee}" if assignee else "assignee=(board-wide)"
     print(
         f"lane-model set: route={override.route} {scope} "

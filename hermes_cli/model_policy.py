@@ -191,6 +191,9 @@ def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
         model = _provider_default_model(cfg, provider)
         if not model:
             return f"{UNRESOLVED_ROUTE_PREFIX} provider {provider!r} names no default_model>"
+        # Startup adopts default_model literally, never through model aliases
+        # (Prism r9 00f1687144ac).
+        return model
     aliases, _ok = _load_direct_aliases(cfg)
     hit = aliases.get(model.lower())
     if hit is not None and str(hit.model or "").strip():

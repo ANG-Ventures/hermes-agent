@@ -284,7 +284,7 @@ def test_create_refuses_flagship_profile_assignee_without_reason(
 
 
 def test_create_accepts_flagship_profile_assignee_with_reason_and_audits(
-    flagship_profiles,
+    flagship_profiles, proven_operator,
 ):
     reason = "delicate infra: dispatcher lock rewrite"
     output = kc.run_slash(
@@ -335,7 +335,9 @@ def test_reassign_to_flagship_profile_refuses_without_reason(flagship_profiles, 
 
 
 @pytest.mark.parametrize("verb", ["reassign", "assign"])
-def test_reassign_to_flagship_profile_with_reason_audits(flagship_profiles, verb):
+def test_reassign_to_flagship_profile_with_reason_audits(
+    flagship_profiles, proven_operator, verb,
+):
     task_id = _created_id(kc.run_slash("create 'plain' --assignee daedalus-opus"))
     output = kc.run_slash(
         f"{verb} {task_id} daedalus-fable --allow-flagship 'lock rewrite'"
@@ -641,7 +643,9 @@ def test_set_model_clear_onto_flagship_default_without_reason_refuses(
         assert kb.list_comments(conn, task_id) == []
 
 
-def test_set_model_clear_onto_flagship_default_with_reason_authorizes(flagship_profiles):
+def test_set_model_clear_onto_flagship_default_with_reason_authorizes(
+    flagship_profiles, proven_operator,
+):
     with kb.connect() as conn:
         task_id = _pinned_flagship_card(conn)
     output = kc.run_slash(f"set-model {task_id} --allow-flagship 'approved infra'")
@@ -654,7 +658,7 @@ def test_set_model_clear_onto_flagship_default_with_reason_authorizes(flagship_p
     assert task_id not in res.flagship_refused
 
 
-def test_db_set_model_clear_onto_flagship_default(flagship_profiles):
+def test_db_set_model_clear_onto_flagship_default(flagship_profiles, proven_operator):
     with kb.connect() as conn:
         task_id = _pinned_flagship_card(conn)
         with pytest.raises(ValueError, match="assignee profile default"):
@@ -843,7 +847,7 @@ def test_worker_authored_override_comment_does_not_authorize_reassign(
     assert "assignee profile default" in out, out
 
 
-@pytest.mark.parametrize("author", ["apollo", "default", "human:ace", "user", "operator"])
+@pytest.mark.parametrize("author", ["apollo", "default", "human:ace", "user"])
 def test_operator_authored_override_comment_authorizes_reassign(flagship_profiles, author):
     task_id = _plain_card()
     with kb.connect() as conn:
@@ -866,15 +870,16 @@ def test_own_create_with_reason_writes_an_authorizing_comment(
 
 
 def test_unproven_operator_create_override_does_not_preauthorize_reassign(flagship_profiles):
-    """An unproven CLI caller's override is ``unverified:default``: dispatch
-    still reads the card's comment, but a later reassign/clear needs its own
-    --allow-flagship."""
+    """An unproven CLI caller's override is ``unverified:default``: it
+    pre-authorizes neither a later reassign/clear nor, on a profile route,
+    dispatch (Prism r9 b4b270f9b067)."""
     task_id = _created_id(kc.run_slash(
         "create 'GATE' --assignee daedalus-fable --allow-flagship 'infra'"))
     with kb.connect() as conn:
         authors = [c.author for c in kb.list_comments(conn, task_id)]
         assert len(authors) == 1 and authors[0].startswith("unverified:"), authors
         assert not kb._card_flagship_authorized(conn, task_id)
+        assert task_id in kbd.dispatch_once(conn, dry_run=True).flagship_refused
 
 
 # ---- Prism r8 7018f089fcce: a read error on an EXISTING profile fails closed --
@@ -919,3 +924,98 @@ def test_missing_profile_and_human_stay_ungated(flagship_profiles):
     assert assignee_default_model("no-such-profile") is None
     assert assignee_default_model("human") is None
     assert assignee_default_model("human:ace") is None
+
+
+# ---- Prism r9 ----------------------------------------------------------------
+
+def _legacy_flagship_card(conn) -> str:
+    task_id = kb.create_task(conn, title="legacy", assignee="daedalus-opus")
+    conn.execute("UPDATE tasks SET assignee = 'daedalus-fable' WHERE id = ?", (task_id,))
+    conn.commit()
+    return task_id
+
+
+@pytest.mark.parametrize("author,run_id", [
+    ("daedalus-opus", 7),
+    ("daedalus-opus", None),
+    ("unverified:default", None),
+    ("operator", None),
+])
+def test_dispatch_profile_route_ignores_worker_authored_override(
+    flagship_profiles, author, run_id,
+):
+    """b4b270f9b067 / d00abfd8d56e: dispatch uses the same author + run_id
+    check as reassign, so a worker's own override comment admits nothing."""
+    with kb.connect() as conn:
+        task_id = _legacy_flagship_card(conn)
+        kb.add_comment(conn, task_id, author, "flagship override: approved",
+                       run_id=run_id)
+        assert task_id in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+
+
+def test_dispatch_profile_route_admits_operator_authored_override(flagship_profiles):
+    with kb.connect() as conn:
+        task_id = _legacy_flagship_card(conn)
+        kb.add_comment(conn, task_id, "apollo", "flagship override: approved")
+        assert task_id not in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+
+
+def test_literal_operator_author_does_not_preauthorize(flagship_profiles):
+    """9893c2209071: ``operator`` is not an operator label."""
+    task_id = _plain_card()
+    with kb.connect() as conn:
+        kb.add_comment(conn, task_id, "operator", "flagship override: approved")
+        assert not kb._card_flagship_authorized(conn, task_id)
+    out = kc.run_slash(f"reassign {task_id} daedalus-fable")
+    assert "assignee profile default" in out, out
+
+
+def test_db_override_comment_author_is_the_acting_identity(
+    flagship_profiles, monkeypatch,
+):
+    """9893c2209071: with no explicit author the override comment is written
+    under the acting identity, never a hard-coded ``operator``."""
+    for var in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="db", assignee="daedalus-fable",
+                                 flagship_override_reason="infra")
+        authors = [c.author for c in kb.list_comments(conn, task_id)]
+    assert authors and "operator" not in authors, authors
+
+
+def test_worker_lane_override_with_firepower_is_refused(worker_env):
+    """c71daffd8661: a lane's firepower text authorizes every card on the lane,
+    so a worker cannot install one."""
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="operator/orchestrator-only"):
+            kb.set_lane_model_override(
+                conn, provider="claude-apr", model="claude-fable-5-1",
+                expires_at=4_000_000_000, assignee="daedalus-opus",
+                firepower="self approved",
+            )
+        assert kb.get_lane_model_override(conn, assignee="daedalus-opus") is None
+
+
+def test_set_model_clear_with_plain_audit_comment_is_still_gated(flagship_profiles):
+    """aed001cfb920: a non-flagship audit comment must not skip the clear check."""
+    with kb.connect() as conn:
+        task_id = _pinned_flagship_card(conn)
+        with pytest.raises(ValueError, match="cannot clear the model pin"):
+            kb.set_model_override(
+                conn, task_id, None,
+                audit_comment_author="apollo", audit_comment_body="rate limit",
+            )
+        assert kb.get_task(conn, task_id).model_override
+
+
+def test_provider_default_model_is_not_alias_resolved(flagship_profiles):
+    """00f1687144ac: startup adopts providers.<p>.default_model literally."""
+    from hermes_cli.model_policy import assignee_default_model
+
+    _raw_profile(
+        flagship_profiles, "worker-prov",
+        _FLEET_PROVIDER.format(model="fast")
+        + "model_aliases:\n  fast:\n    model: claude-fable-5-1\n    provider: claude-apr\n",
+    )
+    assert assignee_default_model("worker-prov") == "fast"

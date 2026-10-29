@@ -6835,11 +6835,17 @@ def _dispatch_once_locked(
                 # An unresolved ${VAR} default fails closed (Prism 69a5d42a9476).
                 if not assignee_route_gated(model, _model_policy_config):
                     return False
-        override = conn.execute(
-            "SELECT 1 FROM task_comments WHERE task_id = ? "
-            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
-            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
-        ).fetchone()
+        if profile_route:
+            # Same author + run_id check as reassign/pin clear: a worker's own
+            # ``flagship override:`` comment never admits it (Prism r9
+            # b4b270f9b067 / d00abfd8d56e).
+            override = _kb._card_flagship_authorized(conn, task_id)
+        else:
+            override = conn.execute(
+                "SELECT 1 FROM task_comments WHERE task_id = ? "
+                "AND lower(ltrim(body)) LIKE ? LIMIT 1",
+                (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
+            ).fetchone()
         if override:
             return False
 

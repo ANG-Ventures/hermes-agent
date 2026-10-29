@@ -6698,7 +6698,7 @@ def create_task(
                     add_comment(
                         conn,
                         task_id,
-                        flagship_override_author or created_by or "operator",
+                        _flagship_override_author(flagship_override_author or created_by),
                         override_comment(flagship_override_reason),
                     )
                 if no_worker:
@@ -7106,10 +7106,24 @@ def _card_flagship_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def _flagship_override_author_trusted(author: Optional[str]) -> bool:
+    # The literal ``operator`` is not an operator label: a worker can write it
+    # by setting HERMES_PROFILE_NAME=operator (Prism r9 9893c2209071).
     from hermes_cli.kanban_identity import is_operator_label
 
-    a = (author or "").strip().lower()
-    return a == "operator" or is_operator_label(a)
+    return is_operator_label(author)
+
+
+def _flagship_override_author(author: Optional[str]) -> str:
+    """Author for a ``flagship override:`` comment: the caller's explicit
+    label, else the ACTING identity resolved the way ``kanban comment``
+    resolves it (an unproven operator name becomes ``unverified:<name>``),
+    never a hard-coded ``operator`` (Prism r9 9893c2209071)."""
+    if (author or "").strip():
+        return str(author).strip()
+    from hermes_cli.kanban_identity import verified_profile_author
+    from hermes_cli.profiles import current_profile_name
+
+    return verified_profile_author(current_profile_name("user") or "user")
 
 
 def clear_pin_flagship_reason(
@@ -7151,7 +7165,7 @@ def _add_flagship_override_comment(
 ) -> None:
     from hermes_cli.model_policy import override_comment
 
-    add_comment(conn, task_id, author or "operator", override_comment(reason))
+    add_comment(conn, task_id, _flagship_override_author(author), override_comment(reason))
 
 
 def _set_no_worker_locked(
@@ -7384,16 +7398,29 @@ def set_model_override(
         pin_sub_fallback=pin_sub_fallback,
         force_model_reason=force_model_reason,
     )
+    from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+
+    # Only a flagship override (authority-checked in
+    # _validate_model_override_args) may stand in for the clear-route check;
+    # any other audit comment does not (Prism r9 aed001cfb920).
+    validated_override = (audit_comment_body or "").lstrip().casefold().startswith(
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+    )
     with write_txn(conn):
-        if not model and not audit_comment_body:
+        if not model and not validated_override:
             # A clear lands on the profile route: gate it in this txn.
             clear_reason = clear_pin_flagship_reason(
                 conn, task_id, flagship_override_reason,
             )
-            if clear_reason:
+            if clear_reason and audit_comment_body:
+                # Keep the caller's audit comment; record the override too.
+                _add_flagship_override_comment(
+                    conn, task_id, flagship_override_author, clear_reason,
+                )
+            elif clear_reason:
                 from hermes_cli.model_policy import override_comment
 
-                audit_comment_author = flagship_override_author or "operator"
+                audit_comment_author = _flagship_override_author(flagship_override_author)
                 audit_comment_body = override_comment(clear_reason)
         if not _set_model_override_locked(
             conn, task_id, model, provider,
@@ -7513,7 +7540,7 @@ def _flagship_reason_to_audit(
     )
     if not is_firepower_model(resolved):
         return audit_comment_author, audit_comment_body
-    return flagship_override_author or "operator", override_comment(reason)
+    return _flagship_override_author(flagship_override_author), override_comment(reason)
 
 
 def _set_model_override_locked(
@@ -20730,8 +20757,15 @@ def set_lane_model_override(
     upsert, so an operator extending a window never stacks duplicate rows.
     """
 
-    from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
+    from hermes_cli.model_policy import (
+        pin_sub_arg_error,
+        require_flagship_authority,
+        validate_route_provider,
+    )
 
+    # A lane's firepower text authorizes every card on the lane at dispatch,
+    # so a worker may not write one (Prism r9 c71daffd8661).
+    require_flagship_authority(firepower)
     pin_sub_error = pin_sub_arg_error(model, provider, pin_sub_reason)
     if pin_sub_error:
         raise ValueError(pin_sub_error)

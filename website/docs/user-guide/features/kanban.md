@@ -455,9 +455,9 @@ leaving the card queued until an explicit override comment is present.
 
 The assignee is a route choice too. On a card with no `--model` pin and no
 lane override, the route is the assignee profile's `model.default`, and the
-same ban applies to it: `create --assignee <profile>` and `assign`/`reassign
-<id> <profile>` refuse a profile whose default matches the banned list
-("assignee profile default of '<profile>' is a flagship route: ...") unless
+same ban applies to it: `create --assignee <profile>` and
+`assign`/`reassign <id> <profile>` refuse a profile whose default matches the
+banned list (`assignee profile default of '<profile>' is a flagship route: ...`) unless
 `--allow-flagship "<reason>"` is given. The reason is written as the same
 `flagship override:` comment. The dispatcher applies the check to the profile
 route when there is no pin or lane, so a card that reached `ready` by another
@@ -473,7 +473,10 @@ provider's `default_model` (`providers.<p>.default_model`, or the legacy
 provider with no default it can find counts as unresolved.
 The reason itself is operator/orchestrator-only: a dispatched worker (a process
 with `HERMES_KANBAN_TASK` set) is refused on every path that takes one, whether
-the CLI, the `kanban_create` tool or a direct `kanban_db` call.
+the CLI, the `kanban_create` tool or a direct `kanban_db` call, and that
+includes the `--firepower` text on `lane-model set`. For a profile route, only
+a `flagship override:` comment written by an operator label (not from a worker
+run) admits the card at dispatch, as it does for reassign and pin clear.
 `kanban swarm` takes `--allow-flagship "<reason>"` for its child cards; the
 swarm's root card is `no_worker` (never dispatched) and is not gated.
 
