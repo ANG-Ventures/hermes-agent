@@ -487,8 +487,10 @@ def test_notice_names_the_529_seen_earlier_in_the_same_wait():
         wb.note_lane_switch(a)
         with patch("agent.fallback_wall_budget._buffering_lane", return_value=False):
             text = wb.notice_due(a, now=241.0)
+    # No x-relay-error-hop on this 529: the status is named, its sender is not.
     assert text == ("⏳ still waiting for a first reply: 241s on claude-dtlr/claude-fable-5-1, "
-                    "2 lanes tried; last upstream: 529 overloaded ×2 on sub-vps-5, retrying"), text
+                    "2 lanes tried; last failure: HTTP 529 overloaded ×2 on sub-vps-5, retrying"), text
+    assert "upstream" not in text and "Anthropic" not in text, text
 
 
 def test_notice_names_a_stream_reset_retried_inside_the_stream_call():
@@ -504,7 +506,8 @@ def test_notice_names_a_stream_reset_retried_inside_the_stream_call():
         emit_stream_drop(a, error=err, attempt=1, max_attempts=3, mid_tool_call=False,
                          diag={"http_status": 200, "started_at": 0.0})
         text = wb.notice_due(a, now=121.0)
-    assert text and "last upstream: connection reset" in text and "retrying" in text, text
+    assert text and "last failure: connection reset" in text and "retrying" in text, text
+    assert "upstream" not in text and "Anthropic" not in text, text
     assert "buffering lane" not in text, text
 
 
@@ -534,4 +537,87 @@ def test_failure_memory_is_per_wait():
         wb.disarm(a)
         wb.arm(a, now=0.0)
         text = wb.notice_due(a, now=121.0)
-    assert "last upstream" not in text and "502" not in text, text
+    assert "last failure" not in text and "502" not in text, text
+
+
+# ── t_b0a117bd send-back (Apollo 2026-10-28 20:2x): name the STAGE, never blame ──
+# the provider for our own path. 17:00-20:00 the slow stage was relay_send (our
+# uplink, p90 80-117 s) while upstream_ttfb p90 stayed 13-19 s, and the 502s were
+# ECONNRESET between relay and box. Each case below is RED on 58dc308d4b.
+
+def _failed_once(err, status, provider="claude-alr"):
+    from agent import fallback_events as fbe
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent(provider=provider)
+        wb.arm(a, now=0.0)
+        fbe.stash_api_error(a, err, status, None, elapsed_s=1.0)
+        with patch("agent.fallback_wall_budget._buffering_lane", return_value=False), \
+                patch("agent.fallback_cause.wait_notice", return_value=None):
+            return wb.notice_due(a, now=121.0)
+
+
+def test_r2_econnreset_502_reads_as_a_connection_fault_between_relay_and_box():
+    """The relay's 502 for an ECONNRESET on its box hop (class conn, hop relay->bridge)."""
+    err = RelayError(502, {"error": "upstream unreachable"},
+                     {"x-relay-error-class": "conn", "x-relay-error-hop": "relay->bridge",
+                      "x-relay-seat": "sub-vps-14"},
+                     text='HTTP 502: read ECONNRESET {"error":"upstream unreachable"}')
+    text = _failed_once(err, 502)
+    assert "last failure: connection reset between relay and box (502) on sub-vps-14" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r2_relay_unreachable_without_errno_is_a_connection_failure_on_our_path():
+    err = RelayError(502, {"error": "upstream unreachable"},
+                     {"x-relay-error-class": "conn", "x-relay-error-hop": "relay->bridge",
+                      "x-relay-seat": "sub-vps-7"})
+    text = _failed_once(err, 502)
+    assert "last failure: connection failed between relay and box (502) on sub-vps-7" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r2_408_is_a_connection_fault_not_a_provider_status():
+    err = RelayError(408, {"error": "request timeout"}, {"x-relay-seat": "sub-vps-3"})
+    text = _failed_once(err, 408)
+    assert "last failure: request timed out (408) on sub-vps-3" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r1_relay_stage_refusal_names_our_relay():
+    err = RelayError(503, {"error": "pool at capacity"},
+                     {"x-relay-error-class": "pool_pressure", "x-relay-error-hop": "relay",
+                      "x-relay-seat": "none"})
+    text = _failed_once(err, 503)
+    assert "last failure: 503 unavailable at our relay (pool at capacity)" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r1_box_stage_status_names_the_relay_to_box_hop():
+    err = RelayError(504, {"error": "upstream attempt timed out"},
+                     {"x-relay-error-class": "pool_stalled", "x-relay-error-hop": "relay->bridge",
+                      "x-relay-seat": "sub-vps-9"})
+    text = _failed_once(err, 504)
+    assert "last failure: 504 gateway timeout between relay and box on sub-vps-9" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r1_provider_origin_status_is_the_only_one_that_names_anthropic():
+    """hop bridge->upstream = the relay marks the answer as the provider's own."""
+    err = RelayError(529, {"type": "error", "error": {"type": "overloaded_error",
+                                                       "message": "Overloaded"}},
+                     {"x-relay-error-class": "pool_pressure",
+                      "x-relay-error-hop": "bridge->upstream", "x-relay-seat": "sub-vps-5"})
+    text = _failed_once(err, 529)
+    assert "last failure: Anthropic 529 overloaded on sub-vps-5" in text, text
+
+
+def test_r1_silent_wait_never_says_upstream():
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent()
+        wb.arm(a, now=0.0)
+        with patch("agent.fallback_wall_budget._buffering_lane", return_value=False):
+            text = wb.notice_due(a, now=121.0)
+    assert text.startswith("⏳ still waiting for a first reply: 121s"), text
+    assert "upstream" not in text and "Anthropic" not in text, text

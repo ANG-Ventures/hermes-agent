@@ -142,7 +142,7 @@ def note_excused_wait(agent: Any, seconds: float) -> None:
         st["excused_s"] = st.get("excused_s", 0.0) + credit
 
 
-# t_b0a117bd: the words a failed upstream attempt is named by in the notice.
+# t_b0a117bd: the words a failed attempt is named by in the notice.
 _STATUS_WORDS = {429: "rate limited", 500: "server error", 502: "bad gateway",
                  503: "unavailable", 504: "gateway timeout", 529: "overloaded"}
 _SOCKET_WORDS = {"conn_reset": "connection reset", "read_timeout": "read timeout",
@@ -150,16 +150,67 @@ _SOCKET_WORDS = {"conn_reset": "connection reset", "read_timeout": "read timeout
                  "remote_protocol": "stream dropped", "read_error": "stream dropped",
                  "connect_error": "connection failed", "pool_timeout": "pool timeout",
                  "tls": "TLS error", "dns": "DNS failure"}
+# Where a failure happened, by the hop the relay stated (``x-relay-error-hop``,
+# fallback_policy.normalize_hop). Apollo 2026-10-28 20:2x: the 17:00-20:00 stall
+# was our uplink (relay_send p90 80-117 s, upstream_ttfb p90 13-19 s) and the 502s
+# were ECONNRESET on our path; the notice must never blame the provider for that.
+_HOP_WHERE = {"relay": "at our relay", "relay→bridge": "between relay and box",
+              "bridge→anthropic": "between box and provider"}
+
+
+def _failure_phrase(code: Optional[int], socket: Optional[str], exc_name: Optional[str],
+                    hop: Optional[str], relay_class: Optional[str], relay_error: Optional[str],
+                    text: str, lane: str) -> Optional[str]:
+    """One failed attempt in plain words, naming the stage it failed at.
+
+    A transport fault (reset, stream drop, connect/read timeout, 408, relay class
+    ``conn``) is a connection fault on our path, never "Anthropic 502". The
+    provider is named only for a status the relay marks as the provider's answer
+    (hop ``bridge->upstream`` and not class ``conn``)."""
+    t = (text or "").lower()
+    transport = (code == 408 or (code is None and bool(socket or exc_name))
+                 or (relay_class or "").lower() == "conn"
+                 or "econnreset" in t or "connection reset" in t)
+    if transport:
+        if socket:
+            what = _SOCKET_WORDS.get(socket, socket.replace("_", " "))
+        elif "econnreset" in t or "reset" in t:
+            what = "connection reset"
+        elif relay_error and "timed out" in relay_error:
+            what = "timed out"
+        elif relay_error and "unreachable" in relay_error:
+            what = "connection failed"
+        elif code == 408:
+            what = "request timed out"
+        else:
+            what = "connection fault"
+        where = _HOP_WHERE.get(hop or "", "")
+        # No stated hop: name the fault, not a place (a direct lane has no relay).
+        return f"{what} {where}".rstrip() + (f" ({code})" if code else "")
+    if code is None:
+        return None
+    words = f"{code} {_STATUS_WORDS.get(code, 'error')}"
+    if hop == "bridge→anthropic":
+        who = "Anthropic" if lane.startswith("claude-") else "provider"
+        return f"{who} {words}"
+    if hop == "relay":
+        return f"{words} at our relay" + (f" ({relay_error})" if relay_error else "")
+    if hop in _HOP_WHERE:
+        return f"{words} {_HOP_WHERE[hop]}"
+    # No relay attribution: say the status, never who sent it.
+    return f"HTTP {words}"
 
 
 def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[str] = None,
-                          exc_name: Optional[str] = None, box: Optional[str] = None) -> None:
-    """An attempt of the armed wait failed upstream (status, reset, stream drop).
+                          exc_name: Optional[str] = None, box: Optional[str] = None,
+                          hop: Optional[str] = None, relay_class: Optional[str] = None,
+                          relay_error: Optional[str] = None, text: Any = None) -> None:
+    """An attempt of the armed wait failed (status, reset, stream drop).
 
     Ace 2026-10-28 17:58 PT: 47 bare "still waiting for a first reply: 120s, 1 lane tried"
-    lines in one hour while the same waits had seen 502/529/resets. The notice now names
-    the last failure, how many this wait has seen, and the box when the relay said it.
-    No-op when nothing is armed (the failure is not part of a no-first-byte wait)."""
+    lines in one hour while the same waits had seen failures. The notice now names the
+    last failure and the stage it failed at, how many times that same failure repeated
+    in this wait, and the box when the relay said it. No-op when nothing is armed."""
     st = _state(agent)
     if st is None:
         return
@@ -169,27 +220,26 @@ def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[st
         code = None
     if code is not None and code < 400:
         code = None   # a 200 head that then dropped is a drop, not a status
-    if code is not None:
-        text = f"{code} {_STATUS_WORDS.get(code, 'error')}"
-    elif socket:
-        text = _SOCKET_WORDS.get(socket, socket.replace("_", " "))
-    elif exc_name:
-        text = str(exc_name)
-    else:
+    phrase = _failure_phrase(code, socket, exc_name, hop, relay_class, relay_error,
+                             str(text or ""), str(getattr(agent, "provider", "") or ""))
+    if not phrase:
         return
-    st["failures"] = int(st.get("failures", 0)) + 1
-    st["last_failure"] = text
+    counts = st.setdefault("failure_counts", {})
+    counts[phrase] = int(counts.get(phrase, 0)) + 1
+    st["last_failure"] = phrase
     st["last_box"] = (str(box).strip() or None) if box else None
 
 
 def _failure_text(st: dict) -> str:
-    """``last upstream: 529 overloaded ×3 on sub-vps-5``, or "" when nothing failed."""
-    n = int(st.get("failures", 0))
-    if n <= 0 or not st.get("last_failure"):
+    """``last failure: connection reset between relay and box (502) ×3 on sub-vps-5``,
+    or "" when nothing failed. The count is how often THAT failure repeated."""
+    last = st.get("last_failure")
+    if not last:
         return ""
+    n = int((st.get("failure_counts") or {}).get(last, 0))
     count = f" ×{n}" if n > 1 else ""
     box = f" on {st['last_box']}" if st.get("last_box") else ""
-    return f"last upstream: {st['last_failure']}{count}{box}"
+    return f"last failure: {last}{count}{box}"
 
 
 def elapsed(agent: Any, now: Optional[float] = None) -> Optional[float]:
@@ -273,8 +323,8 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
     tried = f", {lanes} lanes tried" if lanes != 1 else ""
     failed = _failure_text(st)
     if failed:
-        # t_b0a117bd: this wait has seen an upstream failure on an earlier attempt;
-        # name it instead of a bare lane count (wins over the buffering wording too:
+        # t_b0a117bd: this wait has seen a failure on an earlier attempt; name it
+        # and the stage it failed at instead of a bare lane count (wins over the buffering wording too:
         # a lane that just failed is not a healthy turn in progress).
         return (f"⏳ still waiting for a first reply: {int(waited)}s on {route}{tried}; "
                 f"{failed}, retrying{_ahead_suffix(agent)}")

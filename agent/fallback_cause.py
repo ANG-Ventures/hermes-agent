@@ -161,9 +161,15 @@ def note_error(agent: Any, pending: Dict[str, Any], api_error: Any, raw_headers:
         # remembered on the wall clock, so its notice names the cause.
         from agent.fallback_wall_budget import note_upstream_failure
 
+        from agent.fallback_events import relay_hop_seat, relay_synthetic_error
+
+        hop, seat = relay_hop_seat(raw_headers, body)
         note_upstream_failure(agent, status=pending.get("status"),
                               socket=pending.get("socket_cause"), exc_name=exc,
-                              box=attribution(raw_headers, body)["seat"])
+                              box=seat or attribution(raw_headers, body)["seat"], hop=hop,
+                              relay_class=(pending.get("headers") or {}).get("x-relay-error-class"),
+                              relay_error=relay_synthetic_error(body, pending.get("text")),
+                              text=pending.get("text"))
         if isinstance(getattr(agent, "_failover_cause", None), FailoverCause) \
                 and agent._failover_cause.lane == (str(getattr(agent, "provider", "") or "") or None):
             return
