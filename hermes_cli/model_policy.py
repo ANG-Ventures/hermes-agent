@@ -90,12 +90,37 @@ def override_comment(reason: str) -> str:
     return f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} {reason.strip()}"
 
 
-def assignee_default_model(assignee: Optional[str]) -> Optional[str]:
-    """The assignee profile's ``model.default`` (fail-soft ``None``).
+def _profile_effective_config(config_path: Any) -> dict:
+    """``config_path`` the way worker startup (``load_cli_config``) sees it:
+    root-model normalization, ``${VAR}`` expansion, then the managed overlay.
+    The parsed file is mtime-cached; expansion and overlay run per call so an
+    env or managed-scope change is never served stale."""
+    import copy
 
-    Same read as ``kanban_db.effective_worker_route``: the profile the
-    dispatcher activates for this assignee. A missing profile or the human
-    sentinel resolves to ``None`` (no route to gate).
+    from hermes_cli.config import (
+        _expand_env_vars,
+        _normalize_root_model_keys,
+        read_user_config_raw,
+    )
+    from hermes_cli import managed_scope
+    from hermes_cli.profiles import _cached_profile_read
+
+    parsed = _cached_profile_read(
+        config_path, "config-effective-src",
+        lambda: _normalize_root_model_keys(read_user_config_raw(config_path)),
+    )
+    cfg = _expand_env_vars(copy.deepcopy(parsed or {}))
+    return managed_scope.apply_managed_overlay(cfg if isinstance(cfg, dict) else {})
+
+
+def assignee_default_model(assignee: Optional[str]) -> Optional[str]:
+    """The model an unpinned worker on ``assignee`` will RUN (fail-soft ``None``).
+
+    The profile's effective ``model.default`` (``${VAR}`` expanded, managed
+    overlay applied), resolved through that profile's own ``model_aliases`` /
+    ``model.aliases`` the way worker startup does (Prism 22663f69a1d3,
+    9e7596b4c0ed). A missing profile or the human sentinel resolves to
+    ``None`` (no route to gate).
     """
     name = str(assignee or "").strip()
     if not name or name == "human" or name.startswith("human:"):
@@ -103,12 +128,27 @@ def assignee_default_model(assignee: Optional[str]) -> Optional[str]:
     try:
         from pathlib import Path
 
-        from hermes_cli.profiles import _read_config_model, resolve_profile_env
+        from hermes_cli.model_switch import _load_direct_aliases
+        from hermes_cli.profiles import resolve_profile_env
 
-        model, _provider = _read_config_model(Path(resolve_profile_env(name)))
+        cfg = _profile_effective_config(Path(resolve_profile_env(name)) / "config.yaml")
+        section = cfg.get("model")
+        if isinstance(section, str):
+            model = section
+        elif isinstance(section, dict):
+            model = section.get("default") or section.get("model")
+        else:
+            model = None
+        model = str(model or "").strip()
+        if not model:
+            return None
+        aliases, _ok = _load_direct_aliases(cfg)
+        hit = aliases.get(model.lower())
+        if hit is not None and str(hit.model or "").strip():
+            return str(hit.model).strip()
+        return model
     except Exception:
         return None
-    return (str(model).strip() or None) if model else None
 
 
 def assignee_flagship_error(assignee: str, model: str) -> str:

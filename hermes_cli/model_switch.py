@@ -232,8 +232,9 @@ def _clean(value: Any) -> str:
 DIRECT_ALIASES: dict[str, DirectAlias] = {}
 
 
-def _load_direct_aliases() -> tuple[dict[str, DirectAlias], bool]:
-    """Load direct aliases from config.yaml.
+def _load_direct_aliases(cfg: Optional[dict] = None) -> tuple[dict[str, DirectAlias], bool]:
+    """Load direct aliases from config.yaml (or from ``cfg``, another profile's
+    effective config, when given — the kanban flagship gate, t_9e7ba884).
 
     ``model_aliases:`` entries are dicts (``model``, ``provider``, ``base_url``, optional
     ``api_key`` — literal or ``"${VAR}"`` — / ``key_env``); with neither credential field the key
@@ -250,8 +251,9 @@ def _load_direct_aliases() -> tuple[dict[str, DirectAlias], bool]:
     """
     merged = dict(_BUILTIN_DIRECT_ALIASES)
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        if cfg is None:
+            from hermes_cli.config import load_config
+            cfg = load_config()
 
         user_aliases = cfg.get("model_aliases")
         if isinstance(user_aliases, dict):

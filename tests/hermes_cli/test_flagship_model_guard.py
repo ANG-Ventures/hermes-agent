@@ -393,3 +393,80 @@ def test_assign_same_flagship_profile_with_reason_authorizes_legacy_card(
     kc.run_slash(f"assign {task_id} daedalus-fable --allow-flagship 'approved'")
     with kb.connect() as conn:
         assert len(kb.list_comments(conn, task_id)) == 1
+
+
+# ---- Prism r2: the gate judges the model the worker will RUN ----------------
+# (22663f69a1d3: profile aliases; 9e7596b4c0ed: ${VAR} expansion + managed overlay)
+
+def _raw_profile(kanban_home, name: str, body: str) -> None:
+    profile = kanban_home / "profiles" / name
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "config.yaml").write_text(body, encoding="utf-8")
+
+
+def _assert_gated(assignee: str) -> None:
+    output = kc.run_slash(f"create 'GATE-PROBE' --assignee {assignee}")
+    assert "assignee profile default" in output, output
+    assert "claude-fable-5-1" in output, output
+    with kb.connect() as conn:
+        # Seed unassigned: under a managed pin every profile route is gated.
+        task_id = kb.create_task(conn, title="legacy", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, task_id))
+        conn.commit()
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert task_id in res.flagship_refused
+
+
+@pytest.mark.parametrize("aliases", [
+    "  aliases:\n    fast: claude-apr/claude-fable-5-1\n",
+    "  aliases:\n    fast: {model: claude-fable-5-1, provider: claude-apr}\n",
+    None,  # top-level model_aliases form
+])
+def test_profile_alias_resolving_to_flagship_is_gated(flagship_profiles, aliases):
+    body = "model:\n  default: fast\n  provider: claude-apr\n"
+    if aliases is None:
+        body += "model_aliases:\n  fast: {model: claude-fable-5-1, provider: claude-apr}\n"
+    else:
+        body += aliases
+    _raw_profile(flagship_profiles, "worker-fast", body)
+    _assert_gated("worker-fast")
+
+
+def test_profile_alias_named_like_flagship_but_resolving_to_opus_is_not_gated(
+    flagship_profiles,
+):
+    _raw_profile(flagship_profiles, "worker-lite",
+                 "model:\n  default: fable-lite\n  provider: claude-apr\n"
+                 "  aliases:\n    fable-lite: claude-apr/claude-opus-5-5\n")
+    task_id = _created_id(kc.run_slash("create 'plain' --assignee worker-lite"))
+    with kb.connect() as conn:
+        assert kb.list_comments(conn, task_id) == []
+        assert task_id not in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+
+
+def test_profile_env_var_default_is_expanded_before_the_gate(
+    flagship_profiles, monkeypatch,
+):
+    monkeypatch.setenv("T9E_WORKER_MODEL", "claude-fable-5-1")
+    _raw_profile(flagship_profiles, "worker-env",
+                 "model:\n  default: ${T9E_WORKER_MODEL}\n  provider: claude-apr\n")
+    _assert_gated("worker-env")
+
+
+def test_managed_overlay_default_is_the_gated_route(
+    flagship_profiles, monkeypatch, tmp_path,
+):
+    from hermes_cli import managed_scope
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text("model:\n  default: claude-fable-5-1\n",
+                                         encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+    try:
+        # daedalus-opus's own file says claude-opus-5-5; the managed pin wins.
+        _assert_gated("daedalus-opus")
+    finally:
+        monkeypatch.delenv("HERMES_MANAGED_DIR")
+        managed_scope.invalidate_managed_cache()
