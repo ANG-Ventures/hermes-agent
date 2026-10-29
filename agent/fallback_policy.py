@@ -1666,6 +1666,12 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
             from agent.fork_ext.relay_quota import fable_cap_busy_text
 
             return f"{prefix}{fable_cap_busy_text(cap, tz)}, {window}", ()
+        from agent.fork_ext.relay_quota import pool_pressure_text
+
+        pp = row.get("pool_pressure")
+        if isinstance(pp, Mapping):
+            # t_b0c67f3e: the refusal stated the numbers it was decided on.
+            return f"{prefix}{pool_pressure_text(pp)}, {window}", ()
         return f"{prefix}relay busy: all subs at capacity (at the relay), {window}", ()
     if cause == SEAT_TIMEOUT_CAUSE:
         return f"{prefix}{_seat_timeout_body(row, seat)}{_pool_context(row)}, {window}", ()

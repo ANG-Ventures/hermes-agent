@@ -94,3 +94,65 @@ def fable_cap_busy_text(cap: Mapping[str, Any], tz: Optional[_dt.tzinfo] = None)
     if isinstance(reset, (int, float)) and not isinstance(reset, bool):
         text += f"; earliest reset {_dt.datetime.fromtimestamp(float(reset), tz).strftime('%a %H:%M')}"
     return text
+
+
+# t_b0c67f3e: a pool-wide refusal states the numbers it was decided on
+# (claude-pool ``pool_pressure_headers``). The gateway renders them; it never
+# asks /health. Headers absent (an older relay) -> None -> today's wording.
+POOL_PRESSURE_HEADERS = ("x-pool-seats-total", "x-pool-seats-eligible", "x-pool-seats-busy",
+                         "x-pool-inflight", "x-pool-inflight-max",
+                         "x-pool-ineligible-reasons")
+
+
+def _count(v: Any) -> Optional[int]:
+    s = str(v if v is not None else "").strip()
+    return int(s) if s.isdigit() else None
+
+
+def pool_pressure(headers: Any) -> Optional[dict]:
+    """``{total, eligible, busy, inflight, inflight_max, ineligible}`` from the
+    refusal's ``x-pool-*`` headers, else None. ``total`` and ``eligible`` are
+    required; ``busy`` is None when the relay had no fresh box reading;
+    ``ineligible`` is ``[(reason, n), ...]`` largest first. Junk -> None.
+    Never raises."""
+    try:
+        h = {str(k).lower(): v for k, v in (headers.items() if headers is not None else ())}
+        total, elig = _count(h.get("x-pool-seats-total")), _count(h.get("x-pool-seats-eligible"))
+        if total is None or elig is None or total <= 0 or elig > total:
+            return None
+        busy = _count(h.get("x-pool-seats-busy"))
+        if busy is not None and busy > elig:
+            busy = None
+        reasons = []
+        for i, part in enumerate(str(h.get("x-pool-ineligible-reasons") or "").split(",")):
+            name, _, n = part.strip().partition(":")
+            if name.strip() and _count(n):
+                reasons.append((i, name.strip(), int(n)))
+        reasons.sort(key=lambda r: (-r[2], r[0]))
+        return {"total": total, "eligible": elig, "busy": busy,
+                "inflight": _count(h.get("x-pool-inflight")),
+                "inflight_max": _count(h.get("x-pool-inflight-max")),
+                "ineligible": [(name, n) for _i, name, n in reasons]}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pool_pressure_text(pp: Mapping[str, Any]) -> str:
+    """``relay busy: 11 of 11 eligible seats full (26 in pool; 15 ineligible:
+    quota 13, transport 2), 142/304 in flight``."""
+    total, elig, busy = int(pp["total"]), int(pp["eligible"]), pp.get("busy")
+    if isinstance(busy, int):
+        head = f"relay busy: {busy} of {elig} eligible seats full"
+    else:
+        head = f"relay busy: {elig} of {total} seats eligible"
+    inel = total - elig
+    paren = f"{total} in pool" if isinstance(busy, int) else ""
+    if inel > 0:
+        why = ", ".join(f"{name} {n}" for name, n in pp.get("ineligible") or ())
+        tail = f"{inel} ineligible" + (f": {why}" if why else "")
+        paren = f"{paren}; {tail}" if paren else tail
+    text = f"{head} ({paren})" if paren else head
+    n, m = pp.get("inflight"), pp.get("inflight_max")
+    if isinstance(n, int) and isinstance(m, int) and m > 0:
+        text += f", {n}/{m} in flight"
+    return text
