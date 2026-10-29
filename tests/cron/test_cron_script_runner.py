@@ -728,6 +728,46 @@ def test_g_watchdog_snapshot_survives_a_held_procs_lock(root, monkeypatch, procs
     assert (_hb(root)["state"], _hb(root)["standby_reason"]) == ("standby", "watchdog_tripped")
 
 
+def test_g_watchdog_trip_names_the_blocking_frame(root, caplog):
+    """t_f2e71f40: the 2026-10-28 20:22 trip left a marker with no clue where the tick was. The
+    marker now carries every thread's stack and the tick thread's innermost cron frame (phase), and
+    the CRITICAL log names that frame, so the next trip says which call blocked."""
+    from cron import jobs, script_runner
+
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)],
+                                   exit_fn=lambda _c: None)
+    r.enumerate_homes()
+    tick_ready = threading.Event()
+
+    def tick_thread():
+        r.on_tick_start(root)
+        tick_ready.set()
+        with jobs._jobs_lock():  # blocks: the holder below owns the in-process jobs lock
+            pass
+
+    caplog.set_level(logging.CRITICAL, logger="cron.script_runner")
+    with jobs._jobs_file_lock:
+        t = threading.Thread(target=tick_thread, name="cron-script-runner", daemon=True)
+        t.start()
+        assert tick_ready.wait(5)
+        time.sleep(0.3)  # let the tick thread reach the blocking acquire
+        try:
+            r._watchdog_fire(root, _now_iso())
+        finally:
+            r.cancel_deadline()
+            r.on_tick_end(root)
+    t.join(5)
+    marker = json.loads(script_runner.trip_marker_path().read_text(encoding="utf-8"))
+    assert marker["home"] == str(root)
+    assert marker["phase"].startswith("cron.jobs:_jobs_lock:"), marker["phase"]
+    assert marker["tick_thread"] == "cron-script-runner"
+    tick_frames = marker["threads"]["cron-script-runner"]
+    assert any("_jobs_lock" in f for f in tick_frames), tick_frames
+    assert any(name.startswith("cron-runner-watchdog") or name == "MainThread"
+               for name in marker["threads"])
+    assert any("cron.jobs:_jobs_lock:" in rec.getMessage() for rec in caplog.records)
+
+
 def test_g_watchdog_kills_a_group_whose_leader_already_exited(root, monkeypatch, tmp_path):
     """Prism d9f3c814a2c6: the script leader exited but a background child keeps the output pipe,
     so ``communicate()`` has not reaped it yet (a zombie). The watchdog still kills the group; a

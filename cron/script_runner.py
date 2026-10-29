@@ -154,6 +154,7 @@ class ScriptRunner:
         self._recovered: set = set()
         self._timer: Optional[threading.Timer] = None
         self._deadline: Optional[threading.Timer] = None
+        self._tick_thread: Optional[threading.Thread] = None
         self._pid = os.getpid()
         self._pid_start = self._own_start_time()
         self._code_sha = _boot_code_sha()
@@ -308,6 +309,7 @@ class ScriptRunner:
 
     def on_tick_start(self, home) -> None:
         started = _now_iso()
+        self._tick_thread = threading.current_thread()
         self._tick_started[str(home)] = started
         self._write(home, "active")
         timer = threading.Timer(float(lanes.RUNNER_TICK_WATCHDOG_S), self._watchdog_fire,
@@ -334,10 +336,12 @@ class ScriptRunner:
         self._deadline.daemon = True
         self._deadline.start()
         try:
-            logger.critical("script runner tick exceeded %s s on %s; tripping (one strike) and "
-                            "exiting %d", lanes.RUNNER_TICK_WATCHDOG_S, home, EXIT_WATCHDOG)
+            diag = self._stack_diagnosis()
+            logger.critical("script runner tick exceeded %s s on %s (tick thread in %s); tripping "
+                            "(one strike) and exiting %d", lanes.RUNNER_TICK_WATCHDOG_S, home,
+                            diag.get("phase"), EXIT_WATCHDOG)
             self.tripped = True
-            self._write_trip_marker(home, tick_started_at)
+            self._write_trip_marker(home, tick_started_at, diag)
             for _name, h in self._last_homes or [(None, home)]:
                 with contextlib.suppress(Exception):
                     self._write(h, "standby", "watchdog_tripped")
@@ -348,13 +352,44 @@ class ScriptRunner:
         finally:
             self._exit_fn(EXIT_WATCHDOG)
 
-    def _write_trip_marker(self, home, tick_started_at) -> None:
+    def _stack_diagnosis(self) -> dict:
+        """Every thread's stack plus the tick thread's innermost ``cron.*`` frame (``phase``), so a
+        trip names the call that blocked (t_f2e71f40: the 2026-10-28 trip left no clue). Also the
+        recent ``_jobs_lock`` waits. Never raises."""
+        diag: Dict[str, Any] = {"phase": None, "tick_thread": None, "threads": {}}
+        try:
+            import traceback
+
+            names = {t.ident: t.name for t in threading.enumerate()}
+            tick = self._tick_thread
+            diag["tick_thread"] = tick.name if tick is not None else None
+            for ident, frame in sys._current_frames().items():
+                name = names.get(ident, f"thread-{ident}")
+                if name in diag["threads"]:
+                    name = f"{name}#{ident}"
+                diag["threads"][name] = [f"{f.filename}:{f.lineno} in {f.name}"
+                                         for f in traceback.extract_stack(frame)]
+                if tick is not None and ident == tick.ident:
+                    f = frame
+                    while f is not None:
+                        module = f.f_globals.get("__name__", "")
+                        if module.startswith("cron.") and module != __name__:
+                            diag["phase"] = f"{module}:{f.f_code.co_name}:{f.f_lineno}"
+                            break
+                        f = f.f_back
+            diag["lock_waits"] = [[label, round(s, 3)] for label, s in lanes.lock_waits()[-20:]]
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not block the trip
+            diag["error"] = f"{type(exc).__name__}: {exc}"
+        return diag
+
+    def _write_trip_marker(self, home, tick_started_at, diag: Optional[dict] = None) -> None:
         from utils import atomic_write_text
 
         try:
             atomic_write_text(trip_marker_path(), json.dumps({
                 "at": _now_iso(), "home": str(home), "pid": self._pid,
                 "code_sha": self._code_sha, "tick_started_at": tick_started_at,
+                **(diag or {}),
             }, sort_keys=True) + "\n", tmp_prefix=".script_runner_tripped_", mode=0o600)
         except Exception:
             logger.error("script runner: trip marker write failed; the restart will be armed",
