@@ -26,7 +26,6 @@ from agent.message_content import flatten_message_text
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.message_sanitization import is_interrupt_close_row, provider_owns_transcript
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
-from agent.route_identity import ROUTE_NOTE_DISPLAY_KIND
 from agent.route_note_ingest import relabel_route_note_content, relabel_route_note_text
 from agent.tool_dispatch_helpers import _degrade_prior_turn_multimodal_messages
 from agent.turn_handoff import consume_handoff_context
@@ -1154,11 +1153,11 @@ def build_turn_context(
         user_message = sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
-    # E11: received text never carries the harness's route-note marker (the harness adds its own
-    # note later, per call, so it is never relabelled here).
-    if persist_user_display_kind != ROUTE_NOTE_DISPLAY_KIND:
-        user_message = relabel_route_note_content(user_message)
-        persist_user_message = relabel_route_note_content(persist_user_message)
+    # E11: received text never carries the harness's route-note marker. Unconditional: the
+    # harness's own note never enters here (route_identity._persist_note appends it per call),
+    # so no declared display kind may opt received text out of the relabel.
+    user_message = relabel_route_note_content(user_message)
+    persist_user_message = relabel_route_note_content(persist_user_message)
 
     # Turn identity is bound BEFORE the primary restore: its recovery /
     # restore_refused ledger rows belong to THIS turn (C7 k73).
