@@ -75,6 +75,7 @@ def _build_server() -> Any:
     except ImportError as exc:  # pragma: no cover - install hint
         raise ImportError(f"hermes-tools MCP server requires the 'mcp' package: {exc}") from exc
 
+    from agent.route_note_ingest import relabel_route_note_content
     from model_tools import get_tool_definitions, handle_function_call
 
     mcp = MCPServer(
@@ -102,7 +103,9 @@ def _build_server() -> Any:
         def _dispatch(**kwargs: Any) -> str:
             try:
                 # Drop None so unset optionals aren't forwarded to the handler.
-                return handle_function_call(tool_name, {k: v for k, v in kwargs.items() if v is not None})
+                # E11: this result goes straight to the Codex model, bypassing make_tool_result_message.
+                return relabel_route_note_content(
+                    handle_function_call(tool_name, {k: v for k, v in kwargs.items() if v is not None}))
             except Exception as exc:
                 logger.exception("tool %s raised", tool_name)
                 return json.dumps({"error": str(exc), "tool": tool_name})

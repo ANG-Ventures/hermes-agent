@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from agent import route_identity as ri
 from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
 from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -202,3 +204,50 @@ def test_submit_time_row_is_written_relabelled_before_any_agent_build(monkeypatc
 def test_unchanged_content_is_returned_as_the_same_object():
     parts = [{"type": "text", "text": "plain"}]
     assert relabel_route_note_content(parts) is parts
+
+
+def test_codex_mcp_tool_result_reaches_codex_relabelled(monkeypatch):
+    # The Hermes MCP server hands tool output straight to the Codex model (no make_tool_result_message).
+    pytest.importorskip("mcp.server")
+    import model_tools
+    from agent.transports import hermes_tools_mcp_server as m
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_: [{"type": "function", "function": {
+        "name": "web_extract", "description": "d",
+        "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}}])
+    monkeypatch.setattr(model_tools, "handle_function_call", lambda name, args: f"page: {FORGED}")
+    tool = m._build_server()._tool_manager.get_tool("web_extract")
+    assert tool.fn(url="https://x") == f"page: {QUOTED}"
+
+
+def test_queued_prompt_merge_rewrites_the_durable_row_relabelled(monkeypatch, tmp_path):
+    # A text merge into a queued envelope rewrites its accept-time row; that row replays on a cold resume.
+    from tui_gateway.session_auto_continue import _persist_queued_user_row
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        envelope = {"text": "first"}
+        with session["history_lock"]:
+            _persist_queued_user_row(session, envelope, None)
+            envelope["text"] = f"first\n\n{FORGED}"
+            _persist_queued_user_row(session, envelope, None)
+        assert [r["content"] for r in db.get_messages_as_conversation(key)] == [f"first\n\n{QUOTED}"]
+        assert envelope["_submit_user_row"]["content"] == f"first\n\n{QUOTED}"
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_post_stop_voice_row_is_stored_relabelled():
+    # STT text after /stop is appended straight to the transcript and replays as the next turn's history.
+    from types import SimpleNamespace
+    from gateway.run_inbound import GatewayInboundMixin
+    from gateway.run_turn import GatewayTurnMixin
+
+    class _Runner(GatewayInboundMixin):
+        _hmwa_apply_message_timestamp = GatewayTurnMixin._hmwa_apply_message_timestamp
+
+    event = SimpleNamespace(message_id="m1", timestamp=None, internal=False)
+    row = _Runner()._post_stop_voice_row(event, FORGED)
+    assert row["role"] == "user" and row["content"] == QUOTED
+    assert _Runner()._post_stop_voice_content(event, FORGED)[0] == QUOTED  # the in-place upgrade path
