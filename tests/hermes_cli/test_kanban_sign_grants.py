@@ -812,6 +812,42 @@ def test_board_for_conn_pin_alias_replaced_by_a_snapshot_is_the_pinned_board_not
         c2.close()
 
 
+def test_board_for_conn_pin_alias_swapped_after_the_pin_compare_is_still_the_pinned_board(
+        board, tmp_path, monkeypatch):
+    """Prism 88ae868bb7c2: once the layout scan found no owner and the connection's file IS the pin, the
+    answer is the pinned board. Re-resolving the mutable pin path afterwards must not hand back the slug of
+    a layout board the pin alias was swapped to in between (that board does not own ``conn``)."""
+    import shutil
+
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    with kb.connect_closing():
+        pass
+    live = kb.kanban_db_path()
+    pin = tmp_path / "pin.db"
+    shutil.copyfile(str(live), str(pin))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    real_same_path = kb._same_path
+    swapped = []
+
+    def racing_same_path(a, b, memo=None):
+        same = real_same_path(a, b, memo)
+        if same and not swapped and Path(b) == pin:
+            alias = tmp_path / "alias.db"
+            os.link(str(live), str(alias))
+            os.replace(str(alias), str(pin))
+            swapped.append(True)
+        return same
+
+    conn = sqlite3.connect(str(pin))
+    try:
+        monkeypatch.setattr(kb, "_same_path", racing_same_path)
+        assert kbr.board_for_conn(conn) == kbr.PINNED_SLUG
+        assert swapped, "the race was never provoked"
+    finally:
+        conn.close()
+
+
 def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
     import shutil
     import time as _time

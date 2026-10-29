@@ -154,11 +154,15 @@ def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
 
     THE one answer to "which board does a journal record for this connection belong to"
     (Prism 826db72bcf2d): a layout board's DB names that board; the ``HERMES_KANBAN_DB`` pin's
-    file names :func:`board_named_by_pin` (``PINNED_SLUG`` off-layout). Anything else (a
+    file, when no layout board owns it, is ``PINNED_SLUG``. Anything else (a
     snapshot, a forensics copy, ``:memory:``) is ``None``: journaling it under the ambient board
     would replay its writes into the live one (Prism 77b7e56c0d2c). Compared by filesystem
     identity on every call, never memoised (Prism 25e888cf0c09, fde771bf9eaa): a retargeted board
     symlink or a swapped pin alias changes the answer without moving any cheap key. Never raises.
+
+    Judged by the current path of the connection's filename (``PRAGMA database_list``), not the
+    open file's identity: an alias replaced under an open connection is a known gap, card
+    t_5cc1943b (Prism 1cb3ded18c44).
     """
     _kb = _facade()
     try:
@@ -176,7 +180,10 @@ def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
                     found = slug
                     break
         if found is None and raw and _kb._same_path(here, Path(raw).expanduser()):
-            found = board_named_by_pin(raw)
+            # No layout board owns ``here`` and ``here`` IS the pin's file, so it is the pinned
+            # board. Never re-resolve ``raw``: a pin alias swapped since the compare would name a
+            # layout board that does not own ``conn`` (Prism 88ae868bb7c2).
+            found = PINNED_SLUG
         return found
     except Exception:
         return None
