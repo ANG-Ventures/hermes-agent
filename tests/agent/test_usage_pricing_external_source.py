@@ -191,6 +191,37 @@ def test_direct_vendor_route_is_still_priced_once(seeded_models_dev, default_sou
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("base_url", "priced"),
+    [
+        ("", True),  # provider default
+        ("https://opencode.ai/zen/v1", True),
+        ("https://opencode.ai/zen/v1/", True),
+        ("http://127.0.0.1:8080/v1", False),  # loopback proxy
+        ("https://zen-proxy.example.com/zen/v1", False),  # custom proxy host
+        ("https://opencode.ai/zen/go/v1", False),  # the other product on the same host
+        ("http://opencode.ai/zen/v1", False),  # not HTTPS
+        ("https://opencode.ai:8443/zen/v1", False),  # not :443
+    ],
+)
+def test_scoped_fallback_requires_the_providers_default_endpoint(
+    base_url, priced, seeded_models_dev, default_source_order, monkeypatch
+):
+    """opencode-zen (models.dev ``opencode``) gets Zen list prices only through Zen's own endpoint (#71911)."""
+    monkeypatch.setattr(usage_pricing, "fetch_endpoint_model_metadata", lambda *_a, **_k: {})
+    monkeypatch.setattr(usage_pricing, "fetch_model_metadata", lambda *_a, **_k: {})
+    seeded_models_dev({"opencode": {"models": {"zen-model-1": {"cost": {"input": 2, "output": 8}}}}})
+
+    route = usage_pricing.resolve_billing_route("zen-model-1", provider="opencode-zen", base_url=base_url)
+    entry = usage_pricing._models_dev_scoped_pricing_entry(route)
+
+    assert (entry is not None) is priced
+    if priced:
+        assert entry.input_cost_per_million == Decimal("2")
+    full = get_pricing_entry("zen-model-1", provider="opencode-zen", base_url=base_url)
+    assert (full is not None) is priced
+
+
 def test_curated_snapshot_still_precedes_external_catalog(
     seeded_models_dev, default_source_order
 ):

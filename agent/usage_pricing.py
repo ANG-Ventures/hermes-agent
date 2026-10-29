@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata, strip_codex_context_variant_suffix
-from utils import base_url_host_matches, base_url_hostname, base_url_origin
+from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path
 
 logger = logging.getLogger(__name__)
 
@@ -582,15 +582,42 @@ def _vendor_catalog_ids() -> frozenset:
     return frozenset(PROVIDER_TO_MODELS_DEV.get(p, p) for p in _MODELS_DEV_DIRECT_HOSTS)
 
 
+def _route_on_provider_default_endpoint(route: BillingRoute) -> bool:
+    """True when the route bills through its provider's own default endpoint: no base URL, or
+    HTTPS:443 to the registry default's host AND path. A proxy, loopback, or a sibling product on
+    the same host (opencode-zen pointed at ``/zen/go/v1``) has no proof it bills at that rate card."""
+    if not route.base_url:
+        return True
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        pconfig = PROVIDER_REGISTRY.get(route.provider)
+    except Exception:
+        return False
+    default = getattr(pconfig, "inference_base_url", "") or ""
+    if not default:
+        return False
+    scheme, host, port = base_url_origin(route.base_url)
+    return (
+        (scheme, port) == ("https", 443)
+        and host == base_url_hostname(default)
+        and base_url_path(route.base_url) == base_url_path(default)
+    )
+
+
 def _models_dev_scoped_pricing_entry(route: BillingRoute, *, cache_only: bool = False) -> Optional[PricingEntry]:
     """models.dev row scoped to the route's own provider (relays such as opencode-go carry their
     own). A provider whose models.dev catalog IS a first-party vendor's (xai-oauth -> xai,
     openai-codex -> openai) is skipped: the vendor's list price applies only through the direct
-    gate above. Always cache-only (``cache_only`` is accepted for the builder signature)."""
+    gate above. The row applies only on the provider's default endpoint
+    (``_route_on_provider_default_endpoint``). Always cache-only (``cache_only`` is accepted for
+    the builder signature)."""
     from agent.models_dev import PROVIDER_TO_MODELS_DEV, lookup_models_dev_pricing
 
     mdev_id = PROVIDER_TO_MODELS_DEV.get(route.provider or "")
     if not mdev_id or not route.model or mdev_id in _vendor_catalog_ids():
+        return None
+    if not _route_on_provider_default_endpoint(route):
         return None
     cost = lookup_models_dev_pricing(route.provider, route.model, allow_network=False)
     if not cost:
