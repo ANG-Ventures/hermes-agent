@@ -400,3 +400,32 @@ def test_rereplay_after_migration_backfills_the_grant_id_instead_of_duplicating(
     rows = rc.execute("SELECT author, grant_id FROM task_comments").fetchall()
     rc.close()
     assert rows == [(f"[grant:{GID}] apollo (subagent)", GID)]
+
+
+def test_backfill_never_collapses_an_ordinary_comment_into_a_granted_one(journal_env, tmp_path):
+    """Prism af6b6e94038c: an ordinary row whose author string carries the grant marker, with equal body and
+    created_at second, but written by another session/run, is not the granted write restored pre-migration.
+    Replay inserts the granted row next to it instead of stamping the grant onto the ordinary one."""
+    kanban_journal, _ = journal_env
+    from hermes_cli import kanban_journal_replay
+
+    marked = f"[grant:{GID}] apollo (subagent)"
+    snapshot = tmp_path / "snap.db"
+    conn = _make_board_db(snapshot)
+    conn.execute("ALTER TABLE task_comments ADD COLUMN grant_id TEXT")
+    base = int(time.time()) - 300
+    conn.execute("INSERT INTO tasks VALUES (?,?,?,?)", ("t_o", "t", "running", base))
+    conn.execute("INSERT INTO task_comments (task_id, author, body, run_id, session_ref, created_at) "
+                 "VALUES (?,?,?,?,?,?)", ("t_o", marked, "granted APPROVE", None, "sr-other", base + 20))
+    conn.commit()
+    conn.close()
+    kanban_journal.append("b8", "t_o", "comment_body",
+                          {"author": "apollo", "body": "granted APPROVE", "created_at": base + 20,
+                           "session_ref": "sr-child", "grant_id": GID}, run_id=7)
+    out = tmp_path / "out.db"
+    result = kanban_journal_replay.replay_into("b8", snapshot, out, since=0)
+    assert result.comments_restored == 1, result.as_dict()
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT session_ref, run_id, grant_id FROM task_comments ORDER BY id").fetchall()
+    rc.close()
+    assert rows == [("sr-other", None, None), ("sr-child", 7, GID)]

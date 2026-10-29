@@ -578,3 +578,56 @@ def test_granted_comment_reads_expiry_time_inside_the_write_lock(board, monkeypa
         _child_comment(a, _approve(), g["grant_id"])
     monkeypatch.setattr(kb, "write_txn", real_txn)
     assert _rows(a) == []
+
+
+def test_a_revoked_grant_stays_revoked_through_a_journal_replay(board, tmp_path, monkeypatch):
+    """Prism a35d26840b79: the revoke is journaled, so restoring a snapshot taken while the grant was live
+    and replaying the journal tail brings the grant back revoked, never live."""
+    import shutil
+    import time as _time
+
+    from hermes_cli import kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    _home, a, _b = board
+    g = _mint(a)
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(kb.kanban_db_path()), str(snap))
+    since = _time.time() - 0.001
+    with kb.connect_closing() as conn:
+        assert ksg.revoke(conn, g["grant_id"]) == 1
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    rc.close()
+    assert len(rows) == 1 and rows[0][0] is not None, rows
+
+
+def _record_pr(card, profile, pr):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",
+                     (card, profile, "done", 1, json.dumps({"pr_url": pr})))
+
+
+def test_an_implicit_release_is_checked_against_the_cards_own_prs(board):
+    """Prism 4fdc26d69c92: a bare `close-on: merged` names no PR, so the own-PR exclusion reads the PRs the
+    card itself records; one the parent run authored (on its own card) is refused, and a release on a card
+    with no PR at all is refused, since no PR can be established."""
+    _home, a, b = board
+    g = _mint(b, verbs=["verdict", "release"])
+    with pytest.raises(ksg.GrantRefused, match="no PR"):
+        _child_comment(b, "close-on: merged", g["grant_id"])
+    assert _rows(b) == []
+    own = "https://github.com/acme/repo/pull/7"
+    _record_pr(a, "default", own)          # the parent run's own card and PR
+    _record_pr(b, "daedalus", own)         # card B lands that same PR
+    with pytest.raises(ksg.GrantRefused, match="authored"):
+        _child_comment(b, "close-on: merged", g["grant_id"])
+    assert _rows(b) == []
+    with kb.connect_closing() as conn:
+        c = kb.create_task(conn, title="review card C")
+    _record_pr(c, "daedalus", "https://github.com/acme/repo/pull/8")
+    g2 = _mint(c, verbs=["verdict", "release"])
+    _child_comment(c, "close-on: merged", g2["grant_id"])
+    assert [r["grant_id"] for r in _rows(c)] == [g2["grant_id"]]
