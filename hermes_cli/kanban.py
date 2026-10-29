@@ -489,7 +489,7 @@ _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "reclaim", "set-model", "priority", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
     "request-changes", "link", "unlink", "specify", "decompose", "workspace",
-    "rehome",
+    "rehome", "sendback",
 })
 
 
@@ -593,7 +593,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "requeue", "workspace", "reopen", "promote", "triage-resolve",
     "archive", "dispatch", "admit", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "sendback",
     "gc",
 })
 
@@ -3908,6 +3908,27 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sendback(args: argparse.Namespace) -> int:
+    """Forge L0 §2.4 producer verb: ``kb.request_sendback`` with a §2.4 row (hermes-home scripts/lib/sendback.py
+    calls this). rc 0 delivered (prints the delivery), 1 refused, 2 bad payload."""
+    tid = args.task_id
+    try:
+        payload = json.loads(args.payload)
+    except ValueError as exc:
+        print(f"cannot send back {tid}: --payload is not JSON ({exc})", file=sys.stderr)
+        return 2
+    if not isinstance(payload, dict):
+        print(f"cannot send back {tid}: --payload must be a JSON object", file=sys.stderr)
+        return 2
+    with kbc.connect_closing() as conn:
+        ok, detail = kb.request_sendback(conn, tid, payload=payload)
+    if not ok:
+        print(f"cannot send back {tid}: {detail}", file=sys.stderr)
+        return 1
+    print(f"Sent back {tid}: {detail}")
+    return 0
+
+
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason, text_error = kvi.resolve_text(args, "request-changes", words_attr="reason")
@@ -5047,6 +5068,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "requeue": _cmd_requeue, "workspace": _cmd_workspace, "reopen": _cmd_reopen,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+    "sendback": _cmd_sendback,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "triage-resolve": _cmd_triage_resolve,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch, "admit": _cmd_admit,

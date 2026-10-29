@@ -10482,6 +10482,87 @@ class ExternalCloseError(ValueError):
         )
 
 
+# Event kinds that take a card OUT of review (or end the review cycle). An ``assigned`` event while the latest
+# review cycle is open (after its ``review_requested``, before an exit, or after a resume back INTO review) is a
+# reviewer swap.
+# ``descendant_invalidated``: a reopened parent demotes the card to todo (Prism f696ae12d330).
+# ``gave_up``: the failure breaker blocks the card, untyped path without a ``blocked`` event (f696ae12d330).
+_REVIEW_EXIT_KINDS = ("dependency_wait", "changes_requested", "sendback", "blocked", "completed", "unblocked",
+                      "reopened", "requeued", "archived", "triage_resolved", "descendant_invalidated", "gave_up")
+# Of those, the kinds that can also put the card BACK in review, and the payload key naming the destination:
+# ``unblocked`` / ``promoted`` with ``status: review`` (a parked or dependency-held review card resuming its review
+# phase; Prism 2a08733c4d2a); ``reopened`` with ``to_status: review`` (``reopen_task(to_status="review")``, no new
+# ``review_requested``; Prism 3ad3e981f866).
+_REVIEW_RESUME_KINDS = {"unblocked": "status", "promoted": "status", "reopened": "to_status"}
+
+
+def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
+    """``(swaps, last_assignment_in_review)`` for the latest review cycle, from the event ORDER (not a payload
+    field, so a reassignment written by any version counts; Prism 1953ce5049b5).
+
+    ``swaps``: assignees of ``assigned`` events made while the card was in review, oldest first. A review phase
+    resumed by ``unblocked``/``promoted`` with ``status: review`` or ``reopened`` with ``to_status: review`` counts
+    as in review again (2a08733c4d2a, 3ad3e981f866).
+    ``last_assignment_in_review``: False when the newest ``assigned`` event of the cycle was made while the card
+    was OUT of review -- an operator's explicit choice (4509b37e638c); True otherwise (none, or made in review).
+    ``(None, True)`` when the card was never reviewed."""
+    rr = conn.execute(
+        "SELECT max(id) FROM task_events WHERE task_id = ? AND kind = 'review_requested'", (task_id,),
+    ).fetchone()[0]
+    if rr is None:
+        return None, True
+    kinds = tuple(dict.fromkeys(("assigned", *_REVIEW_EXIT_KINDS, *_REVIEW_RESUME_KINDS)))
+    marks = ",".join("?" for _ in kinds)
+    swaps: list = []
+    in_review = True
+    last_in_review = True
+    for row in conn.execute(
+        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? AND kind IN ({marks}) ORDER BY id",
+        (task_id, rr, *kinds),
+    ):
+        kind = row["kind"]
+        if kind == "assigned":
+            last_in_review = in_review
+            a = _json_dict(row["payload"]).get("assignee")
+            if in_review and _nonblank_str(a):
+                swaps.append(a)
+            continue
+        resume_key = _REVIEW_RESUME_KINDS.get(kind)
+        if resume_key and _json_dict(row["payload"]).get(resume_key) == "review":
+            in_review = True
+        elif kind in _REVIEW_EXIT_KINDS:
+            in_review = False
+    return swaps, last_in_review
+
+
+def _review_swaps(conn: sqlite3.Connection, task_id: str) -> list:
+    """Assignees of the ``assigned`` events made while the latest review cycle was open, oldest first
+    (:func:`_review_cycle_scan`)."""
+    return _review_cycle_scan(conn, task_id)[0] or []
+
+
+def landing_policy_knob(name: str) -> Optional[str]:
+    """One knob of hermes-home ``config/landing-policy.json`` (Forge L0 kill switches), or None. Missing file /
+    key / unreadable = None (off). ``KANBAN_LANDING_POLICY`` overrides the path (tests); inside pytest with no
+    override it reads nothing, so a dev box's live policy never leaks into the suite."""
+    path = os.environ.get("KANBAN_LANDING_POLICY") or ""
+    if not path:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None
+        try:
+            from hermes_constants import get_default_hermes_root
+            path = str(get_default_hermes_root() / "config" / "landing-policy.json")
+        except Exception:  # noqa: BLE001 -- off
+            return None
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    v = cfg.get(name) if isinstance(cfg, dict) else None
+    return v if isinstance(v, str) else None
+
+
 def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
     """Forge L0 section 2.3 (a), card PRE t_7ff229a7: run hermes-home ``scripts/lib/landable.py check`` on each
     of the card's OWN open fleet PRs before the open-PR route, so the worker hears what fleet-merge would refuse at
@@ -10650,6 +10731,9 @@ def _enforce_branch_base(
         payload = {"failures": failures}
         if untied:
             payload["survivor_merged_untied"] = untied
+        # Forge L0 §2.4 "Also changed" (SB-P): the stale-base advisory under `sendback: on` is OFF by the
+        # operator's round-4 cut rule (t_cb6e1433, Prism 16462e5a9800): the guard always takes the strict path.
+        # The own-fleet-PR exception goes to FLIP-SB (t_5820b99b).
         with write_txn(conn):
             _append_event(conn, task.id, "completion_blocked_stale_base", payload)
         raise
@@ -14110,10 +14194,17 @@ def _latest_review_provenance(conn: sqlite3.Connection, task_id: str):
     "who reviews this card" (every review cycle records the resolved reviewer,
     explicit or inherited). ``None`` = never reviewed, or that cycle resolved
     no reviewer (unconfigured board); ``False`` = the event exists but its
-    reviewer is missing/blank/malformed."""
+    reviewer is missing/blank/malformed.
+
+    An operator reassignment made while that review cycle was still open (see
+    :func:`_review_swaps`) is the reviewer of record instead (SB-K key
+    766baef3760b): the live assignee and the recorded reviewer must not diverge."""
     event = _latest_event(conn, task_id, "review_requested")
     if event is None:
         return None
+    swaps = _review_swaps(conn, task_id)
+    if swaps:
+        return swaps[-1]
     payload = _json_dict(_row_get(event, "payload"))
     if "reviewer" not in payload:
         return False
@@ -14725,6 +14816,20 @@ def _sendback_payload_error(payload: Any) -> Optional[str]:
     return None
 
 
+def _review_cycle_reviewers(conn: sqlite3.Connection, task_id: str) -> set:
+    """Every reviewer of the latest review cycle: the newest ``review_requested`` reviewer plus each reviewer swap
+    made while that cycle was open (:func:`_review_swaps`). A reassignment after the card left review is an
+    operator's explicit choice and is not in the set (d3eaed71c036)."""
+    rr = _latest_event(conn, task_id, "review_requested")
+    if rr is None:
+        return set()
+    out = set(_review_swaps(conn, task_id))
+    rv = _json_dict(_row_get(rr, "payload")).get("reviewer")
+    if _nonblank_str(rv):
+        out.add(rv)
+    return out
+
+
 def _review_handoff_implementer(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """The implementer recorded by the latest ``review_requested``, or ``None``."""
     requested = _latest_event(conn, task_id, "review_requested")
@@ -14796,11 +14901,19 @@ def request_sendback(
         if status in ("ready", "todo"):
             # A card demoted from review (reopened parent) still names the
             # reviewer: restore the implementer as the review branch does.
+            # Only then (SB-K key d3eaed71c036): any other assignee is an
+            # operator's explicit choice (a reassign after a lane outage) and
+            # stands.
+            # Read at action time, inside this txn: restore only when the current assignee is a reviewer of the
+            # cycle AND no assignment was made after the card left review (4509b37e638c): an operator who moved
+            # the demoted card -- even to a former reviewer -- made an explicit choice, and a sendback never
+            # overwrites an assignment it did not set.
             implementer = _review_handoff_implementer(conn, task_id)
             extra: dict = {}
             if implementer is not None:
                 extra["implementer"] = implementer
-                if row["assignee"] != implementer:
+                if (row["assignee"] != implementer and _review_cycle_scan(conn, task_id)[1]
+                        and row["assignee"] in _review_cycle_reviewers(conn, task_id)):
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = ? WHERE id = ? AND status = ?",
                         (implementer, task_id, status),
