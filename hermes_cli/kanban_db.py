@@ -7045,11 +7045,17 @@ def _assignee_flagship_reason(
         return None
 
     def _authorized() -> bool:
-        return conn.execute(
-            "SELECT 1 FROM task_comments WHERE task_id = ? "
-            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
-            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
-        ).fetchone() is not None
+        # Prefix test in Python, as _validate_route does: the marker is prose
+        # (any case), and SQL LIKE on a comment body is the #1921 shape.
+        rows = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)
+        ).fetchall()
+        return any(
+            (r["body"] or "").lstrip().casefold().startswith(
+                FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+            )
+            for r in rows
+        )
 
     try:
         allowed = validate_assignee_route(
