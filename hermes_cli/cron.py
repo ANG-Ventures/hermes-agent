@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import math
 import re
 import sys
 from datetime import timezone
@@ -383,7 +384,9 @@ def _abandon_record_wait_secs() -> float:
         budget = float(_resolve_hook_callback_timeout())
     except Exception:
         budget = _HOOK_CALLBACK_TIMEOUT_SECS
-    if budget <= 0:
+    # Non-finite too (Prism f094fa505f02): ``.nan`` passes the resolver's range checks, and
+    # ``Thread.join(timeout=nan)`` raises in the handler before ``os._exit`` runs.
+    if not math.isfinite(budget) or budget <= 0:
         budget = _HOOK_CALLBACK_TIMEOUT_SECS
     return budget + _ABANDON_RECORD_MARGIN_SECS
 
