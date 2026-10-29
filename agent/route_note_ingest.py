@@ -39,17 +39,22 @@ def relabel_route_note_text(text: str) -> str:
 
 
 def relabel_route_note_content(content: Any) -> Any:
-    """``content`` (a string, or a part list whose text parts are relabelled) with every
-    ``[Route note:`` restated as quoted. Anything else, or content with nothing to relabel, is
-    returned as the same object."""
+    """``content`` (a string, or a part list whose text parts and bare string parts are
+    relabelled) with every ``[Route note:`` restated as quoted. Anything else, or content with
+    nothing to relabel, is returned as the same object."""
     if isinstance(content, str):
         return relabel_route_note_text(content)
     if not isinstance(content, list):
         return content
     out, changed = [], False
     for part in content:
-        text = part.get("text") if isinstance(part, dict) else None
-        if isinstance(text, str) and (new := relabel_route_note_text(text)) != text:
-            part, changed = dict(part, text=new), True
-        out.append(part)
+        if isinstance(part, str):  # the Anthropic and Responses converters send bare strings as text blocks
+            new_part = relabel_route_note_text(part)
+        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+            new_text = relabel_route_note_text(part["text"])
+            new_part = part if new_text == part["text"] else dict(part, text=new_text)
+        else:
+            new_part = part
+        changed = changed or new_part != part
+        out.append(new_part)
     return out if changed else content

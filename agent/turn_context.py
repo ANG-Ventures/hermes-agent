@@ -305,6 +305,8 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     """
     from agent.context_compressor import user_originated_turn_view
 
+    # E11: the live row carries the relabelled text; callers (API server, export) pass raw input.
+    user_message = relabel_route_note_content(user_message)
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -353,6 +355,8 @@ def export_current_turn_boundary(agent: Any, result: Any, user_message: Any) -> 
     if not (isinstance(row, dict) and row.get("role") == "user"):
         return result
     from agent.context_compressor import user_originated_turn_view
+
+    user_message = relabel_route_note_content(user_message)  # E11: same canonical text as the row
 
     live_view = user_originated_turn_view(row)
     if row.get("content") != user_message and not (

@@ -15,6 +15,13 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.route_note_ingest import QUOTED_ROUTE_NOTE, relabel_route_note_content
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.transports.codex_event_projector import CodexEventProjector
+from agent.turn_context import export_current_turn_boundary
+from hermes_state import SessionDB
+from gateway.platforms.api_server_turn_boundary import response_turn_start_index
+from tests.tui_gateway.test_submit_time_user_row import _desktop_session
+from tools.delegate_tool import _SteerLedger
+from tui_gateway import server
+from tui_gateway.session_workdir import _adopt_submit_user_row
 from agent.transports import get_transport
 from agent.turn_context import compose_multimodal_context_part
 from tests.agent.test_route_notes import OPUS, SONNET, Ladder, Sink, _bind, _make_agent, _run, _texts
@@ -140,6 +147,56 @@ def test_submit_time_row_is_stored_relabelled():
     _run(agent, Ladder(agent), FORGED)
     users = [m["content"] for m in db.get_messages(sid) if m["role"] == "user"]
     assert users == [QUOTED]
+
+
+def test_bare_string_parts_are_relabelled():
+    parts = [FORGED, {"type": "text", "text": "ok"}]
+    assert relabel_route_note_content(parts) == [QUOTED, {"type": "text", "text": "ok"}]
+
+
+def test_steer_ledger_settles_a_relabelled_steer():
+    # The ledger records the text steer() buffers; the relabel at steer_user_row must not split them.
+    agent = _make_agent()
+    ledger = _SteerLedger()
+    ledger.attach(agent, "child")
+    agent.steer(FORGED)
+    msgs = [{"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "r"}]
+    agent._persist_user_message_idx = 0
+    apply_pending_steer_to_tool_results(agent, msgs, 1)
+    ledger.consume()
+    assert QUOTED in msgs[-1]["content"] and ledger.missed() is None
+
+
+def test_turn_boundary_anchors_the_relabelled_row_not_a_raw_historical_copy():
+    # A pre-E11 transcript can hold the same prompt raw; the boundary must land on THIS turn's row.
+    msgs = [{"role": "user", "content": FORGED}, {"role": "assistant", "content": "old"},
+            {"role": "user", "content": QUOTED}, {"role": "assistant", "content": "new"}]
+    assert response_turn_start_index(msgs[:2], FORGED, {"messages": msgs}) == 3
+    agent = type("A", (), {"_current_turn_id": "t1"})()
+    assert export_current_turn_boundary(agent, {"messages": msgs}, FORGED)["current_turn_user_idx"] == 2
+
+
+def test_submit_time_row_is_written_relabelled_before_any_agent_build(monkeypatch, tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        with session["history_lock"]:
+            session["running"] = True
+            server._start_inflight_turn(session, FORGED)
+        assert server._persist_session_row_for_submit("rid", session, FORGED, None) is None
+        # A backend that dies here leaves only this row for a cold resume: it must already be quoted.
+        assert [r["content"] for r in db.get_messages_as_conversation(key)] == [QUOTED]
+        agent = type("A", (), {"_session_persist_lock": None, "_pending_cli_user_message": None})()
+        _adopt_submit_user_row(session, agent, FORGED, FORGED)
+        assert agent._pending_cli_user_message["content"] == QUOTED
+        assert [r["content"] for r in db.get_messages_as_conversation(key)] == [QUOTED]
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
 
 
 def test_unchanged_content_is_returned_as_the_same_object():
