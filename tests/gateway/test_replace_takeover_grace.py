@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+from gateway import run_bootstrap
+
 from gateway.restart import (
     CRON_DRAIN_CLEANUP_RESERVE_S,
     REPLACE_TAKEOVER_GRACE_FLOOR_S,
@@ -74,7 +76,7 @@ async def test_replace_waits_past_ten_seconds_before_sigkill(monkeypatch, tmp_pa
     monkeypatch.setattr("gateway.status.reap_gateway_children",
                         lambda children, *, parent_pid, timeout=5.0: 0)
     monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
-    monkeypatch.setattr("gateway.status.release_all_scoped_locks", lambda **kwargs: 0)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_all_scoped_locks", lambda **kwargs: 0)
     monkeypatch.setattr(
         "gateway.status._read_pid_record",
         lambda path=None: {
@@ -143,7 +145,7 @@ def _install_replace_stubs(monkeypatch, tmp_path, *, pid_record, old_exits_at_s)
     monkeypatch.setattr("gateway.status.reap_gateway_children",
                         lambda children, *, parent_pid, timeout=5.0: 0)
     monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
-    monkeypatch.setattr("gateway.status.release_all_scoped_locks", lambda **kwargs: 0)
+    monkeypatch.setattr("gateway.status_scoped_locks.release_all_scoped_locks", lambda **kwargs: 0)
     monkeypatch.setattr("gateway.status._read_pid_record", lambda path=None: pid_record)
 
     def _terminate(pid, force=False, **kwargs):
@@ -208,7 +210,7 @@ async def test_lowered_config_cannot_shorten_the_old_generations_lease(monkeypat
         "drain it snapshotted at its own start"
     )
     assert old_alive["v"] is False
-    assert run_mod._replace_takeover_grace_s(42) >= 180.0
+    assert run_bootstrap._replace_takeover_grace_s(42) >= 180.0
 
 
 @pytest.mark.asyncio
@@ -245,12 +247,12 @@ async def test_config_loader_failure_cannot_collapse_the_kill_deadline(monkeypat
     from gateway.restart import REPLACE_TAKEOVER_GRACE_UNKNOWN_LEASE_FLOOR_S
     monkeypatch.setattr("gateway.status._read_pid_record",
                         lambda path=None: _pid_record_with_budget(tmp_path, None))
-    assert run_mod._replace_takeover_grace_s(42) >= REPLACE_TAKEOVER_GRACE_UNKNOWN_LEASE_FLOOR_S
+    assert run_bootstrap._replace_takeover_grace_s(42) >= REPLACE_TAKEOVER_GRACE_UNKNOWN_LEASE_FLOOR_S
 
     # Unreadable config while the old gateway DID publish a long lease: honour the old lease.
     monkeypatch.setattr("gateway.status._read_pid_record",
                         lambda path=None: _pid_record_with_budget(tmp_path, 300.0))
-    assert run_mod._replace_takeover_grace_s(42) >= 300.0
+    assert run_bootstrap._replace_takeover_grace_s(42) >= 300.0
 
 
 # --- Unknown lease: a guessed floor is not destructive authority --------------------------------
@@ -286,7 +288,7 @@ async def test_unknown_legacy_lease_never_force_kills_at_the_floor(monkeypatch, 
     )
     cleanup = []
     monkeypatch.setattr("gateway.status.remove_pid_file", lambda: cleanup.append("remove_pid_file"))
-    monkeypatch.setattr("gateway.status.release_all_scoped_locks",
+    monkeypatch.setattr("gateway.status_scoped_locks.release_all_scoped_locks",
                         lambda **kwargs: cleanup.append("release_all_scoped_locks") or 0)
 
     ok = await run_mod._start_gateway_replace_existing_instance(42, replace=True)
