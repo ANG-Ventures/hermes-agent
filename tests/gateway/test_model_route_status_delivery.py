@@ -139,6 +139,39 @@ def test_failover_mid_turn_late_binds_adapter_and_sends_durable_message():
     assert stale.update_calls == []
 
 
+def test_delivered_route_change_is_logged_with_chat(caplog):
+    """t_f1f73872: a delivered 🔄 line leaves its own gateway.log record, so a
+    missing line in gateway.log means not delivered (dropped/muted log their own)."""
+    adapter = _RecordingAdapter()
+
+    async def scenario():
+        runner = _make_turn_runner(adapter, loop=asyncio.get_running_loop())
+        await asyncio.to_thread(runner._status_callback_sync, "lifecycle", ROUTE_MESSAGE)
+        await _wait_until(lambda: "route-change status delivered" in caplog.text)
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        asyncio.run(scenario())
+
+    assert (f"route-change status delivered: platform=telegram chat=571820863 "
+            f"message={ROUTE_MESSAGE}") in caplog.text
+    assert "route-change status dropped" not in caplog.text
+
+
+def test_failed_route_change_is_not_logged_as_delivered(caplog):
+    adapter = _RecordingAdapter(
+        result=SimpleNamespace(success=False, message_id=None, error="transport unavailable"))
+
+    async def scenario():
+        runner = _make_turn_runner(adapter, loop=asyncio.get_running_loop())
+        await asyncio.to_thread(runner._status_callback_sync, "lifecycle", ROUTE_MESSAGE)
+        await _wait_until(lambda: "adapter_send_failed" in caplog.text)
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        asyncio.run(scenario())
+
+    assert "route-change status delivered" not in caplog.text
+
+
 def test_recovery_producer_message_reaches_durable_delivery_path():
     adapter = _RecordingAdapter()
 

@@ -17,6 +17,8 @@ import datetime as dt
 import time
 import types
 
+import pytest
+
 import anthropic  # noqa: F401  (first import outside the home I/O guard, as in the sibling tests)
 
 from agent import fallback_events as fbe
@@ -210,6 +212,39 @@ def test_a_new_turn_does_not_merge_with_the_last(_home, monkeypatch):
     _hop(a, _err(_busy_headers("25/26")))
     _settle(a)
     assert len(_lines(a)) == 2, _lines(a)
+
+
+@pytest.mark.parametrize("chain", [
+    [("claude-alr", OPUS)],                                             # one hop
+    [("claude-btpr", FABLE), ("claude-bpr", FABLE), ("claude-alr", OPUS)],  # live chain
+], ids=["one-hop", "three-hops"])
+def test_pinned_model_capped_on_all_lanes_announces_every_turn(_home, monkeypatch, chain):
+    """t_f1f73872: a session whose pinned Fable is capped on every lane walks the
+    SAME chain to alr/opus on consecutive turns, so the route transitions repeat
+    byte-for-byte. A dedupe that outlived the turn would swallow every banner
+    after the first (it can only bite the one-hop walk: on a longer chain the
+    next turn's first hop differs from the last one announced). Each turn posts
+    its own line (live 2026-10-29 02:20 / 02:25 / 02:54, session
+    20261023_104818_32a4431a, all three posted to Discord)."""
+    from agent.turn_context import _bind_turn_identity
+
+    a = _agent(monkeypatch, chain)
+    per_turn = []
+    for turn in range(3):
+        if turn:
+            # Next turn starts back on the pin (sticky_resume -> primary).
+            a.provider, a.model = "claude-dtlr", FABLE
+            a._fallback_index, a._fallback_activated = 0, False
+        _bind_turn_identity(a, None, None, None, None, None)
+        before = len(_lines(a))
+        for _ in chain:
+            _hop(a, _err(_busy_headers("25/26")))
+        _settle(a)
+        per_turn.append(_lines(a)[before:])
+    assert [len(p) for p in per_turn] == [1, 1, 1], per_turn
+    for [line] in per_turn:
+        assert line.startswith("🔄 Model fallback (Fable weekly cap): "), line
+        assert "claude-dtlr/claude-fable-5-1" in line and "claude-alr/claude-opus-5-5" in line, line
 
 
 def test_first_stream_byte_and_turn_end_flush(monkeypatch):
