@@ -27,11 +27,14 @@ anything but ``on`` refuses every mint and every granted write.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 import sqlite3
 import time
 from typing import Iterable, Optional
+
+logger = logging.getLogger(__name__)
 
 #: Verbs a grant may carry. ``verdict``: a review note / ``prism-verdict:`` line /
 #: non-verdict coverage record; ``approve``: an APPROVE coverage record;
@@ -287,7 +290,12 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
         from hermes_cli import kanban_journal
 
         board = _conn_board_slug(conn)
-        for card in cards:
+        if board is None and cards:
+            # No registered board owns this file (a snapshot, a forensics copy): journaling under the
+            # ambient board would revoke ITS live grant on the next restore (Prism 77b7e56c0d2c).
+            logger.warning("sign grant %s revoked on an unregistered board connection; "
+                           "revocation not journaled", grant_id)
+        for card in (cards if board is not None else ()):
             kanban_journal.append(board, card, "sign_grant_revoked",
                                   {"grant_id": grant_id, "revoked_at": now})
     except Exception:  # pragma: no cover - the journal is a net, never a gate
@@ -296,7 +304,7 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
 
 
 def _conn_board_slug(conn: sqlite3.Connection) -> Optional[str]:
-    """The board whose database file ``conn`` is open on; the ambient board when none matches."""
+    """The board whose database file ``conn`` is open on; None when no registered board matches."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_board_registry import board_db_layout
 
@@ -305,8 +313,8 @@ def _conn_board_slug(conn: sqlite3.Connection) -> Optional[str]:
             if kb._conn_is_board(conn, slug):
                 return slug
     except Exception:
-        pass
-    return kb._journal_board_slug()
+        return None
+    return None
 
 
 def _revoke_rows(conn: sqlite3.Connection, where: str, args: list, now: int) -> list:

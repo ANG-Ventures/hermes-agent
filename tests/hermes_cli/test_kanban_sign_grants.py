@@ -638,6 +638,37 @@ def test_a_revoke_on_another_board_is_journaled_to_that_board(board, tmp_path, m
     assert len(rows) == 1 and rows[0][0] is not None, rows
 
 
+def test_a_revoke_on_an_unregistered_copy_never_journals_into_the_ambient_board(board, tmp_path, monkeypatch):
+    """Prism 77b7e56c0d2c: a revoke on a connection no registered board matches (a snapshot or forensics
+    copy) writes no journal row, so restoring the ambient board and replaying leaves its grant live."""
+    import shutil
+    import time as _time
+
+    from hermes_cli import kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    _home, a, _b = board
+    g = _mint(a)
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(kb.kanban_db_path()), str(snap))
+    copy = tmp_path / "forensics-copy.db"
+    shutil.copyfile(str(kb.kanban_db_path()), str(copy))
+    since = _time.time() - 0.001
+    cc = sqlite3.connect(str(copy), isolation_level=None)
+    try:
+        assert ksg.revoke(cc, g["grant_id"]) == 1
+        assert cc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?",
+                          (g["grant_id"],)).fetchone()[0] is not None   # the UPDATE still happens
+    finally:
+        cc.close()
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    rc.close()
+    assert rows == [(None,)], rows
+
+
 def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
     import shutil
     import time as _time
