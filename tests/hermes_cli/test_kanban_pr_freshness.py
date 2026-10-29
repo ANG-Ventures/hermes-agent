@@ -439,3 +439,106 @@ def test_cli_draft_ok_flag_refused_then_audited(board, monkeypatch):
         assert _status(conn, tid) == "done"
         assert _events(conn, tid, "completion_draft_override") == [
             {"prs": ["o/r#5"], "reason": "CI vehicle"}]
+
+
+# --- Forge L0 EV-A (t_d343020c): spawn_arm removed while event_land is on --------
+
+
+def _landing_policy(home: Path, event_land, disabled: bool = False) -> None:
+    (home / "config").mkdir(parents=True, exist_ok=True)
+    cfg = {"tiers": "off", "ladder": "v3"}
+    if event_land is not None:
+        cfg["event_land"] = event_land
+    (home / "config" / "landing-policy.json").write_text(__import__("json").dumps(cfg))
+    if disabled:
+        (home / "state").mkdir(parents=True, exist_ok=True)
+        (home / "state" / "event-land.disabled").write_text("")
+
+
+def test_event_land_switch_reads_like_land_evaluator(tmp_path):
+    """On only for ``"event_land": true`` with no kill file; missing/false/truthy-non-true/unreadable = off."""
+    assert fr.event_land_enabled(tmp_path) is False                       # no config at all
+    for value, want in ((True, True), (False, False), ("true", False), (1, False), (None, False)):
+        _landing_policy(tmp_path, value)
+        assert fr.event_land_enabled(tmp_path) is want, value
+    _landing_policy(tmp_path, True, disabled=True)
+    assert fr.event_land_enabled(tmp_path) is False
+    (tmp_path / "state" / "event-land.disabled").unlink()
+    (tmp_path / "config" / "landing-policy.json").write_text("{not json")
+    assert fr.event_land_enabled(tmp_path) is False
+
+
+@pytest.mark.parametrize("checks,profile,waiting", [
+    (("success",), "v1", "waiting:prism"),
+    (("failure",), "v1", "waiting:fast-tier"),
+    (("failure",), "v2", "waiting:fast-tier"),   # v2 used to arm a red head; under event_land it waits
+])
+def test_spawn_arm_removed(monkeypatch, tmp_path, checks, profile, waiting):
+    """event_land on: the handoff never asks the lander. It records waiting:<what> and calls evaluate (E6)."""
+    _profile(monkeypatch, tmp_path, profile, [REPO])
+    armed, evaluated = [], []
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(checks=checks), event_land=True,
+                   arm=lambda *a: armed.append(a) or "/arm", evaluate=lambda *a: evaluated.append(a) or "/ev")
+    entry = rep["prs"]["o/r#5"]
+    assert armed == []
+    assert evaluated == [(REPO, 5, HEAD, "t_x")]
+    assert entry["waiting"] == waiting
+    assert "evaluate E6 spawned (/ev)" in entry["automerge"]
+
+
+def test_spawn_arm_removed_stale_head_waits_on_fast_tier():
+    gh, armed, evaluated = FakeGh(behind=40, ms="behind"), [], []
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, event_land=True,
+                   arm=lambda *a: armed.append(a), evaluate=lambda *a: evaluated.append(a))
+    assert len(gh.updates()) == 1 and armed == [] and evaluated == []
+    assert rep["prs"]["o/r#5"]["waiting"] == "waiting:fast-tier"
+
+
+def test_spawn_evaluate_argv(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    (home / "scripts" / "lib").mkdir(parents=True)
+    (home / "scripts" / "lib" / "land_evaluator.py").write_text("")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    seen = []
+    monkeypatch.setattr(fr.subprocess, "Popen", lambda argv, **kw: seen.append(argv))
+    assert fr.spawn_evaluate(REPO, 5, HEAD, "t_x")
+    argv = seen[0]
+    assert argv[1].endswith("scripts/lib/land_evaluator.py")
+    assert argv[2:] == ["evaluate", "--repo", REPO, "--pr", "5", "--source", "event", "--event", "E6",
+                        "--head", HEAD]
+    assert not any("fleet-merge" in a for a in argv)
+
+
+def test_e2e_spawn_arm_removed_records_waiting(board, monkeypatch):
+    """Through complete_task with the live config shape: no fleet-merge spawn, waiting:<what> on the card."""
+    _landing_policy(board, True)
+    armed, evaluated = [], []
+    _use_gh(monkeypatch, FakeGh(), armed)
+    monkeypatch.setattr(fr, "spawn_evaluate", lambda *a: evaluated.append(a) or "/tmp/ev")
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}",
+                                metadata={"pr_url": PR_URL}, expected_run_id=run)
+        meta = kb.latest_run(conn, tid).metadata
+    assert armed == []
+    assert evaluated == [(REPO, 5, HEAD, tid)]
+    assert meta["handoff_freshness"]["prs"]["o/r#5"]["waiting"] == "waiting:prism"
+
+
+@pytest.mark.parametrize("event_land,disabled", [(None, False), (False, False), (True, True)])
+def test_event_land_off(board, monkeypatch, event_land, disabled):
+    """I1: missing/false event_land, or state/event-land.disabled, = today: spawn_arm arms, no evaluate, no waiting."""
+    _landing_policy(board, event_land, disabled)
+    armed, evaluated = [], []
+    _use_gh(monkeypatch, FakeGh(), armed)
+    monkeypatch.setattr(fr, "spawn_evaluate", lambda *a: evaluated.append(a) or "/tmp/ev")
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert kb.complete_task(conn, tid, summary=f"done {PR_URL}",
+                                metadata={"pr_url": PR_URL}, expected_run_id=run)
+        meta = kb.latest_run(conn, tid).metadata
+    assert armed == [(REPO, 5, HEAD, tid)]
+    assert evaluated == []
+    entry = meta["handoff_freshness"]["prs"]["o/r#5"]
+    assert "waiting" not in entry and entry["automerge"] == "fleet-merge spawned (/tmp/log)"

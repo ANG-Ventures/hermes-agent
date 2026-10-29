@@ -34,6 +34,10 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
     for the repo (:func:`merge_gate_profile`), a red/pending/no-CI head is armed
     too, its CI state REPORTED in the fleet-merge ``--reason`` (CI gates deploy,
     not merge). Absent/unreadable/unknown profile = v1 = green only.
+    Forge L0 EV-A (t_d343020c): while ``event_land`` is on (hermes-home
+    ``config/landing-policy.json``, kill file ``state/event-land.disabled``) (c)
+    never arms. It records ``waiting:<fast-tier|prism>`` and spawns
+    ``land_evaluator.py evaluate --event E6``; off = (c) as above (I1).
 
 Fail-OPEN everywhere except (a): a GitHub lookup error, an update-branch
 failure or a missing fleet-merge.sh is recorded and the handoff proceeds —
@@ -269,6 +273,52 @@ def spawn_arm(repo: str, number: int, sha: str, task_id: str, ci_report: str = "
     return str(log_path)
 
 
+def event_land_enabled(root: Optional[Path] = None) -> bool:
+    """Forge L0 EV kill switch, read exactly as hermes-home ``scripts/lib/land_evaluator.py enabled()`` reads it.
+
+    True only when ``<hermes root>/config/landing-policy.json`` has ``"event_land": true`` AND
+    ``<root>/state/event-land.disabled`` is absent. Missing/unreadable config = off (I1): off, the
+    handoff keeps arming through :func:`spawn_arm` exactly as before EV-A (t_d343020c)."""
+    try:
+        if root is None:
+            from hermes_constants import get_default_hermes_root
+            root = get_default_hermes_root()
+        with open(Path(root) / "config" / "landing-policy.json", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cfg, dict) or cfg.get("event_land") is not True:
+        return False
+    return not (Path(root) / "state" / "event-land.disabled").exists()
+
+
+def spawn_evaluate(repo: str, number: int, sha: str, task_id: str) -> Optional[str]:
+    """E6 (card handoff with an open PR): ``land_evaluator.py evaluate --source event --event E6``, detached.
+
+    Replaces :func:`spawn_arm` while event_land is on (Forge L0 EV-A, spec 2.2.2 E6): the evaluator,
+    not the handoff, decides READY and is the only one that submits a land request. Returns the log
+    path, or None when the evaluator is missing or the spawn failed (fail-open: E1-E3 and the sweep
+    re-evaluate the PR)."""
+    from hermes_constants import get_default_hermes_root
+    root = get_default_hermes_root()
+    script = root / "scripts" / "lib" / "land_evaluator.py"
+    if not script.is_file():
+        return None
+    log_dir = root / "logs" / "handoff-automerge"
+    log_path = log_dir / f"{task_id}-{repo.replace('/', '_')}-{number}.log"
+    argv = [sys.executable or "python3", str(script), "evaluate", "--repo", repo, "--pr", str(number),
+            "--source", "event", "--event", "E6", "--head", sha]
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as fh:
+            subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        _log.warning("handoff freshness: land_evaluator spawn failed: %s", exc)
+        return None
+    return str(log_path)
+
+
 ArmFn = Callable[..., Optional[str]]   # (repo, number, sha, task_id[, ci_report]) -> log path
 ReadyFn = Callable[[str, int], Optional[int]]   # (repo, number) -> ace_gate.py rc, None = not run
 
@@ -340,7 +390,8 @@ def _default_ready() -> Optional[ReadyFn]:
 def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
           arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
           armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
-          flipped: Optional[dict] = None) -> dict:
+          flipped: Optional[dict] = None, evaluate: Optional[ArmFn] = None,
+          event_land: Optional[bool] = None) -> dict:
     """Apply (a)/(b)/(c) to OPEN PR ``refs``. Raises :class:`DraftPrError`.
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
@@ -356,6 +407,12 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
 
     ``flipped``: persisted flip records ``{"o/r#n": {"head": sha, "at": epoch}}`` from earlier
     handoffs of this card (t_c1ee61ae); a recorded PR is armed only on post-flip CI evidence.
+
+    Forge L0 EV-A (t_d343020c): while :func:`event_land_enabled` (``event_land`` None = read it) the
+    handoff never arms. Where (c) would have called ``arm``, it records ``entry["waiting"]`` =
+    ``waiting:fast-tier`` (CI not green / not started) or ``waiting:prism`` (CI green; the evaluator
+    reads tier, Prism and review) and calls ``evaluate`` (default :func:`spawn_evaluate`, E6).
+    Off: (c) is unchanged, ``spawn_arm`` and all.
     """
     report: dict = {"prs": {}, "checked_at": int(time.time())}
     # Never update-branch or arm a third-party PR (t_06dccfe3): the caller
@@ -369,6 +426,8 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
         if gh is None:
             return report
     arm = arm or spawn_arm
+    evaluate = evaluate or spawn_evaluate
+    ev_on = event_land_enabled() if event_land is None else event_land
     armable_keys = None if armable is None else {str(k).lower() for k in armable}
     flip_records = {str(k).lower(): v for k, v in (flipped or {}).items() if isinstance(v, dict)}
 
@@ -446,6 +505,8 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             upd = gh("-X", "PUT", f"repos/{ref.repo}/pulls/{ref.number}/update-branch",
                      "-f", f"expected_head_sha={head}")
             entry["update_branch"] = "requested" if upd is not None else "failed (fail-open)"
+            if ev_on and allow_arm:
+                entry["waiting"] = "waiting:fast-tier"   # EV-A: E1 on the new head's CI evaluates it
             # The new head has fresh CI; arming is fleet-merge's job once it is green.
             continue
         if entry.get("draft_flip"):
@@ -454,6 +515,8 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             # the ready event; the lander arms it from there.
             if allow_arm:
                 entry["automerge"] = "not armed: flipped ready at handback, CI starts now"
+                if ev_on:
+                    entry["waiting"] = "waiting:fast-tier"   # EV-A: E1 on the ready CI evaluates it
         elif allow_arm and armable_keys is not None and key.lower() not in armable_keys:
             entry["automerge"] = "not armed: PR only mentioned, not this card's handoff PR"
         elif allow_arm and automerge_enabled():
@@ -475,7 +538,14 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
                                           if items is not None else "not armed: check-runs unreadable")
                     continue
             ci = _ci_report(gh, ref.repo, head, items)
-            if not ci:
+            if ev_on:
+                # EV-A (spec 2.2.2 E6): the handoff records what the PR waits on and hands it to the
+                # evaluator; it never asks the lander itself (spawn_arm is off while event_land is on).
+                entry["waiting"] = "waiting:fast-tier" if ci else "waiting:prism"
+                log = evaluate(ref.repo, ref.number, head, task_id)
+                entry["automerge"] = (f"event-land: evaluate E6 spawned ({log})" if log
+                                      else "event-land: evaluate not spawned")
+            elif not ci:
                 log = arm(ref.repo, ref.number, head, task_id)
                 entry["automerge"] = f"fleet-merge spawned ({log})" if log else "not spawned"
             elif ci != "check-runs unreadable" and merge_gate_profile(ref.repo) == "v2":
