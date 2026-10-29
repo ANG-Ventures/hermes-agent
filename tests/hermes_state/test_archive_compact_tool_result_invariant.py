@@ -140,3 +140,38 @@ def test_legacy_duplicate_result_carried_unchanged_does_not_wedge_compaction(db)
     db.archive_and_compact("S", [{"role": "user", "content": "[summary]"}, _call("t1"),
                                  _result("t1", "a"), _result("t1", "a")])
     assert _active_results(db, "t1") == 2
+
+
+def test_double_carry_is_caught_for_legacy_rows_without_call_uids(db):
+    """Rows written before durable call uids carry neither ``tool_call_uids`` nor ``tool_call_uid``.
+    Two valid ``terminal:0`` occurrences must stay two occurrences, so a double carry of the later
+    result still raises instead of matching a false pre-existing excess (review on c76e70ab86)."""
+    _append(db, [{"role": "user", "content": "go"}, _call("terminal:0"), _result("terminal:0", "old"),
+                 _call("terminal:0")])
+    watermark = db.get_active_message_watermark("S")
+    _append(db, [_result("terminal:0", "new")])  # arrived during the slow summary
+    db._conn.execute("UPDATE messages SET tool_call_uids = NULL, tool_call_uid = NULL WHERE session_id = 'S'")
+    db._conn.commit()
+    assert _active_results(db, "terminal:0") == 2
+    before = _rows(db)
+
+    with pytest.raises(TranscriptInvariantError, match="terminal:0"):
+        db.archive_and_compact("S", [{"role": "user", "content": "[summary]"},
+                                     _call("terminal:0"), _result("terminal:0", "new")],
+                               watermark=watermark)
+    assert _rows(db) == before
+    assert sorted(r[0] for r in db._conn.execute(
+        "SELECT content FROM messages WHERE session_id='S' AND active=1 AND role='tool'")) == ["new", "old"]
+
+
+def test_legacy_rows_without_call_uids_still_compact_cleanly(db):
+    """The same legacy shape without the double carry commits: distinct occurrences are not an excess."""
+    _append(db, [{"role": "user", "content": "go"}, _call("terminal:0"), _result("terminal:0", "a"),
+                 _call("terminal:0"), _result("terminal:0", "b")])
+    db._conn.execute("UPDATE messages SET tool_call_uids = NULL, tool_call_uid = NULL WHERE session_id = 'S'")
+    db._conn.commit()
+
+    db.archive_and_compact("S", [{"role": "user", "content": "[summary]"},
+                                 _call("terminal:0"), _result("terminal:0", "a"),
+                                 _call("terminal:0"), _result("terminal:0", "b")])
+    assert _active_results(db, "terminal:0") == 2

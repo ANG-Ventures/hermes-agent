@@ -1177,15 +1177,25 @@ class SessionMessagesMixin:
     def _active_tool_result_excess(conn, session_id: str) -> Dict[str, int]:
         """Per raw ``tool_call_id``: ACTIVE ``role='tool'`` rows beyond one per logical call occurrence.
         A result's occurrence is its stored ``tool_call_uid``, else the uid of the NEAREST preceding active
-        assistant row naming the id (the read path's pairing, reset at a user turn), else the raw id."""
+        assistant row naming the id (the read path's pairing, reset at a user turn), else the raw id.
+        A legacy assistant row with no stored uid still names a distinct occurrence: it gets a key from
+        its row id, so two uid-less ``terminal:0`` calls never collapse into one bucket."""
+        from agent.message_sanitization import tool_call_id_variants
+
         index: Dict[str, str] = {}
         per_key: Dict[tuple, int] = {}
         for row in conn.execute(
-                "SELECT role, tool_calls, tool_call_uids, tool_call_id, tool_call_uid FROM messages "
+                "SELECT id, role, tool_calls, tool_call_uids, tool_call_id, tool_call_uid FROM messages "
                 "WHERE session_id = ? AND active = 1 ORDER BY id", (session_id,)):
             if row["role"] == "assistant" and row["tool_calls"]:
-                index_tool_call_uids(index, {"tool_calls": _parse_tool_calls(row["tool_calls"]) or (),
+                calls = _parse_tool_calls(row["tool_calls"]) or ()
+                index_tool_call_uids(index, {"tool_calls": calls,
                                              TOOL_CALL_UIDS: _tool_call_uid_map({"tool_call_uids": row["tool_call_uids"]})})
+                for pos, tc in enumerate(calls):
+                    variants = tool_call_id_variants(tc)
+                    if variants and not any(v in index for v in variants):
+                        for v in variants:
+                            index[v] = f"legacy-row:{row['id']}:{pos}"
             elif row["role"] == "user":
                 index.clear()
             elif row["role"] == "tool" and (tc_id := row["tool_call_id"]):
