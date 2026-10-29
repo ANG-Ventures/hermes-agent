@@ -7074,22 +7074,42 @@ def _assignee_flagship_reason(
 
 
 def _card_flagship_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the card already carries a ``flagship override:`` comment.
+    """True when the card carries an OPERATOR-authored ``flagship override:``.
 
     Prefix test in Python, as _validate_route does: the marker is prose (any
     case), and SQL LIKE on a comment body is the #1921 shape.
+
+    Only an operator's comment counts (Prism r7 bf4b5b6f26f8): a worker can
+    post any body under its own name via kanban_comment, so the author must be
+    an operator label (``is_operator_label``: ruling authors, operator
+    profiles, ``human:*``) or the ``operator`` fallback this module writes,
+    and the row must not come from a worker run (``run_id`` set). An
+    ``unverified:<name>`` author is an operator name the caller could not
+    prove and never counts. An override written under another (non-operator)
+    orchestrator profile no longer pre-authorizes a reassign or pin clear;
+    that verb then needs its own ``--allow-flagship``.
     """
     from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
 
     rows = conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)
+        "SELECT author, body, run_id FROM task_comments WHERE task_id = ?",
+        (task_id,),
     ).fetchall()
     return any(
         (r["body"] or "").lstrip().casefold().startswith(
             FLAGSHIP_OVERRIDE_COMMENT_PREFIX
         )
+        and r["run_id"] is None
+        and _flagship_override_author_trusted(r["author"])
         for r in rows
     )
+
+
+def _flagship_override_author_trusted(author: Optional[str]) -> bool:
+    from hermes_cli.kanban_identity import is_operator_label
+
+    a = (author or "").strip().lower()
+    return a == "operator" or is_operator_label(a)
 
 
 def clear_pin_flagship_reason(

@@ -372,8 +372,18 @@ def test_dispatch_refuses_flagship_profile_default_without_override(
     ), bodies
 
 
+@pytest.fixture
+def proven_operator(monkeypatch):
+    """The CLI caller is a PROVEN operator (Apollo's gateway tree, or the
+    operator token). Unproven, its label is ``unverified:default`` and its
+    override comment does not pre-authorize later verbs (Prism r7 bf4b5b6f26f8)."""
+    from hermes_cli import kanban_identity
+
+    monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: True)
+
+
 def test_assign_same_flagship_profile_with_reason_authorizes_legacy_card(
-    flagship_profiles,
+    flagship_profiles, proven_operator,
 ):
     """Prism 70a0613a6b24: re-assigning a legacy flagship card to its own
     profile with --allow-flagship must record the override, not drop it."""
@@ -801,3 +811,67 @@ def test_provider_without_a_findable_default_fails_closed(flagship_profiles):
         conn.execute("UPDATE tasks SET assignee = 'worker-prov' WHERE id = ?", (task_id,))
         conn.commit()
         assert task_id in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+
+
+# ---- Prism r7 bf4b5b6f26f8: only an OPERATOR-authored override authorizes ----
+# A worker can post any comment body under its own name (kanban_comment); the
+# reassign / pin-clear gates must not read that as an operator's authorization.
+
+def _plain_card() -> str:
+    with kb.connect() as conn:
+        return kb.create_task(conn, title="plain", assignee="daedalus-opus")
+
+
+@pytest.mark.parametrize("author,run_id", [
+    ("daedalus-opus", 7),          # what the kanban_comment tool records for a worker
+    ("daedalus-opus", None),       # a worker CLI comment outside its run context
+    ("unverified:default", None),  # an operator name the caller could not prove
+    ("apollo", 7),                 # an operator label written from inside a worker run
+])
+def test_worker_authored_override_comment_does_not_authorize_reassign(
+    flagship_profiles, author, run_id,
+):
+    task_id = _plain_card()
+    with kb.connect() as conn:
+        kb.add_comment(conn, task_id, author, "flagship override: self approved",
+                       run_id=run_id)
+        assert not kb._card_flagship_authorized(conn, task_id)
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            kb.reassign_task(conn, task_id, "daedalus-fable")
+        assert kb.get_task(conn, task_id).assignee == "daedalus-opus"
+    out = kc.run_slash(f"reassign {task_id} daedalus-fable")
+    assert "assignee profile default" in out, out
+
+
+@pytest.mark.parametrize("author", ["apollo", "default", "human:ace", "user", "operator"])
+def test_operator_authored_override_comment_authorizes_reassign(flagship_profiles, author):
+    task_id = _plain_card()
+    with kb.connect() as conn:
+        kb.add_comment(conn, task_id, author, "flagship override: approved")
+        assert kb._card_flagship_authorized(conn, task_id)
+    out = kc.run_slash(f"reassign {task_id} daedalus-fable")
+    assert "daedalus-fable" in out and "assignee profile default" not in out, out
+
+
+def test_own_create_with_reason_writes_an_authorizing_comment(
+    flagship_profiles, proven_operator,
+):
+    task_id = _created_id(kc.run_slash(
+        "create 'GATE' --assignee daedalus-fable --allow-flagship 'infra'"))
+    with kb.connect() as conn:
+        db_id = kb.create_task(conn, title="db", assignee="daedalus-fable",
+                               flagship_override_reason="infra")
+        assert kb._card_flagship_authorized(conn, task_id)
+        assert kb._card_flagship_authorized(conn, db_id)
+
+
+def test_unproven_operator_create_override_does_not_preauthorize_reassign(flagship_profiles):
+    """An unproven CLI caller's override is ``unverified:default``: dispatch
+    still reads the card's comment, but a later reassign/clear needs its own
+    --allow-flagship."""
+    task_id = _created_id(kc.run_slash(
+        "create 'GATE' --assignee daedalus-fable --allow-flagship 'infra'"))
+    with kb.connect() as conn:
+        authors = [c.author for c in kb.list_comments(conn, task_id)]
+        assert len(authors) == 1 and authors[0].startswith("unverified:"), authors
+        assert not kb._card_flagship_authorized(conn, task_id)
