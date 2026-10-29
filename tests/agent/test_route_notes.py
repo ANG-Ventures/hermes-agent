@@ -746,3 +746,45 @@ def test_tier_recovery_after_a_told_downgrade_is_corrected_once():
     _run(agent, ladder, "5", history)
     assert ladder.calls[-1][2] == []  # steady state: no reversed or repeated notes
     assert _known(agent).serving.speed_tier == "fast"
+
+
+# ---------------------------------------------------------------------------------------------
+# Prism 27736e64e38f: a transcript write that reports failure is not a transcript write
+# ---------------------------------------------------------------------------------------------
+
+_NOTE = "[Route note: fell back to sonnet-5 (provider overloaded).]"
+
+
+@pytest.mark.parametrize("arm", ["api_content_rowcount_0", "user_content_rowcount_0", "flush_false"])
+def test_failed_transcript_write_never_checkpoints_known_and_the_note_is_re_sent(tmp_path, arm):
+    """Step 1 must SUCCEED before step 2: a 0-row guarded UPDATE or a flush that returned False
+    left the note out of the transcript, so ``Known`` stays unadvanced (in memory and in the
+    SessionEntry) and the next successful call re-sends the note."""
+    db = _db(tmp_path)
+    agent = _make_agent(session_db=db, session_id=f"s-{arm}")
+    sink = Sink()
+    _bind(agent, sink)
+    ladder = Ladder(agent)
+    ladder.script = {OPUS: [503]}
+    text = "hi"
+    if arm == "api_content_rowcount_0":
+        fail = patch.object(db, "set_message_api_content", return_value=0)
+    elif arm == "user_content_rowcount_0":
+        text = [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        fail = patch.object(db, "set_user_message_content", return_value=0)
+    else:
+        real = agent._flush_messages_to_session_db
+        fail = patch.object(agent, "_flush_messages_to_session_db",
+                            side_effect=lambda m, h=None: (real(m, h), False)[1])
+    with fail as spy, patch.object(type(agent), "_model_supports_vision", return_value=True):
+        history = _run(agent, ladder, text)
+    assert spy.called, f"{arm}: the failing write path was never exercised"
+    assert ladder.ok()[0][2] == [_NOTE]
+    assert all(w["serving"]["model"] != SONNET for w in sink.writes), sink.writes  # no false checkpoint
+    assert _known(agent) is None or _known(agent).serving.model != SONNET  # in memory: unadvanced too
+    # The store works again: the next successful call re-sends the note and only then checkpoints.
+    ladder.calls.clear()
+    _no_cooldown(agent)
+    _run(agent, ladder, "again", history)
+    assert ladder.ok()[0][2] == [_NOTE]
+    assert sink.writes[-1]["serving"]["model"] == SONNET
