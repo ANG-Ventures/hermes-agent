@@ -147,3 +147,31 @@ def test_unreadable_board_is_logged_not_silently_dropped(board, caplog):
     with caplog.at_level(logging.WARNING, logger="gateway.kanban_watchers"):
         assert b.publish_demand([{"slug": "default"}, {"slug": "broken"}]) == 2
     assert any("broken" in r.getMessage() for r in caplog.records)
+
+
+def test_quarantined_or_unopenable_board_is_zero_demand_and_not_reopened(board):
+    """Corrupt-board guard (operator send-back 17:5x): the demand read never re-opens a board the dispatcher has
+    quarantined, or one whose open already raised this tick; with no board readable nothing is published."""
+    opened = []
+
+    def connect(board=None):
+        opened.append(board)
+        if board == "broken":
+            raise RuntimeError("file is not a database")
+        return kb.connect()
+
+    gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None, cost=2.0)
+    b = kgt.GateTickBuilder(gate, fleet_dir=lambda: board / "fleet", kanban_cfg=lambda: {},
+                            ledger=lambda boards: {}, connect=connect,
+                            skip_board=lambda slug: slug == "quarantined")
+    assert b.publish_demand([{"slug": "default"}, {"slug": "quarantined"}]) == 2
+    assert "quarantined" not in opened
+    opened.clear()
+    with pytest.raises(RuntimeError):
+        b._tick_connect(board="broken")                                # an earlier probe this tick hit it
+    assert b.publish_demand([{"slug": "default"}, {"slug": "broken"}]) == 2
+    assert opened == ["broken", "default"]                             # not re-opened by the demand read
+    path = board / "var" / "placement" / "demand" / "kanban.json"
+    path.unlink()
+    assert b.publish_demand([{"slug": "quarantined"}]) is None         # nothing readable: nothing published
+    assert not path.exists()
