@@ -303,6 +303,14 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 
 # --- Command dispatch ---
 
+# `boards` sub-verbs that report the call's board and so go through kbsel.resolve.
+_BOARDS_RESOLVED = frozenset({"list", "show"})
+
+
+def _boards_sub(args: argparse.Namespace) -> str:
+    return getattr(args, "boards_action", None) or "list"
+
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
     action = getattr(args, "kanban_action", None)
@@ -335,9 +343,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         _record_refused_block(args, refusal)
         return _err(f"kanban: {refusal}")
 
-    # `boards …` manages board metadata itself, so it must ignore the `--board` routing override
-    # (else `--board beta boards show` reports beta).
-    if action == "boards":
+    # `boards create|rm|rename|…` name their board positionally and are filesystem-only. `boards
+    # list|show` REPORT the scoped board, so they resolve it like every other verb below (Prism
+    # 7b28513d644d): a malformed or unknown --board gets the same refusal, never a traceback.
+    if action == "boards" and _boards_sub(args) not in _BOARDS_RESOLVED:
         return _dispatch_boards(args)
 
     # `locate` reads every board read-only; it must not initialise (or depend on) any one board.
@@ -358,6 +367,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     except (ValueError, kb.KanbanPinDivergenceError) as exc:
         msg = str(exc)
         return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
+    if action == "boards":  # list|show: filesystem-only, reported against the resolved board
+        args._resolved_board = resolved
+        return _dispatch_boards(args)
     board_scope = contextlib.nullcontext()
     if resolved and resolved != kb.PINNED_SLUG:
         board_scope = kb.scoped_current_board(resolved)

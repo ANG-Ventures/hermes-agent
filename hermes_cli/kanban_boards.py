@@ -71,7 +71,8 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         name = (b.get("name") or "") + (" [archived]" if b.get("archived") else "")
         print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {_fmt_counts(b['counts'] or {}, '(empty)')}")
     if current:
-        print(f"\nThis call is scoped to: {current}")
+        print(f"\nThis call is scoped to: "
+              f"{_pin_scope_line() if current == kb.PINNED_SLUG else current}")
     if len(boards) > 1:
         print("Address a board with `hermes kanban --board <slug> <verb>`.")
     return 0
@@ -111,21 +112,23 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
 
 
 def _scoped_board(args: argparse.Namespace) -> Optional[str]:
-    """The board ``boards show``/``list`` report: ``--board`` or the DB pin (S7 D2 steps 1-2), never
-    a pointer. ``None`` when neither names one."""
-    explicit = getattr(args, "board", None)
-    if explicit is not None:
-        return kb._normalize_board_slug(explicit) or None
-    return kb.pinned_board()
+    """The board ``boards show``/``list`` report: what ``kanban_command`` resolved through
+    ``kbsel.resolve`` (``--board`` or the DB pin, S7 D2 steps 1-2), never a pointer. ``None`` when
+    neither names one."""
+    return getattr(args, "_resolved_board", None)
+
+
+def _pin_scope_line() -> str:
+    return f"the HERMES_KANBAN_DB pin {kb.raw_db_pin()} (names no board)"
 
 
 def _cmd_boards_show(args: argparse.Namespace) -> int:
-    try:
-        current = _scoped_board(args)
-    except ValueError as exc:
-        return _err(f"kanban boards show: {exc}", 2)
+    current = _scoped_board(args)
     if not current:
         print("no board pinned; pass --board <slug> (boards: hermes kanban boards list)")
+        return 0
+    if current == kb.PINNED_SLUG:
+        print(f"Board: {_pin_scope_line()}")
         return 0
     meta = kb.read_board_metadata(current)
     counts = _board_task_counts(current)

@@ -465,3 +465,71 @@ def test_board_of_task_and_pinned_board_cost_is_recorded(home, monkeypatch, caps
               f"(threshold 250 ms)")
     assert cpu[p95] * 1000 < 250
     assert pin_cpu_ms < 250
+
+
+
+# --- Prism 39b758962810: the pin sentinel is never a board name -------------------------------
+
+def test_sentinel_is_refused_as_a_board_name(home):
+    with pytest.raises(ValueError, match="reserved"):
+        kb._normalize_board_slug(kb.PINNED_SLUG)
+    with pytest.raises(ValueError, match="reserved"):
+        kb.create_board(kb.PINNED_SLUG)
+    assert _boards_argv(["boards", "create", kb.PINNED_SLUG]) == 2
+
+
+def test_pre_existing_override_board_is_not_found_and_never_opened_unscoped(home, capsys):
+    """A board dir literally named ``override`` (made before the sentinel was reserved) is
+    BoardNotFound-with-reason on an explicit --board, never derived, and a write never lands."""
+    kb.init_db()
+    legacy = kb.boards_root() / kb.PINNED_SLUG
+    legacy.mkdir(parents=True)
+    conn = kbc.connect(db_path=legacy / "kanban.db")
+    tid = kb.create_task(conn, title="legacy", assignee="dev")
+    conn.close()
+    (legacy / "board.json").write_text('{"slug": "override"}', encoding="utf-8")
+    _policy(home, "refuse")
+    with pytest.raises(kbsel.BoardNotFound, match="reserved for a HERMES_KANBAN_DB pin"):
+        kbsel.resolve_slug(kb.PINNED_SLUG, verb="create")
+    with pytest.raises(kb.KanbanCardNotFound):
+        kb.board_of_task(tid)  # never derived onto the sentinel
+    assert kb.PINNED_SLUG not in [b["slug"] for b in kb.list_boards()]
+    rc = kanban.kanban_command(_ns(kanban_action="create", board=kb.PINNED_SLUG, title="w",
+                                   parent=[]))
+    assert rc == 1
+    assert "reserved" in capsys.readouterr().err
+    with kbc.connect_closing(board="default") as c:
+        assert c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+# --- Prism 7b28513d644d: boards list|show resolve like every other verb ------------------------
+
+def _boards_argv(argv: list[str]) -> int:
+    from hermes_cli.kanban_parser import build_parser
+
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers(dest="cmd"))
+    return kanban.kanban_command(parser.parse_args(["kanban", *argv]))
+
+
+def test_boards_list_malformed_board_is_a_clean_rc2(home, capsys):
+    _policy(home, "refuse")
+    assert _boards_argv(["boards", "list", "--board", "bad slug"]) == 2
+    assert "invalid board slug" in capsys.readouterr().err
+
+
+def test_boards_show_unknown_board_is_board_not_found(home, capsys):
+    _policy(home, "refuse")
+    assert _boards_argv(["--board", "typo", "boards", "show"]) == 1
+    assert "board 'typo' does not exist" in capsys.readouterr().err
+
+
+def test_boards_list_and_show_bare_still_work_under_refuse(home, capsys):
+    kb.create_board("beta")
+    _policy(home, "refuse")
+    assert _boards_argv(["boards", "list"]) == 0
+    assert "beta" in capsys.readouterr().out
+    assert _boards_argv(["boards", "show"]) == 0
+    assert "no board pinned" in capsys.readouterr().out
+    assert _boards_argv(["--board", "beta", "boards", "show"]) == 0
+    assert capsys.readouterr().out.startswith("Board: beta")

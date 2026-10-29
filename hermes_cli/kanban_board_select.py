@@ -113,6 +113,11 @@ def resolve_slug(board: Optional[str], *, verb: str, card_ids: Iterable[str] = (
     from hermes_cli import kanban_db as kb
 
     if board is not None:
+        if str(board).strip().lower() == kb.PINNED_SLUG:  # Prism 39b758962810
+            raise BoardNotFound(
+                f"kanban: board {board!r} does not exist: {kb.PINNED_SLUG!r} is reserved for a "
+                f"HERMES_KANBAN_DB pin that names no board and is never a board name. "
+                f"Pass the board's real slug (boards: hermes kanban boards list).")
         normed = kb._normalize_board_slug(board)
         if not normed:
             raise ValueError("kanban: --board requires a slug")
@@ -167,4 +172,12 @@ def resolve(args: argparse.Namespace) -> Optional[str]:
         return None
     if verb == "notify-repair" and getattr(args, "all_boards", False):
         return None
+    if verb == "boards" and getattr(args, "board", None) is None:
+        # `boards list|show` with no --board report the pin's board, else no board (they
+        # enumerate); never a bare-verb refusal (Prism 7b28513d644d).
+        from hermes_cli import kanban_db as kb
+
+        if not kb.pinned_board():
+            return None
+        verb = f"boards {getattr(args, 'boards_action', None) or 'list'}"
     return resolve_slug(getattr(args, "board", None), verb=verb, card_ids=card_ids_of(args))

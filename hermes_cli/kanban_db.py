@@ -1152,6 +1152,13 @@ def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
             f"invalid board slug {slug!r}: must be 1-64 chars, lowercase "
             f"alphanumerics / hyphens / underscores, not starting with '-' or '_'"
         )
+    if s == PINNED_SLUG:
+        # The pin sentinel is never a board name (Prism 39b758962810): a board dir called
+        # ``override`` would be indistinguishable from an unnamed pin and open unscoped.
+        raise ValueError(
+            f"invalid board slug {slug!r}: {PINNED_SLUG!r} is reserved for a HERMES_KANBAN_DB "
+            f"pin that names no board"
+        )
     return s
 
 
@@ -1530,7 +1537,7 @@ def get_current_board() -> str:
         if normed and board_exists(normed):
             return normed
     pinned = pinned_board()
-    if pinned and (pinned != PINNED_SLUG or board_exists(PINNED_SLUG)):
+    if pinned and pinned != PINNED_SLUG:
         return pinned
     return DEFAULT_BOARD
 
