@@ -76,14 +76,15 @@ _knob_cache: Dict[str, Tuple[Tuple[int, int], bool]] = {}
 _knob_lock = threading.Lock()
 
 
-def knob_enabled() -> bool:
+def knob_enabled(home=None) -> bool:
     """``cron.script_runner.enabled`` from the PROCESS home's ``config.yaml`` (never the per-tick
-    profile scope), True only for a YAML boolean ``true``. Missing file, missing key, a string,
-    a number or a parse failure all read False. Cached on the file's (mtime, size)."""
+    profile scope), or from *home*'s when given, True only for a YAML boolean ``true``. Missing
+    file, missing key, a string, a number or a parse failure all read False. Cached on the file's
+    (mtime, size)."""
     try:
         from hermes_constants import get_process_hermes_home
 
-        path = get_process_hermes_home() / "config.yaml"
+        path = (Path(home) if home is not None else get_process_hermes_home()) / "config.yaml"
         st = path.stat()
     except (OSError, ValueError):
         return False
@@ -285,9 +286,13 @@ def delegate(home) -> bool:
     """True when this gateway hands *home*'s script lane to the runner: the knob is on, the
     runner heartbeat is ``active``, ``last_ok_at`` (progress, not liveness) is within
     ``RUNNER_PROGRESS_STALE_S`` and the heartbeat pid is alive with a matching start time. Fails
-    toward False (the gateway ticks ``"all"``)."""
+    toward False (the gateway ticks ``"all"``). The knob is the HOST root's, where the runner
+    reads it: a profile gateway ticking the root home while root's gateway is down must hand the
+    lane to the same runner (t_0faaf89b)."""
     try:
-        if not knob_enabled():
+        from hermes_constants import get_default_hermes_root
+
+        if not knob_enabled(get_default_hermes_root()):
             return False
         return runner_progressing(home)
     except Exception:

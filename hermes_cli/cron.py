@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import math
 import re
 import sys
 from datetime import timezone
@@ -383,7 +384,9 @@ def _abandon_record_wait_secs() -> float:
         budget = float(_resolve_hook_callback_timeout())
     except Exception:
         budget = _HOOK_CALLBACK_TIMEOUT_SECS
-    if budget <= 0:
+    # Non-finite too (Prism f094fa505f02): ``.nan`` passes the resolver's range checks, and
+    # ``Thread.join(timeout=nan)`` raises in the handler before ``os._exit`` runs.
+    if not math.isfinite(budget) or budget <= 0:
         budget = _HOOK_CALLBACK_TIMEOUT_SECS
     return budget + _ABANDON_RECORD_MARGIN_SECS
 
@@ -1270,10 +1273,18 @@ def cron_runtime_export(args) -> int:
 
 
 def cron_runner(args) -> int:
-    """``hermes cron runner [rearm]`` (cron/script_runner.py)."""
+    """``hermes cron runner [rearm|install|uninstall|lint]`` (cron/script_runner.py,
+    hermes_cli/cron_runner_plist.py)."""
+    action = getattr(args, "runner_action", None)
+    if action in ("install", "uninstall", "lint"):
+        # Imported before (and without) cron/*: uninstall must work ahead of an S1 revert (§12).
+        from hermes_cli import cron_runner_plist
+        if action == "install":
+            return cron_runner_plist.install(dry_run=bool(getattr(args, "runner_dry_run", False)))
+        return getattr(cron_runner_plist, action)()
     from cron import script_runner
 
-    if getattr(args, "runner_action", None) == "rearm":
+    if action == "rearm":
         return script_runner.rearm()
     return script_runner.main([])
 

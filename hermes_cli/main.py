@@ -226,6 +226,9 @@ def _set_process_title() -> None:
     kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if kanban_task:
         title = f"hermes kanban-worker {kanban_task}"
+    elif sys.argv[1:] == ["cron", "runner"]:
+        # cron_runner_plist.uninstall() finds a surviving runner by this title (t_5a9e1629).
+        title = "hermes cron runner"
     try:
         import setproctitle  # type: ignore[import-untyped]
 

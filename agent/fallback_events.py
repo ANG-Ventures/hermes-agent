@@ -1059,6 +1059,10 @@ def stash_api_error(agent: Any, api_error: BaseException,
                                  "x-pool-route-id", "retry-after",
                                  "x-relay-eligible", "x-pool-other-eligible",
                                  "x-pool-fable-allowance",
+                                 # t_b0c67f3e: pool-wide refusal numbers.
+                                 "x-pool-seats-total", "x-pool-seats-eligible",
+                                 "x-pool-seats-busy", "x-pool-inflight",
+                                 "x-pool-inflight-max", "x-pool-ineligible-reasons",
                                  "x-ratelimit-limit", "x-ratelimit-remaining",
                                  "x-ratelimit-reset")},
             "body": body if isinstance(body, dict) else None,
@@ -1447,6 +1451,11 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         fa = fable_allowance(headers)
         if fa is not None and "fable_allowance" not in row:
             row["fable_allowance"] = fa   # notice only, not a ledger column
+        from agent.fork_ext.relay_quota import pool_pressure
+
+        pp = pool_pressure(headers)
+        if pp is not None and "pool_pressure" not in row:
+            row["pool_pressure"] = pp     # notice only (t_b0c67f3e)
         if pending and pending.get("elapsed_s") is not None:
             row.setdefault("elapsed_s", pending.get("elapsed_s"))
         if not r_seat:

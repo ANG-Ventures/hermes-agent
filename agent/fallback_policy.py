@@ -1660,6 +1660,18 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
     if _is_pool_wide_relay_busy(row, hop, cause):
         if cause == RELAY_DRAIN_CAUSE:
             return f"{prefix}{cause} (at the relay), {window}", ()
+        cap = _fable_cap_busy(row)
+        if cap is not None:
+            # t_634b4ddf: the busy refusal is the per-model allowance remainder.
+            from agent.fork_ext.relay_quota import fable_cap_busy_text
+
+            return f"{prefix}{fable_cap_busy_text(cap, tz)}, {window}", ()
+        from agent.fork_ext.relay_quota import pool_pressure_text
+
+        pp = row.get("pool_pressure")
+        if isinstance(pp, Mapping):
+            # t_b0c67f3e: the refusal stated the numbers it was decided on.
+            return f"{prefix}{pool_pressure_text(pp)}, {window}", ()
         return f"{prefix}relay busy: all subs at capacity (at the relay), {window}", ()
     if cause == SEAT_TIMEOUT_CAUSE:
         return f"{prefix}{_seat_timeout_body(row, seat)}{_pool_context(row)}, {window}", ()
@@ -1853,6 +1865,21 @@ def _is_pool_wide_relay_busy(row: Mapping[str, Any], hop: Optional[str], cause: 
             and not is_direct_pin(row.get("from_provider")))
 
 
+def _fable_cap_busy(row: Mapping[str, Any]) -> Optional[dict]:
+    """t_634b4ddf: a pool-wide "relay busy" refusal for Fable while the relay's
+    allowance header says <= 2 seats have Fable allowance left: the remainder of
+    the per-model weekly cap is busy, not the pool."""
+    if not _is_pool_wide_relay_busy(row, normalize_hop(row.get("hop")), _cause_phrase(row)) \
+            or _cause_phrase(row) not in ("relay busy", "pool at capacity"):
+        return None
+    from agent.fork_ext.relay_quota import fable_cap_busy
+
+    return fable_cap_busy(row)
+
+
+FABLE_CAP_HEAD = "Fable weekly cap"
+
+
 def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     """The one head-label byte change (§4.8): relay-sourced conn/pool_pressure
     name the real cause instead of the status-derived ``rate limit``. When
@@ -1898,6 +1925,8 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
         return "relay deploying"
     if cls == "pool_pressure" and _cause_phrase(row).startswith(SESSION_DEMOTED_CAUSE):
         return "session demoted"
+    if cls == "pool_pressure" and _fable_cap_busy(row) is not None:
+        return FABLE_CAP_HEAD
     fa = row.get("fable_allowance")
     if windowed and not (isinstance(fa, Mapping) and isinstance(fa.get("exhausted"), int)
                          and fa["exhausted"] > 0):

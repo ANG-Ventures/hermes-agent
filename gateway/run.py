@@ -869,7 +869,7 @@ def _has_platform_display_override(user_config: dict, platform_key: str, setting
 
 def _resolve_gateway_display_bool(
     user_config: dict, platform_key: str, setting: str, *, default: bool = False,
-    platform: Any = None, require_platform_override_for: set[Any] | None = None) -> bool:
+    platform: Any = None, require_platform_override_for: set[Any] | None = None, **scope: Any) -> bool:
     """Resolve a boolean display setting with optional platform-only opt-in.
 
     Scratch-text is too noisy for threaded surfaces (Mattermost): they need an explicit per-platform override.
@@ -883,7 +883,7 @@ def _resolve_gateway_display_bool(
 
     from gateway.display_config import resolve_display_setting
 
-    value = resolve_display_setting(user_config, platform_key, setting, default)
+    value = resolve_display_setting(user_config, platform_key, setting, default, **scope)
     if isinstance(value, bool):
         return value
     if isinstance(value, str):

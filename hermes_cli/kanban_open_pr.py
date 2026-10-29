@@ -86,19 +86,22 @@ QUERY_TIMEOUT_SECONDS = 10
 NOT_FOUND = "NOT_FOUND"
 
 
-def query_pr_state(repo: str, number: int) -> Optional[dict]:
+def query_pr_state(repo: str, number: int, env: Optional[dict] = None) -> Optional[dict]:
     """REST PR state: ``{"state": OPEN|CLOSED|MERGED|NOT_FOUND}`` or None.
 
     Unlike :func:`kanban_pr_gate.query_pr` this separates a definite 404
     (``NOT_FOUND``: the ref names no PR, e.g. an upstream number qualified with
     the fork's slug) from "cannot tell" (None: timeout, rate/READ cap, auth).
     Completion routing fails closed on None and must not on a 404.
+    ``env`` = the child env for ``gh`` (the card's profile identity); None inherits.
     """
     try:
         proc = subprocess.run(
-            ["gh", "api", f"repos/{repo}/pulls/{number}"],
+            # every extracted ref is a github.com ref; a profile env may carry GH_HOST (Enterprise), which would
+            # resolve an unrelated owner/repo/number there and let a MERGED answer close the card (Prism 7cf1422cf1d2)
+            ["gh", "api", "--hostname", "github.com", f"repos/{repo}/pulls/{number}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=QUERY_TIMEOUT_SECONDS, check=False,
+            timeout=QUERY_TIMEOUT_SECONDS, check=False, env=env,
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
         return None

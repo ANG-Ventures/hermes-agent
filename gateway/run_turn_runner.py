@@ -215,7 +215,7 @@ class TurnRunner:
                 )
                 render_notification(
                     lambda: self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error"),
-                    platform=ctx.source.platform, user_config=ctx.user_config)
+                    platform=ctx.source.platform, user_config=ctx.user_config, source=ctx.source)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
 
@@ -1070,7 +1070,7 @@ class TurnRunner:
                 fut.add_done_callback(_track_status_result)
             if is_route_change:
                 outcome[0] = True
-        render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
+        render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config, source=ctx.source,
                             diagnostic=is_warning_status(event_type, message))
         return outcome[0]
 
@@ -1467,7 +1467,7 @@ class TurnRunner:
             if line:
                 self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
-                            user_config=self._ctx.user_config, diagnostic=diagnostic)
+                            user_config=self._ctx.user_config, diagnostic=diagnostic, source=self._ctx.source)
 
     def _bg_review_chat_muted(self) -> bool:
         """True when this turn's chat is an act-now page channel: the review receipt ("💾

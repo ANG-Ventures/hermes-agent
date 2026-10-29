@@ -28,6 +28,9 @@ def temp_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_CRON_RUNTIME_STATE", raising=False)
     monkeypatch.delenv("HERMES_CRON_MIRROR_INTERVAL_S", raising=False)
+    # These tests pin the MERGED jobs.json mirror contract, i.e. the switch-off arm of
+    # HERMES_CRON_DEFINITIONS_ONLY (t_3c8fa4d6); test_cron_definitions_only.py covers on.
+    monkeypatch.setenv("HERMES_CRON_DEFINITIONS_ONLY", "0")
     (tmp_path / "cron").mkdir()
     return tmp_path
 

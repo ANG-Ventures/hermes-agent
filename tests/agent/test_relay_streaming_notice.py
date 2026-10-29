@@ -41,7 +41,12 @@ def _agent(provider: str, base_url: str):
 def _notice(agent):
     with patch("hermes_cli.config.load_config_readonly", return_value=CFG):
         wb.arm(agent, now=0.0)
-        return wb.notice_due(agent, now=121.0)
+        try:
+            return wb.notice_due(agent, now=121.0)
+        finally:
+            # One solo wait per call: a wait left armed would read as a sibling session
+            # on the same lane (t_78b5a5bb cross-session dedupe).
+            wb.disarm(agent, now=121.0)
 
 
 def test_streaming_relay_drops_the_buffering_wording():

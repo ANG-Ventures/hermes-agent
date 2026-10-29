@@ -157,6 +157,19 @@ def note_error(agent: Any, pending: Dict[str, Any], api_error: Any, raw_headers:
         if exc in TIMER_EXCS:
             _carry(agent, attribution(getattr(api_error, "pool_headers", None)))
             return
+        # t_b0a117bd: every failing attempt of the armed no-first-byte wait is
+        # remembered on the wall clock, so its notice names the cause.
+        from agent.fallback_wall_budget import note_upstream_failure
+
+        from agent.fallback_events import relay_hop_seat, relay_synthetic_error
+
+        hop, seat = relay_hop_seat(raw_headers, body)
+        note_upstream_failure(agent, status=pending.get("status"),
+                              socket=pending.get("socket_cause"), exc_name=exc,
+                              box=seat or attribution(raw_headers, body)["seat"], hop=hop,
+                              relay_class=(pending.get("headers") or {}).get("x-relay-error-class"),
+                              relay_error=relay_synthetic_error(body, pending.get("text")),
+                              text=pending.get("text"))
         if isinstance(getattr(agent, "_failover_cause", None), FailoverCause) \
                 and agent._failover_cause.lane == (str(getattr(agent, "provider", "") or "") or None):
             return
@@ -278,3 +291,81 @@ def clear(agent: Any) -> None:
         agent._failover_carry = None
     except Exception:  # noqa: BLE001
         pass
+
+
+
+
+# ── same-cause banner collapse (t_634b4ddf) ────────────────────────────────
+# 2026-10-28 20:02-20:03: one Fable turn walked dtlr -> btpr -> bpr -> alr/opus
+# and posted one "Model fallback" line per hop for ONE cause (Fable weekly
+# allowance capped on 25/26 seats). A pool-wide refusal repeats on every lane of
+# the same pool, so its banner is held until the route settles (a first byte, a
+# served call, a banner for another cause, or the turn end) and the hops of one
+# cause in one turn post as ONE line naming the final route. The line itself is
+# built by the announce (``_emit_fallback_announce``); this only holds it.
+
+_HOLD_ATTR = "_fallback_banner_hold"
+# Head labels that may merge, and the cause each one names. The busy remainder
+# of the Fable allowance ("Fable weekly cap") and the refusal once no seat is
+# left ("Fable weekly limit") are one cause; a pool-wide "relay busy" is another.
+_COLLAPSE_KEYS = {"Fable weekly cap": "fable-weekly", "Fable weekly limit": "fable-weekly",
+                  "relay busy": "relay-busy"}
+_COLLAPSE_CLASSES = frozenset({"pool_pressure", "quota_model", "quota_seat"})
+
+
+def collapse_key(row: Any, head_label: Optional[str]) -> Optional[str]:
+    """The cause a failover banner may merge on, or None (post it now)."""
+    try:
+        if not isinstance(row, dict) or row.get("trigger_class") not in _COLLAPSE_CLASSES:
+            return None
+        return _COLLAPSE_KEYS.get(str(head_label or "").strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def held_banner(agent: Any, key: str, from_label: str) -> Optional[Dict[str, Any]]:
+    """The held banner this hop extends (same cause, same turn, its destination is
+    this hop's source), else None."""
+    h = getattr(agent, _HOLD_ATTR, None)
+    if (isinstance(h, dict) and h.get("turn") == getattr(agent, "_current_turn_id", None)
+            and h.get("key") == key and h.get("to") == from_label):
+        return h
+    return None
+
+
+def hold_banner(agent: Any, *, msg: str, key: str, first_from: str, to_label: str,
+                hops: int, label: str, rider: Optional[str]) -> None:
+    """Hold ``msg`` (replacing a held banner it extends; flushing any other)."""
+    try:
+        h = getattr(agent, _HOLD_ATTR, None)
+        if isinstance(h, dict) and hops <= 1:
+            flush_banner(agent)
+        setattr(agent, _HOLD_ATTR, {"turn": getattr(agent, "_current_turn_id", None),
+                                    "key": key, "first_from": first_from, "to": to_label,
+                                    "hops": hops, "msg": msg, "label": label,
+                                    "rider": rider})
+    except Exception:  # noqa: BLE001
+        logger.debug("fallback banner hold failed", exc_info=True)
+        _emit(agent, msg)
+
+
+def flush_banner(agent: Any) -> Optional[str]:
+    """Post the held banner (if any), once. Returns the text posted. Never raises."""
+    try:
+        h = getattr(agent, _HOLD_ATTR, None)
+        if not isinstance(h, dict):
+            return None
+        setattr(agent, _HOLD_ATTR, None)
+        _emit(agent, h["msg"])
+        return h["msg"]
+    except Exception:  # noqa: BLE001
+        logger.debug("fallback banner flush failed", exc_info=True)
+        return None
+
+
+def _emit(agent: Any, msg: str) -> None:
+    emit = getattr(agent, "_emit_status", None)
+    if callable(emit):
+        emit(msg)
+    else:
+        logger.warning("route-change announce has no _emit_status sink; message dropped: %s", msg)

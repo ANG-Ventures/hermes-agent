@@ -879,7 +879,7 @@ class GatewayBusySessionMixin:
     def _busy_steer_ack_enabled(self, event: MessageEvent, session_key: str) -> bool:
         # Some mobile chat setups want silent steering — keep the behavior, drop the bubble.
         from gateway.run import _load_gateway_config, _platform_config_key
-        from gateway.display_config import resolve_display_setting
+        from gateway.display_config import display_scope, resolve_display_setting
         steer_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED")
         if steer_ack_env is not None:
             steer_ack_enabled = steer_ack_env.strip().lower() in {"1", "true", "yes", "on"}
@@ -887,7 +887,7 @@ class GatewayBusySessionMixin:
             steer_ack_enabled = bool(
                 resolve_display_setting(
                     _load_gateway_config(), _platform_config_key(event.source.platform),
-                    "busy_steer_ack_enabled", True,
+                    "busy_steer_ack_enabled", True, **display_scope(event.source),
                 )
             )
         if not steer_ack_enabled:
@@ -907,14 +907,14 @@ class GatewayBusySessionMixin:
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _hermes_home, _load_gateway_config, _platform_config_key
         )
-        from gateway.display_config import resolve_display_setting
+        from gateway.display_config import display_scope, resolve_display_setting
 
         # Terse by default; iteration/tool detail opts in via display.platforms.<p>.busy_ack_detail.
         status_parts = []
         busy_ack_detail_enabled = bool(
             resolve_display_setting(
                 _load_gateway_config(), _platform_config_key(event.source.platform),
-                "busy_ack_detail", True,
+                "busy_ack_detail", True, **display_scope(event.source),
             )
         )
         if busy_ack_detail_enabled and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:

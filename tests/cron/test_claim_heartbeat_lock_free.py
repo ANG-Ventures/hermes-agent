@@ -187,5 +187,12 @@ def test_unlocked_heartbeat_mirror_flush_still_takes_the_cross_process_flock(tem
         return real_save(*a, **kw)
 
     monkeypatch.setattr(cj, "_save_jobs_unlocked", spy_save)
+    real_publish = cj._publish_runtime_mirror
+
+    def spy_publish(*a, **kw):  # definitions-only mode writes jobs.runtime.json (t_3c8fa4d6)
+        seen.append((True, cj._jobs_lock_state.depth, cj._jobs_lock_state.degraded))
+        return real_publish(*a, **kw)
+
+    monkeypatch.setattr(cj, "_publish_runtime_mirror", spy_publish)
     assert cj.heartbeat_fire_claim(jid, expected_owner=owner) is True
     assert (True, 1, False) in seen, seen  # mirror written under the flocked section

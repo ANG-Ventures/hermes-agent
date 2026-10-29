@@ -2924,7 +2924,10 @@ CREATE TABLE IF NOT EXISTS task_comments (
     -- reads as attributed.
     run_id      INTEGER,
     session_ref TEXT,
-    created_at  INTEGER NOT NULL
+    created_at  INTEGER NOT NULL,
+    -- Scoped signing grant (kanban_sign_grants) the comment was written
+    -- under; NULL for every ordinary comment.
+    grant_id    TEXT
 );
 
 -- Retained across config rollback so old volatile paths stay fenced.
@@ -3058,6 +3061,24 @@ CREATE TABLE IF NOT EXISTS lane_model_overrides (
     expires_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lane_model_expires ON lane_model_overrides(expires_at);
+
+-- Scoped board-signing grants for delegate children (hermes_cli/kanban_sign_grants.py).
+CREATE TABLE IF NOT EXISTS sign_grants (
+    grant_id           TEXT NOT NULL,
+    task_id            TEXT NOT NULL,
+    verbs              TEXT NOT NULL,      -- JSON list, subset of VALID_VERBS
+    by_author          TEXT NOT NULL,      -- the identity the child writes as
+    parent_session_ref TEXT,
+    child_id           TEXT,               -- delegate subagent id (sa-...)
+    child_session_ref  TEXT NOT NULL,      -- derive_session_ref(child session id)
+    parent_model       TEXT NOT NULL,
+    child_model        TEXT NOT NULL,
+    parent_profiles    TEXT NOT NULL DEFAULT '[]',  -- JSON: profiles whose runs' PRs are never covered
+    created_at         INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    revoked_at         INTEGER,
+    PRIMARY KEY (grant_id, task_id)
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -7988,6 +8009,7 @@ def add_comment(
     claimed_author: Optional[str] = None,
     if_latest_release: Optional[int] = None,
     _kernel_approve: bool = False,
+    grant_id: Optional[str] = None,
 ) -> int:
     """Append a comment, recording who wrote it and from which run/session.
 
@@ -8012,6 +8034,12 @@ def add_comment(
     scripts/lib/operator_approve.py; t_f2eb71b3). ``_kernel_approve`` is the
     kernel's own reviewer-approval record in :func:`complete_task`, never a
     caller's.
+
+    ``grant_id`` names a scoped signing grant (``kanban_sign_grants``): the
+    comment is written as ``author`` with no ``(subagent)`` marker and with
+    ``task_comments.grant_id`` set, only after the grant validated for this
+    card, author, verb and session inside the insert's transaction; else
+    :class:`~hermes_cli.kanban_sign_grants.GrantRefused` and nothing is written.
     """
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -8031,26 +8059,71 @@ def add_comment(
         claimed_author = claimed_author.strip()
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
+    if grant_id is not None:
+        return _add_granted_comment(
+            conn, task_id, author, body, run_id, session_ref, now, grant_id,
+            if_latest_release,
+        )
     if _is_delegated_child():
         # The one write a delegate_task child may make (t_70fcc2c3). Append-only
         # and attributed: the marker is added here, not by the caller, so an
         # explicit ``--author`` cannot pass a child's words off as the parent's.
         if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
             author = author.strip() + SUBAGENT_AUTHOR_MARKER
-        grant = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
-        conn.execute("PRAGMA query_only=OFF")
-        try:
+        with delegated_child_write(conn):
             return _add_comment_txn(
                 conn, task_id, author, body, run_id, session_ref, now,
                 claimed_author, if_latest_release,
             )
-        finally:
-            conn.execute("PRAGMA query_only=ON")
-            _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
     return _add_comment_txn(
         conn, task_id, author, body, run_id, session_ref, now, claimed_author,
         if_latest_release,
     )
+
+
+def _add_granted_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    run_id: Optional[int],
+    session_ref: Optional[str],
+    now: int,
+    grant_id: str,
+    if_latest_release: Optional[int] = None,
+) -> int:
+    """A comment signed under a scoped grant (t_19c567a8); see :func:`add_comment`.
+
+    Only a delegate child signs under a grant: the parent signs as itself.
+    """
+    if not _is_delegated_child():
+        from hermes_cli.kanban_sign_grants import GrantRefused
+
+        raise GrantRefused("a signing grant is used only from inside the delegate child it was minted for")
+    with delegated_child_write(conn):
+        return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now,
+                                if_latest_release=if_latest_release, grant_id=grant_id)
+
+
+@contextlib.contextmanager
+def delegated_child_write(conn: sqlite3.Connection):
+    """Lift a delegate child's read-only fence for exactly one write.
+
+    The capability token is reset on EVERY exit, including a PRAGMA that raises on a
+    closed connection (Prism 87255cd0399f): it is set inside the outer try and reset
+    in the outermost finally, after the fence is restored.
+    """
+    lift = None
+    try:
+        lift = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
+        conn.execute("PRAGMA query_only=OFF")
+        try:
+            yield
+        finally:
+            conn.execute("PRAGMA query_only=ON")
+    finally:
+        if lift is not None:
+            _DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8074,14 +8147,26 @@ def _add_comment_txn(
     now: int,
     claimed_author: Optional[str] = None,
     if_latest_release: Optional[int] = None,
+    grant_id: Optional[str] = None,
 ) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
+        if grant_id is not None:
+            # A grant's expiry is judged when the write lock is held, not when the caller asked
+            # (Prism 4b338b50d765).
+            now = int(time.time())
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        signer = author.strip()
+        if grant_id is not None:
+            from hermes_cli import kanban_sign_grants as ksg
+
+            # Stored under a grant-marked author no label reader honours; only
+            # ksg.operator_rows_with_live_grants promotes it (Apollo r8 ruling).
+            author = ksg.granted_author(signer, grant_id)
         if if_latest_release is not None:
             from hermes_cli.kanban_close_on_guard import (
                 ReleaseSuperseded, newer_release_comment,
@@ -8090,12 +8175,22 @@ def _add_comment_txn(
             why = newer_release_comment(conn, task_id, if_latest_release, body, author, now)
             if why:
                 raise ReleaseSuperseded(why)
-        cur = conn.execute(
-            "INSERT INTO task_comments "
-            "(task_id, author, body, run_id, session_ref, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), run_id, session_ref, now),
-        )
+        if grant_id is not None:
+            ksg.validate_comment(conn, grant_id, task_id, signer, body,
+                                 caller_session_ref=session_ref, now=now)
+            cur = conn.execute(
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at, grant_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, author.strip(), body.strip(), run_id, session_ref, now, grant_id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, author.strip(), body.strip(), run_id, session_ref, now),
+            )
         _append_event(
             conn,
             task_id,
@@ -8107,6 +8202,7 @@ def _add_comment_txn(
                 # attributable even if a comment row is later pruned.
                 **({"session_ref": session_ref} if session_ref else {}),
                 **({"claimed_author": claimed_author} if claimed_author else {}),
+                **({"grant_id": grant_id} if grant_id else {}),
             },
             run_id=run_id,
         )
@@ -8117,26 +8213,22 @@ def _add_comment_txn(
         # discussion did not. Journaling the body is the single thing that
         # would have saved them, so it is recorded explicitly rather than
         # inferred from the event.
-        try:
-            from hermes_cli import kanban_journal
-
-            kanban_journal.append(
-                _journal_board_slug(),
-                task_id,
-                "comment_body",
-                {
-                    "author": author.strip(),
-                    "body": body.strip(),
-                    "session_ref": session_ref,
-                    "created_at": now,
-                    "comment_id": int(cur.lastrowid or 0),
-                    **({"claimed_author": claimed_author} if claimed_author else {}),
-                },
-                actor=author.strip(),
-                run_id=run_id,
-            )
-        except Exception:  # pragma: no cover - never fail the comment write
-            pass
+        _journal_append(
+            conn,
+            task_id,
+            "comment_body",
+            {
+                "author": author.strip(),
+                "body": body.strip(),
+                "session_ref": session_ref,
+                "created_at": now,
+                "comment_id": int(cur.lastrowid or 0),
+                **({"claimed_author": claimed_author} if claimed_author else {}),
+                **({"grant_id": grant_id} if grant_id else {}),
+            },
+            actor=author.strip(),
+            run_id=run_id,
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -8342,17 +8434,38 @@ def _insert_comment(
     )
 
 
-def _journal_board_slug() -> Optional[str]:
-    """Best-effort board slug for a journal record.
+_NO_JOURNAL_BOARD = object()
 
-    Resolution must never raise inside a write txn, and must never be the
-    reason a mutation fails, so every error degrades to ``None`` (which the
-    journal records under the ``default`` board).
+
+def _journal_board_slug(conn: Optional[sqlite3.Connection] = None):
+    """Board slug for a journal record of a write on ``conn``.
+
+    With a connection: :func:`board_for_conn`, the one resolver revoke uses too, so every record
+    of one board lands in ONE journal, a pinned off-layout board included (Prism 826db72bcf2d).
+    A connection no board owns (snapshot, forensics copy) returns :data:`_NO_JOURNAL_BOARD` and
+    the caller journals nothing (Prism 77b7e56c0d2c). Without one: the ambient board. Never
+    raises; an error degrades to ``None`` (the ``default`` journal).
     """
     try:
+        if conn is not None:
+            slug = board_for_conn(conn)
+            return _NO_JOURNAL_BOARD if slug is None else slug
         return get_current_board()
     except Exception:
         return None
+
+
+def _journal_append(conn: sqlite3.Connection, task_id, kind, payload, **kw) -> None:
+    """Best-effort journal append under ``conn``'s board; skipped for an unowned connection."""
+    try:
+        board = _journal_board_slug(conn)
+        if board is _NO_JOURNAL_BOARD:
+            return
+        from hermes_cli import kanban_journal
+
+        kanban_journal.append(board, task_id, kind, payload, **kw)
+    except Exception:  # pragma: no cover - the journal is a net, never a gate
+        pass
 
 
 def _append_event(
@@ -8382,18 +8495,7 @@ def _append_event(
     # deleter took the whole kanban directory, so a journal inside it would
     # have died with the data it protects. Best-effort by contract: a journal
     # failure must never fail the board write.
-    try:
-        from hermes_cli import kanban_journal
-
-        kanban_journal.append(
-            _journal_board_slug(),
-            task_id,
-            kind,
-            payload,
-            run_id=run_id,
-        )
-    except Exception:  # pragma: no cover - the journal is a net, never a gate
-        pass
+    _journal_append(conn, task_id, kind, payload, run_id=run_id)
 
 
 def _append_deferred_event_once(
@@ -10389,7 +10491,102 @@ class ExternalCloseError(ValueError):
         )
 
 
-def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
+# Event kinds that take a card OUT of review (or end the review cycle). An ``assigned`` event while the latest
+# review cycle is open (after its ``review_requested``, before an exit, or after a resume back INTO review) is a
+# reviewer swap.
+# ``descendant_invalidated``: a reopened parent demotes the card to todo (Prism f696ae12d330).
+# ``gave_up``: the failure breaker blocks the card, untyped path without a ``blocked`` event (f696ae12d330).
+_REVIEW_EXIT_KINDS = ("dependency_wait", "changes_requested", "sendback", "blocked", "completed", "unblocked",
+                      "reopened", "requeued", "archived", "triage_resolved", "descendant_invalidated", "gave_up")
+# Of those, the kinds that can also put the card BACK in review, and the payload key naming the destination:
+# ``unblocked`` / ``promoted`` with ``status: review`` (a parked or dependency-held review card resuming its review
+# phase; Prism 2a08733c4d2a); ``reopened`` with ``to_status: review`` (``reopen_task(to_status="review")``, no new
+# ``review_requested``; Prism 3ad3e981f866).
+_REVIEW_RESUME_KINDS = {"unblocked": "status", "promoted": "status", "reopened": "to_status"}
+
+
+def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
+    """``(swaps, last_assignment_in_review)`` for the latest review cycle, from the event ORDER (not a payload
+    field, so a reassignment written by any version counts; Prism 1953ce5049b5).
+
+    ``swaps``: assignees of ``assigned`` events made while the card was in review, oldest first. A review phase
+    resumed by ``unblocked``/``promoted`` with ``status: review`` or ``reopened`` with ``to_status: review`` counts
+    as in review again (2a08733c4d2a, 3ad3e981f866).
+    ``last_assignment_in_review``: False when the newest ``assigned`` event of the cycle was made while the card
+    was OUT of review -- an operator's explicit choice (4509b37e638c); True otherwise (none, or made in review).
+    ``(None, True)`` when the card was never reviewed."""
+    rr = conn.execute(
+        "SELECT max(id) FROM task_events WHERE task_id = ? AND kind = 'review_requested'", (task_id,),
+    ).fetchone()[0]
+    if rr is None:
+        return None, True
+    kinds = tuple(dict.fromkeys(("assigned", *_REVIEW_EXIT_KINDS, *_REVIEW_RESUME_KINDS)))
+    marks = ",".join("?" for _ in kinds)
+    swaps: list = []
+    in_review = True
+    last_in_review = True
+    for row in conn.execute(
+        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? AND kind IN ({marks}) ORDER BY id",
+        (task_id, rr, *kinds),
+    ):
+        kind = row["kind"]
+        if kind == "assigned":
+            last_in_review = in_review
+            a = _json_dict(row["payload"]).get("assignee")
+            if in_review and _nonblank_str(a):
+                swaps.append(a)
+            continue
+        resume_key = _REVIEW_RESUME_KINDS.get(kind)
+        if resume_key and _json_dict(row["payload"]).get(resume_key) == "review":
+            in_review = True
+        elif kind in _REVIEW_EXIT_KINDS:
+            in_review = False
+    return swaps, last_in_review
+
+
+def _review_swaps(conn: sqlite3.Connection, task_id: str) -> list:
+    """Assignees of the ``assigned`` events made while the latest review cycle was open, oldest first
+    (:func:`_review_cycle_scan`)."""
+    return _review_cycle_scan(conn, task_id)[0] or []
+
+
+def landing_policy_knob(name: str) -> Optional[str]:
+    """One knob of hermes-home ``config/landing-policy.json`` (Forge L0 kill switches), or None. Missing file /
+    key / unreadable = None (off). ``KANBAN_LANDING_POLICY`` overrides the path (tests); inside pytest with no
+    override it reads nothing, so a dev box's live policy never leaks into the suite."""
+    path = os.environ.get("KANBAN_LANDING_POLICY") or ""
+    if not path:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None
+        try:
+            from hermes_constants import get_default_hermes_root
+            path = str(get_default_hermes_root() / "config" / "landing-policy.json")
+        except Exception:  # noqa: BLE001 -- off
+            return None
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    v = cfg.get(name) if isinstance(cfg, dict) else None
+    return v if isinstance(v, str) else None
+
+
+def _assignee_gh_env(worker: str) -> tuple:
+    """``(True, env)`` = the ``gh`` child env for the card's profile (``env`` None = ambient: unassigned card or
+    the human lane); ``(False, exc)`` = an assigned profile that cannot be resolved. One resolver for the open-PR
+    candidate query and the pre-PR verifier, so both read GitHub as the same identity (Prism 2125185a24e1)."""
+    try:
+        from hermes_cli.kanban_pr_acceptance import _assignee_profile_home, _gh_env
+        return True, _gh_env(_assignee_profile_home(worker))
+    except Exception as exc:  # noqa: BLE001 -- callers fail open
+        return False, exc
+
+
+_UNRESOLVED = object()
+
+
+def _pre_pr_refusals(refs, *, task_id: str, worker: str, ident=_UNRESOLVED) -> list:
     """Forge L0 section 2.3 (a), card PRE t_7ff229a7: run hermes-home ``scripts/lib/landable.py check`` on each
     of the card's OWN open fleet PRs before the open-PR route, so the worker hears what fleet-merge would refuse at
     land in its own run. -> ``[(repo#n, refusal text)]`` for each PR the verifier refused (rc 1).
@@ -10420,7 +10617,17 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
         if not isinstance(cfg, dict) or cfg.get("pre_pr") != "on":
             return []
         script = str(root / "scripts" / "lib" / "landable.py")
-    if not os.path.isfile(script):
+    if not os.path.isfile(script) or not refs:
+        return []
+    # The verifier reads GitHub as the card's profile, never as whichever process runs complete_task (a
+    # multiplexed gateway's launch env carries ANOTHER profile's HERMES_HOME and gh login; Prism 3728a4da34a1).
+    # Same seam as the acceptance gate: the assignee's home, its own credentials overlaid. Unresolvable = did
+    # not run (fail-open), never the ambient login.
+    # ``ident`` = the ``_assignee_gh_env`` result the caller already used for the candidate query.
+    resolved, env = _assignee_gh_env(worker) if ident is _UNRESOLVED else ident
+    if not resolved:
+        _log.warning("pre-PR verifier did not run for %s: profile env for %r unresolvable: %s",
+                     task_id, worker, env)
         return []
     out = []
     for ref in refs:
@@ -10428,17 +10635,23 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
                 "--card", task_id, "--worker", worker or "worker", "--draft-ok"]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
-                                  stdin=subprocess.DEVNULL, check=False)
+                                  stdin=subprocess.DEVNULL, check=False, env=env)
         except (OSError, subprocess.SubprocessError) as exc:
             _log.warning("pre-PR verifier %s#%s did not run: %s", ref.repo, ref.number, exc)
             continue
         if proc.returncode != 1:
             continue
-        text = ""
+        # rc 1 is a refusal ONLY when the last stdout line is the verdict JSON ({"landable": false, ...}).
+        # CPython also exits 1 on an uncaught exception; a crashing verifier must fail OPEN (Prism 0b37fb2ab9a0).
         try:
-            text = str(json.loads((proc.stdout or "").strip().splitlines()[-1]).get("text") or "")
-        except (ValueError, IndexError, AttributeError):
-            pass
+            verdict = json.loads((proc.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            verdict = None
+        if not isinstance(verdict, dict) or verdict.get("landable") is not False:
+            _log.warning("pre-PR verifier %s#%s did not run (rc 1, no verdict line): %s", ref.repo, ref.number,
+                         (proc.stderr or proc.stdout or "").strip()[-400:])
+            continue
+        text = str(verdict.get("text") or "")
         out.append((f"{ref.repo}#{ref.number}", text or (proc.stdout or "").strip()[-2000:]))
     return out
 
@@ -10557,6 +10770,9 @@ def _enforce_branch_base(
         payload = {"failures": failures}
         if untied:
             payload["survivor_merged_untied"] = untied
+        # Forge L0 §2.4 "Also changed" (SB-P): the stale-base advisory under `sendback: on` is OFF by the
+        # operator's round-4 cut rule (t_cb6e1433, Prism 16462e5a9800): the guard always takes the strict path.
+        # The own-fleet-PR exception goes to FLIP-SB (t_5820b99b).
         with write_txn(conn):
             _append_event(conn, task.id, "completion_blocked_stale_base", payload)
         raise
@@ -10926,7 +11142,32 @@ def complete_task(
             metadata = dict(metadata or {}, mentioned_foreign_prs=[
                 f"{r.repo}#{r.number}" for r in foreign
             ])
-        _pr_query = _open_pr.memo_query()
+        # The candidate set is read as the card's profile, the same identity the pre-PR verifier runs as: under
+        # the launch login a multiplexed gateway can 404 on the assignee's private repo, leaving still_open empty
+        # and the verifier silently skipped (Prism 2125185a24e1). Resolved lazily, once; unresolvable = ambient
+        # read (as before) and the verifier does not run (fail-open). A PR the assignee cannot see (no login of
+        # its own: None; 404) falls back to the ambient read, so no card reads less than it did before.
+        _ident: list = []
+
+        def _card_ident() -> tuple:
+            if not _ident:
+                _ident.append(_assignee_gh_env(candidate.assignee or ""))
+            return _ident[0]
+        _base_query = _open_pr._default_query()
+        if _base_query is _open_pr.query_pr_state:
+            def _base_query(repo, number):
+                resolved, env = _card_ident()
+                if not resolved or env is None:
+                    return _open_pr.query_pr_state(repo, number)
+                mine = _open_pr.query_pr_state(repo, number, env=env)
+                if mine and mine.get("state") != _open_pr.NOT_FOUND:
+                    return mine
+                # The assignee did not find it: the ambient read decides, exactly as before this change. None
+                # (timeout, rate limit) stays fail-closed (Prism 3a5427313c61); a definite 404 stays NOT_FOUND even
+                # when the assignee read failed, e.g. a routed profile with no login of its own (Prism 3a5427313c61
+                # at df6d7581).
+                return _open_pr.query_pr_state(repo, number)
+        _pr_query = _open_pr.memo_query(_base_query)
         unowned_prs: list = []
         branch_owned_prs: list = []
         still_open = _open_pr.open_pr_refs(
@@ -10951,7 +11192,7 @@ def complete_task(
             own_keys |= {(r.repo.lower(), r.number) for r in branch_owned_prs}
             refusals = _pre_pr_refusals(
                 [r for r in still_open if (r.repo.lower(), r.number) in own_keys],
-                task_id=task_id, worker=candidate.assignee or "",
+                task_id=task_id, worker=candidate.assignee or "", ident=_card_ident(),
             )
             if refusals:
                 with write_txn(conn):
@@ -14017,10 +14258,17 @@ def _latest_review_provenance(conn: sqlite3.Connection, task_id: str):
     "who reviews this card" (every review cycle records the resolved reviewer,
     explicit or inherited). ``None`` = never reviewed, or that cycle resolved
     no reviewer (unconfigured board); ``False`` = the event exists but its
-    reviewer is missing/blank/malformed."""
+    reviewer is missing/blank/malformed.
+
+    An operator reassignment made while that review cycle was still open (see
+    :func:`_review_swaps`) is the reviewer of record instead (SB-K key
+    766baef3760b): the live assignee and the recorded reviewer must not diverge."""
     event = _latest_event(conn, task_id, "review_requested")
     if event is None:
         return None
+    swaps = _review_swaps(conn, task_id)
+    if swaps:
+        return swaps[-1]
     payload = _json_dict(_row_get(event, "payload"))
     if "reviewer" not in payload:
         return False
@@ -14584,18 +14832,13 @@ def request_changes(
     # Journal the committed coverage comment (add_comment's content hook),
     # only after commit so a rolled-back send-back journals nothing.
     for comment_id, comment_run_id, created_at in posted:
-        try:
-            from hermes_cli import kanban_journal
-
-            kanban_journal.append(
-                _journal_board_slug(), task_id, "comment_body",
-                {"author": comment_author, "body": coverage_body,
-                 "session_ref": None, "created_at": created_at,
-                 "comment_id": comment_id},
-                actor=comment_author, run_id=comment_run_id,
-            )
-        except Exception:  # pragma: no cover - never fail the transition
-            pass
+        _journal_append(
+            conn, task_id, "comment_body",
+            {"author": comment_author, "body": coverage_body,
+             "session_ref": None, "created_at": created_at,
+             "comment_id": comment_id},
+            actor=comment_author, run_id=comment_run_id,
+        )
     return ok, detail
 
 
@@ -14630,6 +14873,20 @@ def _sendback_payload_error(payload: Any) -> Optional[str]:
     if size > _SENDBACK_MAX_PAYLOAD_BYTES:
         return f"sendback payload is {size} bytes (max {_SENDBACK_MAX_PAYLOAD_BYTES})"
     return None
+
+
+def _review_cycle_reviewers(conn: sqlite3.Connection, task_id: str) -> set:
+    """Every reviewer of the latest review cycle: the newest ``review_requested`` reviewer plus each reviewer swap
+    made while that cycle was open (:func:`_review_swaps`). A reassignment after the card left review is an
+    operator's explicit choice and is not in the set (d3eaed71c036)."""
+    rr = _latest_event(conn, task_id, "review_requested")
+    if rr is None:
+        return set()
+    out = set(_review_swaps(conn, task_id))
+    rv = _json_dict(_row_get(rr, "payload")).get("reviewer")
+    if _nonblank_str(rv):
+        out.add(rv)
+    return out
 
 
 def _review_handoff_implementer(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -14703,11 +14960,19 @@ def request_sendback(
         if status in ("ready", "todo"):
             # A card demoted from review (reopened parent) still names the
             # reviewer: restore the implementer as the review branch does.
+            # Only then (SB-K key d3eaed71c036): any other assignee is an
+            # operator's explicit choice (a reassign after a lane outage) and
+            # stands.
+            # Read at action time, inside this txn: restore only when the current assignee is a reviewer of the
+            # cycle AND no assignment was made after the card left review (4509b37e638c): an operator who moved
+            # the demoted card -- even to a former reviewer -- made an explicit choice, and a sendback never
+            # overwrites an assignment it did not set.
             implementer = _review_handoff_implementer(conn, task_id)
             extra: dict = {}
             if implementer is not None:
                 extra["implementer"] = implementer
-                if row["assignee"] != implementer:
+                if (row["assignee"] != implementer and _review_cycle_scan(conn, task_id)[1]
+                        and row["assignee"] in _review_cycle_reviewers(conn, task_id)):
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = ? WHERE id = ? AND status = ?",
                         (implementer, task_id, status),
@@ -21823,6 +22088,7 @@ from hermes_cli.kanban_db_board_registry import (  # noqa: E402
     KanbanBoardUnreadable,
     KanbanCardAmbiguous,
     KanbanCardNotFound,
+    board_for_conn,
     board_named_by_pin,
     board_of_task,
     pinned_board,

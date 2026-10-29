@@ -232,7 +232,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runner = cron_subparsers.add_parser(
         "runner", help="Run the cron script runner (plain-script jobs outside the gateway)")
     cron_runner.add_argument(
-        "runner_action", nargs="?", choices=["rearm"],
-        help="rearm: clear a watchdog trip so the runner ticks again")
+        "runner_action", nargs="?", choices=["rearm", "install", "uninstall", "lint"],
+        help="rearm: clear a watchdog trip so the runner ticks again; install/uninstall: the "
+             "ai.hermes.cron-script-runner LaunchAgent; lint: its env vs the gateway plist")
+    cron_runner.add_argument(
+        "--dry-run", action="store_true", dest="runner_dry_run",
+        help="With install: print the plist, write and load nothing")
     add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)

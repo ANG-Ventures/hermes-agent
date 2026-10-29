@@ -570,6 +570,7 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     agent._pending_fallback_error = None
     from agent import fallback_cause as _fbc
     _fbc.clear(agent)   # the attempt block ended served: its cause recovered
+    _fbc.flush_banner(agent)   # the route settled: post the held fallback line
     # The route the call went out on, not the live agent (FleetReview
     # 73d9dc1df836): a switch to/from a pooled provider mid-flight must not
     # drop or mis-gate this call's ledger row.
@@ -3148,6 +3149,32 @@ def _emit_fallback_announce(
 
     if not announce_enabled:
         return
+    from agent import fallback_cause as _fbc
+
+    _ckey = (_fbc.collapse_key(ledger_row, _reason_label)
+             if kind != "recovery" and isinstance(ledger_row, dict) else None)
+    if _ckey:
+        # t_634b4ddf: hops of one pool-wide cause in one turn post as ONE line,
+        # held until the route settles (first byte / served call / turn end).
+        _held = _fbc.held_banner(agent, _ckey, old_label)
+        if _held is None:
+            _fbc.hold_banner(agent, msg=msg, key=_ckey, first_from=old_label,
+                             to_label=new_label, hops=1, label=_reason_label,
+                             rider=msg.partition(" — ")[2])
+        else:
+            # Label from the first hop (the cause the walk started on); rider
+            # from the latest (the freshest relay evidence).
+            _hops = int(_held["hops"]) + 1
+            _rider = msg.partition(" — ")[2] or _held.get("rider")
+            _cmsg = (f"{icon} {verb} ({_held['label']}): fell back through {_hops} lanes "
+                     f"to {new_label} (from {_held['first_from']})")
+            if _rider:
+                _cmsg += f" — {_rider}"
+            _fbc.hold_banner(agent, msg=_cmsg, key=_ckey, first_from=_held["first_from"],
+                             to_label=new_label, hops=_hops, label=_held["label"],
+                             rider=_rider)
+        return
+    _fbc.flush_banner(agent)   # keep chat order: a held hop posts before this line
     emit = getattr(agent, "_emit_status", None)
     if callable(emit):
         emit(msg)
@@ -5081,6 +5108,9 @@ class _StreamingCall(StreamingWaitMonitor):
         if not heartbeat:
             from agent.fallback_wall_budget import disarm
             disarm(self.agent)
+            if getattr(self.agent, "_fallback_banner_hold", None) is not None:
+                from agent.fallback_cause import flush_banner
+                flush_banner(self.agent)   # first byte: the route settled (t_634b4ddf)
         with contextlib.suppress(Exception):
             diag["chunks"] = int(diag.get("chunks", 0)) + 1
             if diag.get("first_chunk_at") is None:

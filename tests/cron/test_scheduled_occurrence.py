@@ -52,6 +52,17 @@ def _fire(home, mode):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def _restore(store, text):
+    """Roll the whole job store back to *text*: jobs.json AND runtime_state.db, whose rows win
+    over the file (#2287), so a jobs.json write alone rewinds nothing. Only the executions
+    ledger survives, and it is the authority under test."""
+    from cron import runtime_state
+
+    for suffix in runtime_state.SIDECAR_SUFFIXES:
+        Path(str(runtime_state.db_path(store.parent)) + suffix).unlink(missing_ok=True)
+    store.write_text(text)
+
+
 @pytest.mark.parametrize('mode', ['builtin', 'provider', 'worker'])
 def test_completed_occurrence_survives_restart_and_prestamp_rollback(tmp_path, mode):
     from datetime import timedelta
@@ -76,21 +87,21 @@ def test_completed_occurrence_survives_restart_and_prestamp_rollback(tmp_path, m
     store.write_text(snapshot)
     _fire(home, mode)
     assert effect.read_text().splitlines() == ['effect']
-    store.write_text(snapshot)  # no last_dispatch stamp, no post-completion fields
+    _restore(store, snapshot)  # no last_dispatch stamp, no post-completion fields
     _fire(home, mode)  # a fresh interpreter, same authoritative ledger
     assert effect.read_text().splitlines() == ['effect'], 'completed occurrence executed twice'
 
     # A different missed slot must remain runnable despite the completed row.
     job['next_run_at'] = (now() - timedelta(minutes=10)).isoformat()
-    store.write_text(json.dumps({'jobs': [job]}))
+    _restore(store, json.dumps({'jobs': [job]}))
     _fire(home, mode)
     assert len(effect.read_text().splitlines()) == 2
     # Manual force is not a completion of the pending scheduled slot.
     job['next_run_at'] = (now() - timedelta(minutes=5)).isoformat()
     pending = json.dumps({'jobs': [job]})
-    store.write_text(pending)
+    _restore(store, pending)
     _fire(home, 'manual')
-    store.write_text(pending)
+    _restore(store, pending)
     _fire(home, mode)
     assert len(effect.read_text().splitlines()) == 4
 

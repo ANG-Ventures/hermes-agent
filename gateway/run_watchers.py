@@ -184,6 +184,7 @@ class GatewaySessionWatchersMixin:
                         "fresh_idle=%s", session_key, still_pending, fresh_idle)
             notified_map.pop(session_key, None)  # re-arm so a FUTURE genuine stall notifies again
             return False
+        from gateway.display_config import display_scope
         from gateway.warning_notifications import present_notification
         from gateway.run import _async_profile_runtime_scope
         try:
@@ -199,7 +200,7 @@ class GatewaySessionWatchersMixin:
                     timeout=_STALL_NOTIFY_SEND_TIMEOUT_SECONDS,
                 )
             async with _async_profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                presented = await present_notification(send_notice, platform=source.platform)
+                presented = await present_notification(send_notice, platform=source.platform, **display_scope(source))
             if not presented:
                 notified_map[session_key] = True  # suppressed: latch so the stall is not re-evaluated every tick
                 return False

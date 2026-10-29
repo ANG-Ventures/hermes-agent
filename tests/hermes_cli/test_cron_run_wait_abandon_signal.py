@@ -133,3 +133,16 @@ def test_sigterm_while_main_thread_holds_registry_lock_still_exits(tmp_path):
     rc, out, _ = _run_and_sigterm(tmp_path, "hold-lock", hook_callback_timeout=1)
     assert rc == 128 + signal.SIGTERM
     assert not out.exists()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("budget", [".nan", ".inf"])
+def test_non_finite_hook_budget_still_waits_for_record(tmp_path, budget):
+    """A non-finite ``plugins.hook_callback_timeout`` must not reach ``Thread.join`` (Prism
+    f094fa505f02): ``join(timeout=nan)`` raises ValueError inside the handler, the process dies
+    without ``os._exit(143)`` and the slow record is lost. Fall back to the finite default."""
+    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=3", hook_callback_timeout=budget, wait_s=60)
+    assert rc == 128 + signal.SIGTERM
+    assert out.exists(), f"record cut before it landed (exit after {elapsed:.1f}s)"
+    calls = json.loads(out.read_text())
+    assert calls == [{"hook": "on_turn_abandoned", "turn_id": "cron_x:turn1", "reason": "signal_15"}]

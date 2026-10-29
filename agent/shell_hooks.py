@@ -655,16 +655,31 @@ def _terminal_session_cwd(kwargs: Dict[str, Any]) -> Optional[str]:
     return terminal_tool.get_session_cwd(get_current_session_key(default="") or kwargs.get("task_id") or "")
 
 
+def _terminal_session_git_env(kwargs: Dict[str, Any]) -> Optional[Dict[str, bool]]:
+    """GIT_* state (``{"GIT_DIR": True}``: set in the shell when its last reported command finished) of
+    the environment this terminal call would run in NOW, whichever session's command reported it.
+    None when the terminal tool is not loaded, there is no environment yet, or it has no record."""
+    terminal_tool = sys.modules.get("tools.terminal_tool")
+    if terminal_tool is None or not hasattr(terminal_tool, "current_env_git_id"):
+        return None
+    return terminal_tool.get_session_git_env(terminal_tool.current_env_git_id(kwargs.get("task_id")))
+
+
 def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
     """Render the stdin JSON payload; unserialisable values are stringified.
 
     ``pre_tool_call`` for ``terminal`` carries a top-level ``session_cwd`` when the session has a
-    recorded cwd; the key is absent otherwise."""
+    recorded cwd, and ``session_git_env`` (``{"GIT_DIR": true, ...}``, set names only; ``{}`` = none
+    set) once a command in the session has reported its shell's GIT_* state; each key is absent
+    otherwise (card t_20695198)."""
     fields = _payload_fields(kwargs)
     if event == "pre_tool_call" and kwargs.get("tool_name") == "terminal":
         session_cwd = _terminal_session_cwd(kwargs)
         if session_cwd:
             fields["session_cwd"] = session_cwd
+        git_env = _terminal_session_git_env(kwargs)
+        if git_env is not None:
+            fields["session_git_env"] = {name: True for name, value in git_env.items() if value}
     return json.dumps({"hook_event_name": event, **fields}, ensure_ascii=False, default=str)
 
 

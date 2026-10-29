@@ -968,11 +968,17 @@ def test_every_cli_verb_reaching_a_guarded_writer_binds_the_actor():
     tree = _ast.parse(src)
     funcs = {n.name: n for n in tree.body if isinstance(n, _ast.FunctionDef)}
     # Upstream moved verb bodies into kanban_ops / kanban_boards (re-imported by kanban.py).
-    from hermes_cli import kanban_boards as _kbo, kanban_ops as _kop
-    for _m in (_kop, _kbo):
+    from hermes_cli import kanban_admit as _kad, kanban_boards as _kbo, kanban_ops as _kop
+    for _m in (_kop, _kbo, _kad):
         for _n in _ast.parse(_module_src(_m)).body:
             if isinstance(_n, _ast.FunctionDef):
                 funcs.setdefault(_n.name, _n)
+    # Verbs imported under an alias (`from hermes_cli.kanban_admit import cmd_admit as _cmd_admit`).
+    for _n in tree.body:
+        if isinstance(_n, _ast.ImportFrom):
+            for _a in _n.names:
+                if _a.asname and _a.name in funcs:
+                    funcs.setdefault(_a.asname, funcs[_a.name])
     # The verb table was `handlers = {...}` inside main(); upstream hoisted it to
     # module-level `_HANDLERS = {...}`. Accept either; a miss must fail, not pass.
     table = _re.search(r"(?:_HANDLERS|handlers) = \{(.*?)\}", src, _re.S).group(1)

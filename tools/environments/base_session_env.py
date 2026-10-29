@@ -47,10 +47,55 @@ def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
 
 
+# Repository-selecting git variables whose presence in the session shell a policy hook cannot see from
+# the command text (card t_20695198). The marker line reports which are SET after each command.
+SESSION_GIT_ENV_NAMES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+_GIT_ENV_TAG = "git:"
+
+
 def _cwd_marker_printf(marker: str) -> str:
     """Emit the CWD marker on its own line (leading ``\\n`` guards against a
-    command whose output lacks a trailing newline; ``_split_cwd_marker`` strips it)."""
-    return f"printf '\\n{marker}%s{marker}\\n' \"$(pwd -P)\""
+    command whose output lacks a trailing newline; ``_split_cwd_marker`` strips it).
+    After the closing marker, ``git:`` lists `` NAME=1`` for each SESSION_GIT_ENV_NAMES variable set in
+    the shell (``${NAME+x}``: set, exported or not) when the command finished; ``_split_git_env`` reads it.
+    It sits on the marker line, so the model never sees it. `` seq=N`` leads the section: the shell's
+    command counter (``_seq_bump_lines``; 0 in the bootstrap), so a late-finalizing older snapshot can be
+    told from a newer one (``terminal_tool.record_session_git_env``).
+
+    The command ran in this same shell and may have redefined anything it can reach (Prism 36b227820e17):
+    a ``printf``/``pwd``/``builtin`` function, an alias (even on ``{`` or ``case``). So the line is emitted
+    in POSIX mode, where the special builtin ``unset`` is found before any function: drop those functions
+    and every alias (a separate line, since aliases expand when a line is parsed), then print with
+    ``\\builtin printf`` behind a ``[[`` (a reserved word, nothing can redefine it once aliases are gone)
+    that checks both steps took. Every value is a parameter expansion of this shell or the readonly counter.
+    Anything that defeats a step (readonly POSIXLY_CORRECT, ``readonly -f builtin``, ``enable -n printf``)
+    suppresses the line, and a missing line from a command nobody killed makes the record UNKNOWN
+    (``BaseEnvironment._extract_cwd_from_output``). Residual, not closable from inside the shell: a command
+    that disables the ``unset`` builtin (``enable -n unset``) AND defines ``unset``/``builtin`` functions, or
+    that prints its own line and exits before this epilogue, can still forge one well-formed line."""
+    flags = "".join(f"${{{name}+ {name}=1}}" for name in SESSION_GIT_ENV_NAMES)
+    return "\n".join([
+        "POSIXLY_CORRECT=y 2>/dev/null",
+        "\\unset -f builtin printf pwd unalias 2>/dev/null && \\unalias -a 2>/dev/null && __hermes_mk=1 "
+        "|| __hermes_mk=0",
+        f"[[ $__hermes_mk == 1 && :$SHELLOPTS: == *:posix:* ]] && "
+        f"\\builtin printf '\\n{marker}%s{marker}{_GIT_ENV_TAG} seq=%s%s\\n' \"$(\\builtin pwd -P)\" "
+        f"\"${{{_SEQ_NOW}-0}}\" \"{flags}\""])
+
+
+# The environment's command counter (card t_20695198): persisted in the snapshot as _SEQ_VAR, bumped into
+# the READONLY _SEQ_NOW before the user's command runs (so the command cannot rewrite the number its own
+# marker reports), and written back after it. A non-numeric / oversized stored value restarts at 0.
+_SEQ_VAR = "__HERMES_SEQ"
+_SEQ_NOW = "__hermes_seq"
+
+
+def _seq_bump_lines() -> list[str]:
+    return [
+        f'case "${{{_SEQ_VAR}-}}" in \'\'|*[!0-9]*|?????????????????*) {_SEQ_NOW}=0 ;; '
+        f'*) {_SEQ_NOW}=${_SEQ_VAR} ;; esac',
+        # 10#: a stored "08" is decimal, not an invalid octal that aborts the wrapper (Prism e084363a13a5).
+        f"readonly {_SEQ_NOW}=$((10#${_SEQ_NOW} + 1)) 2>/dev/null || true"]
 
 
 def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
@@ -163,9 +208,11 @@ def _wrap_command_script(
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
+        *_seq_bump_lines(),
         f"builtin cd -- {quoted_cwd} || exit 126",
         f"eval '{escaped}'",
         "__hermes_ec=$?",
+        f"export {_SEQ_VAR}=\"${_SEQ_NOW}\" 2>/dev/null || true",
         "umask 077"]
     if snapshot_ready:
         parts.append(
@@ -196,3 +243,33 @@ def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None
     line_end = output.find("\n", last + len(marker))
     line_end = line_end + 1 if line_end != -1 else len(output)
     return cwd_path, output[:line_start] + output[line_end:]
+
+
+def _split_git_env(output: str, marker: str) -> dict[str, bool] | None:
+    """The ``git:`` section after the last complete ``marker<path>marker`` pair: ``{name: set}`` for every
+    SESSION_GIT_ENV_NAMES variable, or ``None`` when there is no complete pair or no ``git:`` section
+    (a killed command; a wrapper without the section)."""
+    last = output.rfind(marker)
+    if last == -1 or output.rfind(marker, max(0, last - 4096), last) == -1:
+        return None
+    tail = output[last + len(marker):]
+    tail = tail.split("\n", 1)[0].rstrip("\r")
+    if not tail.startswith(_GIT_ENV_TAG):
+        return None
+    present = {word.partition("=")[0] for word in tail[len(_GIT_ENV_TAG):].split() if word.endswith("=1")}
+    return {name: name in present for name in SESSION_GIT_ENV_NAMES}
+
+
+def _split_git_seq(output: str, marker: str) -> int | None:
+    """The `` seq=N`` of the ``git:`` section ``_split_git_env`` reads, or None (no section / no seq)."""
+    last = output.rfind(marker)
+    if last == -1 or output.rfind(marker, max(0, last - 4096), last) == -1:
+        return None
+    tail = output[last + len(marker):].split("\n", 1)[0].rstrip("\r")
+    if not tail.startswith(_GIT_ENV_TAG):
+        return None
+    for word in tail[len(_GIT_ENV_TAG):].split():
+        name, _, value = word.partition("=")
+        if name == "seq" and value.isdigit():
+            return int(value)
+    return None

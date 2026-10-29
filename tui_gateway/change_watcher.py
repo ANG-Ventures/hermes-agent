@@ -289,7 +289,9 @@ def _bot_relay_outbox_sig():
 # persists platform connect/disconnect/health (the Messaging page's status signal).
 _CHANGE_WATCHES: dict[str, tuple[float, Any, Any]] = {
     "pet.changed": (2.0, _pet_sig, _pet_changed_payload),
-    "cron.changed": (1.0, lambda: _home_mtime_ns("cron", "jobs.json"), lambda: {}),
+    # jobs.runtime.json: the merged view moves there in definitions-only mode (t_3c8fa4d6).
+    "cron.changed": (1.0, lambda: (_home_mtime_ns("cron", "jobs.json"),
+                                   _home_mtime_ns("cron", "jobs.runtime.json")), lambda: {}),
     "sessions.changed": (0.5, _sessions_sig, lambda: {}),
     # Projects created/switched by CLI or agent tooling write projects.db without any
     # state.db movement, so sessions.changed never fires and the desktop Projects
