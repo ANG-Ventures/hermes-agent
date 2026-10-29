@@ -188,6 +188,26 @@ def test_delegate_knob(root, clock, knob, expected):
     assert lanes.delegate(root) is expected
 
 
+def test_delegate_reads_the_host_root_knob_from_a_profile_gateway(root, clock, monkeypatch):
+    """t_0faaf89b: a profile gateway (HERMES_HOME=<root>/profiles/chiron, no knob in its own
+    config) ticks the ROOT home while root's gateway is down. The runner reads the knob from the
+    host root, so delegation must too, or the sibling ticks the root script lane ("all") under a
+    progressing runner. Observed 2026-10-28 19:23:05 (pid 99498, 4 root no_agent claims)."""
+    from cron import lanes
+
+    chiron = _make_profile(root, "chiron")
+    monkeypatch.setenv("HERMES_HOME", str(chiron))
+    lanes._knob_cache.clear()
+    _hb(root)
+    assert lanes.delegate(root) is True
+    # chiron's OWN published field still follows its own config (no knob there): the runner keeps
+    # standing by on chiron's home, so this fix moves no home onto the runner.
+    assert lanes.gateway_lane_status_fields()["cron_script_lane_delegation"] == 0
+    # The host knob still governs: off at the root -> the sibling takes the lane back (AC-9).
+    _write_config(root, knob=False)
+    assert lanes.delegate(root) is False
+
+
 def test_knob_default_is_false():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
