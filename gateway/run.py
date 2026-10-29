@@ -6005,6 +6005,11 @@ class GatewayRunner(
             )
             if not line:
                 return  # gating said skip (noop/idle/etc.) — nothing to deliver
+            from gateway.response_filters import lifecycle_notice_muted
+            if lifecycle_notice_muted(source.platform, source.chat_id, _cfg if isinstance(_cfg, dict) else {}):
+                logger.info("COMPACTION_ANNOUNCE_MUTED reason=%s session=%s page_channel=%s",
+                            trigger_reason, new_session_id, source.chat_id)
+                return
 
             _adapter = self.adapters.get(source.platform)
             if not (_adapter and source.chat_id):
@@ -7206,6 +7211,17 @@ class GatewayRunner(
             message = format_restart_notice(verdict)
             if not message:
                 return
+            if verdict.planned:
+                # A restart we requested is not a page: keep it out of an act-now channel
+                # (t_75a91ccc). An UNPLANNED one still posts.
+                from gateway.response_filters import lifecycle_notice_muted
+                from gateway.warning_notifications import effective_user_config
+                _src = getattr(event, "source", None)
+                if _src is not None and lifecycle_notice_muted(
+                        _src.platform, _src.chat_id, effective_user_config()):
+                    logger.info("PHASE=restart_notice_muted key=%s by=%s page_channel=%s",
+                                session_key, verdict.planned_by or "-", _src.chat_id)
+                    return
             # Idempotent per (boot, session): a re-scheduled resume or a crash
             # loop must not spam the channel. The claim does an atomic rename,
             # so it goes OFF-LOOP — a blocking os.replace on the loop thread is
