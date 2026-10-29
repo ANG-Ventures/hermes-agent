@@ -336,6 +336,10 @@ def structural_free(plan, name: str) -> int:
     d = plan.detail.get(name) or {}
     if h is None or not (h.enabled and h.state == "active") or d.get("load1") is None:
         return 0
+    if h.slots is None:
+        # Count-free host (t_c834e0d8): only the per-tick stand-in, never running.
+        from hermes_cli.kanban_worker_pool import UNCOUNTED_TICK_FREE
+        return max(0, UNCOUNTED_TICK_FREE - plan.taken.get(name, 0))
     return max(0, h.slots - int(d.get("running") or 0) - plan.taken.get(name, 0))
 
 

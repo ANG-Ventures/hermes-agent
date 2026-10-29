@@ -227,7 +227,10 @@ def format_fleet(rep: Mapping) -> List[str]:
         out.append(f"    {c['task_id']} [{c['board']}] @{c['assignee']} rule={c.get('rule') or '-'}")
     for name, h in _map(rep.get("hosts")).items():
         flags = (" HOT" if h.get("hot") else "") + ("" if h.get("in_pool") else " (not in pool)")
-        out.append(f"  {name}: running={h['running']} slots={h.get('slots') if h.get('slots') is not None else '?'} "
+        # A pool host with no count (t_c834e0d8) reads ``uncounted``; '?' = not in the pool files.
+        slots_txt = (h.get("slots") if h.get("slots") is not None
+                     else "uncounted" if h.get("in_pool") else "?")
+        out.append(f"  {name}: running={h['running']} slots={slots_txt} "
                    f"free={h.get('free') if h.get('free') is not None else '?'} band={h['band']}{flags}")
         if h.get("pressure"):
             out.append(f"    pressure: {h['pressure']}")
