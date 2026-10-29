@@ -262,7 +262,7 @@ class InterruptControlMixin:
         interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
         if not text or not text.strip():
             return False
-        cleaned = relabel_route_note_text(text.strip())  # E11: received text never carries the harness marker
+        cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
@@ -275,7 +275,8 @@ class InterruptControlMixin:
         to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
         if not text or not text.strip():
             return False
-        cleaned = relabel_route_note_text(text.strip())  # E11: received text never carries the harness marker
+        # E11: one relabel for both redirect sinks (codex native turn/steer and the correction row).
+        cleaned = relabel_route_note_text(text.strip())
 
         _native_steer = _ic_codex_method(self, "request_steer")
         if _native_steer is not None:

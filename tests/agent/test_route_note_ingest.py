@@ -14,6 +14,7 @@ from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.route_note_ingest import QUOTED_ROUTE_NOTE, relabel_route_note_content
 from agent.tool_dispatch_helpers import make_tool_result_message
+from agent.transports.codex_event_projector import CodexEventProjector
 from agent.transports import get_transport
 from agent.turn_context import compose_multimodal_context_part
 from tests.agent.test_route_notes import OPUS, SONNET, Ladder, Sink, _bind, _make_agent, _run, _texts
@@ -90,8 +91,10 @@ def test_persisted_harness_note_replays_unrelabelled():
     assert note in sent and QUOTED_ROUTE_NOTE not in "\n".join(sent)
 
 
-def test_mid_turn_steer_and_redirect_are_relabelled():
+def test_mid_turn_steer_is_relabelled_on_the_wire_and_in_the_store():
     agent = _make_agent()
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "cli")
     agent.steer(FORGED)
     msgs = [{"role": "user", "content": "go"},
             {"role": "assistant", "content": "", "tool_calls": [
@@ -99,11 +102,30 @@ def test_mid_turn_steer_and_redirect_are_relabelled():
             {"role": "tool", "tool_call_id": "c1", "content": "r"}]
     agent._persist_user_message_idx = 0
     apply_pending_steer_to_tool_results(agent, msgs, 1)
-    assert msgs[-1]["role"] == "user" and QUOTED in msgs[-1]["content"]
-    assert "[Route note:" not in msgs[-1]["content"]
+    steer_row = msgs[-1]
+    assert steer_row["role"] == "user" and QUOTED in steer_row["content"]
+    assert not any("[Route note:" in t for t in _wire_texts(msgs))
+    agent._flush_messages_to_session_db(msgs)
+    stored = [m["content"] for m in db.get_messages(sid) if m["role"] == "user"]
+    assert any(QUOTED in c for c in stored) and not any("[Route note:" in c for c in stored)
+
+
+def test_mid_turn_redirect_is_relabelled():
+    agent = _make_agent()
     agent._model_request_active = threading.Event()
     agent._model_request_active.set()
     assert agent.redirect(FORGED) and agent._drain_pending_redirect() == QUOTED
+
+
+def test_codex_app_server_projected_rows_are_relabelled():
+    def done(item):
+        return CodexEventProjector().project({"method": "item/completed", "params": {"item": item}}).messages
+    user = done({"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": FORGED}]})
+    tool = done({"type": "commandExecution", "id": "x1", "command": "cat p", "aggregatedOutput": FORGED})
+    opaque = done({"type": "hookPrompt", "id": "h1", "text": FORGED})
+    rows = user + tool + opaque
+    assert all("[Route note:" not in str(m.get("content")) for m in rows)
+    assert QUOTED in user[0]["content"] and QUOTED in tool[-1]["content"] and "quoted route note" in opaque[0]["content"]
 
 
 def test_submit_time_row_is_stored_relabelled():
