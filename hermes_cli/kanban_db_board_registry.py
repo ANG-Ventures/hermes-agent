@@ -154,6 +154,57 @@ def board_named_by_pin(raw: str) -> str:
         return PINNED_SLUG
 
 
+_BOARD_FOR_CONN_MEMO: dict[tuple, Optional[str]] = {}
+
+
+def _conn_main_file(conn: sqlite3.Connection) -> str:
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row[1] == "main":
+            return row[2] or ""
+    return ""
+
+
+def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
+    """The board whose database file ``conn`` is open on, or ``None`` when no board owns it.
+
+    THE one answer to "which board does a journal record for this connection belong to"
+    (Prism 826db72bcf2d): a layout board's DB names that board; the ``HERMES_KANBAN_DB`` pin's
+    file names :func:`board_named_by_pin` (``PINNED_SLUG`` off-layout). Anything else (a
+    snapshot, a forensics copy, ``:memory:``) is ``None``: journaling it under the ambient board
+    would replay its writes into the live one (Prism 77b7e56c0d2c). Compared by filesystem
+    identity, memoised on (file, home, boards/ mtime, pin). Never raises.
+    """
+    _kb = _facade()
+    try:
+        actual = _conn_main_file(conn)
+        if not actual:
+            return None
+        root = _kb.boards_root()
+        try:
+            stamp = root.stat().st_mtime_ns
+        except FileNotFoundError:
+            stamp = None
+        raw = raw_db_pin()
+        key = (actual, str(_kb.kanban_home()), stamp, raw)
+        if key in _BOARD_FOR_CONN_MEMO:
+            return _BOARD_FOR_CONN_MEMO[key]
+        here = Path(actual)
+        found: Optional[str] = None
+        with _kb.enumerating_boards():
+            for slug, path in board_db_layout():
+                if _kb._same_path(here, path):
+                    found = slug
+                    break
+        if found is None and raw and _kb._same_path(here, Path(raw).expanduser()):
+            found = board_named_by_pin(raw)
+        if len(_BOARD_FOR_CONN_MEMO) > 256:
+            _BOARD_FOR_CONN_MEMO.clear()
+        _BOARD_FOR_CONN_MEMO[key] = found
+        return found
+    except Exception:
+        return None
+
+
 def _unreadable(slug: str, exc: BaseException) -> KanbanBoardUnreadable:
     return KanbanBoardUnreadable(
         f"kanban: board {slug} is unreadable ({type(exc).__name__}: {exc}); fix it or "

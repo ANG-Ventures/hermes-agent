@@ -669,6 +669,61 @@ def test_a_revoke_on_an_unregistered_copy_never_journals_into_the_ambient_board(
     assert rows == [(None,)], rows
 
 
+def test_a_revoke_on_a_pinned_board_is_journaled_with_that_boards_other_writes(board, tmp_path, monkeypatch):
+    """Prism 826db72bcf2d: a HERMES_KANBAN_DB pin outside kanban/boards matches no layout path, but it IS a
+    registered board (``PINNED_SLUG``). Its revoke journals under the same slug as its comments, so restoring
+    a snapshot and replaying that journal brings the comment back AND the grant back revoked."""
+    import shutil
+    import time as _time
+
+    from hermes_cli import kanban_db_board_registry as kbr
+    from hermes_cli import kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    pin = tmp_path / "elsewhere" / "kanban.db"
+    pin.parent.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    kb._INITIALIZED_PATHS.clear()
+    with kb.connect_closing() as conn:
+        c = kb.create_task(conn, title="review card on the pinned board")
+        assert kbr.board_for_conn(conn) == kbr.PINNED_SLUG
+    g = _mint(c)
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(pin), str(snap))
+    since = _time.time() - 0.001
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, c, "apollo", "after the snapshot")
+        assert ksg.revoke(conn, g["grant_id"]) == 1
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into(kbr.PINNED_SLUG, snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    bodies = [r[0] for r in rc.execute("SELECT body FROM task_comments WHERE task_id = ?", (c,))]
+    rc.close()
+    assert len(rows) == 1 and rows[0][0] is not None, rows
+    assert "after the snapshot" in bodies, bodies
+
+
+def test_board_for_conn_names_layout_boards_and_refuses_an_unregistered_copy(board, tmp_path):
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    kb.create_board("other")
+    with kb.connect_closing() as conn:
+        assert kbr.board_for_conn(conn) == kb.DEFAULT_BOARD
+    with kb.connect_closing(board="other") as conn:
+        assert kbr.board_for_conn(conn) == "other"
+    cc = sqlite3.connect(str(tmp_path / "copy.db"))
+    try:
+        assert kbr.board_for_conn(cc) is None
+    finally:
+        cc.close()
+    mem = sqlite3.connect(":memory:")
+    try:
+        assert kbr.board_for_conn(mem) is None
+    finally:
+        mem.close()
+
+
 def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
     import shutil
     import time as _time

@@ -294,7 +294,9 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
     try:
         from hermes_cli import kanban_journal
 
-        board = _conn_board_slug(conn)
+        from hermes_cli.kanban_db_board_registry import board_for_conn
+
+        board = board_for_conn(conn)
         if board is None and cards:
             # No registered board owns this file (a snapshot, a forensics copy): journaling under the
             # ambient board would revoke ITS live grant on the next restore (Prism 77b7e56c0d2c).
@@ -306,20 +308,6 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
     except Exception:  # pragma: no cover - the journal is a net, never a gate
         pass
     return len(cards)
-
-
-def _conn_board_slug(conn: sqlite3.Connection) -> Optional[str]:
-    """The board whose database file ``conn`` is open on; None when no registered board matches."""
-    from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_board_registry import board_db_layout
-
-    try:
-        for slug, _path in board_db_layout():
-            if kb._conn_is_board(conn, slug):
-                return slug
-    except Exception:
-        return None
-    return None
 
 
 def _revoke_rows(conn: sqlite3.Connection, where: str, args: list, now: int) -> list:
