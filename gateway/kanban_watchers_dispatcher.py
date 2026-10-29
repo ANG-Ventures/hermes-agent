@@ -8,7 +8,6 @@ the singleton lock and the health telemetry; everything that only needs the
 from __future__ import annotations
 
 import contextlib
-import os
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
@@ -234,63 +233,6 @@ class _KanbanDispatcher:
                     with contextlib.suppress(Exception):
                         conn.close()
         return False
-
-    def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
-        """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
-
-        Runs before dispatch fans out; the per-tick cap keeps a bulk triage
-        load from burst-spending the aux LLM. Returns the number decomposed.
-        """
-        try:
-            from hermes_cli import kanban_decompose as _decomp
-        except Exception as exc:  # pragma: no cover
-            logger.warning("kanban auto-decompose: import failed (%s); skipping", exc)
-            return 0
-        attempted = 0
-        successes = 0
-        with _default_profile_secret_scope():
-            for slug in self._board_slugs():
-                if attempted >= auto_decompose_per_tick:
-                    break
-                # Pin the board via env for the call: the decomposer connects
-                # with no board kwarg (same pattern as the dashboard specify endpoint).
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
-                    try:
-                        triage_ids = _decomp.list_triage_ids()
-                    except Exception as exc:
-                        logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
-                        triage_ids = []
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        attempted += 1
-                        successes += self._decompose_one(_decomp, slug, tid)
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
-        return successes
-
-    @staticmethod
-    def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:
-        """Decompose one triage task; returns 1 on success, 0 otherwise."""
-        try:
-            outcome = _decomp.decompose_task(tid, author="auto-decomposer")
-        except Exception:
-            logger.exception("kanban auto-decompose: decompose_task crashed on %s", tid)
-            return 0
-        if not outcome.ok:
-            # Common no-op reasons (no aux client) must not spam logs every tick.
-            logger.debug("kanban auto-decompose [%s]: %s skipped: %s", slug, tid, outcome.reason)
-            return 0
-        if outcome.fanout and outcome.child_ids:
-            logger.info("kanban auto-decompose [%s]: %s → %d children", slug, tid, len(outcome.child_ids))
-        else:
-            logger.info("kanban auto-decompose [%s]: %s → single task (no fanout)", slug, tid)
-        return 1
 
 
 @contextlib.contextmanager

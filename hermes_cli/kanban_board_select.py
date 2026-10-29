@@ -11,20 +11,21 @@
 5. otherwise :func:`bare_verb_policy`: ``refuse`` -> :class:`BoardRequired`, whose text names the
    next command; ``default`` -> ``DEFAULT_BOARD``.
 
-Gated (S7 C1a): ``kanban.bare_verb`` in the ROOT config.yaml. Absent == ``legacy``: the pre-S7
-resolution (``--board`` > ``HERMES_KANBAN_BOARD`` > ``kanban/current`` > ``default``) is untouched
-and this module only serves ``hermes kanban locate``. ``refuse`` / ``default`` turn S7 on. C1b
-flips the absent value to ``refuse`` and deletes ``legacy`` with the pointer.
+Kill switch (S7 D7): ``kanban.bare_verb`` in the ROOT config.yaml, ``refuse`` (absent) or
+``default``. ``default`` turns step 5 into ``DEFAULT_BOARD``; it never resurrects a current-board
+file or env var, and never relaxes step 1's pin check.
 """
 from __future__ import annotations
 
 import argparse
 from typing import Iterable, Optional
 
-BARE_VERB_LEGACY = "legacy"
 BARE_VERB_REFUSE = "refuse"
 BARE_VERB_DEFAULT = "default"
 _POLICIES = frozenset({BARE_VERB_REFUSE, BARE_VERB_DEFAULT})
+# What an absent / unreadable / unknown ``kanban.bare_verb`` means. ``refuse`` is the shipped
+# answer (S7 D7); the test suite's legacy tests run under ``default`` until C1c rewrites them.
+ABSENT_POLICY = BARE_VERB_REFUSE
 
 # Verbs that address no single board: they sweep every board, or touch none.
 BOARD_AGNOSTIC_VERBS = frozenset({
@@ -45,8 +46,8 @@ class BoardNotFound(ValueError):
 def bare_verb_policy() -> str:
     """``kanban.bare_verb`` from the ROOT ``config.yaml`` (``kanban_home()``), never a profile's.
 
-    ``refuse`` / ``default`` (S7 D7) or ``legacy`` (absent, unreadable, anything else). Cached on
-    the file's (mtime, size): ``get_current_board`` asks on every call.
+    ``default`` only when set to exactly that; anything else (absent, unreadable, a typo) is
+    ``refuse``. Cached on the file's (mtime, size).
     """
     from hermes_cli import kanban_db as kb
 
@@ -55,7 +56,7 @@ def bare_verb_policy() -> str:
         st = path.stat()
         stamp: Optional[tuple[int, int]] = (st.st_mtime_ns, st.st_size)
     except OSError:
-        return BARE_VERB_LEGACY
+        return ABSENT_POLICY
     cached = _POLICY_CACHE.get(str(path))
     if cached is not None and cached[0] == stamp:
         return cached[1]
@@ -67,14 +68,9 @@ def bare_verb_policy() -> str:
         value = str((kanban or {}).get("bare_verb") or "").strip().lower() if isinstance(kanban, dict) else ""
     except Exception:
         value = ""
-    policy = value if value in _POLICIES else BARE_VERB_LEGACY
+    policy = value if value in _POLICIES else ABSENT_POLICY
     _POLICY_CACHE[str(path)] = (stamp, policy)
     return policy
-
-
-def s7_enabled() -> bool:
-    """True when the S7 resolver replaces the pointer (``kanban.bare_verb`` set)."""
-    return bare_verb_policy() != BARE_VERB_LEGACY
 
 
 def refusal_text(verb: str) -> str:

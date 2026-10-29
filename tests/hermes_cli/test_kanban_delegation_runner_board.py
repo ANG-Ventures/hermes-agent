@@ -108,7 +108,7 @@ def test_k1_delegations_argv_is_the_unit_runner(capture_spawn, home):
     cmd, env = capture_spawn(BOARD)
     assert cmd == ["hermes", "-p", "unit-owner", "delegation-unit"]
     assert env["HERMES_KANBAN_HOME"] == str(kb.kanban_home())
-    assert env["HERMES_KANBAN_BOARD"] == BOARD
+    assert "HERMES_KANBAN_BOARD" not in env
     assert env["HERMES_KANBAN_TASK"] == "t_deleg1"
 
 

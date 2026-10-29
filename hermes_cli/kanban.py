@@ -335,8 +335,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         _record_refused_block(args, refusal)
         return _err(f"kanban: {refusal}")
 
-    # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
-    # the `--board` routing override (else `--board beta boards show` reports beta).
+    # `boards …` manages board metadata itself, so it must ignore the `--board` routing override
+    # (else `--board beta boards show` reports beta).
     if action == "boards":
         return _dispatch_boards(args)
 
@@ -346,40 +346,21 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     from hermes_cli import kanban_board_select as kbsel
 
-    # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
-    # exact resolution the dispatcher uses for workers.
-    board_override = getattr(args, "board", None)
+    # S7 D2: the verb names its board, or the DB pin or its card id does; otherwise it is refused
+    # with the next command. The resolved slug is the context board for the whole verb, so library
+    # callers see the board the connection is on.
+    try:
+        resolved = kbsel.resolve(args)
+    except kbsel.BoardRequired as exc:
+        return _err(str(exc), 2)
+    except kbsel.BoardNotFound as exc:
+        return _err(str(exc))
+    except (ValueError, kb.KanbanPinDivergenceError) as exc:
+        msg = str(exc)
+        return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
     board_scope = contextlib.nullcontext()
-    if kbsel.s7_enabled():
-        # S7 D2 (kanban.bare_verb set): the verb names its board, or the DB pin or its card id
-        # does; otherwise it is refused with the next command. The resolved slug is the context
-        # board for the whole verb, so library callers see the board the connection is on.
-        try:
-            resolved = kbsel.resolve(args)
-        except kbsel.BoardRequired as exc:
-            return _err(str(exc), 2)
-        except kbsel.BoardNotFound as exc:
-            return _err(str(exc))
-        except (ValueError, kb.KanbanPinDivergenceError) as exc:
-            msg = str(exc)
-            return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
-        if resolved and resolved != kb.PINNED_SLUG:
-            board_scope = kb.scoped_current_board(resolved)
-    # `is not None`: an explicit empty selector (empty $BOARD in a script) is refused below,
-    # never treated as "no selector" and routed to the current board.
-    elif board_override is not None:
-        try:
-            normed = kb._normalize_board_slug(board_override)
-        except ValueError as exc:
-            return _err(f"kanban: {exc}", 2)
-        if not normed:
-            return _err("kanban: --board requires a slug", 2)
-        # Boards other than 'default' must already exist — typoed slugs would otherwise silently
-        # create an empty board.
-        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
-            return _err(f"kanban: board {normed!r} does not exist. "
-                        f"Create it with `hermes kanban boards create {normed}`.")
-        board_scope = kb.scoped_current_board(normed)
+    if resolved and not kb.pin_names_no_board(resolved):
+        board_scope = kb.scoped_current_board(resolved)
 
     with board_scope:
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises

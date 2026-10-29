@@ -124,9 +124,10 @@ def _profile_author(default: str = "specifier") -> str:
     return verified_profile_author(current_profile_name() or os.environ.get("USER") or default)
 
 
-def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
-    """``(task, "")`` when the task exists and is in triage, else ``(None, reason)``."""
-    with kbc.connect_closing() as conn:
+def _load_triage_task(task_id: str, *, board: Optional[str] = None) -> tuple[Optional[kb.Task], str]:
+    """``(task, "")`` when the task exists and is in triage on ``board`` (the ambient board when
+    ``None``), else ``(None, reason)``."""
+    with kbc.connect_closing(board=board) as conn:
         task = kb.get_task(conn, task_id)
     if task is None:
         return None, "unknown task id"

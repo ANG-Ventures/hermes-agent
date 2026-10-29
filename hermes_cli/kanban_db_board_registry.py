@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -61,15 +62,17 @@ def raw_db_pin() -> str:
     return _kb._kanban_path_override("HERMES_KANBAN_DB").strip()
 
 
-def board_db_layout() -> list[tuple[str, Path]]:
+def board_db_layout(home: Optional[Path] = None) -> list[tuple[str, Path]]:
     """``(slug, layout DB path)`` for every board on disk, archived included, ``default`` first.
 
     The set :func:`kanban_db.list_boards` enumerates, resolved from ONE root read: per-board
     ``kanban_home()`` resolution costs ~4 ms a board at the live count (S7 RC-2). A dir named for
-    a slug IS that board's dir; aliases redirect retired names, which have no dir.
+    a slug IS that board's dir; aliases redirect retired names, which have no dir. ``home`` names
+    another Hermes root's registry (an env snapshot of a worker under that root); default: ours.
     """
     _kb = _facade()
-    home = _kb.kanban_home()
+    if home is None:
+        home = _kb.kanban_home()
     out: list[tuple[str, Path]] = [(_kb.DEFAULT_BOARD, home / "kanban.db")]
     root = home / "kanban" / "boards"
     if not root.is_dir():
@@ -108,50 +111,87 @@ def pinned_board() -> Optional[str]:
     return board_named_by_pin(raw) if raw else None
 
 
+def pin_names_no_board(slug: Optional[str]) -> bool:
+    """True only when ``slug`` is the sentinel for a ``HERMES_KANBAN_DB`` pin that names no
+    board. ``override`` is also a valid board slug (Prism 45a44320e2b8 / 36b894e284eb): with no
+    pin, or with a pin on board ``override``'s own DB, it is that board and routes like any other.
+    """
+    if slug != PINNED_SLUG:
+        return False
+    raw = raw_db_pin()
+    if not raw or board_named_by_pin(raw) != PINNED_SLUG:
+        return False
+    _kb = _facade()
+    if not _kb.board_exists(PINNED_SLUG):
+        return True
+    return not _kb._pin_file_agrees(_kb._board_db_path_ignoring_pin(PINNED_SLUG),
+                                    Path(raw).expanduser())
+
+
 def pinned_board_error() -> Optional[str]:
     """Why the current pin could not be named, or ``None`` (no pin, or it was named)."""
     raw = raw_db_pin()
     return _PINNED_BOARD_ERRORS.get(raw) if raw else None
 
 
-def board_named_by_pin(raw: str) -> str:
+def board_named_by_pin(raw: str, *, home: Optional[Path] = None) -> str:
     """The board whose layout DB path is the file ``raw`` names, else :data:`PINNED_SLUG`.
 
     Spelling-blind inverse of ``_board_db_path_ignoring_pin`` (RC-7): compared through
     ``_pin_file_agrees``, the contradiction guard's own predicate, so a firmlink / symlinked /
-    case-variant spelling of a board's DB names that board. Memoised on (pin, root, boards/
-    mtime): a new board dir changes the mtime, so a process pays one scan per pin.
+    case-variant spelling of a board's DB names that board. Memoised on (pin, its resolved
+    identity, root, boards/ mtime): a new board dir changes the mtime, and a retargeted symlink
+    pin changes the identity (Prism 69c969208e42), so a process pays one scan per pin target.
+    ``home`` is the Hermes root whose registry names the pin (Prism f984ec16d458); default: ours.
+    ``_PINNED_BOARD_ERRORS`` describes OUR pin only, so a foreign root never writes or clears it
+    (Prism df36eaaa7231): a local memo hit would otherwise leave a foreign failure standing.
     """
     _kb = _facade()
+    foreign = home is not None
     try:
-        root = _kb.boards_root()
+        if not foreign:
+            home = _kb.kanban_home()
+        root = home / "kanban" / "boards"
         try:
             stamp = root.stat().st_mtime_ns
         except FileNotFoundError:
             stamp = None
-        key = (raw, str(_kb.kanban_home()), stamp)
+        key = (raw, _pin_identity(raw), str(home), stamp)
         hit = _PINNED_BOARD_MEMO.get(key)
         if hit is not None:
             return hit
         pin = Path(raw).expanduser()
         found = PINNED_SLUG
         with _kb.enumerating_boards():
-            for slug, path in board_db_layout():
+            for slug, path in (board_db_layout(home) if foreign else board_db_layout()):
                 if _kb._pin_file_agrees(path, pin):
                     found = slug
                     break
         if len(_PINNED_BOARD_MEMO) > 256:
             _PINNED_BOARD_MEMO.clear()
         _PINNED_BOARD_MEMO[key] = found
-        _PINNED_BOARD_ERRORS.pop(raw, None)
+        if not foreign:
+            _PINNED_BOARD_ERRORS.pop(raw, None)
         return found
     except Exception as exc:  # RC-11: total; the pin still routes every open.
-        _PINNED_BOARD_ERRORS[raw] = f"{type(exc).__name__}: {exc}"
+        if not foreign:
+            _PINNED_BOARD_ERRORS[raw] = f"{type(exc).__name__}: {exc}"
         if raw not in _PINNED_BOARD_ERROR_LOGGED:
             _PINNED_BOARD_ERROR_LOGGED.add(raw)
             _log.warning("kanban: could not name the board HERMES_KANBAN_DB=%s pins (%s: %s); "
                          "using %r", raw, type(exc).__name__, exc, PINNED_SLUG)
         return PINNED_SLUG
+
+
+def _pin_identity(raw: str) -> tuple:
+    """The file a pin names right now: realpath + (st_dev, st_ino) of the target, or
+    ``(realpath, None)`` when it does not exist yet."""
+    real = os.path.realpath(os.path.expanduser(raw))
+    try:
+        st = os.stat(real)
+    except OSError:
+        return (real, None)
+    return (real, (st.st_dev, st.st_ino))
 
 
 def _unreadable(slug: str, exc: BaseException) -> KanbanBoardUnreadable:
