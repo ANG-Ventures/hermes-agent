@@ -50,7 +50,7 @@ def studio(tmp_path, monkeypatch):
     (root / "fleet").mkdir(parents=True)
     (root / "fleet" / "admission-priority.json").write_text(json.dumps(PRIORITY), encoding="utf-8")
     monkeypatch.setenv("PLACEMENT_HOME", str(root))
-    monkeypatch.delenv("KANBAN_UNIFIED_ADMIT", raising=False)
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
     c = {"host": "mac-studio", "ceiling": None, "ceiling_reason": "-",
          "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"),
          "limits": ad.Limits(mem_reserve_gb=128.0), "mem_available_gb": 360.0, "mem_total_gb": 512.0}
@@ -156,7 +156,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
-    monkeypatch.delenv("KANBAN_UNIFIED_ADMIT", raising=False)
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
@@ -452,3 +452,22 @@ def test_vendored_admission_demand_matches_canonical():
 
     ours = Path(dmd.__file__).read_text(encoding="utf-8")
     assert body(ours) == body(Path(env).read_text(encoding="utf-8"))
+
+
+def test_kanban_unified_admit_defaults_off_until_t_c466b7ee(monkeypatch):
+    """t_3694ab3c hard stop: absent KANBAN_UNIFIED_ADMIT = 0 (today's rule) on every reader, the vendored band
+    rule included; "1" opts in; other classes keep the vendored default (absent = on)."""
+    from hermes_cli.fleet_placement import admission_demand as dmd
+    from hermes_cli.kanban_load_gate import unified_admit
+
+    monkeypatch.delenv("KANBAN_UNIFIED_ADMIT", raising=False)
+    monkeypatch.delenv("PRISM_UNIFIED_ADMIT", raising=False)
+    assert unified_admit() is False
+    assert dmd.unified("kanban") is False
+    assert dmd.unified(dmd.workload_of("athena")) is False
+    assert dmd.unified("kanban", {}) is False
+    assert dmd.unified("prism") is True
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
+    assert unified_admit() is True and dmd.unified("kanban") is True
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
+    assert unified_admit() is False

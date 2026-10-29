@@ -34,7 +34,7 @@ def root(tmp_path, monkeypatch):
     r = tmp_path / "root"
     (r / "fleet").mkdir(parents=True)
     (r / "fleet" / "admission-priority.json").write_text(json.dumps(PRIORITY), encoding="utf-8")
-    monkeypatch.delenv("KANBAN_UNIFIED_ADMIT", raising=False)
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
     monkeypatch.delenv(placement.BAND_BASIS_ENV, raising=False)
     return r
 
@@ -96,7 +96,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
-    monkeypatch.delenv("KANBAN_UNIFIED_ADMIT", raising=False)
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     (home / "fleet").mkdir()
