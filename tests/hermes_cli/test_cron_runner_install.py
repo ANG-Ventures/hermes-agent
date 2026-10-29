@@ -25,15 +25,18 @@ GATEWAY_ENV = {
 class FakeLaunchd:
     """Records launchctl/pgrep calls; ``alive`` is the runner process set pgrep reports."""
 
-    def __init__(self, alive=(), exits_after_bootout=True):
+    def __init__(self, alive=(), exits_after_bootout=True, bootout=(0, "")):
         self.calls = []
         self.alive = list(alive)
         self.exits_after_bootout = exits_after_bootout
+        self.bootout = bootout  # (rc, stderr) launchctl bootout returns
 
     def launchctl(self, *args):
         self.calls.append(("launchctl", *args))
-        if args and args[0] == "bootout" and self.exits_after_bootout:
-            self.alive = []
+        if args and args[0] == "bootout":
+            if self.exits_after_bootout:
+                self.alive = []
+            return subprocess.CompletedProcess(["launchctl", *args], self.bootout[0], "", self.bootout[1])
         return subprocess.CompletedProcess(["launchctl", *args], 0, "", "")
 
     def pgrep(self):
@@ -49,14 +52,18 @@ def scratch(tmp_path, monkeypatch):
     vhome.mkdir()
     monkeypatch.setattr(crp, "account_home", lambda: home)
     monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
-    monkeypatch.setattr(crp, "runner_python", lambda: "/opt/venv/bin/python3")
     env = dict(GATEWAY_ENV, HERMES_HOME=str(vhome))
     return home, vhome, env
 
 
-def _write_gateway(home, env):
+GATEWAY_ARGV = ["/opt/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]
+
+
+def _write_gateway(home, env, **extra):
     path = home / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
-    path.write_bytes(plistlib.dumps({"Label": "ai.hermes.gateway", "EnvironmentVariables": env}))
+    body = {"Label": "ai.hermes.gateway", "ProgramArguments": GATEWAY_ARGV,
+            "LimitLoadToSessionType": ["Aqua", "Background"], "EnvironmentVariables": env}
+    path.write_bytes(plistlib.dumps({**body, **extra}))
     return path
 
 
@@ -72,9 +79,9 @@ def test_generated_plist_matches_spec_and_copies_gateway_env(scratch):
     data = plistlib.loads(crp.render_plist(home))
     assert data["Label"] == "ai.hermes.cron-script-runner"
     assert data["EnvironmentVariables"] == env
-    assert data["ProgramArguments"][0] == "/opt/venv/bin/python3"
-    assert data["ProgramArguments"][-2:] == ["cron", "runner"]
-    assert any("hermes_cli.main" in a for a in data["ProgramArguments"])
+    # spec §5.7: [<runtime venv python>, -m, hermes_cli.main, cron, runner], the gateway's own python
+    assert data["ProgramArguments"] == ["/opt/venv/bin/python", "-m", "hermes_cli.main", "cron", "runner"]
+    assert data["LimitLoadToSessionType"] == ["Aqua", "Background"]
     assert data["KeepAlive"] is True and data["RunAtLoad"] is True
     assert data["ProcessType"] == "Interactive" and data["ExitTimeOut"] == 30
     assert data["SoftResourceLimits"] == {"NumberOfFiles": 4096}
@@ -86,23 +93,23 @@ def test_generated_plist_matches_spec_and_copies_gateway_env(scratch):
 
 def test_lint_green_after_install_red_on_source_path_mutation(scratch, capsys):
     home, _vhome, env = scratch
-    gw = _write_gateway(home, env)
+    _write_gateway(home, env)
     fake = FakeLaunchd()
     assert crp.install(launchctl=fake.launchctl) == 0
     assert crp.lint() == 0
     mutated = dict(env, PATH="/usr/bin:/bin")
-    gw.write_bytes(plistlib.dumps({"Label": "ai.hermes.gateway", "EnvironmentVariables": mutated}))
+    _write_gateway(home, mutated)
     assert crp.lint() == 1
     assert "PATH" in capsys.readouterr().out
 
 
 def test_lint_allows_xpc_keys_only(scratch):
     home, _vhome, env = scratch
-    gw = _write_gateway(home, env)
+    _write_gateway(home, env)
     assert crp.install(launchctl=FakeLaunchd().launchctl) == 0
-    gw.write_bytes(plistlib.dumps({"EnvironmentVariables": dict(env, XPC_SERVICE_NAME="x")}))
+    _write_gateway(home, dict(env, XPC_SERVICE_NAME="x"))
     assert crp.lint() == 0
-    gw.write_bytes(plistlib.dumps({"EnvironmentVariables": dict(env, EXTRA="1")}))
+    _write_gateway(home, dict(env, EXTRA="1"))
     assert crp.lint() == 1
 
 
@@ -274,3 +281,35 @@ def test_runner_pids_finds_runner_after_setproctitle_rewrite():
     finally:
         proc.kill()
         proc.wait()
+
+
+def test_install_refuses_2_when_gateway_program_arguments_not_runtime_python(scratch):
+    """No `<python> -m hermes_cli.main` in the gateway plist: no python to share, so nothing is written."""
+    home, vhome, env = scratch
+    _write_gateway(home, env, ProgramArguments=["/usr/bin/osascript", "-l", "JavaScript", "-e", "x"])
+    fake = FakeLaunchd()
+    assert crp.install(launchctl=fake.launchctl) == 2
+    assert crp.install(dry_run=True, launchctl=fake.launchctl) == 2
+    assert not _runner_path(home).exists() and not (vhome / "logs").exists()
+    assert fake.calls == []
+
+
+def test_uninstall_fails_on_bootout_error_and_keeps_plist(scratch, capsys):
+    """Prism 127626c196fe: a failed bootout leaves the job registered; never report success."""
+    home, _vhome, env = scratch
+    _write_gateway(home, env)
+    assert crp.install(launchctl=FakeLaunchd().launchctl) == 0
+    fake = FakeLaunchd(bootout=(5, "Boot-out failed: 5: Input/output error"))
+    assert crp.uninstall(launchctl=fake.launchctl, pgrep=fake.pgrep, wait_s=0) == 1
+    assert "Input/output error" in capsys.readouterr().out
+    assert _runner_path(home).exists()
+
+
+def test_uninstall_treats_not_loaded_bootout_as_success(scratch):
+    """launchctl bootout of an absent label: rc 3 'No such process' (measured macOS 26.7)."""
+    home, _vhome, env = scratch
+    _write_gateway(home, env)
+    assert crp.install(launchctl=FakeLaunchd().launchctl) == 0
+    fake = FakeLaunchd(bootout=(3, "Boot-out failed: 3: No such process"))
+    assert crp.uninstall(launchctl=fake.launchctl, pgrep=fake.pgrep, wait_s=0) == 0
+    assert not _runner_path(home).exists()

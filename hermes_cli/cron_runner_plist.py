@@ -33,6 +33,8 @@ _XPC = re.compile(r"^XPC_")
 # A runner started by this plist: `<python> ... hermes_cli.main ... cron runner` with nothing after it,
 # or `hermes cron runner` once main._set_process_title() rewrote argv via setproctitle.
 _RUNNER_CMDLINE = r"(hermes_cli[.]main.*|^hermes) cron runner$"
+# launchctl bootout of a label that is not loaded: 3 "No such process", 113 "Could not find service".
+_BOOTOUT_NOT_LOADED = (3, 113)
 
 
 class SourceMissing(Exception):
@@ -49,11 +51,6 @@ def _uid() -> int:
     return os.getuid()  # windows-footgun: ok — launchd (macOS) only
 
 
-def runner_python() -> str:
-    from hermes_cli._launchers import resolve_store_python
-    return str(resolve_store_python(PROJECT_ROOT) or sys.executable)
-
-
 def agents_dir(home: Path) -> Path:
     return home / "Library" / "LaunchAgents"
 
@@ -66,29 +63,41 @@ def gateway_plist_path(home: Path) -> Path:
     return agents_dir(home) / f"{GATEWAY_LABEL}.plist"
 
 
-def _read_env(path: Path) -> Dict[str, str]:
+def _read_plist(path: Path) -> dict:
     if not path.is_file():
         raise SourceMissing(str(path))
-    return dict(plistlib.loads(path.read_bytes()).get("EnvironmentVariables") or {})
+    return plistlib.loads(path.read_bytes())
+
+
+def _read_env(path: Path) -> Dict[str, str]:
+    return dict(_read_plist(path).get("EnvironmentVariables") or {})
 
 
 def _hermes_home(home: Path, env: Dict[str, str]) -> Path:
     return Path(env.get("HERMES_HOME") or home / ".hermes")
 
 
-def _program_arguments() -> List[str]:
-    from hermes_cli._launchers import runtime_command
-    return runtime_command(PROJECT_ROOT, ["cron", "runner"], python=runner_python())
+def _program_arguments(gateway: dict, path: Path) -> List[str]:
+    """Spec §5.7: ``[<runtime venv python>, -m, hermes_cli.main, cron, runner]``, the python being the
+    gateway plist's own argv[0], so both processes import through one interpreter (§5.6)."""
+    argv = list(gateway.get("ProgramArguments") or [])
+    if len(argv) < 3 or argv[1:3] != ["-m", "hermes_cli.main"]:
+        raise SourceMissing(f"{path} (ProgramArguments is not `<python> -m hermes_cli.main ...`)")
+    return [argv[0], "-m", "hermes_cli.main", "cron", "runner"]
 
 
 def render_plist(home: Path) -> bytes:
-    """The runner plist. Env copied verbatim from the root gateway plist; raises SourceMissing."""
-    env = _read_env(gateway_plist_path(home))
+    """The runner plist. Env, python and session type copied from the root gateway plist;
+    raises SourceMissing."""
+    gw_path = gateway_plist_path(home)
+    gateway = _read_plist(gw_path)
+    env = dict(gateway.get("EnvironmentVariables") or {})
     vhome = _hermes_home(home, env)
     log = str(vhome / "logs" / LOG_NAME)
+    session = {k: gateway[k] for k in ("LimitLoadToSessionType",) if k in gateway}
     return plistlib.dumps({
         "Label": LABEL,
-        "ProgramArguments": _program_arguments(),
+        "ProgramArguments": _program_arguments(gateway, gw_path),
         "EnvironmentVariables": env,
         "WorkingDirectory": str(vhome),
         "RunAtLoad": True,
@@ -99,6 +108,7 @@ def render_plist(home: Path) -> bytes:
         "HardResourceLimits": {"NumberOfFiles": 8192},
         "StandardOutPath": log,
         "StandardErrorPath": log,
+        **session,  # same launchd session type as the gateway (Local Network grant)
     })
 
 
@@ -145,7 +155,7 @@ def install(*, dry_run: bool = False, launchctl: Callable = _run_launchctl) -> i
         refused = _machine_id_source(home)
         body = render_plist(home)
     except SourceMissing as exc:
-        print(f"cron runner install: source plist {exc} not found; nothing written")
+        print(f"cron runner install: source plist {exc} missing or unusable; nothing written")
         return EXIT_SOURCE_MISSING
     if refused:
         print(f"cron runner install: refusing, {REFUSED_KEY} is set in {refused} "
@@ -180,7 +190,12 @@ def uninstall(*, launchctl: Callable = _run_launchctl, pgrep: Callable = _runner
     """Boot out, remove the plist, confirm no runner process remains (spec §12 step 2)."""
     home = account_home()
     path = runner_plist_path(home)
-    launchctl("bootout", f"gui/{_uid()}/{LABEL}")  # not loaded is fine
+    res = launchctl("bootout", f"gui/{_uid()}/{LABEL}")
+    if res.returncode not in _BOOTOUT_NOT_LOADED and res.returncode != 0:
+        # The job may still be registered; KeepAlive would respawn it. Keep the plist for a retry.
+        print(f"cron runner uninstall: launchctl bootout failed (rc {res.returncode}): "
+              f"{(res.stderr or '').strip()}; plist left in place")
+        return 1
     if path.exists():
         path.unlink()
         print(f"cron runner uninstall: removed {path}")
