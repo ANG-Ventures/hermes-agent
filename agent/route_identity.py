@@ -148,7 +148,15 @@ def _delta(old: RouteIdentity, new: RouteIdentity) -> List[str]:
     return parts
 
 
-def _wrap(body: str) -> str:
+def _wrap(body: str, correction: Optional[str] = None) -> str:
+    """One note ≤ ``MAX_NOTE_CHARS`` (E10). A pending tier ``correction`` body is reserved first:
+    when the two do not fit, the change body is cut, never the correction, because committing
+    the call clears ``pending_correction`` on the strength of this note having carried it."""
+    if correction:
+        budget = MAX_NOTE_CHARS - len(f"{ROUTE_NOTE_OPENER} ; {correction}.]")
+        if len(body) > budget:
+            body = body[:max(budget, 0)].rstrip()
+        body = f"{body}; {correction}" if body else correction
     note = f"{ROUTE_NOTE_OPENER} {body}.]"
     return note if len(note) <= MAX_NOTE_CHARS else note[:MAX_NOTE_CHARS - 2] + ".]"
 
@@ -204,8 +212,10 @@ def render_note(known: Optional[Known], now: Now, reason: str = "unavailable") -
             body = "; ".join([f"fell back to {model_label(serving.model)} ({reason})"] + changes[1:])
         else:
             body = "; ".join(changes)
-    parts = [p for p in (body, _body(pending)) if p]
-    return _wrap("; ".join(parts)) if parts else None
+    correction = _body(pending) or None
+    if body is None and correction is None:
+        return None
+    return _wrap(body or "", correction)
 
 
 # --- runtime reads (post-swap agent, never config defaults) ------------------------------------

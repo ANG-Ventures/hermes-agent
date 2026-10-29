@@ -1503,12 +1503,18 @@ class SessionStore(
         self._record_gateway_session_peer(
             peer_sid, session_key, peer_origin, display_name=peer_name, transport_profile=peer_transport)
 
-    def set_route_known(self, session_key: str, route_known: Dict[str, Any]) -> bool:
+    def set_route_known(
+        self, session_key: str, route_known: Dict[str, Any], *, expected_session_id: Optional[str] = None,
+    ) -> bool:
         """Persist the route-note ``Known`` for one session under the store lock (metadata-only
-        UPSERT). Raises on a failed write so the caller does not advance its in-memory copy."""
+        UPSERT). ``expected_session_id`` makes the write conditional, like ``update_session``: a
+        call that commits after ``/new`` or ``/reset`` rotated the key must not write the old
+        conversation's ``Known`` into the new one. Returns False when nothing was written."""
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
+                return False
+            if expected_session_id is not None and entry.session_id != expected_session_id:
                 return False
             entry.route_known = dict(route_known)
         self._save_entry(session_key)

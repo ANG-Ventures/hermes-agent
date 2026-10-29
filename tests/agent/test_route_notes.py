@@ -364,6 +364,18 @@ def test_e10_note_is_capped_at_200_chars():
     assert note.startswith(ri.ROUTE_NOTE_OPENER) and note.endswith(".]") and len(note) <= ri.MAX_NOTE_CHARS
 
 
+def test_e10_cap_cuts_the_change_body_never_the_pending_correction():
+    """Prism 10ccec2d3aaa: committing a sent note clears ``pending_correction``, so the correction
+    must be in every note that claims to carry it, even when the route change alone fills E10."""
+    correction = ri.correction_note(ri.FAST, ri.STANDARD)
+    known = Known(_rid(OPUS, None, ri.FAST), _rid(OPUS, None, ri.FAST), (ri.FAST, ri.STANDARD), correction)
+    now = Now(_rid("a" * 80, "ultra", ri.FAST), _rid("b" * 80, "low", ri.FAST))
+    note = render_note(known, now, "weekly cap")
+    assert len(note) <= ri.MAX_NOTE_CHARS
+    assert note.endswith("speed fast → standard (provider served standard).]")
+    assert note.startswith("[Route note: the user selected aaaa")  # the change body is what got cut
+
+
 def test_kill_switch_off_attaches_nothing_but_known_advances():
     agent = _make_agent()
     sink = Sink()
