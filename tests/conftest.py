@@ -833,6 +833,24 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_owning_install_retarget(request, monkeypatch):
+    """Keep ``cmd_update`` from re-running itself in the checkout whose venv runs the suite.
+
+    Update tests point ``PROJECT_ROOT`` at a fake tree; under a checkout's in-tree ``.venv``
+    ``retarget_to_owning_install`` correctly reads that as a redirected install and re-execs
+    the real updater with pytest's argv (SystemExit 2). Tests of the repair itself opt in with
+    ``@pytest.mark.real_owning_install``.
+    """
+    if request.node.get_closest_marker("real_owning_install"):
+        return
+    try:
+        from hermes_cli import update_owning_install
+    except Exception:
+        return
+    monkeypatch.setattr(update_owning_install, "retarget_to_owning_install", lambda *_: None)
+
+
+@pytest.fixture(autouse=True)
 def _close_leaked_session_dbs():
     """Close every SessionDB a test constructed but forgot to close.
 
@@ -1659,6 +1677,9 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers", "real_release_channels: keep the real R2 channel reader (no local source-branch stub)."
+    )
+    config.addinivalue_line(
+        "markers", "real_owning_install: keep the real cmd_update owning-install retarget (no autouse stub)."
     )
     config.addinivalue_line(
         "markers",
