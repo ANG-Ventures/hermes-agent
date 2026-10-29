@@ -482,11 +482,9 @@ def validate_comment(
     candidates = body_pr_keys(body)
     if "release" in body_verbs(body):
         # A bare `close-on: merged` names no PR: it releases the card on ITS PRs, so those are candidates
-        # too, and a release whose PR cannot be established is refused (Prism 4fdc26d69c92).
+        # too (Prism 4fdc26d69c92). With none there is nothing to exclude: the row is stored grant-marked
+        # and the read side never treats it as a gate (#2401 release-guard contract).
         candidates |= card_pr_keys(conn, task_id)
-        if not candidates:
-            raise GrantRefused(f"grant {grant_id}: release on {task_id} names no PR and the card records none; "
-                               "a granted release needs an established PR")
     own = authored_pr_keys(conn, json.loads(row["parent_profiles"] or "[]"), task_id=task_id,
                            candidates=candidates)
     if own:

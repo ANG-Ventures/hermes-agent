@@ -726,13 +726,15 @@ def _record_pr(card, profile, pr):
 
 def test_an_implicit_release_is_checked_against_the_cards_own_prs(board):
     """Prism 4fdc26d69c92: a bare `close-on: merged` names no PR, so the own-PR exclusion reads the PRs the
-    card itself records; one the parent run authored (on its own card) is refused, and a release on a card
-    with no PR at all is refused, since no PR can be established."""
+    card itself records; one the parent run authored (on its own card) is refused. A card with no PR has no
+    candidate to exclude, so that release is stored (the read side never takes it as a gate, #2401)."""
     _home, a, b = board
+    with kb.connect_closing() as conn:
+        bare = kb.create_task(conn, title="PR-less card")
+    g0 = _mint(bare, verbs=["verdict", "release"])
+    _child_comment(bare, "close-on: merged", g0["grant_id"])
+    assert [r["grant_id"] for r in _rows(bare)] == [g0["grant_id"]]
     g = _mint(b, verbs=["verdict", "release"])
-    with pytest.raises(ksg.GrantRefused, match="no PR"):
-        _child_comment(b, "close-on: merged", g["grant_id"])
-    assert _rows(b) == []
     own = "https://github.com/acme/repo/pull/7"
     _record_pr(a, "default", own)          # the parent run's own card and PR
     _record_pr(b, "daedalus", own)         # card B lands that same PR
