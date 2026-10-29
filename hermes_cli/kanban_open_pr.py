@@ -379,7 +379,8 @@ class ClosedUnmergedPrError(ValueError):
                 f"was deleted looks exactly like this). Reopen/retarget and land it, or name what superseded "
                 f"it with the close-reason token: 'SUPERSEDED-BY owner/repo#N' / 'RE-CARRIED-AS #N' (a MERGED "
                 f"PR) or 'SUPERSEDED-BY <sha>' (a commit on the default branch), in --result/--summary or "
-                f"--superseded-by <ref>."
+                f"--superseded-by <ref>. A PR abandoned on purpose: close-record it on GitHub with "
+                f"'CLOSED: ABANDONED|REJECTED|THROWAWAY -- <why>' and pass --abandon-routed-pr '<reason>' to done (archive needs no flag)."
             )
             if len(self.closed) > 1:
                 parts.append("Each closed PR needs its own token: name it before the token, e.g. "
@@ -631,8 +632,23 @@ def has_close_record(body) -> bool:
     return isinstance(body, str) and bool(_CLOSE_RECORD_RE.search(body))
 
 
-def pr_close_record(repo: str, number: int) -> Optional[bool]:
-    """True iff a comment on ``repo#number`` carries ``CLOSED: <TOKEN>``; None when GitHub cannot be read."""
+# t_2ce83b37 (2026-10-29): a PR closed on purpose with ``CLOSED: ABANDONED|REJECTED|THROWAWAY -- ...`` on its
+# own thread has no merged survivor by design (hermes-home#7741, re-carded as a new card). That record is a
+# terminal reason: ``archive`` accepts it, ``done`` accepts it with the audited ``--abandon-routed-pr <reason>``.
+# A stacked PR auto-closed by base deletion carries no such comment, so it is still refused.
+TERMINAL_CLOSE_TOKENS = ("ABANDONED", "REJECTED", "THROWAWAY")
+_TERMINAL_RECORD_RE = re.compile(r"^\s*CLOSED: (?:" + "|".join(TERMINAL_CLOSE_TOKENS) + r")\b", re.MULTILINE)
+
+
+def has_terminal_close_record(body) -> bool:
+    """Does one PR comment body carry a terminal (no-survivor) close-reason line?"""
+    return isinstance(body, str) and bool(_TERMINAL_RECORD_RE.search(body))
+
+
+def pr_close_record(repo: str, number: int, *, match=None) -> Optional[bool]:
+    """True iff a comment on ``repo#number`` carries ``CLOSED: <TOKEN>`` (``match`` narrows the tokens);
+    None when GitHub cannot be read."""
+    match = match or has_close_record
     try:
         proc = subprocess.run(
             ["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments?per_page=100",
@@ -646,7 +662,7 @@ def pr_close_record(repo: str, number: int) -> Optional[bool]:
         return None
     for line in (proc.stdout or "").splitlines():
         try:
-            if has_close_record(json.loads(line)):
+            if match(json.loads(line)):
                 return True
         except ValueError:
             continue
@@ -658,6 +674,32 @@ def _default_close_record() -> Optional[CloseRecordFn]:
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return None
     return pr_close_record
+
+
+def pr_terminal_close_record(repo: str, number: int) -> Optional[bool]:
+    """True iff a comment on ``repo#number`` carries ``CLOSED: ABANDONED|REJECTED|THROWAWAY``."""
+    return pr_close_record(repo, number, match=has_terminal_close_record)
+
+
+def _default_terminal_record() -> Optional[CloseRecordFn]:
+    """The real ``gh``-backed terminal close-record reader, or None inside pytest (no live GitHub)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    return pr_terminal_close_record
+
+
+def _terminally_closed(refs, record_fn: Optional[CloseRecordFn]) -> list:
+    """The subset of ``refs`` whose own GitHub thread carries a terminal close record. Unreadable -> not."""
+    out = []
+    for ref in refs:
+        try:
+            ok = record_fn(ref.repo, ref.number) if record_fn is not None else None
+        except Exception as exc:
+            _log.warning("kanban closed-pr check: terminal close record %s lookup failed: %s", ref, exc)
+            ok = None
+        if ok:
+            out.append(ref)
+    return out
 
 
 def _default_sha_check() -> Optional[ShaCheckFn]:
@@ -691,11 +733,15 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
                                 query_fn: Optional[QueryFn] = None,
                                 sha_check: Optional[ShaCheckFn] = None,
                                 verb: str = "done", decision_texts=(), recorded=(),
-                                close_record_fn: Optional[CloseRecordFn] = None) -> list:
+                                close_record_fn: Optional[CloseRecordFn] = None,
+                                abandon_reason: Optional[str] = None,
+                                terminal_record_fn: Optional[CloseRecordFn] = None) -> list:
     """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged (or unreadable) and
     the handoff (``texts`` + ``superseded_by``) carries no SUPERSEDED-BY/RE-CARRIED-AS token naming merged
     work for it. ``decision_texts`` (archive only: card comments) may instead record an explicit
-    ``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|DUPLICATE-OF`` decision. Returns the closed refs accepted."""
+    ``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|DUPLICATE-OF`` decision. A closed PR whose OWN GitHub thread
+    carries ``CLOSED: ABANDONED|REJECTED|THROWAWAY`` is terminal for ``archive``, and for ``done`` when a
+    non-empty ``abandon_reason`` (``--abandon-routed-pr``) is given. Returns the closed refs accepted."""
     # Fleet-owned refs only: a foreign (upstream / third-party) PR is a mention the fleet cannot land.
     # ``recorded``: PR strings earlier runs persisted for this card (see :func:`recorded_pr_refs`), so a
     # reviewer approving without repeating the PR is still gated on it (FleetReview #1339).
@@ -715,6 +761,13 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
     uncovered = [c for c in uncovered if not any(_decision_covers(c, t, sole=sole) for t in decision_texts)]
     if not uncovered:
         return closed
+    if verb == "archive" or (isinstance(abandon_reason, str) and abandon_reason.strip()):
+        if terminal_record_fn is None:
+            terminal_record_fn = _default_terminal_record()
+        abandoned = _terminally_closed(uncovered, terminal_record_fn)
+        uncovered = [c for c in uncovered if c not in abandoned]
+        if not uncovered:
+            return closed
     # A merged survivor + the PR's own close record (t_9aff2951). ``done`` takes the survivor from
     # ``--survivor-pr``; ``archive`` has no flag, so any of the card's own PRs that merged qualifies.
     candidates = primary if verb == "archive" else split_fleet(extract_pr_refs(survivor_pr=survivor_pr))[0]

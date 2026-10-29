@@ -641,7 +641,9 @@ _SPECS = [
              help="Audited override: the card was routed to review on its own PR, that PR is still "
                   "OPEN, and the --survivor-pr/--survivor-ref claim names something else. Without "
                   "this flag such a completion is refused (t_829fce95); with it a "
-                  "routed_pr_abandoned event records the PRs and REASON. An empty REASON is refused."),
+                  "routed_pr_abandoned event records the PRs and REASON. An empty REASON is refused. "
+                  "Also closes a card whose own PR is CLOSED unmerged with a 'CLOSED: "
+                  "ABANDONED|REJECTED|THROWAWAY' comment on GitHub (t_2ce83b37)."),
         _arg("--survivor-ref", action="append", metavar="[REPO=]URL#SHA",
              help="Name an external survivor when the implementation lives on a remote, not in "
                   "the workspace. Verified with git ls-remote AND required to name this task: "
