@@ -64,7 +64,7 @@ def _journal_path() -> Path:
     return _current_cron_store().cron_dir / JOURNAL_FILENAME
 
 
-def _append(record: Dict[str, Any]) -> None:
+def _append(record: dict[str, Any]) -> None:
     """Append one record. Best effort — never raises into a cron write."""
     try:
         path = _journal_path()
@@ -110,7 +110,7 @@ def _default_actor() -> str:
     return f"{os.path.basename(os.environ.get('HERMES_ACTOR', '') or 'hermes')}:{os.getpid()}"
 
 
-def read_entries(*, window_hours: float = DEFAULT_WINDOW_HOURS) -> List[Dict[str, Any]]:
+def read_entries(*, window_hours: float = DEFAULT_WINDOW_HOURS) -> list[dict[str, Any]]:
     """Return journal entries inside the window, oldest first.
 
     Malformed lines are skipped rather than failing the read: the journal is
@@ -121,7 +121,7 @@ def read_entries(*, window_hours: float = DEFAULT_WINDOW_HOURS) -> List[Dict[str
     if not path.exists():
         return []
     cutoff = _hermes_now() - timedelta(hours=window_hours)
-    entries: List[Dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -165,7 +165,7 @@ def prune() -> int:
     if not path.exists():
         return 0
     cutoff = _hermes_now() - timedelta(days=_RETENTION_DAYS)
-    kept: List[str] = []
+    kept: list[str] = []
     dropped = 0
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -226,7 +226,7 @@ class VanishedJobReport:
     """
 
     status: str
-    vanished: List[Dict[str, Any]] = field(default_factory=list)
+    vanished: list[dict[str, Any]] = field(default_factory=list)
     created_count: int = 0
     removed_count: int = 0
     present_count: int = 0
@@ -257,7 +257,7 @@ class VanishedJobReport:
 def check_vanished_jobs(
     *,
     window_hours: float = DEFAULT_WINDOW_HOURS,
-    jobs: Optional[List[Dict[str, Any]]] = None,
+    jobs: Optional[list[dict[str, Any]]] = None,
 ) -> VanishedJobReport:
     """Reconcile journalled creates against what jobs.json actually holds.
 
@@ -292,8 +292,8 @@ def check_vanished_jobs(
     }
 
     # Latest create, and every removal, per id.
-    created: Dict[str, Dict[str, Any]] = {}
-    removed: Dict[str, List[Any]] = {}
+    created: dict[str, dict[str, Any]] = {}
+    removed: dict[str, list[Any]] = {}
     for rec in entries:
         jid = rec.get("job_id")
         at = _parse_at(rec.get("at"))
@@ -308,7 +308,7 @@ def check_vanished_jobs(
         elif rec.get("event") == EVENT_REMOVED:
             removed.setdefault(jid, []).append(at)
 
-    vanished: List[Dict[str, Any]] = []
+    vanished: list[dict[str, Any]] = []
     for jid, rec in created.items():
         if jid in present:
             continue

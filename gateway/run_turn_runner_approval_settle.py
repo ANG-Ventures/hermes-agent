@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
+from agent.i18n import t
 from gateway.platforms.base_exec_approval import approval_timeout_seconds, format_approval_timed_out_notice
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,9 @@ def register_timeout_notice(
     session_key = runner._ctx.session_key or ""
     if not request_id or not session_key:
         return
-    timeout_s = approval_timeout_seconds()
+    timeout_s = approval_data.get("timeout_s")
+    if timeout_s is None:
+        timeout_s = approval_timeout_seconds()
 
     def settle(reason: str) -> None:
         if reason != "timeout":
@@ -61,7 +64,9 @@ async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str]
     metadata = _interim_metadata(ctx._status_thread_metadata)
     try:
         # Plain markdown, not the card's platform markup: ``edit_message`` re-formats it itself.
-        if card_message_id and await _edit_card(adapter, ctx._status_chat_id, card_message_id, f"{notice}\n```\n{command}\n```"):
+        if card_message_id and await _edit_card(
+                adapter, ctx._status_chat_id, card_message_id,
+                t("gateway.exec_approval.timed_out_card_body", notice=notice, command=command)):
             return
         await adapter.send(ctx._status_chat_id, notice, metadata=metadata)
     except Exception:
@@ -70,7 +75,10 @@ async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str]
 
 async def _edit_card(adapter, chat_id: str, message_id: str, content: str) -> bool:
     """Edit the card in place (drops the buttons on platforms whose edit replaces the markup)."""
-    edit: Optional[Callable[..., Any]] = getattr(adapter, "edit_message", None)
+    expire = getattr(type(adapter), "expire_exec_approval", None)
+    edit: Optional[Callable[..., Any]] = (
+        adapter.expire_exec_approval if callable(expire) else getattr(adapter, "edit_message", None)
+    )
     if edit is None:
         return False
     try:
