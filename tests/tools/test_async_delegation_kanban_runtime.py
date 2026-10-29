@@ -207,6 +207,22 @@ def test_dispatcher_flag_gates_eligibility():
     assert akb.dispatcher_serves_here() is True
 
 
+def test_ineligible_fallback_is_logged_at_info_naming_the_reason(caplog):
+    import logging as _logging
+
+    with caplog.at_level(_logging.DEBUG, logger="tools.async_delegation"):
+        akb.log_ineligible("no_dispatcher", "deleg_x")
+        akb.log_ineligible("knob_in_process", "deleg_y")
+    by_reason = {r.getMessage().split("ineligible_reason=")[-1]: r.levelno for r in caplog.records}
+    assert by_reason == {"no_dispatcher": _logging.INFO, "knob_in_process": _logging.DEBUG}
+    assert "delegation_id=deleg_x" in caplog.records[0].getMessage()
+
+
+def test_delegate_tool_routes_every_ineligible_unit_through_the_logger():
+    src = (Path(__file__).resolve().parents[2] / "tools" / "delegate_tool.py").read_text(encoding="utf-8")
+    assert "_akb.log_ineligible(_why_not, live_deleg_id)" in src
+
+
 def test_parent_route_persists_the_configured_provider_name():
     parent = SimpleNamespace(requested_provider="custom:my-endpoint", provider="custom", model="gpt-x")
     route = akb.parent_route(parent, {"base_url": ""})

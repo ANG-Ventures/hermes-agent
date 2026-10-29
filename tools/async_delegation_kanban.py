@@ -112,6 +112,14 @@ def ineligible_reason(*, durable_spec: Optional[Dict[str, Any]], children: List[
     return None
 
 
+def log_ineligible(reason: str, delegation_id: Optional[str]) -> None:
+    """Record why a durable unit stays in-process. INFO when the knob asked for the kanban runtime
+    (an operator must see which §5.1 condition failed), DEBUG when the knob itself is ``in_process``."""
+    level = logging.DEBUG if reason == "knob_in_process" else logging.INFO
+    logger.log(level, "async_delegation_kanban_ineligible delegation_id=%s ineligible_reason=%s",
+               delegation_id, reason)
+
+
 def parent_route(parent_agent: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
     """The non-secret route the runner rebuilds the parent from (§5.2.1). ``requested_provider`` is the
     CONFIGURED name (a named custom endpoint), never the resolved generic provider."""
