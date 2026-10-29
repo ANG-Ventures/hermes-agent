@@ -607,6 +607,37 @@ def test_a_revoked_grant_stays_revoked_through_a_journal_replay(board, tmp_path,
     assert len(rows) == 1 and rows[0][0] is not None, rows
 
 
+def test_a_revoke_on_another_board_is_journaled_to_that_board(board, tmp_path, monkeypatch):
+    """Prism c2baca2e9dd1: the revoke journals under the board its connection is open on, not the ambient
+    current board, so replaying the grant's own board journal brings the grant back revoked."""
+    import shutil
+    import time as _time
+
+    from hermes_cli import kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    kb.create_board("other")
+    with kb.connect_closing(board="other") as conn:
+        c = kb.create_task(conn, title="review card on other")
+    args = dict(cards=[c], verbs=["verdict", "approve"], by="apollo",
+                child_session_ref=kb.derive_session_ref(CHILD_SID), parent_model=MODEL, child_model=MODEL,
+                parent_profiles=["default", "apollo"])
+    with kb.connect_closing(board="other") as conn:
+        g = ksg.mint(conn, **args)
+    assert kb._journal_board_slug() != "other"
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(kb.kanban_db_path(board="other")), str(snap))
+    since = _time.time() - 0.001
+    with kb.connect_closing(board="other") as conn:
+        assert ksg.revoke(conn, g["grant_id"]) == 1
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into("other", snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    rc.close()
+    assert len(rows) == 1 and rows[0][0] is not None, rows
+
+
 def _record_pr(card, profile, pr):
     with kb.connect_closing() as conn, kb.write_txn(conn):
         conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",

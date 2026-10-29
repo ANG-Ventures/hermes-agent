@@ -280,16 +280,33 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
             with kb.write_txn(conn):
                 cards = _revoke_rows(conn, where + " AND child_session_ref = ?", [*args, own_ref], now)
     # Journaled after commit, one record per card, so a snapshot + journal replay restores the grant
-    # revoked instead of live (Prism a35d26840b79). Best-effort, like every journal write.
+    # revoked instead of live (Prism a35d26840b79). Best-effort, like every journal write. Under the
+    # board ``conn`` is open on, not the ambient one, since replay reads only the restored board's
+    # journal (Prism c2baca2e9dd1).
     try:
         from hermes_cli import kanban_journal
 
+        board = _conn_board_slug(conn)
         for card in cards:
-            kanban_journal.append(kb._journal_board_slug(), card, "sign_grant_revoked",
+            kanban_journal.append(board, card, "sign_grant_revoked",
                                   {"grant_id": grant_id, "revoked_at": now})
     except Exception:  # pragma: no cover - the journal is a net, never a gate
         pass
     return len(cards)
+
+
+def _conn_board_slug(conn: sqlite3.Connection) -> Optional[str]:
+    """The board whose database file ``conn`` is open on; the ambient board when none matches."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_board_registry import board_db_layout
+
+    try:
+        for slug, _path in board_db_layout():
+            if kb._conn_is_board(conn, slug):
+                return slug
+    except Exception:
+        pass
+    return kb._journal_board_slug()
 
 
 def _revoke_rows(conn: sqlite3.Connection, where: str, args: list, now: int) -> list:
