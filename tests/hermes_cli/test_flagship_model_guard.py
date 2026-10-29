@@ -556,3 +556,131 @@ def test_flagship_placeholder_remapped_to_cheap_profile_is_accepted(
         task_id = kb.create_task(conn, title="child", assignee="apollo", parents=[parent])
         assert kb.get_task(conn, task_id).assignee == "daedalus-opus"
         assert kb.list_comments(conn, task_id) == []
+
+
+# ---- Prism r5 -----------------------------------------------------------------
+# d1a3754ac7e5: the gate judges DISPATCHABLE routes; a swarm's no-worker root is not.
+# f6a54f1196fd: a pin clear is judged on the RESULTING (profile) route, before reclaim.
+# 69a5d42a9476: an unresolved ${VAR} default fails closed.
+
+def test_swarm_root_for_flagship_default_caller_is_not_gated(flagship_profiles):
+    _profile(flagship_profiles, "apollo", "claude-fable-5-1")
+    with kb.connect() as conn:
+        from hermes_cli import kanban_swarm as ks
+
+        created = ks.create_swarm(
+            conn, goal="probe", verifier_assignee="daedalus-opus",
+            synthesizer_assignee="daedalus-opus", created_by="apollo",
+            workers=[ks.SwarmWorkerSpec(profile="daedalus-opus", title="w1", body="")],
+        )
+        root = kb.get_task(conn, created.root_id)
+        assert root.assignee == "apollo"
+        assert root.status == "done"
+        assert not any(
+            c.body.startswith("flagship override:")
+            for c in kb.list_comments(conn, created.root_id)
+        )
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert not set(res.flagship_refused) & {created.root_id, *created.worker_ids}
+
+
+def test_swarm_flagship_child_without_reason_is_refused(flagship_profiles):
+    output = kc.run_slash(
+        "swarm 'probe' --worker 'daedalus-fable:w1' --verifier daedalus-opus "
+        "--synthesizer daedalus-opus"
+    )
+    assert "assignee profile default of 'daedalus-fable'" in output, output
+    with kb.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_swarm_allow_flagship_reason_reaches_the_children(flagship_profiles):
+    output = kc.run_slash(
+        "swarm 'probe' --worker 'daedalus-fable:w1' --verifier daedalus-opus "
+        "--synthesizer daedalus-opus --allow-flagship 'approved infra' --json"
+    )
+    import json as _json
+
+    created = _json.loads(output)
+    worker = created["worker_ids"][0]
+    with kb.connect() as conn:
+        bodies = [c.body for c in kb.list_comments(conn, worker)]
+        verifier_bodies = [c.body for c in kb.list_comments(conn, created["verifier_id"])]
+    assert "flagship override: approved infra" in bodies, bodies
+    # A non-flagship child gets no override comment from the shared reason.
+    assert not any(b.startswith("flagship override:") for b in verifier_bodies)
+
+
+def _pinned_flagship_card(conn) -> str:
+    task_id = kb.create_task(conn, title="pinned", assignee="daedalus-fable",
+                             model_override="claude-opus-5-5")
+    assert kb.list_comments(conn, task_id) == []
+    return task_id
+
+
+def test_set_model_clear_onto_flagship_default_without_reason_refuses(
+    flagship_profiles, monkeypatch,
+):
+    reclaimed = []
+    monkeypatch.setattr(kb, "reclaim_task", lambda *a, **k: reclaimed.append(a) or True)
+    with kb.connect() as conn:
+        task_id = _pinned_flagship_card(conn)
+    output = kc.run_slash(f"set-model {task_id} --reclaim")
+    assert "assignee profile default of 'daedalus-fable'" in output, output
+    assert reclaimed == []
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+        assert kb.list_comments(conn, task_id) == []
+
+
+def test_set_model_clear_onto_flagship_default_with_reason_authorizes(flagship_profiles):
+    with kb.connect() as conn:
+        task_id = _pinned_flagship_card(conn)
+    output = kc.run_slash(f"set-model {task_id} --allow-flagship 'approved infra'")
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert task.model_override is None, output
+    assert bodies == ["flagship override: approved infra"], bodies
+    assert task_id not in res.flagship_refused
+
+
+def test_db_set_model_clear_onto_flagship_default(flagship_profiles):
+    with kb.connect() as conn:
+        task_id = _pinned_flagship_card(conn)
+        with pytest.raises(ValueError, match="assignee profile default"):
+            kb.set_model_override(conn, task_id, None)
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+        assert kb.set_model_override(conn, task_id, None,
+                                     flagship_override_reason="approved")
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+        assert bodies == ["flagship override: approved"], bodies
+        assert task_id not in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+
+
+def test_set_model_clear_onto_cheap_default_needs_no_reason(flagship_profiles):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="p", assignee="daedalus-opus",
+                                 model_override="claude-sonnet-5")
+        assert kb.set_model_override(conn, task_id, None)
+        assert kb.list_comments(conn, task_id) == []
+
+
+def test_unresolved_env_default_fails_closed(flagship_profiles, monkeypatch):
+    monkeypatch.delenv("T9E_UNSET_MODEL", raising=False)
+    _raw_profile(flagship_profiles, "worker-unres",
+                 "model:\n  default: ${T9E_UNSET_MODEL}\n  provider: claude-apr\n")
+    output = kc.run_slash("create 'GATE-PROBE' --assignee worker-unres")
+    assert "cannot resolve worker-unres model default" in output, output
+    assert "--allow-flagship" in output, output
+    with kb.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+        task_id = kb.create_task(conn, title="legacy", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = 'worker-unres' WHERE id = ?", (task_id,))
+        conn.commit()
+        assert task_id in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+    ok = _created_id(kc.run_slash(
+        "create 'x' --assignee worker-unres --allow-flagship 'known lane'"))
+    with kb.connect() as conn:
+        assert [c.body for c in kb.list_comments(conn, ok)] == ["flagship override: known lane"]

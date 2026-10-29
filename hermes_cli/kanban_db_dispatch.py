@@ -6806,6 +6806,8 @@ def _dispatch_once_locked(
             FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
             FLAGSHIP_REFUSAL_COMMENT_PREFIX,
             assignee_default_model,
+            assignee_route_gated,
+            assignee_route_unresolved,
             flagship_model_match,
             is_firepower_model,
         )
@@ -6830,7 +6832,8 @@ def _dispatch_once_locked(
             else:
                 profile_route = True
                 model = assignee_default_model(assignee or task.assignee)
-                if not flagship_model_match(model, _model_policy_config):
+                # An unresolved ${VAR} default fails closed (Prism 69a5d42a9476).
+                if not assignee_route_gated(model, _model_policy_config):
                     return False
         override = conn.execute(
             "SELECT 1 FROM task_comments WHERE task_id = ? "
@@ -6843,7 +6846,14 @@ def _dispatch_once_locked(
         result.flagship_refused.append(task_id)
         if dry_run:
             return True
-        if profile_route:
+        if profile_route and assignee_route_unresolved(model):
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} cannot resolve "
+                f"{assignee or task.assignee} model default ({model!r}); pin "
+                f"--model, or add '{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' "
+                f"to this card."
+            )
+        elif profile_route:
             body = (
                 f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model {model!r} from the "
                 f"assignee profile default of {assignee or task.assignee} is "

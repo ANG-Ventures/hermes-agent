@@ -428,6 +428,9 @@ _SPECS = [
         _PRIORITY,
         _arg("--created-by", help="Creator/anchor profile"),
         _arg("--idempotency-key", help="Dedup key for the root card"),
+        _arg("--allow-flagship", dest="allow_flagship", metavar="REASON",
+             help="Authorize child cards whose assignee profile default is a "
+                  "flagship model (logged as a 'flagship override:' comment)"),
         _json_flag(help="Emit JSON output"),
     ], help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)"),
     _cmd("list", [

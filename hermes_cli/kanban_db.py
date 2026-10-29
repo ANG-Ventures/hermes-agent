@@ -6023,8 +6023,14 @@ def create_task(
     continues: Optional[str] = None,
     workspace_of: Optional[str] = None,
     boomerang_wake: Optional[bool] = None,
+    no_worker: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
+
+    ``no_worker=True`` mints the card operator-only (the ``no_worker`` flag,
+    see :func:`set_no_worker`): it never reaches a worker, so the assignee
+    flagship gate does not judge its route (a swarm's bookkeeping root,
+    Prism d1a3754ac7e5).
 
     New cards are portable unless a constraint says otherwise; a parent link
     is not a constraint. ``workspace_of`` (``--workspace-of X``) is the
@@ -6450,7 +6456,7 @@ def create_task(
                 if assignee_err:
                     raise ValueError(assignee_err)
                 assignee = _canonical_assignee(assignee) if assignee else assignee
-                if not flagship_override_reason:
+                if not flagship_override_reason and not no_worker:
                     # The assignee is a route choice too (t_9e7ba884): an
                     # unpinned card on a flagship-default profile needs the same
                     # --allow-flagship reason. Judged on the FINAL (post-remap)
@@ -6693,6 +6699,10 @@ def create_task(
                         task_id,
                         flagship_override_author or created_by or "operator",
                         override_comment(flagship_override_reason),
+                    )
+                if no_worker:
+                    _set_no_worker_locked(
+                        conn, task_id, True, source="create", operator=created_by,
                     )
                 if ruled_mint is not None:
                     _append_event(
@@ -7033,10 +7043,7 @@ def _assignee_flagship_reason(
     exactly as the dispatcher's gate admits it. Raises
     :class:`FlagshipAssigneeRefused` for an unauthorized flagship route.
     """
-    from hermes_cli.model_policy import (
-        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
-        validate_assignee_route,
-    )
+    from hermes_cli.model_policy import validate_assignee_route
 
     row = conn.execute(
         "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
@@ -7046,29 +7053,69 @@ def _assignee_flagship_reason(
     if row is None or (row["assignee"] == profile and not (reason or "").strip()):
         return None
 
-    def _authorized() -> bool:
-        # Prefix test in Python, as _validate_route does: the marker is prose
-        # (any case), and SQL LIKE on a comment body is the #1921 shape.
-        rows = conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)
-        ).fetchall()
-        return any(
-            (r["body"] or "").lstrip().casefold().startswith(
-                FLAGSHIP_OVERRIDE_COMMENT_PREFIX
-            )
-            for r in rows
-        )
-
     try:
         allowed = validate_assignee_route(
             profile, model_override=row["model_override"],
             allow_flagship_reason=reason,
         )
     except ValueError as exc:
-        if _authorized():
+        if _card_flagship_authorized(conn, task_id):
             return None
         raise FlagshipAssigneeRefused(f"cannot reassign {task_id}: {exc}") from None
-    if allowed and row["assignee"] == profile and _authorized():
+    if allowed and row["assignee"] == profile and _card_flagship_authorized(conn, task_id):
+        return None
+    return allowed
+
+
+def _card_flagship_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card already carries a ``flagship override:`` comment.
+
+    Prefix test in Python, as _validate_route does: the marker is prose (any
+    case), and SQL LIKE on a comment body is the #1921 shape.
+    """
+    from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)
+    ).fetchall()
+    return any(
+        (r["body"] or "").lstrip().casefold().startswith(
+            FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+        )
+        for r in rows
+    )
+
+
+def clear_pin_flagship_reason(
+    conn: sqlite3.Connection, task_id: str, reason: Optional[str],
+) -> Optional[str]:
+    """Flagship gate for CLEARING a card's model pin (Prism f6a54f1196fd).
+
+    A clear moves the card onto its assignee's profile route (or the lane
+    override, which the dispatcher gates on its own). Judge that RESULTING
+    route before anything is written or reclaimed: returns the reason to
+    record as the ``flagship override:`` comment (``None`` when none is
+    needed or the card is already authorized), or raises ``ValueError`` when
+    the profile route is flagship/unresolved and there is no reason.
+    """
+    from hermes_cli.model_policy import validate_assignee_route
+
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["assignee"]:
+        return None
+    if get_lane_model_override(conn, assignee=row["assignee"]) is not None:
+        return None
+    try:
+        allowed = validate_assignee_route(
+            row["assignee"], allow_flagship_reason=reason,
+        )
+    except ValueError as exc:
+        if _card_flagship_authorized(conn, task_id):
+            return None
+        raise ValueError(f"cannot clear the model pin on {task_id}: {exc}") from None
+    if allowed and _card_flagship_authorized(conn, task_id):
         return None
     return allowed
 
@@ -7309,6 +7356,16 @@ def set_model_override(
         force_model_reason=force_model_reason,
     )
     with write_txn(conn):
+        if not model and not audit_comment_body:
+            # A clear lands on the profile route: gate it in this txn.
+            clear_reason = clear_pin_flagship_reason(
+                conn, task_id, flagship_override_reason,
+            )
+            if clear_reason:
+                from hermes_cli.model_policy import override_comment
+
+                audit_comment_author = flagship_override_author or "operator"
+                audit_comment_body = override_comment(clear_reason)
         if not _set_model_override_locked(
             conn, task_id, model, provider,
             audit_comment_author=audit_comment_author,

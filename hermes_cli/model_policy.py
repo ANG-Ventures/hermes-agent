@@ -163,10 +163,30 @@ def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
 
 
 def assignee_flagship_error(assignee: str, model: str) -> str:
+    if assignee_route_unresolved(model):
+        return (
+            f"cannot resolve {assignee} model default ({model!r}); pass "
+            "--allow-flagship \"<reason>\" or pin a model"
+        )
     return (
         f"assignee profile default of '{assignee}' is a flagship route: "
         f"{flagship_model_error(model)}"
     )
+
+
+def assignee_route_unresolved(model: Optional[str]) -> bool:
+    """A default still carrying ``${...}`` after the assignee's scope was bound
+    (an unhydrated secret source) is an UNKNOWN route; the gate fails closed on
+    it instead of running a foreign profile's secret commands (Prism
+    69a5d42a9476)."""
+    return "${" in str(model or "")
+
+
+def assignee_route_gated(
+    model: Optional[str], config: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """True when an unpinned card on this profile route needs a reason."""
+    return assignee_route_unresolved(model) or bool(flagship_model_match(model, config))
 
 
 def validate_assignee_route(
@@ -187,7 +207,7 @@ def validate_assignee_route(
     if str(model_override or "").strip():
         return None
     model = assignee_default_model(assignee)
-    if not flagship_model_match(model, config):
+    if not assignee_route_gated(model, config):
         return None
     reason = (allow_flagship_reason or "").strip()
     if not reason:

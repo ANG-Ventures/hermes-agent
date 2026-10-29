@@ -1120,6 +1120,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
             created_by=_comment_author(args.created_by)[0], priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            flagship_override_reason=getattr(args, "allow_flagship", None),
         )
     if getattr(args, "json", False):
         _print_json(created.as_dict())
@@ -2093,9 +2094,19 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 )
             writes: list[kb.BatchRouteWrite] = []
             for task in tasks:
+                clear_reason = None
                 if touch_model and not model and not provider:
                     lane = kb.get_lane_model_override(conn, assignee=task.assignee)
                     cleared_routes[task.id] = lane.route if lane else "profile-default"
+                    # The clear lands on the profile route: judge it BEFORE
+                    # any write or --reclaim (Prism f6a54f1196fd).
+                    try:
+                        clear_reason = kb.clear_pin_flagship_reason(
+                            conn, task.id, firepower_reason,
+                        )
+                    except ValueError as exc:
+                        print(f"kanban: {exc}; no cards were changed", file=sys.stderr)
+                        return 2
                 write = kb.BatchRouteWrite(
                     task_id=task.id,
                     require_statuses=require_statuses,
@@ -2114,12 +2125,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.force_model_reason = getattr(args, "force_model", None)
                     if write.pin_sub_reason:
                         write.pin_sub_author = _profile_author()
-                    if firepower:
+                    if firepower or clear_reason:
                         write.audit_comment_author = _profile_author()
                         # Same comment main's create/set-model writes, so
                         # the dispatcher's flagship gate authorizes it.
                         write.audit_comment_body = override_comment(
-                            firepower_reason,
+                            clear_reason or firepower_reason,
                         )
                 if effort is not None or clear_effort:
                     write.touch_effort = True

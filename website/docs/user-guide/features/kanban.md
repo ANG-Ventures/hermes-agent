@@ -463,6 +463,12 @@ same ban applies to it: `create --assignee <profile>` and `assign`/`reassign
 route when there is no pin or lane, so a card that reached `ready` by another
 path gets a `flagship dispatch refused:` comment naming the profile. A
 non-flagship `--model` pin replaces the profile route and needs no reason.
+Clearing a pin (`set-model <id>` with no model) lands the card on the profile
+route, so it is judged the same way, before anything is written or
+`--reclaim`ed. A default that still holds an unexpanded `${VAR}` after the
+profile's own `.env` is bound counts as unresolved and needs a reason too.
+`kanban swarm` takes `--allow-flagship "<reason>"` for its child cards; the
+swarm's root card is `no_worker` (never dispatched) and is not gated.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
