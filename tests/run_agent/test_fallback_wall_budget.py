@@ -447,3 +447,91 @@ def test_notice_omits_the_chain_but_still_says_when_nothing_is_left():
         wb.arm(last, now=0.0)
         tail = wb.notice_due(last, now=121.0)
         assert tail and tail.endswith("; nothing left in the fallback chain")
+
+
+
+# ── t_b0a117bd: the notice names the upstream cause, or says what happens next ──
+# Ace 2026-10-28 17:58 PT: 47 bare "still waiting for a first reply: 120s, 1 lane
+# tried" lines in one hour while the same waits had seen 502/529/resets.
+
+_OVERLOADED_529 = RelayError(529, {"type": "error", "error": {"type": "overloaded_error",
+                                                              "message": "Overloaded"}},
+                             {"x-relay-seat": "sub-vps-5"})
+_NOTICE_CFG = {"fallback": {"still_waiting_notice_seconds": 120,
+                            "no_first_byte_budget_seconds": 600}}
+
+
+def _wait_agent(provider="claude-dtlr"):
+    a = _bare(index=1)
+    a.provider = provider
+    a.base_url = "http://127.0.0.1:18810/v1"
+    a._pending_fallback_error = None
+    a.session_id, a._current_turn_id = "s", "s:t1"
+    a._buffer_diagnostic_status = lambda *_a, **_k: None
+    a._touch_activity = lambda *_a, **_k: None
+    return a
+
+
+def test_notice_names_the_529_seen_earlier_in_the_same_wait():
+    """RED on base: two 529s on alr, the failover consumes the cause and the wait goes
+    on on dtlr; the next notice used to be the bare lane count."""
+    from agent import fallback_cause, fallback_events as fbe
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent(provider="claude-alr")
+        wb.arm(a, now=0.0)
+        fbe.stash_api_error(a, _OVERLOADED_529, 529, None, elapsed_s=1.0)
+        fbe.stash_api_error(a, _OVERLOADED_529, 529, None, elapsed_s=2.0)
+        fallback_cause.take(a)          # the failover row consumed the cause
+        a.provider = "claude-dtlr"      # the walker moved the same wait on
+        wb.note_lane_switch(a)
+        with patch("agent.fallback_wall_budget._buffering_lane", return_value=False):
+            text = wb.notice_due(a, now=241.0)
+    assert text == ("⏳ still waiting for a first reply: 241s on claude-dtlr/claude-fable-5-1, "
+                    "2 lanes tried; last upstream: 529 overloaded ×2 on sub-vps-5, retrying"), text
+
+
+def test_notice_names_a_stream_reset_retried_inside_the_stream_call():
+    """RED on base: a connection reset retried by the stream loop never reaches
+    stash_api_error; the wall clock still saw it."""
+    from agent import fallback_wall_budget as wb
+    from agent.stream_diag import emit_stream_drop
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent()
+        wb.arm(a, now=0.0)
+        err = httpx.ReadError("reset")
+        err.__cause__ = ConnectionResetError(104, "Connection reset by peer")
+        emit_stream_drop(a, error=err, attempt=1, max_attempts=3, mid_tool_call=False,
+                         diag={"http_status": 200, "started_at": 0.0})
+        text = wb.notice_due(a, now=121.0)
+    assert text and "last upstream: connection reset" in text and "retrying" in text, text
+    assert "buffering lane" not in text, text
+
+
+def test_silent_wait_notice_says_when_the_cut_comes():
+    """D2: nothing failed yet, keep the wording and add the next step on the same line."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent(provider="openai-codex")
+        a.model = "gpt-6.1-sol"
+        wb.arm(a, now=0.0)
+        text = wb.notice_due(a, now=121.0)
+    assert text == ("⏳ still waiting for a first reply: 121s, 1 lane tried "
+                    "(now on openai-codex/gpt-6.1-sol); cut to next lane at 600s"), text
+    assert "ahead" not in text and "claude-btpr" not in text
+
+
+def test_failure_memory_is_per_wait():
+    """A served byte disarms the clock; the next wait starts with no failures."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent(provider="openai-codex")
+        if hasattr(wb, "note_upstream_failure"):
+            wb.note_upstream_failure(a, status=529)    # nothing armed: not a wait, no-op
+        wb.arm(a, now=0.0)
+        if hasattr(wb, "note_upstream_failure"):
+            wb.note_upstream_failure(a, status=502)
+        wb.disarm(a)
+        wb.arm(a, now=0.0)
+        text = wb.notice_due(a, now=121.0)
+    assert "last upstream" not in text and "502" not in text, text

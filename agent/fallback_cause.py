@@ -157,6 +157,13 @@ def note_error(agent: Any, pending: Dict[str, Any], api_error: Any, raw_headers:
         if exc in TIMER_EXCS:
             _carry(agent, attribution(getattr(api_error, "pool_headers", None)))
             return
+        # t_b0a117bd: every failing attempt of the armed no-first-byte wait is
+        # remembered on the wall clock, so its notice names the cause.
+        from agent.fallback_wall_budget import note_upstream_failure
+
+        note_upstream_failure(agent, status=pending.get("status"),
+                              socket=pending.get("socket_cause"), exc_name=exc,
+                              box=attribution(raw_headers, body)["seat"])
         if isinstance(getattr(agent, "_failover_cause", None), FailoverCause) \
                 and agent._failover_cause.lane == (str(getattr(agent, "provider", "") or "") or None):
             return

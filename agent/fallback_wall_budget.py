@@ -142,6 +142,56 @@ def note_excused_wait(agent: Any, seconds: float) -> None:
         st["excused_s"] = st.get("excused_s", 0.0) + credit
 
 
+# t_b0a117bd: the words a failed upstream attempt is named by in the notice.
+_STATUS_WORDS = {429: "rate limited", 500: "server error", 502: "bad gateway",
+                 503: "unavailable", 504: "gateway timeout", 529: "overloaded"}
+_SOCKET_WORDS = {"conn_reset": "connection reset", "read_timeout": "read timeout",
+                 "connect_timeout": "connect timeout", "connect_refused": "connection refused",
+                 "remote_protocol": "stream dropped", "read_error": "stream dropped",
+                 "connect_error": "connection failed", "pool_timeout": "pool timeout",
+                 "tls": "TLS error", "dns": "DNS failure"}
+
+
+def note_upstream_failure(agent: Any, *, status: Any = None, socket: Optional[str] = None,
+                          exc_name: Optional[str] = None, box: Optional[str] = None) -> None:
+    """An attempt of the armed wait failed upstream (status, reset, stream drop).
+
+    Ace 2026-10-28 17:58 PT: 47 bare "still waiting for a first reply: 120s, 1 lane tried"
+    lines in one hour while the same waits had seen 502/529/resets. The notice now names
+    the last failure, how many this wait has seen, and the box when the relay said it.
+    No-op when nothing is armed (the failure is not part of a no-first-byte wait)."""
+    st = _state(agent)
+    if st is None:
+        return
+    try:
+        code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        code = None
+    if code is not None and code < 400:
+        code = None   # a 200 head that then dropped is a drop, not a status
+    if code is not None:
+        text = f"{code} {_STATUS_WORDS.get(code, 'error')}"
+    elif socket:
+        text = _SOCKET_WORDS.get(socket, socket.replace("_", " "))
+    elif exc_name:
+        text = str(exc_name)
+    else:
+        return
+    st["failures"] = int(st.get("failures", 0)) + 1
+    st["last_failure"] = text
+    st["last_box"] = (str(box).strip() or None) if box else None
+
+
+def _failure_text(st: dict) -> str:
+    """``last upstream: 529 overloaded ×3 on sub-vps-5``, or "" when nothing failed."""
+    n = int(st.get("failures", 0))
+    if n <= 0 or not st.get("last_failure"):
+        return ""
+    count = f" ×{n}" if n > 1 else ""
+    box = f" on {st['last_box']}" if st.get("last_box") else ""
+    return f"last upstream: {st['last_failure']}{count}{box}"
+
+
 def elapsed(agent: Any, now: Optional[float] = None) -> Optional[float]:
     st = _state(agent)
     if st is None:
@@ -220,12 +270,32 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
     waiting = wait_notice(agent)
     if waiting:
         return f"{waiting}; {int(waited)}s elapsed{_ahead_suffix(agent)}"
+    tried = f", {lanes} lanes tried" if lanes != 1 else ""
+    failed = _failure_text(st)
+    if failed:
+        # t_b0a117bd: this wait has seen an upstream failure on an earlier attempt;
+        # name it instead of a bare lane count (wins over the buffering wording too:
+        # a lane that just failed is not a healthy turn in progress).
+        return (f"⏳ still waiting for a first reply: {int(waited)}s on {route}{tried}; "
+                f"{failed}, retrying{_ahead_suffix(agent)}")
     if _buffering_lane(agent):
         return (f"⏳ turn in progress on {route} (buffering lane, first byte not visible until "
                 f"the turn ends): {int(waited)}s elapsed; long outputs run 2–4 min; "
                 f"cut at {int(st['budget_s'])}s{_ahead_suffix(agent)}")
     return (f"⏳ still waiting for a first reply: {int(waited)}s, "
-            f"{lanes} lane{'s' if lanes != 1 else ''} tried (now on {route}){_ahead_suffix(agent)}")
+            f"{lanes} lane{'s' if lanes != 1 else ''} tried (now on {route})"
+            f"{_cut_suffix(agent, st, waited) or _ahead_suffix(agent)}")
+
+
+def _cut_suffix(agent: Any, st: dict, waited: float) -> str:
+    """t_b0a117bd D2: genuine silence says what happens next, in the same line:
+    ``; cut to next lane at 600s``. Empty when the budget is off, the cut already
+    fired or is past, or no usable lane is ahead (the caller then keeps the
+    "nothing left" suffix). Never lists the chain (Ace 2026-10-16)."""
+    budget = st.get("budget_s") or 0
+    if budget <= 0 or st.get("fired") or waited >= budget or not _lane_ahead(agent):
+        return ""
+    return f"; cut to next lane at {int(budget)}s"
 
 
 def _buffering_lane(agent: Any) -> bool:
