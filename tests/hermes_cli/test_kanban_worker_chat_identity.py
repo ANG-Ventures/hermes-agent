@@ -228,3 +228,51 @@ def test_foreign_env_tilde_kanban_home_expands_against_env_home(monkeypatch, tmp
         "HERMES_KANBAN_TASK": "t_example",
     }
     assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
+
+
+def test_foreign_env_tilde_hermes_home_expands_against_env_home(monkeypatch, tmp_path):
+    """Prism ba00e8f88abd: a described env's ``HERMES_HOME=~/.hermes`` (no KANBAN_HOME) expands
+    against THAT env's ``HOME`` too: every env-described path goes through ``_env_path``."""
+    from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
+    operator_home = tmp_path / "operator"
+    worker_home = tmp_path / "worker"
+    worker_root = worker_home / ".hermes"
+    operator_root = operator_home / ".hermes"
+    for root in (operator_root, worker_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HOME", str(worker_home))
+    monkeypatch.setenv("HERMES_HOME", str(worker_root))
+    kb.create_board("alpha")  # board alpha exists ONLY under the worker's root
+    alpha_db = worker_root / "kanban" / "boards" / "alpha" / "kanban.db"
+    assert alpha_db.parent.is_dir()
+    monkeypatch.setenv("HOME", str(operator_home))  # the process HOME is the operator's
+    monkeypatch.setenv("HERMES_HOME", str(operator_root))
+
+    env = {
+        "HOME": str(worker_home),
+        "HERMES_HOME": "~/.hermes",
+        "HERMES_KANBAN_DB": str(alpha_db),
+        "HERMES_KANBAN_TASK": "t_example",
+    }
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
+
+
+def test_kanban_identity_expands_user_paths_only_in_env_path():
+    """Prism ba00e8f88abd as a RULE (operator-requested source contract): the only ``expanduser``
+    in kanban_identity is ``_env_path``'s no-HOME fallback, so a new env-described path cannot
+    expand ``~`` against the process."""
+    import ast
+    import inspect
+
+    from hermes_cli import kanban_identity
+
+    tree = ast.parse(inspect.getsource(kanban_identity))
+    owners = [fn.name for fn in ast.walk(tree)
+              if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+              for node in ast.walk(fn)
+              if isinstance(node, ast.Attribute) and node.attr == "expanduser"]
+    assert owners and set(owners) == {"_env_path"}, owners

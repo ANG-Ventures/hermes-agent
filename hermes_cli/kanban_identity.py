@@ -33,7 +33,10 @@ def resolve_kanban_worker_chat_identity(
         if pin:
             from hermes_cli.kanban_db_board_registry import board_named_by_pin
 
-            board = board_named_by_pin(pin, home=None if env is None else _env_kanban_root(source))
+            if env is None:
+                board = board_named_by_pin(pin)
+            else:
+                board = board_named_by_pin(str(_env_path(source, pin)), home=_env_kanban_root(source))
     chat_name = (
         " / ".join(part for part in ("kanban", board, task_id) if part)
         if task_id
@@ -42,28 +45,37 @@ def resolve_kanban_worker_chat_identity(
     return task_id, chat_name
 
 
+def _env_path(env: Mapping[str, str], raw: str):
+    """``raw`` (a path a described env carries) with a leading ``~`` expanded against THAT env's
+    ``HOME``, never this process's (Prism 9342cb794d7b, ba00e8f88abd). The ONE expansion every
+    env-described path in this module goes through; process ``expanduser`` only when the env has
+    no ``HOME``.
+    """
+    from pathlib import Path
+
+    env_home = (env.get("HOME") or "").strip()
+    if env_home and (raw == "~" or raw.startswith("~/")):
+        return Path(env_home + raw[1:])
+    return Path(raw).expanduser()
+
+
 def _env_kanban_root(env: Mapping[str, str]):
     """The Hermes root a described env's board registry lives under (Prism f984ec16d458).
 
     Same order as ``kanban_db.kanban_home``, read from ``env`` instead of the process: an explicit
     ``HERMES_KANBAN_HOME``, else the root of its ``HERMES_HOME``. ``None`` (use the process root)
-    only when the env names neither, i.e. it describes this process's own root.
+    only when the env names neither, i.e. it describes this process's own root. Both go through
+    :func:`_env_path`.
     """
-    from pathlib import Path
-
     explicit = (env.get("HERMES_KANBAN_HOME") or "").strip()
     if explicit:
-        # Prism 9342cb794d7b: ``~`` is the described env's HOME, not this process's.
-        env_home = (env.get("HOME") or "").strip()
-        if env_home and (explicit == "~" or explicit.startswith("~/")):
-            return Path(env_home + explicit[1:])
-        return Path(explicit).expanduser()
+        return _env_path(env, explicit)
     home = (env.get("HERMES_HOME") or "").strip()
     if not home:
         return None
     from hermes_constants import get_default_hermes_root
 
-    return get_default_hermes_root(home=home)
+    return get_default_hermes_root(home=_env_path(env, home))
 
 
 def _resolve_current_session_id() -> Optional[str]:
