@@ -467,6 +467,13 @@ Clearing a pin (`set-model <id>` with no model) lands the card on the profile
 route, so it is judged the same way, before anything is written or
 `--reclaim`ed. A default that still holds an unexpanded `${VAR}` after the
 profile's own `.env` is bound counts as unresolved and needs a reason too.
+A profile with an empty `model.default` and a `model.provider` runs that
+provider's `default_model` (`providers.<p>.default_model`, or the legacy
+`custom_providers[].model`), so that model is the route that is judged; a
+provider with no default it can find counts as unresolved.
+The reason itself is operator/orchestrator-only: a dispatched worker (a process
+with `HERMES_KANBAN_TASK` set) is refused on every path that takes one, whether
+the CLI, the `kanban_create` tool or a direct `kanban_db` call.
 `kanban swarm` takes `--allow-flagship "<reason>"` for its child cards; the
 swarm's root card is `no_worker` (never dispatched) and is not gated.
 
