@@ -596,6 +596,11 @@
    "verdict": "kept",
    "why": "git object ids are hex and case-insensitive; lowercasing canonicalizes the PR head sha before the exact == compare against the resolved seen sha, so byte-exact would split one commit in two.",
    "where": "hermes_cli/kanban_handback_new_head.py:195 read_view (no-op handback, t_f716021d)"
+  },
+  "hermes_cli/kanban_pr_freshness.py::_owns_draft::fold::repo::return branch_names_card(head_ref, task_id) and ref.repo.casefold() in worker_draft_repos()": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and worker_draft_repos() folds its set the same way, so the folded repo IS the canonical key; byte-exact would miss a worker-draft repo written in another case.",
+   "where": "hermes_cli/kanban_pr_freshness.py:309 _owns_draft"
   }
  }
 }
