@@ -400,9 +400,21 @@ def _prepare_call(agent: Any, s: Any) -> Optional[PendingCall]:
     return PendingCall(now, note, base, reason, noted)
 
 
+class TranscriptWriteFailed(RuntimeError):
+    """Step 1 reported failure (a 0-row guarded UPDATE, a flush that returned False): the note is
+    not durable, so ``Known`` must not advance (``commit_call_safely`` re-sends it)."""
+
+
+def _require_row(rowcount: Any, what: str) -> None:
+    if isinstance(rowcount, int) and not isinstance(rowcount, bool) and rowcount < 1:
+        raise TranscriptWriteFailed(f"route note: {what} matched no active row")
+
+
 def _persist_note(agent: Any, s: Any, note: str) -> None:
     """Transcript write (step 1): the note becomes part of the durable history, in the same shape
-    the request carried, before ``Known`` advances."""
+    the request carried, before ``Known`` advances. Raises ``TranscriptWriteFailed`` when any
+    store write reports that it did not land (Prism 27736e64e38f): a swallowed failure would let
+    step 2 checkpoint a note no transcript holds."""
     messages = s.messages
     tail = messages[-1] if messages else None
     db = getattr(agent, "_session_db", None)
@@ -428,7 +440,8 @@ def _persist_note(agent: Any, s: Any, note: str) -> None:
             tail["api_content"] = api_content
             if db is not None and isinstance(row_id, int):
                 with _persist_lock(agent):
-                    db.set_message_api_content(agent.session_id, row_id, durable, api_content)
+                    _require_row(db.set_message_api_content(agent.session_id, row_id, durable, api_content),
+                                 "set_message_api_content")
         elif isinstance(content, list):
             # Multimodal rows have no string sidecar: the live parts ARE what replays (same writer
             # protocol as the turn-start multimodal context backfill), so the note takes the exact
@@ -438,10 +451,12 @@ def _persist_note(agent: Any, s: Any, note: str) -> None:
             tail["content"] = _noted_content(content, note)
             if db is not None and isinstance(row_id, int):
                 with _persist_lock(agent):
-                    db.set_user_message_content(agent.session_id, row_id,
-                                                _persisted_content_projection(tail, tail["content"]))
+                    _require_row(db.set_user_message_content(agent.session_id, row_id,
+                                                             _persisted_content_projection(tail, tail["content"])),
+                                 "set_user_message_content")
     if db is not None:
-        agent._flush_messages_to_session_db(messages, getattr(s, "conversation_history", None))
+        if agent._flush_messages_to_session_db(messages, getattr(s, "conversation_history", None)) is False:
+            raise TranscriptWriteFailed("route note: session flush failed")
 
 
 def _observed_tier(agent: Any, known_obs: Optional[Tuple[str, str]], requested: str) -> Optional[Tuple[str, str]]:
@@ -510,8 +525,8 @@ def commit_call(agent: Any, s: Any, call: PendingCall) -> None:
     if obs and obs[0] != requested:
         obs = None  # the requested tier changed: the next response re-establishes it (§6.5)
     if call.note is not None:
-        _persist_note(agent, s, call.note)  # step 1: transcript
-        st["notes"] += 1
+        st["notes"] += 1  # the model saw it: it counts toward E12 even if step 1 fails and it is re-sent
+        _persist_note(agent, s, call.note)  # step 1: transcript (raises TranscriptWriteFailed)
     # A sent note carried any pending correction; the kill switch drops it unsent.
     pending = None if (call.note is not None or not enabled) else (known.pending_correction if known else None)
     serving = replace(now.serving, speed_tier=effective_tier(Known(now.intended, now.serving, obs), requested))
