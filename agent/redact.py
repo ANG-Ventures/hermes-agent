@@ -482,18 +482,22 @@ def _is_test_pass_counter(m) -> bool:
     )
 
 
-# ``PASS`` as a non-final ``_`` part (``MERGE_PASS_CARD_EVENT=0``, a review "pass") is
-# a word, not a password: masking it rewrote the agent's own stored turns and broke
-# prompt-cache replay (t_b924fb6d). Final ``*_PASS``, ``PASS``, ``PASSWORD``/``PASSWD``
-# and the credential compounds below still mask.
-_PASS_SECRET_NEXT_PARTS = frozenset({"PHRASE", "CODE", "WORD", "WD", "KEY", "FILE_CONTENT"})
+# ``PASS`` followed by a part that makes it a word (``MERGE_PASS_CARD_EVENT=0``, a review
+# "pass", ``PASS_THROUGH``) is not a password: masking it rewrote the agent's own stored
+# turns and broke prompt-cache replay (t_b924fb6d). ALLOWLIST, not denylist: an unknown
+# qualifier (``DB_PASS_PROD``, ``ROOT_PASS_OLD``, ``MYSQL_PASS_2``, ``USER_PASS_HASH``) is a
+# password and keeps masking, since a short value matches no other pattern.
+_PASS_NON_SECRET_NEXT_PARTS = frozenset({
+    "CARD", "COUNT", "COUNTS", "COUNTER", "NUM", "NUMBER", "INDEX", "IDX", "TOTAL",
+    "RATE", "STATUS", "RESULT", "RESULTS", "EVENT", "EVENTS", "ROUND", "STAGE", "STEP",
+    "ENABLED", "DISABLED", "THROUGH", "THRU",
+})
 
 
 def _is_inner_pass_part(key: str, m) -> bool:
     if m.group(0).lower() != "pass" or key[m.end():m.end() + 1] != "_":
         return False
-    rest = key[m.end() + 1:]
-    return bool(rest) and rest.split("_", 1)[0].upper() not in _PASS_SECRET_NEXT_PARTS
+    return key[m.end() + 1:].split("_", 1)[0].upper() in _PASS_NON_SECRET_NEXT_PARTS
 
 
 def _env_key_has_secret_keyword(key: str) -> bool:

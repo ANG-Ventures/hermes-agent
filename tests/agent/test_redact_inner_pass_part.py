@@ -37,7 +37,14 @@ def test_inner_pass_part_untouched(text):
     ("GPG_PASS_PHRASE=hunter2", "hunter2"),
     ("SMTP_PASS_WORD=hunter2", "hunter2"),
     ("VAULT_PASS_KEY=hunter2", "hunter2"),
-    ("MERGE_PASS_TOKEN=abcd1234efgh5678", "abcd1234efgh5678"),  # another keyword still counts
+    ("MERGE_PASS_SECRET=hunter2", "hunter2"),  # another keyword still counts
+    # Unknown qualifiers are passwords (Prism #2461 P1s): allowlist, not denylist.
+    ("DB_PASS_PROD=hunter2", "hunter2"),
+    ("DB_PASS_BACKUP=hunter2", "hunter2"),
+    ("ADMIN_PASS_NEW=hunter2", "hunter2"),
+    ("ROOT_PASS_OLD=hunter2", "hunter2"),
+    ("MYSQL_PASS_2=hunter2", "hunter2"),
+    ("USER_PASS_HASH=hunter2", "hunter2"),
 ])
 def test_password_names_still_masked(text, secret):
     out = redact_sensitive_text(text, force=True)
