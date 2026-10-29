@@ -83,6 +83,33 @@ def test_no_live_github_under_pytest():
     assert op._default_terminal_record() is None
 
 
+def test_terminal_record_read_is_pinned_to_github_com(monkeypatch):
+    # Prism eba82c5693c8: the PR state is read on github.com, so its close record must be too, never GH_HOST.
+    import subprocess
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps("CLOSED: ABANDONED -- x") + "\n", stderr="")
+    monkeypatch.setenv("GH_HOST", "ghe.example.com")
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    assert op.pr_terminal_close_record("ANG-Ventures/r", 5) is True
+    assert seen and seen[0][:4] == ["gh", "api", "--hostname", "github.com"]
+
+
+def test_abandoned_out_lists_only_terminal_record_refs():
+    # Prism 36dde7c631ff: #5 is covered by a merged SUPERSEDED-BY token, #6 by its ABANDONED record.
+    two = [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]
+    states = {5: "CLOSED", 6: "CLOSED", 9: "MERGED"}
+    abandoned: list = []
+    out = op.enforce_not_closed_unmerged(
+        "t_x", "ANG-Ventures/r#5 SUPERSEDED-BY ANG-Ventures/r#9", recorded=two,
+        query_fn=lambda r, n: {"state": states.get(n, op.NOT_FOUND)},
+        abandon_reason="abandoned", terminal_record_fn=lambda r, n: n == 6, abandoned_out=abandoned)
+    assert sorted(r.number for r in out) == [5, 6]
+    assert [r.number for r in abandoned] == [6]
+
+
 # --- E2E through complete_task / archive_task on a temp board ---------------
 
 
@@ -132,6 +159,21 @@ def test_e2e_abandoned_pr_with_flag_completes_and_is_audited(board, no_survivor,
         assert _status(conn, tid) == "done"
         audit = [p for k, p in _events(conn, tid) if k == "routed_pr_abandoned"]
         assert audit == [{"prs": ["ANG-Ventures/r#5"], "reason": "re-carded as t_90019410", "closed": True}]
+
+
+def test_e2e_mixed_superseded_and_abandoned_audits_only_the_abandoned(board, no_survivor, monkeypatch):
+    # Prism 36dde7c631ff repro through complete_task.
+    states = {5: "CLOSED", 6: "CLOSED", 9: "MERGED"}
+    monkeypatch.setattr(op, "_default_query", lambda: (lambda r, n: {"state": states.get(n, op.NOT_FOUND)}))
+    monkeypatch.setattr(op, "_default_terminal_record", lambda: (lambda r, n: n == 6))
+    with kb.connect() as conn:
+        tid = _in_review(conn)
+        assert kb.complete_task(conn, tid, summary="r#5 landed via #9",
+                                result="ANG-Ventures/r#5 SUPERSEDED-BY ANG-Ventures/r#9",
+                                metadata={"pr_urls": [PR_URL, "https://github.com/ANG-Ventures/r/pull/6"]},
+                                survivor_none=True, survivor_reason="r", abandon_routed_pr="#6 abandoned")
+        audit = [p for k, p in _events(conn, tid) if k == "routed_pr_abandoned"]
+        assert audit == [{"prs": ["ANG-Ventures/r#6"], "reason": "#6 abandoned", "closed": True}]
 
 
 def test_e2e_closed_pr_without_token_still_refused(board, no_survivor, monkeypatch):

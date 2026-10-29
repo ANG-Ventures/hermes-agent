@@ -651,7 +651,8 @@ def pr_close_record(repo: str, number: int, *, match=None) -> Optional[bool]:
     match = match or has_close_record
     try:
         proc = subprocess.run(
-            ["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments?per_page=100",
+            ["gh", "api", "--hostname", "github.com", "--paginate",
+             f"repos/{repo}/issues/{number}/comments?per_page=100",
              "--jq", ".[].body | @json"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=QUERY_TIMEOUT_SECONDS, check=False,
@@ -735,13 +736,15 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
                                 verb: str = "done", decision_texts=(), recorded=(),
                                 close_record_fn: Optional[CloseRecordFn] = None,
                                 abandon_reason: Optional[str] = None,
-                                terminal_record_fn: Optional[CloseRecordFn] = None) -> list:
+                                terminal_record_fn: Optional[CloseRecordFn] = None,
+                                abandoned_out: Optional[list] = None) -> list:
     """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged (or unreadable) and
     the handoff (``texts`` + ``superseded_by``) carries no SUPERSEDED-BY/RE-CARRIED-AS token naming merged
     work for it. ``decision_texts`` (archive only: card comments) may instead record an explicit
     ``CLOSED: REJECTED|ABANDONED|THROWAWAY|STALE|DUPLICATE-OF`` decision. A closed PR whose OWN GitHub thread
     carries ``CLOSED: ABANDONED|REJECTED|THROWAWAY`` is terminal for ``archive``, and for ``done`` when a
-    non-empty ``abandon_reason`` (``--abandon-routed-pr``) is given. Returns the closed refs accepted."""
+    non-empty ``abandon_reason`` (``--abandon-routed-pr``) is given; those refs (and only those) are appended
+    to ``abandoned_out``. Returns the closed refs accepted."""
     # Fleet-owned refs only: a foreign (upstream / third-party) PR is a mention the fleet cannot land.
     # ``recorded``: PR strings earlier runs persisted for this card (see :func:`recorded_pr_refs`), so a
     # reviewer approving without repeating the PR is still gated on it (FleetReview #1339).
@@ -767,6 +770,8 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
         abandoned = _terminally_closed(uncovered, terminal_record_fn)
         uncovered = [c for c in uncovered if c not in abandoned]
         if not uncovered:
+            if abandoned_out is not None:
+                abandoned_out.extend(abandoned)
             return closed
     # A merged survivor + the PR's own close record (t_9aff2951). ``done`` takes the survivor from
     # ``--survivor-pr``; ``archive`` has no flag, so any of the card's own PRs that merged qualifies.
