@@ -356,6 +356,42 @@ def route_notice_muted(source: Any, user_config: Optional[dict]) -> bool:
     return chat_id in {str(c) for c in configured if c}
 
 
+def lifecycle_notice_muted(platform: Any, chat_id: Any, user_config: Optional[dict]) -> bool:
+    """True when a gateway LIFECYCLE notice would post into an act-now page channel: the shutdown
+    notice ("⚠️ Hermes is shutting down"), the PLANNED-restart notice ("🔄 Restarted at ... —
+    planned") and the automatic compaction announce ("🗜️ Context compacted"). They describe the
+    session's own machinery, not something to act on (t_75a91ccc: 11 of 15 lines/day of
+    legacy:gateway-progress in fleet #alerts from the alerts-handling session). Each stays in the
+    gateway log. ``display.lifecycle_notice_muted_chats`` lists chat ids; unset means the fleet
+    #alerts channel on Discord; ``[]`` disables. Takes platform + chat id, not a source: the
+    shutdown fan-out may only have a parsed session key.
+    """
+    chat_id = str(chat_id or "")
+    if not chat_id:
+        return False
+    configured = ((user_config or {}).get("display") or {}).get("lifecycle_notice_muted_chats")
+    if configured is None:
+        from gateway.config import Platform
+        if platform not in (Platform.DISCORD, Platform.DISCORD.value):
+            return False
+        from gateway.kanban_watchers import _needs_input_channels
+        configured = [_needs_input_channels()[0]]
+    if not isinstance(configured, (list, tuple, set)):
+        configured = [configured]
+    return chat_id in {str(c) for c in configured if c}
+
+
+_COMPACTION_NO_CHANGE_RE = re.compile(r"^🗜️ [^\n:]+: nothing to compact this pass")
+
+
+def is_compaction_announce(message: Any) -> bool:
+    """True for a line from ``_format_compaction_announce`` (agent/fork_ext/compaction_ext.py): the
+    "🗜️ Context compacted" head or its no-change close. Not the in-progress "Compacting" status."""
+    if not isinstance(message, str):
+        return False
+    return message.startswith("🗜️ Context compacted") or bool(_COMPACTION_NO_CHANGE_RE.match(message))
+
+
 def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
     """Whether a successful bare silence marker may remain silent for this turn."""
     return is_machinery_display_kind(display_kind) or reply_expected is False

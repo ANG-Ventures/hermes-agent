@@ -1005,6 +1005,14 @@ class TurnRunner:
                             ctx._status_chat_id,
                             _redact_gateway_user_facing_secrets(str(message or ""))[:160])
                 return False
+        else:
+            from gateway.response_filters import is_compaction_announce, lifecycle_notice_muted
+            if is_compaction_announce(message) and lifecycle_notice_muted(
+                    ctx.source.platform, ctx.source.chat_id, ctx.user_config):
+                # Not a lost send: None tells _emit_compaction_announce the boundary was handled
+                # (no STATUS_CALLBACK_FAILED, no re-announce). t_75a91ccc.
+                logger.info("COMPACTION_ANNOUNCE_MUTED in-turn page_channel=%s", ctx._status_chat_id)
+                return None
         resolver = ctx._current_status_adapter
         try:
             adapter = resolver() if callable(resolver) else None
