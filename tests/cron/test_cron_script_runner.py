@@ -768,6 +768,51 @@ def test_g_watchdog_trip_names_the_blocking_frame(root, caplog):
     assert any("cron.jobs:_jobs_lock:" in rec.getMessage() for rec in caplog.records)
 
 
+def test_g_watchdog_trip_marker_survives_a_blocking_source_lookup(root, monkeypatch):
+    """Prism e4bf7ba79da1: a stack dump that reads source lines (linecache) blocks on a stalled
+    mount until the hard deadline exits the process, so the trip was never persisted. The marker
+    is written before any stack walk, and the walk reads no source at all."""
+    import linecache
+
+    from cron import lanes, script_runner
+
+    monkeypatch.setattr(lanes, "RUNNER_WATCHDOG_KILL_GRACE_S", 0.1)  # deadline = 2.1 s
+    release = threading.Event()
+    lookups = []
+
+    def stalled(*a, **_kw):
+        lookups.append(a)
+        release.wait(6)  # a stalled mount: outlives the hard deadline
+        return ""
+
+    for name in ("getline", "getlines", "updatecache", "checkcache", "lazycache"):
+        monkeypatch.setattr(linecache, name, stalled)
+    at_exit = []
+
+    def exit_fn(_code):
+        path = script_runner.trip_marker_path()
+        at_exit.append(json.loads(path.read_text(encoding="utf-8")) if path.exists() else None)
+
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)], exit_fn=exit_fn)
+    r.enumerate_homes()
+    r.on_tick_start(root)
+    fire = threading.Thread(target=r._watchdog_fire, args=(root, _now_iso()), daemon=True)
+    try:
+        fire.start()
+        deadline = time.monotonic() + 5
+        while not at_exit and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        release.set()
+        fire.join(10)
+        r.cancel_deadline()
+        r.on_tick_end(root)
+    assert at_exit and at_exit[0] is not None, "process exited before the trip marker was written"
+    assert at_exit[0]["home"] == str(root) and "tick_started_at" in at_exit[0]
+    assert "phase" in at_exit[0] and at_exit[0]["threads"], at_exit[0]
+    assert not lookups, f"stack walk read source lines: {lookups[:3]}"
+
+
 def test_g_watchdog_kills_a_group_whose_leader_already_exited(root, monkeypatch, tmp_path):
     """Prism d9f3c814a2c6: the script leader exited but a background child keeps the output pipe,
     so ``communicate()`` has not reaped it yet (a zombie). The watchdog still kills the group; a

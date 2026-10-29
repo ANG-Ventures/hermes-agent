@@ -336,11 +336,13 @@ class ScriptRunner:
         self._deadline.daemon = True
         self._deadline.start()
         try:
+            # The cheap marker lands before any stack walk, so a slow dump never costs the trip.
+            self.tripped = True
+            self._write_trip_marker(home, tick_started_at)
             diag = self._stack_diagnosis()
             logger.critical("script runner tick exceeded %s s on %s (tick thread in %s); tripping "
                             "(one strike) and exiting %d", lanes.RUNNER_TICK_WATCHDOG_S, home,
                             diag.get("phase"), EXIT_WATCHDOG)
-            self.tripped = True
             self._write_trip_marker(home, tick_started_at, diag)
             for _name, h in self._last_homes or [(None, home)]:
                 with contextlib.suppress(Exception):
@@ -358,8 +360,6 @@ class ScriptRunner:
         recent ``_jobs_lock`` waits. Never raises."""
         diag: Dict[str, Any] = {"phase": None, "tick_thread": None, "threads": {}}
         try:
-            import traceback
-
             names = {t.ident: t.name for t in threading.enumerate()}
             tick = self._tick_thread
             diag["tick_thread"] = tick.name if tick is not None else None
@@ -367,8 +367,14 @@ class ScriptRunner:
                 name = names.get(ident, f"thread-{ident}")
                 if name in diag["threads"]:
                     name = f"{name}#{ident}"
-                diag["threads"][name] = [f"{f.filename}:{f.lineno} in {f.name}"
-                                         for f in traceback.extract_stack(frame)]
+                # A plain frame walk: traceback's extractors stat/read source via linecache
+                # (checkcache stats even with lookup_lines=False), which hangs on a stalled mount.
+                frames = []
+                f = frame
+                while f is not None:
+                    frames.append(f"{f.f_code.co_filename}:{f.f_lineno} in {f.f_code.co_name}")
+                    f = f.f_back
+                diag["threads"][name] = frames[::-1]
                 if tick is not None and ident == tick.ident:
                     f = frame
                     while f is not None:
