@@ -37,7 +37,7 @@ def board(tmp_path, monkeypatch):
 
 
 def _agents(child_model=MODEL):
-    parent = SimpleNamespace(model=MODEL, session_id="parent-sid", _delegate_depth=0)
+    parent = SimpleNamespace(model=MODEL, session_id="parent-sid", _delegate_depth=0, _dispatched_model=MODEL)
     child = SimpleNamespace(model=child_model, session_id="child-sid", _subagent_id="sa-0-abc",
                             _context_inherited="summary")
     return parent, child
@@ -109,7 +109,7 @@ def test_delegate_task_grant_is_live_through_the_parent_turn_and_revoked_at_its_
     from tests.tools.test_delegate import _make_mock_parent
 
     parent = _make_mock_parent()
-    parent.model = MODEL
+    parent.model = parent._dispatched_model = MODEL
     parent.session_id = "parent-sid"
     seen = {}
 
@@ -157,7 +157,8 @@ def _facade_agent():
         agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
                         skip_context_files=True, skip_memory=True)
     agent.client = MagicMock()
-    agent.model, agent._delegate_depth = MODEL, 0
+    agent.model = MODEL
+    agent._delegate_depth = 0
     return agent
 
 
@@ -173,6 +174,7 @@ def test_every_parent_turn_exit_revokes_its_grants(board, exit_kind):
     seen = {}
 
     def fake_loop(ag, *_a, **_kw):
+        ag._dispatched_model = MODEL  # the call that served this turn
         g = dsg.mint_for_child(_task(board), child, ag)
         dsg.register_turn_grants(ag, [g])
         seen["g"] = g
@@ -204,6 +206,7 @@ def test_a_failing_turn_end_revoke_never_replaces_the_turn_result(board, monkeyp
     seen = {}
 
     def fake_loop(ag, *_a, **_kw):
+        ag._dispatched_model = MODEL
         g = dsg.mint_for_child(_task(board), child, ag)
         dsg.register_turn_grants(ag, [g])
         seen["g"] = g
@@ -275,6 +278,52 @@ def test_perform_api_call_revokes_on_the_model_it_actually_sends(board, monkeypa
     assert _live_rows(g["grant_id"]) == [] and calls == [MODEL, "claude-sonnet-5"]
 
 
+@pytest.mark.parametrize("sent", [MODEL, "claude-sonnet-5"])
+def test_mint_binds_the_model_the_parent_actually_dispatched(board, monkeypatch, sent):
+    """Prism c37b9eed0ae3: middleware may send another model (next_api_kwargs["model"]) while
+    agent.model stays the configured one. The grant binds the model the delegating call was
+    DISPATCHED on, so a child on the configured model is refused when the parent ran another."""
+    from types import SimpleNamespace as NS
+
+    from agent import turn_api_call
+
+    _p, child = _agents()
+
+    class _Parent:
+        pass
+
+    parent = _Parent()
+    parent.__dict__.update(model=MODEL, session_id="parent-sid", _delegate_depth=0, provider="anthropic",
+                           base_url="", api_mode="anthropic_messages", platform="cli", _disable_streaming=True,
+                           _has_stream_consumers=lambda: False, _has_pending_redirect=lambda: False,
+                           _interruptible_api_call=lambda kw: NS(choices=[]))
+    monkeypatch.setattr("hermes_cli.middleware.run_llm_execution_middleware",
+                        lambda kw, fn, **_k: fn({**kw, "model": sent}))
+    monkeypatch.setattr("agent.relay_llm.execute", lambda kw, fn, **_k: fn(kw))
+    monkeypatch.setattr("agent.turn_body_budget.terminal_request_body", lambda _a, kw: kw)
+    monkeypatch.setattr("agent.agent_runtime_helpers.note_steer_consumed", lambda _a: None)
+    turn_api_call.perform_api_call(
+        parent, api_kwargs={"model": MODEL}, _original_api_kwargs={"model": MODEL}, _llm_middleware_trace=[],
+        _moa_prepared_request=None, _retry=None, thinking_spinner=None, retry_count=0, api_call_count=1,
+        api_request_id="r", effective_task_id="t", turn_id="turn", interrupted=False)
+    assert parent.model == MODEL
+    if sent == MODEL:
+        assert dsg.mint_for_child(_task(board), child, parent)
+        return
+    with pytest.raises(dsg.SignGrantError, match="claude-sonnet-5"):
+        dsg.mint_for_child(_task(board), child, parent)
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sign_grants").fetchone()[0] == 0
+
+
+def test_mint_refuses_when_no_dispatched_model_is_known(board):
+    """No dispatch stamp on the parent: the model that produced the delegation cannot be established."""
+    parent, child = _agents()
+    del parent._dispatched_model
+    with pytest.raises(dsg.SignGrantError, match="dispatched"):
+        dsg.mint_for_child(_task(board), child, parent)
+
+
 def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
     """The LIVE model path (AIAgent._dispatch_delegate_task) forwards sign_grant and does not background it, so a
     top-level session can actually mint; an ungranted top-level call keeps backgrounding."""
@@ -294,7 +343,8 @@ def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
 
 def test_provider_spelling_of_the_same_model_is_not_drift(board):
     """Prism 9b929567c500: minted on the provider spelling, called on the wire spelling: no drift."""
-    parent = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="parent-sid", _delegate_depth=0)
+    parent = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="parent-sid", _delegate_depth=0,
+                             _dispatched_model="anthropic/claude-opus-4.6")
     child = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="child-sid", _subagent_id="sa-0-abc",
                             _context_inherited="summary")
     g = dsg.mint_for_child(_task(board), child, parent)
@@ -380,8 +430,13 @@ def test_only_the_sessions_own_identity_may_be_granted(board, monkeypatch, profi
         assert conn.execute("SELECT count(*) FROM sign_grants").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("inherit_max_tokens, minted", [(50000, True), ("not-an-int", False)])
-def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_tokens, minted):
+@pytest.mark.parametrize("inherit_max_tokens, extra, minted", [
+    (50000, {}, True), ("not-an-int", {}, False),
+    # Prism b0adf0220303: an empty materialized prefix skips inheritance (delegate_tool.py mode=None)
+    # while the request still says inherit_context=true; the built child decides.
+    (50000, {"materialized_prefill_messages": []}, False),
+])
+def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_tokens, extra, minted):
     """Prism 8283ee6dbefe: inherit_context=true is only the REQUEST. When the summary fold fails
     at construction the child carries none of the parent's rulings, so the mint is refused."""
     import json
@@ -391,7 +446,7 @@ def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_toke
     from tests.tools.test_delegate import _make_mock_parent
 
     parent = _make_mock_parent()
-    parent.model = MODEL
+    parent.model = parent._dispatched_model = MODEL
     parent.session_id = "parent-sid"
     parent.prefill_messages = None
     parent._session_messages = [{"role": "user", "content": "RULING: ship only on green CI"}]
@@ -410,7 +465,7 @@ def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_toke
             patch("tools.delegate_tool._load_config", return_value=cfg):
         out = json.loads(delegate_task(
             tasks=[{"goal": "review it", "inherit_context": True,
-                    "sign_grant": {"cards": [board], "verbs": ["approve"]}}],
+                    "sign_grant": {"cards": [board], "verbs": ["approve"]}, **extra}],
             parent_agent=parent))
     with kb.connect_closing() as conn:
         rows = conn.execute("SELECT COUNT(*) FROM sign_grants").fetchone()[0]
@@ -420,3 +475,110 @@ def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_toke
     else:
         assert rows == 0, out
         assert "sign_grant refused" in out.get("error", "") and "inherit" in out["error"], out
+
+
+def _api_parent(**kw):
+    from types import SimpleNamespace as NS
+
+    class _Parent:
+        pass
+
+    parent = _Parent()
+    parent.__dict__.update(model=MODEL, session_id="parent-sid", _delegate_depth=0, provider="anthropic",
+                           base_url="", api_mode="anthropic_messages", platform="cli", _disable_streaming=True,
+                           _has_stream_consumers=lambda: False, _has_pending_redirect=lambda: False,
+                           _interruptible_api_call=lambda kw: NS(choices=[]), **kw)
+    return parent
+
+
+def _api_call(parent, model=MODEL):
+    from agent import turn_api_call
+
+    return turn_api_call.perform_api_call(
+        parent, api_kwargs={"model": model}, _original_api_kwargs={"model": model}, _llm_middleware_trace=[],
+        _moa_prepared_request=None, _retry=None, thinking_spinner=None, retry_count=0, api_call_count=1,
+        api_request_id="r", effective_task_id="t", turn_id="turn", interrupted=False)
+
+
+@pytest.mark.parametrize("served", ["short_circuit", "dispatch_raised", "dispatch_discarded"])
+def test_a_call_that_never_dispatched_leaves_no_model_to_bind(board, monkeypatch, served):
+    """Prism e306c1d110a0 / 30358ce63550: a response the dispatch edge did not serve (middleware
+    short-circuit, a cached reply, a dispatch that raised, or one that succeeded but whose result the
+    middleware discarded for another) must not let a grant bind a model: the stamp names the model of
+    the dispatch whose response the turn actually got, or nothing."""
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setattr("agent.relay_llm.execute", lambda kw, fn, **_k: fn(kw))
+    monkeypatch.setattr("agent.turn_body_budget.terminal_request_body", lambda _a, kw: kw)
+    monkeypatch.setattr("agent.agent_runtime_helpers.note_steer_consumed", lambda _a: None)
+    parent = _api_parent(_dispatched_model="claude-earlier-call")
+
+    def middleware(kw, fn, **_k):
+        if served in ("dispatch_raised", "dispatch_discarded"):
+            try:
+                fn(kw)
+            except RuntimeError:
+                pass
+        return NS(choices=[], model="claude-sonnet-5")   # the answer the turn got did not come from fn
+
+    if served == "dispatch_raised":
+        parent._interruptible_api_call = lambda kw: (_ for _ in ()).throw(RuntimeError("provider down"))
+    monkeypatch.setattr("hermes_cli.middleware.run_llm_execution_middleware", middleware)
+    _p, child = _agents()
+    _api_call(parent)
+    with pytest.raises(dsg.SignGrantError, match="dispatched"):
+        dsg.mint_for_child(_task(board), child, parent)
+
+
+def test_a_turn_starts_with_no_dispatched_model(board):
+    """Prism e306c1d110a0: the stamp is the CURRENT turn's; a turn that served no call mints nothing."""
+    from unittest.mock import patch
+
+    agent = _facade_agent()
+    agent._dispatched_model = MODEL   # left over from the previous turn
+    _p, child = _agents()
+    seen = {}
+
+    def fake_loop(ag, *_a, **_kw):
+        try:
+            dsg.mint_for_child(_task(board), child, ag)
+        except dsg.SignGrantError as exc:
+            seen["refused"] = str(exc)
+        return {"final_response": "done", "messages": [], "api_calls": 0, "completed": True}
+
+    with patch("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: []), \
+            patch("agent.conversation_loop.run_conversation", fake_loop):
+        agent.run_conversation("go")
+    assert "dispatched" in seen.get("refused", ""), seen
+
+
+@pytest.mark.parametrize("where", ["second_child", "after_mint"])
+def test_a_rollback_revoke_that_fails_stays_registered_for_turn_end(board, monkeypatch, where):
+    """Prism 9c236305da52: a minted grant whose rollback revoke failed is handed to the parent's turn
+    registry, so revoke_turn_grants retries it instead of leaving it live to its expiry."""
+    parent, child = _agents()
+    _p2, child2 = _agents()
+    child2.session_id = "child-sid-2"
+    real_mint, real_revoke = dsg.mint_for_child, dsg.revoke
+    if where == "second_child":
+        def mint(t, c, p, **kw):
+            if c is child2:
+                raise KeyboardInterrupt
+            return real_mint(t, c, p, **kw)
+
+        monkeypatch.setattr(dsg, "mint_for_child", mint)
+    else:
+        def ledger(event):
+            raise RuntimeError("ledger down")
+
+        monkeypatch.setattr(dsg, "_ledger", ledger)
+    monkeypatch.setattr(dsg, "revoke", lambda grants: [str(g["grant_id"]) for g in grants])
+    with pytest.raises((KeyboardInterrupt, RuntimeError)):
+        dsg.mint_for_children([(0, _task(board), child), (1, _task(board), child2)], parent)
+    with kb.connect_closing() as conn:
+        live = [r[0] for r in conn.execute("SELECT DISTINCT grant_id FROM sign_grants WHERE revoked_at IS NULL")]
+    assert len(live) == 1
+    assert [g["grant_id"] for g in parent.__dict__.get("_sign_grants", [])] == live
+    monkeypatch.setattr(dsg, "revoke", real_revoke)
+    dsg.revoke_turn_grants(parent)
+    assert _live_rows(live[0]) == []

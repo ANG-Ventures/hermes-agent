@@ -82,6 +82,10 @@ def perform_api_call(
     # agent after the call returns (a mid-turn switch would misprice it, t_0c5c3822). The sent
     # ``model`` wins over the agent's when the request carries one.
     _call_route = _live_route(agent)
+    # A response this dispatch edge does not serve (middleware short-circuit, a cached reply, a raised
+    # dispatch) leaves no model a sign grant could bind: never an earlier call's (Prism e306c1d110a0).
+    agent._dispatched_model = None
+    _dispatch_record: dict = {}
     if isinstance(api_kwargs, dict) and isinstance(api_kwargs.get("model"), str) and api_kwargs["model"]:
         _call_route["model"] = api_kwargs["model"]
 
@@ -122,9 +126,19 @@ def perform_api_call(
             revoke_on_model_drift(agent, _call_route["model"])
         agent._inflight_request_route = _dispatch_route_snapshot(agent, _call_route)
         if _use_streaming:
-            return agent._interruptible_streaming_api_call(
+            served = agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
             )
+        else:
+            served = _relay_execute(next_api_kwargs)
+        # The model this call was actually served on (middleware may differ from agent.model): a
+        # delegation this response produces mints its sign grant against it (Prism c37b9eed0ae3).
+        # Recorded with the response it produced; published only if the middleware returns that same
+        # object (Prism e306c1d110a0, 30358ce63550).
+        _dispatch_record["response"], _dispatch_record["model"] = served, _call_route["model"]
+        return served
+
+    def _relay_execute(next_api_kwargs):
         from agent import relay_llm
 
         return relay_llm.execute(
@@ -188,6 +202,10 @@ def perform_api_call(
         else:
             interrupted = True
         return _verdict("break")
+    # A cached/replacement response the middleware returned in place of the dispatched one has no
+    # known model, so it stays None and a mint from it is refused (Prism 30358ce63550).
+    if _dispatch_record and response is _dispatch_record["response"]:
+        agent._dispatched_model = _dispatch_record["model"]
     # The model answered a request carrying every steer injected so far: only now are they delivered
     # (fork #1585/#1595, I1). An interrupt that ends the turn before this point leaves them missed.
     from agent.agent_runtime_helpers import note_steer_consumed

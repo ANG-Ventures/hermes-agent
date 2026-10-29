@@ -150,6 +150,8 @@ class TurnFacadeMixin:
                 try:
                     if lease is not None:
                         lease.start()
+                    # The dispatch stamp is this turn's: a sign grant never binds a previous turn's model.
+                    self._dispatched_model = None
                     result = run_conversation(
                         self, user_message, system_message, conversation_history, effective_task_id,
                         stream_callback, persist_user_message,
