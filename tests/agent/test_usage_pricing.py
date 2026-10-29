@@ -2026,6 +2026,26 @@ def test_openrouter_kimi_k3_prices_from_snapshot_without_catalog(monkeypatch):
     assert result.amount_usd is not None and float(result.amount_usd) == 18.30  # type: ignore[arg-type]
 
 
+
+@pytest.mark.parametrize("provider,model,expected", [
+    ("cpa", "kimi-k3.1-pro", 12.20),             # 2.00 + 10.00 + 0.20
+    ("kimi-code", "kimi-k3.1-pro", 12.20),
+    ("cpa", "kimi-k3.1-pro-highspeed", 24.40),   # 4.00 + 20.00 + 0.40
+    ("openrouter", "moonshotai/kimi-k3.1-pro", 12.20),
+])
+def test_kimi_k3_1_pro_lanes_have_their_own_rows(provider, model, expected):
+    """K3.1 Pro (2026-10-23) is repriced vs K3 and must never borrow the K3 row:
+    the kimi-k3 normalizer keys on exact ids, so k3.1 needs its own priced rows or
+    every cpa turn records cost_status=unknown (measured 2026-10-28 on the first
+    daedalus-kimi / athena-kimi turns)."""
+    k3 = get_pricing_entry("kimi-k3", provider="moonshotai")
+    entry = get_pricing_entry(model, provider=provider)
+    assert entry is not None and entry != k3
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    result = estimate_usage_cost(model, usage, provider=provider)
+    assert result.amount_usd is not None
+    assert round(float(result.amount_usd), 2) == expected  # type: ignore[arg-type]
+
 # ── Anthropic Claude Sonnet 5.5 (launched 2026-09-28) ────────────────────────
 # Behaviour contracts from the announcement: 1M context, $2/$10 in/out, $0.20
 # cache read. The older claude-sonnet-5 row must keep pricing (ADD-KEEP).

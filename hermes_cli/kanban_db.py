@@ -2924,7 +2924,10 @@ CREATE TABLE IF NOT EXISTS task_comments (
     -- reads as attributed.
     run_id      INTEGER,
     session_ref TEXT,
-    created_at  INTEGER NOT NULL
+    created_at  INTEGER NOT NULL,
+    -- Scoped signing grant (kanban_sign_grants) the comment was written
+    -- under; NULL for every ordinary comment.
+    grant_id    TEXT
 );
 
 -- Retained across config rollback so old volatile paths stay fenced.
@@ -3058,6 +3061,24 @@ CREATE TABLE IF NOT EXISTS lane_model_overrides (
     expires_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lane_model_expires ON lane_model_overrides(expires_at);
+
+-- Scoped board-signing grants for delegate children (hermes_cli/kanban_sign_grants.py).
+CREATE TABLE IF NOT EXISTS sign_grants (
+    grant_id           TEXT NOT NULL,
+    task_id            TEXT NOT NULL,
+    verbs              TEXT NOT NULL,      -- JSON list, subset of VALID_VERBS
+    by_author          TEXT NOT NULL,      -- the identity the child writes as
+    parent_session_ref TEXT,
+    child_id           TEXT,               -- delegate subagent id (sa-...)
+    child_session_ref  TEXT NOT NULL,      -- derive_session_ref(child session id)
+    parent_model       TEXT NOT NULL,
+    child_model        TEXT NOT NULL,
+    parent_profiles    TEXT NOT NULL DEFAULT '[]',  -- JSON: profiles whose runs' PRs are never covered
+    created_at         INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    revoked_at         INTEGER,
+    PRIMARY KEY (grant_id, task_id)
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -7986,6 +8007,9 @@ def add_comment(
     run_id: Optional[int] = None,
     session_ref: Optional[str] = None,
     claimed_author: Optional[str] = None,
+    if_latest_release: Optional[int] = None,
+    _kernel_approve: bool = False,
+    grant_id: Optional[str] = None,
 ) -> int:
     """Append a comment, recording who wrote it and from which run/session.
 
@@ -7998,15 +8022,35 @@ def add_comment(
     allowed to use (``kanban comment --author`` without the operator token).
     It is recorded on the ``commented`` event and the journal only; every
     reader of ``task_comments.author`` keeps seeing the real author.
+
+    ``if_latest_release`` is a comment id: the insert happens only while that
+    comment is still the card's newest release-bearing (``close-on:``) comment,
+    checked in the same write transaction, else
+    :class:`~hermes_cli.kanban_close_on_guard.ReleaseSuperseded` and nothing
+    is written (Prism 3406ba8bbfd9 / f3498875f176).
+
+    An operator APPROVE ``review_coverage`` stamp is refused unless the process
+    is the one writer (``OPERATOR_APPROVE_WRITER=1``, set by hermes-home
+    scripts/lib/operator_approve.py; t_f2eb71b3). ``_kernel_approve`` is the
+    kernel's own reviewer-approval record in :func:`complete_task`, never a
+    caller's.
+
+    ``grant_id`` names a scoped signing grant (``kanban_sign_grants``): the
+    comment is written as ``author`` with no ``(subagent)`` marker and with
+    ``task_comments.grant_id`` set, only after the grant validated for this
+    card, author, verb and session inside the insert's transaction; else
+    :class:`~hermes_cli.kanban_sign_grants.GrantRefused` and nothing is written.
     """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     # The one place every comment writer shares, so the body is exact (t_ebc8eb87).
-    from hermes_cli.kanban_close_on_guard import check_comment
+    from hermes_cli.kanban_close_on_guard import check_approve_stamp, check_comment
 
     check_comment(author, body)
+    if not _kernel_approve:
+        check_approve_stamp(author, body)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")
@@ -8015,25 +8059,71 @@ def add_comment(
         claimed_author = claimed_author.strip()
     run_id, session_ref = _validate_comment_provenance(run_id, session_ref)
     now = int(time.time())
+    if grant_id is not None:
+        return _add_granted_comment(
+            conn, task_id, author, body, run_id, session_ref, now, grant_id,
+            if_latest_release,
+        )
     if _is_delegated_child():
         # The one write a delegate_task child may make (t_70fcc2c3). Append-only
         # and attributed: the marker is added here, not by the caller, so an
         # explicit ``--author`` cannot pass a child's words off as the parent's.
         if not author.strip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
             author = author.strip() + SUBAGENT_AUTHOR_MARKER
-        grant = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
-        conn.execute("PRAGMA query_only=OFF")
-        try:
+        with delegated_child_write(conn):
             return _add_comment_txn(
                 conn, task_id, author, body, run_id, session_ref, now,
-                claimed_author,
+                claimed_author, if_latest_release,
             )
+    return _add_comment_txn(
+        conn, task_id, author, body, run_id, session_ref, now, claimed_author,
+        if_latest_release,
+    )
+
+
+def _add_granted_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    run_id: Optional[int],
+    session_ref: Optional[str],
+    now: int,
+    grant_id: str,
+    if_latest_release: Optional[int] = None,
+) -> int:
+    """A comment signed under a scoped grant (t_19c567a8); see :func:`add_comment`.
+
+    Only a delegate child signs under a grant: the parent signs as itself.
+    """
+    if not _is_delegated_child():
+        from hermes_cli.kanban_sign_grants import GrantRefused
+
+        raise GrantRefused("a signing grant is used only from inside the delegate child it was minted for")
+    with delegated_child_write(conn):
+        return _add_comment_txn(conn, task_id, author, body, run_id, session_ref, now,
+                                if_latest_release=if_latest_release, grant_id=grant_id)
+
+
+@contextlib.contextmanager
+def delegated_child_write(conn: sqlite3.Connection):
+    """Lift a delegate child's read-only fence for exactly one write.
+
+    The capability token is reset on EVERY exit, including a PRAGMA that raises on a
+    closed connection (Prism 87255cd0399f): it is set inside the outer try and reset
+    in the outermost finally, after the fence is restored.
+    """
+    lift = None
+    try:
+        lift = _DELEGATED_CHILD_COMMENT_GRANT.set(True)
+        conn.execute("PRAGMA query_only=OFF")
+        try:
+            yield
         finally:
             conn.execute("PRAGMA query_only=ON")
-            _DELEGATED_CHILD_COMMENT_GRANT.reset(grant)
-    return _add_comment_txn(
-        conn, task_id, author, body, run_id, session_ref, now, claimed_author
-    )
+    finally:
+        if lift is not None:
+            _DELEGATED_CHILD_COMMENT_GRANT.reset(lift)
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8056,6 +8146,8 @@ def _add_comment_txn(
     session_ref: Optional[str],
     now: int,
     claimed_author: Optional[str] = None,
+    if_latest_release: Optional[int] = None,
+    grant_id: Optional[str] = None,
 ) -> int:
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -8064,12 +8156,37 @@ def _add_comment_txn(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
-            "INSERT INTO task_comments "
-            "(task_id, author, body, run_id, session_ref, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), run_id, session_ref, now),
-        )
+        signer = author.strip()
+        if grant_id is not None:
+            from hermes_cli import kanban_sign_grants as ksg
+
+            # Stored under a grant-marked author no label reader honours; only
+            # ksg.operator_rows_with_live_grants promotes it (Apollo r8 ruling).
+            author = ksg.granted_author(signer, grant_id)
+        if if_latest_release is not None:
+            from hermes_cli.kanban_close_on_guard import (
+                ReleaseSuperseded, newer_release_comment,
+            )
+
+            why = newer_release_comment(conn, task_id, if_latest_release, body, author, now)
+            if why:
+                raise ReleaseSuperseded(why)
+        if grant_id is not None:
+            ksg.validate_comment(conn, grant_id, task_id, signer, body,
+                                 caller_session_ref=session_ref, now=now)
+            cur = conn.execute(
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at, grant_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, author.strip(), body.strip(), run_id, session_ref, now, grant_id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO task_comments "
+                "(task_id, author, body, run_id, session_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, author.strip(), body.strip(), run_id, session_ref, now),
+            )
         _append_event(
             conn,
             task_id,
@@ -8081,6 +8198,7 @@ def _add_comment_txn(
                 # attributable even if a comment row is later pruned.
                 **({"session_ref": session_ref} if session_ref else {}),
                 **({"claimed_author": claimed_author} if claimed_author else {}),
+                **({"grant_id": grant_id} if grant_id else {}),
             },
             run_id=run_id,
         )
@@ -8105,6 +8223,7 @@ def _add_comment_txn(
                     "created_at": now,
                     "comment_id": int(cur.lastrowid or 0),
                     **({"claimed_author": claimed_author} if claimed_author else {}),
+                    **({"grant_id": grant_id} if grant_id else {}),
                 },
                 actor=author.strip(),
                 run_id=run_id,
@@ -9685,6 +9804,8 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "external": "done",
     "review_requested": "review",
     "changes_requested": "changes_requested",
+    # A no-op handback bounce (t_f716021d): the send-back still stands.
+    "no_new_head": "changes_requested",
     "blocked": "blocked",
     "dependency_wait": "blocked",
 }
@@ -10361,6 +10482,87 @@ class ExternalCloseError(ValueError):
         )
 
 
+# Event kinds that take a card OUT of review (or end the review cycle). An ``assigned`` event while the latest
+# review cycle is open (after its ``review_requested``, before an exit, or after a resume back INTO review) is a
+# reviewer swap.
+# ``descendant_invalidated``: a reopened parent demotes the card to todo (Prism f696ae12d330).
+# ``gave_up``: the failure breaker blocks the card, untyped path without a ``blocked`` event (f696ae12d330).
+_REVIEW_EXIT_KINDS = ("dependency_wait", "changes_requested", "sendback", "blocked", "completed", "unblocked",
+                      "reopened", "requeued", "archived", "triage_resolved", "descendant_invalidated", "gave_up")
+# Of those, the kinds that can also put the card BACK in review, and the payload key naming the destination:
+# ``unblocked`` / ``promoted`` with ``status: review`` (a parked or dependency-held review card resuming its review
+# phase; Prism 2a08733c4d2a); ``reopened`` with ``to_status: review`` (``reopen_task(to_status="review")``, no new
+# ``review_requested``; Prism 3ad3e981f866).
+_REVIEW_RESUME_KINDS = {"unblocked": "status", "promoted": "status", "reopened": "to_status"}
+
+
+def _review_cycle_scan(conn: sqlite3.Connection, task_id: str):
+    """``(swaps, last_assignment_in_review)`` for the latest review cycle, from the event ORDER (not a payload
+    field, so a reassignment written by any version counts; Prism 1953ce5049b5).
+
+    ``swaps``: assignees of ``assigned`` events made while the card was in review, oldest first. A review phase
+    resumed by ``unblocked``/``promoted`` with ``status: review`` or ``reopened`` with ``to_status: review`` counts
+    as in review again (2a08733c4d2a, 3ad3e981f866).
+    ``last_assignment_in_review``: False when the newest ``assigned`` event of the cycle was made while the card
+    was OUT of review -- an operator's explicit choice (4509b37e638c); True otherwise (none, or made in review).
+    ``(None, True)`` when the card was never reviewed."""
+    rr = conn.execute(
+        "SELECT max(id) FROM task_events WHERE task_id = ? AND kind = 'review_requested'", (task_id,),
+    ).fetchone()[0]
+    if rr is None:
+        return None, True
+    kinds = tuple(dict.fromkeys(("assigned", *_REVIEW_EXIT_KINDS, *_REVIEW_RESUME_KINDS)))
+    marks = ",".join("?" for _ in kinds)
+    swaps: list = []
+    in_review = True
+    last_in_review = True
+    for row in conn.execute(
+        f"SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? AND kind IN ({marks}) ORDER BY id",
+        (task_id, rr, *kinds),
+    ):
+        kind = row["kind"]
+        if kind == "assigned":
+            last_in_review = in_review
+            a = _json_dict(row["payload"]).get("assignee")
+            if in_review and _nonblank_str(a):
+                swaps.append(a)
+            continue
+        resume_key = _REVIEW_RESUME_KINDS.get(kind)
+        if resume_key and _json_dict(row["payload"]).get(resume_key) == "review":
+            in_review = True
+        elif kind in _REVIEW_EXIT_KINDS:
+            in_review = False
+    return swaps, last_in_review
+
+
+def _review_swaps(conn: sqlite3.Connection, task_id: str) -> list:
+    """Assignees of the ``assigned`` events made while the latest review cycle was open, oldest first
+    (:func:`_review_cycle_scan`)."""
+    return _review_cycle_scan(conn, task_id)[0] or []
+
+
+def landing_policy_knob(name: str) -> Optional[str]:
+    """One knob of hermes-home ``config/landing-policy.json`` (Forge L0 kill switches), or None. Missing file /
+    key / unreadable = None (off). ``KANBAN_LANDING_POLICY`` overrides the path (tests); inside pytest with no
+    override it reads nothing, so a dev box's live policy never leaks into the suite."""
+    path = os.environ.get("KANBAN_LANDING_POLICY") or ""
+    if not path:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None
+        try:
+            from hermes_constants import get_default_hermes_root
+            path = str(get_default_hermes_root() / "config" / "landing-policy.json")
+        except Exception:  # noqa: BLE001 -- off
+            return None
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    v = cfg.get(name) if isinstance(cfg, dict) else None
+    return v if isinstance(v, str) else None
+
+
 def _assignee_gh_env(worker: str) -> tuple:
     """``(True, env)`` = the ``gh`` child env for the card's profile (``env`` None = ambient: unassigned card or
     the human lane); ``(False, exc)`` = an assigned profile that cannot be resolved. One resolver for the open-PR
@@ -10559,6 +10761,9 @@ def _enforce_branch_base(
         payload = {"failures": failures}
         if untied:
             payload["survivor_merged_untied"] = untied
+        # Forge L0 §2.4 "Also changed" (SB-P): the stale-base advisory under `sendback: on` is OFF by the
+        # operator's round-4 cut rule (t_cb6e1433, Prism 16462e5a9800): the guard always takes the strict path.
+        # The own-fleet-PR exception goes to FLIP-SB (t_5820b99b).
         with write_txn(conn):
             _append_event(conn, task.id, "completion_blocked_stale_base", payload)
         raise
@@ -10985,31 +11190,63 @@ def complete_task(
                     _append_event(conn, task_id, "completion_blocked_pre_pr",
                                   {"prs": [pr for pr, _ in refusals]})
                 raise NotLandableError(task_id, refusals)
+        # No-op handback (t_f716021d), decided BEFORE the freshness gate so a completion
+        # that will bounce never arms fleet-merge on the head the reviewer sent back
+        # (Prism 6dc02dcaa12e, r2).
+        no_new = None
+        if (still_open and expected_run_id is not None and candidate.status == 'running'
+                and not review_claimed and not negative_trigger):
+            from hermes_cli import kanban_handback_new_head as _nh
+            no_new = _nh.verdict(conn, task_id, still_open)
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
             # DraftPrError, nothing mutated), update a stale head, arm a green
             # non-milestone PR through fleet-merge.sh.
             from hermes_cli import kanban_pr_freshness as _fresh
-            try:
-                # Arm only the card's OWN handoff PR(s), never a PR the prose
-                # merely mentions (FleetReview #1234 finding).
-                freshness = _fresh.check(
-                    still_open, task_id=task_id,
-                    allow_arm=not is_milestone_card(conn, task_id),
-                    armable={
-                        f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
-                            metadata=metadata, survivor_pr=survivor_pr,
-                        )
-                    },
-                    draft_ok=draft_ok is not None,
+            # Arm only the card's OWN handoff PR(s), never a PR the prose
+            # merely mentions (FleetReview #1234 finding).
+            armable = {
+                f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
+                    metadata=metadata, survivor_pr=survivor_pr,
                 )
-            except _fresh.DraftPrError as draft_err:
-                with write_txn(conn):
-                    _append_event(
-                        conn, task_id, "completion_blocked_draft_pr",
-                        {"prs": draft_err.prs},
+            }
+            may_arm = not is_milestone_card(conn, task_id)
+            # Ready-flip evidence from earlier handoffs of this card (t_c1ee61ae, Prism
+            # d34048d53f3c): a PR flipped ready before is armed only on post-flip CI.
+            flip_records: dict = {}
+            for (payload,) in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'handoff_draft_flipped' "
+                "ORDER BY id", (task_id,),
+            ).fetchall():
+                try:
+                    flip_records.update((json.loads(payload) or {}).get("flipped") or {})
+                except (TypeError, ValueError, AttributeError):
+                    continue
+
+            def _record_flips(flipped):
+                if flipped:
+                    flip_records.update(flipped)
+                    with write_txn(conn):
+                        _append_event(conn, task_id, "handoff_draft_flipped", {"flipped": flipped})
+
+            def _freshness_gate(refs, allow_arm):
+                try:
+                    out = _fresh.check(
+                        refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
+                        draft_ok=draft_ok is not None, flipped=dict(flip_records),
                     )
-                raise
+                except _fresh.DraftPrError as draft_err:
+                    _record_flips(draft_err.flipped)
+                    with write_txn(conn):
+                        _append_event(
+                            conn, task_id, "completion_blocked_draft_pr",
+                            {"prs": draft_err.prs},
+                        )
+                    raise
+                _record_flips(out.get("draft_flipped_at"))
+                return out
+
+            freshness = _freshness_gate(still_open, no_new is None and may_arm)
             overridden = freshness.get("draft_override") or []
             if overridden:
                 # Audited, never silent (t_f38605be): the intentionally-open
@@ -11022,6 +11259,40 @@ def complete_task(
                 still_open = [
                     r for r in still_open if f"{r.repo}#{r.number}" not in overridden
                 ]
+        if no_new is not None:
+            # The freshness gate can update-branch after the verdict; a moved head is
+            # content the verdict never judged, so it routes (Prism 4f5d7679ba58).
+            no_new = _nh.still_holds(no_new, freshness)
+            if no_new is None and still_open and may_arm:
+                # The voided verdict routes to review like any handback, so arm it as one: the gate
+                # ran with arming off for the verdict (Prism 188c162a38e9). A PR the gate just
+                # update-branched is left to fleet-merge once its fresh CI is green, as in check().
+                gated = freshness.get("prs") or {}
+                # A PR flipped ready this handoff is not re-armed either (t_c1ee61ae): its CI
+                # starts on the ready event, its draft-skipped check-runs read green.
+                rearm = [r for r in still_open
+                         if not {"update_branch", "draft_flip"} & set(
+                             gated.get(f"{r.repo}#{r.number}") or {})]
+                if rearm:
+                    again = _freshness_gate(rearm, True)
+                    freshness = dict(freshness, prs={**gated, **(again.get("prs") or {})})
+        if still_open and no_new is not None:
+            # No-op handback (t_f716021d): nothing on the PR the reviewer has not
+            # seen, so the send-back stands and the card goes back to its worker.
+            from hermes_cli import kanban_handback_new_head as _nh
+            # The run's own handoff and artifacts survive the bounce (Prism 9c7fd6708b92).
+            from hermes_cli import kanban_negative_handoff as _neg
+            bounce_meta, staged = _stage_routed_scratch_artifacts(
+                conn, task_id, dict(metadata or {}, no_new_head=no_new),
+                summary=summary, result=result,
+            )
+            ok = _nh.bounce(
+                conn, task_id, no_new, expected_run_id=expected_run_id,
+                summary=_neg.routed_summary(_nh.comment(no_new["seen"]), summary, result),
+                metadata=bounce_meta,
+            )
+            _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+            return ok
         if still_open:
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
@@ -11265,6 +11536,7 @@ def complete_task(
                     {"verdict": "approve", "head_sha": approve_head_sha}
                 ),
                 run_id=int(candidate.current_run_id),
+                _kernel_approve=True,
             )
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
@@ -13139,6 +13411,12 @@ def redact_review_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_review_value(item) for item in value)
     return redact_sensitive_json(value, force=True)
+
+
+def redact_review_handoff(summary: Any, metadata: Any) -> tuple:
+    """The ONE redaction of a review-lane handoff (summary, metadata), shared by :func:`request_review` and the
+    no-op handback bounce so the two durable paths cannot drift (Prism cde5d0610ef1, t_f716021d)."""
+    return redact_review_value(summary), redact_review_value(metadata)
 HUMAN_REVIEWER_SENTINEL = "human"
 
 
@@ -13170,6 +13448,47 @@ def spawnable_reviewer_profiles() -> list[str]:
         return []
 
 
+# path -> (file_signature, parsed dict). The dispatcher reads the board home's
+# config several times per tick (pause hold, capability layer, review knobs);
+# re-parsing the YAML each time was ~7 % of the gateway's GIL samples
+# (2026-10-26). ``read_user_config_raw`` stays uncached for write-back callers.
+_BOARD_HOME_CFG_CACHE: dict[str, tuple] = {}
+_BOARD_HOME_CFG_LOCK = threading.Lock()
+
+
+def _board_home_config_raw(path: Path) -> dict:
+    """``read_user_config_raw(path)`` memoized on the file signature; returns a deepcopy.
+
+    Same contract: missing file -> ``{}``, non-mapping -> ``{}``, unparseable
+    YAML raises (and is never cached, so a fixed file is seen next call).
+    """
+    import copy
+
+    from utils import file_signature
+    from hermes_cli.config import read_user_config_raw
+
+    key = str(path)
+    try:
+        sig = file_signature(os.stat(path))
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return read_user_config_raw(path)
+    with _BOARD_HOME_CFG_LOCK:
+        entry = _BOARD_HOME_CFG_CACHE.get(key)
+    if entry is not None and entry[0] == sig:
+        return copy.deepcopy(entry[1])
+    data = read_user_config_raw(path)
+    try:
+        after = file_signature(os.stat(path))
+    except OSError:
+        after = None
+    if after == sig:  # the file did not change under the read
+        with _BOARD_HOME_CFG_LOCK:
+            _BOARD_HOME_CFG_CACHE[key] = (sig, copy.deepcopy(data))
+    return data
+
+
 def _board_home_kanban_cfg() -> dict:
     """The ``kanban`` section of ``kanban_home()/config.yaml`` — the board's owner.
 
@@ -13179,9 +13498,9 @@ def _board_home_kanban_cfg() -> dict:
     overlay are applied like the gateway's presence-sensitive bridges.
     Missing file -> ``{}``; unparseable YAML raises (callers fail closed).
     """
-    from hermes_cli.config import _expand_env_vars, read_user_config_raw
+    from hermes_cli.config import _expand_env_vars
 
-    cfg = _expand_env_vars(read_user_config_raw(kanban_home() / "config.yaml"))
+    cfg = _expand_env_vars(_board_home_config_raw(kanban_home() / "config.yaml"))
     if not isinstance(cfg, dict):
         cfg = {}
     try:
@@ -13631,8 +13950,7 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
-    summary = redact_review_value(summary)
-    metadata = redact_review_value(metadata)
+    summary, metadata = redact_review_handoff(summary, metadata)
 
     # ── Review-round cap (kanban.max_review_rounds) ────────────────────────
     # Evaluated BEFORE the transaction because block_task opens its own.
@@ -13701,6 +14019,15 @@ def request_review(
                 conn, task_id, summary=summary, metadata=skip_meta,
                 expected_run_id=expected_run_id,
             )
+            if done:
+                # A no-op handback bounce (t_f716021d) left the card with its worker:
+                # neither completed nor reviewed, so no review_skipped event. Read from
+                # THIS run's ended row BEFORE the card's status, which a successor may
+                # already have moved to review (Prism 35bc66834b1d).
+                from hermes_cli import kanban_handback_new_head as _nh
+                _bounced = _nh.bounced_note(conn, task_id, expected_run_id)
+                if _bounced is not None:
+                    return _ret(True, _bounced)
             if done and _task_status(conn, task_id) == "review":
                 return _ret(True, "open PR named in the handoff — auto-routed to review instead of done")
             if not done:
@@ -13922,10 +14249,17 @@ def _latest_review_provenance(conn: sqlite3.Connection, task_id: str):
     "who reviews this card" (every review cycle records the resolved reviewer,
     explicit or inherited). ``None`` = never reviewed, or that cycle resolved
     no reviewer (unconfigured board); ``False`` = the event exists but its
-    reviewer is missing/blank/malformed."""
+    reviewer is missing/blank/malformed.
+
+    An operator reassignment made while that review cycle was still open (see
+    :func:`_review_swaps`) is the reviewer of record instead (SB-K key
+    766baef3760b): the live assignee and the recorded reviewer must not diverge."""
     event = _latest_event(conn, task_id, "review_requested")
     if event is None:
         return None
+    swaps = _review_swaps(conn, task_id)
+    if swaps:
+        return swaps[-1]
     payload = _json_dict(_row_get(event, "payload"))
     if "reviewer" not in payload:
         return False
@@ -14537,6 +14871,20 @@ def _sendback_payload_error(payload: Any) -> Optional[str]:
     return None
 
 
+def _review_cycle_reviewers(conn: sqlite3.Connection, task_id: str) -> set:
+    """Every reviewer of the latest review cycle: the newest ``review_requested`` reviewer plus each reviewer swap
+    made while that cycle was open (:func:`_review_swaps`). A reassignment after the card left review is an
+    operator's explicit choice and is not in the set (d3eaed71c036)."""
+    rr = _latest_event(conn, task_id, "review_requested")
+    if rr is None:
+        return set()
+    out = set(_review_swaps(conn, task_id))
+    rv = _json_dict(_row_get(rr, "payload")).get("reviewer")
+    if _nonblank_str(rv):
+        out.add(rv)
+    return out
+
+
 def _review_handoff_implementer(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """The implementer recorded by the latest ``review_requested``, or ``None``."""
     requested = _latest_event(conn, task_id, "review_requested")
@@ -14608,11 +14956,19 @@ def request_sendback(
         if status in ("ready", "todo"):
             # A card demoted from review (reopened parent) still names the
             # reviewer: restore the implementer as the review branch does.
+            # Only then (SB-K key d3eaed71c036): any other assignee is an
+            # operator's explicit choice (a reassign after a lane outage) and
+            # stands.
+            # Read at action time, inside this txn: restore only when the current assignee is a reviewer of the
+            # cycle AND no assignment was made after the card left review (4509b37e638c): an operator who moved
+            # the demoted card -- even to a former reviewer -- made an explicit choice, and a sendback never
+            # overwrites an assignment it did not set.
             implementer = _review_handoff_implementer(conn, task_id)
             extra: dict = {}
             if implementer is not None:
                 extra["implementer"] = implementer
-                if row["assignee"] != implementer:
+                if (row["assignee"] != implementer and _review_cycle_scan(conn, task_id)[1]
+                        and row["assignee"] in _review_cycle_reviewers(conn, task_id)):
                     cur = conn.execute(
                         "UPDATE tasks SET assignee = ? WHERE id = ? AND status = ?",
                         (implementer, task_id, status),
@@ -14986,14 +15342,33 @@ def _unblock_expectation_holds(
     conn: sqlite3.Connection, task_id: str,
     expect_block_event: Optional[int], expect_last_comment: Optional[int],
 ) -> bool:
-    """The CAS read for :func:`unblock_task`; call inside its write txn."""
-    if _task_status(conn, task_id) != "blocked":
+    """The CAS read for :func:`unblock_task`; call inside its write txn.
+
+    A ``scheduled`` card (a ``block --kind deferred`` park) is compared on its
+    latest ``scheduled`` event, which is the park's own event: the sweep may
+    lift a deferral whose ``unblock_when`` predicate cleared before the date
+    (hermes-home t_7f670c57). Event ids share one sequence, so a card moved
+    between blocked and scheduled after the read never matches."""
+    status = _task_status(conn, task_id)
+    if status not in ("blocked", "scheduled"):
+        return False
+    # A scheduled card is accepted only with its park event pinned: a comment-only
+    # CAS would pass on a card re-parked from blocked after the read (deferred
+    # writes no comment) and release a deliberate time park (Prism 503b929774f2).
+    if status == "scheduled" and expect_block_event is None:
         return False
     if expect_block_event is not None:
+        # A scheduled card's revision also moves on a wake reset (`kanban schedule
+        # --at`), which writes `schedule_wake_set` and no `scheduled` event: a CAS
+        # read before the reset must not cancel it (Prism 503b929774f2, round 2).
+        kinds = ("scheduled", "schedule_wake_set") if status == "scheduled" else ("blocked",)
         row = conn.execute(
-            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
-            (task_id,),
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN (%s)"
+            % ",".join("?" * len(kinds)),
+            (task_id, *kinds),
         ).fetchone()
+        if status == "scheduled" and row[0] is None:   # no park event to pin: no CAS
+            return False
         if (row[0] or 0) != expect_block_event:
             return False
     if expect_last_comment is not None:
@@ -15025,7 +15400,8 @@ def unblock_task(
     ``expect_block_event`` / ``expect_last_comment`` make the unblock a
     compare-and-swap for a caller that decided from an EARLIER read (the
     hermes-home unblock_when sweep, t_12d49eb5): the card must still be
-    ``blocked`` with that latest ``blocked`` event id and that latest comment
+    ``blocked`` with that latest ``blocked`` event id (or ``scheduled`` with
+    that latest ``scheduled``/``schedule_wake_set`` event id, t_7f670c57) and that latest comment
     id (0 = none), checked inside the same IMMEDIATE txn as the flip. A card
     re-blocked or re-pointed in between returns False and is left alone.
 
@@ -17040,7 +17416,9 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
 # continuation, not a duplicate: one spawn after the newest PR comment
 # consumes it, like an operator requeue. Deliberately NOT in the operator
 # tuple above (overlap-hold release and failure staleness stay operator-only).
-_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute",)
+# The no-op handback bounce (``kanban_handback_new_head.EVENT``, t_f716021d) is
+# one too: it returns the card to its worker with the send-back still standing.
+_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute", "completion_no_new_head")
 
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:

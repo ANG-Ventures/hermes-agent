@@ -312,6 +312,38 @@ def _sync_completion(conn, event, result, disposition=None):
     same_event = _same_completion_event(json.loads(row[0] or "null"), event)
     if result is None:
         result = json.loads(row[1]) if same_event and row[1] else None
+    if _store.is_compacted_payload(event):
+        # The canonical envelope was compacted after delivery (D5). The mirror's event_json is
+        # the replay source if this row is ever pending again: keep its full body rather than
+        # overwriting it with the identity-only stub.
+        if not (same_event and row[0]):
+            # No full body to keep: record the terminal state and disposition, but never reset
+            # the row to pending or store the stub as its replay source, or a later replay lacks
+            # summary/results (Prism 565b0259b9ff). The result still belongs to this event: store
+            # the supplied one, or clear a different attempt's (Prism 781de1176bcd). With no stored
+            # event there is no evidence of a mismatch, so an unsupplied result keeps the mirror's.
+            archived = _store.exact_json_archive(result)
+            if archived is not None:
+                stored_result = json.dumps(archived)
+            elif row[0] or result is not None:
+                stored_result = None
+            else:
+                stored_result = row[1]
+            conn.execute(
+                """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                   result_json=? WHERE delegation_id=?""",
+                (event.get("status", "completed"), event.get("completed_at", now), now,
+                 stored_result, event["delegation_id"]),
+            )
+            if disposition in {"delivered", "dropped", "parked"}:
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state=?,
+                       delivery_claim=NULL, delivery_claimed_at=NULL
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (disposition, event["delegation_id"]),
+                )
+            return
+        event = json.loads(row[0])
     if not same_event:
         conn.execute(
             """UPDATE async_delegations SET delivery_state='pending',
@@ -445,8 +477,8 @@ def _recover_abandoned_delegations(registry, invalid_ids=None) -> int:
                 continue
             canonical = registry["records"].get(delegation_id) or {}
             if (canonical.get("state") in {"running", "recoverable"}
-                    and (canonical.get("execution") or {}).get("detached")):
-                continue  # its child outlives the owner; the adopting boot owns the outcome
+                    and ((canonical.get("execution") or {}).get("detached") or _store.is_kanban_record(canonical))):
+                continue  # its child (or kanban unit) outlives the owner; that unit owns the outcome
             if canonical.get("state") in {"done", "failed", "cancelled"}:
                 metadata = canonical.get("terminal")
                 if metadata is not None and metadata.get("completed_at") is not None:
@@ -920,10 +952,13 @@ def reopen_admitted_event(event_id: str, profile_home: Path, *, reason: str) -> 
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         token = set_hermes_home_override(profile_home)
         try:
-            # Only this attempt's mirror row: a newer generation's receipt must not be reopened.
+            # Only this attempt's mirror row: a newer generation's receipt must not be reopened. A row
+            # still ``pending`` under the admitting consumer's claim (crash between the JSON admission and
+            # the SQLite receipt) loses that claim too, or the re-injected wake fails its own claim inside
+            # the lease and is discarded as owned elsewhere (Prism 9057f657dd27).
             _update_delivery("""UPDATE async_delegations SET delivery_state='pending', delivered_at=NULL,
                           delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-                   WHERE delegation_id=? AND delivery_state='delivered'
+                   WHERE delegation_id=? AND delivery_state IN ('delivered', 'pending')
                      AND json_extract(event_json, '$.event_id') = ?""",
                              (time.time(), delegation_id, event_id))
         finally:
@@ -1101,6 +1136,19 @@ def active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
 
 
+def kanban_active_count() -> int:
+    """The live units of ``active_count`` that run on the kanban runtime (their own processes)."""
+    with _records_lock:
+        return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES and r.get("kanban_unit"))
+
+
+def in_process_active_count() -> int:
+    """The live units of ``active_count`` this process runs, from ONE snapshot: the difference of
+    two separately locked counts can hide one when a kanban unit lands between them."""
+    with _records_lock:
+        return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES and not r.get("kanban_unit"))
+
+
 def active_task_count() -> int:
     """Number of running child subagents (a batch of N contributes N; a batch with
     no goal list counts 1) — the truthful observability figure, unlike slots."""
@@ -1270,6 +1318,7 @@ def _dispatch_admitted(
     durable_spec: Optional[Dict[str, Any]] = None,
     current_boot_id: Optional[str] = None,
     detached: Optional[Dict[str, Any]] = None,
+    kanban: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -1277,6 +1326,10 @@ def _dispatch_admitted(
     can't pile up unbounded background work. ``slot_key`` names the pool slot the unit occupies
     (default: its own id); the units of one delegate_task call share the first unit's id so
     splitting a call into per-group completions never consumes more capacity than the call did.
+
+    ``kanban`` (docs/dev/delegate-background-on-kanban-runtime.md §5.2): the unit runs as a card on
+    the ``delegations`` board; its runner owns the terminal write and the card-end watcher settles
+    this live record. A failed card/spawn supersedes the attempt and runs ``runner`` in-process.
 
     ``durable_spec`` (fork) registers the unit in the restart-durable JSON registry under
     ``current_boot_id``; a registry refusal rejects the dispatch (``reason``) so the caller falls
@@ -1297,6 +1350,8 @@ def _dispatch_admitted(
         "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id,
+        # A kanban unit is one from dispatch on: a shutdown racing its spawn must leave it running (I9).
+        **({"kanban_unit": True} if kanban is not None and durable_spec is not None else {}),
         **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
@@ -1370,8 +1425,13 @@ def _dispatch_admitted(
 
         job_dir = None
         handed_off = False
+        kanban_spawned = False
         try:
-            if detached is not None and record.get("attempt_id"):
+            if kanban is not None and record.get("attempt_id"):
+                kanban_spawned = _launch_kanban_unit(delegation_id, record, kanban)
+            if kanban_spawned:
+                raw = None  # the runner owns the terminal write; the card-end watcher settles this record
+            elif detached is not None and record.get("attempt_id"):
                 raw, job_dir = _run_detached_unit(
                     delegation_id, record["attempt_id"], _record_profile_home(record), continuation=None,
                     live_delegation_id=detached.get("live_delegation_id"), fallback_runner=runner,
@@ -1389,7 +1449,7 @@ def _dispatch_admitted(
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
             status = "error"
         finally:
-            if not handed_off:
+            if not handed_off and not kanban_spawned:
                 _finalize(delegation_id, result, status)
                 if job_dir is not None:
                     _cleanup_detached_job(delegation_id, job_dir, _record_profile_home(record))
@@ -1474,7 +1534,7 @@ def dispatch_async_delegation_batch(
     task_indexes: Optional[List[int]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
     durable_spec: Optional[Dict[str, Any]] = None, current_boot_id: Optional[str] = None,
-    detached: Optional[Dict[str, Any]] = None,
+    detached: Optional[Dict[str, Any]] = None, kanban: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -1493,7 +1553,7 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, task_transcripts=task_transcripts,
-        durable_spec=durable_spec, current_boot_id=current_boot_id, detached=detached,
+        durable_spec=durable_spec, current_boot_id=current_boot_id, detached=detached, kanban=kanban,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -1505,6 +1565,66 @@ def dispatch_async_delegation_batch(
 
 
 # ── Detached units (docs/dev/delegate-detached-background.md) ───────────────
+
+
+def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict[str, Any]) -> bool:
+    """§5.2 steps 2-5, on the dispatch worker after ``mark_submitted``. True: the unit's card runs
+    it (this live record becomes a ``kanban_unit`` the card-end watcher settles). False: run the
+    unit in-process on ``record["attempt_id"]`` (superseded here when the card or spawn failed);
+    raises when even the supersede was refused (the attempt is no longer current: nothing runs)."""
+    from tools import async_delegation_kanban as _akb
+
+    profile_home = _record_profile_home(record) or _registry_path().parent.parent
+    old_attempt = str(record["attempt_id"])
+    launched = _akb.launch_unit(
+        delegation_id=delegation_id, attempt_id=old_attempt, profile_home=Path(profile_home),
+        profile=str(kanban.get("profile") or "default"), goal=str(record.get("goal") or ""),
+        cwd=str(kanban.get("cwd") or ""), session_id=kanban.get("session_id"),
+        spawn_fn=kanban.get("spawn_fn"), slot_key=record.get("slot_key"))
+    if launched.get("ok"):
+        with _records_lock:
+            rec = _records.get(delegation_id)
+            if rec is not None:
+                rec.update(interrupt_fn=_akb.cancel_fn(delegation_id, Path(profile_home)),
+                           progress_fn=None, kanban_unit=True, kanban_task_id=launched.get("task_id"))
+        # A stop accepted while the card was being spawned signalled the old in-process callback: the
+        # runner past its record read would never see it. Re-read the durable record now that the
+        # card's cancel is installed, and archive the card if it was cancelled meanwhile.
+        if _akb.cancelled_during_launch(delegation_id, old_attempt, Path(profile_home)):
+            _akb.cancel_unit(delegation_id, Path(profile_home))
+        on_spawned = kanban.get("on_spawned")
+        if on_spawned is not None:
+            try:
+                on_spawned()
+            except Exception:
+                logger.debug("kanban on_spawned hook failed", exc_info=True)
+        logger.info("async_delegation_kanban_spawned delegation_id=%s task_id=%s pid=%s",
+                    delegation_id, launched.get("task_id"), launched.get("pid"))
+        return True
+    logger.warning("async_delegation_kanban_spawn_failed delegation_id=%s attempt_id=%s error=%s",
+                   delegation_id, old_attempt, launched.get("error"))
+    try:
+        return _fall_back_in_process(delegation_id, record, launched, old_attempt, profile_home)
+    finally:
+        _akb.release_launch_fence(launched.get("task_id"))
+
+
+def _fall_back_in_process(delegation_id: str, record: Dict[str, Any], launched: Dict[str, Any],
+                          old_attempt: str, profile_home: Any) -> bool:
+    if not launched.get("fenced"):
+        # The card could not be archived and its runner may have started: running the unit here too
+        # would put two writers on one tree. Deliver the error instead (Q1: no automatic re-run).
+        raise RuntimeError(f"background unit card {launched.get('task_id')} not fenced after a failed "
+                           f"spawn ({launched.get('error')}); not run in-process")
+    new_attempt = _store.supersede_attempt(delegation_id, old_attempt, profile_home=profile_home)
+    if new_attempt is None:
+        raise RuntimeError("background unit stopped before it started (attempt no longer current)")
+    with _records_lock:
+        record["attempt_id"] = new_attempt
+        record.pop("kanban_unit", None)  # an in-process unit now: shutdown/interrupt_all treat it as one
+    if not _store.mark_submitted(delegation_id, new_attempt, profile_home=profile_home):
+        raise RuntimeError("background unit stopped before it started (fallback attempt refused)")
+    return False
 
 
 def _durable_record(delegation_id: str, profile_home: Optional[Path]) -> Optional[Dict[str, Any]]:
@@ -1791,6 +1911,26 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         if delegation_id in _records:
             _records[delegation_id]["status"] = status
         _prune_completed_locked()
+
+
+#: Registry state -> live status for a settled kanban unit (spec §5.4 step 3).
+_KANBAN_SETTLE_STATUS = {"done": "completed", "failed": "error", "cancelled": "cancelled"}
+
+
+def _settle_kanban_record(delegation_id: str, state: Optional[str]) -> bool:
+    """Move a ``kanban_unit`` live record out of the active states once its registry record is
+    terminal (fixed table; any other state: no settle, retried next tick). The ONLY path that does,
+    so the unit's capacity slot, ``active_count`` and ``has_live_for_session`` end with it (I10)."""
+    status = _KANBAN_SETTLE_STATUS.get(str(state or ""))
+    if status is None:
+        return False
+    with _records_lock:
+        rec = _records.get(delegation_id)
+        if rec is None or not rec.get("kanban_unit") or rec.get("status") not in _LIVE_STATES:
+            return False
+        rec.update(interrupt_fn=None, progress_fn=None, completed_at=time.time(), status=status)
+        _prune_completed_locked()
+    return True
 
 
 def _publish_restartable_completion(
@@ -2498,7 +2638,7 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
 
 def interrupt_all(
     reason: str = "shutdown", *, recoverable: bool = False, lock_timeout: float = 0.1,
-    boot_id: Optional[str] = None,
+    boot_id: Optional[str] = None, include_kanban: bool = False,
 ) -> int:
     """Signal every running async delegation to stop (``/stop``, shutdown). Returns how
     many. The child still emits a completion event (status='interrupted') via the
@@ -2509,12 +2649,18 @@ def interrupt_all(
     the in-memory half (which only ever signals records in this process's ``_records``). It
     DEFAULTS to this process's boot id, so the scoping is structural: no shutdown path has to
     remember to opt in. Pass ``""`` to deliberately cancel across boots.
+
+    ``include_kanban``: kanban-runtime units (``kanban_unit``) run in their own process and are
+    skipped in both modes unless set: no ``recover_on_shutdown``, no recoverable flip (which would
+    make the runner's terminal write refused), no signal, no durable cancel (I9). A shutdown leaves
+    them running for the next boot; only a session-scoped stop reaches them.
     """
     caller = _immediate_caller()
     if boot_id is None:
         boot_id = current_boot_id()
     with _records_lock:
-        targets = [r for r in _records.values() if r.get("status") in _ACTIVE_STATES]
+        targets = [r for r in _records.values() if r.get("status") in _ACTIVE_STATES
+                   and (include_kanban or not r.get("kanban_unit"))]
         if recoverable:
             for record in targets:
                 record["recover_on_shutdown"] = True
@@ -2539,7 +2685,8 @@ def interrupt_all(
         # /stop and other explicit parent/user cancellation are terminal,
         # including resume-disabled records without a live handle.
         _store.cancel_matching(
-            all_active=True, owner_boot_id=str(boot_id or ""), reason=reason, caller=caller)
+            all_active=True, owner_boot_id=str(boot_id or ""), reason=reason, caller=caller,
+            include_kanban=include_kanban)
     return _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
 
 

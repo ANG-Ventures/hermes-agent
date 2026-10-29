@@ -39,6 +39,8 @@ class _RecordingDB:
     def get_meta(self, key):
         return None
 
+    get_meta_committed = get_meta
+
 
 @pytest.fixture(autouse=True)
 def _clean_cache(monkeypatch):
@@ -134,6 +136,8 @@ def test_slow_construction_does_not_block_the_loop(monkeypatch):
 
         def get_meta(self, key):
             return None
+
+        get_meta_committed = get_meta
 
     _patch_sessiondb(monkeypatch, _BlockingDB)
     elapsed = None

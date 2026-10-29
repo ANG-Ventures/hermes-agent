@@ -78,7 +78,9 @@ from hermes_state_profile_repair import SessionProfileRepairMixin
 from hermes_state_schema import SessionSchemaMixin, _FTS_TRIGRAM_TRIGGERS
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
-from hermes_state_lockowners import describe_write_lock_holders, hold_ended, hold_started, log_write_lock_holders
+from hermes_state_lockowners import (
+    describe_write_lock_holders, hold_committing, hold_ended, hold_started, log_write_lock_holders,
+)
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
@@ -860,6 +862,13 @@ class SessionDB(
         # is transient EMFILE, and a permanent flag would demote every reader forever.
         self._read_open_failed_at = 0.0
         self._wal_active, self._write_count = False, 0
+        # Periodic PASSIVE checkpoint runs on its OWN connection, off self._lock, in one background thread
+        # (single-flight via _ckpt_lock; lock order _ckpt_lock -> _lock). Measured 2026-10-25 on the live
+        # gateway: run under self._lock it held every writer for >=42 s on a 6.25 GB state.db.
+        self._ckpt_conn: Optional[sqlite3.Connection] = None
+        self._ckpt_lock = threading.Lock()
+        self._ckpt_thread: Optional[threading.Thread] = None
+        self._retired_ckpt_conn: Optional[sqlite3.Connection] = None  # kept open with a retired handle
         # File identity of the opened state.db, compared on every write so an out-of-band
         # replace cannot limp through in-place surgery (inode: mv/new-file; application_id: cp).
         self._db_file_identity: Optional[tuple] = None
@@ -1287,6 +1296,7 @@ class SessionDB(
                         hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
                         fn_started = True
                         result = fn(self._conn)
+                        hold_committing(hold)  # a long hold then says callback vs commit I/O
                         self._conn.commit()
                     except BaseException:
                         try:
@@ -1299,7 +1309,7 @@ class SessionDB(
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
+                    self._kick_wal_checkpoint()
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
@@ -1756,26 +1766,61 @@ class SessionDB(
             return "a deleted WAL generation (split-brain)"
         return None
 
+    def _kick_wal_checkpoint(self) -> None:
+        """Start the periodic checkpoint in the background; a checkpoint already running absorbs this
+        kick. The writer that hit the interval returns at once instead of waiting out the checkpoint."""
+        t = self._ckpt_thread
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=self._try_wal_checkpoint, name="state-db-wal-checkpoint", daemon=True)
+        self._ckpt_thread = t
+        t.start()
+
+    def _checkpoint_conn_locked(self) -> sqlite3.Connection:
+        """The dedicated checkpoint connection (opened once, closed in close()). Caller holds self._lock,
+        so its open/close is ordered against the writer's own open/close and the WAL lock guard."""
+        if self._ckpt_conn is None:
+            self._ckpt_conn = _connect_tracked_db(
+                self.db_path, tracking_path=self.db_path, check_same_thread=False, timeout=1.0,
+                isolation_level=None,
+            )
+        return self._ckpt_conn
+
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint; never raises. PASSIVE never blocks writers;
         TRUNCATE corrupted B-trees on 65K+ page databases under exclusive-lock I/O pressure.
 
         Previous TRUNCATE strategy caused B-tree corruption on large databases (65K+ pages) due to the
         exclusive-lock I/O pressure from checkpointing thousands of frames at once (issue #45383).
+
+        The PRAGMA runs on a dedicated connection OUTSIDE self._lock: SQLite's PASSIVE mode does not block
+        writers, but holding the process-wide Python write lock around it did (every writer queued for the
+        whole checkpoint). Only the guard refresh and the connection lookup take self._lock.
+        The guard refresh (an fd-table scan) runs only on the checkpoint conn's first use or a new -shm inode.
         """
         if self._quarantine_reason() is not None:
             return
-        try:
-            with self._lock:
-                if self._conn is None:
-                    return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
-                if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        with self._ckpt_lock:
+            try:
+                try:  # stat outside _lock: under GIL load one syscall pays a full handoff
+                    st = os.stat(f"{self.db_path}-shm")
+                    shm_ident = (st.st_dev, st.st_ino)
+                except OSError:
+                    shm_ident = None
+                with self._lock:
+                    if self._conn is None or self._db_replaced:
+                        return  # closed or replaced underneath the timer: nothing to checkpoint
+                    first_use = self._ckpt_conn is None
+                    conn = self._checkpoint_conn_locked()
+                    guard = self._wal_lock_guard
+                    if guard and (first_use or (shm_ident is not None and shm_ident not in guard)):
+                        # a -shm minted after open, and/or the checkpoint conn's new fds
+                        _lockguard.hold(self.db_path, guard)
+                result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
-        except Exception as exc:
-            logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+            except Exception as exc:
+                logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
     def __enter__(self) -> "SessionDB":
         """``with SessionDB(path) as db:`` closes on exit; owners must release deterministically.
@@ -1820,7 +1865,7 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
-        with self._lock:
+        with self._ckpt_lock, self._lock:
             if self._conn:
                 generation_lost = not self.read_only and (
                     self._db_wal_generation_lost
@@ -1847,6 +1892,12 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+                ckpt, self._ckpt_conn = self._ckpt_conn, None
+                if ckpt is not None:  # closed while the guard still holds (a close() cancels POSIX locks)
+                    if retire_without_close:
+                        self._retired_ckpt_conn = ckpt  # keep its fds with the retired generation
+                    else:
+                        self._close_connection_quietly(ckpt)
                 _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)
@@ -1862,14 +1913,61 @@ class SessionDB(
         # retired unclosed keeps its recorded generation in the deleted-WAL registry.
         unregister_live_writer(self)
 
-    def __del__(self) -> None:
+    def __del__(self, _finalizing=sys.is_finalizing,
+                _no_ckpt_on_close=getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays
-        guarded: module teardown order is undefined."""
+        guarded: module teardown order is undefined.
+
+        Skipped during interpreter finalization: sys.modules is already being
+        torn down there, so close()'s lazy imports block forever on the import
+        lock (a gateway boot hung at exit this way, t_a29b8266). The connections
+        are still finalized afterwards, and sqlite3's destructor would run the
+        last-connection checkpoint that writes a lost generation's frames over
+        the newer database, so retire them here instead, import-free."""
+        if _finalizing():
+            self._retire_connections_at_finalization(_no_ckpt_on_close)
+            return
         if self.__dict__.get("_conn") is not None:
             try:
                 self.close()
             except Exception:
                 pass
+
+    def _retire_connections_at_finalization(self, no_ckpt_on_close) -> None:
+        """Keep a writer's teardown finalization from checkpointing stale frames (Prism 24f888f2a0c1).
+
+        Import-free and lock-free, reading only ``__dict__`` (teardown order is undefined): the
+        flag arrives bound at definition time and the pin callable (ctypes Py_IncRef) at __init__.
+
+        - 3.12+ (setconfig): SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE on the writer and checkpoint
+          connections. A healthy WAL left behind is replayed by the next open.
+        - < 3.12: when the handle already recorded a lost WAL generation, pin the exact writer
+          connection once, as close() does. Retained unclosed, it keeps the process from ever being
+          the last connection, so no close-time checkpoint runs. The durable capture
+          (_settle_lost_generation_locked / _capture_retired_generation) is NOT attempted here: it
+          imports, logs and writes files. That capture is lost for this exit; the pin is what
+          prevents the corruption. A loss not yet detected (flag still False) is not probed for:
+          no stat calls in a finalizer."""
+        d = self.__dict__
+        if d.get("read_only", True):
+            return
+        if no_ckpt_on_close is not None:
+            for name in ("_conn", "_ckpt_conn"):
+                setconfig = getattr(d.get(name), "setconfig", None)
+                if setconfig is not None:
+                    try:
+                        setconfig(no_ckpt_on_close, True)
+                    except BaseException:
+                        pass
+        conn, retire = d.get("_conn"), d.get("_retire_connection")
+        if (conn is None or retire is None or d.get("_connection_pinned")
+                or not d.get("_db_wal_generation_lost")):
+            return
+        try:
+            retire(conn)
+            d["_connection_pinned"] = True
+        except BaseException:
+            pass
 
     # ── Async token accounting (SessionUsageMixin) ──
     # queue_token_counts() is a deque append; a single-writer thread applies deltas in
@@ -1942,6 +2040,13 @@ class SessionDB(
             row = self._conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else row[0]
 
+    def get_meta_committed(self, key: str) -> Optional[str]:
+        """``get_meta`` via ``_read_ctx``: under WAL a pooled reader, never queued behind this process's
+        writers on ``self._lock`` (t_04b5d027: a goal pin / loop load waited out writer retries while
+        a foreign process held the write lock). For keys no in-flight write transaction reads back."""
+        row = self._read_one("SELECT value FROM state_meta WHERE key = ?", (key,))
+        return None if row is None else row[0]
+
     def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:
         """Upsert state_meta[key]; with ``cursor`` the write is inline (the caller already holds a
         transaction — nesting BEGIN IMMEDIATE would deadlock)."""
@@ -1953,6 +2058,14 @@ class SessionDB(
             cursor.execute(sql, (key, value))
         else:
             self._write_sql(sql, (key, value))
+
+    def compare_and_set_meta(self, key: str, expected: Optional[str], value: str) -> bool:
+        """Write state_meta[key] only while it still holds ``expected`` (None = no row); True if written."""
+        if expected is None:
+            sql, params = "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)", (key, value)
+        else:
+            sql, params = "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?", (value, key, expected)
+        return self._write_rowcount(sql, params) > 0
 
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces

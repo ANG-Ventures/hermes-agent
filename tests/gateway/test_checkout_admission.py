@@ -602,7 +602,7 @@ def test_cron_tick_refused_under_hold_and_ticket_spans_tick(store, monkeypatch, 
                 return None
             return lambda: (released.append(len(g.snapshot()["tickets"])), t.release())
 
-    monkeypatch.setattr(sched, "_get_lock_paths", lambda: (tmp_path, tmp_path / "tick.lock"))
+    monkeypatch.setattr(sched, "_get_lock_paths", lambda lane="agent": (tmp_path, tmp_path / f"tick-{lane}.lock"))
     due_calls = []
     monkeypatch.setattr(sched, "get_due_jobs", lambda *a, **k: due_calls.append(1) or [], raising=False)
     store.hold("op", [GW])

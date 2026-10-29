@@ -139,7 +139,8 @@ def test_zip_command_migrates_profiles_recovers_snapshot_and_verifies_fleet(
         assert config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert config["model"]["default"] == "retained-model"
     assert (state.sibling / ".env").read_bytes() == (state.active / ".env").read_bytes()
-    assert json.loads(state.jobs.read_text()) == state.original_jobs
+    # The jobs survive; the restore's merged re-publish adds the top-level updated_at (#2420).
+    assert json.loads(state.jobs.read_text())["jobs"] == state.original_jobs["jobs"]
     assert (state.root / "payload.txt").read_text() == "new"
     for name in ("tools/code.py", "apps/desktop/source.js", "new-entry/data"):
         assert (state.root / name).read_text(encoding="utf-8") == "new"
@@ -181,7 +182,8 @@ def test_zip_helper_propagates_completion_status_after_real_verification(zip_upd
     assert receipt["outcome"] == ("success" if verdict == "healthy" else "partial")
     assert receipt["runtime_outcomes"][0]["outcome"] == (
         "unaccounted" if verdict == "stale-fleet" else "restarted")
-    assert json.loads(state.jobs.read_text()) == state.original_jobs
+    # The jobs survive; the restore's merged re-publish adds the top-level updated_at (#2420).
+    assert json.loads(state.jobs.read_text())["jobs"] == state.original_jobs["jobs"]
 
 
 @pytest.mark.parametrize("route", ["direct", "git-failure"])

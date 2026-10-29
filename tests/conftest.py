@@ -457,6 +457,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # create cards without a session predate that. The refusal's own tests
     # (test_kanban_operator_home.py) unset this.
     monkeypatch.setenv("HERMES_KANBAN_ALLOW_UNHOMED_CREATE", "1")
+    # t_f2eb71b3: add_comment refuses an operator APPROVE review_coverage stamp
+    # unless the one writer (hermes-home operator_approve.py) set this; fixtures
+    # that seed operator APPROVE records predate that. The refusal's own tests
+    # (test_kanban_close_on_guard.py) unset it.
+    monkeypatch.setenv("OPERATOR_APPROVE_WRITER", "1")
     # And never let a developer-shell (or leaked child) bypass disarm the
     # guard for in-process code under test.
     monkeypatch.delenv("HERMES_STATE_DB_GUARD_BYPASS", raising=False)

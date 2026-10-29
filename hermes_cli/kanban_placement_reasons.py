@@ -110,6 +110,11 @@ _unknown_switch_warned: Dict[tuple, float] = {}
 # child never waits on, or builds on, the parent's output. ``blocks`` and a
 # NULL kind (read as ``blocks``) stay pinning; an unknown kind fails closed.
 PROVENANCE_LINK_KINDS = frozenset({"derived-from"})
+# Link kinds that hold only the CHILD (t_250a7fc5): ``after-merge`` gates the
+# child on the parent's PR merging; the parent owes the child nothing, so its
+# own outgoing edge never constrains where it runs. t_041ad167 sat 20 h in
+# ``not_portable:linked(after-merge->t_84e763a3)`` behind its own child.
+CHILD_ONLY_LINK_KINDS = frozenset({"after-merge"})
 
 
 # Phase 2a (t_7133e03d): hold codes written by the dispatcher itself.

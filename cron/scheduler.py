@@ -961,7 +961,7 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 from cron.jobs import (
     LATE_FIRE_KEY, AmbiguousJobReference, _ensure_cron_dir, advance_next_run, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    get_job, resolve_job_ref, save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
+    get_job, live_fire_claim_owner, resolve_job_ref, save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
@@ -1861,11 +1861,14 @@ def _get_hermes_home() -> Path:
     return _hermes_home or get_hermes_home()
 
 
-def _get_lock_paths() -> tuple[Path, Path]:
-    """Resolve cron lock paths at call time so profile/env changes are honored."""
+def _get_lock_paths(lane: str = "agent") -> tuple[Path, Path]:
+    """Resolve cron lock paths at call time so profile/env changes are honored. ``lane`` picks the
+    per-lane tick lock (``.tick.lock`` for agent, ``.tick-script.lock`` for script; cron/lanes.py)."""
+    from cron.lanes import tick_lock_name
+
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
-    return lock_dir, lock_dir / ".tick.lock"
+    return lock_dir, lock_dir / tick_lock_name(lane)
 
 
 # Errnos that mean "another ticker (or manual tick) holds the tick lock", as opposed to a real failure
@@ -3851,6 +3854,7 @@ def _process_one_job(
     adapters=None,
     loop=None,
     enforce_dispatch_limit: bool = True,
+    defer_to_live_fire_claim: bool = False,
 ) -> dict:
     """Run one job end-to-end: execute → save → deliver → mark.
 
@@ -3871,6 +3875,8 @@ def _process_one_job(
     making a perfectly healthy scheduler read as if it were crash-looping.
     """
     execution_id = job.get("execution_id")
+    # An unclaimed run (``cron run --wait``) never records over another owner's live fire_claim.
+    _defer_kw: dict = {"defer_to_live_fire_claim": True} if defer_to_live_fire_claim else {}
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3957,7 +3963,7 @@ def _process_one_job(
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error, **_defer_kw)
         if execution_id:
             finish_execution(execution_id, success=success, error=error)
         return {
@@ -3972,7 +3978,7 @@ def _process_one_job(
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        mark_job_run(job["id"], False, str(e))
+        mark_job_run(job["id"], False, str(e), **_defer_kw)
         if execution_id:
             finish_execution(execution_id, success=False, error=str(e))
         return {
@@ -4034,6 +4040,23 @@ def run_job_now(job_id: str, *, verbose: bool = True, adapters=None, loop=None) 
             "delivery_error": None,
             "output_file": None,
         }
+    # Stand down beside a live run: this path holds no fire_claim, so running (and then writing
+    # the job's terminal record) would clear the live owner's claim and the scheduler would kill
+    # that healthy run (x-feed-brief 10-27 04:39). Defer with no job-record write.
+    live_owner = live_fire_claim_owner(job)
+    if live_owner:
+        logger.info("Job '%s' (%s): deferred to live run %s; not started",
+                    job.get("name", job_id), job["id"], live_owner)
+        return {
+            "processed": False,
+            "success": False,
+            "job_id": job["id"],
+            "final_response": "",
+            "error": f"deferred to live run {live_owner}",
+            "deferred_to": live_owner,
+            "delivery_error": None,
+            "output_file": None,
+        }
     if verbose:
         logger.info("Running job '%s' (%s) synchronously now", job.get("name", job_id), job_id)
     # Preserve scheduler-scoped ContextVar state, mirroring the tick passes.
@@ -4045,6 +4068,7 @@ def run_job_now(job_id: str, *, verbose: bool = True, adapters=None, loop=None) 
         adapters=adapters,
         loop=loop,
         enforce_dispatch_limit=False,
+        defer_to_live_fire_claim=True,
     )
 
 
@@ -5351,18 +5375,23 @@ _last_worktree_maintenance_at: Optional[float] = None
 _worktree_maintenance_lock = threading.Lock()
 
 
-def _deliver_missed_oneshot_notices(adapters=None, loop=None) -> int:
+def _deliver_missed_oneshot_notices(adapters=None, loop=None, lane: str = "all",
+                                    notices=None) -> int:
     """Deliver queued MISSED notices for one-shots the due-scan retired.
 
     The due-scan runs under the jobs lock and only queues them; delivery is
     framed as a failure (success=False) to the job's own deliver target so a
     one-shot that never ran is loud, not a success-looking line in
     cron/output. Best-effort: delivery errors are logged, never raised.
+    ``notices``: an already-drained batch (the tick drains under its lock and
+    delivers off it); None drains ``lane`` here.
     """
     from cron.jobs import drain_missed_oneshot_notices
 
+    if notices is None:
+        notices = drain_missed_oneshot_notices(lane)
     delivered = 0
-    for notice in drain_missed_oneshot_notices():
+    for notice in notices:
         job = notice.get("job") or {}
         try:
             err = _deliver_result(
@@ -5522,6 +5551,10 @@ def _maybe_reap_dead_owners() -> None:
                 "Reclaimed %d cron execution(s) whose owner process died "
                 "before reaching a terminal state (marked unknown)",
                 _reclaimed)
+        # A no_agent script left running by a dead scheduler is graded once it exits (t_854cd586).
+        from cron.scheduler_provider import _settle_script_outcomes
+
+        _settle_script_outcomes()
     except Exception as _reap_exc:
         logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 

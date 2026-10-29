@@ -787,7 +787,14 @@ class GatewayInboundMixin:
             if self._queue_depth(_quick_key, adapter=adapter) <= depth_before:
                 # Depth cap refused it (logged there); nothing queued, so do not ack a queue.
                 return None
-            logger.info(
+            # One INFO line per flush window (30 s), DEBUG for the requeue laps after it.
+            _turn = self._session_state(_quick_key).turn
+            _log_now = time.time()
+            _level = logging.INFO if _log_now - _turn.flush_log_ts >= 30 else logging.DEBUG
+            if _level == logging.INFO:
+                _turn.flush_log_ts = _log_now
+            logger.log(
+                _level,
                 "PHASE=lease_flush_queued session=%s internal=%s depth=%d: previous turn still holds "
                 "the turn lease (persist/deliver); queued instead of dispatching a fresh turn",
                 _quick_key, bool(is_internal), self._queue_depth(_quick_key, adapter=adapter),
@@ -1613,12 +1620,10 @@ class GatewayInboundMixin:
                     _quick_key, exc.session_id,
                 )
                 return self._hm_lease_rejection_reply(event, source, _quick_key)
-            try:
-                await self._run_post_turn_hooks(
-                    agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
-                )
-            except Exception as _goal_exc:
-                logger.debug("post-turn hook failed: %s", _goal_exc)
+            await self._post_turn_hooks_after_delivery(
+                _quick_key, _run_generation, agent_result=_agent_result, source=source,
+                is_internal=is_internal, event=event,
+            )
             return _agent_result
         finally:
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
@@ -1703,9 +1708,10 @@ class GatewayInboundMixin:
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
         """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
+        from gateway.config import session_isolation_flags
+        group_per_user, thread_per_user = session_isolation_flags(self.config, source.platform)
         _is_shared_multi_user = is_shared_multi_user_session(
-            source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            source, group_sessions_per_user=group_per_user, thread_sessions_per_user=thread_per_user,
         )
         # Fork: synthetic gateway events (boot auto-resume, queued continuations, internal re-prompts)
         # must never impersonate the user — stamping "[<user>] " onto an EMPTY internal event turned it
@@ -2225,7 +2231,10 @@ class GatewayInboundMixin:
             )
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
-        if "@" in message_text:
+        # An internal event (async-delegation wake, steered leftover) carries already-rendered text:
+        # an ``@file:`` in a child's result is data, never a fresh injection request, and an
+        # over-budget expansion would return None and strand the wake (Prism 5723164466ce).
+        if "@" in message_text and not getattr(event, "internal", False):
             message_text = await self._expand_inbound_context_references(source, session_key, message_text)
             if message_text is None:
                 return None

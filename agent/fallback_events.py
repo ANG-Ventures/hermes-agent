@@ -302,17 +302,17 @@ def classify_trigger(*, text: Optional[str] = None,
     # A bridge machine code in the body is the lane refusing the request shape:
     # it beats the text table, whose rows describe upstream/relay capacity
     # (t_1ed37625: "tools[] must be empty (52 tools)" rendered "unclassified").
-    from agent.fallback_capability import (BRIDGE_ERROR_CODES, body_lane_incapable_code,
+    from agent.fallback_capability import (body_lane_incapable_code, bridge_code_entry,
                                            bridge_error_code)
 
     if body_lane_incapable_code(body, text) or reason == LANE_INCAPABLE_CLASS:
         return LANE_INCAPABLE_CLASS, "relay_code"
-    # Any other bridge machine code names its class from ONE table
-    # (fallback_capability.BRIDGE_ERROR_CODES): a 409 tui_busy rendered
-    # "unclassified error (Anthropic 409)" (t_5d79bfea).
-    bridge_code = bridge_error_code(body)
-    if bridge_code:
-        return BRIDGE_ERROR_CODES[bridge_code].trigger_class, "relay_code"
+    # Any other bridge / DPX content-alias machine code names its class from ONE
+    # table (fallback_capability.BRIDGE_ERROR_CODES / CONTENTALIAS_ERROR_CODES): a
+    # 409 tui_busy rendered "unclassified error (Anthropic 409)" (t_5d79bfea).
+    entry = bridge_code_entry(bridge_error_code(body, text))
+    if entry:
+        return entry.trigger_class, "relay_code"
     cls = classify_text(text, http_status=http_status, exc_name=exc_name,
                         reason=reason)
     if (cls == "unclassified" and isinstance(floor, dict)
@@ -1053,6 +1053,7 @@ def stash_api_error(agent: Any, api_error: BaseException,
             "text": msg[:2000],
             "headers": {k: v for k, v in headers.items()
                         if k in ("x-relay-error-class", "x-relay-error-hop",
+                                 "x-relay-quota-window",
                                  "x-relay-seat", "x-pool-served-by",
                                  "x-pool-unreachable",
                                  "x-pool-route-id", "retry-after",
@@ -1459,6 +1460,10 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
 
         code = (body_lane_incapable_code(body, text)
                 if trigger_class == LANE_INCAPABLE_CLASS else None)
+        if code and code.startswith("contentalias:"):
+            # The DPX alias layer's codes render from their own table row
+            # (fallback_capability.CONTENTALIAS_ERROR_CODES, t_40a9186f).
+            code = None
         if code:
             # The body's machine code is the evidence the banner renders from, and
             # the hop is OURS: the relay stamps bridge->upstream on a bridge 400 it
@@ -1470,7 +1475,7 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             # Every other bridge machine code (fallback_capability.BRIDGE_ERROR_CODES):
             # the bridge wrote the body, so the relay's bridge->upstream hop is wrong
             # (t_5d79bfea: a 409 tui_busy rendered "(Anthropic 409)").
-            bcode = bridge_error_code(body)
+            bcode = bridge_error_code(body, text)
             if bcode:
                 row["bridge_code"] = bcode
                 row["hop"] = bridge_code_hop(bcode)

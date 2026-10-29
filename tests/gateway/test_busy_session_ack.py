@@ -205,14 +205,15 @@ class TestBusySessionAck:
 
         agent = MagicMock()
         agent.steer = MagicMock(return_value=True)
+        steer = agent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
         runner._running_agents[sk] = agent
 
         with patch("gateway.platforms.base.merge_pending_message_event") as mock_merge:
             await runner._handle_active_session_busy_message(event, sk)
 
         # VERIFY: Agent was steered, NOT interrupted
-        agent.steer.assert_called_once()
-        injected = agent.steer.call_args.args[0]
+        steer.assert_called_once()
+        injected = steer.call_args.args[0]
         assert injected.endswith("also check the tests")
         assert '"chat_id": "123"' in injected
         agent.interrupt.assert_not_called()
@@ -251,6 +252,7 @@ class TestBusySessionAck:
 
         agent = MagicMock()
         agent.steer = MagicMock(return_value=True)
+        steer = agent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
         runner._running_agents[sk] = agent
 
         await runner._handle_active_session_busy_message(event, sk)
@@ -258,8 +260,8 @@ class TestBusySessionAck:
         runner._enrich_message_with_transcription.assert_awaited_once_with(
             "", ["/tmp/follow-up.ogg"]
         )
-        agent.steer.assert_called_once()
-        injected = agent.steer.call_args.args[0]
+        steer.assert_called_once()
+        injected = steer.call_args.args[0]
         assert injected.endswith('"yönü teknik mimariye çevir"')
         assert '"chat_id": "123"' in injected
         agent.interrupt.assert_not_called()
@@ -282,11 +284,12 @@ class TestBusySessionAck:
 
         agent = MagicMock()
         agent.steer = MagicMock(return_value=False)  # rejected
+        steer = agent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
         runner._running_agents[sk] = agent
 
         await runner._handle_active_session_busy_message(event, sk)
 
-        agent.steer.assert_called_once()
+        steer.assert_called_once()
         agent.interrupt.assert_not_called()
         # Fell back to queue semantics: event was stored for the next turn
         # via the FIFO path (each follow-up its own turn — no newline-merge

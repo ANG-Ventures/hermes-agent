@@ -279,7 +279,7 @@ def load_loop(session_id: str) -> Optional[LoopState]:
     db = _get_session_db() if session_id else None
     if db is None:
         return None
-    raw = _db_op("get_meta", lambda: db.get_meta(_meta_key(session_id)))
+    raw = _db_op("get_meta", lambda: db.get_meta_committed(_meta_key(session_id)))
     return _parse_state(raw, session_id) if raw else None
 
 
@@ -546,11 +546,13 @@ class LoopManager:
         self._save()
         return {"status": status, "stopped": True, "reason": reason, "message": message}
 
-    def complete_tick(self, last_response: str) -> Dict[str, Any]:
+    def complete_tick(self, last_response: str, *, defer_judge: bool = False) -> Dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 
         Returns ``{"status": "active|done|paused", "stopped": bool, "reason": str, "message": str}``;
-        ``message`` is a user-visible one-liner, "" in the common still-looping case.
+        ``message`` is a user-visible one-liner, "" in the common still-looping case. ``defer_judge``
+        skips the --until judge (an aux-LLM call) and returns ``judge_pending`` = ``(until, ticks_fired,
+        created_at)`` instead; the caller runs ``judge_until`` later and applies it via ``apply_until_verdict``.
         """
         s = self._state
         if s is None or not s.awaiting_response:
@@ -565,13 +567,11 @@ class LoopManager:
                               f"✓ Loop finished after {ticks} — task complete.")
 
         # 2. Evidence-based --until judge (reuses the /goal judge; fail-open).
-        if s.until and (last_response or "").strip():
-            try:
-                from hermes_cli.goals import judge_goal
-
-                verdict, reason, _pf, _wait, _tf = judge_goal(s.until, last_response)
-            except Exception as exc:
-                verdict, reason = "continue", f"judge unavailable: {type(exc).__name__}"
+        pending = None
+        if s.until and (last_response or "").strip() and defer_judge:
+            pending = (s.until, s.ticks_fired, s.created_at)
+        elif s.until and (last_response or "").strip():
+            verdict, reason = judge_until(s.until, last_response)
             if verdict == "done":
                 return self._stop("done", f"stop condition met: {reason}",
                                   f"✓ Loop finished after {ticks} — {reason}")
@@ -607,7 +607,36 @@ class LoopManager:
             s.current_delay = s.interval_seconds
         s.next_due_at = now + s.current_delay
         self._save()
-        return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
+        return {"status": "active", "stopped": False, "reason": "loop continues", "message": "",
+                **({"judge_pending": pending} if pending else {})}
+
+    def apply_until_verdict(self, pending: tuple, verdict: str, reason: str) -> Dict[str, Any]:
+        """Apply a deferred --until verdict to the tick ``complete_tick(defer_judge=True)`` settled. A
+        ``continue`` changes nothing (that tick already scheduled the next one). Skipped when the loop
+        was replaced, stopped, paused, or has fired another tick since (the verdict belongs to that tick)."""
+        self.refresh()
+        s = self._state
+        until, ticks_fired, created_at = pending
+        if (s is None or s.status != "active" or s.awaiting_response or s.until != until
+                or s.ticks_fired != ticks_fired or s.created_at != created_at or verdict not in {"done", "blocked"}):
+            return {"status": s.status if s else None, "stopped": False, "reason": "verdict not applied", "message": ""}
+        ticks = _ticks_label(s.ticks_fired)
+        if verdict == "done":
+            return self._stop("done", f"stop condition met: {reason}", f"✓ Loop finished after {ticks} — {reason}")
+        why = f"stop condition judged unachievable: {reason}"
+        return self._stop("paused", why,
+                          f"⏸ Loop paused — {why}. /loop resume to keep going, /loop stop to end it.")
+
+
+def judge_until(until: str, last_response: str) -> tuple:
+    """The --until judge (reuses the /goal judge; fail-open): ``(verdict, reason)``. No DB access."""
+    try:
+        from hermes_cli.goals import judge_goal
+
+        verdict, reason, _pf, _wait, _tf = judge_goal(until, last_response)
+    except Exception as exc:
+        verdict, reason = "continue", f"judge unavailable: {type(exc).__name__}"
+    return verdict, reason
 
 
 def goal_blocks_loop_tick(session_id: str) -> bool:

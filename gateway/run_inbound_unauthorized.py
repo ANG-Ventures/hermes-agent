@@ -108,6 +108,6 @@ class UnauthorizedOwnerNotifier:
                 lambda: runner._send_home_channel_message(
                     platform, home, transport, f"⚠️ {hint}", "unauthorized-sender notice failed for %s:%s: %s",
                 ),
-                platform=platform,
+                platform=platform, chat_id=getattr(home, "chat_id", None), thread_id=getattr(home, "session_id", None),
             )
             return

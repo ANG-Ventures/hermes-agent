@@ -31,6 +31,7 @@ second pass inserts nothing.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import sqlite3
 from pathlib import Path
@@ -39,6 +40,8 @@ from typing import Optional
 from hermes_cli import kanban_journal
 
 __all__ = ["replay_into", "ReplayResult"]
+
+logger = logging.getLogger(__name__)
 
 
 class ReplayResult:
@@ -51,6 +54,7 @@ class ReplayResult:
         self.events_restored = 0
         self.orphan_events = 0
         self.orphan_task_ids: set = set()
+        self.grant_ids_dropped = 0
         self.snapshot_ts: float = 0.0
 
     def as_dict(self) -> dict:
@@ -61,6 +65,7 @@ class ReplayResult:
             "events_restored": self.events_restored,
             "orphan_events": self.orphan_events,
             "orphan_task_ids": sorted(self.orphan_task_ids),
+            "grant_ids_dropped": self.grant_ids_dropped,
             "snapshot_ts": self.snapshot_ts,
         }
 
@@ -126,6 +131,11 @@ def replay_into(
         watermark = _snapshot_watermark(conn) if since is None else float(since)
         result.snapshot_ts = watermark
 
+        has_grant_col = any(
+            r[1] == "grant_id"
+            for r in conn.execute("PRAGMA table_info(task_comments)").fetchall()
+        )
+
         known = {
             str(r[0]) for r in conn.execute("SELECT id FROM tasks").fetchall()
         }
@@ -159,26 +169,49 @@ def replay_into(
                 body = payload.get("body") or ""
                 if not body:
                     continue
-                dupe = conn.execute(
-                    "SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
-                    "AND body = ? AND created_at = ?",
-                    (task_id, author, body, created),
-                ).fetchone()
+                grant_id = payload.get("grant_id")
+                # A granted comment is journaled under its grant-marked author
+                # (``[grant:<id>] by (subagent)``) and replay keeps it, so a restore
+                # never turns it into a plain operator comment, column or no column
+                # (Apollo r8 ruling). A line carrying a grant_id under an unmarked
+                # author is marked the same way here.
+                if grant_id:
+                    from hermes_cli import kanban_sign_grants as ksg
+
+                    if ksg.parse_granted_author(author) is None:
+                        author = ksg.granted_author(author, grant_id)
+                # grant_id is part of the row's identity: a granted record and an
+                # identical ungranted operator record are two comments, and
+                # collapsing them would lose the durable one (Prism 3ee6a1868ab2).
+                dupe_sql = ("SELECT 1 FROM task_comments WHERE task_id = ? AND author = ? "
+                            "AND body = ? AND created_at = ?")
+                dupe_args = [task_id, author, body, created]
+                if has_grant_col:
+                    dupe_sql += " AND grant_id IS ?"
+                    dupe_args.append(grant_id)
+                dupe = conn.execute(dupe_sql, dupe_args).fetchone()
                 if dupe:
                     result.comments_already_present += 1
                     continue
+                # grant_id survives the restore into a migrated board; into a
+                # pre-migration board the marked author still carries the grant id.
+                cols = ["task_id", "author", "body", "run_id", "session_ref", "created_at"]
+                vals = [task_id, author, body, record.get("run_id"),
+                        payload.get("session_ref"), created]
+                if has_grant_col:
+                    cols.append("grant_id")
+                    vals.append(grant_id)
+                elif grant_id:
+                    result.grant_ids_dropped += 1
+                    logger.warning(
+                        "journal replay: %s comment by %s at %s lost grant_id %s "
+                        "(snapshot predates task_comments.grant_id)",
+                        task_id, author, created, grant_id,
+                    )
                 conn.execute(
-                    "INSERT INTO task_comments "
-                    "(task_id, author, body, run_id, session_ref, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        task_id,
-                        author,
-                        body,
-                        record.get("run_id"),
-                        payload.get("session_ref"),
-                        created,
-                    ),
+                    "INSERT INTO task_comments (" + ", ".join(cols) + ") VALUES ("
+                    + ", ".join("?" * len(cols)) + ")",
+                    vals,
                 )
                 result.comments_restored += 1
                 continue

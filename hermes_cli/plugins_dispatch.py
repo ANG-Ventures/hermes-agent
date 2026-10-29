@@ -51,6 +51,11 @@ _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
+# Once-per-turn record hooks: a skipped call is a lost turn record, not a skipped observation.
+# One slow ``on_session_end`` (blackbox, 30 s budget) used to drop the NEXT turns' rows for the
+# whole cooldown, leaving their ``turn_api_calls`` with no ``turns`` row (t_4e9dd8d5). No
+# cooldown for these; the abandoned-worker cap below still bounds the threads.
+_HOOK_TIMEOUT_NO_COOLDOWN_HOOKS: Set[str] = {"on_session_end"}
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
 # Fork #819: the refusal names the callback and distinguishes THIS call timing out from a
@@ -445,8 +450,9 @@ class PluginDispatchMixin:
         if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
             with self._hook_timeout_lock:
                 # See #6622.
-                self._hook_timeout_suppressed_until[suppression_key] = (
-                    time.monotonic() + self._hook_timeout_suppression_seconds)
+                if hook_name not in _HOOK_TIMEOUT_NO_COOLDOWN_HOOKS:
+                    self._hook_timeout_suppressed_until[suppression_key] = (
+                        time.monotonic() + self._hook_timeout_suppression_seconds)
                 # The worker may have finished (and released its token) between the wait
                 # expiring and this lock; recording it as abandoned then would block the
                 # callback for that call id until reload with no thread behind it.

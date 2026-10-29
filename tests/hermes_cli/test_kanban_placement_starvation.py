@@ -182,6 +182,38 @@ def test_structural_hold_gets_one_comment_across_ticks(kanban_home, monkeypatch)
         assert _comments(conn, low) == []           # below the priority floor
 
 
+def test_low_priority_hold_repeating_n_ticks_surfaces_once(kanban_home, monkeypatch):
+    """t_250a7fc5: t_041ad167 (p2) sat 20 h on ``not_portable:linked`` with 13+
+    identical placement_wait rows and nobody told; the priority floor hid it.
+    After STARVED_REPEAT_EVENTS same-code rows it gets ONE comment and ONE
+    #logs line, whatever its priority."""
+    sent = []
+    from hermes_cli import kanban_budget as _kbudget
+    monkeypatch.setattr(_kbudget, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(_kbudget, "_run_notify", lambda argv: sent.append(argv) or True)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="p2", assignee="alpha", priority=2, body="x")
+        wait = {"code": "not_portable:linked", "detail": "after-merge->t_84e763a3",
+                "reason": "not_portable:linked(after-merge->t_84e763a3)", "route": "wait",
+                "host": None, "since": int(NOW)}
+        waits = {tid: wait["reason"]}
+        for i in range(4):  # STARVED_REPEAT_EVENTS
+            assert kps.notify_starved_holds(conn, waits, int(NOW) + i * 900) == []
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "placement_wait", wait)
+        (hit,) = kps.notify_starved_holds(conn, waits, int(NOW) + 4 * 900)
+        assert hit["code"] == "not_portable:linked"
+        assert hit["events"] == 4
+        (body,) = _comments(conn, tid)
+        assert "not_portable:linked" in body and "derived-from" in body
+        assert len(sent) == 1 and "--target" in sent[0] and tid in sent[0][-1]
+        # Latched: later ticks post nothing more.
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "placement_wait", wait)
+        assert kps.notify_starved_holds(conn, waits, int(NOW) + 6 * 900) == []
+        assert len(_comments(conn, tid)) == 1 and len(sent) == 1
+
+
 def test_capacity_waits_are_never_reported(kanban_home):
     assert kps.fix_for("local_full") is None
     assert kps.fix_for("pool_full") is None

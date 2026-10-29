@@ -243,8 +243,17 @@ class InterruptControlMixin:
             # Hard stop only (see docstring). The comment that used to run unconditionally here
             # claimed a hard interrupt supersedes the steer — but nothing gated this wipe on
             # hard_cancel, so a soft clear dropped a live user message with no trace.
-            with _ic_lock(self, "_pending_steer_lock"):
-                self._pending_steer = None
+            def _wipe() -> None:
+                with _ic_lock(self, "_pending_steer_lock"):
+                    self._pending_steer = None
+
+            # A steer provenance ledger (gateway ``_steer_wipe_sink``) wipes under its own lock and
+            # drops the entries that described the wiped text (Prism 7c35492cc023 / 43b1ce3c30ef).
+            sink = getattr(self, "_steer_wipe_sink", None)
+            if callable(sink):
+                sink(_wipe)
+            else:
+                _wipe()
         return True
 
     def steer(self, text: str) -> bool:

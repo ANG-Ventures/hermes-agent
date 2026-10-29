@@ -6,6 +6,7 @@ not clear a card that was re-blocked or re-pointed between its read and the writ
 from pathlib import Path
 
 import argparse
+import time
 
 import pytest
 
@@ -73,6 +74,63 @@ def test_expectation_refuses_a_non_blocked_card(kanban_home):
         conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (t,))
         assert not kb.unblock_task(conn, t, expect_block_event=0)
         assert kb.unblock_task(conn, t)   # without an expectation the old behaviour holds
+
+
+def _deferred(conn, reason="unblock_when: pr_merged:o/r#1"):
+    t = kb.create_task(conn, title="deferred", assignee="daedalus")
+    assert kb.block_task(conn, t, reason=reason, kind="deferred", until=int(time.time()) + 86400)
+    assert kb.get_task(conn, t).status == "scheduled"
+    ev = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='scheduled'", (t,)).fetchone()[0]
+    cm = conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id=?", (t,)).fetchone()[0] or 0
+    return t, ev, cm
+
+
+def test_deferred_card_cas_on_its_scheduled_event(kanban_home):   # t_7f670c57
+    with kb.connect() as conn:
+        t, ev, cm = _deferred(conn)
+        assert not kb.unblock_task(conn, t, expect_block_event=ev + 1, expect_last_comment=cm)
+        assert kb.get_task(conn, t).status == "scheduled"
+        assert kb.unblock_task(conn, t, expect_block_event=ev, expect_last_comment=cm)
+        row = conn.execute("SELECT status, next_eligible_at FROM tasks WHERE id=?", (t,)).fetchone()
+        assert row[0] == "ready" and row[1] is None   # the deferral's wake stamp is lifted too
+
+
+def test_deferred_card_reparked_or_repointed_is_left_alone(kanban_home):   # t_7f670c57
+    with kb.connect() as conn:
+        t, ev, cm = _deferred(conn)
+        kb.add_comment(conn, t, "apollo", "unblock_when: ruling:changed")
+        assert not kb.unblock_task(conn, t, expect_block_event=ev, expect_last_comment=cm)
+        t2, ev2, cm2 = _deferred(conn)
+        assert kb.unblock_task(conn, t2)
+        assert kb.block_task(conn, t2, reason="unblock_when: after:+1h", kind="deferred",
+                             until=int(time.time()) + 3600)
+        assert not kb.unblock_task(conn, t2, expect_block_event=ev2, expect_last_comment=None)
+        assert kb.get_task(conn, t2).status == "scheduled"
+
+
+def test_comment_only_cas_never_lifts_a_card_reparked_from_blocked(kanban_home):   # Prism 503b929774f2
+    with kb.connect() as conn:
+        t = _blocked(conn)
+        _ev, cm = _latest(conn, t)
+        assert kb.block_task(conn, t, reason="later", kind="deferred", until=int(time.time()) + 3600)
+        assert kb.get_task(conn, t).status == "scheduled"
+        assert not kb.unblock_task(conn, t, expect_last_comment=cm)
+        row = conn.execute("SELECT status, next_eligible_at FROM tasks WHERE id=?", (t,)).fetchone()
+        assert row[0] == "scheduled" and row[1] is not None
+
+
+def test_wake_reset_after_the_read_invalidates_the_scheduled_cas(kanban_home):   # Prism 503b929774f2 r2
+    with kb.connect() as conn:
+        t, ev, cm = _deferred(conn)
+        later = int(time.time()) + 7 * 86400
+        ok, why = kb.set_schedule_wake(conn, t, wake_at=later, actor="apollo")
+        assert ok, why
+        assert not kb.unblock_task(conn, t, expect_block_event=ev, expect_last_comment=cm)
+        row = conn.execute("SELECT status, next_eligible_at FROM tasks WHERE id=?", (t,)).fetchone()
+        assert row[0] == "scheduled" and row[1] == later
+        rev = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='schedule_wake_set'",
+                           (t,)).fetchone()[0]
+        assert kb.unblock_task(conn, t, expect_block_event=rev, expect_last_comment=cm)   # a fresh read still flips
 
 
 def test_cli_flags_reach_the_cas(kanban_home, capsys):

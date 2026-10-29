@@ -114,6 +114,12 @@ def perform_api_call(
         _sent_model = next_api_kwargs.get("model") if isinstance(next_api_kwargs, dict) else None
         if isinstance(_sent_model, str) and _sent_model:
             _call_route["model"] = _sent_model
+        if "_held_sign_grants" in getattr(agent, "__dict__", {}):
+            # A signing grant is bound to the model it was minted for: any call on another model
+            # revokes it first (t_19c567a8, Prism 6b322f502e4d).
+            from tools.delegate_tool_sign_grant import revoke_on_model_drift
+
+            revoke_on_model_drift(agent, _call_route["model"])
         agent._inflight_request_route = _dispatch_route_snapshot(agent, _call_route)
         if _use_streaming:
             return agent._interruptible_streaming_api_call(

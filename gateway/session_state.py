@@ -27,6 +27,9 @@ class TurnState:
     started_ts: float = 0.0  # 0.0 = not running
     lease: Any = None  # cross-process active-session slot lease
     busy_ack_ts: float = 0.0  # debounce; 0.0 = never acked
+    # Last INFO log of PHASE=lease_flush_queued. Not reset by clear(): the slot clears BEFORE the
+    # flush it debounces, and the requeue back-off re-queues the same wake about once a second.
+    flush_log_ts: float = 0.0
     # Held turn-lease tokens keyed by acquiring run generation: release/rebind resolve the
     # token for their own generation, so a displaced turn's unwind frees only its own lease and
     # never a successor's (an evicted turn and its replacement may both hold one briefly).

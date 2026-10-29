@@ -585,7 +585,13 @@ _SPECS = [
              help="Read the comment body from PATH ('-' = stdin). Use this for "
                   "text with backticks or $(...): the shell never sees it."),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
+        _arg("--grant", metavar="GRANT_ID",
+             help="Sign as --author under a scoped signing grant this delegate child was given "
+                  "(kanban.sign_grants: on); refused outside its cards, verbs, expiry or session"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
+        _arg("--if-latest-release", type=int, metavar="COMMENT_ID",
+             help="Append only while COMMENT_ID is still the card's newest release-bearing "
+                  "(close-on:) comment, checked in the insert's transaction; else exit 3, nothing written"),
         _WHY,
     ], help="Append a comment"),
     _cmd("attach", [
@@ -818,6 +824,11 @@ _SPECS = [
         # ``--operator "<who: why>"`` comes from the home-guard loop in build_parser;
         # on request-changes it is also the operator send-back (coverage waived).
     ], help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("sendback", [
+        _TASK_ID,
+        _arg("--payload", required=True,
+             help="The Forge L0 section 2.4 sendback row as a JSON object (source, reason, summary, evidence, ...)"),
+    ], help="Producer verb: return a PR defect (CI red, Prism, lander, conflict, revert) to the card's implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
@@ -864,6 +875,15 @@ _SPECS = [
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
         _json_flag(),
     ], help="One dispatcher pass: reclaim stale, promote ready, spawn workers"),
+    _cmd("admit", [
+        _TASK_ID,
+        _arg("--host", required=True,
+             help="The ONE host to spawn this card on (must be in the card's eligible set)"),
+        _arg("--reason", required=True,
+             help="Why (required; quote the ruling). Recorded on the admission_override event"),
+    ], help="Operator-only: spawn ONE ready card on ONE host now, skipping the load gate "
+            "and the host admission band (never the measured-danger floor or eligibility). "
+            "Needs KANBAN_OPERATOR_TOKEN; kill switch kanban.admin_admit.enabled"),
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),

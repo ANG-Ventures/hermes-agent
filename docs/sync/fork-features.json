@@ -246,7 +246,7 @@
       "tests/gateway/test_restart_config_bridge_call_site.py::test_effect",
       "tests/gateway/test_restart_config_bridge_call_site.py::test_restart_breadcrumb_frozen_contract_is_consumed"
     ],
-    "call_site": "gateway/run.py::_bridge_config_to_env",
+    "call_site": "hermes_cli/process_bootstrap.py::_bridge_config_to_env",
     "call_site_tests": [
       "tests/gateway/test_restart_config_bridge_call_site.py::test_every_fork_only_key_has_a_call_site_pair",
       "tests/gateway/test_restart_config_bridge_call_site.py::test_call_site_passes_the_agent_section_to_the_fork_helper",
@@ -1273,6 +1273,338 @@
     ],
     "why": "2026-10-24 14:45 Apollo default gateway: _run_agent released the turn slot at 'response ready' while _handle_message held the turn lease through a ~170 s persist+deliver; a same-key kanban wake was dispatched as a fresh turn (gen 3), the registry read the live gen-2 holder as 'stopped and draining' because gen 2 was no longer current, clipped the wait to 5 s and bounced it, and Ace's voice message queued behind gen 3 was dropped with the bounce. Fixed by: _hm_queue_during_lease_flush (queue while a lease token is still held), PersistentState.invalidated_run_generation + is_generation_invalidated (supersession is not invalidation), _hm_lease_rejection_reply (hold + count queued prompts on a fail-closed rejection). The lease and its stale-holder predicate are fork-only, so a parity merge resolving these files toward upstream silently reopens all three.",
     "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "idle-TTL-evicted AIAgent closes its per-agent LCM context-engine clone (release_clients/close -> _shutdown_context_engine)",
+    "tests": [
+      "tests/agent/test_context_engine_released_on_evict.py"
+    ],
+    "paths": [
+      "run_agent.py"
+    ],
+    "why": "2026-10-23 Apollo gateway EMFILE wedge: 4,200 fds against a 4,096 soft limit, ~1,996 of them lcm.db handles leaked by idle-TTL-evicted agents whose per-agent LCM context-engine clone was never shut down; session storage and model-preference reads failed. Fixed by hermes-agent#2237 (squash 84975a7787e, 2026-10-24): AIAgent._shutdown_context_engine() called once from release_clients() and close(), tolerant of engines without shutdown() and of shutdown errors. tests/tools/test_delegate_child_lifecycle.py::_real_agent_methods stubs _shutdown_context_engine; keep that stub in sync. Upstream has no _shutdown_context_engine (0 hits in upstream/main run_agent.py): PR shape is a re-author patching run_agent.py release_clients()/close(); repro = build an agent with a context engine, evict it, count open engine handles.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "cron"
+    ]
+  },
+  {
+    "feature": "SessionDB periodic PASSIVE WAL checkpoint runs on its own connection, off SessionDB._lock",
+    "tests": [
+      "tests/hermes_state/test_wal_checkpoint_strategy.py::TestCheckpointNeverHoldsTheWriteLock"
+    ],
+    "paths": [
+      "hermes_state.py",
+      "hermes_state_*.py"
+    ],
+    "why": "2026-10-25 Apollo: 19-23 state.db writers queued for 42+ s behind _try_wal_checkpoint running inside the shared SessionDB._lock write lock on a 6.25 GB state.db. Fixed by hermes-agent#2311 (merge e12b459f94df, 2026-10-26): the interval checkpoint uses a dedicated _ckpt_conn under single-flight _ckpt_lock (lock order _ckpt_lock -> _lock), the interval writer never waits on it, and close() closes the checkpoint connection. Upstream has no _ckpt_conn (0 hits in upstream/main hermes_state.py): PR shape is a re-author patching hermes_state.py _try_wal_checkpoint; repro = block a checkpoint and assert a concurrent write completes.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "cron"
+    ]
+  },
+  {
+    "feature": "cron claim heartbeats and fire_claim_fence ownership check run off _jobs_lock (sqlite mode)",
+    "tests": [
+      "tests/cron/test_claim_heartbeat_lock_free.py::test_heartbeats_and_fence_do_not_wait_on_jobs_lock",
+      "tests/cron/test_claim_heartbeat_lock_free.py::test_run_claim_heartbeat_does_not_wait_on_jobs_lock",
+      "tests/cron/test_claim_heartbeat_lock_free.py::test_json_mode_heartbeat_still_takes_the_locked_path",
+      "tests/cron/test_claim_heartbeat_lock_free.py::test_fence_revalidates_definition_after_unlocked_row_read"
+    ],
+    "paths": [
+      "cron/jobs.py"
+    ],
+    "why": "2026-10-26 Apollo gateway (pid 23958): after #2287 py-spy still showed 14-21 threads waiting on cron _jobs_lock (6x fire_claim_fence, 3x heartbeat_fire_claim per dump), stalling cron dispatch. Fixed by hermes-agent#2320 (merge 0a77dddc9c6c, 2026-10-26): heartbeat_fire_claim/heartbeat_run_claim -> _refresh_claim_unlocked (owner-guarded UPDATE in its own BEGIN IMMEDIATE), fire_claim_fence reads _fast_job_view, _cached_definition parses jobs.json once per stamp; json mode keeps the locked path. Upstream has no _refresh_claim_unlocked (0 hits in upstream/main cron/jobs.py) and no runtime_state.db (#2287): PR shape is a re-author on top of an upstream port of #2287; repro = hold _jobs_lock and assert a heartbeat completes.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron",
+      "gateway"
+    ]
+  },
+  {
+    "feature": "gateway GoalManager/LoopManager construction and get_meta never run on the event loop (executor hops in async defs)",
+    "tests": [
+      "tests/gateway/test_goal_loop_state_never_on_loop.py::test_goal_loop_state_is_never_touched_on_the_event_loop"
+    ],
+    "paths": [
+      "gateway/slash_commands_goals.py",
+      "gateway/run_goals.py"
+    ],
+    "why": "2026-10-19..26 Apollo gateway.error.log: 169 PHASE=event_loop_blocked stalls of 10-30 s with the loop parked in SessionDB.get_meta (124 from the 15 s goal idle-wake scan building GoalManager inline); every platform froze at once. Fixed by hermes-agent#2322 (merge 4e156d27ff89, 2026-10-26): goal/loop state loaders reached from async defs hop through _run_in_executor_with_context. The guard AST-walks every async def in gateway/run_goals.py and gateway/slash_commands_goals.py, so run_goals.py is listed although this PR only edited slash_commands_goals.py. Upstream has both files but still calls the loaders inline from async defs: PR shape is the six-call-site executor-hop patch plus the AST guard; repro = the guard test.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
+  },
+  {
+    "feature": "cron preflight caches primary-home profile_routes on the config files' stat signature",
+    "tests": [
+      "tests/cron/test_preflight_routes_cache.py::test_unchanged_files_parse_once"
+    ],
+    "paths": [
+      "cron/scheduler_preflight.py"
+    ],
+    "why": "2026-10-26 07:05 Apollo gateway (pid 23958) py-spy --gil: 6.5% of all GIL time was read_yaml_layers in _primary_profile_routes_for_current_home, re-parsing config.yaml + managed overlay on every cron run (24-32 concurrent runs of 702 jobs). Fixed by hermes-agent#2335 (merge dd4ac4ac6c4b, 2026-10-26): module cache keyed (primary_home, current_home), validated by utils.file_signature of every file read_yaml_layers reads, lock-guarded, exceptions not cached; sibling tests in the same file prove rewrite/touch/appear re-reads. Upstream has scheduler_preflight.py without file_signature caching: PR shape is a small cache patch in cron/scheduler_preflight.py; repro = 10 calls -> 1 parse.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron"
+    ]
+  },
+  {
+    "feature": "gateway_health._safe_profile caches the active profile name per home key (no realpath per heartbeat)",
+    "tests": [
+      "tests/monitoring/test_gateway_health_profile_cache.py::test_same_home_resolves_profile_once_across_transitions"
+    ],
+    "paths": [
+      "agent/monitoring/gateway_health.py",
+      "agent/monitoring/gateway_health_*.py"
+    ],
+    "why": "2026-10-26 19:05 Apollo gateway (pid 19817) PHASE=event_loop_blocked 10 s: api_server heartbeat -> emit_runtime_status_transition -> _safe_profile -> get_active_profile_name -> Path.resolve/realpath on the loop at load ~27. Fixed by hermes-agent#2363 (merge 1f04de005b9e, 2026-10-27): _profile_cache keyed on (get_hermes_home(), $HOME, $HERMES_DATA_DIR_SUFFIX) with no filesystem calls, recomputed on home change, failures fail open and are not cached. Upstream has gateway_health.py without _profile_cache (0 hits): PR shape is the cache in _safe_profile; repro = three transitions -> one resolve.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "global LogRecord factory resolves the hermes home once per raw path (lru_cache), not per log record",
+    "tests": [
+      "tests/test_log_record_factory_resolve_cache.py::test_same_home_is_resolved_once_across_records",
+      "tests/test_log_record_factory_resolve_cache.py::test_distinct_homes_resolve_separately"
+    ],
+    "paths": [
+      "hermes_logging.py"
+    ],
+    "why": "2026-10-26 20:04 Apollo gateway (pid 19817) PHASE=event_loop_blocked 10 s: kanban dispatcher watcher logging.info -> _session_record_factory -> get_hermes_home().resolve() -> realpath on the loop at host load 48. Fixed by hermes-agent#2364 (merge 92bea91ed238, 2026-10-27): _resolved_home_str lru_cache(64) keyed on the unresolved home string; per-profile homes resolve separately; resolve failures not cached. Upstream has _session_record_factory but no _resolved_home_str (0 hits): PR shape is the lru_cache helper in hermes_logging.py; repro = 20 records -> 1 Path.resolve.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli",
+      "cron"
+    ]
+  },
+  {
+    "feature": "Discord admission reuses one process-wide PairingStore; split-dir pairing migration runs once per (home, active) per process",
+    "tests": [
+      "tests/gateway/test_pairing_store_hotpath.py::test_twenty_admission_checks_run_migration_once",
+      "tests/gateway/test_pairing_store_hotpath.py::test_second_construction_skips_migration_io"
+    ],
+    "paths": [
+      "gateway/pairing.py",
+      "plugins/platforms/discord/adapter.py",
+      "plugins/platforms/discord/adapter_*.py",
+      "gateway/platforms/yuanbao.py",
+      "gateway/platforms/yuanbao_*.py"
+    ],
+    "why": "2026-10-26 23:54 Apollo gateway (pid 95445) PHASE=event_loop_blocked 10 s: Discord on_message -> _discord_message_admission -> _is_pairing_approved_user -> PairingStore().__init__ -> _migrate_split_pairing_dirs (resolve/exists/mkdir/glob/json) on the loop for every admitted message. Fixed by hermes-agent#2368 (merge 6212a72bc961, 2026-10-27): migration latched per (home, active) only after success, new shared_pairing_store() keyed on the freshly resolved pairing dir, Discord admission + component auth and Yuanbao DM pairing switched to it; fail-closed unchanged. Upstream has gateway/pairing.py without shared_pairing_store (0 hits): PR shape is the pairing.py latch + shared store and the two adapter call sites; repro = 20 admission checks -> 1 migration.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord"
+    ]
+  },
+  {
+    "feature": "async-delegation registry: stamp-keyed read cache (shared read-only object, private copy for writers) and compaction of DELIVERED terminal outbox bodies",
+    "tests": [
+      "tests/tools/test_async_delegation_compaction.py::test_compaction_shrinks_registry_and_preserves_pending_and_integrity",
+      "tests/tools/test_async_delegation_compaction.py::test_compaction_leaves_recent_terminal_bodies_alone",
+      "tests/tools/test_async_delegation_compaction.py::test_completion_delivered_then_compacted_still_renders_result",
+      "tests/tools/test_async_delegation_compaction.py::test_backup_directory_fsync_unsupported_is_tolerated",
+      "tests/tools/test_async_delegation_compaction.py::test_write_refresh_does_not_trust_value_equal_rewrite",
+      "tests/tools/test_async_delegation_compaction.py::test_failed_backup_leaves_no_artifact_and_blocks_compaction",
+      "tests/tools/test_async_delegation_compaction.py::test_acknowledge_backs_up_the_locked_registry_even_if_cwd_moves",
+      "tests/tools/test_async_delegation_compaction.py::test_compacted_resync_onto_empty_mirror_row_never_reopens_delivery",
+      "tests/tools/test_async_delegation_compaction.py::test_delivered_ack_backs_up_the_registry_it_locked_even_if_cwd_moves",
+      "tests/tools/test_async_delegation_compaction.py::test_caller_mutating_a_shared_read_never_corrupts_later_reads",
+      "tests/tools/test_async_delegation_compaction.py::test_leftover_backup_still_requires_a_successful_directory_fsync",
+      "tests/tools/test_async_delegation_compaction.py::test_compacted_canonical_never_reopens_a_mirror_row_with_a_stub",
+      "tests/tools/test_async_delegation_compaction.py::test_compacted_other_attempt_writes_its_result_without_reopening"
+    ],
+    "paths": [
+      "tools/async_delegation.py",
+      "tools/async_delegation_*.py"
+    ],
+    "why": "2026-10-26 Apollo gateway py-spy: state/async-delegations.json had grown to ~10 MB for ~150 records and every locked_registry() enter re-ran json.loads (24-81 ms) plus a per-record sha256 (claim_completion_delivery enters once per delivered event): 13% of gateway GIL samples. Fixed by hermes-agent#2323 (merge efabaac983b5, 2026-10-27): _load caches on (mtime_ns, size, ino, sha256) and skips parse+checksum on a hit (content-hash confirm inside 2 s of mtime), write=True callers get a private copy, delivered terminal outbox bodies are compacted with payload_sha256 (live copy 10.1 MB -> 2.8 MB, pending events byte-identical). Upstream has no tools/async_delegation_store.py (path absent in upstream/main): PR shape is a re-author against upstream's delegation store; repro = 100 read enters on a 10 MB registry -> 1 parse. Not registered: test_unchanged_registry_parses_and_checksums_once (the 100-enters = 1-parse guard) is RED on fork/main itself on macOS: the harness per-test RSS budget trips at 1.00-1.03 GiB grown (limit 1.00 GiB) before its assertion runs.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ],
+    "coverage_gap": "test_unchanged_registry_parses_and_checksums_once (read-cache parse count) fails on fork/main on macOS on the RSS-growth harness budget (measured 3/3 runs, 2026-10-27, Studio): needs @pytest.mark.big_memory or a smaller fixture before it can be registered; the registered set still goes red when the cache/compaction source is reverted."
+  },
+  {
+    "feature": "kanban dispatcher tick hot path: memoised git toplevel/remotes per workspace, stat-keyed board-home config parse, fork-free macOS _pid_alive, orphan sweep once per window",
+    "tests": [
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_unchanged_checkout_spawns_git_once_per_probe",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_walk_up_still_answers_not_toplevel_and_stays_cached",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_repeat_within_ttl_still_hits_the_cache",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_board_home_cfg_parses_an_unchanged_file_once",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_pid_alive_spawns_no_subprocess_per_pid",
+      "tests/hermes_cli/test_kanban_tick_hotpath.py::test_orphan_sweep_runs_once_per_window_per_board"
+    ],
+    "paths": [
+      "hermes_cli/kanban_db.py",
+      "hermes_cli/kanban_db_*.py",
+      "hermes_cli/kanban_pr_gate.py"
+    ],
+    "why": "2026-10-26 16:28 PT Apollo gateway (pid 4484) 40 s py-spy: 34% of all GIL samples in the kanban watcher tick (2 git forks per gated card per tick, board-home config.yaml re-parse, a `ps -o stat=` fork per pid on macOS, orphan sweep every tick). Fixed by hermes-agent#2358 (merge 52c3ec749c4c, 2026-10-27): stat-signature LRU memo for _is_repo_toplevel/_remotes_for, _board_home_config_raw cached on file_signature (deepcopy out), _pid_alive drops the darwin ps fork (psutil status already catches zombies), sweep_terminal_workspace_orphans throttled per board. Upstream still forks `ps -o stat=` in kanban_db_dispatch.py and has no _board_home_kanban_cfg / kanban_pr_gate.py (0 hits): PR shape is the _pid_alive + config-cache halves; repro = N ticks on an unchanged checkout -> 1 git spawn per probe.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ]
+  },
+  {
+    "feature": "cron runtime-mirror flush is single-flight per process and double-checked under _jobs_lock (no herd re-reading jobs.json)",
+    "tests": [
+      "tests/cron/test_mirror_flush_single_flight.py::test_due_flush_herd_coalesces_to_one_write_and_no_reread_chain",
+      "tests/cron/test_mirror_flush_single_flight.py::test_write_after_inflight_seq_read_stays_dirty_and_flushes_next_window",
+      "tests/cron/test_mirror_flush_single_flight.py::test_sibling_process_flushed_while_we_waited_skips_load_under_lock"
+    ],
+    "paths": [
+      "cron/jobs.py"
+    ],
+    "why": "2026-10-26 18:00 PT Apollo gateway (pid 4484) 12 py-spy dumps: 15-19 threads blocked on cron _jobs_lock in every dump, cron at 57% of GIL samples; the holder was always maybe_flush_runtime_mirror, and each queued thread re-ran load_jobs + _parse_jobs_file on the 1.36 MB jobs.json after the first flush had already written. Fixed by hermes-agent#2362 (merge 6c2250156a76, 2026-10-27): module _mirror_flush_gate taken non-blocking before _jobs_lock (force=True waits), then dirty_since + file stamp re-read under the lock before any load. Upstream has no maybe_flush_runtime_mirror / runtime_state.db (0 hits in upstream/main cron/): PR shape rides on an upstream port of #2287; repro = 8 threads leaving sections after the window -> 1 write, 0 re-reads.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cron",
+      "gateway"
+    ]
+  },
+  {
+    "feature": "kanban PR-gate prefetch batches cache misses into one `gh api graphql` per repo per <=50 PRs (partial errors keep resolved nodes)",
+    "tests": [
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_forty_misses_in_one_repo_cost_one_gh_call",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_two_repos_cost_two_gh_calls",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_chunking_120_prs_cost_three_calls",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_per_tick_lookup_cap_still_applies",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_batch_normalization_matches_query_pr",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_whole_call_failure_is_none_for_all_and_never_cached",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_partial_errors_use_resolved_nodes",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_merged_cached_forever_open_requeried_after_ttl",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_out_of_range_number_never_enters_a_batch",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_errors_only_document_rejection_splits_so_valid_nodes_resolve",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_rate_limited_errors_only_is_not_split",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_replacing_query_prs_without_sandbox_is_refused",
+      "tests/hermes_cli/test_kanban_pr_gate_batched_prefetch.py::test_replacing_query_prs_with_sandbox_declared_is_allowed"
+    ],
+    "paths": [
+      "hermes_cli/kanban_pr_gate.py"
+    ],
+    "why": "2026-10-26 20:14 PT Apollo gateway (pid 19817) py-spy --gil: 9.6% of all samples in kanban_pr_gate.query_pr -> subprocess.run(gh api repos/<r>/pulls/<n>), one fork/exec of a multi-GB process per stale PR (up to 30/tick) every 300 s TTL expiry. Fixed by hermes-agent#2366 (merge 4628d149a8cf, 2026-10-27): query_prs() = one gh api graphql per repo per <=50 PRs normalised to query_pr's shape; whole-call failure -> None for the chunk (never cached), partial NOT_FOUND keeps resolved nodes; cap, cache keys and TTLs unchanged; injected query_fn keeps the per-PR path. hermes_cli/kanban_pr_gate.py is absent upstream (0 hits for query_prs): PR shape rides on upstreaming the PR gate itself; repro = 40 cache misses in one repo -> 1 gh call.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ]
+  },
+  {
+    "feature": "a relay-summed prompt reading right after a usage-less reply is billed but never adopted as the context size (compressor, usage anchor, meter)",
+    "tests": [
+      "tests/agent/test_summed_usage_reading.py::TestRecordResponseUsage::test_gap_closes_after_one_measured_reading",
+      "tests/agent/test_summed_usage_reading.py::TestRecordResponseUsage::test_first_reading_over_window_is_rejected"
+    ],
+    "paths": [
+      "agent/turn_usage.py",
+      "agent/usage_anchor.py"
+    ],
+    "why": "2026-10-26 03:41 aegis on claude-dtlr: the first measured usage after a usage-less reply summed every assistant message since the turn mark (619,053 -> unknown -> 1,241,066 on a 1M window); record_response_usage stamped it as last_prompt_tokens and captured the usage anchor from it, so preflight compaction fired at a real ~622k (threshold 650k) and the footer meter, hygiene valve and delegate headroom read 2x. 24 of 383 post-usage-less claude-dtlr readings were 2.0x (2026-10-12..27). Fixed by hermes-agent#2385 (merge 77a98b9e2821, 2026-10-27): implausible_prompt_reading() rejects a figure above the window, or above 1.5x the anchor prediction + 32k only right after a usage-less reply; a rejected figure still counts for billing. Upstream has agent/turn_usage.py and agent/usage_anchor.py without the bound: PR shape is the bound + its record_response_usage call site; repro = the incident sequence 619,053 -> None -> 1,241,066.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ],
+    "coverage_gap": "test_summed_reading_does_not_become_context also goes RED on the pre-fix source, but on the Studio it fails on fork/main too: its first openai import trips tests/home_io_guard.py on the venv's editable pytest-hermeticity-guard path under the real home (local venv artifact, measured 2026-10-27). Register it once it is green on the canary host."
+  },
+  {
+    "feature": "shell-hook batches reuse a warm --serve dispatcher (up to 4 idle per interpreter/cwd/env) instead of a fork+exec of the gateway per tool call",
+    "tests": [
+      "tests/agent/test_shell_hooks_batch.py::test_n_batches_start_one_warm_dispatcher",
+      "tests/agent/test_shell_hooks_batch.py::test_dead_warm_dispatcher_is_replaced",
+      "tests/agent/test_shell_hooks_batch.py::test_serve_mode_answers_several_requests_on_one_process"
+    ],
+    "paths": [
+      "agent/shell_hook_dispatcher.py",
+      "agent/shell_hooks_batch.py"
+    ],
+    "why": "2026-10-26 20:13 PT Apollo gateway (pid 19817) 30 s py-spy --gil: 90 of 159 hook samples were shell_hooks_batch._start_dispatcher -> subprocess.Popen, one fork+exec of the multi-GB gateway plus a fresh interpreter on every tool call. Fixed by hermes-agent#2386 (merge d229eb63b1f8, 2026-10-27): shell_hook_dispatcher.py --serve answers one request per stdin line; shell_hooks_batch keeps up to 4 idle dispatchers and never reuses a killed or crashed one; per-hook fork, timeout and process-group kill unchanged. Upstream has no agent/shell_hook_dispatcher.py or agent/shell_hooks_batch.py (absent in upstream/main): PR shape rides on upstreaming the batched shell-hook runner; repro = 5 tool calls -> 1 dispatcher start.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ]
+  },
+  {
+    "feature": "gateway sends the reply before post-turn hooks (/goal judge, loop tick) run; a goal stopped, paused, replaced or re-evaluated during the send or judge gets no stale continuation",
+    "tests": [
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_reply_is_sent_before_the_goal_judge_starts",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_loop_tick_settles_inside_the_callback",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_stop_during_the_final_send_runs_no_hooks",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_stale_evaluator_save_is_dropped_and_never_continues",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_stale_evaluation_aborts_before_touching_the_replacement_goal",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_goal_set_during_the_send_is_not_judged_on_the_old_reply",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_pause_during_the_status_send_drops_the_continuation",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_replacement_goal_at_the_same_revision_gets_no_continuation",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_transient_refresh_failure_keeps_the_loaded_goal",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_unbounded_goal_hook_does_not_unbound_a_chained_callback",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_failed_turn_end_pin_skips_the_deferred_judge",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_subgoal_during_the_final_send_still_judges_and_continues",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_subgoal_during_the_judge_reevaluates_the_edited_goal",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_pause_and_resume_during_the_send_is_not_a_nonterminal_edit",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_pause_and_resume_during_the_judge_stops_the_stale_evaluation",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_a_newer_evaluation_during_the_judge_stops_the_older_one",
+      "tests/gateway/test_post_turn_hooks_after_delivery.py::test_a_newer_evaluation_after_the_pin_skips_the_older_judge"
+    ],
+    "paths": [
+      "gateway/platforms/base.py",
+      "gateway/platforms/base_*.py",
+      "gateway/run_goals.py",
+      "gateway/run_inbound.py",
+      "gateway/run_inbound_*.py",
+      "hermes_cli/goals.py",
+      "hermes_state.py",
+      "hermes_state_*.py"
+    ],
+    "why": "2026-10-26 Apollo: a turn with an active /goal held its finished reply until the goal judge (a second model call) returned, so the human saw nothing for the judge's whole duration. Fixed by hermes-agent#2351 (merge 6871aa27ebd1, 2026-10-27): post-turn hooks run from a callback after the final send, pinned to the goal revision at turn end, so a stop, pause, replacement goal or newer evaluation during the send or the judge drops the stale continuation. Upstream has all five files and runs the judge before delivery: PR shape is the after-send callback + revision pin; repro = test_reply_is_sent_before_the_goal_judge_starts.",
+    "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
     "surfaces": [

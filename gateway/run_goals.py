@@ -8,6 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import logging
 import time
@@ -22,6 +23,17 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# True while the post-turn hooks run as the adapter's post-delivery callback: that slot has already
+# been popped, so a /goal status notice is sent directly (registering would fire on the NEXT turn).
+_AFTER_DELIVERY: contextvars.ContextVar[bool] = contextvars.ContextVar("post_turn_after_delivery", default=False)
+# goal_pin sentinel: the turn-end goal row could not be read, so the deferred judge is skipped (the idle
+# check-in re-evaluates later); judging unpinned could score a goal set during the send on this reply.
+GOAL_PIN_FAILED = ("<goal pin failed>",)
+# A list while /loop completion runs inline before the send: a tick with --until settles there without
+# its judge (an aux-LLM call, t_d81971a0) and parks (mgr, pending, reply, source) here for the
+# post-delivery callback, which judges after the reply is sent.
+_LOOP_JUDGE_DEFER: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar("loop_judge_defer", default=None)
 
 
 class GatewayGoalsMixin:
@@ -71,6 +83,35 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.warning("%s: session DB warm-up failed: %s", label, exc)
 
+    async def _claim_off_loop(self, claim, give_back):
+        """Run a state.db CLAIM (``claim()``: a heartbeat fire, a /loop tick) in the executor and return
+        its result. A worker thread cannot be stopped: if the caller is cancelled while the claim waits on
+        the SessionDB lock, the thread still persists it, and nobody would dispatch or abandon it (Prism
+        fd214c8b7386). So the hop is shielded, and on cancel ``give_back(result)`` runs off the loop once
+        the claim lands, under the caller's contextvars (profile home)."""
+        hop = asyncio.ensure_future(self._run_in_executor_with_context(claim))
+        try:
+            return await asyncio.shield(hop)
+        except asyncio.CancelledError:
+            ctx = contextvars.copy_context()
+
+            def _orphaned(done):
+                if done.cancelled() or done.exception() is not None:
+                    return
+                result = done.result()
+
+                def _run():
+                    try:
+                        give_back(result)
+                    except Exception:
+                        logger.warning("giving back an orphaned claim failed", exc_info=True)
+
+                with suppress(RuntimeError):  # loop already closed: nothing left to run it on
+                    done.get_loop().run_in_executor(None, ctx.run, _run)
+
+            hop.add_done_callback(_orphaned)
+            raise
+
     async def _session_entry_for_manager(self, event: "MessageEvent", label: str):
         """Session entry for a /goal or /heartbeat manager, or None when lookup fails. Warms the
         SessionDB cache first (a cold cache drops the first write while the reply claims it was
@@ -96,7 +137,8 @@ class GatewayGoalsMixin:
         session_entry = await self._session_entry_for_manager(event, f"{kind} manager")
         if session_entry is None:
             return None, None
-        return factory(session_entry.session_id), session_entry
+        # Construction reads state.db (SessionDB.get_meta on the db lock): off the loop thread.
+        return await self._run_in_executor_with_context(factory, session_entry.session_id), session_entry
 
     async def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return ``(GoalManager, session_entry)`` for this event, or ``(None, None)``."""
@@ -165,11 +207,20 @@ class GatewayGoalsMixin:
             return  # keep missed intervals due until user work has drained
         from hermes_cli.heartbeat import HeartbeatManager
 
-        mgr = HeartbeatManager(session_id=session_id)
+        def _claim():
+            # load_heartbeat (get_meta) and the due_prompt write both take the SessionDB lock.
+            m = HeartbeatManager(session_id=session_id)
+            return m, (m.due_prompt() if m.has_heartbeat() else None)
+
+        def _give_back(claimed):
+            m, p = claimed
+            if p:
+                m.abandon_fire()
+
+        mgr, prompt = await self._claim_off_loop(_claim, _give_back)
         if not mgr.has_heartbeat():
             watch.pop(quick_key, None)
             return
-        prompt = mgr.due_prompt()
         if not prompt:
             return
         event = self._synthetic_prompt_event(source, prompt)
@@ -188,7 +239,7 @@ class GatewayGoalsMixin:
                 from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
                 task.add_done_callback(lambda done: settle_heartbeat_attempt(event, mgr))
             elif quick_key not in adapter._active_sessions:
-                mgr.abandon_fire()
+                await self._run_in_executor_with_context(mgr.abandon_fire)
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
@@ -258,7 +309,7 @@ class GatewayGoalsMixin:
         session_key = None
         with suppress(Exception):
             session_key = self._session_key_for_source(source)
-        if session_key and hasattr(adapter, "register_post_delivery_callback"):
+        if session_key and not _AFTER_DELIVERY.get() and hasattr(adapter, "register_post_delivery_callback"):
             try:
                 active = getattr(adapter, "_active_sessions", {}).get(session_key)
                 generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
@@ -281,13 +332,15 @@ class GatewayGoalsMixin:
         if not sid:
             return None
         await self._warm_goals_session_db(label)
-        return factory(sid)
+        return await self._run_in_executor_with_context(factory, sid)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None, goal_pin: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        if goal_pin is GOAL_PIN_FAILED:  # the turn-end pin could not be read: never judge unpinned
+            return
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -308,7 +361,9 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
-        from hermes_cli.goals import DEFAULT_NO_PROGRESS_TURNS, is_goal_synthetic_text
+        from hermes_cli.goals import (
+            DEFAULT_CHECKIN_MINUTES, DEFAULT_MAX_IDLE_CHECKINS, DEFAULT_NO_PROGRESS_TURNS, is_goal_synthetic_text,
+        )
         # A turn the goal loop did not start (user message, worker/process result) re-arms idle check-ins.
         _real_event = event is not None and not is_goal_synthetic_text(getattr(event, "text", ""))
         # api_calls > 1 means the model called at least one tool (each tool round is another API call).
@@ -323,23 +378,31 @@ class GatewayGoalsMixin:
             and not getattr(getattr(event, "source", None), "is_bot", False)
         )
         _nudge_read_only = bool(self._goals_config().get("nudge_on_read_only_turns", False))
+        # The hold targets wakes and pages, not the loop's own heartbeat: a continuation/check-in turn
+        # the goal fired itself is exempt (it answered the loop, so the loop keeps going).
+        _goal_turn = event is not None and not _real_event
+        _checkin = self._goal_int_setting("checkin_minutes", DEFAULT_CHECKIN_MINUTES)
+        _max_checkins = self._goal_int_setting("max_idle_checkins", DEFAULT_MAX_IDLE_CHECKINS)
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=True, background_processes=_bg_procs,
+                final_response or "", **({"baseline": goal_pin[0]} if goal_pin else {}), user_initiated=True, background_processes=_bg_procs,
                 active_delegations=_active_deleg, real_event=_real_event,
                 made_tool_calls=_made_tools, no_progress_turns=_no_progress,
-                turn_effect=_effect, user_spoke=_user_spoke, nudge_on_read_only_turns=_nudge_read_only,
+                turn_effect=_effect, user_spoke=_user_spoke or _goal_turn,
+                nudge_on_read_only_turns=_nudge_read_only, checkin_minutes=_checkin, max_checkins=_max_checkins,
             ),
         )
+        _sid = getattr(session_entry, "session_id", "?")
         if decision.get("held"):
             logger.info(
                 "goal continuation held for %s: turn effect %s, user_spoke=%s (next nudge: idle check-in)",
-                getattr(session_entry, "session_id", "?"), _effect, _user_spoke,
+                _sid, _effect, _user_spoke,
             )
         elif decision.get("should_continue"):
             logger.info(
-                "goal continuation queued for %s: turn effect %s, user_spoke=%s",
-                getattr(session_entry, "session_id", "?"), _effect, _user_spoke,
+                "goal continuation queued for %s: turn effect %s, user_spoke=%s, goal_turn=%s%s",
+                _sid, _effect, _user_spoke, _goal_turn,
+                f" ({decision['hold_overridden']})" if decision.get("hold_overridden") else "",
             )
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
@@ -347,6 +410,19 @@ class GatewayGoalsMixin:
             await self._defer_goal_status_notice_after_delivery(source, msg)
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
+            return
+        # A /goal pause, clear or replacement that landed during the status send wins: enqueue only onto
+        # the row this evaluation wrote, or a nonterminal edit of that same active goal (/subgoal during
+        # the send: nothing else re-arms the loop). Identity is goal text + created_at, not the revision.
+        from hermes_cli.goals import _load_goal_raw, same_active_goal
+        try:
+            state_now, raw_now = await self._run_in_executor_with_context(
+                lambda: _load_goal_raw(mgr.session_id, strict=True))
+        except Exception as exc:
+            logger.warning("goal continuation for %s dropped: goal re-read failed: %s", _sid, exc)
+            return
+        if raw_now is None or (raw_now != mgr._stored and not same_active_goal(state_now, mgr.state)):
+            logger.info("goal continuation for %s dropped: goal changed during the status send", _sid)
             return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
         try:
@@ -362,8 +438,86 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
+    async def _post_turn_hooks_after_delivery(
+        self, session_key: str, generation: int, *, agent_result: Any, source: Any, is_internal: bool,
+        event: Any = None,
+    ) -> None:
+        """Run the post-turn hooks (the /goal judge) AFTER the reply is sent (t_3acac80f): as the
+        adapter's post-delivery callback, which fires in the session task's finally after the send and
+        before the session guard is released. The session stays busy while the judge runs, so a new
+        message queues behind it and /stop cancels it with the turn. Inline when this turn is not the
+        adapter's session task (a /retry or handoff turn) or the adapter has no callback slot."""
+        kwargs = dict(agent_result=agent_result, source=source, is_internal=is_internal, event=event)
+        adapter = self._delivery_adapter_for(source) if session_key else None
+        owned = adapter is not None and getattr(adapter, "_session_tasks", {}).get(session_key) is asyncio.current_task()
+        if not (owned and hasattr(adapter, "register_post_delivery_callback")):
+            try:
+                await self._run_post_turn_hooks(**kwargs)
+            except Exception as exc:
+                logger.debug("post-turn hook failed: %s", exc)
+            return
+        # /loop completion stays inline, before the send, while this turn still owns the session: deferred,
+        # it would complete a wakeup tick fired during the send. It settles the tick (marker, caps, next
+        # schedule) without the --until judge; the judge runs after the send, like the /goal judge, and its
+        # verdict applies only to the tick it judged (LoopManager.apply_until_verdict).
+        _t0 = time.monotonic()
+        loop_judges: list = []
+        _defer_token = _LOOP_JUDGE_DEFER.set(loop_judges)
+        try:  # the class method: an instance override of _run_post_turn_hooks stands for the deferred judge
+            # is_internal=True: no routing touch before the send. That upsert is a state.db WRITE that waits out
+            # any foreign writer's hold (t_04b5d027: 4.05 s); the deferred judge's own lookup touches after it.
+            await GatewayGoalsMixin._run_post_turn_hooks(
+                self, **{**kwargs, "is_internal": True}, parts=("loop completion",))
+        except Exception as exc:
+            logger.debug("post-turn hook failed: %s", exc)
+        finally:
+            _LOOP_JUDGE_DEFER.reset(_defer_token)
+        _t1 = time.monotonic()
+        # Pin the goal row as of turn end: a /goal set during the send is not judged on this reply.
+        try:
+            from hermes_cli.goals import _load_goal_raw
+            sid = self.session_store.peek_session_id(session_key)
+            if isinstance(sid, str) and sid:
+                kwargs["goal_pin"] = ((await self._run_in_executor_with_context(
+                    lambda: _load_goal_raw(sid, strict=True)))[1],)
+        except Exception as exc:  # unpinned would judge a goal set during the send on this reply: skip
+            logger.warning("goal pin for %s failed, deferred judge skipped: %s", session_key, exc)
+            kwargs["goal_pin"] = GOAL_PIN_FAILED
+        if event is not None:  # pre-send share of this method: PHASE=post_handler_stages reads it
+            event._pre_send_post_turn_s = (_t1 - _t0, time.monotonic() - _t1)
+
+        # The routed profile scope (home/secret/terminal contextvars) is left before the adapter fires the
+        # callback; run the hooks in the context captured here so they read the routed profile's state.db.
+        ctx = contextvars.copy_context()
+
+        async def _run() -> None:
+            _AFTER_DELIVERY.set(True)  # inside the task's copy of ctx only
+            for args in loop_judges:
+                try:
+                    await self._post_turn_loop_judge(*args)
+                except Exception as exc:
+                    logger.debug("loop --until judge failed: %s", exc)
+            await self._run_post_turn_hooks(**kwargs, parts=("goal continuation",))
+
+        async def _hooks() -> None:
+            task = asyncio.current_task()
+            if not self._is_session_run_current(session_key, generation) or (task is not None and task.cancelling()):
+                logger.info("post-turn hooks for %s skipped: turn was stopped before they ran", session_key)
+                return
+            started = time.monotonic()
+            try:
+                await asyncio.create_task(_run(), context=ctx)  # cancelling this await cancels the task
+            finally:
+                if (took := time.monotonic() - started) > 2.0:
+                    logger.info("PHASE=post_turn_hooks session=%s s=%.2f (after delivery)", session_key, took)
+
+        # Unbounded, as the inline await was: the judge and the gates (300 s each) carry their own timeouts.
+        _hooks.post_delivery_timeout = None
+        adapter.register_post_delivery_callback(session_key, _hooks, generation=generation)
+
     async def _run_post_turn_hooks(
-        self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
+        self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None, goal_pin: Any = None,
+        parts: tuple = ("goal continuation", "loop completion"),
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
@@ -380,8 +534,10 @@ class GatewayGoalsMixin:
         if final_text.strip():
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
+            if label not in parts:
+                continue
             try:
-                extra = {"event": event} if label == "goal continuation" else {}
+                extra = {"event": event, "goal_pin": goal_pin} if label == "goal continuation" else {}
                 await hook(session_entry=session_entry, source=source, final_response=final_text, **extra)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
@@ -417,7 +573,21 @@ class GatewayGoalsMixin:
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
-        decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        deferred = _LOOP_JUDGE_DEFER.get()
+        decision = await self._run_in_executor_with_context(
+            lambda: mgr.complete_tick(final_response or "", defer_judge=deferred is not None))
+        if deferred is not None and decision.get("judge_pending"):
+            deferred.append((mgr, decision["judge_pending"], final_response or "", source))
+        msg = decision.get("message") or ""
+        if msg and source is not None:
+            await self._defer_goal_status_notice_after_delivery(source, msg)
+
+    async def _post_turn_loop_judge(self, mgr: Any, pending: tuple, final_response: str, source: Any) -> None:
+        """The --until judge for a tick settled before the send, run after it (t_d81971a0)."""
+        from hermes_cli.loops import judge_until
+
+        verdict, reason = await self._run_in_executor_with_context(judge_until, pending[0], final_response)
+        decision = await self._run_in_executor_with_context(mgr.apply_until_verdict, pending, verdict, reason)
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
@@ -469,16 +639,17 @@ class GatewayGoalsMixin:
             return  # busy — stays due, next scan retries
         if session_key and self._stop_latched(session_key):
             return  # /stop latched: hold the tick (stays due) instead of firing it into the held queue
-        if goal_blocks_loop_tick(sid):
-            return
+        def _load():
+            # Both read state.db under the SessionDB lock; a writer holding it would freeze the loop.
+            return None if goal_blocks_loop_tick(sid) else LoopManager(session_id=sid)
 
-        mgr = LoopManager(session_id=sid)
-        if not mgr.is_due(now):
+        mgr = await self._run_in_executor_with_context(_load)
+        if mgr is None or not mgr.is_due(now):
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+        wakeup = await self._claim_off_loop(mgr.fire_tick, lambda w: w and mgr.abandon_tick())
         if not wakeup:
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
@@ -500,7 +671,7 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
             with suppress(Exception):
-                mgr.abandon_tick()
+                await self._run_in_executor_with_context(mgr.abandon_tick)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops
@@ -627,13 +798,18 @@ class GatewayGoalsMixin:
             return  # busy: the running turn's own post-turn judge owns the next step
         if getattr(entry, "user_stopped_at", None) is not None or self._stop_latched(quick_key):
             return  # /stop latched: only a human turn resumes automatic work
-        with self._profile_scope_for_source(source):
+        max_turns = self._goal_max_turns_from_config()
+
+        def _wake():
             from hermes_cli.goals import GoalManager
 
-            mgr = GoalManager(session_id=session_id, default_max_turns=self._goal_max_turns_from_config())
-            prompt = await self._run_in_executor_with_context(
-                lambda: mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins),
-            )
+            # GoalManager() loads the goal via SessionDB.get_meta, which waits on the db lock while
+            # another thread writes: build it in the hop with idle_wake_prompt, never on the loop.
+            mgr = GoalManager(session_id=session_id, default_max_turns=max_turns)
+            return mgr, mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins)
+
+        with self._profile_scope_for_source(source):
+            mgr, prompt = await self._run_in_executor_with_context(_wake)
         if not prompt:
             return
         logger.info(

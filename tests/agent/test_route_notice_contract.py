@@ -38,7 +38,8 @@ _CAUSE_TEXT = {
     "unclassified": "weird thing",
 }
 _CAUSE_RE = re.compile(r"[a-zA-Z]{3,}")
-_HOP_RE = re.compile(r"(to the relay|at the relay|bridge|\(Anthropic [^)]+\)|proxy|CLI|hop unknown|hop=relay-200)")
+_HOP_RE = re.compile(r"(to the relay|at the relay|bridge|\(Anthropic [^)]+\)|proxy|CLI|hop unknown|hop=relay-200"
+                     r"|at the DPX alias layer)")
 _SUB_RE = re.compile(r"(sub-vps-\d+|claude-[abc]px-\d+|all subs|sub unknown|sub=unknown)")
 _TIME_RE = re.compile(r"\d\d:\d\d:\d\d(-\d\d(:\d\d:\d\d)?)?$")
 _COUNT_RE = re.compile(r"^\d+x ")

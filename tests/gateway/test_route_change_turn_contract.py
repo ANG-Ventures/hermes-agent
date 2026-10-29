@@ -439,6 +439,57 @@ def test_cross_session_pin_mismatch_announces_on_emitted_turn(monkeypatch, tmp_p
     asyncio.run(scenario())
 
 
+def test_pinned_session_on_its_own_fallback_says_so_once_per_episode(monkeypatch, tmp_path):
+    """t_40a9186f: the pinned session replying on its own fallback read "emitting
+    session uses a different route", on every reply. Mutation: pass
+    own_fallback=False from _announce_chat_pin_mismatch -> RED (wording + count)."""
+    from gateway.chat_model_pins import ChatModelPins
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    agent = make_agent(monkeypatch)
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda *a, **kw: response())
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", lambda *a, **kw: response())
+    owner = make_turn_owner(agent, None)
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._db = None
+    owner.session_store = store
+    pin = {"model": "user-pinned/model", "provider": "openrouter"}
+    ChatModelPins(tmp_path).set("main", "discord", "test-chat", pin)
+    # The emitting session's own override IS the pin: this is its own failover.
+    monkeypatch.setattr(store, "entry_for",
+                        lambda key: SimpleNamespace(model_override_identity=dict(pin)))
+    adapter = RecordingAdapter()
+
+    async def scenario():
+        await run_turn(owner, agent, adapter)
+        await run_turn(owner, agent, adapter)
+        notices = [text for _, text, _ in adapter.messages if "⚠️ replying on" in text]
+        assert len(notices) == 1, notices
+        assert notices[0] == ("⚠️ replying on openrouter/primary/model — on fallback from "
+                              "pinned openrouter/user-pinned/model"), notices[0]
+        assert "different route" not in notices[0]
+
+    asyncio.run(scenario())
+
+
+def test_chat_pin_notice_branches():
+    from agent.chat_completion_helpers import chat_pin_own_fallback, format_chat_pin_notice
+
+    pin = {"model": "claude-fable-5-1", "provider": "claude-alr"}
+    own = format_chat_pin_notice("claude-fable-5-1", "claude-btpr", pin, own_fallback=True,
+                                 fallback_label="content-alias refused")
+    assert own == ("⚠️ replying on claude-btpr/claude-fable-5-1 (fallback: content-alias refused)"
+                   " — pinned route claude-alr/claude-fable-5-1")
+    other = format_chat_pin_notice("claude-fable-5-1", "claude-btpr", pin)
+    assert other.endswith("emitting session uses a different route")
+    agent = SimpleNamespace(_primary_runtime={"model": "claude-fable-5-1", "provider": "claude-alr"},
+                            _last_fallback_event={"head_label": "content-alias refused"})
+    assert chat_pin_own_fallback(agent, pin) == (True, "content-alias refused")
+    agent._primary_runtime = {"model": "claude-fable-5-1", "provider": "claude-dtlr"}
+    assert chat_pin_own_fallback(agent, pin) == (False, None)
+
+
 def prepare_warm_fallback(monkeypatch, same_route):
     agent = make_agent(monkeypatch)
     agent.reasoning_config = {"effort": "medium"}

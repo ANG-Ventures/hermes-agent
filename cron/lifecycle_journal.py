@@ -64,11 +64,19 @@ EVENT_PAUSED = "paused"
 EVENT_RESUMED = "resumed"
 EVENTS = (EVENT_CREATED, EVENT_REMOVED, EVENT_PAUSED, EVENT_RESUMED)
 
+# t_71499bfa: an API edit of an existing row's DEFINITION (prompt, schedule, script, model, ...) goes to its
+# own file beside lifecycle.jsonl, one {"event": "updated", "job_id", "fields": {key: {"from", "to"}}, "at",
+# "actor"} per write. Not lifecycle.jsonl: read_entries_with_health counts any event outside EVENTS as
+# malformed, and check_vanished_jobs then refuses to certify the store (#2349). hermes-home's push gate and
+# cron-jobs-runtime-committer read it (scripts/lib/autocommit_tier.py) so an API edit is data, not a hand edit.
+EDITS_FILENAME = "edits.jsonl"
+EVENT_UPDATED = "updated"
 
-def _journal_path() -> Path:
+
+def _journal_path(filename: str = JOURNAL_FILENAME) -> Path:
     from cron.jobs import _current_cron_store
 
-    return _current_cron_store().cron_dir / JOURNAL_FILENAME
+    return _current_cron_store().cron_dir / filename
 
 
 @contextlib.contextmanager
@@ -135,10 +143,25 @@ def _ends_with_newline(path: Path) -> bool:
         return True  # unreadable: the append below will fail loudly enough
 
 
-def _append(record: Dict[str, Any]) -> None:
+def _iter_raw_lines(f):
+    """Yield each record of a binary journal handle, split on universal newlines.
+
+    Every reader opens the journal in BINARY mode so one non-UTF-8 line is one malformed record
+    (t_19a16be2). Binary iteration splits on ``\\n`` only, though, while the text readers it replaced
+    split on ``\\n``, ``\\r`` and ``\\r\\n``: a CR-delimited journal then fused every record into one
+    unparseable line and ``last_removed`` lost all removal evidence (t_e6448717). ``bytes.splitlines``
+    splits on exactly those three terminators, and a ``\\r\\n`` pair never straddles two chunks
+    because binary iteration ends each chunk at ``\\n``. UTF-8 never encodes ``\\r``/``\\n`` inside a
+    multi-byte sequence, so splitting before decoding is safe.
+    """
+    for chunk in f:
+        yield from chunk.splitlines()
+
+
+def _append(record: Dict[str, Any], filename: str = JOURNAL_FILENAME) -> None:
     """Append one record. Best effort — never raises into a cron write."""
     try:
-        path = _journal_path()
+        path = _journal_path(filename)
         with _journal_lock(path):
             # Separator-before-record, under the lock: heals a torn tail so the
             # new event lands on its own parseable line. The torn remnant stays
@@ -199,6 +222,22 @@ def record_removed(job_id: str, *, reason: Optional[str] = None,
     })
 
 
+def record_updated(job_id: str, fields: Dict[str, Dict[str, Any]], *, name: Optional[str] = None,
+                   actor: Optional[str] = None) -> None:
+    """Journal an API edit of a row's definition to ``edits.jsonl``: ``fields`` is {key: {"from", "to"}}
+    for exactly the keys the write changed. Nothing is written when ``fields`` is empty."""
+    if not job_id or not fields:
+        return
+    _append({
+        "event": EVENT_UPDATED,
+        "job_id": str(job_id),
+        "name": name,
+        "fields": fields,
+        "actor": actor or _default_actor(),
+        "at": _hermes_now().isoformat(),
+    }, EDITS_FILENAME)
+
+
 def _default_actor() -> str:
     """Best-effort writer identity: which process asked for this."""
     return f"{os.path.basename(os.environ.get('HERMES_ACTOR', '') or 'hermes')}:{os.getpid()}"
@@ -240,9 +279,15 @@ def read_entries_with_health(
     cutoff = _hermes_now() - timedelta(hours=window_hours)
     entries: List[Dict[str, Any]] = []
     malformed = 0
-    with open(path, "r", encoding="utf-8-sig") as f:
-        for seq, line in enumerate(f):
-            line = line.strip()
+    with open(path, "rb") as f:
+        for seq, raw in enumerate(_iter_raw_lines(f)):
+            try:
+                # Per-line decode (t_19a16be2): a non-UTF-8 line is ONE malformed record, never an
+                # exception out of the file iterator that abandons the whole read.
+                line = raw.decode("utf-8-sig").strip()
+            except UnicodeDecodeError:
+                malformed += 1
+                continue
             if not line:
                 continue
             try:
@@ -267,6 +312,40 @@ def read_entries_with_health(
             rec["_seq"] = seq
             entries.append(rec)
     return entries, malformed
+
+
+def last_removed(job_ids) -> set:
+    """The ids in *job_ids* whose LAST journal event is ``removed`` (append order, whole file).
+
+    Read by the store's merge (t_0cae2938): a save whose payload still carries a row a sibling
+    removed through the API after this writer's load must not write that row back. Malformed lines
+    are skipped ONE AT A TIME (the guard reports them): a line that is not UTF-8, not JSON, not an
+    object, or carries a non-string ``job_id``/``event`` must never abandon the scan, or one bad line
+    discards every valid removal and a stale save resurrects the row (t_19a16be2). Best effort: an
+    unreadable journal FILE returns an empty set, which keeps the pre-existing merge behaviour."""
+    wanted = {str(i) for i in job_ids if i}
+    if not wanted:
+        return set()
+    last: Dict[str, str] = {}
+    try:
+        path = _journal_path()
+        if not path.exists():
+            return set()
+        with open(path, "rb") as f:
+            for raw in _iter_raw_lines(f):
+                try:
+                    rec = json.loads(raw.decode("utf-8-sig"))
+                except ValueError:  # UnicodeDecodeError and JSONDecodeError are both ValueError
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                jid, event = rec.get("job_id"), rec.get("event")
+                if isinstance(jid, str) and isinstance(event, str) and jid in wanted and event in EVENTS:
+                    last[jid] = event
+    except Exception:
+        logger.debug("cron lifecycle journal read failed", exc_info=True)
+        return set()
+    return {i for i, ev in last.items() if ev == EVENT_REMOVED}
 
 
 def _parse_at(raw: Any):
@@ -302,32 +381,35 @@ def prune() -> int:
 def _prune_locked(path: Path) -> int:
     """Read and replace while holding the same mutex as every appender."""
     cutoff = _hermes_now() - timedelta(days=_RETENTION_DAYS)
-    kept: List[str] = []
+    kept: List[bytes] = []
     dropped = 0
     try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped:
+        # Bytes in, bytes out (t_19a16be2): a non-UTF-8 line is kept verbatim like any other
+        # unparseable line, instead of raising out of the iterator and aborting every prune.
+        with open(path, "rb") as f:
+            for raw in _iter_raw_lines(f):
+                stripped_raw = raw.strip()
+                if not stripped_raw:
                     continue
                 try:
+                    stripped = stripped_raw.decode("utf-8-sig")
                     at = _parse_at(json.loads(stripped).get("at"))
                 except Exception:
-                    kept.append(stripped)  # unparseable: keep, never guess away
+                    kept.append(stripped_raw)  # unparseable: keep, never guess away
                     continue
                 if at is not None and at < cutoff:
                     dropped += 1
                 else:
-                    kept.append(stripped)
+                    kept.append(stripped.encode("utf-8"))
         if not dropped:
             return 0
         from utils import atomic_replace
 
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".lifecycle_",
                                    suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "wb") as f:
             for line in kept:
-                f.write(line + "\n")
+                f.write(line + b"\n")
             f.flush()
             os.fsync(f.fileno())
         atomic_replace(tmp, path)
@@ -525,10 +607,12 @@ def check_vanished_jobs(
 
 __all__ = [
     "DEFAULT_WINDOW_HOURS",
+    "EDITS_FILENAME",
     "EVENT_CREATED",
     "EVENT_PAUSED",
     "EVENT_REMOVED",
     "EVENT_RESUMED",
+    "EVENT_UPDATED",
     "EVENTS",
     "JOURNAL_FILENAME",
     "MAX_WINDOW_HOURS",
@@ -543,4 +627,5 @@ __all__ = [
     "record_created",
     "record_removed",
     "record_toggled",
+    "record_updated",
 ]

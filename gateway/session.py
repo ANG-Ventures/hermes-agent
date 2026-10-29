@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields, replace
 from typing import Callable, Dict, List, Optional, Any, Literal, NamedTuple
 
-from .config import Platform, GatewayConfig, HomeChannel
+from .config import Platform, GatewayConfig, HomeChannel, session_isolation_flags
 from .whatsapp_identity import canonical_whatsapp_identifier
 from utils import atomic_replace
 from hermes_state import RewindWouldOrphanError
@@ -23,6 +23,7 @@ from gateway.session_identity import transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED, _SESSIONS_JSON_README
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
+from gateway.session_room_shape import SessionRoomShapeMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
 
@@ -1130,7 +1131,7 @@ def _is_transient_db_busy(exc: BaseException) -> bool:
 
 class SessionStore(
     SessionPersistenceMixin, SessionRecoveryMixin, SessionLifecycleMixin, SessionTranscriptMixin,
-    SessionPromptPinMixin,
+    SessionPromptPinMixin, SessionRoomShapeMixin,
 ):
     """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
 
@@ -1308,6 +1309,9 @@ class SessionStore(
         only ``_entries`` / ``_loaded`` mutations."""
         session_key = self._generate_session_key(source)
         now = _now()
+        # Before any write: a Matrix room whose shape changed (dm <-> group) still owns a route
+        # under the old key, which the write guard would refuse as a second spelling.
+        self._adopt_room_shape_aliases(source, session_key)
         if not force_new:
             self._adopt_legacy_slack_entry(source, session_key)
 
@@ -1808,16 +1812,24 @@ class SessionStore(
         which knows the real channel type. Returns the number of canonical
         routes touched.
         """
-        from gateway.routing_identity import SessionKeyConflict, assert_unique_routing_entries
-
         groups: Dict[str, list] = {}
         for key, entry in self._entries.items():
-            canonical = self._legacy_alias_canonical_key(key)
+            canonical = self._legacy_alias_canonical_key(key) or self._room_shape_canonical_key(key, entry)
             if canonical is None:
                 continue
             groups.setdefault(canonical, []).append((key, entry))
         if not groups:
             return 0
+        return self._fold_alias_groups_locked(groups)
+
+    def _fold_alias_groups_locked(self, groups: Dict[str, list]) -> int:
+        """Fold ``{canonical: [(alias_key, entry), ...]}`` onto each canonical key and persist.
+
+        Caller holds ``_lock``. Each group is trialled on a copy first and skipped (left as is)
+        when the folded index would still collide. Returns the number of canonical routes touched.
+        """
+        from gateway.routing_identity import SessionKeyConflict, assert_unique_routing_entries
+
         merged = 0
         retired_keys: set = set()
         for canonical, aliases in groups.items():
@@ -2070,10 +2082,11 @@ class SessionStore(
                     origin.thread_id = origin.chat_id
                 elif kind == "dm":
                     origin.thread_id = origin.prospective_thread_id = None
+                group_per_user, thread_per_user = session_isolation_flags(self.config, Platform.DISCORD)
                 canonical = build_session_key(
                     origin,
-                    group_sessions_per_user=self.config.group_sessions_per_user,
-                    thread_sessions_per_user=self.config.thread_sessions_per_user,
+                    group_sessions_per_user=group_per_user,
+                    thread_sessions_per_user=thread_per_user,
                     # The key slot is a namespace (``main`` / ``main~``), not a profile id.
                     profile=profile_from_session_key_namespace(parts[1]),
                 )
@@ -3057,9 +3070,9 @@ def build_session_context(
 ) -> SessionContext:
     """Build a full session context (for system prompt injection)."""
     connected = config.get_connected_platforms()
+    group_per_user, thread_per_user = session_isolation_flags(config, source.platform)
     shared = is_shared_multi_user_session(
-        source, group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
-        thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+        source, group_sessions_per_user=group_per_user, thread_sessions_per_user=thread_per_user,
     )
     context = SessionContext(
         source=source, connected_platforms=connected, shared_multi_user_session=shared,

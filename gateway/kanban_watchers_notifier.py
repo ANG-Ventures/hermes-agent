@@ -690,7 +690,8 @@ class _KanbanNotification:
         async def send_ping():
             nonlocal _send_res
             _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
-        if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
+        if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev),
+                                          chat_id=sub.get("chat_id"), thread_id=metadata.get("thread_id")):
             return False
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the

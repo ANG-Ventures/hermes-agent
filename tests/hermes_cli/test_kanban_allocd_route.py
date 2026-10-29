@@ -36,7 +36,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_worker_pool as kwp
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 from hermes_cli import placement_policy as pp
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "kanban_placement" / "allocd_replay.json"
@@ -639,7 +639,7 @@ def test_vendored_alloc_client_matches_canonical():
             skip = 1
             continue
         if skip and x.startswith("import placement"):
-            theirs_n.append("from hermes_cli import placement  # VENDORED: the fork's placement copy "
+            theirs_n.append("from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy "
                             "(hermes-home: sys.path + import placement)")
             skip = 0
             continue

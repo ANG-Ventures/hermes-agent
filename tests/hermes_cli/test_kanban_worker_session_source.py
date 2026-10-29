@@ -63,6 +63,35 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
 
 
+def test_worker_spawn_names_the_card_to_the_gh_shim(monkeypatch, tmp_path):
+    """hermes-home t_949765e3: the worker env carries GH_CALLER=card:<id>:<assignee>, replacing any inherited one."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    captured = {}
+
+    class _Proc:
+        pid = 4321
+
+    def _fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return _Proc()
+
+    monkeypatch.setenv("GH_CALLER", "dispatcher-own")
+    monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
+    task = kb.Task(id="t_949765e3", title="x", body=None, assignee="daedalus-opus", status="in_progress",
+                   priority=0, created_by=None, created_at=0, started_at=None, completed_at=None,
+                   workspace_kind="scratch", workspace_path=None, claim_lock=None, claim_expires=None, tenant=None)
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace, exist_ok=True)
+
+    kbd._default_spawn(task, workspace)
+
+    assert captured["env"]["GH_CALLER"] == "card:t_949765e3:daedalus-opus"
+
+
 def test_kanban_rows_stay_out_of_the_session_list(db):
     """A `kanban` row is filtered by the same exclude the sidebar sends."""
     db.create_session(session_id="chat", source="desktop")

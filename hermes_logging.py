@@ -9,6 +9,7 @@ with ``RedactingFormatter`` so secrets never reach disk.
 import atexit
 import contextlib
 import copy
+import functools
 import io
 import logging
 import os
@@ -233,6 +234,19 @@ def clear_session_context() -> None:
     _session_context.session_id = None
 
 
+@functools.lru_cache(maxsize=64)
+def _resolved_home_str(raw: str) -> str:
+    """``str(Path(raw).resolve())``, computed once per unresolved home string.
+
+    The record factory runs for every log record on every thread, the asyncio
+    loop included; ``Path.resolve()`` is several lstat syscalls, and under disk
+    pressure one of them stalled the gateway loop for 10 s. Keyed on the raw
+    string, so distinct profile homes stay distinct. A raised exception is not
+    cached (lru_cache only stores returns), so a later call retries.
+    """
+    return str(Path(raw).resolve())
+
+
 def _install_session_record_factory() -> None:
     """Replace the global LogRecord factory with one that adds ``session_tag``.
 
@@ -252,7 +266,7 @@ def _install_session_record_factory() -> None:
         # ContextVar is gone; keep the resolved home on the record so a
         # multiplex desktop ticker can route to the job owner's files (#97489).
         try:
-            record.hermes_home = str(get_hermes_home().resolve())  # type: ignore[attr-defined]
+            record.hermes_home = _resolved_home_str(str(get_hermes_home()))  # type: ignore[attr-defined]
         except Exception:
             record.hermes_home = ""  # type: ignore[attr-defined]
         return record

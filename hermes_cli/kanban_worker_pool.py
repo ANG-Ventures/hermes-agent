@@ -1731,7 +1731,7 @@ class SpilloverPlan:
             return {}
         if sig.placement_live is not None:
             return sig.placement_live
-        from hermes_cli import placement as _placement
+        from hermes_cli.fleet_placement import placement as _placement
         # A corrupt ledger raises LedgerError: take() refuses (never reads it as empty).
         return _placement.live_reservations(sig.placement_reservations, now=sig.clock(),
                                             table=sig.placement_table)
@@ -1742,7 +1742,7 @@ class SpilloverPlan:
             return None
         return {"load1": d.get("load1"), "ncpu": d.get("ncpu")}
 
-    def pin_host_refusal(self, pin: str) -> Optional[str]:
+    def pin_host_refusal(self, pin: str, skip_admission: bool = False) -> Optional[str]:
         """Why the HOST behind ``pin`` cannot give a slot now, or None.
 
         Host state only: no profile check and no reservation, so the no-slot
@@ -1758,6 +1758,10 @@ class SpilloverPlan:
                     else "pin_host_dropped"
                     if low in {h.lower() for h in (self.config.hosts or ())}
                     else "pin_unknown_host")
+        if skip_admission:
+            # kanban admit (t_32e8796a): no slot / band / pressure verdict; the
+            # host's fleet-roles state still binds.
+            return None if host.state == "active" else f"pin_host_{host.state}"
         if self.slots.get(pin, 0) > 0:
             return None
         if host.state != "active":
@@ -1785,7 +1789,7 @@ class SpilloverPlan:
     def take(self, assignee: Optional[str], pin: Optional[str] = None,
              only: Optional[Collection[str]] = None,
              board: Optional[str] = None, job: Any = None,
-             job_id: Optional[str] = None) -> Optional[PoolHost]:
+             job_id: Optional[str] = None, skip_admission: bool = False) -> Optional[PoolHost]:
         """Reserve one slot: on ``pin`` only, else (signal + placement table)
         ``placement.choose()`` over the hosts that serve ``assignee`` with
         ``job`` overrides (t_d6ce856e); without a table the band pick. ``only``
@@ -1806,7 +1810,7 @@ class SpilloverPlan:
             if host is not None and assignee not in host.profiles:
                 self.refusal = "pin_profile"  # the pinned host does not serve this assignee
                 return None
-            self.refusal = self.pin_host_refusal(pin)
+            self.refusal = self.pin_host_refusal(pin, skip_admission=skip_admission)
             if self.refusal is not None:
                 return None
             why = self.board_refusal(pin, board)
@@ -1821,7 +1825,7 @@ class SpilloverPlan:
                     self._simulated[pin] = self._simulated.get(pin, 0) + 1
                 else:
                     from hermes_cli import kanban_headroom as _kh
-                    from hermes_cli import placement as _placement
+                    from hermes_cli.fleet_placement import placement as _placement
                     try:
                         rid = _kh.book_pin(self, pin, job_id, job)
                     except _placement.PlacementError as exc:  # corrupt ledger: fail closed
@@ -1829,7 +1833,7 @@ class SpilloverPlan:
                         return None
                     self.last_reservation = rid
                 self._rids.setdefault(pin, []).append(rid)
-            self.slots[pin] -= 1
+            self.slots[pin] = self.slots.get(pin, 0) - 1
             self.taken[pin] = self.taken.get(pin, 0) + 1
             return host
         if only is not None:
@@ -1887,7 +1891,7 @@ class SpilloverPlan:
         """The in-process scorer take (kanban.placement.allocd off / shadow): one
         locked ``placement.admit`` (``choose`` on a dry run) over ``names``."""
         from hermes_cli import kanban_headroom as _kh
-        from hermes_cli import placement as _placement
+        from hermes_cli.fleet_placement import placement as _placement
         rid = None
         try:
             if self.dry_run:
