@@ -39,7 +39,8 @@ lines, all from ONE slow window on claude-alr/claude-fable-5-1. One session cann
 its siblings, so this module keeps a process-local registry of armed waits
 (``_REGISTRY``, guarded by ``_LOCK``). When 2+ sessions are slow (past their own
 notice interval) on the SAME lane (provider, model, base_url), a session's notice
-becomes ``⏳ provider slow: N sessions waiting on <lane> ...`` once, and later
+becomes ``⏳ N sessions waiting on <lane> ...`` once (never "provider slow": the
+2026-10-28 window was our uplink, not the provider), and later
 intervals of that wait post nothing until the condition changes (lane switch, the cut
 fired, back to solo). At 3+ slow sessions one line goes to #logs (never #alerts), and
 one more when the lane has no slow waiter left; at most one such pair per lane per
@@ -199,7 +200,7 @@ def _evaluate_locked(lane: tuple, now: float) -> list:
     lines = []
     if rec["open"]:
         if not slow:
-            lines.append(f"provider slow window over: lane {_lane_label(lane)}, "
+            lines.append(f"slow window over: lane {_lane_label(lane)}, "
                          f"{len(rec['sessions'])} sessions, peak wait {int(rec['peak'])}s, "
                          f"502/529 ×{rec['errors']}")
             rec.update(open=False, peak=0.0, errors=0, sessions=set())
@@ -207,7 +208,7 @@ def _evaluate_locked(lane: tuple, now: float) -> list:
     if len(slow) >= WINDOW_OPEN_SESSIONS and (
             rec["last_open"] is None or now - rec["last_open"] >= WINDOW_RATE_LIMIT_S):
         rec.update(open=True, last_open=now)
-        lines.append(f"⏳ provider slow window open: lane {_lane_label(lane)}, "
+        lines.append(f"⏳ slow window open: lane {_lane_label(lane)}, "
                      f"{len(slow)} sessions waiting (oldest {int(max(slow.values()))}s)")
     elif not waiters:
         rec.update(peak=0.0, errors=0, sessions=set())  # episode over, nothing was opened
@@ -621,9 +622,26 @@ def _shared_notice(agent: Any, st: dict, waited: float, now: float) -> Optional[
     if st.get("shared") == key:
         return ""
     st["shared"] = key
-    return (f"⏳ provider slow: {len(slow)} sessions waiting on {_lane_label(lane)} "
-            f"(oldest {int(max(slow.values()))}s); this turn {int(waited)}s, "
-            f"cut at {int(st['budget_s'])}s{_ahead_suffix(agent)}")
+    stage = _slow_stage(agent)
+    return (f"⏳ {len(slow)} sessions waiting on {_lane_label(lane)} "
+            f"(oldest {int(max(slow.values()))}s){': ' + stage if stage else ''}; "
+            f"this turn {int(waited)}s, cut at {int(st['budget_s'])}s{_ahead_suffix(agent)}")
+
+
+def _slow_stage(agent: Any) -> str:
+    """What is slow, only when the lane has RECORDED it (``fallback_cause``), else "".
+    Never "provider slow": 2026-10-28's shared window was our uplink (Apollo 20:20,
+    relay_send p90 1 s -> 80-117 s, upstream ttfb flat), not the provider. The stage
+    wording itself is t_b0a117bd's; this line only carries it."""
+    try:
+        from agent import fallback_cause as _fbc
+        cause = _fbc.peek(agent)
+        if cause is None or cause.lane != (str(getattr(agent, "provider", "") or "") or None):
+            return ""
+        return str(_fbc.cause_text(agent, cause) or "").strip()
+    except Exception:
+        logger.debug("wall budget: slow-stage lookup failed", exc_info=True)
+        return ""
 
 
 def _buffering_lane(agent: Any) -> bool:

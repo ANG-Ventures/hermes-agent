@@ -64,7 +64,7 @@ def test_two_sessions_one_lane_get_the_shared_line_once_then_silence(cfg, emits)
     wb.arm(a1, now=0.0)
     wb.arm(a2, now=0.0)
     p1, p2 = _run([a1, a2], 10.0, 590.0)
-    shared = ("⏳ provider slow: 2 sessions waiting on claude-alr/claude-fable-5-1 "
+    shared = ("⏳ 2 sessions waiting on claude-alr/claude-fable-5-1 "
               "(oldest 120s); this turn 120s, cut at 600s")
     # agent 1 is first past its interval while agent 2 is too: both get the shared line ONCE.
     assert p1 == [(120.0, shared)]
@@ -78,9 +78,9 @@ def test_first_past_the_interval_alone_keeps_the_solo_line_then_goes_shared_once
     wb.arm(a2, now=50.0)
     p1, p2 = _run([a1, a2], 10.0, 590.0)
     assert len(p1) == 2 and p1[0][0] == 120.0 and p1[0][1].startswith("⏳ turn in progress on ")
-    assert p1[1] == (240.0, "⏳ provider slow: 2 sessions waiting on claude-alr/claude-fable-5-1 "
+    assert p1[1] == (240.0, "⏳ 2 sessions waiting on claude-alr/claude-fable-5-1 "
                             "(oldest 240s); this turn 240s, cut at 600s")
-    assert p2 == [(170.0, "⏳ provider slow: 2 sessions waiting on claude-alr/claude-fable-5-1 "
+    assert p2 == [(170.0, "⏳ 2 sessions waiting on claude-alr/claude-fable-5-1 "
                           "(oldest 170s); this turn 120s, cut at 600s")]
 
 
@@ -89,7 +89,7 @@ def test_shared_line_returns_to_solo_when_the_sibling_recovers(cfg, emits):
     wb.arm(a1, now=0.0)
     wb.arm(a2, now=0.0)
     p1, _ = _run([a1, a2], 10.0, 250.0)
-    assert len(p1) == 1 and "provider slow" in p1[0][1]
+    assert len(p1) == 1 and "2 sessions waiting on" in p1[0][1]
     wb.disarm(a2, now=255.0)  # a2's lane recovered
     p1, = _run([a1], 260.0, 370.0)
     assert len(p1) == 1 and p1[0][1].startswith("⏳ turn in progress"), p1
@@ -102,7 +102,7 @@ def test_cut_fired_is_a_changed_condition(cfg, emits):
     _run([a1, a2], 10.0, 590.0)
     assert wb.should_cut_attempt(a2, now=600.0)
     _, p2 = _run([a1, a2], 600.0, 720.0)
-    assert len(p2) == 1 and p2[0][1].startswith("⏳ provider slow: 2 sessions"), p2
+    assert len(p2) == 1 and p2[0][1].startswith("⏳ 2 sessions waiting on"), p2
 
 
 def test_other_lane_is_not_a_sibling(cfg, emits):
@@ -111,7 +111,7 @@ def test_other_lane_is_not_a_sibling(cfg, emits):
     wb.arm(a2, now=0.0)
     wb.notice_due(a1, now=121.0)
     text = wb.notice_due(a2, now=121.0)
-    assert text and "provider slow" not in text
+    assert text and "sessions waiting on" not in text
 
 
 def test_three_sessions_open_one_logs_window_fourth_adds_none_disarm_closes_it(cfg, emits):
@@ -122,7 +122,7 @@ def test_three_sessions_open_one_logs_window_fourth_adds_none_disarm_closes_it(c
     wb.notice_due(agents[1], now=121.0)
     assert emits == []
     wb.notice_due(agents[2], now=121.0)
-    assert emits == ["⏳ provider slow window open: lane claude-alr/claude-fable-5-1, "
+    assert emits == ["⏳ slow window open: lane claude-alr/claude-fable-5-1, "
                      "3 sessions waiting (oldest 121s)"]
     wb.arm(agents[3], now=130.0)
     wb.note_status(agents[3], 529)
@@ -134,7 +134,7 @@ def test_three_sessions_open_one_logs_window_fourth_adds_none_disarm_closes_it(c
         wb.disarm(a, now=400.0)
     assert len(emits) == 1, "the 4th session is still slow on the lane"
     wb.disarm(agents[3], now=410.0)
-    assert emits[1:] == ["provider slow window over: lane claude-alr/claude-fable-5-1, "
+    assert emits[1:] == ["slow window over: lane claude-alr/claude-fable-5-1, "
                          "4 sessions, peak wait 400s, 502/529 ×2"]
 
 
@@ -161,7 +161,7 @@ def test_turn_reset_without_disarm_leaves_no_phantom_waiter(cfg, emits):
     wb.arm(a2, now=0.0)
     wb.reset(a1)  # turn start bypasses disarm (agent/turn_context.py resets _wall_budget)
     text = wb.notice_due(a2, now=121.0)
-    assert text and "provider slow" not in text
+    assert text and "sessions waiting on" not in text
 
 
 def test_unpolled_waiter_goes_stale_but_a_declared_sleep_keeps_it(cfg, emits):
@@ -169,12 +169,12 @@ def test_unpolled_waiter_goes_stale_but_a_declared_sleep_keeps_it(cfg, emits):
     wb.arm(a1, now=0.0)
     wb.arm(a2, now=0.0)
     # a1 was last seen at 0 and declares nothing: at 121 it is a dead turn, not a waiter.
-    assert "provider slow" not in wb.notice_due(a2, now=121.0)
+    assert "sessions waiting on" not in wb.notice_due(a2, now=121.0)
     b1, b2 = _agent("s3"), _agent("s4")
     wb.arm(b1, now=1000.0)
     wb.arm(b2, now=1000.0)
     wb.note_quiet(b1, 200.0, now=1000.0)  # a retry backoff: nothing polls it
-    assert wb.notice_due(b2, now=1121.0).startswith("⏳ provider slow: 2 sessions")
+    assert wb.notice_due(b2, now=1121.0).startswith("⏳ 2 sessions waiting on")
 
 
 def test_registry_is_thread_safe_under_concurrent_arm_poll_disarm(cfg, emits):
@@ -214,3 +214,20 @@ def test_kill_switch_restores_per_session_behaviour(emits):
     assert all(t and t.startswith("⏳ turn in progress") for t in texts + later), texts + later
     assert emits == []
     assert wb._REGISTRY == {}
+
+
+def test_shared_line_never_says_provider_slow_and_carries_a_recorded_stage(cfg, emits):
+    """Apollo 20:20 premise correction: the 10-28 window was our uplink. The shared line
+    names no cause it does not have; with a recorded cause on the lane it carries it."""
+    a1, a2 = _agent("s1"), _agent("s2")
+    wb.arm(a1, now=0.0)
+    wb.arm(a2, now=0.0)
+    with patch("agent.fallback_cause.peek",
+               side_effect=lambda ag: SimpleNamespace(lane=ag.provider) if ag is a2 else None), \
+         patch("agent.fallback_cause.cause_text", return_value="request still uploading to the relay box"):
+        p1, p2 = _run([a1, a2], 10.0, 130.0)
+    assert all("provider slow" not in m for _, m in p1 + p2)
+    assert p1 == [(120.0, "⏳ 2 sessions waiting on claude-alr/claude-fable-5-1 (oldest 120s); "
+                          "this turn 120s, cut at 600s")]
+    assert p2 == [(120.0, "⏳ 2 sessions waiting on claude-alr/claude-fable-5-1 (oldest 120s): "
+                          "request still uploading to the relay box; this turn 120s, cut at 600s")]
