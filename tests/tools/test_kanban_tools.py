@@ -2095,26 +2095,79 @@ def test_attach_path_rejects_invalid_supplied_digest(worker_env, tmp_path, monke
         conn.close()
 
 
-def test_create_flagship_profile_assignee_needs_allow_flagship(worker_env):
-    """kanban_create on a flagship-default profile is gated like --model (t_9e7ba884)."""
+def _write_fable_profile():
     import os
     from pathlib import Path as _Path
-
-    from tools import kanban_tools as kt
-    from hermes_cli import kanban_db as kb
 
     prof = _Path(os.environ["HERMES_HOME"]) / "profiles" / "daedalus-fable"
     prof.mkdir(parents=True)
     (prof / "config.yaml").write_text("model:\n  default: claude-fable-5-1\n", encoding="utf-8")
+
+
+def _card_count() -> int:
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        return conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_create_flagship_profile_assignee_needs_allow_flagship(worker_env):
+    """kanban_create on a flagship-default profile is gated like --model (t_9e7ba884)."""
+    from tools import kanban_tools as kt
+
+    _write_fable_profile()
     refused = json.loads(kt._handle_create({
         "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
     }))
     assert "assignee profile default" in refused.get("error", ""), refused
-    ok = json.loads(kt._handle_create({
+
+
+def test_worker_cannot_self_approve_flagship_assignee(worker_env):
+    """Prism r4 ddc94954a4e7: a dispatched worker typing a reason must not mint a
+    flagship-default child. Refused before any write; no card is created."""
+    from tools import kanban_tools as kt
+
+    _write_fable_profile()
+    before = _card_count()
+    refused = json.loads(kt._handle_create({
         "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
         "allow_flagship": "delicate infra",
     }))
-    assert ok["ok"] is True, ok
+    assert "allow_flagship is operator/orchestrator-only" in refused.get("error", ""), refused
+    assert _card_count() == before
+
+
+def test_worker_cannot_self_approve_flagship_model_pin(worker_env):
+    """Same bypass via a flagship model pin on a cheap assignee."""
+    from tools import kanban_tools as kt
+
+    before = _card_count()
+    refused = json.loads(kt._handle_create({
+        "title": "fable pin", "assignee": "test-worker", "parents": [worker_env],
+        "model": "claude-fable-5-1", "allow_flagship": "delicate infra",
+    }))
+    assert "allow_flagship is operator/orchestrator-only" in refused.get("error", ""), refused
+    assert _card_count() == before
+
+
+def test_orchestrator_allow_flagship_creates_and_audits(worker_env, monkeypatch):
+    """No HERMES_KANBAN_TASK (orchestrator/operator session): the reason is honoured
+    and recorded as the 'flagship override:' comment."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    _write_fable_profile()
+    parent = worker_env
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    ok = json.loads(kt._handle_create({
+        "title": "fable job", "assignee": "daedalus-fable", "parents": [parent],
+        "allow_flagship": "delicate infra",
+    }))
+    assert ok.get("ok") is True, ok
     conn = kb.connect()
     try:
         bodies = [c.body for c in kb.list_comments(conn, ok["task_id"])]

@@ -1476,6 +1476,11 @@ def _handle_create(args: dict, **kw) -> str:
     _check(allow_flagship is None or isinstance(allow_flagship, str),
            "allow_flagship must be a reason string")
     from hermes_cli import kanban_worker_policy as _worker_policy
+    # Flagship is orchestrator-only (Ace 2026-09-17): a dispatched worker must not
+    # self-approve a flagship route by typing a reason (Prism r4 ddc94954a4e7).
+    # Keyed on the env marker, not ownership, so an inheriting subprocess fails closed.
+    _check(not (allow_flagship and _worker_policy.is_dispatched_worker()),
+           "allow_flagship is operator/orchestrator-only; ask Apollo to assign")
     with _board(args.get("board")) as (kb, conn):
         until = None
         if until_raw not in (None, ""):
