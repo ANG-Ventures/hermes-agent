@@ -7,6 +7,9 @@ provider actually RECEIVED (the outbound payload) and what ``Known`` is after th
 
 from __future__ import annotations
 
+import tempfile
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -140,6 +143,8 @@ class Ladder:
         self.calls.append((model, outcome, _tail_notes(api_kwargs), api_kwargs))
         if outcome == 503:
             raise Overloaded()
+        if outcome == 413:
+            raise BodyTooLarge()
         return _response(f"ok from {model}", service_tier=self.tiers.get(model))
 
     def ok(self):
@@ -149,11 +154,16 @@ class Ladder:
         return [c for c in self.calls if c[1] != 200]
 
 
-def _make_agent(model=OPUS, fallbacks=(SONNET,), session_db=None, session_id=None, **kw):
+def _make_agent(model=OPUS, fallbacks=(SONNET,), session_db=..., session_id=None, **kw):
     tool_defs = [{"type": "function", "function": {"name": "web_search", "description": "s",
                                                    "parameters": {"type": "object", "properties": {}}}}]
     chain = [fb if isinstance(fb, dict) else {"provider": "custom", "model": fb, "base_url": "https://example.invalid/v1"}
              for fb in fallbacks]
+    if session_db is ...:
+        # A transcript store is the normal case (CLI and gateway both hand one in); without one a
+        # note is not durable and Known is deliberately NOT checkpointed (Prism dffb525648cf).
+        from hermes_state import SessionDB
+        session_db = SessionDB(db_path=Path(tempfile.mkdtemp(prefix="route-notes-")) / "state.db")
     with (
         patch("model_tools.get_tool_definitions", return_value=tool_defs),
         patch("model_tools.check_toolset_requirements", return_value={}),
@@ -162,7 +172,7 @@ def _make_agent(model=OPUS, fallbacks=(SONNET,), session_db=None, session_id=Non
         agent = AIAgent(
             api_key="k-abcdef12", base_url="https://example.invalid/v1", provider="custom",
             model=model, quiet_mode=True, skip_context_files=True, skip_memory=True,
-            fallback_model=chain, session_db=session_db, session_id=session_id, **kw,
+            fallback_model=chain, session_db=session_db, session_id=session_id or f"s-{uuid.uuid4().hex[:8]}", **kw,
         )
     agent.client = MagicMock()
     agent._api_max_retries = 1
@@ -570,3 +580,169 @@ def test_failed_rung_leaves_request_and_known_untouched():
     assert call.note
     ri.abandon_call(s, call)
     assert s.api_messages == before_api and _known(a) == before_known
+
+
+# ---------------------------------------------------------------------------------------------
+# Prism round 1/2: the hook must never undo what the error handlers did to the request
+# ---------------------------------------------------------------------------------------------
+
+class BodyTooLarge(Exception):
+    status_code = 413
+
+    def __init__(self):
+        super().__init__("Error code: 413 - request_too_large: request body too large")
+        self.response = SimpleNamespace(headers={})
+        self.body = {"error": {"type": "request_too_large", "message": "request body too large"}}
+
+
+def _fake_recover(agent, api_error, *, api_kwargs, api_messages, _retry):
+    """Stands in for ``recover_body_too_large``: a copy-on-write rewrite of the request (what the
+    real one does to retained images), flagged as the one allowed retry."""
+    _retry.body_byte_retry_attempted = True
+    out = []
+    for m in api_messages:
+        c = m.get("content")
+        if isinstance(c, str) and "BIGIMAGE" in c:
+            m = {**m, "content": c.replace("BIGIMAGE", "[evicted]")}
+        out.append(m)
+    return out, None
+
+
+def _tail_text(api_kwargs):
+    return _texts({"messages": api_kwargs["messages"][-1:]})[0]
+
+
+@pytest.mark.parametrize("with_note", [False, True])
+def test_413_remediation_survives_the_route_hook(with_note):
+    """Prism 27736e64e38f / 50271503d6cd: ``handle_api_error`` rewrote ``api_messages`` for the one
+    allowed body-too-large retry; the hook's ``finally`` must not put the oversized body back."""
+    agent = _make_agent()
+    _bind(agent, Sink())
+    ladder = Ladder(agent)
+    ladder.script = {OPUS: [503], SONNET: [413, 200]} if with_note else {OPUS: [413, 200]}
+    with patch("agent.turn_body_budget.recover_body_too_large", side_effect=_fake_recover):
+        _run(agent, ladder, "hi BIGIMAGE")
+    rejected, retried = [c for c in ladder.calls if c[1] == 413][0], ladder.ok()[0]
+    assert "BIGIMAGE" in _tail_text(rejected[3])
+    assert "[evicted]" in _tail_text(retried[3]) and "BIGIMAGE" not in _tail_text(retried[3])
+    if with_note:
+        # The note rides the retry exactly once (re-attached to the remediated list, not stacked).
+        assert retried[2] == ["[Route note: fell back to sonnet-5 (provider overloaded).]"]
+        assert _tail_text(retried[3]).count(ri.ROUTE_NOTE_OPENER) == 1
+    else:
+        assert retried[2] == []
+
+
+def test_abandon_strips_only_the_note_from_a_replaced_request():
+    a = _stub_agent()
+    s = _stub_state()
+    ri.commit_call(a, s, ri.prepare_call(a, s))
+    a.model, a._fallback_activated = SONNET, True
+    call = ri.prepare_call(a, s)
+    assert s.api_messages[-1]["content"] == call.note
+    # An error handler replaced the list (and cache decoration turned the row into parts).
+    s.api_messages = [*s.api_messages[:-1], {"role": "user", "content": [{"type": "text", "text": call.note,
+                                                                           "cache_control": {"type": "ephemeral"}}]}]
+    s.api_messages[1] = {**s.api_messages[1], "content": "REMEDIATED"}
+    ri.abandon_call(s, call)
+    assert s.api_messages[-1]["role"] == "tool" and s.api_messages[1]["content"] == "REMEDIATED"
+
+
+def test_without_note_handles_every_shape_with_note_produces():
+    note = "[Route note: x.]"
+    for msgs in (
+        [{"role": "user", "content": "hi"}],
+        [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "u"}}]}],
+        [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "u"}}]}],
+        [{"role": "assistant", "content": "", "tool_calls": []}, {"role": "tool", "content": "r", "tool_call_id": "c"}],
+    ):
+        noted = ri._with_note(msgs, note)
+        assert noted is not None and ri._without_note(noted, note) == msgs
+    assert ri._without_note([{"role": "user", "content": "plain"}], note) == [{"role": "user", "content": "plain"}]
+
+
+# ---------------------------------------------------------------------------------------------
+# Prism a699ad7eecac: multimodal user tail — wire shape == persisted shape, and it reaches SQLite
+# ---------------------------------------------------------------------------------------------
+
+def test_multimodal_tail_note_persists_in_wire_shape_and_replays_after_restart(tmp_path):
+    db = _db(tmp_path)
+    agent = _make_agent(session_db=db, session_id="s-mm")
+    _bind(agent, Sink())
+    ladder = Ladder(agent)
+    ladder.script = {OPUS: [503]}
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    with patch.object(type(agent), "_model_supports_vision", return_value=True):
+        _run(agent, ladder, [{"type": "text", "text": "look"}, image])
+    sent_tail = ladder.ok()[0][3]["messages"][-1]["content"]
+    note = "[Route note: fell back to sonnet-5 (provider overloaded).]"
+    assert isinstance(sent_tail, list) and sent_tail[0]["text"].startswith(note)  # merged into the leading text part
+    assert sum(1 for p in sent_tail if p.get("type") == "text") == 1  # no separate note block
+    # The row was flushed BEFORE the note (turn start); the note must still reach SQLite.
+    rows = [m for m in db.get_messages("s-mm") if m.get("role") == "user"]
+    assert len(rows) == 1 and str(rows[0]["content"]).startswith(note)
+    # Restart: a fresh agent replays the transcript; the note is in the prefix and not re-sent.
+    history = db.get_messages_as_conversation("s-mm")
+    fresh = _make_agent(session_db=db, session_id="s-mm")
+    _bind(fresh, Sink(), Known(_rid(OPUS), _rid(SONNET)).to_dict())
+    ladder2 = Ladder(fresh)
+    ladder2.script = {OPUS: [503]}
+    _run(fresh, ladder2, "next", history)
+    replayed = ladder2.ok()[0][3]["messages"]
+    assert any(t.startswith(note) for t in _texts({"messages": replayed[:-1]}))
+    assert ladder2.ok()[0][2] == []
+
+
+def test_persist_note_identifies_the_current_turn_row_by_position():
+    """Prism a699ad7eecac (context loss): two equal user rows compare equal, so ``list.index`` found
+    the earlier one and the current row lost its injected context."""
+    a = _stub_agent()
+    a._session_db = None
+    msgs = [{"role": "user", "content": "again"}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "again"}]
+    s = SimpleNamespace(turn_id="t", messages=msgs, api_messages=msgs, current_turn_user_idx=2,
+                        _plugin_user_context="PLUGIN CONTEXT", _ext_prefetch_cache="")
+    ri._persist_note(a, s, "[Route note: x.]")
+    assert "PLUGIN CONTEXT" in msgs[-1]["api_content"] and "api_content" not in msgs[0]
+
+
+# ---------------------------------------------------------------------------------------------
+# Prism dffb525648cf: no transcript store -> no checkpoint
+# ---------------------------------------------------------------------------------------------
+
+def test_no_session_db_sends_the_note_but_never_checkpoints_known():
+    agent = _make_agent(session_db=None)
+    sink = Sink()
+    _bind(agent, sink)
+    ladder = Ladder(agent)
+    ladder.script = {OPUS: [503]}
+    _run(agent, ladder)
+    assert ladder.ok()[0][2] == ["[Route note: fell back to sonnet-5 (provider overloaded).]"]
+    assert sink.writes == []  # nothing durable received the note: a restart re-sends it
+    assert _known(agent).serving.model == SONNET  # in-process, the turn still knows
+
+
+# ---------------------------------------------------------------------------------------------
+# Prism 6f8607e871fc / 938de819937f: a tier RECOVERY is an observation too
+# ---------------------------------------------------------------------------------------------
+
+def test_tier_recovery_after_a_told_downgrade_is_corrected_once():
+    agent = _fast_agent()
+    sink = Sink()
+    _bind(agent, sink)
+    ladder = Ladder(agent)
+    ladder.tiers = {OPUS: "default"}
+    history = _run(agent, ladder)  # downgrade observed
+    history = _run(agent, ladder, "2", history)  # correction delivered
+    assert ladder.calls[-1][2] == ["[Route note: speed fast → standard (provider served standard).]"]
+    assert _known(agent).serving.speed_tier == "standard" and _known(agent).pending_correction is None
+    ladder.tiers = {OPUS: "priority"}  # the provider serves fast again
+    history = _run(agent, ladder, "3", history)
+    assert ladder.calls[-1][2] == []  # the recovery is observed on this response, told on the next
+    assert _known(agent).pending_correction == "[Route note: speed standard → fast (provider served fast).]"
+    assert _known(agent).observed_tier == ("fast", "fast")
+    history = _run(agent, ladder, "4", history)
+    assert ladder.calls[-1][2] == ["[Route note: speed standard → fast (provider served fast).]"]
+    assert _known(agent).serving.speed_tier == "fast" and _known(agent).pending_correction is None
+    _run(agent, ladder, "5", history)
+    assert ladder.calls[-1][2] == []  # steady state: no reversed or repeated notes
+    assert _known(agent).serving.speed_tier == "fast"

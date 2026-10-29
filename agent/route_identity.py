@@ -295,6 +295,7 @@ class PendingCall:
     note: Optional[str]
     base_api_messages: Any
     reason: str
+    noted: Any = None  # the request list the note was attached to; None when no note rode this rung
 
 
 def _participates(agent: Any) -> bool:
@@ -310,6 +311,19 @@ def _turn_state(agent: Any, turn_id: Any) -> Dict[str, Any]:
     return st
 
 
+def _noted_content(content: Any, note: str) -> Any:
+    """``content`` with ``note`` prepended, in the shape the wire AND the transcript share: a string
+    gets a text prefix; a part list gets the prefix on its leading text part, or a new leading text
+    part when it has none. ``None`` when the content cannot take a note."""
+    if isinstance(content, str):
+        return f"{note}\n\n{content}"
+    if isinstance(content, list) and content and isinstance(content[0], dict) and content[0].get("type") == "text":
+        return [dict(content[0], text=f"{note}\n\n{content[0].get('text', '')}")] + list(content[1:])
+    if isinstance(content, list):
+        return [{"type": "text", "text": note}] + list(content)
+    return None
+
+
 def _with_note(api_messages: List[Dict[str, Any]], note: str) -> Optional[List[Dict[str, Any]]]:
     """A request copy carrying ``note``: prepended to a trailing user row, or a standalone user row
     after a trailing tool result. ``None`` when the tail cannot take one without breaking alternation."""
@@ -321,18 +335,40 @@ def _with_note(api_messages: List[Dict[str, Any]], note: str) -> Optional[List[D
         return list(api_messages) + [{"role": "user", "content": note}]
     if role != "user":
         return None
-    new_tail = dict(tail)
-    content = tail.get("content")
-    if isinstance(content, str):
-        new_tail["content"] = f"{note}\n\n{content}"
-    elif isinstance(content, list) and content and isinstance(content[0], dict) and content[0].get("type") == "text":
-        # Same bytes the persisted ``api_content`` replays as (cache decoration is re-applied later).
-        new_tail["content"] = [dict(content[0], text=f"{note}\n\n{content[0].get('text', '')}")] + list(content[1:])
-    elif isinstance(content, list):
-        new_tail["content"] = [{"type": "text", "text": note}] + list(content)
-    else:
+    content = _noted_content(tail.get("content"), note)
+    if content is None:
         return None
-    return list(api_messages[:-1]) + [new_tail]
+    return list(api_messages[:-1]) + [dict(tail, content=content)]
+
+
+def _without_note(api_messages: Any, note: str) -> Any:
+    """Undo ``_with_note`` on whatever list is current: an error handler may have REPLACED the noted
+    list (the 413 body remediation rewrites it copy-on-write), so only the note is removed and every
+    other change to the request is kept. Tolerates the request-local cache decoration."""
+    if not isinstance(api_messages, list) or not api_messages:
+        return api_messages
+    tail = api_messages[-1]
+    if not isinstance(tail, dict) or tail.get("role") != "user":
+        return api_messages
+    content = tail.get("content")
+    prefix = f"{note}\n\n"
+    if content == note:
+        return list(api_messages[:-1])  # the standalone row after a tool result
+    if isinstance(content, str):
+        if content.startswith(prefix):
+            return list(api_messages[:-1]) + [dict(tail, content=content[len(prefix):])]
+        return api_messages
+    if isinstance(content, list) and content and isinstance(content[0], dict) and content[0].get("type") == "text":
+        text = content[0].get("text", "")
+        if text == note:
+            rest = list(content[1:])
+            if not rest:
+                return list(api_messages[:-1])  # the standalone row, cache-decorated
+            return list(api_messages[:-1]) + [dict(tail, content=rest)]  # the added leading part
+        if text.startswith(prefix):
+            return list(api_messages[:-1]) + [dict(tail, content=[dict(content[0], text=text[len(prefix):])]
+                                                     + list(content[1:]))]
+    return api_messages
 
 
 def prepare_call(agent: Any, s: Any) -> Optional[PendingCall]:
@@ -356,13 +392,12 @@ def _prepare_call(agent: Any, s: Any) -> Optional[PendingCall]:
     reason = _current_reason(agent)
     note = render_note(known, now, reason) if st["enabled"] and st["notes"] < MAX_NOTES_PER_TURN else None
     base = s.api_messages
-    if note:
-        noted = _with_note(base, note)
-        if noted is None:
-            note = None
-        else:
-            s.api_messages = noted
-    return PendingCall(now, note, base, reason)
+    noted = _with_note(base, note) if note else None
+    if noted is None:
+        note = None  # no note rides this rung: the request list stays the loop's own business
+    else:
+        s.api_messages = noted
+    return PendingCall(now, note, base, reason, noted)
 
 
 def _persist_note(agent: Any, s: Any, note: str) -> None:
@@ -370,31 +405,42 @@ def _persist_note(agent: Any, s: Any, note: str) -> None:
     the request carried, before ``Known`` advances."""
     messages = s.messages
     tail = messages[-1] if messages else None
+    db = getattr(agent, "_session_db", None)
     if isinstance(tail, dict) and tail.get("role") == "tool":
         messages.append({"role": "user", "content": note, "display_kind": ROUTE_NOTE_DISPLAY_KIND})
     elif isinstance(tail, dict) and tail.get("role") == "user":
+        from agent.session_persistence import _persist_lock, durable_user_row_content
         content = tail.get("content")
+        row_id = tail.get("_row_id") or tail.get("_db_persisted_row_id")
         if isinstance(content, str):
             from agent.turn_context import compose_user_api_content
             base = tail.get("api_content")
             if not (isinstance(base, str) and base):
                 base = None
-                if messages.index(tail) == getattr(s, "current_turn_user_idx", None):
+                # The current turn's row is the tail BY POSITION: equal-text rows compare equal, so
+                # ``messages.index`` would find an earlier "again" and skip the injected context.
+                if len(messages) - 1 == getattr(s, "current_turn_user_idx", None):
                     base = compose_user_api_content(content, getattr(s, "_ext_prefetch_cache", "") or "",
                                                     getattr(s, "_plugin_user_context", "") or "")
                 base = base or content
             api_content = f"{note}\n\n{base.strip()}"
-            from agent.session_persistence import _persist_lock, durable_user_row_content
             durable, api_content = durable_user_row_content(agent, tail, content, api_content)
             tail["api_content"] = api_content
-            row_id = tail.get("_row_id") or tail.get("_db_persisted_row_id")
-            db = getattr(agent, "_session_db", None)
             if db is not None and isinstance(row_id, int):
                 with _persist_lock(agent):
                     db.set_message_api_content(agent.session_id, row_id, durable, api_content)
         elif isinstance(content, list):
-            tail["content"] = [{"type": "text", "text": note}] + list(content)
-    if getattr(agent, "_session_db", None) is not None:
+            # Multimodal rows have no string sidecar: the live parts ARE what replays (same writer
+            # protocol as the turn-start multimodal context backfill), so the note takes the exact
+            # shape ``_with_note`` sent, and an already-flushed row is rewritten in place because the
+            # append-only flush skips it.
+            from agent.session_persistence import _persisted_content_projection
+            tail["content"] = _noted_content(content, note)
+            if db is not None and isinstance(row_id, int):
+                with _persist_lock(agent):
+                    db.set_user_message_content(agent.session_id, row_id,
+                                                _persisted_content_projection(tail, tail["content"]))
+    if db is not None:
         agent._flush_messages_to_session_db(messages, getattr(s, "conversation_history", None))
 
 
@@ -409,15 +455,25 @@ def _observed_tier(agent: Any, known_obs: Optional[Tuple[str, str]], requested: 
     except Exception:
         pass
     reported = normalize_tier(served)
-    if reported == requested or known_obs == (requested, reported):
-        return None
+    if known_obs == (requested, reported):
+        return None  # the same observation again: nothing new
+    if reported == requested and (known_obs is None or known_obs[1] == reported):
+        return None  # served as requested, and the model has not been told otherwise
+    # A new observation: a downgrade, or a RECOVERY (served as requested again after a downgrade
+    # the model was told about; §6.5 "the next response re-establishes it").
     return (requested, reported)
 
 
 def abandon_call(s: Any, call: Optional[PendingCall]) -> None:
-    """The rung failed or was retried: the note leaves with the request (§5 ephemeral)."""
-    if call is not None:
+    """The rung failed or was retried: the note leaves with the request (§5 ephemeral), and ONLY the
+    note. A rung that carried none never touched ``s.api_messages``; a rung whose error handler
+    replaced the list (413 body remediation) keeps that replacement, minus the note."""
+    if call is None or call.noted is None or not call.note:
+        return
+    if s.api_messages is call.noted:
         s.api_messages = call.base_api_messages
+    else:
+        s.api_messages = _without_note(s.api_messages, call.note)
 
 
 def call_succeeded(s: Any, action: str) -> bool:
@@ -462,16 +518,22 @@ def commit_call(agent: Any, s: Any, call: PendingCall) -> None:
     new_obs = _observed_tier(agent, obs, requested)
     if new_obs is not None:
         obs = new_obs
-        if enabled:
-            # §6.2: record the correction; the served tier is not advanced until it is delivered.
-            pending, serving = correction_note(*new_obs), replace(serving, speed_tier=requested)
-        else:
+        told = serving.speed_tier  # the tier the model believes is serving (after this call's note)
+        if not enabled:
             serving = replace(serving, speed_tier=new_obs[1])
+        elif new_obs[1] != told:
+            # §6.2: record the correction (downgrade, or recovery after a told downgrade); the
+            # served tier is not advanced until it is delivered.
+            pending = correction_note(told, new_obs[1])
+        else:
+            pending = None  # the provider is back on what the model was told: nothing to correct
     new_known = Known(now.intended, serving, obs, pending)
     if call.note is not None:
         _audit(agent, getattr(s, "api_request_id", None), known.serving if known else None,
                now.serving, call.reason)
     sink = getattr(agent, "_route_known_sink", None)
-    if callable(sink):
-        sink(new_known.to_dict())  # step 2: SessionEntry
+    if callable(sink) and (call.note is None or getattr(agent, "_session_db", None) is not None):
+        # step 2: SessionEntry. A note that no transcript store received stays undurable: the
+        # checkpoint is not written, so a restart re-sends it instead of believing it was delivered.
+        sink(new_known.to_dict())
     agent._route_known = new_known
