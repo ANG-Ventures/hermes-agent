@@ -38,7 +38,8 @@ def board(tmp_path, monkeypatch):
 
 def _agents(child_model=MODEL):
     parent = SimpleNamespace(model=MODEL, session_id="parent-sid", _delegate_depth=0)
-    child = SimpleNamespace(model=child_model, session_id="child-sid", _subagent_id="sa-0-abc")
+    child = SimpleNamespace(model=child_model, session_id="child-sid", _subagent_id="sa-0-abc",
+                            _context_inherited="summary")
     return parent, child
 
 
@@ -120,7 +121,7 @@ def test_delegate_task_grant_is_live_through_the_parent_turn_and_revoked_at_its_
                 "duration_seconds": 0.1}
 
     def _child(**kw):
-        return SimpleNamespace(model=MODEL, session_id="child-sid", _subagent_id="sa-0-x")
+        return SimpleNamespace(model=MODEL, session_id="child-sid", _subagent_id="sa-0-x", _context_inherited="summary")
 
     with patch("tools.delegate_tool._run_single_child", side_effect=_run), \
             patch("tools.delegate_tool._build_child_preserving_parent_tools", side_effect=_child):
@@ -294,7 +295,8 @@ def test_model_dispatch_path_runs_a_granted_delegation_synchronously(board):
 def test_provider_spelling_of_the_same_model_is_not_drift(board):
     """Prism 9b929567c500: minted on the provider spelling, called on the wire spelling: no drift."""
     parent = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="parent-sid", _delegate_depth=0)
-    child = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="child-sid", _subagent_id="sa-0-abc")
+    child = SimpleNamespace(model="anthropic/claude-opus-4.6", session_id="child-sid", _subagent_id="sa-0-abc",
+                            _context_inherited="summary")
     g = dsg.mint_for_child(_task(board), child, parent)
     dsg.revoke_on_model_drift(child, "claude-opus-4-6")
     assert len(_live_rows(g["grant_id"])) == 1
@@ -376,3 +378,45 @@ def test_only_the_sessions_own_identity_may_be_granted(board, monkeypatch, profi
         dsg.mint_for_child(task, child, parent)
     with kb.connect_closing() as conn:
         assert conn.execute("SELECT count(*) FROM sign_grants").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("inherit_max_tokens, minted", [(50000, True), ("not-an-int", False)])
+def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_tokens, minted):
+    """Prism 8283ee6dbefe: inherit_context=true is only the REQUEST. When the summary fold fails
+    at construction the child carries none of the parent's rulings, so the mint is refused."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from tools.delegate_tool import delegate_task
+    from tests.tools.test_delegate import _make_mock_parent
+
+    parent = _make_mock_parent()
+    parent.model = MODEL
+    parent.session_id = "parent-sid"
+    parent.prefill_messages = None
+    parent._session_messages = [{"role": "user", "content": "RULING: ship only on green CI"}]
+
+    def _fake_aiagent(**kw):
+        child = MagicMock()
+        child.model = kw.get("model")
+        child.session_id = "child-sid"
+        child._subagent_id = "sa-0-x"
+        child._delegate_depth = 1
+        child.run_conversation.return_value = {"final_response": "done", "completed": True, "api_calls": 1}
+        return child
+
+    cfg = {"boomerang": {"inherit_max_tokens": inherit_max_tokens}}
+    with patch("run_agent.AIAgent", side_effect=_fake_aiagent), \
+            patch("tools.delegate_tool._load_config", return_value=cfg):
+        out = json.loads(delegate_task(
+            tasks=[{"goal": "review it", "inherit_context": True,
+                    "sign_grant": {"cards": [board], "verbs": ["approve"]}}],
+            parent_agent=parent))
+    with kb.connect_closing() as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM sign_grants").fetchone()[0]
+    if minted:
+        assert rows == 1, out
+        dsg.revoke_turn_grants(parent)
+    else:
+        assert rows == 0, out
+        assert "sign_grant refused" in out.get("error", "") and "inherit" in out["error"], out
