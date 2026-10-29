@@ -11407,12 +11407,15 @@ def complete_task(
         texts=(result, summary))
     if content_survivors:
         metadata = dict(metadata or {}, superseded_content=content_survivors)
+    closed_abandoned: list = []
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, result, summary, metadata=metadata,
             survivor_pr=survivor_pr, superseded_by=superseded_by,
             query_fn=_pr_query or _open_pr.memo_query(),
             recorded=_card_recorded_pr_refs(conn, task_id),
+            abandon_reason=None if _overlong(str(abandon_routed_pr or "").strip()) else abandon_routed_pr,
+            abandoned_out=closed_abandoned,
         )
     except _open_pr.ClosedUnmergedPrError as closed_err:
         with write_txn(conn):
@@ -11425,6 +11428,11 @@ def complete_task(
         conn, task_id, survivor_pr=survivor_pr, survivor_ref=survivor_ref,
         abandon_routed_pr=abandon_routed_pr, query_fn=_pr_query or _open_pr.memo_query(),
     )
+    # t_2ce83b37: a closed own PR let through by --abandon-routed-pr is audited like an open one.
+    # Only the refs the terminal-record exemption accepted, never ones a SUPERSEDED-BY token covered.
+    if closed_abandoned and not routed_abandon:
+        routed_abandon = {"prs": [f"{r.repo}#{r.number}" for r in closed_abandoned],
+                          "reason": str(abandon_routed_pr).strip(), "closed": True}
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
