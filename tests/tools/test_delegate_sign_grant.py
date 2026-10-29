@@ -500,11 +500,12 @@ def _api_call(parent, model=MODEL):
         api_request_id="r", effective_task_id="t", turn_id="turn", interrupted=False)
 
 
-@pytest.mark.parametrize("served", ["short_circuit", "dispatch_raised"])
+@pytest.mark.parametrize("served", ["short_circuit", "dispatch_raised", "dispatch_discarded"])
 def test_a_call_that_never_dispatched_leaves_no_model_to_bind(board, monkeypatch, served):
-    """Prism e306c1d110a0: a response the dispatch edge did not serve (middleware short-circuit, a cached
-    reply, a dispatch that raised before the fallback answered) must not let a grant bind an EARLIER
-    call's stamped model: the stamp is cleared per call and set only once the dispatch returned."""
+    """Prism e306c1d110a0 / 30358ce63550: a response the dispatch edge did not serve (middleware
+    short-circuit, a cached reply, a dispatch that raised, or one that succeeded but whose result the
+    middleware discarded for another) must not let a grant bind a model: the stamp names the model of
+    the dispatch whose response the turn actually got, or nothing."""
     from types import SimpleNamespace as NS
 
     monkeypatch.setattr("agent.relay_llm.execute", lambda kw, fn, **_k: fn(kw))
@@ -513,12 +514,12 @@ def test_a_call_that_never_dispatched_leaves_no_model_to_bind(board, monkeypatch
     parent = _api_parent(_dispatched_model="claude-earlier-call")
 
     def middleware(kw, fn, **_k):
-        if served == "dispatch_raised":
+        if served in ("dispatch_raised", "dispatch_discarded"):
             try:
                 fn(kw)
             except RuntimeError:
                 pass
-        return NS(choices=[])   # the answer the turn got did not come from fn
+        return NS(choices=[], model="claude-sonnet-5")   # the answer the turn got did not come from fn
 
     if served == "dispatch_raised":
         parent._interruptible_api_call = lambda kw: (_ for _ in ()).throw(RuntimeError("provider down"))
