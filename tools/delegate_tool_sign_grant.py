@@ -152,7 +152,10 @@ def mint_for_child(task: Dict[str, Any], child: Any, parent_agent: Any, *,
                  "by": by, "board": board, "cards": len(cards), "verbs": grant["verbs"],
                  "expires_at": grant["expires_at"], "at": int(time.time())})
     except BaseException:
-        revoke([grant])   # minted but never handed back: nothing may hold it live
+        # Minted but never handed back: nothing may hold it live. A failed revoke goes to the parent's
+        # turn registry so revoke_turn_grants retries it (Prism 9c236305da52).
+        if revoke([grant]):
+            register_turn_grants(parent_agent, [grant])
         raise
     return grant
 
@@ -168,7 +171,8 @@ def mint_for_children(children: List[Any], parent_agent: Any, *, inherit_context
             if g:
                 minted.append(g)
     except BaseException:
-        revoke(minted)
+        failed = set(revoke(minted))
+        register_turn_grants(parent_agent, [g for g in minted if str(g.get("grant_id")) in failed])
         raise
     return minted
 

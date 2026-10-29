@@ -8152,6 +8152,10 @@ def _add_comment_txn(
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
+        if grant_id is not None:
+            # A grant's expiry is judged when the write lock is held, not when the caller asked
+            # (Prism 4b338b50d765).
+            now = int(time.time())
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
