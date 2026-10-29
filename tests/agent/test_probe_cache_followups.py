@@ -343,10 +343,22 @@ class TestLMStudioDetectionRequiresNativePayload:
         ) == "lm-studio"
         # Idle LM Studio: running, no model loaded.
         assert self._detect({"models": []}) == "lm-studio"
-        # `type` + `state` together are an acceptable weaker signal.
+        # `type` + `state` together are an acceptable weaker signal on `models`.
+        assert self._detect(
+            {"models": [{"id": "m", "type": "llm", "state": "loaded"}]}
+        ) == "lm-studio"
+
+    def test_data_keyed_payload_is_never_lm_studio(self):
+        """Both LM Studio consumers read only ``payload["models"]``, so a
+        ``data``-keyed payload classified as LM Studio yields empty metadata.
+        Without the ``object: "list"`` envelope, entries carrying LM Studio
+        markers must still not classify."""
+        assert self._detect(
+            {"data": [{"id": "m", "key": "publisher/m"}]}
+        ) != "lm-studio"
         assert self._detect(
             {"data": [{"id": "m", "type": "llm", "state": "loaded"}]}
-        ) == "lm-studio"
+        ) != "lm-studio"
 
     def test_unparseable_or_ambiguous_payloads_fail_closed(self):
         """Fail closed, never open: an unrecognised body must not classify as
@@ -379,6 +391,7 @@ class TestLMStudioDetectionRequiresNativePayload:
             {"models": [{"key": "qwen/qwen3-4b", "loaded_instances": []}]},
             {"models": [{"id": "m", "max_context_length": 4096}]},
             {"data": [{"id": "m", "type": "llm", "state": "loaded"}]},
+            {"data": [{"id": "m", "key": "publisher/m"}]},
             {},
             {"models": []},
         ]
@@ -386,7 +399,7 @@ class TestLMStudioDetectionRequiresNativePayload:
             resp = MagicMock()
             resp.json.return_value = payload
             classified = _is_lmstudio_models_payload(resp)
-            if classified and payload.get("models"):
+            if classified and payload != {"models": []}:
                 assert parser_can_read(payload), (
                     f"classified as LM Studio but the LM Studio parser reads "
                     f"nothing from it: {payload}"

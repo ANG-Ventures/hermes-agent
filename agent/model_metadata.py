@@ -753,19 +753,16 @@ def _is_lmstudio_models_payload(response: Any) -> bool:
     # OpenAI-compatible server up front, whatever its entries happen to carry.
     if data.get("object") == "list":
         return False
-    # LM Studio keys entries under `models`; the OpenAI envelope never does, so
-    # the key itself is a positive signal. Fall back to `data` for builds that
-    # use it.
-    lmstudio_keyed = isinstance(data.get("models"), list)
-    entries = data.get("models") if lmstudio_keyed else data.get("data")
+    # LM Studio keys entries under `models`, and both LM Studio consumers in
+    # this module read only `payload["models"]`. A `data`-keyed payload would
+    # classify as LM Studio and then yield no metadata at all, which is the
+    # bug this predicate exists to prevent, so the native key is required.
+    entries = data.get("models")
     if not isinstance(entries, list):
         return False
     if not entries:
         # An idle LM Studio (running, no model loaded) returns an empty list.
-        # Accept that only on the LM Studio-native `models` key — an empty
-        # `{"data": []}` is indistinguishable from an idle OpenAI server once
-        # the `object: "list"` envelope is absent, so fail closed there.
-        return lmstudio_keyed
+        return True
     first = entries[0]
     if not isinstance(first, dict):
         return False
