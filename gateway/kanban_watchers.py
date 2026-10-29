@@ -1399,7 +1399,13 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
     #alerts gets ONE page per (card, reason) from a card homed there or with no
     home (t_081bb603): its "still waiting" re-page goes to #logs instead (a
     standing wait is a report, not a page), and a card whose origin IS #alerts
-    is not mirrored there a second time."""
+    is not mirrored there a second time.
+
+    t_d36da044 (13 #alerts lines/day vs a budget of 3): the p>=200 mirror
+    fires on the first page only, never on a "still waiting" re-page; and a
+    card homed in #alerts below the pager's own floor
+    (``NEEDS_INPUT_PAGE_MIN_PRIORITY``) posts to #logs, because it pages only
+    for having #alerts as its home, not for its priority."""
     script = _alert_notify_script()
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; needs-input page not delivered")
@@ -1417,11 +1423,17 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
     if channel is not None and not str(channel).isdigit():
         channel = None  # numeric channel ids only
     alerts_ch, logs_ch = _needs_input_channels()
-    if channel and still_waiting and str(channel) == alerts_ch:
+    from hermes_cli.kanban_db import NEEDS_INPUT_PAGE_MIN_PRIORITY
+
+    try:
+        below_floor = int(item.get("priority") or 0) < NEEDS_INPUT_PAGE_MIN_PRIORITY
+    except (TypeError, ValueError):
+        below_floor = True
+    if channel and str(channel) == alerts_ch and (still_waiting or below_floor):
         return _notify_send(script, message, ["--target", logs_ch])
     if channel:
         ok = _notify_send(script, message, ["--target", str(channel)])
-        if (item.get("alerts") and str(channel) != alerts_ch
+        if (item.get("alerts") and not still_waiting and str(channel) != alerts_ch
                 and not _notify_send(script, message, ["--sev", "error"])):
             logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
         return ok

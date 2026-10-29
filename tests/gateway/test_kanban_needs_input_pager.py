@@ -212,8 +212,12 @@ def test_send_routes_origin_target_and_alerts_mirror(monkeypatch, tmp_path):
 
     calls.clear()
     assert kw._send_needs_input_page("ops", dict(item, alerts=True), True)
-    assert [c[1] for c in calls] == [["--target", CHAN], ["--sev", "error"]]
+    assert [c[1] for c in calls] == [["--target", CHAN]]  # re-page: no #alerts mirror (t_d36da044)
     assert calls[0][0].startswith("⚠️ still waiting: ")
+
+    calls.clear()
+    assert kw._send_needs_input_page("ops", dict(item, alerts=True))
+    assert [c[1] for c in calls] == [["--target", CHAN], ["--sev", "error"]]  # first page mirrors
     assert "hermes kanban --board ops show t_1" in calls[0][0]
 
     calls.clear()
