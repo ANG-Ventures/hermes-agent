@@ -11,8 +11,10 @@ measure those numbers." The relay (claude-pool ``pool_pressure_headers``) sends
 from __future__ import annotations
 
 import datetime as dt
+import time
 
 import anthropic  # noqa: F401  (first import outside the home I/O guard, as in the sibling tests)
+import pytest
 
 from agent import fallback_events as fbe
 from agent import fallback_policy as fp
@@ -29,6 +31,19 @@ FULL = {"x-pool-seats-total": "26", "x-pool-seats-eligible": "11", "x-pool-seats
 SPEC_LINE = ("relay busy: 11 of 11 eligible seats full (26 in pool; 15 ineligible: "
              "quota 13, transport 2), 142/304 in flight")
 OLD_LINE = "relay busy: all subs at capacity (at the relay)"
+
+
+@pytest.fixture(autouse=True)
+def _pdt():
+    """The banner clock is local time; pin PT so '20:02:11' holds on a UTC runner."""
+    mp = pytest.MonkeyPatch()
+    mp.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        yield
+    finally:
+        mp.undo()
+        time.tzset()
 
 
 def _measured(**over):
