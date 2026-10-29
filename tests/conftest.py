@@ -675,6 +675,20 @@ def _isolate_fallback_sticky_store():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_wall_budget_registry():
+    """Fresh process-global cross-session wait registry per test (t_78b5a5bb): a wait
+    armed in one test must not read as a sibling session in the next."""
+    try:
+        from agent import fallback_wall_budget as _wb
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    _wb.clear_registry()
+    yield
+    _wb.clear_registry()
+
+
+@pytest.fixture(autouse=True)
 def _refuse_real_detached_delegation_child(request, monkeypatch):
     """A background delegate_task in a gateway-bound session spawns a REAL ``python -m
     tools.delegate_detached`` process by default (``delegation.detached_background``). It never runs

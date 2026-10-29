@@ -95,6 +95,9 @@ def handle_api_error(
     from agent import fallback_events as _fbe
     _fbe.stash_api_error(agent, api_error, status_code, error_context,
                          elapsed_s=time.time() - api_start_time)
+    # t_78b5a5bb: a 502/529 on the lane is counted in its #logs slow-window close line.
+    from agent.fallback_wall_budget import note_status as _wb_note_status
+    _wb_note_status(agent, status_code)
     if _retry.invalid_response_retry_floor is not None:
         # t_d35beb85: the empty-tool_use retry raised instead; its own error now drives the
         # normal error path.
@@ -477,9 +480,11 @@ def settle_unrecovered_error(
     # t_94a2b0e4: the wall-budget notice reads the sleep (it is not polled during
     # one), and a notice due now names the wait instead of an in-flight turn.
     from agent.fallback_cause import note_sleep
-    from agent.fallback_wall_budget import notice_due as _wb_notice_due
+    from agent.fallback_wall_budget import note_quiet as _wb_note_quiet, notice_due as _wb_notice_due
     note_sleep(agent, wait_time)
     _wb_notice = _wb_notice_due(agent)
+    # t_78b5a5bb: nothing polls the clock during the sleep; it stays a live waiter.
+    _wb_note_quiet(agent, wait_time)
     if _wb_notice:
         from agent.fallback_cause import flush_banner
         flush_banner(agent)   # t_634b4ddf: the held fallback line posts first
