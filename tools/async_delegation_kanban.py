@@ -71,6 +71,75 @@ def dispatcher_serves_here() -> bool:
         return False
 
 
+#: Beside the machine-global ``.dispatcher.lock``: the lock holder rewrites it every dispatcher tick.
+DISPATCHER_HEARTBEAT = ".dispatcher.heartbeat"
+#: A heartbeat older than ``max(HEARTBEAT_TICKS * interval, HEARTBEAT_MIN_SECONDS)`` is not live.
+HEARTBEAT_TICKS = 3
+HEARTBEAT_MIN_SECONDS = 180.0
+
+
+def _heartbeat_path() -> Path:
+    from hermes_cli import kanban_db as kb
+
+    return kb.kanban_home() / "kanban" / DISPATCHER_HEARTBEAT
+
+
+def _hostname() -> str:
+    import socket
+
+    try:
+        return socket.gethostname() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def write_dispatcher_heartbeat(interval_s: float) -> None:
+    """The dispatcher-lock holder is ticking (§5.1.5). Best effort: a missed write only makes other
+    gateways' units run in-process until the next tick."""
+    try:
+        path = _heartbeat_path()
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "host": _hostname(),
+                                   "interval_s": float(interval_s)}), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        logger.debug("async_delegation_kanban_heartbeat_write_failed", exc_info=True)
+
+
+def clear_dispatcher_heartbeat() -> None:
+    """Drop the heartbeat on release, only if it is this process's own."""
+    try:
+        path = _heartbeat_path()
+        if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def dispatcher_live_on_host() -> bool:
+    """A live dispatcher serves the delegations board on this host and no estop is engaged (§5.1.5).
+
+    True in the lock holder itself; elsewhere a read-only check of the holder's heartbeat: same host,
+    fresh mtime, pid alive. Unknown or unreadable is False (the unit stays in-process, I6)."""
+    if dispatcher_serves_here():
+        return True
+    try:
+        from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+        from gateway.status import _pid_exists
+
+        path = _heartbeat_path()
+        age = time.time() - path.stat().st_mtime
+        beat = json.loads(path.read_text(encoding="utf-8"))
+        pid, interval = beat.get("pid"), float(beat.get("interval_s") or 0)
+        if type(pid) is not int or pid <= 0 or beat.get("host") != _hostname():
+            return False
+        if not 0 <= age <= max(HEARTBEAT_TICKS * interval, HEARTBEAT_MIN_SECONDS):
+            return False
+        return bool(_pid_exists(pid)) and bool(_kanban_dispatch_allowed())
+    except Exception:
+        return False
+
+
 def _terminal_backend() -> str:
     from tools.terminal_tool import _session_scope
 
@@ -98,7 +167,7 @@ def ineligible_reason(*, durable_spec: Optional[Dict[str, Any]], children: List[
         return "backend_unreadable"
     if backend not in ELIGIBLE_BACKENDS:
         return f"backend_{backend or 'unknown'}"
-    if not dispatcher_serves_here():
+    if not dispatcher_live_on_host():
         return "no_dispatcher"
     if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
         return "no_session_cwd"
