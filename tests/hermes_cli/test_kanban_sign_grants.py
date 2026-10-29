@@ -669,6 +669,185 @@ def test_a_revoke_on_an_unregistered_copy_never_journals_into_the_ambient_board(
     assert rows == [(None,)], rows
 
 
+def test_a_revoke_on_a_pinned_board_is_journaled_with_that_boards_other_writes(board, tmp_path, monkeypatch):
+    """Prism 826db72bcf2d: a HERMES_KANBAN_DB pin outside kanban/boards matches no layout path, but it IS a
+    registered board (``PINNED_SLUG``). Its revoke journals under the same slug as its comments, so restoring
+    a snapshot and replaying that journal brings the comment back AND the grant back revoked."""
+    import shutil
+    import time as _time
+
+    from hermes_cli import kanban_db_board_registry as kbr
+    from hermes_cli import kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    pin = tmp_path / "elsewhere" / "kanban.db"
+    pin.parent.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    kb._INITIALIZED_PATHS.clear()
+    with kb.connect_closing() as conn:
+        c = kb.create_task(conn, title="review card on the pinned board")
+        assert kbr.board_for_conn(conn) == kbr.PINNED_SLUG
+    g = _mint(c)
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(pin), str(snap))
+    since = _time.time() - 0.001
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, c, "apollo", "after the snapshot")
+        assert ksg.revoke(conn, g["grant_id"]) == 1
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into(kbr.PINNED_SLUG, snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    bodies = [r[0] for r in rc.execute("SELECT body FROM task_comments WHERE task_id = ?", (c,))]
+    rc.close()
+    assert len(rows) == 1 and rows[0][0] is not None, rows
+    assert "after the snapshot" in bodies, bodies
+
+
+def test_board_for_conn_names_layout_boards_and_refuses_an_unregistered_copy(board, tmp_path):
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    kb.create_board("other")
+    with kb.connect_closing() as conn:
+        assert kbr.board_for_conn(conn) == kb.DEFAULT_BOARD
+    with kb.connect_closing(board="other") as conn:
+        assert kbr.board_for_conn(conn) == "other"
+    cc = sqlite3.connect(str(tmp_path / "copy.db"))
+    try:
+        assert kbr.board_for_conn(cc) is None
+    finally:
+        cc.close()
+    mem = sqlite3.connect(":memory:")
+    try:
+        assert kbr.board_for_conn(mem) is None
+    finally:
+        mem.close()
+
+
+def test_board_for_conn_does_not_reuse_a_cached_slug_after_the_path_is_replaced(board, tmp_path):
+    """Prism 2bfd9f8c68d9: a hard-link alias of a live board resolves to that board; once the alias path is
+    os.replace'd with an independent snapshot, a new connection to it is owned by no board."""
+    import shutil
+
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    live = kb.kanban_db_path()
+    alias = tmp_path / "alias.db"
+    os.link(str(live), str(alias))
+    c1 = sqlite3.connect(str(alias))
+    try:
+        assert kbr.board_for_conn(c1) == kb.DEFAULT_BOARD
+    finally:
+        c1.close()
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(live), str(snap))
+    os.replace(str(snap), str(alias))
+    c2 = sqlite3.connect(str(alias))
+    try:
+        assert kbr.board_for_conn(c2) is None
+    finally:
+        c2.close()
+
+
+def test_board_for_conn_does_not_reuse_a_cached_slug_after_a_layout_symlink_is_retargeted(board, tmp_path):
+    """Prism 25e888cf0c09: a board's kanban.db is a symlink. Retarget it inside the board's directory (the
+    boards/ root mtime does not move); a connection to the OLD target is no longer that board's file."""
+    import shutil
+
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    kb.create_board("other")
+    link = kb.board_dir("other") / "kanban.db"
+    with kb.connect_closing(board="other"):
+        pass
+    old = kb.board_dir("other") / "old.db"
+    new = kb.board_dir("other") / "new.db"
+    os.replace(str(link), str(old))
+    shutil.copyfile(str(old), str(new))
+    os.symlink("old.db", str(link))
+    c1 = sqlite3.connect(str(old))
+    try:
+        assert kbr.board_for_conn(c1) == "other"
+    finally:
+        c1.close()
+    tmp_link = kb.board_dir("other") / "kanban.db.tmp"
+    os.symlink("new.db", str(tmp_link))
+    os.replace(str(tmp_link), str(link))
+    c2 = sqlite3.connect(str(old))
+    try:
+        assert kbr.board_for_conn(c2) is None
+    finally:
+        c2.close()
+
+
+def test_board_for_conn_pin_alias_replaced_by_a_snapshot_is_the_pinned_board_not_the_old_layout_slug(
+        board, tmp_path, monkeypatch):
+    """Prism fde771bf9eaa: a HERMES_KANBAN_DB pin that hard-links a layout board names that board; once the
+    pin path is os.replace'd with an independent snapshot it names no layout board, so it is ``override``."""
+    import shutil
+
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    kb.create_board("other")
+    with kb.connect_closing(board="other"):
+        pass
+    live = kb.board_dir("other") / "kanban.db"
+    pin = tmp_path / "pin.db"
+    os.link(str(live), str(pin))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    c1 = sqlite3.connect(str(pin))
+    try:
+        assert kbr.board_for_conn(c1) == "other"
+    finally:
+        c1.close()
+    assert kbr.board_named_by_pin(str(pin)) == "other"
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(live), str(snap))
+    os.replace(str(snap), str(pin))
+    assert kbr.board_named_by_pin(str(pin)) == kbr.PINNED_SLUG
+    c2 = sqlite3.connect(str(pin))
+    try:
+        assert kbr.board_for_conn(c2) == kbr.PINNED_SLUG
+    finally:
+        c2.close()
+
+
+def test_board_for_conn_pin_alias_swapped_after_the_pin_compare_is_still_the_pinned_board(
+        board, tmp_path, monkeypatch):
+    """Prism 88ae868bb7c2: once the layout scan found no owner and the connection's file IS the pin, the
+    answer is the pinned board. Re-resolving the mutable pin path afterwards must not hand back the slug of
+    a layout board the pin alias was swapped to in between (that board does not own ``conn``)."""
+    import shutil
+
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    with kb.connect_closing():
+        pass
+    live = kb.kanban_db_path()
+    pin = tmp_path / "pin.db"
+    shutil.copyfile(str(live), str(pin))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    real_same_path = kb._same_path
+    swapped = []
+
+    def racing_same_path(a, b, memo=None):
+        same = real_same_path(a, b, memo)
+        if same and not swapped and Path(b) == pin:
+            alias = tmp_path / "alias.db"
+            os.link(str(live), str(alias))
+            os.replace(str(alias), str(pin))
+            swapped.append(True)
+        return same
+
+    conn = sqlite3.connect(str(pin))
+    try:
+        monkeypatch.setattr(kb, "_same_path", racing_same_path)
+        assert kbr.board_for_conn(conn) == kbr.PINNED_SLUG
+        assert swapped, "the race was never provoked"
+    finally:
+        conn.close()
+
+
 def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
     import shutil
     import time as _time

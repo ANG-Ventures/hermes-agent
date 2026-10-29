@@ -8213,27 +8213,22 @@ def _add_comment_txn(
         # discussion did not. Journaling the body is the single thing that
         # would have saved them, so it is recorded explicitly rather than
         # inferred from the event.
-        try:
-            from hermes_cli import kanban_journal
-
-            kanban_journal.append(
-                _journal_board_slug(),
-                task_id,
-                "comment_body",
-                {
-                    "author": author.strip(),
-                    "body": body.strip(),
-                    "session_ref": session_ref,
-                    "created_at": now,
-                    "comment_id": int(cur.lastrowid or 0),
-                    **({"claimed_author": claimed_author} if claimed_author else {}),
-                    **({"grant_id": grant_id} if grant_id else {}),
-                },
-                actor=author.strip(),
-                run_id=run_id,
-            )
-        except Exception:  # pragma: no cover - never fail the comment write
-            pass
+        _journal_append(
+            conn,
+            task_id,
+            "comment_body",
+            {
+                "author": author.strip(),
+                "body": body.strip(),
+                "session_ref": session_ref,
+                "created_at": now,
+                "comment_id": int(cur.lastrowid or 0),
+                **({"claimed_author": claimed_author} if claimed_author else {}),
+                **({"grant_id": grant_id} if grant_id else {}),
+            },
+            actor=author.strip(),
+            run_id=run_id,
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -8439,17 +8434,38 @@ def _insert_comment(
     )
 
 
-def _journal_board_slug() -> Optional[str]:
-    """Best-effort board slug for a journal record.
+_NO_JOURNAL_BOARD = object()
 
-    Resolution must never raise inside a write txn, and must never be the
-    reason a mutation fails, so every error degrades to ``None`` (which the
-    journal records under the ``default`` board).
+
+def _journal_board_slug(conn: Optional[sqlite3.Connection] = None):
+    """Board slug for a journal record of a write on ``conn``.
+
+    With a connection: :func:`board_for_conn`, the one resolver revoke uses too, so every record
+    of one board lands in ONE journal, a pinned off-layout board included (Prism 826db72bcf2d).
+    A connection no board owns (snapshot, forensics copy) returns :data:`_NO_JOURNAL_BOARD` and
+    the caller journals nothing (Prism 77b7e56c0d2c). Without one: the ambient board. Never
+    raises; an error degrades to ``None`` (the ``default`` journal).
     """
     try:
+        if conn is not None:
+            slug = board_for_conn(conn)
+            return _NO_JOURNAL_BOARD if slug is None else slug
         return get_current_board()
     except Exception:
         return None
+
+
+def _journal_append(conn: sqlite3.Connection, task_id, kind, payload, **kw) -> None:
+    """Best-effort journal append under ``conn``'s board; skipped for an unowned connection."""
+    try:
+        board = _journal_board_slug(conn)
+        if board is _NO_JOURNAL_BOARD:
+            return
+        from hermes_cli import kanban_journal
+
+        kanban_journal.append(board, task_id, kind, payload, **kw)
+    except Exception:  # pragma: no cover - the journal is a net, never a gate
+        pass
 
 
 def _append_event(
@@ -8479,18 +8495,7 @@ def _append_event(
     # deleter took the whole kanban directory, so a journal inside it would
     # have died with the data it protects. Best-effort by contract: a journal
     # failure must never fail the board write.
-    try:
-        from hermes_cli import kanban_journal
-
-        kanban_journal.append(
-            _journal_board_slug(),
-            task_id,
-            kind,
-            payload,
-            run_id=run_id,
-        )
-    except Exception:  # pragma: no cover - the journal is a net, never a gate
-        pass
+    _journal_append(conn, task_id, kind, payload, run_id=run_id)
 
 
 def _append_deferred_event_once(
@@ -14827,18 +14832,13 @@ def request_changes(
     # Journal the committed coverage comment (add_comment's content hook),
     # only after commit so a rolled-back send-back journals nothing.
     for comment_id, comment_run_id, created_at in posted:
-        try:
-            from hermes_cli import kanban_journal
-
-            kanban_journal.append(
-                _journal_board_slug(), task_id, "comment_body",
-                {"author": comment_author, "body": coverage_body,
-                 "session_ref": None, "created_at": created_at,
-                 "comment_id": comment_id},
-                actor=comment_author, run_id=comment_run_id,
-            )
-        except Exception:  # pragma: no cover - never fail the transition
-            pass
+        _journal_append(
+            conn, task_id, "comment_body",
+            {"author": comment_author, "body": coverage_body,
+             "session_ref": None, "created_at": created_at,
+             "comment_id": comment_id},
+            actor=comment_author, run_id=comment_run_id,
+        )
     return ok, detail
 
 
@@ -22088,6 +22088,7 @@ from hermes_cli.kanban_db_board_registry import (  # noqa: E402
     KanbanBoardUnreadable,
     KanbanCardAmbiguous,
     KanbanCardNotFound,
+    board_for_conn,
     board_named_by_pin,
     board_of_task,
     pinned_board,
