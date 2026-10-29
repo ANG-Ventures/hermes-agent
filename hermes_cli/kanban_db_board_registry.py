@@ -160,9 +160,10 @@ def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
     identity on every call, never memoised (Prism 25e888cf0c09, fde771bf9eaa): a retargeted board
     symlink or a swapped pin alias changes the answer without moving any cheap key. Never raises.
 
-    Judged by the current path of the connection's filename (``PRAGMA database_list``), not the
-    open file's identity: an alias replaced under an open connection is a known gap, card
-    t_5cc1943b (Prism 1cb3ded18c44).
+    Judged by the OPEN file's identity when the kanban layer opened ``conn`` (``_sqlite_connect``
+    records it), so an alias replaced under an open connection still names the board of the file
+    it writes (Prism 1cb3ded18c44). A foreign connection falls back to the current path of its
+    filename (``PRAGMA database_list``).
     """
     _kb = _facade()
     try:
@@ -171,15 +172,22 @@ def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
             return None
         raw = raw_db_pin()
         here = Path(actual)
-        if _kb._path_identity(here) is None:
+        opened = getattr(conn, "_hermes_open_identity", None)
+        if opened is None and _kb._path_identity(here) is None:
             return None
+
+        def owns(path: Path) -> bool:
+            if opened is not None:
+                return _kb._path_identity(path) == opened
+            return _kb._same_path(here, path)
+
         found: Optional[str] = None
         with _kb.enumerating_boards():
             for slug, path in board_db_layout():
-                if _kb._same_path(here, path):
+                if owns(path):
                     found = slug
                     break
-        if found is None and raw and _kb._same_path(here, Path(raw).expanduser()):
+        if found is None and raw and owns(Path(raw).expanduser()):
             # No layout board owns ``here`` and ``here`` IS the pin's file, so it is the pinned
             # board. Never re-resolve ``raw``: a pin alias swapped since the compare would name a
             # layout board that does not own ``conn`` (Prism 88ae868bb7c2).

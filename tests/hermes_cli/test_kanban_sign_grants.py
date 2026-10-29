@@ -848,6 +848,41 @@ def test_board_for_conn_pin_alias_swapped_after_the_pin_compare_is_still_the_pin
         conn.close()
 
 
+def test_board_for_conn_alias_swapped_under_an_open_connection_is_still_the_open_files_board(
+        board, tmp_path, monkeypatch):
+    """Prism 1cb3ded18c44: a connection opened through a pin alias of board A keeps A's file open after the
+    alias is os.replace'd with a hard link of board B. Its committed write and its journal record belong to A,
+    the file it wrote; the current path names B."""
+    from hermes_cli import kanban_db_board_registry as kbr
+    from hermes_cli import kanban_journal
+
+    _home, a, _b = board
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    kb.create_board("other")
+    with kb.connect_closing(board="other"):
+        pass
+    live_a = kb.kanban_db_path()
+    live_b = kb.board_dir("other") / "kanban.db"
+    pin = tmp_path / "pin.db"
+    os.link(str(live_a), str(pin))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
+    kb._INITIALIZED_PATHS.clear()
+    conn = kb.connect()
+    try:
+        assert kbr.board_for_conn(conn) == kb.DEFAULT_BOARD
+        tmp_alias = tmp_path / "pin.tmp"
+        os.link(str(live_b), str(tmp_alias))
+        os.replace(str(tmp_alias), str(pin))
+        assert kbr.board_for_conn(conn) == kb.DEFAULT_BOARD
+        kb.add_comment(conn, a, "apollo", "written to A after the alias moved to B")
+    finally:
+        conn.close()
+    bodies_a = [r["payload"].get("body") for r in kanban_journal.read_entries(kb.DEFAULT_BOARD)]
+    bodies_b = [r["payload"].get("body") for r in kanban_journal.read_entries("other")]
+    assert "written to A after the alias moved to B" in bodies_a, bodies_a
+    assert "written to A after the alias moved to B" not in bodies_b, bodies_b
+
+
 def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
     import shutil
     import time as _time
