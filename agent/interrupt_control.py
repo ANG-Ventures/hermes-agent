@@ -9,6 +9,7 @@ import threading
 from typing import Optional
 
 from agent.interrupt_compat import request_hard_interrupt
+from agent.route_note_ingest import relabel_route_note_text
 from tools.interrupt import request_yield as _request_yield
 from tools.interrupt import set_interrupt as _set_interrupt
 
@@ -261,7 +262,7 @@ class InterruptControlMixin:
         interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
         if not text or not text.strip():
             return False
-        cleaned = text.strip()
+        cleaned = relabel_route_note_text(text.strip())  # E11: received text never carries the harness marker
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
@@ -274,7 +275,7 @@ class InterruptControlMixin:
         to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
         if not text or not text.strip():
             return False
-        cleaned = text.strip()
+        cleaned = relabel_route_note_text(text.strip())  # E11: received text never carries the harness marker
 
         _native_steer = _ic_codex_method(self, "request_steer")
         if _native_steer is not None:

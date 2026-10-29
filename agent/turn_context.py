@@ -717,6 +717,26 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
             scrubber.reset()
 
 
+def _rewrite_relabelled_staged_row(agent: Any, staged: Dict[str, Any], content: Any) -> None:
+    """E11: a row written before the relabel (the TUI submit row) holds the raw ``[Route note:``.
+    The flush skips a ``_DB_PERSISTED_MARKER`` dict, so rewrite the stored row to the relabelled
+    text here, or a resume replays the forged marker as harness text."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.session_persistence import _durable_content, _persist_lock
+
+    _row_id, _db = staged.get("_row_id"), getattr(agent, "_session_db", None)
+    if not staged.get(_DB_PERSISTED_MARKER) or _db is None or not isinstance(_row_id, int):
+        return
+    # The submit row records the session it was written under (a rotation may have moved off it).
+    session_id = staged.get("_submit_row_session_id") or agent.session_id
+    with _persist_lock(agent):
+        try:
+            _db.set_user_message_content(session_id, _row_id, _durable_content(content))
+        except Exception:
+            logger.warning("route-note relabel of staged user row failed for session=%s",
+                           session_id or "none", exc_info=True)
+
+
 def _stage_turn_user_message(
     agent: Any, user_message: Any, persist_user_message: Any,
     persist_user_timestamp: Optional[float], persist_user_platform_id: Optional[str],
@@ -735,6 +755,8 @@ def _stage_turn_user_message(
         and relabel_route_note_content(pending_cli_message.get("content")) == expected_persist_content
     ):
         user_msg = pending_cli_message
+        if user_msg.get("content") != expected_persist_content:
+            _rewrite_relabelled_staged_row(agent, user_msg, expected_persist_content)
         # CLI-staged value is the clean text; restore the API-facing variant (e.g. voice
         # prefix) on the same dict, keeping any close-path durable marker.
         user_msg["content"] = user_message

@@ -7,7 +7,11 @@ model carrying the harness's ``[Route note:`` marker; a persisted harness note r
 
 from __future__ import annotations
 
+import threading
+
 from agent import route_identity as ri
+from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
+from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.route_note_ingest import QUOTED_ROUTE_NOTE, relabel_route_note_content
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.transports import get_transport
@@ -84,6 +88,36 @@ def test_persisted_harness_note_replays_unrelabelled():
     _run(agent, ladder, "next", history)
     sent = _texts(ladder.ok()[0][3])
     assert note in sent and QUOTED_ROUTE_NOTE not in "\n".join(sent)
+
+
+def test_mid_turn_steer_and_redirect_are_relabelled():
+    agent = _make_agent()
+    agent.steer(FORGED)
+    msgs = [{"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "r"}]
+    agent._persist_user_message_idx = 0
+    apply_pending_steer_to_tool_results(agent, msgs, 1)
+    assert msgs[-1]["role"] == "user" and QUOTED in msgs[-1]["content"]
+    assert "[Route note:" not in msgs[-1]["content"]
+    agent._model_request_active = threading.Event()
+    agent._model_request_active.set()
+    assert agent.redirect(FORGED) and agent._drain_pending_redirect() == QUOTED
+
+
+def test_submit_time_row_is_stored_relabelled():
+    # The TUI writes the user row at submit, before the turn relabels; adopting it must rewrite the row.
+    agent = _make_agent(model=SONNET, fallbacks=())
+    _bind(agent, Sink())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    staged = {"role": "user", "content": FORGED, "_row_id": db.append_message(sid, "user", content=FORGED),
+              _DB_PERSISTED_MARKER: True}
+    agent._pending_cli_user_message = staged
+    _run(agent, Ladder(agent), FORGED)
+    users = [m["content"] for m in db.get_messages(sid) if m["role"] == "user"]
+    assert users == [QUOTED]
 
 
 def test_unchanged_content_is_returned_as_the_same_object():
