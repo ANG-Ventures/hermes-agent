@@ -447,3 +447,177 @@ def test_notice_omits_the_chain_but_still_says_when_nothing_is_left():
         wb.arm(last, now=0.0)
         tail = wb.notice_due(last, now=121.0)
         assert tail and tail.endswith("; nothing left in the fallback chain")
+
+
+
+# ── t_b0a117bd: the notice names the upstream cause, or says what happens next ──
+# Ace 2026-10-28 17:58 PT: 47 bare "still waiting for a first reply: 120s, 1 lane
+# tried" lines in one hour while the same waits had seen 502/529/resets.
+
+_OVERLOADED_529 = RelayError(529, {"type": "error", "error": {"type": "overloaded_error",
+                                                              "message": "Overloaded"}},
+                             {"x-relay-seat": "sub-vps-5"})
+_NOTICE_CFG = {"fallback": {"still_waiting_notice_seconds": 120,
+                            "no_first_byte_budget_seconds": 600}}
+
+
+def _wait_agent(provider="claude-dtlr"):
+    a = _bare(index=1)
+    a.provider = provider
+    a.base_url = "http://127.0.0.1:18810/v1"
+    a._pending_fallback_error = None
+    a.session_id, a._current_turn_id = "s", "s:t1"
+    a._buffer_diagnostic_status = lambda *_a, **_k: None
+    a._touch_activity = lambda *_a, **_k: None
+    return a
+
+
+def test_notice_names_the_529_seen_earlier_in_the_same_wait():
+    """RED on base: two 529s on alr, the failover consumes the cause and the wait goes
+    on on dtlr; the next notice used to be the bare lane count."""
+    from agent import fallback_cause, fallback_events as fbe
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent(provider="claude-alr")
+        wb.arm(a, now=0.0)
+        fbe.stash_api_error(a, _OVERLOADED_529, 529, None, elapsed_s=1.0)
+        fbe.stash_api_error(a, _OVERLOADED_529, 529, None, elapsed_s=2.0)
+        fallback_cause.take(a)          # the failover row consumed the cause
+        a.provider = "claude-dtlr"      # the walker moved the same wait on
+        wb.note_lane_switch(a)
+        with patch("agent.fallback_wall_budget._buffering_lane", return_value=False):
+            text = wb.notice_due(a, now=241.0)
+    # No x-relay-error-hop on this 529: the status is named, its sender is not.
+    assert text == ("⏳ still waiting for a first reply: 241s on claude-dtlr/claude-fable-5-1, "
+                    "2 lanes tried; last failure: HTTP 529 overloaded ×2 on sub-vps-5, retrying"), text
+    assert "upstream" not in text and "Anthropic" not in text, text
+
+
+def test_notice_names_a_stream_reset_retried_inside_the_stream_call():
+    """RED on base: a connection reset retried by the stream loop never reaches
+    stash_api_error; the wall clock still saw it."""
+    from agent import fallback_wall_budget as wb
+    from agent.stream_diag import emit_stream_drop
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent()
+        wb.arm(a, now=0.0)
+        err = httpx.ReadError("reset")
+        err.__cause__ = ConnectionResetError(104, "Connection reset by peer")
+        emit_stream_drop(a, error=err, attempt=1, max_attempts=3, mid_tool_call=False,
+                         diag={"http_status": 200, "started_at": 0.0})
+        text = wb.notice_due(a, now=121.0)
+    assert text and "last failure: connection reset" in text and "retrying" in text, text
+    assert "upstream" not in text and "Anthropic" not in text, text
+    assert "buffering lane" not in text, text
+
+
+def test_silent_wait_notice_says_when_the_cut_comes():
+    """D2: nothing failed yet, keep the wording and add the next step on the same line."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent(provider="openai-codex")
+        a.model = "gpt-6.1-sol"
+        wb.arm(a, now=0.0)
+        text = wb.notice_due(a, now=121.0)
+    assert text == ("⏳ still waiting for a first reply: 121s, 1 lane tried "
+                    "(now on openai-codex/gpt-6.1-sol); cut to next lane at 600s"), text
+    assert "ahead" not in text and "claude-btpr" not in text
+
+
+def test_failure_memory_is_per_wait():
+    """A served byte disarms the clock; the next wait starts with no failures."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent(provider="openai-codex")
+        if hasattr(wb, "note_upstream_failure"):
+            wb.note_upstream_failure(a, status=529)    # nothing armed: not a wait, no-op
+        wb.arm(a, now=0.0)
+        if hasattr(wb, "note_upstream_failure"):
+            wb.note_upstream_failure(a, status=502)
+        wb.disarm(a)
+        wb.arm(a, now=0.0)
+        text = wb.notice_due(a, now=121.0)
+    assert "last failure" not in text and "502" not in text, text
+
+
+# ── t_b0a117bd send-back (Apollo 2026-10-28 20:2x): name the STAGE, never blame ──
+# the provider for our own path. 17:00-20:00 the slow stage was relay_send (our
+# uplink, p90 80-117 s) while upstream_ttfb p90 stayed 13-19 s, and the 502s were
+# ECONNRESET between relay and box. Each case below is RED on 58dc308d4b.
+
+def _failed_once(err, status, provider="claude-alr"):
+    from agent import fallback_events as fbe
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent(provider=provider)
+        wb.arm(a, now=0.0)
+        fbe.stash_api_error(a, err, status, None, elapsed_s=1.0)
+        with patch("agent.fallback_wall_budget._buffering_lane", return_value=False), \
+                patch("agent.fallback_cause.wait_notice", return_value=None):
+            return wb.notice_due(a, now=121.0)
+
+
+def test_r2_econnreset_502_reads_as_a_connection_fault_between_relay_and_box():
+    """The relay's 502 for an ECONNRESET on its box hop (class conn, hop relay->bridge)."""
+    err = RelayError(502, {"error": "upstream unreachable"},
+                     {"x-relay-error-class": "conn", "x-relay-error-hop": "relay->bridge",
+                      "x-relay-seat": "sub-vps-14"},
+                     text='HTTP 502: read ECONNRESET {"error":"upstream unreachable"}')
+    text = _failed_once(err, 502)
+    assert "last failure: connection reset between relay and box (502) on sub-vps-14" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r2_relay_unreachable_without_errno_is_a_connection_failure_on_our_path():
+    err = RelayError(502, {"error": "upstream unreachable"},
+                     {"x-relay-error-class": "conn", "x-relay-error-hop": "relay->bridge",
+                      "x-relay-seat": "sub-vps-7"})
+    text = _failed_once(err, 502)
+    assert "last failure: connection failed between relay and box (502) on sub-vps-7" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r2_408_is_a_connection_fault_not_a_provider_status():
+    err = RelayError(408, {"error": "request timeout"}, {"x-relay-seat": "sub-vps-3"})
+    text = _failed_once(err, 408)
+    assert "last failure: request timed out (408) on sub-vps-3" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r1_relay_stage_refusal_names_our_relay():
+    err = RelayError(503, {"error": "pool at capacity"},
+                     {"x-relay-error-class": "pool_pressure", "x-relay-error-hop": "relay",
+                      "x-relay-seat": "none"})
+    text = _failed_once(err, 503)
+    assert "last failure: 503 unavailable at our relay (pool at capacity)" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r1_box_stage_status_names_the_relay_to_box_hop():
+    err = RelayError(504, {"error": "upstream attempt timed out"},
+                     {"x-relay-error-class": "pool_stalled", "x-relay-error-hop": "relay->bridge",
+                      "x-relay-seat": "sub-vps-9"})
+    text = _failed_once(err, 504)
+    assert "last failure: 504 gateway timeout between relay and box on sub-vps-9" in text, text
+    assert "Anthropic" not in text and "upstream" not in text, text
+
+
+def test_r1_provider_origin_status_is_the_only_one_that_names_anthropic():
+    """hop bridge->upstream = the relay marks the answer as the provider's own."""
+    err = RelayError(529, {"type": "error", "error": {"type": "overloaded_error",
+                                                       "message": "Overloaded"}},
+                     {"x-relay-error-class": "pool_pressure",
+                      "x-relay-error-hop": "bridge->upstream", "x-relay-seat": "sub-vps-5"})
+    text = _failed_once(err, 529)
+    assert "last failure: Anthropic 529 overloaded on sub-vps-5" in text, text
+
+
+def test_r1_silent_wait_never_says_upstream():
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value=_NOTICE_CFG):
+        a = _wait_agent()
+        wb.arm(a, now=0.0)
+        with patch("agent.fallback_wall_budget._buffering_lane", return_value=False):
+            text = wb.notice_due(a, now=121.0)
+    assert text.startswith("⏳ still waiting for a first reply: 121s"), text
+    assert "upstream" not in text and "Anthropic" not in text, text
