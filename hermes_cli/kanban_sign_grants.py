@@ -311,17 +311,18 @@ def _coverage_verdicts(body: str) -> list:
 # t_301365d1 (FLIP gate): the read side void-filters only review_coverage records, prism-verdict lines and
 # close-on release lines. Every other operator line grammar is honoured on author alone, so a granted body may
 # never carry one. Named grammars mirror their hermes-home readers, matched at least as broadly (anywhere in
-# the body, through markdown decoration), so an out-of-kind line is refused at the insert, never read later.
+# the body, through markdown decoration, with no left boundary: `-GATE-PROVEN:` / `xGATE-PROVEN:` are refused too,
+# Prism d9a6097a446f), so an out-of-kind line is refused at the insert, never read later.
 _DECOR = r"[ \t>*_`#~+\-]*"
 _OUT_OF_KIND = (
-    ("ACCEPTANCE-CLOSED", re.compile(r"(?<![\w-])ACCEPTANCE-(?:CLOSED|OPEN)[*_`]*[ \t]*:")),  # acceptance_marker
-    ("GATE-PROVEN", re.compile(r"(?<![\w-])GATE-PROVEN[*_`]*[ \t]*:")),                     # close_contract
-    ("gate_repair", re.compile(r"(?<![\w-])gate_repair[*_`]*[ \t]*:", re.I)),               # gate_repair
-    ("ungraded-run", re.compile(r"(?<![\w-])ungraded-run[*_`]*[ \t]*:", re.I)),             # new_red_gate
-    ("prism-scope", re.compile(r"(?<![\w-])prism-scope[*_`]*[ \t]*:", re.I)),               # prism-findings-route
-    ("prism-ruling", re.compile(r"(?<![\w-])prism-ruling[*_`]*[ \t]*:", re.I)),             # prism_ruling
+    ("ACCEPTANCE-CLOSED", re.compile(r"ACCEPTANCE-(?:CLOSED|OPEN)[*_`]*[ \t]*:")),  # acceptance_marker
+    ("GATE-PROVEN", re.compile(r"GATE-PROVEN[*_`]*[ \t]*:")),                     # close_contract
+    ("gate_repair", re.compile(r"gate_repair[*_`]*[ \t]*:", re.I)),               # gate_repair
+    ("ungraded-run", re.compile(r"ungraded-run[*_`]*[ \t]*:", re.I)),             # new_red_gate
+    ("prism-scope", re.compile(r"prism-scope[*_`]*[ \t]*:", re.I)),               # prism-findings-route
+    ("prism-ruling", re.compile(r"prism-ruling[*_`]*[ \t]*:", re.I)),             # prism_ruling
     ("OPERATOR OVERRIDE / CUT RULING",                                                      # round_cap_override,
-     re.compile(r"(?<![\w-])OPERATOR (?:CUT RULING|OVERRIDE)\b")),                          # prism-findings-route
+     re.compile(r"OPERATOR (?:CUT RULING|OVERRIDE)\b")),                          # prism-findings-route
 )
 # Any other marker-shaped line leading a line: a multi-word `UPPER-TOKEN:` / `UPPER TOKEN:` (the shape of every
 # operator marker above) or a `kebab-key:` / `snake_key:` (fixes-main-red:, ...), plus `deadman:`. Fail closed: a

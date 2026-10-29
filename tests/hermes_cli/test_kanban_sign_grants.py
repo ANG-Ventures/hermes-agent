@@ -493,6 +493,19 @@ def test_out_of_kind_line_inside_a_coverage_record_or_formatted_is_refused(board
     assert _rows(a) == []
 
 
+@pytest.mark.parametrize("kind", sorted(OUT_OF_KIND))
+@pytest.mark.parametrize("glue", ["-", "x", "_"])
+def test_out_of_kind_line_glued_onto_an_allowed_line_is_refused(board, kind, glue):
+    """Prism d9a6097a446f: a marker glued to a prefix inside a prism-verdict line has no left boundary to hide behind."""
+    _home, a, _b = board
+    g = _mint(a, verbs=sorted(ksg.VALID_VERBS))
+    body = "prism-verdict: 9e7e6653e13e fixed " + SHA + " " + glue + OUT_OF_KIND[kind]
+    assert ksg.out_of_kind_line(body) is not None
+    with pytest.raises(ksg.GrantRefused):
+        _child_comment(a, body, g["grant_id"])
+    assert _rows(a) == []
+
+
 def test_granted_prism_verdict_only_under_a_verdict_grant_is_accepted(board):
     _home, a, _b = board
     g = _mint(a, verbs=["verdict"])
