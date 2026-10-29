@@ -482,6 +482,26 @@ def _is_test_pass_counter(m) -> bool:
     )
 
 
+# ``PASS`` as a non-final ``_`` part (``MERGE_PASS_CARD_EVENT=0``, a review "pass") is
+# a word, not a password: masking it rewrote the agent's own stored turns and broke
+# prompt-cache replay (t_b924fb6d). Final ``*_PASS``, ``PASS``, ``PASSWORD``/``PASSWD``
+# and the credential compounds below still mask.
+_PASS_SECRET_NEXT_PARTS = frozenset({"PHRASE", "CODE", "WORD", "WD", "KEY", "FILE_CONTENT"})
+
+
+def _is_inner_pass_part(key: str, m) -> bool:
+    if m.group(0).lower() != "pass" or key[m.end():m.end() + 1] != "_":
+        return False
+    rest = key[m.end() + 1:]
+    return bool(rest) and rest.split("_", 1)[0].upper() not in _PASS_SECRET_NEXT_PARTS
+
+
+def _env_key_has_secret_keyword(key: str) -> bool:
+    """ENV-pass key validator: _key_has_secret_keyword minus an inner ``PASS`` part."""
+    return any(_is_word_start(key, m.start()) and _is_word_end(key, m.end()) and not _is_inner_pass_part(key, m)
+               for m in _KEY_KEYWORD_RE.finditer(key))
+
+
 def _key_has_secret_keyword(key: str) -> bool:
     """Post-match key validator: ``API_KEY``/``DB_PW`` count, ``KEYBOARD``/``secretary`` do not."""
     return _has_word_bounded_keyword(key, _KEY_KEYWORD_RE)
@@ -1017,6 +1037,8 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
                 return m.group(0)
             # ``PASS=174 FAIL=0`` test summary, not a password (fork #1025).
             if _is_test_pass_counter(m):
+                return m.group(0)
+            if not _env_key_has_secret_keyword(name):
                 return m.group(0)
             if not _should_redact_assignment(name, value, check_keyword=True):
                 return m.group(0)
