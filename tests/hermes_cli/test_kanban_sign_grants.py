@@ -254,6 +254,9 @@ def test_coverage_close_on_is_a_release_verb(board):
         _child_comment(a, body, g["grant_id"])
     assert _rows(a) == []
     g2 = _mint(a, verbs=["verdict", "release"])
+    with kb.connect_closing() as conn, kb.write_txn(conn):   # the release lands the card's own (non-parent) PR
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",
+                     (a, "daedalus", "done", 1, json.dumps({"pr_url": "https://github.com/acme/repo/pull/8"})))
     _child_comment(a, body, g2["grant_id"])
     assert [r["grant_id"] for r in _rows(a)] == [g2["grant_id"]]
 
@@ -578,3 +581,211 @@ def test_granted_comment_reads_expiry_time_inside_the_write_lock(board, monkeypa
         _child_comment(a, _approve(), g["grant_id"])
     monkeypatch.setattr(kb, "write_txn", real_txn)
     assert _rows(a) == []
+
+
+def test_a_revoked_grant_stays_revoked_through_a_journal_replay(board, tmp_path, monkeypatch):
+    """Prism a35d26840b79: the revoke is journaled, so restoring a snapshot taken while the grant was live
+    and replaying the journal tail brings the grant back revoked, never live."""
+    import shutil
+    import time as _time
+
+    from hermes_cli import kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    _home, a, _b = board
+    g = _mint(a)
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(kb.kanban_db_path()), str(snap))
+    since = _time.time() - 0.001
+    with kb.connect_closing() as conn:
+        assert ksg.revoke(conn, g["grant_id"]) == 1
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    rc.close()
+    assert len(rows) == 1 and rows[0][0] is not None, rows
+
+
+def test_a_revoke_on_another_board_is_journaled_to_that_board(board, tmp_path, monkeypatch):
+    """Prism c2baca2e9dd1: the revoke journals under the board its connection is open on, not the ambient
+    current board, so replaying the grant's own board journal brings the grant back revoked."""
+    import shutil
+    import time as _time
+
+    from hermes_cli import kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    kb.create_board("other")
+    with kb.connect_closing(board="other") as conn:
+        c = kb.create_task(conn, title="review card on other")
+    args = dict(cards=[c], verbs=["verdict", "approve"], by="apollo",
+                child_session_ref=kb.derive_session_ref(CHILD_SID), parent_model=MODEL, child_model=MODEL,
+                parent_profiles=["default", "apollo"])
+    with kb.connect_closing(board="other") as conn:
+        g = ksg.mint(conn, **args)
+    assert kb._journal_board_slug() != "other"
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(kb.kanban_db_path(board="other")), str(snap))
+    since = _time.time() - 0.001
+    with kb.connect_closing(board="other") as conn:
+        assert ksg.revoke(conn, g["grant_id"]) == 1
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into("other", snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    rc.close()
+    assert len(rows) == 1 and rows[0][0] is not None, rows
+
+
+def test_a_revoke_on_an_unregistered_copy_never_journals_into_the_ambient_board(board, tmp_path, monkeypatch):
+    """Prism 77b7e56c0d2c: a revoke on a connection no registered board matches (a snapshot or forensics
+    copy) writes no journal row, so restoring the ambient board and replaying leaves its grant live."""
+    import shutil
+    import time as _time
+
+    from hermes_cli import kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    _home, a, _b = board
+    g = _mint(a)
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(kb.kanban_db_path()), str(snap))
+    copy = tmp_path / "forensics-copy.db"
+    shutil.copyfile(str(kb.kanban_db_path()), str(copy))
+    since = _time.time() - 0.001
+    cc = sqlite3.connect(str(copy), isolation_level=None)
+    try:
+        assert ksg.revoke(cc, g["grant_id"]) == 1
+        assert cc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?",
+                          (g["grant_id"],)).fetchone()[0] is not None   # the UPDATE still happens
+    finally:
+        cc.close()
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    rc.close()
+    assert rows == [(None,)], rows
+
+
+def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
+    import shutil
+    import time as _time
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    g = _mint(a)
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(kb.kanban_db_path()), str(snap))
+    since = _time.time() - 0.001
+    with kb.connect_closing() as conn:
+        assert ksg.revoke(conn, g["grant_id"], now=now) == 1
+    return g, snap, since
+
+
+def test_a_failed_revocation_replay_raises_instead_of_restoring_the_grant_live(board, tmp_path, monkeypatch):
+    """Prism da22ed097c63: only a snapshot with no sign_grants table skips the revocation; any other
+    OperationalError on the UPDATE (disk full, a broken schema) fails the replay, never returns success."""
+    from hermes_cli import kanban_journal_replay
+
+    _home, a, _b = board
+    g, snap, since = _snapshot_then_revoke(a, tmp_path, monkeypatch)
+    sc = sqlite3.connect(str(snap))
+    sc.execute("CREATE TRIGGER t_fail BEFORE UPDATE ON sign_grants BEGIN SELECT no_such_fn_t73276888(); END")
+    sc.commit()
+    sc.close()
+    with pytest.raises(sqlite3.OperationalError):
+        kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, tmp_path / "restored.db", since=since)
+    sc = sqlite3.connect(str(snap))
+    sc.execute("DROP TABLE sign_grants")   # a pre-grant snapshot: nothing to revive, the replay succeeds
+    sc.commit()
+    sc.close()
+    res = kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, tmp_path / "pre.db", since=since)
+    assert res.grants_revoked == 0
+
+
+def test_a_revocation_at_time_zero_replays_as_zero(board, tmp_path, monkeypatch):
+    """Prism 0f1918273a42: an explicit revoked_at=0 is restored as 0, not swapped for the journal ts."""
+    from hermes_cli import kanban_journal_replay
+
+    _home, a, _b = board
+    g, snap, since = _snapshot_then_revoke(a, tmp_path, monkeypatch, now=0)
+    out = tmp_path / "restored.db"
+    kanban_journal_replay.replay_into(kb._journal_board_slug(), snap, out, since=since)
+    rc = sqlite3.connect(str(out))
+    rows = rc.execute("SELECT revoked_at FROM sign_grants WHERE grant_id = ?", (g["grant_id"],)).fetchall()
+    rc.close()
+    assert rows == [(0,)], rows
+
+
+def _record_pr(card, profile, pr):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) VALUES (?,?,?,?,?)",
+                     (card, profile, "done", 1, json.dumps({"pr_url": pr})))
+
+
+def test_an_implicit_release_is_checked_against_the_cards_own_prs(board):
+    """Prism 4fdc26d69c92: a bare `close-on: merged` names no PR, so the own-PR exclusion reads the PRs the
+    card itself records; one the parent run authored (on its own card) is refused. A card with no PR has no
+    candidate to exclude, so that release is stored (the read side never takes it as a gate, #2401)."""
+    _home, a, b = board
+    with kb.connect_closing() as conn:
+        bare = kb.create_task(conn, title="PR-less card")
+    g0 = _mint(bare, verbs=["verdict", "release"])
+    _child_comment(bare, "close-on: merged", g0["grant_id"])
+    assert [r["grant_id"] for r in _rows(bare)] == [g0["grant_id"]]
+    g = _mint(b, verbs=["verdict", "release"])
+    own = "https://github.com/acme/repo/pull/7"
+    _record_pr(a, "default", own)          # the parent run's own card and PR
+    _record_pr(b, "daedalus", own)         # card B lands that same PR
+    with pytest.raises(ksg.GrantRefused, match="authored"):
+        _child_comment(b, "close-on: merged", g["grant_id"])
+    assert _rows(b) == []
+    with kb.connect_closing() as conn:
+        c = kb.create_task(conn, title="review card C")
+    _record_pr(c, "daedalus", "https://github.com/acme/repo/pull/8")
+    g2 = _mint(c, verbs=["verdict", "release"])
+    _child_comment(c, "close-on: merged", g2["grant_id"])
+    assert [r["grant_id"] for r in _rows(c)] == [g2["grant_id"]]
+
+
+def _record_run(card, profile, *, metadata=None, summary=None):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata, summary) "
+                     "VALUES (?,?,?,?,?,?)",
+                     (card, profile, "done", 1, json.dumps(metadata) if metadata is not None else None, summary))
+
+
+def test_an_implicit_release_refuses_a_parent_pr_named_only_in_a_handoff_summary(board):
+    """Prism 2120e3fcb716: the release reader (kanban_session_closeout.card_prs) also takes a metadata-less
+    run's summary, so a parent-authored PR named only there must be an own-PR candidate too."""
+    _home, a, b = board
+    _record_pr(a, "default", "https://github.com/acme/repo/pull/7")          # parent run authored Y
+    _record_run(b, "daedalus", metadata={"pr_url": "https://github.com/acme/repo/pull/8"})   # X
+    _record_run(b, "daedalus", summary="handoff: landed acme/repo#7")       # Y, summary only
+    g = _mint(b, verbs=["verdict", "release"])
+    with pytest.raises(ksg.GrantRefused, match="authored"):
+        _child_comment(b, "close-on: merged", g["grant_id"])
+    assert _rows(b) == []
+
+
+def test_card_pr_keys_is_the_release_readers_pr_set(board):
+    """One resolver: the grant check's PR set equals what the bare merged release fires on."""
+    from hermes_cli.kanban_session_closeout import card_prs
+
+    _home, a, b = board
+    with kb.connect_closing() as conn:
+        c = kb.create_task(conn, title="result-only card")
+    _record_run(a, "daedalus", metadata={"pr_url": "https://github.com/acme/repo/pull/1"})
+    _record_run(a, "daedalus", summary="see acme/repo#2")
+    _record_run(b, "daedalus", summary="handoff names Acme/Repo#3")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET result = ? WHERE id = ?", ("merged acme/repo#4", c))
+    for card in (a, b, c):
+        with kb.connect_closing() as conn:
+            result = conn.execute("SELECT result FROM tasks WHERE id = ?", (card,)).fetchone()[0]
+            runs = [{"summary": s, "metadata": m} for s, m in conn.execute(
+                "SELECT summary, metadata FROM task_runs WHERE task_id = ? ORDER BY id", (card,))]
+            got = ksg.card_pr_keys(conn, card)
+        want = {f"{r.lower()}#{n}" for r, n in card_prs({"result": result, "runs": runs})}
+        assert want and got == want, (card, got, want)

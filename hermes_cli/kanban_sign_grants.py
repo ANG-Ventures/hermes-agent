@@ -27,11 +27,14 @@ anything but ``on`` refuses every mint and every granted write.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 import sqlite3
 import time
 from typing import Iterable, Optional
+
+logger = logging.getLogger(__name__)
 
 #: Verbs a grant may carry. ``verdict``: a review note / ``prism-verdict:`` line /
 #: non-verdict coverage record; ``approve``: an APPROVE coverage record;
@@ -152,6 +155,19 @@ def _run_meta_pr_keys(meta_text) -> set:
     return _pr_keys(recorded_pr_refs(meta))
 
 
+def card_pr_keys(conn: sqlite3.Connection, task_id: str) -> set:
+    """The card's own PRs (``owner/repo#N``), resolved by the SAME reader a bare merged release fires on
+    (``kanban_session_closeout.card_prs``: run metadata, a metadata-less run's summary, then the result),
+    so the own-PR check can never validate a narrower set than the release acts on (Prism 2120e3fcb716)."""
+    from hermes_cli.kanban_session_closeout import card_prs
+
+    row = conn.execute("SELECT result FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    runs = [{"summary": s, "metadata": m} for s, m in conn.execute(
+        "SELECT summary, metadata FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,))]
+    card = {"result": row[0] if row else None, "runs": runs}
+    return {f"{repo.lower()}#{number}" for repo, number in card_prs(card)}
+
+
 def authored_pr_keys(conn: sqlite3.Connection, profiles: Iterable[str], *, task_id: Optional[str] = None,
                      candidates: Iterable[str] = ()) -> set:
     """PRs a run of one of ``profiles`` recorded as its own: every such run on ``task_id``, plus any run on the
@@ -257,19 +273,59 @@ def revoke(conn: sqlite3.Connection, grant_id: str, *, now: Optional[int] = None
     from hermes_cli import kanban_db as kb
 
     now = int(time.time()) if now is None else int(now)
-    sql, args = "UPDATE sign_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL", [now, grant_id]
+    where, args = "grant_id = ? AND revoked_at IS NULL", [grant_id]
     if not kb._is_delegated_child():
         with kb.write_txn(conn):
-            return conn.execute(sql, args).rowcount
-    own_ref = executing_session_ref()
-    if not own_ref:
-        raise GrantRefused("a delegate child revokes only its own grant (no session bound)")
-    if not conn.execute("SELECT 1 FROM sign_grants WHERE grant_id = ? AND child_session_ref = ?",
-                        (grant_id, own_ref)).fetchone():
-        raise GrantRefused(f"grant {grant_id} belongs to another session; a child revokes only its own")
-    with kb.delegated_child_write(conn):
-        with kb.write_txn(conn):
-            return conn.execute(sql + " AND child_session_ref = ?", (*args, own_ref)).rowcount
+            cards = _revoke_rows(conn, where, args, now)
+    else:
+        own_ref = executing_session_ref()
+        if not own_ref:
+            raise GrantRefused("a delegate child revokes only its own grant (no session bound)")
+        if not conn.execute("SELECT 1 FROM sign_grants WHERE grant_id = ? AND child_session_ref = ?",
+                            (grant_id, own_ref)).fetchone():
+            raise GrantRefused(f"grant {grant_id} belongs to another session; a child revokes only its own")
+        with kb.delegated_child_write(conn):
+            with kb.write_txn(conn):
+                cards = _revoke_rows(conn, where + " AND child_session_ref = ?", [*args, own_ref], now)
+    # Journaled after commit, one record per card, so a snapshot + journal replay restores the grant
+    # revoked instead of live (Prism a35d26840b79). Best-effort, like every journal write. Under the
+    # board ``conn`` is open on, not the ambient one, since replay reads only the restored board's
+    # journal (Prism c2baca2e9dd1).
+    try:
+        from hermes_cli import kanban_journal
+
+        board = _conn_board_slug(conn)
+        if board is None and cards:
+            # No registered board owns this file (a snapshot, a forensics copy): journaling under the
+            # ambient board would revoke ITS live grant on the next restore (Prism 77b7e56c0d2c).
+            logger.warning("sign grant %s revoked on an unregistered board connection; "
+                           "revocation not journaled", grant_id)
+        for card in (cards if board is not None else ()):
+            kanban_journal.append(board, card, "sign_grant_revoked",
+                                  {"grant_id": grant_id, "revoked_at": now})
+    except Exception:  # pragma: no cover - the journal is a net, never a gate
+        pass
+    return len(cards)
+
+
+def _conn_board_slug(conn: sqlite3.Connection) -> Optional[str]:
+    """The board whose database file ``conn`` is open on; None when no registered board matches."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_board_registry import board_db_layout
+
+    try:
+        for slug, _path in board_db_layout():
+            if kb._conn_is_board(conn, slug):
+                return slug
+    except Exception:
+        return None
+    return None
+
+
+def _revoke_rows(conn: sqlite3.Connection, where: str, args: list, now: int) -> list:
+    cards = [r[0] for r in conn.execute(f"SELECT task_id FROM sign_grants WHERE {where}", args)]
+    conn.execute(f"UPDATE sign_grants SET revoked_at = ? WHERE {where}", [now, *args])
+    return cards
 
 
 def executing_session_ref() -> Optional[str]:
@@ -423,8 +479,14 @@ def validate_comment(
     missing = body_verbs(body) - allowed
     if missing:
         raise GrantRefused(f"grant {grant_id} does not carry verb(s) {sorted(missing)} (has {sorted(allowed)})")
+    candidates = body_pr_keys(body)
+    if "release" in body_verbs(body):
+        # A bare `close-on: merged` names no PR: it releases the card on ITS PRs, so those are candidates
+        # too (Prism 4fdc26d69c92). With none there is nothing to exclude: the row is stored grant-marked
+        # and the read side never treats it as a gate (#2401 release-guard contract).
+        candidates |= card_pr_keys(conn, task_id)
     own = authored_pr_keys(conn, json.loads(row["parent_profiles"] or "[]"), task_id=task_id,
-                           candidates=body_pr_keys(body))
+                           candidates=candidates)
     if own:
         raise GrantRefused(f"grant {grant_id} never covers PR(s) {sorted(own)} its parent run authored")
     return row
