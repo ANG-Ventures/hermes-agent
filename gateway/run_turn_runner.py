@@ -1048,6 +1048,14 @@ class TurnRunner:
                 self._queue_undelivered_route_notice(event_type, prepared)
                 return
             if is_route_change:
+                # The delivered leg is logged like the dropped/muted ones, so gateway.log alone
+                # answers "did chat X get the 🔄 line" (t_f1f73872: its absence read as a miss).
+                logger.info(
+                    "route-change status delivered: platform=%s chat=%s message=%s",
+                    getattr(ctx.source.platform, "value", ctx.source.platform) or "unknown",
+                    ctx._status_chat_id,
+                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+                )
                 # The platform is reachable again: flush anything queued.
                 self._flush_route_notice_outbox()
                 return  # route announcements are durable messages, not temporary progress
