@@ -497,7 +497,10 @@ _PASS_NON_SECRET_NEXT_PARTS = frozenset({
 def _is_inner_pass_part(key: str, m) -> bool:
     if m.group(0).lower() != "pass" or key[m.end():m.end() + 1] != "_":
         return False
-    return key[m.end() + 1:].split("_", 1)[0].upper() in _PASS_NON_SECRET_NEXT_PARTS
+    # Prism e565ccfc9b25: EVERY part after PASS must be a known non-secret word, not only the
+    # first one (DB_PASS_CARD_PROD=x is a password: PROD is not on the list, so it masks).
+    rest = key[m.end() + 1:].split("_")
+    return bool(rest) and all(p and p.upper() in _PASS_NON_SECRET_NEXT_PARTS for p in rest)
 
 
 def _env_key_has_secret_keyword(key: str) -> bool:

@@ -50,3 +50,15 @@ def test_password_names_still_masked(text, secret):
     out = redact_sensitive_text(text, force=True)
     assert "***" in out, out
     assert secret not in out, out
+
+
+@pytest.mark.parametrize("line", [
+    "DB_PASS_CARD_PROD=x",          # Prism e565ccfc9b25: a known word followed by a qualifier
+    "DB_PASS_EVENT_SECRET=x",
+    "ROOT_PASS_COUNT_OLD=x",
+    "MYSQL_PASS_CARD_=x",           # empty trailing part never exempts
+])
+def test_every_part_after_pass_must_be_non_secret(line):
+    """Prism e565ccfc9b25: the exemption reads all parts after PASS, not only the first."""
+    out = redact_sensitive_text(line, force=True)
+    assert out != line and "=x" not in out, out
