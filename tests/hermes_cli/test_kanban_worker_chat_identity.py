@@ -197,3 +197,34 @@ def test_foreign_root_env_names_its_own_board(monkeypatch, tmp_path):
     chat_id, chat_name = resolve_kanban_worker_chat_identity(env=env)
     assert chat_id == "t_12345678"
     assert chat_name == "kanban / beta / t_12345678"
+
+
+def test_foreign_env_tilde_kanban_home_expands_against_env_home(monkeypatch, tmp_path):
+    """Prism 9342cb794d7b: a described env's ``HERMES_KANBAN_HOME=~/.hermes`` expands against
+    THAT env's ``HOME``, never the process HOME, so its pin resolves in its own registry."""
+    from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
+    operator_home = tmp_path / "operator"
+    worker_home = tmp_path / "worker"
+    worker_root = worker_home / ".hermes"
+    operator_root = operator_home / ".hermes"
+    for root in (operator_root, worker_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HOME", str(worker_home))
+    monkeypatch.setenv("HERMES_HOME", str(worker_root))
+    kb.create_board("alpha")  # board alpha exists ONLY under the worker's root
+    alpha_db = worker_root / "kanban" / "boards" / "alpha" / "kanban.db"
+    assert alpha_db.parent.is_dir()
+    monkeypatch.setenv("HOME", str(operator_home))  # the process HOME is the operator's
+    monkeypatch.setenv("HERMES_HOME", str(operator_root))
+
+    env = {
+        "HOME": str(worker_home),
+        "HERMES_KANBAN_HOME": "~/.hermes",
+        "HERMES_KANBAN_DB": str(alpha_db),
+        "HERMES_KANBAN_TASK": "t_example",
+    }
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")

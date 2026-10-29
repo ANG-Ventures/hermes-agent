@@ -53,6 +53,10 @@ def _env_kanban_root(env: Mapping[str, str]):
 
     explicit = (env.get("HERMES_KANBAN_HOME") or "").strip()
     if explicit:
+        # Prism 9342cb794d7b: ``~`` is the described env's HOME, not this process's.
+        env_home = (env.get("HOME") or "").strip()
+        if env_home and (explicit == "~" or explicit.startswith("~/")):
+            return Path(env_home + explicit[1:])
         return Path(explicit).expanduser()
     home = (env.get("HERMES_HOME") or "").strip()
     if not home:

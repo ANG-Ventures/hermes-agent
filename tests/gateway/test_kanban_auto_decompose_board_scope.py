@@ -115,3 +115,38 @@ async def test_decompose_loop_scopes_its_board_to_its_own_thread(loop):
     assert seen["other_thread"] == kb.DEFAULT_BOARD, seen
     # The loop leaves no process-global pointer behind.
     assert "HERMES_KANBAN_BOARD" not in os.environ
+
+
+@pytest.mark.kanban_bare_verb_refuse
+def test_shipped_dispatcher_unit_names_its_board(tmp_path, monkeypatch):
+    """Prism 56158c7d096a: under the shipped bare-verb refusal the standalone dispatcher unit's
+    ExecStart must resolve a board on its own (no pin, no current-board file), else the unit
+    exits 2 and crash-loops under systemd. ``daemon`` stays out of BOARD_AGNOSTIC_VERBS."""
+    import argparse
+    import shlex
+
+    from hermes_cli import kanban as kanban_cli
+    from hermes_cli import kanban_board_select as kbsel
+
+    unit = (Path(hermes_cli.__file__).resolve().parent.parent / "plugins" / "kanban" / "systemd"
+            / "hermes-kanban-dispatcher.service")
+    exec_start = next(line.split("=", 1)[1] for line in unit.read_text(encoding="utf-8").splitlines()
+                      if line.startswith("ExecStart="))
+    argv = shlex.split(exec_start.replace("%t", str(tmp_path)))
+    argv = argv[argv.index("kanban"):]
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_HOME"):
+        monkeypatch.delenv(key, raising=False)
+    assert "daemon" not in kbsel.BOARD_AGNOSTIC_VERBS
+    assert kbsel.bare_verb_policy() == kbsel.BARE_VERB_REFUSE
+
+    root = argparse.ArgumentParser(prog="hermes")
+    kanban_cli.build_parser(root.add_subparsers(dest="command"))
+    ns = root.parse_args(argv)
+    assert ns.kanban_action == "daemon"
+    board = getattr(ns, "verb_board", None) or ns.board
+    assert kbsel.resolve_slug(board, verb="daemon", card_ids=kbsel.card_ids_of(ns)) == kb.DEFAULT_BOARD
