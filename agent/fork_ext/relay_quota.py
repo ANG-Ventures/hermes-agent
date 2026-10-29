@@ -1,4 +1,7 @@
 """Remote relay quota evidence for the main turn's existing exhaustion path."""
+import datetime as _dt
+from typing import Any, Mapping, Optional
+
 from agent.error_classifier import FailoverReason
 from agent.fallback_events import relay_error_class
 from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS
@@ -43,3 +46,51 @@ def relay_quota_outlasts_retry_window(agent, error, classified) -> bool:
         and str(value).strip().lower() == "rejected"
         for name, value in (headers.items() if headers is not None else ())
     )
+
+
+# t_634b4ddf: a relay "pool at capacity" refusal for a Fable request while the
+# relay's own Fable allowance header says at most this many seats have allowance
+# left is the per-model allowance, not concurrency saturation. 2026-10-28 20:02:
+# 25/26 seats capped, the one left busy, banner read "relay busy: all subs at
+# capacity". With 10 eligible seats all saturated the refusal stays "relay busy".
+FABLE_CAP_MAX_LEFT = 2
+
+
+def fable_cap_busy(row: Mapping[str, Any]) -> Optional[dict]:
+    """``{left, of, earliest_reset}`` when a ``pool_pressure`` refusal arrived with
+    ``x-pool-fable-allowance`` (parsed onto the row as ``fable_allowance``)
+    stating at most :data:`FABLE_CAP_MAX_LEFT` seats with Fable allowance left,
+    else None. Reads only what the refusal carried. Never raises."""
+    try:
+        if row.get("trigger_class") != "pool_pressure":
+            return None
+        fa = row.get("fable_allowance")
+        if not isinstance(fa, Mapping):
+            return None
+        n, m = fa.get("exhausted"), fa.get("of")
+        if (not isinstance(n, int) or not isinstance(m, int) or isinstance(n, bool)
+                or n <= 0 or m <= 0 or n > m):
+            return None
+        left = m - n
+        elig = row.get("pool_eligible")
+        if left > FABLE_CAP_MAX_LEFT or (isinstance(elig, int) and elig > FABLE_CAP_MAX_LEFT):
+            # A wide eligible set that is all busy is concurrency, not the cap.
+            return None
+        return {"left": left, "of": m, "earliest_reset": fa.get("earliest_reset")}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def fable_cap_busy_text(cap: Mapping[str, Any], tz: Optional[_dt.tzinfo] = None) -> str:
+    """``1 of 26 seats has Fable allowance left and it is busy; earliest reset Thu 17:00``."""
+    left, of = int(cap["left"]), int(cap["of"])
+    if left == 0:
+        text = f"0 of {of} seats have Fable allowance left"
+    elif left == 1:
+        text = f"1 of {of} seats has Fable allowance left and it is busy"
+    else:
+        text = f"{left} of {of} seats have Fable allowance left and all are busy"
+    reset = cap.get("earliest_reset")
+    if isinstance(reset, (int, float)) and not isinstance(reset, bool):
+        text += f"; earliest reset {_dt.datetime.fromtimestamp(float(reset), tz).strftime('%a %H:%M')}"
+    return text
