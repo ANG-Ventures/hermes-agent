@@ -347,7 +347,6 @@ async def test_manual_reset_persisted_entry_wins_map_divergence(store, monkeypat
     assert runner._session_model_overrides[old.session_key]["model"] == "gpt-5.6-sol"
     assert runner._session_model_overrides[old.session_key]["api_key"] == "fresh-runtime-secret"
     assert runner._session_reasoning_overrides[old.session_key] == REASONING_NONE
-    assert old.session_key not in runner._pending_model_notes
     assert "Preserved explicit model and reasoning preferences" in str(reply)
     assert "/model reset" in str(reply)
     assert "/reasoning reset" in str(reply)

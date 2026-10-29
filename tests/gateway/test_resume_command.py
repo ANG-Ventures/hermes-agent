@@ -121,19 +121,13 @@ class TestHandleResumeCommand:
             key: {"model": "gpt-5", "provider": "openai"},
             "agent:main:telegram:dm:other": {"model": "keep-me"},
         }
-        runner._pending_model_notes = {
-            key: "[Note: switched to gpt-5]",
-            "agent:main:telegram:dm:other": "[Note: keep-me]",
-        }
 
         await runner._handle_resume_command(event)
         assert runner.session_store.switch_session.call_args.kwargs["preserve_prompt_pin"] is False
-        # The resumed chat's override + pending note are cleared...
+        # The resumed chat's override is cleared...
         assert key not in runner._session_model_overrides
-        assert key not in runner._pending_model_notes
         # ...but an unrelated chat's state is untouched.
         assert runner._session_model_overrides["agent:main:telegram:dm:other"] == {"model": "keep-me"}
-        assert runner._pending_model_notes["agent:main:telegram:dm:other"] == "[Note: keep-me]"
         db.close()
 
     @pytest.mark.asyncio
