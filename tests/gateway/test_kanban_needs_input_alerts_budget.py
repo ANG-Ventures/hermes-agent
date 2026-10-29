@@ -147,3 +147,49 @@ def test_failed_first_mirror_is_retried_once_on_repage(monkeypatch, tmp_path):
 def test_delivered_mirror_is_never_repeated(monkeypatch, tmp_path):
     per_tick = _pager_ticks(monkeypatch, tmp_path, [True])
     assert per_tick == [[["--sev", "error"]], [], []]
+
+
+# r2 (Prism 7dfa6f11a80d): a card homed in #alerts has its own "alerts-first"
+# ledger entry, so one raised over the floor after paging #logs below it still
+# gets its first #alerts page, exactly once.
+def _alerts_homed_ticks(monkeypatch, tmp_path, priorities, alerts_results=None):
+    monkeypatch.delenv("DISCORD_ALERTS_CHANNEL", raising=False)
+    monkeypatch.delenv("DISCORD_LOGS_CHANNEL", raising=False)
+    monkeypatch.setattr(kw, "_alert_notify_script", lambda: tmp_path / "notify.py")
+    results = iter(alerts_results or [])
+    out: list = []
+
+    def fake_send(script, msg, extra):
+        out.append(extra)
+        return next(results, True) if extra == ["--target", ALERTS] else True
+
+    monkeypatch.setattr(kw, "_notify_send", fake_send)
+    per_tick = []
+    for n, priority in enumerate(priorities):
+        out.clear()
+        cards = [("default", _item(ALERTS, priority, priority >= 200))]
+        pager = kw._NeedsInputPager(tmp_path / "ledger.json")
+        pager.observe(cards, kw._send_needs_input_page, {"default"},
+                      now=1000.0 + n * (_REPAGE + 1))
+        per_tick.append(list(out))
+    return per_tick
+
+
+def test_alerts_homed_card_raised_over_floor_gets_first_alerts_page_once(monkeypatch, tmp_path):
+    per_tick = _alerts_homed_ticks(monkeypatch, tmp_path, [50, 200, 200, 200])
+    assert per_tick == [
+        [["--target", LOGS]],    # p50 at t=1000: below the floor
+        [["--target", ALERTS]],  # raised to p200: first #alerts page
+        [["--target", LOGS]],    # later pages follow the re-page rule
+        [["--target", LOGS]],
+    ]
+
+
+def test_failed_first_alerts_page_is_retried(monkeypatch, tmp_path):
+    per_tick = _alerts_homed_ticks(monkeypatch, tmp_path, [50, 200, 200, 200],
+                                   alerts_results=[False, True])
+    # The failed send stays due, so the next tick (same window) retries it.
+    assert per_tick[0] == [["--target", LOGS]]
+    assert per_tick[1] == [["--target", ALERTS]]
+    assert per_tick[2] == [["--target", ALERTS]]
+    assert per_tick[3] == [["--target", LOGS]]

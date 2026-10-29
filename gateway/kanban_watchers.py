@@ -1333,12 +1333,18 @@ class _NeedsInputPager(_GuardStuckNotifier):
     # mirror lost to a transient failure is retried on the next page, and a
     # delivered one is never repeated.
     _MIRROR_SUFFIX = "|alerts-mirror"
+    # Same pattern for a card homed in #alerts (t_d36da044 r2, Prism
+    # 7dfa6f11a80d): set only when a page to #alerts itself returned True. A
+    # card whose earlier pages went to #logs (below the floor) and is later
+    # raised over it still gets its first #alerts page.
+    _ALERTS_FIRST_SUFFIX = "|alerts-first"
 
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
         deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
-        current |= {key + self._MIRROR_SUFFIX for key in current}
+        current |= {key + suffix for key in current
+                    for suffix in (self._MIRROR_SUFFIX, self._ALERTS_FIRST_SUFFIX)}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
         before = dict(self._sent)
@@ -1367,12 +1373,16 @@ class _NeedsInputPager(_GuardStuckNotifier):
             if time.monotonic() >= deadline:
                 break
             mirror_key = key + self._MIRROR_SUFFIX
-            page = dict(item, alerts_mirror_due=mirror_key not in self._sent)
+            first_key = key + self._ALERTS_FIRST_SUFFIX
+            page = dict(item, alerts_mirror_due=mirror_key not in self._sent,
+                        alerts_first_due=first_key not in self._sent)
             if send(board, page, last is not None):
                 self._sent[key] = now
                 delivered += 1
             if page.get("alerts_mirror_delivered"):
                 self._sent[mirror_key] = now
+            if page.get("alerts_first_delivered"):
+                self._sent[first_key] = now
         if self._sent != before:
             self._save()
         return delivered
@@ -1440,8 +1450,18 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
         below_floor = int(item.get("priority") or 0) < NEEDS_INPUT_PAGE_MIN_PRIORITY
     except (TypeError, ValueError):
         below_floor = True
-    if channel and str(channel) == alerts_ch and (still_waiting or below_floor):
-        return _notify_send(script, message, ["--target", logs_ch])
+    if channel and str(channel) == alerts_ch:
+        # #alerts gets the card's first page once it is at or above the floor,
+        # whatever still_waiting says: the pager sets ``alerts_first_due`` from
+        # its own ledger entry and reads back ``alerts_first_delivered``. A
+        # direct caller without the flag keeps the first-page-only rule.
+        first_due = item.get("alerts_first_due", not still_waiting)
+        if below_floor or not first_due:
+            return _notify_send(script, message, ["--target", logs_ch])
+        ok = _notify_send(script, message, ["--target", alerts_ch])
+        if ok:
+            item["alerts_first_delivered"] = True
+        return ok
     if channel:
         ok = _notify_send(script, message, ["--target", str(channel)])
         # The pager sets ``alerts_mirror_due`` from its own mirror ledger entry
