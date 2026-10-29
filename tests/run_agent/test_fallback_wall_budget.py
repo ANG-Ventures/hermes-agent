@@ -749,3 +749,17 @@ def test_stage_is_never_read_off_a_non_relay_or_non_loopback_lane():
     opened: list = []
     assert _REAL_FETCH_RELAY_STAGE("https://api.example.com/v1", "s", opener=opened.append) is None
     assert opened == []
+
+
+@pytest.mark.parametrize("since", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_since_ms_from_the_relay_never_raises(since):
+    """Prism 68a4a9cd4e90: json.loads accepts NaN/Infinity; int() of them raised out of
+    notice_due and would end the stream monitor thread. The stage still names the hop."""
+    import json
+    raw = json.dumps({"stage": "relay_send", "seat": "sub-vps-7", "since_ms": since})
+    base, _seen, stop = _inflight_relay(json.loads(raw))
+    try:
+        assert _stage_notice(base) == (
+            "⏳ request still uploading to sub-vps-7 (our uplink): 121s elapsed; cut at 600s")
+    finally:
+        stop()

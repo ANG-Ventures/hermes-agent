@@ -37,6 +37,7 @@ p90 168 s / max 275 s on 2026-10-11): it ends dead air, not slow turns.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Optional
 
@@ -368,8 +369,10 @@ def _relay_stage_phrase(agent: Any) -> Optional[str]:
         return None
     seat = info.get("seat") if isinstance(info.get("seat"), str) and info.get("seat") else None
     since_ms = info.get("since_ms")
+    # json.loads accepts NaN/Infinity; int() of those raises in the monitor thread.
     in_stage = (f" for {int(since_ms // 1000)}s"
-                if isinstance(since_ms, (int, float)) and not isinstance(since_ms, bool) else "")
+                if isinstance(since_ms, (int, float)) and not isinstance(since_ms, bool)
+                and math.isfinite(since_ms) else "")
     stage = info.get("stage")
     if stage == "relay_send":
         return f"request still uploading to {seat or 'the pool seat'} (our uplink){in_stage}"
