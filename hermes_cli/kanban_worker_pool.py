@@ -58,7 +58,23 @@ ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
 # Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
 # until hermes-home drops the count (t_1acfaa85). Every other role keeps its count.
-COUNT_FREE_ROLES = frozenset({"ci-runner"})
+# kanban-worker joined (t_c834e0d8, bug class A: admission is measured use, never
+# a count): ``{}`` parses to ``PoolHost.slots = None``; a legacy count stays a ceiling.
+COUNT_FREE_ROLES = frozenset({"ci-runner", ROLE})
+# A count-free kanban host's free slots for ONE plan (t_c834e0d8). A per-tick
+# stand-in so ``plan.slots`` / ``budget`` / load_gate.json stay finite ints; it is
+# not a concurrency count (running workers are not subtracted). Measured
+# admission decides: allocd / the placement ledger per take, the band and the
+# memory cap per plan. Equal to the fleet-roles slots maximum (1..64).
+UNCOUNTED_TICK_FREE = 64
+
+
+def count_free(h: "PoolHost", running: int) -> int:
+    """Free pool slots on ``h`` from its count alone: ``slots - running`` for a
+    legacy count, :data:`UNCOUNTED_TICK_FREE` for a count-free host."""
+    if h.slots is None:
+        return UNCOUNTED_TICK_FREE
+    return max(0, h.slots - running)
 # Per-worker-host SSH reach matrix (card t_1e9ea7e9): written daily by the
 # hermes-home no_agent cron ``kanban-reach-matrix`` (``ssh -o BatchMode=yes
 # <alias> true`` from EVERY worker host, rc recorded), read here fail-closed.
@@ -192,7 +208,7 @@ class PoolHost:
     name: str
     ssh_host: str
     ssh_user: str
-    slots: int
+    slots: Optional[int]   # None = count-free (fleet-roles ``kanban-worker: {}``)
     capacity_pct: float
     absence: str
     profiles: Tuple[str, ...]
@@ -273,7 +289,8 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
             if not isinstance(role, str) or not _ROLE_RE.fullmatch(role):
                 raise PoolError(f"fleet-roles.json: host {hid}: bad role {role!r}")
             if role in COUNT_FREE_ROLES and spec == {}:
-                # Membership only (t_940fc400): the per-box allocator owns CI capacity.
+                # Membership only (t_940fc400): the per-box allocator owns CI capacity;
+                # for kanban-worker, measured admission does (t_c834e0d8).
                 parsed[role] = None
                 continue
             if not isinstance(spec, dict) or set(spec) != {"slots"}:
@@ -2064,7 +2081,7 @@ def _plan_v01(hosts, running_by_host, *, probe, disabled, planned_at, config,
     detail: Dict[str, dict] = {}
     for h in sorted(hosts, key=lambda x: x.priority):
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
+        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         probed = free > 0
         sample = _probe_states(probe, h, probed, workspace_paths.get(h.name, ()), states)
         load1: Optional[float] = None
@@ -2118,7 +2135,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     samples: Dict[str, Tuple[Optional[float], str]] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
+        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
                "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "boards": None}

@@ -130,7 +130,7 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
         if h.state != "active":
             return 0
         running = int(_num(row.get("running")) or 0)
-        return max(0, min(int(_num(row.get("free")) or 0), h.slots - running))
+        return max(0, min(int(_num(row.get("free")) or 0), kwp.count_free(h, running)))
 
     slots = {h.name: _free_now(h) for h in hosts}
     detail = {h.name: {k: v for k, v in _map(tick_hosts.get(h.name)).items() if k != "free"}
