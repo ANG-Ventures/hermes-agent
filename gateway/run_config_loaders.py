@@ -195,9 +195,11 @@ class GatewayConfigLoadersMixin:
             return
         # Per-session field write: a lazy ``_session_reasoning_overrides = {}`` init replaced the
         # WHOLE dict, racing concurrent sessions; a SessionState field reset cannot cross sessions.
-        self._session_state(session_key).conversation.reasoning_override = (
-            None if reasoning_config is None else dict(reasoning_config)
-        )
+        conversation = self._session_state(session_key).conversation
+        conversation.reasoning_override = None if reasoning_config is None else dict(reasoning_config)
+        # Until the persisted copy is nulled, a clear stays pending: the rehydrate below must not
+        # restore the override the user just cleared, and it retries the write each turn.
+        conversation.reasoning_clear_pending = reasoning_config is None
         # Write through so the override survives a gateway restart, mirroring the /model leg.
         # Clearing (None) nulls the persisted field too, so a later rehydrate cannot undo it.
         store = getattr(self, "session_store", None)
@@ -207,6 +209,8 @@ class GatewayConfigLoadersMixin:
             store.set_reasoning_override(session_key, reasoning_config)
         except Exception:
             logger.debug("Failed to persist session reasoning override", exc_info=True)
+            return
+        conversation.reasoning_clear_pending = False
 
     def _rehydrate_session_reasoning_override(self, session_key: str) -> None:
         """Lazily restore a persisted /reasoning override after a restart (mirrors
@@ -218,6 +222,15 @@ class GatewayConfigLoadersMixin:
             return
         store = getattr(self, "session_store", None)
         if store is None:
+            return
+        if state is not None and state.conversation.reasoning_clear_pending:
+            # A clear whose write-through failed: retry it, and never restore the stale copy.
+            try:
+                store.set_reasoning_override(session_key, None)
+            except Exception:
+                logger.debug("Retry of a failed reasoning-override clear failed", exc_info=True)
+                return
+            state.conversation.reasoning_clear_pending = False
             return
         try:
             persisted = store.get_reasoning_override(session_key)
