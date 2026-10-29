@@ -875,3 +875,47 @@ def test_unproven_operator_create_override_does_not_preauthorize_reassign(flagsh
         authors = [c.author for c in kb.list_comments(conn, task_id)]
         assert len(authors) == 1 and authors[0].startswith("unverified:"), authors
         assert not kb._card_flagship_authorized(conn, task_id)
+
+
+# ---- Prism r8 7018f089fcce: a read error on an EXISTING profile fails closed --
+# `None` means "no route to gate" (missing profile / human sentinel) only; a
+# config that exists but cannot be read is an unknown route, not an admitted one.
+
+def _assert_unresolved_gated(name: str) -> None:
+    out = kc.run_slash(f"create 'GATE-PROBE' --assignee {name}")
+    assert f"cannot resolve {name} model default" in out, out
+    assert _card_count() == 0
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (name, task_id))
+        conn.commit()
+        assert task_id in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+
+
+def test_profile_config_read_oserror_fails_closed(flagship_profiles, monkeypatch):
+    from hermes_cli import config as vcfg
+
+    _raw_profile(flagship_profiles, "worker-eio",
+                 "model:\n  default: claude-opus-5-5\n  provider: claude-apr\n")
+    real = vcfg.read_user_config_raw
+
+    def flaky(path=None):
+        if path is not None and "worker-eio" in str(path):
+            raise OSError(5, "Input/output error")
+        return real(path)
+
+    monkeypatch.setattr(vcfg, "read_user_config_raw", flaky)
+    _assert_unresolved_gated("worker-eio")
+
+
+def test_profile_config_bad_yaml_fails_closed(flagship_profiles):
+    _raw_profile(flagship_profiles, "worker-badyaml", "model: [unclosed\n  default: x\n")
+    _assert_unresolved_gated("worker-badyaml")
+
+
+def test_missing_profile_and_human_stay_ungated(flagship_profiles):
+    from hermes_cli.model_policy import assignee_default_model
+
+    assert assignee_default_model("no-such-profile") is None
+    assert assignee_default_model("human") is None
+    assert assignee_default_model("human:ace") is None

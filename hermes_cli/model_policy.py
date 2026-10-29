@@ -142,20 +142,27 @@ def assignee_default_model(assignee: Optional[str]) -> Optional[str]:
     secret scope (its ``.env`` + secret sources), bound by the same helper the
     dispatcher uses for the worker's spawn env, never the caller's env
     (Prism 858c7319e28f, 13a34c96f1e2). A missing profile or the human
-    sentinel resolves to ``None`` (no route to gate).
+    sentinel resolves to ``None`` (no route to gate). Any error reading an
+    EXISTING profile (OSError, bad YAML, scope bind) is an unknown route and
+    returns the unresolved sentinel, which the gate fails closed on (Prism r8
+    7018f089fcce): "could not read" must never mean "nothing to gate".
     """
     name = str(assignee or "").strip()
     if not name or name == "human" or name.startswith("human:"):
         return None
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        home = resolve_profile_env(name)
+    except (FileNotFoundError, ValueError):
+        return None  # no such (or no valid) profile: no route to gate
     try:
         from hermes_cli.kanban_db_dispatch import _worker_profile_scope
-        from hermes_cli.profiles import resolve_profile_env
 
-        home = resolve_profile_env(name)
         with _worker_profile_scope(home, bind_home=False):
             return _resolve_profile_default_model(home)
-    except Exception:
-        return None
+    except Exception as exc:
+        return f"{UNRESOLVED_ROUTE_PREFIX} {type(exc).__name__} reading {name} config>"
 
 
 def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
