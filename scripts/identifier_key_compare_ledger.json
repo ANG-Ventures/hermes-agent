@@ -601,6 +601,26 @@
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), and worker_draft_repos() folds its set the same way, so the folded repo IS the canonical key; byte-exact would miss a worker-draft repo written in another case.",
    "where": "hermes_cli/kanban_pr_freshness.py:309 _owns_draft"
+  },
+  "hermes_cli/kanban_sign_grants.py::operator_rows_with_live_grants::sql::author LIKE::for r in conn.execute(f\"SELECT {sel} FROM task_comments WHERE task_id = ? AND author LIKE ? ORDER BY id\",": {
+   "verdict": "kept",
+   "why": "prefilter on the constant granted-author shape `[grant:g-%] % (subagent)` (no identifier key bound into the pattern); every matched row is re-parsed by parse_granted_author and its grant fetched by exact id (get(conn, gid, task_id)) before it counts, so the LIKE cannot admit a wrong grant.",
+   "where": "hermes_cli/kanban_sign_grants.py:125 operator_rows_with_live_grants"
+  },
+  "hermes_cli/kanban_sign_grants.py::_pr_keys::fold::repo::return {f\"{r.repo.lower()}#{r.number}\" for t in texts for r in parse_pr_refs(str(t or \"\"), default_repo=None)}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_sign_grants.py:145 _pr_keys"
+  },
+  "hermes_cli/kanban_sign_grants.py::card_pr_keys::fold::repo::return {f\"{repo.lower()}#{number}\" for repo, number in card_prs(card)}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_sign_grants.py:168 card_pr_keys"
+  },
+  "hermes_cli/kanban_sign_grants.py::authored_pr_keys::sql::metadata LIKE::f\"SELECT metadata FROM task_runs WHERE profile IN ({marks}) AND metadata LIKE ?\",": {
+   "verdict": "kept",
+   "why": "`%<number>%` is a candidate prefilter on run-metadata JSON; each matched row is re-parsed by _run_meta_pr_keys and intersected with the exact `owner/repo#N` key, so the LIKE cannot admit a wrong PR.",
+   "where": "hermes_cli/kanban_sign_grants.py:188 authored_pr_keys"
   }
  }
 }
