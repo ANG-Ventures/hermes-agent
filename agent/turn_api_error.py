@@ -481,6 +481,8 @@ def settle_unrecovered_error(
     note_sleep(agent, wait_time)
     _wb_notice = _wb_notice_due(agent)
     if _wb_notice:
+        from agent.fallback_cause import flush_banner
+        flush_banner(agent)   # t_634b4ddf: the held fallback line posts first
         agent._emit_diagnostic_status(_wb_notice)
     _interrupted = interruptible_backoff_sleep(
         agent, wait_time, _retry, messages=messages, conversation_history=conversation_history,

@@ -43,6 +43,8 @@ class StreamingWaitMonitor:
         lane on another model is ahead. True = the attempt was cut."""
         notice = wb.notice_due(self.agent)
         if notice:
+            from agent.fallback_cause import flush_banner
+            flush_banner(self.agent)   # t_634b4ddf: the held fallback line posts first
             self.agent._emit_diagnostic_status(notice)
         if wb.should_cut_attempt(self.agent):
             self._cut_for_wall_budget()
