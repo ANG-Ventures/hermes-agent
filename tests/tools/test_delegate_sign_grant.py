@@ -157,7 +157,7 @@ def _facade_agent():
         agent = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
                         skip_context_files=True, skip_memory=True)
     agent.client = MagicMock()
-    agent.model = agent._dispatched_model = MODEL
+    agent.model = MODEL
     agent._delegate_depth = 0
     return agent
 
@@ -174,6 +174,7 @@ def test_every_parent_turn_exit_revokes_its_grants(board, exit_kind):
     seen = {}
 
     def fake_loop(ag, *_a, **_kw):
+        ag._dispatched_model = MODEL  # the call that served this turn
         g = dsg.mint_for_child(_task(board), child, ag)
         dsg.register_turn_grants(ag, [g])
         seen["g"] = g
@@ -205,6 +206,7 @@ def test_a_failing_turn_end_revoke_never_replaces_the_turn_result(board, monkeyp
     seen = {}
 
     def fake_loop(ag, *_a, **_kw):
+        ag._dispatched_model = MODEL
         g = dsg.mint_for_child(_task(board), child, ag)
         dsg.register_turn_grants(ag, [g])
         seen["g"] = g
@@ -428,8 +430,13 @@ def test_only_the_sessions_own_identity_may_be_granted(board, monkeypatch, profi
         assert conn.execute("SELECT count(*) FROM sign_grants").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("inherit_max_tokens, minted", [(50000, True), ("not-an-int", False)])
-def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_tokens, minted):
+@pytest.mark.parametrize("inherit_max_tokens, extra, minted", [
+    (50000, {}, True), ("not-an-int", {}, False),
+    # Prism b0adf0220303: an empty materialized prefix skips inheritance (delegate_tool.py mode=None)
+    # while the request still says inherit_context=true; the built child decides.
+    (50000, {"materialized_prefill_messages": []}, False),
+])
+def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_tokens, extra, minted):
     """Prism 8283ee6dbefe: inherit_context=true is only the REQUEST. When the summary fold fails
     at construction the child carries none of the parent's rulings, so the mint is refused."""
     import json
@@ -439,7 +446,7 @@ def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_toke
     from tests.tools.test_delegate import _make_mock_parent
 
     parent = _make_mock_parent()
-    parent.model = MODEL
+    parent.model = parent._dispatched_model = MODEL
     parent.session_id = "parent-sid"
     parent.prefill_messages = None
     parent._session_messages = [{"role": "user", "content": "RULING: ship only on green CI"}]
@@ -458,7 +465,7 @@ def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_toke
             patch("tools.delegate_tool._load_config", return_value=cfg):
         out = json.loads(delegate_task(
             tasks=[{"goal": "review it", "inherit_context": True,
-                    "sign_grant": {"cards": [board], "verbs": ["approve"]}}],
+                    "sign_grant": {"cards": [board], "verbs": ["approve"]}, **extra}],
             parent_agent=parent))
     with kb.connect_closing() as conn:
         rows = conn.execute("SELECT COUNT(*) FROM sign_grants").fetchone()[0]
@@ -468,3 +475,109 @@ def test_a_child_whose_context_fold_failed_gets_no_grant(board, inherit_max_toke
     else:
         assert rows == 0, out
         assert "sign_grant refused" in out.get("error", "") and "inherit" in out["error"], out
+
+
+def _api_parent(**kw):
+    from types import SimpleNamespace as NS
+
+    class _Parent:
+        pass
+
+    parent = _Parent()
+    parent.__dict__.update(model=MODEL, session_id="parent-sid", _delegate_depth=0, provider="anthropic",
+                           base_url="", api_mode="anthropic_messages", platform="cli", _disable_streaming=True,
+                           _has_stream_consumers=lambda: False, _has_pending_redirect=lambda: False,
+                           _interruptible_api_call=lambda kw: NS(choices=[]), **kw)
+    return parent
+
+
+def _api_call(parent, model=MODEL):
+    from agent import turn_api_call
+
+    return turn_api_call.perform_api_call(
+        parent, api_kwargs={"model": model}, _original_api_kwargs={"model": model}, _llm_middleware_trace=[],
+        _moa_prepared_request=None, _retry=None, thinking_spinner=None, retry_count=0, api_call_count=1,
+        api_request_id="r", effective_task_id="t", turn_id="turn", interrupted=False)
+
+
+@pytest.mark.parametrize("served", ["short_circuit", "dispatch_raised"])
+def test_a_call_that_never_dispatched_leaves_no_model_to_bind(board, monkeypatch, served):
+    """Prism e306c1d110a0: a response the dispatch edge did not serve (middleware short-circuit, a cached
+    reply, a dispatch that raised before the fallback answered) must not let a grant bind an EARLIER
+    call's stamped model: the stamp is cleared per call and set only once the dispatch returned."""
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setattr("agent.relay_llm.execute", lambda kw, fn, **_k: fn(kw))
+    monkeypatch.setattr("agent.turn_body_budget.terminal_request_body", lambda _a, kw: kw)
+    monkeypatch.setattr("agent.agent_runtime_helpers.note_steer_consumed", lambda _a: None)
+    parent = _api_parent(_dispatched_model="claude-earlier-call")
+
+    def middleware(kw, fn, **_k):
+        if served == "dispatch_raised":
+            try:
+                fn(kw)
+            except RuntimeError:
+                pass
+        return NS(choices=[])   # the answer the turn got did not come from fn
+
+    if served == "dispatch_raised":
+        parent._interruptible_api_call = lambda kw: (_ for _ in ()).throw(RuntimeError("provider down"))
+    monkeypatch.setattr("hermes_cli.middleware.run_llm_execution_middleware", middleware)
+    _p, child = _agents()
+    _api_call(parent)
+    with pytest.raises(dsg.SignGrantError, match="dispatched"):
+        dsg.mint_for_child(_task(board), child, parent)
+
+
+def test_a_turn_starts_with_no_dispatched_model(board):
+    """Prism e306c1d110a0: the stamp is the CURRENT turn's; a turn that served no call mints nothing."""
+    from unittest.mock import patch
+
+    agent = _facade_agent()
+    agent._dispatched_model = MODEL   # left over from the previous turn
+    _p, child = _agents()
+    seen = {}
+
+    def fake_loop(ag, *_a, **_kw):
+        try:
+            dsg.mint_for_child(_task(board), child, ag)
+        except dsg.SignGrantError as exc:
+            seen["refused"] = str(exc)
+        return {"final_response": "done", "messages": [], "api_calls": 0, "completed": True}
+
+    with patch("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: []), \
+            patch("agent.conversation_loop.run_conversation", fake_loop):
+        agent.run_conversation("go")
+    assert "dispatched" in seen.get("refused", ""), seen
+
+
+@pytest.mark.parametrize("where", ["second_child", "after_mint"])
+def test_a_rollback_revoke_that_fails_stays_registered_for_turn_end(board, monkeypatch, where):
+    """Prism 9c236305da52: a minted grant whose rollback revoke failed is handed to the parent's turn
+    registry, so revoke_turn_grants retries it instead of leaving it live to its expiry."""
+    parent, child = _agents()
+    _p2, child2 = _agents()
+    child2.session_id = "child-sid-2"
+    real_mint, real_revoke = dsg.mint_for_child, dsg.revoke
+    if where == "second_child":
+        def mint(t, c, p, **kw):
+            if c is child2:
+                raise KeyboardInterrupt
+            return real_mint(t, c, p, **kw)
+
+        monkeypatch.setattr(dsg, "mint_for_child", mint)
+    else:
+        def ledger(event):
+            raise RuntimeError("ledger down")
+
+        monkeypatch.setattr(dsg, "_ledger", ledger)
+    monkeypatch.setattr(dsg, "revoke", lambda grants: [str(g["grant_id"]) for g in grants])
+    with pytest.raises((KeyboardInterrupt, RuntimeError)):
+        dsg.mint_for_children([(0, _task(board), child), (1, _task(board), child2)], parent)
+    with kb.connect_closing() as conn:
+        live = [r[0] for r in conn.execute("SELECT DISTINCT grant_id FROM sign_grants WHERE revoked_at IS NULL")]
+    assert len(live) == 1
+    assert [g["grant_id"] for g in parent.__dict__.get("_sign_grants", [])] == live
+    monkeypatch.setattr(dsg, "revoke", real_revoke)
+    dsg.revoke_turn_grants(parent)
+    assert _live_rows(live[0]) == []

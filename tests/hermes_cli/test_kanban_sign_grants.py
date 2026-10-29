@@ -545,3 +545,36 @@ def test_granted_review_prose_with_single_word_labels_is_accepted(board):
             "Fix: none needed\n" + _approve().splitlines()[1])
     _child_comment(a, body, g["grant_id"])
     assert len(_rows(a)) == 1
+
+
+def test_granted_comment_reads_expiry_time_inside_the_write_lock(board, monkeypatch):
+    """Prism 4b338b50d765: a grant that expires while the writer waits for the board lock is refused:
+    the expiry check reads the clock inside the transaction, not a ``now`` captured before it."""
+    import contextlib
+    import time as _real_time
+
+    _home, a, _b = board
+    g = _mint(a)
+    state = {"locked": False}
+
+    class _Clock:
+        def __getattr__(self, name):
+            return getattr(_real_time, name)
+
+        def time(self):
+            return _real_time.time() + (ksg.MAX_EXPIRES_MIN * 60 + 60 if state["locked"] else 0)
+
+    real_txn = kb.write_txn
+
+    @contextlib.contextmanager
+    def slow_lock(conn, **kw):
+        with real_txn(conn, **kw):
+            state["locked"] = True   # the lock was granted after the grant's expiry
+            yield conn
+
+    monkeypatch.setattr(kb, "time", _Clock())
+    monkeypatch.setattr(kb, "write_txn", slow_lock)
+    with pytest.raises(ksg.GrantRefused, match="expired"):
+        _child_comment(a, _approve(), g["grant_id"])
+    monkeypatch.setattr(kb, "write_txn", real_txn)
+    assert _rows(a) == []
