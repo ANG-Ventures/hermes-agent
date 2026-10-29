@@ -474,7 +474,7 @@ class GatewayAgentCacheMixin:
             if _carry_held:
                 state.conversation.held_queue.extend(_carry_held)
         # Legacy plain-dict stores still in _CONVERSATION_SCOPED_STATE (not yet folded into
-        # SessionState), e.g. _pending_model_notes. SessionState-backed names resolve to MutableMapping
+        # SessionState), e.g. _pending_skills_reload_notes. SessionState-backed names resolve to MutableMapping
         # views (not dict), so the isinstance(dict) guard skips them — already handled above.
         for attr in _CONVERSATION_SCOPED_STATE:
             store = getattr(self, attr, None)

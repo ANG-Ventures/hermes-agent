@@ -2427,7 +2427,7 @@ class _CronDispatchGate:
 
 # Conversation-scoped per-session state registry (legacy contract). State lives in
 # ``SessionState.conversation`` (cleared via ``ConversationState.clear()``); this list remains for
-# plain-dict stores not yet folded in (``_pending_model_notes``, popped per-key by
+# plain-dict stores not yet folded in (e.g. ``_pending_skills_reload_notes``, popped per-key by
 # _clear_conversation_scope) and the public test contract. NOT listed (different lifecycles): turn-scoped
 # _running_agents*/_active_session_leases/_busy_ack_ts/_turn_lease_tokens (_release_running_agent_state +
 # dispatch finally); _session_run_generation (monotonic; clearing breaks stale-run detection);
@@ -2442,7 +2442,6 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
     "_session_service_tier_overrides",
-    "_pending_model_notes",
     "_last_resolved_model",
     "_queued_events",
     # Stall-watchdog "already notified" latch; cleared on /new so a fresh conversation can warn again.
@@ -7510,6 +7509,25 @@ class GatewayRunner(
             )
         except Exception as exc:
             logger.debug("Abandoned-turn on_session_end emit failed: %s", exc)
+
+    def _bind_route_known(self, agent, session_key) -> None:
+        """Hand the agent this session's persisted route-note ``Known`` and its writer
+        (agent/route_identity.py). The writer persists to ``SessionEntry.route_known`` and raises
+        on failure, so the agent never advances past what survives a restart."""
+        if agent is None:
+            return
+        from agent.route_identity import seed_known
+        store = self.session_store
+        entry = None
+        if session_key:
+            with suppress(Exception):
+                entry = store._entries.get(session_key)
+
+        def _sink(known: dict) -> None:
+            if not store.set_route_known(session_key, known):
+                raise RuntimeError("route_known: session entry vanished")
+
+        seed_known(agent, getattr(entry, "route_known", None), _sink if entry is not None else None)
 
     def _announce_and_persist_served_route(
         self,

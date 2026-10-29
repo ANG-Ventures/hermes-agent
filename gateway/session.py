@@ -682,6 +682,10 @@ class SessionEntry:
     # so its silent snap-back to the config default was previously invisible.
     # Cleared on /new, /reset, auto-reset by SessionEntry reconstruction.
     last_served_identity: Optional[Dict[str, Any]] = None
+    # What the MODEL was last told about its route (agent/route_identity.py ``Known``:
+    # intended/serving RouteIdentity, observed_tier, pending_correction). Written only after the
+    # note it reflects reached the transcript; survives restarts so a re-init does not re-announce.
+    route_known: Optional[Dict[str, Any]] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -722,6 +726,7 @@ class SessionEntry:
             else sanitize_model_override_identity(self.model_override_identity)
         )
         result["last_served_identity"] = self.last_served_identity
+        result["route_known"] = self.route_known
         if self.model_override:
             # Defence-in-depth against an unsanitized dict stored directly.
             result["model_override"] = sanitize_model_override(self.model_override)
@@ -815,6 +820,7 @@ class SessionEntry:
                 if isinstance(data.get("last_served_identity"), dict)
                 else None
             ),
+            route_known=data.get("route_known") if isinstance(data.get("route_known"), dict) else None,
             model_override=sanitize_model_override(data.get("model_override")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
@@ -1496,6 +1502,17 @@ class SessionStore(
         self._save_entry(session_key)
         self._record_gateway_session_peer(
             peer_sid, session_key, peer_origin, display_name=peer_name, transport_profile=peer_transport)
+
+    def set_route_known(self, session_key: str, route_known: Dict[str, Any]) -> bool:
+        """Persist the route-note ``Known`` for one session under the store lock (metadata-only
+        UPSERT). Raises on a failed write so the caller does not advance its in-memory copy."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            entry.route_known = dict(route_known)
+        self._save_entry(session_key)
+        return True
 
     def get_session_metadata(self, session_key: str, key: str, default: Any = None) -> Any:
         """Return a metadata value stored on a live session entry."""

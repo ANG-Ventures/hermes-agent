@@ -2180,12 +2180,16 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
+    from agent import route_identity as _route
     while s.retry_count < s.max_retries:
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result
         if _ng.action == "break":
             return None
+        # Route note: computed per rung against the route about to be tried; it rides this
+        # request only and is committed (transcript, then Known) only when the rung succeeds.
+        _route_call = _route.prepare_call(agent, s)
         try:
             _bq = _run_phase(build_api_request, agent, s)
             if _bq.action == "return":
@@ -2193,6 +2197,8 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
             if _run_phase(perform_api_call, agent, s).action == "break":
                 return None
             _rc = _run_phase(check_api_response, agent, s)
+            if _route_call is not None and _route.call_succeeded(s, _rc.action):
+                _route_call = _route.commit_call_safely(agent, s, _route_call)
             if _rc.action == "return":
                 return _rc.result
             if _rc.action == "break":
@@ -2206,6 +2212,8 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
                 return _ae.result
             if _ae.action == "break":
                 return None
+        finally:
+            _route.abandon_call(s, _route_call)
     return None
 
 

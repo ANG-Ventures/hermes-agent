@@ -3420,7 +3420,6 @@ class GatewaySlashCommandsMixin(
                     "Model session override was not cleared because the session "
                     "store could not persist the reset. No route change was made."
                 )
-            getattr(self, "_pending_model_notes", {}).pop(session_key, None)
             getattr(self, "_last_resolved_model", {}).pop(session_key, None)
             _fb_cleared = await asyncio.to_thread(
                 self._clear_fallback_for_user_route,
@@ -3665,26 +3664,9 @@ class GatewaySlashCommandsMixin(
                                     "Failed to persist model switch to DB: %s", exc
                                 )
 
-                        # Store model note + session override.  Use display
-                        # form (strips opaque Palantir prefix) for the user-
-                        # visible note; session-override map still gets the
-                        # full opaque ID, which is what the wire needs.
+                        # Store the session override (changes ``intended`` only). The model
+                        # learns of the switch from the per-call route note (agent/route_identity.py).
                         from hermes_cli.model_switch import format_model_for_display
-                        _display_cur = format_model_for_display(_cur_model)
-                        _display_new = format_model_for_display(result.new_model)
-                        if not hasattr(_self, "_pending_model_notes"):
-                            _self._pending_model_notes = {}
-                        # Route (provider) is named explicitly: a sub-to-sub move
-                        # keeps the model slug, so "fable-5-1 to fable-5-1" alone
-                        # reads as a no-op when the provider actually changed.
-                        # `_cur_provider` is the LIVE agent's provider (read at the
-                        # top of the handler), not the config/override value.
-                        _self._pending_model_notes[_session_key] = (
-                            f"[Note: model was just switched from {_display_cur} to {_display_new} "
-                            f"via {result.provider_label or result.target_provider} "
-                            f"(route {_cur_provider} -> {result.target_provider}). "
-                            f"Adjust your self-identification accordingly.]"
-                        )
                         # Off the loop: the persistability check re-resolves
                         # credentials (config load + provider resolution, which
                         # can refresh an OAuth token over the network).
@@ -4030,24 +4012,9 @@ class GatewaySlashCommandsMixin(
                         "Failed to persist model switch to DB: %s", exc
                     )
 
-            # Store a note to prepend to the next user message so the model
-            # knows about the switch (avoids system messages mid-history).
-            # Display form strips opaque Palantir RID prefixes; the override
-            # map below keeps the full ID for the wire.
+            # No model-facing note here: the switch changes ``intended`` only, and the
+            # per-call route note (agent/route_identity.py) tells the model what serves.
             from hermes_cli.model_switch import format_model_for_display
-            if not hasattr(self, "_pending_model_notes"):
-                self._pending_model_notes = {}
-            # `current_model`/`current_provider` are the LIVE agent's route (read
-            # near the top of the handler), so the note names what the session
-            # was actually running, and the provider is spelled out because a
-            # sub-to-sub move keeps the model slug.
-            self._pending_model_notes[session_key] = (
-                f"[Note: model was just switched from {format_model_for_display(current_model)} to {format_model_for_display(result.new_model)} "
-                f"via {result.provider_label or result.target_provider} "
-                f"(route {current_provider} -> {result.target_provider}). "
-                f"{'This override applies to the next turn only. ' if one_turn else ''}"
-                f"Adjust your self-identification accordingly.]"
-            )
 
             # Store session override so next agent creation uses the new model
             # (single door — also persists the config-backed identity, RC-2/P3b).
