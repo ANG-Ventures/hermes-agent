@@ -1328,10 +1328,17 @@ class _NeedsInputPager(_GuardStuckNotifier):
         digest = hashlib.sha1(str(item.get("reason") or "").encode("utf-8")).hexdigest()[:12]
         return "|".join((str(board), str(item["task_id"]), digest))
 
+    # The p>=200 #alerts mirror has its own ledger entry, set only when the
+    # mirror send itself returned True (t_d36da044 r1, Prism 560c78346c1a): a
+    # mirror lost to a transient failure is retried on the next page, and a
+    # delivered one is never repeated.
+    _MIRROR_SUFFIX = "|alerts-mirror"
+
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
         deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
+        current |= {key + self._MIRROR_SUFFIX for key in current}
         if observed_boards is None:
             observed_boards = {board for board, _ in cards}
         before = dict(self._sent)
@@ -1359,9 +1366,13 @@ class _NeedsInputPager(_GuardStuckNotifier):
                 continue
             if time.monotonic() >= deadline:
                 break
-            if send(board, item, last is not None):
+            mirror_key = key + self._MIRROR_SUFFIX
+            page = dict(item, alerts_mirror_due=mirror_key not in self._sent)
+            if send(board, page, last is not None):
                 self._sent[key] = now
                 delivered += 1
+            if page.get("alerts_mirror_delivered"):
+                self._sent[mirror_key] = now
         if self._sent != before:
             self._save()
         return delivered
@@ -1433,9 +1444,15 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
         return _notify_send(script, message, ["--target", logs_ch])
     if channel:
         ok = _notify_send(script, message, ["--target", str(channel)])
-        if (item.get("alerts") and not still_waiting and str(channel) != alerts_ch
-                and not _notify_send(script, message, ["--sev", "error"])):
-            logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
+        # The pager sets ``alerts_mirror_due`` from its own mirror ledger entry
+        # and reads back ``alerts_mirror_delivered``; a direct caller without
+        # the flag mirrors on the first page only.
+        mirror_due = item.get("alerts_mirror_due", not still_waiting)
+        if item.get("alerts") and mirror_due and str(channel) != alerts_ch:
+            if _notify_send(script, message, ["--sev", "error"]):
+                item["alerts_mirror_delivered"] = True
+            else:
+                logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
         return ok
     if still_waiting:
         return _notify_send(script, message, ["--target", logs_ch])

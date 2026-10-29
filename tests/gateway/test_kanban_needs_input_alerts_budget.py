@@ -108,3 +108,42 @@ def test_census_replay_fits_the_family_budget(calls):
     to_alerts = [c for c in calls if c == ["--sev", "error"] or c == ["--target", ALERTS]]
     assert len(to_alerts) == 2  # was 12; budget <= 3/day
     assert calls.count(["--target", LOGS]) == 7
+
+
+# r1 (Prism 560c78346c1a): mirror delivery has its own ledger entry, so a p>=200
+# mirror lost on the first page is retried on the next page, exactly once.
+_REPAGE = kw._NEEDS_INPUT_REPAGE_SECONDS
+
+
+def _pager_ticks(monkeypatch, tmp_path, mirror_results):
+    monkeypatch.delenv("DISCORD_ALERTS_CHANNEL", raising=False)
+    monkeypatch.delenv("DISCORD_LOGS_CHANNEL", raising=False)
+    monkeypatch.setattr(kw, "_alert_notify_script", lambda: tmp_path / "notify.py")
+    results = iter(mirror_results)
+    out: list = []
+
+    def fake_send(script, msg, extra):
+        out.append(extra)
+        return next(results) if extra == ["--sev", "error"] else True
+
+    monkeypatch.setattr(kw, "_notify_send", fake_send)
+    cards = [("default", _item(OTHER, 200, True))]
+    per_tick = []
+    for n in range(3):
+        out.clear()
+        # A fresh pager each tick re-reads the ledger, as after a gateway restart.
+        pager = kw._NeedsInputPager(tmp_path / "ledger.json")
+        assert pager.observe(cards, kw._send_needs_input_page, {"default"},
+                             now=1000.0 + n * (_REPAGE + 1)) == 1
+        per_tick.append([c for c in out if c == ["--sev", "error"]])
+    return per_tick
+
+
+def test_failed_first_mirror_is_retried_once_on_repage(monkeypatch, tmp_path):
+    per_tick = _pager_ticks(monkeypatch, tmp_path, [False, True])
+    assert per_tick == [[["--sev", "error"]], [["--sev", "error"]], []]
+
+
+def test_delivered_mirror_is_never_repeated(monkeypatch, tmp_path):
+    per_tick = _pager_ticks(monkeypatch, tmp_path, [True])
+    assert per_tick == [[["--sev", "error"]], [], []]
