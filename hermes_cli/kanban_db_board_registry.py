@@ -76,6 +76,8 @@ def board_db_layout(home: Optional[Path] = None) -> list[tuple[str, Path]]:
     if not root.is_dir():
         return out
     for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if child.is_dir() and _kb.skip_reserved_board_dir(child):
+            continue
         try:
             slug = _kb._normalize_board_slug(child.name)
         except ValueError:

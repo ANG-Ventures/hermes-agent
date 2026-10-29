@@ -63,8 +63,9 @@ def _env_kanban_root(env: Mapping[str, str]):
     """The Hermes root a described env's board registry lives under (Prism f984ec16d458).
 
     Same order as ``kanban_db.kanban_home``, read from ``env`` instead of the process: an explicit
-    ``HERMES_KANBAN_HOME``, else the root of its ``HERMES_HOME``. ``None`` (use the process root)
-    only when the env names neither, i.e. it describes this process's own root. Both go through
+    ``HERMES_KANBAN_HOME``, else the root of its ``HERMES_HOME``, else the default root under its
+    ``HOME`` when that is not this process's (Prism 03487e108873). ``None`` (use the process root)
+    only when the env names none of them, or its ``HOME`` is ours. Paths go through
     :func:`_env_path`.
     """
     explicit = (env.get("HERMES_KANBAN_HOME") or "").strip()
@@ -72,7 +73,12 @@ def _env_kanban_root(env: Mapping[str, str]):
         return _env_path(env, explicit)
     home = (env.get("HERMES_HOME") or "").strip()
     if not home:
-        return None
+        from pathlib import Path
+
+        env_home = (env.get("HOME") or "").strip()
+        if not env_home or os.path.realpath(env_home) == os.path.realpath(str(Path.home())):
+            return None
+        return Path(env_home) / (".hermes" + env.get("HERMES_DATA_DIR_SUFFIX", ""))
     from hermes_constants import get_default_hermes_root
 
     return get_default_hermes_root(home=_env_path(env, home))

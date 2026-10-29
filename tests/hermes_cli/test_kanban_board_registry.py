@@ -502,6 +502,36 @@ def test_pre_existing_override_board_is_not_found_and_never_opened_unscoped(home
         assert c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
+def test_reserved_board_dir_never_breaks_discovery_or_tracebacks(home, capsys, caplog):
+    """Prism c12f81da4e1f: a pre-existing ``boards/override/`` beside ``alpha`` is skipped by
+    discovery with ONE warning line naming the migration; every other board still lists, and an
+    explicit ``--board override`` is BoardNotFound (rc 1), never a ValueError traceback."""
+    import logging
+
+    kb.init_db()
+    kb.create_board("alpha")
+    legacy = kb.boards_root() / kb.PINNED_SLUG
+    legacy.mkdir(parents=True)
+    conn = kbc.connect(db_path=legacy / "kanban.db")
+    kb.create_task(conn, title="legacy", assignee="dev")
+    conn.close()
+    (legacy / "board.json").write_text('{"slug": "override"}', encoding="utf-8")
+    kb._RESERVED_BOARD_WARNED.clear()
+    caplog.clear()
+    _policy(home, "refuse")
+    with caplog.at_level(logging.WARNING, logger=kb._log.name):
+        assert _boards_argv(["boards", "list"]) == 0
+        assert _boards_argv(["boards", "list"]) == 0
+        assert [s for s, _ in reg.board_db_layout()] == ["default", "alpha"]
+    out = capsys.readouterr().out
+    assert "alpha" in out and " override " not in out
+    warned = [r.getMessage() for r in caplog.records if "reserved" in r.getMessage()]
+    assert len(warned) == 1 and str(legacy) in warned[0] and "mv " in warned[0]
+    assert _boards_argv(["--board", kb.PINNED_SLUG, "boards", "show"]) == 1
+    assert _boards_argv(["--board", kb.PINNED_SLUG, "list"]) == 1
+    assert "reserved" in capsys.readouterr().err
+
+
 # --- Prism 7b28513d644d: boards list|show resolve like every other verb ------------------------
 
 def _boards_argv(argv: list[str]) -> int:

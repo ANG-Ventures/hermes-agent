@@ -2156,6 +2156,23 @@ def create_board(
 
 # Phantom board dirs already warned about in this process (see list_boards).
 _PHANTOM_BOARD_WARNED: set[str] = set()
+# Board dirs named for the pin sentinel, already warned about in this process.
+_RESERVED_BOARD_WARNED: set[str] = set()
+
+
+def skip_reserved_board_dir(child: Path) -> bool:
+    """True (after ONE warning per process per dir) when discovery must skip ``child`` because
+    its name is the pin sentinel (Prism c12f81da4e1f). A ``boards/override/`` made before the
+    sentinel was reserved never breaks discovery of the other boards; the warning names the rename
+    that makes it addressable again."""
+    if child.name.strip().lower() != PINNED_SLUG:
+        return False
+    if str(child) not in _RESERVED_BOARD_WARNED:
+        _RESERVED_BOARD_WARNED.add(str(child))
+        _log.warning("kanban: skipping board dir %s: %r is reserved for a HERMES_KANBAN_DB pin "
+                     "that names no board. Rename it to address it: mv %s %s",
+                     child, PINNED_SLUG, child, child.with_name("<new-slug>"))
+    return True
 
 
 def _board_db_is_empty(db_path: Path) -> bool:
@@ -2221,6 +2238,8 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 if not child.is_dir():
                     continue
                 slug = child.name
+                if skip_reserved_board_dir(child):
+                    continue
                 # Keep slug normalisation soft for discovery — but skip dirs
                 # that don't parse as valid slugs so we don't surface junk.
                 try:

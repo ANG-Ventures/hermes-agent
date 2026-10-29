@@ -261,6 +261,39 @@ def test_foreign_env_tilde_hermes_home_expands_against_env_home(monkeypatch, tmp
     assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
 
 
+def test_foreign_env_home_alone_names_its_own_root(monkeypatch, tmp_path):
+    """Prism 03487e108873: an env whose ``HOME`` differs from this process's, naming neither
+    ``HERMES_KANBAN_HOME`` nor ``HERMES_HOME``, describes ``<env HOME>/.hermes``, never this
+    process's root."""
+    from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
+    operator_home = tmp_path / "operator"
+    worker_home = tmp_path / "worker"
+    worker_root = worker_home / ".hermes"
+    operator_root = operator_home / ".hermes"
+    for root in (operator_root, worker_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HOME", str(worker_home))
+    monkeypatch.setenv("HERMES_HOME", str(worker_root))
+    kb.create_board("alpha")  # board alpha exists ONLY under the worker's root
+    alpha_db = worker_root / "kanban" / "boards" / "alpha" / "kanban.db"
+    assert alpha_db.parent.is_dir()
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.setenv("HERMES_HOME", str(operator_root))
+
+    env = {"HOME": str(worker_home), "HERMES_KANBAN_DB": str(alpha_db),
+           "HERMES_KANBAN_TASK": "t_example"}
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
+    # An env whose HOME IS this process's still means this process's root.
+    from hermes_cli.kanban_identity import _env_kanban_root
+
+    assert _env_kanban_root({"HOME": str(operator_home)}) is None
+    assert _env_kanban_root({}) is None
+
+
 def test_kanban_identity_expands_user_paths_only_in_env_path():
     """Prism ba00e8f88abd as a RULE (operator-requested source contract): the only ``expanduser``
     in kanban_identity is ``_env_path``'s no-HOME fallback, so a new env-described path cannot
