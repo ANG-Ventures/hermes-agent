@@ -6138,16 +6138,6 @@ def create_task(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
     assignee = _canonical_assignee(assignee)
-    if not flagship_override_reason:
-        # The assignee is a route choice too (t_9e7ba884): an unpinned card on
-        # a flagship-default profile needs the same --allow-flagship reason.
-        from hermes_cli.model_policy import validate_assignee_route
-
-        flagship_override_reason = validate_assignee_route(
-            assignee,
-            model_override=model_override,
-            allow_flagship_reason=_raw_flagship_reason,
-        )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -6460,6 +6450,18 @@ def create_task(
                 if assignee_err:
                     raise ValueError(assignee_err)
                 assignee = _canonical_assignee(assignee) if assignee else assignee
+                if not flagship_override_reason:
+                    # The assignee is a route choice too (t_9e7ba884): an
+                    # unpinned card on a flagship-default profile needs the same
+                    # --allow-flagship reason. Judged on the FINAL (post-remap)
+                    # assignee (Prism 311c94f92990); a refusal rolls back the txn.
+                    from hermes_cli.model_policy import validate_assignee_route
+
+                    flagship_override_reason = validate_assignee_route(
+                        assignee,
+                        model_override=model_override,
+                        allow_flagship_reason=_raw_flagship_reason,
+                    )
 
                 if tenant is None and parents:
                     # Parent order breaks ties in this soft namespace; an

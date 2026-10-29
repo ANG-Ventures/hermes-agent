@@ -447,9 +447,13 @@ def test_profile_alias_named_like_flagship_but_resolving_to_opus_is_not_gated(
 def test_profile_env_var_default_is_expanded_before_the_gate(
     flagship_profiles, monkeypatch,
 ):
-    monkeypatch.setenv("T9E_WORKER_MODEL", "claude-fable-5-1")
+    # The var lives in the assignee's own .env (its secret scope), not the
+    # caller's env: Prism r3 858c7319e28f.
+    monkeypatch.delenv("T9E_WORKER_MODEL", raising=False)
     _raw_profile(flagship_profiles, "worker-env",
                  "model:\n  default: ${T9E_WORKER_MODEL}\n  provider: claude-apr\n")
+    (flagship_profiles / "profiles" / "worker-env" / ".env").write_text(
+        "T9E_WORKER_MODEL=claude-fable-5-1\n", encoding="utf-8")
     _assert_gated("worker-env")
 
 
@@ -470,3 +474,85 @@ def test_managed_overlay_default_is_the_gated_route(
     finally:
         monkeypatch.delenv("HERMES_MANAGED_DIR")
         managed_scope.invalidate_managed_cache()
+
+
+# ---- Prism r3 -----------------------------------------------------------------
+# 858c7319e28f / 13a34c96f1e2: ${VAR} resolves in the ASSIGNEE's secret scope.
+# 311c94f92990: the create gate judges the FINAL (post-remap) assignee.
+
+def _profile_env(kanban_home, name: str, text: str) -> None:
+    (kanban_home / "profiles" / name / ".env").write_text(text, encoding="utf-8")
+
+
+def test_profile_dotenv_var_beats_caller_env_and_is_gated(flagship_profiles, monkeypatch):
+    monkeypatch.setenv("T9E_WORKER_MODEL", "claude-opus-5-5")  # the caller's value
+    _raw_profile(flagship_profiles, "worker-env",
+                 "model:\n  default: ${T9E_WORKER_MODEL}\n  provider: claude-apr\n")
+    _profile_env(flagship_profiles, "worker-env", "T9E_WORKER_MODEL=claude-fable-5-1\n")
+    _assert_gated("worker-env")
+
+
+def test_profile_dotenv_non_flagship_var_is_not_gated_by_caller_env(
+    flagship_profiles, monkeypatch,
+):
+    monkeypatch.setenv("T9E_WORKER_MODEL", "claude-fable-5-1")  # the caller's value
+    _raw_profile(flagship_profiles, "worker-env",
+                 "model:\n  default: ${T9E_WORKER_MODEL}\n  provider: claude-apr\n")
+    _profile_env(flagship_profiles, "worker-env", "T9E_WORKER_MODEL=claude-opus-5-5\n")
+    task_id = _created_id(kc.run_slash("create 'plain' --assignee worker-env"))
+    with kb.connect() as conn:
+        assert kb.list_comments(conn, task_id) == []
+        assert task_id not in kbd.dispatch_once(conn, dry_run=True).flagship_refused
+
+
+@pytest.fixture
+def worker_remap(flagship_profiles, monkeypatch):
+    """A dispatched worker minting a child under a parent; placeholder
+    assignees remap to ``kanban.default_assignee``."""
+    from hermes_cli import kanban_worker_policy as kwp
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="daedalus-opus")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+
+    def _set_default(name):
+        monkeypatch.setattr(kwp, "_load_config",
+                            lambda: {"kanban": {"default_assignee": name}})
+    return parent, _set_default
+
+
+def test_placeholder_remapped_to_flagship_profile_keeps_the_reason(worker_remap):
+    parent, set_default = worker_remap
+    set_default("daedalus-fable")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="child", assignee="human", parents=[parent],
+                                 flagship_override_reason="approved infra")
+        assert kb.get_task(conn, task_id).assignee == "daedalus-fable"
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        conn.commit()
+        res = kbd.dispatch_once(conn, dry_run=True)
+    assert "flagship override: approved infra" in bodies, bodies
+    assert task_id not in res.flagship_refused
+
+
+def test_placeholder_remapped_to_flagship_profile_without_reason_refuses(worker_remap):
+    parent, set_default = worker_remap
+    set_default("daedalus-fable")
+    with kb.connect() as conn:
+        before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="assignee profile default of 'daedalus-fable'"):
+            kb.create_task(conn, title="child", assignee="human", parents=[parent])
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
+
+
+def test_flagship_placeholder_remapped_to_cheap_profile_is_accepted(
+    flagship_profiles, worker_remap,
+):
+    parent, set_default = worker_remap
+    _profile(flagship_profiles, "apollo", "claude-fable-5-1")
+    set_default("daedalus-opus")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="child", assignee="apollo", parents=[parent])
+        assert kb.get_task(conn, task_id).assignee == "daedalus-opus"
+        assert kb.list_comments(conn, task_id) == []

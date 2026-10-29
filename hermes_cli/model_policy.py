@@ -119,36 +119,47 @@ def assignee_default_model(assignee: Optional[str]) -> Optional[str]:
     The profile's effective ``model.default`` (``${VAR}`` expanded, managed
     overlay applied), resolved through that profile's own ``model_aliases`` /
     ``model.aliases`` the way worker startup does (Prism 22663f69a1d3,
-    9e7596b4c0ed). A missing profile or the human sentinel resolves to
-    ``None`` (no route to gate).
+    9e7596b4c0ed). ``${VAR}`` refs and aliases resolve under the ASSIGNEE's
+    secret scope (its ``.env`` + secret sources), bound by the same helper the
+    dispatcher uses for the worker's spawn env, never the caller's env
+    (Prism 858c7319e28f, 13a34c96f1e2). A missing profile or the human
+    sentinel resolves to ``None`` (no route to gate).
     """
     name = str(assignee or "").strip()
     if not name or name == "human" or name.startswith("human:"):
         return None
     try:
-        from pathlib import Path
-
-        from hermes_cli.model_switch import _load_direct_aliases
+        from hermes_cli.kanban_db_dispatch import _worker_profile_scope
         from hermes_cli.profiles import resolve_profile_env
 
-        cfg = _profile_effective_config(Path(resolve_profile_env(name)) / "config.yaml")
-        section = cfg.get("model")
-        if isinstance(section, str):
-            model = section
-        elif isinstance(section, dict):
-            model = section.get("default") or section.get("model")
-        else:
-            model = None
-        model = str(model or "").strip()
-        if not model:
-            return None
-        aliases, _ok = _load_direct_aliases(cfg)
-        hit = aliases.get(model.lower())
-        if hit is not None and str(hit.model or "").strip():
-            return str(hit.model).strip()
-        return model
+        home = resolve_profile_env(name)
+        with _worker_profile_scope(home, bind_home=False):
+            return _resolve_profile_default_model(home)
     except Exception:
         return None
+
+
+def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
+    from pathlib import Path
+
+    from hermes_cli.model_switch import _load_direct_aliases
+
+    cfg = _profile_effective_config(Path(profile_home) / "config.yaml")
+    section = cfg.get("model")
+    if isinstance(section, str):
+        model = section
+    elif isinstance(section, dict):
+        model = section.get("default") or section.get("model")
+    else:
+        model = None
+    model = str(model or "").strip()
+    if not model:
+        return None
+    aliases, _ok = _load_direct_aliases(cfg)
+    hit = aliases.get(model.lower())
+    if hit is not None and str(hit.model or "").strip():
+        return str(hit.model).strip()
+    return model
 
 
 def assignee_flagship_error(assignee: str, model: str) -> str:
