@@ -172,7 +172,7 @@ def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
     file names :func:`board_named_by_pin` (``PINNED_SLUG`` off-layout). Anything else (a
     snapshot, a forensics copy, ``:memory:``) is ``None``: journaling it under the ambient board
     would replay its writes into the live one (Prism 77b7e56c0d2c). Compared by filesystem
-    identity, memoised on (file, home, boards/ mtime, pin). Never raises.
+    identity, memoised on (file, its identity, home, boards/ mtime, pin, its identity). Never raises.
     """
     _kb = _facade()
     try:
@@ -185,10 +185,16 @@ def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
         except FileNotFoundError:
             stamp = None
         raw = raw_db_pin()
-        key = (actual, str(_kb.kanban_home()), stamp, raw)
+        here = Path(actual)
+        ident = _kb._path_identity(here)
+        if ident is None:
+            return None
+        # The FILE's identity is in the key, not just its name: a path re-pointed at another
+        # file (os.replace of a hard-link alias with a snapshot) must miss (Prism 2bfd9f8c68d9).
+        pin_ident = _kb._path_identity(Path(raw).expanduser()) if raw else None
+        key = (actual, ident, str(_kb.kanban_home()), stamp, raw, pin_ident)
         if key in _BOARD_FOR_CONN_MEMO:
             return _BOARD_FOR_CONN_MEMO[key]
-        here = Path(actual)
         found: Optional[str] = None
         with _kb.enumerating_boards():
             for slug, path in board_db_layout():

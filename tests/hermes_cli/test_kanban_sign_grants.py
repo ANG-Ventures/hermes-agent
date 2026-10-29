@@ -724,6 +724,31 @@ def test_board_for_conn_names_layout_boards_and_refuses_an_unregistered_copy(boa
         mem.close()
 
 
+def test_board_for_conn_does_not_reuse_a_cached_slug_after_the_path_is_replaced(board, tmp_path):
+    """Prism 2bfd9f8c68d9: a hard-link alias of a live board resolves to that board; once the alias path is
+    os.replace'd with an independent snapshot, a new connection to it is owned by no board."""
+    import shutil
+
+    from hermes_cli import kanban_db_board_registry as kbr
+
+    live = kb.kanban_db_path()
+    alias = tmp_path / "alias.db"
+    os.link(str(live), str(alias))
+    c1 = sqlite3.connect(str(alias))
+    try:
+        assert kbr.board_for_conn(c1) == kb.DEFAULT_BOARD
+    finally:
+        c1.close()
+    snap = tmp_path / "snap.db"
+    shutil.copyfile(str(live), str(snap))
+    os.replace(str(snap), str(alias))
+    c2 = sqlite3.connect(str(alias))
+    try:
+        assert kbr.board_for_conn(c2) is None
+    finally:
+        c2.close()
+
+
 def _snapshot_then_revoke(a, tmp_path, monkeypatch, *, now=None):
     import shutil
     import time as _time
