@@ -1136,6 +1136,103 @@ def test_pending_requeue_keeps_the_newest_trip_stamp(root):
     assert rr.apply_pending_requeues() == 1
 
 
+def test_replay_skips_a_job_that_succeeded_before_the_trip_snapshot(root):
+    """Prism dbe5fc2fa076: a job that recorded ``ok`` at T is still listed as running (its worker
+    has not reached ``release_running_job``) when the trip snapshots at T+5. The replay must
+    compare against that run's START, not the trip time, or it re-fires a finished job."""
+    import cron.scheduler as sched
+    from cron import script_runner_rearm as rr
+    from cron.jobs import mark_job_run
+    from cron.scheduler_provider import _profile_cron_scope
+    from cron.script_runner import ScriptRunner
+
+    j = _job(root, "J", "j.sh")
+    with _profile_cron_scope(root):
+        assert sched.try_register_running_job(j["id"])  # run starts
+    try:
+        with _profile_cron_scope(root):
+            mark_job_run(j["id"], True)  # T: exits 0, worker not yet released
+        time.sleep(0.05)
+        ScriptRunner._requeue_inflight()  # T+5: the trip snapshot still lists J
+    finally:
+        sched.release_running_job(j["id"], home=root)
+    assert rr.apply_pending_requeues() == 0
+
+
+def test_requeue_inflight_stamps_before_the_snapshot(root, monkeypatch):
+    """Apollo item 3 / Prism 29502ffb3d71: with no run start known, the row is stamped with a time
+    taken BEFORE ``_running_job_ids`` is read, so a clean run recorded after the snapshot but
+    before the write is not replayed."""
+    import cron.scheduler as sched
+    from cron import script_runner_rearm as rr
+    from cron.jobs import mark_job_run
+    from cron.scheduler_provider import _profile_cron_scope
+    from cron.script_runner import ScriptRunner
+
+    j = _job(root, "J", "j.sh")
+    with _profile_cron_scope(root):
+        assert sched.try_register_running_job(j["id"])
+    sched._running_since.clear()  # a claim with no recorded start
+    real_record = rr.record_pending_requeues
+
+    def finish_then_record(items, **kw):
+        time.sleep(0.05)
+        with _profile_cron_scope(root):
+            mark_job_run(j["id"], True)  # completes between the snapshot and the write
+        return real_record(items, **kw)
+
+    monkeypatch.setattr(rr, "record_pending_requeues", finish_then_record)
+    try:
+        ScriptRunner._requeue_inflight()
+    finally:
+        sched.release_running_job(j["id"], home=root)
+    assert rr.apply_pending_requeues() == 0
+
+
+def test_self_rearm_waits_for_a_fast_ledger_probe(root, monkeypatch):
+    """Apollo item 4: the marker is removed only when one ledger round-trip fits in half the
+    watchdog budget; a still-wedged ledger keeps the lane parked."""
+    from cron import lanes, script_runner
+
+    monkeypatch.setattr(lanes, "RUNNER_REARM_AFTER_S", 0)
+    marker = script_runner.trip_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"at": "x", "phase": "p"}', encoding="utf-8")
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    real_probe = script_runner.ScriptRunner.__dict__["_ledger_probe_s"]
+    monkeypatch.setattr(script_runner.ScriptRunner, "_ledger_probe_s",
+                        staticmethod(lambda: lanes.RUNNER_TICK_WATCHDOG_S / 2 + 1))
+    r._maybe_self_rearm()
+    assert marker.exists() and r._rearmed is None
+    monkeypatch.setattr(script_runner.ScriptRunner, "_ledger_probe_s", staticmethod(lambda: None))
+    r._maybe_self_rearm()
+    assert marker.exists()
+    monkeypatch.setattr(script_runner.ScriptRunner, "_ledger_probe_s", real_probe)
+    probe = script_runner.ScriptRunner._ledger_probe_s()
+    assert probe is not None and probe < lanes.RUNNER_TICK_WATCHDOG_S / 2
+    r._maybe_self_rearm()
+    assert not marker.exists() and r._rearmed is not None
+
+
+def test_replay_commit_keeps_the_file_without_the_lock(root, monkeypatch):
+    """Apollo item 5: when the commit cannot take the file lock it does not rewrite the file."""
+    import contextlib as _cl
+
+    from cron import script_runner_rearm as rr
+
+    j = _job(root, "J", "j.sh")
+    rr.record_pending_requeues([(str(root), j["id"])], trip_epoch=time.time())
+    path = root / "cron" / rr.REQUEUE_NAME
+
+    @_cl.contextmanager
+    def no_lock(_path, timeout=5.0):
+        yield False
+
+    monkeypatch.setattr(rr, "_file_lock", no_lock)
+    assert rr.apply_pending_requeues() == 1
+    assert [row[1] for row in json.loads(path.read_text())] == [j["id"]]
+
+
 def test_concurrent_trip_records_lose_no_line(root):
     """Prism 2777c74d0091: two writers of the trip history must not drop each other's line."""
     from cron import script_runner_rearm as rr

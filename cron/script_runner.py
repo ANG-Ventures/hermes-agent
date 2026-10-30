@@ -236,6 +236,13 @@ class ScriptRunner:
         delay = rearm_policy.rearm_delay_s(trips)
         if age < delay:
             return
+        probe_s = self._ledger_probe_s()
+        budget = lanes.RUNNER_TICK_WATCHDOG_S / 2
+        if probe_s is None or probe_s > budget:
+            self._warn_hourly("rearm_probe", None, "script runner self re-arm held: ledger probe "
+                              "%s (budget %.0f s); lane stays parked",
+                              "failed" if probe_s is None else f"took {probe_s:.1f} s", budget)
+            return
         try:
             content = marker.read_text(encoding="utf-8-sig")
             marker.unlink()
@@ -253,6 +260,32 @@ class ScriptRunner:
                          "age_s": round(age), "trips_24h": trips}
         logger.warning("script runner re-armed itself: trip at %s (%s) is %d s old, %d trip(s) in "
                        "24 h, delay %d s", info.get("at"), info.get("phase"), age, trips, delay)
+
+    @staticmethod
+    def _ledger_probe_s() -> Optional[float]:
+        """Seconds for one ledger ``_transaction`` round-trip (connect + ``SELECT 1``), or None on
+        error. Run on a daemon thread, joined for at most the watchdog budget, so a still-wedged
+        ledger keeps the lane parked instead of re-tripping and killing in-flight jobs again."""
+        from cron import executions
+
+        out: List[Optional[float]] = [None]
+
+        def probe() -> None:
+            started = time.monotonic()
+            try:
+                with executions._transaction() as conn:
+                    conn.execute("SELECT 1").fetchone()
+                out[0] = time.monotonic() - started
+            except Exception:
+                logger.warning("script runner self re-arm: ledger probe failed", exc_info=True)
+
+        t = threading.Thread(target=probe, name="script-runner-rearm-probe", daemon=True)
+        started = time.monotonic()
+        t.start()
+        t.join(float(lanes.RUNNER_TICK_WATCHDOG_S))
+        if t.is_alive():
+            return time.monotonic() - started
+        return out[0]
 
     def _check_skew(self) -> None:
         if not self.draining and _detect_code_skew() is not None:
@@ -457,17 +490,22 @@ class ScriptRunner:
         import cron.scheduler as sched
         from cron import script_runner_rearm as rearm_policy
 
+        # Stamped BEFORE the snapshot (Prism 29502ffb3d71), and each row carries its run's start
+        # (Prism dbe5fc2fa076): a worker that already marked ``ok`` is still listed until its
+        # ``finally`` releases it, so only a stamp no later than the run's start is safe.
+        trip_epoch = time.time()
         got = sched._running_lock.acquire(timeout=0.2)
         try:
             keys = list(sched._running_job_ids)
+            since = dict(sched._running_since)
         except RuntimeError:
-            keys = []
+            keys, since = [], {}
         finally:
             if got:
                 sched._running_lock.release()
         rearm_policy.record_pending_requeues(
-            [(str(sched._inflight_home_path(home_key)), job_id) for home_key, job_id in keys],
-            lock_timeout=1.0)
+            [(str(sched._inflight_home_path(key[0])), key[1], since.get(key)) for key in keys],
+            trip_epoch=trip_epoch, lock_timeout=1.0)
 
     @staticmethod
     def _await_inflight(deadline: float) -> None:

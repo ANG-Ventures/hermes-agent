@@ -57,11 +57,13 @@ def _thread_lock(path: Path) -> threading.Lock:
 def _file_lock(path: Path, timeout: float = 5.0):
     """Serialize a read-modify-write of ``path`` across threads and processes (the tripped
     runner records while a restarted one may be replaying). Bounded: on timeout it proceeds
-    unlocked and logs, because the recording side runs on the watchdog's way to exit."""
+    unlocked and logs, because the recording side runs on the watchdog's way to exit. Yields
+    whether both locks were obtained, so a caller that can wait (the replay) skips its write."""
     tlock = _thread_lock(path)
     got_t = tlock.acquire(timeout=timeout)
     if not got_t:
         logger.error("script runner: %s thread lock timed out; proceeding unlocked", path.name)
+    locked = got_t
     deadline = time.monotonic() + timeout
     fd = None
     try:
@@ -71,7 +73,7 @@ def _file_lock(path: Path, timeout: float = 5.0):
     try:
         if fcntl is not None:
             try:
-                fd = open(path.with_name(path.name + ".lock"), "a+")
+                fd = open(path.with_name(path.name + ".lock"), "a+", encoding="utf-8")
                 while True:
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -80,11 +82,13 @@ def _file_lock(path: Path, timeout: float = 5.0):
                         if time.monotonic() >= deadline:
                             logger.error("script runner: %s lock timed out; proceeding "
                                          "unlocked", path.name)
+                            locked = False
                             break
                         time.sleep(0.05)
             except OSError:
                 logger.error("script runner: %s lock unavailable", path.name, exc_info=True)
-        yield
+                locked = False
+        yield locked
     finally:
         if fd is not None:
             with contextlib.suppress(OSError):
@@ -102,7 +106,7 @@ def record_trip(entry: Dict[str, Any], lock_timeout: float = 1.0) -> None:
         path = trips_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with _file_lock(path, timeout=lock_timeout):
-            lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+            lines = path.read_text(encoding="utf-8-sig").splitlines() if path.exists() else []
             lines = lines[-(_KEEP_LINES - 1):] + [json.dumps(entry, sort_keys=True, default=str)]
             from utils import atomic_write_text
 
@@ -116,7 +120,7 @@ def recent_trips(now: Optional[float] = None) -> List[Dict[str, Any]]:
     """Trips whose ``epoch`` is inside the window. Unreadable lines are skipped."""
     now = time.time() if now is None else now
     try:
-        text = trips_path().read_text(encoding="utf-8")
+        text = trips_path().read_text(encoding="utf-8-sig")
     except OSError:
         return []
     out = []
@@ -164,16 +168,19 @@ def _pending_items(raw) -> Dict[tuple, float]:
 
 def _read_pending(path: Path) -> Dict[tuple, float]:
     try:
-        return _pending_items(json.loads(path.read_text(encoding="utf-8")))
+        return _pending_items(json.loads(path.read_text(encoding="utf-8-sig")))
     except FileNotFoundError:
         return {}
 
 
 def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = None,
                             lock_timeout: float = 5.0) -> None:
-    """``[(home, job_id)]`` in flight at a trip, for the restarted runner, stamped with the trip
-    time so the replay can skip a job that finished cleanly after the snapshot. Merged with any
-    still pending (newest stamp wins), under ``_file_lock``. Never raises."""
+    """``[(home, job_id[, run_start])]`` in flight at a trip, for the restarted runner. Each row is
+    stamped with that run's START (``_running_since``), else ``trip_epoch``, so the replay can skip
+    a job whose clean completion was recorded after the run began: a worker that already marked
+    ``ok`` stays listed as running until its ``finally`` releases it, so a stamp taken at the trip
+    would re-fire a finished job (Prism dbe5fc2fa076). Merged with any still pending (newest
+    stamp wins), under ``_file_lock``. Never raises."""
     if not items:
         return
     trip_epoch = time.time() if trip_epoch is None else float(trip_epoch)
@@ -181,11 +188,12 @@ def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = No
         path = _requeue_path()
         with _file_lock(path, timeout=lock_timeout):
             pending = _read_pending(path)
-            for h, j in items:
-                # Keep the NEWER trip stamp: an older snapshot recorded late must not lower the
+            for h, j, *rest in items:
+                stamp = float(rest[0]) if rest and rest[0] is not None else trip_epoch
+                # Keep the NEWER stamp: an older snapshot recorded late must not lower the
                 # reconciliation threshold (Prism d37c5059edb2).
                 key = (str(h), str(j))
-                pending[key] = max(pending.get(key, 0.0), trip_epoch)
+                pending[key] = max(pending.get(key, 0.0), stamp)
             _write_pending(path, [[h, j, e] for (h, j), e in pending.items()])
     except Exception:
         logger.error("script runner: pending re-queue write failed", exc_info=True)
@@ -193,7 +201,8 @@ def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = No
 
 def _finished_after(job_id: str, trip_epoch: float) -> bool:
     """True when the job already re-fires (a pending marker) or recorded a clean run at or after
-    the trip snapshot: the kill raced its completion, so a replay would run it twice."""
+    the row's stamp (the killed run's start): the kill raced its completion, so a replay would
+    run it twice."""
     from cron.jobs import RESTART_REQUEUE_KEY, _parse_aware, get_job
 
     job = get_job(job_id)
@@ -214,7 +223,7 @@ def apply_pending_requeues() -> int:
     Returns re-queued."""
     path = _requeue_path()
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return 0
     except OSError:
@@ -251,7 +260,13 @@ def apply_pending_requeues() -> int:
     # Commit against the file as it is NOW: drop only what this replay resolved, so a row
     # recorded (or re-stamped by a newer trip) while the replay ran survives.
     try:
-        with _file_lock(path):
+        with _file_lock(path) as locked:
+            if not locked:
+                # A concurrent record may be mid-write; keep the file, the next start replays
+                # it (resolved rows are skipped then: re-fire marker or clean run).
+                logger.error("script runner: pending re-queue commit skipped (lock timeout); "
+                             "file kept for the next start")
+                return done
             current = _read_pending(path)
             for key, epoch in resolved.items():
                 if key in current and current[key] <= epoch:
