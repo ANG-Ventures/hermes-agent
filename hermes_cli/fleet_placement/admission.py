@@ -63,6 +63,7 @@ class Lease:
     need: Estimate
     at: float                  # admit time
     job_id: Optional[str] = None
+    holdback: bool = False     # a stand-in for a higher class's QUEUED work (holdback()); job_class is that class
 
 
 @dataclasses.dataclass(frozen=True)
@@ -256,9 +257,10 @@ def holdback(workload: str, demand: Iterable[Demand], priority: Priority, host: 
             continue
         n = min(int(d.queued), priority.holdback_units)
         u = d.unit
-        out.append(Lease(host, f"holdback:{d.workload}",
+        # job_class stays the real class, so SliceMem.classes (startswith) still counts it (Prism 44a27d9ae8e6)
+        out.append(Lease(host, d.workload,
                          Estimate(u.cpus * n, u.ram_gb * n, u.gpu_mib * n, f"holdback {d.workload} x{n}"),
-                         at=math.inf, job_id=f"queued:{d.workload}:{int(d.queued)}"))
+                         at=math.inf, job_id=f"queued:{d.workload}:{int(d.queued)}", holdback=True))
     return out
 
 
@@ -378,9 +380,11 @@ def _history_row(ln) -> Optional[dict]:
     return r if isinstance(r, dict) and r.get("schema") == SCHEMA else None
 
 
-# path -> [open binary file, bytes consumed, rows parsed so far, checkpoint]   (read_history_cached; t_c9fd9c5e)
-# checkpoint = the last CHECKPOINT_BYTES consumed bytes: re-read before reusing the rows, so a truncate + refill to the
-# old size or past it (same inode, never smaller at a read) resets the cache instead of replaying the old generation.
+# path -> [open binary file, bytes consumed, rows parsed so far, tail checkpoint, head checkpoint, (mtime_ns, size)]
+# (read_history_cached; t_c9fd9c5e). Checkpoints = the last / first CHECKPOINT_BYTES consumed bytes: re-read before
+# reusing the rows, so a truncate + refill to the old size or past it (same inode, never smaller at a read) resets the
+# cache instead of replaying the old generation. An append always grows the file, so the same size with a moved mtime
+# is an in-place rewrite and resets too, whatever the checkpoints say (Prism e63812f5e349).
 # The file stays OPEN while its rows are cached, so its inode cannot be recycled by an unlink + recreate (Prism e2ace455c12a).
 _HISTORY_CACHE: dict = {}
 _HISTORY_LOCK = threading.Lock()
@@ -391,6 +395,13 @@ def _checkpoint_ok(fh, consumed: int, want: bytes) -> bool:
     if consumed <= 0 or not want:
         return True
     fh.seek(consumed - len(want))
+    return fh.read(len(want)) == want
+
+
+def _head_ok(fh, want: bytes) -> bool:
+    if not want:
+        return True
+    fh.seek(0)
     return fh.read(len(want)) == want
 
 
@@ -418,11 +429,12 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
                 hit[0].close()
                 _HISTORY_CACHE.pop(key, None)
                 hit = None
-            elif held.st_size < hit[1] or not _checkpoint_ok(hit[0], hit[1], hit[3]):
-                hit[1], hit[2], hit[3] = 0, [], b""   # shrunk or rewritten in place: start over on the same descriptor
+            elif (held.st_size < hit[1] or (held.st_size == hit[5][1] and held.st_mtime_ns != hit[5][0])
+                  or not _checkpoint_ok(hit[0], hit[1], hit[3]) or not _head_ok(hit[0], hit[4])):
+                hit[1:5] = [0, [], b"", b""]          # shrunk or rewritten in place: start over on the same descriptor
         if hit is None:
             try:
-                hit = [p.open("rb"), 0, [], b""]
+                hit = [p.open("rb"), 0, [], b"", b"", (None, None)]
             except FileNotFoundError:
                 return []
         fh = hit[0]
@@ -435,9 +447,13 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
             r = _history_row(ln)
             if r is not None:
                 hit[2].append(r)
-        hit[1] += end
         if end:
             hit[3] = (hit[3] + chunk[:end])[-CHECKPOINT_BYTES:]
+            if len(hit[4]) < CHECKPOINT_BYTES:
+                hit[4] = (hit[4] + chunk[:end])[:CHECKPOINT_BYTES]
+        hit[1] += end
+        after = os.fstat(fh.fileno())
+        hit[5] = (after.st_mtime_ns, after.st_size)
         _HISTORY_CACHE[str(p)] = hit
         rows = list(hit[2])
     if since is None:

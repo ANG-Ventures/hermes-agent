@@ -651,8 +651,16 @@ class LoadGate:
         allowance, verdict = 0, None
         # the worker slice's own memory cap (Linux kanbanw.slice; None elsewhere = host axis only, Prism 616c5f0203bd)
         slice_mem = _ad.read_slice_memory(classes=(UTIL_CLASS,))
+        unified = unified_admit()
+        demand, priority = unified_inputs(ctx["host"]) if unified else ([], _ad.Priority())
         for _ in range(self.max_spawn_per_tick):
-            v = _ad.admit(sample, ctx["need"], leases, host=ctx["host"], limits=ctx["limits"], slice_mem=slice_mem)
+            if unified:
+                # t_3694ab3c (inventory D8/D9): the ONE rule, admit_class("kanban"): the fleet line
+                # (fleet/admission-priority.json) and the queued demand of every class above kanban
+                v = _ad.admit_class(sample, UNIFIED_WORKLOAD, ctx["need"], leases, demand=demand,
+                                    priority=priority, host=ctx["host"], limits=ctx["limits"], slice_mem=slice_mem)
+            else:
+                v = _ad.admit(sample, ctx["need"], leases, host=ctx["host"], limits=ctx["limits"], slice_mem=slice_mem)
             if not v.ok:
                 verdict = v
                 break
@@ -669,8 +677,8 @@ class LoadGate:
                 why = f"ceiling: {self.running} running of kanban ceiling {ceiling} ({ctx['ceiling_reason']})"
         if allowance == 0 and why is None:
             why = f"utilization: {verdict.reason} (binding {verdict.binding})" if verdict else "utilization: no room"
-        self.util = {"host": ctx["host"], "need": {"cpus": ctx["need"].cpus, "ram_gb": ctx["need"].ram_gb,
-                                                   "source": ctx["need"].source},
+        self.util = {"rule": "admit_class" if unified else "admit", "host": ctx["host"],
+                     "need": {"cpus": ctx["need"].cpus, "ram_gb": ctx["need"].ram_gb, "source": ctx["need"].source},
                      "ceiling": ceiling, "leases": len(leases) - allowance,
                      "binding": verdict.binding if verdict else None,
                      "free": {k: round(float(x), 3) for k, x in (verdict.free if verdict else {}).items()}}
@@ -1301,6 +1309,58 @@ def sample_psi(root: str = "/proc/pressure") -> dict:
         except (OSError, ValueError, KeyError):
             continue
     return out
+
+
+UNIFIED_WORKLOAD = "kanban"
+
+
+def unified_admit(env: Optional[dict] = None) -> bool:
+    """KANBAN_UNIFIED_ADMIT (t_3694ab3c): "0" = today's rule (admission.admit, the caller's own line); anything else =
+    admission.admit_class("kanban") with the fleet priority + queued demand (admission_demand.unified)."""
+    from hermes_cli.fleet_placement import admission_demand as _dmd
+
+    return _dmd.unified(UNIFIED_WORKLOAD, env)
+
+
+def unified_inputs(host: str) -> "tuple[list, Any]":
+    """(queued demand that may run on ``host``, Priority) from the shared kanban root. An unreadable priority file is
+    the built-in default (said once by admission_demand); an unreadable demand dir holds nothing back."""
+    from hermes_cli.fleet_placement import admission as _ad
+    from hermes_cli.fleet_placement import admission_demand as _dmd
+    from hermes_cli.fleet_placement import placement as _pl
+
+    try:
+        # resolve folds aliases on both sides of a demand's ``hosts`` restriction, as may_start does (Prism f6d8d4445d4c)
+        try:
+            resolve = _pl.load_hosts().resolve
+        except Exception:  # no table: string match only, as before
+            resolve = None
+        return _dmd.read_demand(host, resolve=resolve), _dmd.load_priority()
+    except Exception as exc:  # never a crash in the tick: no demand, the default line
+        _log.warning("kanban load gate: unified admission inputs unreadable (%s); no holdback this tick", exc)
+        return [], _ad.Priority()
+
+
+def publish_ready_demand(queued: int, root=None) -> Optional[str]:
+    """Kanban's queue for the ONE rule (t_3694ab3c): var/placement/demand/kanban.json, hosts null (a portable card
+    may run on any pool host or here). Unit = the table's kanban footprint (the prior work_estimate seeds from).
+    A demand file is advisory, so a failed write never stops the tick: it returns the error text (None = written)
+    for the caller to log, and the next tick writes again (Prism 8397e82995e1)."""
+    from hermes_cli.fleet_placement import admission as _ad
+    from hermes_cli.fleet_placement import admission_demand as _dmd
+    from hermes_cli.fleet_placement import placement as _pl
+
+    unit = _ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior")
+    try:
+        table = _pl.load_hosts(None if root is None else Path(root) / _pl.TABLE_REL)
+        unit = _pl.need_of(table.footprint(UNIFIED_WORKLOAD))
+    except Exception:
+        pass
+    try:
+        _dmd.publish(UNIFIED_WORKLOAD, int(queued), unit, root=root)
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 def utilization_context() -> dict:

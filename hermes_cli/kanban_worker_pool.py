@@ -1536,6 +1536,16 @@ BAND_OK, BAND_WARM, BAND_HOT, BAND_UNKNOWN = "ok", "warm", "hot", "unknown"
 TARGET_STATE_FILE = "kanban-target-state.json"
 
 
+def _kanban_unified_admit(signal: Any = None) -> bool:
+    """True only where the ONE rule actually replaces the 6 GB/worker cap (D9, t_3694ab3c; Prism f4d9c1273272):
+    KANBAN_UNIFIED_ADMIT on, a placement table on the signal, and ``kanban.admission: utilization``, i.e. exactly
+    when kanban_headroom.unified_filter runs for every take (pinned ones included). Anywhere else the cap binds."""
+    from hermes_cli import kanban_load_gate as _klg
+    from hermes_cli.fleet_placement import placement as _pl
+    return (_klg.unified_admit() and signal is not None and getattr(signal, "placement_table", None) is not None
+            and _pl.admission_mode() == "utilization")
+
+
 @dataclass
 class TargetSignal:
     """What ``plan()`` needs to read target pressure (read_signal = true)."""
@@ -1834,6 +1844,15 @@ class SpilloverPlan:
             if why is not None:
                 self.refusal = f"pin_host_board_unhostable ({pin}: {board} {why})"
                 return None
+            # a pin keeps its precedence, not an exemption from the ONE rule (Prism f4d9c1273272: with the
+            # memory cap folded into admit_class, a pinned take must pass may_start too)
+            unified = not skip_admission and _kanban_unified_admit(self.signal)
+            if unified and self.dry_run:          # a dry run books nothing: the read-only verdict is its answer
+                from hermes_cli import kanban_headroom as _kh
+                _keep, held = _kh.unified_filter(self, [pin], job)
+                if pin in held:
+                    self.refusal = f"pin_host_unified_admission ({pin}: {held[pin]})"
+                    return None
             if self.signal is not None and self.signal.placement_table is not None:
                 # A pin keeps its precedence but its footprint is booked like any
                 # take, so later admissions see it (Prism 4609a040ad20 / b8c13f6c2e7a).
@@ -1844,7 +1863,12 @@ class SpilloverPlan:
                     from hermes_cli import kanban_headroom as _kh
                     from hermes_cli.fleet_placement import placement as _placement
                     try:
-                        rid = _kh.book_pin(self, pin, job_id, job)
+                        # unified: may_start under the ledger lock, booking what it admitted on
+                        # (Prism c8d0343d7fb6 / 8e0e895ec5d4)
+                        rid = _kh.book_pin(self, pin, job_id, job, check=unified)
+                    except _kh.ClassRefusal as exc:
+                        self.refusal = f"pin_host_unified_admission ({pin}: {exc})"
+                        return None
                     except _placement.PlacementError as exc:  # corrupt ledger: fail closed
                         self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
                         return None
@@ -1873,6 +1897,11 @@ class SpilloverPlan:
             names = [n for n, h in self.hosts.items() if n in allowed and assignee in h.profiles]
             if not names:
                 self.refusal = "pool_full"
+                return None
+            names, held = _kh.unified_filter(self, names, job)
+            if not names:
+                self.refusal = "unified_admission (" + "; ".join(
+                    f"{n}: {w}" for n, w in sorted(held.items())) + ")"
                 return None
             mode = _kh.plan_allocd_mode(self)
             if mode == _kh.ALLOCD_ON:
@@ -1925,6 +1954,8 @@ class SpilloverPlan:
             self.refusal = f"pool_unavailable ({d.reason or 'no_slot'}: " + "; ".join(
                 f"{r.host} {r.reason}" for r in d.rows if not r.eligible) + ")"
             return None
+        if self._class_refused(key, job, rid, release=lambda: _kh.release_id(self.signal, rid)):
+            return None
         self.last_reservation = rid
         self._rids.setdefault(key, []).append(rid)
         if self.dry_run:
@@ -1957,6 +1988,8 @@ class SpilloverPlan:
             _kh.release_alloc(r.reservation_id)
             self.refusal = f"pool_unavailable (allocd picked {r.host}, not a candidate)"
             return None
+        if self._class_refused(key, job, r.reservation_id, release=lambda: _kh.release_alloc(r.reservation_id)):
+            return None
         debit = self.slots.get(key, 0) > 0
         if debit:
             self.slots[key] -= 1
@@ -1966,6 +1999,21 @@ class SpilloverPlan:
         self.taken[key] = self.taken.get(key, 0) + 1
         self.last_pick = key
         return self.hosts[key]
+
+    def _class_refused(self, key: str, job: Any, rid: Optional[str], *, release) -> bool:
+        """The ONE rule's verdict for a take the old locked rule just booked, UNDER the ledger lock (Prism
+        c8d0343d7fb6): refused = the row is already dropped, ``release`` clears the booker's own state, refusal
+        set. An unreadable ledger fails closed the same way. False = admitted (or the rule is off)."""
+        from hermes_cli import kanban_headroom as _kh
+        try:
+            why = _kh.confirm_class(self, key, job, rid)
+        except Exception as exc:  # LedgerError / lock fault: fail closed
+            why = f"closed:{type(exc).__name__}: {exc}"
+        if why is None:
+            return False
+        release()
+        self.refusal = f"unified_admission ({key}: {why})"
+        return True
 
     def reservation_via(self, rid: Optional[str]) -> Optional[str]:
         """``alloc_client`` when ``rid`` was booked by :meth:`_take_allocd`, else None."""
@@ -2194,7 +2242,9 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             limit, cap_why = r["cap"]
             if limit is not None and limit < free:
                 admission[h.name] = f"cap {limit} < free {free}: {cap_why}"
-                if signal.admit_on_memory:
+                # D9 (t_3694ab3c): under KANBAN_UNIFIED_ADMIT the memory axis is admit_class's (measured estimate,
+                # not 6 GB per worker); the cap is still computed and reported, never enforced
+                if signal.admit_on_memory and not _kanban_unified_admit(signal):
                     free = limit
                     if free == 0:
                         why = f"admission: {cap_why}"
