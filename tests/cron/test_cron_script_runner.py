@@ -16,7 +16,8 @@ AC -> test:
   S2 (h)         test_h_runner_writes_no_ticker_markers
   S2 (i)         test_i_rearm_and_knob_toggle_clear_the_trip
   t_302ab1e8     test_ledger_lock_trip_names_holder_requeues_and_self_rearms,
-                 test_second_trip_in_24h_pages_alerts_and_backs_off
+                 test_second_trip_in_24h_pages_alerts_and_backs_off,
+                 test_pending_requeues_survive_failures_and_skip_finished_runs
   AC-4c          test_ac4c_profile_holder_on_s1_that_does_not_delegate
   E2E            test_e2e_runner_fires_echo_job
   S1_MERGE_SHA   test_s1_merge_sha_is_the_merged_s1
@@ -1029,7 +1030,7 @@ def test_ledger_lock_trip_names_holder_requeues_and_self_rearms(root, tmp_path, 
     assert len(trips) == 1 and trips[0]["ledger"]["lock_holder"]["thread"] == "ledger-holder"
     assert not [c for c in _calls(calls) if "episode_pager" in c[0]], _calls(calls)  # 1 trip: no page
     pending = json.loads((root / "cron" / script_runner_rearm.REQUEUE_NAME).read_text())
-    assert [job["id"]] == [j for _h, j in pending], pending
+    assert [job["id"]] == [row[1] for row in pending], pending
     # Supervisor restart with the hold gone: the killed job is re-queued (a restart kill, not a
     # failure), the runner stands by, then re-arms itself and ticks ADMITTED.
     (ctl / "hold").unlink()
@@ -1050,6 +1051,59 @@ def test_ledger_lock_trip_names_holder_requeues_and_self_rearms(root, tmp_path, 
     assert script_runner_rearm.LOGS_CHAT in receipts[0]
     assert "re-armed itself" in tail()
     assert runner.poll() is None, tail()
+
+
+def test_pending_requeues_survive_failures_and_skip_finished_runs(root, monkeypatch):
+    """Prism 3961dd0f50bb / a7f6f2d90126 / 29502ffb3d71: an unreadable pending file is kept, an
+    entry whose re-queue raised is kept for the next start, and a job that finished cleanly after
+    the trip snapshot is not replayed."""
+    import cron.jobs as jobs_mod
+    from cron import script_runner_rearm as rr
+    from cron.jobs import mark_job_run
+    from cron.runtime_state import merged_jobs
+    from cron.scheduler_provider import _profile_cron_scope
+
+    a = _job(root, "A", "a.sh")
+    b = _job(root, "B", "b.sh")
+    path = root / "cron" / rr.REQUEUE_NAME
+
+    def count(job_id):
+        rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job_id]
+        return int(rec.get("restart_requeue_count") or 0)
+
+    # 1. A read error leaves the queue on disk and re-queues nothing.
+    rr.record_pending_requeues([(str(root), a["id"])], trip_epoch=time.time())
+    real_read = Path.read_text
+
+    def emfile(self, *args, **kwargs):
+        if self == path:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", emfile)
+    assert rr.apply_pending_requeues() == 0
+    monkeypatch.setattr(Path, "read_text", real_read)
+    assert path.exists() and count(a["id"]) == 0
+
+    # 2. A re-queue that raises is retained; the next start applies it.
+    real_requeue = jobs_mod.request_restart_requeue
+
+    def boom(*_a, **_k):
+        raise OSError(errno.EIO, "jobs.json write failed")
+
+    monkeypatch.setattr(jobs_mod, "request_restart_requeue", boom)
+    assert rr.apply_pending_requeues() == 0
+    assert [row[1] for row in json.loads(path.read_text())] == [a["id"]]
+    monkeypatch.setattr(jobs_mod, "request_restart_requeue", real_requeue)
+    assert rr.apply_pending_requeues() == 1
+    assert not path.exists() and count(a["id"]) == 1
+
+    # 3. B is snapshotted, then records a clean run before the kill: no replay.
+    rr.record_pending_requeues([(str(root), b["id"])], trip_epoch=time.time() - 1)
+    with _profile_cron_scope(root):
+        mark_job_run(b["id"], True)
+    assert rr.apply_pending_requeues() == 0
+    assert not path.exists() and count(b["id"]) == 0
 
 
 def test_second_trip_in_24h_pages_alerts_and_backs_off(root, tmp_path, monkeypatch):

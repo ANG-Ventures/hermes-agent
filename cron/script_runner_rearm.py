@@ -18,6 +18,7 @@ into the runner.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import subprocess
@@ -85,56 +86,111 @@ def _requeue_path() -> Path:
     return trips_path().with_name(REQUEUE_NAME)
 
 
-def record_pending_requeues(items: List[tuple]) -> None:
-    """``[(home, job_id)]`` in flight at a trip, for the restarted runner. Merged with any still
-    pending. Never raises."""
+def _write_pending(path: Path, items) -> None:
+    from utils import atomic_write_text
+
+    atomic_write_text(path, json.dumps(sorted(items)) + "\n",
+                      tmp_prefix=".script_runner_requeue_", mode=0o600)
+
+
+def _pending_items(raw) -> Dict[tuple, float]:
+    """``{(home, job_id): trip_epoch}`` from the file's list. A pre-epoch ``[home, job_id]`` row
+    gets epoch 0 (no completion can be reconciled against it, so it re-fires as before)."""
+    out: Dict[tuple, float] = {}
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            home, job_id, *rest = item
+            key = (str(home), str(job_id))
+            out[key] = max(out.get(key, 0.0), float(rest[0]) if rest else 0.0)
+        except (TypeError, ValueError):
+            logger.warning("script runner: dropping malformed pending re-queue %r", item)
+    return out
+
+
+def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = None) -> None:
+    """``[(home, job_id)]`` in flight at a trip, for the restarted runner, stamped with the trip
+    time so the replay can skip a job that finished cleanly after the snapshot. Merged with any
+    still pending. Never raises."""
     if not items:
         return
+    trip_epoch = time.time() if trip_epoch is None else float(trip_epoch)
     try:
         path = _requeue_path()
         try:
-            pending = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pending = []
-        merged = {(str(h), str(j)) for h, j in (pending if isinstance(pending, list) else [])}
-        merged |= {(str(h), str(j)) for h, j in items}
-        from utils import atomic_write_text
-
-        atomic_write_text(path, json.dumps(sorted(merged)) + "\n",
-                          tmp_prefix=".script_runner_requeue_", mode=0o600)
+            pending = _pending_items(json.loads(path.read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            pending = {}
+        for h, j in items:
+            pending[(str(h), str(j))] = trip_epoch
+        _write_pending(path, [[h, j, e] for (h, j), e in pending.items()])
     except Exception:
         logger.error("script runner: pending re-queue write failed", exc_info=True)
 
 
+def _finished_after(job_id: str, trip_epoch: float) -> bool:
+    """True when the job already re-fires (a pending marker) or recorded a clean run at or after
+    the trip snapshot: the kill raced its completion, so a replay would run it twice."""
+    from cron.jobs import RESTART_REQUEUE_KEY, _parse_aware, get_job
+
+    job = get_job(job_id)
+    if job is None:
+        return False
+    if job.get(RESTART_REQUEUE_KEY):
+        return True
+    last = _parse_aware(job.get("last_run_at"))
+    return (bool(trip_epoch) and last is not None and last.timestamp() >= trip_epoch
+            and job.get("last_status") in ("ok", "delivery_failed"))
+
+
 def apply_pending_requeues() -> int:
     """Persist one re-fire per job killed by the last trip (``request_restart_requeue``, capped at
-    ``RESTART_REQUEUE_MAX``), then drop the file. A job that fails to re-queue is logged, not
-    retried: the cap means a retry could not add a second re-fire anyway. Returns re-queued."""
+    ``RESTART_REQUEUE_MAX``). A job that completed cleanly after the snapshot, or already carries a
+    re-fire marker, is skipped. Entries whose re-queue RAISED stay in the file for the next start;
+    a refusal (cap, unknown or one-shot job) is final. An unreadable file is left in place.
+    Returns re-queued."""
     path = _requeue_path()
     try:
-        pending = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return 0
-    except (OSError, ValueError):
-        pending = []
+    except OSError:
+        logger.error("script runner: pending re-queue read failed; kept for the next start",
+                     exc_info=True)
+        return 0
+    try:
+        pending = _pending_items(json.loads(text))
+    except ValueError:
+        bad = path.with_name(path.name + ".bad")
+        logger.error("script runner: pending re-queue file is not JSON; moved to %s", bad)
+        with contextlib.suppress(OSError):
+            path.replace(bad)
+        return 0
     from cron.jobs import request_restart_requeue
     from cron.scheduler_provider import _profile_cron_scope
 
     done = 0
-    for item in pending if isinstance(pending, list) else []:
+    keep: List[list] = []
+    for (home, job_id), trip_epoch in pending.items():
         try:
-            home, job_id = item
             with _profile_cron_scope(Path(home)):
-                if request_restart_requeue(str(job_id), "script killed by the runner watchdog"):
+                if _finished_after(job_id, trip_epoch):
+                    logger.warning("Job '%s': finished or already re-queued after the watchdog "
+                                   "snapshot; not replayed", job_id)
+                elif request_restart_requeue(job_id, "script killed by the runner watchdog"):
                     done += 1
                     logger.warning("Job '%s': killed by the runner watchdog; re-queued to fire "
                                    "once", job_id)
         except Exception:
-            logger.warning("watchdog re-queue of %r failed", item, exc_info=True)
+            logger.warning("watchdog re-queue of %s failed; kept for the next start", job_id,
+                           exc_info=True)
+            keep.append([home, job_id, trip_epoch])
     try:
-        path.unlink()
+        if keep:
+            _write_pending(path, keep)
+        else:
+            path.unlink()
     except OSError:
-        pass
+        logger.error("script runner: pending re-queue rewrite failed", exc_info=True)
     return done
 
 
