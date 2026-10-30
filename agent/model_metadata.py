@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Dict, List, Optional, Tuple
@@ -775,9 +776,43 @@ def _catalog_key_matches(key: str, model_lower: str) -> bool:
     return key in model_lower or _normalize_model_version(key) in _normalize_model_version(model_lower)
 
 
+# Anthropic rows of DEFAULT_CONTEXT_LENGTHS follow the fleet catalog <fleet root>/config/anthropic-limits.json
+# (models[*].context_window + aliases; agent/anthropic_limits.py). The literal rows are the FALLBACK when the
+# catalog is unreadable; hermes-home's `anthropic-limits-render.py --check` keeps them equal to it. The overlay
+# is applied in place on the first lookup and again whenever the catalog's mtime changes.
+_ANTHROPIC_LITERAL_ROWS: Dict[str, int] = {k: v for k, v in DEFAULT_CONTEXT_LENGTHS.items() if k.startswith("claude")}
+_anthropic_rows_lock = threading.Lock()
+_anthropic_rows_applied: Dict[str, Any] = {"catalog": None}
+
+
+def _sync_anthropic_context_rows() -> None:
+    """Overlay the catalog's Anthropic windows onto DEFAULT_CONTEXT_LENGTHS; restore the literals without one."""
+    try:
+        from agent import anthropic_limits
+        cat = anthropic_limits.load_catalog()
+    except Exception:
+        return
+    if cat is _anthropic_rows_applied["catalog"]:
+        return
+    with _anthropic_rows_lock:
+        if cat is _anthropic_rows_applied["catalog"]:
+            return
+        try:
+            rows = (anthropic_limits.context_rows(cat) if cat is not None else None) or {}
+        except Exception:
+            rows = {}
+        for k in [k for k in DEFAULT_CONTEXT_LENGTHS
+                  if k.startswith("claude") and k not in _ANTHROPIC_LITERAL_ROWS and k not in rows]:
+            del DEFAULT_CONTEXT_LENGTHS[k]
+        DEFAULT_CONTEXT_LENGTHS.update({**_ANTHROPIC_LITERAL_ROWS, **rows})
+        _anthropic_rows_applied["catalog"] = cat
+
+
 def _longest_key_match(table: Dict[str, int], model_lower: str) -> Optional[Tuple[str, int]]:
     """First ``(key, value)`` whose key is a substring of ``model_lower``, longest key first so
     specific entries (``gpt-5.4-mini``) beat their family catch-all (``gpt-5``); ties keep table order."""
+    if table is DEFAULT_CONTEXT_LENGTHS:
+        _sync_anthropic_context_rows()
     for key, value in sorted(table.items(), key=lambda x: len(x[0]), reverse=True):
         if _catalog_key_matches(key, model_lower):
             return key, value
@@ -1829,6 +1864,7 @@ def _stale_pre_catalog_cache_entry(model: str, cached: int) -> bool:
     """True when a persisted window is a pre-catalog leftover: the model resolves (longest-key-first) to a
     _PRE_CATALOG_STALE_KEYS key and the cached value is <= the largest shorter matching catch-all (or 256K)."""
     model_lower = model.lower()
+    _sync_anthropic_context_rows()
     matches = [(key, value) for key, value in DEFAULT_CONTEXT_LENGTHS.items() if _catalog_key_matches(key, model_lower)]
     if not matches:
         return False

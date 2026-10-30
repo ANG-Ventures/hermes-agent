@@ -12,13 +12,22 @@ logger = logging.getLogger(__name__)
 
 # Anthropic raised the Messages / Token Counting max request size from 32 MB to
 # 128 MB (decimal) on 2026-10-29 (ClaudeDevs status 2115923971279614171). The
-# limit is not published via the API, so it is pinned here. Keep 4 MiB of
-# headroom for SDK/provider serialization differences and proxy-added fields.
-ANTHROPIC_MAX_REQUEST_BODY_BYTES = 128_000_000 - 4 * 1024 * 1024  # 123_805_696
+# limit is not published via the API. The live value comes from the fleet
+# catalog <fleet root>/config/anthropic-limits.json (request_body_bytes minus
+# agent_headroom_bytes, re-read on mtime change; agent/anthropic_limits.py).
+# The profile literal below is the FALLBACK when the catalog is unreadable;
+# hermes-home's anthropic-limits-fallback-lint keeps it equal to the catalog.
+# 4 MiB of headroom covers SDK/provider serialization and proxy-added fields.
 
 
 class AnthropicProfile(ProviderProfile):
     """Native Anthropic — uses x-api-key header, not Bearer."""
+
+    def get_max_request_body_bytes(self, model: str | None) -> int | None:
+        """Catalog body cap (follows a catalog edit without a restart); the profile literal when unreadable."""
+        from agent.anthropic_limits import request_body_cap
+
+        return request_body_cap(self.max_request_body_bytes)
 
     def fetch_models(
         self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 8.0
@@ -56,7 +65,8 @@ anthropic = AnthropicProfile(
     name="anthropic", aliases=("claude", "claude-oauth", "claude-code"), api_mode="anthropic_messages",
     env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
     base_url="https://api.anthropic.com", auth_type="api_key", default_aux_model="claude-haiku-4-5-20251001",
-    max_request_body_bytes=ANTHROPIC_MAX_REQUEST_BODY_BYTES,
+    max_request_body_bytes=128_000_000 - 4 * 1024 * 1024,  # 123_805_696; FALLBACK, see the note above
 )
+ANTHROPIC_MAX_REQUEST_BODY_BYTES = anthropic.max_request_body_bytes  # the fallback constant
 
 register_provider(anthropic)

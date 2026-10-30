@@ -73,7 +73,19 @@ def _require_sdk(purpose: str, verb: str = "Install it with"):
 
 logger = logging.getLogger(__name__)
 
+# Manual-thinking budget ladder. FALLBACK only: the live ladder is the fleet catalog's thinking_budget
+# (<fleet root>/config/anthropic-limits.json, via _thinking_budget()); hermes-home's
+# anthropic-limits-fallback-lint keeps this literal equal to the catalog.
 THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+
+
+def _thinking_budget() -> Dict[str, int]:
+    """The catalog's thinking_budget overlaid on THINKING_BUDGET (re-read on catalog mtime change)."""
+    try:
+        from agent.anthropic_limits import thinking_budget
+        return thinking_budget(THINKING_BUDGET)
+    except Exception:  # the catalog is advisory: never fail a request on it
+        return THINKING_BUDGET
 # Hermes effort -> Anthropic adaptive-thinking effort (output_config.effort). 4.7+ exposes
 # low/medium/high/xhigh/max; Opus/Sonnet 4.6 have no xhigh, so callers downgrade xhigh->max
 # there (see _supports_xhigh_effort). "minimal" is a legacy alias for low on every model.
@@ -831,7 +843,7 @@ def _thinking_kwargs(reasoning_config: Dict[str, Any], model: str, effective_max
         if adaptive_effort == "xhigh" and not _supports_xhigh_effort(model):
             adaptive_effort = "max"
         return {"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": adaptive_effort}}
-    budget = THINKING_BUDGET.get(effort, 8000)
+    budget = _thinking_budget().get(effort, 8000)
     return {
         "thinking": {"type": "enabled", "budget_tokens": budget},
         "temperature": 1,  # required when thinking is enabled on older models
