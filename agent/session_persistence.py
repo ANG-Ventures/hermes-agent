@@ -25,8 +25,8 @@ from agent.message_sanitization import _INTERRUPT_CLOSE_FINISH_REASON
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.message_metadata import (
-    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID, copy_identity_fields,
-    tool_call_uid_from_history)
+    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, PENDING_USER_CONTENT_REWRITE, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID,
+    copy_identity_fields, tool_call_uid_from_history)
 from agent.transcript_repair import sync_flushed_message_markers
 
 
@@ -234,7 +234,7 @@ def _db_flush_fork_state(agent) -> Tuple[Dict[int, int], Dict[int, Any], set]:
 # these must never be skipped as part of the matched prefix, or the in-place
 # stamp is silently lost on re-flush (an interrupted turn then reads back as a
 # clean one). Keep this list in sync with any new in-place mutation site.
-_MUTABLE_FLUSH_STATE_FIELDS = ("finish_reason",)
+_MUTABLE_FLUSH_STATE_FIELDS = ("finish_reason", PENDING_USER_CONTENT_REWRITE)
 
 
 def _has_mutable_flush_state(msg: Any) -> bool:
@@ -317,6 +317,18 @@ def _db_flush_repersist_in_place(agent, msg: Dict, flushed_row_ids: Dict[int, in
       sends what was sent and keeps the steer (t_a17e2305).
     """
     msg_id = id(msg)
+    pending = msg.get(PENDING_USER_CONTENT_REWRITE)
+    if pending is not None and isinstance(msg.get("_row_id"), int):
+        # A staged user row's rewrite that could not run when decided (turn_context E11 relabel): retry it
+        # on the same row until it lands; the row id is never dropped, so no second row is appended.
+        session_id, content = pending
+        try:
+            active_id = agent._session_db.resolve_active_row_id(session_id, msg["_row_id"])
+            if active_id is not None and agent._session_db.set_user_message_content(session_id, active_id, content) > 0:
+                msg["_row_id"] = active_id
+                msg.pop(PENDING_USER_CONTENT_REWRITE, None)
+        except Exception as e:
+            logger.warning("pending user-row rewrite failed (row=%s): %s", msg["_row_id"], e)
     if _tool_content_mutated_since_flush(msg, content_refs):
         row_id = msg["_db_persisted_row_id"]
         sent = _persisted_content_projection(msg, msg.get("content"))

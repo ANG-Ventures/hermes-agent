@@ -24,6 +24,7 @@ except ImportError:
     # would reset the already-imported ``web`` to None (500 on POST /v1/runs).
     RequestKey = None  # type: ignore[assignment,misc]
 
+from agent.route_note_ingest import relabel_client_history
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
@@ -455,7 +456,8 @@ def _resolve_conversation_history(
                     content = " ".join(p.get("text", "") for p in content
                                        if isinstance(p, dict) and p.get("type") == "text")
                 conversation_history.append({"role": msg["role"], "content": str(content)})
-    return conversation_history, instructions, stored_session_id, None
+    # E11: client-authored history is relabelled at ingestion (harness note rows pass unchanged).
+    return relabel_client_history(conversation_history), instructions, stored_session_id, None
 
 
 def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> "web.Response":

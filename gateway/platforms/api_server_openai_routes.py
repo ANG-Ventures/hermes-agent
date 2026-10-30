@@ -16,6 +16,7 @@ from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
 from agent.i18n import t
+from agent.route_note_ingest import relabel_client_history
 
 try:
     from aiohttp import web
@@ -672,7 +673,8 @@ class OpenAICompatRoutesMixin:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
                 conversation_messages.append({"role": role, "content": content})
         user_message: Any = (conversation_messages[-1].get("content", "") if conversation_messages else "")
-        history = conversation_messages[:-1]
+        # E11: client-authored history is relabelled here; X-Hermes-Session-Id replaces it with the store's.
+        history = relabel_client_history(conversation_messages[:-1])
         if not _content_has_visible_payload(user_message):
             return _invalid_request("No user message found in messages")
 
@@ -1114,6 +1116,8 @@ class OpenAICompatRoutesMixin:
                 instructions = stored.get("instructions")
         # All input messages but the last become history; the last is the user message.
         conversation_history.extend(input_messages[:-1])
+        # E11: client-authored rows are relabelled at ingestion (harness note rows pass unchanged).
+        conversation_history = relabel_client_history(conversation_history)
         user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
         if not _content_has_visible_payload(user_message):
             return _error_response("No user message found in input", 400)

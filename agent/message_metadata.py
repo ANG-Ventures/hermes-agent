@@ -37,12 +37,16 @@ ABSORBED_MESSAGE_UIDS = "_absorbed_message_uids"
 # (``messages.tool_call_uid``). The provider-facing ``id`` is untouched; these never reach the wire.
 TOOL_CALL_UIDS = "_tool_call_uids"
 TOOL_CALL_UID = "_tool_call_uid"
+# A durable user-row rewrite that could not be applied when it was decided (the E11 relabel of a staged
+# row whose lookup failed transiently): the content to write. The flush retries it on the row it addresses.
+PENDING_USER_CONTENT_REWRITE = "_pending_user_content_rewrite"
 PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
     # Membership is the real contract, NOT the leading underscore: the chat-completions transport happens
     # to sweep underscore keys, but turn_context.py pops this set from every outgoing copy and a strict
     # backend 400s on any key it does not know.
     {"timestamp", "display_kind", "display_metadata", "_row_id", "_submit_row_session_id",
-     MERGED_TURN_PREFIX, MESSAGE_UID, ABSORBED_MESSAGE_UIDS, TOOL_CALL_UIDS, TOOL_CALL_UID}
+     MERGED_TURN_PREFIX, MESSAGE_UID, ABSORBED_MESSAGE_UIDS, TOOL_CALL_UIDS, TOOL_CALL_UID,
+     PENDING_USER_CONTENT_REWRITE}
 ) | REPAIR_BOOKKEEPING_FIELDS
 
 

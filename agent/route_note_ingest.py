@@ -73,7 +73,7 @@ _TEXT = ("text", _relabel_str)
 _BLOCK_TEXT_PATHS: dict[Any, tuple[tuple[str, Any], ...]] = {
     "document": (_TEXT, ("title", _relabel_str), ("context", _relabel_str), ("source", _relabel_document_source)),
     "tool_result": (_TEXT, ("content", _relabel_nested)),
-    "search_result": (_TEXT, ("title", _relabel_str), ("content", _relabel_nested)),
+    "search_result": (_TEXT, ("title", _relabel_str), ("source", _relabel_str), ("content", _relabel_nested)),
     "function_call_output": (_TEXT, ("output", _relabel_nested)),
 }
 _DEFAULT_TEXT_PATHS = (_TEXT,)
@@ -114,3 +114,14 @@ def relabel_route_note_content(content: Any) -> Any:
         changed = changed or new_part is not part
         out.append(new_part)
     return out if changed else content
+
+
+def relabel_client_history(history: list) -> list:
+    """API-supplied history relabelled at ingestion: every user-role row, the same rule as the current
+    turn (a stateless client resends its transcript raw). Rows typed ``display_kind="route_note"`` are the
+    harness's own notes replayed from a server-side store and pass unchanged (E11(b)); a client-built row
+    never carries that key."""
+    return [dict(row, content=relabel_route_note_content(row["content"]))
+            if isinstance(row, dict) and row.get("role") == "user" and "content" in row
+            and row.get("display_kind") != ROUTE_NOTE_DISPLAY_KIND else row
+            for row in history]

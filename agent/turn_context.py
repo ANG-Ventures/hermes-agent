@@ -733,10 +733,11 @@ def _rewrite_relabelled_staged_row(agent: Any, staged: Dict[str, Any], content: 
 
     A rewrite that still fails after a bounded retry (the setter already waits out the busy timeout)
     hands the row to the normal flush: the marker is cleared and the dict carries the stored row's
-    digest, so the flush's row-addressed CAS rewrites that row in place (or appends when it is gone).
+    digest, so the flush's row-addressed CAS rewrites that row in place (or appends when a read proves it
+    gone). When that read itself fails the row stays addressed and the flush retries the rewrite.
     The live and durable rows never diverge silently."""
     from agent.context_compressor import _DB_PERSISTED_MARKER
-    from agent.message_metadata import DB_ROW_SNAPSHOT
+    from agent.message_metadata import DB_ROW_SNAPSHOT, PENDING_USER_CONTENT_REWRITE
     from agent.session_persistence import _durable_content, _persist_lock
     from agent.transcript_repair import transcript_row_snapshot
 
@@ -766,7 +767,12 @@ def _rewrite_relabelled_staged_row(agent: Any, staged: Dict[str, Any], content: 
                 row = _db._read_one("SELECT * FROM messages WHERE id = ? AND session_id = ? AND active = 1",
                                     (active_id if isinstance(active_id, int) else _row_id, session_id))
             except Exception:
+                # A failed read is not an absent row: keep the row durable and addressed, and hand the
+                # rewrite to the flush, which retries it in place (never the append fallback).
                 logger.warning("route-note relabel: staged row read failed", exc_info=True)
+                staged[_DB_PERSISTED_MARKER] = True
+                staged[PENDING_USER_CONTENT_REWRITE] = (session_id, _durable_content(content))
+                return
         if row is None:
             # No addressable live row in this session: the flush appends the relabelled row.
             staged.pop("_row_id", None)
