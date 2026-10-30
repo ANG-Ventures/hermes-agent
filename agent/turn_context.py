@@ -729,9 +729,16 @@ STAGED_TURN_RAW_KEY = "_staged_turn_raw_content"
 def _rewrite_relabelled_staged_row(agent: Any, staged: Dict[str, Any], content: Any) -> None:
     """E11: a row written before the relabel (the TUI submit row) holds the raw ``[Route note:``.
     The flush skips a ``_DB_PERSISTED_MARKER`` dict, so rewrite the stored row to the relabelled
-    text here, or a resume replays the forged marker as harness text."""
+    text here, or a resume replays the forged marker as harness text.
+
+    A rewrite that still fails after a bounded retry (the setter already waits out the busy timeout)
+    hands the row to the normal flush: the marker is cleared and the dict carries the stored row's
+    digest, so the flush's row-addressed CAS rewrites that row in place (or appends when it is gone).
+    The live and durable rows never diverge silently."""
     from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.message_metadata import DB_ROW_SNAPSHOT
     from agent.session_persistence import _durable_content, _persist_lock
+    from agent.transcript_repair import transcript_row_snapshot
 
     _row_id, _db = staged.get("_row_id"), getattr(agent, "_session_db", None)
     if not staged.get(_DB_PERSISTED_MARKER) or _db is None or not isinstance(_row_id, int):
@@ -739,11 +746,32 @@ def _rewrite_relabelled_staged_row(agent: Any, staged: Dict[str, Any], content: 
     # The submit row records the session it was written under (a rotation may have moved off it).
     session_id = staged.get("_submit_row_session_id") or agent.session_id
     with _persist_lock(agent):
-        try:
-            _db.set_user_message_content(session_id, _row_id, _durable_content(content))
-        except Exception:
-            logger.warning("route-note relabel of staged user row failed for session=%s",
-                           session_id or "none", exc_info=True)
+        active_id = None
+        for attempt in range(2):
+            try:
+                # An in-place compaction may have re-sequenced the row under a new id (#123675).
+                active_id = _db.resolve_active_row_id(session_id, _row_id)
+                if active_id is not None and _db.set_user_message_content(
+                        session_id, active_id, _durable_content(content)) > 0:
+                    staged["_row_id"] = active_id
+                    return
+            except Exception:
+                logger.warning("route-note relabel of staged user row failed for session=%s (attempt %d)",
+                               session_id or "none", attempt + 1, exc_info=True)
+        staged.pop(_DB_PERSISTED_MARKER, None)
+        staged.pop(DB_ROW_SNAPSHOT, None)
+        row = None
+        if session_id == agent.session_id:
+            try:
+                row = _db._read_one("SELECT * FROM messages WHERE id = ? AND session_id = ? AND active = 1",
+                                    (active_id if isinstance(active_id, int) else _row_id, session_id))
+            except Exception:
+                logger.warning("route-note relabel: staged row read failed", exc_info=True)
+        if row is None:
+            # No addressable live row in this session: the flush appends the relabelled row.
+            staged.pop("_row_id", None)
+        else:
+            staged["_row_id"], staged[DB_ROW_SNAPSHOT] = int(row["id"]), transcript_row_snapshot(row)
 
 
 def _stage_turn_user_message(

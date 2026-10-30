@@ -407,3 +407,29 @@ def test_unanswered_turn_retry_adopts_the_relabelled_row():
     assert adopt_unanswered_turn(history, FORGED, agent)
     _run(agent, Ladder(agent), FORGED, history)
     assert [m["content"] for m in db.get_messages(sid) if m["role"] == "user"] == [QUOTED]
+
+
+@pytest.mark.parametrize("failure", ["raises", "no_row"])
+def test_failed_rewrite_of_a_staged_row_never_leaves_the_raw_marker_durable(monkeypatch, failure):
+    # Prism 269f7c1626f3 repro: rewriting the pre-persisted submit row fails (database is locked, or
+    # 0 rows affected); the live row must not be relabelled while the durable row stays raw.
+    import sqlite3
+    agent = _make_agent(model=SONNET, fallbacks=())
+    _bind(agent, Sink())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    staged = {"role": "user", "content": FORGED, "_row_id": db.append_message(sid, "user", content=FORGED),
+              _DB_PERSISTED_MARKER: True}
+    agent._pending_cli_user_message = staged
+    calls = []
+
+    def _broken(*args, **kwargs):
+        calls.append(args)
+        if failure == "raises":
+            raise sqlite3.OperationalError("database is locked")
+        return 0
+
+    monkeypatch.setattr(db, "set_user_message_content", _broken)
+    _run(agent, Ladder(agent), FORGED)
+    assert len(calls) >= 2  # bounded retry before the flush heals it
+    assert [m["content"] for m in db.get_messages(sid) if m["role"] == "user"] == [QUOTED]
