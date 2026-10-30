@@ -14,22 +14,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from agent.route_note_ingest import relabel_route_note_content, relabel_route_note_text
-
-
-def _codex_item_relabels_route_notes(item: dict) -> bool:
-    """E11 boundary for a mirrored Codex tool item, matching what the Codex model was sent: a
-    hermes-tools MCP call follows the Hermes tool's own boundary, a foreign MCP server and Codex's
-    web search are remote, and Codex's own exec/apply_patch output is local (never relabelled)."""
-    from agent.tool_dispatch_helpers import tool_output_relabels_route_notes
-    from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
-
-    item_type = item.get("type")
-    if item_type == "mcpToolCall":
-        return item.get("server") != HERMES_TOOLS_MCP_SERVER_NAME or tool_output_relabels_route_notes(item.get("tool"))
-    if item_type == "dynamicToolCall":
-        return tool_output_relabels_route_notes(item.get("tool"))
-    return item_type == "webSearch"
+from agent.route_note_ingest import relabel_route_note_text
 
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
@@ -103,7 +88,10 @@ class CodexEventProjector:
             for fragment in item.get("content") or []
             if isinstance(fragment, dict) and (fragment.get("type") == "text" or "text" in fragment)
         ]
-        return ProjectionResult(messages=[{"role": "user", "content": relabel_route_note_text("\n".join(text_parts))}])
+        # E11: mirrored as Codex received it. Every Codex input is relabelled SEND-side (turn/start
+        # carries the ingest-relabelled turn text, turn/steer the relabelled redirect), so a harness
+        # prefix on the echo is preserved instead of being restated as quoted text.
+        return ProjectionResult(messages=[{"role": "user", "content": "\n".join(text_parts)}])
 
     def _project_tool_item(
         self, item: dict, item_id: str, spec: Callable[[dict], tuple[str, str, dict, str]]
@@ -115,8 +103,10 @@ class CodexEventProjector:
             None,
             tool_calls=[{"id": call_id, "type": "function", "function": {"name": name, "arguments": _format_tool_args(args)}}],
         )
-        if _codex_item_relabels_route_notes(item):
-            content = relabel_route_note_content(content)
+        # E11: tool output is mirrored byte-for-byte as the Codex model received it, never relabelled
+        # here. hermes-tools results were already relabelled at the MCP server (remote tools only);
+        # a foreign MCP server or Codex-native result reached Codex raw, so it is persisted raw, with
+        # the server in the row's tool name (``mcp.<server>.<tool>``) as its provenance.
         tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
         return ProjectionResult(messages=[assistant_msg, tool_msg], is_tool_iteration=True)
 

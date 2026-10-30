@@ -582,9 +582,12 @@ def make_tool_result_message(
     return message
 
 
-# Tools whose results carry attacker-controllable content; outputs under 32 chars skip wrapping.
-_UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search"})
-_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_")
+# Tools whose results carry attacker-controllable content (other people's pages, messages, posts,
+# remote docs; never local state); outputs under 32 chars skip wrapping.
+_UNTRUSTED_TOOL_NAMES = frozenset({
+    "web_extract", "web_search", "x_search", "discord", "discord_admin", "feishu_doc_read",
+})
+_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_", "connectors__")
 _UNTRUSTED_WRAP_MIN_CHARS = 32
 
 # Case-insensitive so a differently-cased tag can't forge or prematurely close the boundary.

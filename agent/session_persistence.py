@@ -166,9 +166,14 @@ def adopt_unanswered_turn(history: List[Dict[str, Any]], query: Any, agent: Any)
     answer lands after them as a valid continuation). Anything else declines — no user row at the tail, or a
     different text there — so a person's deliberate re-send of the same text is never swallowed.
     """
+    from agent.route_note_ingest import relabel_route_note_content
+    from agent.turn_context import STAGED_TURN_RAW_KEY
+
     idx = next((i for i in range(len(history) - 1, -1, -1)
                 if isinstance(history[i], dict) and history[i].get("role") == "user"), None)
-    if idx is None or history[idx].get("content") != query:
+    # E11: the first attempt stored the DM relabelled; the dispatcher re-sends the raw query. Both
+    # sides are the same submission here by construction (the dispatcher vouches for the re-run).
+    if idx is None or history[idx].get("content") not in (query, relabel_route_note_content(query)):
         return False
     if not all(isinstance(row, dict) and (row.get("role") == "tool" or (row.get("role") == "assistant" and row.get("tool_calls")))
                for row in history[idx + 1:]):
@@ -176,6 +181,7 @@ def adopt_unanswered_turn(history: List[Dict[str, Any]], query: Any, agent: Any)
     tail = history[idx]
     del history[idx:]
     tail[_DB_PERSISTED_MARKER] = True
+    tail[STAGED_TURN_RAW_KEY] = query  # staging matches on the raw turn text
     agent._pending_cli_user_message = tail
     return True
 
