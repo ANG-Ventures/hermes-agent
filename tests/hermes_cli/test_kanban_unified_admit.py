@@ -494,12 +494,15 @@ def test_confirm_leaves_out_the_takes_own_row_by_reservation_id(home):
     assert own not in ids and big in ids, ids
 
 
-@pytest.mark.parametrize("local", [False, True])
-def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypatch, local):
+@pytest.mark.parametrize("local,detail", [(False, {"class_rule": "admit_class"}), (False, {"rule": "utilization"}),
+                                          (False, None), (True, {"class_rule": "admit_class"})])
+def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypatch, local, detail):
     """Prism 72e85daf44a6 / d618d0a51436: off the router host allocd books in ITS ledger, never this dispatcher's file;
     confirm_class looked the row up locally, found nothing and refused every remote allocd take (closed: not live).
-    Remote: the take stands on allocd's verdict. Router host (one ledger): the local check still runs, and a row
-    allocd says it booked but the shared file lacks is refused as before."""
+    Prism 11efd32500fc: off the router host the take stands ONLY on a router-side class verdict (the reply's
+    ``class_rule: admit_class``); an ordinary grant (placement.admit's older rule) is refused and released, since
+    unified_filter's local pre-check cannot see allocd's ledger. Router host (one ledger): the local check still runs,
+    and a row allocd says it booked but the shared file lacks is refused as before, whatever the reply says."""
     from hermes_cli import alloc_client
 
     t0 = time.time()
@@ -508,15 +511,39 @@ def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypat
     monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: local)
     released = []
     monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
-        host="ci-box", reservation_id="r_allocd_1", reason="ok"))
+        host="ci-box", reservation_id="r_allocd_1", reason="", detail=detail))
     monkeypatch.setattr(kh, "release_alloc", lambda rid: released.append(rid))
     host = plan.take("alpha", only=["ci-box"], job_id="t_remote")
-    if not local:
+    if local:
+        assert host is None and "r_allocd_1 not live" in plan.refusal, plan.refusal
+        assert released == ["r_allocd_1"]
+    elif detail and detail.get("class_rule") == "admit_class":
         assert host is not None and host.name == "ci-box", plan.refusal
         assert plan.last_reservation == "r_allocd_1" and released == []
     else:
-        assert host is None and "r_allocd_1 not live" in plan.refusal, plan.refusal
-        assert released == ["r_allocd_1"]
+        assert host is None and plan.refusal.startswith("unified_admission"), plan.refusal
+        assert "no router-side class verdict" in plan.refusal and released == ["r_allocd_1"]
+
+
+def test_remote_plain_allocd_grants_cannot_overrun_the_class_rule(home, monkeypatch):
+    """Prism 11efd32500fc repro: off the router host, a router that runs only placement.admit() grants every take; the
+    local pre-check reads an empty dispatcher ledger and passes both. Under the unified rule neither plain grant may
+    stand (the second would project 0.880 + (4+2)/256 > 0.90 with Prism's demand held); both are released."""
+    from hermes_cli import alloc_client
+
+    t0 = time.time()
+    f = Fleet(t0)
+    f.busy = {"ci-box": 0.880, "ace-ai": 0.5, "ace-media": 0.5}
+    plan = _plan_mode(home, f, "on", monkeypatch)
+    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: False)
+    n = iter(range(10))
+    released = []
+    monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
+        host="ci-box", reservation_id=f"r_plain_{next(n)}", reason="", rule="utilization", detail={"host": "ci-box"}))
+    monkeypatch.setattr(kh, "release_alloc", lambda rid: released.append(rid))
+    assert plan.take("alpha", only=["ci-box"], job_id="t_a") is None
+    assert plan.take("alpha", only=["ci-box"], job_id="t_b") is None
+    assert released == ["r_plain_0", "r_plain_1"], released
 
 
 @pytest.mark.parametrize("extra,why", [({"slo_breach": True}, "saturated:slo"),

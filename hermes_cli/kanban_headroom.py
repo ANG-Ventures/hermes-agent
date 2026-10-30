@@ -320,18 +320,27 @@ def book_pin(plan, name: str, job_id: Optional[str], job: Optional[placement.Job
                                            now=now, admissions_path=aps, decision=None, job_class=ctx.job_class)
 
 
+# The allocd /admit reply field that says the ROUTER ran the class rule (admission.admit_class / may_start) on its
+# own locked ledger for this grant. Off the router host it is the only class verdict a take can stand on (Prism
+# 11efd32500fc, t_c466b7ee): an ordinary grant is placement.admit()'s older rule.
+ROUTER_CLASS_FIELD = "class_rule"
+ROUTER_CLASS_RULE = "admit_class"
+
+
 def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[str], *,
-                  via_alloc: bool = False) -> Optional[str]:
+                  via_alloc: bool = False, decision: Any = None) -> Optional[str]:
     """Prism c8d0343d7fb6: the class rule for a take whose row ``rid`` the old locked rule (placement.admit, or
     allocd) just booked, re-run UNDER the ledger lock against the locked ledger with that row left out (the take as
     it would be admitted now). Refused -> the row is dropped in the SAME lock section and the refusal returned; None
     = admitted. Every competing take confirms serially under one lock, and a refused one leaves before the next
     confirms, so two takes where only one fits admit exactly one. Inert (None) without the one rule or a ledger.
     An unreadable ledger raises PlacementError (the caller fails closed).
-    ``via_alloc``: allocd booked ``rid``. Off the router host (``alloc_client.ledger_is_local()`` false) the row is in
-    allocd's ledger, never this dispatcher's file, so there is nothing local to confirm against: the take stands on
-    allocd's own locked verdict plus unified_filter's class pre-check over the candidates (Prism 72e85daf44a6 /
-    d618d0a51436, t_c466b7ee). On the router host the two ledgers are one file and the check below runs."""
+    ``via_alloc``: allocd booked ``rid`` (``decision`` = its AdmitResult). Off the router host
+    (``alloc_client.ledger_is_local()`` false) the row is in allocd's ledger, never this dispatcher's file, so there is
+    nothing local to confirm against (Prism 72e85daf44a6 / d618d0a51436). The take stands only on the ROUTER's class
+    verdict: the reply must say ``class_rule: admit_class``. A grant without it came from the older rule, and
+    unified_filter's local pre-check cannot see allocd's ledger, so it is refused and released (Prism 11efd32500fc).
+    On the router host the two ledgers are one file and the check below runs."""
     sig = plan.signal
     if not rid or not unified_active(plan) or getattr(sig, "placement_reservations", None) is None:
         return None
@@ -339,7 +348,12 @@ def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[s
     if via_alloc:
         from hermes_cli import alloc_client
         if not alloc_client.ledger_is_local(table):
-            return None
+            detail = getattr(decision, "detail", None)
+            got = detail.get(ROUTER_CLASS_FIELD) if isinstance(detail, Mapping) else None
+            if got == ROUTER_CLASS_RULE:
+                return None
+            return (f"closed:allocd grant {rid} carries no router-side class verdict "
+                    f"({ROUTER_CLASS_FIELD}={got!r}, need {ROUTER_CLASS_RULE!r})")
     rpath = Path(sig.placement_reservations)
     with placement._locked(rpath):
         now = sig.clock()

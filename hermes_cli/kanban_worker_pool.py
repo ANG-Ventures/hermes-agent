@@ -1997,7 +1997,7 @@ class SpilloverPlan:
             self.refusal = f"pool_unavailable (allocd picked {r.host}, not a candidate)"
             return None
         if self._class_refused(key, job, r.reservation_id, release=lambda: _kh.release_alloc(r.reservation_id),
-                               via_alloc=True):
+                               via_alloc=True, decision=r):
             return None
         debit = self.slots.get(key, 0) > 0
         if debit:
@@ -2009,13 +2009,14 @@ class SpilloverPlan:
         self.last_pick = key
         return self.hosts[key]
 
-    def _class_refused(self, key: str, job: Any, rid: Optional[str], *, release, via_alloc: bool = False) -> bool:
+    def _class_refused(self, key: str, job: Any, rid: Optional[str], *, release, via_alloc: bool = False,
+                       decision: Any = None) -> bool:
         """The ONE rule's verdict for a take the old locked rule just booked, UNDER the ledger lock (Prism
         c8d0343d7fb6): refused = the row is already dropped, ``release`` clears the booker's own state, refusal
         set. An unreadable ledger fails closed the same way. False = admitted (or the rule is off)."""
         from hermes_cli import kanban_headroom as _kh
         try:
-            why = _kh.confirm_class(self, key, job, rid, via_alloc=via_alloc)
+            why = _kh.confirm_class(self, key, job, rid, via_alloc=via_alloc, decision=decision)
         except Exception as exc:  # LedgerError / lock fault: fail closed
             why = f"closed:{type(exc).__name__}: {exc}"
         if why is None:
