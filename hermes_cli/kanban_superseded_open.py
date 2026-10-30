@@ -198,6 +198,44 @@ def sha_close_covers(pr_key: str, shas, *, thread_fn: Optional[ThreadFn] = None,
     return None
 
 
+_PR_KEYS = ("pr_url", "pr_urls", "pr")
+
+
+def _drop_closed_refs(meta: dict, closed: set, open_pr) -> dict:
+    """``meta`` with every superseded PR removed from the PR declaration keys ``recorded_pr_refs`` reads first
+    (Prism 41184b66e3f3), so ``_routed_pr_head`` never picks the CLOSED PR; unaffected PRs stay."""
+    def _is_closed(s) -> bool:
+        refs = open_pr.extract_pr_refs(s) if isinstance(s, str) else []
+        return bool(refs) and all(f"{r.repo}#{r.number}".lower() in closed for r in refs)
+    for key in _PR_KEYS:
+        val = meta.get(key)
+        if isinstance(val, str) and _is_closed(val):
+            meta.pop(key)
+        elif isinstance(val, (list, tuple)):
+            kept = [v for v in val if not _is_closed(v)]
+            if kept:
+                meta[key] = kept
+            else:
+                meta.pop(key)
+    return meta
+
+
+def _implementer(conn: sqlite3.Connection, task_id: str, trow, kb) -> Optional[str]:
+    """The card's implementer. A card already handed to review is assigned to its REVIEWER, so when the latest
+    ``review_requested`` names the current assignee as reviewer, its recorded implementer wins (Prism
+    3cf9606f6d32); otherwise the current run's profile, then the assignee."""
+    ev = kb._latest_event(conn, task_id, "review_requested")
+    payload = kb._json_dict(kb._row_get(ev, "payload")) if ev is not None else {}
+    handed = kb._nonblank_str(payload.get("implementer"))
+    if handed and str(payload.get("reviewer") or "").casefold() == str(trow["assignee"] or "").casefold():
+        return handed
+    if trow["current_run_id"] is not None:
+        arow = conn.execute("SELECT profile FROM task_runs WHERE id = ?", (trow["current_run_id"],)).fetchone()
+        if arow and arow["profile"]:
+            return arow["profile"]
+    return trow["assignee"]
+
+
 def park(conn: sqlite3.Connection, task_id: str, targets: list, *, expected_run_id: Optional[int] = None,
          force: bool = False, summary: Optional[str] = None, result: Optional[str] = None,
          metadata: Optional[dict] = None, own_prs=()) -> bool:
@@ -213,8 +251,11 @@ def park(conn: sqlite3.Connection, task_id: str, targets: list, *, expected_run_
     own = list(dict.fromkeys(keep + [t["successor"] for t in targets]))
     refs = _open_pr.extract_pr_refs(*own)
     note = _open_pr.route_note(refs) + " (" + "; ".join(f"{t['closed']} {t['token']}" for t in targets) + ")"
+    summary, metadata = kb.redact_review_handoff(summary, metadata)  # Prism b44e05780ff8: same as request_review
+    result = kb.redact_review_value(result)
     text = "\n".join(x for x in (note, summary, result) if x)
-    meta = dict(metadata or {}, own_prs=own, auto_routed_open_prs=own, routed_pr_superseded={"targets": targets})
+    meta = _drop_closed_refs(dict(metadata or {}), closed, _open_pr)  # Prism 41184b66e3f3
+    meta.update(own_prs=own, auto_routed_open_prs=own, routed_pr_superseded={"targets": targets})
     with kb.write_txn(conn):
         trow = conn.execute("SELECT assignee, status, claim_lock, current_run_id, worker_pid, worker_started_at "
                             "FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -222,11 +263,7 @@ def park(conn: sqlite3.Connection, task_id: str, targets: list, *, expected_run_
             return False
         if expected_run_id is None and not force and kb._claim_is_live(trow):
             raise kb.LiveClaimError(task_id)
-        implementer = None
-        if trow["current_run_id"] is not None:
-            arow = conn.execute("SELECT profile FROM task_runs WHERE id = ?", (trow["current_run_id"],)).fetchone()
-            implementer = arow["profile"] if arow else None
-        implementer = implementer or trow["assignee"]
+        implementer = _implementer(conn, task_id, trow, kb)
         reviewer, err = kb.resolve_reviewer(None, implementer)
         if err is not None:
             raise ValueError(f"{task_id}: superseded park refused: {err}")

@@ -168,3 +168,49 @@ def test_e2e_park_keeps_result_and_records_review_provenance(board, monkeypatch)
         assert "RESULT-EVIDENCE-LINE" in (kb.list_runs(conn, tid)[-1].summary or "")
         ev = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
         assert ev and ev[-1].payload["implementer"] == "worker"
+
+
+# --- Prism round 2 (#2465) -----------------------------------------------------
+
+
+def test_e2e_park_drops_the_closed_pr_from_every_declaration_key(board, monkeypatch):
+    # Prism 41184b66e3f3: pr_url/pr_urls/pr naming the CLOSED PR must not survive into the parked run
+    from hermes_cli import kanban_handback_head as hh
+    from hermes_cli import kanban_verb_input as vi
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        old_url = f"https://github.com/{REPO}/pull/{OLD}"
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}",
+                                metadata={"pr_url": old_url, "pr_urls": [old_url, f"{REPO}#7900"],
+                                          "pr": f"{REPO}#{OLD}"}) is True
+        meta = kb.list_runs(conn, tid)[-1].metadata
+        assert "pr_url" not in meta and "pr" not in meta and meta["pr_urls"] == [f"{REPO}#7900"]
+        refs = op.split_fleet(op.extract_pr_refs(*op.recorded_pr_refs(meta)))[0]
+        assert (REPO, OLD) not in {(r.repo, r.number) for r in refs}
+        monkeypatch.setattr(hh, "_default_reader", lambda: (lambda r, n: {"head": f"head-of-{n}"}))
+        assert vi._routed_pr_head(conn, tid)[1] != f"{REPO}#{OLD}"
+
+
+def test_e2e_park_redacts_the_handoff(board, monkeypatch):
+    # Prism b44e05780ff8: the same domain-boundary redaction as request_review
+    secret = "ghp_" + "R" * 40
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}", summary=f"handoff {secret}",
+                                result=f"res {secret}", metadata={"password": "plaintext-value"}) is True
+        run = kb.list_runs(conn, tid)[-1]
+        assert secret not in (run.summary or "")
+        assert "plaintext-value" not in str(run.metadata)
+
+
+def test_e2e_repark_of_a_review_card_keeps_the_original_implementer(board, monkeypatch):
+    # Prism 3cf9606f6d32: a card already in review is assigned to its reviewer; that is not the implementer
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET assignee='human:apollo' WHERE id=?", (tid,))
+            kb._append_event(conn, tid, "review_requested",
+                             {"summary": "x", "implementer": "worker", "reviewer": "human:apollo"})
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}") is True
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
+        assert ev[-1].payload["implementer"] == "worker"
