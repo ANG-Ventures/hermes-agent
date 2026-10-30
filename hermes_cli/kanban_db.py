@@ -9417,6 +9417,14 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
                 "needs_attention": True}
     return None
 
+
+def _live_owner_detail(alive: dict) -> str:
+    """`` (run R, pid P, identity I)`` for a refusal naming the live owner, so
+    the operator can check that exact pid (and see an ``unverified`` verdict)
+    instead of guessing which run the gate meant (t_2911d7bc)."""
+    return (f" (run {alive.get('prev_run_id')}, pid {alive.get('prev_pid')}, "
+            f"identity {alive.get('owner_identity')})")
+
 # Causal-window tolerances for owner identity, in seconds. Event timestamps
 # are integer seconds (floored), so allow 1 s before the claim and 2 s after
 # the spawned event. The window is deliberately ONE-SIDED around the spawn:
@@ -14965,8 +14973,12 @@ def request_changes(
             if coverage_body is None and operator_reason is None:
                 # Same message the gate gives; refused before any claim churn.
                 return False, _REVIEW_COVERAGE_MISSING
-            if _prior_worker_still_alive(conn, task_id) is not None:
-                return False, "a prior worker run on this task is still alive"
+            alive = _prior_worker_still_alive(conn, task_id)
+            if alive is not None:
+                return False, (
+                    "a prior worker run on this task is still alive"
+                    + _live_owner_detail(alive)
+                )
             now = int(time.time())
             run_id = _open_review_run(
                 conn, task_id, lock=str(claimer),
@@ -14991,13 +15003,16 @@ def request_changes(
             # of which run it owns (``claimer`` is a reusable profile name, not
             # a run credential), so it may close only a lapsed run: claim
             # expired and no live owner. A live run is closed with its run id.
-            if (
+            claim_live = bool(
                 task_row["claim_lock"]
                 and int(task_row["claim_expires"] or 0) > int(time.time())
-            ) or _prior_worker_still_alive(conn, task_id) is not None:
+            )
+            alive = None if claim_live else _prior_worker_still_alive(conn, task_id)
+            if claim_live or alive is not None:
                 return False, (
                     "a live review run holds this task; pass its run id "
                     "(expected_run_id) to close it"
+                    + (_live_owner_detail(alive) if alive else "")
                 )
 
         requested_event = _latest_event(conn, task_id, "review_requested")
