@@ -1027,3 +1027,43 @@ def test_assign_rejudges_the_route_inside_the_write_txn(flagship_profiles, monke
         assert kb.get_task(conn, task_id).assignee == "daedalus-opus"
     assert len(calls) == 2
     assert _comments(task_id) == []
+
+
+def _review_card(reviewer: str, implementer: str) -> str:
+    """A ``review`` card parked on ``reviewer`` whose recorded implementer is ``implementer``."""
+    task_id = _card(implementer)
+    with kb.connect() as conn:
+        run = kb.claim_task(conn, task_id, claimer=f"{implementer}:1")
+        assert kb.request_review(conn, task_id, summary="ready", reviewer="human",
+                                 expected_run_id=run.current_run_id) is True
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (reviewer, task_id))
+        conn.commit()
+    return task_id
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_request_changes_judges_the_post_send_back_route_before_committing(
+    flagship_profiles, proven_operator, monkeypatch, verb,
+):
+    """Prism 8b7984d6e364: assigning a review card to its current reviewer with
+    --request-changes looks unchanged, but the send-back restores the
+    implementer first, so the card really moves implementer -> profile. That
+    route is judged BEFORE the send-back commits: refused, still in review,
+    hold intact, nothing written."""
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            fn(conn, task_id, "daedalus-fable", request_changes_reason="rework", operator="apollo")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee) == ("review", "daedalus-fable")
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
+        ).fetchone()
+    assert _comments(task_id) == []
+    # The same send-back onto a non-flagship profile still lands.
+    with kb.connect() as conn:
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee) == ("ready", "daedalus-sonnet")

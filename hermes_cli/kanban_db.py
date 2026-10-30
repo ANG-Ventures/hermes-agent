@@ -7159,6 +7159,20 @@ def _route_flagship_reason(
     return allowed
 
 
+def _send_back_assignee(
+    conn: sqlite3.Connection, task_id: str, current: Optional[str],
+) -> Optional[str]:
+    """The assignee :func:`request_changes` leaves on a ``review`` card: the
+    implementer of the latest ``review_requested`` (``current`` otherwise).
+    Raw, as request_changes writes it, so any mismatch is judged, not skipped."""
+    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if status is None or status["status"] not in ("review", "running"):
+        return current
+    event = _latest_event(conn, task_id, "review_requested")
+    implementer = _nonblank_str(_json_dict(_row_get(event, "payload")).get("implementer")) if event else None
+    return implementer or current
+
+
 def _assignee_flagship_reason(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7167,19 +7181,25 @@ def _assignee_flagship_reason(
     actor: Optional[str],
     *,
     releases_dispatch: bool = False,
+    sends_back: bool = False,
 ) -> Optional[str]:
     """Flagship gate for assign/reassign (t_9e7ba884): the route only changes
     when the assignee does and the card has no model pin, but an explicit
     reason on the same assignee still authorizes a legacy flagship card.
     ``releases_dispatch`` (``--worker-ok`` clearing ``no_worker``) judges an
     unchanged assignee too: the card becomes dispatchable on that route
-    (Prism 40019830ac27)."""
+    (Prism 40019830ac27). ``sends_back`` (``--request-changes``) compares
+    against the assignee the send-back restores, so a reviewer-named profile
+    is judged BEFORE that send-back commits (Prism 8b7984d6e364)."""
     row = conn.execute(
         "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
-    if row is None or (
-        row["assignee"] == profile and not releases_dispatch and not (reason or "").strip()
-    ):
+    if row is None:
+        return None
+    current = row["assignee"]
+    if sends_back:
+        current = _send_back_assignee(conn, task_id, current)
+    if current == profile and not releases_dispatch and not (reason or "").strip():
         return None
     return _route_flagship_reason(
         conn, task_id, profile, reason, actor,
@@ -7341,12 +7361,13 @@ def assign_task(
         raise NoWorkerFlagSet(refusal)
     clear_no_worker = bool(refusal)
     # ``operator`` (the CLI's verified author) is the actor; authority is
-    # judged in here before any write or reclaim.
+    # judged in here before any write or reclaim. A send-back commits on its
+    # own, so its post-send-back route is judged here first (Prism 8b7984d6e364).
+    changes_reason = str(request_changes_reason or "").strip()
     flagship_reason = _assignee_flagship_reason(
         conn, task_id, profile, flagship_override_reason, operator,
-        releases_dispatch=clear_no_worker,
+        releases_dispatch=clear_no_worker, sends_back=bool(changes_reason),
     )
-    changes_reason = str(request_changes_reason or "").strip()
     if not changes_reason:
         held = review_hold_open_prs(conn, task_id, query_fn=pr_query)
         if held:
@@ -10567,6 +10588,7 @@ def reassign_task(
     _assignee_flagship_reason(
         conn, task_id, _canonical_assignee(profile), flagship_override_reason, operator,
         releases_dispatch=bool(refusal),
+        sends_back=bool(str(request_changes_reason or "").strip()),
     )
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
