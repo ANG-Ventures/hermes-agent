@@ -1131,7 +1131,7 @@ class GatewayNotificationsMixin:
             await present_notification(
                 lambda: self._send_home_channel_message(
                     platform, home, transport, message, "state.db warning notification failed for %s:%s: %s"),
-                platform=platform)
+                platform=platform, chat_id=getattr(home, "chat_id", None), thread_id=getattr(home, "thread_id", None))
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
@@ -2090,6 +2090,11 @@ class GatewayNotificationsMixin:
         """Card-end watcher (§5.4): drain each served profile's ended kanban units under its scope."""
         from gateway.run import _profile_runtime_scope
         from tools.async_delegation_kanban import drain_profile
+        from hermes_cli.kanban_db_dispatch import reap_worker_zombies
+        # A unit runner is this process's child even when another gateway holds the dispatcher lock
+        # (§5.1.5): wait on our own exited runners here, nobody else can.
+        with _log_suppressed(logging.DEBUG, "Kanban unit zombie reap failed: %s"):
+            reap_worker_zombies()
         boot_id = self._current_boot_id()
         for profile_name, profile_home in self._kanban_drain_homes():
             try:
@@ -2405,7 +2410,8 @@ class GatewayNotificationsMixin:
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                         await present_notification(
                             lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
-                            platform=platform_name, diagnostic=session.exit_code not in {0, None})
+                            platform=platform_name, diagnostic=session.exit_code not in {0, None},
+                            chat_id=chat_id, thread_id=thread_id)
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers

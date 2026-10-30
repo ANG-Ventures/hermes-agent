@@ -7,6 +7,7 @@ rc 1 + a JSON line with `text` = refused, anything else = landable / fail-open.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,9 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     q = lambda repo, number: {"state": "OPEN"}  # noqa: E731
     monkeypatch.setattr(op, "_default_query", lambda: q)
+    # the card's assignee is a real profile: the verifier runs with ITS env (Prism 3728a4da34a1)
+    (home / "profiles" / "daedalus").mkdir(parents=True)
+    (home / "profiles" / "daedalus" / ".env").write_text("GH_TOKEN=daedalus-token\n", encoding="utf-8")
     kb.init_db()
     return home
 
@@ -135,15 +139,167 @@ def test_pre_pr_off_runs_nothing(kanban_home, tmp_path, monkeypatch):
     (root / "scripts" / "lib").mkdir(parents=True)
     marker = tmp_path / "ran"
     (root / "scripts" / "lib" / "landable.py").write_text(
-        "open(%r, 'w').write('x')\nimport sys\nsys.exit(1)\n" % str(marker))
+        "open(%r, 'w').write('x')\nimport json, sys\nprint(json.dumps({'landable': False}))\nsys.exit(1)\n" % str(marker))
     monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda **k: root)
     ref = op.extract_pr_refs(PR)
     for doc in (None, {"pre_pr": "off"}):
         if doc is not None:
             (root / "config" / "landing-policy.json").write_text(json.dumps(doc))
-        assert kb._pre_pr_refusals(ref, task_id="t_x", worker="w") == []
+        assert kb._pre_pr_refusals(ref, task_id="t_x", worker="daedalus") == []
         assert not marker.exists()
     (root / "config" / "landing-policy.json").write_text(json.dumps({"pre_pr": "on"}))
-    assert [pr for pr, _ in kb._pre_pr_refusals(ref, task_id="t_x", worker="w")] == ["o/r#7"]
+    assert [pr for pr, _ in kb._pre_pr_refusals(ref, task_id="t_x", worker="daedalus")] == ["o/r#7"]
     assert marker.exists()
     assert sys.executable
+
+
+def test_verifier_crash_fails_open(kanban_home, tmp_path, monkeypatch):
+    """Prism 0b37fb2ab9a0: CPython exits 1 on an uncaught exception. rc 1 is a refusal ONLY when the last stdout
+    line is the verdict JSON; a raising verifier is 'did not run' and the handoff proceeds."""
+    script = tmp_path / "landable_raises.py"
+    script.write_text("print('gathering')\nraise KeyError('boom')\n")
+    monkeypatch.setenv("KANBAN_PRE_PR_SCRIPT", str(script))
+    with kb.connect() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, summary="shipped", survivor_pr=PR) is True
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "review"
+        assert "completion_blocked_pre_pr" not in _kinds(conn, tid)
+    # a JSON last line that is NOT a refusal verdict (landable true / no key) is not a refusal either
+    for line in ("{\"landable\": true}", "{\"pre_pr\": \"on\", \"error\": \"x\"}", "[1]"):
+        script.write_text("import sys\nprint(%r)\nsys.exit(1)\n" % line)
+        assert kb._pre_pr_refusals(op.extract_pr_refs(PR), task_id="t_x", worker="daedalus") == []
+
+
+@pytest.mark.platforms("posix")
+def test_verifier_runs_with_the_assignee_profile_env(kanban_home, tmp_path, monkeypatch):
+    """Prism 3728a4da34a1: the subprocess gets the card's profile home + its own GH credentials, never the launch
+    process's (a multiplexed gateway's os.environ is another profile's)."""
+    monkeypatch.setenv("GH_TOKEN", "launch-token")
+    dump = tmp_path / "env.json"
+    script = tmp_path / "landable_env.py"
+    script.write_text("import json, os, sys\njson.dump(dict(os.environ), open(%r, 'w'))\n"
+                      "print(json.dumps({'landable': False, 'text': 'refused'}))\nsys.exit(1)\n" % str(dump))
+    monkeypatch.setenv("KANBAN_PRE_PR_SCRIPT", str(script))
+    got = kb._pre_pr_refusals(op.extract_pr_refs(PR), task_id="t_x", worker="daedalus")
+    assert got == [(PR, "refused")]
+    env = json.loads(dump.read_text())
+    assert env["GH_TOKEN"] == "daedalus-token"
+    assert os.path.realpath(env["HERMES_HOME"]) == os.path.realpath(kanban_home / "profiles" / "daedalus")
+    # an assignee whose profile cannot be resolved: did not run (fail-open), never the ambient login
+    dump.unlink()
+    assert kb._pre_pr_refusals(op.extract_pr_refs(PR), task_id="t_x", worker="ghost") == []
+    assert not dump.exists()
+
+
+def test_pr_lookup_is_pinned_to_github_com(monkeypatch):
+    """Prism 7cf1422cf1d2: the assignee env may carry GH_HOST; every extracted ref is a github.com ref."""
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        class R:  # noqa: D401
+            returncode, stdout, stderr = 0, '{"state": "open", "head": {"ref": "x"}}', ""
+        return R()
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op.query_pr_state("o/r", 7, env={"GH_HOST": "ghe.example.com", "GH_TOKEN": "t"})
+    assert "--hostname" in seen["argv"] and seen["argv"][seen["argv"].index("--hostname") + 1] == "github.com"
+
+
+@pytest.mark.platforms("posix")
+def test_launch_profile_assignee_keeps_the_process_injected_token(kanban_home, monkeypatch):
+    """Prism d637c235ac85: the assignee IS the launch profile and the only GitHub login is a token injected into
+    the process (shell / service unit). The scrub dropped it and the verifier ran unauthenticated."""
+    from hermes_cli import kanban_pr_acceptance as pa
+    monkeypatch.setenv("GH_TOKEN", "injected-token")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    home = pa._assignee_profile_home("default") or str(kanban_home)
+    monkeypatch.setattr("tools.environments.local._is_routed_home", lambda h: False)
+    env = pa._gh_env(home)
+    assert env is not None and env.get("GH_TOKEN") == "injected-token"
+
+
+def test_candidate_query_keeps_an_indeterminate_ambient_read(kanban_home, tmp_path, monkeypatch):
+    """Prism 3a5427313c61: the assignee's read says NOT_FOUND (its profile cannot see the private repo) and the
+    ambient read is indeterminate (None: timeout / rate limit). Before, that collapsed to NOT_FOUND and the PR
+    dropped out of still_open, so its verifier never ran. None must survive: open_pr_refs keeps an unreadable PR
+    as a candidate (fail-closed, t_1bd02e0b) and the verifier runs on it."""
+    seen = []
+
+    def fake_query(repo, number, env=None):
+        seen.append(env is not None)
+        return {"state": op.NOT_FOUND} if env is not None else None
+
+    monkeypatch.setattr(op, "query_pr_state", fake_query)
+    monkeypatch.setattr(op, "_default_query", lambda: op.query_pr_state)
+    monkeypatch.setattr(kb, "_assignee_gh_env", lambda who: (True, {"GH_TOKEN": "daedalus-token"}))
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)
+    calls = _stub(tmp_path, monkeypatch, 1)                 # the verifier refuses whatever it is handed
+    with kb.connect() as conn:
+        tid = _card(conn)
+        with pytest.raises(kb.NotLandableError) as err:
+            kb.complete_task(conn, tid, summary="shipped", survivor_pr=PR)
+        assert err.value.prs == [PR]                         # the PR stayed a candidate and was verified
+        assert "completion_blocked_pre_pr" in _kinds(conn, tid)
+    assert seen[:2] == [True, False], seen                   # assignee first, then the ambient fallback
+    assert calls.exists()
+
+
+def test_candidate_query_keeps_a_definite_ambient_404_when_the_assignee_read_fails(kanban_home, tmp_path,
+                                                                                  monkeypatch):
+    """Prism 3a5427313c61 (df6d7581): the assignee has no login of its own, so its read is None (gh 'not logged
+    in'), and the ambient read is a definite 404. That is base behaviour (the ref names no PR): the card completes.
+    Before, the None from the assignee read made the ref indeterminate and completion failed closed on every retry."""
+    seen = []
+
+    def fake_query(repo, number, env=None):
+        seen.append(env is not None)
+        return None if env is not None else {"state": op.NOT_FOUND}
+
+    monkeypatch.setattr(op, "query_pr_state", fake_query)
+    monkeypatch.setattr(op, "_default_query", lambda: op.query_pr_state)
+    monkeypatch.setattr(kb, "_assignee_gh_env", lambda who: (True, {"GH_CONFIG_DIR": str(tmp_path / "empty")}))
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)
+    calls = _stub(tmp_path, monkeypatch, 1)
+    with kb.connect() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, summary="shipped", survivor_pr="o/r#999") is True
+        assert "completion_blocked_pre_pr" not in _kinds(conn, tid)
+    assert seen[:2] == [True, False], seen
+    assert not calls.exists()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("answers_for", ["daedalus-token", "launch-token"])
+def test_candidate_query_runs_as_the_assignee(kanban_home, tmp_path, monkeypatch, answers_for):
+    """Prism 2125185a24e1: the open-PR candidate set is read with the SAME assignee env the verifier gets. A fake gh
+    404s under the launch identity (another profile's token in a multiplexed gateway) and answers under the
+    assignee's; the verifier must still run and refuse (on base the candidate set was empty and it was skipped).
+    The converse (only the launch login can read it: an assignee with no login of its own) falls back to the
+    ambient read, so the candidate set is never smaller than before."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$GH_TOKEN\" = %s ]; then\n"
+        "  echo '{\"state\": \"open\", \"head\": {\"ref\": \"feature/x\"}}'; exit 0\n"
+        "fi\n"
+        "echo 'gh: Not Found (HTTP 404)' >&2; exit 1\n" % answers_for)
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("GH_TOKEN", "launch-token")
+    monkeypatch.setattr(op, "_default_query", lambda: op.query_pr_state)
+    if answers_for == "daedalus-token":
+        assert op.query_pr_state("o/r", 7) == {"state": op.NOT_FOUND}  # the launch identity cannot see it
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)  # its own gh read: out of scope
+    calls = _stub(tmp_path, monkeypatch, 1)
+    with kb.connect() as conn:
+        tid = _card(conn)
+        with pytest.raises(kb.NotLandableError) as err:
+            kb.complete_task(conn, tid, summary="shipped", survivor_pr=PR)
+        assert err.value.prs == [PR]
+        assert "completion_blocked_pre_pr" in _kinds(conn, tid)
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "running"
+    assert calls.exists()
+

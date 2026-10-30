@@ -215,7 +215,7 @@ class TurnRunner:
                 )
                 render_notification(
                     lambda: self._schedule(self._runner._deliver_platform_notice(ctx.source, line), "subagent failure notice scheduling error"),
-                    platform=ctx.source.platform, user_config=ctx.user_config)
+                    platform=ctx.source.platform, user_config=ctx.user_config, source=ctx.source)
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
 
@@ -1005,6 +1005,14 @@ class TurnRunner:
                             ctx._status_chat_id,
                             _redact_gateway_user_facing_secrets(str(message or ""))[:160])
                 return False
+        else:
+            from gateway.response_filters import is_compaction_announce, lifecycle_notice_muted
+            if is_compaction_announce(message) and lifecycle_notice_muted(
+                    ctx.source.platform, ctx.source.chat_id, ctx.user_config):
+                # Not a lost send: None tells _emit_compaction_announce the boundary was handled
+                # (no STATUS_CALLBACK_FAILED, no re-announce). t_75a91ccc.
+                logger.info("COMPACTION_ANNOUNCE_MUTED in-turn page_channel=%s", ctx._status_chat_id)
+                return None
         resolver = ctx._current_status_adapter
         try:
             adapter = resolver() if callable(resolver) else None
@@ -1048,6 +1056,14 @@ class TurnRunner:
                 self._queue_undelivered_route_notice(event_type, prepared)
                 return
             if is_route_change:
+                # The delivered leg is logged like the dropped/muted ones, so gateway.log alone
+                # answers "did chat X get the 🔄 line" (t_f1f73872: its absence read as a miss).
+                logger.info(
+                    "route-change status delivered: platform=%s chat=%s message=%s",
+                    getattr(ctx.source.platform, "value", ctx.source.platform) or "unknown",
+                    ctx._status_chat_id,
+                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+                )
                 # The platform is reachable again: flush anything queued.
                 self._flush_route_notice_outbox()
                 return  # route announcements are durable messages, not temporary progress
@@ -1070,7 +1086,7 @@ class TurnRunner:
                 fut.add_done_callback(_track_status_result)
             if is_route_change:
                 outcome[0] = True
-        render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
+        render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config, source=ctx.source,
                             diagnostic=is_warning_status(event_type, message))
         return outcome[0]
 
@@ -1467,7 +1483,7 @@ class TurnRunner:
             if line:
                 self._schedule(self._runner._deliver_platform_notice(self._ctx.source, line), "notice_callback delivery scheduling error")
         render_notification(present, platform=self._ctx.source.platform,
-                            user_config=self._ctx.user_config, diagnostic=diagnostic)
+                            user_config=self._ctx.user_config, diagnostic=diagnostic, source=self._ctx.source)
 
     def _bg_review_chat_muted(self) -> bool:
         """True when this turn's chat is an act-now page channel: the review receipt ("💾
@@ -1614,6 +1630,7 @@ class TurnRunner:
             _fw.flush_unconsumed_recovery_row(agent)
         agent.service_tier = runner._service_tier
         self._merge_turn_request_overrides(agent, turn_route)
+        runner._bind_route_known(agent, ctx.session_key)
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.
         agent._gateway_turn_context_notes = "\n\n".join(runner._consume_pending_turn_sidecar_notes(ctx.session_key))
@@ -1968,7 +1985,6 @@ class TurnRunner:
         )
         ctx = self._ctx
         persist_override: Optional[Any] = ctx.persist_user_message
-        self._prepend_pending_note("_pending_model_notes")
         # Auto-continue: history ending with a tool result means the previous turn was cut off
         # (restart, crash, SIGTERM). Session-level resume_pending (drain-timeout shutdown) uses
         # stronger reason-aware wording that subsumes this case. Both gate on the age of

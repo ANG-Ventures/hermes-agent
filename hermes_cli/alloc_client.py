@@ -1,7 +1,7 @@
 # SCHEDULE: manual   (a library consumers import; never scheduled; card t_552773f1)
 # VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 2fe117cbcb (hermes-home#4462 merge, t_dc9a0f9a + t_314b3ea5;
 # sha256 fbbd8a806628a79acc2d0ff981d75c29b48d3eb5c9f2333a51efa88519971cb3) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code. The ONLY
-# local change is the placement import (hermes_cli.placement, not sys.path + import placement); tests/hermes_cli/test_kanban_allocd_route.py checks
+# local change is the placement import (hermes_cli.fleet_placement.placement, not sys.path + import placement); tests/hermes_cli/test_kanban_allocd_route.py checks
 # the rest against the canonical file (ALLOC_CLIENT_CANONICAL).
 """alloc_client -- the thin library every work generator calls to get a host (Router Core Card A, t_552773f1).
 
@@ -70,7 +70,7 @@ import uuid
 from pathlib import Path
 from typing import Mapping, Optional
 
-from hermes_cli import placement  # VENDORED: the fork's placement copy (hermes-home: sys.path + import placement)
+from hermes_cli.fleet_placement import placement  # VENDORED: the fork's placement copy (hermes-home: sys.path + import placement)
 
 DEFAULT_URL = "http://127.0.0.1:18850"
 TIMEOUT_S = 2.0                      # spec §6: a client-side 2 s timeout fires only when allocd is wedged
@@ -328,11 +328,14 @@ def _fallback_admit(consumer: str, *, job_id: str, ttl_s: float, klass: Optional
 
 def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0, klass: Optional[str] = None,
           footprint: Optional[Mapping] = None, job: Optional[Mapping] = None, previous: Optional[str] = None,
-          timeout: float = TIMEOUT_S, fallback: bool = True, candidates: Optional[list] = None) -> AdmitResult:
+          timeout: float = TIMEOUT_S, fallback: bool = True, candidates: Optional[list] = None,
+          unified: bool = False, stale_after_s: Optional[float] = None) -> AdmitResult:
     """Ask allocd for a host; on any liveness fault run the same scorer in-process (``fallback=False`` raises
     Unreachable instead: tests only). ``job`` = placement.Job fields (affinity, continuity, priority, core_class, footprint, profile).
     ``klass`` = "p0" for the reserve-entitled class (main/merge-queue CI, lander), else None.
     ``candidates`` = restrict the scorer to these hosts (renew's re-admit pins the job's host with it).
+    ``unified`` = ask allocd to run the ONE rule (admit_class) on its own ledger for the booked row; a grant that ran it
+    carries ``unified: true`` in its detail (Prism 11efd32500fc). ``stale_after_s`` = the caller's sample freshness.
     Raises ``Refused`` on a terminal answer (4xx, empty/unreadable token file): the fallback never runs for it."""
     t0 = time.monotonic()
     tok = _token(consumer)                 # FIRST: an unreadable token refuses even with the router off
@@ -341,6 +344,10 @@ def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0,
             "job": dict(job or {}), "previous": previous}
     if candidates is not None:
         body["candidates"] = list(candidates)
+    if unified:
+        body["unified"] = True
+        if stale_after_s is not None:
+            body["stale_after_s"] = float(stale_after_s)
     try:
         if (placement.fleet_root() / ROUTER_OFF_REL).exists():
             raise Unreachable("router-off file present")

@@ -596,6 +596,9 @@ _SPECS = [
              help="Read the comment body from PATH ('-' = stdin). Use this for "
                   "text with backticks or $(...): the shell never sees it."),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
+        _arg("--grant", metavar="GRANT_ID",
+             help="Sign as --author under a scoped signing grant this delegate child was given "
+                  "(kanban.sign_grants: on); refused outside its cards, verbs, expiry or session"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
         _arg("--if-latest-release", type=int, metavar="COMMENT_ID",
              help="Append only while COMMENT_ID is still the card's newest release-bearing "
@@ -649,7 +652,9 @@ _SPECS = [
              help="Audited override: the card was routed to review on its own PR, that PR is still "
                   "OPEN, and the --survivor-pr/--survivor-ref claim names something else. Without "
                   "this flag such a completion is refused (t_829fce95); with it a "
-                  "routed_pr_abandoned event records the PRs and REASON. An empty REASON is refused."),
+                  "routed_pr_abandoned event records the PRs and REASON. An empty REASON is refused. "
+                  "Also closes a card whose own PR is CLOSED unmerged with a 'CLOSED: "
+                  "ABANDONED|REJECTED|THROWAWAY' comment on GitHub (t_2ce83b37)."),
         _arg("--survivor-ref", action="append", metavar="[REPO=]URL#SHA",
              help="Name an external survivor when the implementation lives on a remote, not in "
                   "the workspace. Verified with git ls-remote AND required to name this task: "
@@ -832,6 +837,11 @@ _SPECS = [
         # ``--operator "<who: why>"`` comes from the home-guard loop in build_parser;
         # on request-changes it is also the operator send-back (coverage waived).
     ], help="Reviewer verdict: return the active review run to its implementer"),
+    _cmd("sendback", [
+        _TASK_ID,
+        _arg("--payload", required=True,
+             help="The Forge L0 section 2.4 sendback row as a JSON object (source, reason, summary, evidence, ...)"),
+    ], help="Producer verb: return a PR defect (CI red, Prism, lander, conflict, revert) to the card's implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),

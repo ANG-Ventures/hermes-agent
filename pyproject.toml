@@ -946,6 +946,9 @@ select = ["PLW1514", "ASYNC210", "ASYNC220", "ASYNC221", "ASYNC251", "TID251"]
 # Plugin platform adapters run ON the gateway event loop — the ASYNC gate
 # applies to them with full force; only PLW1514 stays relaxed.
 "plugins/**" = ["PLW1514"]
+# Byte copies of hermes-home scripts/lib, sha256-pinned by VENDORED.json (t_29403e19): never edited here.
+# Their only bare-encoding opens are a lock file and an ASCII json.dumps journal append.
+"hermes_cli/fleet_placement/{admission,admission_demand,placement,work_estimate}.py" = ["PLW1514"]
 # ---------------------------------------------------------------------------
 # ASYNC ratchet baseline — legacy blocking sites that predate the gate.
 # Each entry is an EXISTING violation being fixed in its own PR; do NOT add

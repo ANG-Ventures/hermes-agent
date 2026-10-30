@@ -151,7 +151,6 @@ async def test_new_command_preserves_session_route_preferences():
         "api_mode": "codex_responses",
     }
     entry.reasoning_override = {"enabled": True, "effort": "high"}
-    runner._pending_model_notes[session_key] = "[Note: switched to gpt-4o.]"
 
     await runner._handle_reset_command(_make_event("/new"))
 
@@ -160,7 +159,6 @@ async def test_new_command_preserves_session_route_preferences():
         "enabled": True,
         "effort": "high",
     }
-    assert session_key not in runner._pending_model_notes
 
 
 @pytest.mark.parametrize("command", ["/new", "/reset"])
@@ -451,8 +449,6 @@ async def test_new_command_only_rotates_own_session_preferences():
         "api_mode": "codex_responses",
     }
     entry.reasoning_override = {"enabled": True, "effort": "high"}
-    runner._pending_model_notes[session_key] = "[Note: switched to gpt-4o.]"
-    runner._pending_model_notes[other_key] = "[Note: switched to claude-sonnet-4-6.]"
 
     await runner._handle_reset_command(_make_event("/new"))
 
@@ -460,8 +456,6 @@ async def test_new_command_only_rotates_own_session_preferences():
     assert other_key in runner._session_model_overrides
     assert runner._session_reasoning_overrides[session_key]["effort"] == "high"
     assert other_key in runner._session_reasoning_overrides
-    assert session_key not in runner._pending_model_notes
-    assert other_key in runner._pending_model_notes
 
 
 @pytest.mark.parametrize("command", ["/new", "/reset"])

@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from hermes_cli import admission as ad
+from hermes_cli.fleet_placement import admission as ad
 from hermes_cli import kanban_load_gate as klg
 
 INTERIM = {"pause_above": 64, "resume_below": 48, "cpu_busy_pause": 0.80, "cpu_spill": 0.90, "cpu_pause": 0.90,

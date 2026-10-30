@@ -728,6 +728,91 @@ def test_g_watchdog_snapshot_survives_a_held_procs_lock(root, monkeypatch, procs
     assert (_hb(root)["state"], _hb(root)["standby_reason"]) == ("standby", "watchdog_tripped")
 
 
+def test_g_watchdog_trip_names_the_blocking_frame(root, caplog):
+    """t_f2e71f40: the 2026-10-28 20:22 trip left a marker with no clue where the tick was. The
+    marker now carries every thread's stack and the tick thread's innermost cron frame (phase), and
+    the CRITICAL log names that frame, so the next trip says which call blocked."""
+    from cron import jobs, script_runner
+
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)],
+                                   exit_fn=lambda _c: None)
+    r.enumerate_homes()
+    tick_ready = threading.Event()
+
+    def tick_thread():
+        r.on_tick_start(root)
+        tick_ready.set()
+        with jobs._jobs_lock():  # blocks: the holder below owns the in-process jobs lock
+            pass
+
+    caplog.set_level(logging.CRITICAL, logger="cron.script_runner")
+    with jobs._jobs_file_lock:
+        t = threading.Thread(target=tick_thread, name="cron-script-runner", daemon=True)
+        t.start()
+        assert tick_ready.wait(5)
+        time.sleep(0.3)  # let the tick thread reach the blocking acquire
+        try:
+            r._watchdog_fire(root, _now_iso())
+        finally:
+            r.cancel_deadline()
+            r.on_tick_end(root)
+    t.join(5)
+    marker = json.loads(script_runner.trip_marker_path().read_text(encoding="utf-8"))
+    assert marker["home"] == str(root)
+    assert marker["phase"].startswith("cron.jobs:_jobs_lock:"), marker["phase"]
+    assert marker["tick_thread"] == "cron-script-runner"
+    tick_frames = marker["threads"]["cron-script-runner"]
+    assert any("_jobs_lock" in f for f in tick_frames), tick_frames
+    assert any(name.startswith("cron-runner-watchdog") or name == "MainThread"
+               for name in marker["threads"])
+    assert any("cron.jobs:_jobs_lock:" in rec.getMessage() for rec in caplog.records)
+
+
+def test_g_watchdog_trip_marker_survives_a_blocking_source_lookup(root, monkeypatch):
+    """Prism e4bf7ba79da1: a stack dump that reads source lines (linecache) blocks on a stalled
+    mount until the hard deadline exits the process, so the trip was never persisted. The marker
+    is written before any stack walk, and the walk reads no source at all."""
+    import linecache
+
+    from cron import lanes, script_runner
+
+    monkeypatch.setattr(lanes, "RUNNER_WATCHDOG_KILL_GRACE_S", 0.1)  # deadline = 2.1 s
+    release = threading.Event()
+    lookups = []
+
+    def stalled(*a, **_kw):
+        lookups.append(a)
+        release.wait(6)  # a stalled mount: outlives the hard deadline
+        return ""
+
+    for name in ("getline", "getlines", "updatecache", "checkcache", "lazycache"):
+        monkeypatch.setattr(linecache, name, stalled)
+    at_exit = []
+
+    def exit_fn(_code):
+        path = script_runner.trip_marker_path()
+        at_exit.append(json.loads(path.read_text(encoding="utf-8")) if path.exists() else None)
+
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)], exit_fn=exit_fn)
+    r.enumerate_homes()
+    r.on_tick_start(root)
+    fire = threading.Thread(target=r._watchdog_fire, args=(root, _now_iso()), daemon=True)
+    try:
+        fire.start()
+        deadline = time.monotonic() + 5
+        while not at_exit and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        release.set()
+        fire.join(10)
+        r.cancel_deadline()
+        r.on_tick_end(root)
+    assert at_exit and at_exit[0] is not None, "process exited before the trip marker was written"
+    assert at_exit[0]["home"] == str(root) and "tick_started_at" in at_exit[0]
+    assert "phase" in at_exit[0] and at_exit[0]["threads"], at_exit[0]
+    assert not lookups, f"stack walk read source lines: {lookups[:3]}"
+
+
 def test_g_watchdog_kills_a_group_whose_leader_already_exited(root, monkeypatch, tmp_path):
     """Prism d9f3c814a2c6: the script leader exited but a background child keeps the output pipe,
     so ``communicate()`` has not reaped it yet (a zombie). The watchdog still kills the group; a

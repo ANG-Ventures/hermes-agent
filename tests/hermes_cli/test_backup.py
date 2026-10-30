@@ -3317,6 +3317,12 @@ class TestRestoreCronPromptFieldsIfDegraded:
         hermes_home = tmp_path / ".hermes"
         jobs_path = hermes_home / "cron" / "jobs.json"
         self._seed_jobs(jobs_path, [{"id": "a", "name": "A", "prompt": "A prompt."}])
+        # A live store's jobs.json is already in the store's own format; the first store
+        # section on a raw seed adopts it (runtime db + merged mirror, t_3c8fa4d6), which is
+        # a format rewrite, not the restore. Adopt first so the bytes below are the store's.
+        from cron import jobs as cron_jobs
+        with cron_jobs.use_cron_store(hermes_home):
+            cron_jobs.load_jobs()
         snap_id = self._make_snapshot(hermes_home)
         assert snap_id
         before = jobs_path.read_text()

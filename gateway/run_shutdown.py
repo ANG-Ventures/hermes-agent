@@ -1097,7 +1097,7 @@ class GatewayShutdownMixin:
                         ):
                             notified.add(dedup_key)
                     from gateway.warning_notifications import present_notification
-                    await present_notification(send_notice, platform=platform)
+                    await present_notification(send_notice, platform=platform, chat_id=chat_id, thread_id=thread_id)
         if notified:
             logger.info("Shutdown: delivered %d interrupted-cron-job notice(s)", len(notified))
         return len(notified)
@@ -1168,6 +1168,9 @@ class GatewayShutdownMixin:
                     restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
         notified: set[tuple[str, str, Optional[str]]] = set()
+        from gateway.response_filters import lifecycle_notice_muted
+        from gateway.warning_notifications import effective_user_config
+        lifecycle_cfg = effective_user_config()
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1187,6 +1190,12 @@ class GatewayShutdownMixin:
                 if not adapter:
                     continue
                 if not self._notice_allowed(platform, "active session"):
+                    continue
+                # A page channel does not take the shutdown notice (t_75a91ccc). The requester's own
+                # chat on an in-chat /restart still does: there it is the command's answer.
+                if restart_key != dedup_key and lifecycle_notice_muted(platform, chat_id, lifecycle_cfg):
+                    logger.info("Shutdown notice not posted to page channel %s:%s", platform_str, chat_id)
+                    notified.add(dedup_key)  # latch: the home-channel pass must not re-target it
                     continue
                 reply_to_message_id = getattr(source, "message_id", None)
                 if reply_to_message_id is None and restart_key == dedup_key:
@@ -1212,7 +1221,9 @@ class GatewayShutdownMixin:
             scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
                      if source is not None else nullcontext())
             async with scope:
-                presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key)
+                presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key,
+                                                       chat_id=chat_id, thread_id=thread_id,
+                                                       parent_id=getattr(source, "parent_chat_id", None))
             if not presented:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
         if self._restart_requested and restart_source is not None:
@@ -1244,6 +1255,9 @@ class GatewayShutdownMixin:
             dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=profile)
             if dedup_key in notified:
                 continue
+            if lifecycle_notice_muted(platform, home.chat_id, lifecycle_cfg):
+                logger.info("Shutdown notice not posted to page channel %s:%s (home)", platform.value, home.chat_id)
+                continue
             try:
                 metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=adapter)
             except Exception as e:
@@ -1261,7 +1275,7 @@ class GatewayShutdownMixin:
             # present_notification reads the ACTIVE profile's display settings: bind the served one's.
             profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
             async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
-                await present_notification(_send_home, platform=platform)
+                await present_notification(_send_home, platform=platform, chat_id=getattr(home, "chat_id", None), thread_id=getattr(home, "thread_id", None))
 
     # Agent finalization / resource cleanup
     @staticmethod

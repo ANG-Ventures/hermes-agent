@@ -1716,9 +1716,13 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
     assert runner._running_agents[pending_entry.session_key] is _AGENT_PENDING_SENTINEL
     assert pending_entry.session_key in runner._running_agents_ts
 
-    # Release the task and let it complete.
+    # Release the task and let it complete. The release path crosses an
+    # asyncio.to_thread hop (auto-resume attempt accounting) before its finally
+    # frees the slot, so a fixed short sleep flakes on a loaded host: poll.
     gate.set()
-    await asyncio.sleep(0.05)
+    deadline = time.monotonic() + 5.0
+    while pending_entry.session_key in runner._running_agents and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
 
     # After the task completes, the sentinel should be cleaned up.
     assert pending_entry.session_key not in runner._running_agents

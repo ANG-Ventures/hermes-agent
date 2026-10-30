@@ -675,6 +675,20 @@ def _isolate_fallback_sticky_store():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_wall_budget_registry():
+    """Fresh process-global cross-session wait registry per test (t_78b5a5bb): a wait
+    armed in one test must not read as a sibling session in the next."""
+    try:
+        from agent import fallback_wall_budget as _wb
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    _wb.clear_registry()
+    yield
+    _wb.clear_registry()
+
+
+@pytest.fixture(autouse=True)
 def _refuse_real_detached_delegation_child(request, monkeypatch):
     """A background delegate_task in a gateway-bound session spawns a REAL ``python -m
     tools.delegate_detached`` process by default (``delegation.detached_background``). It never runs
@@ -816,6 +830,24 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(_subprocess_compat, "_user_safe_directories", lambda base_env: [], raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_owning_install_retarget(request, monkeypatch):
+    """Keep ``cmd_update`` from re-running itself in the checkout whose venv runs the suite.
+
+    Update tests point ``PROJECT_ROOT`` at a fake tree; under a checkout's in-tree ``.venv``
+    ``retarget_to_owning_install`` correctly reads that as a redirected install and re-execs
+    the real updater with pytest's argv (SystemExit 2). Tests of the repair itself opt in with
+    ``@pytest.mark.real_owning_install``.
+    """
+    if request.node.get_closest_marker("real_owning_install"):
+        return
+    try:
+        from hermes_cli import update_owning_install
+    except Exception:
+        return
+    monkeypatch.setattr(update_owning_install, "retarget_to_owning_install", lambda *_: None)
 
 
 @pytest.fixture(autouse=True)
@@ -1645,6 +1677,9 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers", "real_release_channels: keep the real R2 channel reader (no local source-branch stub)."
+    )
+    config.addinivalue_line(
+        "markers", "real_owning_install: keep the real cmd_update owning-install retarget (no autouse stub)."
     )
     config.addinivalue_line(
         "markers",

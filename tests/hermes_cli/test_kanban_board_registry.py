@@ -32,7 +32,6 @@ def home(tmp_path, monkeypatch):
                 "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
         monkeypatch.delenv(var, raising=False)
     kb._INITIALIZED_PATHS.clear()
-    reg._PINNED_BOARD_MEMO.clear()
     reg._PINNED_BOARD_ERRORS.clear()
     return h
 
@@ -45,7 +44,6 @@ def _pin(monkeypatch, path: Path) -> None:
     """A dispatched worker's DB pin. The sandbox flag would neutralise it, so drop that."""
     monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — the pin under test is what the sandbox neutralises; HERMES_KANBAN_DB points at a tmp_path DB
     monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
-    reg._PINNED_BOARD_MEMO.clear()
 
 
 def _card(board: str, title: str = "t") -> str:
@@ -192,8 +190,9 @@ def test_pinned_board_error_clears_once_the_pin_is_named(home, monkeypatch):
     assert kb.pinned_board_error() is None
 
 
-def test_pinned_board_cost_is_paid_once_per_pin(home, monkeypatch):
-    """RC-11 cost: memoised on (pin, root, boards/ mtime); a second call does not rescan."""
+def test_pinned_board_rescans_on_every_call(home, monkeypatch):
+    """Prism fde771bf9eaa: naming the pin is about which file it names NOW, so it is never memoised; a
+    second call rescans the layout (one iterdir + one stat a board)."""
     kb.create_board("subs-ace")
     _pin(monkeypatch, kb.board_dir("subs-ace") / "kanban.db")
     calls = []
@@ -201,7 +200,7 @@ def test_pinned_board_cost_is_paid_once_per_pin(home, monkeypatch):
     monkeypatch.setattr(reg, "board_db_layout", lambda: calls.append(1) or real())
     assert kb.pinned_board() == "subs-ace"
     assert kb.pinned_board() == "subs-ace"
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 # --- D3: board_of_task never guesses -----------------------------------------------------------

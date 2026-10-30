@@ -20,7 +20,7 @@ from tests.hermes_cli.test_kanban_headroom_placement import (  # noqa: F401  (fi
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
-from hermes_cli import placement
+from hermes_cli.fleet_placement import placement
 
 
 def _budget_for_four(home):

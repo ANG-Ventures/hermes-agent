@@ -83,6 +83,13 @@ def test_config_defaults_are_off_and_six():
 
 
 # -- the planner -------------------------------------------------------------
+# These arms pin today's enforcing cap, which is the KANBAN_UNIFIED_ADMIT=0 rule since t_3694ab3c (D9: under the
+# unified rule admit_class owns the memory axis; tests/hermes_cli/test_kanban_unified_admit.py covers that arm).
+
+@pytest.fixture(autouse=True)
+def _legacy_admission_rule(monkeypatch):
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
+
 
 def _plan(fleet, sig, *, on):
     sig.admit_on_memory = on

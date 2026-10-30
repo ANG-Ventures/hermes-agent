@@ -132,6 +132,10 @@ QUOTA_SPENT_PREFIX = "load gate: this tick's allowance of "
 POOL_UNAVAILABLE = "pool_unavailable"
 POOL_FULL = "pool_full"
 BOARD_UNHOSTABLE = "board_unhostable"
+# The ONE admission rule (placement.may_start / admit_class) refused every candidate, or refused the take under the
+# ledger lock (t_3694ab3c). Capacity: the hosts exist and serve the row, the class rule has no room now (Prism
+# 43117075a644, t_c466b7ee).
+UNIFIED_ADMISSION = "unified_admission"
 
 # The ONE vocabulary of ``SpilloverPlan.take()`` refusals for an UNPINNED row
 # (Control-Plane Protection spec v0.3, Momus pass 3 R4). The placement record's
@@ -141,7 +145,7 @@ BOARD_UNHOSTABLE = "board_unhostable"
 # no free slot that serves the row; structural = no pool host may take this row
 # at all (reach, board root). "Profile served on no free host" is reported as
 # capacity (``pool_full`` / ``pool_unavailable``): take() has no code for it.
-TAKE_CAPACITY = frozenset({POOL_FULL, POOL_UNAVAILABLE})
+TAKE_CAPACITY = frozenset({POOL_FULL, POOL_UNAVAILABLE, UNIFIED_ADMISSION})
 TAKE_STRUCTURAL = frozenset({HOST_REACH, BOARD_UNHOSTABLE})
 TAKE_REFUSALS = TAKE_CAPACITY | TAKE_STRUCTURAL
 # ``placement.reason`` of a portable row the Studio spawned after take()

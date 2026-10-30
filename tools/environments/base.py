@@ -27,7 +27,8 @@ from tools.environments.base_output import (  # noqa: F401 (_BoundedOutputCollec
 )
 from tools.environments.base_session_env import (  # noqa: F401 (snapshot-exclusion names: fork test seam)
     _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _SNAPSHOT_EXCLUDED_ENV_REGEX, _cwd_marker,
-    _export_dump_excluding_session_vars, _snapshot_bootstrap_script, _split_cwd_marker,
+    _export_dump_excluding_session_vars, _snapshot_bootstrap_script, _split_cwd_marker, _split_git_env,
+    _split_git_seq,
     _wrap_command_script,
 )
 from tools.environments.base_wait import _WaitTrace
@@ -576,10 +577,33 @@ class BaseEnvironment(ABC):
         ``self.cwd`` and strip the marker line. ``result["cwd_observed"]``/``["cwd"]`` are set
         only when THIS command emitted a marker: a killed/timed-out command emits none and
         ``self.cwd`` keeps the previous value. The environment is shared across sessions, so
-        concurrent callers must read ``result["cwd"]`` rather than ``self.cwd``."""
-        split = _split_cwd_marker(result.get("output", ""), self._cwd_marker)
+        concurrent callers must read ``result["cwd"]`` rather than ``self.cwd``.
+
+        The same marker line carries the session shell's GIT_* repository variables (card t_20695198):
+        ``result["git_env"]`` (+ ``["git_env_seq"]``, the shell's command counter) is set only when this
+        command emitted the line, like ``cwd_observed``.
+
+        ``result["git_env_unknown"]`` marks a report that cannot be trusted (Prism 36b227820e17 /
+        33d27ec2d4e3): more than one marker line (the command, or a background child of it, printed one;
+        killed or not, Prism 1dc874797ab0), or no line from a command Hermes did not kill (the wrapper suppresses it when the command defeated
+        its emit path, see ``_cwd_marker_printf``). A killed command still leaves the record as it was.
+        The cwd handling is unchanged."""
+        output = result.get("output", "")
+        split = _split_cwd_marker(output, self._cwd_marker)
+        killed = result.get("hermes_interrupted") or result.get("hermes_timed_out")
+        markers = output.count(self._cwd_marker)
+        if markers > 2:
+            # Duplicate marker lines are UNKNOWN even on a killed command (Prism 1dc874797ab0).
+            logger.warning("forged-marker: %d marker strings in terminal output; GIT_* state unknown", markers)
+            result["git_env_unknown"] = True
+        elif (split is None or markers != 2) and not killed:
+            result["git_env_unknown"] = True
         if split is None:
             return
+        git_env = None if result.get("git_env_unknown") else _split_git_env(output, self._cwd_marker)
+        if git_env is not None:
+            result["git_env"] = git_env
+            result["git_env_seq"] = _split_git_seq(output, self._cwd_marker)
         cwd_path, cleaned = split
         if cwd_path:
             self.cwd = cwd_path
@@ -625,6 +649,7 @@ class BaseEnvironment(ABC):
         See #94285.
         """
         self._before_execute()
+        started = time.monotonic()  # orders a GIT_* report against an UNKNOWN one (record_session_git_env)
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap by default; callers
@@ -714,6 +739,7 @@ class BaseEnvironment(ABC):
         else:
             result = bounded.value
         self._update_cwd(result)
+        result["git_env_started"] = started
         if getattr(self, "_recreated_notice_pending", False):
             self._recreated_notice_pending = False
             result["environment_recreated"] = True

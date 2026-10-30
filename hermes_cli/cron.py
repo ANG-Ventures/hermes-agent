@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import math
 import re
 import sys
 from datetime import timezone
@@ -362,6 +363,34 @@ def _record_abandoned_cron_turns(signum: int) -> int:
         return 0
 
 
+# Slack past the hook budget for the record path's own work (ledger read, lock hand-off).
+_ABANDON_RECORD_MARGIN_SECS = 5.0
+
+
+def _abandon_record_wait_secs() -> float:
+    """How long the signal handler waits for the abandoned-turn record before ``os._exit``.
+
+    Derived from ``plugins.hook_callback_timeout`` (Prism 33a31a0e74cc): a literal 10 s killed a
+    blackbox write the hook budget still allowed, leaving ``turn_api_calls`` with no ``turns`` row.
+    ``<= 0`` (bounding disabled) falls back to the default budget so the exit stays bounded.
+    Resolved at install time, never in the handler: the config read takes locks the interrupted
+    main thread may hold. The only supervisor of ``cron run --wait`` is ``timeout(1)`` without
+    ``-k`` (digest-job-runner), which never follows SIGTERM with SIGKILL, so this wait is not cut.
+    """
+    from hermes_cli.plugins import _resolve_hook_callback_timeout
+    from hermes_cli.plugins_dispatch import _HOOK_CALLBACK_TIMEOUT_SECS
+
+    try:
+        budget = float(_resolve_hook_callback_timeout())
+    except Exception:
+        budget = _HOOK_CALLBACK_TIMEOUT_SECS
+    # Non-finite too (Prism f094fa505f02): ``.nan`` passes the resolver's range checks, and
+    # ``Thread.join(timeout=nan)`` raises in the handler before ``os._exit`` runs.
+    if not math.isfinite(budget) or budget <= 0:
+        budget = _HOOK_CALLBACK_TIMEOUT_SECS
+    return budget + _ABANDON_RECORD_MARGIN_SECS
+
+
 def _install_abandon_on_signal() -> Dict[int, Any]:
     """SIGTERM/SIGHUP: record in-flight cron turns, then exit 128+signum.
 
@@ -376,6 +405,7 @@ def _install_abandon_on_signal() -> Dict[int, Any]:
     if threading.current_thread() is not threading.main_thread():
         return previous
     fired = threading.Event()
+    record_wait = _abandon_record_wait_secs()
 
     def _handler(signum, _frame):
         # One-shot: a second signal (SIGHUP after SIGTERM) must not record twice.
@@ -389,7 +419,7 @@ def _install_abandon_on_signal() -> Dict[int, Any]:
             target=_record_abandoned_cron_turns, args=(signum,), name="cron-abandon-record",
             daemon=True)
         recorder.start()
-        recorder.join(timeout=10.0)
+        recorder.join(timeout=record_wait)
         with contextlib.suppress(Exception):
             sys.stdout.flush()
             sys.stderr.flush()
@@ -1243,10 +1273,18 @@ def cron_runtime_export(args) -> int:
 
 
 def cron_runner(args) -> int:
-    """``hermes cron runner [rearm]`` (cron/script_runner.py)."""
+    """``hermes cron runner [rearm|install|uninstall|lint]`` (cron/script_runner.py,
+    hermes_cli/cron_runner_plist.py)."""
+    action = getattr(args, "runner_action", None)
+    if action in ("install", "uninstall", "lint"):
+        # Imported before (and without) cron/*: uninstall must work ahead of an S1 revert (§12).
+        from hermes_cli import cron_runner_plist
+        if action == "install":
+            return cron_runner_plist.install(dry_run=bool(getattr(args, "runner_dry_run", False)))
+        return getattr(cron_runner_plist, action)()
     from cron import script_runner
 
-    if getattr(args, "runner_action", None) == "rearm":
+    if action == "rearm":
         return script_runner.rearm()
     return script_runner.main([])
 

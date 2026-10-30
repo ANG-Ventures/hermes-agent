@@ -2061,6 +2061,8 @@ def _build_child_agent(
     # Default path (inherit_context False) is byte-identical: keep the historical
     # boot-attr forward (INV-5).
     child_prefill_messages: Any = getattr(parent_agent, "prefill_messages", None)
+    # Which inheritance construction ACTUALLY delivered (None = none): a sign grant needs it (Prism 8283ee6dbefe).
+    context_inherited: Optional[str] = None
     if materialized_prefill_messages is not None:
         child_prefill_messages = copy.deepcopy(materialized_prefill_messages)
     elif mode == "summary":
@@ -2088,6 +2090,7 @@ def _build_child_agent(
             _folded = _fold_conversation_history_to_context(_parent_history, _max_tokens)
             if _folded is not None:
                 child_prefill_messages = [_folded]
+                context_inherited = "summary"
         except Exception as _inh_exc:
             logger.warning("boomerang inherit_context fold failed (continuing without): %s", _inh_exc)
     # Fork: the parent's ephemeral prompt / prefill / request_overrides, not the slim child build (INV-2).
@@ -2123,6 +2126,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._context_inherited = context_inherited
     if mode == "fork":
         # _apply_child_cache_ttl and _regate_inherited_child_tier are SKIPPED: both rewrite request bytes.
         _fork.apply_fork_overlay(child, parent_agent)
@@ -2138,6 +2142,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             return _build_child_agent(**{**_call_args, "inherit_mode": "summary", "inherit_context": True})
         _arm_first_request_pin(child, parent_agent, "fork")
+        child._context_inherited = "fork"
         child._boomerang_fork_log_pending = True   # one `boomerang.fork served_by=…` line
     else:
         _apply_child_cache_ttl(child)
@@ -3872,6 +3877,7 @@ def delegate_task(
     parent_agent=None,
     _recovery_spec: Optional[Dict[str, Any]] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    sign_grant: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -4092,6 +4098,10 @@ def delegate_task(
 
     if not task_list:
         return tool_error("No tasks provided.")
+    if sign_grant:
+        # Top-level grant: every task without its own gets one (each bound to its own child).
+        task_list = [dict(t, sign_grant=t.get("sign_grant") or sign_grant) if isinstance(t, dict) else t
+                     for t in task_list]
 
     # Validate each task has a goal
     for i, task in enumerate(task_list):
@@ -4283,6 +4293,24 @@ def delegate_task(
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    # Scoped board-signing grants (t_19c567a8): minted only now, bound to each built
+    # child's session and model, and revoked when the children's run ends.
+    sign_grants: List[Dict[str, Any]] = []
+    if any(isinstance(t, dict) and t.get("sign_grant") for _i, t, _c in children):
+        from tools.delegate_tool_sign_grant import SignGrantError, mint_for_children, register_turn_grants
+
+        if background:
+            return tool_error("sign_grant needs background=false: a grant ends with this turn")
+        try:
+            # All or nothing: any exception revokes what was already minted.
+            sign_grants = mint_for_children(children, parent_agent, inherit_context=inherit_context,
+                                            inherit_mode=inherit_mode)
+        except SignGrantError as exc:
+            return tool_error(f"sign_grant refused: {exc}")
+        # Live until the PARENT's turn ends (the turn facade's finally revokes them) or expiry, whichever is first:
+        # the parent may still run the merge gate over the child's stamp in this turn.
+        register_turn_grants(parent_agent, sign_grants)
 
     # Record an accepted override only after task validation and child construction.
     # A rejected or unbuildable request must not leave a success-shaped audit.
@@ -4738,7 +4766,7 @@ def delegate_task(
                 _kanban = {"profile": _durable_spec.get("profile") or "default", "cwd": _unit_cwd,
                            "session_id": _parent_session_id, "on_spawned": _on_kanban_spawned}
             else:
-                logger.debug("delegate_task: kanban runtime not used (%s)", _why_not)
+                _akb.log_ineligible(_why_not, live_deleg_id)
         # Detached mode (docs/dev/delegate-detached-background.md): a durable unit runs its children in
         # its own process so a gateway restart neither kills nor re-runs it. Only on a restart-safe spawn.
         _detached = None
@@ -5088,6 +5116,13 @@ DELEGATE_TASK_SCHEMA = {
                         "role": _p(
                             "string", "Per-task role; overrides the top-level 'role'.", enum=["leaf", "orchestrator"],
                         ),
+                        "sign_grant": _p(
+                            "object",
+                            "Optional scoped board-signing grant (needs kanban.sign_grants: on, inherit_context, "
+                            "background=false, and an operator session): {cards: [t_...], verbs: [verdict, approve, "
+                            "request_changes, release], expires_in_min: <=120 (default 45), by: 'apollo'}. The child "
+                            "may sign comments as `by` on those cards only; the grant is revoked when its run ends.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -5117,6 +5152,9 @@ DELEGATE_TASK_SCHEMA = {
                 items={"type": "string"},
             ),
             "role": _p("string", _ROLE_PARAM_DESCRIPTION, enum=["leaf", "orchestrator"]),
+            "sign_grant": _p(
+                "object", "Scoped board-signing grant for every task without its own; see tasks[].sign_grant.",
+            ),
             "model": _p("string", "Optional per-call model override. Flagship models require allow_flagship_reason."),
             "provider": _p("string", "Provider for per-call model override; requires model."),
             "allow_flagship_reason": _p(
@@ -5159,7 +5197,9 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
     within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
     the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0
+    from tools.delegate_tool_sign_grant import carries_sign_grant
+
+    return not getattr(parent_agent, "_delegate_depth", 0) > 0 and not carries_sign_grant(args)
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 
@@ -5190,7 +5230,7 @@ registry.register(
         inherit_mode=args.get("inherit_mode"),
         model=args.get("model"), provider=args.get("provider"), allow_flagship_reason=args.get("allow_flagship_reason"),
         force_model=args.get("force_model"), images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        parent_agent=kw.get("parent_agent"),
+        parent_agent=kw.get("parent_agent"), sign_grant=args.get("sign_grant"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

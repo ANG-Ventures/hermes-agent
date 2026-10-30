@@ -199,6 +199,16 @@ def emit_stream_drop(
     log_stream_retry(
         agent, kind=kind, error=error, attempt=attempt, max_attempts=max_attempts, mid_tool_call=mid_tool_call, diag=diag
     )
+    try:
+        # t_b0a117bd: an in-stream drop/reset retried here never reaches stash_api_error;
+        # the armed wall clock still has to name it in its "still waiting" notice.
+        from agent.fallback_events import socket_cause
+        from agent.fallback_wall_budget import note_upstream_failure
+        note_upstream_failure(agent, status=diag.get("http_status") if isinstance(diag, dict) else None,
+                              socket=socket_cause(error) or "remote_protocol",
+                              exc_name=type(error).__name__)
+    except Exception:
+        pass
     provider = agent.provider or "provider"
     _suffix = ""
     try:

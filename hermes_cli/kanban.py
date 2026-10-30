@@ -489,7 +489,7 @@ _HOME_GUARDED_ACTIONS: frozenset[str] = frozenset({
     "reclaim", "set-model", "priority", "edit", "update", "promote", "triage-resolve",
     "schedule", "requeue", "reopen", "reopen-review", "request-review",
     "request-changes", "link", "unlink", "specify", "decompose", "workspace",
-    "rehome",
+    "rehome", "sendback",
 })
 
 
@@ -593,7 +593,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "requeue", "workspace", "reopen", "promote", "triage-resolve",
     "archive", "dispatch", "admit", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "sendback",
     "gc",
 })
 
@@ -2943,6 +2943,9 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
+    grant_id = (getattr(args, "grant", None) or "").strip() or None
+    if grant_id is not None:
+        return _granted_comment(args, body, grant_id)
     author, claimed = _comment_author(args.author)
     from hermes_cli.kanban_identity import is_operator_label
 
@@ -2975,6 +2978,27 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         except ReleaseSuperseded as exc:
             return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
     print(f"Comment added to {args.task_id}")
+    return 0
+
+
+def _granted_comment(args: argparse.Namespace, body: str, grant_id: str) -> int:
+    """``comment --grant``: the grant row, not the caller's profile, authorizes ``--author``
+    (``kanban_db.add_comment`` validates it inside the insert's transaction)."""
+    from hermes_cli.kanban_sign_grants import GrantRefused
+
+    author = (args.author or "").strip()
+    if not author:
+        return _err("kanban: --grant needs --author <the grant's by identity>", 2)
+    _run_id, session_ref = safe_comment_provenance(args.task_id)
+    with kb.connect_closing() as conn:
+        try:
+            kb.add_comment(conn, args.task_id, author, body, session_ref=session_ref, grant_id=grant_id,
+                           if_latest_release=getattr(args, "if_latest_release", None))
+        except GrantRefused as exc:
+            return _err(f"kanban: granted comment refused, nothing posted: {exc}", 3)
+        except ReleaseSuperseded as exc:
+            return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
+    print(f"Comment added to {args.task_id} (as {author} via grant {grant_id})")
     return 0
 
 
@@ -3899,6 +3923,27 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         persisted_run = kb.latest_run(conn, tid)
         display_summary = persisted_run.summary if persisted_run else None
         print(f"Requested review for {tid}" + (f": {display_summary}" if display_summary else ""))
+    return 0
+
+
+def _cmd_sendback(args: argparse.Namespace) -> int:
+    """Forge L0 §2.4 producer verb: ``kb.request_sendback`` with a §2.4 row (hermes-home scripts/lib/sendback.py
+    calls this). rc 0 delivered (prints the delivery), 1 refused, 2 bad payload."""
+    tid = args.task_id
+    try:
+        payload = json.loads(args.payload)
+    except ValueError as exc:
+        print(f"cannot send back {tid}: --payload is not JSON ({exc})", file=sys.stderr)
+        return 2
+    if not isinstance(payload, dict):
+        print(f"cannot send back {tid}: --payload must be a JSON object", file=sys.stderr)
+        return 2
+    with kbc.connect_closing() as conn:
+        ok, detail = kb.request_sendback(conn, tid, payload=payload)
+    if not ok:
+        print(f"cannot send back {tid}: {detail}", file=sys.stderr)
+        return 1
+    print(f"Sent back {tid}: {detail}")
     return 0
 
 
@@ -5041,6 +5086,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "requeue": _cmd_requeue, "workspace": _cmd_workspace, "reopen": _cmd_reopen,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+    "sendback": _cmd_sendback,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "triage-resolve": _cmd_triage_resolve,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch, "admit": _cmd_admit,

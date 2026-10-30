@@ -1,7 +1,8 @@
 """Per-platform display/verbosity resolver (``resolve_display_setting``).
 
-Resolution order, first non-None wins: ``display.platforms.<platform>.<key>`` →
-``display.<key>`` → ``_PLATFORM_DEFAULTS[platform][key]`` → ``_GLOBAL_DEFAULTS[key]``.
+Resolution order, first non-None wins: ``display.channels.<platform>.<chat_id>.<key>`` (then the
+thread id, then its parent channel: a thread inherits its channel, same order as ``channel_overrides``)
+→ ``display.platforms.<platform>.<key>`` → ``display.<key>`` → ``_PLATFORM_DEFAULTS[platform][key]`` → ``_GLOBAL_DEFAULTS[key]``.
 Exception: ``display.streaming`` is CLI-only; gateway streaming follows the top-level
 ``streaming`` config unless a per-platform override sets it. Legacy
 ``display.tool_progress_overrides`` is still read as a ``tool_progress`` fallback.
@@ -9,7 +10,10 @@ Exception: ``display.streaming`` is CLI-only; gateway streaming follows the top-
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Settings configurable per-platform; other display settings are CLI-only.
 _GLOBAL_DEFAULTS: dict[str, Any] = {
@@ -79,13 +83,19 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
 
 
-def resolve_display_setting(user_config: dict, platform_key: str, setting: str, fallback: Any = None) -> Any:
-    """Resolve a display setting with per-platform override support (see module docstring for order).
+def resolve_display_setting(
+    user_config: dict, platform_key: str, setting: str, fallback: Any = None, *,
+    chat_id: Any = None, thread_id: Any = None, parent_id: Any = None,
+) -> Any:
+    """Resolve a display setting with per-channel and per-platform override support (see module
+    docstring for order).
 
     ``platform_key`` is the platform config key (``"telegram"``; see ``_platform_config_key`` in
-    gateway/run.py). Returns *fallback* when nothing is configured.
+    gateway/run.py). ``chat_id``/``thread_id``/``parent_id`` select the channel tier; omitted, the
+    channel tier is skipped. Returns *fallback* when nothing is configured.
     """
-    configured = _configured_display_value(user_config, platform_key, setting)
+    configured = _configured_display_value(
+        user_config, platform_key, setting, chat_id=chat_id, thread_id=thread_id, parent_id=parent_id)
     if configured is not None:
         return _normalise(setting, configured)
     val = _PLATFORM_DEFAULTS.get(platform_key, {}).get(setting)
@@ -94,11 +104,52 @@ def resolve_display_setting(user_config: dict, platform_key: str, setting: str, 
     return fallback if val is None else val
 
 
-def _configured_display_value(user_config: dict, platform_key: str, setting: str) -> Any:
+def display_scope(source: Any) -> dict:
+    """``chat_id``/``thread_id``/``parent_id`` kwargs for the channel tier, from a ``SessionSource``."""
+    if source is None:
+        return {}
+    return {
+        "chat_id": getattr(source, "chat_id", None),
+        "thread_id": getattr(source, "thread_id", None),
+        "parent_id": getattr(source, "parent_chat_id", None),
+    }
+
+
+_warned_channel_keys: set = set()
+
+
+def _channel_display_value(display_cfg: dict, platform_key: str, setting: str, ids: tuple) -> Any:
+    channels = display_cfg.get("channels")
+    plat_channels = channels.get(platform_key) if isinstance(channels, dict) else None
+    if not isinstance(plat_channels, dict):
+        return None
+    plat_channels = {str(k): v for k, v in plat_channels.items()}  # unquoted YAML ids load as int
+    for key in dict.fromkeys(str(i) for i in ids if i):
+        overrides = plat_channels.get(key)
+        if not isinstance(overrides, dict):
+            continue
+        for unknown in set(overrides) - OVERRIDEABLE_KEYS:
+            marker = (platform_key, key, unknown)
+            if marker not in _warned_channel_keys:
+                _warned_channel_keys.add(marker)
+                logger.warning("display.channels.%s.%s.%s is not a per-channel display key; ignored",
+                               platform_key, key, unknown)
+        if setting in OVERRIDEABLE_KEYS and overrides.get(setting) is not None:
+            return overrides[setting]
+    return None
+
+
+def _configured_display_value(
+    user_config: dict, platform_key: str, setting: str, *,
+    chat_id: Any = None, thread_id: Any = None, parent_id: Any = None,
+) -> Any:
     """First non-None operator value, without introducing tier defaults."""
     display_cfg = user_config.get("display")
     if not isinstance(display_cfg, dict):
         return None
+    channel_value = _channel_display_value(display_cfg, platform_key, setting, (chat_id, thread_id, parent_id))
+    if channel_value is not None:
+        return channel_value
     platforms = display_cfg.get("platforms")
     plat_overrides = platforms.get(platform_key) if isinstance(platforms, dict) else None
     if isinstance(plat_overrides, dict) and plat_overrides.get(setting) is not None:
@@ -112,18 +163,22 @@ def _configured_display_value(user_config: dict, platform_key: str, setting: str
     return None
 
 
-def resolve_tool_progress(user_config: dict, platform_key: str, env_mode: str | None = None) -> tuple[str, bool]:
+def resolve_tool_progress(
+    user_config: dict, platform_key: str, env_mode: str | None = None, *,
+    chat_id: Any = None, thread_id: Any = None, parent_id: Any = None,
+) -> tuple[str, bool]:
     """Return (mode, explicit intent) from the same winning source.
 
     Non-None YAML wins over the legacy env bridge. Null inherits through to env,
     then tier defaults. A tier's off is not an operator request to disable cards.
     """
-    configured = _configured_display_value(user_config, platform_key, "tool_progress")
+    scope = {"chat_id": chat_id, "thread_id": thread_id, "parent_id": parent_id}
+    configured = _configured_display_value(user_config, platform_key, "tool_progress", **scope)
     if configured is not None:
         return _normalise("tool_progress", configured), True
     if env_mode:
         return _normalise("tool_progress", env_mode), True
-    return resolve_display_setting(user_config, platform_key, "tool_progress"), False
+    return resolve_display_setting(user_config, platform_key, "tool_progress", **scope), False
 
 
 # --- Normalisation of YAML quirks (bare ``off`` → False in YAML 1.1, etc.) ---

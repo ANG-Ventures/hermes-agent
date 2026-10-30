@@ -2471,7 +2471,7 @@ DEFAULT_CONFIG = {
                       # picks and books; release/renew go through alloc_client.
                       "allocd": "off"},
         # Admission predicate (t_da6f84f7, read per tick by the gateway gate, `kanban dispatch` and the shared
-        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/admission.py admit() over the
+        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/fleet_placement/admission.py admit() over the
         # host's measured cpu_busy / memory / PSI / procs with one measured-estimate lease per recent spawn. In
         # utilization the dispatch_load_gate load/CPU keys are inert (procs pause and max_spawn_per_tick still apply).
         "admission": "legacy",
@@ -2600,6 +2600,11 @@ DEFAULT_CONFIG = {
         # A present-but-unknown/empty value fails to "none" (never "all")
         # and logs review_policy_invalid.
         "review_policy": "all",
+        # Scoped board-signing grants for same-model delegate children
+        # (hermes_cli/kanban_sign_grants.py): "on" lets an operator session
+        # pass delegate_task(sign_grant=...) and the child sign comments under
+        # it; anything else refuses every mint and every granted write.
+        "sign_grants": "off",
         # Default reviewer profile for request_review. None/blank = no
         # default: a review request with no reviewer is refused rather than
         # leaving the implementer as its own reviewer.
@@ -2983,6 +2988,11 @@ DEFAULT_CONFIG = {
         # host 127.0.0.1:7890"). Per-platform vars (DISCORD_PROXY, TELEGRAM_PROXY, ...) are still
         # honored.
         "trust_env": True,
+        # After a messaging user (matrix/discord/telegram/whatsapp/signal/imessage) gets the "Sorry, I
+        # encountered an error" notice, page the operator via <root>/scripts/lib/episode_pager.py:
+        # one page per room per episode, cleared after 30 min with no new error. Read per error
+        # (no restart to flip). No-op when the pager script is absent.
+        "page_on_turn_error": True,
         # Media delivery. False: any emitted file path is delivered natively unless under the
         # credential/system denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env, auth.json). True:
         # files must be under the Hermes cache, media_delivery_allow_dirs, or fresher than

@@ -3,7 +3,9 @@ Bound onto ``GatewayRunner`` through ``GatewaySlashCommandsMixin``."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 
 from agent.i18n import t
 from gateway.platforms.event import MessageEvent, MessageType
@@ -44,6 +46,7 @@ class GatewayGoalCommandsMixin:
             return None
 
         def dispatch():
+            mgr.reload()  # re-read under the lock: the pre-lock snapshot may be stale
             return dispatch_goal_command(
                 mgr, event.get_command_args() or "", authorize_gate=authorize_gate,
                 render=lambda key, default, **values: t(key, **values),
@@ -52,12 +55,25 @@ class GatewayGoalCommandsMixin:
 
         # Drafting resolves profile-scoped credentials. Keep ContextVars across the
         # executor hop; manager I/O must also stay off the messaging event loop.
-        result = await self._run_in_executor_with_context(dispatch)
+        # Serialized with the idle-wake watcher so neither saves over the other's goal state.
+        async with self._goal_session_lock(mgr.session_id):
+            result = await self._run_in_executor_with_context(dispatch)
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:
             self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff)
         return result.output
+
+    def _goal_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Per-session lock serializing goal-state read/mutate/save between /goal commands and the
+        idle-wake watcher (both hop to an executor, so the event loop alone does not order them)."""
+        locks = getattr(self, "_goal_session_locks", None)
+        if locks is None:
+            locks = self._goal_session_locks = weakref.WeakValueDictionary()
+        lock = locks.get(session_id)
+        if lock is None:
+            lock = locks[session_id] = asyncio.Lock()
+        return lock
 
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
         try:

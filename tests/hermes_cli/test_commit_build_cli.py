@@ -37,6 +37,9 @@ def test_sealed_cli_never_checks_or_spawns_updater(payload, tmp_path, args):
     home = tmp_path / "home"
     home.mkdir()
     env = {**os.environ, "HERMES_HOME": str(home), "HERMES_INSTALL_ROOT": str(root)}
+    # The sealed copy on PYTHONPATH is the documented "this tree was chosen" signal, so
+    # cmd_update does not retarget to the checkout whose .venv runs this suite.
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(root), os.environ.get("PYTHONPATH")) if p)
     # Real imports and parser, no admission mocks. Audit attempts even if a caller swallows the error.
     script = f"""
 import json, sys

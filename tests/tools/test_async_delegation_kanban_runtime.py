@@ -7,6 +7,7 @@ Real store + real kanban DB under the test's sandboxed ``HERMES_HOME``; the unit
 from __future__ import annotations
 
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -205,6 +206,22 @@ def test_dispatcher_flag_gates_eligibility():
     assert akb.dispatcher_serves_here() is False
     akb.set_dispatcher_active(True)
     assert akb.dispatcher_serves_here() is True
+
+
+def test_ineligible_fallback_is_logged_at_info_naming_the_reason(caplog):
+    import logging as _logging
+
+    with caplog.at_level(_logging.DEBUG, logger="tools.async_delegation"):
+        akb.log_ineligible("no_dispatcher", "deleg_x")
+        akb.log_ineligible("knob_in_process", "deleg_y")
+    by_reason = {r.getMessage().split("ineligible_reason=")[-1]: r.levelno for r in caplog.records}
+    assert by_reason == {"no_dispatcher": _logging.INFO, "knob_in_process": _logging.DEBUG}
+    assert "delegation_id=deleg_x" in caplog.records[0].getMessage()
+
+
+def test_delegate_tool_routes_every_ineligible_unit_through_the_logger():
+    src = (Path(__file__).resolve().parents[2] / "tools" / "delegate_tool.py").read_text(encoding="utf-8")
+    assert "_akb.log_ineligible(_why_not, live_deleg_id)" in src
 
 
 def test_parent_route_persists_the_configured_provider_name():
@@ -1303,3 +1320,84 @@ def test_alias_permuted_lock_roots_are_taken_in_one_shared_order(tmp_path, monke
     view1 = order([a, b])
     view2 = order([tmp_path / "y_b", tmp_path / "z_a"])
     assert len(view1) == 2 and view1 == view2, "alias views acquire the shared locks in different orders"
+
+
+# ── §5.1.5 (t_3646c28e ruling B): a live dispatcher on this HOST, not only in this process ──────────
+
+
+@pytest.fixture
+def standby(monkeypatch):
+    """This gateway does not hold the dispatcher lock; no estop."""
+    from gateway import kanban_watchers_common as kwc
+
+    akb.set_dispatcher_active(False)
+    monkeypatch.setattr(kwc, "_kanban_dispatch_allowed", lambda: True)
+    return akb._heartbeat_path()
+
+
+def _holder(tmp_path):
+    """A live same-uid process standing in for the lock-holding gateway (I8: Popen handle)."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+
+def test_standby_gateway_sees_the_lock_holders_fresh_heartbeat(standby, tmp_path, monkeypatch):
+    proc = _holder(tmp_path)
+    try:
+        standby.parent.mkdir(parents=True, exist_ok=True)
+        standby.write_text(json.dumps({"pid": proc.pid, "host": akb._hostname(), "interval_s": 60.0}))
+        assert akb.dispatcher_serves_here() is False  # not the holder: the old predicate said no
+        assert akb.dispatcher_live_on_host() is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+@pytest.mark.parametrize("case", ["absent", "stale", "dead_pid", "other_host", "garbage", "estop"])
+def test_no_live_dispatcher_on_host_keeps_the_unit_in_process(standby, tmp_path, monkeypatch, case):
+    from gateway import kanban_watchers_common as kwc
+
+    proc = _holder(tmp_path)
+    try:
+        standby.parent.mkdir(parents=True, exist_ok=True)
+        beat = {"pid": proc.pid, "host": akb._hostname(), "interval_s": 60.0}
+        if case == "dead_pid":
+            proc.kill()
+            proc.wait(timeout=10)
+        if case == "other_host":
+            beat["host"] = "not-" + akb._hostname()
+        if case != "absent":
+            standby.write_text("{not json" if case == "garbage" else json.dumps(beat))
+        if case == "stale":
+            old = time.time() - (akb.HEARTBEAT_TICKS * 60.0 + 5)
+            os.utime(standby, (old, old))
+        if case == "estop":
+            monkeypatch.setattr(kwc, "_kanban_dispatch_allowed", lambda: False)
+        assert akb.dispatcher_live_on_host() is False
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_ineligible_reason_accepts_a_dispatcher_in_another_gateway(eligible, standby, tmp_path, monkeypatch):
+    monkeypatch.setattr(akb, "dispatcher_serves_here", lambda: False)  # this process is a standby
+    assert akb.ineligible_reason(**eligible) == "no_dispatcher"
+    proc = _holder(tmp_path)
+    try:
+        standby.parent.mkdir(parents=True, exist_ok=True)
+        standby.write_text(json.dumps({"pid": proc.pid, "host": akb._hostname(), "interval_s": 60.0}))
+        assert akb.ineligible_reason(**eligible) is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_heartbeat_clear_removes_only_its_own(standby, tmp_path, monkeypatch):
+    standby.parent.mkdir(parents=True, exist_ok=True)
+    standby.write_text(json.dumps({"pid": os.getpid() + 100000, "host": akb._hostname(), "interval_s": 1}))
+    akb.clear_dispatcher_heartbeat()
+    assert standby.exists()  # another holder's beat survives a standby's release
+    akb.write_dispatcher_heartbeat(5.0)
+    assert json.loads(standby.read_text()) == {"pid": os.getpid(), "host": akb._hostname(), "interval_s": 5.0}
+    akb.clear_dispatcher_heartbeat()
+    assert not standby.exists()

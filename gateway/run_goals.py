@@ -803,15 +803,39 @@ class GatewayGoalsMixin:
         def _wake():
             from hermes_cli.goals import GoalManager
 
-            # GoalManager() loads the goal via SessionDB.get_meta, which waits on the db lock while
-            # another thread writes: build it in the hop with idle_wake_prompt, never on the loop.
+            # Load inside the hop (SessionDB.get_meta waits on the db lock; never on the loop) and
+            # under the session's goal lock: a /goal pause|clear that committed before this point is
+            # what we read, so the save below cannot undo it.
             mgr = GoalManager(session_id=session_id, default_max_turns=max_turns)
-            return mgr, mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins)
+            before = mgr.idle_wake_snapshot()
+            prompt = mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins)
+            after = mgr.idle_wake_snapshot()  # includes the exact row the wake saved
+            return mgr, prompt, before, after
+
+        from hermes_cli.goals import undo_idle_wake
 
         with self._profile_scope_for_source(source):
-            mgr, prompt = await self._run_in_executor_with_context(_wake)
-        if not prompt:
-            return
+            async with self._goal_session_lock(session_id):
+                mgr, prompt, before, after = await self._run_in_executor_with_context(_wake)
+                if not prompt:
+                    return
+                # Writers outside this lock (CLI/TUI on the same session) may have ended the goal since
+                # the wake's save. Nothing to give back then: the row is no longer the wake's.
+                if not await self._run_in_executor_with_context(lambda: mgr.reload() is not None and mgr.is_active()):
+                    return
+                # Final eligibility check, AFTER the last executor await: a real message, a /goal
+                # command (it claims the active-session guard before waiting on this lock) or /stop
+                # that landed during the hop owns the next step. Nothing awaits between this check and
+                # handle_message below, so it cannot go stale. The wake never ran: give it back.
+                if (
+                    quick_key in getattr(self, "_running_agents", {})
+                    or quick_key in adapter._active_sessions
+                    or self._queue_depth(quick_key, adapter=adapter) > 0
+                    or getattr(entry, "user_stopped_at", None) is not None
+                    or self._stop_latched(quick_key)
+                ):
+                    await self._run_in_executor_with_context(lambda: undo_idle_wake(session_id, before, after))
+                    return
         logger.info(
             "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
             quick_key, session_id, prompt.splitlines()[0][:80],
