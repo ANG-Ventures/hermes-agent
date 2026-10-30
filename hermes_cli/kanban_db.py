@@ -7489,6 +7489,13 @@ def set_model_override(
         FLAGSHIP_OVERRIDE_COMMENT_PREFIX
     )
     with write_txn(conn):
+        # The locked writer's refusals come before authorize_flagship, whose
+        # comment journals outside the txn (Prism 324c92ac41be).
+        status = _task_status(conn, task_id)
+        if status is None:
+            return False
+        if status == "archived":
+            raise RuntimeError(f"cannot set model override on archived task {task_id}")
         if not validated_override:
             # A clear lands on the profile route; a pin runs through the
             # assignee's aliases (Prism a1f3096286e2): gate both in this txn.

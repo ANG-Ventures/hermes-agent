@@ -1385,6 +1385,27 @@ def test_batch_with_an_archived_card_journals_nothing(flagship_profiles, monkeyp
     assert _journal_kinds(board, ok)[before:] == []
 
 
+@pytest.mark.parametrize("model", [None, FABLE])
+def test_set_model_on_an_archived_card_journals_no_authorization(flagship_profiles, proven_operator, monkeypatch, tmp_path, model):
+    """Prism 324c92ac41be: single-card set_model_override refuses an archived
+    card BEFORE authorize_flagship journals the override comment, so replay
+    never restores an authorization the failed call did not commit."""
+    _journal_env(monkeypatch, tmp_path)
+    assignee = "daedalus-fable" if model is None else "daedalus-opus"
+    task_id = _card(assignee, "claude-opus-5-5")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,))
+        conn.commit()
+    before = len(_journal_kinds(board, task_id))
+    with kb.connect() as conn:
+        with pytest.raises(RuntimeError, match="archived task"):
+            kb.set_model_override(conn, task_id, model, flagship_override_reason=REASON)
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+    assert _journal_kinds(board, task_id)[before:] == []
+    assert _comments(task_id) == []
+
+
 @pytest.mark.parametrize("verb", ["assign", "reassign"])
 def test_send_back_journals_under_the_writer_lock(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
     """Prism 268821347bd4: every journal record of a send-back assignment is
