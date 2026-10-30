@@ -1406,6 +1406,61 @@ def test_set_model_on_an_archived_card_journals_no_authorization(flagship_profil
     assert _comments(task_id) == []
 
 
+def _refuse_release_line_comments(monkeypatch):
+    """The fleet release-line guard, on: any comment body naming the release-line
+    token is refused (CloseOnLineRefused), like a real malformed close gate."""
+    from hermes_cli import kanban_close_on_guard as guard
+
+    def check(author, body):
+        if "close-on" in (body or ""):
+            raise guard.CloseOnLineRefused("close-on token in prose")
+
+    monkeypatch.setattr(guard, "check_comment", check)
+
+
+BAD_REASON = "fixing the close-on parser"
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign", "set_model", "create"])
+def test_a_refused_override_comment_journals_nothing(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 8b7984d6e364 (r14): the override COMMENT is judged with every
+    add_comment refusal before the first write. A reason the release-line guard
+    rejects raises with the card unchanged and zero journal lines (a send-back
+    stays in review; a create writes no card)."""
+    from hermes_cli import kanban_journal
+
+    _journal_env(monkeypatch, tmp_path)
+    if verb in ("assign", "reassign"):
+        task_id = _review_card("daedalus-opus", "daedalus-sonnet")
+    elif verb == "set_model":
+        task_id = _card("daedalus-fable", "claude-opus-5-5")
+    else:
+        task_id = _card("daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    _refuse_release_line_comments(monkeypatch)
+    before = len(list(kanban_journal.read_entries(board)))
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="close-on token"):
+            if verb == "assign":
+                kb.assign_task(conn, task_id, "daedalus-fable", request_changes_reason="rework",
+                               operator="apollo", flagship_override_reason=BAD_REASON)
+            elif verb == "reassign":
+                kb.reassign_task(conn, task_id, "daedalus-fable", request_changes_reason="rework",
+                                 operator="apollo", flagship_override_reason=BAD_REASON)
+            elif verb == "set_model":
+                kb.set_model_override(conn, task_id, None, flagship_override_reason=BAD_REASON)
+            else:
+                kb.create_task(conn, title="bad", assignee="daedalus-fable",
+                               flagship_override_reason=BAD_REASON)
+        task = kb.get_task(conn, task_id)
+        if verb in ("assign", "reassign"):
+            assert (task.status, task.assignee) == ("review", "daedalus-opus")
+        elif verb == "set_model":
+            assert task.model_override == "claude-opus-5-5"
+    assert [e["kind"] for e in list(kanban_journal.read_entries(board))[before:]] == []
+
+
 @pytest.mark.parametrize("verb", ["assign", "reassign"])
 def test_send_back_journals_under_the_writer_lock(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
     """Prism 268821347bd4: every journal record of a send-back assignment is

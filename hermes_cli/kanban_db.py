@@ -6492,6 +6492,9 @@ def create_task(
                         model_override=model_override,
                         allow_flagship_reason=_raw_flagship_reason,
                     )
+                # The override comment is written after the card's first
+                # journaled event; judge it before the INSERT (Prism 8b7984d6e364 r14).
+                flagship_override_comment(flagship_override_author, flagship_override_reason)
 
                 if tenant is None and parents:
                     # Parent order breaks ties in this soft namespace; an
@@ -7067,11 +7070,29 @@ def authorize_flagship(
     reads back. A caller that mutates before this call checks
     ``require_flagship_authority`` first.
     """
+    comment = flagship_override_comment(actor, reason)
+    if comment:
+        add_comment(conn, task_id, *comment)
+
+
+def flagship_override_comment(
+    actor: Optional[str], reason: Optional[str],
+) -> Optional[tuple[str, str]]:
+    """The ``(author, body)`` :func:`authorize_flagship` would write, judged
+    with no database access: the authority (:func:`model_policy.require_flagship_authority`)
+    and every refusal :func:`add_comment` applies to that author and body
+    (:func:`_validate_comment_args`). ``None`` when no reason was given. Each
+    caller that writes before ``authorize_flagship`` calls this first, so the
+    override comment can never refuse after a journaled write (Prism 8b7984d6e364 r14).
+    """
     from hermes_cli.model_policy import override_comment, require_flagship_authority
 
     actor, reason = require_flagship_authority(reason, actor)
-    if reason:
-        add_comment(conn, task_id, actor, override_comment(reason))
+    if not reason:
+        return None
+    body = override_comment(reason)
+    _validate_comment_args(actor, body)
+    return actor, body
 
 
 def _check_flagship_override_body(author: str, body: str) -> None:
@@ -7160,6 +7181,9 @@ def _route_flagship_reason(
         raise FlagshipAssigneeRefused(f"cannot {verb} {task_id}: {exc}") from None
     if allowed and _card_flagship_authorized(conn, task_id):
         return None
+    # The override comment this reason will be written as, judged with every
+    # add_comment refusal before the caller's first write (Prism 8b7984d6e364 r14).
+    flagship_override_comment(actor, allowed)
     return allowed
 
 
