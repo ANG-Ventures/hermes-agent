@@ -477,25 +477,39 @@ def _class_verdict(plan, n: str, job: Optional[placement.Job], *, now: float, le
         return False, f"closed:{type(exc).__name__}: {exc}"
 
 
-def _with_simulated(plan, hid: str, job: Optional[placement.Job], *, now: float, root) -> Tuple[Any, Optional[float]]:
-    """(leases, admitted) for may_start: (None, None) = the ledger's own, unless this plan holds SIMULATED takes on
-    ``hid`` (a dry run books nothing). Then the ledger's leases plus one lease per simulated take, at the estimate
-    may_start admits on, so a dry run's verdict counts the takes it already granted (Prism 9eecf7c2e1ee)."""
+def sim_lease(plan, name: str, job: Optional[placement.Job]) -> "admission.Lease":
+    """The lease a dry-run take on ``name`` stands for: the estimate and class may_start admitted THIS job on
+    (Prism fd6bd8070eee). An unreadable estimate input falls back to the declared footprint, never to nothing."""
     sig = plan.signal
     table = sig.placement_table
-    k = sum(v for n, v in plan._simulated.items() if v and (table.resolve(n) or n) == hid)
-    if not k:
-        return None, None
-    rpath = Path(sig.placement_reservations) if sig.placement_reservations is not None else None
+    hid = table.resolve(name) or name
+    now = sig.clock()
     fp = table.footprint(CONSUMER, job.footprint if job is not None else None,
                          profile=job.profile if job is not None else None)
-    ctx = placement.admit_context(CONSUMER, fp, now=now, job=job, table=table, root=root)
-    need = ctx.need(hid)
+    root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
+    try:
+        ctx = placement.admit_context(CONSUMER, fp, now=now, job=job, table=table, root=root)
+        need, klass = ctx.need(hid), ctx.job_class
+    except placement.PlacementError:
+        need, klass = placement.need_of(fp), placement.job_class_for(CONSUMER)
+    return admission.Lease(host=hid, job_class=klass, need=need, at=now)
+
+
+def _with_simulated(plan, hid: str, job: Optional[placement.Job], *, now: float, root) -> Tuple[Any, Optional[float]]:
+    """(leases, admitted) for may_start: (None, None) = the ledger's own, unless this plan holds SIMULATED takes on
+    ``hid`` (a dry run books nothing). Then the ledger's leases plus each simulated take's OWN lease (sim_lease, its
+    estimate and class at take time; Prism 9eecf7c2e1ee / fd6bd8070eee), so a dry run's verdict counts exactly the
+    work it already granted. ``job`` is the take being judged and is not needed here."""
+    sig = plan.signal
+    table = sig.placement_table
+    sim = [le for n, ls in plan._sim_leases.items() if (table.resolve(n) or n) == hid for le in ls]
+    if not sim:
+        return None, None
+    rpath = Path(sig.placement_reservations) if sig.placement_reservations is not None else None
     leases = placement.ledger_leases(rpath, now=now, table=table) if rpath is not None else []
-    leases += [admission.Lease(host=hid, job_class=ctx.job_class, need=need, at=now) for _ in range(k)]
     admitted = (placement.live_admissions(CONSUMER, rpath, now=now, table=table).get(hid, 0)
-                if rpath is not None else 0) + k
-    return leases, admitted
+                if rpath is not None else 0) + len(sim)
+    return leases + sim, admitted
 
 
 def allocd_request(plan, names, job: Optional[placement.Job]) -> Dict[str, Any]:

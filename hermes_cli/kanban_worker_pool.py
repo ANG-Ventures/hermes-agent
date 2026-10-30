@@ -1704,6 +1704,9 @@ class SpilloverPlan:
     _rids: Dict[str, List[Optional[str]]] = field(default_factory=dict)
     # Dry-run takes per host: never in the ledger, so choose() adds them.
     _simulated: Dict[str, int] = field(default_factory=dict)
+    # Dry-run takes per host under the ONE rule: each take's OWN lease (its estimate and class), newest last, so a
+    # later verdict replays what was granted, never the current job's footprint times k (Prism fd6bd8070eee).
+    _sim_leases: Dict[str, List[Any]] = field(default_factory=dict)
     # Reservations alloc_client booked (kanban.placement.allocd on): rid -> whether
     # that take debited ``slots`` (a band-closed host has none to debit).
     _alloc: Dict[str, bool] = field(default_factory=dict)
@@ -1859,6 +1862,9 @@ class SpilloverPlan:
                 rid = None
                 if self.dry_run:
                     self._simulated[pin] = self._simulated.get(pin, 0) + 1
+                    if unified:
+                        from hermes_cli import kanban_headroom as _kh
+                        self._sim_leases.setdefault(pin, []).append(_kh.sim_lease(self, pin, job))
                 else:
                     from hermes_cli import kanban_headroom as _kh
                     from hermes_cli.fleet_placement import placement as _placement
@@ -1960,6 +1966,8 @@ class SpilloverPlan:
         self._rids.setdefault(key, []).append(rid)
         if self.dry_run:
             self._simulated[key] = self._simulated.get(key, 0) + 1
+            if _kh.unified_active(self):
+                self._sim_leases.setdefault(key, []).append(_kh.sim_lease(self, key, job))
         self.slots[key] -= 1
         self.taken[key] = self.taken.get(key, 0) + 1
         self.last_pick = key
@@ -2046,6 +2054,8 @@ class SpilloverPlan:
                 self.taken[host.name] -= 1
             if self._simulated.get(host.name):
                 self._simulated[host.name] -= 1
+                if self._sim_leases.get(host.name):
+                    self._sim_leases[host.name].pop()
         if not rids:
             return
         if reservation is not None:

@@ -589,3 +589,22 @@ def test_dry_run_counts_its_simulated_takes_against_the_class_rule(home):
     keep, held = kh.unified_filter(plan, ["ace-ai"], None)
     assert keep == [] and held["ace-ai"].startswith("saturated:cpu"), held
     assert _kanban_rows(home) == []                               # still a dry run: nothing booked
+
+
+def test_dry_run_replays_each_simulated_takes_own_footprint(home):
+    """Prism fd6bd8070eee: _with_simulated rebuilt every earlier simulated take from the CURRENT job's footprint, so a
+    3-thread take followed by a 1-thread one counted the first as 1 thread (0.80 + 2/32 = 0.8625, granted). Each
+    simulated take now carries its own lease: 0.80 + (3 + 1)/32 = 0.925 > 0.90, refused."""
+    t0 = time.time()
+    f = Fleet(t0)
+    f.busy["ace-ai"] = 0.80
+    plan = _plan(home, f)
+    plan.dry_run = True
+    big = placement.Job(footprint={"threads": 3, "ram_gb": 3})
+    small = placement.Job(footprint={"threads": 1, "ram_gb": 3})
+    assert plan.take("alpha", pin="ace-ai", job=big) is not None, plan.refusal      # 0.80 + 3/32 = 0.894
+    assert plan.take("alpha", pin="ace-ai", job=small) is None
+    assert plan.refusal.startswith("pin_host_unified_admission (ace-ai: saturated:cpu"), plan.refusal
+    plan.release(plan.hosts["ace-ai"])                                             # refund the 3-thread take
+    assert plan._sim_leases["ace-ai"] == []
+    assert plan.take("alpha", pin="ace-ai", job=small) is not None, plan.refusal    # 0.80 + 1/32 fits again

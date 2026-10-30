@@ -6269,7 +6269,8 @@ def _dispatch_once_locked(
             # Real takes already sit in the ledger choose() reads; only this
             # copy's own takes are simulated (Prism 08bbc332020f).
             spillover = _dc.replace(spillover, slots=dict(spillover.slots), taken=dict(spillover.taken),
-                                    dry_run=True, _rids={}, _simulated=dict(spillover._simulated))
+                                    dry_run=True, _rids={}, _simulated=dict(spillover._simulated),
+                                    _sim_leases={h: list(v) for h, v in spillover._sim_leases.items()})
         _eff_default = (default_assignee or "").strip() or None
         _native: dict = {}
         _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
