@@ -663,7 +663,22 @@ class GatewayGoalsMixin:
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
+            event = self._synthetic_prompt_event(source, wakeup, internal=True)
+            refused = []
+
+            def _admit(key: str) -> bool:
+                # The /stop check above precedes the fire_tick hop and the adapter's own awaits:
+                # re-check at the claim (same class as Prism eb13daf988ed).
+                if self._stop_latched(key):
+                    refused.append(key)
+                    return False
+                return True
+
+            event._admission_check = _admit
+            await adapter.handle_message(event)
+            if refused:  # nothing ran: roll the tick back (stays due)
+                await self._run_in_executor_with_context(mgr.abandon_tick)
+                return
             # Slash-command loops dispatch through the command path and never hit the post-turn
             # completion hook — complete the tick immediately (caps + scheduling).
             if wakeup.lstrip().startswith("/"):
@@ -814,32 +829,61 @@ class GatewayGoalsMixin:
 
         from hermes_cli.goals import undo_idle_wake
 
+        def _ineligible(key: str) -> bool:
+            # A real message, a /goal command (it claims the active-session guard before waiting on the
+            # goal lock) or /stop owns the next step.
+            return (
+                key in getattr(self, "_running_agents", {})
+                or key in adapter._active_sessions
+                or self._queue_depth(key, adapter=adapter) > 0
+                or getattr(entry, "user_stopped_at", None) is not None
+                or self._stop_latched(key)
+            )
+
+        def _still_active() -> bool:
+            # Strict (Prism 99ea851df13d): a failed read is not proof another writer ended the goal.
+            try:
+                return mgr.reload(strict=True) is not None and mgr.is_active()
+            except Exception as exc:
+                logger.debug("goal idle wake for %s: post-save reload failed: %s", quick_key, exc)
+                return False
+
+        def _refund() -> bool:
+            # Compare-guarded: a no-op when another surface paused, cleared or replaced the goal.
+            return undo_idle_wake(session_id, before, after)
+
         with self._profile_scope_for_source(source):
+            # The goal lock is held through admission, so a gateway /goal pause|clear cannot complete
+            # while the adapter prepares the event (Discord awaits get_chat_info before claiming).
             async with self._goal_session_lock(session_id):
                 mgr, prompt, before, after = await self._run_in_executor_with_context(_wake)
                 if not prompt:
                     return
                 # Writers outside this lock (CLI/TUI on the same session) may have ended the goal since
-                # the wake's save. Nothing to give back then: the row is no longer the wake's.
-                if not await self._run_in_executor_with_context(lambda: mgr.reload() is not None and mgr.is_active()):
+                # the wake's save, or the re-read failed: give the wake back either way.
+                if not await self._run_in_executor_with_context(_still_active):
+                    await self._run_in_executor_with_context(_refund)
                     return
-                # Final eligibility check, AFTER the last executor await: a real message, a /goal
-                # command (it claims the active-session guard before waiting on this lock) or /stop
-                # that landed during the hop owns the next step. Nothing awaits between this check and
-                # handle_message below, so it cannot go stale. The wake never ran: give it back.
-                if (
-                    quick_key in getattr(self, "_running_agents", {})
-                    or quick_key in adapter._active_sessions
-                    or self._queue_depth(quick_key, adapter=adapter) > 0
-                    or getattr(entry, "user_stopped_at", None) is not None
-                    or self._stop_latched(quick_key)
-                ):
-                    await self._run_in_executor_with_context(lambda: undo_idle_wake(session_id, before, after))
+                if _ineligible(quick_key):
+                    await self._run_in_executor_with_context(_refund)
                     return
-        logger.info(
-            "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
-            quick_key, session_id, prompt.splitlines()[0][:80],
-        )
-        event = self._synthetic_prompt_event(source, prompt, internal=True)
-        event.metadata["gateway_session_key"] = quick_key
-        await adapter.handle_message(event)
+                logger.info(
+                    "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
+                    quick_key, session_id, prompt.splitlines()[0][:80],
+                )
+                event = self._synthetic_prompt_event(source, prompt, internal=True)
+                event.metadata["gateway_session_key"] = quick_key
+                refused = []
+
+                def _admit(key: str) -> bool:
+                    # Final eligibility check, run by the adapter at the claim itself (Prism
+                    # eb13daf988ed): no await separates it from the session claim or queue.
+                    if _ineligible(key):
+                        refused.append(key)
+                        return False
+                    return True
+
+                event._admission_check = _admit
+                await adapter.handle_message(event)
+                if refused:  # the wake never ran: give it back
+                    await self._run_in_executor_with_context(_refund)
