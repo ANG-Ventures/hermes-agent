@@ -82,9 +82,15 @@ def test_band_is_may_starts_verdict_for_one_and_two_jobs(root, busy, queued, one
 
 
 def test_band_kill_switch_is_admit(root, monkeypatch):
-    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
+    """The band follows the kanban ADMITTER's rule as it published it (Prism 59574d3a240b), never the reader's env;
+    a missing or stale mode is the switch's live default (unset = on since #2462, Prism 8a9579c42a36)."""
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")                         # the reader's env is not the switch
     dmd.publish("prism", 64, PRISM_UNIT, root=root, now=NOW)
-    assert _band(_table(), _sample(0.60), root)[0] == "ok"
+    assert _band(_table(), _sample(0.60), root)[0] == "hot"                 # no kanban.json: default on
+    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW, env={"KANBAN_UNIFIED_ADMIT": "0"})
+    assert _band(_table(), _sample(0.60), root)[0] == "ok"                  # admitter's published kill switch
+    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW - 3600, env={"KANBAN_UNIFIED_ADMIT": "0"})
+    assert _band(_table(), _sample(0.60), root)[0] == "hot"                 # aged out: back to the default
 
 
 # ------------------------------------------------------------- 8397e82995e1: a failed publish is seen, then retried

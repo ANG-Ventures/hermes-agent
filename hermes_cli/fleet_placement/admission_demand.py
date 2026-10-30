@@ -9,10 +9,14 @@ reads its two inputs from disk and gives every caller the same kill switch.
                                                      every class's FRESH queue that may run on ``host``
   unified(workload, env=None) -> bool                the per-caller kill switch: <WORKLOAD>_UNIFIED_ADMIT=0 = the
                                                      caller's old local rule (one release, card step 4)
+  published_unified(workload, root=None, now=None) -> bool | None
+                                                     that switch as the class's admitter published it (demand file
+                                                     ``unified``), for a reader in another process
 
 Demand file (one per class, atomic replace; the class's own scheduler writes it every tick):
   {"schema": 1, "workload": "prism", "at": <epoch>, "queued": 64, "hosts": ["ci-box", "ace-ai"] | null,
-   "unit": {"cpus": 1.0, "ram_gb": 4.0, "gpu_mib": 0}}
+   "unit": {"cpus": 1.0, "ram_gb": 4.0, "gpu_mib": 0}, "unified": true}
+``unified`` = the publisher's <WORKLOAD>_UNIFIED_ADMIT switch (absent in a file from an older publisher).
 ``hosts`` null = may run anywhere. A file older than demand_max_age_s, unreadable, or malformed holds nothing back
 (said once on stderr): a dead publisher must never starve the other classes, and the host line still protects the box.
 """
@@ -105,12 +109,16 @@ def max_age_s(path=None, root=None) -> float:
 
 
 def publish(workload: str, queued: int, unit: admission.Estimate, *, hosts=None, root=None,
-            now: Optional[float] = None) -> Path:
+            now: Optional[float] = None, env: Optional[Mapping[str, str]] = None) -> Path:
+    """``unified`` records the PUBLISHER's kill switch (its own process env, or ``env``): the class's admitter is
+    the process that publishes, so a reader in another process (the placement collector's band) takes the rule
+    mode from here, never from its own env (Prism 59574d3a240b)."""
     d = _root(root) / DEMAND_REL
     d.mkdir(parents=True, exist_ok=True)
     doc = {"schema": SCHEMA, "workload": workload, "at": float(time.time() if now is None else now),
            "queued": max(0, int(queued)), "hosts": None if hosts is None else sorted(str(h) for h in hosts),
-           "unit": {"cpus": float(unit.cpus), "ram_gb": float(unit.ram_gb), "gpu_mib": float(unit.gpu_mib)}}
+           "unit": {"cpus": float(unit.cpus), "ram_gb": float(unit.ram_gb), "gpu_mib": float(unit.gpu_mib)},
+           "unified": unified(workload, env)}
     fd, tmp = tempfile.mkstemp(dir=str(d), prefix=f".{workload}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -176,6 +184,25 @@ def unified(workload: str, env: Optional[Mapping[str, str]] = None) -> bool:
     env = os.environ if env is None else env
     key = workload.upper().replace("-", "_") + "_UNIFIED_ADMIT"
     return str(env.get(key, "1")).strip() != "0"
+
+
+def published_unified(workload: str, *, root=None, now: Optional[float] = None,
+                      max_age: Optional[float] = None) -> Optional[bool]:
+    """The kill switch as ``workload``'s admitter last published it (var/placement/demand/<workload>.json ``unified``),
+    or None: no file, unreadable, malformed, no ``unified`` key (an older publisher) or older than demand_max_age_s.
+    A reader in ANOTHER process than the admitter reads the mode here, never its own env (Prism 59574d3a240b)."""
+    now = float(time.time() if now is None else now)
+    max_age = max_age_s(root=root) if max_age is None else float(max_age)
+    try:
+        doc = json.loads((_root(root) / DEMAND_REL / f"{workload}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != SCHEMA or doc.get("workload") != workload:
+        return None
+    at, mode = doc.get("at"), doc.get("unified")
+    if not _num(at) or abs(now - float(at)) > max_age or not isinstance(mode, bool):
+        return None
+    return mode
 
 
 def workload_of(consumer: str) -> str:
