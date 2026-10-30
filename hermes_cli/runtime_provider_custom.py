@@ -188,12 +188,21 @@ def _match_legacy_custom_provider(requested_norm: str, custom_providers) -> Opti
     return None
 
 
-def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
+def _get_named_custom_provider(requested_provider: str,
+                               config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """The ``providers:`` / ``custom_providers:`` entry startup runs ``requested_provider`` on.
+
+    ``config`` defaults to this process's merged config; a caller judging ANOTHER profile's
+    route (the kanban flagship gate reading an assignee's effective config) passes that
+    config so the answer is the one that profile's worker startup gets, not a parallel
+    lookup (Prism 8aa2ca1bca8a).
+    """
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm or requested_norm == "auto" or _shadowed_by_builtin(requested_norm):
         return None
     rp = _rp()
-    config = rp.load_config()
+    if config is None:
+        config = rp.load_config()
     providers = config.get("providers")
     found = _match_new_style_provider(requested_norm, providers) if isinstance(providers, dict) else None
     if found:

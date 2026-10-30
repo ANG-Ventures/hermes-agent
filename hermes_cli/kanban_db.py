@@ -20983,6 +20983,16 @@ class LaneModelOverride:
     def route(self) -> str:
         return f"{self.provider}/{self.model}"
 
+    def flagship_authorized(self) -> bool:
+        """THE lane-row flagship reader (Prism 89f43d1114a4): a non-empty
+        ``firepower`` reason recorded under an operator-label actor, exactly
+        what ``set_lane_model_override`` persists after
+        ``require_flagship_authority``. A legacy row with an empty, worker or
+        ``unverified:<name>`` actor fails closed; it is not migrated."""
+        from hermes_cli.kanban_identity import is_operator_label
+
+        return bool((self.firepower or "").strip()) and is_operator_label(self.created_by)
+
     def ttl_remaining(self, now: Optional[int] = None) -> int:
         """Seconds left before the dispatcher stops applying this row."""
 
@@ -21037,8 +21047,14 @@ def set_lane_model_override(
     )
 
     # A lane's firepower text authorizes every card on the lane at dispatch,
-    # so only flagship authority may write one (same actor rule as a card).
-    require_flagship_authority(firepower, created_by)
+    # so only flagship authority may write one (same actor rule as a card),
+    # and the row records the RESOLVED actor: the dispatcher admits a lane
+    # only when ``created_by`` is an operator label, so a row persisted before
+    # this gate (or planted by hand) under a worker/unverified/empty actor
+    # authorizes nothing (Prism 89f43d1114a4).
+    actor, _reason = require_flagship_authority(firepower, created_by)
+    if actor:
+        created_by = actor
     pin_sub_error = pin_sub_arg_error(model, provider, pin_sub_reason)
     if pin_sub_error:
         raise ValueError(pin_sub_error)

@@ -246,32 +246,19 @@ UNRESOLVED_ROUTE_PREFIX = "<unresolved:"
 
 
 def _provider_default_model(cfg: Mapping[str, Any], provider: str) -> Optional[str]:
-    """``providers.<p>.default_model`` or legacy ``custom_providers[].model``,
-    matched the way runtime_provider_custom resolves a named provider."""
-    from hermes_cli.config import is_provider_enabled
-    from hermes_cli.providers import custom_provider_aliases
+    """The ``default_model`` of the entry worker startup resolves ``provider``
+    to, through the SAME lookup startup uses
+    (``runtime_provider_custom._get_named_custom_provider`` on ``cfg``), never
+    a parallel scan (Prism 8aa2ca1bca8a: a ``providers:`` entry with no
+    endpoint is skipped by startup, which then runs the legacy
+    ``custom_providers`` entry of the same name; a side lookup that accepted
+    the endpoint-less entry read Opus while the worker ran Fable)."""
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider
 
-    want = provider.strip().lower().replace(" ", "-")
-    providers = cfg.get("providers")
-    if isinstance(providers, Mapping):
-        for key, entry in providers.items():
-            if not isinstance(entry, Mapping) or not is_provider_enabled(entry):
-                continue
-            if want in custom_provider_aliases(str(entry.get("name") or key), str(key)):
-                found = str(entry.get("default_model") or "").strip()
-                if found:
-                    return found
-    legacy = cfg.get("custom_providers")
-    if isinstance(legacy, list):
-        for entry in legacy:
-            if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
-                continue
-            key = str(entry.get("provider_key") or "")
-            if want in custom_provider_aliases(entry["name"], key):
-                found = str(entry.get("model") or "").strip()
-                if found:
-                    return found
-    return None
+    entry = _get_named_custom_provider(provider, dict(cfg))
+    if not entry:
+        return None
+    return str(entry.get("model") or "").strip() or None
 
 
 def assignee_flagship_error(assignee: str, model: str) -> str:

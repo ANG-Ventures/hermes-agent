@@ -6798,8 +6798,9 @@ def _dispatch_once_locked(
         lane is checked against the policy loaded for THIS tick, so a ban
         tightened after ``lane-model set`` cannot be walked around by the lane
         the old policy admitted. A lane route is authorized by the lane's own
-        ``--allow-flagship``/``--firepower`` reason, or by the card's
-        ``flagship override:`` comment. With neither, the route is the
+        ``--allow-flagship``/``--firepower`` reason when the row's actor is an
+        operator label (``LaneModelOverride.flagship_authorized``), or by the
+        card's ``flagship override:`` comment. With neither, the route is the
         assignee profile's ``model.default`` (t_9e7ba884): the assignee is a
         route choice, so a flagship-default profile needs the card's
         ``flagship override:`` comment too (create/reassign write it with
@@ -6832,7 +6833,10 @@ def _dispatch_once_locked(
                 model = lane.model
                 if not is_firepower_model(model, _model_policy_config):
                     return False
-                if (lane.firepower or "").strip():
+                # The lane's own reason counts only under an operator-label
+                # actor (Prism 89f43d1114a4); a legacy/worker row falls
+                # through to the card's override comment.
+                if lane.flagship_authorized():
                     return False
             else:
                 profile_route = True

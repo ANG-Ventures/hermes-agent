@@ -370,7 +370,33 @@ def test_lane_override_with_firepower(actor):
             assert kb.get_lane_model_override(conn, assignee="daedalus-opus") is None
         return
     assert lane is not None and lane.firepower == REASON, out
+    from hermes_cli.kanban_identity import is_operator_label
+
+    assert is_operator_label(lane.created_by), lane.created_by  # the resolved actor, persisted
     assert not _refused_at_dispatch(_card("daedalus-opus"))
+
+
+@pytest.mark.parametrize("created_by", ["daedalus-opus", "unverified:apollo", "operator", "", None])
+def test_lane_row_with_a_non_operator_actor_authorizes_nothing(flagship_profiles, created_by):
+    """The lane reader (Prism 89f43d1114a4): a ``lane_model_overrides`` row
+    whose firepower was recorded before the write gate, or planted by hand,
+    under a worker / unverified / empty actor admits no card. Fail closed, no
+    migration; the card's own operator override still does."""
+    with kb.connect() as conn:
+        conn.execute(
+            "INSERT INTO lane_model_overrides (assignee, provider, model, reason, firepower, "
+            "created_by, created_at, expires_at) VALUES ('daedalus-opus', 'openai-codex', "
+            "'gpt-6-astra-900k', 'capacity', 'self approved', ?, 1, 4000000000)",
+            (created_by,),
+        )
+        conn.commit()
+        lane = kb.get_lane_model_override(conn, assignee="daedalus-opus")
+    assert lane is not None and not lane.flagship_authorized()
+    card = _card("daedalus-opus")
+    assert _refused_at_dispatch(card)
+    with kb.connect() as conn:
+        kb.add_comment(conn, card, "apollo", OVERRIDE)
+    assert not _refused_at_dispatch(card)
 
 
 @pytest.mark.parametrize("actor", ACTORS, indirect=True)
@@ -521,6 +547,19 @@ _FLEET_PROVIDER = ("model:\n  provider: fleet\nproviders:\n  fleet:\n"
 ])
 def test_provider_default_model_is_the_gated_route(flagship_profiles, body):
     _profile(flagship_profiles, "worker-prov", body)
+    _assert_gated("worker-prov")
+
+
+def test_provider_default_resolves_through_the_startup_lookup(flagship_profiles):
+    """Prism 8aa2ca1bca8a: a ``providers:`` entry with no endpoint is skipped
+    by worker startup (``_match_new_style_provider``), which then runs the
+    legacy ``custom_providers`` entry of the same name. The gate must read the
+    route the worker RUNS, through that same lookup: Fable here, not the
+    endpoint-less entry's Opus."""
+    _profile(flagship_profiles, "worker-prov",
+             "model:\n  provider: fleet\nproviders:\n  fleet:\n    default_model: claude-opus-5-5\n"
+             f"custom_providers:\n  - name: fleet\n    base_url: http://127.0.0.1:9/v1\n    model: {FABLE}\n")
+    assert assignee_default_model("worker-prov") == FABLE
     _assert_gated("worker-prov")
 
 
