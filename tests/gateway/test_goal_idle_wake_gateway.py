@@ -385,3 +385,70 @@ async def test_idle_wake_undo_still_refunds_an_untouched_row(rig):
     undone, state = await asyncio.to_thread(_scenario)
     assert undone is True
     assert (state.idle_wakes, state.last_idle_wake_at, state.status) == (0, 0.0, "active")
+
+
+@pytest.mark.asyncio
+async def test_reload_refreshes_the_stored_row_with_the_state(rig):
+    """Prism 6c9984a79951: reload() re-reads the state AND the stored row together. A manager built
+    before another writer saved must not keep the pre-save row as its write/compare token."""
+    def _scenario():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        stale = goals.GoalManager("goal-sess")                # e.g. built before waiting on the lock
+        mgr.state.created_at = mgr.state.last_turn_at = time.time() - 31 * 60
+        mgr._save()
+        assert mgr.idle_wake_prompt(checkin_minutes=30, max_checkins=1)   # the wake saves meanwhile
+        stale.reload()
+        row = goals._get_session_db().get_meta_committed(goals._meta_key("goal-sess"))
+        return stale, row
+
+    stale, row = await asyncio.to_thread(_scenario)
+    assert stale.state.idle_wakes == 1
+    assert stale._stored == row                              # token matches the state it was read with
+    assert stale.idle_wake_snapshot()["_row"] == row
+
+
+@pytest.mark.asyncio
+async def test_idle_wake_undo_holds_the_write_lock_across_read_compare_write(rig):
+    """Prism 78812616985c: undo_idle_wake's SELECT, compare and UPDATE run in ONE BEGIN IMMEDIATE
+    transaction. A writer on another connection (another process: CLI/TUI) that tries to land
+    between the read and the write is refused with SQLITE_BUSY, so it can only commit before
+    (the row no longer matches: no give-back) or after (it sees the refunded row)."""
+    import sqlite3
+
+    def _scenario():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.state.created_at = mgr.state.last_turn_at = time.time() - 31 * 60
+        mgr._save()
+        before = mgr.idle_wake_snapshot()
+        assert mgr.idle_wake_prompt(checkin_minutes=30, max_checkins=1)
+        after = mgr.idle_wake_snapshot()
+        db_path = str(goals._get_session_db().db_path)
+        probes = []
+        real_from_json = goals.GoalState.from_json
+        orig_attr = goals.GoalState.__dict__["from_json"]
+
+        def from_json_then_foreign_write(raw):                # runs between the txn's SELECT and UPDATE
+            other = sqlite3.connect(db_path, timeout=0)
+            try:
+                other.execute("UPDATE state_meta SET value = value WHERE key = ?", (goals._meta_key("goal-sess"),))
+                other.commit()
+                probes.append("landed")
+            except sqlite3.OperationalError as exc:
+                probes.append(str(exc))
+            finally:
+                other.close()
+            return real_from_json(raw)
+
+        goals.GoalState.from_json = staticmethod(from_json_then_foreign_write)
+        try:
+            undone = goals.undo_idle_wake("goal-sess", before, after)
+        finally:
+            goals.GoalState.from_json = orig_attr
+        return undone, probes, goals.load_goal("goal-sess")
+
+    undone, probes, state = await asyncio.to_thread(_scenario)
+    assert probes and all("locked" in p or "busy" in p for p in probes), probes
+    assert undone is True
+    assert (state.idle_wakes, state.last_idle_wake_at, state.status) == (0, 0.0, "active")

@@ -1368,8 +1368,10 @@ class GoalManager:
         self._evaluating = False
 
     def reload(self) -> Optional[GoalState]:
-        """Re-read the persisted goal, dropping this manager's snapshot (another writer may have saved)."""
-        self._state = load_goal(self.session_id)
+        """Re-read the persisted goal, dropping this manager's snapshot (another writer may have saved).
+        State and stored row are refreshed together: ``_stored`` is the CAS token ``_save`` and
+        ``idle_wake_snapshot`` compare against, so it must be the row this state was read from."""
+        self._state, self._stored = _load_goal_raw(self.session_id)
         return self._state
 
     # --- introspection ------------------------------------------------
