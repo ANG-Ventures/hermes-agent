@@ -1473,7 +1473,10 @@ def timed_out_handback_pr(conn: sqlite3.Connection, task_id: str, run_started_at
                 head = pr.get("head") or {}
                 if not branch_names_card(head.get("ref"), task_id) or not head.get("sha"):
                     continue
-                if start is not None and start["branch"] == head["ref"]:
+                head_repo = ((head.get("repo") or {}).get("full_name")) or repo
+                # Prism e3d4632ea5e3: start_head was read from the BASE repo's branch; it only answers for a
+                # same-repo PR. A fork head with a same-named branch takes the push-time path instead.
+                if start is not None and start["branch"] == head["ref"] and head_repo == repo:
                     produced = head["sha"] != start.get("sha")
                 else:
                     produced = _pushed_during_run(repo, head, run_started_at)
@@ -1554,10 +1557,12 @@ def emit_soft_deadlines(conn: sqlite3.Connection, *, now: Optional[int] = None) 
                 "AND kind = 'soft_deadline' LIMIT 1", (tid, run_id),
             ).fetchone():
                 continue
+            # Comment first, inside the same write txn as the once-per-run event (Prism 6190b2739be7): a crash
+            # between the two can no longer leave the event recorded with the warning never posted.
+            _kb.add_comment(conn, tid, "dispatcher", _kwp.soft_deadline_comment(hard))
             _kb._append_event(conn, tid, "soft_deadline",
                               {"soft_at": soft, "hard_at": hard, "limit_seconds": limit},
                               run_id=run_id)
-        _kb.add_comment(conn, tid, "dispatcher", _kwp.soft_deadline_comment(hard))
         emitted.append(tid)
     return emitted
 

@@ -345,3 +345,24 @@ def test_spawn_records_start_head_on_the_run(home, tmp_path, monkeypatch):
     kbd._default_spawn(claimed, str(ws))
     with kbc.connect_closing() as conn:
         assert kbd._run_start_head(conn, tid) == {"branch": f"wt/{tid}", "sha": "e" * 40}
+
+
+def test_fork_head_with_same_branch_name_uses_push_time_not_base_start_head(home, monkeypatch):
+    """Prism e3d4632ea5e3: start_head is the BASE repo's branch. A PR whose head lives in a FORK under the same
+    branch name must not be judged against it; it takes the push-time path (here: pushed during the run)."""
+    with kbc.connect_closing() as conn:
+        tid, start = _running(conn, limit=60, started_ago=120)
+        _set_start_head(conn, tid, f"wt/{tid}", "a" * 40)   # base branch head == PR head: same-repo would say retry
+        seen = []
+
+        def fake_gh(ep):
+            if "/pulls?" in ep:
+                return [{"number": 9, "head": {"ref": f"wt/{tid}", "sha": "a" * 40,
+                                               "repo": {"full_name": "someone/fork"}}}]
+            seen.append(ep)
+            return [{"activity_type": "push", "after": "a" * 40, "timestamp": _ts(start + 30)}]
+
+        monkeypatch.setattr(kbd, "_gh_json", fake_gh)
+        kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=kbd.timed_out_handback_pr)
+        assert kb.get_task(conn, tid).status == "review"
+        assert seen and "someone/fork/activity" in seen[0]
