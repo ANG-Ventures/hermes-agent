@@ -26,7 +26,10 @@ from agent.message_content import flatten_message_text
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.message_sanitization import is_interrupt_close_row, provider_owns_transcript
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
-from agent.route_note_ingest import relabel_route_note_content, relabel_route_note_text
+from agent.route_identity import ROUTE_NOTE_DISPLAY_KIND
+from agent.route_note_ingest import (
+    relabel_replayed_user_content, relabel_route_note_content, relabel_route_note_text,
+)
 from agent.tool_dispatch_helpers import _degrade_prior_turn_multimodal_messages
 from agent.turn_handoff import consume_handoff_context
 from agent.image_token_cost import bind_image_token_cost
@@ -1403,17 +1406,30 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
     return _sanitize_model
 
 
-def _relabel_untrusted_tool_replay(msg: Dict[str, Any], api_msg: Dict[str, Any], call_names: Dict[Any, Any]) -> None:
+def _relabel_replay_row(msg: Dict[str, Any], api_msg: Dict[str, Any], call_names: Dict[Any, Any]) -> None:
     """E11 at replay: a remote tool row persisted raw (a Codex-native / foreign-MCP result, named
     ``mcp.<server>.<tool>`` and mirrored as Codex received it) is relabelled on the wire copy for every
     provider this builder serves. The Codex runtime never replays through here (its history seed is
-    separate), so Codex stays byte-identical. Rows already relabelled at creation are unchanged."""
+    separate), so Codex stays byte-identical. Rows already relabelled at creation are unchanged.
+
+    User rows: every one is relabelled except a harness note (``display_kind="route_note"``, E11(b)).
+    A raw user row can survive in the store (the pending-rewrite flush bound appends the relabelled
+    copy and leaves the raw row active); ingest already sent the relabelled bytes, so the relabel is
+    idempotent and the cache prefix is unchanged."""
     from agent.tool_dispatch_helpers import tool_output_relabels_route_notes
 
     if msg.get("role") == "assistant":
         for call in msg.get("tool_calls") or ():
             if isinstance(call, dict) and isinstance(call.get("function"), dict):
                 call_names[call.get("id")] = call["function"].get("name")
+        return
+    if msg.get("role") == "user":
+        if msg.get("display_kind") != ROUTE_NOTE_DISPLAY_KIND:
+            # A harness note prepended to the row (route_identity._noted_content) is kept; the row's own
+            # content tells a user-typed leading marker apart from it when the wire bytes are a sidecar.
+            sidecar = msg.get("api_content")
+            user_text = msg.get("content") if isinstance(sidecar, str) and sidecar != msg.get("content") else None
+            api_msg["content"] = relabel_replayed_user_content(api_msg.get("content"), user_text)
         return
     if msg.get("role") != "tool":
         return
@@ -1504,7 +1520,7 @@ def build_api_messages(
             # prefix stays byte-stable. User rows carry the injection sidecar; user
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
-        _relabel_untrusted_tool_replay(msg, api_msg, _tool_call_names)
+        _relabel_replay_row(msg, api_msg, _tool_call_names)
 
         # Pass reasoning back to the API for ALL assistant messages so multi-turn
         # reasoning context is preserved.

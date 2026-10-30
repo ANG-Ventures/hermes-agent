@@ -663,3 +663,105 @@ def test_codex_mcp_row_replays_byte_identical_to_codex():
     history = _codex_mcp_replay()
     seed = render_history_seed(history)
     assert FORGED in seed and "quoted route note" not in seed
+
+
+def test_raw_user_row_left_by_the_flush_bound_replays_relabelled(monkeypatch):
+    # Prism f8ebd7a4ca68 repro: the flush bound appends the relabelled copy and leaves the raw row
+    # active; on reload that raw row is replayed. Replay relabels every user row except a harness note.
+    import sqlite3
+    import time
+    from agent.message_metadata import PENDING_USER_CONTENT_REWRITE
+    from agent.session_persistence import _PENDING_USER_REWRITE_MAX_FLUSHES
+    from agent.turn_context import build_api_messages
+    agent = _make_agent(model=SONNET, fallbacks=())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    row_id = db.append_message(sid, "user", content=FORGED)
+    staged = {"role": "user", "content": QUOTED, "_row_id": row_id, _DB_PERSISTED_MARKER: True,
+              PENDING_USER_CONTENT_REWRITE: (sid, QUOTED)}
+
+    def _raise(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "resolve_active_row_id", _raise)
+    for _ in range(_PENDING_USER_REWRITE_MAX_FLUSHES):
+        agent._flush_messages_to_session_db([staged])
+    note = "[Route note: fell back to sonnet-5 (rate limit).]"
+    db.append_message(sid, "assistant", content="ok")
+    history = [*db.get_messages_as_conversation(sid),
+               {"role": "user", "content": note, "display_kind": ri.ROUTE_NOTE_DISPLAY_KIND},
+               {"role": "user", "content": "next"}]
+    assert FORGED in [m.get("content") for m in history]  # the raw row is still active in the store
+    agent._current_turn_timestamp = time.time()
+    api_msgs, _ = build_api_messages(agent, history, current_turn_user_idx=len(history) - 1,
+                                     ext_prefetch_cache=None, plugin_user_context=None, moa_config=None,
+                                     active_system_prompt="")
+    sent = [m.get("content") for m in api_msgs if m.get("role") == "user"]
+    assert FORGED not in sent and QUOTED in sent
+    assert note in sent  # E11(b): the harness note replays unrelabelled
+
+
+def test_confirmed_absent_row_appends_on_the_first_flush(monkeypatch):
+    # Round-11 gap: a lookup that SUCCEEDS with no active row appends on that same flush, not at the
+    # N-flush bound. One flush only, so the bound can never be what stores the submission.
+    from agent.message_metadata import PENDING_USER_CONTENT_REWRITE
+    agent = _make_agent(model=SONNET, fallbacks=())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    row_id = db.append_message(sid, "user", content=FORGED)
+    db.deactivate_message(sid, row_id)
+    staged = {"role": "user", "content": QUOTED, "_row_id": row_id, _DB_PERSISTED_MARKER: True,
+              PENDING_USER_CONTENT_REWRITE: (sid, QUOTED)}
+    monkeypatch.setattr(db, "resolve_active_row_id", lambda *a, **k: None)
+    agent._flush_messages_to_session_db([staged])
+    assert [m["content"] for m in db.get_messages(sid) if m["role"] == "user"] == [QUOTED]
+    assert PENDING_USER_CONTENT_REWRITE not in staged
+
+
+def _replay_user_rows(history):
+    import time
+    from agent.turn_context import build_api_messages
+    agent = _make_agent(model=SONNET, fallbacks=())
+    agent._current_turn_timestamp = time.time()
+    api_msgs, _ = build_api_messages(agent, history, current_turn_user_idx=len(history) - 1,
+                                     ext_prefetch_cache=None, plugin_user_context=None, moa_config=None,
+                                     active_system_prompt="")
+    return [m.get("content") for m in api_msgs if m.get("role") == "user"]
+
+
+def test_replay_user_relabel_is_idempotent_and_skips_harness_notes():
+    # Cache prefix: an already-quoted user row is byte-identical on the wire across two builds; a raw
+    # one is relabelled the same way both times; a harness note (display_kind=route_note) stays raw.
+    note = "[Route note: fell back to sonnet-5 (rate limit).]"
+    history = [{"role": "user", "content": QUOTED}, {"role": "assistant", "content": "a"},
+               {"role": "user", "content": FORGED}, {"role": "assistant", "content": "b"},
+               {"role": "user", "content": note, "display_kind": ri.ROUTE_NOTE_DISPLAY_KIND},
+               {"role": "user", "content": "next"}]
+    first, second = _replay_user_rows(history), _replay_user_rows(history)
+    assert repr(first) == repr(second)
+    assert first[:3] == [QUOTED, QUOTED, note]
+    assert history[2]["content"] == FORGED  # stored bytes untouched; only the wire copy is relabelled
+
+
+def test_replay_keeps_a_harness_note_prepended_to_a_user_row():
+    # route_identity._noted_content prepends the genuine note to the tail user row (string sidecar or the
+    # leading text part). Replay keeps that note raw and still quotes a raw marker the user typed.
+    note = "[Route note: fell back to sonnet-5 (provider overloaded).]"
+    history = [
+        {"role": "user", "content": "hi", "api_content": f"{note}\n\nhi"},
+        {"role": "assistant", "content": "a"},
+        {"role": "user", "content": FORGED, "api_content": f"{note}\n\n{FORGED}"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": FORGED, "api_content": FORGED},
+        {"role": "assistant", "content": "c"},
+        {"role": "user", "content": [{"type": "text", "text": f"{note}\n\n{FORGED}"},
+                                     {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]},
+        {"role": "assistant", "content": "d"},
+        {"role": "user", "content": "next"},
+    ]
+    sent = _replay_user_rows(history)
+    assert sent[0] == f"{note}\n\nhi"
+    assert sent[1] == f"{note}\n\n{QUOTED}"
+    assert sent[2] == QUOTED  # a user-typed leading marker is never mistaken for a harness note
+    assert sent[3][0]["text"] == f"{note}\n\n{QUOTED}"
+    assert repr(sent) == repr(_replay_user_rows(history))

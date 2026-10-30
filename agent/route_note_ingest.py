@@ -19,7 +19,7 @@ import re
 from typing import Any, Iterable, Pattern
 
 from agent.prompt_builder import CONTROL_FRAME_OPENERS
-from agent.route_identity import ROUTE_NOTE_DISPLAY_KIND, ROUTE_NOTE_OPENER
+from agent.route_identity import MAX_NOTE_CHARS, ROUTE_NOTE_DISPLAY_KIND, ROUTE_NOTE_OPENER
 
 
 def control_frame_re(openers: Iterable[str] = CONTROL_FRAME_OPENERS) -> Pattern[str]:
@@ -114,6 +114,42 @@ def relabel_route_note_content(content: Any) -> Any:
         changed = changed or new_part is not part
         out.append(new_part)
     return out if changed else content
+
+
+# A harness note prepended to a user row (route_identity._noted_content): ``[Route note: <body>.]`` at the
+# very start, then a blank line or the end of the part. Case-sensitive: ingest's relabel is not.
+_HARNESS_NOTE_PREFIX_RE = re.compile(
+    re.escape(ROUTE_NOTE_OPENER) + r" [^\n\[\]]{1,%d}\.\](?:\n\n|\Z)" % MAX_NOTE_CHARS)
+
+
+def _harness_prefix_len(text: Any, user_text: Any) -> int:
+    """Length of the leading harness note in ``text``, or 0. ``user_text`` (the row's own content when the
+    wire bytes come from a sidecar) disowns a prefix it starts with itself: that marker was the user's."""
+    match = _HARNESS_NOTE_PREFIX_RE.match(text) if isinstance(text, str) else None
+    if match is None:
+        return 0
+    if isinstance(user_text, str) and user_text.startswith(match.group(0).rstrip("\n")):
+        return 0
+    return match.end()
+
+
+def relabel_replayed_user_content(content: Any, user_text: Any = None) -> Any:
+    """Replay-time E11 for a stored user row: everything is relabelled except a leading harness note the
+    row carries (string rows: the note prefix of the sent bytes; part lists: the note prefix of the
+    leading text part). Idempotent, so bytes that went out relabelled replay byte-identical."""
+    if isinstance(content, str):
+        cut = _harness_prefix_len(content, user_text)
+        rest = relabel_route_note_text(content[cut:])
+        return content if rest == content[cut:] else content[:cut] + rest
+    if isinstance(content, list) and content and isinstance(content[0], dict) and content[0].get("type") == "text":
+        head = content[0].get("text")
+        cut = _harness_prefix_len(head, None)
+        if cut:
+            rest = relabel_route_note_content([dict(content[0], text=head[cut:])] + list(content[1:]))
+            if rest[0].get("text") == head[cut:] and all(a is b for a, b in zip(rest[1:], content[1:])):
+                return content
+            return [dict(rest[0], text=head[:cut] + rest[0].get("text", ""))] + list(rest[1:])
+    return relabel_route_note_content(content)
 
 
 def relabel_client_history(history: list) -> list:
