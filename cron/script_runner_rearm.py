@@ -44,16 +44,70 @@ def trips_path() -> Path:
     return get_process_hermes_home() / "cron" / TRIPS_NAME
 
 
-def record_trip(entry: Dict[str, Any]) -> None:
-    """Append one trip line (trimmed to the last ``_KEEP_LINES``). Never raises."""
+_tlocks: Dict[str, threading.Lock] = {}
+_tlocks_guard = threading.Lock()
+
+
+def _thread_lock(path: Path) -> threading.Lock:
+    with _tlocks_guard:
+        return _tlocks.setdefault(str(path), threading.Lock())
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path, timeout: float = 5.0):
+    """Serialize a read-modify-write of ``path`` across threads and processes (the tripped
+    runner records while a restarted one may be replaying). Bounded: on timeout it proceeds
+    unlocked and logs, because the recording side runs on the watchdog's way to exit."""
+    tlock = _thread_lock(path)
+    got_t = tlock.acquire(timeout=timeout)
+    if not got_t:
+        logger.error("script runner: %s thread lock timed out; proceeding unlocked", path.name)
+    deadline = time.monotonic() + timeout
+    fd = None
+    try:
+        import fcntl
+    except ImportError:  # Windows: in-process lock only
+        fcntl = None
+    try:
+        if fcntl is not None:
+            try:
+                fd = open(path.with_name(path.name + ".lock"), "a+")
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            logger.error("script runner: %s lock timed out; proceeding "
+                                         "unlocked", path.name)
+                            break
+                        time.sleep(0.05)
+            except OSError:
+                logger.error("script runner: %s lock unavailable", path.name, exc_info=True)
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            fd.close()
+        if got_t:
+            tlock.release()
+
+
+def record_trip(entry: Dict[str, Any], lock_timeout: float = 1.0) -> None:
+    """Append one trip line (trimmed to the last ``_KEEP_LINES``), the read-modify-write under
+    ``_file_lock`` so two writers cannot drop each other's line (Prism 2777c74d0091). Never
+    raises."""
     try:
         path = trips_path()
-        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-        lines = lines[-(_KEEP_LINES - 1):] + [json.dumps(entry, sort_keys=True, default=str)]
-        from utils import atomic_write_text
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _file_lock(path, timeout=lock_timeout):
+            lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+            lines = lines[-(_KEEP_LINES - 1):] + [json.dumps(entry, sort_keys=True, default=str)]
+            from utils import atomic_write_text
 
-        atomic_write_text(path, "\n".join(lines) + "\n", tmp_prefix=".script_runner_trips_",
-                          mode=0o600)
+            atomic_write_text(path, "\n".join(lines) + "\n", tmp_prefix=".script_runner_trips_",
+                              mode=0o600)
     except Exception:
         logger.error("script runner: trip history write failed", exc_info=True)
 
@@ -108,45 +162,6 @@ def _pending_items(raw) -> Dict[tuple, float]:
     return out
 
 
-_pending_tlock = threading.Lock()
-
-
-@contextlib.contextmanager
-def _pending_lock(path: Path, timeout: float = 5.0):
-    """Serialize read-modify-write of the pending file across threads and processes (the tripped
-    runner records while a restarted one may be replaying). Bounded: on flock timeout it proceeds
-    in-process-only and logs, because the recording side runs on the watchdog's way to exit."""
-    with _pending_tlock:
-        fd = None
-        try:
-            import fcntl
-        except ImportError:  # Windows: in-process lock only
-            fcntl = None
-        if fcntl is not None:
-            try:
-                fd = open(path.with_name(path.name + ".lock"), "a+")
-                deadline = time.monotonic() + timeout
-                while True:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except OSError:
-                        if time.monotonic() >= deadline:
-                            logger.error("script runner: pending re-queue lock timed out; "
-                                         "proceeding unlocked")
-                            break
-                        time.sleep(0.05)
-            except OSError:
-                logger.error("script runner: pending re-queue lock unavailable", exc_info=True)
-        try:
-            yield
-        finally:
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                fd.close()
-
-
 def _read_pending(path: Path) -> Dict[tuple, float]:
     try:
         return _pending_items(json.loads(path.read_text(encoding="utf-8")))
@@ -154,19 +169,23 @@ def _read_pending(path: Path) -> Dict[tuple, float]:
         return {}
 
 
-def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = None) -> None:
+def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = None,
+                            lock_timeout: float = 5.0) -> None:
     """``[(home, job_id)]`` in flight at a trip, for the restarted runner, stamped with the trip
     time so the replay can skip a job that finished cleanly after the snapshot. Merged with any
-    still pending, under ``_pending_lock``. Never raises."""
+    still pending (newest stamp wins), under ``_file_lock``. Never raises."""
     if not items:
         return
     trip_epoch = time.time() if trip_epoch is None else float(trip_epoch)
     try:
         path = _requeue_path()
-        with _pending_lock(path):
+        with _file_lock(path, timeout=lock_timeout):
             pending = _read_pending(path)
             for h, j in items:
-                pending[(str(h), str(j))] = trip_epoch
+                # Keep the NEWER trip stamp: an older snapshot recorded late must not lower the
+                # reconciliation threshold (Prism d37c5059edb2).
+                key = (str(h), str(j))
+                pending[key] = max(pending.get(key, 0.0), trip_epoch)
             _write_pending(path, [[h, j, e] for (h, j), e in pending.items()])
     except Exception:
         logger.error("script runner: pending re-queue write failed", exc_info=True)
@@ -232,7 +251,7 @@ def apply_pending_requeues() -> int:
     # Commit against the file as it is NOW: drop only what this replay resolved, so a row
     # recorded (or re-stamped by a newer trip) while the replay ran survives.
     try:
-        with _pending_lock(path):
+        with _file_lock(path):
             current = _read_pending(path)
             for key, epoch in resolved.items():
                 if key in current and current[key] <= epoch:

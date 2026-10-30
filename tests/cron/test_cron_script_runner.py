@@ -1118,6 +1118,86 @@ def test_pending_requeues_survive_failures_and_skip_finished_runs(root, monkeypa
     assert [row[1] for row in json.loads(path.read_text())] == [b["id"]]
 
 
+def test_pending_requeue_keeps_the_newest_trip_stamp(root):
+    """Prism d37c5059edb2: an older snapshot recorded after a newer one must not lower the
+    stamp, or a clean run between the two trips would be read as the killed run's completion."""
+    from cron import script_runner_rearm as rr
+    from cron.jobs import mark_job_run
+    from cron.scheduler_provider import _profile_cron_scope
+
+    j = _job(root, "J", "j.sh")
+    newer = time.time() + 30  # the newer trip lands after the clean run below
+    rr.record_pending_requeues([(str(root), j["id"])], trip_epoch=newer)
+    rr.record_pending_requeues([(str(root), j["id"])], trip_epoch=newer - 3600)
+    path = root / "cron" / rr.REQUEUE_NAME
+    assert [row[2] for row in json.loads(path.read_text())] == [newer]
+    with _profile_cron_scope(root):
+        mark_job_run(j["id"], True)  # before the newer trip: not the killed run's completion
+    assert rr.apply_pending_requeues() == 1
+
+
+def test_concurrent_trip_records_lose_no_line(root):
+    """Prism 2777c74d0091: two writers of the trip history must not drop each other's line."""
+    from cron import script_runner_rearm as rr
+
+    n = 16
+    barrier = threading.Barrier(n)
+
+    def write(i):
+        barrier.wait(5)
+        rr.record_trip({"epoch": time.time(), "i": i})
+
+    threads = [threading.Thread(target=write, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert sorted(e["i"] for e in rr.recent_trips()) == list(range(n))
+
+
+def test_g_watchdog_recovers_before_a_stalled_trip_notice(root, monkeypatch, procs):
+    """Prism eb08fba97ed9: a trip record/notice that stalls past the hard deadline must not
+    cost the requeue snapshot or the tree kill."""
+    import cron.scheduler as sched
+    from cron import lanes, script_runner, script_runner_rearm as rr
+
+    monkeypatch.setattr(lanes, "RUNNER_WATCHDOG_KILL_GRACE_S", 1)  # deadline = 3 s
+    j = _job(root, "K", "k.sh")
+    child = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    procs.append(child)
+    pgid = os.getpgid(child.pid)
+    monkeypatch.setitem(sched._active_script_procs, id(child), child)
+    key = (str(root), j["id"])
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+    release = threading.Event()
+    monkeypatch.setattr(rr, "record_trip", lambda *_a, **_k: release.wait(10))
+    exits = []
+    done = threading.Event()
+
+    def fake_exit(code):
+        exits.append(code)
+        done.set()
+
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)], exit_fn=fake_exit)
+    r.enumerate_homes()
+    fire = threading.Thread(target=r._watchdog_fire, args=(root, _now_iso()), daemon=True)
+    try:
+        fire.start()
+        assert done.wait(8)
+        child.wait(timeout=5)
+        assert _group_gone(pgid)
+        rows = json.loads((root / "cron" / rr.REQUEUE_NAME).read_text())
+        assert [row[1] for row in rows] == [j["id"]], rows
+    finally:
+        release.set()
+        fire.join(10)
+        r.cancel_deadline()
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+    assert exits[0] == 70
+
+
 def test_second_trip_in_24h_pages_alerts_and_backs_off(root, tmp_path, monkeypatch):
     from cron import lanes, script_runner, script_runner_rearm
 

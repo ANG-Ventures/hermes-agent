@@ -399,7 +399,13 @@ class ScriptRunner:
             for _name, h in self._last_homes or [(None, home)]:
                 with contextlib.suppress(Exception):
                     self._write(h, "standby", "watchdog_tripped")
-            self._record_and_notify_trip(home, tick_started_at, diag)
+            # Trip record + notice run beside the recovery, never ahead of it: a stalled history
+            # write or sender start must not let the hard deadline fire before the requeue
+            # snapshot and the tree kill (Prism eb08fba97ed9).
+            notify = threading.Thread(target=self._record_and_notify_trip,
+                                      args=(home, tick_started_at, diag), daemon=True,
+                                      name="cron-runner-trip-notify")
+            notify.start()
             # A script killed below is the runner's own doing, not a job failure: with the
             # scheduler marked shutting down, a worker that records the -15 before the exit takes
             # the restart-kill path (no failure page, one re-fire request), as on a gateway
@@ -413,6 +419,7 @@ class ScriptRunner:
                 self._requeue_inflight()
             self._tree_kill(grace)
             self._await_inflight(min(time.monotonic() + 1.5, hard_exit_at - 0.5))
+            notify.join(max(0.0, hard_exit_at - 0.3 - time.monotonic()))
             for handler in logging.getLogger().handlers:
                 with contextlib.suppress(Exception):
                     handler.flush()
@@ -459,7 +466,8 @@ class ScriptRunner:
             if got:
                 sched._running_lock.release()
         rearm_policy.record_pending_requeues(
-            [(str(sched._inflight_home_path(home_key)), job_id) for home_key, job_id in keys])
+            [(str(sched._inflight_home_path(home_key)), job_id) for home_key, job_id in keys],
+            lock_timeout=1.0)
 
     @staticmethod
     def _await_inflight(deadline: float) -> None:
