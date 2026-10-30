@@ -114,8 +114,12 @@ def append(
     *,
     actor: Optional[str] = None,
     run_id: Optional[int] = None,
+    ts: Optional[float] = None,
 ) -> bool:
     """Append one mutation record. Returns True when it reached the disk.
+
+    ``ts`` (default: now) lets a record written after its commit keep the
+    time its event row was stamped with, so replay's dedupe matches it.
 
     NEVER raises. A journal failure must not fail the board write that
     triggered it -- the journal is a safety net, and a safety net that can
@@ -125,7 +129,7 @@ def append(
     if disabled():
         return False
     record = {
-        "ts": time.time(),
+        "ts": time.time() if ts is None else ts,
         "board": (board or "default"),
         "kind": kind,
         "task_id": task_id,

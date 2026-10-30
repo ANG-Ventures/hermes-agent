@@ -7370,7 +7370,11 @@ def assign_task(
                 f"(changes_requested, status ready) or land/close the PR first."
             )
     implementer = None
-    with write_txn(conn):
+    # A send-back defers EVERY journal record of this assignment to the outer
+    # commit, so they flush in event order (Prism 49c7edaaed90).
+    with write_txn(conn), (
+        _journal_deferred_until_commit(conn) if sends_back else contextlib.nullcontext()
+    ):
         if sends_back:
             # Same txn as the route judge and the assignee write: a refusal
             # below rolls the send-back back too (Prism 95da6539e615).
@@ -8778,6 +8782,9 @@ def _journal_append(conn: sqlite3.Connection, task_id, kind, payload, **kw) -> N
         if _JOURNAL_DEFERRED_CONN.get() is conn and getattr(conn, "in_transaction", False):
             from hermes_cli.kanban_db_connect import on_commit
 
+            # Stamp now, not at flush: replay dedupes on the event's created_at
+            # (Prism c3dc62f26dbe).
+            kw.setdefault("ts", time.time())
             on_commit(conn, functools.partial(kanban_journal.append, board, task_id, kind, payload, **kw))
             return
         kanban_journal.append(board, task_id, kind, payload, **kw)
@@ -8800,10 +8807,11 @@ def _append_event(
             "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
         ).fetchone()[0]
     actor_profile, actor_session_id = _event_actor()
+    now = time.time()
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
         "actor_profile, actor_session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, _json_or_null(payload), int(time.time()), actor_profile, actor_session_id),
+        (task_id, run_id, kind, _json_or_null(payload), int(now), actor_profile, actor_session_id),
     )
     # Append-only mutation journal (card t_357330bf). This is the single choke
     # point every lifecycle mutation already flows through, so journaling here
@@ -8812,7 +8820,7 @@ def _append_event(
     # deleter took the whole kanban directory, so a journal inside it would
     # have died with the data it protects. Best-effort by contract: a journal
     # failure must never fail the board write.
-    _journal_append(conn, task_id, kind, payload, run_id=run_id)
+    _journal_append(conn, task_id, kind, payload, run_id=run_id, ts=now)
 
 
 def _append_deferred_event_once(

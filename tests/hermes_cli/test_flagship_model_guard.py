@@ -1188,3 +1188,94 @@ def test_refused_send_back_journals_nothing(flagship_profiles, proven_operator, 
         assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
     kinds = [e["kind"] for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
     assert {"claimed", "changes_requested", "operator_override"} <= set(kinds[len(before):])
+
+
+def _journal_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_send_back_assignment_journals_in_event_order(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 49c7edaaed90: with --request-changes, every journal record of the
+    assignment flushes after the outer commit, in event order, so replay never
+    puts the send-back after the ``assigned`` that superseded it."""
+    import sqlite3
+
+    from hermes_cli import kanban_journal, kanban_journal_replay
+
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    snapshot = tmp_path / "snapshot.db"
+    with kb.connect() as conn, sqlite3.connect(str(snapshot)) as snap:
+        conn.backup(snap)
+    before = len([e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id])
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        db_kinds = [r[0] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND kind IN "
+            "('changes_requested', 'operator_override', 'assigned') ORDER BY id", (task_id,),
+        )]
+    journal = [e["kind"] for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id][before:]
+    assert db_kinds[-1] == "assigned"
+    assert [k for k in journal if k in set(db_kinds)] == db_kinds
+    out = tmp_path / "replayed.db"
+    kanban_journal_replay.replay_into(board, snapshot, out, since=0)
+    rconn = sqlite3.connect(str(out))
+    try:
+        rows = rconn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN "
+            "('changes_requested', 'assigned') ORDER BY id", (task_id,),
+        ).fetchall()
+    finally:
+        rconn.close()
+    assert rows[-1][0] == "assigned"
+    assert json.loads(rows[-1][1])["assignee"] == "daedalus-sonnet"
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_deferred_journal_keeps_the_event_timestamp(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism c3dc62f26dbe: a record flushed after commit carries the ts its
+    event row was stamped with. A commit that crosses a second boundary (clock
+    +2 s at flush) must not journal a different ts, or replay over a
+    post-commit snapshot inserts duplicates."""
+    import sqlite3
+    import time as _time
+
+    from hermes_cli import kanban_db_connect, kanban_journal, kanban_journal_replay
+
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    before = len([e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id])
+    real_time = _time.time
+    shift = [0.0]
+    monkeypatch.setattr(_time, "time", lambda: real_time() + shift[0])
+    real_run = kanban_db_connect._post_commit_run
+
+    def late_flush(conn):
+        shift[0] = 2.0
+        return real_run(conn)
+
+    monkeypatch.setattr(kanban_db_connect, "_post_commit_run", late_flush)
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        created = {r[0]: r[1] for r in conn.execute(
+            "SELECT kind, created_at FROM task_events WHERE task_id = ? AND kind IN "
+            "('changes_requested', 'operator_override', 'assigned')", (task_id,),
+        )}
+    monkeypatch.setattr(kanban_db_connect, "_post_commit_run", real_run)
+    journal = [e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id][before:]
+    stamped = {e["kind"]: int(e["ts"]) for e in journal if e["kind"] in created}
+    assert stamped == created
+    snapshot = tmp_path / "post-commit.db"
+    with kb.connect() as conn, sqlite3.connect(str(snapshot)) as snap:
+        conn.backup(snap)
+    result = kanban_journal_replay.replay_into(board, snapshot, tmp_path / "replayed.db")
+    assert result.events_restored == 0
