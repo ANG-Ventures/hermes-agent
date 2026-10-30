@@ -9,6 +9,9 @@ Runs ``cron.script_runner.main([])`` with test constants taken from the environm
   AFTER ``.tick-script.lock`` is taken) blocks opening a FIFO nobody writes: a wedged tick that holds
   the script-lane lock (AC-4e, RC-3).
 * ``RUNNER_HARNESS_STALE_S``     -> ``cron.lanes.RUNNER_PROGRESS_STALE_S`` (S3 scaled clock)
+* ``RUNNER_HARNESS_REARM_S``     -> ``cron.lanes.RUNNER_REARM_AFTER_S`` (self re-arm, t_302ab1e8)
+* ``RUNNER_HARNESS_LEDGER_HOLD`` -> a path. While a file exists there, a thread holds the
+  ``cron.executions`` ledger lock (t_302ab1e8).
 * ``RUNNER_HARNESS_FAULT``       -> ``emfile:<path>`` | ``retirement:<path>``. While a file exists at
   ``<path>``, every tick raises ``OSError(EMFILE)`` / is refused by retirement admission, and
   ``<path>.hit`` is touched (S3 AC-4b).
@@ -77,12 +80,34 @@ def _install_fault(spec: str) -> None:
         raise SystemExit(f"unknown RUNNER_HARNESS_FAULT {spec!r}")
 
 
+def _install_ledger_hold(flag: Path) -> None:
+    """While ``flag`` exists, a thread named ``ledger-holder`` sits inside
+    ``cron.executions._transaction`` (it owns the ledger lock), so every ledger call of the tick
+    waits on it: the t_302ab1e8 trip shape. Removing the flag releases it."""
+    import threading
+    import time
+
+    from cron import executions
+
+    def hold_lock_for_test():
+        while True:
+            if flag.exists():
+                with executions._transaction():
+                    (flag.parent / "holding").write_text(str(os.getpid()), encoding="utf-8")
+                    while flag.exists():
+                        time.sleep(0.05)
+            time.sleep(0.05)
+
+    threading.Thread(target=hold_lock_for_test, name="ledger-holder", daemon=True).start()
+
+
 def main() -> int:
     from cron import lanes
 
     for env, attr in (("RUNNER_HARNESS_CYCLE_S", "RUNNER_CYCLE_S"),
                       ("RUNNER_HARNESS_WATCHDOG_S", "RUNNER_TICK_WATCHDOG_S"),
-                      ("RUNNER_HARNESS_GRACE_S", "RUNNER_WATCHDOG_KILL_GRACE_S")):
+                      ("RUNNER_HARNESS_GRACE_S", "RUNNER_WATCHDOG_KILL_GRACE_S"),
+                      ("RUNNER_HARNESS_REARM_S", "RUNNER_REARM_AFTER_S")):
         if os.environ.get(env):
             setattr(lanes, attr, float(os.environ[env]))
     if os.environ.get("RUNNER_HARNESS_STALE_S"):
@@ -92,6 +117,9 @@ def main() -> int:
     block = os.environ.get("RUNNER_HARNESS_BLOCK")
     if block:
         _install_block_stub(Path(block))
+    hold = os.environ.get("RUNNER_HARNESS_LEDGER_HOLD")
+    if hold:
+        _install_ledger_hold(Path(hold))
     from cron import script_runner
 
     return script_runner.main([])

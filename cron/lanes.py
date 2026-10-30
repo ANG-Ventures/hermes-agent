@@ -37,6 +37,12 @@ RUNNER_TICK_WATCHDOG_S = 30
 # Watchdog tree-kill grace (§5.5 step 5). ``terminate_running_scripts`` has no named grace, so this
 # is the spec's own value.
 RUNNER_WATCHDOG_KILL_GRACE_S = 3
+# t_302ab1e8: a tripped runner re-arms itself this long after the trip (times the number of trips
+# in the last 24 h, so a repeating fault backs off linearly). The gateway runs the script lane
+# meanwhile. The first ADMITTED tick after the re-arm posts one #logs receipt; the second trip in
+# 24 h pages #alerts.
+RUNNER_REARM_AFTER_S = 600
+RUNNER_TRIP_WINDOW_S = 86400
 # hermes-agent#2396 (S1) merge commit: a gateway whose boot code_sha descends from it takes both
 # lane locks, so the runner may tick (host precondition, §5.4).
 S1_MERGE_SHA: Optional[str] = "410f6d65af5af9045ee1c0d24c56090cf715d4ff"

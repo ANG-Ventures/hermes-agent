@@ -152,6 +152,8 @@ class ScriptRunner:
         self._last_homes: List[tuple] = []
         self._warned: Dict[str, tuple] = {}
         self._recovered: set = set()
+        # Set by a self re-arm; consumed by the first ADMITTED tick, which posts the receipt.
+        self._rearmed: Optional[dict] = None
         self._timer: Optional[threading.Timer] = None
         self._deadline: Optional[threading.Timer] = None
         self._tick_thread: Optional[threading.Thread] = None
@@ -212,10 +214,45 @@ class ScriptRunner:
                                    "trip marker removed")
         self.tripped = trip_marker_path().exists()
         if self.tripped:
+            self._maybe_self_rearm()
+        if self.tripped:
             self._warn_hourly("tripped", True, "script runner standby: watchdog tripped (%s); "
-                              "run 'hermes cron runner rearm'", trip_marker_path())
+                              "self re-arm pending, or run 'hermes cron runner rearm'",
+                              trip_marker_path())
         self._check_host()
         return homes
+
+    def _maybe_self_rearm(self) -> None:
+        """Delete the trip marker once it is ``rearm_delay_s(trips in 24 h)`` old (t_302ab1e8).
+        The receipt waits for the first ADMITTED tick (``on_home_cycle``)."""
+        from cron import script_runner_rearm as rearm_policy
+
+        marker = trip_marker_path()
+        try:
+            age = time.time() - marker.stat().st_mtime
+        except OSError:
+            return
+        trips = len(rearm_policy.recent_trips())
+        delay = rearm_policy.rearm_delay_s(trips)
+        if age < delay:
+            return
+        try:
+            content = marker.read_text(encoding="utf-8-sig")
+            marker.unlink()
+        except OSError:
+            logger.warning("script runner self re-arm: marker removal failed", exc_info=True)
+            return
+        try:
+            info = json.loads(content)
+        except ValueError:
+            info = None
+        if not isinstance(info, dict):
+            info = {}
+        self.tripped = False
+        self._rearmed = {"trip_at": info.get("at"), "phase": info.get("phase"),
+                         "age_s": round(age), "trips_24h": trips}
+        logger.warning("script runner re-armed itself: trip at %s (%s) is %d s old, %d trip(s) in "
+                       "24 h, delay %d s", info.get("at"), info.get("phase"), age, trips, delay)
 
     def _check_skew(self) -> None:
         if not self.draining and _detect_code_skew() is not None:
@@ -294,6 +331,8 @@ class ScriptRunner:
             label = outcome.value
             if gated_in and outcome is lanes.TickOutcome.ADMITTED:
                 self._last_ok[key] = _now_iso()
+                if self._rearmed is not None:
+                    self._post_rearm_receipt(home)
         elif isinstance(outcome, BaseException):
             label = type(outcome).__name__
         else:
@@ -304,6 +343,18 @@ class ScriptRunner:
             self._write(home, "active", outcome=label)
         else:
             self._write(home, "standby", self._reasons.get(key) or "gated", outcome=label)
+
+    def _post_rearm_receipt(self, home) -> None:
+        """One #logs line for a self re-arm, on the first ADMITTED tick after it."""
+        from cron import script_runner_rearm as rearm_policy
+
+        info, self._rearmed = self._rearmed or {}, None
+        rearm_policy.post_logs(
+            f"🔁 cron script runner re-armed itself after a watchdog trip at {info.get('trip_at')} "
+            f"({info.get('phase') or 'phase unknown'}); first tick on {_home_label(home)} under "
+            f"budget. Trips in 24 h: {info.get('trips_24h')}. History: "
+            f"{rearm_policy.trips_path()}")
+        rearm_policy.clear_alerts()  # closes the 2nd-trip episode; ``quiet`` when none is open
 
     # --- tick watchdog (§5.5) --------------------------------------------------------------
 
@@ -331,6 +382,7 @@ class ScriptRunner:
 
     def _watchdog_fire(self, home, tick_started_at) -> None:
         grace = float(lanes.RUNNER_WATCHDOG_KILL_GRACE_S)
+        hard_exit_at = time.monotonic() + grace + 2
         # 1. Hard deadline: the exit happens even if a step below blocks.
         self._deadline = threading.Timer(grace + 2, self._exit_fn, args=(EXIT_WATCHDOG,))
         self._deadline.daemon = True
@@ -347,12 +399,74 @@ class ScriptRunner:
             for _name, h in self._last_homes or [(None, home)]:
                 with contextlib.suppress(Exception):
                     self._write(h, "standby", "watchdog_tripped")
+            self._record_and_notify_trip(home, tick_started_at, diag)
+            # A script killed below is the runner's own doing, not a job failure: with the
+            # scheduler marked shutting down, a worker that records the -15 before the exit takes
+            # the restart-kill path (no failure page, one re-fire request), as on a gateway
+            # restart drain (t_302ab1e8).
+            with contextlib.suppress(Exception):
+                import cron.scheduler as sched
+
+                sched.signal_shutdown("cron script runner watchdog trip")
+            # Before the kill: snapshot what was in flight while the pool still lists it.
+            with contextlib.suppress(Exception):
+                self._requeue_inflight()
             self._tree_kill(grace)
+            self._await_inflight(min(time.monotonic() + 1.5, hard_exit_at - 0.5))
             for handler in logging.getLogger().handlers:
                 with contextlib.suppress(Exception):
                     handler.flush()
         finally:
             self._exit_fn(EXIT_WATCHDOG)
+
+    def _record_and_notify_trip(self, home, tick_started_at, diag: dict) -> None:
+        """Trip history line; #alerts page on the 2nd trip in 24 h (the 1st is self-healing and
+        posts its #logs receipt when the re-armed runner ticks). Never raises."""
+        try:
+            from cron import script_runner_rearm as rearm_policy
+
+            entry = {"epoch": time.time(), "at": _now_iso(), "home": str(home), "pid": self._pid,
+                     "code_sha": self._code_sha, "tick_started_at": tick_started_at,
+                     "phase": diag.get("phase"), "ledger": diag.get("ledger"),
+                     "lock_waits": diag.get("lock_waits")}
+            rearm_policy.record_trip(entry)
+            trips = rearm_policy.recent_trips()
+            if len(trips) >= 2:
+                rearm_policy.page_alerts(
+                    f"🔴 cron script runner watchdog: {len(trips)} trips in 24 h; latest "
+                    f"{rearm_policy.trip_summary(entry)}. In-flight scripts were killed and "
+                    f"re-queued; the gateway runs the script lane until the runner re-arms itself "
+                    f"in {round(rearm_policy.rearm_delay_s(len(trips)) / 60)} min. History: "
+                    f"{rearm_policy.trips_path()}")
+        except Exception:
+            logger.error("script runner: trip record/notify failed", exc_info=True)
+
+    @staticmethod
+    def _requeue_inflight() -> None:
+        """Record every job in flight at the trip for one re-fire (t_302ab1e8). Not written to
+        jobs.json here: the trip usually means the tick is stuck inside a ``_jobs_lock`` section
+        waiting on the ledger, so the restarted runner applies the file
+        (``script_runner_rearm.apply_pending_requeues``)."""
+        import cron.scheduler as sched
+        from cron import script_runner_rearm as rearm_policy
+
+        got = sched._running_lock.acquire(timeout=0.2)
+        try:
+            keys = list(sched._running_job_ids)
+        except RuntimeError:
+            keys = []
+        finally:
+            if got:
+                sched._running_lock.release()
+        rearm_policy.record_pending_requeues(
+            [(str(sched._inflight_home_path(home_key)), job_id) for home_key, job_id in keys])
+
+    @staticmethod
+    def _await_inflight(deadline: float) -> None:
+        """Give killed scripts' workers until ``deadline`` to record their run before the exit."""
+        with contextlib.suppress(Exception):
+            while _inflight_count() and time.monotonic() < deadline:
+                time.sleep(0.05)
 
     def _stack_diagnosis(self) -> dict:
         """Every thread's stack plus the tick thread's innermost ``cron.*`` frame (``phase``), so a
@@ -384,6 +498,11 @@ class ScriptRunner:
                             break
                         f = f.f_back
             diag["lock_waits"] = [[label, round(s, 3)] for label, s in lanes.lock_waits()[-20:]]
+            # Which thread holds the ledger lock and what every ledger transaction is doing
+            # (t_302ab1e8). Only when already imported: a trip must not import anything.
+            executions = sys.modules.get("cron.executions")
+            if executions is not None:
+                diag["ledger"] = executions.ledger_activity()
         except Exception as exc:  # noqa: BLE001 - diagnostics must not block the trip
             diag["error"] = f"{type(exc).__name__}: {exc}"
         return diag
@@ -534,6 +653,12 @@ def main(argv: Optional[list] = None) -> int:
 
         record_boot_fingerprint()
     runner = ScriptRunner()
+    with contextlib.suppress(Exception):
+        # Jobs a watchdog trip killed get their one re-fire now, from a process whose locks are
+        # fresh (the tripped one could not take ``_jobs_lock``; t_302ab1e8).
+        from cron import script_runner_rearm
+
+        script_runner_rearm.apply_pending_requeues()
     stop = threading.Event()
     kwargs = runner.start_kwargs(stop)
     signal.signal(signal.SIGTERM, lambda *_a: runner.request_shutdown())

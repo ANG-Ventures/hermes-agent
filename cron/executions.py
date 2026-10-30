@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -95,12 +96,64 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+# What each thread's ledger transaction is doing right now, and who holds ``_lock``: the script
+# runner's watchdog reads both when a tick trips (t_302ab1e8). Four trips in 36 h all stopped in
+# this function with nothing saying whether the tick waited on ``_lock`` or on SQLite.
+# thread ident -> [caller label, stage, tx start (monotonic), stage start (monotonic)].
+_inflight: Dict[int, List[Any]] = {}
+# (thread name, caller label, held since (monotonic)) of the ``_lock`` owner, or None.
+_lock_holder: Optional[tuple] = None
+LEDGER_LOCK_WAIT_NOTE_S = 0.1
+
+
+def ledger_activity() -> Dict[str, Any]:
+    """Snapshot of ``_inflight`` and ``_lock_holder`` with ages in seconds. Never raises."""
+    now = time.monotonic()
+    names = {t.ident: t.name for t in threading.enumerate()}
+    holder = _lock_holder
+    return {
+        "inflight": {
+            names.get(ident, f"thread-{ident}"): {
+                "label": s[0], "stage": s[1], "tx_s": round(now - s[2], 3),
+                "stage_s": round(now - s[3], 3)}
+            for ident, s in _inflight.copy().items()},  # dict.copy is atomic under the GIL
+        "lock_holder": None if holder is None else {
+            "thread": holder[0], "label": holder[1], "held_s": round(now - holder[2], 3)},
+    }
+
+
+def _stage(state: List[Any], stage: str) -> None:
+    state[1], state[3] = stage, time.monotonic()
+
+
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
+    global _lock_holder
+    from cron.lanes import caller_section_label, record_lock_wait
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
-        yield conn
+    label = caller_section_label(sys._getframe(1))
+    ident = threading.get_ident()
+    started = time.monotonic()
+    state = _inflight[ident] = [label, "lock_wait", started, started]
+    try:
+        with _lock:
+            waited = time.monotonic() - started
+            if waited >= LEDGER_LOCK_WAIT_NOTE_S:
+                record_lock_wait(f"ledger_lock:{label}", waited)
+            prev, _lock_holder = _lock_holder, (threading.current_thread().name, label,
+                                                time.monotonic())
+            try:
+                _stage(state, "connect")
+                with transaction(_connect()) as conn:
+                    _stage(state, "body")
+                    yield conn
+                    _stage(state, "commit")
+            finally:
+                _lock_holder = prev
+    finally:
+        if _inflight.get(ident) is state:
+            _inflight.pop(ident, None)
 
 
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[Dict[str, Any]]:
