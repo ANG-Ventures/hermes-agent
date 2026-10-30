@@ -1403,6 +1403,25 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
     return _sanitize_model
 
 
+def _relabel_untrusted_tool_replay(msg: Dict[str, Any], api_msg: Dict[str, Any], call_names: Dict[Any, Any]) -> None:
+    """E11 at replay: a remote tool row persisted raw (a Codex-native / foreign-MCP result, named
+    ``mcp.<server>.<tool>`` and mirrored as Codex received it) is relabelled on the wire copy for every
+    provider this builder serves. The Codex runtime never replays through here (its history seed is
+    separate), so Codex stays byte-identical. Rows already relabelled at creation are unchanged."""
+    from agent.tool_dispatch_helpers import tool_output_relabels_route_notes
+
+    if msg.get("role") == "assistant":
+        for call in msg.get("tool_calls") or ():
+            if isinstance(call, dict) and isinstance(call.get("function"), dict):
+                call_names[call.get("id")] = call["function"].get("name")
+        return
+    if msg.get("role") != "tool":
+        return
+    name = msg.get("tool_name") or msg.get("name") or call_names.get(msg.get("tool_call_id"))
+    if tool_output_relabels_route_notes(name):
+        api_msg["content"] = relabel_route_note_content(api_msg.get("content"))
+
+
 def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
@@ -1443,6 +1462,7 @@ def build_api_messages(
     # provider never produced, and the relay's coherence gate answers it with a full-history
     # re-mint. Looked up once per request; fail-open (row sent) on any error.
     _omit_interrupt_close = provider_owns_transcript(agent.provider)
+    _tool_call_names: Dict[Any, Any] = {}  # call id -> tool name, for result rows that carry no name
     for idx, msg in enumerate(canonical_messages):
         if _omit_interrupt_close and is_interrupt_close_row(msg):
             continue
@@ -1484,6 +1504,7 @@ def build_api_messages(
             # prefix stays byte-stable. User rows carry the injection sidecar; user
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
+        _relabel_untrusted_tool_replay(msg, api_msg, _tool_call_names)
 
         # Pass reasoning back to the API for ALL assistant messages so multi-turn
         # reasoning context is preserved.

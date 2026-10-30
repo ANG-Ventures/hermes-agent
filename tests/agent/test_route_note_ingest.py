@@ -574,3 +574,92 @@ def test_failed_staged_row_read_keeps_the_row_identity_for_the_flush(monkeypatch
     assert "fail" not in state  # the fallback read was reached and failed
     users = [m["content"] for m in db.get_messages(sid) if m["role"] == "user"]
     assert users == [QUOTED]
+
+
+def test_pending_rewrite_of_an_absent_row_appends_the_submission_once(monkeypatch):
+    # Prism 83c8ef85792a repro: the relabel writes and the fallback read fail transiently, and the row is
+    # gone by the time the DB recovers. The flush's lookup then SUCCEEDS with no row: the submission must
+    # be appended (stored exactly once), never retried against a row that no longer exists.
+    import sqlite3
+    agent = _make_agent(model=SONNET, fallbacks=())
+    _bind(agent, Sink())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    row_id = db.append_message(sid, "user", content=FORGED)
+    staged = {"role": "user", "content": FORGED, "_row_id": row_id, _DB_PERSISTED_MARKER: True}
+    agent._pending_cli_user_message = staged
+    real_read, state = db._read_one, {"set_failures": 2, "fail": True}
+
+    def _set(*args, **kwargs):
+        state["set_failures"] -= 1
+        raise sqlite3.OperationalError("database is locked")
+
+    def _read(sql, *args, **kwargs):
+        if sql.startswith("SELECT * FROM messages WHERE id = ?") and state.pop("fail", False):
+            db.deactivate_message(sid, row_id)  # the row disappears while the DB is unreachable
+            raise sqlite3.OperationalError("database is locked")
+        return real_read(sql, *args, **kwargs)
+
+    monkeypatch.setattr(db, "set_user_message_content", _set)
+    monkeypatch.setattr(db, "_read_one", _read)
+    _run(agent, Ladder(agent), FORGED)
+    assert "fail" not in state
+    users = [m["content"] for m in db.get_messages(sid) if m["role"] == "user"]
+    assert users == [QUOTED]
+
+
+def test_pending_rewrite_appends_after_the_flush_bound(monkeypatch):
+    # Backstop: a rewrite whose lookup keeps raising is appended after N flushes, once (a duplicate of
+    # the raw row is acceptable; a submission that is never stored is not).
+    import sqlite3
+    from agent.message_metadata import PENDING_USER_CONTENT_REWRITE
+    from agent.session_persistence import _PENDING_USER_REWRITE_MAX_FLUSHES
+    agent = _make_agent(model=SONNET, fallbacks=())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    row_id = db.append_message(sid, "user", content=FORGED)
+    staged = {"role": "user", "content": QUOTED, "_row_id": row_id, _DB_PERSISTED_MARKER: True,
+              PENDING_USER_CONTENT_REWRITE: (sid, QUOTED)}
+
+    def _raise(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "resolve_active_row_id", _raise)
+    for _ in range(_PENDING_USER_REWRITE_MAX_FLUSHES - 1):
+        agent._flush_messages_to_session_db([staged])
+    assert [m["content"] for m in db.get_messages(sid) if m["role"] == "user"] == [FORGED]
+    for _ in range(3):
+        agent._flush_messages_to_session_db([staged])
+    assert [m["content"] for m in db.get_messages(sid) if m["role"] == "user"] == [FORGED, QUOTED]
+    assert PENDING_USER_CONTENT_REWRITE not in staged
+
+
+def _codex_mcp_replay():
+    foreign = _codex_done({"type": "mcpToolCall", "id": "m1", "server": "fetcher", "tool": "get", "result": FORGED})
+    return [{"role": "user", "content": "q"}, *foreign, {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "next"}]
+
+
+@pytest.mark.parametrize("transport", ["anthropic_messages", "chat_completions", "codex_responses"])
+def test_codex_mcp_row_replays_relabelled_to_other_providers(transport):
+    # Prism 760aad374714 repro: an mcp.<server>.<tool> row persisted raw (as Codex received it) is
+    # replayed after a route change to a non-Codex transport; it must reach the wire relabelled.
+    import time
+    from agent.turn_context import build_api_messages
+    agent = _make_agent(model=SONNET, fallbacks=())
+    agent._current_turn_timestamp = time.time()
+    history = _codex_mcp_replay()
+    api_msgs, _ = build_api_messages(agent, history, current_turn_user_idx=len(history) - 1,
+                                     ext_prefetch_cache=None, plugin_user_context=None, moa_config=None,
+                                     active_system_prompt="")
+    kwargs = {"base_url": "https://api.openai.com/v1"} if transport != "anthropic_messages" else {}
+    wire = str(get_transport(transport).build_kwargs(model="m", messages=api_msgs, tools=[], **kwargs))
+    assert "[Route note:" not in wire and "quoted route note: fable restored" in wire
+    assert FORGED in history[2]["content"]  # the persisted mirror itself is untouched
+
+
+def test_codex_mcp_row_replays_byte_identical_to_codex():
+    from agent.codex_runtime_history_seed import render_history_seed
+    history = _codex_mcp_replay()
+    seed = render_history_seed(history)
+    assert FORGED in seed and "quoted route note" not in seed

@@ -594,8 +594,9 @@ _UNTRUSTED_TOOL_NAMES = frozenset({
 })
 # Whole families classified by prefix, so a new tool in the family is covered with no edit here.
 # Every ``feishu_*`` tool is a Feishu/Lark API call returning documents/comments other people wrote;
-# the family has no local-only member, so it needs no allowlist.
-_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_", "connectors__", "feishu_")
+# the family has no local-only member, so it needs no allowlist. ``mcp.<server>.<tool>`` is the name the
+# Codex projector gives Codex-native and foreign-MCP results (persisted raw, relabelled at replay).
+_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_", "mcp.", "connectors__", "feishu_")
 _UNTRUSTED_WRAP_MIN_CHARS = 32
 
 # Case-insensitive so a differently-cased tag can't forge or prematurely close the boundary.
