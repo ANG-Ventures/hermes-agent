@@ -127,7 +127,7 @@ def test_missing_catalog_falls_back_to_constants_with_one_warning(root, caplog):
     from agent import anthropic_limits, model_metadata
     from agent.anthropic_adapter import THINKING_BUDGET, _thinking_kwargs
 
-    assert THINKING_BUDGET == FALLBACK_THINKING
+    assert dict(THINKING_BUDGET) == FALLBACK_THINKING
     with caplog.at_level(logging.WARNING, logger=anthropic_limits.logger.name):
         for _ in range(3):
             assert _cap() == PLUGIN_FALLBACK

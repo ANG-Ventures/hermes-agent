@@ -76,16 +76,18 @@ logger = logging.getLogger(__name__)
 # Manual-thinking budget ladder. FALLBACK only: the live ladder is the fleet catalog's thinking_budget
 # (<fleet root>/config/anthropic-limits.json, via _thinking_budget()); hermes-home's
 # anthropic-limits-fallback-lint keeps this literal equal to the catalog.
-THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+# Immutable on purpose: hermes-home's fallback lint only certifies literals that cannot change after
+# this line (allow-list, #7860). Read through _thinking_budget().
+THINKING_BUDGET = (("xhigh", 32000), ("high", 16000), ("medium", 8000), ("low", 4000))
 
 
 def _thinking_budget() -> Dict[str, int]:
     """The catalog's thinking_budget overlaid on THINKING_BUDGET (re-read on catalog mtime change)."""
     try:
         from agent.anthropic_limits import thinking_budget
-        return thinking_budget(THINKING_BUDGET)
+        return thinking_budget(dict(THINKING_BUDGET))
     except Exception:  # the catalog is advisory: never fail a request on it
-        return THINKING_BUDGET
+        return dict(THINKING_BUDGET)
 # Hermes effort -> Anthropic adaptive-thinking effort (output_config.effort). 4.7+ exposes
 # low/medium/high/xhigh/max; Opus/Sonnet 4.6 have no xhigh, so callers downgrade xhigh->max
 # there (see _supports_xhigh_effort). "minimal" is a legacy alias for low on every model.
