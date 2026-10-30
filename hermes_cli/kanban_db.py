@@ -7370,14 +7370,16 @@ def assign_task(
                 f"(changes_requested, status ready) or land/close the PR first."
             )
     implementer = None
-    # A send-back defers EVERY journal record of this assignment to the outer
-    # commit, so they flush in event order (Prism 49c7edaaed90).
-    with write_txn(conn), (
-        _journal_deferred_until_commit(conn) if sends_back else contextlib.nullcontext()
-    ):
+    with write_txn(conn):
+        # Judge before any write, under the writer lock: the route the card
+        # ends on is ``profile``'s (a send-back only moves the assignee), and
+        # a pin cleared since the preflight is seen here (Prism 5df499a16242,
+        # 95da6539e615). A refusal leaves nothing written, so nothing to unwind.
+        flagship_reason = _assignee_flagship_reason(
+            conn, task_id, profile, flagship_override_reason, operator,
+            releases_dispatch=clear_no_worker, sends_back=sends_back,
+        )
         if sends_back:
-            # Same txn as the route judge and the assignee write: a refusal
-            # below rolls the send-back back too (Prism 95da6539e615).
             implementer = _reassign_request_changes(
                 conn, task_id, profile, changes_reason, operator,
             )
@@ -7391,12 +7393,6 @@ def assign_task(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        # Re-judge on the locked row: a pin cleared between the preflight and
-        # this txn changes the route (Prism 5df499a16242, Stale Validation).
-        flagship_reason = _assignee_flagship_reason(
-            conn, task_id, profile, flagship_override_reason, operator,
-            releases_dispatch=clear_no_worker, sends_back=sends_back,
-        )
         # The send-back already restored ``profile``: no assignee write and no
         # ``assigned`` event, as before the send-back joined this txn.
         restored = sends_back and implementer == profile
@@ -7939,13 +7935,14 @@ def apply_batch_route_writes(
         if ov is not None:
             overrides[write.task_id] = ov
 
-    from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
-
     written: list[str] = []
     fields: dict[str, tuple[str, ...]] = {}
     skipped_now: dict[str, str] = {}
     live_now: dict[str, int] = {}
     with write_txn(conn):
+        # Judge every card before the first write, under the writer lock: a
+        # refusal leaves nothing written (Prism 0b1cb4a34ceb).
+        apply: list[tuple[BatchRouteWrite, Optional[str], Optional[str], Optional[str]]] = []
         for write, model, provider, effort in prepared:
             mismatch = _batch_write_mismatch(conn, write)
             if mismatch is not None:
@@ -7955,21 +7952,23 @@ def apply_batch_route_writes(
                     )
                 skipped_now[write.task_id] = mismatch
                 continue
+            if write.touch_model and not (write.audit_comment_body or "").lstrip().casefold().startswith(
+                FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+            ):
+                if model:
+                    # The pin as the assignee RUNS it (its aliases), under
+                    # the same lock the write commits against (a1f3096286e2).
+                    # Raises unless the card already carries an override.
+                    pin_flagship_reason(conn, write.task_id, model, None)
+                else:
+                    # The CLI judged the clear before the lock; re-judge it on
+                    # the locked row so a reassign onto a flagship default in
+                    # between refuses the batch (Prism e25e5d877449/cd10822b8d6e).
+                    clear_pin_flagship_reason(conn, write.task_id, None)
+            apply.append((write, model, provider, effort))
+        for write, model, provider, effort in apply:
             changed: tuple[str, ...] = ()
             if write.touch_model:
-                if not (write.audit_comment_body or "").lstrip().casefold().startswith(
-                    FLAGSHIP_OVERRIDE_COMMENT_PREFIX
-                ):
-                    if model:
-                        # The pin as the assignee RUNS it (its aliases), under
-                        # the same lock the write commits against (a1f3096286e2).
-                        # Raises unless the card already carries an override.
-                        pin_flagship_reason(conn, write.task_id, model, None)
-                    else:
-                        # The CLI judged the clear before the lock; re-judge it on
-                        # the locked row so a reassign onto a flagship default in
-                        # between unwinds the batch (Prism e25e5d877449/cd10822b8d6e).
-                        clear_pin_flagship_reason(conn, write.task_id, None)
                 if not _set_model_override_locked(
                     conn, write.task_id, model, provider,
                     audit_comment_author=write.audit_comment_author,
@@ -8751,26 +8750,6 @@ def _journal_board_slug(conn: Optional[sqlite3.Connection] = None):
         return None
 
 
-# The connection whose journal records wait for its outer COMMIT (a nested
-# send-back, Prism 3935fbf11941): a savepoint rollback must not leave records
-# a journal replay would resurrect.
-_JOURNAL_DEFERRED_CONN: ContextVar[Optional[sqlite3.Connection]] = ContextVar(
-    "kanban_journal_deferred_conn", default=None,
-)
-
-
-@contextlib.contextmanager
-def _journal_deferred_until_commit(conn: sqlite3.Connection):
-    """Queue ``conn``'s journal records on its post-commit list for this scope:
-    run after the outer ``write_txn`` commits, dropped with a rolled-back
-    savepoint or outer txn."""
-    token = _JOURNAL_DEFERRED_CONN.set(conn)
-    try:
-        yield
-    finally:
-        _JOURNAL_DEFERRED_CONN.reset(token)
-
-
 def _journal_append(conn: sqlite3.Connection, task_id, kind, payload, **kw) -> None:
     """Best-effort journal append under ``conn``'s board; skipped for an unowned connection."""
     try:
@@ -8779,14 +8758,6 @@ def _journal_append(conn: sqlite3.Connection, task_id, kind, payload, **kw) -> N
             return
         from hermes_cli import kanban_journal
 
-        if _JOURNAL_DEFERRED_CONN.get() is conn and getattr(conn, "in_transaction", False):
-            from hermes_cli.kanban_db_connect import on_commit
-
-            # Stamp now, not at flush: replay dedupes on the event's created_at
-            # (Prism c3dc62f26dbe).
-            kw.setdefault("ts", time.time())
-            on_commit(conn, functools.partial(kanban_journal.append, board, task_id, kind, payload, **kw))
-            return
         kanban_journal.append(board, task_id, kind, payload, **kw)
     except Exception:  # pragma: no cover - the journal is a net, never a gate
         pass
@@ -8807,11 +8778,10 @@ def _append_event(
             "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,),
         ).fetchone()[0]
     actor_profile, actor_session_id = _event_actor()
-    now = time.time()
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
         "actor_profile, actor_session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, _json_or_null(payload), int(now), actor_profile, actor_session_id),
+        (task_id, run_id, kind, _json_or_null(payload), int(time.time()), actor_profile, actor_session_id),
     )
     # Append-only mutation journal (card t_357330bf). This is the single choke
     # point every lifecycle mutation already flows through, so journaling here
@@ -8820,7 +8790,7 @@ def _append_event(
     # deleter took the whole kanban directory, so a journal inside it would
     # have died with the data it protects. Best-effort by contract: a journal
     # failure must never fail the board write.
-    _journal_append(conn, task_id, kind, payload, run_id=run_id, ts=now)
+    _journal_append(conn, task_id, kind, payload, run_id=run_id)
 
 
 def _append_deferred_event_once(
@@ -15167,9 +15137,7 @@ def request_changes(
         return True, implementer
 
     try:
-        with write_txn(conn, allow_nested=nested), (
-            _journal_deferred_until_commit(conn) if nested else contextlib.nullcontext()
-        ):
+        with write_txn(conn, allow_nested=nested):
             ok, detail = _in_txn()
             # A refusal rolls back everything this call wrote: the opened
             # claim AND a posted coverage comment the gate just rejected

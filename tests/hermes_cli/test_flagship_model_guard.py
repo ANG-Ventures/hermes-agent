@@ -1279,3 +1279,86 @@ def test_deferred_journal_keeps_the_event_timestamp(flagship_profiles, proven_op
         conn.backup(snap)
     result = kanban_journal_replay.replay_into(board, snapshot, tmp_path / "replayed.db")
     assert result.events_restored == 0
+
+
+def _journal_kinds(board: str, task_id: str) -> list[str]:
+    from hermes_cli import kanban_journal
+
+    return [e["kind"] for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
+
+
+def _db_kinds_after(conn, task_id: str, after_id: int) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? AND id > ? ORDER BY id", (task_id, after_id),
+    )]
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_foreign_send_back_journals_in_event_order(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 1ce4d22df5a6: a send-back on a card homed to another session also
+    writes write_txn's foreign-action audit. Every journal record of the call
+    (send-back, override audit, assigned) lands in task_events order."""
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET session_id = 'home-sess' WHERE id = ?", (task_id,))
+        conn.commit()
+        board = kb._journal_board_slug(conn)
+        last = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+                            (task_id,)).fetchone()[0]
+    before = len(_journal_kinds(board, task_id))
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with kb.mutation_actor(session_ids=("away",), profile="apollo", operator="Ace: rework",
+                               foreign_ok="rework"):
+            assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        db_kinds = _db_kinds_after(conn, task_id, last)
+    assert "changes_requested" in db_kinds and db_kinds.count("operator_override") >= 1
+    journal = _journal_kinds(board, task_id)[before:]
+    assert [k for k in journal if k in set(db_kinds)] == db_kinds
+
+
+def test_refused_batch_journals_nothing(flagship_profiles, monkeypatch, tmp_path):
+    """Prism 0b1cb4a34ceb: a batch the in-txn judge refuses on a later card
+    wrote nothing for the earlier card, journal included (replay must not
+    resurrect a clear that never committed)."""
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _card("daedalus-opus", "claude-opus-5-5")
+    other = _card("daedalus-opus", "claude-opus-5-5")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-fable' WHERE id = ?", (task_id,))
+        conn.commit()
+    before = len(_journal_kinds(board, other))
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="cannot clear the model pin"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=other, touch_model=True),
+                kb.BatchRouteWrite(task_id=task_id, touch_model=True),
+            ])
+        assert kb.get_task(conn, other).model_override == "claude-opus-5-5"
+    assert _journal_kinds(board, other)[before:] == []
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_send_back_journals_under_the_writer_lock(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 268821347bd4: every journal record of a send-back assignment is
+    appended while the writer lock is held, so the journal's order across
+    processes is the commit order (no post-commit flush another writer can
+    overtake)."""
+    from hermes_cli import kanban_journal
+
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    real = kanban_journal.append
+    outside: list[str] = []
+    with kb.connect() as conn:
+        def watched(board, tid, kind, *a, **k):
+            if tid == task_id and not conn.in_transaction:
+                outside.append(kind)
+            return real(board, tid, kind, *a, **k)
+
+        monkeypatch.setattr(kanban_journal, "append", watched)
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+    assert outside == []
