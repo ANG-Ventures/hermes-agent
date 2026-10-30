@@ -198,3 +198,30 @@ async def test_loop_tick_refused_by_a_stop_landing_during_adapter_preparation(ri
 
 def rig_source(runner):
     return runner.session_store.list_sessions()[0].origin
+
+
+@pytest.mark.asyncio
+async def test_admission_check_is_one_shot_across_a_queued_replay(rig):
+    """Prism 199961bfd516: an event queued behind an active session and later replayed through
+    handle_message is not refused after its producer stopped watching (no rollback would run)."""
+    from gateway.platforms.base import MessageEvent
+
+    runner, adapter, received, key = rig
+    calls = []
+
+    def _admit(k):
+        calls.append(k)
+        return len(calls) == 1                               # a replay would be refused
+
+    event = MessageEvent(text="tick", source=rig_source(runner), internal=True)
+    event.metadata["gateway_session_key"] = key
+    event._admission_check = _admit
+    adapter._active_sessions[key] = asyncio.Event()          # busy: the event is queued
+    await adapter.handle_message(event)
+    assert calls == [key]
+    queued = adapter._pending_messages.pop(key, None) or event
+    adapter._active_sessions.pop(key, None)
+    await adapter.handle_message(queued)                     # replay
+    await _drain(adapter)
+    assert calls == [key]                                    # never re-evaluated
+    assert [e.text for e in received] == ["tick"]
