@@ -1340,6 +1340,28 @@ def test_refused_batch_journals_nothing(flagship_profiles, monkeypatch, tmp_path
     assert _journal_kinds(board, other)[before:] == []
 
 
+@pytest.mark.parametrize("touch", ["touch_model", "touch_effort", "touch_brain"])
+def test_batch_with_an_archived_card_journals_nothing(flagship_profiles, monkeypatch, tmp_path, touch):
+    """Prism e6f355767f2f: the batch judges every refusal the locked writers
+    raise (an archived card) before the first write, so a valid earlier card
+    journals nothing when a later one is archived."""
+    _journal_env(monkeypatch, tmp_path)
+    ok = _card("daedalus-opus")
+    gone = _card("daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (gone,))
+        conn.commit()
+    before = len(_journal_kinds(board, ok))
+    with kb.connect() as conn:
+        with pytest.raises(RuntimeError, match="archived task"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=ok, **{touch: True}),
+                kb.BatchRouteWrite(task_id=gone, **{touch: True}),
+            ])
+    assert _journal_kinds(board, ok)[before:] == []
+
+
 @pytest.mark.parametrize("verb", ["assign", "reassign"])
 def test_send_back_journals_under_the_writer_lock(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
     """Prism 268821347bd4: every journal record of a send-back assignment is

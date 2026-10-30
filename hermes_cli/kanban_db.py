@@ -7952,6 +7952,12 @@ def apply_batch_route_writes(
                     )
                 skipped_now[write.task_id] = mismatch
                 continue
+            # The locked writers' own refusal, judged before any card is
+            # written: a rollback cannot unwrite the journal (Prism e6f355767f2f).
+            if (write.touch_model or write.touch_effort or write.touch_brain) and conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (write.task_id,),
+            ).fetchone()["status"] == "archived":
+                raise RuntimeError(f"cannot set route on archived task {write.task_id}")
             if write.touch_model and not (write.audit_comment_body or "").lstrip().casefold().startswith(
                 FLAGSHIP_OVERRIDE_COMMENT_PREFIX
             ):
