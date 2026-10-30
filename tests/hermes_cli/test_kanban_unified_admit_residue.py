@@ -82,14 +82,17 @@ def test_band_is_may_starts_verdict_for_one_and_two_jobs(root, busy, queued, one
 
 
 def test_band_kill_switch_is_admit(root, monkeypatch):
-    """The band takes the switch the kanban ADMITTER published (demand file ``unified``), never this process's env
-    (Prism 59574d3a240b, vendored from hermes-home f2691dc07)."""
+    """The band follows the kanban ADMITTER's rule (Prism 59574d3a240b, 8a9579c42a36). Production shape: with the
+    switch at its shipped default (unset = off) the admitter publishes no kanban demand file at all, so a missing or
+    stale mode must read as off (admit(), no holdback); only a fresh ``unified: true`` from the admitter is the one
+    rule, whatever the reader's own env says."""
+    monkeypatch.delenv("KANBAN_UNIFIED_ADMIT", raising=False)
     dmd.publish("prism", 64, PRISM_UNIT, root=root, now=NOW)
-    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW, env={"KANBAN_UNIFIED_ADMIT": "0"})
-    assert _band(_table(), _sample(0.60), root)[0] == "ok"
+    assert _band(_table(), _sample(0.60), root)[0] == "ok"                  # no kanban.json: default off
     dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW, env={"KANBAN_UNIFIED_ADMIT": "1"})
-    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")          # the reader's own env never names the rule
-    assert _band(_table(), _sample(0.60), root)[0] == "hot"
+    assert _band(_table(), _sample(0.60), root)[0] == "hot"                 # admitter opted in
+    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW - 3600, env={"KANBAN_UNIFIED_ADMIT": "1"})
+    assert _band(_table(), _sample(0.60), root)[0] == "ok"                  # switch flipped off: file aged out
 
 
 # ------------------------------------------------------------- 8397e82995e1: a failed publish is seen, then retried
