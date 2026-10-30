@@ -67,13 +67,16 @@ def test_timed_out_run_with_pushed_pr_goes_to_review(home):
         events = kb.list_events(conn, tid)
         to = next(e for e in events if e.kind == "timed_out")
         assert to.payload["handback_pr"] == "ANG-Ventures/hermes-home#7842"
-        assert to.payload["retry_status"] == "review"
-        assert any(e.kind == "review_requested" and e.payload.get("timed_out_handback") for e in events)
+        # Routed through kanban_db.request_review (Prism 61fefd32c672): its own event + run.
+        rr = next(e for e in events if e.kind == "review_requested")
+        assert rr.payload["implementer"] == "daedalus-opus"
         assert not any(e.kind == "gave_up" for e in events)
-        run = kb.list_runs(conn, tid)[-1]
-        assert run.outcome == "timed_out"
-        assert run.summary.startswith("timed-out handback: PR ANG-Ventures/hermes-home#7842 @")
-        assert run.metadata["own_prs"] == ["ANG-Ventures/hermes-home#7842"]
+        runs = kb.list_runs(conn, tid)
+        timed = next(r for r in runs if r.outcome == "timed_out")
+        assert timed.summary.startswith("timed-out handback: PR ANG-Ventures/hermes-home#7842 @")
+        routed = next(r for r in runs if r.outcome == "review_requested")
+        assert routed.metadata["own_prs"] == ["ANG-Ventures/hermes-home#7842"]
+        assert routed.metadata["same_actor_bypass"].startswith("dispatcher timed-out handback")
         # The failure counter is not charged for a delivered handback.
         assert int(conn.execute("SELECT consecutive_failures FROM tasks WHERE id=?",
                                 (tid,)).fetchone()[0] or 0) == 0
@@ -231,3 +234,114 @@ def test_worker_context_renders_deadline_line(home):
         tid, _ = _running(conn, limit=5400, started_ago=10)
         ctx = kb.build_worker_context(conn, tid)
     assert "Deadline: Hard limit at " in ctx and "hand back by " in ctx
+
+
+def _set_start_head(conn, tid, branch, sha):
+    run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+    kb.merge_run_metadata(conn, run_id, {kbd.RUN_START_HEAD_KEY: {"branch": branch, "sha": sha}})
+
+
+def _no_activity(ep):
+    raise AssertionError(f"push-time fallback must not run with a start head: {ep}")
+
+
+def test_pr_on_page_two_is_found(home, monkeypatch):
+    """Prism a0391e200843: >100 open PRs; the card's PR is on page 2."""
+    with kbc.connect_closing() as conn:
+        tid, start = _running(conn, limit=60, started_ago=120)
+        _set_start_head(conn, tid, f"wt/{tid}", None)
+        pages = []
+
+        def fake_gh(ep):
+            assert "/pulls?" in ep, ep
+            pages.append(ep)
+            if ep.endswith("&page=1"):
+                return [{"number": i, "head": {"ref": f"x/t_0000{i:04d}", "sha": "f" * 40}}
+                        for i in range(100)]
+            return [{"number": 501, "head": {"ref": f"wt/{tid}", "sha": "a" * 40}}]
+
+        monkeypatch.setattr(kbd, "_gh_json", fake_gh)
+        hb = kbd.timed_out_handback_pr(conn, tid, start)
+        assert hb == {"pr": "ANG-Ventures/hermes-home#501", "sha": "a" * 40, "url": None}
+        assert len(pages) == 2 and "sort=updated&direction=desc" in pages[0]
+
+
+def test_pr_head_equal_to_start_head_retries(home, monkeypatch):
+    """Prism 50102547ef05 (a): the run pushed nothing (head == head at spawn) -> retry."""
+    with kbc.connect_closing() as conn:
+        tid, start = _running(conn, limit=60, started_ago=120)
+        _set_start_head(conn, tid, f"wt/{tid}", "a" * 40)
+
+        def fake_gh(ep):
+            if "/pulls?" in ep:
+                return [{"number": 9, "head": {"ref": f"wt/{tid}", "sha": "a" * 40}}]
+            return _no_activity(ep)
+
+        monkeypatch.setattr(kbd, "_gh_json", fake_gh)
+        assert kbd.timed_out_handback_pr(conn, tid, start) is None
+        kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=kbd.timed_out_handback_pr)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_pr_head_differs_from_start_head_is_review(home, monkeypatch):
+    """Prism 50102547ef05 (b): a rebased/amended head (any date) differs from spawn -> review."""
+    with kbc.connect_closing() as conn:
+        tid, start = _running(conn, limit=60, started_ago=120)
+        _set_start_head(conn, tid, f"wt/{tid}", "a" * 40)
+
+        def fake_gh(ep):
+            if "/pulls?" in ep:
+                return [{"number": 9, "head": {"ref": f"wt/{tid}", "sha": "b" * 40}}]
+            return _no_activity(ep)
+
+        monkeypatch.setattr(kbd, "_gh_json", fake_gh)
+        kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=kbd.timed_out_handback_pr)
+        assert kb.get_task(conn, tid).status == "review"
+        to = next(e for e in kb.list_events(conn, tid) if e.kind == "timed_out")
+        assert to.payload["handback_sha"] == "b" * 40
+
+
+def test_no_start_head_fresh_push_is_review(home, monkeypatch):
+    """Prism 50102547ef05 (c): no start head recorded -> push-time fallback; a push during the
+    run -> review."""
+    with kbc.connect_closing() as conn:
+        tid, start = _running(conn, limit=60, started_ago=120)
+        sha = "c" * 40
+        monkeypatch.setattr(kbd, "_gh_json", lambda ep: (
+            [{"number": 9, "head": {"ref": f"wt/{tid}", "sha": sha}}] if "/pulls?" in ep
+            else [{"activity_type": "push", "after": sha, "timestamp": _ts(start + 30)}]))
+        kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=kbd.timed_out_handback_pr)
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_refused_route_retries_and_charges_breaker(home, monkeypatch):
+    """A request_review refusal leaves the card on its retry path (failure accounting as before)."""
+    monkeypatch.setattr(kb, "request_review", lambda *a, **k: (False, "refused for test"))
+    with kbc.connect_closing() as conn:
+        tid, _ = _running(conn, limit=60, started_ago=120)
+        kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=lambda *a: {
+            "pr": "o/r#1", "sha": "d" * 40, "url": None})
+        assert kb.get_task(conn, tid).status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "timed_out_handback_refused" in kinds
+        assert int(conn.execute("SELECT consecutive_failures FROM tasks WHERE id=?",
+                                (tid,)).fetchone()[0] or 0) == 1
+
+
+def test_spawn_records_start_head_on_the_run(home, tmp_path, monkeypatch):
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="clock", assignee="a", max_runtime_seconds=5400,
+                             completion_contract="ANG-Ventures/hermes-home")
+        claimed = kb.claim_task(conn, tid)
+
+    class _Proc:
+        pid = 4242
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Proc())
+    monkeypatch.setattr(kbd, "_start_head_fn",
+                        lambda conn, t, branch: {"branch": branch or f"wt/{t}", "sha": "e" * 40})
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    kbd._default_spawn(claimed, str(ws))
+    with kbc.connect_closing() as conn:
+        assert kbd._run_start_head(conn, tid) == {"branch": f"wt/{tid}", "sha": "e" * 40}

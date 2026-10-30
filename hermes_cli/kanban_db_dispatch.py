@@ -1389,45 +1389,128 @@ def _gh_json(endpoint: str) -> Any:
     return json.loads(proc.stdout or "null")
 
 
-def timed_out_handback_pr(conn: sqlite3.Connection, task_id: str, run_started_at: int) -> Optional[dict]:
-    """An OPEN PR on this card's branch whose head was pushed during the timed-out run (t_e7537cb1).
+# Open-PR pages walked for the card's PR (100 per page, newest-updated first; Prism a0391e200843).
+_HANDBACK_PR_MAX_PAGES = 10
+# Run-metadata key: the card branch's remote head when the run started (Prism 50102547ef05).
+RUN_START_HEAD_KEY = "start_head"
 
-    The branch is any head ref naming the card (``wt/<card>``, ``<profile>/<card>-topic``). The
-    PUSH that put the PR's head on the branch must be at or after the run's start, read from the
-    repo activity API (server-side push time + pushed sha), never the commit's own date: a
-    future-dated commit is not a push by this run, and an old commit pushed now is. A run that
-    pushed nothing new (e.g. a send-back it never answered) still retries. Returns
-    ``{"pr": "o/r#n", "sha": <head>, "url": ...}`` or None. Lookup errors return None, so the
-    run retries exactly as before (fail toward the old behaviour).
+
+def card_branch_start_head(conn: sqlite3.Connection, task_id: str,
+                           branch: Optional[str]) -> Optional[dict]:
+    """``{"branch": b, "sha": <remote head or None if the branch is absent>}`` at spawn, or None
+    when it could not be read (no repo, gh error): one ``git/ref/heads/<branch>`` call."""
+    from urllib.parse import quote
+
+    repo = _card_repo(conn, task_id)
+    branch = (branch or "").strip() or f"wt/{task_id}"
+    if not repo:
+        return None
+    proc = subprocess.run(
+        ["gh", "api", "--hostname", "github.com",
+         f"repos/{repo}/git/ref/heads/{quote(branch, safe='/')}"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=15, check=False)
+    if proc.returncode != 0:
+        # A missing branch is a recorded fact (no head yet), any other failure is unknown.
+        return {"branch": branch, "sha": None} if "HTTP 404" in (proc.stderr or "") else None
+    obj = (json.loads(proc.stdout or "null") or {}).get("object") or {}
+    return {"branch": branch, "sha": obj.get("sha")} if obj.get("sha") else None
+
+
+def _run_start_head(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """The ``start_head`` recorded on the card's current run, or None."""
+    row = conn.execute(
+        "SELECT r.metadata FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.id = ?", (task_id,)).fetchone()
+    try:
+        meta = json.loads(row["metadata"]) if row and row["metadata"] else {}
+    except (TypeError, ValueError):
+        return None
+    start = meta.get(RUN_START_HEAD_KEY) if isinstance(meta, dict) else None
+    return start if isinstance(start, dict) and start.get("branch") else None
+
+
+def _pushed_during_run(repo: str, head: dict, run_started_at: int) -> bool:
+    """Fallback attribution (no start head for this branch): the newest ref update on the branch
+    is the push of this exact head, at or after the run start (server push time, activity API)."""
+    from datetime import datetime
+    from urllib.parse import quote
+
+    head_repo = ((head.get("repo") or {}).get("full_name")) or repo
+    ref = quote(f"refs/heads/{head['ref']}", safe="/")
+    acts = _gh_json(f"repos/{head_repo}/activity?ref={ref}&per_page=1")
+    act = (acts or [None])[0] or {}
+    if act.get("after") != head["sha"] or act.get("activity_type") not in (
+            "push", "force_push", "branch_creation"):
+        return False
+    pushed = int(datetime.fromisoformat(str(act["timestamp"]).replace("Z", "+00:00")).timestamp())
+    return pushed >= int(run_started_at)
+
+
+def timed_out_handback_pr(conn: sqlite3.Connection, task_id: str, run_started_at: int) -> Optional[dict]:
+    """An OPEN PR on this card's branch whose head this timed-out run produced (t_e7537cb1).
+
+    The branch is any head ref naming the card (``wt/<card>``, ``<profile>/<card>-topic``); all
+    open-PR pages are walked, newest-updated first, until one is found. Attribution: when the
+    run recorded its branch's remote head at spawn (``start_head``), the PR head must DIFFER from
+    it (a rebase, amend or old commit pushed now counts; an unanswered send-back's untouched PR
+    does not). For any other branch, or no recorded start head, the server-side push time of
+    that exact head must be at or after the run start (:func:`_pushed_during_run`); a commit's
+    own date is never read. Returns ``{"pr": "o/r#n", "sha": <head>, "url": ...}`` or None.
+    Lookup errors return None, so the run retries exactly as before.
     """
     from hermes_cli.kanban_open_pr import branch_names_card
 
     repo = _card_repo(conn, task_id)
     if not repo:
         return None
+    start = _run_start_head(conn, task_id)
     try:
-        pulls = _gh_json(f"repos/{repo}/pulls?state=open&per_page=100&sort=updated&direction=desc")
-        for pr in pulls or []:
-            head = pr.get("head") or {}
-            if not branch_names_card(head.get("ref"), task_id) or not head.get("sha"):
-                continue
-            head_repo = ((head.get("repo") or {}).get("full_name")) or repo
-            from urllib.parse import quote
-            ref = quote(f"refs/heads/{head['ref']}", safe="/")
-            # Newest first: the latest ref update must be the push of this exact head.
-            acts = _gh_json(f"repos/{head_repo}/activity?ref={ref}&per_page=1")
-            act = (acts or [None])[0] or {}
-            if act.get("after") != head["sha"] or act.get("activity_type") not in (
-                    "push", "force_push", "branch_creation"):
-                continue
-            from datetime import datetime
-            pushed = int(datetime.fromisoformat(str(act["timestamp"]).replace("Z", "+00:00")).timestamp())
-            if pushed >= int(run_started_at):
-                return {"pr": f"{repo}#{pr['number']}", "sha": head["sha"],
-                        "url": pr.get("html_url")}
+        for page in range(1, _HANDBACK_PR_MAX_PAGES + 1):
+            pulls = _gh_json(f"repos/{repo}/pulls?state=open&per_page=100"
+                             f"&sort=updated&direction=desc&page={page}") or []
+            for pr in pulls:
+                head = pr.get("head") or {}
+                if not branch_names_card(head.get("ref"), task_id) or not head.get("sha"):
+                    continue
+                if start is not None and start["branch"] == head["ref"]:
+                    produced = head["sha"] != start.get("sha")
+                else:
+                    produced = _pushed_during_run(repo, head, run_started_at)
+                if produced:
+                    return {"pr": f"{repo}#{pr['number']}", "sha": head["sha"],
+                            "url": pr.get("html_url")}
+            if len(pulls) < 100:
+                break
     except Exception as exc:
         _kb._log.warning("timed-out handback lookup for %s failed (retrying as before): %s", task_id, exc)
     return None
+
+
+# Test hook for the spawn-time start-head read; None = the real read outside pytest.
+_start_head_fn: Optional[Callable] = None
+
+
+def _record_run_start_head(task: Task, board: Optional[str]) -> None:
+    """Record the card branch's remote head on the claimed run (``start_head``), the baseline
+    :func:`timed_out_handback_pr` compares the PR head against. Capped runs only; any failure
+    records nothing (the timeout then falls back to push-time attribution)."""
+    fn = _start_head_fn
+    if fn is None:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        fn = card_branch_start_head
+    if not task.max_runtime_seconds or task.current_run_id is None:
+        return
+    try:
+        with _kb.connect_closing(board=board) as conn:
+            if _kdb.conn_is_delegations(conn):
+                return
+            start = fn(conn, task.id, task.branch_name)
+            if start is not None:
+                _kb.merge_run_metadata(conn, int(task.current_run_id), {RUN_START_HEAD_KEY: start})
+    except Exception as exc:
+        _kb._log.debug("kanban worker: start head unreadable for %s (%s)", task.id, exc)
 
 
 def _default_handback_fn():
@@ -1477,6 +1560,46 @@ def emit_soft_deadlines(conn: sqlite3.Connection, *, now: Optional[int] = None) 
         _kb.add_comment(conn, tid, "dispatcher", _kwp.soft_deadline_comment(hard))
         emitted.append(tid)
     return emitted
+
+
+def _route_timed_out_handback(conn: sqlite3.Connection, tid: str, handback: dict) -> bool:
+    """Hand a timed-out run's pushed PR to review through :func:`kanban_db.request_review`, the
+    path a worker's ``kanban_request_review`` takes (review policy, reviewer provenance, round
+    cap, open-PR route), with the dispatcher as actor. The card is already released to its retry
+    status with the run ended ``timed_out``; True = routed (review/done, or blocked by the round
+    cap), False = refused, the card stays released and retries as before.
+
+    Same-actor: the dispatcher is not the implementer, so the check is bypassed explicitly
+    (``allow_same_actor``) and the reason rides the metadata."""
+    summary = (f"timed-out handback: PR {handback['pr']} @{handback['sha']} "
+               "(dispatcher: the worker hit max_runtime after pushing this head)")
+    metadata = {
+        "pr_url": handback.get("url") or handback["pr"],
+        "own_prs": [handback["pr"]],
+        "head_sha": handback["sha"],
+        "timed_out_handback": True,
+        "actor": "dispatcher",
+        "same_actor_bypass": "dispatcher timed-out handback: the dispatcher is not the implementer",
+    }
+    try:
+        ok, reason = _kb.request_review(conn, tid, summary=summary, metadata=metadata,
+                                        allow_same_actor=True, with_reason=True)
+    except Exception as exc:
+        ok, reason = False, f"{type(exc).__name__}: {exc}"
+    status = _kb._task_status(conn, tid)
+    if status == "blocked" and not ok:
+        # The shared path's review-round cap blocked it (needs_input) for the orchestrator.
+        return True
+    if ok and status in ("review", "done"):
+        _kb.add_comment(conn, tid, "dispatcher",
+                        f"timed out with its handback pushed: PR {handback['pr']} "
+                        f"@{handback['sha']} -> {status}, not retry")
+        return True
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, tid, "timed_out_handback_refused",
+                          {"handback_pr": handback["pr"], "status": status,
+                           "reason": (reason or "")[:400] or None})
+    return False
 
 
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None, handback_fn=None) -> list[str]:
@@ -1569,25 +1692,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None, handback_fn
             except Exception as exc:
                 _kb._log.warning("timed-out handback lookup for %s raised (retrying): %s", tid, exc)
                 handback = None
-        reviewer = None
-        if handback:
-            reviewer, _rev_err = _kb.resolve_reviewer(None, None)
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
-            next_status = "review" if handback else _kdb.requeue_status(conn, retry_status)
-            implementer = None
-            if handback:
-                prow = conn.execute("SELECT profile FROM task_runs WHERE id = ?",
-                                    (row["current_run_id"],)).fetchone()
-                implementer = prow["profile"] if prow else None
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL"
-                + (", assignee = ?" if reviewer else "") + " "
+                "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (next_status, *((reviewer,) if reviewer else ()), tid, pid, row["claim_lock"]),
+                (_kdb.requeue_status(conn, retry_status), tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -1595,44 +1708,29 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None, handback_fn
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
                     "sigkill": killed,
-                    "retry_status": "review" if handback else retry_status,
+                    "retry_status": retry_status,
                 }
                 if handback:
                     payload["handback_pr"] = handback["pr"]
                     payload["handback_sha"] = handback["sha"]
                 if termination.get("identity_mismatch"):
                     payload["identity_mismatch"] = True
-                summary = (f"timed-out handback: PR {handback['pr']} @{handback['sha'][:10]}"
-                           if handback else None)
-                run_meta = payload
-                if handback:
-                    # own_prs: the card's PR record later approval/archive gates read.
-                    run_meta = dict(payload, own_prs=[handback["pr"]],
-                                    auto_routed_open_prs=[handback["pr"]])
                 run_id = _kb._end_run(
                     conn, tid,
-                    outcome="timed_out", status="timed_out", summary=summary,
+                    outcome="timed_out", status="timed_out",
+                    summary=(f"timed-out handback: PR {handback['pr']} @{handback['sha'][:10]}"
+                             if handback else None),
                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                    metadata=run_meta,
+                    metadata=payload,
                 )
                 _kb._append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
-                if handback:
-                    # Same provenance a worker's request_review records, so the review lane
-                    # (approve / request_changes) routes it like any other handback.
-                    _kb._append_event(conn, tid, "review_requested", {
-                        "summary": summary, "implementer": implementer, "reviewer": reviewer,
-                        "timed_out_handback": True,
-                    }, run_id=run_id)
                 if _kdb.conn_is_delegations(conn):
                     _kdb.park_event(conn, tid, outcome="timed_out",
                                     retry_status=retry_status, run_id=run_id)
                 timed_out.append(tid)
-        if cur.rowcount == 1 and handback:
-            _kb.add_comment(conn, tid, "dispatcher",
-                            f"timed out with its handback pushed: PR {handback['pr']} "
-                            f"@{handback['sha']} -> review, not retry")
+        if cur.rowcount == 1 and handback and _route_timed_out_handback(conn, tid, handback):
             continue
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
@@ -8727,6 +8825,7 @@ def _default_spawn(
     for _name in (_kwp.DEADLINE_ENV, _kwp.MAX_RUNTIME_ENV):
         env.pop(_name, None)
     env.update(_kwp.deadline_env(_run_started_at(task, board), task.max_runtime_seconds))
+    _record_run_start_head(task, board)
     # Pin the shared board + workspaces root the dispatcher resolved, so
     # that even when the worker activates a profile (`hermes -p <name>`
     # rewrites HERMES_HOME), its kanban paths still match the
