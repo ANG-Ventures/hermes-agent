@@ -40,6 +40,18 @@ TOOL_CALL_UID = "_tool_call_uid"
 # A durable user-row rewrite that could not be applied when it was decided (the E11 relabel of a staged
 # row whose lookup failed transiently): the content to write. The flush retries it on the row it addresses.
 PENDING_USER_CONTENT_REWRITE = "_pending_user_content_rewrite"
+# Provenance of a harness route note prepended to a user row (route_identity._persist_note): a
+# ``display_metadata`` key whose value is ``{"text": <the exact prefix the harness wrote>}``, stored in the
+# same durable update as the noted bytes. Replay keeps exactly that prefix raw; nothing else is trusted.
+ROUTE_NOTE_PREFIX = "route_note_prefix"
+
+
+def recorded_route_note_prefix(msg: Mapping[str, Any]) -> Optional[str]:
+    """The harness note prefix *msg* records (``ROUTE_NOTE_PREFIX``), else ``None``."""
+    meta = msg.get("display_metadata")
+    entry = meta.get(ROUTE_NOTE_PREFIX) if isinstance(meta, Mapping) else None
+    text = entry.get("text") if isinstance(entry, Mapping) else None
+    return text if isinstance(text, str) and text else None
 PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
     # Membership is the real contract, NOT the leading underscore: the chat-completions transport happens
     # to sweep underscore keys, but turn_context.py pops this set from every outgoing copy and a strict

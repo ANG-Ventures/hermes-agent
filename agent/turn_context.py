@@ -23,7 +23,9 @@ from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
-from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
+from agent.message_metadata import (
+    PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, recorded_route_note_prefix, stamp_message_timestamp,
+)
 from agent.message_sanitization import is_interrupt_close_row, provider_owns_transcript
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
 from agent.route_identity import ROUTE_NOTE_DISPLAY_KIND
@@ -1425,11 +1427,9 @@ def _relabel_replay_row(msg: Dict[str, Any], api_msg: Dict[str, Any], call_names
         return
     if msg.get("role") == "user":
         if msg.get("display_kind") != ROUTE_NOTE_DISPLAY_KIND:
-            # A harness note prepended to the row (route_identity._noted_content) is kept; the row's own
-            # content tells a user-typed leading marker apart from it when the wire bytes are a sidecar.
-            sidecar = msg.get("api_content")
-            user_text = msg.get("content") if isinstance(sidecar, str) and sidecar != msg.get("content") else None
-            api_msg["content"] = relabel_replayed_user_content(api_msg.get("content"), user_text)
+            # Only the note prefix the harness RECORDED on the row (route_identity._persist_note) stays raw.
+            api_msg["content"] = relabel_replayed_user_content(api_msg.get("content"),
+                                                               recorded_route_note_prefix(msg))
         return
     if msg.get("role") != "tool":
         return
