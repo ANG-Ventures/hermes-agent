@@ -73,7 +73,7 @@ def _file_lock(path: Path, timeout: float = 5.0):
     try:
         if fcntl is not None:
             try:
-                fd = open(path.with_name(path.name + ".lock"), "a+", encoding="utf-8")
+                fd = open(path.with_name(path.name + ".lock"), "a+", encoding="utf-8")  # windows-footgun: ok, lock file is never read
                 while True:
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

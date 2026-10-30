@@ -498,6 +498,8 @@ class ScriptRunner:
         try:
             keys = list(sched._running_job_ids)
             since = dict(sched._running_since)
+            if not got:  # unlocked reads (Prism aa167090b0a2): no start = released = finished
+                keys = [key for key in keys if key in since]
         except RuntimeError:
             keys, since = [], {}
         finally:
