@@ -1392,9 +1392,11 @@ def _gh_json(endpoint: str) -> Any:
 def timed_out_handback_pr(conn: sqlite3.Connection, task_id: str, run_started_at: int) -> Optional[dict]:
     """An OPEN PR on this card's branch whose head was pushed during the timed-out run (t_e7537cb1).
 
-    The branch is any head ref naming the card (``wt/<card>``, ``<profile>/<card>-topic``); the
-    head commit's committer date must be at or after the run's start, so a run that pushed
-    nothing new (e.g. a send-back it never answered) still retries. Returns
+    The branch is any head ref naming the card (``wt/<card>``, ``<profile>/<card>-topic``). The
+    PUSH that put the PR's head on the branch must be at or after the run's start, read from the
+    repo activity API (server-side push time + pushed sha), never the commit's own date: a
+    future-dated commit is not a push by this run, and an old commit pushed now is. A run that
+    pushed nothing new (e.g. a send-back it never answered) still retries. Returns
     ``{"pr": "o/r#n", "sha": <head>, "url": ...}`` or None. Lookup errors return None, so the
     run retries exactly as before (fail toward the old behaviour).
     """
@@ -1409,10 +1411,17 @@ def timed_out_handback_pr(conn: sqlite3.Connection, task_id: str, run_started_at
             head = pr.get("head") or {}
             if not branch_names_card(head.get("ref"), task_id) or not head.get("sha"):
                 continue
-            commit = _gh_json(f"repos/{repo}/commits/{head['sha']}")
-            stamp = ((commit or {}).get("commit") or {}).get("committer", {}).get("date")
+            head_repo = ((head.get("repo") or {}).get("full_name")) or repo
+            from urllib.parse import quote
+            ref = quote(f"refs/heads/{head['ref']}", safe="/")
+            # Newest first: the latest ref update must be the push of this exact head.
+            acts = _gh_json(f"repos/{head_repo}/activity?ref={ref}&per_page=1")
+            act = (acts or [None])[0] or {}
+            if act.get("after") != head["sha"] or act.get("activity_type") not in (
+                    "push", "force_push", "branch_creation"):
+                continue
             from datetime import datetime
-            pushed = int(datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp())
+            pushed = int(datetime.fromisoformat(str(act["timestamp"]).replace("Z", "+00:00")).timestamp())
             if pushed >= int(run_started_at):
                 return {"pr": f"{repo}#{pr['number']}", "sha": head["sha"],
                         "url": pr.get("html_url")}

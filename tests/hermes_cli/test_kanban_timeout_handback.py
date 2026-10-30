@@ -102,7 +102,7 @@ def test_handback_lookup_error_retries(home):
 
 def test_incident_replay_pr_at_32m_kill_at_90m_is_review(home, monkeypatch):
     """t_e019e240 shape: 90 min cap, head pushed at t+32m, killed at t+90m19s -> review.
-    The real lookup runs against a stubbed gh: the committer date decides."""
+    The real lookup runs against a stubbed gh: the push time from the activity API decides."""
     limit = 5400
     calls = []
 
@@ -116,7 +116,8 @@ def test_incident_replay_pr_at_32m_kill_at_90m_is_review(home, monkeypatch):
                 return [{"number": 7842, "html_url": "u",
                          "head": {"ref": f"daedalus/{tid}-apple-egress-lane", "sha": "c0ffee" * 6 + "abcd"}},
                         {"number": 1, "head": {"ref": "daedalus/t_00000000-other", "sha": "f" * 40}}]
-            return {"commit": {"committer": {"date": pushed}}}
+            assert "/activity?ref=refs/heads/daedalus/" in endpoint
+            return [{"activity_type": "push", "after": "c0ffee" * 6 + "abcd", "timestamp": pushed}]
 
         monkeypatch.setattr(kbd, "_gh_json", fake_gh)
         kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=kbd.timed_out_handback_pr)
@@ -132,7 +133,53 @@ def test_head_older_than_run_start_is_not_a_handback(home, monkeypatch):
         stale = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start - 3600))
         monkeypatch.setattr(kbd, "_gh_json", lambda ep: (
             [{"number": 9, "head": {"ref": f"wt/{tid}", "sha": "a" * 40}}] if "/pulls?" in ep
-            else {"commit": {"committer": {"date": stale}}}))
+            else [{"activity_type": "push", "after": "a" * 40, "timestamp": stale}]))
+        assert kbd.timed_out_handback_pr(conn, tid, start) is None
+
+
+def _ts(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def test_future_dated_commit_pushed_before_run_is_not_a_handback(home, monkeypatch):
+    """Prism 50102547ef05: pushed 11:50, committer date 12:05, run 12:00-12:10 pushed nothing.
+    The push time decides, so the stale PR is not this run's handback -> retry."""
+    with kbc.connect_closing() as conn:
+        tid, start = _running(conn, limit=600, started_ago=610)
+        sha = "b" * 40
+
+        def fake_gh(ep):
+            if "/pulls?" in ep:
+                return [{"number": 9, "head": {"ref": f"wt/{tid}", "sha": sha}}]
+            if "/commits/" in ep:  # the committer date would wrongly say "during the run"
+                return {"commit": {"committer": {"date": _ts(start + 300)}}}
+            return [{"activity_type": "push", "after": sha, "timestamp": _ts(start - 600)}]
+
+        monkeypatch.setattr(kbd, "_gh_json", fake_gh)
+        assert kbd.timed_out_handback_pr(conn, tid, start) is None
+        kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=kbd.timed_out_handback_pr)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_old_commit_pushed_during_run_is_a_handback(home, monkeypatch):
+    """An old local commit force-pushed during the run counts: push time, not commit date."""
+    with kbc.connect_closing() as conn:
+        tid, start = _running(conn, limit=60, started_ago=120)
+        sha = "c" * 40
+        monkeypatch.setattr(kbd, "_gh_json", lambda ep: (
+            [{"number": 9, "head": {"ref": f"wt/{tid}", "sha": sha}}] if "/pulls?" in ep
+            else [{"activity_type": "force_push", "after": sha, "timestamp": _ts(start + 30)}]))
+        hb = kbd.timed_out_handback_pr(conn, tid, start)
+        assert hb and hb["sha"] == sha
+
+
+def test_latest_push_not_the_pr_head_is_not_a_handback(home, monkeypatch):
+    """The newest ref update must be the push of the PR's head sha; anything else retries."""
+    with kbc.connect_closing() as conn:
+        tid, start = _running(conn, limit=60, started_ago=120)
+        monkeypatch.setattr(kbd, "_gh_json", lambda ep: (
+            [{"number": 9, "head": {"ref": f"wt/{tid}", "sha": "d" * 40}}] if "/pulls?" in ep
+            else [{"activity_type": "push", "after": "e" * 40, "timestamp": _ts(start + 30)}]))
         assert kbd.timed_out_handback_pr(conn, tid, start) is None
 
 
