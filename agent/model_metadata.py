@@ -425,20 +425,38 @@ _LOCAL_CTX_PROBE_CACHE: Dict[tuple, tuple] = {}
 # session, offline box), so it must expire rather than stick.
 _BEDROCK_PROBE_FAILURE_TTL_SECONDS = 300.0
 _BEDROCK_PROBE_FAILURE_CACHE: Dict[tuple, float] = {}
+# Anthropic — bare ids only (prefixed ids resolve via OpenRouter/models.dev
+# and would collide: "anthropic/claude-sonnet-4" ⊂ "anthropic/claude-sonnet-4.6").
+# Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
+# longest-key-first lookup resolves the exact id and never falls to the 200K catch-all.
+# An IMMUTABLE ((id, window), ...) tuple, not dict rows: it is the FALLBACK hermes-home's
+# scripts/anthropic-limits-render.py --check certifies against config/anthropic-limits.json, and a tuple
+# cannot be changed after this line (hermes-home#7860, Prism f-ce7cb29c7df69f55 / f-bbf4d7c761341baa).
+ANTHROPIC_CONTEXT_FALLBACK: Tuple[Tuple[str, int], ...] = (
+    ("claude-fable-5-1", 1000000),
+    ("claude-fable-5", 1000000),
+    ("claude-fable", 1000000),
+    ("claude-mythos-5", 1000000),
+    ("claude-opus-5-5", 1000000),
+    ("claude-opus-5", 1000000),
+    ("claude-sonnet-5-5", 1000000),
+    ("claude-sonnet-5", 1000000),
+    ("claude-haiku-5-5", 1000000),  # 1M; haiku-4-5 stays on the 200K "claude" catch-all
+    ("claude-opus-4-8", 1000000),
+    ("claude-opus-4.8", 1000000),
+    ("claude-opus-4-7", 1000000),
+    ("claude-opus-4.7", 1000000),
+    ("claude-opus-4-6", 1000000),
+    ("claude-sonnet-4-6", 1000000),
+    ("claude-opus-4.6", 1000000),
+    ("claude-sonnet-4.6", 1000000),
+    ("claude", 200000),  # catch-all for older Claude models
+)
 # Family-pattern fallbacks, used only when provider-aware sources all miss.
 # Lookups are longest-key-first substring matches, so dict order is cosmetic
 # and a specific key must be STRICTLY longer than its catch-all.
 DEFAULT_CONTEXT_LENGTHS = {
-    # Anthropic — bare ids only (prefixed ids resolve via OpenRouter/models.dev
-    # and would collide: "anthropic/claude-sonnet-4" ⊂ "anthropic/claude-sonnet-4.6").
-    # Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
-    # longest-key-first lookup resolves the exact id and never falls to the 200K catch-all.
-    "claude-fable-5-1": 1000000, "claude-fable-5": 1000000, "claude-fable": 1000000, "claude-mythos-5": 1000000,
-    "claude-opus-5-5": 1000000, "claude-opus-5": 1000000, "claude-sonnet-5-5": 1000000, "claude-sonnet-5": 1000000,
-    "claude-haiku-5-5": 1000000,  # 1M; haiku-4-5 stays on the 200K "claude" catch-all
-    "claude-opus-4-8": 1000000, "claude-opus-4.8": 1000000, "claude-opus-4-7": 1000000, "claude-opus-4.7": 1000000,
-    "claude-opus-4-6": 1000000, "claude-sonnet-4-6": 1000000, "claude-opus-4.6": 1000000, "claude-sonnet-4.6": 1000000,
-    "claude": 200000,  # catch-all for older Claude models
+    **dict(ANTHROPIC_CONTEXT_FALLBACK),
     # OpenAI — direct-API windows (Codex OAuth caps gpt-5.4+/5.5/5.6 at 272K, resolved by
     # its own branch). 5.4-nano/-mini are 400k, not 1.05M; gpt-5.3-codex-spark is
     # Codex-OAuth-only and listed so "gpt-5" (400k) doesn't win.
@@ -776,11 +794,11 @@ def _catalog_key_matches(key: str, model_lower: str) -> bool:
     return key in model_lower or _normalize_model_version(key) in _normalize_model_version(model_lower)
 
 
-# Anthropic rows of DEFAULT_CONTEXT_LENGTHS follow the fleet catalog <fleet root>/config/anthropic-limits.json
+# Anthropic rows of DEFAULT_CONTEXT_LENGTHS (seeded from ANTHROPIC_CONTEXT_FALLBACK) follow the fleet catalog <fleet root>/config/anthropic-limits.json
 # (models[*].context_window + aliases; agent/anthropic_limits.py). The literal rows are the FALLBACK when the
-# catalog is unreadable; hermes-home's `anthropic-limits-render.py --check` keeps them equal to it. The overlay
+# catalog is unreadable; hermes-home's `anthropic-limits-render.py --check` keeps the tuple equal to it. The overlay
 # is applied in place on the first lookup and again whenever the catalog's mtime changes.
-_ANTHROPIC_LITERAL_ROWS: Dict[str, int] = {k: v for k, v in DEFAULT_CONTEXT_LENGTHS.items() if k.startswith("claude")}
+_ANTHROPIC_LITERAL_ROWS: Dict[str, int] = dict(ANTHROPIC_CONTEXT_FALLBACK)
 _anthropic_rows_lock = threading.Lock()
 _anthropic_rows_applied: Dict[str, Any] = {"catalog": None}
 
