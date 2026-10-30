@@ -1105,6 +1105,18 @@ def test_pending_requeues_survive_failures_and_skip_finished_runs(root, monkeypa
     assert rr.apply_pending_requeues() == 0
     assert not path.exists() and count(b["id"]) == 0
 
+    # 4. Prism 23a6c2701848: a row recorded while the replay runs survives its commit.
+    c = _job(root, "C", "c.sh")
+    rr.record_pending_requeues([(str(root), c["id"])], trip_epoch=time.time())
+
+    def requeue_and_record(job_id, *args, **kwargs):
+        rr.record_pending_requeues([(str(root), b["id"])], trip_epoch=time.time())
+        return real_requeue(job_id, *args, **kwargs)
+
+    monkeypatch.setattr(jobs_mod, "request_restart_requeue", requeue_and_record)
+    assert rr.apply_pending_requeues() == 1
+    assert [row[1] for row in json.loads(path.read_text())] == [b["id"]]
+
 
 def test_second_trip_in_24h_pages_alerts_and_backs_off(root, tmp_path, monkeypatch):
     from cron import lanes, script_runner, script_runner_rearm

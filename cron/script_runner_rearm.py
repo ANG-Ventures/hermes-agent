@@ -23,6 +23,7 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -107,22 +108,66 @@ def _pending_items(raw) -> Dict[tuple, float]:
     return out
 
 
+_pending_tlock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _pending_lock(path: Path, timeout: float = 5.0):
+    """Serialize read-modify-write of the pending file across threads and processes (the tripped
+    runner records while a restarted one may be replaying). Bounded: on flock timeout it proceeds
+    in-process-only and logs, because the recording side runs on the watchdog's way to exit."""
+    with _pending_tlock:
+        fd = None
+        try:
+            import fcntl
+        except ImportError:  # Windows: in-process lock only
+            fcntl = None
+        if fcntl is not None:
+            try:
+                fd = open(path.with_name(path.name + ".lock"), "a+")
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            logger.error("script runner: pending re-queue lock timed out; "
+                                         "proceeding unlocked")
+                            break
+                        time.sleep(0.05)
+            except OSError:
+                logger.error("script runner: pending re-queue lock unavailable", exc_info=True)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                fd.close()
+
+
+def _read_pending(path: Path) -> Dict[tuple, float]:
+    try:
+        return _pending_items(json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+
+
 def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = None) -> None:
     """``[(home, job_id)]`` in flight at a trip, for the restarted runner, stamped with the trip
     time so the replay can skip a job that finished cleanly after the snapshot. Merged with any
-    still pending. Never raises."""
+    still pending, under ``_pending_lock``. Never raises."""
     if not items:
         return
     trip_epoch = time.time() if trip_epoch is None else float(trip_epoch)
     try:
         path = _requeue_path()
-        try:
-            pending = _pending_items(json.loads(path.read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            pending = {}
-        for h, j in items:
-            pending[(str(h), str(j))] = trip_epoch
-        _write_pending(path, [[h, j, e] for (h, j), e in pending.items()])
+        with _pending_lock(path):
+            pending = _read_pending(path)
+            for h, j in items:
+                pending[(str(h), str(j))] = trip_epoch
+            _write_pending(path, [[h, j, e] for (h, j), e in pending.items()])
     except Exception:
         logger.error("script runner: pending re-queue write failed", exc_info=True)
 
@@ -169,7 +214,7 @@ def apply_pending_requeues() -> int:
     from cron.scheduler_provider import _profile_cron_scope
 
     done = 0
-    keep: List[list] = []
+    resolved: Dict[tuple, float] = {}
     for (home, job_id), trip_epoch in pending.items():
         try:
             with _profile_cron_scope(Path(home)):
@@ -180,16 +225,24 @@ def apply_pending_requeues() -> int:
                     done += 1
                     logger.warning("Job '%s': killed by the runner watchdog; re-queued to fire "
                                    "once", job_id)
+            resolved[(home, job_id)] = trip_epoch
         except Exception:
             logger.warning("watchdog re-queue of %s failed; kept for the next start", job_id,
                            exc_info=True)
-            keep.append([home, job_id, trip_epoch])
+    # Commit against the file as it is NOW: drop only what this replay resolved, so a row
+    # recorded (or re-stamped by a newer trip) while the replay ran survives.
     try:
-        if keep:
-            _write_pending(path, keep)
-        else:
-            path.unlink()
-    except OSError:
+        with _pending_lock(path):
+            current = _read_pending(path)
+            for key, epoch in resolved.items():
+                if key in current and current[key] <= epoch:
+                    del current[key]
+            if current:
+                _write_pending(path, [[h, j, e] for (h, j), e in current.items()])
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+    except (OSError, ValueError):
         logger.error("script runner: pending re-queue rewrite failed", exc_info=True)
     return done
 
