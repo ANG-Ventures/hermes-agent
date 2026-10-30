@@ -58,3 +58,51 @@ def test_limits_default_is_the_pre_r2c_predicate():
     assert "psi_cpu_some60" not in admission.admit(row, need).free
     v = admission.admit(row, need, limits=admission.Limits(r2c=True))
     assert not v.ok and v.binding == "psi_cpu_some10"
+
+
+# ── the kanban load gate builds its own Limits (Prism 8e21846c06c9): it must follow the scorer like _limits() ──────
+_TABLE = {
+    "schema": 1, "default_first": "studio", "saturate_to": 1.0,
+    "footprints": {"kanban": {"ram_gb": 3, "threads": 1, "scratch_gb": 0, "gpu_mb": 0}},
+    "hosts": {
+        "studio": {"aliases": ["local"], "cores": 24, "threads": 32, "mem_total_gb": 512, "mem_reserve_gb": 128,
+                   "cores_reserve": 0, "consumers": {"kanban": {"slots": 4}}},
+    },
+}
+
+
+def _gate_ctx(tmp_path, monkeypatch, scorer):
+    import json
+
+    from hermes_cli import kanban_load_gate as klg
+
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "fleet-hosts.json").write_text(json.dumps(dict(_TABLE, scorer=scorer)), encoding="utf-8")
+    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))
+    monkeypatch.delenv("PLACEMENT_SCORER", raising=False)
+    return klg.utilization_context()
+
+
+@pytest.mark.parametrize("scorer,r2c", [("v2", True), ("v1", False)])
+def test_load_gate_limits_follow_the_scorer(tmp_path, monkeypatch, scorer, r2c):
+    ctx = _gate_ctx(tmp_path, monkeypatch, scorer)
+    assert ctx["host"] == "studio"
+    assert ctx["limits"].r2c is r2c
+
+
+@pytest.mark.parametrize("scorer,ok", [("v2", False), ("v1", True)])
+def test_load_gate_at_the_line_avg10_closes_only_under_v2(tmp_path, monkeypatch, scorer, ok):
+    ctx = _gate_ctx(tmp_path, monkeypatch, scorer)
+    row = {"host": ctx["host"], "at": NOW, "os": "linux", "ncpu": 32, "cpu_busy": 0.1, "mem_available_gb": 360.0,
+           "mem_total_gb": 512.0, "psi_cpu_some10": 40.0, "psi_mem_some10": 0.0, "psi_io_some10": 0.0}
+    v = admission.admit(row, ctx["need"], host=ctx["host"], limits=ctx["limits"])
+    assert v.ok is ok, v.reason
+    if not ok:
+        assert v.binding == "psi_cpu_some10"
+
+
+def test_load_gate_without_a_table_row_keeps_the_pre_r2c_predicate(tmp_path, monkeypatch):
+    from hermes_cli import kanban_load_gate as klg
+
+    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))        # no config/fleet-hosts.json
+    assert klg.utilization_context()["limits"].r2c is False
