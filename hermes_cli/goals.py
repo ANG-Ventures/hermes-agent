@@ -766,8 +766,10 @@ def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any
     """Give back a recorded idle wake that was never dispatched (the session turned busy or was
     /stop-ped meanwhile), so it does not consume a check-in. Read, compare and write run in ONE
     write transaction, so a pause/clear from any surface either lands first (and the goal is left
-    alone) or after (and sees the restored fields). A field is restored only while it still holds
-    the value the wake wrote; anything saved since then wins. Returns True when anything changed."""
+    alone) or after (and sees the restored fields). The give-back applies only while the stored row
+    is byte-identical to the row the wake saved (``after["_row"]``): any save since then, including
+    a replacement goal whose fields happen to equal the post-wake values, wins and is left alone.
+    Returns True when anything changed."""
     db = _get_session_db() if session_id and before else None
     execute_write = getattr(db, "_execute_write", None)
     if execute_write is None:
@@ -776,6 +778,8 @@ def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any
 
     def _txn(conn) -> bool:
         row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if not row or not after.get("_row") or row[0] != after["_row"]:
+            return False  # the row is no longer the one this wake wrote (another save or another goal)
         state = GoalState.from_json(row[0]) if row and row[0] else None
         if state is None or state.status != "active":
             return False
@@ -2014,9 +2018,12 @@ class GoalManager:
         return prompt
 
     def idle_wake_snapshot(self) -> Dict[str, Any]:
-        """The fields ``idle_wake_prompt`` may change, for ``undo_idle_wake``."""
+        """The fields ``idle_wake_prompt`` may change, plus the exact stored row (``_row``), for
+        ``undo_idle_wake``. Take the post-wake snapshot right after the wake's save."""
         s = self._state
-        return {} if s is None else {f: getattr(s, f) for f in _IDLE_WAKE_FIELDS}
+        if s is None:
+            return {}
+        return {**{f: getattr(s, f) for f in _IDLE_WAKE_FIELDS}, "_row": self._stored}
 
     def set_checkin_minutes(self, minutes: int) -> GoalState:
         """Per-goal check-in interval (minutes; 0 = off for this goal; -1 = config default)."""

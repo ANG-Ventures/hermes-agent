@@ -296,3 +296,88 @@ async def test_idle_wake_undo_never_reactivates_a_goal_paused_from_another_surfa
     undone, state = await asyncio.to_thread(_scenario)
     assert undone is False
     assert state.status == "paused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy_after_hop", [1, 2])
+async def test_checkin_is_never_handed_off_while_the_session_is_active(rig, busy_after_hop):
+    """Prism d8319143ee50 / 3f5d9f5e1df7: the final busy/stop check runs after the LAST executor
+    await. A /goal command that claims the session's active guard during any pre-dispatch hop (here:
+    after hop 1 or hop 2) must stop the wake; it must never be queued behind the command, where the
+    pause/clear continuation sweep does not recognise a check-in. The abandoned wake is refunded."""
+    runner, adapter, received, key = rig
+
+    def _quiet_due():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.state.created_at = mgr.state.last_turn_at = time.time() - 31 * 60
+        mgr._save()
+
+    await asyncio.to_thread(_quiet_due)
+    real_hop = runner._run_in_executor_with_context
+    hops = []
+
+    async def hop_then_command_claims_session(fn, *args):
+        result = await real_hop(fn, *args)
+        hops.append(fn)
+        if len(hops) == busy_after_hop:
+            adapter._active_sessions[key] = asyncio.Event()   # /goal pause took the guard
+        return result
+
+    handed_off = []
+    real_handle = adapter.handle_message
+
+    async def spy_handle(event):
+        handed_off.append(key in adapter._active_sessions)
+        return await real_handle(event)
+
+    adapter.handle_message = spy_handle
+    runner._run_in_executor_with_context = hop_then_command_claims_session
+    entry = runner.session_store.list_sessions()[0]
+    await runner._goal_idle_wake_one(entry, 30, 1)
+    assert True not in handed_off                            # never queued behind the command
+    if not handed_off:
+        state = await asyncio.to_thread(goals.load_goal, "goal-sess")
+        assert (state.idle_wakes, state.last_idle_wake_at) == (0, 0.0)   # refunded
+
+
+@pytest.mark.asyncio
+async def test_idle_wake_undo_never_writes_into_a_replacement_goal(rig):
+    """Prism 3897e56402cb: the give-back is bound to the exact row the wake saved. A replacement goal
+    whose wait fields equal the post-wake values must not inherit the old goal's deadline/reason."""
+    def _scenario():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("old goal")
+        mgr.wait_for_seconds(1, reason="CI")
+        mgr.state.waiting_until = time.time() - 1          # expired timer park
+        mgr._save()
+        before = mgr.idle_wake_snapshot()
+        assert mgr.idle_wake_prompt(checkin_minutes=30, max_checkins=3)
+        after = mgr.idle_wake_snapshot()
+        assert after["waiting_until"] == 0.0 and before["waiting_until"] > 0
+        goals.GoalManager("goal-sess").set("replacement")  # another surface replaces the goal
+        undone = goals.undo_idle_wake("goal-sess", before, after)
+        return undone, goals.load_goal("goal-sess")
+
+    undone, state = await asyncio.to_thread(_scenario)
+    assert undone is False
+    assert state.goal == "replacement"
+    assert (state.waiting_until, state.waiting_reason) == (0.0, None)
+
+
+@pytest.mark.asyncio
+async def test_idle_wake_undo_still_refunds_an_untouched_row(rig):
+    """The identity guard does not disable the give-back: the row the wake saved is restored."""
+    def _scenario():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.state.created_at = mgr.state.last_turn_at = time.time() - 31 * 60
+        mgr._save()
+        before = mgr.idle_wake_snapshot()
+        assert mgr.idle_wake_prompt(checkin_minutes=30, max_checkins=1)
+        after = mgr.idle_wake_snapshot()
+        return goals.undo_idle_wake("goal-sess", before, after), goals.load_goal("goal-sess")
+
+    undone, state = await asyncio.to_thread(_scenario)
+    assert undone is True
+    assert (state.idle_wakes, state.last_idle_wake_at, state.status) == (0, 0.0, "active")
