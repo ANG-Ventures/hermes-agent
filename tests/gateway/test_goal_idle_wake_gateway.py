@@ -299,8 +299,9 @@ async def test_idle_wake_undo_never_reactivates_a_goal_paused_from_another_surfa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("claim", ["guard", "stop"])
 @pytest.mark.parametrize("busy_after_hop", [1, 2])
-async def test_checkin_is_never_handed_off_while_the_session_is_active(rig, busy_after_hop):
+async def test_checkin_is_never_handed_off_while_the_session_is_active(rig, busy_after_hop, claim):
     """Prism d8319143ee50 / 3f5d9f5e1df7: the final busy/stop check runs after the LAST executor
     await. A /goal command that claims the session's active guard during any pre-dispatch hop (here:
     after hop 1 or hop 2) must stop the wake; it must never be queued behind the command, where the
@@ -321,14 +322,17 @@ async def test_checkin_is_never_handed_off_while_the_session_is_active(rig, busy
         result = await real_hop(fn, *args)
         hops.append(fn)
         if len(hops) == busy_after_hop:
-            adapter._active_sessions[key] = asyncio.Event()   # /goal pause took the guard
+            if claim == "guard":
+                adapter._active_sessions[key] = asyncio.Event()   # /goal pause took the guard
+            else:
+                runner._stop_latched = lambda k: k == key         # Prism 5bf6d1a6c65b: a late /stop
         return result
 
     handed_off = []
     real_handle = adapter.handle_message
 
     async def spy_handle(event):
-        handed_off.append(key in adapter._active_sessions)
+        handed_off.append(key in adapter._active_sessions or runner._stop_latched(key))
         return await real_handle(event)
 
     adapter.handle_message = spy_handle
