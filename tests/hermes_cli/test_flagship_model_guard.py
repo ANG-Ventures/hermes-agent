@@ -672,6 +672,58 @@ def test_create_judges_the_final_assignee_after_placeholder_remap(flagship_profi
     assert _comments(task_id) == []
 
 
+def test_lane_model_remapped_to_flagship_by_the_assignee_aliases_is_refused(flagship_profiles, proven_operator):
+    """Prism 0ed436221a5c: the lane row is handed to the worker as ``-m
+    <lane.model>`` and re-resolved through the ASSIGNEE's aliases, exactly
+    like a card pin (a1f3096286e2). An Opus lane (no firepower authority
+    needed to install it) on a profile aliasing Opus to Fable runs Fable, so
+    the dispatcher judges the lane as the assignee RUNS it: refused, with a
+    comment naming the remap; the card's own operator override admits it."""
+    _profile(flagship_profiles, "worker-remap", _REMAP)
+    with kb.connect() as conn:
+        kb.set_lane_model_override(conn, provider="claude-apr", model="claude-opus-5-5",
+                                   expires_at=4_000_000_000, assignee="worker-remap")
+    card = _card("worker-remap")
+    assert _refused_at_dispatch(card)
+    with kb.connect() as conn:
+        kbd.dispatch_once(conn, dry_run=False)
+    bodies = [b for _a, b in _comments(card)]
+    assert len(bodies) == 1 and "claude-opus-5-5" in bodies[0] and FABLE in bodies[0], bodies
+    assert "lane-model override" in bodies[0] and "worker-remap" in bodies[0], bodies
+    with kb.connect() as conn:
+        kb.add_comment(conn, card, "apollo", OVERRIDE)
+    assert not _refused_at_dispatch(card)
+    # The same lane on a profile with no such alias runs Opus: not gated.
+    assert not _refused_at_dispatch(_card("daedalus-opus"))
+
+
+@pytest.mark.parametrize("default", ["fleet", "Fleet", "custom:fleet"])
+def test_provider_name_as_model_default_is_the_provider_default_model(flagship_profiles, default):
+    """Prism 10d1b746c9aa: a ``model.default`` that is the provider's own
+    slug / display name is not a model; worker startup
+    (``cli_agent_setup_mixin``) substitutes the entry's ``default_model``,
+    so that is the route the gate judges: Fable here, not the string
+    ``"fleet"``."""
+    _profile(flagship_profiles, "worker-prov",
+             f"model:\n  default: {default}\n  provider: fleet\nproviders:\n  fleet:\n"
+             f"    base_url: http://127.0.0.1:9/v1\n    default_model: {FABLE}\n")
+    assert assignee_default_model("worker-prov") == FABLE
+    _assert_gated("worker-prov")
+    # A provider-name default on an entry with no default_model is an unknown route.
+    _profile(flagship_profiles, "worker-prov",
+             f"model:\n  default: {default}\n  provider: fleet\nproviders:\n  fleet:\n"
+             "    base_url: http://127.0.0.1:9/v1\n")
+    assert assignee_default_model("worker-prov").startswith("<unresolved:")
+    with pytest.raises(kb.FlagshipAssigneeRefused, match="cannot resolve worker-prov model default"):
+        with kb.connect() as conn:
+            kb.create_task(conn, title="x", assignee="worker-prov")
+    _profile(flagship_profiles, "worker-prov",
+             f"model:\n  default: {default}\n  provider: fleet\nproviders:\n  fleet:\n"
+             "    base_url: http://127.0.0.1:9/v1\n    default_model: claude-opus-5-5\n")
+    assert assignee_default_model("worker-prov") == "claude-opus-5-5"
+    _assert_not_gated("worker-prov")
+
+
 def test_pin_clear_onto_a_lane_override_is_the_dispatchers_call(flagship_profiles):
     """A clear whose resulting route is the lane is judged by the dispatcher
     gate on the lane's own authority, not by the pin-clear gate."""

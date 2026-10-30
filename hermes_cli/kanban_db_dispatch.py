@@ -6800,7 +6800,11 @@ def _dispatch_once_locked(
         the old policy admitted. A lane route is authorized by the lane's own
         ``--allow-flagship``/``--firepower`` reason when the row's actor is an
         operator label (``LaneModelOverride.flagship_authorized``), or by the
-        card's ``flagship override:`` comment. With neither, the route is the
+        card's ``flagship override:`` comment. A pin and a non-flagship lane
+        are both judged as the ASSIGNEE runs them, through its own aliases
+        (``assignee_pinned_model``; Prism a1f3096286e2 / 0ed436221a5c): a
+        remap to a flagship is admitted only by the card's comment. With
+        neither pin nor lane, the route is the
         assignee profile's ``model.default`` (t_9e7ba884): the assignee is a
         route choice, so a flagship-default profile needs the card's
         ``flagship override:`` comment too (create/reassign write it with
@@ -6838,13 +6842,23 @@ def _dispatch_once_locked(
             lane = _lane_override_for(assignee or task.assignee)
             if lane is not None:
                 model = lane.model
-                if not is_firepower_model(model, _model_policy_config):
-                    return False
-                # The lane's own reason counts only under an operator-label
-                # actor (Prism 89f43d1114a4); a legacy/worker row falls
-                # through to the card's override comment.
-                if lane.flagship_authorized():
-                    return False
+                if is_firepower_model(model, _model_policy_config):
+                    # The lane's own reason counts only under an
+                    # operator-label actor (Prism 89f43d1114a4); a
+                    # legacy/worker row falls through to the card's
+                    # override comment.
+                    if lane.flagship_authorized():
+                        return False
+                else:
+                    # A lane is handed to the worker as ``-m <lane.model>``
+                    # and re-resolved through the ASSIGNEE's aliases, like a
+                    # pin (Prism 0ed436221a5c): a non-flagship lane string,
+                    # installable with no firepower authority, may run a
+                    # flagship under this profile. The lane's own reason
+                    # never covers the remap; only the card's comment does.
+                    pin_remap = assignee_pinned_model(assignee or task.assignee, model)
+                    if not assignee_route_gated(pin_remap, _model_policy_config):
+                        return False
             else:
                 profile_route = True
                 model = assignee_default_model(assignee or task.assignee)
@@ -6871,6 +6885,16 @@ def _dispatch_once_locked(
                 f"orchestrator-only; reassign to a non-flagship profile, pin "
                 f"--model, or add '{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' "
                 f"to this card."
+            )
+        elif pin_remap is not None and lane is not None:
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model {model!r} from the "
+                f"lane-model override for {lane.assignee or '(board-wide)'} "
+                f"({lane.route}) runs as {pin_remap!r} through the profile "
+                f"aliases of {assignee or task.assignee}, which is "
+                f"orchestrator-only; re-set the lane to the real model id, "
+                f"clear it, reassign, or add "
+                f"'{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' to this card."
             )
         elif pin_remap is not None:
             body = (

@@ -228,13 +228,16 @@ def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
     else:
         model = None
     model = str(model or "").strip()
-    if not model:
+    provider = section.get("provider") if isinstance(section, dict) else None
+    provider = str(provider or "").strip()
+    if not model or _names_the_provider(cfg, model, provider):
         # Worker startup adopts the named provider's default_model when
         # model.default is empty (cli_agent_setup_mixin), so that IS the route
-        # (Prism r6 7018f089fcce). A provider with no findable default is an
-        # unknown route and fails closed.
-        provider = section.get("provider") if isinstance(section, dict) else None
-        provider = str(provider or "").strip()
+        # (Prism r6 7018f089fcce). It does the same when model.default is
+        # just the provider's slug / display name (Prism 10d1b746c9aa:
+        # ``default: fleet, provider: fleet`` runs the entry's default_model,
+        # not a model called "fleet"). A provider with no findable default is
+        # an unknown route and fails closed.
         if not provider or provider.casefold() == "auto":
             return None
         model = _provider_default_model(cfg, provider)
@@ -244,6 +247,26 @@ def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
         # (Prism r9 00f1687144ac).
         return model
     return _alias_target(cfg, model)
+
+
+def _names_the_provider(cfg: Mapping[str, Any], model: str, provider: str) -> bool:
+    """True when ``model`` is the provider's own name rather than a model id:
+    the configured ``provider`` string itself, or any identity of the custom
+    entry startup resolves it to (display name, config key, ``custom:`` slug;
+    ``custom_provider_aliases``), the test ``cli_agent_setup_mixin`` applies
+    before substituting the entry's ``default_model``."""
+    if not provider or provider.casefold() == "auto":
+        return False
+    if model.casefold() == provider.casefold():
+        return True
+    from hermes_cli.providers import custom_provider_aliases
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+
+    entry = _get_named_custom_provider(provider, dict(cfg))
+    if not entry:
+        return False
+    return model.strip().lower() in custom_provider_aliases(
+        str(entry.get("name") or ""), str(entry.get("provider_key") or ""))
 
 
 def _alias_target(cfg: Mapping[str, Any], model: str) -> str:
