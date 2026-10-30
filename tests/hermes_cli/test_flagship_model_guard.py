@@ -1447,3 +1447,35 @@ def test_unassign_or_park_a_legacy_flagship_pin_needs_no_permission(flagship_pro
         assert kb.assign_task(conn, task_id, target)
         assert kb.get_task(conn, task_id).assignee == target
     assert _comments(task_id) == []
+
+
+@pytest.mark.parametrize("verb", ["request_changes", "assign", "reassign"])
+@pytest.mark.parametrize("missing", ["review_requested", "implementer"])
+def test_refused_send_back_opens_no_review_run(flagship_profiles, proven_operator, monkeypatch, tmp_path,
+                                               verb, missing):
+    """Prism ce26bdc8d833: every _SendBackRefused precondition is judged
+    before _open_review_run, so a refused send-back journals no ``claimed``
+    (replay would rebuild a running card holding a claim_lock)."""
+    _journal_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-sonnet', status = 'review' WHERE id = ?",
+                     (task_id,))
+        if missing == "implementer":
+            kb._append_event(conn, task_id, "review_requested", {"implementer": " "})
+        conn.commit()
+        board = kb._journal_board_slug(conn)
+    before = len(_journal_kinds(board, task_id))
+    with kb.connect() as conn:
+        if verb == "request_changes":
+            ok, detail = kb.request_changes(conn, task_id, reason="rework", claimer="apollo",
+                                            operator="apollo: rework")
+            assert ok is False and detail
+        else:
+            fn = kb.assign_task if verb == "assign" else kb.reassign_task
+            with pytest.raises(kb.ReviewHoldRequired):
+                fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        row = conn.execute("SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+                           (task_id,)).fetchone()
+        assert tuple(row) == ("review", None, None)
+    assert _journal_kinds(board, task_id)[before:] == []

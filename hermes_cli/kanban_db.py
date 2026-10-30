@@ -15069,12 +15069,27 @@ def request_changes(
         if task_row is None:
             return False, "task not found"
         current_run_id = task_row["current_run_id"]
+        # Read before the claim below (which adds no review_requested): a
+        # refused handoff is judged before _open_review_run journals its
+        # ``claimed`` (Prism ce26bdc8d833).
+        requested_event = _latest_event(conn, task_id, "review_requested")
+        implementer = (
+            None if requested_event is None
+            else _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+        )
+        handoff_error = (
+            "no prior review_requested event" if requested_event is None
+            else "review handoff has no valid implementer provenance" if implementer is None
+            else None
+        )
         if claimer and expected_run_id is None and task_row["status"] == "review":
             if coverage_body is None and operator_reason is None:
                 # Same message the gate gives; refused before any claim churn.
                 return False, _REVIEW_COVERAGE_MISSING
             if _prior_worker_still_alive(conn, task_id) is not None:
                 return False, "a prior worker run on this task is still alive"
+            if handoff_error:
+                return False, handoff_error
             now = int(time.time())
             run_id = _open_review_run(
                 conn, task_id, lock=str(claimer),
@@ -15108,12 +15123,8 @@ def request_changes(
                     "(expected_run_id) to close it"
                 )
 
-        requested_event = _latest_event(conn, task_id, "review_requested")
-        if requested_event is None:
-            return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
-        if implementer is None:
-            return False, "review handoff has no valid implementer provenance"
+        if handoff_error:
+            return False, handoff_error
         if coverage_body is not None:
             now = int(time.time())
             comment_cur = conn.execute(
