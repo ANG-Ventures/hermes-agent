@@ -473,8 +473,11 @@ provider's `default_model` (`providers.<p>.default_model`, or the legacy
 provider with no default it can find counts as unresolved.
 Flagship authority has one definition, used identically on every write and
 read path: the actor is an operator label (`default`/`apollo`/`aegis`,
-`ace`/`user`, `human:<name>`) and the process is not a dispatched worker (no
-`HERMES_KANBAN_TASK`). The actor is the caller's own verified identity (an
+`ace`/`user`, `human:<name>`) and the process is not a dispatched worker: it
+carries no `HERMES_KANBAN_TASK`, and no dispatched worker sits in its process
+ancestry (the board's `task_runs.worker_pid`, the same evidence comment
+authorship uses), so unsetting the env marker inside a worker changes
+nothing. The actor is the caller's own verified identity (an
 operator name the caller cannot prove persists as `unverified:<name>` and
 holds no authority); it is never taken from `--created-by` or a comment body.
 Every path that takes a reason judges it before writing anything: `create`,
@@ -486,8 +489,13 @@ authorized actor writes is a `flagship override:` comment under its own
 operator label, and that is the only comment the read side honours: the
 dispatcher (pin, lane and profile routes alike), reassign and pin clear admit
 a card only on an override whose author is an operator label and which was
-not written from a worker run. A worker's own `kanban_comment` body, an
-`unverified:*` author and the literal `operator` admit nothing.
+not written from a worker run. The same authority gates the WRITE: every
+comment writer (`kanban comment`, the `kanban_comment` tool, a direct
+`add_comment`) refuses a body that starts with `flagship override:` unless
+the author holds flagship authority, so a worker cannot plant one on another
+card (where its comment would otherwise carry no run id). A worker's own
+`kanban_comment` body, an `unverified:*` author and the literal `operator`
+admit nothing.
 `kanban swarm` takes `--allow-flagship "<reason>"` for its child cards; the
 swarm's root card is `no_worker` (never dispatched) and is not gated.
 

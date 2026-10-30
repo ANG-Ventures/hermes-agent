@@ -2977,6 +2977,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             )
         except ReleaseSuperseded as exc:
             return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
+        except kb.FlagshipAssigneeRefused as exc:
+            # A `flagship override:` body is the authorization record itself;
+            # only flagship authority writes one (Prism 7a9e431141ad).
+            return _err(f"kanban: comment not posted: {exc}", 2)
     print(f"Comment added to {args.task_id}")
     return 0
 

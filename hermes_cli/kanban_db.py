@@ -7070,6 +7070,29 @@ def authorize_flagship(
         add_comment(conn, task_id, actor, override_comment(reason))
 
 
+def _check_flagship_override_body(author: str, body: str) -> None:
+    """The WRITE gate on the override comment (Prism 7a9e431141ad).
+
+    A body that starts with ``flagship override:`` is only ever written under
+    an author with :func:`model_policy.flagship_authority` (an operator label,
+    outside a dispatched worker); otherwise :class:`FlagshipAssigneeRefused`
+    and nothing is written. Runs in :func:`add_comment`, so ``kanban_comment``
+    on ANOTHER card (whose provenance stores ``run_id`` NULL) cannot plant the
+    row :func:`_card_flagship_authorized` reads back. ``authorize_flagship``
+    is the intended writer; this makes it the only one.
+    """
+    from hermes_cli.model_policy import (
+        FLAGSHIP_AUTHORITY_ERROR,
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+        flagship_authority,
+    )
+
+    if not (body or "").lstrip().casefold().startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
+        return
+    if not flagship_authority(author):
+        raise FlagshipAssigneeRefused(FLAGSHIP_AUTHORITY_ERROR)
+
+
 def _card_flagship_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
     """THE flagship override reader: the card carries a ``flagship override:``
     comment whose author is an operator label (``is_operator_label``) and that
@@ -8240,6 +8263,7 @@ def add_comment(
     check_comment(author, body)
     if not _kernel_approve:
         check_approve_stamp(author, body)
+    _check_flagship_override_body(author, body)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")
@@ -8616,6 +8640,7 @@ def _insert_comment(
     from hermes_cli.kanban_close_on_guard import check_comment
 
     check_comment(author, body)
+    _check_flagship_override_body(author, body)
     run_id, session_ref = _inline_comment_provenance(task_id)
     conn.execute(
         "INSERT INTO task_comments (task_id, author, body, run_id, session_ref, created_at) "

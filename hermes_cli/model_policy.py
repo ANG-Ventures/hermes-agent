@@ -116,15 +116,22 @@ def flagship_actor(explicit: Optional[str] = None) -> str:
 
 def flagship_authority(actor: Optional[str]) -> bool:
     """The ONE definition of flagship authority: ``actor`` is an operator
-    label (``is_operator_label``) and this process is not a dispatched worker
-    (env marker, so an inheriting subprocess fails closed too). Every write
-    path grants a reason through it; the read side
+    label (``is_operator_label``) and this process is not a dispatched worker.
+    A worker is recognised by EITHER signal: the env marker (so an inheriting
+    subprocess fails closed) OR a dispatched worker in the process ancestry
+    (``worker_ancestor_profile``: the ``task_runs`` row whose ``worker_pid``
+    is this process, a parent, or its session id). The env marker alone is
+    removable (``env -u HERMES_KANBAN_TASK``, Prism 5e978e7740dd); the
+    ancestry is the same evidence ``verified_profile_author`` already walks.
+    Every write path grants a reason through it; the read side
     (``kanban_db._card_flagship_authorized``) trusts exactly the authors it
     admits, so a recorded override is always one dispatch honours."""
-    from hermes_cli.kanban_identity import is_operator_label
+    from hermes_cli.kanban_identity import is_operator_label, worker_ancestor_profile
     from hermes_cli.kanban_worker_policy import is_dispatched_worker
 
-    return is_operator_label(actor) and not is_dispatched_worker()
+    if not is_operator_label(actor) or is_dispatched_worker():
+        return False
+    return worker_ancestor_profile() is None
 
 
 def require_flagship_authority(
