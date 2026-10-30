@@ -6784,18 +6784,11 @@ def _dispatch_once_locked(
         """Whether a capped-pool fallback rung would put ``task_id`` on a
         flagship model this tick's policy bans (alias-aware), with no
         ``flagship override:`` comment on the card to authorize it."""
-        from hermes_cli.model_policy import (
-            FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
-            is_firepower_model,
-        )
+        from hermes_cli.model_policy import is_firepower_model
 
         if not is_firepower_model(model, _model_policy_config):
             return False
-        return conn.execute(
-            "SELECT 1 FROM task_comments WHERE task_id = ? "
-            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
-            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
-        ).fetchone() is None
+        return not _kb._card_flagship_authorized(conn, task_id)
 
     def flagship_refused(task_id: str, assignee: Optional[str] = None) -> bool:
         """Main's flagship gate, applied to the route this spawn will USE.
@@ -6805,13 +6798,27 @@ def _dispatch_once_locked(
         lane is checked against the policy loaded for THIS tick, so a ban
         tightened after ``lane-model set`` cannot be walked around by the lane
         the old policy admitted. A lane route is authorized by the lane's own
-        ``--allow-flagship``/``--firepower`` reason, or by the card's
-        ``flagship override:`` comment. Profile defaults are out of scope, as
-        on main: they are standing config, not a dispatch-time override.
+        ``--allow-flagship``/``--firepower`` reason when the row's actor is an
+        operator label (``LaneModelOverride.flagship_authorized``), or by the
+        card's ``flagship override:`` comment. A pin and a non-flagship lane
+        are both judged as the ASSIGNEE runs them, through its own aliases
+        (``assignee_pinned_model``; Prism a1f3096286e2 / 0ed436221a5c): a
+        remap to a flagship is admitted only by the card's comment. With
+        neither pin nor lane, the route is the
+        assignee profile's ``model.default`` (t_9e7ba884): the assignee is a
+        route choice, so a flagship-default profile needs the card's
+        ``flagship override:`` comment too (create/reassign write it with
+        ``--allow-flagship``). On every branch the comment is read by the ONE
+        reader, ``_card_flagship_authorized``: an operator-label author, not
+        from a worker run; exactly what ``authorize_flagship`` writes.
         """
         from hermes_cli.model_policy import (
             FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
             FLAGSHIP_REFUSAL_COMMENT_PREFIX,
+            assignee_default_model,
+            assignee_pinned_model,
+            assignee_route_gated,
+            assignee_route_unresolved,
             flagship_model_match,
             is_firepower_model,
         )
@@ -6820,29 +6827,84 @@ def _dispatch_once_locked(
         if task is None:
             return False
         lane: Optional[_kb.LaneModelOverride] = None
+        profile_route = False
+        pin_remap: Optional[str] = None
         if task.model_override:
             model = task.model_override
             if not flagship_model_match(model, _model_policy_config):
-                return False
+                # The pin as the worker RUNS it: ``-m <pin>`` is resolved
+                # through the assignee's own aliases at startup (Prism
+                # a1f3096286e2); an unreadable config fails closed.
+                pin_remap = assignee_pinned_model(assignee or task.assignee, model)
+                if not assignee_route_gated(pin_remap, _model_policy_config):
+                    return False
         else:
             lane = _lane_override_for(assignee or task.assignee)
-            model = lane.model if lane is not None else None
-            if not is_firepower_model(model, _model_policy_config):
-                return False
-            if (lane.firepower or "").strip():
-                return False
-        override = conn.execute(
-            "SELECT 1 FROM task_comments WHERE task_id = ? "
-            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
-            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
-        ).fetchone()
-        if override:
+            if lane is not None:
+                model = lane.model
+                if is_firepower_model(model, _model_policy_config):
+                    # The lane's own reason counts only under an
+                    # operator-label actor (Prism 89f43d1114a4); a
+                    # legacy/worker row falls through to the card's
+                    # override comment.
+                    if lane.flagship_authorized():
+                        return False
+                else:
+                    # A lane is handed to the worker as ``-m <lane.model>``
+                    # and re-resolved through the ASSIGNEE's aliases, like a
+                    # pin (Prism 0ed436221a5c): a non-flagship lane string,
+                    # installable with no firepower authority, may run a
+                    # flagship under this profile. The lane's own reason
+                    # never covers the remap; only the card's comment does.
+                    pin_remap = assignee_pinned_model(assignee or task.assignee, model)
+                    if not assignee_route_gated(pin_remap, _model_policy_config):
+                        return False
+            else:
+                profile_route = True
+                model = assignee_default_model(assignee or task.assignee)
+                # An unresolved ${VAR} default fails closed (Prism 69a5d42a9476).
+                if not assignee_route_gated(model, _model_policy_config):
+                    return False
+        if _kb._card_flagship_authorized(conn, task_id):
             return False
 
         result.flagship_refused.append(task_id)
         if dry_run:
             return True
-        if lane is None:
+        if profile_route and assignee_route_unresolved(model):
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} cannot resolve "
+                f"{assignee or task.assignee} model default ({model!r}); pin "
+                f"--model, or add '{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' "
+                f"to this card."
+            )
+        elif profile_route:
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model {model!r} from the "
+                f"assignee profile default of {assignee or task.assignee} is "
+                f"orchestrator-only; reassign to a non-flagship profile, pin "
+                f"--model, or add '{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' "
+                f"to this card."
+            )
+        elif pin_remap is not None and lane is not None:
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model {model!r} from the "
+                f"lane-model override for {lane.assignee or '(board-wide)'} "
+                f"({lane.route}) runs as {pin_remap!r} through the profile "
+                f"aliases of {assignee or task.assignee}, which is "
+                f"orchestrator-only; re-set the lane to the real model id, "
+                f"clear it, reassign, or add "
+                f"'{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' to this card."
+            )
+        elif pin_remap is not None:
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model pin {model!r} runs as "
+                f"{pin_remap!r} through the profile aliases of "
+                f"{assignee or task.assignee}, which is orchestrator-only; pin "
+                f"the real model id, reassign, or add "
+                f"'{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' to this card."
+            )
+        elif lane is None:
             body = (
                 f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model "
                 f"{model!r} is orchestrator-only; add "
@@ -6866,7 +6928,8 @@ def _dispatch_once_locked(
                 "PHASE=kanban_flagship_refused task=%s model=%s source=%s",
                 task_id,
                 model,
-                "card-override" if lane is None else "lane-override",
+                "profile-default" if profile_route
+                else "card-override" if lane is None else "lane-override",
             )
         return True
 

@@ -14,7 +14,8 @@ from hermes_cli.model_policy import FLAGSHIP_MODEL_SUBSTRINGS
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
+# proven_operator: flagship overrides need operator authority (t_9e7ba884).
+def kanban_home(tmp_path, monkeypatch, proven_operator):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -301,7 +302,7 @@ def test_dispatch_allows_direct_db_model_with_override_comment(
         kb.add_comment(
             conn,
             task_id,
-            "operator",
+            "apollo",  # an operator label: the literal "operator" admits nothing
             "flagship override: incident commander approved",
         )
 
