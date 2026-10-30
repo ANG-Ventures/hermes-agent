@@ -453,6 +453,52 @@ as a `flagship override:` task comment. The dispatcher independently refuses
 direct database bypasses and records a `flagship dispatch refused:` comment,
 leaving the card queued until an explicit override comment is present.
 
+The assignee is a route choice too. On a card with no `--model` pin and no
+lane override, the route is the assignee profile's `model.default`, and the
+same ban applies to it: `create --assignee <profile>` and
+`assign`/`reassign <id> <profile>` refuse a profile whose default matches the
+banned list (`assignee profile default of '<profile>' is a flagship route: ...`) unless
+`--allow-flagship "<reason>"` is given. The reason is written as the same
+`flagship override:` comment. The dispatcher applies the check to the profile
+route when there is no pin or lane, so a card that reached `ready` by another
+path gets a `flagship dispatch refused:` comment naming the profile. A
+non-flagship `--model` pin replaces the profile route and needs no reason.
+Clearing a pin (`set-model <id>` with no model) lands the card on the profile
+route, so it is judged the same way, before anything is written or
+`--reclaim`ed. A default that still holds an unexpanded `${VAR}` after the
+profile's own `.env` is bound counts as unresolved and needs a reason too.
+A profile with an empty `model.default` and a `model.provider` runs that
+provider's `default_model` (`providers.<p>.default_model`, or the legacy
+`custom_providers[].model`), so that model is the route that is judged; a
+provider with no default it can find counts as unresolved.
+Flagship authority has one definition, used identically on every write and
+read path: the actor is an operator label (`default`/`apollo`/`aegis`,
+`ace`/`user`, `human:<name>`) and the process is not a dispatched worker: it
+carries no `HERMES_KANBAN_TASK`, and no dispatched worker sits in its process
+ancestry (the board's `task_runs.worker_pid`, the same evidence comment
+authorship uses), so unsetting the env marker inside a worker changes
+nothing. The actor is the caller's own verified identity (an
+operator name the caller cannot prove persists as `unverified:<name>` and
+holds no authority); it is never taken from `--created-by` or a comment body.
+Every path that takes a reason judges it before writing anything: `create`,
+`assign`/`reassign`, `set-model` (a flagship pin, or a clear onto a flagship
+profile route), `lane-model set --firepower`, `kanban swarm`, the
+`kanban_create` tool and a direct `kanban_db` call all refuse with
+`allow_flagship is operator/orchestrator-only; ask Apollo to assign`. What an
+authorized actor writes is a `flagship override:` comment under its own
+operator label, and that is the only comment the read side honours: the
+dispatcher (pin, lane and profile routes alike), reassign and pin clear admit
+a card only on an override whose author is an operator label and which was
+not written from a worker run. The same authority gates the WRITE: every
+comment writer (`kanban comment`, the `kanban_comment` tool, a direct
+`add_comment`) refuses a body that starts with `flagship override:` unless
+the author holds flagship authority, so a worker cannot plant one on another
+card (where its comment would otherwise carry no run id). A worker's own
+`kanban_comment` body, an `unverified:*` author and the literal `operator`
+admit nothing.
+`kanban swarm` takes `--allow-flagship "<reason>"` for its child cards; the
+swarm's root card is `no_worker` (never dispatched) and is not gated.
+
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
 start` directly, or wire the gateway up as a systemd user unit (see the

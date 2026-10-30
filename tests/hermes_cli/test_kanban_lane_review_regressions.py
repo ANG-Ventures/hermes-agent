@@ -1,5 +1,6 @@
 """Independent review regressions for lane routing and batch controls."""
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,8 @@ from tests.hermes_cli.test_kanban_batch_set_model import _create
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
+# proven_operator: flagship overrides need operator authority (t_9e7ba884).
+def kanban_home(tmp_path, monkeypatch, proven_operator):
     home = tmp_path / '.hermes'
     home.mkdir()
     monkeypatch.setenv('HERMES_KANBAN_SANDBOX', '1')
@@ -141,7 +143,11 @@ def test_provider_only_alias_in_profile_requires_firepower(kanban_home):
     profile = kanban_home / 'profiles' / 'worker'
     profile.mkdir(parents=True)
     (profile / 'config.yaml').write_text('model:\n  provider: batch-provider\n  default: astra\n')
-    card = _create('provider-only alias', 'worker')
+    # The profile default `astra` is itself a flagship route, so the create is
+    # gated too (t_9e7ba884); authorize it so the set-model path is what's tested.
+    out = kc.run_slash("create 'provider-only alias' --assignee worker --allow-flagship 'profile route ok'")
+    assert 'orchestrator-only' not in out, out
+    card = re.search(r't_[a-f0-9]+', out).group(0)
     out = kc.run_slash(f'set-model {card} --provider batch-provider')
     assert 'orchestrator-only' in out
     with kb.connect() as conn:
@@ -151,7 +157,8 @@ def test_provider_only_alias_in_profile_requires_firepower(kanban_home):
     with kb.connect() as conn:
         assert kb.get_task(conn, card).model_override == 'gpt-6-astra-900k'
         # Main's comment contract (what the dispatcher gate authorizes on).
-        assert kb.list_comments(conn, card)[0].body == 'flagship override: urgent task'
+        bodies = [c.body for c in kb.list_comments(conn, card)]
+        assert 'flagship override: urgent task' in bodies, bodies
 
 
 def test_lane_reason_and_effort_round_trip(kanban_home):

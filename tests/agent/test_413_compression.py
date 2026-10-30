@@ -343,11 +343,25 @@ class TestHTTP413Compression:
         assert "image lifecycle invariant violated" in caplog.text.lower()
         mock_compress.assert_not_called()
 
-    def test_live_and_rebuilt_anthropic_history_share_prior_image_projection(self, agent):
+    def test_live_and_rebuilt_anthropic_history_share_prior_image_projection(
+        self, agent, monkeypatch
+    ):
         """Live and persisted rebuilds send byte-identical prior-turn summaries."""
         from agent.request_body_budget import (
             request_body_limit_for_provider,
             serialized_request_body_size,
+        )
+        from providers import get_provider_profile
+
+        # Pin a small cap so ~14 MB of fixture images overflows it; the real
+        # Anthropic cap (~124 MB) would need a far larger fixture.
+        anthropic_profile = get_provider_profile("anthropic")
+        assert anthropic_profile is not None
+        monkeypatch.setattr(
+            anthropic_profile,
+            "max_request_body_bytes",
+            int(9.5 * 1024 * 1024),
+            raising=False,
         )
 
         agent.provider = "claude-apx-1"
