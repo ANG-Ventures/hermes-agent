@@ -1398,6 +1398,8 @@ def utilization_context() -> dict:
         pass
     limits = _ad.Limits(mem_reserve_gb=spec.mem_reserve_gb if spec else 0.0,
                         cpu_saturable=bool(spec.cpu_saturable) if spec else False,
+                        # R2c closures follow this host's scorer, as placement._limits() does (Prism 8e21846c06c9)
+                        r2c=spec is not None and spec.scorer == "v2",
                         unmeasurable=tuple(a for a in (spec.unmeasurable_axes if spec else ()) if a.startswith("psi_")))
     return {"host": host, "ceiling": ceiling, "ceiling_reason": reason or "no reason recorded", "need": need,
             "limits": limits, "mem_available_gb": avail, "mem_total_gb": total}

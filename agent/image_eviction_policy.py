@@ -13,21 +13,42 @@ A keep-newest-N window retires one more message on every new image, so every tur
 full-prefix miss. Holding images until the request would cross a real API limit and then
 retiring a batch costs one slower turn per batch and nothing below the limit.
 
-20 is the documented threshold at which Anthropic applies a stricter per-image dimension cap
-(2000 px) to EVERY image in the request, counting images nested in tool_result content. The hard
-ceilings are higher (100 images per request on 200K-context models, 600 otherwise) but the 32 MB
-request-size limit usually binds first, which the byte budget guards with headroom for text.
+Both numbers are Anthropic limits mirrored in the fleet catalog ``config/anthropic-limits.json``
+(hermes-home, ``images.*``; card t_3a0b1ce4), read at CALL time through
+:func:`agent.anthropic_limits.image_limits` so a catalog edit applies without a restart; the literals
+below are only the fallback when the catalog is unreadable, and hermes-home's
+``anthropic-limits-fallback-lint`` holds ``OUTBOUND_IMAGE_BUDGET_BYTES`` equal to
+``images.outbound_budget_bytes``. ``images.stricter_cap_threshold_count`` (20) is the documented
+image count above which Anthropic applies a stricter per-image dimension cap to EVERY image in the
+request, counting images nested in tool_result content; since 2026-10-29 that cap is 3000 px (was
+2000 px). The hard ceilings are higher (100 images per request on 200K-context models, 600
+otherwise), but the request-size limit usually binds first: 128 MB on the first-party API since
+2026-10-29 (was 32 MB; 20-32 MB through Bedrock/Vertex, catalog
+``cloud_platform_request_body_bytes``). The byte budget is 75% of it (96 MB, was 24 MB), leaving
+headroom for text.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
+# Fallbacks for catalog images.stricter_cap_threshold_count / images.outbound_budget_bytes (see docstring).
 OUTBOUND_IMAGE_LIMIT = 20
-OUTBOUND_IMAGE_BUDGET_BYTES = 24_000_000
+OUTBOUND_IMAGE_BUDGET_BYTES = 96_000_000
 IMAGE_EVICTION_BATCH = 8
 # Satisfiability floor — see outbound_image_retire_count.
 OUTBOUND_IMAGE_FLOOR = 3
+
+
+def _catalog_image_limits() -> Tuple[int, int]:
+    """``(limit, budget)`` from the fleet catalog, else the literals. Imported lazily so this module stays a
+    stdlib-only leaf at import time; any failure to read the catalog means the literals."""
+    try:
+        from agent.anthropic_limits import image_limits
+
+        return image_limits(OUTBOUND_IMAGE_LIMIT, OUTBOUND_IMAGE_BUDGET_BYTES)
+    except Exception:  # noqa: BLE001 - the send path must never fail on the catalog
+        return OUTBOUND_IMAGE_LIMIT, OUTBOUND_IMAGE_BUDGET_BYTES
 
 
 def outbound_image_retire_count(
@@ -36,8 +57,8 @@ def outbound_image_retire_count(
     *,
     carrier_bytes_newest_first: Optional[Sequence[int]] = None,
     reserved_bytes: int = 0,
-    limit: int = OUTBOUND_IMAGE_LIMIT,
-    budget: int = OUTBOUND_IMAGE_BUDGET_BYTES,
+    limit: Optional[int] = None,
+    budget: Optional[int] = None,
     batch: int = IMAGE_EVICTION_BATCH,
     floor: int = OUTBOUND_IMAGE_FLOOR,
 ) -> int:
@@ -63,7 +84,13 @@ def outbound_image_retire_count(
     The floor is a SATISFIABILITY floor: it shelters the newest frames only when reserved
     uploads alone breach the block ceiling (no retirement can fix that), and never under byte
     pressure — the request-size limit is hard and the provider answers 413.
+
+    ``limit`` / ``budget`` default (None) to the catalog values, resolved per call; pass them to pin.
     """
+    if limit is None or budget is None:
+        cat_limit, cat_budget = _catalog_image_limits()
+        limit = cat_limit if limit is None else limit
+        budget = cat_budget if budget is None else budget
     total = len(carrier_blocks_newest_first)
     sizes = carrier_bytes_newest_first
     blocks_kept = [0] * (total + 1)
