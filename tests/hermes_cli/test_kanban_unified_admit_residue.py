@@ -82,9 +82,14 @@ def test_band_is_may_starts_verdict_for_one_and_two_jobs(root, busy, queued, one
 
 
 def test_band_kill_switch_is_admit(root, monkeypatch):
-    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
+    """The band takes the switch the kanban ADMITTER published (demand file ``unified``), never this process's env
+    (Prism 59574d3a240b, vendored from hermes-home f2691dc07)."""
     dmd.publish("prism", 64, PRISM_UNIT, root=root, now=NOW)
+    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW, env={"KANBAN_UNIFIED_ADMIT": "0"})
     assert _band(_table(), _sample(0.60), root)[0] == "ok"
+    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW, env={"KANBAN_UNIFIED_ADMIT": "1"})
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")          # the reader's own env never names the rule
+    assert _band(_table(), _sample(0.60), root)[0] == "hot"
 
 
 # ------------------------------------------------------------- 8397e82995e1: a failed publish is seen, then retried
