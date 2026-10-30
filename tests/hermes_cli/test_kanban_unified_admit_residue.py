@@ -72,6 +72,8 @@ def _band(table, s, root):
     (0.53, 64, True, False), (0.80, 0, True, False), (0.95, 0, False, False)])
 def test_band_is_may_starts_verdict_for_one_and_two_jobs(root, busy, queued, one, two):
     table = _table()
+    # The switch is ON (fixture), so the admitter publishes its mode the way kanban_gate_tick does (Prism ad972e752286).
+    dmd.publish("kanban", 0, PRISM_UNIT, root=root, now=NOW)
     if queued:
         dmd.publish("prism", queued, PRISM_UNIT, hosts=["studio"], root=root, now=NOW)
     s = _sample(busy)
