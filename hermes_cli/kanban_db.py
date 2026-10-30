@@ -7968,7 +7968,16 @@ def apply_batch_route_writes(
         # Judge every card before the first write, under the writer lock: a
         # refusal leaves nothing written (Prism 0b1cb4a34ceb).
         apply: list[tuple[BatchRouteWrite, Optional[str], Optional[str], Optional[str]]] = []
+        seen: set[str] = set()
         for write, model, provider, effort in prepared:
+            # Each entry is judged against the ORIGINAL row, so a repeated id
+            # would pass twice and the later write silently overwrite the
+            # earlier one (Prism e36efbedf0a2).
+            if write.task_id in seen:
+                raise RuntimeError(
+                    f"duplicate task id {write.task_id} in batch; no cards were changed"
+                )
+            seen.add(write.task_id)
             mismatch = _batch_write_mismatch(conn, write)
             if mismatch is not None:
                 if not write.skip_if_unmatched:

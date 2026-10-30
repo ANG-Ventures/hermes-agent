@@ -1340,6 +1340,29 @@ def test_refused_batch_journals_nothing(flagship_profiles, monkeypatch, tmp_path
     assert _journal_kinds(board, other)[before:] == []
 
 
+def test_batch_with_a_duplicate_task_id_writes_nothing(flagship_profiles, monkeypatch, tmp_path):
+    """Prism e36efbedf0a2: two entries for one card both passed the judge
+    against the original row and the second write silently overwrote the
+    first. The judge refuses the batch on the repeated id, before any write."""
+    _journal_env(monkeypatch, tmp_path)
+    first = _card("daedalus-opus")
+    dup = _card("daedalus-opus", "claude-opus-5-5")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    before = {t: len(_journal_kinds(board, t)) for t in (first, dup)}
+    with kb.connect() as conn:
+        with pytest.raises(RuntimeError, match=f"duplicate task id {dup} in batch; no cards were changed"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=first, touch_effort=True, effort="low"),
+                kb.BatchRouteWrite(task_id=dup, touch_effort=True, effort="low"),
+                kb.BatchRouteWrite(task_id=dup, touch_effort=True, effort="high"),
+            ])
+        assert kb.get_task(conn, first).reasoning_effort is None
+        assert kb.get_task(conn, dup).reasoning_effort is None
+        assert kb.get_task(conn, dup).model_override == "claude-opus-5-5"
+    assert {t: _journal_kinds(board, t)[before[t]:] for t in (first, dup)} == {first: [], dup: []}
+
+
 @pytest.mark.parametrize("touch", ["touch_model", "touch_effort", "touch_brain"])
 def test_batch_with_an_archived_card_journals_nothing(flagship_profiles, monkeypatch, tmp_path, touch):
     """Prism e6f355767f2f: the batch judges every refusal the locked writers
