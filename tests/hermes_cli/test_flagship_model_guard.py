@@ -752,3 +752,42 @@ def test_cli_comment_refuses_an_override_body_from_a_worker(flagship_profiles, m
     assert FLAGSHIP_AUTHORITY_ERROR in out, out
     assert _comments(card_b) == [] and _refused_at_dispatch(card_b)
     assert "Comment added" in kc.run_slash(f"comment {card_b} 'handoff: see card A'")
+
+
+# --- an explicit actor is a claim, not a proof (Prism c5514fd79fb5) ----------------
+
+
+@pytest.mark.parametrize("explicit", ["apollo", "default", "human:ace"])
+def test_explicit_operator_actor_from_an_unproven_process_is_refused(flagship_profiles, monkeypatch, explicit):
+    """``authorize_flagship(conn, id, "apollo", reason)`` from a process that
+    cannot prove the operator label is coerced to the caller's own verified
+    identity (``daedalus-opus`` here) and refused: no row is minted."""
+    from hermes_cli import kanban_identity, model_policy
+
+    monkeypatch.setenv("HERMES_PROFILE", "daedalus-opus")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: False)
+    monkeypatch.setattr(kanban_identity, "worker_ancestor_profile", lambda: None)
+    assert model_policy.flagship_actor(explicit) == "daedalus-opus"
+    card = _legacy_flagship_card()
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="operator/orchestrator-only"):
+            kb.authorize_flagship(conn, card, explicit, REASON)
+        assert not kb._card_flagship_authorized(conn, card)
+    assert _comments(card) == [] and _refused_at_dispatch(card)
+
+
+def test_explicit_operator_actor_from_a_proven_process_is_kept(flagship_profiles, monkeypatch):
+    """Positive control: a proven operator may name an operator label and the
+    row is recorded under it."""
+    from hermes_cli import kanban_identity, model_policy
+
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: True)
+    monkeypatch.setattr(kanban_identity, "worker_ancestor_profile", lambda: None)
+    assert model_policy.flagship_actor("apollo") == "apollo"
+    card = _legacy_flagship_card()
+    with kb.connect() as conn:
+        kb.authorize_flagship(conn, card, "apollo", REASON)
+    _assert_authorized(card)

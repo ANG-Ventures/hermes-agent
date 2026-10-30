@@ -105,12 +105,20 @@ def flagship_actor(explicit: Optional[str] = None) -> str:
     caller passes, else the acting identity the way ``kanban comment``
     persists it (``verified_profile_author``: a dispatched worker is its own
     profile; an unproven operator name is ``unverified:<name>``). Never a
-    literal ``operator``."""
-    if (explicit or "").strip():
-        return str(explicit).strip()
-    from hermes_cli.kanban_identity import verified_profile_author
+    literal ``operator``.
+
+    An explicit actor is a CLAIM, not a proof: it is accepted only when the
+    caller could persist that label as itself (``operator_label_proven``,
+    the same proof ``verified_profile_author`` demands of an implicit one).
+    Otherwise it is discarded and the caller's own verified identity is used,
+    so an unproven process cannot mint a trusted row by naming ``apollo``
+    (Prism c5514fd79fb5)."""
+    from hermes_cli.kanban_identity import operator_label_proven, verified_profile_author
     from hermes_cli.profiles import current_profile_name
 
+    claimed = str(explicit or "").strip()
+    if claimed and operator_label_proven(claimed):
+        return claimed
     return verified_profile_author(current_profile_name("user") or "user")
 
 
