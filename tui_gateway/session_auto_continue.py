@@ -334,7 +334,9 @@ def _persist_queued_user_row(session: dict, envelope: dict, display_kind: str | 
                 envelope.pop("_submit_user_row", None)
                 return
             staged["_row_id"], staged["content"] = live_id, merged
-            staged[_SUBMIT_ROW_RAW_KEY] = envelope.get("text")  # adoption identity follows the merge
+        # Adoption identity follows the envelope on EVERY sync: a raw-only change (``[Route note:`` ->
+        # ``[quoted route note:``) relabels to the same content and needs no write, but a new identity.
+        staged[_SUBMIT_ROW_RAW_KEY] = envelope.get("text")
         return
     # ``display_metadata`` marker: ``reopen_session`` retires still-marked rows after a restart
     # discarded the in-memory queue (#125577); the drain's replacement row is unmarked.

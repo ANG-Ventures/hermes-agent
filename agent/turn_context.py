@@ -721,6 +721,11 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
             scrubber.reset()
 
 
+# Key on a staged user dict whose content is stored relabelled: the raw turn text it stands for
+# (adoption identity; popped at staging, leading underscore keeps it off the wire).
+STAGED_TURN_RAW_KEY = "_staged_turn_raw_content"
+
+
 def _rewrite_relabelled_staged_row(agent: Any, staged: Dict[str, Any], content: Any) -> None:
     """E11: a row written before the relabel (the TUI submit row) holds the raw ``[Route note:``.
     The flush skips a ``_DB_PERSISTED_MARKER`` dict, so rewrite the stored row to the relabelled
@@ -746,17 +751,23 @@ def _stage_turn_user_message(
     persist_user_timestamp: Optional[float], persist_user_platform_id: Optional[str],
     persist_user_display_kind: Optional[str],
     persist_user_display_metadata: Optional[Dict[str, Any]],
+    raw_persist_content: Any = None,
 ) -> Tuple[Dict[str, Any], Any]:
     """Build this turn's user dict, reusing CLI-staged input only when its clean text
     matches this turn (a stale handoff must not replace later input; voice turns
-    compare the clean override). Returns ``(user_msg, pending_cli_message)``."""
+    compare the clean override). Returns ``(user_msg, pending_cli_message)``.
+    ``raw_persist_content`` is this turn's persist text BEFORE the E11 relabel: identity is
+    matched on the raw form (the relabel maps two different submits to one text)."""
     pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
     expected_persist_content = (
         persist_user_message if persist_user_message is not None else user_message
     )
+    raw_expected = raw_persist_content if raw_persist_content is not None else expected_persist_content
     if (
         isinstance(pending_cli_message, dict)
-        and relabel_route_note_content(pending_cli_message.get("content")) == expected_persist_content
+        # A dict whose stored content is already relabelled (the TUI submit row) carries the raw
+        # turn text it stands for; any other staged dict holds the raw text as its content.
+        and pending_cli_message.pop(STAGED_TURN_RAW_KEY, pending_cli_message.get("content")) == raw_expected
     ):
         user_msg = pending_cli_message
         if user_msg.get("content") != expected_persist_content:
@@ -1182,6 +1193,7 @@ def build_turn_context(
     # E11: received text never carries the harness's route-note marker. Unconditional: the
     # harness's own note never enters here (route_identity._persist_note appends it per call),
     # so no declared display kind may opt received text out of the relabel.
+    raw_persist_content = persist_user_message if persist_user_message is not None else user_message
     user_message = relabel_route_note_content(user_message)
     persist_user_message = relabel_route_note_content(persist_user_message)
 
@@ -1229,6 +1241,7 @@ def build_turn_context(
     user_msg, pending_cli_message = _stage_turn_user_message(
         agent, user_message, persist_user_message, persist_user_timestamp,
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
+        raw_persist_content=raw_persist_content,
     )
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.

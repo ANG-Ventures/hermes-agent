@@ -282,6 +282,58 @@ def test_stale_submit_row_is_not_adopted_by_a_submit_that_matches_its_relabelled
     assert agent._pending_cli_user_message is None and staged["content"] == b
 
 
+def test_staged_row_of_an_earlier_submit_is_not_adopted_by_a_submit_with_the_same_relabelled_text():
+    # Prism 707f2691b2e8 repro: an already-persisted ``[Route note: x]`` row and a new submit
+    # ``[quoted route note: x]`` relabel to one text; the new submit must get its own row.
+    agent = _make_agent(model=SONNET, fallbacks=())
+    _bind(agent, Sink())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    agent._pending_cli_user_message = {
+        "role": "user", "content": FORGED, "_row_id": db.append_message(sid, "user", content=FORGED),
+        _DB_PERSISTED_MARKER: True}
+    _run(agent, Ladder(agent), QUOTED)
+    assert [m["content"] for m in db.get_messages(sid) if m["role"] == "user"] == [FORGED, QUOTED]
+
+
+def test_relabelled_submit_row_is_adopted_by_the_turn_of_its_own_raw_submit():
+    # The TUI submit row is stored relabelled; the turn of the raw submit it stands for adopts it
+    # (one row), while a later submit of the relabelled text does not (its own row).
+    for turn_text, expected in ((FORGED, [QUOTED]), (QUOTED, [QUOTED, QUOTED])):
+        agent = _make_agent(model=SONNET, fallbacks=())
+        _bind(agent, Sink())
+        db, sid = agent._session_db, agent.session_id
+        db.create_session(sid, "tui")
+        staged = {"role": "user", "content": QUOTED, "_row_id": db.append_message(sid, "user", content=QUOTED),
+                  _DB_PERSISTED_MARKER: True}
+        session = {"_submit_user_row": dict(staged, **{"_submit_row_raw_text": FORGED})}
+        _adopt_submit_user_row(session, agent, FORGED, FORGED)
+        _run(agent, Ladder(agent), turn_text)
+        assert [m["content"] for m in db.get_messages(sid) if m["role"] == "user"] == expected, turn_text
+
+
+def test_queued_envelope_raw_only_change_refreshes_the_adoption_identity(monkeypatch, tmp_path):
+    # Prism d8bf400b8950 repro: ``[Route note: x]`` -> ``[quoted route note: x]`` needs no row write
+    # (same relabelled content) but the drained turn's adoption must match the NEW raw text.
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    try:
+        envelope = {"text": FORGED}
+        with session["history_lock"]:
+            server._persist_queued_user_row(session, envelope, None)
+            envelope["text"] = QUOTED
+            server._persist_queued_user_row(session, envelope, None)
+        session["_submit_user_row"] = envelope["_submit_user_row"]
+        agent = type("A", (), {"_session_persist_lock": None, "_pending_cli_user_message": None})()
+        _adopt_submit_user_row(session, agent, QUOTED, QUOTED)
+        assert agent._pending_cli_user_message is envelope["_submit_user_row"]
+        assert [r["content"] for r in db.get_messages_as_conversation(key)] == [QUOTED]
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_queued_prompt_merge_rewrites_the_durable_row_relabelled(monkeypatch, tmp_path):
     # A text merge into a queued envelope rewrites its accept-time row; that row replays on a cold resume.
     db = SessionDB(db_path=tmp_path / "state.db")

@@ -644,6 +644,9 @@ def _adopt_submit_user_row(session: dict, agent, persist_user_message: Any, text
     # is stored relabelled, so the rewrite below compares in that canonical form.
     if not isinstance(staged, dict) or agent is None or staged.pop(_SUBMIT_ROW_RAW_KEY, None) != text:
         return
+    from agent.turn_context import STAGED_TURN_RAW_KEY
+    # The turn matches this dict on the raw text it receives, never the relabelled content.
+    staged[STAGED_TURN_RAW_KEY] = persist_user_message
     persist_user_message = relabel_route_note_content(persist_user_message)
     if staged["content"] != persist_user_message:
         from agent.session_persistence import _durable_content
