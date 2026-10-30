@@ -132,3 +132,39 @@ def test_e2e_plain_complete_without_an_explicit_flag_is_refused(board, monkeypat
         with pytest.raises(op.ClosedUnmergedPrError):
             kb.complete_task(conn, tid, summary="done")
         assert _status(conn, tid) == "blocked"
+
+
+# --- Prism round 1 (#2465) -----------------------------------------------------
+
+
+def test_e2e_park_keeps_the_cards_other_open_pr(board, monkeypatch):
+    # Prism 0eca5d119ed6: an unaffected own PR (#7900, still open) stays an own PR next to the successor
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        run = kb.list_runs(conn, tid)[-1].id
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?",
+                     ('{"own_prs": ["%s#%d", "%s#7900"], "auto_routed_open_prs": ["%s#%d", "%s#7900"]}'
+                      % (REPO, OLD, REPO, REPO, OLD, REPO), run))
+        conn.commit()
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}") is True
+        assert kb.list_runs(conn, tid)[-1].metadata["own_prs"] == [f"{REPO}#7900", f"{REPO}#{NEW}"]
+
+
+def test_e2e_park_refuses_a_live_claim_without_ownership(board, monkeypatch):
+    # Prism 28a20c93323b: the same live-claim fence as complete_task
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        monkeypatch.setattr(kb, "_claim_is_live", lambda trow: True)
+        with pytest.raises(kb.LiveClaimError):
+            kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}")
+        assert _status(conn, tid) == "blocked"
+
+
+def test_e2e_park_keeps_result_and_records_review_provenance(board, monkeypatch):
+    # Prism 4ba1d3ae3905 + 2a212f2d5c68: --result survives; a review_requested event names the implementer
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}", result="RESULT-EVIDENCE-LINE") is True
+        assert "RESULT-EVIDENCE-LINE" in (kb.list_runs(conn, tid)[-1].summary or "")
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
+        assert ev and ev[-1].payload["implementer"] == "worker"

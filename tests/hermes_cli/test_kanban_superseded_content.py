@@ -536,12 +536,13 @@ def test_frontmatter_deleted_key_replaced_by_a_mapping_is_not_carried():
 F87 = "scripts/tests/mutate_prism_completed_required.sh"
 
 
-def _sha_close(monkeypatch, *, login="ang-fleet-interactive[bot]", files=(F87,), named=SHA[:11]):
+def _sha_close(monkeypatch, *, login="ang-fleet-interactive[bot]", files=(F87,), named=SHA[:11], pr_files=(F87,)):
     from hermes_cli import kanban_superseded_open as so
     body = f"CLOSED: SUPERSEDED-BY {named} -- main fixed the same anchors independently [card t_87e32ff7]"
     monkeypatch.setattr(so, "pr_thread", lambda repo, n: {"body": "", "comments": [
         {"body": body, "login": login, "assoc": "NONE"}]})
     monkeypatch.setattr(so, "commit_files", lambda repo, sha: (SHA, set(files)) if SHA.startswith(sha) else None)
+    monkeypatch.setattr(so, "pr_files", lambda repo, n: set(pr_files))
 
 
 def test_e2e_close_record_sha_touching_every_differing_file_closes(board, monkeypatch):
@@ -561,6 +562,7 @@ def test_e2e_close_record_sha_touching_every_differing_file_closes(board, monkey
     {"files": ("some/other/file.py",)},              # the 4729 shape: the commit did not touch the differing file
     {"login": "random-user"},                        # an untrusted author's CLOSED: line
     {"named": "0123456789a"},                        # the record names a different sha
+    {"pr_files": (F87, "a.py")},                     # Prism 1da76026aee9: the PR's other file is not in that commit
 ])
 def test_e2e_close_record_mutants_still_refused(board, monkeypatch, variant):
     _gate_stubs(monkeypatch, _check(**{SHA: {"sha": SHA, "default": "main", "differs": [F87]}}))

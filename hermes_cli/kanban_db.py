@@ -10866,7 +10866,7 @@ def _enforce_superseded_content(
         # the sha and that commit touched every file that differs; the PR must also have had no other failure.
         if err.differs and not err.unverified and not err.off_default:
             from hermes_cli import kanban_superseded_open as _sopen
-            covered = {pr: _sopen.sha_close_covers(pr, paths, shas) for pr, paths in err.differs.items()}
+            covered = {pr: _sopen.sha_close_covers(pr, shas) for pr in err.differs}
             if all(covered.values()):
                 with write_txn(conn):
                     _append_event(conn, task_id, "routed_pr_superseded",
@@ -11438,8 +11438,18 @@ def complete_task(
                 task_id, [r for r in _open_pr.extract_pr_refs(*closed_err.closed)],
                 superseded_by=superseded_by, query_fn=_pr_query or _open_pr.memo_query())
             if targets:
-                return _sopen.park(conn, task_id, targets, expected_run_id=expected_run_id,
-                                   summary=summary, metadata=metadata)
+                park_meta, staged = _stage_routed_scratch_artifacts(
+                    conn, task_id, dict(metadata or {}), summary=summary, result=result)
+                ok = False
+                try:
+                    ok = _sopen.park(conn, task_id, targets, expected_run_id=expected_run_id, force=force,
+                                     summary=summary, result=result, metadata=park_meta,
+                                     own_prs=[f"{r.repo}#{r.number}" for r in _open_pr.split_fleet(
+                                         _open_pr.extract_pr_refs(*_card_recorded_pr_refs(conn, task_id),
+                                                                  metadata=metadata, survivor_pr=survivor_pr))[0]])
+                finally:
+                    _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+                return ok
         with write_txn(conn):
             _append_event(
                 conn, task_id, "completion_blocked_closed_unmerged_pr",

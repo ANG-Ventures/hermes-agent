@@ -152,14 +152,30 @@ def commit_files(repo: str, sha: str) -> Optional[tuple]:
         return None
 
 
-def sha_close_covers(pr_key: str, paths, shas, *, thread_fn: Optional[ThreadFn] = None,
-                     files_fn: Optional[Callable] = None) -> Optional[str]:
+def pr_files(repo: str, number: int) -> Optional[set]:
+    """Every path a PR changes (REST, paginated), or None when unreadable."""
+    try:
+        proc = subprocess.run(["gh", "api", "--hostname", "github.com", "--paginate",
+                               f"repos/{repo}/pulls/{int(number)}/files?per_page=100", "--jq", ".[].filename"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=QUERY_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {ln for ln in proc.stdout.splitlines() if ln.strip()} or None
+
+
+def sha_close_covers(pr_key: str, shas, *, thread_fn: Optional[ThreadFn] = None,
+                     files_fn: Optional[Callable] = None, pr_files_fn: Optional[Callable] = None) -> Optional[str]:
     """t_87e32ff7: the sha (one of ``shas``) the closed PR's own trusted ``CLOSED: SUPERSEDED-BY <sha>`` names, when
-    that commit touched every path in ``paths`` (the files the line-match found worded differently); else None.
-    The 4729 shape (a commit on main that touched 1 of the PR's 14 files) is still refused."""
+    that ONE commit touched EVERY file the PR changes (Prism 1da76026aee9: never a file that only the tip carries);
+    else None. The 4729 shape (a commit on main that touched 1 of the PR's 14 files) is still refused."""
     thread_fn = thread_fn or _default_thread()
-    files_fn = files_fn or (None if os.environ.get("PYTEST_CURRENT_TEST") else commit_files)
-    if thread_fn is None or files_fn is None:
+    live = not os.environ.get("PYTEST_CURRENT_TEST")
+    files_fn = files_fn or (commit_files if live else None)
+    pr_files_fn = pr_files_fn or (pr_files if live else None)
+    if thread_fn is None or files_fn is None or pr_files_fn is None:
         return None
     repo, _, n = pr_key.rpartition("#")
     thread = thread_fn(repo, int(n))
@@ -170,6 +186,9 @@ def sha_close_covers(pr_key: str, paths, shas, *, thread_fn: Optional[ThreadFn] 
     if tok not in FOLLOW or not m:
         return None
     named = m.group(1)
+    paths = pr_files_fn(repo, int(n))
+    if not paths:
+        return None
     for sha in shas:
         if not (sha.startswith(named) or named.startswith(sha)):
             continue
@@ -180,28 +199,50 @@ def sha_close_covers(pr_key: str, paths, shas, *, thread_fn: Optional[ThreadFn] 
 
 
 def park(conn: sqlite3.Connection, task_id: str, targets: list, *, expected_run_id: Optional[int] = None,
-         summary: Optional[str] = None, metadata: Optional[dict] = None) -> bool:
-    """Move the card to ``review`` with the successors as its own PRs (the open-PR route; the closer completes it
-    when they merge). One ``routed_pr_superseded`` event + the route comment."""
+         force: bool = False, summary: Optional[str] = None, result: Optional[str] = None,
+         metadata: Optional[dict] = None, own_prs=()) -> bool:
+    """Move the card to ``review`` with the successors replacing the superseded PRs among its own PRs (the open-PR
+    route; the closer completes it when they ALL merge). Same fences as a normal review handoff: a live worker claim
+    needs ``expected_run_id`` or ``force`` (:class:`kanban_db.LiveClaimError`), the reviewer is resolved by
+    ``resolve_reviewer`` and a ``review_requested`` event records the implementer. One ``routed_pr_superseded``
+    event + the route comment."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_open_pr as _open_pr
-    succ = list(dict.fromkeys(t["successor"] for t in targets))
-    refs = _open_pr.extract_pr_refs(*succ)
+    closed = {t["closed"].lower() for t in targets}
+    keep = [p for p in own_prs if str(p).lower() not in closed]
+    own = list(dict.fromkeys(keep + [t["successor"] for t in targets]))
+    refs = _open_pr.extract_pr_refs(*own)
     note = _open_pr.route_note(refs) + " (" + "; ".join(f"{t['closed']} {t['token']}" for t in targets) + ")"
-    meta = dict(metadata or {}, own_prs=succ, auto_routed_open_prs=succ,
-                routed_pr_superseded={"targets": targets})
+    text = "\n".join(x for x in (note, summary, result) if x)
+    meta = dict(metadata or {}, own_prs=own, auto_routed_open_prs=own, routed_pr_superseded={"targets": targets})
     with kb.write_txn(conn):
+        trow = conn.execute("SELECT assignee, status, claim_lock, current_run_id, worker_pid, worker_started_at "
+                            "FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if trow is None:
+            return False
+        if expected_run_id is None and not force and kb._claim_is_live(trow):
+            raise kb.LiveClaimError(task_id)
+        implementer = None
+        if trow["current_run_id"] is not None:
+            arow = conn.execute("SELECT profile FROM task_runs WHERE id = ?", (trow["current_run_id"],)).fetchone()
+            implementer = arow["profile"] if arow else None
+        implementer = implementer or trow["assignee"]
+        reviewer, err = kb.resolve_reviewer(None, implementer)
+        if err is not None:
+            raise ValueError(f"{task_id}: superseded park refused: {err}")
         sql = ("UPDATE tasks SET status = 'review', claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-               "block_kind = NULL WHERE id = ? AND status IN ('running', 'ready', 'blocked', 'review')")
-        args: tuple = (task_id,)
+               "block_kind = NULL" + (", assignee = ?" if reviewer is not None else "") +
+               " WHERE id = ? AND status IN ('running', 'ready', 'blocked', 'review')")
+        args: tuple = ((reviewer,) if reviewer is not None else ()) + (task_id,)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             args += (int(expected_run_id),)
         if conn.execute(sql, args).rowcount != 1:
             return False
-        kb._end_or_synthesize_run(conn, task_id, outcome="review_requested", status="review",
-                                  summary="\n".join(x for x in (note, summary) if x), metadata=meta,
-                                  synthesize=True)
-        kb._append_event(conn, task_id, "routed_pr_superseded", {"targets": targets})
+        run_id = kb._end_or_synthesize_run(conn, task_id, outcome="review_requested", status="review",
+                                           summary=text, metadata=meta, synthesize=True, profile=implementer)
+        kb._append_event(conn, task_id, "review_requested",
+                         {"summary": note[:400], "implementer": implementer, "reviewer": reviewer}, run_id=run_id)
+        kb._append_event(conn, task_id, "routed_pr_superseded", {"targets": targets, "own_prs": own})
     kb.add_comment(conn, task_id, "kanban", _open_pr.route_comment(refs))
     return True
