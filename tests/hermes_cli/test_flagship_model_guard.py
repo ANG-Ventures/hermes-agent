@@ -1384,3 +1384,43 @@ def test_send_back_journals_under_the_writer_lock(flagship_profiles, proven_oper
         monkeypatch.setattr(kanban_journal, "append", watched)
         assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
     assert outside == []
+
+
+@pytest.mark.parametrize("author", [" ", "\t"])
+def test_batch_with_a_bad_audit_comment_journals_nothing(flagship_profiles, monkeypatch, tmp_path, author):
+    """Prism d0b2bf482d38: the batch judges add_comment's refusals for every
+    audit comment the write pass will insert, before the first write, so a
+    valid earlier card journals nothing when a later card's comment is bad."""
+    _journal_env(monkeypatch, tmp_path)
+    ok = _card("daedalus-opus")
+    bad = _card("daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    before = len(_journal_kinds(board, ok))
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="comment author is required"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=ok, touch_model=True, model="claude-sonnet-5",
+                                   audit_comment_author="apollo", audit_comment_body="audit"),
+                kb.BatchRouteWrite(task_id=bad, touch_model=True, model="claude-sonnet-5",
+                                   audit_comment_author=author, audit_comment_body="audit"),
+            ])
+        assert kb.get_task(conn, ok).model_override is None
+    assert _journal_kinds(board, ok)[before:] == []
+    assert _comments(ok) == []
+
+
+@pytest.mark.parametrize("target", [None, "human", "human:ace"])
+def test_unassign_or_park_a_legacy_flagship_pin_needs_no_permission(flagship_profiles, target):
+    """Prism cc3a960e76a8: a target nothing can run (unassigned, human) is not
+    a route, so unassigning or parking a card pinned to a flagship with no
+    override succeeds and writes no override."""
+    task_id = _legacy_flagship_card()
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-opus', model_override = ? WHERE id = ?",
+                     (FABLE, task_id))
+        conn.commit()
+    with kb.connect() as conn:
+        assert kb.assign_task(conn, task_id, target)
+        assert kb.get_task(conn, task_id).assignee == target
+    assert _comments(task_id) == []

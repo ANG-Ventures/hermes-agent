@@ -7669,29 +7669,54 @@ def _set_model_override_locked(
     if pin_sub_reason:
         payload.update(pin_sub_reason=pin_sub_reason, pin_sub_fallback=pin_sub_fallback)
     _append_event(conn, task_id, "model_override_set", payload)
+    for author, body in _model_override_comments(
+        model, provider,
+        audit_comment_author=audit_comment_author,
+        audit_comment_body=audit_comment_body,
+        pin_sub_reason=pin_sub_reason,
+        pin_sub_fallback=pin_sub_fallback,
+        pin_sub_author=pin_sub_author,
+        force_model_reason=force_model_reason,
+    ):
+        add_comment(conn, task_id, author, body)
+    return True
+
+
+def _model_override_comments(
+    model: Optional[str],
+    provider: Optional[str],
+    *,
+    audit_comment_author: Optional[str] = None,
+    audit_comment_body: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
+    pin_sub_author: Optional[str] = None,
+    force_model_reason: Optional[str] = None,
+) -> list[tuple[str, str]]:
+    """The ``(author, body)`` comments :func:`_set_model_override_locked`
+    writes, in order. One list for the writer and the batch judge, so the
+    judge validates exactly what the write pass inserts (Prism d0b2bf482d38)."""
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    pin_sub_fallback = bool(pin_sub_reason and pin_sub_fallback)
+    out: list[tuple[str, str]] = []
     if audit_comment_body:
-        add_comment(
-            conn,
-            task_id,
-            audit_comment_author or "",
-            audit_comment_body,
-        )
+        out.append((audit_comment_author or "", audit_comment_body))
     if pin_sub_reason:
         from hermes_cli.model_policy import sub_pin_comment
 
-        add_comment(
-            conn, task_id, pin_sub_author or audit_comment_author or "operator",
+        out.append((
+            pin_sub_author or audit_comment_author or "operator",
             sub_pin_comment(provider, pin_sub_reason, fallback=pin_sub_fallback),
-        )
+        ))
     if model and (force_model_reason or "").strip():
         from hermes_cli.model_registry import resolve
 
         if resolve(provider, model, force_reason=force_model_reason, resolve_aliases=False).reason == "forced":
-            add_comment(
-                conn, task_id, pin_sub_author or audit_comment_author or "operator",
+            out.append((
+                pin_sub_author or audit_comment_author or "operator",
                 _model_force_comment(provider, model, force_model_reason or ""),
-            )
-    return True
+            ))
+    return out
 
 
 def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optional[str]) -> bool:
@@ -7958,6 +7983,19 @@ def apply_batch_route_writes(
                 "SELECT status FROM tasks WHERE id = ?", (write.task_id,),
             ).fetchone()["status"] == "archived":
                 raise RuntimeError(f"cannot set route on archived task {write.task_id}")
+            if write.touch_model:
+                # add_comment's refusals for every comment the write pass will
+                # insert, judged before the first write (Prism d0b2bf482d38).
+                for author, body in _model_override_comments(
+                    model, provider,
+                    audit_comment_author=write.audit_comment_author,
+                    audit_comment_body=write.audit_comment_body,
+                    pin_sub_reason=write.pin_sub_reason,
+                    pin_sub_fallback=write.pin_sub_fallback,
+                    pin_sub_author=write.pin_sub_author or write.audit_comment_author,
+                    force_model_reason=write.force_model_reason,
+                ):
+                    _validate_comment_args(author, body)
             if write.touch_model and not (write.audit_comment_body or "").lstrip().casefold().startswith(
                 FLAGSHIP_OVERRIDE_COMMENT_PREFIX
             ):
@@ -8293,6 +8331,23 @@ def _validate_comment_provenance(
     return run_id, session_ref
 
 
+def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = False) -> None:
+    """:func:`add_comment`'s author/body refusals, with no database access, so a
+    batch can judge every comment it will insert before its first write
+    (Prism d0b2bf482d38)."""
+    if not body or not body.strip():
+        raise ValueError("comment body is required")
+    if not author or not author.strip():
+        raise ValueError("comment author is required")
+    # The one place every comment writer shares, so the body is exact (t_ebc8eb87).
+    from hermes_cli.kanban_close_on_guard import check_approve_stamp, check_comment
+
+    check_comment(author, body)
+    if not kernel_approve:
+        check_approve_stamp(author, body)
+    _check_flagship_override_body(author, body)
+
+
 # Bound on an unhonoured ``--author`` label kept for forensics (see add_comment).
 _CLAIMED_AUTHOR_MAX = 200
 
@@ -8340,17 +8395,7 @@ def add_comment(
     card, author, verb and session inside the insert's transaction; else
     :class:`~hermes_cli.kanban_sign_grants.GrantRefused` and nothing is written.
     """
-    if not body or not body.strip():
-        raise ValueError("comment body is required")
-    if not author or not author.strip():
-        raise ValueError("comment author is required")
-    # The one place every comment writer shares, so the body is exact (t_ebc8eb87).
-    from hermes_cli.kanban_close_on_guard import check_approve_stamp, check_comment
-
-    check_comment(author, body)
-    if not _kernel_approve:
-        check_approve_stamp(author, body)
-    _check_flagship_override_body(author, body)
+    _validate_comment_args(author, body, kernel_approve=_kernel_approve)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")
