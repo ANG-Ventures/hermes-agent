@@ -1350,15 +1350,147 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+_GH_REPO_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$")
+_GH_PR_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/\d+$")
+_GH_REMOTE_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+
+
+def _card_repo(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The card's GitHub repo: ``completion_contract`` (OWNER/REPO or a PR URL), else the
+    workspace checkout's ``origin`` when it is readable on this host."""
+    row = conn.execute("SELECT completion_contract, workspace_path FROM tasks WHERE id = ?",
+                       (task_id,)).fetchone()
+    if row is None:
+        return None
+    contract = (_kb._row_get(row, "completion_contract") or "").strip()
+    for rx in (_GH_REPO_RE, _GH_PR_URL_RE):
+        m = rx.match(contract)
+        if m:
+            return m.group(1)
+    ws = _kb._row_get(row, "workspace_path")
+    if ws and os.path.isdir(ws):
+        try:
+            url = subprocess.run(["git", "-C", ws, "remote", "get-url", "origin"],
+                                 capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        m = _GH_REMOTE_RE.search(url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _gh_json(endpoint: str) -> Any:
+    proc = subprocess.run(["gh", "api", "--hostname", "github.com", endpoint],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=30, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh api {endpoint.split('?')[0]} rc={proc.returncode}")
+    return json.loads(proc.stdout or "null")
+
+
+def timed_out_handback_pr(conn: sqlite3.Connection, task_id: str, run_started_at: int) -> Optional[dict]:
+    """An OPEN PR on this card's branch whose head was pushed during the timed-out run (t_e7537cb1).
+
+    The branch is any head ref naming the card (``wt/<card>``, ``<profile>/<card>-topic``); the
+    head commit's committer date must be at or after the run's start, so a run that pushed
+    nothing new (e.g. a send-back it never answered) still retries. Returns
+    ``{"pr": "o/r#n", "sha": <head>, "url": ...}`` or None. Lookup errors return None, so the
+    run retries exactly as before (fail toward the old behaviour).
+    """
+    from hermes_cli.kanban_open_pr import branch_names_card
+
+    repo = _card_repo(conn, task_id)
+    if not repo:
+        return None
+    try:
+        pulls = _gh_json(f"repos/{repo}/pulls?state=open&per_page=100&sort=updated&direction=desc")
+        for pr in pulls or []:
+            head = pr.get("head") or {}
+            if not branch_names_card(head.get("ref"), task_id) or not head.get("sha"):
+                continue
+            commit = _gh_json(f"repos/{repo}/commits/{head['sha']}")
+            stamp = ((commit or {}).get("commit") or {}).get("committer", {}).get("date")
+            from datetime import datetime
+            pushed = int(datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp())
+            if pushed >= int(run_started_at):
+                return {"pr": f"{repo}#{pr['number']}", "sha": head["sha"],
+                        "url": pr.get("html_url")}
+    except Exception as exc:
+        _kb._log.warning("timed-out handback lookup for %s failed (retrying as before): %s", task_id, exc)
+    return None
+
+
+def _default_handback_fn():
+    """The real lookup, or None inside pytest (tests pass an explicit stub)."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    return timed_out_handback_pr
+
+
+def emit_soft_deadlines(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+    """Post ONE ``SOFT DEADLINE`` comment + ``soft_deadline`` event per run at limit - margin.
+
+    Margin = max(10 min, 15% of max_runtime) (``kanban_worker_policy.soft_margin_seconds``).
+    The worker sees the comment on its next board read; the event keys the once-per-run guard.
+    """
+    from hermes_cli import kanban_worker_policy as _kwp
+
+    now = int(time.time()) if now is None else int(now)
+    host_prefix = _kb._host_prefix()
+    emitted: list[str] = []
+    rows = conn.execute(
+        "SELECT t.id, t.max_runtime_seconds, t.claim_lock, t.current_run_id, "
+        "       r.started_at AS run_started_at "
+        "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "  AND t.max_runtime_seconds > 0 AND r.started_at IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        if not (row["claim_lock"] or "").startswith(host_prefix):
+            continue
+        limit = int(row["max_runtime_seconds"])
+        started = int(row["run_started_at"])
+        hard = started + limit
+        soft = hard - _kwp.soft_margin_seconds(limit)
+        if now < soft or now >= hard:
+            continue
+        tid, run_id = row["id"], int(row["current_run_id"])
+        with _kb.write_txn(conn):
+            if conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = 'soft_deadline' LIMIT 1", (tid, run_id),
+            ).fetchone():
+                continue
+            _kb._append_event(conn, tid, "soft_deadline",
+                              {"soft_at": soft, "hard_at": hard, "limit_seconds": limit},
+                              run_id=run_id)
+        _kb.add_comment(conn, tid, "dispatcher", _kwp.soft_deadline_comment(hard))
+        emitted.append(tid)
+    return emitted
+
+
+def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None, handback_fn=None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
     task's source phase so the next tick re-spawns the same kind of worker —
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+
+    A run that already pushed its handback (an open PR on the card's branch with a head
+    pushed during the run, ``handback_fn``) goes to ``review`` instead of a retry
+    (t_e7537cb1): the ``timed_out`` event carries ``handback_pr`` and the failure counter
+    is not charged. ``handback_fn(conn, task_id, run_started_at)`` defaults to
+    :func:`timed_out_handback_pr` (None under pytest).
     """
     timed_out: list[str] = []
+    try:
+        emit_soft_deadlines(conn)
+    except Exception as exc:  # advisory; never costs the hard-limit pass
+        _kb._log.warning("soft-deadline pass failed: %s", exc)
+    if handback_fn is None:
+        handback_fn = _default_handback_fn()
     now = int(time.time())
     host_prefix = _kb._host_prefix()
 
@@ -1418,15 +1550,35 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        # A handback already on the remote (t_e7537cb1): read outside the write txn (network).
+        # Only an implementation run (source phase ready) on an ordinary board qualifies.
+        handback = None
+        if (handback_fn is not None and not _kdb.conn_is_delegations(conn)
+                and _kb._retry_status_for_run(conn, tid) == "ready"):
+            try:
+                handback = handback_fn(conn, tid, int(row["active_started_at"]))
+            except Exception as exc:
+                _kb._log.warning("timed-out handback lookup for %s raised (retrying): %s", tid, exc)
+                handback = None
+        reviewer = None
+        if handback:
+            reviewer, _rev_err = _kb.resolve_reviewer(None, None)
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
+            next_status = "review" if handback else _kdb.requeue_status(conn, retry_status)
+            implementer = None
+            if handback:
+                prow = conn.execute("SELECT profile FROM task_runs WHERE id = ?",
+                                    (row["current_run_id"],)).fetchone()
+                implementer = prow["profile"] if prow else None
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL"
+                + (", assignee = ?" if reviewer else "") + " "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (_kdb.requeue_status(conn, retry_status), tid, pid, row["claim_lock"]),
+                (next_status, *((reviewer,) if reviewer else ()), tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -1434,23 +1586,45 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
                     "sigkill": killed,
-                    "retry_status": retry_status,
+                    "retry_status": "review" if handback else retry_status,
                 }
+                if handback:
+                    payload["handback_pr"] = handback["pr"]
+                    payload["handback_sha"] = handback["sha"]
                 if termination.get("identity_mismatch"):
                     payload["identity_mismatch"] = True
+                summary = (f"timed-out handback: PR {handback['pr']} @{handback['sha'][:10]}"
+                           if handback else None)
+                run_meta = payload
+                if handback:
+                    # own_prs: the card's PR record later approval/archive gates read.
+                    run_meta = dict(payload, own_prs=[handback["pr"]],
+                                    auto_routed_open_prs=[handback["pr"]])
                 run_id = _kb._end_run(
                     conn, tid,
-                    outcome="timed_out", status="timed_out",
+                    outcome="timed_out", status="timed_out", summary=summary,
                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                    metadata=payload,
+                    metadata=run_meta,
                 )
                 _kb._append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
+                if handback:
+                    # Same provenance a worker's request_review records, so the review lane
+                    # (approve / request_changes) routes it like any other handback.
+                    _kb._append_event(conn, tid, "review_requested", {
+                        "summary": summary, "implementer": implementer, "reviewer": reviewer,
+                        "timed_out_handback": True,
+                    }, run_id=run_id)
                 if _kdb.conn_is_delegations(conn):
                     _kdb.park_event(conn, tid, outcome="timed_out",
                                     retry_status=retry_status, run_id=run_id)
                 timed_out.append(tid)
+        if cur.rowcount == 1 and handback:
+            _kb.add_comment(conn, tid, "dispatcher",
+                            f"timed out with its handback pushed: PR {handback['pr']} "
+                            f"@{handback['sha']} -> review, not retry")
+            continue
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
         # ``gave_up`` on top of the ``timed_out`` already emitted.
@@ -8315,6 +8489,21 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
+def _run_started_at(task: Task, board: Optional[str]) -> int:
+    """``task_runs.started_at`` of the claimed run: the origin enforce_max_runtime measures from.
+    Falls back to now (a claim opens its run in the same tick)."""
+    if task.max_runtime_seconds and task.current_run_id is not None:
+        try:
+            with _kb.connect_closing(board=board) as conn:
+                row = conn.execute("SELECT started_at FROM task_runs WHERE id = ?",
+                                   (int(task.current_run_id),)).fetchone()
+            if row and row["started_at"] is not None:
+                return int(row["started_at"])
+        except Exception as exc:
+            _kb._log.debug("kanban worker: run start unreadable for %s (%s)", task.id, exc)
+    return int(time.time())
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8524,6 +8713,11 @@ def _default_spawn(
     )
     if foreground_timeout is not None:
         env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = foreground_timeout
+    # The worker's clock (t_e7537cb1): the epoch enforce_max_runtime kills it at.
+    from hermes_cli import kanban_worker_policy as _kwp
+    for _name in (_kwp.DEADLINE_ENV, _kwp.MAX_RUNTIME_ENV):
+        env.pop(_name, None)
+    env.update(_kwp.deadline_env(_run_started_at(task, board), task.max_runtime_seconds))
     # Pin the shared board + workspaces root the dispatcher resolved, so
     # that even when the worker activates a profile (`hermes -p <name>`
     # rewrites HERMES_HOME), its kanban paths still match the
