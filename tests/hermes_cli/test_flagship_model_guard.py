@@ -916,3 +916,114 @@ def test_override_body_write_gate_proves_the_claimed_author(flagship_profiles, m
         _assert_authorized(card)
     else:
         assert _comments(card) == [] and _refused_at_dispatch(card)
+
+
+# --- follow-ups t_b5dfd04f (Prism 40019830ac27, e25e5d877449, cd10822b8d6e) ---------
+
+
+def _no_worker_card(assignee: str) -> str:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="nw", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = ?, no_worker = 1 WHERE id = ?", (assignee, task_id))
+        conn.commit()
+    return task_id
+
+
+def test_worker_ok_on_an_unchanged_flagship_assignee_is_gated_at_assign(flagship_profiles):
+    """Clearing no_worker releases the card to dispatch on its profile route:
+    a flagship default is refused here, not parked flagship_refused later."""
+    task_id = _no_worker_card("daedalus-fable")
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            kb.assign_task(conn, task_id, "daedalus-fable", worker_ok=True)
+        assert kb.get_task(conn, task_id).no_worker
+    assert _comments(task_id) == []
+    plain = _no_worker_card("daedalus-opus")
+    with kb.connect() as conn:
+        assert kb.assign_task(conn, plain, "daedalus-opus", worker_ok=True)
+        assert not kb.get_task(conn, plain).no_worker
+    assert _comments(plain) == []
+
+
+def test_batch_pin_clear_rechecks_the_route_inside_the_write_txn(flagship_profiles):
+    """A reassign that lands between the CLI precheck and the batch commit
+    (legal: a pinned card's route is its pin) cannot carry the clear onto a
+    flagship profile default. The whole batch unwinds."""
+    task_id = _card("daedalus-opus", "claude-opus-5-5")
+    other = _card("daedalus-opus", "claude-opus-5-5")
+    with kb.connect() as conn:
+        assert kb.clear_pin_flagship_reason(conn, task_id, None) is None   # the precheck passes
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-fable' WHERE id = ?", (task_id,))
+        conn.commit()
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="cannot clear the model pin"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=other, touch_model=True),
+                kb.BatchRouteWrite(task_id=task_id, touch_model=True),
+            ])
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+        assert kb.get_task(conn, other).model_override == "claude-opus-5-5"
+    assert _comments(task_id) == [] and _comments(other) == []
+
+
+def test_reassign_worker_ok_reclaim_refuses_before_signalling(flagship_profiles, monkeypatch):
+    """Prism 5df499a16242: reassign --worker-ok --reclaim on an unchanged
+    flagship-default assignee is refused BEFORE the reclaim, so the live
+    worker is never signalled and its claim stays intact."""
+    reclaimed = []
+    monkeypatch.setattr(kb, "reclaim_task", lambda *a, **k: reclaimed.append(a) or True)
+    task_id = _card("daedalus-opus")
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task_id)
+        conn.execute(
+            "UPDATE tasks SET assignee = 'daedalus-fable', no_worker = 1 WHERE id = ?", (task_id,),
+        )
+        conn.commit()
+        receipt: dict = {}
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            kb.reassign_task(conn, task_id, "daedalus-fable", reclaim_first=True,
+                             worker_ok=True, receipt=receipt)
+        assert reclaimed == [] and receipt == {}
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running" and task.claim_lock and task.no_worker
+    assert _comments(task_id) == []
+
+
+def test_assign_reason_on_a_flagship_pin_is_recorded(flagship_profiles, proven_operator):
+    """Prism 0cfef50d081b (#2425 r16): a card whose PIN itself is flagship (no
+    alias remap) is a flagship route; an operator reason given on assign is
+    recorded, not dropped, so the card is no longer refused at dispatch."""
+    task_id = _legacy_flagship_card()
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-opus', model_override = ? WHERE id = ?",
+                     (FABLE, task_id))
+        conn.commit()
+    assert _refused_at_dispatch(task_id)
+    with kb.connect() as conn:
+        assert kb.assign_task(conn, task_id, "daedalus-opus", flagship_override_reason=REASON)
+    _assert_authorized(task_id)
+
+
+def test_assign_rejudges_the_route_inside_the_write_txn(flagship_profiles, monkeypatch):
+    """Prism 5df499a16242 (carried, Stale Validation): the pre-txn check can
+    pass on a pin that a concurrent clear removes before the assignment
+    commits. The route is judged again on the locked row; the assignment
+    unwinds instead of landing a flagship default with no override."""
+    task_id = _card("daedalus-opus", "claude-opus-5-5")
+    real = kb._assignee_flagship_reason
+    calls = []
+
+    def racing(conn, tid, *a, **k):
+        calls.append(tid)
+        out = real(conn, tid, *a, **k)
+        if len(calls) == 1:   # the preflight passed; the pin is cleared before the txn
+            conn.execute("UPDATE tasks SET model_override = NULL WHERE id = ?", (tid,))
+            conn.commit()
+        return out
+
+    monkeypatch.setattr(kb, "_assignee_flagship_reason", racing)
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            kb.assign_task(conn, task_id, "daedalus-fable")
+        assert kb.get_task(conn, task_id).assignee == "daedalus-opus"
+    assert len(calls) == 2
+    assert _comments(task_id) == []

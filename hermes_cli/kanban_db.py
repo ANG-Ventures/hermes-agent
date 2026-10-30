@@ -7165,14 +7165,21 @@ def _assignee_flagship_reason(
     profile: Optional[str],
     reason: Optional[str],
     actor: Optional[str],
+    *,
+    releases_dispatch: bool = False,
 ) -> Optional[str]:
     """Flagship gate for assign/reassign (t_9e7ba884): the route only changes
     when the assignee does and the card has no model pin, but an explicit
-    reason on the same assignee still authorizes a legacy flagship card."""
+    reason on the same assignee still authorizes a legacy flagship card.
+    ``releases_dispatch`` (``--worker-ok`` clearing ``no_worker``) judges an
+    unchanged assignee too: the card becomes dispatchable on that route
+    (Prism 40019830ac27)."""
     row = conn.execute(
         "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
-    if row is None or (row["assignee"] == profile and not (reason or "").strip()):
+    if row is None or (
+        row["assignee"] == profile and not releases_dispatch and not (reason or "").strip()
+    ):
         return None
     return _route_flagship_reason(
         conn, task_id, profile, reason, actor,
@@ -7337,6 +7344,7 @@ def assign_task(
     # judged in here before any write or reclaim.
     flagship_reason = _assignee_flagship_reason(
         conn, task_id, profile, flagship_override_reason, operator,
+        releases_dispatch=clear_no_worker,
     )
     changes_reason = str(request_changes_reason or "").strip()
     if not changes_reason:
@@ -7374,6 +7382,12 @@ def assign_task(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        # Re-judge on the locked row: a pin cleared between the preflight and
+        # this txn changes the route (Prism 5df499a16242, Stale Validation).
+        flagship_reason = _assignee_flagship_reason(
+            conn, task_id, profile, flagship_override_reason, operator,
+            releases_dispatch=clear_no_worker,
+        )
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
@@ -7910,6 +7924,8 @@ def apply_batch_route_writes(
         if ov is not None:
             overrides[write.task_id] = ov
 
+    from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+
     written: list[str] = []
     fields: dict[str, tuple[str, ...]] = {}
     skipped_now: dict[str, str] = {}
@@ -7926,13 +7942,19 @@ def apply_batch_route_writes(
                 continue
             changed: tuple[str, ...] = ()
             if write.touch_model:
-                if model and not (write.audit_comment_body or "").lstrip().casefold().startswith(
+                if not (write.audit_comment_body or "").lstrip().casefold().startswith(
                     FLAGSHIP_OVERRIDE_COMMENT_PREFIX
                 ):
-                    # The pin as the assignee RUNS it (its aliases), under
-                    # the same lock the write commits against (a1f3096286e2).
-                    # Raises unless the card already carries an override.
-                    pin_flagship_reason(conn, write.task_id, model, None)
+                    if model:
+                        # The pin as the assignee RUNS it (its aliases), under
+                        # the same lock the write commits against (a1f3096286e2).
+                        # Raises unless the card already carries an override.
+                        pin_flagship_reason(conn, write.task_id, model, None)
+                    else:
+                        # The CLI judged the clear before the lock; re-judge it on
+                        # the locked row so a reassign onto a flagship default in
+                        # between unwinds the batch (Prism e25e5d877449/cd10822b8d6e).
+                        clear_pin_flagship_reason(conn, write.task_id, None)
                 if not _set_model_override_locked(
                     conn, write.task_id, model, provider,
                     audit_comment_author=write.audit_comment_author,
@@ -10535,14 +10557,16 @@ def reassign_task(
     The ``no_worker`` refusal (:class:`NoWorkerFlagSet`) is checked BEFORE
     the reclaim, so a refused reassign never signals a live worker.
     """
-    if not worker_ok:
-        refusal = _no_worker_refusal(conn, task_id, _canonical_assignee(profile))
-        if refusal:
-            raise NoWorkerFlagSet(refusal)
+    refusal = _no_worker_refusal(conn, task_id, _canonical_assignee(profile))
+    if refusal and not worker_ok:
+        raise NoWorkerFlagSet(refusal)
     # Flagship assignee gate BEFORE the reclaim, for the same reason: a refused
-    # reassign must never signal a live worker (t_9e7ba884).
+    # reassign must never signal a live worker (t_9e7ba884). ``--worker-ok``
+    # clearing no_worker is judged here exactly as assign_task judges it
+    # (Prism 5df499a16242).
     _assignee_flagship_reason(
         conn, task_id, _canonical_assignee(profile), flagship_override_reason, operator,
+        releases_dispatch=bool(refusal),
     )
     if reclaim_first:
         # Safe to call even if nothing to reclaim.

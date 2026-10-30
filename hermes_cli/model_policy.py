@@ -321,10 +321,13 @@ def pin_run_route_error(
     model: Optional[str],
     config: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    """Error text when the pin ``model`` RUNS as a flagship (or an unknown
-    route) under ``assignee``'s aliases, else ``None``. The pin string itself
-    is the caller's check (:func:`validate_worker_model`)."""
+    """Error text when the pin ``model`` is a flagship itself, or RUNS as one
+    (or an unknown route) under ``assignee``'s aliases, else ``None``. The
+    dispatcher refuses either without the card's override, so an assign
+    reason must be judged (and recorded) on both (Prism 0cfef50d081b)."""
     pin = str(model or "").strip()
+    if flagship_model_match(pin, config):
+        return flagship_model_error(pin)
     run = assignee_pinned_model(assignee, pin)
     if not run or run.casefold() == pin.casefold() or not assignee_route_gated(run, config):
         return None
