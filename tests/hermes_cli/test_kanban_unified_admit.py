@@ -136,12 +136,15 @@ class Fleet:
         self.mem = {"ci-box": 181.0, "ace-ai": 75.0, "ace-media": 77.0}
         self.age = 5.0
         self.gpu = {}
+        self.band = {}         # host -> published band.kanban (default ok)
+        self.extra = {}        # host -> extra pressure-row fields (procs, maxproc, slo_breach)
 
     def text(self, h):
-        return json.dumps({"host": h, "at": self.t0 - self.age, "load_ratio": 0.1, "band": {"kanban": "ok"},
+        return json.dumps({"host": h, "at": self.t0 - self.age, "load_ratio": 0.1,
+                           "band": {"kanban": self.band.get(h, "ok")},
                            "mem_available_gb": self.mem[h], "psi_cpu_some10": 1.0, "psi_mem_some10": 0.0,
                            "psi_io_some10": 0.5, "os": "linux", "ncpu": self.ncpu[h], "cpu_busy": self.busy[h],
-                           **({"gpu_free_mib": self.gpu[h]} if h in self.gpu else {})})
+                           **({"gpu_free_mib": self.gpu[h]} if h in self.gpu else {}), **self.extra.get(h, {})})
 
     def runner(self, argv, **kw):
         h = argv[-2].split("@", 1)[1]
@@ -454,20 +457,135 @@ def test_vendored_admission_demand_matches_canonical():
     assert body(ours) == body(Path(env).read_text(encoding="utf-8"))
 
 
-def test_kanban_unified_admit_defaults_off_until_t_c466b7ee(monkeypatch):
-    """t_3694ab3c hard stop: absent KANBAN_UNIFIED_ADMIT = 0 (today's rule) on every reader, the vendored band
-    rule included; "1" opts in; other classes keep the vendored default (absent = on)."""
+def test_kanban_unified_admit_defaults_on_kill_switch_zero(monkeypatch):
+    """t_c466b7ee: absent KANBAN_UNIFIED_ADMIT = 1 (the ONE rule) on every reader, the vendored rule included;
+    "0" is the kill switch (today's rule); other classes keep the vendored default."""
     from hermes_cli.fleet_placement import admission_demand as dmd
     from hermes_cli.kanban_load_gate import unified_admit
 
     monkeypatch.delenv("KANBAN_UNIFIED_ADMIT", raising=False)
     monkeypatch.delenv("PRISM_UNIFIED_ADMIT", raising=False)
-    assert unified_admit() is False
-    assert dmd.unified("kanban") is False
-    assert dmd.unified(dmd.workload_of("athena")) is False
-    assert dmd.unified("kanban", {}) is False
+    assert unified_admit() is True
+    assert dmd.unified("kanban") is True
+    assert dmd.unified(dmd.workload_of("athena")) is True
+    assert dmd.unified("kanban", {}) is True
     assert dmd.unified("prism") is True
-    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
-    assert unified_admit() is True and dmd.unified("kanban") is True
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
-    assert unified_admit() is False
+    assert unified_admit() is False and dmd.unified("kanban") is False
+
+
+# ------------------------------------------------- t_c466b7ee: round-8/9 Prism residue of #2397, red-on-base each
+
+def test_confirm_leaves_out_the_takes_own_row_by_reservation_id(home):
+    """Prism d1bd26bd688c: confirm_class dropped the FIRST lease matching (host, job_id, at). A second live row with the
+    same three (a re-admit of the same card in the same second) but a big footprint came first in the ledger, so it
+    was left out instead of the take's own row: the verdict read room that a live 150-thread row holds. By id, the
+    big row counts and the take is refused (and its own row dropped)."""
+    t0 = time.time()
+    plan = _plan(home, Fleet(t0))
+    rpath = Path(plan.signal.placement_reservations)
+    big = placement.reserve("ci-box", "kanban", placement.Footprint(ram_gb=3.0, threads=150.0), ttl_s=600,
+                            job_id="t_dup", path=rpath, now=t0)
+    own = placement.reserve("ci-box", "kanban", placement.Footprint(ram_gb=3.0, threads=2.0), ttl_s=600,
+                            job_id="t_dup", path=rpath, now=t0)
+    why = kh.confirm_class(plan, "ci-box", None, own)
+    assert why is not None and why.startswith("saturated:cpu"), why   # 0.40 + 150/256 + 2/256 > 0.90
+    ids = {r["id"] for r in _kanban_rows(home)}
+    assert own not in ids and big in ids, ids
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypatch, local):
+    """Prism 72e85daf44a6 / d618d0a51436: off the router host allocd books in ITS ledger, never this dispatcher's file;
+    confirm_class looked the row up locally, found nothing and refused every remote allocd take (closed: not live).
+    Remote: the take stands on allocd's verdict. Router host (one ledger): the local check still runs, and a row
+    allocd says it booked but the shared file lacks is refused as before."""
+    from hermes_cli import alloc_client
+
+    t0 = time.time()
+    f = Fleet(t0)
+    plan = _plan_mode(home, f, "on", monkeypatch)
+    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: local)
+    released = []
+    monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
+        host="ci-box", reservation_id="r_allocd_1", reason="ok"))
+    monkeypatch.setattr(kh, "release_alloc", lambda rid: released.append(rid))
+    host = plan.take("alpha", only=["ci-box"], job_id="t_remote")
+    if not local:
+        assert host is not None and host.name == "ci-box", plan.refusal
+        assert plan.last_reservation == "r_allocd_1" and released == []
+    else:
+        assert host is None and "r_allocd_1 not live" in plan.refusal, plan.refusal
+        assert released == ["r_allocd_1"]
+
+
+@pytest.mark.parametrize("extra,why", [({"slo_breach": True}, "saturated:slo"),
+                                       ({"procs": 9900, "maxproc": 10000}, "saturated:procs")])
+def test_the_full_utilization_sample_reaches_admit_class(home, extra, why):
+    """Prism ce581503f8d8: sample_fields / sample_from_detail dropped procs, maxproc and slo_breach, so admit_class
+    never saw the process-table and latency-SLO guards the band cap it replaces carried (ACE-AI voice hub)."""
+    f = Fleet(time.time())
+    f.extra["ace-ai"] = extra
+    plan = _plan(home, f)
+    keep, held = kh.unified_filter(plan, ["ace-ai"], None)
+    assert keep == [] and held["ace-ai"].startswith(why), held
+
+
+@pytest.mark.parametrize("admit_on_memory", [True, False])
+def test_hot_band_with_slo_breach_is_refused_on_both_paths_under_unified(home, admit_on_memory):
+    """Prism ce581503f8d8 (card acceptance): a published hot band.kanban + slo_breach on ace-ai, KANBAN_UNIFIED_ADMIT=1.
+    The pinned and the unpinned take both refuse. With admit_on_memory the band axis still zeroes the slots (only the
+    memory axis is retired); without it (the live config) admit_class refuses on the SLO guard."""
+    t0 = time.time()
+    f = Fleet(t0)
+    f.band["ace-ai"] = "hot"
+    f.extra["ace-ai"] = {"slo_breach": True}
+    cfg = {"placement": {"admit_on_memory": admit_on_memory}}
+    plan = _plan_cfg(home, f, cfg)
+    plan.signal.clock = lambda: t0
+    if admit_on_memory:
+        assert plan.slots["ace-ai"] == 0 and "band.kanban hot" in plan.detail["ace-ai"]["pressure"]
+    assert plan.take("alpha", pin="ace-ai") is None
+    assert plan.refusal.startswith("pin_host_"), plan.refusal
+    assert plan.take("alpha", only=["ace-ai"]) is None
+    assert plan.refusal.startswith(("unified_admission", "pool_unavailable")), plan.refusal
+
+
+def test_hot_band_kill_switch_keeps_todays_cap(home, monkeypatch):
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
+    f = Fleet(time.time())
+    f.band["ace-ai"] = "hot"
+    plan = _plan_cfg(home, f, {"placement": {"admit_on_memory": True}})
+    assert plan.slots["ace-ai"] == 0                              # today's cap: band.kanban hot = 0
+
+
+def test_unified_refusal_code_is_in_the_shared_take_vocabulary(home):
+    """Prism 43117075a644: take() refused with ``unified_admission (...)``, a code outside TAKE_REFUSALS, so the I-1
+    closeout query read every such refusal as a violation."""
+    from hermes_cli import kanban_placement_reasons as pr
+
+    t0 = time.time()
+    f = Fleet(t0)
+    f.busy = {"ci-box": 0.885, "ace-ai": 0.86, "ace-media": 0.86}
+    dmd.publish("prism", 64, PRISM_UNIT, root=home, now=t0)
+    plan = _plan(home, f)
+    assert plan.take("alpha") is None
+    assert pr.take_refusal_code(plan.refusal) == pr.UNIFIED_ADMISSION
+    assert pr.UNIFIED_ADMISSION in pr.TAKE_REFUSALS
+
+
+def test_dry_run_counts_its_simulated_takes_against_the_class_rule(home):
+    """Prism 9eecf7c2e1ee: a dry run books nothing, and _class_verdict read only the ledger, so every simulated take
+    on a host saw the same empty headroom: the dry run granted pins the live run refuses. ace-ai at 0.80 busy on 32
+    CPUs, 2 CPUs a take: one = 0.8625 fits, two = 0.925 does not."""
+    t0 = time.time()
+    f = Fleet(t0)
+    f.busy["ace-ai"] = 0.80
+    plan = _plan(home, f)
+    plan.dry_run = True
+    assert plan.take("alpha", pin="ace-ai") is not None, plan.refusal
+    assert plan.take("alpha", pin="ace-ai") is None
+    assert plan.refusal.startswith("pin_host_unified_admission (ace-ai: saturated:cpu"), plan.refusal
+    keep, held = kh.unified_filter(plan, ["ace-ai"], None)
+    assert keep == [] and held["ace-ai"].startswith("saturated:cpu"), held
+    assert _kanban_rows(home) == []                               # still a dry run: nothing booked

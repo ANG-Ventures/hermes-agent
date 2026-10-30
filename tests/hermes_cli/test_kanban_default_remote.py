@@ -278,7 +278,8 @@ def _rec(**kw):
 
 @pytest.mark.parametrize("refusal, violation", [
     ("pool_full", False), ("host_reach", False), ("board_unhostable (ci-box: x no_board_root)", False),
-    ("pool_unavailable (ace-ai: hot)", False), (None, True), ("profile_unserved", True),
+    ("pool_unavailable (ace-ai: hot)", False), ("unified_admission (ace-ai: held_back:kanban for prism 4 queued)", False),
+    (None, True), ("profile_unserved", True),
     ("pool_fullish", True),
 ])
 def test_i1_query_keys_on_the_frozen_vocabulary(home, refusal, violation):
@@ -303,7 +304,7 @@ def test_i1_guards_fail_closed(home):
         assert any("kind guard" in r for r in gates.check_i1(conn, 0)["red"])
 
 
-def test_every_unpinned_take_refusal_is_in_the_vocabulary():
+def test_every_unpinned_take_refusal_is_in_the_vocabulary(monkeypatch):
     """R4: drive every unpinned refusal path of take() and check its code is
     in TAKE_REFUSALS (a new code fails here before it reaches the query)."""
     seen = set()
@@ -323,6 +324,13 @@ def test_every_unpinned_take_refusal_is_in_the_vocabulary():
     p = _plan(slots=0)
     p.signal = SimpleNamespace(placement_table=None)
     p.detail["ace-ai"]["pressure"] = "hot 2/2"
+    assert p.take("alpha") is None
+    seen.add(p.refusal)
+    # the ONE rule refused every candidate (Prism 43117075a644)
+    from hermes_cli import kanban_headroom as kh
+    monkeypatch.setattr(kh, "unified_filter", lambda plan, names, job: ([], {n: "held_back:kanban" for n in names}))
+    p = _plan()
+    p.signal = SimpleNamespace(placement_table=object())
     assert p.take("alpha") is None
     seen.add(p.refusal)
     codes = {pr.take_refusal_code(r) for r in seen}
