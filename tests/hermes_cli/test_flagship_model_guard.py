@@ -505,6 +505,52 @@ def test_profile_alias_named_like_flagship_but_resolving_to_opus_is_not_gated(fl
     _assert_not_gated("worker-lite")
 
 
+_REMAP = ("model:\n  default: claude-sonnet-5\n  provider: claude-apr\n"
+          f"  aliases:\n    claude-opus-5-5: claude-apr/{FABLE}\n")
+
+
+def test_pin_remapped_to_flagship_by_the_assignee_aliases_is_gated(flagship_profiles, proven_operator):
+    """Prism a1f3096286e2: the spawned worker re-resolves ``-m <pin>`` through
+    ITS OWN profile aliases, so an Opus pin on a profile aliasing Opus to Fable
+    runs Fable. The pin is judged as the assignee RUNS it: create, set-model
+    (single + batch), reassign and the dispatcher's pin branch all refuse it
+    without ``--allow-flagship``; with one, the override is recorded."""
+    _profile(flagship_profiles, "worker-remap", _REMAP)
+    out = kc.run_slash("create 'x' --assignee worker-remap --model claude-opus-5-5")
+    assert "--allow-flagship" in out and "worker-remap" in out and FABLE in out, out
+    assert _card_count() == 0
+
+    task_id = _card("worker-remap")  # the profile default (sonnet) is not gated
+    assert FABLE in kc.run_slash(f"set-model {task_id} claude-opus-5-5")
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match=FABLE):
+            kb.set_model_override(conn, task_id, "claude-opus-5-5")
+        with pytest.raises(ValueError, match=FABLE):
+            kb.apply_batch_route_writes(conn, [kb.BatchRouteWrite(
+                task_id=task_id, touch_model=True, model="claude-opus-5-5")])
+        assert kb.get_task(conn, task_id).model_override is None
+        assert kb.set_model_override(conn, task_id, "claude-sonnet-5")  # not aliased: fine
+    assert _comments(task_id) == []
+
+    pinned = _card("daedalus-opus", "claude-opus-5-5")
+    assert FABLE in kc.run_slash(f"reassign {pinned} worker-remap")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, pinned).assignee == "daedalus-opus"
+        legacy = kb.create_task(conn, title="legacy", assignee="worker-remap")
+        conn.execute("UPDATE tasks SET model_override = 'claude-opus-5-5' WHERE id = ?", (legacy,))
+        conn.commit()
+    assert _refused_at_dispatch(legacy)
+
+    ok = _created_id(kc.run_slash(
+        "create 'x' --assignee worker-remap --model claude-opus-5-5 --allow-flagship 'known lane'"))
+    assert [b for _a, b in _comments(ok)] == ["flagship override: known lane"]
+    assert not _refused_at_dispatch(ok)
+    with kb.connect() as conn:
+        assert kb.set_model_override(conn, task_id, "claude-opus-5-5", flagship_override_reason="known lane")
+    assert [b for _a, b in _comments(task_id)] == ["flagship override: known lane"]
+    assert not _refused_at_dispatch(task_id)
+
+
 @pytest.mark.parametrize("caller_env,dotenv,gated", [
     (None, FABLE, True),               # the var lives in the assignee's own .env
     ("claude-opus-5-5", FABLE, True),  # the assignee's scope beats the caller's env

@@ -2114,9 +2114,20 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     skip_if_unmatched=not task_ids,
                     live=live,
                 )
+                pin_reason = None
                 if touch_model:
                     effective_model = model or inherited_models.get(task.id)
                     firepower = is_firepower_model(effective_model)
+                    if effective_model and not firepower:
+                        # The pin as the assignee RUNS it (its own aliases,
+                        # Prism a1f3096286e2); judged before any write.
+                        try:
+                            pin_reason = kb.pin_flagship_reason(
+                                conn, task.id, effective_model, firepower_reason, _profile_author(),
+                            )
+                        except ValueError as exc:
+                            print(f"kanban: {exc}; no cards were changed", file=sys.stderr)
+                            return 2
                     write.touch_model = True
                     write.model = effective_model
                     write.provider = provider
@@ -2125,12 +2136,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.force_model_reason = getattr(args, "force_model", None)
                     if write.pin_sub_reason:
                         write.pin_sub_author = _profile_author()
-                    if firepower or clear_reason:
+                    if firepower or clear_reason or pin_reason:
                         write.audit_comment_author = _profile_author()
                         # Same comment main's create/set-model writes, so
                         # the dispatcher's flagship gate authorizes it.
                         write.audit_comment_body = override_comment(
-                            clear_reason or firepower_reason,
+                            clear_reason or pin_reason or firepower_reason,
                         )
                 if effort is not None or clear_effort:
                     write.touch_effort = True

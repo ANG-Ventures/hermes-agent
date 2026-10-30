@@ -6812,6 +6812,7 @@ def _dispatch_once_locked(
             FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
             FLAGSHIP_REFUSAL_COMMENT_PREFIX,
             assignee_default_model,
+            assignee_pinned_model,
             assignee_route_gated,
             assignee_route_unresolved,
             flagship_model_match,
@@ -6823,10 +6824,16 @@ def _dispatch_once_locked(
             return False
         lane: Optional[_kb.LaneModelOverride] = None
         profile_route = False
+        pin_remap: Optional[str] = None
         if task.model_override:
             model = task.model_override
             if not flagship_model_match(model, _model_policy_config):
-                return False
+                # The pin as the worker RUNS it: ``-m <pin>`` is resolved
+                # through the assignee's own aliases at startup (Prism
+                # a1f3096286e2); an unreadable config fails closed.
+                pin_remap = assignee_pinned_model(assignee or task.assignee, model)
+                if not assignee_route_gated(pin_remap, _model_policy_config):
+                    return False
         else:
             lane = _lane_override_for(assignee or task.assignee)
             if lane is not None:
@@ -6864,6 +6871,14 @@ def _dispatch_once_locked(
                 f"orchestrator-only; reassign to a non-flagship profile, pin "
                 f"--model, or add '{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' "
                 f"to this card."
+            )
+        elif pin_remap is not None:
+            body = (
+                f"{FLAGSHIP_REFUSAL_COMMENT_PREFIX} model pin {model!r} runs as "
+                f"{pin_remap!r} through the profile aliases of "
+                f"{assignee or task.assignee}, which is orchestrator-only; pin "
+                f"the real model id, reassign, or add "
+                f"'{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} <reason>' to this card."
             )
         elif lane is None:
             body = (

@@ -243,11 +243,77 @@ def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
         # Startup adopts default_model literally, never through model aliases
         # (Prism r9 00f1687144ac).
         return model
+    return _alias_target(cfg, model)
+
+
+def _alias_target(cfg: Mapping[str, Any], model: str) -> str:
+    """``model`` after the profile's ``model_aliases`` / ``model.aliases``
+    (the DIRECT_ALIASES table worker startup resolves ``-m`` through)."""
+    from hermes_cli.model_switch import _load_direct_aliases
+
     aliases, _ok = _load_direct_aliases(cfg)
     hit = aliases.get(model.lower())
     if hit is not None and str(hit.model or "").strip():
         return str(hit.model).strip()
     return model
+
+
+def assignee_pinned_model(assignee: Optional[str], model: Optional[str]) -> Optional[str]:
+    """The model a worker on ``assignee`` RUNS for the stored pin ``model``.
+
+    The dispatcher passes a pin as ``-m <model>`` and worker startup resolves
+    it through the WORKER's own ``model_aliases`` / ``model.aliases``
+    (``resolve_startup_model_route``), so a profile aliasing
+    ``claude-opus-5-5`` to a flagship runs the flagship from an Opus pin
+    (Prism a1f3096286e2). Resolved in the assignee's scope exactly like
+    :func:`assignee_default_model`; returns the pin itself when nothing remaps
+    it, ``None`` for no pin, and the unresolved sentinel (fail closed) when an
+    existing profile's config cannot be read.
+    """
+    pin = str(model or "").strip()
+    if not pin:
+        return None
+    name = str(assignee or "").strip()
+    if not name or name == "human" or name.startswith("human:"):
+        return pin
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        home = resolve_profile_env(name)
+    except (FileNotFoundError, ValueError):
+        return pin
+    try:
+        from pathlib import Path
+
+        from hermes_cli.kanban_db_dispatch import _worker_profile_scope
+
+        with _worker_profile_scope(home, bind_home=False):
+            return _alias_target(_profile_effective_config(Path(home) / "config.yaml"), pin)
+    except Exception as exc:
+        return f"{UNRESOLVED_ROUTE_PREFIX} {type(exc).__name__} reading {name} config>"
+
+
+def pin_run_route_error(
+    assignee: Optional[str],
+    model: Optional[str],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Error text when the pin ``model`` RUNS as a flagship (or an unknown
+    route) under ``assignee``'s aliases, else ``None``. The pin string itself
+    is the caller's check (:func:`validate_worker_model`)."""
+    pin = str(model or "").strip()
+    run = assignee_pinned_model(assignee, pin)
+    if not run or run.casefold() == pin.casefold() or not assignee_route_gated(run, config):
+        return None
+    if assignee_route_unresolved(run):
+        return (
+            f"cannot resolve the model pin {pin!r} under {assignee} ({run!r}); "
+            "pass --allow-flagship \"<reason>\" or reassign"
+        )
+    return (
+        f"model pin {pin!r} runs as {run!r} through the profile aliases of "
+        f"'{assignee}': {flagship_model_error(run)}"
+    )
 
 
 UNRESOLVED_ROUTE_PREFIX = "<unresolved:"
@@ -307,22 +373,27 @@ def validate_assignee_route(
 ) -> Optional[str]:
     """Flagship gate for the route an ASSIGNEE implies (t_9e7ba884).
 
-    A card pin replaces the profile route, so with ``model_override`` set
-    this is a no-op (the pin goes through :func:`validate_worker_model`).
-    Otherwise the assignee's profile default is held to the same ban as
-    ``--model``: returns the normalized reason, ``None`` when the route is not
-    flagship, or raises :class:`FlagshipAssigneeRefused` when a flagship route
-    has no reason. The reason's authority is the caller's check
-    (:func:`require_flagship_authority`, before any mutation).
+    With ``model_override`` set the route is that pin AS THE ASSIGNEE RUNS
+    IT (:func:`pin_run_route_error`: the pin string itself went through
+    :func:`validate_worker_model`; here only the assignee's alias remap of it
+    is judged). Otherwise the assignee's profile default is held to the same
+    ban as ``--model``. Returns the normalized reason, ``None`` when the
+    route is not flagship, or raises :class:`FlagshipAssigneeRefused` when a
+    flagship route has no reason. The reason's authority is the caller's
+    check (:func:`require_flagship_authority`, before any mutation).
     """
     if str(model_override or "").strip():
-        return None
-    model = assignee_default_model(assignee)
-    if not assignee_route_gated(model, config):
-        return None
+        error = pin_run_route_error(assignee, model_override, config)
+        if error is None:
+            return None
+    else:
+        model = assignee_default_model(assignee)
+        if not assignee_route_gated(model, config):
+            return None
+        error = assignee_flagship_error(str(assignee), str(model))
     reason = (allow_flagship_reason or "").strip()
     if not reason:
-        raise FlagshipAssigneeRefused(assignee_flagship_error(str(assignee), str(model)))
+        raise FlagshipAssigneeRefused(error)
     return reason
 
 

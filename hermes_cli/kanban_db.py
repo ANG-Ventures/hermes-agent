@@ -7180,6 +7180,29 @@ def _assignee_flagship_reason(
     )
 
 
+def pin_flagship_reason(
+    conn: sqlite3.Connection, task_id: str, model: Optional[str], reason: Optional[str],
+    actor: Optional[str] = None,
+) -> Optional[str]:
+    """Flagship gate for SETTING a card's model pin, judged as the card's
+    assignee RUNS it (Prism a1f3096286e2: the worker resolves ``-m <pin>``
+    through its own profile aliases, so an Opus pin on a profile aliasing
+    Opus to Fable runs Fable). The pin string itself is
+    :func:`_validate_model_override_args`' check; this is the remap. Judged
+    before anything is written; ``None`` when nothing needs recording."""
+    if not str(model or "").strip():
+        return None
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["assignee"]:
+        return None
+    return _route_flagship_reason(
+        conn, task_id, row["assignee"], reason, actor,
+        model_override=model, verb="pin the model on",
+    )
+
+
 def clear_pin_flagship_reason(
     conn: sqlite3.Connection, task_id: str, reason: Optional[str], actor: Optional[str] = None,
 ) -> Optional[str]:
@@ -7441,14 +7464,18 @@ def set_model_override(
         FLAGSHIP_OVERRIDE_COMMENT_PREFIX
     )
     with write_txn(conn):
-        if not model and not validated_override:
-            # A clear lands on the profile route: gate it in this txn.
-            authorize_flagship(
-                conn, task_id, flagship_override_author,
-                clear_pin_flagship_reason(
+        if not validated_override:
+            # A clear lands on the profile route; a pin runs through the
+            # assignee's aliases (Prism a1f3096286e2): gate both in this txn.
+            if model:
+                needed = pin_flagship_reason(
+                    conn, task_id, model, flagship_override_reason, flagship_override_author,
+                )
+            else:
+                needed = clear_pin_flagship_reason(
                     conn, task_id, flagship_override_reason, flagship_override_author,
-                ),
-            )
+                )
+            authorize_flagship(conn, task_id, flagship_override_author, needed)
         if not _set_model_override_locked(
             conn, task_id, model, provider,
             audit_comment_author=audit_comment_author,
@@ -7856,6 +7883,8 @@ def apply_batch_route_writes(
     up front so an argument error also cannot reach the transaction
     half-applied.
     """
+    from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+
     prepared: list[tuple[BatchRouteWrite, Optional[str], Optional[str], Optional[str]]] = []
     for write in writes:
         model, provider = (None, None)
@@ -7897,6 +7926,13 @@ def apply_batch_route_writes(
                 continue
             changed: tuple[str, ...] = ()
             if write.touch_model:
+                if model and not (write.audit_comment_body or "").lstrip().casefold().startswith(
+                    FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+                ):
+                    # The pin as the assignee RUNS it (its aliases), under
+                    # the same lock the write commits against (a1f3096286e2).
+                    # Raises unless the card already carries an override.
+                    pin_flagship_reason(conn, write.task_id, model, None)
                 if not _set_model_override_locked(
                     conn, write.task_id, model, provider,
                     audit_comment_author=write.audit_comment_author,
