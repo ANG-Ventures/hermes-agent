@@ -345,15 +345,30 @@ class TestOutboundStaleVisionEviction:
         kept = _image_bearing_tool_ids(outbound)
         assert kept[-OUTBOUND_IMAGE_FLOOR:] == [f"call_{i}" for i in range(6 - OUTBOUND_IMAGE_FLOOR, 6)]
 
-    def test_byte_pressure_overrides_the_keep_newest_floor(self):
+    def test_byte_pressure_overrides_the_keep_newest_floor(self, tmp_path, monkeypatch):
         """A hard request-size breach must not be preserved by the floor.
 
-        Five 5 MB uploads plus three 3 MB tool images serialize to ~34 MB against
-        Anthropic's 32 MB Messages limit
+        Five 5 MB uploads plus three 3 MB tool images serialize to ~34 MB against a
+        32 MB request-size limit
         (https://platform.claude.com/docs/en/api/overview#request-size-limits).
         Uploads are never rewritten, so the only way under the ceiling is to retire
         every removable tool image — the floor may cost a frame, never a 413.
+
+        The budget comes from the fleet catalog (``images.outbound_budget_bytes``, card
+        t_3a0b1ce4); a temp catalog pins the pre-2026-10-29 world (32 MB cap, 24 MB budget)
+        so the fixture stays small now that the first-party cap is 128 MB.
         """
+        from agent import anthropic_limits
+
+        root = tmp_path / "fleet-root"
+        (root / "config").mkdir(parents=True)
+        (root / "config" / "anthropic-limits.json").write_text(json.dumps({
+            "version": 1,
+            "request_body_bytes": {"value": 32_000_000},
+            "images": {"outbound_budget_bytes": {"value": 24_000_000}},
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        anthropic_limits._reset_for_tests()
         mb = 1024 * 1024
         hard_limit = 32 * mb
 

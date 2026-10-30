@@ -6,7 +6,8 @@ and the manual-thinking budget ladder. Consumers here (card t_f08ad655):
 
 * ``plugins/model-providers/anthropic`` body cap = ``request_body_bytes - agent_headroom_bytes``;
 * ``agent.model_metadata.DEFAULT_CONTEXT_LENGTHS`` Anthropic rows;
-* ``agent.anthropic_adapter`` THINKING_BUDGET.
+* ``agent.anthropic_adapter`` THINKING_BUDGET;
+* ``agent.image_eviction_policy`` send-path image limit and byte budget (``images.*``, card t_3a0b1ce4).
 
 Each keeps its in-code literal as the FALLBACK used when the catalog is missing or unreadable; hermes-home's
 ``scripts/lints/anthropic-limits-fallback-lint.py`` and ``scripts/anthropic-limits-render.py --check`` refuse a
@@ -43,7 +44,7 @@ def catalog_path() -> Path:
 def _validate(cat: Any) -> Dict[str, Any]:
     if not isinstance(cat, dict):
         raise ValueError("top level is not an object")
-    for key in ("request_body_bytes", "agent_headroom_bytes", "models", "thinking_budget"):
+    for key in ("request_body_bytes", "agent_headroom_bytes", "models", "thinking_budget", "images"):
         if key in cat and not isinstance(cat[key], dict):
             raise ValueError(f"`{key}` is not an object")
     return cat
@@ -93,7 +94,8 @@ def load_catalog() -> Optional[Dict[str, Any]]:
 
 
 def _int_value(cat: Dict[str, Any], key: str) -> Optional[int]:
-    v = (cat.get(key) or {}).get("value")
+    entry = cat.get(key)
+    v = entry.get("value") if isinstance(entry, dict) else None
     return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
 
 
@@ -138,6 +140,20 @@ def thinking_budget(fallback: Dict[str, int]) -> Dict[str, int]:
     tb = cat.get("thinking_budget") or {}
     over = {k: v for k, v in tb.items() if isinstance(v, int) and not isinstance(v, bool) and v > 0}
     return {**fallback, **over} if over else fallback
+
+
+def image_limits(limit_fallback: int, budget_fallback: int) -> Tuple[int, int]:
+    """Send-path image policy ``(block limit, byte budget)``: catalog ``images.stricter_cap_threshold_count`` and
+    ``images.outbound_budget_bytes``, each falling back to its literal when the catalog or the entry is unusable."""
+    cat = load_catalog()
+    if cat is None:
+        return limit_fallback, budget_fallback
+    images = cat.get("images")
+    if not isinstance(images, dict):
+        return limit_fallback, budget_fallback
+    limit = _int_value(images, "stricter_cap_threshold_count")
+    budget = _int_value(images, "outbound_budget_bytes")
+    return (limit or limit_fallback), (budget or budget_fallback)
 
 
 def _reset_for_tests() -> None:
