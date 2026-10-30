@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent import route_identity
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_worker_route as kwr
@@ -263,13 +264,18 @@ def test_live_provider_switch_midrun_keeps_conversation_and_next_call_uses_new_r
     sent = client_b.chat.completions.create.call_args.kwargs
     assert sent["model"] == "model-b"
     # Conversation kept: the request to B carries the whole history
-    # (system, user, assistant tool call, tool result).
+    # (system, user, assistant tool call, tool result), then the RN-1 route note
+    # (agent/route_identity.py): a standalone user row after the tool result.
     roles = [m["role"] for m in sent["messages"]]
-    assert roles == ["system", "user", "assistant", "tool"]
-    assert sent["messages"][-1]["tool_call_id"] == "c1"
+    assert roles == ["system", "user", "assistant", "tool", "user"]
+    assert sent["messages"][-2]["tool_call_id"] == "c1"
+    note = sent["messages"][-1]["content"]
+    assert note.startswith(route_identity.ROUTE_NOTE_OPENER) and "model-b" in note, note
     assert "Model: model-b" in sent["messages"][0]["content"]
     assert "Provider: custom-b" in sent["messages"][0]["content"]
-    assert [m["role"] for m in result["messages"]] == ["user", "assistant", "tool", "assistant"]
+    # The committed note is persisted in the transcript, in the shape the request carried.
+    assert [m["role"] for m in result["messages"]] == ["user", "assistant", "tool", "user", "assistant"]
+    assert result["messages"][3]["display_kind"] == route_identity.ROUTE_NOTE_DISPLAY_KIND
     assert workspace_file.read_text() == "written before the switch"
     # Board ledger: one route_switched on THIS run, at iteration 2.
     switched = _events(task_id, kwr.LIVE_ROUTE_SWITCHED_EVENT)
