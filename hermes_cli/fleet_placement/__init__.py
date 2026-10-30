@@ -33,21 +33,5 @@ def _demand_root(root=None) -> Path:
     return Path(root) if root is not None else placement.fleet_root()
 
 
-_vendored_unified = admission_demand.unified
-
-# Workloads whose kill switch defaults OFF here (absent = "0" = the caller's old rule). KANBAN_UNIFIED_ADMIT ships
-# off until t_c466b7ee fixes the round-8 Prism keys and flips it (t_3694ab3c hard stop); set it to "1" to opt in.
-_DEFAULT_OFF = frozenset({"kanban"})
-
-
-def _unified(workload, env=None):
-    env = os.environ if env is None else env
-    key = str(workload).upper().replace("-", "_") + "_UNIFIED_ADMIT"
-    if workload in _DEFAULT_OFF and key not in env:
-        return False
-    return _vendored_unified(workload, env)
-
-
 placement.fleet_root = _fleet_root
 admission_demand._root = _demand_root
-admission_demand.unified = _unified

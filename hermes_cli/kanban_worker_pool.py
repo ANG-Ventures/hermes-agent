@@ -1704,6 +1704,9 @@ class SpilloverPlan:
     _rids: Dict[str, List[Optional[str]]] = field(default_factory=dict)
     # Dry-run takes per host: never in the ledger, so choose() adds them.
     _simulated: Dict[str, int] = field(default_factory=dict)
+    # Dry-run takes per host under the ONE rule: each take's OWN lease (its estimate and class), newest last, so a
+    # later verdict replays what was granted, never the current job's footprint times k (Prism fd6bd8070eee).
+    _sim_leases: Dict[str, List[Any]] = field(default_factory=dict)
     # Reservations alloc_client booked (kanban.placement.allocd on): rid -> whether
     # that take debited ``slots`` (a band-closed host has none to debit).
     _alloc: Dict[str, bool] = field(default_factory=dict)
@@ -1859,6 +1862,9 @@ class SpilloverPlan:
                 rid = None
                 if self.dry_run:
                     self._simulated[pin] = self._simulated.get(pin, 0) + 1
+                    if unified:
+                        from hermes_cli import kanban_headroom as _kh
+                        self._sim_leases.setdefault(pin, []).append(_kh.sim_lease(self, pin, job))
                 else:
                     from hermes_cli import kanban_headroom as _kh
                     from hermes_cli.fleet_placement import placement as _placement
@@ -1900,7 +1906,7 @@ class SpilloverPlan:
                 return None
             names, held = _kh.unified_filter(self, names, job)
             if not names:
-                self.refusal = "unified_admission (" + "; ".join(
+                self.refusal = f"{_reasons.UNIFIED_ADMISSION} (" + "; ".join(
                     f"{n}: {w}" for n, w in sorted(held.items())) + ")"
                 return None
             mode = _kh.plan_allocd_mode(self)
@@ -1960,6 +1966,8 @@ class SpilloverPlan:
         self._rids.setdefault(key, []).append(rid)
         if self.dry_run:
             self._simulated[key] = self._simulated.get(key, 0) + 1
+            if _kh.unified_active(self):
+                self._sim_leases.setdefault(key, []).append(_kh.sim_lease(self, key, job))
         self.slots[key] -= 1
         self.taken[key] = self.taken.get(key, 0) + 1
         self.last_pick = key
@@ -1988,7 +1996,8 @@ class SpilloverPlan:
             _kh.release_alloc(r.reservation_id)
             self.refusal = f"pool_unavailable (allocd picked {r.host}, not a candidate)"
             return None
-        if self._class_refused(key, job, r.reservation_id, release=lambda: _kh.release_alloc(r.reservation_id)):
+        if self._class_refused(key, job, r.reservation_id, release=lambda: _kh.release_alloc(r.reservation_id),
+                               via_alloc=True, decision=r):
             return None
         debit = self.slots.get(key, 0) > 0
         if debit:
@@ -2000,19 +2009,20 @@ class SpilloverPlan:
         self.last_pick = key
         return self.hosts[key]
 
-    def _class_refused(self, key: str, job: Any, rid: Optional[str], *, release) -> bool:
+    def _class_refused(self, key: str, job: Any, rid: Optional[str], *, release, via_alloc: bool = False,
+                       decision: Any = None) -> bool:
         """The ONE rule's verdict for a take the old locked rule just booked, UNDER the ledger lock (Prism
         c8d0343d7fb6): refused = the row is already dropped, ``release`` clears the booker's own state, refusal
         set. An unreadable ledger fails closed the same way. False = admitted (or the rule is off)."""
         from hermes_cli import kanban_headroom as _kh
         try:
-            why = _kh.confirm_class(self, key, job, rid)
+            why = _kh.confirm_class(self, key, job, rid, via_alloc=via_alloc, decision=decision)
         except Exception as exc:  # LedgerError / lock fault: fail closed
             why = f"closed:{type(exc).__name__}: {exc}"
         if why is None:
             return False
         release()
-        self.refusal = f"unified_admission ({key}: {why})"
+        self.refusal = f"{_reasons.UNIFIED_ADMISSION} ({key}: {why})"
         return True
 
     def reservation_via(self, rid: Optional[str]) -> Optional[str]:
@@ -2045,6 +2055,8 @@ class SpilloverPlan:
                 self.taken[host.name] -= 1
             if self._simulated.get(host.name):
                 self._simulated[host.name] -= 1
+                if self._sim_leases.get(host.name):
+                    self._sim_leases[host.name].pop()
         if not rids:
             return
         if reservation is not None:
@@ -2186,10 +2198,12 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "boards": None}
+               "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "band_cap": "",
+               "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
+            row["band_cap"] = _admission.band_cap(sample.pressure_text)
             if signal.placement_table is not None:
                 from hermes_cli import kanban_headroom as _kh
                 row["placement"] = _kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text,
@@ -2248,6 +2262,11 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
                     free = limit
                     if free == 0:
                         why = f"admission: {cap_why}"
+                elif signal.admit_on_memory and r["band_cap"]:
+                    # ...but only the memory axis: a PUBLISHED hot band.kanban still closes the host on every
+                    # path, pinned and unpinned (Prism ce581503f8d8, t_c466b7ee)
+                    free = 0
+                    why = f"admission: {r['band_cap']}"
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": r["running"], "load1": r["load1"], "ncpu": r["ncpu"],
