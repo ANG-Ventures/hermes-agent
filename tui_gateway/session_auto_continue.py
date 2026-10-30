@@ -334,6 +334,7 @@ def _persist_queued_user_row(session: dict, envelope: dict, display_kind: str | 
                 envelope.pop("_submit_user_row", None)
                 return
             staged["_row_id"], staged["content"] = live_id, merged
+            staged[_SUBMIT_ROW_RAW_KEY] = envelope.get("text")  # adoption identity follows the merge
         return
     # ``display_metadata`` marker: ``reopen_session`` retires still-marked rows after a restart
     # discarded the in-memory queue (#125577); the drain's replacement row is unmarked.

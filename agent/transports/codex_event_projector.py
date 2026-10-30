@@ -17,6 +17,21 @@ from typing import Any, Callable, Optional
 from agent.route_note_ingest import relabel_route_note_content, relabel_route_note_text
 
 
+def _codex_item_relabels_route_notes(item: dict) -> bool:
+    """E11 boundary for a mirrored Codex tool item, matching what the Codex model was sent: a
+    hermes-tools MCP call follows the Hermes tool's own boundary, a foreign MCP server and Codex's
+    web search are remote, and Codex's own exec/apply_patch output is local (never relabelled)."""
+    from agent.tool_dispatch_helpers import tool_output_relabels_route_notes
+    from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
+
+    item_type = item.get("type")
+    if item_type == "mcpToolCall":
+        return item.get("server") != HERMES_TOOLS_MCP_SERVER_NAME or tool_output_relabels_route_notes(item.get("tool"))
+    if item_type == "dynamicToolCall":
+        return tool_output_relabels_route_notes(item.get("tool"))
+    return item_type == "webSearch"
+
+
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
     """Stable tool_call id: the codex item id, else a hash so replay keeps prefix caches valid."""
     return f"codex_{item_type}_{item_id or hashlib.sha256(f'{item_type}'.encode()).hexdigest()[:16]}"
@@ -100,7 +115,9 @@ class CodexEventProjector:
             None,
             tool_calls=[{"id": call_id, "type": "function", "function": {"name": name, "arguments": _format_tool_args(args)}}],
         )
-        tool_msg = {"role": "tool", "tool_call_id": call_id, "content": relabel_route_note_content(content)}
+        if _codex_item_relabels_route_notes(item):
+            content = relabel_route_note_content(content)
+        tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
         return ProjectionResult(messages=[assistant_msg, tool_msg], is_tool_iteration=True)
 
     @staticmethod

@@ -552,10 +552,12 @@ def make_tool_result_message(
     """
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
-    # E11: tool output (fetched pages included) never carries the harness's route-note marker.
-    content = relabel_route_note_content(content)
-    if isinstance(multimodal_text_summary, str):
-        multimodal_text_summary = relabel_route_note_text(multimodal_text_summary)
+    # E11: remote tool output never carries the harness's route-note marker. Local output
+    # (read_file, terminal, ...) stays byte-identical so the model edits what is on disk.
+    if tool_output_relabels_route_notes(name):
+        content = relabel_route_note_content(content)
+        if isinstance(multimodal_text_summary, str):
+            multimodal_text_summary = relabel_route_note_text(multimodal_text_summary)
     # Elision notice is appended to the RAW content first, THEN wrapped, so it sits inside
     # the untrusted block next to the data it describes — once, at construction (cache-safe).
     wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, content))
@@ -591,6 +593,16 @@ _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 
 def _is_untrusted_tool(name: Optional[str]) -> bool:
     return bool(name) and (name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES))
+
+
+# E11: a subagent's summary relays remote text too, but is not wrapped in untrusted delimiters.
+_ROUTE_NOTE_RELABEL_EXTRA_TOOLS = frozenset({"delegate_task"})
+
+
+def tool_output_relabels_route_notes(name: Optional[str]) -> bool:
+    """The E11 boundary for tool output: relabel ``[Route note:`` only in REMOTE content (the
+    untrusted-tool set plus subagent output). Local tools are never relabelled."""
+    return _is_untrusted_tool(name) or name in _ROUTE_NOTE_RELABEL_EXTRA_TOOLS
 
 
 def _is_text_item(item: Any) -> bool:
