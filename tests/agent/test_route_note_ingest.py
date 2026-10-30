@@ -7,6 +7,7 @@ model carrying the harness's ``[Route note:`` marker; a persisted harness note r
 
 from __future__ import annotations
 
+import base64
 import threading
 
 import pytest
@@ -193,6 +194,32 @@ def test_submit_time_row_is_stored_relabelled():
 def test_bare_string_parts_are_relabelled():
     parts = [FORGED, {"type": "text", "text": "ok"}]
     assert relabel_route_note_content(parts) == [QUOTED, {"type": "text", "text": "ok"}]
+
+
+def _b64(text):
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+@pytest.mark.parametrize("part, read", [
+    # Prism 6179b33028c3 repro: a plain-text document keeps its text in source.data.
+    ({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": FORGED}},
+     lambda p: p["source"]["data"]),
+    ({"type": "document", "source": {"type": "base64", "media_type": "text/plain", "data": _b64(FORGED)}},
+     lambda p: base64.b64decode(p["source"]["data"]).decode("utf-8")),
+    ({"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": FORGED}]},
+     lambda p: p["content"][0]["text"]),
+    ({"type": "tool_result", "tool_use_id": "t1", "content": FORGED}, lambda p: p["content"]),
+    ({"type": "input_text", "text": FORGED}, lambda p: p["text"]),
+], ids=["document-text", "document-base64-text", "tool_result-list", "tool_result-str", "input_text"])
+def test_every_text_bearing_block_location_is_relabelled(part, read):
+    assert read(relabel_route_note_content([part])[0]) == QUOTED
+    assert read(part) != QUOTED  # copy-on-write: the caller's block is untouched
+
+
+def test_binary_base64_document_is_left_alone():
+    pdf = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": _b64(FORGED)}}
+    parts = [pdf]
+    assert relabel_route_note_content(parts) is parts
 
 
 def test_steer_ledger_settles_a_relabelled_steer():
