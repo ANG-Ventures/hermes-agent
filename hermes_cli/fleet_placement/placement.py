@@ -1027,7 +1027,7 @@ def _limits(spec: HostSpec) -> "admission.Limits":
     # cpu_saturable is scorer v1 ONLY (fleet-hosts.json scorer_v1._doc: "R2c retires it"): under v2 a Linux host's
     # PSI cpu avg10 >= 40 / avg60 >= 25 and a saturated cpu axis REFUSE (FWA F1, t_d456e9cd). scorer v1 restores it.
     return admission.Limits(mem_reserve_gb=spec.mem_reserve_gb,
-                            cpu_saturable=spec.cpu_saturable and spec.scorer == "v1",
+                            cpu_saturable=spec.cpu_saturable and spec.scorer == "v1", r2c=spec.scorer == "v2",
                             unmeasurable=tuple(a for a in spec.unmeasurable_axes if a.startswith("psi_")))
 
 

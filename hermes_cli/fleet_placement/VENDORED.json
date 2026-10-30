@@ -8,11 +8,13 @@
   "files": {
     "placement.py": {
       "source_path": "scripts/lib/placement.py",
-      "sha256": "f0c2f475aef1fa9965b5f4c57863aa120d8d1f654eca5e1ecc60b64a963a7704"
+      "sha256": "5e50cb3dd792b043d29b765ca0b60393e3a60151758d0890540330620aae8cb2",
+      "local_hunk": "t_80e4c88c: Limits(r2c=spec.scorer == \"v2\") in _limits(), the same hunk as hermes-home#7559 (unmerged); drop on the next re-vendor from a home main that carries it"
     },
     "admission.py": {
       "source_path": "scripts/lib/admission.py",
-      "sha256": "1c661a6734db6c28ce3d0afed0a62f28c128743d1656fa51169b787a5ecb0a85"
+      "sha256": "b2be403f1d801bf353b59b0a8f601fd9a3fb4170f530d3544a9bab6100acbafb",
+      "local_hunk": "t_80e4c88c: Limits.r2c gates the avg60 axis and the at-the-line PSI cpu closure (Prism 78da7ab3e3d9), the same hunk as hermes-home#7559 (unmerged); drop on the next re-vendor from a home main that carries it"
     },
     "work_estimate.py": {
       "source_path": "scripts/lib/work_estimate.py",
