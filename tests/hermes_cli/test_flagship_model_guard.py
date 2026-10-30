@@ -1031,8 +1031,12 @@ def test_assign_rejudges_the_route_inside_the_write_txn(flagship_profiles, monke
 
 def _review_card(reviewer: str, implementer: str) -> str:
     """A ``review`` card parked on ``reviewer`` whose recorded implementer is ``implementer``."""
-    task_id = _card(implementer)
     with kb.connect() as conn:
+        # Raw assignee write: a flagship-default implementer reached its
+        # profile by a path the gate never saw (as _legacy_flagship_card).
+        task_id = kb.create_task(conn, title="review", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (implementer, task_id))
+        conn.commit()
         run = kb.claim_task(conn, task_id, claimer=f"{implementer}:1")
         assert kb.request_review(conn, task_id, summary="ready", reviewer="human",
                                  expected_run_id=run.current_run_id) is True
@@ -1067,3 +1071,59 @@ def test_request_changes_judges_the_post_send_back_route_before_committing(
         assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
         task = kb.get_task(conn, task_id)
         assert (task.status, task.assignee) == ("ready", "daedalus-sonnet")
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_request_changes_and_route_judge_are_one_txn(flagship_profiles, proven_operator, monkeypatch, verb):
+    """Prism 95da6539e615 (Partial Send-back): the send-back and the final
+    route judge commit together. A pin cleared after the preflight passed
+    makes the in-txn judge refuse, and that refusal rolls the send-back back
+    too: still in review on the reviewer, no changes_requested."""
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    task_id = _review_card("daedalus-opus", "daedalus-sonnet")
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET model_override = 'claude-opus-5-5' WHERE id = ?", (task_id,))
+        conn.commit()
+    real = kb._assignee_flagship_reason
+    calls = []
+    preflights = 1 if verb == "assign" else 2   # reassign_task runs its own before assign_task's
+
+    def racing(conn, tid, *a, **k):
+        calls.append(tid)
+        out = real(conn, tid, *a, **k)
+        if len(calls) == preflights:   # every preflight passed on the pin; it is cleared before the txn
+            conn.execute("UPDATE tasks SET model_override = NULL WHERE id = ?", (tid,))
+            conn.commit()
+        return out
+
+    monkeypatch.setattr(kb, "_assignee_flagship_reason", racing)
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            fn(conn, task_id, "daedalus-fable", request_changes_reason="rework", operator="apollo")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee) == ("review", "daedalus-opus")
+        assert len(calls) == preflights + 1
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
+        ).fetchone()
+    assert _comments(task_id) == []
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_send_back_onto_the_implementer_is_a_route_change(flagship_profiles, proven_operator, monkeypatch, verb):
+    """Prism f550c8b6cc77: profile == recorded implementer is NOT an unchanged
+    assignee when a send-back moves the card reviewer -> implementer. A
+    flagship-default implementer with no override is refused, still in review."""
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    task_id = _review_card("daedalus-opus", "daedalus-fable")
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            fn(conn, task_id, "daedalus-fable", request_changes_reason="rework", operator="apollo")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee) == ("review", "daedalus-opus")
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
+        ).fetchone()
+    assert _comments(task_id) == []

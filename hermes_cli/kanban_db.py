@@ -6994,6 +6994,9 @@ def _reassign_request_changes(
 ) -> Optional[str]:
     """Route a reassign of a ``review`` card through :func:`request_changes`.
 
+    Runs inside assign_task's write txn (``nested``): the send-back and the
+    final route judge commit or roll back together (Prism 95da6539e615).
+
     Same event and payload as ``request-changes --operator``: the review run is
     opened and closed as the caller, ``changes_requested`` carries
     ``"operator": "<who>: <why>"`` (hermes-home changes_hold.py keys on it), the
@@ -7004,6 +7007,7 @@ def _reassign_request_changes(
     ok, detail = request_changes(
         conn, task_id, reason=reason, claimer=who,
         operator=f"{who}: reassign to {profile or '(unassigned)'}: {reason}",
+        nested=True,
     )
     if not ok:
         raise ReviewHoldRequired(
@@ -7159,20 +7163,6 @@ def _route_flagship_reason(
     return allowed
 
 
-def _send_back_assignee(
-    conn: sqlite3.Connection, task_id: str, current: Optional[str],
-) -> Optional[str]:
-    """The assignee :func:`request_changes` leaves on a ``review`` card: the
-    implementer of the latest ``review_requested`` (``current`` otherwise).
-    Raw, as request_changes writes it, so any mismatch is judged, not skipped."""
-    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if status is None or status["status"] not in ("review", "running"):
-        return current
-    event = _latest_event(conn, task_id, "review_requested")
-    implementer = _nonblank_str(_json_dict(_row_get(event, "payload")).get("implementer")) if event else None
-    return implementer or current
-
-
 def _assignee_flagship_reason(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7188,18 +7178,19 @@ def _assignee_flagship_reason(
     reason on the same assignee still authorizes a legacy flagship card.
     ``releases_dispatch`` (``--worker-ok`` clearing ``no_worker``) judges an
     unchanged assignee too: the card becomes dispatchable on that route
-    (Prism 40019830ac27). ``sends_back`` (``--request-changes``) compares
-    against the assignee the send-back restores, so a reviewer-named profile
-    is judged BEFORE that send-back commits (Prism 8b7984d6e364)."""
+    (Prism 40019830ac27). ``sends_back`` (``--request-changes``) is never
+    "unchanged": the send-back moves the card off its reviewer, so the route
+    is judged whoever the stored assignee is (Prism 8b7984d6e364, f550c8b6cc77).
+    assign_task judges it again in the send-back's own txn (95da6539e615)."""
     row = conn.execute(
         "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return None
-    current = row["assignee"]
-    if sends_back:
-        current = _send_back_assignee(conn, task_id, current)
-    if current == profile and not releases_dispatch and not (reason or "").strip():
+    if (
+        row["assignee"] == profile and not sends_back and not releases_dispatch
+        and not (reason or "").strip()
+    ):
         return None
     return _route_flagship_reason(
         conn, task_id, profile, reason, actor,
@@ -7361,14 +7352,15 @@ def assign_task(
         raise NoWorkerFlagSet(refusal)
     clear_no_worker = bool(refusal)
     # ``operator`` (the CLI's verified author) is the actor; authority is
-    # judged in here before any write or reclaim. A send-back commits on its
-    # own, so its post-send-back route is judged here first (Prism 8b7984d6e364).
+    # judged in here before any write or reclaim (fast refusal; the
+    # authoritative judge runs again on the locked row below).
     changes_reason = str(request_changes_reason or "").strip()
-    flagship_reason = _assignee_flagship_reason(
+    sends_back = bool(changes_reason)
+    _assignee_flagship_reason(
         conn, task_id, profile, flagship_override_reason, operator,
-        releases_dispatch=clear_no_worker, sends_back=bool(changes_reason),
+        releases_dispatch=clear_no_worker, sends_back=sends_back,
     )
-    if not changes_reason:
+    if not sends_back:
         held = review_hold_open_prs(conn, task_id, query_fn=pr_query)
         if held:
             raise ReviewHoldRequired(
@@ -7377,22 +7369,14 @@ def assign_task(
                 f"worker. Pass --request-changes \"<reason>\" to send it back "
                 f"(changes_requested, status ready) or land/close the PR first."
             )
-    else:
-        implementer = _reassign_request_changes(
-            conn, task_id, profile, changes_reason, operator,
-        )
-        if implementer == profile:
-            if clear_no_worker or flagship_reason:
-                with write_txn(conn):
-                    if clear_no_worker:
-                        _set_no_worker_locked(
-                            conn, task_id, False, source="worker_ok", operator=operator,
-                        )
-                    if flagship_reason:
-                        authorize_flagship(conn, task_id, operator, flagship_reason)
-            notify_task_updated(conn, task_id, ("assignee", "status"))
-            return True
+    implementer = None
     with write_txn(conn):
+        if sends_back:
+            # Same txn as the route judge and the assignee write: a refusal
+            # below rolls the send-back back too (Prism 95da6539e615).
+            implementer = _reassign_request_changes(
+                conn, task_id, profile, changes_reason, operator,
+            )
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -7407,9 +7391,14 @@ def assign_task(
         # this txn changes the route (Prism 5df499a16242, Stale Validation).
         flagship_reason = _assignee_flagship_reason(
             conn, task_id, profile, flagship_override_reason, operator,
-            releases_dispatch=clear_no_worker,
+            releases_dispatch=clear_no_worker, sends_back=sends_back,
         )
-        if row["assignee"] != profile:
+        # The send-back already restored ``profile``: no assignee write and no
+        # ``assigned`` event, as before the send-back joined this txn.
+        restored = sends_back and implementer == profile
+        if restored:
+            pass
+        elif row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
@@ -7425,13 +7414,14 @@ def assign_task(
             # Same txn as the assignee write: never a flagship route without
             # the comment the dispatcher's gate authorizes on.
             authorize_flagship(conn, task_id, operator, flagship_reason)
-        # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
-        # a no-op re-assign or an unassign, which must not lift ``active_pr``.
-        _append_event(
-            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
-        )
+        if not restored:
+            # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
+            # a no-op re-assign or an unassign, which must not lift ``active_pr``.
+            _append_event(
+                conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
+            )
     # Observer fires AFTER commit so subscribers see durable state.
-    notify_task_updated(conn, task_id, ("assignee",))
+    notify_task_updated(conn, task_id, ("assignee", "status") if sends_back else ("assignee",))
     return True
 
 
@@ -14918,6 +14908,7 @@ def request_changes(
     session_ref: Optional[str] = None,
     operator: Optional[str] = None,
     operator_kind: Optional[str] = None,
+    nested: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -14963,7 +14954,15 @@ def request_changes(
     a FIELD, not on the operator string, to tell a human CHANGES REQUESTED
     (holds a landing) from a machine send-back (never holds; t_86ca5b3d).
     Without ``operator`` it is refused.
+
+    ``nested`` composes the send-back into the caller's open write txn (a
+    savepoint): nothing is durable until the caller commits, so the caller's
+    own refusal rolls the send-back back too (``assign_task --request-changes``,
+    Prism 95da6539e615). It carries no ``coverage`` (that journals post-commit)
+    and a fleet pause hold is returned as a refusal, not recorded.
     """
+    if nested and coverage:
+        return False, "a nested send-back carries no coverage"
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -15135,7 +15134,7 @@ def request_changes(
         return True, implementer
 
     try:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=nested):
             ok, detail = _in_txn()
             # A refusal rolls back everything this call wrote: the opened
             # claim AND a posted coverage comment the gate just rejected
@@ -15145,6 +15144,9 @@ def request_changes(
     except _SendBackRefused as exc:
         return False, exc.detail
     except PauseHeld as exc:
+        if nested:
+            # The caller's txn is still open; its refusal rolls everything back.
+            return False, f"{exc}: resume or abandon the pause first"
         # Fleet pause layer 2 (t_133d6efd): the review card stays ``review``, held.
         from hermes_cli.kanban_pause_hold import record_refusal
         record_refusal(conn, exc, stage="request_changes")
