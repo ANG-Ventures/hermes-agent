@@ -1127,3 +1127,64 @@ def test_send_back_onto_the_implementer_is_a_route_change(flagship_profiles, pro
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
         ).fetchone()
     assert _comments(task_id) == []
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_refused_send_back_journals_nothing(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 3935fbf11941: the savepoint rollback must also roll back the
+    mutation journal. A refused nested send-back (pin cleared after the
+    preflight) leaves zero journal lines for the card, and a journal replay
+    leaves it in review with no changes_requested. An accepted send-back still
+    journals once the outer txn commits."""
+    import sqlite3
+
+    from hermes_cli import kanban_journal, kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    task_id = _review_card("daedalus-opus", "daedalus-sonnet")
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET model_override = 'claude-opus-5-5' WHERE id = ?", (task_id,))
+        conn.commit()
+        board = kb._journal_board_slug(conn)
+    real = kb._assignee_flagship_reason
+    calls = []
+    preflights = 1 if verb == "assign" else 2
+
+    def racing(conn, tid, *a, **k):
+        calls.append(tid)
+        out = real(conn, tid, *a, **k)
+        if len(calls) == preflights:   # the pin is cleared after every preflight passed
+            conn.execute("UPDATE tasks SET model_override = NULL WHERE id = ?", (tid,))
+            conn.commit()
+        return out
+
+    monkeypatch.setattr(kb, "_assignee_flagship_reason", racing)
+    snapshot = tmp_path / "snapshot.db"
+    with kb.connect() as conn, sqlite3.connect(str(snapshot)) as snap:
+        conn.backup(snap)
+    before = [e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused):
+            fn(conn, task_id, "daedalus-fable", request_changes_reason="rework", operator="apollo")
+        assert kb.get_task(conn, task_id).status == "review"
+    after = [e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
+    assert [e["kind"] for e in after[len(before):]] == []
+    out = tmp_path / "replayed.db"
+    kanban_journal_replay.replay_into(board, snapshot, out, since=0)
+    rconn = sqlite3.connect(str(out))
+    try:
+        assert rconn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == "review"
+        assert not rconn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
+        ).fetchone()
+    finally:
+        rconn.close()
+    # An accepted send-back journals its records after the outer commit.
+    monkeypatch.setattr(kb, "_assignee_flagship_reason", real)
+    with kb.connect() as conn:
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+    kinds = [e["kind"] for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
+    assert {"claimed", "changes_requested", "operator_override"} <= set(kinds[len(before):])

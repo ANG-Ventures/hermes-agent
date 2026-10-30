@@ -8747,6 +8747,26 @@ def _journal_board_slug(conn: Optional[sqlite3.Connection] = None):
         return None
 
 
+# The connection whose journal records wait for its outer COMMIT (a nested
+# send-back, Prism 3935fbf11941): a savepoint rollback must not leave records
+# a journal replay would resurrect.
+_JOURNAL_DEFERRED_CONN: ContextVar[Optional[sqlite3.Connection]] = ContextVar(
+    "kanban_journal_deferred_conn", default=None,
+)
+
+
+@contextlib.contextmanager
+def _journal_deferred_until_commit(conn: sqlite3.Connection):
+    """Queue ``conn``'s journal records on its post-commit list for this scope:
+    run after the outer ``write_txn`` commits, dropped with a rolled-back
+    savepoint or outer txn."""
+    token = _JOURNAL_DEFERRED_CONN.set(conn)
+    try:
+        yield
+    finally:
+        _JOURNAL_DEFERRED_CONN.reset(token)
+
+
 def _journal_append(conn: sqlite3.Connection, task_id, kind, payload, **kw) -> None:
     """Best-effort journal append under ``conn``'s board; skipped for an unowned connection."""
     try:
@@ -8755,6 +8775,11 @@ def _journal_append(conn: sqlite3.Connection, task_id, kind, payload, **kw) -> N
             return
         from hermes_cli import kanban_journal
 
+        if _JOURNAL_DEFERRED_CONN.get() is conn and getattr(conn, "in_transaction", False):
+            from hermes_cli.kanban_db_connect import on_commit
+
+            on_commit(conn, functools.partial(kanban_journal.append, board, task_id, kind, payload, **kw))
+            return
         kanban_journal.append(board, task_id, kind, payload, **kw)
     except Exception:  # pragma: no cover - the journal is a net, never a gate
         pass
@@ -15134,7 +15159,9 @@ def request_changes(
         return True, implementer
 
     try:
-        with write_txn(conn, allow_nested=nested):
+        with write_txn(conn, allow_nested=nested), (
+            _journal_deferred_until_commit(conn) if nested else contextlib.nullcontext()
+        ):
             ok, detail = _in_txn()
             # A refusal rolls back everything this call wrote: the opened
             # claim AND a posted coverage comment the gate just rejected
