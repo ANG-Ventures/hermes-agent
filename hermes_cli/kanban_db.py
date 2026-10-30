@@ -7080,16 +7080,25 @@ def _check_flagship_override_body(author: str, body: str) -> None:
     on ANOTHER card (whose provenance stores ``run_id`` NULL) cannot plant the
     row :func:`_card_flagship_authorized` reads back. ``authorize_flagship``
     is the intended writer; this makes it the only one.
+
+    ``author`` is a CLAIM: it is judged through :func:`model_policy.flagship_actor`
+    (Prism eaff1b1213a3 / 8fb42c6aeb7e), which keeps an operator label only
+    when the caller can prove it (``operator_label_proven``) and otherwise
+    coerces it to the caller's own verified identity. A coerced actor never
+    equals the claimed label, so an unproven non-worker process naming
+    ``apollo`` is refused before the row exists.
     """
     from hermes_cli.model_policy import (
         FLAGSHIP_AUTHORITY_ERROR,
         FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+        flagship_actor,
         flagship_authority,
     )
 
     if not (body or "").lstrip().casefold().startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
         return
-    if not flagship_authority(author):
+    actor = flagship_actor(author)
+    if actor != author or not flagship_authority(actor):
         raise FlagshipAssigneeRefused(FLAGSHIP_AUTHORITY_ERROR)
 
 

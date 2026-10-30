@@ -377,7 +377,7 @@ def test_lane_override_with_firepower(actor):
 
 
 @pytest.mark.parametrize("created_by", ["daedalus-opus", "unverified:apollo", "operator", "", None])
-def test_lane_row_with_a_non_operator_actor_authorizes_nothing(flagship_profiles, created_by):
+def test_lane_row_with_a_non_operator_actor_authorizes_nothing(flagship_profiles, proven_operator, created_by):
     """The lane reader (Prism 89f43d1114a4): a ``lane_model_overrides`` row
     whose firepower was recorded before the write gate, or planted by hand,
     under a worker / unverified / empty actor admits no card. Fail closed, no
@@ -426,7 +426,7 @@ def test_swarm_with_reason(actor):
 
 
 @pytest.mark.parametrize("author", ["apollo", "default", "human:ace", "user"])
-def test_operator_authored_override_admits_everywhere(flagship_profiles, author):
+def test_operator_authored_override_admits_everywhere(flagship_profiles, proven_operator, author):
     profile_card, pinned = _legacy_flagship_card(), _card("daedalus-opus")
     plain = _card("daedalus-opus")
     with kb.connect() as conn:
@@ -791,3 +791,30 @@ def test_explicit_operator_actor_from_a_proven_process_is_kept(flagship_profiles
     with kb.connect() as conn:
         kb.authorize_flagship(conn, card, "apollo", REASON)
     _assert_authorized(card)
+
+
+@pytest.mark.parametrize("proven", [False, True])
+def test_override_body_write_gate_proves_the_claimed_author(flagship_profiles, monkeypatch, proven):
+    """The write gate on ``add_comment`` (Prism eaff1b1213a3 / 8fb42c6aeb7e)
+    judges the author the way ``flagship_actor`` does: a non-worker process
+    that cannot prove the operator label it names is refused; the same call
+    from a proven operator is written."""
+    from hermes_cli import kanban_identity
+
+    monkeypatch.setenv("HERMES_PROFILE", "daedalus-opus")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: proven)
+    monkeypatch.setattr(kanban_identity, "worker_ancestor_profile", lambda: None)
+    card = _legacy_flagship_card()
+    with kb.connect() as conn:
+        if proven:
+            kb.add_comment(conn, card, "apollo", OVERRIDE)
+            assert kb._card_flagship_authorized(conn, card)
+        else:
+            with pytest.raises(kb.FlagshipAssigneeRefused, match="operator/orchestrator-only"):
+                kb.add_comment(conn, card, "apollo", OVERRIDE)
+            assert not kb._card_flagship_authorized(conn, card)
+    if proven:
+        _assert_authorized(card)
+    else:
+        assert _comments(card) == [] and _refused_at_dispatch(card)
