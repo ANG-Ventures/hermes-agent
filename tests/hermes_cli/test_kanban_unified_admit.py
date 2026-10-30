@@ -494,13 +494,14 @@ def test_confirm_leaves_out_the_takes_own_row_by_reservation_id(home):
     assert own not in ids and big in ids, ids
 
 
-@pytest.mark.parametrize("local,detail", [(False, {"class_rule": "admit_class"}), (False, {"rule": "utilization"}),
-                                          (False, None), (True, {"class_rule": "admit_class"})])
+@pytest.mark.parametrize("local,detail", [(False, {"unified": True}), (False, {"rule": "utilization"}),
+                                          (False, {"unified": "yes"}), (False, None), (True, {"unified": True})])
 def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypatch, local, detail):
     """Prism 72e85daf44a6 / d618d0a51436: off the router host allocd books in ITS ledger, never this dispatcher's file;
     confirm_class looked the row up locally, found nothing and refused every remote allocd take (closed: not live).
     Prism 11efd32500fc: off the router host the take stands ONLY on a router-side class verdict (the reply's
-    ``class_rule: admit_class``); an ordinary grant (placement.admit's older rule) is refused and released, since
+    ``unified: true``, set by an allocd that ran admit_class); an ordinary grant (placement.admit's older rule) is
+    refused and released, since
     unified_filter's local pre-check cannot see allocd's ledger. Router host (one ledger): the local check still runs,
     and a row allocd says it booked but the shared file lacks is refused as before, whatever the reply says."""
     from hermes_cli import alloc_client
@@ -511,13 +512,13 @@ def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypat
     monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: local)
     released = []
     monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
-        host="ci-box", reservation_id="r_allocd_1", reason="", detail=detail))
+        host="ci-box", reservation_id="r_allocd_1", reason="", source="allocd", detail=detail))
     monkeypatch.setattr(kh, "release_alloc", lambda rid: released.append(rid))
     host = plan.take("alpha", only=["ci-box"], job_id="t_remote")
     if local:
         assert host is None and "r_allocd_1 not live" in plan.refusal, plan.refusal
         assert released == ["r_allocd_1"]
-    elif detail and detail.get("class_rule") == "admit_class":
+    elif detail and detail.get("unified") is True:
         assert host is not None and host.name == "ci-box", plan.refusal
         assert plan.last_reservation == "r_allocd_1" and released == []
     else:
@@ -539,11 +540,80 @@ def test_remote_plain_allocd_grants_cannot_overrun_the_class_rule(home, monkeypa
     n = iter(range(10))
     released = []
     monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
-        host="ci-box", reservation_id=f"r_plain_{next(n)}", reason="", rule="utilization", detail={"host": "ci-box"}))
+        host="ci-box", reservation_id=f"r_plain_{next(n)}", reason="", source="allocd", rule="utilization",
+        detail={"host": "ci-box"}))
     monkeypatch.setattr(kh, "release_alloc", lambda rid: released.append(rid))
     assert plan.take("alpha", only=["ci-box"], job_id="t_a") is None
     assert plan.take("alpha", only=["ci-box"], job_id="t_b") is None
     assert released == ["r_plain_0", "r_plain_1"], released
+
+
+@pytest.fixture
+def remote_allocd(home, monkeypatch):
+    """A kanban dispatcher OFF the router host, taking through a real HTTP allocd (FakeAllocd mirrors hermes-home
+    scripts/allocd.py, including its unified confirm). The local pre-check is a pass-through: off the router it reads
+    the dispatcher's own file, which never holds allocd's rows (Prism 11efd32500fc), so only allocd can refuse."""
+    from hermes_cli import alloc_client
+    from tests.hermes_cli.test_kanban_allocd_route import FakeAllocd
+
+    def make(fleet, *, legacy=False):
+        plan = _plan_mode(home, fleet, "on", monkeypatch)
+        (home / "var" / "alloc" / "router-off").unlink()
+        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: False)
+        monkeypatch.setattr(kh, "unified_filter", lambda plan, names, job: (list(names), {}))
+        fake = FakeAllocd()
+        if legacy:                      # an allocd that predates the ask: runs placement.admit() only
+            real = fake.admit
+            fake.admit = lambda req: real({k: v for k, v in req.items() if k not in ("unified", "stale_after_s")})
+        monkeypatch.setenv("ALLOCD_URL", fake.url)
+        fakes.append(fake)
+        return plan, fake
+
+    fakes = []
+    yield make
+    for f in fakes:
+        f.close()
+
+
+def _live_kanban(fleet_t0):
+    return [r for r in placement._read_ledger(placement.reservations_path())["rows"]
+            if r["consumer"] == "kanban" and placement._row_live(r, time.time())]
+
+
+def test_remote_take_from_an_allocd_without_the_class_verdict_is_refused(home, remote_allocd):
+    """Prism 11efd32500fc: an allocd whose /admit is placement.admit() alone grants; the reply has no unified field,
+    so the remote take is refused and the row allocd booked is released."""
+    f = Fleet(time.time())
+    plan, fake = remote_allocd(f, legacy=True)
+    assert plan.take("alpha", only=["ci-box"], job_id="t_r1") is None
+    assert plan.refusal.startswith("unified_admission") and "unified: true" in plan.refusal, plan.refusal
+    assert [p for p, _ in fake.requests] == ["/admit", "/release"]
+    assert _live_kanban(f.t0) == []
+
+
+def test_remote_take_from_an_admit_class_allocd_is_admitted(home, remote_allocd):
+    f = Fleet(time.time())
+    plan, fake = remote_allocd(f)
+    host = plan.take("alpha", only=["ci-box"], job_id="t_r1")
+    assert host is not None and host.name == "ci-box", plan.refusal
+    assert plan.last_decision.detail["unified"] is True
+    path, req = fake.requests[0]
+    assert path == "/admit" and req["unified"] is True and req["stale_after_s"] == POLICY.stale_after_s
+
+
+def test_two_remote_takes_against_a_full_class_second_refused(home, remote_allocd):
+    """Prism 11efd32500fc repro: ci-box at cpu_busy 0.880 / 256 CPUs, kanban need 2, Prism's demand holding 2. The
+    first remote take fits (0.880 + 4/256); the second (0.880 + 6/256 = 0.9034) is refused by allocd's admit_class
+    on ITS ledger, though the dispatcher's local pre-check passed both."""
+    t0 = time.time()
+    f = Fleet(t0)
+    f.busy["ci-box"] = 0.880
+    dmd.publish("prism", 64, PRISM_UNIT, hosts=["ci-box"], root=home, now=t0)
+    plan, fake = remote_allocd(f)
+    assert plan.take("alpha", only=["ci-box"], job_id="t_r1") is not None, plan.refusal
+    assert plan.take("alpha", only=["ci-box"], job_id="t_r2") is None
+    assert "unified_admission" in plan.refusal, plan.refusal
+    assert len(_live_kanban(t0)) == 1
 
 
 @pytest.mark.parametrize("extra,why", [({"slo_breach": True}, "saturated:slo"),

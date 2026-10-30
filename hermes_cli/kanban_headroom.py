@@ -320,13 +320,6 @@ def book_pin(plan, name: str, job_id: Optional[str], job: Optional[placement.Job
                                            now=now, admissions_path=aps, decision=None, job_class=ctx.job_class)
 
 
-# The allocd /admit reply field that says the ROUTER ran the class rule (admission.admit_class / may_start) on its
-# own locked ledger for this grant. Off the router host it is the only class verdict a take can stand on (Prism
-# 11efd32500fc, t_c466b7ee): an ordinary grant is placement.admit()'s older rule.
-ROUTER_CLASS_FIELD = "class_rule"
-ROUTER_CLASS_RULE = "admit_class"
-
-
 def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[str], *,
                   via_alloc: bool = False, decision: Any = None) -> Optional[str]:
     """Prism c8d0343d7fb6: the class rule for a take whose row ``rid`` the old locked rule (placement.admit, or
@@ -338,8 +331,9 @@ def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[s
     ``via_alloc``: allocd booked ``rid`` (``decision`` = its AdmitResult). Off the router host
     (``alloc_client.ledger_is_local()`` false) the row is in allocd's ledger, never this dispatcher's file, so there is
     nothing local to confirm against (Prism 72e85daf44a6 / d618d0a51436). The take stands only on the ROUTER's class
-    verdict: the reply must say ``class_rule: admit_class``. A grant without it came from the older rule, and
-    unified_filter's local pre-check cannot see allocd's ledger, so it is refused and released (Prism 11efd32500fc).
+    verdict: allocd ran admit_class on its ledger for this row and said so with ``unified: true`` (hermes-home
+    allocd, asked by allocd_admit). A grant without it came from placement.admit()'s older rule, and unified_filter's
+    local pre-check cannot see allocd's ledger, so it is refused and released (Prism 11efd32500fc).
     On the router host the two ledgers are one file and the check below runs."""
     sig = plan.signal
     if not rid or not unified_active(plan) or getattr(sig, "placement_reservations", None) is None:
@@ -349,11 +343,10 @@ def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[s
         from hermes_cli import alloc_client
         if not alloc_client.ledger_is_local(table):
             detail = getattr(decision, "detail", None)
-            got = detail.get(ROUTER_CLASS_FIELD) if isinstance(detail, Mapping) else None
-            if got == ROUTER_CLASS_RULE:
+            if getattr(decision, "source", None) == "allocd" and isinstance(detail, Mapping) \
+                    and detail.get("unified") is True:
                 return None
-            return (f"closed:allocd grant {rid} carries no router-side class verdict "
-                    f"({ROUTER_CLASS_FIELD}={got!r}, need {ROUTER_CLASS_RULE!r})")
+            return f"closed:allocd grant {rid} carries no router-side class verdict (unified: true)"
     rpath = Path(sig.placement_reservations)
     with placement._locked(rpath):
         now = sig.clock()
@@ -538,7 +531,9 @@ def allocd_admit(plan, names, job: Optional[placement.Job], job_id: Optional[str
     """``alloc_client.admit`` for an unpinned take (mode on). Returns AdmitResult;
     raises alloc_client.Refused on a terminal answer (never bypassed)."""
     from hermes_cli import alloc_client
+    unified = unified_active(plan)
     return alloc_client.admit(CONSUMER, job_id=admission_key(job_id), ttl_s=RESERVE_TTL_S,
+                              unified=unified, stale_after_s=float(plan.signal.policy.stale_after_s) if unified else None,
                               **allocd_request(plan, names, job))
 
 
