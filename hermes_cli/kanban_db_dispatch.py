@@ -6774,18 +6774,11 @@ def _dispatch_once_locked(
         """Whether a capped-pool fallback rung would put ``task_id`` on a
         flagship model this tick's policy bans (alias-aware), with no
         ``flagship override:`` comment on the card to authorize it."""
-        from hermes_cli.model_policy import (
-            FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
-            is_firepower_model,
-        )
+        from hermes_cli.model_policy import is_firepower_model
 
         if not is_firepower_model(model, _model_policy_config):
             return False
-        return conn.execute(
-            "SELECT 1 FROM task_comments WHERE task_id = ? "
-            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
-            (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
-        ).fetchone() is None
+        return not _kb._card_flagship_authorized(conn, task_id)
 
     def flagship_refused(task_id: str, assignee: Optional[str] = None) -> bool:
         """Main's flagship gate, applied to the route this spawn will USE.
@@ -6800,7 +6793,9 @@ def _dispatch_once_locked(
         assignee profile's ``model.default`` (t_9e7ba884): the assignee is a
         route choice, so a flagship-default profile needs the card's
         ``flagship override:`` comment too (create/reassign write it with
-        ``--allow-flagship``).
+        ``--allow-flagship``). On every branch the comment is read by the ONE
+        reader, ``_card_flagship_authorized``: an operator-label author, not
+        from a worker run; exactly what ``authorize_flagship`` writes.
         """
         from hermes_cli.model_policy import (
             FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
@@ -6835,18 +6830,7 @@ def _dispatch_once_locked(
                 # An unresolved ${VAR} default fails closed (Prism 69a5d42a9476).
                 if not assignee_route_gated(model, _model_policy_config):
                     return False
-        if profile_route:
-            # Same author + run_id check as reassign/pin clear: a worker's own
-            # ``flagship override:`` comment never admits it (Prism r9
-            # b4b270f9b067 / d00abfd8d56e).
-            override = _kb._card_flagship_authorized(conn, task_id)
-        else:
-            override = conn.execute(
-                "SELECT 1 FROM task_comments WHERE task_id = ? "
-                "AND lower(ltrim(body)) LIKE ? LIMIT 1",
-                (task_id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
-            ).fetchone()
-        if override:
+        if _kb._card_flagship_authorized(conn, task_id):
             return False
 
         result.flagship_refused.append(task_id)

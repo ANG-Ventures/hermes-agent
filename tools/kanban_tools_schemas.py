@@ -547,7 +547,7 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Reason for a flagship route (a flagship 'model', or an assignee "
                 "whose profile default is flagship). Without it such a card is "
                 "refused. Recorded as a 'flagship override:' comment. "
-                "Operator/orchestrator-only: refused from a dispatched worker."
+                "Operator-only: honoured from an operator label outside a dispatched worker."
         )),
     },
     ["title", "assignee"],

@@ -95,18 +95,52 @@ FLAGSHIP_AUTHORITY_ERROR = (
 )
 
 
-def require_flagship_authority(reason: Optional[str]) -> None:
-    """Refuse a flagship override reason from a dispatched worker (Prism r6
-    423541efe928). The ONE choke point: create_task, assign/reassign,
-    set_model_override all call it, so the CLI, the tool and a direct DB
-    call get the same answer. Keyed on the worker env marker, so a
-    subprocess that inherited it fails closed too."""
-    if not (reason or "").strip():
-        return
+class FlagshipAssigneeRefused(ValueError):
+    """A flagship route (a flagship ``--model``, or an assignee whose profile
+    default is one) was asked for without an authorized reason."""
+
+
+def flagship_actor(explicit: Optional[str] = None) -> str:
+    """The ONE actor definition (t_9e7ba884): the explicit override author a
+    caller passes, else the acting identity the way ``kanban comment``
+    persists it (``verified_profile_author``: a dispatched worker is its own
+    profile; an unproven operator name is ``unverified:<name>``). Never a
+    literal ``operator``."""
+    if (explicit or "").strip():
+        return str(explicit).strip()
+    from hermes_cli.kanban_identity import verified_profile_author
+    from hermes_cli.profiles import current_profile_name
+
+    return verified_profile_author(current_profile_name("user") or "user")
+
+
+def flagship_authority(actor: Optional[str]) -> bool:
+    """The ONE definition of flagship authority: ``actor`` is an operator
+    label (``is_operator_label``) and this process is not a dispatched worker
+    (env marker, so an inheriting subprocess fails closed too). Every write
+    path grants a reason through it; the read side
+    (``kanban_db._card_flagship_authorized``) trusts exactly the authors it
+    admits, so a recorded override is always one dispatch honours."""
+    from hermes_cli.kanban_identity import is_operator_label
     from hermes_cli.kanban_worker_policy import is_dispatched_worker
 
-    if is_dispatched_worker():
-        raise ValueError(FLAGSHIP_AUTHORITY_ERROR)
+    return is_operator_label(actor) and not is_dispatched_worker()
+
+
+def require_flagship_authority(
+    reason: Optional[str], actor: Optional[str] = None,
+) -> tuple[str, str]:
+    """``(actor, reason)`` a flagship override may be recorded under, or
+    ``("", "")`` when no reason was given. ``actor`` is resolved with
+    :func:`flagship_actor`; raises :class:`FlagshipAssigneeRefused` when it
+    holds no flagship authority. Call it BEFORE any mutation."""
+    reason = (reason or "").strip()
+    if not reason:
+        return "", ""
+    actor = flagship_actor(actor)
+    if not flagship_authority(actor):
+        raise FlagshipAssigneeRefused(FLAGSHIP_AUTHORITY_ERROR)
+    return actor, reason
 
 
 def _profile_effective_config(config_path: Any) -> dict:
@@ -275,7 +309,9 @@ def validate_assignee_route(
     this is a no-op (the pin goes through :func:`validate_worker_model`).
     Otherwise the assignee's profile default is held to the same ban as
     ``--model``: returns the normalized reason, ``None`` when the route is not
-    flagship, or raises ``ValueError`` when a flagship route has no reason.
+    flagship, or raises :class:`FlagshipAssigneeRefused` when a flagship route
+    has no reason. The reason's authority is the caller's check
+    (:func:`require_flagship_authority`, before any mutation).
     """
     if str(model_override or "").strip():
         return None
@@ -284,7 +320,7 @@ def validate_assignee_route(
         return None
     reason = (allow_flagship_reason or "").strip()
     if not reason:
-        raise ValueError(assignee_flagship_error(str(assignee), str(model)))
+        raise FlagshipAssigneeRefused(assignee_flagship_error(str(assignee), str(model)))
     return reason
 
 

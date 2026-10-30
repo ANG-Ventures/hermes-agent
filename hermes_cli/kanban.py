@@ -2102,7 +2102,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     # any write or --reclaim (Prism f6a54f1196fd).
                     try:
                         clear_reason = kb.clear_pin_flagship_reason(
-                            conn, task.id, firepower_reason,
+                            conn, task.id, firepower_reason, _profile_author(),
                         )
                     except ValueError as exc:
                         print(f"kanban: {exc}; no cards were changed", file=sys.stderr)

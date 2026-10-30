@@ -6135,11 +6135,13 @@ def create_task(
     validate_route_provider(model_override, provider_override, pin_sub_reason=pin_sub_reason)
     from hermes_cli.model_policy import require_flagship_authority, validate_worker_model
 
-    require_flagship_authority(flagship_override_reason)
-    _raw_flagship_reason = flagship_override_reason
+    # Flagship authority is judged ONCE, here, before any write (t_9e7ba884).
+    flagship_override_author, _raw_flagship_reason = require_flagship_authority(
+        flagship_override_reason, flagship_override_author,
+    )
     flagship_override_reason = validate_worker_model(
         model_override,
-        allow_flagship_reason=flagship_override_reason,
+        allow_flagship_reason=_raw_flagship_reason,
     )
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
@@ -6693,13 +6695,8 @@ def create_task(
                             append_event=_append_event, add_comment=add_comment,
                         )
                 if flagship_override_reason:
-                    from hermes_cli.model_policy import override_comment
-
-                    add_comment(
-                        conn,
-                        task_id,
-                        _flagship_override_author(flagship_override_author or created_by),
-                        override_comment(flagship_override_reason),
+                    authorize_flagship(
+                        conn, task_id, flagship_override_author, flagship_override_reason,
                     )
                 if no_worker:
                     _set_no_worker_locked(
@@ -7027,68 +7024,39 @@ def _no_worker_refusal(
     )
 
 
-class FlagshipAssigneeRefused(RuntimeError):
-    """A reassign onto a flagship-default profile had no --allow-flagship reason."""
+from hermes_cli.model_policy import FlagshipAssigneeRefused  # noqa: E402,F401  (re-export; CLI + dashboard catch it here)
 
 
-def _assignee_flagship_reason(
-    conn: sqlite3.Connection,
-    task_id: str,
-    profile: Optional[str],
-    reason: Optional[str],
-) -> Optional[str]:
-    """Flagship gate for a reassign (t_9e7ba884). Returns the reason to audit.
+def authorize_flagship(
+    conn: sqlite3.Connection, task_id: str, actor: Optional[str], reason: Optional[str],
+) -> None:
+    """THE flagship override writer (t_9e7ba884).
 
-    The route only changes when the assignee does and the card has no model
-    pin. A card already carrying a ``flagship override:`` comment is admitted,
-    exactly as the dispatcher's gate admits it. Raises
-    :class:`FlagshipAssigneeRefused` for an unauthorized flagship route.
+    Records ``reason`` as the ``flagship override:`` comment under ``actor``
+    (resolved and judged by :func:`model_policy.require_flagship_authority`:
+    an operator label outside a dispatched worker), else raises
+    :class:`FlagshipAssigneeRefused` having written nothing. Every path that
+    grants a flagship route writes through here (create, assign/reassign,
+    set-model pin and pin clear, swarm children, the kanban_create tool), so
+    the only comment ever recorded is one :func:`_card_flagship_authorized`
+    reads back. A caller that mutates before this call checks
+    ``require_flagship_authority`` first.
     """
-    from hermes_cli.model_policy import require_flagship_authority, validate_assignee_route
+    from hermes_cli.model_policy import override_comment, require_flagship_authority
 
-    # assign_task and reassign_task both reach here before any write/reclaim.
-    try:
-        require_flagship_authority(reason)
-    except ValueError as exc:
-        raise FlagshipAssigneeRefused(f"cannot reassign {task_id}: {exc}") from None
-    row = conn.execute(
-        "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    # An unchanged assignee is not a new route, but an explicit reason on it
-    # still authorizes a legacy flagship card (Prism 70a0613a6b24).
-    if row is None or (row["assignee"] == profile and not (reason or "").strip()):
-        return None
-
-    try:
-        allowed = validate_assignee_route(
-            profile, model_override=row["model_override"],
-            allow_flagship_reason=reason,
-        )
-    except ValueError as exc:
-        if _card_flagship_authorized(conn, task_id):
-            return None
-        raise FlagshipAssigneeRefused(f"cannot reassign {task_id}: {exc}") from None
-    if allowed and row["assignee"] == profile and _card_flagship_authorized(conn, task_id):
-        return None
-    return allowed
+    actor, reason = require_flagship_authority(reason, actor)
+    if reason:
+        add_comment(conn, task_id, actor, override_comment(reason))
 
 
 def _card_flagship_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the card carries an OPERATOR-authored ``flagship override:``.
-
-    Prefix test in Python, as _validate_route does: the marker is prose (any
-    case), and SQL LIKE on a comment body is the #1921 shape.
-
-    Only an operator's comment counts (Prism r7 bf4b5b6f26f8): a worker can
-    post any body under its own name via kanban_comment, so the author must be
-    an operator label (``is_operator_label``: ruling authors, operator
-    profiles, ``human:*``) or the ``operator`` fallback this module writes,
-    and the row must not come from a worker run (``run_id`` set). An
-    ``unverified:<name>`` author is an operator name the caller could not
-    prove and never counts. An override written under another (non-operator)
-    orchestrator profile no longer pre-authorizes a reassign or pin clear;
-    that verb then needs its own ``--allow-flagship``.
-    """
+    """THE flagship override reader: the card carries a ``flagship override:``
+    comment whose author is an operator label (``is_operator_label``) and that
+    was not written from a worker run (``run_id`` NULL). Exactly the authors
+    :func:`authorize_flagship` admits; a worker's own ``kanban_comment`` body,
+    an ``unverified:<name>`` author or a literal ``operator`` never count.
+    Prefix test in Python, as _validate_route does (#1921)."""
+    from hermes_cli.kanban_identity import is_operator_label
     from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
 
     rows = conn.execute(
@@ -7096,50 +7064,75 @@ def _card_flagship_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
         (task_id,),
     ).fetchall()
     return any(
-        (r["body"] or "").lstrip().casefold().startswith(
-            FLAGSHIP_OVERRIDE_COMMENT_PREFIX
-        )
+        (r["body"] or "").lstrip().casefold().startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX)
         and r["run_id"] is None
-        and _flagship_override_author_trusted(r["author"])
+        and is_operator_label(r["author"])
         for r in rows
     )
 
 
-def _flagship_override_author_trusted(author: Optional[str]) -> bool:
-    # The literal ``operator`` is not an operator label: a worker can write it
-    # by setting HERMES_PROFILE_NAME=operator (Prism r9 9893c2209071).
-    from hermes_cli.kanban_identity import is_operator_label
+def _route_flagship_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+    reason: Optional[str],
+    actor: Optional[str],
+    *,
+    model_override: Optional[str] = None,
+    verb: str,
+) -> Optional[str]:
+    """The reason to record for a card landing on ``assignee``'s profile
+    route (a reassign, or a pin clear), or ``None`` when nothing is needed.
 
-    return is_operator_label(author)
+    Authority first, before any write or reclaim: a reason the actor may not
+    grant raises :class:`FlagshipAssigneeRefused`. A flagship/unresolved
+    route with no reason is refused unless the card already carries an
+    operator-authored override; with a reason, an already-authorized card
+    records nothing new (Prism 70a0613a6b24: no duplicate overrides).
+    """
+    from hermes_cli.model_policy import require_flagship_authority, validate_assignee_route
+
+    try:
+        _actor, reason = require_flagship_authority(reason, actor)
+        allowed = validate_assignee_route(
+            assignee, model_override=model_override, allow_flagship_reason=reason,
+        )
+    except FlagshipAssigneeRefused as exc:
+        if not reason and _card_flagship_authorized(conn, task_id):
+            return None
+        raise FlagshipAssigneeRefused(f"cannot {verb} {task_id}: {exc}") from None
+    if allowed and _card_flagship_authorized(conn, task_id):
+        return None
+    return allowed
 
 
-def _flagship_override_author(author: Optional[str]) -> str:
-    """Author for a ``flagship override:`` comment: the caller's explicit
-    label, else the ACTING identity resolved the way ``kanban comment``
-    resolves it (an unproven operator name becomes ``unverified:<name>``),
-    never a hard-coded ``operator`` (Prism r9 9893c2209071)."""
-    if (author or "").strip():
-        return str(author).strip()
-    from hermes_cli.kanban_identity import verified_profile_author
-    from hermes_cli.profiles import current_profile_name
-
-    return verified_profile_author(current_profile_name("user") or "user")
+def _assignee_flagship_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    reason: Optional[str],
+    actor: Optional[str],
+) -> Optional[str]:
+    """Flagship gate for assign/reassign (t_9e7ba884): the route only changes
+    when the assignee does and the card has no model pin, but an explicit
+    reason on the same assignee still authorizes a legacy flagship card."""
+    row = conn.execute(
+        "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or (row["assignee"] == profile and not (reason or "").strip()):
+        return None
+    return _route_flagship_reason(
+        conn, task_id, profile, reason, actor,
+        model_override=row["model_override"], verb="reassign",
+    )
 
 
 def clear_pin_flagship_reason(
-    conn: sqlite3.Connection, task_id: str, reason: Optional[str],
+    conn: sqlite3.Connection, task_id: str, reason: Optional[str], actor: Optional[str] = None,
 ) -> Optional[str]:
-    """Flagship gate for CLEARING a card's model pin (Prism f6a54f1196fd).
-
-    A clear moves the card onto its assignee's profile route (or the lane
-    override, which the dispatcher gates on its own). Judge that RESULTING
-    route before anything is written or reclaimed: returns the reason to
-    record as the ``flagship override:`` comment (``None`` when none is
-    needed or the card is already authorized), or raises ``ValueError`` when
-    the profile route is flagship/unresolved and there is no reason.
-    """
-    from hermes_cli.model_policy import validate_assignee_route
-
+    """Flagship gate for CLEARING a card's model pin (Prism f6a54f1196fd): the
+    card lands on its assignee's profile route (a lane override is the
+    dispatcher's to gate). Judged before anything is written or reclaimed."""
     row = conn.execute(
         "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
@@ -7147,25 +7140,9 @@ def clear_pin_flagship_reason(
         return None
     if get_lane_model_override(conn, assignee=row["assignee"]) is not None:
         return None
-    try:
-        allowed = validate_assignee_route(
-            row["assignee"], allow_flagship_reason=reason,
-        )
-    except ValueError as exc:
-        if _card_flagship_authorized(conn, task_id):
-            return None
-        raise ValueError(f"cannot clear the model pin on {task_id}: {exc}") from None
-    if allowed and _card_flagship_authorized(conn, task_id):
-        return None
-    return allowed
-
-
-def _add_flagship_override_comment(
-    conn: sqlite3.Connection, task_id: str, author: Optional[str], reason: str,
-) -> None:
-    from hermes_cli.model_policy import override_comment
-
-    add_comment(conn, task_id, _flagship_override_author(author), override_comment(reason))
+    return _route_flagship_reason(
+        conn, task_id, row["assignee"], reason, actor, verb="clear the model pin on",
+    )
 
 
 def _set_no_worker_locked(
@@ -7280,8 +7257,10 @@ def assign_task(
     if refusal and not worker_ok:
         raise NoWorkerFlagSet(refusal)
     clear_no_worker = bool(refusal)
+    # ``operator`` (the CLI's verified author) is the actor; authority is
+    # judged in here before any write or reclaim.
     flagship_reason = _assignee_flagship_reason(
-        conn, task_id, profile, flagship_override_reason,
+        conn, task_id, profile, flagship_override_reason, operator,
     )
     changes_reason = str(request_changes_reason or "").strip()
     if not changes_reason:
@@ -7305,9 +7284,7 @@ def assign_task(
                             conn, task_id, False, source="worker_ok", operator=operator,
                         )
                     if flagship_reason:
-                        _add_flagship_override_comment(
-                            conn, task_id, operator, flagship_reason,
-                        )
+                        authorize_flagship(conn, task_id, operator, flagship_reason)
             notify_task_updated(conn, task_id, ("assignee", "status"))
             return True
     with write_txn(conn):
@@ -7336,7 +7313,7 @@ def assign_task(
         if flagship_reason:
             # Same txn as the assignee write: never a flagship route without
             # the comment the dispatcher's gate authorizes on.
-            _add_flagship_override_comment(conn, task_id, operator, flagship_reason)
+            authorize_flagship(conn, task_id, operator, flagship_reason)
         # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
         # a no-op re-assign or an unassign, which must not lift ``active_pr``.
         _append_event(
@@ -7380,9 +7357,16 @@ def set_model_override(
     ``--allow-flagship``) is translated into the ``flagship override:``
     comment the dispatcher's flagship gate looks for. Returns True on success.
     """
-    from hermes_cli.model_policy import require_flagship_authority
+    from hermes_cli.model_policy import (
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+        require_flagship_authority,
+    )
 
-    require_flagship_authority(flagship_override_reason)
+    # Authority once, before any write (the batch path gets the same check in
+    # _validate_model_override_args on the comment author it hands in).
+    flagship_override_author, flagship_override_reason = require_flagship_authority(
+        flagship_override_reason, flagship_override_author,
+    )
     audit_comment_author, audit_comment_body = _flagship_reason_to_audit(
         model, provider,
         audit_comment_author=audit_comment_author,
@@ -7398,30 +7382,20 @@ def set_model_override(
         pin_sub_fallback=pin_sub_fallback,
         force_model_reason=force_model_reason,
     )
-    from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
-
-    # Only a flagship override (authority-checked in
-    # _validate_model_override_args) may stand in for the clear-route check;
-    # any other audit comment does not (Prism r9 aed001cfb920).
+    # Only a flagship override may stand in for the clear-route check; any
+    # other audit comment does not (Prism r9 aed001cfb920).
     validated_override = (audit_comment_body or "").lstrip().casefold().startswith(
         FLAGSHIP_OVERRIDE_COMMENT_PREFIX
     )
     with write_txn(conn):
         if not model and not validated_override:
             # A clear lands on the profile route: gate it in this txn.
-            clear_reason = clear_pin_flagship_reason(
-                conn, task_id, flagship_override_reason,
+            authorize_flagship(
+                conn, task_id, flagship_override_author,
+                clear_pin_flagship_reason(
+                    conn, task_id, flagship_override_reason, flagship_override_author,
+                ),
             )
-            if clear_reason and audit_comment_body:
-                # Keep the caller's audit comment; record the override too.
-                _add_flagship_override_comment(
-                    conn, task_id, flagship_override_author, clear_reason,
-                )
-            elif clear_reason:
-                from hermes_cli.model_policy import override_comment
-
-                audit_comment_author = _flagship_override_author(flagship_override_author)
-                audit_comment_body = override_comment(clear_reason)
         if not _set_model_override_locked(
             conn, task_id, model, provider,
             audit_comment_author=audit_comment_author,
@@ -7506,9 +7480,10 @@ def _validate_model_override_args(
 
     body = (audit_comment_body or "").lstrip().casefold()
     if body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
-        # The set-model batch (apply_batch_route_writes) writes the override
-        # comment through here, not via set_model_override (Prism r6 423541efe928).
-        require_flagship_authority(audit_comment_body)
+        # An override body is only writable under an author with flagship
+        # authority: the set-model batch (apply_batch_route_writes) hands its
+        # comment in here, not through set_model_override.
+        require_flagship_authority(audit_comment_body, audit_comment_author)
     if is_firepower_model(model):
         if not body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
             raise ValueError(flagship_model_error(str(model)))
@@ -7540,7 +7515,7 @@ def _flagship_reason_to_audit(
     )
     if not is_firepower_model(resolved):
         return audit_comment_author, audit_comment_body
-    return _flagship_override_author(flagship_override_author), override_comment(reason)
+    return flagship_override_author, override_comment(reason)
 
 
 def _set_model_override_locked(
@@ -10395,7 +10370,7 @@ def reassign_task(
     # Flagship assignee gate BEFORE the reclaim, for the same reason: a refused
     # reassign must never signal a live worker (t_9e7ba884).
     _assignee_flagship_reason(
-        conn, task_id, _canonical_assignee(profile), flagship_override_reason,
+        conn, task_id, _canonical_assignee(profile), flagship_override_reason, operator,
     )
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
@@ -20764,8 +20739,8 @@ def set_lane_model_override(
     )
 
     # A lane's firepower text authorizes every card on the lane at dispatch,
-    # so a worker may not write one (Prism r9 c71daffd8661).
-    require_flagship_authority(firepower)
+    # so only flagship authority may write one (same actor rule as a card).
+    require_flagship_authority(firepower, created_by)
     pin_sub_error = pin_sub_arg_error(model, provider, pin_sub_reason)
     if pin_sub_error:
         raise ValueError(pin_sub_error)

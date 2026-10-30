@@ -2125,52 +2125,53 @@ def test_create_flagship_profile_assignee_needs_allow_flagship(worker_env):
     assert "assignee profile default" in refused.get("error", ""), refused
 
 
-def test_worker_cannot_self_approve_flagship_assignee(worker_env):
-    """Prism r4 ddc94954a4e7: a dispatched worker typing a reason must not mint a
-    flagship-default child. Refused before any write; no card is created."""
+@pytest.mark.parametrize("actor", ["worker", "orchestrator", "unverified"])
+@pytest.mark.parametrize("route", [
+    {"assignee": "daedalus-fable"},                        # the profile-default route
+    {"assignee": "test-worker", "model": "claude-fable-5-1"},  # a flagship pin
+])
+def test_allow_flagship_without_authority_is_refused(worker_env, monkeypatch, actor, route):
+    """ONE authority (t_9e7ba884): allow_flagship is honoured only from an operator
+    label outside a dispatched worker. A worker, a non-operator orchestrator profile
+    and an unproven operator name are refused before any write."""
     from tools import kanban_tools as kt
 
     _write_fable_profile()
+    if actor != "worker":
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        monkeypatch.setenv("HERMES_PROFILE", "apollo" if actor == "unverified" else "daedalus-opus")
     before = _card_count()
     refused = json.loads(kt._handle_create({
-        "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
-        "allow_flagship": "delicate infra",
+        "title": "fable job", "parents": [worker_env], "allow_flagship": "delicate infra", **route,
     }))
     assert "allow_flagship is operator/orchestrator-only" in refused.get("error", ""), refused
     assert _card_count() == before
 
 
-def test_worker_cannot_self_approve_flagship_model_pin(worker_env):
-    """Same bypass via a flagship model pin on a cheap assignee."""
-    from tools import kanban_tools as kt
-
-    before = _card_count()
-    refused = json.loads(kt._handle_create({
-        "title": "fable pin", "assignee": "test-worker", "parents": [worker_env],
-        "model": "claude-fable-5-1", "allow_flagship": "delicate infra",
-    }))
-    assert "allow_flagship is operator/orchestrator-only" in refused.get("error", ""), refused
-    assert _card_count() == before
-
-
-def test_orchestrator_allow_flagship_creates_and_audits(worker_env, monkeypatch):
-    """No HERMES_KANBAN_TASK (orchestrator/operator session): the reason is honoured
-    and recorded as the 'flagship override:' comment."""
+def test_operator_allow_flagship_creates_and_audits(worker_env, monkeypatch):
+    """A proven operator session: the reason is honoured, recorded under the
+    operator label, and the card dispatches."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_identity
 
     _write_fable_profile()
-    parent = worker_env
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: True)
     ok = json.loads(kt._handle_create({
-        "title": "fable job", "assignee": "daedalus-fable", "parents": [parent],
+        "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
         "allow_flagship": "delicate infra",
     }))
     assert ok.get("ok") is True, ok
     conn = kb.connect()
     try:
-        bodies = [c.body for c in kb.list_comments(conn, ok["task_id"])]
+        comments = [(c.author, c.body) for c in kb.list_comments(conn, ok["task_id"])]
+        refused = kbd.dispatch_once(conn, dry_run=True).flagship_refused
     finally:
         conn.close()
-    assert "flagship override: delicate infra" in bodies, bodies
+    assert comments == [("apollo", "flagship override: delicate infra")], comments
+    assert ok["task_id"] not in refused
