@@ -39,6 +39,7 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli import kanban_verb_input as kvi
+from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
 from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
@@ -942,6 +943,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return 0
     if not (args.title or "").strip():
         return kvi.refuse("create", "title is empty")
+    # The pre_tool_call hook cannot read a body built at run time; this is the real body.
+    pin_refusal = kanban_access_bound_pin.refusal(args.body)
+    if pin_refusal:
+        return _err(f"kanban create: {pin_refusal}", 2)
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
