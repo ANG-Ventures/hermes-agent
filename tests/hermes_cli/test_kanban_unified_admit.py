@@ -428,6 +428,27 @@ def test_tick_demand_skips_operator_only_cards(home):
     assert b.publish_demand([{"slug": "default"}]) == 1
 
 
+def test_tick_demand_skips_human_and_unassigned_cards(home):
+    """t_365e5753 (2026-10-30): 135 ready cards assigned human:apollo (review/operator lanes the dispatcher never
+    spawns) were published as kanban demand 163 and held back ~110 CI runners on ci-box under the ONE rule while 146
+    workflow runs queued. Only cards a worker would actually spawn for are demand: the same predicate the
+    dispatcher uses (kanban_db.is_worker_assignee)."""
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="w1", assignee="alpha")
+        kb.create_task(conn, title="w2", assignee="beta")
+        for who in ("human:apollo", "human", "Human:Ace", " human:aegis "):
+            kb.create_task(conn, title=f"h-{who}", assignee=who)
+        tid = kb.create_task(conn, title="unassigned", assignee="alpha")
+        conn.execute("UPDATE tasks SET assignee = NULL WHERE id = ?", (tid,))
+        conn.commit()
+    gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None, cost=2.0)
+    b = kgt.GateTickBuilder(gate, fleet_dir=lambda: home / "fleet", kanban_cfg=lambda: {},
+                            ledger=lambda boards: {}, connect=lambda board=None: kb.connect())
+    assert b.publish_demand([{"slug": "default"}]) == 2
+    doc = json.loads((home / "var" / "placement" / "demand" / "kanban.json").read_text(encoding="utf-8"))
+    assert doc["queued"] == 2
+
+
 def test_tick_publishes_nothing_under_the_kill_switch(home, monkeypatch):
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "0")
     gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None, cost=2.0)

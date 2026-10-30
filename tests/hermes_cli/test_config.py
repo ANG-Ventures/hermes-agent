@@ -1706,6 +1706,19 @@ class TestDelegationCapUnificationMigration:
         assert DEFAULT_CONFIG["delegation"]["resume_on_restart"] is True
         assert load_config()["delegation"]["resume_on_restart"] is False
 
+    def test_delegation_background_runtime_default_kanban_and_kill_switch(
+        self, tmp_path, monkeypatch
+    ):
+        """Option C P3: default is the kanban runtime; a profile's in_process still wins."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+        assert load_config()["delegation"]["background_runtime"] == "kanban"
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"delegation": {"background_runtime": "in_process"}}),
+            encoding="utf-8",
+        )
+        assert load_config()["delegation"]["background_runtime"] == "in_process"
+
 
 class TestBackgroundNotificationsConciseMigration:
     """v34 → v35: move users on the old implicit default 'all' to 'concise'."""

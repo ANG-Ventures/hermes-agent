@@ -98,7 +98,11 @@ def test_healthy_lane_over_capped_profile_spawns_on_lane_without_fallback(board,
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
-def test_flagship_gate_covers_post_fallback_route(board, monkeypatch, tmp_path, lane):
+def test_flagship_gate_covers_post_fallback_route(
+    board, proven_operator, monkeypatch, tmp_path, lane,
+):
+    # proven_operator: the override comment below is written by a PROVEN
+    # operator; the write gate (t_9e7ba884) refuses an unproven "apollo".
     _profile(tmp_path, fallback_model="gpt-6-astra-900k")
     _health(monkeypatch, capped={"lanepool"})
     tid = _card(board, lane)
