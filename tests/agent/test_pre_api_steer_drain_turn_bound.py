@@ -335,6 +335,71 @@ def test_turn_tail_tool_index_uses_turn_start_and_rejects_invalid_index():
     assert _current_turn_tail_tool_index(messages, 99) is None
 
 
+def test_turn_tail_tool_index_stops_at_an_answered_round():
+    """A tool result the model has already answered is not the tail (t_3f6a01ee).
+
+    Studio 10-30 12:22, session 20261030_120525_57b978: final reply sent, kanban stop-loop
+    nudge appended, then a pre-API /steer inserted at index 38+1 -- BEFORE that already-sent
+    final reply. The replayed history diverged from the bridge ledger (reseed:unclassified)."""
+    from agent.conversation_loop import _current_turn_tail_tool_index
+
+    messages = _history() + [
+        {"role": "user", "content": "new question"},  # 4
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "new result"},  # 6
+        {"role": "assistant", "content": "final reply", "finish_reason": "kanban_terminal_required"},  # 7
+        {"role": "user", "content": "nudge", "_kanban_stop_synthetic": True},
+    ]
+    assert _current_turn_tail_tool_index(messages, 4) is None
+    assert _current_turn_tail_tool_index(messages[:7], 4) == 6  # unanswered: still the tail
+
+
+def test_steer_after_kanban_stop_nudge_never_lands_before_the_sent_final_reply():
+    """Loop-level replay of the incident: steer accepted during the final-reply request, the
+    kanban stop guard appends the reply + a nudge, and the next request must replay the
+    previous one append-only (no row inserted before the reply the provider already saw)."""
+    agent = _make_agent()
+    nudges = iter(["finish with a board call", None])
+
+    responses = [
+        _response(finish_reason="tool_calls", tool_calls=[_tool_call("c1")]),
+        _response(content="final reply"),
+        _response(content="done"),
+    ]
+    sent: list[list] = []
+
+    def _create(*args, **kwargs):
+        sent.append(copy.deepcopy(kwargs.get("messages") or []))
+        if len(sent) == 2:
+            assert agent.steer(STEER)
+        return responses.pop(0)
+
+    agent.client.chat.completions.create.side_effect = _create
+
+    def _execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        for tc in assistant_message.tool_calls:
+            messages.append(make_tool_result_message("web_search", "new result", tc.id))
+
+    with (
+        patch("agent.turn_stop_gates._kanban_stop_nudge", side_effect=lambda a, m: next(nudges)),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_execute),
+    ):
+        result = agent.run_conversation("new question", conversation_history=_history())
+
+    assert len(sent) == 3
+    # Append-only: request 3 starts with request 2 byte-for-byte, then the sent final reply.
+    assert sent[2][: len(sent[1])] == sent[1]
+    assert sent[2][len(sent[1])].get("role") == "assistant"
+    assert "final reply" in _content_text(sent[2][len(sent[1])].get("content"))
+    # The steer is not lost: delivered after the reply, or handed back for the next turn.
+    tail = "".join(_content_text(m.get("content")) for m in sent[2][len(sent[1]) + 1:])
+    assert STEER in tail or STEER in (result.get("pending_steer") or "")
+
+
 def test_pre_api_drain_does_not_depend_on_tool_content_shape():
     """Delivery is a standalone user row, so a current-turn tool result whose content cannot
     take a text block no longer matters (the fork's append-into-content put-back path is gone
