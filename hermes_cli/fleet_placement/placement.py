@@ -1300,13 +1300,16 @@ def band_basis(mode: Optional[str] = None, root=None) -> str:
 def _band_class_rule(spec: HostSpec, sample: Sample, consumer: str, leases, *, now: Optional[float], root=None):
     """The check may_start() runs for ``consumer`` on this host, as a function of the job's estimate, or None while
     the class's kill switch (``<WORKLOAD>_UNIFIED_ADMIT=0``) keeps its old rule (admit(), which headroom() runs).
-    Same sample row, limits, leases, ``root`` demand and priority as may_start() (Prism b22e585970ce)."""
+    Same sample row, limits, leases, ``root`` demand and priority as may_start() (Prism b22e585970ce).
+    The switch is the ADMITTER's, as it published it under ``root`` (demand file ``unified``), never this process's
+    env: the band runs in the placement collector, the admitter elsewhere (Prism 59574d3a240b). No fresh published
+    mode = the switch's default (the one rule), the same answer unified() gives an admitter with the switch unset."""
     try:                             # noqa: PLC0415  (imported as may_start() does)
         from . import admission_demand as dmd
     except ImportError:
         import admission_demand as dmd
     workload = dmd.workload_of(consumer)
-    if not dmd.unified(workload):
+    if dmd.published_unified(workload, root=root, now=_now(now)) is False:
         return None
     names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
     # may_start() resolves demand ``hosts`` through table.resolve; this host's own aliases are the match it needs
