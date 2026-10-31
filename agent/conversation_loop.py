@@ -31,7 +31,8 @@ from agent.prompt_caching import (
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
-    identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
+    identity_line_value, note_inert_pinned_tools, rewrite_identity_line, runtime_host_value,
+    stage_surface_switch_note,
 )
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
@@ -783,6 +784,15 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     stale_field = _stored_prompt_runtime_mismatch(agent, stored_prompt) if stored_prompt else None
+    if stored_prompt and stale_field is not None:
+        rewritten = _provider_identity_rewrite(agent, stored_prompt, stale_field)
+        if rewritten is not None:
+            logger.info(
+                "Stored system prompt for session %s names provider %r; runtime is %r. Rewrote the "
+                "Provider line in place (no rebuild, rest of the prompt byte-identical).",
+                agent.session_id, stale_field[1], stale_field[2],
+            )
+            stored_prompt, stale_field = rewritten, None
     if stored_prompt and stale_field is None:
         # NULL/empty rows never reach this probe: they already rebuild below.
         if _bot_chat_prompt_stale(agent, stored_prompt):
@@ -944,6 +954,24 @@ def _stored_prompt_runtime_mismatch(agent, prompt: str):
     # stored bytes, it only makes their interface section out of date, and that is corrected by
     # agent.surface_switch.stage_surface_switch_note without touching the cached prefix (#104414).
     return None
+
+
+def _provider_identity_rewrite(agent, prompt: str, stale_field):
+    """The stored prompt with its ``Provider:`` trailer set to the runtime's, when that line is
+    the ONLY stale identity; else ``None`` (rebuild).
+
+    A turn can start on another relay face for the same model (claude-alr <-> claude-dtlr when
+    the first-choice pool sheds).  A full rebuild then re-renders every dynamic section, the
+    system bytes drift by hundreds of bytes and the whole transcript re-prefills; flipping back
+    rebuilds again (t_d1f61f76).  The builder renders the provider only in that line (alibaba
+    adds an identity paragraph, so it still rebuilds), and the mid-turn fallback already rewrites
+    just these lines (``rewrite_prompt_model_identity``), so a fallback hop lands on the same
+    bytes the previous turn sent there."""
+    field, stored, current = stale_field
+    if field != "Provider" or not current or "alibaba" in (stored, current):
+        return None
+    rewritten = rewrite_identity_line(prompt, "Provider", current)
+    return rewritten if _stored_prompt_runtime_mismatch(agent, rewritten) is None else None
 
 
 # Named so _is_synthetic_compression_user_turn can recognize a crash-persisted nudge by
