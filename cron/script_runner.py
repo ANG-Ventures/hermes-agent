@@ -697,9 +697,16 @@ class ScriptRunner:
             trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
             # An unreadable same-user process (Prism 952be3262777) only withholds a re-fire for a run
             # cut off here; it never makes a run that already finished on its own count as cut off.
-            trees = [t for t in trees if ss._script_tree_alive(
-                t[1], None if t[2] is None else [m for m in t[2]
-                                                 if not isinstance(m, ss._UnreadableMember)])]
+            # A tree alive ONLY through such a member is not flagged or signalled, but it is still
+            # checked at the end and its re-fire withheld while it runs (Prism dae50bba8939).
+            cut, unsure = [], []
+            for t in trees:
+                if ss._script_tree_alive(t[1], None if t[2] is None else [
+                        m for m in t[2] if not isinstance(m, ss._UnreadableMember)]):
+                    cut.append(t)
+                elif ss._script_tree_alive(t[1], t[2]):
+                    unsure.append(t)
+            trees = cut
             # Every run cut off here is a failure flagged for its re-fire, whatever it exits with
             # (Prism b86087faa72f); consumed by _run_job_script once the run returns.
             sched._skew_interrupted_job_ids.update(
@@ -728,6 +735,8 @@ class ScriptRunner:
                 if not alive or time.monotonic() >= deadline:
                     break
                 time.sleep(0.05)
+            unsure = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in unsure]
+            alive += [t for t in unsure if ss._script_tree_alive(t[1], t[2])]
             withheld = {sched._script_proc_job_ids.get(key) for key, _p, _s in alive} - {None}
             sched._refire_withheld_job_ids.update(withheld)
             sched._restart_killed_job_ids.difference_update(withheld)
