@@ -40,12 +40,14 @@ Registers nothing on a schedule: an operator instrument for route-note changes.
 from __future__ import annotations
 
 import argparse
+import atexit
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -203,6 +205,38 @@ def run_turn(py: Path, tree: Path, env: dict, work: Path, home: Path, step: int,
     return json.loads(out.read_text(encoding="utf-8"))
 
 
+OUT_MARKER = ".route-notes-probe-out"
+OUT_LOCK = ".route-notes-probe.lock"
+
+
+def claim_out(out: Path | None, scratch_root: Path) -> Path:
+    """Own the output dir for this run. Default: a fresh mkdtemp (atomically unique). An explicit
+    --out is locked with an O_EXCL lock file holding our pid BEFORE anything in it is replaced, so a
+    second probe on the same dir is refused (never wipes a running probe's state). Released at exit."""
+    if out is None:
+        work = Path(tempfile.mkdtemp(prefix="route-notes-e2e-", dir=scratch_root)).resolve()
+    else:
+        work = out.resolve()
+        work.mkdir(parents=True, mode=0o700, exist_ok=True)
+    lock = work / OUT_LOCK
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        owner = lock.read_text(encoding="utf-8", errors="replace").strip() or "?"
+        raise SystemExit(f"--out {work} is locked by probe pid {owner} ({lock}); refusing. "
+                         f"If that pid is dead, remove the lock file.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(f"{os.getpid()}\n")
+    atexit.register(lambda: lock.unlink(missing_ok=True))
+    entries = [p for p in work.iterdir() if p.name != OUT_LOCK]
+    if entries and not (work / OUT_MARKER).is_file():
+        raise SystemExit(f"--out {work} is non-empty and not a previous probe output; refusing")
+    for p in entries:
+        shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+    (work / OUT_MARKER).write_text("route_notes_e2e_probe output dir\n", encoding="utf-8")
+    return work
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scratch", action="store_true", help="scratch relay + scratch home (the only mode)")
@@ -224,14 +258,7 @@ def main() -> int:
     tree = a.runtime_tree.resolve()
     live = (Path.home() / ".hermes/runtime/hermes-agent").resolve()
     scratch_root = Path(os.environ.get("TMPDIR") or "/tmp")
-    work = (a.out or scratch_root / f"route-notes-e2e-{time.strftime('%Y%m%d-%H%M%S')}").resolve()
-    marker = ".route-notes-probe-out"
-    if work.exists():
-        if any(work.iterdir()) and not (work / marker).is_file():
-            raise SystemExit(f"--out {work} is non-empty and not a previous probe output; refusing")
-        shutil.rmtree(work)
-    work.mkdir(parents=True, mode=0o700)
-    (work / marker).write_text("route_notes_e2e_probe output dir\n", encoding="utf-8")
+    work = claim_out(a.out, scratch_root)
     log(f"tree={tree} (live runtime tree: {'YES, read-only' if tree == live else 'no'}) out={work}")
 
     seat = a.seat or pick_seat(rig, a.port, work)
