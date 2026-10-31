@@ -1406,6 +1406,25 @@ def test_set_model_on_an_archived_card_journals_no_authorization(flagship_profil
     assert _comments(task_id) == []
 
 
+@pytest.mark.parametrize("author", [" ", "\t"])
+def test_set_model_with_a_bad_audit_comment_journals_no_authorization(flagship_profiles, proven_operator, monkeypatch, tmp_path, author):
+    """Prism b7477c45a580 (r15): single-card set_model_override judges the audit
+    comment with add_comment's refusals BEFORE authorize_flagship journals the
+    override, so a blank author leaves zero journal lines and no comment."""
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _card("daedalus-fable", "claude-opus-5-5")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    before = len(_journal_kinds(board, task_id))
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="comment author is required"):
+            kb.set_model_override(conn, task_id, None, flagship_override_reason=REASON,
+                                  audit_comment_author=author, audit_comment_body="audit")
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+    assert _journal_kinds(board, task_id)[before:] == []
+    assert _comments(task_id) == []
+
+
 def _refuse_release_line_comments(monkeypatch):
     """The fleet release-line guard, on: any comment body naming the release-line
     token is refused (CloseOnLineRefused), like a real malformed close gate."""

@@ -7507,6 +7507,18 @@ def set_model_override(
         pin_sub_fallback=pin_sub_fallback,
         force_model_reason=force_model_reason,
     )
+    # add_comment's refusals on every comment the locked writer inserts, judged
+    # before authorize_flagship journals (Prism b7477c45a580; batch: d0b2bf482d38).
+    for author, body in _model_override_comments(
+        model, provider,
+        audit_comment_author=audit_comment_author,
+        audit_comment_body=audit_comment_body,
+        pin_sub_reason=pin_sub_reason,
+        pin_sub_fallback=pin_sub_fallback,
+        pin_sub_author=pin_sub_author,
+        force_model_reason=force_model_reason,
+    ):
+        _validate_comment_args(author, body)
     # Only a flagship override may stand in for the clear-route check; any
     # other audit comment does not (Prism r9 aed001cfb920).
     validated_override = (audit_comment_body or "").lstrip().casefold().startswith(
