@@ -15168,6 +15168,18 @@ def request_changes(
 
         if handoff_error:
             return False, handoff_error
+        # A call that posts its own record was judged on that record before
+        # the txn (review_coverage_text_error); it becomes the run's newest
+        # record, so the run-scoped re-read could only repeat that verdict.
+        # Skipping it leaves no refusal after this call's first write: the
+        # journal is not rolled back, and a refusal there left ``claimed`` +
+        # ``commented`` lines replay rebuilt into a running card (t_fc9f7319).
+        coverage_error = (
+            None if operator_reason is not None or coverage_body is not None
+            else _validate_review_coverage(conn, task_id, int(current_run_id))
+        )
+        if coverage_error:
+            return False, coverage_error
         if coverage_body is not None:
             now = int(time.time())
             comment_cur = conn.execute(
@@ -15182,12 +15194,6 @@ def request_changes(
                 run_id=int(current_run_id),
             )
             posted.append((int(comment_cur.lastrowid or 0), int(current_run_id), now))
-        coverage_error = (
-            None if operator_reason is not None
-            else _validate_review_coverage(conn, task_id, int(current_run_id))
-        )
-        if coverage_error:
-            return False, coverage_error
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)
