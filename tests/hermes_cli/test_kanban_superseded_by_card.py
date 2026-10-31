@@ -319,3 +319,51 @@ def test_sha_on_default_reads_github_com_like_the_pr_reads(monkeypatch):
     monkeypatch.setattr(op.subprocess, "run", run)
     assert op.sha_on_default("o/r", MERGE_SHA) is True
     assert len(seen) == 2 and all(a[:4] == ["gh", "api", "--hostname", "github.com"] for a in seen)
+
+
+def test_supersession_cover_completes_but_buys_no_workspace_deletion(board, monkeypatch, tmp_path):
+    """Prism c5429c8af4f5: the cover proves #351 REPLACED #350, not that it holds this card's bytes.
+    P9 shape: recorded child repo ``a`` vanishes under a replacement root that ignores it. The
+    supersession close still completes, but its cleanup must keep the unpublished bytes."""
+    import shutil
+    import subprocess as sp
+
+    from hermes_cli import kanban_db_workspace as kbw
+    from hermes_cli import kanban_survivor as ks
+
+    def git(repo, *args):
+        sp.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    def init(repo):
+        repo.mkdir(parents=True, exist_ok=True)
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.name", "QA")
+        git(repo, "config", "user.email", "qa@example.invalid")
+
+    def commit(repo, name, text):
+        (repo / name).write_text(text, encoding="utf-8")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", name)
+
+    monkeypatch.setattr(ks, "_temporary_roots", lambda: [tmp_path / "temporary"])
+    _stub(monkeypatch)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        ws = kbw.resolve_workspace(kb.get_task(conn, tid))
+        a = ws / "a"
+        init(a)
+        commit(a, "lost_impl.py", f"UNPUBLISHED_{tid}\n")
+        kbw.set_workspace_path(conn, tid, ws)
+        ks.record_baseline(conn, tid, ws)
+        assert set(ks._state(conn, tid)[0]) == {"a"}
+        shutil.rmtree(a / ".git")
+        init(ws)
+        commit(ws, ".gitignore", "a/\n")
+        commit(ws, "replacement.txt", "replacement B\n")
+
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=sup) is True
+        assert _status(conn, tid) == "done"
+        assert (a / "lost_impl.py").exists(), "supersession cleanup reaped this card's unpublished bytes"
+        assert (a / "lost_impl.py").read_text(encoding="utf-8") == f"UNPUBLISHED_{tid}\n"
+        assert "unbound" in ks._state(conn, tid)[1]
+        assert kb.list_runs(conn, tid)[-1].metadata["survivor"]["refs"][0]["unbound"] is True

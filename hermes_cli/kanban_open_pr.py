@@ -963,7 +963,10 @@ def card_supersession(closed, *, card: str, card_status: Optional[str], card_prs
         covers.append({"remote": f"https://github.com/{sup.repo}.git", "branch": f"refs/pull/{sup.number}/head",
                        "sha": str(payload.get("merge_commit_sha") or ""), "pr": f"{sup.repo}#{sup.number}",
                        "state": "MERGED", "external": True, "corroborated_by": "superseded-card",
-                       "card": card, "supersedes": f"{c.repo}#{c.number}"})
+                       "card": card, "supersedes": f"{c.repo}#{c.number}",
+                       # Proves another card's PR REPLACED this one, not that it holds this card's
+                       # bytes: completion only, never workspace-deletion authority (Prism c5429c8af4f5).
+                       "unbound": True})
     return covers
 
 
