@@ -139,3 +139,15 @@ def test_missing_hook_module_fails_open(fleet, monkeypatch):
     assert _run("reassign", tid, "human:apollo") == 0
     assert _assignee(tid) == "human:apollo"
     assert _run("create", "probe2", "--assignee", "human:apollo", "--unhomed") == 0
+
+
+def test_policy_off_marker_does_not_disarm_the_handoff_rule(fleet, monkeypatch, capsys):
+    """The marker disarms the pool pin only; the handoff rule's only override is the ledgered quote (as in the hook)."""
+    (fleet / "state").mkdir(exist_ok=True)
+    (fleet / "state" / "access-bound-create-policy-off").write_text("")
+    tid = _card()
+    monkeypatch.setenv("HERMES_PROFILE", "aegis")
+    assert _run("reassign", tid, "human:apollo") == 2
+    assert "aegis-no-apollo-handoff" in capsys.readouterr().err
+    assert _assignee(tid) == "daedalus"
+

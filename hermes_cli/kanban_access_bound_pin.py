@@ -9,7 +9,8 @@ One encoding: the hook module itself is loaded from the fleet root and its ``poo
 ``verdict()`` decide, so the refusal text and rule name are the hook's. Fail OPEN, as the hook
 does: no hook module, a load error, an unreadable pool file, or a raising verdict all allow the
 create (a placement guard, not a security boundary). The hook's off-marker
-``state/access-bound-create-policy-off`` disarms this check too.
+``state/access-bound-create-policy-off`` disarms the pool-pin check only; like the hook, the handoff rule has no
+off-switch (the ledgered AEGIS_HANDOFF_APOLLO quote is the override).
 """
 from __future__ import annotations
 
@@ -105,8 +106,8 @@ def handoff_refusal(verb: str, card: Optional[str], assignee: Optional[str]) -> 
         _log.debug("handoff: cannot resolve the acting profile; failing open", exc_info=True)
         return None
     root = _fleet_root()
-    if (root / OFF_MARKER).exists():
-        return None
+    # No OFF_MARKER check here: the hook's aegis-no-apollo-handoff rule has no off-switch of its own (the
+    # ledgered Ace quote is the only override), and the CLI mirrors that. The marker disarms the pool pin only.
     mod = _load_hook(root)
     if mod is None:
         return None
