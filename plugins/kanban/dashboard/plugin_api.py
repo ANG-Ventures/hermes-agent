@@ -67,15 +67,17 @@ def _normalize_slug_or_400(slug: str) -> Optional[str]:
 def _resolve_board(board: Optional[str]) -> str:
     """Validate/normalise a board slug query param (400 malformed, 404 unknown). Omitted: there
     is no current board (S7 D5), so ``kanban.bare_verb`` decides: 400 ``board required`` under
-    ``refuse``, ``default`` under the kill switch."""
-    if board is None or board == "":
-        from hermes_cli import kanban_board_select as kbsel
+    ``refuse``, ``default`` under the kill switch. A blank selector (``?board=%20``) is omitted:
+    normalised first by ``kbsel.resolve_selector`` (Prism b68acd4edf81)."""
+    from hermes_cli import kanban_board_select as kbsel
 
+    with _value_error_400():
+        normed = kbsel.resolve_selector(board)
+    if normed is None:
         if kbsel.bare_verb_policy() == kbsel.BARE_VERB_DEFAULT:
             return kanban_db.DEFAULT_BOARD
         raise HTTPException(status_code=400, detail="board required: pass ?board=<slug>")
-    normed = _normalize_slug_or_400(board)
-    if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
+    if normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {normed!r} does not exist")
     return normed
 

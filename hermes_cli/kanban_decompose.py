@@ -291,6 +291,7 @@ def _apply_fanout(
                 children=children,
                 author=author,
                 auto_promote=routing.auto_promote,
+                board=board,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -317,7 +318,9 @@ def decompose_task(
     # Resolve the active board ONCE, up front, so the write connections (and
     # the decompose upgrade's default_workdir lookup) can't disagree if a
     # concurrent `boards switch` moves the ambient board mid-call.
-    board = board or kb.get_current_board()
+    from hermes_cli import kanban_board_select as kbsel
+
+    board = kbsel.resolve_selector(board) or kb.get_current_board()
     task, reason = _load_triage_task(task_id, board=board)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)

@@ -594,3 +594,30 @@ def test_boards_list_marks_only_the_resolved_board(home, capsys):
     assert marked == ["alpha"]
     assert _boards_argv(["boards", "list", "--json"]) == 0
     assert not any(b["is_current"] for b in json.loads(capsys.readouterr().out))
+
+
+# --- resolve_selector: one normalise-then-blank-is-omitted rule (round 4, Prism b68acd4edf81) ---
+
+@pytest.mark.parametrize("raw", [None, "", " ", "\t\n "])
+def test_resolve_selector_blank_is_omitted(home, raw):
+    assert kbsel.resolve_selector(raw) is None
+
+
+def test_resolve_selector_normalises_a_real_slug(home):
+    assert kbsel.resolve_selector("  Alpha ") == "alpha"
+
+
+def test_resolve_selector_refuses_malformed_and_the_pin_sentinel(home):
+    with pytest.raises(ValueError):
+        kbsel.resolve_selector("bad slug")
+    with pytest.raises(kbsel.BoardNotFound, match="reserved"):
+        kbsel.resolve_selector(" Override ")
+
+
+def test_blank_board_flag_is_omitted_on_the_cli_path(home):
+    """``--board ' '`` is the bare verb: refused under ``refuse`` (rc 2 BoardRequired), never an
+    error about an empty slug and never a silent default."""
+    with pytest.raises(kbsel.BoardRequired):
+        kbsel.resolve(_ns(kanban_action="list", board=" "))
+    _policy(home, "default")
+    assert kbsel.resolve(_ns(kanban_action="list", board=" ")) == kb.DEFAULT_BOARD

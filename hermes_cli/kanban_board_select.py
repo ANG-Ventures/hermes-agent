@@ -106,21 +106,32 @@ def _check_explicit(slug: str) -> str:
     return slug
 
 
+def resolve_selector(raw: Optional[str]) -> Optional[str]:
+    """Normalise a caller's board selector; ``None`` when it names no board (omitted, ``""`` or
+    whitespace), which every surface treats exactly as omitted. Normalise FIRST, then test for
+    blank (Prism b68acd4edf81: ``?board=%20`` checked as non-blank, then normalised to ``None``).
+    Raises ``ValueError`` for a malformed slug, :class:`BoardNotFound` for the reserved pin
+    sentinel (Prism 39b758962810). Existence is the caller's check."""
+    from hermes_cli import kanban_db as kb
+
+    if raw is None:
+        return None
+    if str(raw).strip().lower() == kb.PINNED_SLUG:
+        raise BoardNotFound(
+            f"kanban: board {raw!r} does not exist: {kb.PINNED_SLUG!r} is reserved for a "
+            f"HERMES_KANBAN_DB pin that names no board and is never a board name. "
+            f"Pass the board's real slug (boards: hermes kanban boards list).")
+    return kb._normalize_board_slug(raw)
+
+
 def resolve_slug(board: Optional[str], *, verb: str, card_ids: Iterable[str] = ()) -> str:
     """The board slug for one verb. Raises :class:`BoardRequired`, :class:`BoardNotFound`,
     ``ValueError``, ``KanbanBoardDerivationError`` or ``KanbanPinDivergenceError``, each naming
     the next command."""
     from hermes_cli import kanban_db as kb
 
-    if board is not None:
-        if str(board).strip().lower() == kb.PINNED_SLUG:  # Prism 39b758962810
-            raise BoardNotFound(
-                f"kanban: board {board!r} does not exist: {kb.PINNED_SLUG!r} is reserved for a "
-                f"HERMES_KANBAN_DB pin that names no board and is never a board name. "
-                f"Pass the board's real slug (boards: hermes kanban boards list).")
-        normed = kb._normalize_board_slug(board)
-        if not normed:
-            raise ValueError("kanban: --board requires a slug")
+    normed = resolve_selector(board)
+    if normed is not None:
         return _check_explicit(normed)
     pinned = kb.pinned_board()
     if pinned:
@@ -168,11 +179,12 @@ def card_ids_of(args: argparse.Namespace) -> list[str]:
 def resolve(args: argparse.Namespace) -> Optional[str]:
     """The board for a parsed ``hermes kanban`` invocation; ``None`` for board-agnostic verbs."""
     verb = getattr(args, "kanban_action", None) or ""
-    if verb in BOARD_AGNOSTIC_VERBS and getattr(args, "board", None) is None:
+    board = resolve_selector(getattr(args, "board", None))  # blank --board == omitted
+    if verb in BOARD_AGNOSTIC_VERBS and board is None:
         return None
     if verb == "notify-repair" and getattr(args, "all_boards", False):
         return None
-    if verb == "boards" and getattr(args, "board", None) is None:
+    if verb == "boards" and board is None:
         # `boards list|show` with no --board report the pin's board, else no board (they
         # enumerate); never a bare-verb refusal (Prism 7b28513d644d).
         from hermes_cli import kanban_db as kb
@@ -180,4 +192,4 @@ def resolve(args: argparse.Namespace) -> Optional[str]:
         if not kb.pinned_board():
             return None
         verb = f"boards {getattr(args, 'boards_action', None) or 'list'}"
-    return resolve_slug(getattr(args, "board", None), verb=verb, card_ids=card_ids_of(args))
+    return resolve_slug(board, verb=verb, card_ids=card_ids_of(args))

@@ -108,3 +108,16 @@ def test_set_current_endpoint_and_field_are_gone(client):
     assert "current" not in listed
     assert all("is_current" not in b for b in listed["boards"])
     assert kb.get_current_board() == kb.DEFAULT_BOARD
+
+
+@pytest.mark.kanban_bare_verb_refuse
+def test_blank_board_query_is_omitted_not_default(client, tmp_path):
+    """Prism b68acd4edf81: ``?board=%20`` normalises to no board and takes the omitted branch:
+    400 under ``refuse`` (no write lands on default), ``default`` only under the kill switch."""
+    r = client.post("/api/plugins/kanban/tasks?board=%20", json={"title": "stray"})
+    assert r.status_code == 400, r.text
+    assert "board required" in r.json()["detail"]
+    with kb.connect(board=kb.DEFAULT_BOARD) as conn:
+        assert not [t for t in kb.list_tasks(conn) if t.title == "stray"]
+    (tmp_path / ".hermes" / "config.yaml").write_text("kanban:\n  bare_verb: default\n", encoding="utf-8")
+    assert client.get("/api/plugins/kanban/board?board=%20").status_code == 200
