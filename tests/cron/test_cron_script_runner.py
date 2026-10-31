@@ -1570,6 +1570,13 @@ def test_first_admitted_tick_closes_an_episode_left_by_a_rearm_off_the_self_rear
     r2.on_home_cycle("default", root, True, admitted)
     assert clears == [1]  # once per process
 
+    # Prism ce116ff61d38: a runner parked past the 24 h window still closes the episode.
+    rr.trips_path().write_text(json.dumps({"epoch": time.time() - 3 * 86400, "at": "old"}) + "\n")
+    assert rr.recent_trips() == []
+    r3 = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r3.on_home_cycle("default", root, True, admitted)
+    assert clears == [1, 1]
+
 
 def test_replay_commit_keeps_the_file_without_the_lock(root, monkeypatch):
     """Apollo item 5: when the commit cannot take the file lock it does not rewrite the file."""

@@ -426,9 +426,11 @@ class ScriptRunner:
                 elif not self._episode_cleared:
                     # A re-arm off the self-rearm path (`hermes cron runner rearm`, a hand
                     # unlink, the knob toggle) also ends the trip; close any open episode once.
+                    # Gated on ANY recorded trip, not the 24 h window: a runner parked longer
+                    # than the window still has an open episode (Prism ce116ff61d38).
                     from cron import script_runner_rearm as rearm_policy
 
-                    if rearm_policy.recent_trips():
+                    if rearm_policy.trips_path().exists():
                         rearm_policy.clear_alerts()
                 self._episode_cleared = True
         elif isinstance(outcome, BaseException):
