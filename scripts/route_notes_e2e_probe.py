@@ -189,7 +189,8 @@ def turn_python(tree: Path) -> Path:
 
 def run_turn(py: Path, tree: Path, env: dict, work: Path, home: Path, step: int, override) -> dict:
     out = work / f"step{step}.json"
-    cmd = [str(py), str(HERE), "--_turn", str(step), "--home", str(home), "--dump", str(out)]
+    cmd = [str(py), str(HERE), "--_turn", str(step), "--home", str(home), "--dump", str(out),
+           "--runtime-tree", str(tree)]
     if override:
         cmd += ["--model-override", override]
     log(f"step {step}: turn start (override={override})")
@@ -322,7 +323,8 @@ def _tail_notes(payload: dict) -> list:
 
 
 def turn_main(a) -> int:
-    sys.path.insert(0, str(REPO))
+    tree = a.runtime_tree.resolve()  # the tree under test, not the checkout holding this script
+    sys.path.insert(0, str(tree))
     from gateway.config import GatewayConfig, Platform
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource, SessionStore
@@ -336,7 +338,7 @@ def turn_main(a) -> int:
     import agent.route_identity as ri
     for mod in (ri, sys.modules["gateway.run"]):
         f = os.path.realpath(mod.__file__)
-        if not f.startswith(os.path.realpath(str(REPO))):
+        if not f.startswith(os.path.realpath(str(tree)) + os.sep):
             raise SystemExit(f"module resolved OUTSIDE the tree: {f}")
 
     home = a.home
