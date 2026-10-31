@@ -695,7 +695,11 @@ class ScriptRunner:
             # flight. Keep only trees alive on a fresh check (Prism 934ec5f4046f): a zombie-only
             # tree finished on its own and keeps its own result, with no interruption flag.
             trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
-            trees = [t for t in trees if ss._script_tree_alive(t[1], t[2])]
+            # An unreadable same-user process (Prism 952be3262777) only withholds a re-fire for a run
+            # cut off here; it never makes a run that already finished on its own count as cut off.
+            trees = [t for t in trees if ss._script_tree_alive(
+                t[1], None if t[2] is None else [m for m in t[2]
+                                                 if not isinstance(m, ss._UnreadableMember)])]
             # Every run cut off here is a failure flagged for its re-fire, whatever it exits with
             # (Prism b86087faa72f); consumed by _run_job_script once the run returns.
             sched._skew_interrupted_job_ids.update(

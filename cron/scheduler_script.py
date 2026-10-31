@@ -304,6 +304,7 @@ def _script_tree_snapshot(proc: subprocess.Popen) -> Optional[list]:
 # cannot find it; the token in its environment can. Set on the Popen as ``_SCRIPT_RUN_TOKEN_ATTR``.
 SCRIPT_RUN_TOKEN_ENV = "_HERMES_CRON_SCRIPT_RUN"
 _SCRIPT_RUN_TOKEN_ATTR = "_hermes_script_run_token"
+_SCRIPT_RUN_STARTED_ATTR = "_hermes_script_run_started"  # time.time() just before the Popen
 
 
 class _UnprovenMember:
@@ -325,21 +326,79 @@ class _UnprovenMember:
         return None
 
 
+class _UnreadableMember:
+    """A same-user process started after the script whose environment cannot be read (Prism
+    952be3262777: a token-inheriting escapee can make itself non-dumpable). It may be ours, so it
+    counts as alive while it runs and the re-fire is withheld; it may not be, so it is never
+    signalled."""
+
+    def __init__(self, process) -> None:
+        self._process = process
+        self.pid = process.pid
+
+    def is_running(self) -> bool:
+        return self._process.is_running()
+
+    def status(self) -> str:
+        return self._process.status()
+
+    def children(self, recursive: bool = False) -> list:
+        return []
+
+    def send_signal(self, _sig) -> None:
+        return None
+
+
+# Re-derived by every token scan, never carried from an earlier snapshot (Prism 06a05538f9a0).
+_SCAN_MARKERS = (_UnprovenMember, _UnreadableMember)
+
+
+def _is_orphaned(cand, started: float) -> bool:
+    """Whether ``cand``'s parent is init or a subreaper: pid 1, or a parent that predates the script
+    and is named like one. Unreadable parent: not proven orphaned."""
+    ppid = cand.ppid()
+    if ppid <= 1:
+        return True
+    import psutil
+    try:
+        parent = psutil.Process(ppid)
+        return (parent.create_time() < started
+                and parent.name() in ("systemd", "init", "launchd", "tini", "s6-svscan"))
+    except psutil.Error:
+        return False
+
+
 def _script_run_token_members(proc: subprocess.Popen) -> list:
     """Live processes whose environment carries ``proc``'s run token, wherever they were reparented
     or whichever session they moved to. [] when ``proc`` has no token; ``[_UnprovenMember()]`` when
-    the scan itself fails. A process whose environ cannot be read (another user's, a zombie) is not
-    ours or is gone, and is skipped."""
+    the scan itself fails. A process that is gone, or another user's, is skipped. An orphaned
+    same-user process started since the script whose environ is unreadable is returned as an
+    ``_UnreadableMember`` (Prism 952be3262777): counted alive, never signalled. Orphaned (parent is
+    init or a subreaper, where an escapee of an exited parent lands) keeps an unrelated
+    non-dumpable process with a live parent (sudo, ssh) from withholding the re-fire."""
     token = getattr(proc, _SCRIPT_RUN_TOKEN_ATTR, None)
     if not token:
         return []
+    started = getattr(proc, _SCRIPT_RUN_STARTED_ATTR, None)
     try:
         import psutil
         found = []
+        uid = os.getuid()  # windows-footgun: ok — POSIX-only caller (cron script runner)
         for cand in psutil.process_iter():
-            with contextlib.suppress(psutil.Error):
-                if cand.pid != os.getpid() and cand.environ().get(SCRIPT_RUN_TOKEN_ENV) == token:
+            if cand.pid == os.getpid():
+                continue
+            try:
+                if cand.environ().get(SCRIPT_RUN_TOKEN_ENV) == token:
                     found.append(cand)
+            except psutil.AccessDenied:
+                with contextlib.suppress(psutil.Error):
+                    if (started is not None and cand.uids().real == uid
+                            and cand.create_time() >= started - 1.0
+                            and cand.status() != psutil.STATUS_ZOMBIE
+                            and _is_orphaned(cand, started)):
+                        found.append(_UnreadableMember(cand))
+            except psutil.Error:
+                continue
         return found
     except Exception:
         logger.warning("cron script run-token scan failed for pid %s; treating the tree as alive",
@@ -355,6 +414,9 @@ def _script_tree_refresh(proc: subprocess.Popen, snapshot: Optional[list]) -> Op
     parent)."""
     if snapshot is None:
         return _script_tree_snapshot(proc)
+    # A marker from an earlier scan says nothing about now: drop it, the scan below re-adds it only
+    # if it still applies (Prism 06a05538f9a0).
+    snapshot = [m for m in snapshot if not isinstance(m, _SCAN_MARKERS)]
     merged = list(snapshot)
     fresh = _script_tree_snapshot(proc) if proc.poll() is None else None
     # Members of the script's own process group (its pgid is the leader pid): a same-group child
@@ -697,6 +759,7 @@ def _run_job_script(
         env.update(env_overlay)
         run_token = uuid.uuid4().hex
         env[SCRIPT_RUN_TOKEN_ENV] = run_token  # finds setsid escapees (Prism 85c0395583d8)
+        run_started = time.time()
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -705,6 +768,7 @@ def _run_job_script(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
         setattr(proc, _SCRIPT_RUN_TOKEN_ATTR, run_token)
+        setattr(proc, _SCRIPT_RUN_STARTED_ATTR, run_started)
         if outcome_record is not None:
             _outcome_records.note_pid(outcome_record, proc.pid)
         # Registered so the shutdown drain can TERMINATE this script (see
