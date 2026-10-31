@@ -337,3 +337,21 @@ def test_env_suffix_on_our_home_names_the_suffixed_root(monkeypatch, tmp_path):
     # Same HOME and same (empty) suffix still means this process's root.
     assert _env_kanban_root({"HOME": str(home)}) is None
     assert _env_kanban_root({"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": ""}) is None
+
+
+def test_env_without_root_vars_inherits_the_process_suffix(monkeypatch, tmp_path):
+    """Prism 976039e81f74 (round 2): an absent key inherits the process value, never ``""``. With a
+    process suffix, a mapping naming no root-selection variable is the process root (``None``); a
+    mapping that sets the suffix explicitly still names its own root."""
+    from hermes_cli.kanban_identity import _env_kanban_root
+
+    home = tmp_path / "alice"
+    home.mkdir()
+    for var in ("HERMES_KANBAN_HOME", "HERMES_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_DATA_DIR_SUFFIX", "-ci")
+    assert _env_kanban_root({}) is None
+    assert _env_kanban_root({"HOME": str(home)}) is None
+    assert _env_kanban_root({"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": ""}) == home / ".hermes"
+    assert _env_kanban_root({"HERMES_DATA_DIR_SUFFIX": "-qa"}) == home / ".hermes-qa"

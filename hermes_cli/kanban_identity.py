@@ -77,10 +77,12 @@ def _env_kanban_root(env: Mapping[str, str]):
         from pathlib import Path
 
         env_home = (env.get("HOME") or "").strip()
-        suffix = env.get("HERMES_DATA_DIR_SUFFIX", "")
+        # An absent key inherits the process value, never "" (Prism 976039e81f74).
+        process_suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+        suffix = env.get("HERMES_DATA_DIR_SUFFIX", process_suffix)
         same_home = not env_home or os.path.realpath(env_home) == os.path.realpath(str(Path.home()))
-        # Our HOME is our root only when the suffix agrees too (Prism 976039e81f74).
-        if same_home and suffix == os.environ.get("HERMES_DATA_DIR_SUFFIX", ""):
+        # Our HOME is our root only when the suffix agrees too.
+        if same_home and suffix == process_suffix:
             return None
         return Path(env_home or str(Path.home())) / (".hermes" + suffix)
     from hermes_constants import get_default_hermes_root

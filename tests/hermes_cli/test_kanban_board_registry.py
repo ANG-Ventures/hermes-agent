@@ -578,3 +578,19 @@ def test_boards_ls_and_current_aliases_resolve_the_board(home, capsys):
     assert capsys.readouterr().out == listed
     assert _boards_argv(["--board", "typo", "boards", "current"]) == 1
     assert "board 'typo' does not exist" in capsys.readouterr().err
+
+
+def test_boards_list_marks_only_the_resolved_board(home, capsys):
+    """Prism ee7333d7b6ff: ``--board alpha boards list`` marks alpha (not the ambient default) as
+    current, matching the footer; with no board resolved nothing is marked."""
+    import json
+
+    kb.create_board("alpha")
+    assert _boards_argv(["--board", "alpha", "boards", "list", "--json"]) == 0
+    current = {b["slug"]: b["is_current"] for b in json.loads(capsys.readouterr().out)}
+    assert current == {"default": False, "alpha": True}
+    assert _boards_argv(["--board", "alpha", "boards", "list"]) == 0
+    marked = [ln.split()[1] for ln in capsys.readouterr().out.splitlines() if ln.startswith("●")]
+    assert marked == ["alpha"]
+    assert _boards_argv(["boards", "list", "--json"]) == 0
+    assert not any(b["is_current"] for b in json.loads(capsys.readouterr().out))
