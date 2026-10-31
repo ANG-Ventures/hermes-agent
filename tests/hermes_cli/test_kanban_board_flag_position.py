@@ -83,10 +83,15 @@ def test_empty_board_selector_is_refused_before_any_write(home, argv):
     assert not default_db.exists() or "T" not in _titles(default_db)
 
 
-def test_boards_show_ignores_verb_position_override(home):
+def test_boards_show_reports_the_named_board_or_says_none_is_pinned(home):
+    """S7 D2: ``boards show`` prints the board from --board (either position) or the DB pin, never
+    a pointer; with neither it says so."""
     r = _cli(home, "boards", "show", "--board", "beta")
     assert r.returncode == 0, r.stderr
-    assert "Current board: default" in r.stdout
+    assert "Board: beta" in r.stdout
+    r = _cli(home, "boards", "show")
+    assert r.returncode == 0, r.stderr
+    assert "no board pinned; pass --board <slug>" in r.stdout
 
 
 def _leaves(action: argparse._SubParsersAction, path=()):

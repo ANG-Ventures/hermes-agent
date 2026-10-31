@@ -1080,7 +1080,6 @@ def test_sandboxed_worker_env_cannot_reach_live_board(tmp_path, monkeypatch):
     scratch.mkdir()
     # Stock dispatched-worker env.
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live_board))
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ban-forensics")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(tmp_path / "live" / "workspaces"))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_live")
     # The "documented" hermeticity move, plus the new flag.

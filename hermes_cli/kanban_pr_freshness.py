@@ -283,7 +283,7 @@ def event_land_enabled(root: Optional[Path] = None) -> bool:
         if root is None:
             from hermes_constants import get_default_hermes_root
             root = get_default_hermes_root()
-        with open(Path(root) / "config" / "landing-policy.json", encoding="utf-8") as fh:
+        with open(Path(root) / "config" / "landing-policy.json", encoding="utf-8-sig") as fh:
             cfg = json.load(fh)
     except (OSError, ValueError):
         return False

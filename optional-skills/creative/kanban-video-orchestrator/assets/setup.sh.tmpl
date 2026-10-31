@@ -13,6 +13,8 @@ set -euo pipefail
 PROJECT_SLUG="{{SLUG}}"
 WORKSPACE="$HOME/projects/video-pipeline/${PROJECT_SLUG}"
 TENANT="{{TENANT}}"
+# Every kanban verb names its board (a bare verb is refused); tenant scopes within it.
+BOARD="default"
 
 # ─────────────────────────────────────────────────────────────────────
 # 1. Verify required API keys
@@ -159,7 +161,7 @@ TEAM_EOF
 # ─────────────────────────────────────────────────────────────────────
 echo "═══ Firing initial kanban task ═══"
 
-hermes kanban create "Direct production of {{TITLE}}" \
+hermes kanban --board "$BOARD" create "Direct production of {{TITLE}}" \
     --assignee director \
     --workspace dir:"$WORKSPACE" \
     --tenant "$TENANT" \
@@ -184,8 +186,8 @@ echo ""
 echo "═══ Setup complete ═══"
 echo ""
 echo "Monitor with:"
-echo "  hermes kanban watch --tenant $TENANT"
-echo "  hermes kanban list  --tenant $TENANT"
+echo "  hermes kanban --board $BOARD watch --tenant $TENANT"
+echo "  hermes kanban --board $BOARD list  --tenant $TENANT"
 echo "  hermes dashboard"
 echo ""
 echo "Workspace: $WORKSPACE"

@@ -329,7 +329,9 @@ def _bare_comment(monkeypatch, profile, tid, token=None, body="APOLLO RULED: go"
         monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, token)
     top = argparse.ArgumentParser(prog="hermes")
     kc.build_parser(top.add_subparsers(dest="command"))
-    assert kc.kanban_command(top.parse_args(["kanban", "comment", tid, body])) == 0
+    # --board: the identity under test, not D3's card-id derivation (which fails closed when
+    # another board is unreadable, as one test below arranges).
+    assert kc.kanban_command(top.parse_args(["kanban", "--board", "default", "comment", tid, body])) == 0
     with kb.connect() as conn:
         return conn.execute(
             "SELECT author FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)

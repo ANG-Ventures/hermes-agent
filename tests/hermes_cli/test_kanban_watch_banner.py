@@ -12,16 +12,16 @@ from hermes_cli.kanban_parser import build_parser
 
 @pytest.mark.parametrize(
     "environment,explicit,expected",
-    [(None, None, "alpha"), ("beta", None, "beta"), ("alpha", "beta", "beta")],
+    [(None, "alpha", "alpha"), ("beta", "alpha", "alpha"), ("alpha", "beta", "beta")],
 )
 def test_watch_names_resolved_board(tmp_path, monkeypatch, capsys, environment, explicit, expected):
+    """S7: the explicit --board is the board; an exported HERMES_KANBAN_BOARD is inert."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     kb.create_board("alpha")
     kb.create_board("beta")
-    kb.set_current_board("alpha")
     if environment:
         monkeypatch.setenv("HERMES_KANBAN_BOARD", environment)
     parser = argparse.ArgumentParser()

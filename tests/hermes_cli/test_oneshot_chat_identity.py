@@ -6,17 +6,17 @@ import types
 import hermes_cli.oneshot as oneshot_mod
 
 
-def _capture_agent_kwargs(monkeypatch, *, task=None, board=None):
+def _capture_agent_kwargs(monkeypatch, *, task=None, db=None):
     captured = {}
 
     if task is None:
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     else:
         monkeypatch.setenv("HERMES_KANBAN_TASK", task)
-    if board is None:
-        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    if db is None:
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     else:
-        monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+        monkeypatch.setenv("HERMES_KANBAN_DB", db)
 
     class FakeAgent:
         def __init__(self, **kwargs):
@@ -60,8 +60,15 @@ def _capture_agent_kwargs(monkeypatch, *, task=None, board=None):
     return captured
 
 
-def test_oneshot_forwards_kanban_chat_identity(monkeypatch):
-    kwargs = _capture_agent_kwargs(monkeypatch, task=" t_3e694374 ", board=" wave3 ")
+def test_oneshot_forwards_kanban_chat_identity(monkeypatch, tmp_path):
+    """S7: the board in the chat name is derived from the worker's DB pin, not a slug env var."""
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "not-this-one")
+    kb.create_board("wave3")
+    db = str(kb.board_dir("wave3") / "kanban.db")
+    kwargs = _capture_agent_kwargs(monkeypatch, task=" t_3e694374 ", db=db)
 
     assert kwargs["chat_id"] == "t_3e694374"
     assert kwargs["chat_name"] == "kanban / wave3 / t_3e694374"
