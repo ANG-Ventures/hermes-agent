@@ -138,15 +138,54 @@ def render(lines: list[str], dropped: int = 0, folds: Optional[list] = None) -> 
     if len("\n".join([head] + full + tail)) <= MAX_MESSAGE_CHARS:
         return "\n".join([head] + full + tail)
     budget = MAX_MESSAGE_CHARS - len(head) - sum(len(t) + 1 for t in tail) - 80
-    body: list[str] = []
-    for i, m in enumerate(lines):
-        c = _compact(m)
-        if budget - (len(c) + 1) < 0:
-            body.append(f"… +{len(lines) - i} more (card events: `hermes kanban show <id>`)")
+    compact = [_compact(m) for m in lines]
+    if sum(len(c) + 1 for c in compact) <= budget:
+        return "\n".join([head] + compact + tail)
+    # Titles do not fit: one line per transition kind listing every card id, so the
+    # day's card flow stays readable in one post (r142 C: titled-compact dropped 102
+    # of 671 ids at a 30 min window).
+    return "\n".join([head] + _grouped_ids(lines, budget) + tail)
+
+
+_KIND_WORDS = {"👀": "ready", "✔": "done", "↩️": "closed", "↩": "closed", "⏸": "blocked", "⏳": "landed"}
+
+
+def _grouped_ids(lines: list[str], budget: int) -> list[str]:
+    """``👀 ready 12: t_a t_b×2 …`` per mark, in first-seen order; a repeat id shows ``×N``."""
+    groups: dict[str, dict[str, int]] = {}
+    other: list[str] = []
+    for m in lines:
+        first = _one_line(m)
+        hit = _LINE_RE.match(first)
+        if not hit:
+            other.append(_compact(m))
+            continue
+        mark, board, tid = hit.group(1), hit.group(2), hit.group(3)
+        key = tid if board == "default" else f"{tid}[{board}]"
+        ids = groups.setdefault(mark, {})
+        ids[key] = ids.get(key, 0) + 1
+    out: list[str] = []
+    for mark, ids in groups.items():
+        word = _KIND_WORDS.get(mark, "")
+        line = f"{mark} {word} {sum(ids.values())}:".replace("  ", " ")
+        shown = 0
+        for tid, n in ids.items():
+            part = f" {tid}" + (f"×{n}" if n > 1 else "")
+            if budget - len(line) - len(part) - 16 < 0:
+                break
+            line += part
+            shown += 1
+        if shown < len(ids):
+            line += f" +{len(ids) - shown} more"
+        out.append(line)
+        budget -= len(line) + 1
+    for i, c in enumerate(other):
+        if budget - len(c) - 1 < 0:
+            out.append(f"… +{len(other) - i} more (card events: `hermes kanban show <id>`)")
             break
-        body.append(c)
+        out.append(c)
         budget -= len(c) + 1
-    return "\n".join([head] + body + tail)
+    return out
 
 
 class LifecycleDigest:
