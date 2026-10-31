@@ -309,3 +309,31 @@ def test_kanban_identity_expands_user_paths_only_in_env_path():
               for node in ast.walk(fn)
               if isinstance(node, ast.Attribute) and node.attr == "expanduser"]
     assert owners and set(owners) == {"_env_path"}, owners
+
+
+def test_env_suffix_on_our_home_names_the_suffixed_root(monkeypatch, tmp_path):
+    """Prism 976039e81f74: an env sharing this process's ``HOME`` but carrying a different
+    ``HERMES_DATA_DIR_SUFFIX`` describes ``<HOME>/.hermes<suffix>``, never the process root."""
+    from hermes_cli.kanban_identity import _env_kanban_root, resolve_kanban_worker_chat_identity
+
+    home = tmp_path / "alice"
+    ci_root = home / ".hermes-ci"
+    ci_root.mkdir(parents=True)
+    ci_root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_DATA_DIR_SUFFIX", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(ci_root))
+    kb.create_board("beta")  # board beta exists ONLY under the suffixed root
+    beta_db = ci_root / "kanban" / "boards" / "beta" / "kanban.db"
+    assert beta_db.parent.is_dir()
+    monkeypatch.delenv("HERMES_HOME")  # the process root is now <home>/.hermes
+
+    env = {"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": "-ci",
+           "HERMES_KANBAN_DB": str(beta_db), "HERMES_KANBAN_TASK": "t_example"}
+    assert _env_kanban_root(env) == home / ".hermes-ci"
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / beta / t_example")
+    # Same HOME and same (empty) suffix still means this process's root.
+    assert _env_kanban_root({"HOME": str(home)}) is None
+    assert _env_kanban_root({"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": ""}) is None

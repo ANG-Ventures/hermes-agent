@@ -563,3 +563,18 @@ def test_boards_list_and_show_bare_still_work_under_refuse(home, capsys):
     assert "no board pinned" in capsys.readouterr().out
     assert _boards_argv(["--board", "beta", "boards", "show"]) == 0
     assert capsys.readouterr().out.startswith("Board: beta")
+
+
+def test_boards_ls_and_current_aliases_resolve_the_board(home, capsys):
+    """Prism ccd467f64b6a: argparse dispatches ``ls``/``current`` under the literal typed, so the
+    aliases must resolve ``--board`` exactly like ``list``/``show``."""
+    kb.create_board("alpha")
+    _policy(home, "refuse")
+    assert _boards_argv(["--board", "alpha", "boards", "current"]) == 0
+    assert capsys.readouterr().out.startswith("Board: alpha")
+    assert _boards_argv(["--board", "alpha", "boards", "list"]) == 0
+    listed = capsys.readouterr().out
+    assert _boards_argv(["--board", "alpha", "boards", "ls"]) == 0
+    assert capsys.readouterr().out == listed
+    assert _boards_argv(["--board", "typo", "boards", "current"]) == 1
+    assert "board 'typo' does not exist" in capsys.readouterr().err

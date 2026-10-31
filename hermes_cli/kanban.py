@@ -303,8 +303,9 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 
 # --- Command dispatch ---
 
-# `boards` sub-verbs that report the call's board and so go through kbsel.resolve.
-_BOARDS_RESOLVED = frozenset({"list", "show"})
+# `boards` sub-verbs that report the call's board and so go through kbsel.resolve. argparse sets
+# `boards_action` to the literal typed, so the `ls`/`current` aliases are listed too (Prism ccd467f64b6a).
+_BOARDS_RESOLVED = frozenset({"list", "ls", "show", "current"})
 
 
 def _boards_sub(args: argparse.Namespace) -> str:
