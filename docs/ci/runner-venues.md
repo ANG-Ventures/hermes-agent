@@ -46,3 +46,5 @@ Only an **explicit, ledgered operator write**:
 
 Turn local back on as the default (for example, once a dedicated CI box exists) by flipping
 both flags in one reviewed hermes-home PR. A test pins the two flags equal.
+
+<!-- merge-queue canary (t_cc53bd7c): comment-only; proves mirror-ci posts on the merge-group sha. -->
