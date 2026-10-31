@@ -31,6 +31,10 @@ Verdict (exit 0 = PASS, 1 = FAIL, 2 = setup error): note counts 0/1/0/1 on steps
 model per step as above, the expected note texts, transcript and audit log agree.
 
   python3 scripts/route_notes_e2e_probe.py --scratch [--out DIR] [--seat sub-vps-N] [--port P]
+      [--pinned-model claude-sonnet-5]   # pin/cap another model while fable is capped fleet-wide
+
+"fable" above stands for --pinned-model (default claude-fable-5-1); the expected note texts follow it.
+The scratch relay counts as ready on /health status ok OR degraded with eligible_count >= 1.
 
 Dumps under --out: report.json, step<N>.json (every outbound call: model, ok, tail notes, messages),
 transcript.json (scratch state.db rows), model-route-changes.log, relay.log.
@@ -60,13 +64,22 @@ DEFAULT_PORT = 18898
 PROMPT = "Reply with exactly the text ROUTE-PROBE-OK and nothing else. Do not use tools."
 NOTE_OPENER = "[Route note:"
 SESSION_CHAT = "route-notes-e2e"
-# step -> (session /model override, expected note count, expected served model, note must contain)
-STEPS = (
-    (0, None, 0, OPUS, None),
-    (1, FABLE, 1, OPUS, "the user selected fable"),
-    (2, None, 0, OPUS, None),
-    (3, None, 1, FABLE, "restored"),
-)
+
+
+def model_label(model: str) -> str:
+    """The short name the route note uses (agent.route_identity.model_label for claude-* ids)."""
+    model = model.rsplit("/", 1)[-1]
+    return model[len("claude-"):] if model.startswith("claude-") and len(model) > 7 else model
+
+
+def steps_for(pinned: str) -> tuple:
+    """step -> (session /model override, expected note count, expected served model, note must contain)."""
+    return (
+        (0, None, 0, OPUS, None),
+        (1, pinned, 1, OPUS, f"the user selected {model_label(pinned)}"),
+        (2, None, 0, OPUS, None),
+        (3, None, 1, pinned, f"{model_label(pinned)} restored"),
+    )
 
 
 def _load_drain_rig():
@@ -104,19 +117,7 @@ class CapRelay:
              "--log", str(r.log_path), "--admin-test-actions"],
             cwd=str(self.rig.DEPLOY_RELAY.parent), env=r.env, stdout=out, stderr=subprocess.STDOUT,
         )
-        deadline = time.time() + wait_s
-        while time.time() < deadline:
-            if r.proc.poll() is not None:
-                raise SystemExit(f"scratch relay exited rc={r.proc.returncode}; see {out.name}")
-            try:
-                h = self.rig.http("GET", r.base + "/health")
-                if h.get("status") == "ok" and h.get("eligible_count", 0) >= 1 and r._serve_started_by(r.proc.pid):
-                    log(f"scratch relay up pid={r.proc.pid} eligible={h.get('eligible_keys')}")
-                    return
-            except Exception:
-                pass
-            time.sleep(0.5)
-        raise SystemExit("scratch relay never reported an eligible seat")
+        r.wait_ready(out.name, wait_s)
 
     def eligible(self, model: str) -> list:
         return list(self.rig.http("GET", self.inner.base + f"/eligibility?model={model}").get("eligible") or [])
@@ -146,7 +147,7 @@ class CapRelay:
         self.inner.stop()
 
 
-def pick_seat(rig, port: int, work: Path) -> str:
+def pick_seat(rig, port: int, work: Path, pinned: str) -> str:
     """The first worker seat the relay calls eligible for BOTH models (never sub 0)."""
     d = json.loads(rig.PROD_REGISTRY.read_text(encoding="utf-8-sig"))
     d["subs"] = [s for s in d["subs"] if str(s.get("label", "")).split(" ")[0] not in rig.SUB0_KEYS
@@ -158,13 +159,23 @@ def pick_seat(rig, port: int, work: Path) -> str:
     relay = CapRelay(rig, port, sel, reg)
     try:
         relay.start()
-        both = [k for k in relay.eligible(FABLE) if k in set(relay.eligible(OPUS))]
+        elig = {m: relay.eligible(m) for m in (pinned, OPUS)}
     finally:
         relay.stop()
         reg.unlink()
+    return choose_seat(elig, pinned)
+
+
+def choose_seat(elig: dict, pinned: str) -> str:
+    """First seat in ``elig[pinned]`` also in ``elig[OPUS]``; the refusal names the model(s) at fault."""
+    both = [k for k in elig[pinned] if k in set(elig[OPUS])]
     if not both:
-        raise SystemExit(f"no worker seat is eligible for both {FABLE} and {OPUS} right now")
-    log(f"seat eligible for fable+opus: {both[0]} (of {both})")
+        empty = [m for m, keys in elig.items() if not keys]
+        why = (f"no eligible seat for {', '.join(empty)}" if empty else
+               f"{pinned} eligible on {elig[pinned]}, {OPUS} on {elig[OPUS]}, no seat in both")
+        hint = " (try --pinned-model with an uncapped model)" if pinned in empty else ""
+        raise SystemExit(f"no worker seat is eligible for both {pinned} and {OPUS}: {why}{hint}")
+    log(f"seat eligible for {pinned}+{OPUS}: {both[0]} (of {both})")
     return both[0]
 
 
@@ -250,7 +261,9 @@ def main() -> int:
     ap.add_argument("--scratch", action="store_true", help="scratch relay + scratch home (the only mode)")
     ap.add_argument("--runtime-tree", type=Path, default=REPO, help="tree the turns import (default: this checkout)")
     ap.add_argument("--out", type=Path, default=None)
-    ap.add_argument("--seat", default=None, help="worker seat (default: first eligible for fable AND opus)")
+    ap.add_argument("--seat", default=None, help="worker seat (default: first eligible for the pinned model AND opus)")
+    ap.add_argument("--pinned-model", default=FABLE,
+                    help=f"model /model pins in step 1 and the relay caps (default {FABLE}; any model but {OPUS})")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--_turn", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--home", type=Path, default=None, help=argparse.SUPPRESS)
@@ -261,19 +274,23 @@ def main() -> int:
         return turn_main(a)
     if not a.scratch:
         ap.error("--scratch is required (the probe never runs against live relays or homes)")
+    pinned = a.pinned_model
+    if pinned == OPUS:
+        ap.error(f"--pinned-model must differ from the fallback {OPUS}")
+    steps_spec = steps_for(pinned)
 
     rig = _load_drain_rig()
     tree = a.runtime_tree.resolve()
     live = (Path.home() / ".hermes/runtime/hermes-agent").resolve()
     scratch_root = Path(os.environ.get("TMPDIR") or "/tmp")
     work = claim_out(a.out, scratch_root)
-    log(f"tree={tree} (live runtime tree: {'YES, read-only' if tree == live else 'no'}) out={work}")
+    log(f"tree={tree} (live runtime tree: {'YES, read-only' if tree == live else 'no'}) out={work} pinned={pinned}")
 
-    seat = a.seat or pick_seat(rig, a.port, work)
+    seat = a.seat or pick_seat(rig, a.port, work, pinned)
     registry = work / "registry.json"
     rig.one_seat_registry(seat, registry)
     home = rig.scratch_home(work, a.port, OPUS, OPUS, None)
-    # Fallback ladder: fable (when pinned) -> opus. capacity wait off; sticky off so R3 re-tries.
+    # Fallback ladder: the pinned model -> opus. capacity wait off; sticky off so R3 re-tries.
     cfg = (home / "config.yaml").read_text(encoding="utf-8")
     cfg += "agent:\n  capacity_retry_attempts: 0\n  api_max_retries: 1\nfallback:\n  sticky_policy: false\n"
     (home / "config.yaml").write_text(cfg, encoding="utf-8")
@@ -284,9 +301,9 @@ def main() -> int:
     steps = []
     try:
         relay.start()
-        for step, override, *_ in STEPS:
+        for step, override, *_ in steps_spec:
             if step == 1:
-                relay.cap(seat, FABLE, 900)
+                relay.cap(seat, pinned, 900)
             if step == 3:
                 relay.uncap()
             steps.append(run_turn(py, tree, env, work, home, step, override))
@@ -304,7 +321,7 @@ def main() -> int:
     (work / "transcript.json").write_text(json.dumps(transcript, indent=2), encoding="utf-8")
 
     results, ok = [], True
-    for (step, override, want_n, want_model, want_text), st in zip(STEPS, steps):
+    for (step, override, want_n, want_model, want_text), st in zip(steps_spec, steps):
         served = [c for c in st["calls"] if c["ok"]]
         notes = [n for c in served for n in c["tail_notes"]]
         failed_notes = [n for c in st["calls"] if not c["ok"] for n in c["tail_notes"]]
@@ -324,7 +341,7 @@ def main() -> int:
     picked, served_seq = relay_turn_picks(events), [c["model"] for st in steps for c in st["calls"] if c["ok"]]
     ok &= picked == served_seq
     report = {
-        "tree": str(tree), "seat": seat, "port": a.port, "relay_launches": relay.inner.launches,
+        "tree": str(tree), "pinned_model": pinned, "seat": seat, "port": a.port, "relay_launches": relay.inner.launches,
         "relay_models_picked": [e.get("model") for e in events if e.get("event") == "pick"],
         "relay_turn_picks": picked, "payload_served_sequence": served_seq, "relay_matches_payload": picked == served_seq,
         "relay_admin_caps": [e for e in events if e.get("event") == "admin_test_cap"],
