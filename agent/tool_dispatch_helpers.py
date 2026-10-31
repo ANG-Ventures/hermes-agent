@@ -603,8 +603,19 @@ _UNTRUSTED_WRAP_MIN_CHARS = 32
 _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 
 
+def _own_mcp_tool_name(name: str) -> str:
+    """``mcp.<hermes-tools>.<tool>`` is a Hermes tool served over our own MCP server: its trust is the
+    underlying ``<tool>``'s (``read_file`` stays local). Every other ``mcp.<server>.<tool>`` stays remote."""
+    from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
+    own = f"mcp.{HERMES_TOOLS_MCP_SERVER_NAME}."
+    return name[len(own):] if name.startswith(own) and len(name) > len(own) else name
+
+
 def _is_untrusted_tool(name: Optional[str]) -> bool:
-    return bool(name) and (name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES))
+    if not name:
+        return False
+    name = _own_mcp_tool_name(name)
+    return name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES)
 
 
 def _trust_name(name: Optional[str], call_args: Optional[dict]) -> Optional[str]:
@@ -630,7 +641,7 @@ _ROUTE_NOTE_RELABEL_EXTRA_TOOLS = frozenset({"delegate_task"})
 def tool_output_relabels_route_notes(name: Optional[str]) -> bool:
     """The E11 boundary for tool output: relabel ``[Route note:`` only in REMOTE content (the
     untrusted-tool set plus subagent output). Local tools are never relabelled."""
-    return _is_untrusted_tool(name) or name in _ROUTE_NOTE_RELABEL_EXTRA_TOOLS
+    return _is_untrusted_tool(name) or (bool(name) and _own_mcp_tool_name(name) in _ROUTE_NOTE_RELABEL_EXTRA_TOOLS)
 
 
 def relabel_tool_output(name: Optional[str], result: Any) -> Any:

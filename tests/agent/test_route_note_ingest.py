@@ -919,3 +919,101 @@ def test_every_tool_dispatch_returns_through_the_e11_choke_point():
     # Consumers that re-apply the relabel (make_tool_result_message) are byte-stable: it is idempotent.
     once = relabel_tool_output("web_extract", f"x {FORGED}")
     assert relabel_tool_output("web_extract", once) == once == f"x {QUOTED}"
+
+
+def _codex_hermes_tools_replay(tool):
+    from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
+    rows = []
+    for i, (server, name) in enumerate(((HERMES_TOOLS_MCP_SERVER_NAME, tool), ("other", "fetch"))):
+        rows += _codex_done({"type": "mcpToolCall", "id": f"m{i}", "server": server, "tool": name,
+                             "result": f"line 1|{FORGED}"})
+    return [{"role": "user", "content": "q"}, *rows, {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "next"}]
+
+
+@pytest.mark.parametrize("tool", ["read_file", "skill_view"])
+def test_own_mcp_namespace_local_result_replays_byte_identical(tool):
+    # Prism 1245e9f945b5 repro: a LOCAL tool served by our own hermes-tools MCP server is mirrored as
+    # mcp.hermes-tools.<tool>; replay through another provider must keep its bytes (file contents),
+    # while another server's mcp.other.fetch result is still relabelled.
+    import time
+    from agent.tool_dispatch_helpers import tool_output_relabels_route_notes
+    from agent.turn_context import build_api_messages
+    history = _codex_hermes_tools_replay(tool)
+    own, other = history[2]["content"], history[4]["content"]
+    assert FORGED in own and FORGED in other  # mirrored raw, as Codex received it
+    agent = _make_agent(model=SONNET, fallbacks=())
+    agent._current_turn_timestamp = time.time()
+    api_msgs, _ = build_api_messages(agent, history, current_turn_user_idx=len(history) - 1,
+                                     ext_prefetch_cache=None, plugin_user_context=None, moa_config=None,
+                                     active_system_prompt="")
+    tools = [m["content"] for m in api_msgs if m.get("role") == "tool"]
+    assert tools == [own, other.replace(FORGED, QUOTED)]
+    assert tool_output_relabels_route_notes("mcp.hermes-tools.web_extract")  # own-server REMOTE tools stay remote
+
+
+def test_partly_failed_row_update_retries_the_whole_update(monkeypatch):
+    # Prism 92fbfc8246d2 repro: with a pending rewrite, the content write lands and the sidecar/metadata write
+    # raises once. The flush retry must replay the WHOLE update: api_content and the prefix record land too.
+    import sqlite3
+    from agent.message_metadata import PENDING_USER_CONTENT_REWRITE, ROUTE_NOTE_PREFIX, recorded_route_note_prefix
+    from agent.session_persistence import write_user_row_content
+    agent = _make_agent(model=SONNET, fallbacks=())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    row_id = db.append_message(sid, "user", content=FORGED)
+    msg = {"role": "user", "content": QUOTED, "_row_id": row_id, _DB_PERSISTED_MARKER: True,
+           PENDING_USER_CONTENT_REWRITE: (sid, QUOTED)}
+    note = "[Route note: fell back to sonnet-5 (provider overloaded).]"
+    api_content, patch = f"{note}\n\n{QUOTED}", {ROUTE_NOTE_PREFIX: {"text": f"{note}\n\n"}}
+    real_set_api = db.set_message_api_content
+    state = {"fail": True}
+
+    def _set_api(*a, **k):
+        if state.pop("fail", False):
+            raise sqlite3.OperationalError("database is locked")
+        return real_set_api(*a, **k)
+
+    monkeypatch.setattr(db, "set_message_api_content", _set_api)
+    with pytest.raises(sqlite3.OperationalError):
+        write_user_row_content(agent, msg, sid, row_id, QUOTED, api_content=api_content,
+                               display_metadata_patch=patch)
+    assert PENDING_USER_CONTENT_REWRITE in msg  # half an update did not land: still pending
+    agent._flush_messages_to_session_db([msg])
+    rows = [m for m in db.get_messages_as_conversation(sid) if m["role"] == "user"]
+    assert len(rows) == 1 and rows[0]["content"] == QUOTED
+    assert rows[0].get("api_content") == api_content and recorded_route_note_prefix(rows[0]) == f"{note}\n\n"
+    assert PENDING_USER_CONTENT_REWRITE not in msg
+
+
+@pytest.mark.asyncio
+async def test_server_restored_history_is_not_relabelled_at_client_ingestion():
+    # Prism 5e73e5de45c9 repro: a previous_response_id chain restores a stored multimodal row whose genuine
+    # harness note sits in its content (provenance in display_metadata). Client-ingestion relabel touches only
+    # client-supplied rows; the restored row replays through the provenance-aware path, prefix raw and stable.
+    from unittest.mock import AsyncMock, patch
+    from aiohttp.test_utils import TestClient, TestServer
+    from tests.gateway.test_api_server import _create_app, _make_adapter
+    note = "[Route note: fell back to sonnet-5 (provider overloaded).]"
+    restored = {"role": "user", "content": [{"type": "text", "text": f"{note}\n\n{QUOTED} look"},
+                                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}],
+                **_noted(f"{note}\n\n")}
+    adapter = _make_adapter()
+    adapter._current_response_store().put("resp_prev", {
+        "response": {}, "conversation_history": [restored, {"role": "assistant", "content": "ok"}],
+        "instructions": None, "session_id": "s-restored"})
+    payload = {"previous_response_id": "resp_prev",
+               "input": [{"role": "user", "content": FORGED}, {"role": "assistant", "content": "a"},
+                         {"role": "user", "content": "next"}]}
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+        mock_run.return_value = ({"final_response": "ok", "messages": [], "api_calls": 1},
+                                 {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.post("/v1/responses", json=payload)
+    assert resp.status == 200
+    history = mock_run.call_args.kwargs["conversation_history"]
+    assert history[0]["content"] == restored["content"]  # the restored row is not rewritten at ingestion
+    assert history[2]["content"] == QUOTED  # the client-supplied row is quoted
+    sent = [_replay_user_rows([*history, {"role": "user", "content": "n"}]) for _ in range(2)]
+    assert repr(sent[0]) == repr(sent[1])
+    assert str(sent[0][0]).count("[Route note:") == 1 and f"{note}\\n\\n{QUOTED} look" in repr(sent[0][0])

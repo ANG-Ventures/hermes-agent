@@ -1105,6 +1105,10 @@ class OpenAICompatRoutesMixin:
                 conversation_history.append({"role": str(entry["role"]), "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+        # E11: client-authored rows are relabelled at ingestion. Server-restored rows (the response store)
+        # are not: they replay through the provenance-aware path (turn_context._relabel_replay_row), which
+        # keeps a recorded harness prefix raw and byte-stable.
+        conversation_history = relabel_client_history(conversation_history)
         stored_session_id = None
         if not conversation_history and previous_response_id:
             stored = self._current_response_store().get(previous_response_id)
@@ -1115,9 +1119,7 @@ class OpenAICompatRoutesMixin:
             if instructions is None:
                 instructions = stored.get("instructions")
         # All input messages but the last become history; the last is the user message.
-        conversation_history.extend(input_messages[:-1])
-        # E11: client-authored rows are relabelled at ingestion (harness note rows pass unchanged).
-        conversation_history = relabel_client_history(conversation_history)
+        conversation_history.extend(relabel_client_history(input_messages[:-1]))
         user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
         if not _content_has_visible_payload(user_message):
             return _error_response("No user message found in input", 400)

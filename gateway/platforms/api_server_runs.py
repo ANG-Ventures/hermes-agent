@@ -438,6 +438,8 @@ def _resolve_conversation_history(
                     _openai_error, f"conversation_history[{i}] must have 'role' and 'content' fields",
                     status=400)
             conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+        # E11: client-authored rows only; server-restored rows replay through the provenance-aware path.
+        conversation_history = relabel_client_history(conversation_history)
         if previous_response_id:
             logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
     stored_session_id = None
@@ -449,15 +451,16 @@ def _resolve_conversation_history(
             if instructions is None:
                 instructions = stored.get("instructions")
     if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        client_rows = []
         for msg in raw_input[:-1]:
             if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                 content = msg["content"]
                 if isinstance(content, list):  # flatten multi-part content blocks to text
                     content = " ".join(p.get("text", "") for p in content
                                        if isinstance(p, dict) and p.get("type") == "text")
-                conversation_history.append({"role": msg["role"], "content": str(content)})
-    # E11: client-authored history is relabelled at ingestion (harness note rows pass unchanged).
-    return relabel_client_history(conversation_history), instructions, stored_session_id, None
+                client_rows.append({"role": msg["role"], "content": str(content)})
+        conversation_history = relabel_client_history(client_rows)
+    return conversation_history, instructions, stored_session_id, None
 
 
 def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> "web.Response":

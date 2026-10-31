@@ -350,24 +350,42 @@ def write_user_row_content(agent, msg: Dict, session_id: str, row_id: int, conte
 
     While a rewrite is pending the stored ``content`` is still the pre-rewrite bytes, so the sidecar's
     content-guarded update would match nothing: the current content is committed first, in the same
-    lock the caller holds."""
+    lock the caller holds. The pending entry is the WHOLE update (content, sidecar, metadata patch), so a
+    write that lands only partly is retried in full, and the entry clears only when all of it has landed."""
     db = agent._session_db
     pending = msg.get(PENDING_USER_CONTENT_REWRITE)
     if pending is not None:
         # Never older than the content being committed now: if this write does not land, the flush
         # retries THESE bytes, not the ones staged before them.
-        msg[PENDING_USER_CONTENT_REWRITE] = (pending[0], content, *pending[2:])
+        attempts = pending[2] if len(pending) > 2 else 0
+        update = {k: v for k, v in (("api_content", api_content),
+                                    ("display_metadata_patch", display_metadata_patch)) if v is not None}
+        msg[PENDING_USER_CONTENT_REWRITE] = (pending[0], content, attempts, update) if update \
+            else (pending[0], content, attempts)
+    written = _write_user_row_update(db, session_id, row_id, content, api_content=api_content,
+                                     display_metadata_patch=display_metadata_patch, content_pending=pending is not None)
+    if written > 0:
+        msg.pop(PENDING_USER_CONTENT_REWRITE, None)
+    return written
+
+
+def _landed(written: Any) -> bool:
+    return isinstance(written, int) and not isinstance(written, bool) and written > 0
+
+
+def _write_user_row_update(db, session_id: str, row_id: int, content: Any, *, api_content: Optional[str],
+                           display_metadata_patch: Optional[Dict[str, Any]], content_pending: bool) -> int:
+    """Write one user-row update; the row count when ALL of it landed, else 0. ``content_pending``: the
+    stored content may still be older bytes, so it is committed before the content-guarded sidecar."""
     if api_content is None:
         written = db.set_user_message_content(session_id, row_id, content,
                                               display_metadata_patch=display_metadata_patch)
-    else:
-        if pending is not None:
-            db.set_user_message_content(session_id, row_id, content)
-        written = db.set_message_api_content(session_id, row_id, content, api_content,
-                                             display_metadata_patch=display_metadata_patch)
-    if isinstance(written, int) and not isinstance(written, bool) and written > 0:
-        msg.pop(PENDING_USER_CONTENT_REWRITE, None)
-    return written
+        return written if _landed(written) else 0
+    if content_pending and not _landed(db.set_user_message_content(session_id, row_id, content)):
+        return 0
+    written = db.set_message_api_content(session_id, row_id, content, api_content,
+                                         display_metadata_patch=display_metadata_patch)
+    return written if _landed(written) else 0
 
 
 # Flushes a pending user-row rewrite may stay unresolved before the flush appends the row instead.
@@ -387,11 +405,15 @@ def _retry_pending_user_rewrite(agent, msg: Dict) -> Any:
         return None
     session_id, content, *rest = pending
     attempts = (rest[0] if rest else 0) + 1
+    update = rest[1] if len(rest) > 1 and isinstance(rest[1], dict) else {}
     row_id = msg.get("_row_id")
     if isinstance(row_id, int):
         try:
             active_id = agent._session_db.resolve_active_row_id(session_id, row_id)
-            if active_id is not None and agent._session_db.set_user_message_content(session_id, active_id, content) > 0:
+            # The whole update is replayed (content, then sidecar + metadata); it clears only when all landed.
+            if active_id is not None and _write_user_row_update(
+                    agent._session_db, session_id, active_id, content, api_content=update.get("api_content"),
+                    display_metadata_patch=update.get("display_metadata_patch"), content_pending=True) > 0:
                 msg["_row_id"] = active_id
                 msg.pop(PENDING_USER_CONTENT_REWRITE, None)
                 return None
@@ -400,12 +422,17 @@ def _retry_pending_user_rewrite(agent, msg: Dict) -> Any:
         except Exception as e:
             logger.warning("pending user-row rewrite failed (row=%s, flush %d): %s", row_id, attempts, e)
         if attempts < _PENDING_USER_REWRITE_MAX_FLUSHES:
-            msg[PENDING_USER_CONTENT_REWRITE] = (session_id, content, attempts)
+            msg[PENDING_USER_CONTENT_REWRITE] = (session_id, content, attempts, *([update] if update else []))
             return None
         logger.warning("pending user-row rewrite of row=%s did not land after %d flush(es); appending the "
                        "relabelled row (a duplicate is possible, a lost submission is not)", row_id, attempts)
         msg.pop("_row_id", None)
         msg.pop(DB_ROW_SNAPSHOT, None)
+    # The appended row carries the whole update too: its sidecar and metadata ride the live dict.
+    if update.get("api_content") is not None:
+        msg["api_content"] = update["api_content"]
+    if update.get("display_metadata_patch"):
+        msg["display_metadata"] = {**(msg.get("display_metadata") or {}), **update["display_metadata_patch"]}
     return content
 
 
