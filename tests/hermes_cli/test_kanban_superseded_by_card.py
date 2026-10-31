@@ -430,3 +430,48 @@ def test_supersession_hold_commits_with_done_and_survives_a_crash_after_commit(b
         kb.archive_task(conn, tid)
     assert (ws / "draft.py").exists(), "archive deleted the unpublished file of a held workspace"
     assert (ws / "draft.py").read_text(encoding="utf-8") == f"DRAFT_{tid}"
+
+
+def _shared_refused(conn, tid, run, sup):
+    with pytest.raises(op.SharedWorkspaceSupersessionError,
+                       match=f"superseded-by {sup} is not supported on a shared workspace"):
+        kb.complete_task(conn, tid, expected_run_id=run, superseded_by=sup)
+    assert _status(conn, tid) == "running"
+    kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert "completion_blocked_closed_unmerged_pr" in kinds and "completed" not in kinds
+
+
+def test_workspace_of_reader_supersession_refuses(board, monkeypatch):
+    """Prism fad0ffab0ac9: the completing card R reads owner O's workspace (workspace_of=O). R's hold
+    protects only R's id, so archiving O later would delete the shared directory. Refused."""
+    _stub(monkeypatch)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        owner = kb.create_task(conn, title="owner", assignee="worker")
+        conn.execute("UPDATE tasks SET workspace_of=? WHERE id=?", (owner, tid))
+        conn.commit()
+        _shared_refused(conn, tid, run, sup)
+
+
+@pytest.mark.parametrize("reader_status", ["todo", "ready", "running", "blocked", "review"])
+def test_owner_with_a_live_reader_supersession_refuses(board, monkeypatch, reader_status):
+    _stub(monkeypatch)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        reader = kb.create_task(conn, title="reader", assignee="worker")
+        conn.execute("UPDATE tasks SET workspace_of=?, status=? WHERE id=?", (tid, reader_status, reader))
+        conn.commit()
+        _shared_refused(conn, tid, run, sup)
+
+
+@pytest.mark.parametrize("reader_status", ["done", "archived"])
+def test_owner_whose_readers_are_closed_still_covers(board, monkeypatch, reader_status):
+    """Only a LIVE reader refuses: once the readers are closed, the owner's own hold covers it."""
+    _stub(monkeypatch)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        reader = kb.create_task(conn, title="reader", assignee="worker")
+        conn.execute("UPDATE tasks SET workspace_of=?, status=? WHERE id=?", (tid, reader_status, reader))
+        conn.commit()
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=sup) is True
+        assert _status(conn, tid) == "done"

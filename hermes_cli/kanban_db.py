@@ -11823,6 +11823,14 @@ def complete_task(
     if sup_card and sup_card != task_id:
         def card_cover(uncovered):
             # --superseded-by <card> (t_6a853d1c): that card's merged work superseded this card's PR.
+            # Refused on a shared workspace (Prism fad0ffab0ac9): this card is a --workspace-of reader,
+            # or a live card reads this card's workspace. The retention hold covers this card's id only.
+            me = get_task(conn, task_id)
+            if (me is not None and me.workspace_of) or conn.execute(
+                    "SELECT 1 FROM tasks WHERE workspace_of=? AND id<>? AND status NOT IN ('done','archived') "
+                    "LIMIT 1", (task_id, task_id)).fetchone():
+                raise _open_pr.SharedWorkspaceSupersessionError(
+                    task_id, [f"{c.repo}#{c.number}" for c in uncovered], sup_card)
             other = get_task(conn, sup_card)
             return _open_pr.card_supersession(
                 uncovered, card=sup_card, card_status=other.status if other else None,

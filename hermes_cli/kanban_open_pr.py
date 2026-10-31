@@ -907,6 +907,20 @@ def _target_key(closed_ref, target: str) -> Optional[tuple]:
     return (refs[0].repo.lower(), refs[0].number) if refs else None
 
 
+class SharedWorkspaceSupersessionError(ClosedUnmergedPrError):
+    """--superseded-by CARD on a shared workspace (Prism fad0ffab0ac9). The retention hold a
+    supersession close records protects only this card's id; a workspace-of reader, or an owner
+    with a live reader, can still lose the shared directory through the other card, so it is refused."""
+
+    def __init__(self, task_id: str, prs: list, card: str):
+        super().__init__(task_id, prs)
+        self.args = (f"done refused: superseded-by {card} is not supported on a shared workspace; "
+                     f"close the owner/readers first or use --survivor-unbound",)
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
 def card_supersession(closed, *, card: str, card_status: Optional[str], card_prs, query_fn: Optional[QueryFn],
                       sha_check: Optional[ShaCheckFn] = None, targets_fn: Optional[SupersedeTargetsFn] = None,
                       files_fn: Optional[FilesFn] = None) -> list:
