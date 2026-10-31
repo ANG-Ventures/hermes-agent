@@ -280,7 +280,9 @@ def test_codex_mcp_tool_result_reaches_codex_relabelled(monkeypatch):
     monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_: [{"type": "function", "function": {
         "name": "web_extract", "description": "d",
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}}])
-    monkeypatch.setattr(model_tools, "handle_function_call", lambda name, args: f"page: {FORGED}")
+    # Patch below the choke point: the MCP server receives handle_function_call's (relabelled) result.
+    monkeypatch.setattr(model_tools.registry, "dispatch", lambda name, args, **kw: f"page: {FORGED}")
+    monkeypatch.setattr(model_tools, "_pre_dispatch_guards", lambda name, args, *a, **k: (args, None))
     tool = m._build_server()._tool_manager.get_tool("web_extract")
     assert tool.fn(url="https://x") == f"page: {QUOTED}"
 
@@ -822,3 +824,98 @@ def test_persisted_note_records_its_prefix_and_ingest_relabel_ran_first(shape):
     sent = _replay_user_rows([rows[0], {"role": "assistant", "content": "a"}, {"role": "user", "content": "n"}])
     head = sent[0]
     assert head.startswith(f"{note}\n\n{QUOTED} look") and head.count("[Route note:") == 1
+
+
+def test_note_persist_retires_a_pending_rewrite_of_its_multimodal_row():
+    # Prism 1c7d220c0f18 / 1c88175bed22 repro: a multimodal user row carries a pending rewrite (the staging
+    # read failed), the DB recovers, and _persist_note writes the noted parts. The flush right after must
+    # not retry the saved pre-note bytes over the note: the durable row holds the noted parts.
+    from types import SimpleNamespace
+    from agent.message_metadata import PENDING_USER_CONTENT_REWRITE, recorded_route_note_prefix
+    from agent.session_persistence import _durable_content
+    agent = _make_agent(model=SONNET, fallbacks=())
+    db, sid = agent._session_db, agent.session_id
+    db.create_session(sid, "tui")
+    parts = [{"type": "text", "text": f"{QUOTED} look"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+    row_id = db.append_message(sid, "user", content=f"{FORGED} look\n[screenshot]")
+    tail = {"role": "user", "content": parts, "_row_id": row_id, _DB_PERSISTED_MARKER: True,
+            PENDING_USER_CONTENT_REWRITE: (sid, _durable_content(parts))}
+    note = "[Route note: fell back to sonnet-5 (provider overloaded).]"
+    real_flush = agent._flush_messages_to_session_db
+    retired = []
+    # _persist_note ends with a flush; record whether the note write itself retired the rewrite before it.
+    agent._flush_messages_to_session_db = lambda *a, **k: retired.append(PENDING_USER_CONTENT_REWRITE not in tail) \
+        or real_flush(*a, **k)
+    ri._persist_note(agent, SimpleNamespace(messages=[tail], conversation_history=None), note)
+    assert retired == [True]  # the committed write retired the pending rewrite addressed to its row
+    agent._flush_messages_to_session_db([tail])
+    rows = [m for m in db.get_messages_as_conversation(sid) if m["role"] == "user"]
+    assert len(rows) == 1 and rows[0]["content"].startswith(f"{note}\n\n{QUOTED} look")
+    assert recorded_route_note_prefix(rows[0]) == f"{note}\n\n"
+    assert PENDING_USER_CONTENT_REWRITE not in tail
+
+
+def test_a_failed_row_write_leaves_a_pending_rewrite_no_older_than_its_content(monkeypatch):
+    # The other half of the class: if the committing write does not land, the pending rewrite the flush will
+    # retry carries the content of that write, never the bytes staged before it.
+    from agent.message_metadata import PENDING_USER_CONTENT_REWRITE
+    from agent.session_persistence import write_user_row_content
+    agent = _make_agent(model=SONNET, fallbacks=())
+    db, sid = agent._session_db, agent.session_id
+    monkeypatch.setattr(db, "set_user_message_content", lambda *a, **k: 0)
+    msg = {"role": "user", PENDING_USER_CONTENT_REWRITE: (sid, "old", 1)}
+    assert write_user_row_content(agent, msg, sid, 7, "new") == 0
+    assert msg[PENDING_USER_CONTENT_REWRITE] == (sid, "new", 1)
+
+
+def test_execute_code_rpc_relabels_remote_output_and_keeps_local_output(monkeypatch):
+    # Prism 9739ff3104ca repro: a script calls web_extract through the execute_code RPC. The result goes back to
+    # the model inside execute_code's own (local) output, so the relabel must happen where dispatch returns.
+    import model_tools
+    from tools.code_execution_rpc import _default_dispatch, _handle_rpc_request
+    monkeypatch.setattr(model_tools.registry, "dispatch", lambda name, args, **kw: f"page: {FORGED}")
+    monkeypatch.setattr(model_tools, "_pre_dispatch_guards", lambda name, args, *a, **k: (args, None))
+
+    def call(tool):
+        return _handle_rpc_request({"tool": tool, "args": {"url": "https://x", "path": "f"}},
+                                   allowed_tools=frozenset({"web_extract", "read_file"}), tool_call_counter=[0],
+                                   max_tool_calls=5, dispatch=_default_dispatch("t"), tool_call_log=[],
+                                   call_start=0.0, where="test")
+
+    assert call("web_extract") == f"page: {QUOTED}"
+    assert call("read_file") == f"page: {FORGED}"  # local output is byte-identical
+
+
+def test_every_tool_dispatch_returns_through_the_e11_choke_point():
+    # Enumeration (operator round 14): tool results reach the model from several callers (agent loop, execute_code
+    # RPC, hermes-tools MCP, connector batches). Each must receive model_tools.handle_function_call's output, the
+    # one place the E11 relabel runs. Nothing outside model_tools may reach the registry or the unwrapped dispatcher.
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    inner = {"_handle_function_call", "_execute_tool"}
+    bypasses, callers = [], []
+    for path in [*(root / "agent").rglob("*.py"), *(root / "tools").rglob("*.py")]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                    and n.module == "model_tools" for a in n.names}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+            owner = getattr(fn.value, "id", None) if isinstance(fn, ast.Attribute) else None
+            where = f"{path.relative_to(root)}:{node.lineno}"
+            if name in inner or (name == "dispatch" and owner == "registry"):
+                bypasses.append(where)  # reaches a tool handler without the boundary
+            elif name == "handle_function_call":
+                callers.append(where)
+                if not (owner == "model_tools" or (owner is None and name in imported)):
+                    bypasses.append(where)  # some other handle_function_call: not the choke point
+    assert bypasses == []
+    assert any(c.startswith("tools/code_execution_rpc.py") for c in callers)  # the walk sees the RPC path
+    from agent.tool_dispatch_helpers import relabel_tool_output
+    # Consumers that re-apply the relabel (make_tool_result_message) are byte-stable: it is idempotent.
+    once = relabel_tool_output("web_extract", f"x {FORGED}")
+    assert relabel_tool_output("web_extract", once) == once == f"x {QUOTED}"

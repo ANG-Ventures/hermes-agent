@@ -341,6 +341,35 @@ def _db_flush_repersist_in_place(agent, msg: Dict, flushed_row_ids: Dict[int, in
     return append_content
 
 
+def write_user_row_content(agent, msg: Dict, session_id: str, row_id: int, content: Any, *,
+                           api_content: Optional[str] = None,
+                           display_metadata_patch: Optional[Dict[str, Any]] = None) -> int:
+    """THE committer of a live user row's full content (and optional ``api_content`` sidecar) onto its
+    durable row. A write that lands RETIRES any pending rewrite addressed to that row: the pending
+    bytes are older than what was just committed, and a later flush retrying them would overwrite it.
+
+    While a rewrite is pending the stored ``content`` is still the pre-rewrite bytes, so the sidecar's
+    content-guarded update would match nothing: the current content is committed first, in the same
+    lock the caller holds."""
+    db = agent._session_db
+    pending = msg.get(PENDING_USER_CONTENT_REWRITE)
+    if pending is not None:
+        # Never older than the content being committed now: if this write does not land, the flush
+        # retries THESE bytes, not the ones staged before them.
+        msg[PENDING_USER_CONTENT_REWRITE] = (pending[0], content, *pending[2:])
+    if api_content is None:
+        written = db.set_user_message_content(session_id, row_id, content,
+                                              display_metadata_patch=display_metadata_patch)
+    else:
+        if pending is not None:
+            db.set_user_message_content(session_id, row_id, content)
+        written = db.set_message_api_content(session_id, row_id, content, api_content,
+                                             display_metadata_patch=display_metadata_patch)
+    if isinstance(written, int) and not isinstance(written, bool) and written > 0:
+        msg.pop(PENDING_USER_CONTENT_REWRITE, None)
+    return written
+
+
 # Flushes a pending user-row rewrite may stay unresolved before the flush appends the row instead.
 # A duplicate row is recoverable; a submission that is never stored is not.
 _PENDING_USER_REWRITE_MAX_FLUSHES = 3

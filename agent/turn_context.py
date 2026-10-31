@@ -1093,7 +1093,7 @@ def _stamp_api_content_sidecar(
     API copy, so stamp the exact sent bytes on the live dict for replay."""
     _turn_user_msg = messages[current_turn_user_idx]
     live_content = _turn_user_msg.get("content")
-    from agent.session_persistence import _persist_lock, durable_user_row_content
+    from agent.session_persistence import _persist_lock, durable_user_row_content, write_user_row_content
     # Match the row the flush wrote (persist override = clean transcript), not the live bytes.
     durable_content, _api_content = durable_user_row_content(
         agent, _turn_user_msg, live_content,
@@ -1123,7 +1123,8 @@ def _stamp_api_content_sidecar(
             return
         try:
             if isinstance(_row_id, int):
-                _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content)
+                write_user_row_content(agent, _turn_user_msg, agent.session_id, _row_id, durable_content,
+                                       api_content=_api_content)
             else:
                 # Compacted copies carry no row id; positional is safe only because
                 # archive_and_compact just made this message the newest active user row.
@@ -1149,7 +1150,7 @@ def _append_multimodal_context(
     _mm_ctx = compose_multimodal_context_part(ext_prefetch_cache, plugin_user_context)
     if not append_notes_to_multimodal_content(turn_user_msg.get("content"), _mm_ctx):
         return
-    from agent.session_persistence import _durable_content, _persist_lock
+    from agent.session_persistence import _durable_content, _persist_lock, write_user_row_content
 
     with _persist_lock(agent):
         _row_id = turn_user_msg.get("_row_id")
@@ -1159,7 +1160,7 @@ def _append_multimodal_context(
         _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
         content = turn_user_msg["content"] if _in_place_compacted else _durable_content(turn_user_msg["content"])
         try:
-            _db.set_user_message_content(agent.session_id, _row_id, content)
+            write_user_row_content(agent, turn_user_msg, agent.session_id, _row_id, content)
         except Exception:
             logger.warning("multimodal context backfill failed for session=%s", agent.session_id or "none", exc_info=True)
 

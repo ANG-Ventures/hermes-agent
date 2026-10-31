@@ -422,7 +422,7 @@ def _persist_note(agent: Any, s: Any, note: str) -> None:
         messages.append({"role": "user", "content": note, "display_kind": ROUTE_NOTE_DISPLAY_KIND})
     elif isinstance(tail, dict) and tail.get("role") == "user":
         from agent.message_metadata import ROUTE_NOTE_PREFIX, recorded_route_note_prefix
-        from agent.session_persistence import _persist_lock, durable_user_row_content
+        from agent.session_persistence import _persist_lock, durable_user_row_content, write_user_row_content
         content = tail.get("content")
         earlier = recorded_route_note_prefix(tail)  # a note already prepended to this row stays ahead
         row_id = tail.get("_row_id") or tail.get("_db_persisted_row_id")
@@ -445,8 +445,8 @@ def _persist_note(agent: Any, s: Any, note: str) -> None:
             patch = {ROUTE_NOTE_PREFIX: {"text": prefix}}
             if db is not None and isinstance(row_id, int):
                 with _persist_lock(agent):
-                    _require_row(db.set_message_api_content(agent.session_id, row_id, durable, api_content,
-                                                            display_metadata_patch=patch),
+                    _require_row(write_user_row_content(agent, tail, agent.session_id, row_id, durable,
+                                                        api_content=api_content, display_metadata_patch=patch),
                                  "set_message_api_content")
             tail["display_metadata"] = {**(tail.get("display_metadata") or {}), **patch}
         elif isinstance(content, list):
@@ -465,9 +465,9 @@ def _persist_note(agent: Any, s: Any, note: str) -> None:
             patch = {ROUTE_NOTE_PREFIX: {"text": prefix}}
             if db is not None and isinstance(row_id, int):
                 with _persist_lock(agent):
-                    _require_row(db.set_user_message_content(agent.session_id, row_id,
-                                                             _persisted_content_projection(tail, tail["content"]),
-                                                             display_metadata_patch=patch),
+                    _require_row(write_user_row_content(agent, tail, agent.session_id, row_id,
+                                                        _persisted_content_projection(tail, tail["content"]),
+                                                        display_metadata_patch=patch),
                                  "set_user_message_content")
             tail["display_metadata"] = {**(tail.get("display_metadata") or {}), **patch}
     if db is not None:

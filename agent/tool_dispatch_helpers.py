@@ -633,6 +633,12 @@ def tool_output_relabels_route_notes(name: Optional[str]) -> bool:
     return _is_untrusted_tool(name) or name in _ROUTE_NOTE_RELABEL_EXTRA_TOOLS
 
 
+def relabel_tool_output(name: Optional[str], result: Any) -> Any:
+    """Apply the E11 tool-output boundary to one dispatch result (``model_tools.handle_function_call``
+    returns through here). Idempotent; local output is returned as the same object."""
+    return relabel_route_note_content(result) if tool_output_relabels_route_notes(name) else result
+
+
 def _is_text_item(item: Any) -> bool:
     return _is_text_part(item) and isinstance(item.get("text"), str)
 
