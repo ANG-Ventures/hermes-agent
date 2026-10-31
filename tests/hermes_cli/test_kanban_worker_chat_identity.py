@@ -355,3 +355,95 @@ def test_env_without_root_vars_inherits_the_process_suffix(monkeypatch, tmp_path
     assert _env_kanban_root({"HOME": str(home)}) is None
     assert _env_kanban_root({"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": ""}) == home / ".hermes"
     assert _env_kanban_root({"HERMES_DATA_DIR_SUFFIX": "-qa"}) == home / ".hermes-qa"
+
+
+def test_env_on_our_home_is_not_our_root_when_hermes_home_moved_it(monkeypatch, tmp_path):
+    """Prism 2be710857d51: ``None`` only when the root the env describes EQUALS the process root.
+    A process rooted by ``HERMES_HOME=/x`` and an env with our ``HOME`` but no ``HERMES_HOME``
+    describe different roots, so the env's default root is returned and its pin names its board."""
+    from hermes_cli.kanban_identity import _env_kanban_root, resolve_kanban_worker_chat_identity
+
+    home = tmp_path / "alice"
+    default_root = home / ".hermes"
+    custom_root = tmp_path / "x"
+    for root in (default_root, custom_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    for var in ("HERMES_KANBAN_HOME", "HERMES_KANBAN_DB", "HERMES_DATA_DIR_SUFFIX"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(default_root))
+    kb.create_board("alpha")  # board alpha exists ONLY under the default root
+    alpha_db = default_root / "kanban" / "boards" / "alpha" / "kanban.db"
+    assert alpha_db.parent.is_dir()
+    monkeypatch.setenv("HERMES_HOME", str(custom_root))  # the process root is now /x
+
+    env = {"HOME": str(home), "HERMES_KANBAN_DB": str(alpha_db), "HERMES_KANBAN_TASK": "t_example"}
+    assert _env_kanban_root(env) == default_root
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
+    # An env describing exactly the process root is the process root.
+    assert _env_kanban_root({"HERMES_HOME": str(custom_root)}) is None
+    assert _env_kanban_root({"HOME": str(home), "HERMES_HOME": str(custom_root)}) is None
+    assert _env_kanban_root({"HERMES_KANBAN_HOME": str(custom_root)}) is None
+
+
+def _our_home(monkeypatch, tmp_path):
+    home = tmp_path / "alice"
+    (home / ".hermes").mkdir(parents=True)
+    for var in ("HERMES_KANBAN_HOME", "HERMES_KANBAN_DB", "HERMES_DATA_DIR_SUFFIX", "HERMES_KANBAN_SANDBOX"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+    return home
+
+
+def test_env_on_our_home_is_our_root_under_a_process_kanban_override(monkeypatch, tmp_path):
+    """Prism 0c5ff7fb032a: an env naming only our HOME is compared with the process's DEFAULT root,
+    never ``kanban_home()``. Under a process ``HERMES_KANBAN_HOME`` it means the
+    process root (``None``), not the live ``<HOME>/.hermes`` registry."""
+    from hermes_cli.kanban_identity import _env_kanban_root
+
+    home = _our_home(monkeypatch, tmp_path)
+    override = tmp_path / "x"
+    override.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(override))
+    assert _env_kanban_root({"HOME": str(home)}) is None
+    assert _env_kanban_root({"HERMES_KANBAN_HOME": str(override)}) is None
+
+
+def test_env_on_our_home_is_our_root_under_the_sandbox(monkeypatch, tmp_path):
+    """Prism 0c5ff7fb032a, sandbox arm: ``kanban_home()`` is the sandbox dir, the env's HOME
+    describes the same default root as the process, so ``None``, never the live registry."""
+    from hermes_cli.kanban_identity import _env_kanban_root
+
+    home = _our_home(monkeypatch, tmp_path)
+    scratch = home / ".hermes" / "profiles" / "p" / "cache" / "scratch" / "x"
+    scratch.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(scratch))
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    monkeypatch.setattr(kb, "_live_kanban_roots", lambda: (home / ".hermes",))
+    assert kb.kanban_home() == scratch  # the sandbox root differs from the default root
+    assert _env_kanban_root({"HOME": str(home)}) is None
+
+
+def test_env_root_resolve_error_is_the_process_root(monkeypatch, tmp_path):
+    """A refused/unresolvable process root answers ``None`` (the guarded process root), never the
+    env root, which can be the live one (Prism 0c5ff7fb032a)."""
+    import hermes_constants
+    from hermes_cli.kanban_identity import _env_kanban_root
+
+    home = _our_home(monkeypatch, tmp_path)
+
+    def refuse():
+        raise kb.KanbanLiveBoardRefusedError("refused")
+
+    real_default = hermes_constants.get_default_hermes_root
+
+    def default_root(*, home=None):
+        if home is None:
+            raise kb.KanbanLiveBoardRefusedError("unresolvable")
+        return real_default(home=home)
+
+    monkeypatch.setattr(kb, "kanban_home", refuse)
+    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", default_root)
+    assert _env_kanban_root({"HOME": str(home)}) is None
