@@ -229,6 +229,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
+    cron_tick.add_argument(
+        "--lane", choices=["all", "agent", "script"], default="all",
+        help="Lane to tick (cron/lanes.py): 'agent' leaves the script lane and its "
+             ".tick-script.lock to the script runner (default: all)")
     cron_runner = cron_subparsers.add_parser(
         "runner", help="Run the cron script runner (plain-script jobs outside the gateway)")
     cron_runner.add_argument(

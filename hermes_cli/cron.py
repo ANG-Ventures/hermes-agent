@@ -320,14 +320,14 @@ def _job_warnings(job: Dict[str, Any]) -> List[str]:
     return lines
 
 
-def cron_tick():
-    """Run due jobs once and exit."""
+def cron_tick(lane="all"):
+    """Run due jobs once and exit. ``lane``: see ``cron.scheduler_tick.tick``."""
     from cron.scheduler import CronTickYielded, tick
     from hermes_cli.observability.shared_metrics_process import begin_process
 
     begin_process("cron")
     try:
-        tick(verbose=True)
+        tick(verbose=True, lane=lane)
     except CronTickYielded as exc:
         # Inert for a one-shot CLI (no boot fingerprint); report cleanly rather than traceback.
         print(color(f"✗ {exc}", Colors.YELLOW))
@@ -1295,7 +1295,7 @@ _CRON_SUBCOMMANDS = {
     "status": lambda a: cron_status() or 0,
     "doctor": lambda a: cron_doctor(),
     "runtime-export": lambda a: cron_runtime_export(a),
-    "tick": lambda a: cron_tick(),
+    "tick": lambda a: cron_tick(getattr(a, "lane", "all")),
     "runner": lambda a: cron_runner(a),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),
