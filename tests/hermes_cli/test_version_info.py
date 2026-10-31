@@ -183,6 +183,37 @@ def test_get_version_info_derives_identity_from_reachable_release_tag(tmp_path, 
     assert info.source == "git"
 
 
+def test_git_version_info_never_writes_the_index(tmp_path):
+    """t_45508cb8: the dirty probe is a read. Plain `git status` refreshes a stale index under
+    .git/index.lock, and a timeout SIGKILL there orphans the lock on the live runtime tree."""
+    import os
+    import time
+    from hermes_cli.version_info import _git_version_info
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+    for args in (("init", "-q"), ("config", "user.name", "t"), ("config", "user.email", "t@example.invalid")):
+        subprocess.run(["git", *args], cwd=repo, check=True, env=env)
+    (repo / "tracked").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", "c1"], cwd=repo, check=True, env=env)
+    index = repo / ".git" / "index"
+    old = time.time() - 600
+    os.utime(index, (old, old))
+    os.utime(repo / "tracked")   # stale stat, same bytes: plain status would rewrite the index
+    before = index.stat().st_mtime_ns
+
+    info = _git_version_info(repo)
+
+    assert info.dirty is False
+    assert index.stat().st_mtime_ns == before
+    assert not (repo / ".git" / "index.lock").exists()
+    (repo / "tracked").write_text("v2\n", encoding="utf-8")
+    assert _git_version_info(repo).dirty is True
+    assert index.stat().st_mtime_ns == before
+
+
 def test_get_version_info_takes_the_version_a_calver_only_release_shipped(tmp_path, monkeypatch):
     """Releases tagged only vYYYY.M.D resolve to their pyproject version, not "unknown"."""
     repo = tmp_path / "repo"
