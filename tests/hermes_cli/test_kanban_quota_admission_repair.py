@@ -143,7 +143,7 @@ def test_repair_cli_dry_run_uses_readonly_connection(board, monkeypatch, capsys)
     tid = quota_fixture(board)
     parser = argparse.ArgumentParser()
     kanban.build_parser(parser.add_subparsers())
-    args = parser.parse_args(["kanban", "repair", "--reclassify-quota-crashes", "--dry-run", "--json"])
+    args = parser.parse_args(["kanban", "repair", "--board", "default", "--reclassify-quota-crashes", "--dry-run", "--json"])
     monkeypatch.setattr(kb, "connect", Mock(side_effect=AssertionError("dry-run must not migrate")))
     assert kanban.kanban_command(args) == 0
     result = json.loads(capsys.readouterr().out)
