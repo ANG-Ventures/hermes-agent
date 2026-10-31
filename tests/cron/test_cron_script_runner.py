@@ -690,6 +690,338 @@ def test_d_code_skew_drains_then_exits_0(root, monkeypatch):
     assert not script_runner.trip_marker_path().exists()
 
 
+@pytest.mark.slow_test(180, reason="real runner subprocess")
+def test_d_code_skew_drain_is_bounded_then_requeues(root, tmp_path, procs):
+    """t_c15baa4b: a deploy (code skew) while a long script runs must not park the runner for the
+    script's whole budget (clock-shift-nightly: up to 3 h). Past RUNNER_SKEW_DRAIN_MAX_S the runner
+    terminates the in-flight group, the run is re-queued once (restart_requeue) and the runner
+    exits 0 so launchd restarts it on the new code."""
+    from cron.jobs import RESTART_REQUEUE_KEY
+    from cron.runtime_state import merged_jobs
+
+    spid = tmp_path / "s.pid"
+    skew = tmp_path / "skew"
+    _script(root, "long.sh", f"echo $$ > {spid}\nsleep 300")
+    job = _job(root, "long", "long.sh")
+    log = tmp_path / "runner.log"
+    runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1,
+                           RUNNER_HARNESS_SKEW=skew, RUNNER_HARNESS_SKEW_DRAIN_S=2)
+    s_pid = int(_wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script"))
+    skew.touch()
+    _wait_for(lambda: (_hb(root) or {}).get("state") == "draining", 30, what="draining heartbeat")
+    try:
+        rc = runner.wait(timeout=45)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("runner still draining behind the long script: "
+                             + log.read_text(encoding="utf-8")[-3000:])
+    assert rc == 0, log.read_text(encoding="utf-8")[-3000:]
+    assert _group_gone(s_pid)
+    rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
+    assert rec.get(RESTART_REQUEUE_KEY), rec
+    assert not (root / "cron" / "script_runner_tripped").exists()
+    assert "drain bounded: re-fire available" in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.slow_test(180, reason="real runner subprocess")
+def test_d_code_skew_bounded_drain_kills_a_term_ignoring_script_before_the_refire(
+        root, tmp_path, procs):
+    """Prism 9dde2d9f29f3: the bounded path used to SIGTERM only and exit after <= 20 s, so a
+    script that traps TERM was still alive when launchd restarted the runner and the re-fire ran
+    beside it. Now TERM, wait RUNNER_SKEW_KILL_GRACE_S, KILL: after rc 0 the group is gone and the
+    re-fire is set."""
+    from cron.jobs import RESTART_REQUEUE_KEY
+    from cron.runtime_state import merged_jobs
+
+    spid = tmp_path / "s.pid"
+    skew = tmp_path / "skew"
+    _script(root, "stubborn.sh", f"trap '' TERM\necho $$ > {spid}\nsleep 600")
+    job = _job(root, "stubborn", "stubborn.sh")
+    log = tmp_path / "runner.log"
+    runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1,
+                           RUNNER_HARNESS_SKEW=skew, RUNNER_HARNESS_SKEW_DRAIN_S=1)
+    s_pid = int(_wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script"))
+    # $$ is bash; the group leader is the outcome-record shim above it.
+    pgid = os.getpgid(s_pid)
+    skew.touch()
+    try:
+        rc = runner.wait(timeout=90)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("runner never exited: " + log.read_text(encoding="utf-8")[-3000:])
+    text = log.read_text(encoding="utf-8")
+    assert rc == 0, text[-3000:]
+    try:
+        os.kill(s_pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError(f"TERM-ignoring script pid {s_pid} outlived the runner: " + text[-3000:])
+    assert _group_gone(pgid), text[-3000:]
+    rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
+    assert rec.get(RESTART_REQUEUE_KEY), rec
+    assert "survived SIGKILL" not in text
+
+
+@pytest.mark.slow_test(180, reason="real runner subprocess")
+def test_d_code_skew_bounded_drain_reaches_a_setsid_grandchild(root, tmp_path, procs):
+    """Prism dbd507fb38d7: the bounded kill signalled only the script's process group, so a
+    descendant that called setsid survived and the re-fire ran beside it. The drain now snapshots
+    the whole tree before signalling (the timeout/cancel tree-kill): after rc 0 the detached child
+    is gone and the re-fire is set."""
+    from cron.jobs import RESTART_REQUEUE_KEY
+    from cron.runtime_state import merged_jobs
+
+    spid, cpid, skew = tmp_path / "s.pid", tmp_path / "c.pid", tmp_path / "skew"
+    detach = tmp_path / "detach.py"
+    detach.write_text("import os, sys, time\nos.setsid()\n"
+                      "open(sys.argv[1], 'w').write(str(os.getpid()))\ntime.sleep(600)\n")
+    _script(root, "detacher.sh", f"{sys.executable} {detach} {cpid} </dev/null >/dev/null 2>&1 &\n"
+                                 f"echo $$ > {spid}\nsleep 600")
+    job = _job(root, "detacher", "detacher.sh")
+    log = tmp_path / "runner.log"
+    runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1,
+                           RUNNER_HARNESS_SKEW=skew, RUNNER_HARNESS_SKEW_DRAIN_S=1)
+    _wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script")
+    c_pid = int(_wait_for(lambda: cpid.exists() and cpid.read_text().strip(), 30, what="child"))
+    assert os.getsid(c_pid) == c_pid
+    skew.touch()
+    try:
+        try:
+            rc = runner.wait(timeout=90)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("runner never exited: " + log.read_text(encoding="utf-8")[-3000:])
+        text = log.read_text(encoding="utf-8")
+        assert rc == 0, text[-3000:]
+        assert _wait_for(lambda: _group_gone(c_pid), 3, what="setsid child gone"), text[-3000:]
+        rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
+        assert rec.get(RESTART_REQUEUE_KEY), rec
+    finally:
+        with contextlib.suppress(Exception):
+            os.killpg(c_pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only test
+
+
+def test_d_code_skew_bounded_drain_marks_a_term_trapping_clean_exit_for_refire(root, tmp_path, procs):
+    """Prism b86087faa72f: the re-fire flag was set only for a signal returncode, so a script that
+    traps TERM and exits 0 after the bounded drain cut it off was recorded as a success with no
+    re-fire. Every run the drain interrupts is a failure flagged for its re-fire, whatever it exits."""
+    from cron.jobs import RESTART_REQUEUE_KEY
+    from cron.runtime_state import merged_jobs
+
+    spid, skew, done = tmp_path / "s.pid", tmp_path / "skew", tmp_path / "report"
+    _script(root, "cleanexit.sh", f"trap 'exit 0' TERM\necho $$ > {spid}\nsleep 600 &\nwait $!\n"
+                                  f"touch {done}")
+    job = _job(root, "cleanexit", "cleanexit.sh")
+    log = tmp_path / "runner.log"
+    runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1, RUNNER_HARNESS_SKEW=skew,
+                           RUNNER_HARNESS_SKEW_DRAIN_S=1, RUNNER_HARNESS_NO_OUTCOME_SHIM=1)
+    _wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script")
+    skew.touch()
+    try:
+        rc = runner.wait(timeout=90)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("runner never exited: " + log.read_text(encoding="utf-8")[-3000:])
+    text = log.read_text(encoding="utf-8")
+    assert rc == 0, text[-3000:]
+    assert not done.exists()
+    rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
+    assert rec.get(RESTART_REQUEUE_KEY), rec
+    assert rec.get("last_status") != "ok", rec
+
+
+# The late child is reparented outside the pytest subtree once its parent dies; the conftest
+# kill guard would block the very SIGKILL under test.
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("late", ["setsid_child_stays", "same_group_parent_exits"])
+def test_d_skew_kill_reaches_a_descendant_forked_during_the_term_grace(root, tmp_path, monkeypatch,
+                                                                      late):
+    """Prism 361a15209668: the tree was snapshotted once before SIGTERM. The leader (the outcome
+    shim) dies on TERM, so the KILL leg reached only pre-TERM members; a grandchild the script
+    forked during the grace survived and the re-fire ran beside it. The tree is re-snapshotted
+    before KILL and before the confirm, so the late grandchild is killed. Second case (Prism
+    85c0395583d8): the TERM handler spawns a same-group child and exits, so the child is reparented
+    away from every snapshot member; the refresh finds it by process group."""
+    import psutil
+    import cron.scheduler as sched
+    from cron import lanes
+
+    gpid = tmp_path / "g.pid"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import os, signal, subprocess, sys, time\n"
+        "def on_term(*_):\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'],\n"
+        f"                         start_new_session={late == 'setsid_child_stays'})\n"
+        f"    open({str(gpid)!r}, 'w').write(str(g.pid))\n"
+        + ("    os._exit(0)\n" if late == "same_group_parent_exits" else "") +
+        "signal.signal(signal.SIGTERM, on_term)\n"
+        "while True:\n    time.sleep(0.1)\n")
+    leader = subprocess.Popen(["/bin/sh", "-c", f"{sys.executable} {child} & wait"],
+                              start_new_session=True)
+    g = None
+    try:
+        _wait_for(lambda: psutil.Process(leader.pid).children(), 30, what="script child")
+        key = sched._inflight_key("latefork", root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        runner = _skew_kill_runner(root, monkeypatch)
+        monkeypatch.setattr(lanes, "RUNNER_SKEW_KILL_GRACE_S", 1.0)
+        runner._skew_kill()
+        g = int(_wait_for(lambda: gpid.exists() and gpid.read_text().strip(), 5, what="grandchild"))
+        assert _wait_for(lambda: not psutil.pid_exists(g)
+                         or psutil.Process(g).status() == psutil.STATUS_ZOMBIE, 3,
+                         what="late grandchild killed")
+    finally:
+        sched.clear_shutdown()
+        if g is not None:
+            with contextlib.suppress(Exception):
+                os.kill(g, signal.SIGKILL)  # windows-footgun: ok — POSIX-only test
+        with contextlib.suppress(Exception):
+            leader.kill()
+        leader.wait(timeout=10)
+
+
+def _skew_kill_runner(root, monkeypatch):
+    from cron import lanes, script_runner
+
+    monkeypatch.setattr(lanes, "RUNNER_SKEW_KILL_GRACE_S", 0.2)
+    monkeypatch.setattr(script_runner, "_SKEW_CONFIRM_S", 0.2)
+    return script_runner.ScriptRunner(profile_homes=lambda: [("default", root)],
+                                      exit_fn=lambda _c: None)
+
+
+def test_d_skew_kill_does_not_withhold_a_zombie_only_tree(root, monkeypatch):
+    """Prism 96d1a12310f7: killpg(pgid, 0) succeeds on a group whose only member is an unreaped
+    zombie, so a dead run read as alive and its re-fire was withheld (a lost run). Zombie-only is
+    gone: the re-fire flag stays and nothing is withheld."""
+    import cron.scheduler as sched
+
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        if sys.platform.startswith("linux"):
+            _wait_for(lambda: Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z", 10,
+                      what="leader exited, unreaped")
+        else:
+            time.sleep(1.0)
+        assert leader.returncode is None and not _group_gone(leader.pid)  # the old probe: "alive"
+        key = sched._inflight_key("zjob", root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", {key})
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+        assert sched._refire_withheld_job_ids == set()
+        assert sched._restart_killed_job_ids == {key}
+    finally:
+        sched.clear_shutdown()
+        leader.wait(timeout=10)
+
+
+def test_d_skew_kill_withholds_only_the_surviving_profiles_refire(root, tmp_path, monkeypatch):
+    """Prism f4526d2bb9fa: two profiles run a job with the same id; profile A's tree survives the
+    kill, B's dies. Withholding is keyed (home, job id), so only A's re-fire is withheld."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    key_a, key_b = sched._inflight_key("same", home_a), sched._inflight_key("same", home_b)
+    assert key_a != key_b
+
+    class _Proc:
+        def __init__(self, pid):
+            self.pid, self.returncode = pid, None
+
+    proc_a, proc_b = _Proc(10**7 + 1), _Proc(10**7 + 2)
+    monkeypatch.setattr(sched, "_active_script_procs", {1: proc_a, 2: proc_b})
+    monkeypatch.setattr(sched, "_script_proc_job_ids", {1: key_a, 2: key_b})
+    monkeypatch.setattr(sched, "_restart_killed_job_ids", {key_a, key_b})
+    monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+    monkeypatch.setattr(ss, "_script_tree_snapshot", lambda _p: None)
+    monkeypatch.setattr(ss, "_signal_script_tree", lambda *_a: None)
+    monkeypatch.setattr(ss, "_script_tree_alive", lambda p, _s: p is proc_a)
+    try:
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+    finally:
+        sched.clear_shutdown()
+    assert sched._refire_withheld_job_ids == {key_a}
+    assert sched._restart_killed_job_ids == {key_b}
+
+
+@pytest.mark.slow_test(180, reason="real runner subprocess")
+def test_d_code_skew_drain_waits_on_a_jobs_final_repetition(root, tmp_path, procs):
+    """Prism cd1ea5071578: a run on its job's last finite repetition (repeat times 1, completed 0)
+    retires the job in mark_job_run (enabled=False, state=completed), so a re-fire marker would
+    never fire. The bounded drain must wait for it (no TERM) and the run completes."""
+    from cron.jobs import update_job
+    from cron.runtime_state import merged_jobs
+    from cron.scheduler_provider import _profile_cron_scope
+
+    spid, done, termed = tmp_path / "s.pid", tmp_path / "done", tmp_path / "termed"
+    skew = tmp_path / "skew"
+    _script(root, "last.sh", f"trap 'touch {termed}; exit 143' TERM\necho $$ > {spid}\n"
+                             f"sleep 8 & wait $!\ntouch {done}")
+    job = _job(root, "last", "last.sh")
+    with _profile_cron_scope(root):
+        update_job(job["id"], {"repeat": {"times": 1, "completed": 0}})
+    log = tmp_path / "runner.log"
+    runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1,
+                           RUNNER_HARNESS_SKEW=skew, RUNNER_HARNESS_SKEW_DRAIN_S=1)
+    _wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script")
+    skew.touch()
+    try:
+        rc = runner.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("runner never exited after the script ended: "
+                             + log.read_text(encoding="utf-8")[-3000:])
+    text = log.read_text(encoding="utf-8")
+    assert rc == 0, text[-3000:]
+    assert done.exists() and not termed.exists(), text[-3000:]
+    assert "drain waiting: re-fire spent, " + job["id"] in text, text[-3000:]
+    assert "drain bounded" not in text, text
+    rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
+    assert rec.get("last_status") == "ok", rec
+
+
+@pytest.mark.slow_test(180, reason="real runner subprocess")
+def test_d_code_skew_drain_waits_when_refire_is_spent(root, tmp_path, procs):
+    """Prism 05343ab9e749: a run that is itself the re-fire (restart_requeue_count at
+    RESTART_REQUEUE_MAX) must not be cut by the bound, because request_restart_requeue would refuse
+    and the job would sit at last_status=error until its next schedule. The drain waits past the
+    bound (the old behaviour), sends no SIGTERM, and the run completes. This is the second skew of
+    Prism's repro: the first one killed the original run and spent the re-fire."""
+    from cron.jobs import RESTART_REQUEUE_COUNT_KEY, RESTART_REQUEUE_MAX, update_job
+    from cron.runtime_state import merged_jobs
+    from cron.scheduler_provider import _profile_cron_scope
+
+    spid, done, termed = tmp_path / "s.pid", tmp_path / "done", tmp_path / "termed"
+    skew = tmp_path / "skew"
+    _script(root, "refire.sh", f"trap 'touch {termed}; exit 143' TERM\necho $$ > {spid}\n"
+                               f"sleep 8 & wait $!\ntouch {done}")
+    job = _job(root, "refire", "refire.sh")
+    with _profile_cron_scope(root):
+        update_job(job["id"], {RESTART_REQUEUE_COUNT_KEY: RESTART_REQUEUE_MAX})
+    log = tmp_path / "runner.log"
+    runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1,
+                           RUNNER_HARNESS_SKEW=skew, RUNNER_HARNESS_SKEW_DRAIN_S=1)
+    _wait_for(lambda: spid.exists() and spid.read_text().strip(), 90, what="script")
+    skew.touch()
+    _wait_for(lambda: (_hb(root) or {}).get("state") == "draining", 30, what="draining heartbeat")
+    try:
+        rc = runner.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("runner never exited after the script ended: "
+                             + log.read_text(encoding="utf-8")[-3000:])
+    text = log.read_text(encoding="utf-8")
+    assert rc == 0, text[-3000:]
+    assert done.exists() and not termed.exists(), text[-3000:]
+    assert "drain waiting: re-fire spent, " + job["id"] in text, text[-3000:]
+    assert "drain bounded" not in text, text
+    rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
+    assert rec.get("last_status") == "ok", rec
+
+
 # --- S2 (g) / AC-4e: watchdog, tree-kill, one strike -------------------------------------------------
 
 def test_g_watchdog_snapshot_survives_a_held_procs_lock(root, monkeypatch, procs, caplog):

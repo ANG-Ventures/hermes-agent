@@ -160,6 +160,35 @@ def test_oneshot_jobs_are_not_requeued(env):
     assert cj.request_restart_requeue(job["id"], "test") is False
 
 
+def test_final_repetition_is_not_requeued(env):
+    """Prism cd1ea5071578: a killed run that reached its repeat limit retired the job, so a marker
+    could never fire. The shared predicate refuses it, in flight and after the count."""
+    from cron import jobs as cj
+    job = _make_job()
+    cj.update_job(job["id"], {"repeat": {"times": 1, "completed": 0}})
+    job = cj.get_job(job["id"])
+    assert cj.restart_refire_refusal(job, run_counted=False) == "final repetition"
+    assert cj.restart_refire_refusal(job, run_counted=True) is None
+    cj.update_job(job["id"], {"repeat": {"times": 1, "completed": 1}})
+    assert cj.request_restart_requeue(job["id"], "test") is False
+    assert not cj.get_job(job["id"]).get(cj.RESTART_REQUEUE_KEY)
+    cj.update_job(job["id"], {"repeat": {"times": 3, "completed": 1}})
+    assert cj.request_restart_requeue(job["id"], "test") is True
+
+
+def test_disabled_job_is_not_requeued(env):
+    """Prism 9b45f30f3479: a disabled (paused) job's re-fire never runs, so the predicate refuses it
+    and the bounded skew drain waits for the run instead of killing it."""
+    from cron import jobs as cj
+    job = _make_job()
+    cj.update_job(job["id"], {"enabled": False})
+    job = cj.get_job(job["id"])
+    assert cj.restart_refire_refusal(job, run_counted=False) == "disabled"
+    assert cj.request_restart_requeue(job["id"], "test") is False
+    cj.update_job(job["id"], {"enabled": True})
+    assert cj.restart_refire_refusal(cj.get_job(job["id"]), run_counted=False) is None
+
+
 def test_dying_process_tick_leaves_requeue_marker_for_next_boot(env):
     """Reviewer race on #1301: the dying gateway's ticker keeps running from
     drain timeout until runner.stop() returns. A tick in that window must not
