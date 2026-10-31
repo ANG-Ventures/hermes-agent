@@ -82,7 +82,7 @@ def load_catalog() -> Optional[Dict[str, Any]]:
         _warn("missing", f"Anthropic limits catalog {path} not found")
         return None
     try:
-        cat: Optional[Dict[str, Any]] = _validate(json.loads(path.read_text(encoding="utf-8")))
+        cat: Optional[Dict[str, Any]] = _validate(json.loads(path.read_text(encoding="utf-8-sig")))
     except (OSError, ValueError) as e:
         cat = None
         _warn(f"unreadable:{mtime}", f"Anthropic limits catalog {path} unreadable ({e})")

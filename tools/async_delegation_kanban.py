@@ -110,7 +110,7 @@ def clear_dispatcher_heartbeat() -> None:
     """Drop the heartbeat on release, only if it is this process's own."""
     try:
         path = _heartbeat_path()
-        if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+        if json.loads(path.read_text(encoding="utf-8-sig")).get("pid") == os.getpid():
             path.unlink()
     except Exception:
         pass
@@ -129,7 +129,7 @@ def dispatcher_live_on_host() -> bool:
 
         path = _heartbeat_path()
         age = time.time() - path.stat().st_mtime
-        beat = json.loads(path.read_text(encoding="utf-8"))
+        beat = json.loads(path.read_text(encoding="utf-8-sig"))
         pid, interval = beat.get("pid"), float(beat.get("interval_s") or 0)
         if type(pid) is not int or pid <= 0 or beat.get("host") != _hostname():
             return False

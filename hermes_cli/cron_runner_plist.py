@@ -140,12 +140,13 @@ def _machine_id_source(home: Path) -> Optional[str]:
 
 
 def _run_launchctl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["launchctl", *args], capture_output=True, text=True, timeout=60, check=False)
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=60, check=False)
 
 
 def _runner_pids() -> List[int]:
-    out = subprocess.run(["pgrep", "-f", _RUNNER_CMDLINE], capture_output=True, text=True,
-                         timeout=10, check=False).stdout
+    out = subprocess.run(["pgrep", "-f", _RUNNER_CMDLINE], capture_output=True,
+                         text=True, encoding="utf-8", errors="replace", timeout=10, check=False).stdout
     return [int(p) for p in out.split() if p.isdigit() and int(p) != os.getpid()]
 
 
