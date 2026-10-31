@@ -1428,6 +1428,8 @@ class CLICommandsMixin:
             self._session_db.set_session_title(new_session_id, branch_title)
         # Switch to the new session
         self._transfer_session_yolo(self.session_id, new_session_id)
+        from hermes_cli.cli_agent_setup_mixin import _carry_route_known
+        _carry_route_known(self, new_session_id)  # same conversation, new id: keep the route baseline
         self.session_id, self.session_start, self._pending_title = new_session_id, now, None
         self._resumed = True  # Prevents auto-title generation
         _sync_process_session_id(new_session_id)

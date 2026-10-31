@@ -257,6 +257,17 @@ def _bind_route_known(cli) -> None:
     seed_known(agent, data, _sink)
 
 
+def _carry_route_known(cli, new_session_id) -> None:
+    """Re-key the held ``Known`` when the session continues under a compression child id.
+
+    The sink only records at the end of a routed call, so a manual /compress (no routed call)
+    would leave the baseline keyed to the ended parent and the next /model rebuild would drop it.
+    Call before ``cli.session_id`` moves to the continuation."""
+    held = getattr(cli, "_route_known_held", None)
+    if isinstance(held, tuple) and held[0] == cli.session_id and new_session_id:
+        cli._route_known_held = (new_session_id, held[1])
+
+
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
 

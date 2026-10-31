@@ -151,3 +151,50 @@ def test_cli_successful_model_switch_sends_a_single_note(enabled):
     assert served == T.SONNET
     assert LEGACY not in tail
     assert _route_notes(tail) == (["[Route note: the user switched to sonnet-5.]"] if enabled else [])
+
+
+def _manual_compress_to_child(cli, child_id):
+    """``/compress`` that continues in a child session and makes no routed call (Prism 0a03db6e1de7)."""
+    def _compress_now(agent, history, request, **kw):
+        agent.session_id = child_id
+        return SimpleNamespace(status="compressed", after_messages=list(history),
+                               summary={"headline": "h", "token_line": "t", "note": "", "noop": False})
+    cli.conversation_history = list(cli.conversation_history) * 2
+    with patch("agent.conversation_compression_manual.compress_now", side_effect=_compress_now), \
+            patch("agent.conversation_compression.finalize_context_engine_compression_notification"), \
+            patch.object(cli.agent, "_flush_messages_to_session_db"), \
+            patch.object(cli, "_write_terminal_breadcrumb"):
+        cli._manual_compress("/compress")
+    assert cli.session_id == child_id
+
+
+def test_cli_model_switch_after_manual_compress_keeps_the_baseline():
+    cli = _make_cli()
+    ladder = CliLadder(cli)
+    with patch.object(ri, "route_notes_enabled", return_value=True):
+        _turn(cli, ladder, "turn one")
+        _manual_compress_to_child(cli, "child-session")
+        _slash_model(cli, T.SONNET)
+        ladder.calls.clear()
+        _turn(cli, ladder, "who are you?")
+    served, tail = ladder.served_tail()
+    assert served == T.SONNET
+    assert _route_notes(tail) == ["[Route note: the user switched to sonnet-5.]"]
+
+
+def test_cli_new_session_starts_without_a_route_baseline():
+    """/new is a different conversation: the prior session's baseline must not carry into it."""
+    cli = _make_cli()
+    ladder = CliLadder(cli)
+    with patch.object(ri, "route_notes_enabled", return_value=True):
+        _turn(cli, ladder, "turn one")
+        old_id = cli.session_id
+        with patch.object(cli, "_write_terminal_breadcrumb"):
+            cli.new_session(silent=True)
+        assert cli.session_id != old_id
+        _slash_model(cli, T.SONNET)
+        ladder.calls.clear()
+        _turn(cli, ladder, "who are you?")
+    served, tail = ladder.served_tail()
+    assert served == T.SONNET
+    assert _route_notes(tail) == []

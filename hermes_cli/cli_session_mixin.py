@@ -1162,6 +1162,8 @@ class CLISessionMixin:
                 # generation point at the live continuation, not the ended parent.
                 agent_sid = getattr(self.agent, "session_id", None)
                 if agent_sid and agent_sid != self.session_id:
+                    from hermes_cli.cli_agent_setup_mixin import _carry_route_known
+                    _carry_route_known(self, agent_sid)
                     self.session_id = self.agent.session_id
                     self._write_terminal_breadcrumb()
                     self._pending_title = None

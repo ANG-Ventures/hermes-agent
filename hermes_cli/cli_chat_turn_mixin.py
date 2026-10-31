@@ -514,6 +514,8 @@ class CLIChatTurnMixin:
         if (self.agent and getattr(self.agent, "session_id", None)
                 and self.agent.session_id != self.session_id):
             self._transfer_session_yolo(self.session_id, self.agent.session_id)
+            from hermes_cli.cli_agent_setup_mixin import _carry_route_known
+            _carry_route_known(self, self.agent.session_id)
             self.session_id = self.agent.session_id
             self._write_terminal_breadcrumb()
             self._pending_title = None
