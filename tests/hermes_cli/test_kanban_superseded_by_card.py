@@ -39,21 +39,24 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return home
 
 
-def _stub(monkeypatch, *, merged=True, on_default=True, record=RECORD, files=None):
-    """The t_eb5bf009 shape on GitHub, every oracle stubbed. Each kwarg breaks one condition."""
-    files = FILES if files is None else files
+def _stub(monkeypatch, *, merged=True, on_default=True, record=RECORD, files=None, head_ref=None):
+    """The t_eb5bf009 shape on GitHub, every oracle stubbed. Each kwarg breaks one condition.
+    #352 is a third card's closed PR with the same record and files as #350 (the chain case)."""
+    files = dict(FILES if files is None else files)
+    files.setdefault(352, files.get(350, set()))
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
 
     def query(repo, n):
         if n == 351:
-            return {"state": "MERGED", "merge_commit_sha": MERGE_SHA} if merged else {"state": "CLOSED"}
-        return {"state": "CLOSED"} if n == 350 else {"state": op.NOT_FOUND}
+            out = {"state": "MERGED", "merge_commit_sha": MERGE_SHA} if merged else {"state": "CLOSED"}
+            return dict(out, head_ref=head_ref) if head_ref else out
+        return {"state": "CLOSED"} if n in (350, 352) else {"state": op.NOT_FOUND}
     monkeypatch.setattr(op, "_default_query", lambda: query)
     monkeypatch.setattr(op, "sha_on_default", lambda repo, sha: on_default)
     monkeypatch.setattr(op, "_default_close_record", lambda: None)
     monkeypatch.setattr(op, "_default_terminal_record", lambda: None)
     monkeypatch.setattr(op, "_default_superseded_targets",
-                        lambda: (lambda repo, n: op._SUPERSEDED_LINE_RE.findall(record) if n == 350 else []))
+                        lambda: (lambda repo, n: op._SUPERSEDED_LINE_RE.findall(record) if n in (350, 352) else []))
     monkeypatch.setattr(op, "_default_files", lambda: (lambda repo, n: set(files.get(n, ()))))
 
 
@@ -171,3 +174,49 @@ def test_superseding_card_parses_one_card_only():
     assert op.superseding_card("t_be729571 or t_eb5bf009") is None
     assert op.superseding_card("ANG-Ventures/fleet-ops-scripts#351") is None
     assert op.superseding_card(None) is None
+
+
+@pytest.mark.parametrize("head_ref", ["daedalus/t_be729571-spawn-path", "feature/no-card-id"])
+def test_merged_pr_on_the_superseding_cards_branch_or_no_card_branch_still_covers(board, monkeypatch, head_ref):
+    _stub(monkeypatch, head_ref=head_ref)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        conn.execute("UPDATE tasks SET id=? WHERE id=?", ("t_be729571", sup))
+        conn.execute("UPDATE task_runs SET task_id=? WHERE task_id=?", ("t_be729571", sup))
+        conn.commit()
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by="t_be729571") is True
+
+
+def test_merged_pr_whose_branch_names_another_card_is_not_the_superseders_own(board, monkeypatch):
+    """Rule 2 "its own PR": a recorded PR whose head branch names a DIFFERENT card was never its work."""
+    _stub(monkeypatch, head_ref="daedalus/t_deadbeef-other-work")
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        _refused(conn, tid, run, sup)
+
+
+def test_supersession_does_not_chain_through_a_survivor_ref(board, monkeypatch):
+    """Prism 7004158a070b: once B closes --superseded-by A, A's #351 sits in B's survivor.refs[].pr. A third
+    card C (closed #352, `CLOSED: SUPERSEDED-BY #351`, same files) must not close --superseded-by B on it."""
+    _stub(monkeypatch)
+    with kb.connect() as conn:
+        sup, b, b_run = _cards(conn)
+        assert kb.complete_task(conn, b, expected_run_id=b_run, superseded_by=sup) is True
+        assert any("#351" in str(r.get("pr")) for r in kb.list_runs(conn, b)[-1].metadata["survivor"]["refs"])
+        c = kb.create_task(conn, title="third", assignee="worker")
+        kb.claim_task(conn, c)
+        c_run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (c,)).fetchone()[0]
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?",
+                     ('{"pr_url": "https://github.com/%s/pull/352"}' % REPO, c_run))
+        conn.commit()
+        _refused(conn, c, c_run, b)
+        # control: C's real superseder still covers it
+        assert kb.complete_task(conn, c, expected_run_id=c_run, superseded_by=sup) is True
+
+
+def test_authored_pr_refs_drops_survivor_evidence_only():
+    md = {"pr_url": "o/r#1", "own_prs": ["o/r#2"],
+          "survivor": {"refs": [{"pr": "o/r#3"}], "claims": [{"pr": "o/r#4"}]}}
+    assert op.authored_pr_refs(md) == ["o/r#1", "o/r#2"]
+    assert set(op.recorded_pr_refs(md)) == {"o/r#1", "o/r#2", "o/r#3", "o/r#4"}
+    assert op.authored_pr_refs(None) == []

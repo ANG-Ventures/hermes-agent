@@ -616,6 +616,16 @@ def recorded_pr_refs(metadata) -> list:
     return out
 
 
+def authored_pr_refs(metadata) -> list:
+    """:func:`recorded_pr_refs` without survivor evidence (``survivor.refs[].pr`` / ``claims[].pr``): the PRs
+    a run declared as its OWN work. A survivor names someone else's merged PR by design (a card closed
+    ``--superseded-by`` records the superseding PR there), so it must never make that PR the card's own
+    (Prism 7004158a070b: supersession would chain transitively)."""
+    if not isinstance(metadata, dict):
+        return []
+    return recorded_pr_refs({k: v for k, v in metadata.items() if k != "survivor"})
+
+
 # --------------------------------------------------------------------------- close-record + merged survivor
 # t_9aff2951 (2026-10-01): a closed-unmerged own PR whose OWN GitHub thread carries the sanctioned close record
 # (``CLOSED: <TOKEN> -- ...``, coding-guardrails/references/pr-close-reasons.md) is not lost work when the
@@ -815,7 +825,8 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
 # content and #351 does not name t_eb5bf009, so every close form refused and the card could only be
 # archived. ``--superseded-by <card>`` now covers the card's closed own PR when ALL of these hold:
 #   1. that card is done;
-#   2. one of its own PRs merged, merge commit on the default branch;
+#   2. one of its own PRs merged, merge commit on the default branch. "Own" = a PR its runs declared
+#      (:func:`authored_pr_refs`, never survivor evidence) whose head branch names no OTHER card;
 #   3. the closed PR's own GitHub thread carries ``CLOSED: SUPERSEDED-BY <that PR>``;
 #   4. the two PRs' changed files intersect.
 # Anything unreadable refuses (the ordinary closed-unmerged refusal stands).
@@ -890,8 +901,16 @@ def card_supersession(closed, *, card: str, card_status: Optional[str], card_prs
     files_fn = files_fn or _default_files()
     if sha_check is None or targets_fn is None or files_fn is None:
         return []
-    merged = {(r.repo.lower(), r.number): r for r in merged_survivors(
-        split_fleet(extract_pr_refs(*card_prs))[0], query_fn=query_fn, sha_check=sha_check)}
+    merged = {}
+    for r in merged_survivors(split_fleet(extract_pr_refs(*card_prs))[0], query_fn=query_fn, sha_check=sha_check):
+        try:
+            payload = query_fn(r.repo, r.number)
+        except Exception as exc:
+            _log.warning("kanban card supersession: %s#%s lookup failed: %s", r.repo, r.number, exc)
+            continue
+        head_ref = payload.get("head_ref") if isinstance(payload, dict) else None
+        if not branch_names_other_card(head_ref, card):
+            merged[(r.repo.lower(), r.number)] = r
     if not merged:
         return []
     covers: list = []

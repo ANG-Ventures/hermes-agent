@@ -11826,7 +11826,9 @@ def complete_task(
             other = get_task(conn, sup_card)
             return _open_pr.card_supersession(
                 uncovered, card=sup_card, card_status=other.status if other else None,
-                card_prs=_card_recorded_pr_refs(conn, sup_card), query_fn=_closed_query)
+                card_prs=[pr for run in list_runs(conn, sup_card)
+                          for pr in _open_pr.authored_pr_refs(run.metadata)],
+                query_fn=_closed_query)
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, result, summary, metadata=metadata,
