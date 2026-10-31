@@ -282,7 +282,7 @@ def test_tool_time_gate_and_open_duplicate(kanban_home):
     dup = json.loads(kt._handle_create({"board": "default", "title": MOMUS1_REFILE, "assignee": "momus"}))
     assert first["task_id"] in dup["error"]
     ok = json.loads(kt._handle_create(
-        {"title": MOMUS1_REFILE, "assignee": "momus", "not_a_duplicate": "new spec version"}))
+        {"board": "default", "title": MOMUS1_REFILE, "assignee": "momus", "not_a_duplicate": "new spec version"}))
     assert ok["ok"] is True
     with kb.connect_closing() as conn:
         assert len(_events(conn, forced["task_id"], "time_gate_forced")) == 1

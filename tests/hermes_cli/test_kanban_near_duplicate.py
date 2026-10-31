@@ -210,14 +210,14 @@ def test_tool_create_refuses_then_force_reason_succeeds(kanban_home, monkeypatch
     from tools import kanban_tools as kt
 
     first = json.loads(kt._handle_create(
-        {"title": TITLE, "body": BODY_A, "assignee": "peer"}
+        {"board": "default", "title": TITLE, "body": BODY_A, "assignee": "peer"}
     ))
     assert first["ok"] is True
     refused = json.loads(kt._handle_create(
-        {"title": TITLE, "body": BODY_B, "assignee": "peer"}
+        {"board": "default", "title": TITLE, "body": BODY_B, "assignee": "peer"}
     ))
     assert "near-duplicate" in refused["error"]
-    forced = json.loads(kt._handle_create({"board": "default", 
+    forced = json.loads(kt._handle_create({"board": "default",
         "title": TITLE, "body": BODY_B, "assignee": "peer",
         "force_reason": "not a duplicate: different host",
     }))

@@ -33,7 +33,7 @@ def test_worker_create_keeps_durable_origin(tmp_path, monkeypatch, linked, expli
     # Even a matching current channel must not upgrade an inherited passive policy.
     tokens = set_session_vars(platform="discord", chat_id="chat", profile="default")
     try:
-        result = json.loads(kt._handle_create(dict(title="child", assignee="daedalus",
+        result = json.loads(kt._handle_create(dict(board="default", title="child", assignee="daedalus",
                             parents=[owner] if linked else [], session_id=explicit)))
     finally:
         clear_session_vars(tokens)
@@ -62,7 +62,7 @@ def test_tool_subscription_captures_conversation_anchors(tmp_path, monkeypatch):
     tokens = set_session_vars(platform="discord", chat_id="thread", chat_type="thread",
                              scope_id="guild", parent_chat_id="forum", profile="default")
     try:
-        result = json.loads(kt._handle_create(dict(title="direct", assignee="default")))
+        result = json.loads(kt._handle_create(dict(board="default", title="direct", assignee="default")))
     finally:
         clear_session_vars(tokens)
     assert result["ok"], result
