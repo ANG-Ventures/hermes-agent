@@ -181,6 +181,14 @@ def state_db_rows(db: Path) -> list:
         con.close()
 
 
+def relay_turn_picks(events: list) -> list:
+    """Models the relay routed for the turns' main calls, in order (aux calls carry no lane_inputs or
+    a non-"-" aux_task). Must equal the payload models of the successful calls, so the PASS rests on
+    what went on the wire and what the relay served, not on agent.model."""
+    return [e.get("model") for e in events if e.get("event") == "pick"
+            and (e.get("lane_inputs") or {}).get("aux_task") == "-"]
+
+
 def turn_python(tree: Path) -> Path:
     for cand in (tree / ".venv/bin/python", tree / "venv/bin/python",
                  Path.home() / ".hermes/hermes-agent/venv/bin/python"):
@@ -313,9 +321,12 @@ def main() -> int:
     note_rows = [m for m in transcript if m["role"] == "user"
                  and (NOTE_OPENER in str(m["api_content"] or "") or NOTE_OPENER in str(m["content"] or ""))]
     counts = "/".join(str(r["note_count"]) for r in results[1:])
+    picked, served_seq = relay_turn_picks(events), [c["model"] for st in steps for c in st["calls"] if c["ok"]]
+    ok &= picked == served_seq
     report = {
         "tree": str(tree), "seat": seat, "port": a.port, "relay_launches": relay.inner.launches,
         "relay_models_picked": [e.get("model") for e in events if e.get("event") == "pick"],
+        "relay_turn_picks": picked, "payload_served_sequence": served_seq, "relay_matches_payload": picked == served_seq,
         "relay_admin_caps": [e for e in events if e.get("event") == "admin_test_cap"],
         "steps": results, "note_counts_steps_1_2_3": counts, "audit_route_note_rows": audit_rows,
         "audit_all_rows": audit_all,
@@ -401,7 +412,9 @@ def turn_main(a) -> int:
 
     def _recording(orig):
         def call(api_kwargs, *args, **kw):
-            rec = {"model": agent.model, "provider": agent.provider, "ok": False,
+            # The served model is what goes on the wire, not what the agent believes it is on.
+            rec = {"model": api_kwargs.get("model"), "agent_model": agent.model, "provider": agent.provider,
+                   "ok": False,
                    "tail_notes": _tail_notes(api_kwargs),
                    "messages": api_kwargs.get("messages") or api_kwargs.get("input"),
                    "system_chars": len(str(api_kwargs.get("system") or ""))}
