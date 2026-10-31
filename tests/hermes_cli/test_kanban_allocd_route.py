@@ -116,9 +116,39 @@ class FakeAllocd:
         d, rid = placement.admit(table, req["consumer"], samples, ttl_s=req.get("ttl_s", 1800.0), job_id=req["job_id"],
                                  footprint=req.get("footprint"), job=job, previous=req.get("previous"),
                                  reuse_job=True, extra_reserved=extra, candidates=cands, now=now)
+        if d.host and req.get("unified") is True:
+            ok, why = self.confirm_class(table, req["consumer"], job, rid, samples, now=now,
+                                         stale_after_s=float(req.get("stale_after_s") or placement.DEFAULT_STALE_AFTER_S))
+            if not ok:
+                return 409, {"refused": True, "reason": f"unified_admission: {why}"}
         if d.host:
-            return 200, {"host": d.host, "reservation_id": rid, "rule": d.rule, "band": None}
+            out = {"host": d.host, "reservation_id": rid, "rule": d.rule, "band": None}
+            if req.get("unified") is True:
+                out["unified"] = True
+            return 200, out
         return 409, {"refused": True, "reason": d.reason}
+
+    @staticmethod
+    def confirm_class(table, consumer, job, rid, samples, *, now, stale_after_s):
+        """``scripts/allocd.py`` _confirm_class (hermes-home, t_c466b7ee): placement.may_start on THIS ledger under
+        its lock with the booked row left out by id; refused = the row is dropped in the same lock section."""
+        rpath = placement.reservations_path()
+        with placement._locked(rpath):
+            doc = placement._read_ledger(rpath)
+            own = next((r for r in doc["rows"] if r.get("id") == rid), None)
+            if own is None or not placement._row_live(own, now):
+                return False, f"closed:reservation {rid} not live at the class check"
+            hid = table.resolve(own["host"]) or own["host"]
+            live = [r for r in doc["rows"] if placement._row_live(r, now)]
+            leases = placement.ledger_leases(rpath, now=now, table=table)
+            del leases[next(i for i, r in enumerate(live) if r.get("id") == rid)]
+            admitted = placement.live_admissions(consumer, rpath, now=now, table=table).get(hid, 0) - 1
+            ok, why = placement.may_start(hid, consumer, job=job, table=table, now=now, samples=samples,
+                                          leases=leases, admitted=admitted, stale_after_s=stale_after_s)
+            if not ok:
+                placement._write_ledger(rpath, {"schema": doc.get("schema", placement.SCHEMA),
+                                                "rows": [r for r in doc["rows"] if r.get("id") != rid]})
+            return ok, why
 
 
 @pytest.fixture

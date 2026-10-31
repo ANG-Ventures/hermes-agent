@@ -67,14 +67,32 @@ def cap(pressure_text: str, *, reservation: float) -> Tuple[Optional[int], str]:
     if mem is not None:
         limit = max(0, int(math.floor(mem / reservation)))
         why.append(f"mem_available {mem:g} GB / {reservation:g} GB reservation = {limit}")
+    band_why = _band_saturated(doc)
+    if band_why:
+        limit = 0
+        why.append(band_why)
+    return limit, "; ".join(why)
+
+
+def band_cap(pressure_text: str) -> str:
+    """The band axis of :func:`cap` alone: ``"band.kanban hot (...)"`` when the host's PUBLISHED kanban band is
+    saturated, else "". The unified rule retires the memory axis only (D9); this axis still closes the host
+    (Prism ce581503f8d8, t_c466b7ee)."""
+    try:
+        doc = json.loads(pressure_text) if pressure_text else None
+    except ValueError:
+        doc = None
+    return _band_saturated(doc) if isinstance(doc, Mapping) else ""
+
+
+def _band_saturated(doc: Mapping) -> str:
     bands = doc.get("band")
     band = bands.get("kanban") if isinstance(bands, Mapping) else None
-    if isinstance(band, str) and band in SATURATED_BANDS:
-        reasons = doc.get("band_reason")
-        detail = reasons.get("kanban") if isinstance(reasons, Mapping) else None
-        limit = 0
-        why.append(f"band.kanban {band}" + (f" ({detail})" if detail else ""))
-    return limit, "; ".join(why)
+    if not (isinstance(band, str) and band in SATURATED_BANDS):
+        return ""
+    reasons = doc.get("band_reason")
+    detail = reasons.get("kanban") if isinstance(reasons, Mapping) else None
+    return f"band.kanban {band}" + (f" ({detail})" if detail else "")
 
 
 def readback_line(refused: Mapping[str, str], *, enforcing: bool, reservation: float) -> str:

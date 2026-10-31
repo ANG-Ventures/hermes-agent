@@ -86,12 +86,41 @@ def test_estimator_matches_actual_openai_sdk_serialized_body_length():
     assert serialized_request_body_size(kwargs) == len(captured["body"])
 
 
-def test_anthropic_profile_sets_headroom_below_hard_ten_mib_limit():
+def test_anthropic_profile_sets_headroom_below_hard_128_mb_limit():
+    # Anthropic raised the Messages max request size to 128 MB (2026-10-29).
     profile = get_provider_profile("anthropic")
 
     cap = profile.get_max_request_body_bytes("claude-opus-4-6")
 
-    assert 9 * 1024 * 1024 < cap < 10 * 1024 * 1024
+    assert cap == 128_000_000 - 4 * 1024 * 1024
+    assert 120_000_000 <= cap < 128_000_000
+
+
+def test_anthropic_cap_admits_50_mb_body_and_rejects_200_mb_body(monkeypatch):
+    import agent.request_body_budget as budget
+
+    cap = request_body_limit_for_provider(
+        "anthropic", "claude-opus-5", api_mode="anthropic_messages"
+    )
+    assert cap is not None
+
+    # A real 50 MB text-only body passes the preflight untouched.
+    request = {
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "x" * 50_000_000}],
+    }
+    admitted = remediate_request_body(request, max_body_bytes=cap)
+    assert admitted.before_bytes > 50_000_000
+    assert admitted.fits is True
+    assert admitted.request_kwargs["messages"] is request["messages"]
+
+    # 200 MB is over the upstream 128 MB cap; with nothing to remediate the
+    # preflight reports it does not fit. Size is stubbed to avoid a 200 MB alloc.
+    monkeypatch.setattr(budget, "serialized_request_body_size", lambda _kw: 200_000_000)
+    rejected = remediate_request_body(
+        {"model": "claude-opus-5", "messages": []}, max_body_bytes=cap
+    )
+    assert rejected.fits is False
 
 
 def test_provider_profiles_default_to_no_request_body_cap():
@@ -106,7 +135,7 @@ def test_unregistered_anthropic_transport_inherits_protocol_body_cap():
     )
 
     assert cap is not None
-    assert 9 * 1024 * 1024 < cap < 10 * 1024 * 1024
+    assert 120_000_000 <= cap < 128_000_000
     assert (
         request_body_limit_for_provider(
             "custom-anthropic-relay",

@@ -19,7 +19,8 @@ from tests.hermes_cli.test_kanban_batch_set_model import _create
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
+# proven_operator: flagship overrides need operator authority (t_9e7ba884).
+def kanban_home(tmp_path, monkeypatch, proven_operator):
     home = tmp_path / '.hermes'
     home.mkdir()
     monkeypatch.setenv('HERMES_KANBAN_SANDBOX', '1')

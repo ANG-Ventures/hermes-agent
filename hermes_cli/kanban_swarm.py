@@ -119,8 +119,14 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    flagship_override_reason: Optional[str] = None,
 ) -> SwarmCreated:
-    """Atomically create a durable, immediately dispatchable Kanban swarm."""
+    """Atomically create a durable, immediately dispatchable Kanban swarm.
+
+    ``flagship_override_reason`` authorizes child cards (workers, verifier,
+    synthesizer) on flagship-default profiles; each such child gets its own
+    ``flagship override:`` comment. The root is ``no_worker`` and never gated.
+    """
     activation_summary = "Swarm topology planned; root remains the shared blackboard."
     activated = False
     with kb.write_txn(conn):
@@ -130,6 +136,7 @@ def create_swarm(
             verifier_title=verifier_title, synthesizer_title=synthesizer_title, tenant=tenant,
             created_by=created_by, workspace_kind=workspace_kind, workspace_path=workspace_path,
             priority=priority, idempotency_key=idempotency_key,
+            flagship_override_reason=flagship_override_reason,
         )
         root = kb.get_task(conn, created.root_id)
         if root is not None and root.status == "blocked":
@@ -167,6 +174,7 @@ def _create_swarm_uncommitted(
     verifier_assignee: str, synthesizer_assignee: str, root_title: Optional[str],
     verifier_title: str, synthesizer_title: str, tenant: Optional[str], created_by: str,
     workspace_kind: Optional[str], workspace_path: Optional[str], priority: int, idempotency_key: Optional[str],
+    flagship_override_reason: Optional[str] = None,
 ) -> SwarmCreated:
     """Create the swarm graph inside the caller's transaction: planning root
     (``blocked`` until the caller activates it), parallel workers, a verifier
@@ -185,6 +193,8 @@ def _create_swarm_uncommitted(
         created_by=created_by, tenant=tenant,
         workspace_kind=workspace_kind, workspace_path=workspace_path,
     )
+    # Children are real worker routes: gated, authorized by the shared reason.
+    child = dict(common, flagship_override_reason=flagship_override_reason)
     root = kb.create_task(
         conn,
         title=root_title or f"Swarm: {goal.splitlines()[0][:80]}",
@@ -195,6 +205,9 @@ def _create_swarm_uncommitted(
         priority=priority,
         idempotency_key=idempotency_key,
         initial_status="blocked",
+        # Bookkeeping root: completed at once, never dispatched, so its
+        # assignee (the caller) is not a worker route (Prism d1a3754ac7e5).
+        no_worker=True,
         **common,
     )
 
@@ -219,7 +232,7 @@ def _create_swarm_uncommitted(
             priority=spec.priority or priority,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
-            **common,
+            **child,
         )
         for spec in worker_specs
     ]
@@ -236,7 +249,7 @@ def _create_swarm_uncommitted(
         parents=worker_ids,
         priority=priority,
         skills=["requesting-code-review"],
-        **common,
+        **child,
     )
     synthesizer = kb.create_task(
         conn,
@@ -250,7 +263,7 @@ def _create_swarm_uncommitted(
         parents=[verifier],
         priority=priority,
         skills=["humanizer"],
-        **common,
+        **child,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)

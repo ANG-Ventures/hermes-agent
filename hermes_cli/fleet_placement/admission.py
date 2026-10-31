@@ -31,6 +31,7 @@ binding free fraction after this job, PSI cpu as a penalty.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -63,6 +64,7 @@ class Lease:
     need: Estimate
     at: float                  # admit time
     job_id: Optional[str] = None
+    holdback: bool = False     # a stand-in for a higher class's QUEUED work (holdback()); job_class is that class
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,6 +78,8 @@ class Limits:
     procs_frac_max: float = 0.85       # procs / maxproc
     cpu_saturable: bool = False        # CPU over the line = score penalty, never a refusal
     unmeasurable: tuple = ()           # axes this host's OS cannot report (never required)
+    r2c: bool = False                  # scorer v2 (FWA R2c) only: the avg60 axis + PSI cpu closing AT its line; False =
+                                       # the pre-R2c predicate byte for byte (the v1 kill switch, Prism 78da7ab3e3d9)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,7 +164,7 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
             continue
         free[axis] = lim - float(sample[axis])
     # R2c avg60 stall closure (t_d456e9cd): read when the sampler pushed it; a pre-avg60 sample is not refused for it
-    if not {"psi_cpu_some10", "psi_cpu_some60"} & unmeasurable and _num(sample.get("psi_cpu_some60")):
+    if limits.r2c and not {"psi_cpu_some10", "psi_cpu_some60"} & unmeasurable and _num(sample.get("psi_cpu_some60")):
         free["psi_cpu_some60"] = limits.psi_cpu60_max - float(sample["psi_cpu_some60"])
     if _num(sample.get("procs")) and _num(sample.get("maxproc")) and sample["maxproc"] > 0:
         free["procs"] = limits.procs_frac_max - float(sample["procs"]) / float(sample["maxproc"])
@@ -174,9 +178,10 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
         return Verdict(False, "slo", "saturated:slo (latency guard breached)", free)
     order = ("slice_mem_gb", "mem_gb", "psi_mem_some10", "psi_io_some10", "procs", "gpu_mib", "psi_cpu_some10",
              "psi_cpu_some60", "cpu")
+    at_line = ("psi_cpu_some10", "psi_cpu_some60") if limits.r2c else ()
     for axis in order:
-        # PSI cpu closes AT its line (R2c: avg10 >= 40 OR avg60 >= 25, as closed_when does on the legacy path)
-        if axis not in free or free[axis] > 0 or (free[axis] == 0 and axis not in ("psi_cpu_some10", "psi_cpu_some60")):
+        # R2c only: PSI cpu closes AT its line (avg10 >= 40 OR avg60 >= 25, as closed_when does on the legacy path)
+        if axis not in free or free[axis] > 0 or (free[axis] == 0 and axis not in at_line):
             continue
         if axis in ("cpu", "psi_cpu_some10", "psi_cpu_some60") and limits.cpu_saturable:
             continue                       # a score penalty on a saturable host (score() reads it), never a refusal
@@ -256,9 +261,10 @@ def holdback(workload: str, demand: Iterable[Demand], priority: Priority, host: 
             continue
         n = min(int(d.queued), priority.holdback_units)
         u = d.unit
-        out.append(Lease(host, f"holdback:{d.workload}",
+        # job_class stays the real class, so SliceMem.classes (startswith) still counts it (Prism 44a27d9ae8e6)
+        out.append(Lease(host, d.workload,
                          Estimate(u.cpus * n, u.ram_gb * n, u.gpu_mib * n, f"holdback {d.workload} x{n}"),
-                         at=math.inf, job_id=f"queued:{d.workload}:{int(d.queued)}"))
+                         at=math.inf, job_id=f"queued:{d.workload}:{int(d.queued)}", holdback=True))
     return out
 
 
@@ -378,19 +384,38 @@ def _history_row(ln) -> Optional[dict]:
     return r if isinstance(r, dict) and r.get("schema") == SCHEMA else None
 
 
-# path -> [open binary file, bytes consumed, rows parsed so far, checkpoint]   (read_history_cached; t_c9fd9c5e)
-# checkpoint = the last CHECKPOINT_BYTES consumed bytes: re-read before reusing the rows, so a truncate + refill to the
-# old size or past it (same inode, never smaller at a read) resets the cache instead of replaying the old generation.
+# path -> [open binary file, bytes consumed, rows parsed so far, prefix sha256, head checkpoint, (mtime_ns, size)]
+# (read_history_cached; t_c9fd9c5e). Checkpoints = a sha256 of every consumed byte (t_48cb7ec2) and the first
+# CHECKPOINT_BYTES of them: re-read before reusing the rows, so a truncate + refill to the old size or past it, or an
+# in-place rewrite of ANY consumed row (same inode), resets the cache instead of replaying the old generation. An append always grows the file, so the same size with a moved mtime
+# is an in-place rewrite and resets too, whatever the checkpoints say (Prism e63812f5e349).
 # The file stays OPEN while its rows are cached, so its inode cannot be recycled by an unlink + recreate (Prism e2ace455c12a).
 _HISTORY_CACHE: dict = {}
 _HISTORY_LOCK = threading.Lock()
 CHECKPOINT_BYTES = 256
 
 
-def _checkpoint_ok(fh, consumed: int, want: bytes) -> bool:
-    if consumed <= 0 or not want:
+def _checkpoint_ok(fh, consumed: int, want) -> bool:
+    """``want`` = a running sha256 over EVERY consumed byte (Prism 001b1324e2a1, t_48cb7ec2): a same-size in-place
+    rewrite of a MIDDLE row that keeps the head + tail bytes, followed by an append (size moved, so the mtime arm is
+    blind), still resets. ~0.5 ms/MiB to hash vs ~11 ms/MiB to parse: the incremental read keeps its point."""
+    if consumed <= 0:
         return True
-    fh.seek(consumed - len(want))
+    fh.seek(0)
+    h, left = hashlib.sha256(), consumed
+    while left > 0:
+        b = fh.read(min(left, 1 << 20))
+        if not b:
+            return False
+        h.update(b)
+        left -= len(b)
+    return h.digest() == want.digest()
+
+
+def _head_ok(fh, want: bytes) -> bool:
+    if not want:
+        return True
+    fh.seek(0)
     return fh.read(len(want)) == want
 
 
@@ -418,11 +443,12 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
                 hit[0].close()
                 _HISTORY_CACHE.pop(key, None)
                 hit = None
-            elif held.st_size < hit[1] or not _checkpoint_ok(hit[0], hit[1], hit[3]):
-                hit[1], hit[2], hit[3] = 0, [], b""   # shrunk or rewritten in place: start over on the same descriptor
+            elif (held.st_size < hit[1] or (held.st_size == hit[5][1] and held.st_mtime_ns != hit[5][0])
+                  or not _checkpoint_ok(hit[0], hit[1], hit[3]) or not _head_ok(hit[0], hit[4])):
+                hit[1:5] = [0, [], hashlib.sha256(), b""]   # shrunk or rewritten in place: start over
         if hit is None:
             try:
-                hit = [p.open("rb"), 0, [], b""]
+                hit = [p.open("rb"), 0, [], hashlib.sha256(), b"", (None, None)]
             except FileNotFoundError:
                 return []
         fh = hit[0]
@@ -435,9 +461,13 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
             r = _history_row(ln)
             if r is not None:
                 hit[2].append(r)
-        hit[1] += end
         if end:
-            hit[3] = (hit[3] + chunk[:end])[-CHECKPOINT_BYTES:]
+            hit[3].update(chunk[:end])
+            if len(hit[4]) < CHECKPOINT_BYTES:
+                hit[4] = (hit[4] + chunk[:end])[:CHECKPOINT_BYTES]
+        hit[1] += end
+        after = os.fstat(fh.fileno())
+        hit[5] = (after.st_mtime_ns, after.st_size)
         _HISTORY_CACHE[str(p)] = hit
         rows = list(hit[2])
     if since is None:

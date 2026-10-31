@@ -278,6 +278,95 @@ def _terminate_cron_script_tree(proc: subprocess.Popen) -> None:
     fallback("Cron script tree-kill reported no signal for pid %s", pid)
 
 
+def _script_tree_snapshot(proc: subprocess.Popen) -> Optional[list]:
+    """psutil handles for the script leader and every descendant, taken BEFORE any signal: a setsid
+    grandchild is reparented once its parent dies and is then unreachable from the leader (#85125).
+    None when psutil is unavailable or the leader is already gone."""
+    try:
+        import psutil
+        root = psutil.Process(proc.pid)
+    except Exception:
+        return None
+    try:
+        return [root] + root.children(recursive=True)
+    except Exception:
+        # A zombie leader has no live children of its own to list; anything else falls back.
+        with contextlib.suppress(Exception):
+            if root.status() == psutil.STATUS_ZOMBIE:
+                return [root]
+        return None
+
+
+def _script_tree_refresh(proc: subprocess.Popen, snapshot: Optional[list]) -> Optional[list]:
+    """``snapshot`` plus every descendant spawned since (Prism 361a15209668): the leader's live tree
+    if it still runs, and the children of every snapshot member still running, so a process forked
+    during the TERM grace is signalled and counted even after the leader is reaped."""
+    if snapshot is None:
+        return _script_tree_snapshot(proc)
+    merged = list(snapshot)
+    fresh = _script_tree_snapshot(proc) if proc.poll() is None else None
+    # Members of the script's own process group (its pgid is the leader pid): a same-group child
+    # whose parent already exited is reparented away from every snapshot member.
+    group: list = []
+    with contextlib.suppress(Exception):
+        import psutil
+        for cand in psutil.process_iter():
+            with contextlib.suppress(Exception):
+                if os.getpgid(cand.pid) == proc.pid:
+                    group.append(cand)
+    for member in list(snapshot) + (fresh or []) + group:
+        found = [member] if member not in merged else []
+        with contextlib.suppress(Exception):
+            if member.is_running():
+                found += member.children(recursive=True)
+        merged += [m for m in found if m not in merged]
+    return merged
+
+
+def _script_tree_alive(proc: subprocess.Popen, snapshot: Optional[list]) -> bool:
+    """Whether any member of ``snapshot`` still runs: same pid AND create_time (psutil's
+    is_running, pid-reuse safe) and not a zombie, so a zombie-only tree counts as gone. Without a
+    snapshot, falls back to probing the script's process group (its pgid is the leader pid)."""
+    if snapshot is None:
+        try:
+            os.killpg(proc.pid, 0)  # windows-footgun: ok — POSIX-only caller (cron script runner)
+        except ProcessLookupError:
+            return False
+        except Exception:
+            return True
+        return True
+    import psutil
+    for member in snapshot:
+        try:
+            if member.is_running() and member.status() != psutil.STATUS_ZOMBIE:
+                return True
+        except psutil.NoSuchProcess:
+            continue
+        except Exception:
+            return True  # cannot tell: count it alive, so no re-fire runs beside it
+    return False
+
+
+def _signal_script_tree(proc: subprocess.Popen, snapshot: Optional[list], sig: int) -> None:
+    """Signal the whole script tree: the leader's live tree through the same unified tree-kill the
+    timeout and cancel paths use (SIGKILL: ``_terminate_cron_script_tree``), then every snapshot
+    member still running, which reaches descendants orphaned from the leader. No snapshot: the
+    process group only."""
+    if snapshot is None:
+        with contextlib.suppress(Exception):
+            os.killpg(proc.pid, sig)  # windows-footgun: ok — POSIX-only caller (cron script runner)
+        return
+    if sig == getattr(signal, "SIGKILL", None):
+        _terminate_cron_script_tree(proc)
+    else:
+        with contextlib.suppress(Exception):
+            from agent.deadline import kill_process_tree
+            kill_process_tree(proc.pid, sig=sig)
+    for member in snapshot:
+        with contextlib.suppress(Exception):
+            member.send_signal(sig)  # psutil checks pid + create_time before signalling
+
+
 def _drain_script_pipes(proc: subprocess.Popen) -> None:
     """Reap a terminated script without blocking forever: a surviving descendant can hold the pipe
     write ends open, so bound the drain and abandon the pipes (output is not needed)."""
@@ -570,6 +659,8 @@ def _run_job_script(
         _proc_key = id(proc)
         with _sched._script_procs_lock:
             _sched._active_script_procs[_proc_key] = proc
+            if job_id:
+                _sched._script_proc_job_ids[_proc_key] = _sched._inflight_key(str(job_id))
         try:
             _started = time.monotonic()
             deadline = _started + script_timeout
@@ -604,6 +695,12 @@ def _run_job_script(
         finally:
             with _sched._script_procs_lock:
                 _sched._active_script_procs.pop(_proc_key, None)
+                _skew_key = _sched._script_proc_job_ids.pop(_proc_key, None)
+                _skew_cut = _skew_key is not None and _skew_key in _sched._skew_interrupted_job_ids
+                if _skew_cut:
+                    _sched._skew_interrupted_job_ids.discard(_skew_key)
+                    if _skew_key not in _sched._refire_withheld_job_ids:
+                        _sched._restart_killed_job_ids.add(_skew_key)
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
@@ -617,6 +714,14 @@ def _run_job_script(
             logger.warning("Failed to redact sensitive text from output: %s", e)
             stdout = stderr = "[REDACTED - redaction failed]"
 
+        if _skew_cut:
+            # Cut off by the script runner's bounded code-skew drain: never a success, whatever the
+            # script's own exit status (Prism b86087faa72f); its re-fire flag is set above.
+            parts = [f"Script interrupted by the cron script runner's code-skew drain "
+                     f"(exit {proc.returncode}); eligible for one re-fire after restart."]
+            if stderr:
+                parts.append(f"stderr:\n{stderr}")
+            return False, "\n".join(parts)
         if proc.returncode != 0:
             parts = [f"Script exited with code {proc.returncode}"]
             if (
@@ -626,8 +731,10 @@ def _run_job_script(
             ):
                 # Killed by the gateway shutdown drain (or its backstop), not a script failure:
                 # flag it so run_one_job re-queues one fire (fork #462/#1429).
+                _killed_key = _sched._inflight_key(str(job_id))
                 with _sched._script_procs_lock:
-                    _sched._restart_killed_job_ids.add(str(job_id))
+                    if _killed_key not in _sched._refire_withheld_job_ids:
+                        _sched._restart_killed_job_ids.add(_killed_key)
                 parts.append(
                     "Killed by gateway shutdown mid-run; eligible for one "
                     "re-fire after restart.")

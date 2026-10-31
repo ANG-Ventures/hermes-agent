@@ -5067,6 +5067,16 @@ class BasePlatformAdapter(ABC):
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
+        # Atomic admission (Prism eb13daf988ed): a producer whose eligibility can go stale across an
+        # adapter's own awaits (Discord resolves the channel first) re-checks here; nothing awaits
+        # between this check and the claim or queue below. False = refused: not accepted, not queued.
+        # One-shot (Prism 199961bfd516): consumed here, so a queued event replayed through this path
+        # later is never refused after its producer has stopped watching (it could not roll back).
+        admit = getattr(event, "_admission_check", None)
+        if admit is not None:
+            event._admission_check = None
+            if not admit(session_key):
+                return
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
             return
