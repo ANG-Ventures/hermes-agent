@@ -606,6 +606,26 @@
    "verdict": "kept",
    "why": "`%<number>%` is a candidate prefilter on run-metadata JSON; each matched row is re-parsed by _run_meta_pr_keys and intersected with the exact `owner/repo#N` key, so the LIKE cannot admit a wrong PR.",
    "where": "hermes_cli/kanban_sign_grants.py:188 authored_pr_keys"
+  },
+  "hermes_cli/kanban_open_pr.py::_target_key::fold::repo::return closed_ref.repo.lower(), int(m.group(1))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
+   "where": "hermes_cli/kanban_open_pr.py:902 _target_key"
+  },
+  "hermes_cli/kanban_open_pr.py::_target_key::fold::repo::return (refs[0].repo.lower(), refs[0].number) if refs else None": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
+   "where": "hermes_cli/kanban_open_pr.py:904 _target_key"
+  },
+  "hermes_cli/kanban_open_pr.py::card_supersession::fold::repo::merged[(r.repo.lower(), r.number)] = r": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
+   "where": "hermes_cli/kanban_open_pr.py:929 card_supersession"
+  },
+  "hermes_cli/kanban_open_pr.py::card_supersession::fold::repo::if s.repo.lower() != c.repo.lower():": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
+   "where": "hermes_cli/kanban_open_pr.py:945 card_supersession"
   }
  }
 }
