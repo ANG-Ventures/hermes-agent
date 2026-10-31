@@ -198,3 +198,36 @@ def test_cli_new_session_starts_without_a_route_baseline():
     served, tail = ladder.served_tail()
     assert served == T.SONNET
     assert _route_notes(tail) == []
+
+
+def _resume_other(cli):
+    """The /resume switch: the CLI moves to another session, then repoints the kept agent."""
+    from hermes_cli.cli_commands_mixin import _sync_agent_to_session
+    old_id, cli.session_id = cli.session_id, "resumed-other-session"
+    cli.conversation_history = []
+    _sync_agent_to_session(cli, cli.session_id, parent_session_id=old_id, reason="resume")
+
+
+@pytest.mark.parametrize("switch", ["new", "resume"])
+def test_cli_kept_agent_across_a_conversation_switch_drops_the_old_baseline(switch):
+    """/new and /resume keep the live agent (Prism 0a03db6e1de7, round 2): the ended conversation's
+    fallback state must not make the first call of the next one announce a route change."""
+    cli = _make_cli()
+    ladder = CliLadder(cli)
+    with patch.object(ri, "route_notes_enabled", return_value=True):
+        _turn(cli, ladder, "turn one")
+        _slash_model(cli, T.SONNET)
+        ladder.script = {T.SONNET: [503]}
+        _turn(cli, ladder, "on opus via fallback")
+        agent = cli.agent
+        if switch == "new":
+            with patch.object(cli, "_write_terminal_breadcrumb"):
+                cli.new_session(silent=True)
+        else:
+            _resume_other(cli)
+        assert cli.agent is agent  # the agent was kept, not rebuilt
+        ladder.script = {}
+        ladder.calls.clear()
+        _turn(cli, ladder, "fresh conversation")
+    _, tail = ladder.served_tail()
+    assert _route_notes(tail) == []

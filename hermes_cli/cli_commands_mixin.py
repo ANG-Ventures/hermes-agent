@@ -336,6 +336,8 @@ def _sync_agent_to_session(cli, session_id: str, *, parent_session_id: str, reas
     if not cli.agent:
         return
     cli.agent.session_id = session_id
+    from hermes_cli.cli_agent_setup_mixin import _bind_route_known
+    _bind_route_known(cli)  # /resume: no baseline; /branch: the carried one
     cli.agent.reset_session_state()
     if hasattr(cli.agent, "_last_flushed_db_idx"):
         cli.agent._last_flushed_db_idx = len(cli.conversation_history)
