@@ -23,9 +23,15 @@ from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
-from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
+from agent.message_metadata import (
+    PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, recorded_route_note_prefix, stamp_message_timestamp,
+)
 from agent.message_sanitization import is_interrupt_close_row, provider_owns_transcript
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
+from agent.route_identity import ROUTE_NOTE_DISPLAY_KIND
+from agent.route_note_ingest import (
+    relabel_replayed_user_content, relabel_route_note_content, relabel_route_note_text,
+)
 from agent.tool_dispatch_helpers import _degrade_prior_turn_multimodal_messages
 from agent.turn_handoff import consume_handoff_context
 from agent.image_token_cost import bind_image_token_cost
@@ -120,7 +126,7 @@ def compose_multimodal_context_part(
     a multimodal (list) turn carries it as a durable text part (#71998)."""
     fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
     injections = [part for part in (fenced, plugin_user_context) if part]
-    return "\n\n".join(injections) if injections else None
+    return relabel_route_note_text("\n\n".join(injections)) if injections else None
 
 
 def compose_user_api_content(
@@ -304,6 +310,8 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     """
     from agent.context_compressor import user_originated_turn_view
 
+    # E11: the live row carries the relabelled text; callers (API server, export) pass raw input.
+    user_message = relabel_route_note_content(user_message)
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -352,6 +360,8 @@ def export_current_turn_boundary(agent: Any, result: Any, user_message: Any) -> 
     if not (isinstance(row, dict) and row.get("role") == "user"):
         return result
     from agent.context_compressor import user_originated_turn_view
+
+    user_message = relabel_route_note_content(user_message)  # E11: same canonical text as the row
 
     live_view = user_originated_turn_view(row)
     if row.get("content") != user_message and not (
@@ -716,24 +726,91 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
             scrubber.reset()
 
 
+# Key on a staged user dict whose content is stored relabelled: the raw turn text it stands for
+# (adoption identity; popped at staging, leading underscore keeps it off the wire).
+STAGED_TURN_RAW_KEY = "_staged_turn_raw_content"
+
+
+def _rewrite_relabelled_staged_row(agent: Any, staged: Dict[str, Any], content: Any) -> None:
+    """E11: a row written before the relabel (the TUI submit row) holds the raw ``[Route note:``.
+    The flush skips a ``_DB_PERSISTED_MARKER`` dict, so rewrite the stored row to the relabelled
+    text here, or a resume replays the forged marker as harness text.
+
+    A rewrite that still fails after a bounded retry (the setter already waits out the busy timeout)
+    hands the row to the normal flush: the marker is cleared and the dict carries the stored row's
+    digest, so the flush's row-addressed CAS rewrites that row in place (or appends when a read proves it
+    gone). When that read itself fails the row stays addressed and the flush retries the rewrite.
+    The live and durable rows never diverge silently."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.message_metadata import DB_ROW_SNAPSHOT, PENDING_USER_CONTENT_REWRITE
+    from agent.session_persistence import _durable_content, _persist_lock
+    from agent.transcript_repair import transcript_row_snapshot
+
+    _row_id, _db = staged.get("_row_id"), getattr(agent, "_session_db", None)
+    if not staged.get(_DB_PERSISTED_MARKER) or _db is None or not isinstance(_row_id, int):
+        return
+    # The submit row records the session it was written under (a rotation may have moved off it).
+    session_id = staged.get("_submit_row_session_id") or agent.session_id
+    with _persist_lock(agent):
+        active_id = None
+        for attempt in range(2):
+            try:
+                # An in-place compaction may have re-sequenced the row under a new id (#123675).
+                active_id = _db.resolve_active_row_id(session_id, _row_id)
+                if active_id is not None and _db.set_user_message_content(
+                        session_id, active_id, _durable_content(content)) > 0:
+                    staged["_row_id"] = active_id
+                    return
+            except Exception:
+                logger.warning("route-note relabel of staged user row failed for session=%s (attempt %d)",
+                               session_id or "none", attempt + 1, exc_info=True)
+        staged.pop(_DB_PERSISTED_MARKER, None)
+        staged.pop(DB_ROW_SNAPSHOT, None)
+        row = None
+        if session_id == agent.session_id:
+            try:
+                row = _db._read_one("SELECT * FROM messages WHERE id = ? AND session_id = ? AND active = 1",
+                                    (active_id if isinstance(active_id, int) else _row_id, session_id))
+            except Exception:
+                # A failed read is not an absent row: keep the row durable and addressed, and hand the
+                # rewrite to the flush, which retries it in place (never the append fallback).
+                logger.warning("route-note relabel: staged row read failed", exc_info=True)
+                staged[_DB_PERSISTED_MARKER] = True
+                staged[PENDING_USER_CONTENT_REWRITE] = (session_id, _durable_content(content))
+                return
+        if row is None:
+            # No addressable live row in this session: the flush appends the relabelled row.
+            staged.pop("_row_id", None)
+        else:
+            staged["_row_id"], staged[DB_ROW_SNAPSHOT] = int(row["id"]), transcript_row_snapshot(row)
+
+
 def _stage_turn_user_message(
     agent: Any, user_message: Any, persist_user_message: Any,
     persist_user_timestamp: Optional[float], persist_user_platform_id: Optional[str],
     persist_user_display_kind: Optional[str],
     persist_user_display_metadata: Optional[Dict[str, Any]],
+    raw_persist_content: Any = None,
 ) -> Tuple[Dict[str, Any], Any]:
     """Build this turn's user dict, reusing CLI-staged input only when its clean text
     matches this turn (a stale handoff must not replace later input; voice turns
-    compare the clean override). Returns ``(user_msg, pending_cli_message)``."""
+    compare the clean override). Returns ``(user_msg, pending_cli_message)``.
+    ``raw_persist_content`` is this turn's persist text BEFORE the E11 relabel: identity is
+    matched on the raw form (the relabel maps two different submits to one text)."""
     pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
     expected_persist_content = (
         persist_user_message if persist_user_message is not None else user_message
     )
+    raw_expected = raw_persist_content if raw_persist_content is not None else expected_persist_content
     if (
         isinstance(pending_cli_message, dict)
-        and pending_cli_message.get("content") == expected_persist_content
+        # A dict whose stored content is already relabelled (the TUI submit row) carries the raw
+        # turn text it stands for; any other staged dict holds the raw text as its content.
+        and pending_cli_message.pop(STAGED_TURN_RAW_KEY, pending_cli_message.get("content")) == raw_expected
     ):
         user_msg = pending_cli_message
+        if user_msg.get("content") != expected_persist_content:
+            _rewrite_relabelled_staged_row(agent, user_msg, expected_persist_content)
         # CLI-staged value is the clean text; restore the API-facing variant (e.g. voice
         # prefix) on the same dict, keeping any close-path durable marker.
         user_msg["content"] = user_message
@@ -1016,7 +1093,7 @@ def _stamp_api_content_sidecar(
     API copy, so stamp the exact sent bytes on the live dict for replay."""
     _turn_user_msg = messages[current_turn_user_idx]
     live_content = _turn_user_msg.get("content")
-    from agent.session_persistence import _persist_lock, durable_user_row_content
+    from agent.session_persistence import _persist_lock, durable_user_row_content, write_user_row_content
     # Match the row the flush wrote (persist override = clean transcript), not the live bytes.
     durable_content, _api_content = durable_user_row_content(
         agent, _turn_user_msg, live_content,
@@ -1046,7 +1123,8 @@ def _stamp_api_content_sidecar(
             return
         try:
             if isinstance(_row_id, int):
-                _db.set_message_api_content(agent.session_id, _row_id, durable_content, _api_content)
+                write_user_row_content(agent, _turn_user_msg, agent.session_id, _row_id, durable_content,
+                                       api_content=_api_content)
             else:
                 # Compacted copies carry no row id; positional is safe only because
                 # archive_and_compact just made this message the newest active user row.
@@ -1072,7 +1150,7 @@ def _append_multimodal_context(
     _mm_ctx = compose_multimodal_context_part(ext_prefetch_cache, plugin_user_context)
     if not append_notes_to_multimodal_content(turn_user_msg.get("content"), _mm_ctx):
         return
-    from agent.session_persistence import _durable_content, _persist_lock
+    from agent.session_persistence import _durable_content, _persist_lock, write_user_row_content
 
     with _persist_lock(agent):
         _row_id = turn_user_msg.get("_row_id")
@@ -1082,7 +1160,7 @@ def _append_multimodal_context(
         _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
         content = turn_user_msg["content"] if _in_place_compacted else _durable_content(turn_user_msg["content"])
         try:
-            _db.set_user_message_content(agent.session_id, _row_id, content)
+            write_user_row_content(agent, turn_user_msg, agent.session_id, _row_id, content)
         except Exception:
             logger.warning("multimodal context backfill failed for session=%s", agent.session_id or "none", exc_info=True)
 
@@ -1152,6 +1230,12 @@ def build_turn_context(
         user_message = sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
+    # E11: received text never carries the harness's route-note marker. Unconditional: the
+    # harness's own note never enters here (route_identity._persist_note appends it per call),
+    # so no declared display kind may opt received text out of the relabel.
+    raw_persist_content = persist_user_message if persist_user_message is not None else user_message
+    user_message = relabel_route_note_content(user_message)
+    persist_user_message = relabel_route_note_content(persist_user_message)
 
     # Turn identity is bound BEFORE the primary restore: its recovery /
     # restore_refused ledger rows belong to THIS turn (C7 k73).
@@ -1197,6 +1281,7 @@ def build_turn_context(
     user_msg, pending_cli_message = _stage_turn_user_message(
         agent, user_message, persist_user_message, persist_user_timestamp,
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
+        raw_persist_content=raw_persist_content,
     )
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.
@@ -1324,6 +1409,36 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
     return _sanitize_model
 
 
+def _relabel_replay_row(msg: Dict[str, Any], api_msg: Dict[str, Any], call_names: Dict[Any, Any]) -> None:
+    """E11 at replay: a remote tool row persisted raw (a Codex-native / foreign-MCP result, named
+    ``mcp.<server>.<tool>`` and mirrored as Codex received it) is relabelled on the wire copy for every
+    provider this builder serves. The Codex runtime never replays through here (its history seed is
+    separate), so Codex stays byte-identical. Rows already relabelled at creation are unchanged.
+
+    User rows: every one is relabelled except a harness note (``display_kind="route_note"``, E11(b)).
+    A raw user row can survive in the store (the pending-rewrite flush bound appends the relabelled
+    copy and leaves the raw row active); ingest already sent the relabelled bytes, so the relabel is
+    idempotent and the cache prefix is unchanged."""
+    from agent.tool_dispatch_helpers import tool_output_relabels_route_notes
+
+    if msg.get("role") == "assistant":
+        for call in msg.get("tool_calls") or ():
+            if isinstance(call, dict) and isinstance(call.get("function"), dict):
+                call_names[call.get("id")] = call["function"].get("name")
+        return
+    if msg.get("role") == "user":
+        if msg.get("display_kind") != ROUTE_NOTE_DISPLAY_KIND:
+            # Only the note prefix the harness RECORDED on the row (route_identity._persist_note) stays raw.
+            api_msg["content"] = relabel_replayed_user_content(api_msg.get("content"),
+                                                               recorded_route_note_prefix(msg))
+        return
+    if msg.get("role") != "tool":
+        return
+    name = msg.get("tool_name") or msg.get("name") or call_names.get(msg.get("tool_call_id"))
+    if tool_output_relabels_route_notes(name):
+        api_msg["content"] = relabel_route_note_content(api_msg.get("content"))
+
+
 def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
@@ -1364,6 +1479,7 @@ def build_api_messages(
     # provider never produced, and the relay's coherence gate answers it with a full-history
     # re-mint. Looked up once per request; fail-open (row sent) on any error.
     _omit_interrupt_close = provider_owns_transcript(agent.provider)
+    _tool_call_names: Dict[Any, Any] = {}  # call id -> tool name, for result rows that carry no name
     for idx, msg in enumerate(canonical_messages):
         if _omit_interrupt_close and is_interrupt_close_row(msg):
             continue
@@ -1405,6 +1521,7 @@ def build_api_messages(
             # prefix stays byte-stable. User rows carry the injection sidecar; user
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
+        _relabel_replay_row(msg, api_msg, _tool_call_names)
 
         # Pass reasoning back to the API for ALL assistant messages so multi-turn
         # reasoning context is preserved.

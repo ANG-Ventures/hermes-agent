@@ -1255,8 +1255,25 @@ class SessionMessagesMixin:
             ") AND content IS ?",
             (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
 
+    def _update_row_with_metadata(self, sql: str, params: tuple, row_id: int,
+                                  display_metadata_patch: Optional[Dict[str, Any]]) -> int:
+        """One UPDATE plus, when it matched and ``display_metadata_patch`` is given, the patch merged into
+        that row's ``display_metadata``: one transaction, so the two can never land apart."""
+        def _do(conn):
+            rowcount = conn.execute(sql, params).rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            if rowcount > 0 and display_metadata_patch:
+                row = conn.execute("SELECT display_metadata FROM messages WHERE id = ?", (row_id,)).fetchone()
+                meta = dict(self._decode_display_metadata(row[0]) or {}) if row is not None else {}
+                meta.update(display_metadata_patch)
+                conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta), row_id))
+            return rowcount
+        return self._execute_write(_do)
+
     def set_message_api_content(
-        self, session_id: str, row_id: int, content: Any, api_content: str
+        self, session_id: str, row_id: int, content: Any, api_content: str,
+        display_metadata_patch: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Backfill the ``api_content`` sidecar onto ONE known durable row.
 
@@ -1277,21 +1294,23 @@ class SessionMessagesMixin:
         """
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
-        return self._write_rowcount(
+        return self._update_row_with_metadata(
             "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
             "AND role = 'user' AND active = 1 AND content IS ?",
-            (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
+            (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)),
+            row_id, display_metadata_patch)
 
-    def set_user_message_content(self, session_id: str, row_id: int, content: Any) -> int:
+    def set_user_message_content(self, session_id: str, row_id: int, content: Any,
+                                 display_metadata_patch: Optional[Dict[str, Any]] = None) -> int:
         """Rewrite the content of ONE known active user row. Used when a user turn was written at submit
         time (before the agent ran) and the turn prologue then rewrote the prompt it persists (@-file
         expansion, native image parts): the early row must show what the transcript will replay, not the
         raw keystrokes, and the turn must not append a second row for the same input."""
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
-        return self._write_rowcount(
+        return self._update_row_with_metadata(
             "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
-            (self._encode_content(content), row_id, session_id))
+            (self._encode_content(content), row_id, session_id), row_id, display_metadata_patch)
 
     def deactivate_message(self, session_id: str, row_id: int) -> int:
         """Deactivate ONE known row (id-addressed, idempotent; returns the affected row count). Used by

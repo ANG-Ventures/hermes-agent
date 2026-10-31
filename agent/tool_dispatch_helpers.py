@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.compression_marker import _COMPRESSION_MARKER_RE
 from agent.message_metadata import stamp_message_timestamp
+from agent.route_note_ingest import relabel_route_note_content, relabel_route_note_text
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
     tool_may_have_side_effect,
@@ -540,6 +541,7 @@ def make_tool_result_message(
     *,
     effect_disposition: str | None = None,
     multimodal_text_summary: str | None = None,
+    call_args: Optional[dict] = None,
 ) -> dict:
     """Build a tool-result message: OpenAI ``name`` (wire format) plus internal ``tool_name``
     (session DB). High-risk tool content (web_extract, web_search, browser_*, mcp_*) is
@@ -548,12 +550,22 @@ def make_tool_result_message(
     ``multimodal_text_summary`` is internal lifecycle metadata: the current
     turn keeps native pixels in ``content`` while persistence and later turns
     use this exact producer-supplied projection.
+
+    ``call_args`` are the call's arguments: a ``tool_call`` bridge row keeps the wrapper name, so its
+    trust is decided by the calls it carries (``_trust_name``).
     """
+    trust_name = _trust_name(name, call_args)
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
+    # E11: remote tool output never carries the harness's route-note marker. Local output
+    # (read_file, terminal, ...) stays byte-identical so the model edits what is on disk.
+    if tool_output_relabels_route_notes(trust_name):
+        content = relabel_route_note_content(content)
+        if isinstance(multimodal_text_summary, str):
+            multimodal_text_summary = relabel_route_note_text(multimodal_text_summary)
     # Elision notice is appended to the RAW content first, THEN wrapped, so it sits inside
     # the untrusted block next to the data it describes — once, at construction (cache-safe).
-    wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, content))
+    wrapped = _maybe_wrap_untrusted(trust_name, _maybe_append_elision_notice(trust_name, content))
     message = stamp_message_timestamp({
         "role": "tool",
         "name": name,
@@ -562,7 +574,7 @@ def make_tool_result_message(
         "tool_call_id": tool_call_id,
     })
     try:
-        risk_metadata = _tool_output_risk_metadata(name, content)
+        risk_metadata = _tool_output_risk_metadata(trust_name, content)
     except Exception as exc:
         logger.debug("Tool output risk scan failed for %s: %s", name, exc)
     else:
@@ -575,17 +587,67 @@ def make_tool_result_message(
     return message
 
 
-# Tools whose results carry attacker-controllable content; outputs under 32 chars skip wrapping.
-_UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search"})
-_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_")
+# Tools whose results carry attacker-controllable content (other people's pages, messages, posts,
+# remote docs; never local state); outputs under 32 chars skip wrapping.
+_UNTRUSTED_TOOL_NAMES = frozenset({
+    "web_extract", "web_search", "x_search", "discord", "discord_admin",
+})
+# Whole families classified by prefix, so a new tool in the family is covered with no edit here.
+# Every ``feishu_*`` tool is a Feishu/Lark API call returning documents/comments other people wrote;
+# the family has no local-only member, so it needs no allowlist. ``mcp.<server>.<tool>`` is the name the
+# Codex projector gives Codex-native and foreign-MCP results (persisted raw, relabelled at replay).
+_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_", "mcp.", "connectors__", "feishu_")
 _UNTRUSTED_WRAP_MIN_CHARS = 32
 
 # Case-insensitive so a differently-cased tag can't forge or prematurely close the boundary.
 _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 
 
+def _own_mcp_tool_name(name: str) -> str:
+    """``mcp.<hermes-tools>.<tool>`` is a Hermes tool served over our own MCP server: its trust is the
+    underlying ``<tool>``'s (``read_file`` stays local). Every other ``mcp.<server>.<tool>`` stays remote."""
+    from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
+    own = f"mcp.{HERMES_TOOLS_MCP_SERVER_NAME}."
+    return name[len(own):] if name.startswith(own) and len(name) > len(own) else name
+
+
 def _is_untrusted_tool(name: Optional[str]) -> bool:
-    return bool(name) and (name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES))
+    if not name:
+        return False
+    name = _own_mcp_tool_name(name)
+    return name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES)
+
+
+def _trust_name(name: Optional[str], call_args: Optional[dict]) -> Optional[str]:
+    """The name whose trust class governs this result. A ``tool_call`` bridge row that kept the wrapper
+    name (a connector batch) carries remote output when ANY inner call is untrusted: return that inner
+    name. Every other row is classified by its own name."""
+    if not isinstance(call_args, dict):
+        return name
+    try:
+        from tools.tool_search import TOOL_CALL_NAME, normalize_tool_call_entries
+        if name != TOOL_CALL_NAME:
+            return name
+        entries, _err = normalize_tool_call_entries(call_args)
+    except Exception:
+        return name
+    return next((e["name"] for e in entries if _is_untrusted_tool(e.get("name"))), name)
+
+
+# E11: a subagent's summary relays remote text too, but is not wrapped in untrusted delimiters.
+_ROUTE_NOTE_RELABEL_EXTRA_TOOLS = frozenset({"delegate_task"})
+
+
+def tool_output_relabels_route_notes(name: Optional[str]) -> bool:
+    """The E11 boundary for tool output: relabel ``[Route note:`` only in REMOTE content (the
+    untrusted-tool set plus subagent output). Local tools are never relabelled."""
+    return _is_untrusted_tool(name) or (bool(name) and _own_mcp_tool_name(name) in _ROUTE_NOTE_RELABEL_EXTRA_TOOLS)
+
+
+def relabel_tool_output(name: Optional[str], result: Any) -> Any:
+    """Apply the E11 tool-output boundary to one dispatch result (``model_tools.handle_function_call``
+    returns through here). Idempotent; local output is returned as the same object."""
+    return relabel_route_note_content(result) if tool_output_relabels_route_notes(name) else result
 
 
 def _is_text_item(item: Any) -> bool:

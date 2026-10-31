@@ -1288,6 +1288,7 @@ def _commit_tool_result(
     tool_message = make_tool_result_message(
         function_name, _tool_content, tool_call_id,
         effect_disposition=effect_disposition, multimodal_text_summary=_multimodal_summary,
+        call_args=function_args,
     )
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
