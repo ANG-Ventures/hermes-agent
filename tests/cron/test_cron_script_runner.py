@@ -15,6 +15,9 @@ AC -> test:
                  test_g_watchdog_snapshot_survives_a_held_procs_lock
   S2 (h)         test_h_runner_writes_no_ticker_markers
   S2 (i)         test_i_rearm_and_knob_toggle_clear_the_trip
+  t_302ab1e8     test_ledger_lock_trip_names_holder_requeues_and_self_rearms,
+                 test_second_trip_in_24h_pages_alerts_and_backs_off,
+                 test_pending_requeues_survive_failures_and_skip_finished_runs
   AC-4c          test_ac4c_profile_holder_on_s1_that_does_not_delegate
   E2E            test_e2e_runner_fires_echo_job
   S1_MERGE_SHA   test_s1_merge_sha_is_the_merged_s1
@@ -55,6 +58,16 @@ def _scrub_env(monkeypatch):
                 "INVOCATION_ID", "HERMES_TIMEZONE", "HERMES_MACHINE_ID",
                 "_HERMES_CRON_EXTERNAL_WORKER"):
             monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _clear_scheduler_shutdown():
+    """A watchdog trip signals scheduler shutdown (t_302ab1e8); in-process trips here use a no-op
+    exit, so the process-global flag must not leak into later tests."""
+    yield
+    import cron.scheduler as sched
+
+    sched.clear_shutdown()
 
 
 @pytest.fixture
@@ -961,3 +974,355 @@ def test_c_sigterm_terminates_script_requeues_and_exits_0(root, tmp_path, procs)
     assert _group_gone(s_pid)
     rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
     assert rec.get(RESTART_REQUEUE_KEY), rec
+
+
+# --- t_302ab1e8: ledger-lock trips name the holder, self re-arm, killed jobs re-queue -----------------
+
+def _stub_senders(root: Path, calls: Path) -> None:
+    """``scripts/notify.py`` and ``scripts/lib/episode_pager.py`` stubs that append their argv."""
+    body = ("import json, sys\n"
+            f"open({str(calls)!r}, 'a').write(json.dumps([__file__] + sys.argv[1:]) + '\\n')\n")
+    (root / "scripts" / "lib").mkdir(parents=True, exist_ok=True)
+    (root / "scripts" / "notify.py").write_text(body, encoding="utf-8")
+    (root / "scripts" / "lib" / "episode_pager.py").write_text(body, encoding="utf-8")
+
+
+def _calls(calls: Path) -> list:
+    if not calls.exists():
+        return []
+    return [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.slow_test(180, reason="real runner subprocess, a trip, a restart and a self re-arm")
+def test_ledger_lock_trip_names_holder_requeues_and_self_rearms(root, tmp_path, procs):
+    """Gate: a held ``cron.executions`` lock (the 10-29/10-30 frame, scaled: 2 s watchdog) trips
+    the runner. The marker and the trip history name the holder thread; the killed script is
+    re-queued, not reported failed; the restarted runner re-arms itself after the scaled delay
+    and posts one #logs receipt; a single trip pages nothing."""
+    from cron import script_runner, script_runner_rearm
+    from cron.runtime_state import merged_jobs
+
+    calls = tmp_path / "calls.jsonl"
+    _stub_senders(root, calls)
+    ctl = tmp_path / "ctl"
+    ctl.mkdir()
+    spid = ctl / "s.pid"
+    _script(root, "s.sh", f"echo $$ > {spid}\nsleep 300")
+    job = _job(root, "S", "s.sh")
+    log = tmp_path / "runner.log"
+    env = dict(RUNNER_HARNESS_CYCLE_S=1, RUNNER_HARNESS_WATCHDOG_S=2, RUNNER_HARNESS_GRACE_S=1,
+               RUNNER_HARNESS_REARM_S=3, RUNNER_HARNESS_LEDGER_HOLD=ctl / "hold")
+    runner = _spawn_runner(procs, root, log, **env)
+
+    def tail():
+        return log.read_text(encoding="utf-8")[-4000:]
+
+    s_pid = int(_wait_for(lambda: spid.exists() and spid.read_text().strip(), 60, what="S pid"))
+    s_pgid = os.getpgid(s_pid)
+    (ctl / "hold").touch()  # the next tick's first ledger read waits on the holder
+    assert runner.wait(timeout=30) == 70, tail()
+    assert _wait_for(lambda: _group_gone(s_pgid), 3, what="S group gone")
+    marker = json.loads(script_runner.trip_marker_path().read_text(encoding="utf-8"))
+    assert marker["phase"].startswith("cron.executions:_transaction"), marker["phase"]
+    holder = marker["ledger"]["lock_holder"]
+    assert holder["thread"] == "ledger-holder" and holder["held_s"] >= 2, marker["ledger"]
+    trips = script_runner_rearm.recent_trips()
+    assert len(trips) == 1 and trips[0]["ledger"]["lock_holder"]["thread"] == "ledger-holder"
+    assert not [c for c in _calls(calls) if "episode_pager" in c[0]], _calls(calls)  # 1 trip: no page
+    pending = json.loads((root / "cron" / script_runner_rearm.REQUEUE_NAME).read_text())
+    assert [job["id"]] == [row[1] for row in pending], pending
+    # Supervisor restart with the hold gone: the killed job is re-queued (a restart kill, not a
+    # failure), the runner stands by, then re-arms itself and ticks ADMITTED.
+    (ctl / "hold").unlink()
+    runner = _spawn_runner(procs, root, log, **env)
+    _wait_for(lambda: (_hb(root) or {}).get("pid") == runner.pid, 60, what="restarted heartbeat")
+    # request_restart_requeue returned True (the marker itself may already be consumed by the
+    # re-armed runner's first fire).
+    assert "re-queued to fire once" in tail(), tail()
+    assert not (root / "cron" / script_runner_rearm.REQUEUE_NAME).exists()
+    rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
+    assert int(rec.get("restart_requeue_count") or 0) == 1, rec
+    _wait_for(lambda: not script_runner.trip_marker_path().exists(), 30, what="self re-arm")
+    _wait_for(lambda: (_hb(root) or {}).get("state") == "active"
+              and (_hb(root) or {}).get("last_ok_at"), 30, what="re-armed tick")
+    receipts = _wait_for(lambda: [c for c in _calls(calls) if c[0].endswith("notify.py")], 10,
+                         what="#logs receipt")
+    assert len(receipts) == 1 and "re-armed itself" in receipts[0][-1], receipts
+    assert script_runner_rearm.LOGS_CHAT in receipts[0]
+    assert "re-armed itself" in tail()
+    assert runner.poll() is None, tail()
+
+
+def test_pending_requeues_survive_failures_and_skip_finished_runs(root, monkeypatch):
+    """Prism 3961dd0f50bb / a7f6f2d90126 / 29502ffb3d71: an unreadable pending file is kept, an
+    entry whose re-queue raised is kept for the next start, and a job that finished cleanly after
+    the trip snapshot is not replayed."""
+    import cron.jobs as jobs_mod
+    from cron import script_runner_rearm as rr
+    from cron.jobs import mark_job_run
+    from cron.runtime_state import merged_jobs
+    from cron.scheduler_provider import _profile_cron_scope
+
+    a = _job(root, "A", "a.sh")
+    b = _job(root, "B", "b.sh")
+    path = root / "cron" / rr.REQUEUE_NAME
+
+    def count(job_id):
+        rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job_id]
+        return int(rec.get("restart_requeue_count") or 0)
+
+    # 1. A read error leaves the queue on disk and re-queues nothing.
+    rr.record_pending_requeues([(str(root), a["id"])], trip_epoch=time.time())
+    real_read = Path.read_text
+
+    def emfile(self, *args, **kwargs):
+        if self == path:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", emfile)
+    assert rr.apply_pending_requeues() == 0
+    monkeypatch.setattr(Path, "read_text", real_read)
+    assert path.exists() and count(a["id"]) == 0
+
+    # 2. A re-queue that raises is retained; the next start applies it.
+    real_requeue = jobs_mod.request_restart_requeue
+
+    def boom(*_a, **_k):
+        raise OSError(errno.EIO, "jobs.json write failed")
+
+    monkeypatch.setattr(jobs_mod, "request_restart_requeue", boom)
+    assert rr.apply_pending_requeues() == 0
+    assert [row[1] for row in json.loads(path.read_text())] == [a["id"]]
+    monkeypatch.setattr(jobs_mod, "request_restart_requeue", real_requeue)
+    assert rr.apply_pending_requeues() == 1
+    assert not path.exists() and count(a["id"]) == 1
+
+    # 3. B is snapshotted, then records a clean run before the kill: no replay.
+    rr.record_pending_requeues([(str(root), b["id"])], trip_epoch=time.time() - 1)
+    with _profile_cron_scope(root):
+        mark_job_run(b["id"], True)
+    assert rr.apply_pending_requeues() == 0
+    assert not path.exists() and count(b["id"]) == 0
+
+    # 4. Prism 23a6c2701848: a row recorded while the replay runs survives its commit.
+    c = _job(root, "C", "c.sh")
+    rr.record_pending_requeues([(str(root), c["id"])], trip_epoch=time.time())
+
+    def requeue_and_record(job_id, *args, **kwargs):
+        rr.record_pending_requeues([(str(root), b["id"])], trip_epoch=time.time())
+        return real_requeue(job_id, *args, **kwargs)
+
+    monkeypatch.setattr(jobs_mod, "request_restart_requeue", requeue_and_record)
+    assert rr.apply_pending_requeues() == 1
+    assert [row[1] for row in json.loads(path.read_text())] == [b["id"]]
+
+
+def test_pending_requeue_keeps_the_newest_trip_stamp(root):
+    """Prism d37c5059edb2: an older snapshot recorded after a newer one must not lower the
+    stamp, or a clean run between the two trips would be read as the killed run's completion."""
+    from cron import script_runner_rearm as rr
+    from cron.jobs import mark_job_run
+    from cron.scheduler_provider import _profile_cron_scope
+
+    j = _job(root, "J", "j.sh")
+    newer = time.time() + 30  # the newer trip lands after the clean run below
+    rr.record_pending_requeues([(str(root), j["id"])], trip_epoch=newer)
+    rr.record_pending_requeues([(str(root), j["id"])], trip_epoch=newer - 3600)
+    path = root / "cron" / rr.REQUEUE_NAME
+    assert [row[2] for row in json.loads(path.read_text())] == [newer]
+    with _profile_cron_scope(root):
+        mark_job_run(j["id"], True)  # before the newer trip: not the killed run's completion
+    assert rr.apply_pending_requeues() == 1
+
+
+def test_replay_skips_a_job_that_succeeded_before_the_trip_snapshot(root):
+    """Prism dbe5fc2fa076: a job that recorded ``ok`` at T is still listed as running (its worker
+    has not reached ``release_running_job``) when the trip snapshots at T+5. The replay must
+    compare against that run's START, not the trip time, or it re-fires a finished job."""
+    import cron.scheduler as sched
+    from cron import script_runner_rearm as rr
+    from cron.jobs import mark_job_run
+    from cron.scheduler_provider import _profile_cron_scope
+    from cron.script_runner import ScriptRunner
+
+    j = _job(root, "J", "j.sh")
+    with _profile_cron_scope(root):
+        assert sched.try_register_running_job(j["id"])  # run starts
+    try:
+        with _profile_cron_scope(root):
+            mark_job_run(j["id"], True)  # T: exits 0, worker not yet released
+        time.sleep(0.05)
+        ScriptRunner._requeue_inflight()  # T+5: the trip snapshot still lists J
+    finally:
+        sched.release_running_job(j["id"], home=root)
+    assert rr.apply_pending_requeues() == 0
+
+
+def test_requeue_inflight_stamps_before_the_snapshot(root, monkeypatch):
+    """Apollo item 3 / Prism 29502ffb3d71: with no run start known, the row is stamped with a time
+    taken BEFORE ``_running_job_ids`` is read, so a clean run recorded after the snapshot but
+    before the write is not replayed."""
+    import cron.scheduler as sched
+    from cron import script_runner_rearm as rr
+    from cron.jobs import mark_job_run
+    from cron.scheduler_provider import _profile_cron_scope
+    from cron.script_runner import ScriptRunner
+
+    j = _job(root, "J", "j.sh")
+    with _profile_cron_scope(root):
+        assert sched.try_register_running_job(j["id"])
+    sched._running_since.clear()  # a claim with no recorded start
+    real_record = rr.record_pending_requeues
+
+    def finish_then_record(items, **kw):
+        time.sleep(0.05)
+        with _profile_cron_scope(root):
+            mark_job_run(j["id"], True)  # completes between the snapshot and the write
+        return real_record(items, **kw)
+
+    monkeypatch.setattr(rr, "record_pending_requeues", finish_then_record)
+    try:
+        ScriptRunner._requeue_inflight()
+    finally:
+        sched.release_running_job(j["id"], home=root)
+    assert rr.apply_pending_requeues() == 0
+
+
+def test_self_rearm_waits_for_a_fast_ledger_probe(root, monkeypatch):
+    """Apollo item 4: the marker is removed only when one ledger round-trip fits in half the
+    watchdog budget; a still-wedged ledger keeps the lane parked."""
+    from cron import lanes, script_runner
+
+    monkeypatch.setattr(lanes, "RUNNER_REARM_AFTER_S", 0)
+    marker = script_runner.trip_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"at": "x", "phase": "p"}', encoding="utf-8")
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    real_probe = script_runner.ScriptRunner.__dict__["_ledger_probe_s"]
+    monkeypatch.setattr(script_runner.ScriptRunner, "_ledger_probe_s",
+                        staticmethod(lambda: lanes.RUNNER_TICK_WATCHDOG_S / 2 + 1))
+    r._maybe_self_rearm()
+    assert marker.exists() and r._rearmed is None
+    monkeypatch.setattr(script_runner.ScriptRunner, "_ledger_probe_s", staticmethod(lambda: None))
+    r._maybe_self_rearm()
+    assert marker.exists()
+    monkeypatch.setattr(script_runner.ScriptRunner, "_ledger_probe_s", real_probe)
+    probe = script_runner.ScriptRunner._ledger_probe_s()
+    assert probe is not None and probe < lanes.RUNNER_TICK_WATCHDOG_S / 2
+    r._maybe_self_rearm()
+    assert not marker.exists() and r._rearmed is not None
+
+
+def test_replay_commit_keeps_the_file_without_the_lock(root, monkeypatch):
+    """Apollo item 5: when the commit cannot take the file lock it does not rewrite the file."""
+    import contextlib as _cl
+
+    from cron import script_runner_rearm as rr
+
+    j = _job(root, "J", "j.sh")
+    rr.record_pending_requeues([(str(root), j["id"])], trip_epoch=time.time())
+    path = root / "cron" / rr.REQUEUE_NAME
+
+    @_cl.contextmanager
+    def no_lock(_path, timeout=5.0):
+        yield False
+
+    monkeypatch.setattr(rr, "_file_lock", no_lock)
+    assert rr.apply_pending_requeues() == 1
+    assert [row[1] for row in json.loads(path.read_text())] == [j["id"]]
+
+
+def test_concurrent_trip_records_lose_no_line(root):
+    """Prism 2777c74d0091: two writers of the trip history must not drop each other's line."""
+    from cron import script_runner_rearm as rr
+
+    n = 16
+    barrier = threading.Barrier(n)
+
+    def write(i):
+        barrier.wait(5)
+        rr.record_trip({"epoch": time.time(), "i": i})
+
+    threads = [threading.Thread(target=write, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert sorted(e["i"] for e in rr.recent_trips()) == list(range(n))
+
+
+def test_g_watchdog_recovers_before_a_stalled_trip_notice(root, monkeypatch, procs):
+    """Prism eb08fba97ed9: a trip record/notice that stalls past the hard deadline must not
+    cost the requeue snapshot or the tree kill."""
+    import cron.scheduler as sched
+    from cron import lanes, script_runner, script_runner_rearm as rr
+
+    monkeypatch.setattr(lanes, "RUNNER_WATCHDOG_KILL_GRACE_S", 1)  # deadline = 3 s
+    j = _job(root, "K", "k.sh")
+    child = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    procs.append(child)
+    pgid = os.getpgid(child.pid)
+    monkeypatch.setitem(sched._active_script_procs, id(child), child)
+    key = (str(root), j["id"])
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+    release = threading.Event()
+    monkeypatch.setattr(rr, "record_trip", lambda *_a, **_k: release.wait(10))
+    exits = []
+    done = threading.Event()
+
+    def fake_exit(code):
+        exits.append(code)
+        done.set()
+
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)], exit_fn=fake_exit)
+    r.enumerate_homes()
+    fire = threading.Thread(target=r._watchdog_fire, args=(root, _now_iso()), daemon=True)
+    try:
+        fire.start()
+        assert done.wait(8)
+        child.wait(timeout=5)
+        assert _group_gone(pgid)
+        rows = json.loads((root / "cron" / rr.REQUEUE_NAME).read_text())
+        assert [row[1] for row in rows] == [j["id"]], rows
+    finally:
+        release.set()
+        fire.join(10)
+        r.cancel_deadline()
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+    assert exits[0] == 70
+
+
+def test_second_trip_in_24h_pages_alerts_and_backs_off(root, tmp_path, monkeypatch):
+    from cron import lanes, script_runner, script_runner_rearm
+
+    calls = tmp_path / "calls.jsonl"
+    _stub_senders(root, calls)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)],
+                                   exit_fn=lambda _c: None)
+    diag = {"phase": "cron.executions:_transaction:102",
+            "ledger": {"lock_holder": {"thread": "w1", "label": "finish_execution", "held_s": 31}}}
+    r._record_and_notify_trip(root, _now_iso(), diag)
+    time.sleep(0.5)
+    assert not _calls(calls)  # the first trip in 24 h is self-healing: silent
+    r._record_and_notify_trip(root, _now_iso(), diag)
+    pages = _wait_for(lambda: _calls(calls), 10, what="#alerts page")
+    assert "episode_pager" in pages[0][0] and pages[0][1] == "page", pages
+    text = pages[0][pages[0].index("--text") + 1]
+    assert "2 trips in 24 h" in text and "w1 in finish_execution" in text, text
+    # Backoff: the delay scales with trips in the window; an old trip falls out of it.
+    assert script_runner_rearm.rearm_delay_s(2) == 2 * lanes.RUNNER_REARM_AFTER_S
+    old = time.time() + lanes.RUNNER_TRIP_WINDOW_S + 1
+    assert script_runner_rearm.recent_trips(now=old) == []
+    # A marker younger than the backed-off delay stays; past it, the runner re-arms itself.
+    marker = script_runner.trip_marker_path()
+    marker.write_text(json.dumps({"at": "x", "phase": diag["phase"]}), encoding="utf-8")
+    r.enumerate_homes()
+    assert marker.exists() and r.tripped
+    past = time.time() - 2 * lanes.RUNNER_REARM_AFTER_S - 1
+    os.utime(marker, (past, past))
+    r.enumerate_homes()
+    assert not marker.exists() and not r.tripped
+    assert r._rearmed and r._rearmed["trips_24h"] == 2
