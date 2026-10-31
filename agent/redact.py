@@ -482,6 +482,52 @@ def _is_test_pass_counter(m) -> bool:
     )
 
 
+# Fleet env names whose ``PASS`` is a merge/review "pass", not a password. Masking
+# ``MERGE_PASS_CARD_EVENT=0`` rewrote the agent's own stored turns and broke prompt-cache replay
+# (t_b924fb6d). EXACT names only, each found in fleet text: a word list guessed which qualifiers
+# can never name a credential and leaked DB_PASS_STAGE / DB_PASS_CARD. Any other name masks as
+# before; a missed counter costs one cache reseed, a leaked password is the thing to avoid.
+# Paths: ~/.hermes/scripts/ (hermes-home) unless marked hermes-agent.
+_PASS_WORD_ENV_NAMES = frozenset({
+    "AE_PASS_REL",                        # fleet-config-lint.py
+    "EVENT_PASS_CLOSE",                   # kanban-review-merge-pass.py
+    "GH_WEBHOOK_MERGE_PASS_DEBOUNCE",     # gh-webhook-consumer.py
+    "GH_WEBHOOK_MERGE_PASS_MAX_LIVE",     # gh-webhook-consumer.py
+    "GH_WEBHOOK_MERGE_PASS_PY",           # gh-webhook-consumer.py
+    "MERGE_PASS_BOARD_HOLD_FIRST",        # kanban-review-merge-pass.py
+    "MERGE_PASS_CARD_EVENT",              # gh-webhook-consumer.py
+    "MERGE_PASS_CARD_EVENT_CURSOR",       # lib/card_event_trigger.py
+    "MERGE_PASS_CARD_EVENT_DEFERRED",     # lib/card_event_trigger.py
+    "MERGE_PASS_CARD_EVENT_TRIGGERS",     # lib/card_event_trigger.py
+    "MERGE_PASS_CARD_PARK_S",             # kanban-review-merge-pass.py
+    "MERGE_PASS_DEBOUNCE",                # gh-webhook-consumer.py
+    "MERGE_PASS_FR_DRIFT_GRACE_S",        # kanban-review-merge-pass.py
+    "MERGE_PASS_FR_DRIFT_SWEEP_S",        # kanban-review-merge-pass.py
+    "MERGE_PASS_FR_PENDING_RECHECK_S",    # kanban-review-merge-pass.py
+    "MERGE_PASS_FR_PENDING_SKIP",         # kanban-review-merge-pass.py
+    "MERGE_PASS_GREEN_V2",                # gh-webhook-consumer.py, kanban-review-merge-pass.py
+    "MERGE_PASS_LOCK_DIR",                # kanban-review-merge-pass.py
+    "MERGE_PASS_LOG",                     # gh-webhook-consumer.py
+    "MERGE_PASS_LOST_GREEN_GRACE_S",      # lib/ci_settled.py
+    "MERGE_PASS_LOST_GREEN_WINDOW_S",     # lib/ci_settled.py
+    "MERGE_PASS_MAX_LIVE",                # gh-webhook-consumer.py, lib/card_event_trigger.py
+    "MERGE_PASS_PR_DEBOUNCE_S",           # kanban-review-merge-pass.py
+    "MERGE_PASS_PY",                      # gh-webhook-consumer.py
+    "MERGE_PASS_SCRIPT",                  # tests/test_merge_pass_remote_tree_hold.py
+    "MERGE_PASS_SHAPES",                  # kanban-review-merge-pass.py, live_evidence_gate.py
+    "MERGE_PASS_SUMMARY",                 # hermes-agent tests/gateway/test_kanban_notify_suppress_closer_stamp.py
+    "MERGE_PASS_SWEEP_FR_REFUSED_SKIP",   # kanban-review-merge-pass.py
+    "MERGE_PASS_SWEEP_RECHECK_S",         # kanban-review-merge-pass.py
+    "PRISM_PASS_S",                       # replays/l0_a4.py
+    "PRISM_PASS_SCORE",                   # lib/land_evaluator.py
+    "PRISM_RECORD_PASS_PY",               # lib/prism_record_trigger.py
+    "PRISM_RECORD_PASS_SCRIPT",           # lib/prism_record_trigger.py
+    "PR_PASS_DEBOUNCE_S",                 # kanban-review-merge-pass.py
+    "PR_PASS_STATE",                      # kanban-review-merge-pass.py
+    "WIRELOG_NIGHTLY_PASS_BUDGET_S",      # wirelog-fleet-nightly-sync.py
+})
+
+
 def _key_has_secret_keyword(key: str) -> bool:
     """Post-match key validator: ``API_KEY``/``DB_PW`` count, ``KEYBOARD``/``secretary`` do not."""
     return _has_word_bounded_keyword(key, _KEY_KEYWORD_RE)
@@ -1017,6 +1063,8 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
                 return m.group(0)
             # ``PASS=174 FAIL=0`` test summary, not a password (fork #1025).
             if _is_test_pass_counter(m):
+                return m.group(0)
+            if _bare in _PASS_WORD_ENV_NAMES:
                 return m.group(0)
             if not _should_redact_assignment(name, value, check_keyword=True):
                 return m.group(0)

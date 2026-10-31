@@ -48,6 +48,9 @@ def _wire(user_config):
             _consume_pending_turn_sidecar_notes=lambda key: [],
             # Fork fallback spec §4.2 / G2: a fresh (not cached) agent gets its re-init announce.
             _announce_reinit_recovery=lambda **kw: None,
+            # Fork (t_b4e5cc7e): route-note Known is bound per turn; a no-op here, like the real
+            # bind with no session store.
+            _bind_route_known=lambda agent, session_key: None,
         ),
         _make_bg_review_callbacks=lambda: (lambda message: None, lambda: None),
         _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,

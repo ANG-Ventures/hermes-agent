@@ -4051,6 +4051,7 @@ class GatewayKanbanWatchersMixin:
             kanban_cfg=_kanban_cfg_now,
             ledger=lambda boards: _kb.count_running_by_placement(boards),
             connect=lambda board=None: _kb.connect(board=board),
+            skip_board=lambda slug: _board_quarantined(slug),
         )
 
         _proc_paged = {"episode": False}
@@ -4114,6 +4115,12 @@ class GatewayKanbanWatchersMixin:
             except OSError:
                 return (resolved, None, None)
             return (resolved, stat.st_mtime_ns, stat.st_size)
+
+        def _board_quarantined(slug: str) -> bool:
+            # Same rule as the dispatch tick: same fingerprint, inside the retry window.
+            q = disabled_corrupt_boards.get(slug)
+            return (q is not None and q[0] == _board_db_fingerprint(slug)
+                    and time.monotonic() - q[1] < CORRUPT_BOARD_RETRY_AFTER_SECONDS)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             # The guard class lives in ``kanban_db_connect`` since upstream's

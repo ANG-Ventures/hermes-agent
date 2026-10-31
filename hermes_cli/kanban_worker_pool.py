@@ -58,7 +58,23 @@ ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
 # Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
 # until hermes-home drops the count (t_1acfaa85). Every other role keeps its count.
-COUNT_FREE_ROLES = frozenset({"ci-runner"})
+# kanban-worker joined (t_c834e0d8, bug class A: admission is measured use, never
+# a count): ``{}`` parses to ``PoolHost.slots = None``; a legacy count stays a ceiling.
+COUNT_FREE_ROLES = frozenset({"ci-runner", ROLE})
+# A count-free kanban host's free slots for ONE plan (t_c834e0d8). A per-tick
+# stand-in so ``plan.slots`` / ``budget`` / load_gate.json stay finite ints; it is
+# not a concurrency count (running workers are not subtracted). Measured
+# admission decides: allocd / the placement ledger per take, the band and the
+# memory cap per plan. Equal to the fleet-roles slots maximum (1..64).
+UNCOUNTED_TICK_FREE = 64
+
+
+def count_free(h: "PoolHost", running: int) -> int:
+    """Free pool slots on ``h`` from its count alone: ``slots - running`` for a
+    legacy count, :data:`UNCOUNTED_TICK_FREE` for a count-free host."""
+    if h.slots is None:
+        return UNCOUNTED_TICK_FREE
+    return max(0, h.slots - running)
 # Per-worker-host SSH reach matrix (card t_1e9ea7e9): written daily by the
 # hermes-home no_agent cron ``kanban-reach-matrix`` (``ssh -o BatchMode=yes
 # <alias> true`` from EVERY worker host, rc recorded), read here fail-closed.
@@ -192,7 +208,7 @@ class PoolHost:
     name: str
     ssh_host: str
     ssh_user: str
-    slots: int
+    slots: Optional[int]   # None = count-free (fleet-roles ``kanban-worker: {}``)
     capacity_pct: float
     absence: str
     profiles: Tuple[str, ...]
@@ -273,7 +289,8 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
             if not isinstance(role, str) or not _ROLE_RE.fullmatch(role):
                 raise PoolError(f"fleet-roles.json: host {hid}: bad role {role!r}")
             if role in COUNT_FREE_ROLES and spec == {}:
-                # Membership only (t_940fc400): the per-box allocator owns CI capacity.
+                # Membership only (t_940fc400): the per-box allocator owns CI capacity;
+                # for kanban-worker, measured admission does (t_c834e0d8).
                 parsed[role] = None
                 continue
             if not isinstance(spec, dict) or set(spec) != {"slots"}:
@@ -1519,6 +1536,16 @@ BAND_OK, BAND_WARM, BAND_HOT, BAND_UNKNOWN = "ok", "warm", "hot", "unknown"
 TARGET_STATE_FILE = "kanban-target-state.json"
 
 
+def _kanban_unified_admit(signal: Any = None) -> bool:
+    """True only where the ONE rule actually replaces the 6 GB/worker cap (D9, t_3694ab3c; Prism f4d9c1273272):
+    KANBAN_UNIFIED_ADMIT on, a placement table on the signal, and ``kanban.admission: utilization``, i.e. exactly
+    when kanban_headroom.unified_filter runs for every take (pinned ones included). Anywhere else the cap binds."""
+    from hermes_cli import kanban_load_gate as _klg
+    from hermes_cli.fleet_placement import placement as _pl
+    return (_klg.unified_admit() and signal is not None and getattr(signal, "placement_table", None) is not None
+            and _pl.admission_mode() == "utilization")
+
+
 @dataclass
 class TargetSignal:
     """What ``plan()`` needs to read target pressure (read_signal = true)."""
@@ -1677,6 +1704,9 @@ class SpilloverPlan:
     _rids: Dict[str, List[Optional[str]]] = field(default_factory=dict)
     # Dry-run takes per host: never in the ledger, so choose() adds them.
     _simulated: Dict[str, int] = field(default_factory=dict)
+    # Dry-run takes per host under the ONE rule: each take's OWN lease (its estimate and class), newest last, so a
+    # later verdict replays what was granted, never the current job's footprint times k (Prism fd6bd8070eee).
+    _sim_leases: Dict[str, List[Any]] = field(default_factory=dict)
     # Reservations alloc_client booked (kanban.placement.allocd on): rid -> whether
     # that take debited ``slots`` (a band-closed host has none to debit).
     _alloc: Dict[str, bool] = field(default_factory=dict)
@@ -1817,17 +1847,34 @@ class SpilloverPlan:
             if why is not None:
                 self.refusal = f"pin_host_board_unhostable ({pin}: {board} {why})"
                 return None
+            # a pin keeps its precedence, not an exemption from the ONE rule (Prism f4d9c1273272: with the
+            # memory cap folded into admit_class, a pinned take must pass may_start too)
+            unified = not skip_admission and _kanban_unified_admit(self.signal)
+            if unified and self.dry_run:          # a dry run books nothing: the read-only verdict is its answer
+                from hermes_cli import kanban_headroom as _kh
+                _keep, held = _kh.unified_filter(self, [pin], job)
+                if pin in held:
+                    self.refusal = f"pin_host_unified_admission ({pin}: {held[pin]})"
+                    return None
             if self.signal is not None and self.signal.placement_table is not None:
                 # A pin keeps its precedence but its footprint is booked like any
                 # take, so later admissions see it (Prism 4609a040ad20 / b8c13f6c2e7a).
                 rid = None
                 if self.dry_run:
                     self._simulated[pin] = self._simulated.get(pin, 0) + 1
+                    if unified:
+                        from hermes_cli import kanban_headroom as _kh
+                        self._sim_leases.setdefault(pin, []).append(_kh.sim_lease(self, pin, job))
                 else:
                     from hermes_cli import kanban_headroom as _kh
                     from hermes_cli.fleet_placement import placement as _placement
                     try:
-                        rid = _kh.book_pin(self, pin, job_id, job)
+                        # unified: may_start under the ledger lock, booking what it admitted on
+                        # (Prism c8d0343d7fb6 / 8e0e895ec5d4)
+                        rid = _kh.book_pin(self, pin, job_id, job, check=unified)
+                    except _kh.ClassRefusal as exc:
+                        self.refusal = f"pin_host_unified_admission ({pin}: {exc})"
+                        return None
                     except _placement.PlacementError as exc:  # corrupt ledger: fail closed
                         self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
                         return None
@@ -1856,6 +1903,11 @@ class SpilloverPlan:
             names = [n for n, h in self.hosts.items() if n in allowed and assignee in h.profiles]
             if not names:
                 self.refusal = "pool_full"
+                return None
+            names, held = _kh.unified_filter(self, names, job)
+            if not names:
+                self.refusal = f"{_reasons.UNIFIED_ADMISSION} (" + "; ".join(
+                    f"{n}: {w}" for n, w in sorted(held.items())) + ")"
                 return None
             mode = _kh.plan_allocd_mode(self)
             if mode == _kh.ALLOCD_ON:
@@ -1908,10 +1960,14 @@ class SpilloverPlan:
             self.refusal = f"pool_unavailable ({d.reason or 'no_slot'}: " + "; ".join(
                 f"{r.host} {r.reason}" for r in d.rows if not r.eligible) + ")"
             return None
+        if self._class_refused(key, job, rid, release=lambda: _kh.release_id(self.signal, rid)):
+            return None
         self.last_reservation = rid
         self._rids.setdefault(key, []).append(rid)
         if self.dry_run:
             self._simulated[key] = self._simulated.get(key, 0) + 1
+            if _kh.unified_active(self):
+                self._sim_leases.setdefault(key, []).append(_kh.sim_lease(self, key, job))
         self.slots[key] -= 1
         self.taken[key] = self.taken.get(key, 0) + 1
         self.last_pick = key
@@ -1940,6 +1996,9 @@ class SpilloverPlan:
             _kh.release_alloc(r.reservation_id)
             self.refusal = f"pool_unavailable (allocd picked {r.host}, not a candidate)"
             return None
+        if self._class_refused(key, job, r.reservation_id, release=lambda: _kh.release_alloc(r.reservation_id),
+                               via_alloc=True, decision=r):
+            return None
         debit = self.slots.get(key, 0) > 0
         if debit:
             self.slots[key] -= 1
@@ -1949,6 +2008,22 @@ class SpilloverPlan:
         self.taken[key] = self.taken.get(key, 0) + 1
         self.last_pick = key
         return self.hosts[key]
+
+    def _class_refused(self, key: str, job: Any, rid: Optional[str], *, release, via_alloc: bool = False,
+                       decision: Any = None) -> bool:
+        """The ONE rule's verdict for a take the old locked rule just booked, UNDER the ledger lock (Prism
+        c8d0343d7fb6): refused = the row is already dropped, ``release`` clears the booker's own state, refusal
+        set. An unreadable ledger fails closed the same way. False = admitted (or the rule is off)."""
+        from hermes_cli import kanban_headroom as _kh
+        try:
+            why = _kh.confirm_class(self, key, job, rid, via_alloc=via_alloc, decision=decision)
+        except Exception as exc:  # LedgerError / lock fault: fail closed
+            why = f"closed:{type(exc).__name__}: {exc}"
+        if why is None:
+            return False
+        release()
+        self.refusal = f"{_reasons.UNIFIED_ADMISSION} ({key}: {why})"
+        return True
 
     def reservation_via(self, rid: Optional[str]) -> Optional[str]:
         """``alloc_client`` when ``rid`` was booked by :meth:`_take_allocd`, else None."""
@@ -1980,6 +2055,8 @@ class SpilloverPlan:
                 self.taken[host.name] -= 1
             if self._simulated.get(host.name):
                 self._simulated[host.name] -= 1
+                if self._sim_leases.get(host.name):
+                    self._sim_leases[host.name].pop()
         if not rids:
             return
         if reservation is not None:
@@ -2064,7 +2141,7 @@ def _plan_v01(hosts, running_by_host, *, probe, disabled, planned_at, config,
     detail: Dict[str, dict] = {}
     for h in sorted(hosts, key=lambda x: x.priority):
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
+        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         probed = free > 0
         sample = _probe_states(probe, h, probed, workspace_paths.get(h.name, ()), states)
         load1: Optional[float] = None
@@ -2118,13 +2195,15 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     samples: Dict[str, Tuple[Optional[float], str]] = {}
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
-        free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
+        free = count_free(h, running) if (h.enabled and h.state == "active") else 0
         sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "boards": None}
+               "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "band_cap": "",
+               "boards": None}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
+            row["band_cap"] = _admission.band_cap(sample.pressure_text)
             if signal.placement_table is not None:
                 from hermes_cli import kanban_headroom as _kh
                 row["placement"] = _kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text,
@@ -2177,10 +2256,17 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             limit, cap_why = r["cap"]
             if limit is not None and limit < free:
                 admission[h.name] = f"cap {limit} < free {free}: {cap_why}"
-                if signal.admit_on_memory:
+                # D9 (t_3694ab3c): under KANBAN_UNIFIED_ADMIT the memory axis is admit_class's (measured estimate,
+                # not 6 GB per worker); the cap is still computed and reported, never enforced
+                if signal.admit_on_memory and not _kanban_unified_admit(signal):
                     free = limit
                     if free == 0:
                         why = f"admission: {cap_why}"
+                elif signal.admit_on_memory and r["band_cap"]:
+                    # ...but only the memory axis: a PUBLISHED hot band.kanban still closes the host on every
+                    # path, pinned and unpinned (Prism ce581503f8d8, t_c466b7ee)
+                    free = 0
+                    why = f"admission: {r['band_cap']}"
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": r["running"], "load1": r["load1"], "ncpu": r["ncpu"],

@@ -50,7 +50,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from hermes_cli.fleet_placement import placement
+from hermes_cli.fleet_placement import admission, placement
 
 _log = logging.getLogger(__name__)
 
@@ -111,7 +111,8 @@ V2_FIELDS = ("d_threads", "runnable_ewma", "procs_running", "psi_cpu_some60")
 # kanban.admission: utilization axes (admission.admit; Prism a864560114d1). Absent = None = ``unmeasured:<axis>``.
 # ``ncpu`` is carried only when the pressure row has it: it is the denominator of that row's ``cpu_busy`` and,
 # when absent, the probe's own getconf count already in the detail row stands (never overwritten with None).
-UTIL_FIELDS = ("cpu_busy", "psi_io_some10")
+UTIL_FIELDS = ("cpu_busy", "psi_io_some10", "gpu_free_mib",   # gpu_free_mib: a GPU card is measured, not unmeasured (85f2492e610e)
+               "procs", "maxproc")   # the process-table guard admit_class applies (Prism ce581503f8d8)
 
 
 def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str, *,
@@ -133,6 +134,9 @@ def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str
         return out
     for k in ("mem_available_gb", "psi_cpu_some10", "psi_mem_some10", "system_pct") + V2_FIELDS + UTIL_FIELDS:
         out[k] = _num(doc.get(k))
+    # the latency-SLO guard (ACE-AI voice hub): True refuses in admit_class; only a real bool is carried
+    if isinstance(doc.get("slo_breach"), bool):
+        out["slo_breach"] = doc["slo_breach"]
     if _num(doc.get("ncpu")) is not None and doc["ncpu"] > 0:
         out["ncpu"] = _num(doc["ncpu"])
     if isinstance(doc.get("os"), str) and doc["os"]:
@@ -158,6 +162,7 @@ def sample_from_detail(d: Mapping) -> Optional[placement.Sample]:
         at=_num(d.get("sample_at")), status=str(status),
         note="" if status == "fresh" else str(d.get("pressure") or ""),
         ncpu=_num(d.get("ncpu")), os=d.get("os") if isinstance(d.get("os"), str) else None,
+        slo_breach=d.get("slo_breach") if isinstance(d.get("slo_breach"), bool) else None,
         **{k: _num(d.get(k)) for k in V2_FIELDS + UTIL_FIELDS})
 
 
@@ -279,19 +284,97 @@ def admit(plan, names, job: Optional[placement.Job], job_id: Optional[str]):
                            admissions_path=rpath.parent / placement.ADMISSIONS_REL.name, job=job, **kw)
 
 
-def book_pin(plan, name: str, job_id: Optional[str], job: Optional[placement.Job] = None) -> str:
+class ClassRefusal(placement.PlacementError):
+    """The ONE rule (may_start) refused a take on the locked ledger (Prism c8d0343d7fb6)."""
+
+
+def book_pin(plan, name: str, job_id: Optional[str], job: Optional[placement.Job] = None, *,
+             check: bool = False) -> str:
     """Book a PINNED take's footprint in the ledger (no scorer: a pin keeps its
     precedence), so the next unpinned admit() and other boards' dispatchers see
-    it (Prism 4609a040ad20 / b8c13f6c2e7a / 9b1349450aff). Returns the id."""
+    it (Prism 4609a040ad20 / b8c13f6c2e7a / 9b1349450aff). Returns the id.
+    ``check`` (KANBAN_UNIFIED_ADMIT, not skip_admission): may_start runs UNDER the
+    ledger lock against the locked ledger, refusal = ClassRefusal and nothing
+    booked (Prism c8d0343d7fb6), and the row books the LEARNED estimate may_start
+    admitted on, not the declared footprint (Prism 8e0e895ec5d4), as admit() does."""
     sig = plan.signal
     table = sig.placement_table
     rpath = Path(sig.placement_reservations)
     fp = table.footprint(CONSUMER, job.footprint if job is not None else None,
                          profile=job.profile if job is not None else None)
-    return placement.reserve(table.resolve(name) or name, CONSUMER, fp,
-                             ttl_s=RESERVE_TTL_S, job_id=job_id, path=rpath,
-                             now=None if sig.clock is time.time else sig.clock(),
-                             admissions_path=rpath.parent / placement.ADMISSIONS_REL.name)
+    aps = rpath.parent / placement.ADMISSIONS_REL.name
+    hid = table.resolve(name) or name
+    if not check:
+        return placement.reserve(hid, CONSUMER, fp, ttl_s=RESERVE_TTL_S, job_id=job_id, path=rpath,
+                                 now=None if sig.clock is time.time else sig.clock(), admissions_path=aps)
+    with placement._locked(rpath):
+        now = sig.clock()                            # after the lock, as reserve() takes it
+        ok, why = _class_verdict(plan, name, job, now=now)   # reads the locked ledger itself
+        if not ok:
+            raise ClassRefusal(why)
+        ctx = placement.admit_context(CONSUMER, fp, now=now, job=job, table=table, root=rpath.parents[2])
+        need = ctx.need(hid)                         # the same call may_start made: the number it admitted on
+        booked = placement.Footprint(ram_gb=need.ram_gb, threads=need.cpus, scratch_gb=fp.scratch_gb,
+                                     gpu_mb=need.gpu_mib)
+        return placement._reserve_unlocked(rpath, hid, CONSUMER, booked, ttl_s=RESERVE_TTL_S, job_id=job_id,
+                                           now=now, admissions_path=aps, decision=None, job_class=ctx.job_class)
+
+
+def confirm_class(plan, name: str, job: Optional[placement.Job], rid: Optional[str], *,
+                  via_alloc: bool = False, decision: Any = None) -> Optional[str]:
+    """Prism c8d0343d7fb6: the class rule for a take whose row ``rid`` the old locked rule (placement.admit, or
+    allocd) just booked, re-run UNDER the ledger lock against the locked ledger with that row left out (the take as
+    it would be admitted now). Refused -> the row is dropped in the SAME lock section and the refusal returned; None
+    = admitted. Every competing take confirms serially under one lock, and a refused one leaves before the next
+    confirms, so two takes where only one fits admit exactly one. Inert (None) without the one rule or a ledger.
+    An unreadable ledger raises PlacementError (the caller fails closed).
+    ``via_alloc``: allocd booked ``rid`` (``decision`` = its AdmitResult). Off the router host
+    (``alloc_client.ledger_is_local()`` false) the row is in allocd's ledger, never this dispatcher's file, so there is
+    nothing local to confirm against (Prism 72e85daf44a6 / d618d0a51436). The take stands only on the ROUTER's class
+    verdict: allocd ran admit_class on its ledger for this row and said so with ``unified: true`` (hermes-home
+    allocd, asked by allocd_admit). A grant without it came from placement.admit()'s older rule, and unified_filter's
+    local pre-check cannot see allocd's ledger, so it is refused and released (Prism 11efd32500fc).
+    On the router host the two ledgers are one file and the check below runs."""
+    sig = plan.signal
+    if not rid or not unified_active(plan) or getattr(sig, "placement_reservations", None) is None:
+        return None
+    table = sig.placement_table
+    if via_alloc:
+        from hermes_cli import alloc_client
+        if not alloc_client.ledger_is_local(table):
+            detail = getattr(decision, "detail", None)
+            if getattr(decision, "source", None) == "allocd" and isinstance(detail, Mapping) \
+                    and detail.get("unified") is True:
+                return None
+            return f"closed:allocd grant {rid} carries no router-side class verdict (unified: true)"
+    rpath = Path(sig.placement_reservations)
+    with placement._locked(rpath):
+        now = sig.clock()
+        doc = placement._read_ledger(rpath)
+        own = next((r for r in doc["rows"] if r.get("id") == rid), None)
+        if own is None or not placement._row_live(own, now):
+            return f"closed:reservation {rid} not live in the ledger at the class check"
+        hid = table.resolve(own["host"]) or own["host"]
+        # this take's own lease, by its UNIQUE reservation id (Prism d1bd26bd688c): ledger_leases yields one lease per
+        # live row in ledger order, read here under the same lock, so the row's position among the live rows is its
+        # lease's. Never by (host, job_id, at): two rows can share those and the wrong one would be left out.
+        live = [r for r in doc["rows"] if placement._row_live(r, now)]
+        leases = placement.ledger_leases(rpath, now=now, table=table)
+        if len(leases) != len(live):
+            raise placement.PlacementError(f"ledger changed under the lock ({len(live)} live rows, {len(leases)} leases)")
+        del leases[next(i for i, r in enumerate(live) if r.get("id") == rid)]
+        admitted = placement.live_admissions(CONSUMER, rpath, now=now, table=table).get(hid, 0)
+        admitted -= 1 if own.get("consumer") == CONSUMER else 0
+        ok, why = _class_verdict(plan, name, job, now=now, leases=leases, admitted=admitted)
+        if ok:
+            return None
+        placement._write_ledger(rpath, {"schema": doc.get("schema", placement.SCHEMA),
+                                        "rows": [r for r in doc["rows"] if r.get("id") != rid]})
+        placement._append_admissions(rpath.parent / placement.ADMISSIONS_REL.name, [placement._ledger_line(
+            at=now, host=own["host"], consumer=own["consumer"], job_id=own.get("job_id"),
+            fp=placement._row_footprint(own), decision="released", reservation=rid,
+            reason=f"unified_admission: {why}")])
+        return why
 
 
 def release_id(sig, rid: Optional[str]) -> None:
@@ -336,11 +419,104 @@ def structural_free(plan, name: str) -> int:
     d = plan.detail.get(name) or {}
     if h is None or not (h.enabled and h.state == "active") or d.get("load1") is None:
         return 0
+    if h.slots is None:
+        # Count-free host (t_c834e0d8): only the per-tick stand-in, never running.
+        from hermes_cli.kanban_worker_pool import UNCOUNTED_TICK_FREE
+        return max(0, UNCOUNTED_TICK_FREE - plan.taken.get(name, 0))
     return max(0, h.slots - int(d.get("running") or 0) - plan.taken.get(name, 0))
 
 
 def _job_kw(job: Optional[placement.Job]) -> Dict[str, Any]:
     return {} if job is None else {k: v for k, v in dataclasses.asdict(job).items() if v is not None}
+
+
+def unified_filter(plan, names, job: Optional[placement.Job]) -> Tuple[List[str], Dict[str, str]]:
+    """Inventory D7 (t_3694ab3c, KANBAN_UNIFIED_ADMIT): every unpinned candidate must pass the ONE rule,
+    ``placement.may_start(host, "kanban")`` (admit_class over the plan's own probe sample, the measured estimate,
+    the ledger's leases, the fleet line and the queued demand of every class above kanban), BEFORE the scorer or
+    allocd picks among them. Read-only: the take still books through placement.admit / alloc_client.
+    -> (names that may start, {name: refusal}). ``KANBAN_UNIFIED_ADMIT=0`` = every name, unchanged. Only on the
+    utilization path (``kanban.admission: utilization``, the live mode): may_start reads cpu_busy, which a legacy
+    probe row need not carry, so ``legacy`` keeps today's scorer unchanged.
+    A pre-check only: a take is admitted by the same verdict UNDER the ledger lock (book_pin(check=True) for a pin,
+    confirm_class() after the old rule books), never on this read (Prism c8d0343d7fb6)."""
+    if not unified_active(plan):
+        return list(names), {}
+    now = plan.signal.clock()
+    keep: List[str] = []
+    refused: Dict[str, str] = {}
+    for n in names:
+        ok, why = _class_verdict(plan, n, job, now=now)
+        if ok:
+            keep.append(n)
+        else:
+            refused[n] = why
+    return keep, refused
+
+
+def unified_active(plan) -> bool:
+    """The ONE rule decides this plan's takes: KANBAN_UNIFIED_ADMIT on, a placement table, utilization admission."""
+    from hermes_cli import kanban_load_gate as _klg
+
+    sig = plan.signal
+    return not (sig is None or sig.placement_table is None or not _klg.unified_admit()
+                or placement.admission_mode() != "utilization")
+
+
+def _class_verdict(plan, n: str, job: Optional[placement.Job], *, now: float, leases=None,
+                   admitted: Optional[float] = None) -> Tuple[bool, str]:
+    """``placement.may_start(host, "kanban")`` over the plan's probe sample. ``leases`` / ``admitted`` default to the
+    ledger's own (read by may_start); confirm_class() passes them with the take's own row left out."""
+    sig = plan.signal
+    table = sig.placement_table
+    root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
+    hid = table.resolve(n) or n
+    s = sample_from_detail(plan.detail.get(n) or {})
+    try:
+        if leases is None:
+            leases, admitted = _with_simulated(plan, hid, job, now=now, root=root)
+        # the freshness bound the scorer uses (choose(stale_after_s=...) above), never a shared default:
+        # a 60-120 s-old push the kanban policy calls fresh must not read closed:stale here (Prism 5113510bdb9a)
+        return placement.may_start(hid, CONSUMER, job=job, table=table, now=now, root=root,
+                                   samples={hid: s} if s is not None else {},
+                                   stale_after_s=float(sig.policy.stale_after_s), leases=leases, admitted=admitted)
+    except placement.PlacementError as exc:      # corrupt ledger / table row: fail closed for that host
+        return False, f"closed:{type(exc).__name__}: {exc}"
+
+
+def sim_lease(plan, name: str, job: Optional[placement.Job]) -> "admission.Lease":
+    """The lease a dry-run take on ``name`` stands for: the estimate and class may_start admitted THIS job on
+    (Prism fd6bd8070eee). An unreadable estimate input falls back to the declared footprint, never to nothing."""
+    sig = plan.signal
+    table = sig.placement_table
+    hid = table.resolve(name) or name
+    now = sig.clock()
+    fp = table.footprint(CONSUMER, job.footprint if job is not None else None,
+                         profile=job.profile if job is not None else None)
+    root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
+    try:
+        ctx = placement.admit_context(CONSUMER, fp, now=now, job=job, table=table, root=root)
+        need, klass = ctx.need(hid), ctx.job_class
+    except placement.PlacementError:
+        need, klass = placement.need_of(fp), placement.job_class_for(CONSUMER)
+    return admission.Lease(host=hid, job_class=klass, need=need, at=now)
+
+
+def _with_simulated(plan, hid: str, job: Optional[placement.Job], *, now: float, root) -> Tuple[Any, Optional[float]]:
+    """(leases, admitted) for may_start: (None, None) = the ledger's own, unless this plan holds SIMULATED takes on
+    ``hid`` (a dry run books nothing). Then the ledger's leases plus each simulated take's OWN lease (sim_lease, its
+    estimate and class at take time; Prism 9eecf7c2e1ee / fd6bd8070eee), so a dry run's verdict counts exactly the
+    work it already granted. ``job`` is the take being judged and is not needed here."""
+    sig = plan.signal
+    table = sig.placement_table
+    sim = [le for n, ls in plan._sim_leases.items() if (table.resolve(n) or n) == hid for le in ls]
+    if not sim:
+        return None, None
+    rpath = Path(sig.placement_reservations) if sig.placement_reservations is not None else None
+    leases = placement.ledger_leases(rpath, now=now, table=table) if rpath is not None else []
+    admitted = (placement.live_admissions(CONSUMER, rpath, now=now, table=table).get(hid, 0)
+                if rpath is not None else 0) + len(sim)
+    return leases + sim, admitted
 
 
 def allocd_request(plan, names, job: Optional[placement.Job]) -> Dict[str, Any]:
@@ -355,7 +531,9 @@ def allocd_admit(plan, names, job: Optional[placement.Job], job_id: Optional[str
     """``alloc_client.admit`` for an unpinned take (mode on). Returns AdmitResult;
     raises alloc_client.Refused on a terminal answer (never bypassed)."""
     from hermes_cli import alloc_client
+    unified = unified_active(plan)
     return alloc_client.admit(CONSUMER, job_id=admission_key(job_id), ttl_s=RESERVE_TTL_S,
+                              unified=unified, stale_after_s=float(plan.signal.policy.stale_after_s) if unified else None,
                               **allocd_request(plan, names, job))
 
 

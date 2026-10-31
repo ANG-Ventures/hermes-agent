@@ -1284,7 +1284,7 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
         # 409 after that tells the operator "still running" while the worker is already dead; the
         # receipt makes the real outcome visible.
         receipt: dict = {}
-        with _map_errors(409, kanban_db.NoWorkerFlagSet):
+        with _map_errors(409, kanban_db.NoWorkerFlagSet, kanban_db.FlagshipAssigneeRefused):
             ok = kanban_db.reassign_task(
                 conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first),
                 reason=payload.reason, receipt=receipt)

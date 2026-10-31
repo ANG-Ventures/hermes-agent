@@ -84,6 +84,18 @@ def all_assignees_spawnable(monkeypatch):
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
 
 
+@pytest.fixture
+def proven_operator(monkeypatch):
+    """The CLI/DB caller is a PROVEN operator (Apollo's gateway tree, or the
+    operator token), so its env-derived label persists as itself and holds
+    flagship authority (t_9e7ba884). Unproven, the label is
+    ``unverified:<name>``: no override it writes is one dispatch honours.
+    """
+    from hermes_cli import kanban_identity
+
+    monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: True)
+
+
 @pytest.fixture(autouse=True)
 def _suppress_concurrent_hermes_gate(request, monkeypatch):
     """Default ``_detect_concurrent_hermes_instances`` to ``[]`` for every test.

@@ -541,6 +541,12 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Reason to pin a 'model' id the provider's live model list does not "
                 "know. Without it an unknown id is refused with the valid list."
         )),
+        "allow_flagship": _prop("string", (
+                "Reason for a flagship route (a flagship 'model', or an assignee "
+                "whose profile default is flagship). Without it such a card is "
+                "refused. Recorded as a 'flagship override:' comment. "
+                "Operator-only: honoured from an operator label outside a dispatched worker."
+        )),
     },
     ["title", "assignee"],
 )

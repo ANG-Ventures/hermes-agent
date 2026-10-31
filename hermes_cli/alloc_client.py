@@ -328,11 +328,14 @@ def _fallback_admit(consumer: str, *, job_id: str, ttl_s: float, klass: Optional
 
 def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0, klass: Optional[str] = None,
           footprint: Optional[Mapping] = None, job: Optional[Mapping] = None, previous: Optional[str] = None,
-          timeout: float = TIMEOUT_S, fallback: bool = True, candidates: Optional[list] = None) -> AdmitResult:
+          timeout: float = TIMEOUT_S, fallback: bool = True, candidates: Optional[list] = None,
+          unified: bool = False, stale_after_s: Optional[float] = None) -> AdmitResult:
     """Ask allocd for a host; on any liveness fault run the same scorer in-process (``fallback=False`` raises
     Unreachable instead: tests only). ``job`` = placement.Job fields (affinity, continuity, priority, core_class, footprint, profile).
     ``klass`` = "p0" for the reserve-entitled class (main/merge-queue CI, lander), else None.
     ``candidates`` = restrict the scorer to these hosts (renew's re-admit pins the job's host with it).
+    ``unified`` = ask allocd to run the ONE rule (admit_class) on its own ledger for the booked row; a grant that ran it
+    carries ``unified: true`` in its detail (Prism 11efd32500fc). ``stale_after_s`` = the caller's sample freshness.
     Raises ``Refused`` on a terminal answer (4xx, empty/unreadable token file): the fallback never runs for it."""
     t0 = time.monotonic()
     tok = _token(consumer)                 # FIRST: an unreadable token refuses even with the router off
@@ -341,6 +344,10 @@ def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0,
             "job": dict(job or {}), "previous": previous}
     if candidates is not None:
         body["candidates"] = list(candidates)
+    if unified:
+        body["unified"] = True
+        if stale_after_s is not None:
+            body["stale_after_s"] = float(stale_after_s)
     try:
         if (placement.fleet_root() / ROUTER_OFF_REL).exists():
             raise Unreachable("router-off file present")

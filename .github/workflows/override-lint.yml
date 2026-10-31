@@ -16,7 +16,7 @@ name: override-lint
 # Not a required check.
 on:
   pull_request:  # no-paths-ok: reads the PR BODY (`edited`); no concurrency on purpose (callee t_69ee9353)
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -24,6 +24,7 @@ permissions:
 
 jobs:
   override_lint:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1' }}
     uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@68136b520946bc9ec073e130fd77c5654bf27979
     with:
       runner: ubuntu-latest

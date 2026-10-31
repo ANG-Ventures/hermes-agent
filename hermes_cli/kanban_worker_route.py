@@ -394,11 +394,8 @@ def _live_route_gate_error(conn, task, model, provider) -> Optional[str]:
     """
     if not model:
         return None
-    from hermes_cli.model_policy import (
-        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
-        flagship_model_match,
-        validate_route_provider,
-    )
+    from hermes_cli.kanban_db import _card_flagship_authorized
+    from hermes_cli.model_policy import flagship_model_match, validate_route_provider
 
     try:
         from hermes_cli.config import load_config
@@ -407,12 +404,8 @@ def _live_route_gate_error(conn, task, model, provider) -> Optional[str]:
     except Exception:
         policy_config = {}
     if flagship_model_match(model, policy_config):
-        authorized = conn.execute(
-            "SELECT 1 FROM task_comments WHERE task_id = ? "
-            "AND lower(ltrim(body)) LIKE ? LIMIT 1",
-            (task.id, f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX}%"),
-        ).fetchone()
-        if not authorized:
+        # The ONE reader the dispatcher uses: an operator-authored override.
+        if not _card_flagship_authorized(conn, task.id):
             return f"flagship model {model!r} has no 'flagship override:' comment on the card"
     try:
         validate_route_provider(model, provider, pin_sub_reason=getattr(task, "pin_sub_reason", None))

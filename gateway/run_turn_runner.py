@@ -1630,6 +1630,7 @@ class TurnRunner:
             _fw.flush_unconsumed_recovery_row(agent)
         agent.service_tier = runner._service_tier
         self._merge_turn_request_overrides(agent, turn_route)
+        runner._bind_route_known(agent, ctx.session_key)
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.
         agent._gateway_turn_context_notes = "\n\n".join(runner._consume_pending_turn_sidecar_notes(ctx.session_key))
@@ -1984,7 +1985,6 @@ class TurnRunner:
         )
         ctx = self._ctx
         persist_override: Optional[Any] = ctx.persist_user_message
-        self._prepend_pending_note("_pending_model_notes")
         # Auto-continue: history ending with a tool result means the previous turn was cut off
         # (restart, crash, SIGTERM). Session-level resume_pending (drain-timeout shutdown) uses
         # stronger reason-aware wording that subsumes this case. Both gate on the age of

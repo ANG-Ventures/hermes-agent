@@ -237,16 +237,6 @@
    "why": "prefilter on PROSE/JSON (no identifier key in the pattern; the literal is a constant marker); every matched row is re-parsed and checked exactly in Python.",
    "where": "hermes_cli/kanban_db_connect.py:1183 backfill_workspace_of"
   },
-  "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.fallback_flagship_banned::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
-   "verdict": "kept",
-   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
-   "where": "hermes_cli/kanban_db_dispatch.py:5683 _dispatch_once_locked.fallback_flagship_banned"
-  },
-  "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.flagship_refused::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
-   "verdict": "kept",
-   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
-   "where": "hermes_cli/kanban_db_dispatch.py:5723 _dispatch_once_locked.flagship_refused"
-  },
   "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.provider_admission::fold::route_provider::\"until\": cooling[(route_provider or \"\").strip().lower()]}": {
    "verdict": "kept",
    "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
@@ -501,11 +491,6 @@
    "verdict": "kept",
    "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
    "where": "hermes_cli/kanban_worker_route.py:187 _is_sibling_pool_same_model"
-  },
-  "hermes_cli/kanban_worker_route.py::_live_route_gate_error::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
-   "verdict": "kept",
-   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
-   "where": "hermes_cli/kanban_worker_route.py:411 _live_route_gate_error"
   },
   "hermes_cli/kanban_worker_route.py::apply_pending_live_route::fold::provider::(agent.provider or \"\").strip().lower() or None if provider else None,": {
    "verdict": "kept",

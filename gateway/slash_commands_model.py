@@ -219,8 +219,6 @@ class GatewayModelCommandsMixin:
         Returns the warning for a ``--global`` switch whose ``config.yaml`` write or stale-override
         cleanup failed (the switch then stays a session override), else ``None``.
         """
-        from hermes_cli.model_switch import format_model_for_display
-
         # Persist the new model to the session DB so the dashboard shows the updated model (#34850).
         _sess_db = getattr(self, "_session_db", None)
         if _sess_db is not None:  # so the dashboard shows the updated model
@@ -237,17 +235,8 @@ class GatewayModelCommandsMixin:
                 )
             except Exception as exc:
                 logger.debug("Failed to persist model switch to DB: %s", exc)
-        # Prepended to the next user message (no system messages mid-history). Display form strips
-        # opaque Palantir RID prefixes; the override map keeps the full ID for the wire.
-        if not hasattr(self, "_pending_model_notes"):
-            self._pending_model_notes = {}
-        self._pending_model_notes[ctx.session_key] = (
-            f"[Note: model was just switched from {format_model_for_display(ctx.current_model)} to "
-            f"{format_model_for_display(result.new_model)} "
-            f"via {result.provider_label or result.target_provider}. "
-            f"{'This override applies to the next turn only. ' if one_turn else ''}"
-            f"Adjust your self-identification accordingly.]"
-        )
+        # No model-facing note: the switch changes ``intended`` only; the per-call route note
+        # (agent/route_identity.py) tells the model what actually serves.
         self._session_model_overrides[ctx.session_key] = {
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,

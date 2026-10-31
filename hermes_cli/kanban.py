@@ -1114,6 +1114,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
             created_by=_comment_author(args.created_by)[0], priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            flagship_override_reason=getattr(args, "allow_flagship", None),
         )
     if getattr(args, "json", False):
         _print_json(created.as_dict())
@@ -1598,8 +1599,10 @@ def _cmd_assign(args: argparse.Namespace) -> int:
                 request_changes_reason=getattr(args, "request_changes", None),
                 operator=_profile_author(),
                 worker_ok=bool(getattr(args, "worker_ok", False)),
+                flagship_override_reason=getattr(args, "allow_flagship", None),
             )
-        except (kb.ReviewHoldRequired, kb.NoWorkerFlagSet) as exc:
+        except (kb.ReviewHoldRequired, kb.NoWorkerFlagSet,
+                kb.FlagshipAssigneeRefused) as exc:
             return _err(str(exc))
     rc = _ok_or_err(ok, f"no such task: {args.task_id}",
                     f"Assigned {args.task_id} to {profile or '(unassigned)'}")
@@ -2085,9 +2088,19 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 )
             writes: list[kb.BatchRouteWrite] = []
             for task in tasks:
+                clear_reason = None
                 if touch_model and not model and not provider:
                     lane = kb.get_lane_model_override(conn, assignee=task.assignee)
                     cleared_routes[task.id] = lane.route if lane else "profile-default"
+                    # The clear lands on the profile route: judge it BEFORE
+                    # any write or --reclaim (Prism f6a54f1196fd).
+                    try:
+                        clear_reason = kb.clear_pin_flagship_reason(
+                            conn, task.id, firepower_reason, _profile_author(),
+                        )
+                    except ValueError as exc:
+                        print(f"kanban: {exc}; no cards were changed", file=sys.stderr)
+                        return 2
                 write = kb.BatchRouteWrite(
                     task_id=task.id,
                     require_statuses=require_statuses,
@@ -2095,9 +2108,20 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     skip_if_unmatched=not task_ids,
                     live=live,
                 )
+                pin_reason = None
                 if touch_model:
                     effective_model = model or inherited_models.get(task.id)
                     firepower = is_firepower_model(effective_model)
+                    if effective_model and not firepower:
+                        # The pin as the assignee RUNS it (its own aliases,
+                        # Prism a1f3096286e2); judged before any write.
+                        try:
+                            pin_reason = kb.pin_flagship_reason(
+                                conn, task.id, effective_model, firepower_reason, _profile_author(),
+                            )
+                        except ValueError as exc:
+                            print(f"kanban: {exc}; no cards were changed", file=sys.stderr)
+                            return 2
                     write.touch_model = True
                     write.model = effective_model
                     write.provider = provider
@@ -2106,12 +2130,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.force_model_reason = getattr(args, "force_model", None)
                     if write.pin_sub_reason:
                         write.pin_sub_author = _profile_author()
-                    if firepower:
+                    if firepower or clear_reason or pin_reason:
                         write.audit_comment_author = _profile_author()
                         # Same comment main's create/set-model writes, so
                         # the dispatcher's flagship gate authorizes it.
                         write.audit_comment_body = override_comment(
-                            firepower_reason,
+                            clear_reason or pin_reason or firepower_reason,
                         )
                 if effort is not None or clear_effort:
                     write.touch_effort = True
@@ -2362,19 +2386,23 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         return 2
     now = int(time.time())
     with kb.connect_closing() as conn:
-        override = kb.set_lane_model_override(
-            conn,
-            provider=provider,
-            model=model,
-            expires_at=now + ttl_seconds,
-            reasoning_effort=reasoning_effort,
-            reason=reason,
-            assignee=assignee,
-            firepower=firepower_reason,
-            created_by=_profile_author(),
-            now=now,
-            pin_sub_reason=pin_sub_reason,
-        )
+        try:
+            override = kb.set_lane_model_override(
+                conn,
+                provider=provider,
+                model=model,
+                expires_at=now + ttl_seconds,
+                reasoning_effort=reasoning_effort,
+                reason=reason,
+                assignee=assignee,
+                firepower=firepower_reason,
+                created_by=_profile_author(),
+                now=now,
+                pin_sub_reason=pin_sub_reason,
+            )
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
     scope = f"assignee={assignee}" if assignee else "assignee=(board-wide)"
     print(
         f"lane-model set: route={override.route} {scope} "
@@ -2586,8 +2614,9 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
                 request_changes_reason=getattr(args, "request_changes", None),
                 operator=_profile_author(),
                 worker_ok=bool(getattr(args, "worker_ok", False)),
+                flagship_override_reason=getattr(args, "allow_flagship", None),
             )
-        except kb.NoWorkerFlagSet as exc:
+        except (kb.NoWorkerFlagSet, kb.FlagshipAssigneeRefused) as exc:
             print(str(exc), file=sys.stderr)
             return 1
     reclaimed = bool(receipt.get("reclaimed"))
@@ -2953,6 +2982,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             )
         except ReleaseSuperseded as exc:
             return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
+        except kb.FlagshipAssigneeRefused as exc:
+            # A `flagship override:` body is the authorization record itself;
+            # only flagship authority writes one (Prism 7a9e431141ad).
+            return _err(f"kanban: comment not posted: {exc}", 2)
     print(f"Comment added to {args.task_id}")
     return 0
 

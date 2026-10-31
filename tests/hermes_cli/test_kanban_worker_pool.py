@@ -149,15 +149,16 @@ def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_ro
 
 
 def test_ci_runner_role_is_count_free_and_other_roles_keep_their_count(tmp_path):
-    """t_1acfaa85: hermes-home#6459 writes ``"ci-runner": {}``; the pool must still load."""
+    """t_1acfaa85: hermes-home#6459 writes ``"ci-runner": {}``; the pool must still load.
+    kanban-worker is count-free too since t_c834e0d8 (test_kanban_count_free_role.py)."""
     def doc(roles):
         return {"schema": 1, "hosts": {"a": {"roles": roles, "state": "active"}}}
 
     assert kwp.parse_roles(doc({"ci-runner": {}})) == {"a": ({"ci-runner": None}, "active")}
     assert kwp.parse_roles(doc({"ci-runner": {"slots": 3}})) == {"a": ({"ci-runner": 3}, "active")}
-    for role in ("kanban-worker", "review-worker"):
-        with pytest.raises(kwp.PoolError, match=r'must be \{"slots": N\}'):
-            kwp.parse_roles(doc({role: {}}))
+    assert kwp.parse_roles(doc({"kanban-worker": {}})) == {"a": ({"kanban-worker": None}, "active")}
+    with pytest.raises(kwp.PoolError, match=r'must be \{"slots": N\}'):
+        kwp.parse_roles(doc({"review-worker": {}}))
     with pytest.raises(kwp.PoolError, match="ci-runner must be"):
         kwp.parse_roles(doc({"ci-runner": {"slots": 3, "x": 1}}))
     with pytest.raises(kwp.PoolError, match="slots must be 1..64"):

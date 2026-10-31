@@ -180,6 +180,12 @@ _ALLOW_FLAGSHIP = _arg(
     help="Allow an orchestrator-only flagship model for this task. Requires a non-empty "
          "reason, recorded as a task comment. --firepower is an alias.",
 )
+_ASSIGN_FLAGSHIP = _arg(
+    "--allow-flagship", "--firepower", dest="allow_flagship", metavar="REASON",
+    help="Required when the new profile's model.default is an orchestrator-only "
+         "flagship and the card has no --model pin. Recorded as a "
+         "'flagship override:' comment.",
+)
 _HANDBACK_FLAGS = (
     _arg("--request-changes", dest="request_changes", metavar="REASON",
          help="Required to hand a card in review with an open PR back: records "
@@ -420,6 +426,9 @@ _SPECS = [
         _PRIORITY,
         _arg("--created-by", help="Creator/anchor profile"),
         _arg("--idempotency-key", help="Dedup key for the root card"),
+        _arg("--allow-flagship", dest="allow_flagship", metavar="REASON",
+             help="Authorize child cards whose assignee profile default is a "
+                  "flagship model (logged as a 'flagship override:' comment)"),
         _json_flag(help="Emit JSON output"),
     ], help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)"),
     _cmd("list", [
@@ -455,6 +464,7 @@ _SPECS = [
         _TASK_ID,
         _arg("profile", help="Profile name (or 'none' to unassign)"),
         *_HANDBACK_FLAGS,
+        _ASSIGN_FLAGSHIP,
     ], help="Assign or reassign a task"),
     _cmd("set-model", [
         _arg("task_ids", nargs="*", metavar="task_id",
@@ -529,6 +539,7 @@ _SPECS = [
              help="Release any active claim before reassigning (required if task is running)"),
         _RECLAIM_REASON,
         *_HANDBACK_FLAGS,
+        _ASSIGN_FLAGSHIP,
     ], help="Reassign a task to a different profile, optionally reclaiming first"),
     _cmd("diagnostics", [
         _arg("--severity", choices=["warning", "error", "critical"],
