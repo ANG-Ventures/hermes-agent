@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from tests.plugins._kanban_board_client import naming_board
 
 from hermes_cli import kanban_db as kb
 
@@ -33,7 +34,7 @@ def board(tmp_path, monkeypatch):
     spec.loader.exec_module(module)
     app = FastAPI()
     app.include_router(module.router, prefix="/api/plugins/kanban")
-    return TestClient(app), module
+    return naming_board(TestClient(app)), module
 
 
 def test_board_projects_home_channel_without_mutating_cards(board, monkeypatch):
