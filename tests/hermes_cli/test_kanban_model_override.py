@@ -167,7 +167,7 @@ def test_cli_edit_model_and_clear_model_mutually_exclusive(kanban_home):
 
 
 def test_cli_edit_nonexistent_id_reports_failure(kanban_home):
-    res = kc.run_slash("edit t_nope --model claude-opus-4-8")
+    res = kc.run_slash("--board default edit t_nope --model claude-opus-4-8")
     assert "cannot set model" in res
 
 

@@ -156,7 +156,7 @@ def test_set_effort_rejects_unknown_level(kanban_home):
 
 
 def test_set_effort_nonexistent_task(kanban_home):
-    res = kc.run_slash("set-model t_nope --effort high")
+    res = kc.run_slash("--board default set-model t_nope --effort high")
     assert "no such task" in res
 
 

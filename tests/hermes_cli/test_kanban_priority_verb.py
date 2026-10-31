@@ -60,7 +60,7 @@ def test_edit_priority_and_unknown_id(kanban_home, capsys):
         assert _prio_events(conn, tid)[-1] == {
             **_prio_events(conn, tid)[-1], "old": 5, "new": -3,
         }
-    assert _run("priority", "t_deadbeef", "1") == 1
+    assert _run("--board", "default", "priority", "t_deadbeef", "1") == 1
     assert "unknown id" in capsys.readouterr().err
 
 
