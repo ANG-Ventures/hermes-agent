@@ -76,3 +76,64 @@ def refusal(body: Optional[str]) -> Optional[str]:
     except Exception:
         _log.debug("access-bound pin: verdict raised; failing open", exc_info=True)
         return None
+
+
+# ── aegis-no-apollo-handoff on the REAL parsed assignee (t_d26f1385) ──────────────────────────────
+# The hook decides from the command text, so `A=human; B=apollo; ... "$A:$B"` or an assignee a
+# script computes reaches the board unread. create/assign/reassign hold the parsed value; the hook
+# module's own constants and handoff_refusal() text decide. Fail open like refusal() above.
+HANDOFF_LEDGER = Path("state") / "aegis-apollo-handoffs.jsonl"
+
+
+def _acting_profile() -> str:
+    from hermes_cli.profiles import current_profile_name
+    return (current_profile_name(default="default") or "default").strip().lower()
+
+
+def handoff_refusal(verb: str, card: Optional[str], assignee: Optional[str]) -> Optional[str]:
+    """The hook's refusal text when an aegis session hands *card* to an Apollo alias without a
+    ledgered ``AEGIS_HANDOFF_APOLLO`` quote, else None (an allowed override is ledgered first)."""
+    import json
+    import os
+    from datetime import datetime, timezone
+
+    if not assignee:
+        return None
+    try:
+        profile = _acting_profile()
+    except Exception:
+        _log.debug("handoff: cannot resolve the acting profile; failing open", exc_info=True)
+        return None
+    root = _fleet_root()
+    if (root / OFF_MARKER).exists():
+        return None
+    mod = _load_hook(root)
+    if mod is None:
+        return None
+    try:
+        if profile != str(mod.HANDOFF_PROFILE).lower():
+            return None
+        target = str(assignee).strip().lower()
+        if target not in {str(a).lower() for a in mod.APOLLO_ASSIGNEES}:
+            return None
+        env_name, minimum = str(mod.HANDOFF_ENV), int(mod.HANDOFF_MIN)
+        offered = os.environ.get(env_name)
+        quote = (offered or "").strip()
+        if len(quote) < minimum:
+            return mod.handoff_refusal(verb, target, offered is not None)
+        rule = str(getattr(mod, "HANDOFF_RULE", "aegis-no-apollo-handoff"))
+    except Exception:
+        _log.debug("handoff: hook surface unusable; failing open", exc_info=True)
+        return None
+    row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "profile": profile,
+           "session_id": os.environ.get("HERMES_SESSION_ID", ""), "tool": "kanban-cli",
+           "verb": verb, "card": card, "assignee": target, "quote": quote}
+    ledger = root / HANDOFF_LEDGER
+    try:
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        with open(ledger, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError:
+        return (f"BLOCKED by {rule}: the hand-off quote is valid but the ledger {ledger} could not "
+                f"be written, and an unledgered hand-off is not allowed.")
+    return None

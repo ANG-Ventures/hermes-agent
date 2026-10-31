@@ -947,6 +947,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     pin_refusal = kanban_access_bound_pin.refusal(args.body)
     if pin_refusal:
         return _err(f"kanban create: {pin_refusal}", 2)
+    handoff = kanban_access_bound_pin.handoff_refusal("create", args.title, getattr(args, "assignee", None))
+    if handoff:
+        return _err(f"kanban create: {handoff}", 2)
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -1603,6 +1606,9 @@ def _warn_review_assign_parked(task_id: str, profile: Optional[str]) -> None:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
+    handoff = kanban_access_bound_pin.handoff_refusal("assign", args.task_id, profile)
+    if handoff:
+        return _err(f"kanban assign: {handoff}", 2)
     with kbc.connect_closing() as conn:
         try:
             ok = kb.assign_task(
@@ -2608,6 +2614,9 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
+    handoff = kanban_access_bound_pin.handoff_refusal("reassign", args.task_id, profile)
+    if handoff:
+        return _err(f"kanban reassign: {handoff}", 2)
     reclaim_first = bool(getattr(args, "reclaim", False))
     # `--reclaim` SIGTERMs the live worker and releases the claim BEFORE the
     # assign is attempted. If the assign then refuses, the old "cannot
