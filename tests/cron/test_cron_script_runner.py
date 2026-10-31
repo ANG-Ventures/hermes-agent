@@ -1546,6 +1546,31 @@ def test_self_rearm_waits_for_a_fast_ledger_probe(root, monkeypatch):
     assert not marker.exists() and r._rearmed is not None
 
 
+def test_first_admitted_tick_closes_an_episode_left_by_a_rearm_off_the_self_rearm_path(
+        root, monkeypatch):
+    """t_b6454aff: the 10-30 20:15 trip page stayed open after the marker went away without
+    ``_maybe_self_rearm`` (a restart / hand rearm), because only that path closed the episode.
+    The first ADMITTED tick of a process closes it when a trip is in the 24 h window, once."""
+    from cron import lanes, script_runner, script_runner_rearm as rr
+
+    clears = []
+    monkeypatch.setattr(rr, "clear_alerts", lambda: clears.append(1) or True)
+    monkeypatch.setattr(lanes, "write_runner_heartbeat", lambda *a, **k: None)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    admitted = lanes.TickOutcome.ADMITTED
+
+    r.on_home_cycle("default", root, True, admitted)  # no trip in the window: no pager call
+    assert clears == []
+
+    rr.record_trip({"epoch": time.time(), "at": "x"})
+    r2 = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r2.on_home_cycle("default", root, True, lanes.TickOutcome.LOCK_BUSY)
+    assert clears == []  # not admitted yet
+    r2.on_home_cycle("default", root, True, admitted)
+    r2.on_home_cycle("default", root, True, admitted)
+    assert clears == [1]  # once per process
+
+
 def test_replay_commit_keeps_the_file_without_the_lock(root, monkeypatch):
     """Apollo item 5: when the commit cannot take the file lock it does not rewrite the file."""
     import contextlib as _cl

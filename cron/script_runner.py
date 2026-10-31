@@ -190,6 +190,8 @@ class ScriptRunner:
         self._recovered: set = set()
         # Set by a self re-arm; consumed by the first ADMITTED tick, which posts the receipt.
         self._rearmed: Optional[dict] = None
+        # The first ADMITTED tick of this process closes a still-open trip episode (t_b6454aff).
+        self._episode_cleared = False
         self._timer: Optional[threading.Timer] = None
         self._deadline: Optional[threading.Timer] = None
         self._tick_thread: Optional[threading.Thread] = None
@@ -421,6 +423,14 @@ class ScriptRunner:
                 self._last_ok[key] = _now_iso()
                 if self._rearmed is not None:
                     self._post_rearm_receipt(home)
+                elif not self._episode_cleared:
+                    # A re-arm off the self-rearm path (`hermes cron runner rearm`, a hand
+                    # unlink, the knob toggle) also ends the trip; close any open episode once.
+                    from cron import script_runner_rearm as rearm_policy
+
+                    if rearm_policy.recent_trips():
+                        rearm_policy.clear_alerts()
+                self._episode_cleared = True
         elif isinstance(outcome, BaseException):
             label = type(outcome).__name__
         else:
