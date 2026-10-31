@@ -146,6 +146,17 @@ class TestRunJobScript:
         assert "alert before" in output
         assert "\ufffd" in output
 
+    def test_script_child_carries_the_run_token(self, cron_env):
+        """The env token the bounded skew drain's escapee scan matches (Prism 85c0395583d8)."""
+        from cron.scheduler_script import SCRIPT_RUN_TOKEN_ENV, _run_job_script
+
+        script = cron_env / "scripts" / "tok.py"
+        script.write_text(f"import os\nprint(os.environ.get({SCRIPT_RUN_TOKEN_ENV!r}, 'MISSING'))\n")
+
+        success, output = _run_job_script(str(script))
+        assert success is True
+        assert len(output) == 32 and output != "MISSING", output
+
     def test_script_relative_path(self, cron_env):
         from cron.scheduler_script import _run_job_script
 
