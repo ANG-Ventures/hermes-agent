@@ -64,30 +64,36 @@ def _env_kanban_root(env: Mapping[str, str]):
 
     Same order as ``kanban_db.kanban_home``, read from ``env`` instead of the process: an explicit
     ``HERMES_KANBAN_HOME``, else the root of its ``HERMES_HOME``, else the default root under its
-    ``HOME`` when that ``HOME`` or its ``HERMES_DATA_DIR_SUFFIX`` is not this process's (Prism
-    03487e108873, 976039e81f74). ``None`` (use the process root) only when the env names none of
-    them, or its ``HOME`` and suffix are ours. Paths go through
-    :func:`_env_path`.
+    ``HOME`` + ``HERMES_DATA_DIR_SUFFIX`` (Prism 03487e108873, 976039e81f74). ``None`` (use the
+    process root) when the env names none of them, or when the root it describes resolves to the
+    process root: compared as paths, never by HOME/suffix inputs, since a process rooted by
+    ``HERMES_HOME`` differs from the default root under the same HOME (Prism 2be710857d51).
+    Paths go through :func:`_env_path`.
     """
+    from pathlib import Path
+
     explicit = (env.get("HERMES_KANBAN_HOME") or "").strip()
-    if explicit:
-        return _env_path(env, explicit)
     home = (env.get("HERMES_HOME") or "").strip()
-    if not home:
-        from pathlib import Path
+    if explicit:
+        root = _env_path(env, explicit)
+    elif home:
+        from hermes_constants import get_default_hermes_root
 
-        env_home = (env.get("HOME") or "").strip()
+        root = get_default_hermes_root(home=_env_path(env, home))
+    elif "HOME" in env or "HERMES_DATA_DIR_SUFFIX" in env:
         # An absent key inherits the process value, never "" (Prism 976039e81f74).
-        process_suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
-        suffix = env.get("HERMES_DATA_DIR_SUFFIX", process_suffix)
-        same_home = not env_home or os.path.realpath(env_home) == os.path.realpath(str(Path.home()))
-        # Our HOME is our root only when the suffix agrees too.
-        if same_home and suffix == process_suffix:
-            return None
-        return Path(env_home or str(Path.home())) / (".hermes" + suffix)
-    from hermes_constants import get_default_hermes_root
+        env_home = (env.get("HOME") or "").strip() or str(Path.home())
+        suffix = env.get("HERMES_DATA_DIR_SUFFIX", os.environ.get("HERMES_DATA_DIR_SUFFIX", ""))
+        root = Path(env_home) / (".hermes" + suffix)
+    else:
+        return None
+    from hermes_cli.kanban_db import kanban_home
 
-    return get_default_hermes_root(home=_env_path(env, home))
+    try:
+        process_root = kanban_home()
+    except Exception:  # a refused/unresolvable process root is not the env's root
+        return root
+    return None if os.path.realpath(root) == os.path.realpath(process_root) else root
 
 
 def _resolve_current_session_id() -> Optional[str]:
