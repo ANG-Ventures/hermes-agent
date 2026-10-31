@@ -6821,6 +6821,7 @@ def _dispatch_once_locked(
             assignee_route_unresolved,
             flagship_model_match,
             is_firepower_model,
+            profile_flagship_allowance,
         )
 
         task = _kb.get_task(conn, task_id)
@@ -6865,6 +6866,8 @@ def _dispatch_once_locked(
                 # An unresolved ${VAR} default fails closed (Prism 69a5d42a9476).
                 if not assignee_route_gated(model, _model_policy_config):
                     return False
+                if profile_flagship_allowance(assignee or task.assignee, model):
+                    return False  # standing per-profile grant (kanban.flagship_profile_allowances)
         if _kb._card_flagship_authorized(conn, task_id):
             return False
 

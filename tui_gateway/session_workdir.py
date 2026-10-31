@@ -562,6 +562,7 @@ def _submit_row_target_key(session: dict) -> str:
 # Wire-sanitizer-safe key carrying the session the submit row was actually written under. Mirrors
 # ``_DB_PERSISTED_MARKER``'s contract (leading underscore, stripped from provider payloads).
 _SUBMIT_ROW_SESSION_KEY = "_submit_row_session_id"
+_SUBMIT_ROW_RAW_KEY = "_submit_row_raw_text"  # E11: the raw submit, adoption's identity (never sent)
 
 
 def _submit_row_owner_key(staged: dict, session: dict) -> str:
@@ -588,7 +589,11 @@ def _write_submit_user_row(session: dict, text: Any, display_kind: str | None,
         return None
     from agent.context_compressor import _DB_PERSISTED_MARKER
     from agent.message_metadata import stamp_message_timestamp, stamp_message_uid
+    from agent.route_note_ingest import relabel_route_note_text
+    raw_text, text = text, relabel_route_note_text(text)  # E11: never store the harness marker
     staged = stamp_message_timestamp({"role": "user", "content": text})
+    # Adoption matches on the RAW submit: two different submits can relabel to the same text.
+    staged[_SUBMIT_ROW_RAW_KEY] = raw_text
     if display_kind:
         staged["display_kind"] = display_kind
     if accept_metadata:
@@ -633,9 +638,16 @@ def _adopt_submit_user_row(session: dict, agent, persist_user_message: Any, text
     was sent and the ``api_content`` sidecar can address it; ``_row_id`` rides along for that stamp.
     ``text`` is THIS turn's raw submit: a staged row from an earlier send (its turn ended before the agent
     ran) is discarded untouched, so the DB row stays the user's message and never a synthesized turn's text."""
+    from agent.route_note_ingest import relabel_route_note_content
     staged = session.pop("_submit_user_row", None)
-    if not isinstance(staged, dict) or agent is None or staged.get("content") != text:
+    # E11: identity is the RAW submit (popped so it never reaches the turn's dict); the row content
+    # is stored relabelled, so the rewrite below compares in that canonical form.
+    if not isinstance(staged, dict) or agent is None or staged.pop(_SUBMIT_ROW_RAW_KEY, None) != text:
         return
+    from agent.turn_context import STAGED_TURN_RAW_KEY
+    # The turn matches this dict on the raw text it receives, never the relabelled content.
+    staged[STAGED_TURN_RAW_KEY] = persist_user_message
+    persist_user_message = relabel_route_note_content(persist_user_message)
     if staged["content"] != persist_user_message:
         from agent.session_persistence import _durable_content
         with _session_db(session) as db:

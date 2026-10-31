@@ -1129,13 +1129,25 @@ def live_cron_agents() -> list:
 # need to track.
 _active_script_procs: dict = {}
 _script_procs_lock = threading.Lock()
-# Job IDs whose script was killed by a signal while the scheduler was shutting
-# down (gateway restart drain). ``run_one_job`` consumes its own entry after
+# In-flight keys (``_inflight_key``: home key, job id) whose script was killed by a
+# signal while the scheduler was shutting down (gateway restart drain). ``run_one_job`` consumes its own entry after
 # the run's bookkeeping and persists a one-shot re-fire request
 # (cron.jobs.request_restart_requeue), so a restart-killed daily job re-fires
 # on the next boot instead of sitting at last_status=error for a day
 # (t_1f4598ad). Guarded by ``_script_procs_lock``.
 _restart_killed_job_ids: set = set()
+# In-flight key (``_inflight_key``: home key, job id) per registered script proc (keyed like
+# ``_active_script_procs``), and the keys whose re-fire the script runner's bounded skew drain
+# withheld because their process tree outlived SIGKILL (t_c15baa4b): a re-fire beside a live copy
+# would run the job twice. Profile-scoped like the in-flight registry, so one profile's survivor
+# never withholds another profile's same-id job (Prism f4526d2bb9fa). Both guarded by
+# ``_script_procs_lock``.
+_script_proc_job_ids: dict = {}
+_refire_withheld_job_ids: set = set()
+# In-flight keys whose run the bounded skew drain interrupted (Prism b86087faa72f). The run is
+# recorded as a failure and flagged for its one re-fire whatever its exit status: a script that
+# traps TERM and exits 0 or 143 was cut off all the same. Guarded by ``_script_procs_lock``.
+_skew_interrupted_job_ids: set = set()
 
 
 def signal_shutdown(reason: str = "") -> None:
@@ -2228,12 +2240,12 @@ def _is_restart_killed(job_id: Any) -> bool:
     The flag is consumed in ``run_one_job``'s finally (re-queue request); the
     delivery path only needs to know it so a restart kill is not paged."""
     with _script_procs_lock:
-        return str(job_id) in _restart_killed_job_ids
+        return _inflight_key(str(job_id)) in _restart_killed_job_ids
 
 
 def _consume_restart_killed(job_id: Any) -> bool:
-    """Pop and return whether ``job_id``'s script was killed by shutdown."""
-    key = str(job_id)
+    """Pop and return whether ``job_id``'s script was killed by shutdown (active profile scope)."""
+    key = _inflight_key(str(job_id))
     with _script_procs_lock:
         if key in _restart_killed_job_ids:
             _restart_killed_job_ids.discard(key)

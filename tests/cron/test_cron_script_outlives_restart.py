@@ -270,7 +270,7 @@ def test_explicit_exit_143_is_not_a_signal_death(env):
     assert not ok
     assert "exited with code 143" in out, out
     assert "Killed by gateway shutdown" not in out, out
-    assert "j143" not in sched._restart_killed_job_ids
+    assert not sched._is_restart_killed("j143")
     assert (env / "cron" / "script-runs" / "e143abc.rc").read_text(encoding="utf-8").strip() == "143"
 
 

@@ -1922,8 +1922,10 @@ class GatewayInboundMixin:
         )
 
     def _post_stop_voice_content(self, event: MessageEvent, text: str) -> Tuple[str, Optional[float]]:
+        from agent.route_note_ingest import relabel_route_note_content
         _, persist_text, persist_ts = self._hmwa_apply_message_timestamp(event, text)
-        return (persist_text if persist_text is not None else text), persist_ts
+        # E11: STT text is user-supplied and this row replays as history without build_turn_context.
+        return relabel_route_note_content(persist_text if persist_text is not None else text), persist_ts
 
     async def _append_post_stop_voice_marker(
         self, event: MessageEvent, text: str, session_id: Optional[str], keyed: bool,

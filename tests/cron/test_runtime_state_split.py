@@ -3034,3 +3034,24 @@ def test_retire_drops_the_database_after_its_connection_closes(temp_home, monkey
     monkeypatch.setattr(rs, "drop_database", windows_drop)
     cj.export_runtime_to_json(retire=True)
     assert not _db(temp_home).exists()
+
+
+def test_row_write_does_not_checkpoint_the_wal_on_close(temp_home):
+    """t_e92870f8: every runtime row write closed the LAST connection to the WAL database, so the
+    close folded the WAL into the main file (fullfsync on macOS) while the caller held
+    ``_jobs_lock``: ~57 ms of a ~95 ms write on the live store, and the frame a 2026-10-30 trip dump
+    caught 16 lane threads queued behind. The write must commit durably without that fold, and the
+    database must still be droppable afterwards."""
+    from cron import runtime_state as rs
+
+    cron = temp_home / "cron"
+    wal = cron / (rs.DB_NAME + "-wal")
+    for i in range(3):
+        with rs.transaction(cron) as conn:
+            rs.upsert_rows(conn, {f"job{i}": {"last_status": "ok"}})
+
+    assert wal.exists() and wal.stat().st_size > 0  # frames still in the WAL: no close fold
+    with sqlite3.connect(_db(temp_home)) as other:  # and committed for every other reader
+        assert other.execute("SELECT count(*) FROM job_runtime").fetchone()[0] == 3
+    rs.drop_database(cron)
+    assert not any(p.name.startswith(rs.DB_NAME) for p in cron.iterdir())

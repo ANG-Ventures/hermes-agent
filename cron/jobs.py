@@ -4792,29 +4792,57 @@ RESTART_REQUEUE_MAX_AGE_SECONDS = DEFAULT_ONESHOT_CATCHUP_SECONDS
 RESTART_REQUEUE_STAGGER_S = 300
 
 
+def restart_refire_refusal(job: Optional[Dict[str, Any]], *, run_counted: bool = True) -> Optional[str]:
+    """Why a restart re-fire of ``job`` would not happen, or None when it would.
+
+    The ONE predicate behind ``request_restart_requeue`` and the script runner's bounded skew drain
+    (t_c15baa4b). ``run_counted``: whether the killed run is already in ``repeat.completed``
+    (True after ``mark_job_run``; False for a run still in flight, which ``mark_job_run`` will
+    count). A job on its final finite repetition is retired by that count (enabled=False,
+    state=completed), so a marker on it would never fire (Prism cd1ea5071578).
+    """
+    if job is None:
+        return "unknown job"
+    if job.get("enabled") is False:
+        return "disabled"  # a paused/retired job's re-fire never runs (Prism 9b45f30f3479)
+    schedule = job.get("schedule")
+    kind = schedule.get("kind") if isinstance(schedule, dict) else None
+    if kind not in {"cron", "interval"}:
+        return "not recurring"
+    if int(job.get(RESTART_REQUEUE_COUNT_KEY) or 0) >= RESTART_REQUEUE_MAX:
+        return "re-fire spent"
+    repeat = job.get("repeat")
+    times = repeat.get("times") if isinstance(repeat, dict) else None
+    if isinstance(times, int) and times > 0:
+        completed = int(repeat.get("completed") or 0) + (0 if run_counted else 1)
+        if completed >= times:
+            return "final repetition"
+    return None
+
+
 def request_restart_requeue(job_id: str, reason: str) -> bool:
     """Persist a one-shot re-fire request for a run killed by a gateway restart.
 
     Returns True when the marker was written. Refuses (False) for unknown or
-    non-recurring jobs, and once ``RESTART_REQUEUE_MAX`` re-fires have been
-    spent without an intervening successful run.
+    non-recurring jobs, a job whose repeat limit the killed run reached, and once
+    ``RESTART_REQUEUE_MAX`` re-fires have been spent without an intervening
+    successful run (``restart_refire_refusal``).
     """
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            schedule = job.get("schedule")
-            kind = schedule.get("kind") if isinstance(schedule, dict) else None
-            if kind not in {"cron", "interval"}:
-                return False
+            refusal = restart_refire_refusal(job, run_counted=True)
             count = int(job.get(RESTART_REQUEUE_COUNT_KEY) or 0)
-            if count >= RESTART_REQUEUE_MAX:
+            if refusal == "re-fire spent":
                 logger.warning(
                     "cron.restart_requeue.refused job='%s' id=%s — already "
                     "re-queued %d time(s) without a successful run",
                     job.get("name", job_id), job_id, count,
                 )
+                return False
+            if refusal is not None:
                 return False
             job[RESTART_REQUEUE_COUNT_KEY] = count + 1
             job[RESTART_REQUEUE_KEY] = {
@@ -4865,6 +4893,12 @@ def _apply_restart_requeue(
         slot = len(fired_this_scan)
         fired_this_scan.append(job.get("id"))
     delay_s = slot * RESTART_REQUEUE_STAGGER_S
+    # Never defer past the job's own next natural occurrence (t_f1302096): the stamp replaces
+    # next_run_at, so slot 26 parked an every-1m job for 2h10m. The stagger only spreads jobs
+    # whose period is longer than their slot delay.
+    natural = _parse_aware(compute_next_run(job.get("schedule") or {}, now.isoformat()) or "")
+    if natural is not None and natural > now:
+        delay_s = min(delay_s, int((natural - now).total_seconds()))
     stamp = (now + timedelta(seconds=delay_s)).isoformat()
     for record in (job, raw):
         if record is not None:
