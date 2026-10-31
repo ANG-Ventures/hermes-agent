@@ -723,11 +723,12 @@ class ScriptRunner:
             # grace is in neither the first snapshot nor the reaped leader's tree (Prism 361a15209668).
             trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
             alive = [t for t in trees if ss._script_tree_alive(t[1], t[2])]
+            kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
             for _key, proc, snap in alive:
-                ss._signal_script_tree(proc, snap, signal.SIGKILL)
+                ss._signal_script_tree(proc, snap, kill_sig)
             alive = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in alive]
             for _key, proc, snap in alive:
-                ss._signal_script_tree(proc, snap, signal.SIGKILL)
+                ss._signal_script_tree(proc, snap, kill_sig)
             deadline = time.monotonic() + _SKEW_CONFIRM_S
             while True:
                 alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
