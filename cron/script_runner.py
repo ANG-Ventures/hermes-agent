@@ -695,14 +695,14 @@ class ScriptRunner:
             # flight. Keep only trees alive on a fresh check (Prism 934ec5f4046f): a zombie-only
             # tree finished on its own and keeps its own result, with no interruption flag.
             trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
-            # An unreadable same-user process (Prism 952be3262777) only withholds a re-fire for a run
-            # cut off here; it never makes a run that already finished on its own count as cut off.
-            # A tree alive ONLY through such a member is not flagged or signalled, but it is still
-            # checked at the end and its re-fire withheld while it runs (Prism dae50bba8939).
+            # A scan marker (an unreadable same-user process, Prism 952be3262777, or a failed token
+            # scan) only withholds a re-fire; it never makes a run that already finished on its own
+            # count as cut off (Prism dae50bba8939). A tree alive ONLY through markers is not flagged
+            # or signalled, but it is still checked at the end and its re-fire withheld.
             cut, unsure = [], []
             for t in trees:
                 if ss._script_tree_alive(t[1], None if t[2] is None else [
-                        m for m in t[2] if not isinstance(m, ss._UnreadableMember)]):
+                        m for m in t[2] if not isinstance(m, ss._SCAN_MARKERS)]):
                     cut.append(t)
                 elif ss._script_tree_alive(t[1], t[2]):
                     unsure.append(t)

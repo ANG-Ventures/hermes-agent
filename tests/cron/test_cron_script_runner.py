@@ -1196,6 +1196,36 @@ def test_d_skew_kill_withholds_a_finished_leaders_unreadable_escapee(root, monke
         leader.wait(timeout=10)
 
 
+def test_d_skew_kill_failed_scan_does_not_flag_a_finished_run_interrupted(root, monkeypatch):
+    """Prism dae50bba8939 (r3): the leader exited (unreaped) and the run-token scan failed, so the
+    tree's only member besides the zombie is an _UnprovenMember. The run finished on its own: it is
+    not flagged interrupted, but its re-fire is withheld because an escapee cannot be ruled out."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        if sys.platform.startswith("linux"):
+            _wait_for(lambda: Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z", 10,
+                      what="leader exited, unreaped")
+        else:
+            time.sleep(1.0)
+        key = sched._inflight_key("zunp", root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", {key})
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        monkeypatch.setattr(ss, "_script_run_token_members", lambda _p: [ss._UnprovenMember()])
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+        assert sched._skew_interrupted_job_ids == set()
+        assert sched._refire_withheld_job_ids == {key}
+        assert sched._restart_killed_job_ids == set()
+    finally:
+        sched.clear_shutdown()
+        leader.wait(timeout=10)
+
+
 def _skew_kill_runner(root, monkeypatch):
     from cron import lanes, script_runner
 
