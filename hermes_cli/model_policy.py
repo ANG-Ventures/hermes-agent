@@ -48,6 +48,46 @@ def banned_worker_model_substrings(
     return normalized or FLAGSHIP_MODEL_SUBSTRINGS
 
 
+def profile_flagship_allowance(
+    assignee: Optional[str],
+    model: Optional[str],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """The standing reason ``kanban.flagship_profile_allowances`` records for
+    ``assignee``'s profile DEFAULT route, or ``None``.
+
+    A per-profile grant written once by the operator in the root config (a
+    file no caller can write through a kanban verb), e.g. Tiresias on Fable
+    per Ace's PRD-astrology-tiresias D1 ruling. It admits only a RESOLVED
+    flagship default: an unresolved route still fails closed, and a pin or
+    lane model is never covered (callers consult it on the profile-default
+    branch only). Every other flagship-default profile stays refused.
+    """
+    if assignee_route_unresolved(model) or not flagship_model_match(model, config):
+        return None
+    if config is None:
+        # The ROOT config (the dispatcher's), never the caller's profile
+        # config: a profile cannot grant its own route.
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            config = _profile_effective_config(get_default_hermes_root() / "config.yaml")
+        except Exception:
+            config = {}
+    kanban = config.get("kanban", {}) if isinstance(config, Mapping) else {}
+    grants = (
+        kanban.get("flagship_profile_allowances")
+        if isinstance(kanban, Mapping)
+        else None
+    )
+    if not isinstance(grants, Mapping):
+        return None
+    name = str(assignee or "").strip()
+    reason = grants.get(name) if name else None
+    reason = str(reason).strip() if isinstance(reason, str) else ""
+    return reason or None
+
+
 def flagship_model_match(
     model: Optional[str],
     config: Optional[Mapping[str, Any]] = None,
@@ -430,6 +470,10 @@ def validate_assignee_route(
     else:
         model = assignee_default_model(assignee)
         if not assignee_route_gated(model, config):
+            return None
+        if profile_flagship_allowance(assignee, model):
+            # Standing operator grant for this profile's default route: no
+            # caller authority and no per-card override comment needed.
             return None
         error = assignee_flagship_error(str(assignee), str(model))
     reason = (allow_flagship_reason or "").strip()
