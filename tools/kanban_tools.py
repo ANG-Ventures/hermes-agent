@@ -772,7 +772,7 @@ def _cap_jsonish(value: Any, limit: int) -> Any:
     return value if len(text) <= limit else _cap_text(text, limit)
 
 
-def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
+def _latest_review(runs: list, events: list) -> Optional[dict[str, Any]]:
     """The newest ``changes_requested`` run, in full, with its reviewer and whether a later handback
     already answered it. Rendered FIRST so it never sits behind the card's history."""
     reviewed = [r for r in runs if r.outcome == "changes_requested"]
@@ -780,7 +780,7 @@ def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
         return None
     run = reviewed[-1]
     reviewer = None
-    for event in reversed(kb.list_events(conn, tid)):
+    for event in reversed(events):  # board + archived events (t_3be5b45f)
         if event.kind == "changes_requested" and event.run_id == run.id:
             reviewer = (event.payload or {}).get("reviewer") if isinstance(event.payload, dict) else None
             break
@@ -821,8 +821,11 @@ def _handle_show(args: dict, **kw) -> str:
         runs = kb.list_runs(conn, tid)
         comments = kb.list_comments(conn, tid)
         events = kb.list_events(conn, tid)
+        # Rows of an old terminal card may live in <board>/kanban-archive.db (t_3be5b45f).
+        from hermes_cli import kanban_archive_read as kar
+        comments, runs, events = kar.fill(kb, conn, task, comments, runs, events)
         out: dict[str, Any] = {
-            "latest_review": _latest_review(kb, conn, tid, runs),
+            "latest_review": _latest_review(runs, events),
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
