@@ -4893,6 +4893,12 @@ def _apply_restart_requeue(
         slot = len(fired_this_scan)
         fired_this_scan.append(job.get("id"))
     delay_s = slot * RESTART_REQUEUE_STAGGER_S
+    # Never defer past the job's own next natural occurrence (t_f1302096): the stamp replaces
+    # next_run_at, so slot 26 parked an every-1m job for 2h10m. The stagger only spreads jobs
+    # whose period is longer than their slot delay.
+    natural = _parse_aware(compute_next_run(job.get("schedule") or {}, now.isoformat()) or "")
+    if natural is not None and natural > now:
+        delay_s = min(delay_s, int((natural - now).total_seconds()))
     stamp = (now + timedelta(seconds=delay_s)).isoformat()
     for record in (job, raw):
         if record is not None:
