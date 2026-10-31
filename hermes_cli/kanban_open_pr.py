@@ -406,7 +406,8 @@ def sha_on_default(repo: str, sha: str) -> Optional[bool]:
     """True iff ``sha`` is reachable from ``repo``'s default branch; None when GitHub cannot tell."""
     def _get(path):
         try:
-            proc = subprocess.run(["gh", "api", path], capture_output=True, text=True, encoding="utf-8",
+            # Same host as the PR reads (Prism fe268dfe02ca): a GH_HOST env must not move the ancestry proof.
+            proc = subprocess.run(["gh", "api", "--hostname", "github.com", path], capture_output=True, text=True, encoding="utf-8",
                                   errors="replace", timeout=QUERY_TIMEOUT_SECONDS, check=False)
         except (OSError, subprocess.SubprocessError, TimeoutError):
             return None, False
@@ -828,7 +829,7 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
 #   2. one of its own PRs merged, merge commit on the default branch. "Own" = a PR its runs declared
 #      (:func:`authored_pr_refs`, never survivor evidence) whose head branch names no OTHER card;
 #   3. the closed PR's own GitHub thread carries ``CLOSED: SUPERSEDED-BY <that PR>``;
-#   4. the two PRs' changed files intersect.
+#   4. both PRs are in the same repo and their changed files (verbatim paths) intersect.
 # Anything unreadable refuses (the ordinary closed-unmerged refusal stands).
 CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
 _SUPERSEDED_LINE_RE = re.compile(r"^\s*CLOSED: SUPERSEDED-BY\s+(" + _TARGET + r")\b", re.MULTILINE)
@@ -843,12 +844,14 @@ def superseding_card(superseded_by: Optional[str]) -> Optional[str]:
 
 
 def pr_files(repo: str, number: int) -> Optional[set]:
-    """Paths a PR changes (new and previous names); None when GitHub cannot be read."""
+    """Paths a PR changes (new and previous names), each kept VERBATIM; None when GitHub cannot be read.
+    One JSON array per page (Prism 340172f6f023): a line split would strip ``a.py `` into ``a.py`` and
+    split a path holding a newline in two."""
     try:
         proc = subprocess.run(
             ["gh", "api", "--hostname", "github.com", "--paginate",
              f"repos/{repo}/pulls/{number}/files?per_page=100",
-             "--jq", ".[] | .filename, (.previous_filename // empty)"],
+             "--jq", "[.[] | .filename, (.previous_filename // empty)]"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=QUERY_TIMEOUT_SECONDS, check=False,
         )
@@ -856,7 +859,20 @@ def pr_files(repo: str, number: int) -> Optional[set]:
         return None
     if proc.returncode != 0:
         return None
-    return {line.strip() for line in (proc.stdout or "").splitlines() if line.strip()}
+    out: set = set()
+    text, pos, dec = proc.stdout or "", 0, json.JSONDecoder()
+    while True:
+        while pos < len(text) and text[pos] in " \t\r\n":
+            pos += 1
+        if pos >= len(text):
+            return out
+        try:
+            page, pos = dec.raw_decode(text, pos)
+        except ValueError:
+            return None
+        if not isinstance(page, list) or not all(isinstance(p, str) and p for p in page):
+            return None
+        out.update(page)
 
 
 def pr_superseded_targets(repo: str, number: int) -> Optional[list]:
@@ -924,6 +940,10 @@ def card_supersession(closed, *, card: str, card_status: Optional[str], card_prs
             return []
         sup = None
         for s in hits:
+            # Rule 4 compares paths, which only mean the same file inside ONE repo: a cross-repo
+            # superseder never covers (README.md in repo A is not README.md in repo B).
+            if s.repo.lower() != c.repo.lower():
+                continue
             try:
                 theirs = files_fn(s.repo, s.number)
             except Exception as exc:

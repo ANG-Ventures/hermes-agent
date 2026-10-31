@@ -220,3 +220,64 @@ def test_authored_pr_refs_drops_survivor_evidence_only():
     assert op.authored_pr_refs(md) == ["o/r#1", "o/r#2"]
     assert set(op.recorded_pr_refs(md)) == {"o/r#1", "o/r#2", "o/r#3", "o/r#4"}
     assert op.authored_pr_refs(None) == []
+
+
+def _fake_gh(pages_by_number):
+    """subprocess.run stand-in for `gh api --paginate .../pulls/N/files --jq <expr>`: emits what gh would
+    print for that jq expr, one array per page for the array form, one path per line for the `.[] |` form."""
+    import subprocess as sp
+
+    def run(argv, **kw):
+        n = int(next(a for a in argv if "/pulls/" in a).split("/pulls/")[1].split("/")[0])
+        jq = argv[argv.index("--jq") + 1]
+        pages = pages_by_number.get(n, [])
+        import json as _j
+        out = "".join(_j.dumps(p) + "\n" for p in pages) if jq.startswith("[") else \
+            "".join(p + "\n" for page in pages for p in page)
+        return sp.CompletedProcess(argv, 0, stdout=out, stderr="")
+    return run
+
+
+def test_trailing_space_twin_path_is_a_different_file_and_refuses(board, monkeypatch):
+    """Prism 340172f6f023: `src/runner.py ` and `src/runner.py` are two files; pr_files keeps both verbatim."""
+    _stub(monkeypatch)
+    gh = _fake_gh({350: [["src/runner.py "]], 351: [["src/runner.py"]], 7: [["a.sh", "old/a.sh"], ["b c.sh"]]})
+
+    def files(repo, n):  # the real pr_files, with only its own gh call faked
+        with monkeypatch.context() as m:
+            m.setattr(op.subprocess, "run", gh)
+            return op.pr_files(repo, n)
+    assert files(REPO, 350) == {"src/runner.py "}
+    assert files(REPO, 7) == {"a.sh", "old/a.sh", "b c.sh"}  # every page, verbatim
+    monkeypatch.setattr(op, "_default_files", lambda: files)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        _refused(conn, tid, run, sup)
+
+
+def test_cross_repo_superseder_with_identical_paths_refuses(board, monkeypatch):
+    """Rule 4 is same-repo only: README.md in another repo is not this PR's README.md."""
+    other = "ANG-Ventures/hermes-home"
+    _stub(monkeypatch, record=f"CLOSED: SUPERSEDED-BY {other}#351", files={350: {SHARED}, 351: {SHARED}})
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?",
+                     ('{"pr_url": "https://github.com/%s/pull/351"}' % other, sup))
+        conn.commit()
+        _refused(conn, tid, run, sup)
+
+
+def test_sha_on_default_reads_github_com_like_the_pr_reads(monkeypatch):
+    """Prism fe268dfe02ca: with GH_HOST set, the ancestry proof must not come from another host."""
+    import json as _j
+    import subprocess as sp
+    seen = []
+
+    def run(argv, **kw):
+        seen.append(argv)
+        out = {"default_branch": "main"} if argv[-1].endswith("/r") else {"status": "behind"}
+        return sp.CompletedProcess(argv, 0, stdout=_j.dumps(out), stderr="")
+    monkeypatch.setenv("GH_HOST", "ghe.example")
+    monkeypatch.setattr(op.subprocess, "run", run)
+    assert op.sha_on_default("o/r", MERGE_SHA) is True
+    assert len(seen) == 2 and all(a[:4] == ["gh", "api", "--hostname", "github.com"] for a in seen)
