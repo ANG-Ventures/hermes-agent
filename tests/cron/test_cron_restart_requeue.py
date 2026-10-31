@@ -349,3 +349,30 @@ def test_requeues_in_one_scan_are_staggered(env, monkeypatch):
     at_slot = later + timedelta(seconds=1)
     monkeypatch.setattr(cj, "_hermes_now", lambda: at_slot)
     assert pending in {j["id"] for j in cj.get_due_jobs()}, "staggered re-fire lost"
+
+
+def test_stagger_never_defers_past_the_jobs_own_cadence(env, monkeypatch):
+    """t_f1302096: slot 26 parked an every-1m job (prism-container-status) 7800 s, holding a
+    resolved page open for 2h. A re-fire is due no later than the job's next natural occurrence;
+    long-cadence jobs keep the full slot * STAGGER spread."""
+    from datetime import datetime
+    from cron import jobs as cj
+
+    daily = [_make_named_job(f"heavy-{i}") for i in range(29)]
+    fast = cj.create_job(prompt=None, schedule="every 1m", name="prism-container-status",
+                         script="long.sh", no_agent=True, deliver="local")
+    killed = daily + [cj.get_job(fast["id"])]
+    for job in killed:
+        assert cj.request_restart_requeue(job["id"], "restart") is True
+
+    t0 = cj._hermes_now()
+    monkeypatch.setattr(cj, "_hermes_now", lambda: t0)
+    cj.get_due_jobs()
+    fire = {j["id"]: datetime.fromisoformat(cj.get_job(j["id"])["next_run_at"]) for j in killed}
+    row = cj.get_job(fast["id"])
+    assert row["next_run_at"] == row["manual_run_at"], "run-now shape kept"
+    assert (fire[fast["id"]] - t0).total_seconds() <= 60, "every-1m job parked past its cadence"
+    # The daily jobs keep the anti-stampede spread: distinct slots, STAGGER apart.
+    delays = sorted((fire[j["id"]] - t0).total_seconds() for j in daily)
+    assert len(set(delays)) == len(daily)
+    assert all(b - a >= cj.RESTART_REQUEUE_STAGGER_S for a, b in zip(delays, delays[1:]))
