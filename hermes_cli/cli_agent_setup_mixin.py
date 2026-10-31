@@ -246,7 +246,8 @@ def _bind_route_known(cli) -> None:
 
     The CLI twin of the gateway's SessionEntry sink: every /model retires and rebuilds the agent,
     and a fresh ``Known`` would make the next note compare against the new pin (a switch reads as
-    "fell back", or as nothing). Held per session id, so /new and /resume start from no baseline."""
+    "fell back", or as nothing). Held per session id, so /new and /resume start from no baseline;
+    they keep the live agent, so they call this again after repointing ``agent.session_id``."""
     from agent.route_identity import seed_known
     agent = cli.agent
     held = getattr(cli, "_route_known_held", None)

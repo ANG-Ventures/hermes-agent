@@ -553,6 +553,8 @@ class CLISessionMixin:
 
         if self.agent:
             self.agent.session_id = self.session_id
+            from hermes_cli.cli_agent_setup_mixin import _bind_route_known
+            _bind_route_known(self)  # the kept agent must not compare against the ended conversation
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
             self.agent.reset_session_state()
