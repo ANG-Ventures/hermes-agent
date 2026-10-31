@@ -25,7 +25,7 @@ def _worker_board(tmp_path, monkeypatch):
         kb.claim_task(conn, tid)
     task = kb.get_task(conn, own)
     for key, value in {
-        "HERMES_KANBAN_DB": str(db), "HERMES_KANBAN_BOARD": "default",
+        "HERMES_KANBAN_DB": str(db),
         "HERMES_KANBAN_TASK": own, "HERMES_KANBAN_RUN_ID": str(task.current_run_id),
         "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock, "HOME": str(tmp_path),
     }.items():
@@ -79,7 +79,7 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
         row = json.loads(next(line.split("SCOPE_RESULT=", 1)[1] for line in output.splitlines() if "SCOPE_RESULT=" in line))
         assert row["show"]["task"]["id"] == own, row
         assert not row["owner"] and row["default"] is None, row
-        assert row["db"] == str(tmp_path / "assigned.db") and row["board"] == "default"
+        assert row["db"] == str(tmp_path / "assigned.db") and row["board"] is None  # S7: no slug env
         assert all("error" in value for value in row["tools"]), row
         assert row["later_cli"]["rc"] != 0, row
     assert [kb.get_task(conn, t).status for t in (own, foreign)] == ["running", "running"]

@@ -11,20 +11,21 @@
 5. otherwise :func:`bare_verb_policy`: ``refuse`` -> :class:`BoardRequired`, whose text names the
    next command; ``default`` -> ``DEFAULT_BOARD``.
 
-Gated (S7 C1a): ``kanban.bare_verb`` in the ROOT config.yaml. Absent == ``legacy``: the pre-S7
-resolution (``--board`` > ``HERMES_KANBAN_BOARD`` > ``kanban/current`` > ``default``) is untouched
-and this module only serves ``hermes kanban locate``. ``refuse`` / ``default`` turn S7 on. C1b
-flips the absent value to ``refuse`` and deletes ``legacy`` with the pointer.
+Kill switch (S7 D7): ``kanban.bare_verb`` in the ROOT config.yaml, ``refuse`` (absent) or
+``default``. ``default`` turns step 5 into ``DEFAULT_BOARD``; it never resurrects a current-board
+file or env var, and never relaxes step 1's pin check.
 """
 from __future__ import annotations
 
 import argparse
 from typing import Iterable, Optional
 
-BARE_VERB_LEGACY = "legacy"
 BARE_VERB_REFUSE = "refuse"
 BARE_VERB_DEFAULT = "default"
 _POLICIES = frozenset({BARE_VERB_REFUSE, BARE_VERB_DEFAULT})
+# What an absent / unreadable / unknown ``kanban.bare_verb`` means. ``refuse`` is the shipped
+# answer (S7 D7); the test suite's legacy tests run under ``default`` until C1c rewrites them.
+ABSENT_POLICY = BARE_VERB_REFUSE
 
 # Verbs that address no single board: they sweep every board, or touch none.
 BOARD_AGNOSTIC_VERBS = frozenset({
@@ -45,8 +46,8 @@ class BoardNotFound(ValueError):
 def bare_verb_policy() -> str:
     """``kanban.bare_verb`` from the ROOT ``config.yaml`` (``kanban_home()``), never a profile's.
 
-    ``refuse`` / ``default`` (S7 D7) or ``legacy`` (absent, unreadable, anything else). Cached on
-    the file's (mtime, size): ``get_current_board`` asks on every call.
+    ``default`` only when set to exactly that; anything else (absent, unreadable, a typo) is
+    ``refuse``. Cached on the file's (mtime, size).
     """
     from hermes_cli import kanban_db as kb
 
@@ -55,7 +56,7 @@ def bare_verb_policy() -> str:
         st = path.stat()
         stamp: Optional[tuple[int, int]] = (st.st_mtime_ns, st.st_size)
     except OSError:
-        return BARE_VERB_LEGACY
+        return ABSENT_POLICY
     cached = _POLICY_CACHE.get(str(path))
     if cached is not None and cached[0] == stamp:
         return cached[1]
@@ -67,14 +68,9 @@ def bare_verb_policy() -> str:
         value = str((kanban or {}).get("bare_verb") or "").strip().lower() if isinstance(kanban, dict) else ""
     except Exception:
         value = ""
-    policy = value if value in _POLICIES else BARE_VERB_LEGACY
+    policy = value if value in _POLICIES else ABSENT_POLICY
     _POLICY_CACHE[str(path)] = (stamp, policy)
     return policy
-
-
-def s7_enabled() -> bool:
-    """True when the S7 resolver replaces the pointer (``kanban.bare_verb`` set)."""
-    return bare_verb_policy() != BARE_VERB_LEGACY
 
 
 def refusal_text(verb: str) -> str:
@@ -110,16 +106,32 @@ def _check_explicit(slug: str) -> str:
     return slug
 
 
+def resolve_selector(raw: Optional[str]) -> Optional[str]:
+    """Normalise a caller's board selector; ``None`` when it names no board (omitted, ``""`` or
+    whitespace), which every surface treats exactly as omitted. Normalise FIRST, then test for
+    blank (Prism b68acd4edf81: ``?board=%20`` checked as non-blank, then normalised to ``None``).
+    Raises ``ValueError`` for a malformed slug, :class:`BoardNotFound` for the reserved pin
+    sentinel (Prism 39b758962810). Existence is the caller's check."""
+    from hermes_cli import kanban_db as kb
+
+    if raw is None:
+        return None
+    if str(raw).strip().lower() == kb.PINNED_SLUG:
+        raise BoardNotFound(
+            f"kanban: board {raw!r} does not exist: {kb.PINNED_SLUG!r} is reserved for a "
+            f"HERMES_KANBAN_DB pin that names no board and is never a board name. "
+            f"Pass the board's real slug (boards: hermes kanban boards list).")
+    return kb._normalize_board_slug(raw)
+
+
 def resolve_slug(board: Optional[str], *, verb: str, card_ids: Iterable[str] = ()) -> str:
     """The board slug for one verb. Raises :class:`BoardRequired`, :class:`BoardNotFound`,
     ``ValueError``, ``KanbanBoardDerivationError`` or ``KanbanPinDivergenceError``, each naming
     the next command."""
     from hermes_cli import kanban_db as kb
 
-    if board is not None:
-        normed = kb._normalize_board_slug(board)
-        if not normed:
-            raise ValueError("kanban: --board requires a slug")
+    normed = resolve_selector(board)
+    if normed is not None:
         return _check_explicit(normed)
     pinned = kb.pinned_board()
     if pinned:
@@ -167,8 +179,17 @@ def card_ids_of(args: argparse.Namespace) -> list[str]:
 def resolve(args: argparse.Namespace) -> Optional[str]:
     """The board for a parsed ``hermes kanban`` invocation; ``None`` for board-agnostic verbs."""
     verb = getattr(args, "kanban_action", None) or ""
-    if verb in BOARD_AGNOSTIC_VERBS and getattr(args, "board", None) is None:
+    board = resolve_selector(getattr(args, "board", None))  # blank --board == omitted
+    if verb in BOARD_AGNOSTIC_VERBS and board is None:
         return None
     if verb == "notify-repair" and getattr(args, "all_boards", False):
         return None
-    return resolve_slug(getattr(args, "board", None), verb=verb, card_ids=card_ids_of(args))
+    if verb == "boards" and board is None:
+        # `boards list|show` with no --board report the pin's board, else no board (they
+        # enumerate); never a bare-verb refusal (Prism 7b28513d644d).
+        from hermes_cli import kanban_db as kb
+
+        if not kb.pinned_board():
+            return None
+        verb = f"boards {getattr(args, 'boards_action', None) or 'list'}"
+    return resolve_slug(board, verb=verb, card_ids=card_ids_of(args))

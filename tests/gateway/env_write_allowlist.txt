@@ -21,12 +21,6 @@ gateway/run.py::_ensure_windows_gateway_venv_imports::set 'PYTHONPATH'  # (b): w
 gateway/run.py::main::setdefault 'AI_AGENT'  # (b): popped from every cron script child env (cron/scheduler_script.py, t_7fee0f83)
 gateway/run.py::main::setdefault 'HERMES_AGENT'  # (b): popped from every cron script child env (cron/scheduler_script.py, t_7fee0f83)
 gateway/session_context.py::set_current_session_id::set 'HERMES_SESSION_ID'  # (b): guarded by _HERMES_GATEWAY != 1, so never written in a gateway; per-turn, not start-path
-gateway/kanban_watchers.py::GatewayKanbanWatchersMixin._run_kanban_dispatcher._auto_decompose_tick::set 'HERMES_KANBAN_BOARD'  # (b): transient board pin around one kanban auto-decompose call, restored in finally; runtime, not start-path
-gateway/kanban_watchers.py::GatewayKanbanWatchersMixin._run_kanban_dispatcher._auto_decompose_tick::pop 'HERMES_KANBAN_BOARD'  # (b): the restore of the pin above
-gateway/kanban_watchers.py::GatewayKanbanWatchersMixin._run_kanban_dispatcher._auto_decompose_tick::set 'HERMES_KANBAN_BOARD'  # (b): the restore of the pin above
-gateway/kanban_watchers_dispatcher.py::_KanbanDispatcher.auto_decompose_tick::set 'HERMES_KANBAN_BOARD'  # (b): transient board pin around one kanban auto-decompose call, restored in finally; runtime, not start-path
-gateway/kanban_watchers_dispatcher.py::_KanbanDispatcher.auto_decompose_tick::pop 'HERMES_KANBAN_BOARD'  # (b): the restore of the pin above
-gateway/kanban_watchers_dispatcher.py::_KanbanDispatcher.auto_decompose_tick::set 'HERMES_KANBAN_BOARD'  # (b): the restore of the pin above
 gateway/platforms/yuanbao.py::AutoSetHomeMiddleware._persist_home::set 'YUANBAO_HOME_CHANNEL'  # (b): written on an inbound Yuanbao message (live adapter); the runner has no adapters
 gateway/relay/__init__.py::self_provision_relay::set 'GATEWAY_RELAY_ID'  # (b): relay self-provisioning at adapter start; GATEWAY_RELAY_* are scrubbed from children
 gateway/relay/__init__.py::self_provision_relay::set 'GATEWAY_RELAY_SECRET'  # (b): relay self-provisioning at adapter start; GATEWAY_RELAY_* are scrubbed from children

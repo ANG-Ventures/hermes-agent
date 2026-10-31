@@ -2,48 +2,27 @@
 
 Regression for #107955 / #57837: the tick runs off-turn in a fresh Context, so
 ``get_secret`` fails closed unless the tick installs the launch profile's scope.
+Drives the gateway's real ``_auto_decompose_tick`` closure (the only copy since S7 D4
+deleted the dead ``_KanbanDispatcher.auto_decompose_tick``).
 """
 
 from __future__ import annotations
 
-import asyncio
-import sys
-from types import SimpleNamespace
+import pytest
 
 from agent import secret_scope as ss
-from gateway import kanban_watchers_dispatcher as kwd
-from gateway.kanban_watchers_common import _to_thread_process_service
+
+from tests.gateway.test_kanban_auto_decompose_board_scope import _one_decompose_iteration, loop  # noqa: F401
 
 
-def _dispatcher():
-    settings = kwd._DispatcherSettings(60.0, None, None, 2, 0, True, None, None)
-    return kwd._KanbanDispatcher(SimpleNamespace(DEFAULT_BOARD="default"), settings)
-
-
-def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkeypatch, tmp_path):
-    import hermes_cli
-
-    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=launch-profile-key\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(kwd, "_board_slugs", lambda kb: ["default"])
-
-    seen = {}
-
-    def fake_decompose(task_id, author=None):
-        seen["value"] = ss.get_secret("ANTHROPIC_API_KEY")
-        return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
-
-    fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
-    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_decompose", fake)
-    monkeypatch.setattr(hermes_cli, "kanban_decompose", fake, raising=False)
-
+@pytest.mark.asyncio
+async def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(loop):  # noqa: F811
+    (loop.home / ".env").write_text("ANTHROPIC_API_KEY=launch-profile-key\n", encoding="utf-8")
     ss.set_multiplex_active(True)
     try:
-        # Same hop the gateway uses: fresh Context, no inherited per-turn scope.
-        decomposed = asyncio.run(_to_thread_process_service(_dispatcher().auto_decompose_tick, 5))
+        await _one_decompose_iteration(loop)
     finally:
         ss.set_multiplex_active(False)
 
-    assert decomposed == 1
-    assert seen["value"] == "launch-profile-key"
+    assert loop.seen["secret"] == "launch-profile-key"
     assert ss.current_secret_scope() is None

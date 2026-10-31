@@ -204,7 +204,6 @@ export interface TaskEstimate {
 }
 export interface BoardsResponse {
   boards: BoardMeta[]
-  current: string
 }
 
 /** GET /tasks/:id/log — the worker's stdout/stderr tail. */

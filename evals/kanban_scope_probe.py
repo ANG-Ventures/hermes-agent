@@ -28,7 +28,7 @@ own, foreign = [kb.create_task(conn, title=x) for x in ("owner", "foreign")]
 for t in (own, foreign):
     kb.claim_task(conn, t)
 task = kb.get_task(conn, own)
-os.environ.update({"HERMES_KANBAN_DB": str(db), "HERMES_KANBAN_BOARD": "default", "HERMES_KANBAN_TASK": own, "HERMES_KANBAN_RUN_ID": str(task.current_run_id), "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock})
+os.environ.update({"HERMES_KANBAN_DB": str(db), "HERMES_KANBAN_TASK": own, "HERMES_KANBAN_RUN_ID": str(task.current_run_id), "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock})
 ch = home / "codex"
 ch.mkdir()
 (ch / "config.toml").write_text(

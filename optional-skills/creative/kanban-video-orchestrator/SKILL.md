@@ -115,8 +115,8 @@ for the setup script structure, profile config patterns, and the critical
 Run `setup.sh`. Then provide the user with monitoring commands:
 
 ```bash
-hermes kanban watch --tenant <project-tenant>     # live events
-hermes kanban list  --tenant <project-tenant>     # board snapshot
+hermes kanban --board <board> watch --tenant <project-tenant>  # live events
+hermes kanban --board <board> list  --tenant <project-tenant>  # board snapshot
 hermes dashboard                                   # visual board UI
 ```
 

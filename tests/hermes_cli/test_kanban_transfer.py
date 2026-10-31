@@ -299,11 +299,11 @@ def test_explicit_slug_is_honoured(kanban_root, tmp_path):
     archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
 
     kanban_root("target")
-    result = kt.import_board(archive, "renamed-board", activate=True)
+    result = kt.import_board(archive, "renamed-board")
 
     assert result["board"] == "renamed-board"
     assert result["renamed"] is False
-    assert kb.get_current_board() == "renamed-board"
+    assert kb.get_current_board() == kb.DEFAULT_BOARD  # an import never selects a board (S7)
 
 
 # ---------------------------------------------------------------------------

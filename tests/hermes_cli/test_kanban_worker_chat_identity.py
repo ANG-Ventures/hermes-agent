@@ -61,6 +61,7 @@ def _capture_spawn_env(monkeypatch, tmp_path) -> dict[str, str]:
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    kb.create_board("identity-board")
 
     assert kbd._default_spawn(_task(), str(workspace), board="identity-board") == 4242
     return captured["env"]  # type: ignore[return-value]
@@ -141,9 +142,9 @@ def test_dispatcher_env_reaches_chat_q_agent_identity(monkeypatch, tmp_path):
     """The real dispatcher env must identify the agent built by ``chat -q``."""
     env = _capture_spawn_env(monkeypatch, tmp_path)
     assert env["HERMES_KANBAN_TASK"] == "t_identity"
-    assert env["HERMES_KANBAN_BOARD"] == "identity-board"
+    assert "HERMES_KANBAN_BOARD" not in env  # S7: the board is derived from the DB pin
     monkeypatch.setenv("HERMES_KANBAN_TASK", env["HERMES_KANBAN_TASK"])
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", env["HERMES_KANBAN_BOARD"])
+    monkeypatch.setenv("HERMES_KANBAN_DB", env["HERMES_KANBAN_DB"])
 
     import cli as cli_mod
     from agent import credits_tracker
@@ -167,3 +168,190 @@ def test_dispatcher_env_reaches_chat_q_agent_identity(monkeypatch, tmp_path):
     assert _fake_cli()._init_agent() is True
     assert captured["chat_id"] == "t_identity"
     assert captured["chat_name"] == "kanban / identity-board / t_identity"
+
+
+def test_foreign_root_env_names_its_own_board(monkeypatch, tmp_path):
+    """Prism f984ec16d458: an ``env`` describing a worker under ANOTHER Hermes root resolves its
+    pin against THAT root's board registry, never the process root's."""
+    from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
+    a_root = tmp_path / "a" / ".hermes"
+    b_root = tmp_path / "b" / ".hermes"
+    for root in (a_root, b_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(b_root))
+    kb.create_board("beta")  # board beta exists ONLY under root b
+    beta_db = b_root / "kanban" / "boards" / "beta" / "kanban.db"
+    assert beta_db.parent.is_dir()
+    monkeypatch.setenv("HERMES_HOME", str(a_root))  # the process root is a
+
+    env = {
+        "HOME": str(tmp_path / "b"),
+        "HERMES_HOME": str(b_root),
+        "HERMES_KANBAN_TASK": "t_12345678",
+        "HERMES_KANBAN_DB": str(beta_db),
+    }
+    chat_id, chat_name = resolve_kanban_worker_chat_identity(env=env)
+    assert chat_id == "t_12345678"
+    assert chat_name == "kanban / beta / t_12345678"
+
+
+def test_foreign_env_tilde_kanban_home_expands_against_env_home(monkeypatch, tmp_path):
+    """Prism 9342cb794d7b: a described env's ``HERMES_KANBAN_HOME=~/.hermes`` expands against
+    THAT env's ``HOME``, never the process HOME, so its pin resolves in its own registry."""
+    from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
+    operator_home = tmp_path / "operator"
+    worker_home = tmp_path / "worker"
+    worker_root = worker_home / ".hermes"
+    operator_root = operator_home / ".hermes"
+    for root in (operator_root, worker_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HOME", str(worker_home))
+    monkeypatch.setenv("HERMES_HOME", str(worker_root))
+    kb.create_board("alpha")  # board alpha exists ONLY under the worker's root
+    alpha_db = worker_root / "kanban" / "boards" / "alpha" / "kanban.db"
+    assert alpha_db.parent.is_dir()
+    monkeypatch.setenv("HOME", str(operator_home))  # the process HOME is the operator's
+    monkeypatch.setenv("HERMES_HOME", str(operator_root))
+
+    env = {
+        "HOME": str(worker_home),
+        "HERMES_KANBAN_HOME": "~/.hermes",
+        "HERMES_KANBAN_DB": str(alpha_db),
+        "HERMES_KANBAN_TASK": "t_example",
+    }
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
+
+
+def test_foreign_env_tilde_hermes_home_expands_against_env_home(monkeypatch, tmp_path):
+    """Prism ba00e8f88abd: a described env's ``HERMES_HOME=~/.hermes`` (no KANBAN_HOME) expands
+    against THAT env's ``HOME`` too: every env-described path goes through ``_env_path``."""
+    from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
+    operator_home = tmp_path / "operator"
+    worker_home = tmp_path / "worker"
+    worker_root = worker_home / ".hermes"
+    operator_root = operator_home / ".hermes"
+    for root in (operator_root, worker_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HOME", str(worker_home))
+    monkeypatch.setenv("HERMES_HOME", str(worker_root))
+    kb.create_board("alpha")  # board alpha exists ONLY under the worker's root
+    alpha_db = worker_root / "kanban" / "boards" / "alpha" / "kanban.db"
+    assert alpha_db.parent.is_dir()
+    monkeypatch.setenv("HOME", str(operator_home))  # the process HOME is the operator's
+    monkeypatch.setenv("HERMES_HOME", str(operator_root))
+
+    env = {
+        "HOME": str(worker_home),
+        "HERMES_HOME": "~/.hermes",
+        "HERMES_KANBAN_DB": str(alpha_db),
+        "HERMES_KANBAN_TASK": "t_example",
+    }
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
+
+
+def test_foreign_env_home_alone_names_its_own_root(monkeypatch, tmp_path):
+    """Prism 03487e108873: an env whose ``HOME`` differs from this process's, naming neither
+    ``HERMES_KANBAN_HOME`` nor ``HERMES_HOME``, describes ``<env HOME>/.hermes``, never this
+    process's root."""
+    from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
+    operator_home = tmp_path / "operator"
+    worker_home = tmp_path / "worker"
+    worker_root = worker_home / ".hermes"
+    operator_root = operator_home / ".hermes"
+    for root in (operator_root, worker_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HOME", str(worker_home))
+    monkeypatch.setenv("HERMES_HOME", str(worker_root))
+    kb.create_board("alpha")  # board alpha exists ONLY under the worker's root
+    alpha_db = worker_root / "kanban" / "boards" / "alpha" / "kanban.db"
+    assert alpha_db.parent.is_dir()
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.setenv("HERMES_HOME", str(operator_root))
+
+    env = {"HOME": str(worker_home), "HERMES_KANBAN_DB": str(alpha_db),
+           "HERMES_KANBAN_TASK": "t_example"}
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
+    # An env whose HOME IS this process's still means this process's root.
+    from hermes_cli.kanban_identity import _env_kanban_root
+
+    assert _env_kanban_root({"HOME": str(operator_home)}) is None
+    assert _env_kanban_root({}) is None
+
+
+def test_kanban_identity_expands_user_paths_only_in_env_path():
+    """Prism ba00e8f88abd as a RULE (operator-requested source contract): the only ``expanduser``
+    in kanban_identity is ``_env_path``'s no-HOME fallback, so a new env-described path cannot
+    expand ``~`` against the process."""
+    import ast
+    import inspect
+
+    from hermes_cli import kanban_identity
+
+    tree = ast.parse(inspect.getsource(kanban_identity))
+    owners = [fn.name for fn in ast.walk(tree)
+              if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+              for node in ast.walk(fn)
+              if isinstance(node, ast.Attribute) and node.attr == "expanduser"]
+    assert owners and set(owners) == {"_env_path"}, owners
+
+
+def test_env_suffix_on_our_home_names_the_suffixed_root(monkeypatch, tmp_path):
+    """Prism 976039e81f74: an env sharing this process's ``HOME`` but carrying a different
+    ``HERMES_DATA_DIR_SUFFIX`` describes ``<HOME>/.hermes<suffix>``, never the process root."""
+    from hermes_cli.kanban_identity import _env_kanban_root, resolve_kanban_worker_chat_identity
+
+    home = tmp_path / "alice"
+    ci_root = home / ".hermes-ci"
+    ci_root.mkdir(parents=True)
+    ci_root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_DATA_DIR_SUFFIX", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(ci_root))
+    kb.create_board("beta")  # board beta exists ONLY under the suffixed root
+    beta_db = ci_root / "kanban" / "boards" / "beta" / "kanban.db"
+    assert beta_db.parent.is_dir()
+    monkeypatch.delenv("HERMES_HOME")  # the process root is now <home>/.hermes
+
+    env = {"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": "-ci",
+           "HERMES_KANBAN_DB": str(beta_db), "HERMES_KANBAN_TASK": "t_example"}
+    assert _env_kanban_root(env) == home / ".hermes-ci"
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / beta / t_example")
+    # Same HOME and same (empty) suffix still means this process's root.
+    assert _env_kanban_root({"HOME": str(home)}) is None
+    assert _env_kanban_root({"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": ""}) is None
+
+
+def test_env_without_root_vars_inherits_the_process_suffix(monkeypatch, tmp_path):
+    """Prism 976039e81f74 (round 2): an absent key inherits the process value, never ``""``. With a
+    process suffix, a mapping naming no root-selection variable is the process root (``None``); a
+    mapping that sets the suffix explicitly still names its own root."""
+    from hermes_cli.kanban_identity import _env_kanban_root
+
+    home = tmp_path / "alice"
+    home.mkdir()
+    for var in ("HERMES_KANBAN_HOME", "HERMES_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_DATA_DIR_SUFFIX", "-ci")
+    assert _env_kanban_root({}) is None
+    assert _env_kanban_root({"HOME": str(home)}) is None
+    assert _env_kanban_root({"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": ""}) == home / ".hermes"
+    assert _env_kanban_root({"HERMES_DATA_DIR_SUFFIX": "-qa"}) == home / ".hermes-qa"

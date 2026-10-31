@@ -26,13 +26,68 @@ def resolve_kanban_worker_chat_identity(
     """Return ``(chat_id, chat_name)`` from the worker's pinned environment."""
     source = os.environ if env is None else env
     task_id = (source.get("HERMES_KANBAN_TASK") or "").strip()
-    board = (source.get("HERMES_KANBAN_BOARD") or "").strip()
+    board = ""
+    if task_id:
+        # S7: the board is derived from the DB pin, never read from a slug env var.
+        pin = (source.get("HERMES_KANBAN_DB") or "").strip()
+        if pin:
+            from hermes_cli.kanban_db_board_registry import board_named_by_pin
+
+            if env is None:
+                board = board_named_by_pin(pin)
+            else:
+                board = board_named_by_pin(str(_env_path(source, pin)), home=_env_kanban_root(source))
     chat_name = (
         " / ".join(part for part in ("kanban", board, task_id) if part)
         if task_id
         else ""
     )
     return task_id, chat_name
+
+
+def _env_path(env: Mapping[str, str], raw: str):
+    """``raw`` (a path a described env carries) with a leading ``~`` expanded against THAT env's
+    ``HOME``, never this process's (Prism 9342cb794d7b, ba00e8f88abd). The ONE expansion every
+    env-described path in this module goes through; process ``expanduser`` only when the env has
+    no ``HOME``.
+    """
+    from pathlib import Path
+
+    env_home = (env.get("HOME") or "").strip()
+    if env_home and (raw == "~" or raw.startswith("~/")):
+        return Path(env_home + raw[1:])
+    return Path(raw).expanduser()
+
+
+def _env_kanban_root(env: Mapping[str, str]):
+    """The Hermes root a described env's board registry lives under (Prism f984ec16d458).
+
+    Same order as ``kanban_db.kanban_home``, read from ``env`` instead of the process: an explicit
+    ``HERMES_KANBAN_HOME``, else the root of its ``HERMES_HOME``, else the default root under its
+    ``HOME`` when that ``HOME`` or its ``HERMES_DATA_DIR_SUFFIX`` is not this process's (Prism
+    03487e108873, 976039e81f74). ``None`` (use the process root) only when the env names none of
+    them, or its ``HOME`` and suffix are ours. Paths go through
+    :func:`_env_path`.
+    """
+    explicit = (env.get("HERMES_KANBAN_HOME") or "").strip()
+    if explicit:
+        return _env_path(env, explicit)
+    home = (env.get("HERMES_HOME") or "").strip()
+    if not home:
+        from pathlib import Path
+
+        env_home = (env.get("HOME") or "").strip()
+        # An absent key inherits the process value, never "" (Prism 976039e81f74).
+        process_suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+        suffix = env.get("HERMES_DATA_DIR_SUFFIX", process_suffix)
+        same_home = not env_home or os.path.realpath(env_home) == os.path.realpath(str(Path.home()))
+        # Our HOME is our root only when the suffix agrees too.
+        if same_home and suffix == process_suffix:
+            return None
+        return Path(env_home or str(Path.home())) / (".hermes" + suffix)
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root(home=_env_path(env, home))
 
 
 def _resolve_current_session_id() -> Optional[str]:
