@@ -217,7 +217,7 @@ def test_tool_create_refuses_then_force_reason_succeeds(kanban_home, monkeypatch
         {"title": TITLE, "body": BODY_B, "assignee": "peer"}
     ))
     assert "near-duplicate" in refused["error"]
-    forced = json.loads(kt._handle_create({
+    forced = json.loads(kt._handle_create({"board": "default", 
         "title": TITLE, "body": BODY_B, "assignee": "peer",
         "force_reason": "not a duplicate: different host",
     }))

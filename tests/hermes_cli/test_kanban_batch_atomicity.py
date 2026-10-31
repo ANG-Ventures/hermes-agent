@@ -163,7 +163,7 @@ def test_selector_batch_skips_and_names_a_card_archived_mid_batch(
         monkeypatch, lambda: _archive_from_another_connection(second),
     )
     out = kc.run_slash(
-        "set-model standard-model --provider batch-provider "
+        "--board default set-model standard-model --provider batch-provider "
         "--where status=ready assignee=worker"
     )
 

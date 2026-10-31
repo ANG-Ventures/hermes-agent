@@ -110,7 +110,7 @@ def test_worker_outranks_cron_and_gateway(kanban_home, monkeypatch):
 ])
 def test_no_home_no_flag(kanban_home, monkeypatch, capsys, origin, refused):
     _as(origin, monkeypatch, worker_card=_unhomed_worker_card())
-    out = _cli("create 'orphan?' --assignee daedalus")
+    out = _cli("--board default create 'orphan?' --assignee daedalus")
     with kb.connect_closing() as conn:
         titles = [t.title for t in kb.list_tasks(conn)]
     if refused:
@@ -124,14 +124,14 @@ def test_no_home_no_flag(kanban_home, monkeypatch, capsys, origin, refused):
 @pytest.mark.parametrize("origin", ORIGINS)
 def test_explicit_unhomed_always_allowed(kanban_home, monkeypatch, origin):
     _as(origin, monkeypatch, worker_card=_unhomed_worker_card())
-    created = json.loads(_cli("create 'on purpose' --unhomed --json"))
+    created = json.loads(_cli("--board default create 'on purpose' --unhomed --json"))
     assert created["session_id"] is None and created["unhomed"] is True
 
 
 @pytest.mark.parametrize("origin", ORIGINS)
 def test_explicit_session_always_allowed(kanban_home, monkeypatch, origin):
     _as(origin, monkeypatch, worker_card=_unhomed_worker_card())
-    created = json.loads(_cli(f"create 'mine' --session {SID} --json"))
+    created = json.loads(_cli(f"--board default create 'mine' --session {SID} --json"))
     assert created["session_id"] == SID
 
 
@@ -147,25 +147,25 @@ def test_homed_parent_resolves_home(kanban_home, monkeypatch, origin):
 def test_hand_create_with_session_stamps_it_and_does_not_warn(kanban_home, monkeypatch):
     _as("hand", monkeypatch)
     monkeypatch.setenv("HERMES_SESSION_ID", SID)
-    out = _cli("create 'typed' --json")
+    out = _cli("--board default create 'typed' --json")
     assert json.loads(out.split("\n\n")[0])["session_id"] == SID
     assert "has no home session" not in out
 
 
 def test_unhomed_is_exclusive_with_session_and_home(kanban_home):
-    assert "exclusive" in _cli(f"create 'x' --unhomed --session {SID}")
-    assert "exclusive" in _cli("create 'x' --unhomed --home operator")
+    assert "exclusive" in _cli(f"--board default create 'x' --unhomed --session {SID}")
+    assert "exclusive" in _cli("--board default create 'x' --unhomed --home operator")
 
 
 def test_minted_by_provenance_on_created_event(kanban_home, monkeypatch):
     """Rung 2 reads ``minted_by`` to map a card to its cron job / minting run."""
     worker_card = _unhomed_worker_card()
     _as("cron", monkeypatch)
-    cron_card = json.loads(_cli("create 'c' --unhomed --json"))["id"]
+    cron_card = json.loads(_cli("--board default create 'c' --unhomed --json"))["id"]
     monkeypatch.delenv("HERMES_CRON_JOB_ID")
     monkeypatch.delenv("HERMES_CRON_SCRIPT")
     _as("worker", monkeypatch, worker_card=worker_card)
-    worker_child = json.loads(_cli("create 'w' --unhomed --json"))["id"]
+    worker_child = json.loads(_cli("--board default create 'w' --unhomed --json"))["id"]
     with kb.connect_closing() as conn:
         def minted(tid):
             row = conn.execute(
@@ -187,9 +187,9 @@ def test_tool_create_refused_without_home_and_allowed_with_unhomed(kanban_home, 
     monkeypatch.setattr(kt, "_current_session_id", lambda: None)
     import tools.async_delegation as ad
     monkeypatch.setattr(ad, "_current_origin_session_id", lambda: None)
-    refused = json.loads(kt._handle_create({"title": "t", "assignee": "daedalus"}))
+    refused = json.loads(kt._handle_create({"board": "default", "title": "t", "assignee": "daedalus"}))
     assert "refused create (worker)" in refused.get("error", "")
-    ok = json.loads(kt._handle_create({"title": "t2", "assignee": "daedalus",
+    ok = json.loads(kt._handle_create({"board": "default", "title": "t2", "assignee": "daedalus",
                                        "unhomed": True}))
     assert ok.get("task_id"), ok
     with kb.connect_closing() as conn:

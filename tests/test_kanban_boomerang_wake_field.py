@@ -187,9 +187,9 @@ def test_explicit_boomerang_create_upgrades_inherited_notify_row(kanban_home, mo
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "cA")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
-    child = json.loads(kt._handle_create({"title": "c", "assignee": "peer", "parents": [parent],
+    child = json.loads(kt._handle_create({"board": "default", "title": "c", "assignee": "peer", "parents": [parent],
                                           "boomerang_wake": True, "unhomed": True}))
-    plain = json.loads(kt._handle_create({"title": "d", "assignee": "peer", "parents": [parent],
+    plain = json.loads(kt._handle_create({"board": "default", "title": "d", "assignee": "peer", "parents": [parent],
                                           "unhomed": True}))
     assert child["ok"] and plain["ok"], (child, plain)
     with kbc.connect_closing() as conn:
@@ -207,9 +207,9 @@ def test_explicit_boomerang_create_bypasses_auto_subscribe_gate(kanban_home, mon
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "cG")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
-    on = json.loads(kt._handle_create({"title": "b", "assignee": "peer", "boomerang_wake": True,
+    on = json.loads(kt._handle_create({"board": "default", "title": "b", "assignee": "peer", "boomerang_wake": True,
                                        "unhomed": True}))
-    plain = json.loads(kt._handle_create({"title": "p", "assignee": "peer", "unhomed": True}))
+    plain = json.loads(kt._handle_create({"board": "default", "title": "p", "assignee": "peer", "unhomed": True}))
     assert on["ok"] and plain["ok"], (on, plain)
     assert on["subscribed"] is True and plain["subscribed"] is False
     with kbc.connect_closing() as conn:
@@ -280,9 +280,9 @@ def test_kanban_create_tool_accepts_boomerang_wake(kanban_home):
 
     props = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
     assert props["boomerang_wake"]["type"] == "boolean" and "auto_handle" not in props
-    on = json.loads(kt._handle_create({"title": "a", "assignee": "peer", "boomerang_wake": True,
+    on = json.loads(kt._handle_create({"board": "default", "title": "a", "assignee": "peer", "boomerang_wake": True,
                                        "unhomed": True}))
-    unset = json.loads(kt._handle_create({"title": "b", "assignee": "peer", "unhomed": True}))
+    unset = json.loads(kt._handle_create({"board": "default", "title": "b", "assignee": "peer", "unhomed": True}))
     assert on["ok"] and unset["ok"], (on, unset)
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, on["task_id"]).boomerang_wake is True

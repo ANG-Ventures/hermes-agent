@@ -60,7 +60,7 @@ def test_set_model_where_selects_status_and_assignee(kanban_home):
             conn.execute("UPDATE tasks SET status='running' WHERE id=?", (running,))
 
     out = kc.run_slash(
-        "set-model model-a --provider batch-provider "
+        "--board default set-model model-a --provider batch-provider "
         "--where status=running,ready assignee=worker"
     )
 
@@ -110,7 +110,7 @@ def test_set_model_reclaim_only_reclaims_selected_running_cards(
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda pid, lock, **_kw: signaled.append(pid) or {})
 
     out = kc.run_slash(
-        "set-model model-a --provider batch-provider --reclaim "
+        "--board default set-model model-a --provider batch-provider --reclaim "
         "--where status=running assignee=worker"
     )
 

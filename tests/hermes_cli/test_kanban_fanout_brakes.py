@@ -129,7 +129,7 @@ def test_kanban_create_tool_parks_worker_created_card(kanban_home, monkeypatch):
         "hermes_cli.kanban_worker_policy._load_config", lambda: {}
     )
     out = json.loads(
-        kanban_tools._handle_create({"title": "child from worker", "assignee": "argus"})
+        kanban_tools._handle_create({"board": "default", "title": "child from worker", "assignee": "argus"})
     )
     assert out.get("ok") is True, out
     assert out["status"] == "triage", out
@@ -145,7 +145,7 @@ def test_kanban_create_tool_leaves_non_worker_card_ready(kanban_home, monkeypatc
         "hermes_cli.kanban_worker_policy._load_config", lambda: {}
     )
     out = json.loads(
-        kanban_tools._handle_create({"title": "apollo card", "assignee": "argus"})
+        kanban_tools._handle_create({"board": "default", "title": "apollo card", "assignee": "argus"})
     )
     assert out.get("ok") is True, out
     assert out["status"] == "ready", out

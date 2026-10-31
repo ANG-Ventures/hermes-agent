@@ -100,7 +100,7 @@ def test_status_selector_skips_cards_that_left_the_set_before_the_lock(
     command = (
         "--board default set-model --effort high --where status=ready assignee=worker"
         if effort_only else
-        "set-model standard-model --provider batch-provider "
+        "--board default set-model standard-model --provider batch-provider "
         "--where status=ready assignee=worker"
     )
     out = kc.run_slash(command)

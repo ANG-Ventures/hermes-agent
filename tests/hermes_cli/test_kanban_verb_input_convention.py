@@ -49,7 +49,7 @@ def _required(verb):
 # (verb, argv after the verb) -- empty and partial inputs. {tid} is the card.
 EMPTY_AND_PARTIAL = [
     ("create", []),
-    ("create", ['""']),
+    ("create", ['""', "--board", "default"]),
     ("comment", []),
     ("comment", ["{tid}"]),
     ("comment", ["{tid}", "--body", '""']),
@@ -245,7 +245,7 @@ def test_priority_value_refuses_garbage_with_both_shapes_named():
 
 def test_create_with_tier_priority_is_accepted(board, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
-    out = cli.run_slash('--board default create "tier prio card" --priority p2 --body x')
+    out = cli.run_slash('create "tier prio card" --board default --priority p2 --body x')
     assert "usage error" not in out, out
     with kb.connect_closing() as conn:
         row = conn.execute("SELECT priority FROM tasks WHERE title = ?", ("tier prio card",)).fetchone()
@@ -256,7 +256,7 @@ def test_argparse_refusal_puts_the_cause_on_the_last_line(board, monkeypatch):
     """The schema is context; the refusal is the answer. A reader (or a `tail`) that sees only
     the last line must see WHY the call was refused, not the example invocation."""
     monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
-    out = cli.run_slash('--board default create "x" --priority high')
+    out = cli.run_slash('create "x" --board default --priority high')
     last = out.rstrip().splitlines()[-1]
     assert "error:" in last and "--priority" in last, out
     assert "example:" in out.lower(), out

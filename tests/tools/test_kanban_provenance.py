@@ -95,7 +95,7 @@ def test_tool_create_only_stamps_persisted_ambient_session(tmp_path, monkeypatch
     # var is set too so the reporter's unverified-env path (the pre-fix stamping seam) is exercised.
     monkeypatch.setenv("HERMES_SESSION_ID", session_id)
     with scoped_current_session_id(session_id):
-        result = json.loads(kt._handle_create({"title": "child", "assignee": "default"}))
+        result = json.loads(kt._handle_create({"board": "default", "title": "child", "assignee": "default"}))
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, result["task_id"])
     assert task.session_id == (session_id if persisted else None)
@@ -118,6 +118,6 @@ def test_tool_create_stamps_request_scoped_session_over_process_env(tmp_path, mo
     state.close()
 
     with scoped_current_session_id("ordering-session"):
-        result = json.loads(kt._handle_create({"title": "child", "assignee": "default"}))
+        result = json.loads(kt._handle_create({"board": "default", "title": "child", "assignee": "default"}))
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, result["task_id"]).session_id == "ordering-session"
