@@ -88,7 +88,6 @@ def test_delete_default_board_is_refused(client):
 
 # --- S7 D5: no server-side current board ------------------------------------------------------
 
-@pytest.mark.kanban_bare_verb_refuse
 def test_board_query_omitted_is_400_under_refuse_and_default_under_the_switch(client, tmp_path):
     """Mutation: let ``_resolve_board(None)`` fall through to an ambient board -> the 400 is 200."""
     r = client.get("/api/plugins/kanban/board")
@@ -110,7 +109,6 @@ def test_set_current_endpoint_and_field_are_gone(client):
     assert kb.get_current_board() == kb.DEFAULT_BOARD
 
 
-@pytest.mark.kanban_bare_verb_refuse
 def test_blank_board_query_is_omitted_not_default(client, tmp_path):
     """Prism b68acd4edf81: ``?board=%20`` normalises to no board and takes the omitted branch:
     400 under ``refuse`` (no write lands on default), ``default`` only under the kill switch."""

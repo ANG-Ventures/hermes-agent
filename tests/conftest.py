@@ -794,20 +794,13 @@ def _reset_foreground_exit_fence():
 
 
 @pytest.fixture(autouse=True)
-def _kanban_bare_verb_default(request, monkeypatch):
-    """S7 C1b ships ``kanban.bare_verb`` absent == ``refuse``: a verb with no ``--board``, pin or
-    card id is refused. Tests written before S7 create and list bare; they run under the kill
-    switch's ``default`` until C1c (t_4f39fb15) rewrites them per spec §6. A test that proves the
-    shipped refusal opts out with ``@pytest.mark.kanban_bare_verb_refuse``. In-process only: a
-    subprocess runs the real code and sees ``refuse``.
-    """
+def _kanban_bare_verb_policy_cache_reset():
+    """``kanban.bare_verb`` is cached per config path; tests write that file under temp homes."""
     try:
         from hermes_cli import kanban_board_select as _kbsel
     except Exception:
         return
     _kbsel._POLICY_CACHE.clear()
-    if not request.node.get_closest_marker("kanban_bare_verb_refuse"):
-        monkeypatch.setattr(_kbsel, "ABSENT_POLICY", _kbsel.BARE_VERB_DEFAULT)
 
 
 @pytest.fixture(autouse=True)
@@ -1691,11 +1684,6 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers", "allow_real_home_io: explicitly bypass the test-only home I/O guard."
-    )
-    config.addinivalue_line(
-        "markers",
-        "kanban_bare_verb_refuse: run with the shipped S7 policy (absent kanban.bare_verb == "
-        "refuse) instead of the suite's pre-C1c default.",
     )
     config.addinivalue_line(
         "markers", "real_release_channels: keep the real R2 channel reader (no local source-branch stub)."
