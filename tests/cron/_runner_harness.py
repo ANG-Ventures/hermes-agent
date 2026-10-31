@@ -15,6 +15,11 @@ Runs ``cron.script_runner.main([])`` with test constants taken from the environm
 * ``RUNNER_HARNESS_FAULT``       -> ``emfile:<path>`` | ``retirement:<path>``. While a file exists at
   ``<path>``, every tick raises ``OSError(EMFILE)`` / is refused by retirement admission, and
   ``<path>.hit`` is touched (S3 AC-4b).
+* ``RUNNER_HARNESS_SKEW``        -> a path. While a file exists there, ``_detect_code_skew`` reports
+  skew (a deploy moved the runtime tree, t_c15baa4b).
+* ``RUNNER_HARNESS_SKEW_DRAIN_S`` -> ``cron.lanes.RUNNER_SKEW_DRAIN_MAX_S``
+* ``RUNNER_HARNESS_NO_OUTCOME_SHIM`` -> set: scripts run without the outcome-record shim, so the
+  script's own exit status reaches the runner (Prism b86087faa72f).
 """
 
 from __future__ import annotations
@@ -112,6 +117,12 @@ def main() -> int:
             setattr(lanes, attr, float(os.environ[env]))
     if os.environ.get("RUNNER_HARNESS_STALE_S"):
         lanes.RUNNER_PROGRESS_STALE_S = float(os.environ["RUNNER_HARNESS_STALE_S"])
+    if os.environ.get("RUNNER_HARNESS_SKEW_DRAIN_S"):
+        lanes.RUNNER_SKEW_DRAIN_MAX_S = float(os.environ["RUNNER_HARNESS_SKEW_DRAIN_S"])
+    if os.environ.get("RUNNER_HARNESS_NO_OUTCOME_SHIM"):
+        import cron.script_outcome_records as records
+
+        records.supported = lambda: False
     if os.environ.get("RUNNER_HARNESS_FAULT"):
         _install_fault(os.environ["RUNNER_HARNESS_FAULT"])
     block = os.environ.get("RUNNER_HARNESS_BLOCK")
@@ -122,6 +133,9 @@ def main() -> int:
         _install_ledger_hold(Path(hold))
     from cron import script_runner
 
+    skew = os.environ.get("RUNNER_HARNESS_SKEW")
+    if skew:
+        script_runner._detect_code_skew = lambda: ("boot", "disk") if Path(skew).exists() else None
     return script_runner.main([])
 
 

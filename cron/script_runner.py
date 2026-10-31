@@ -37,6 +37,9 @@ TRIP_MARKER_NAME = "script_runner_tripped"
 EXIT_CONFIG = 78
 EXIT_WATCHDOG = 70
 _SHUTDOWN_WAIT_S = 20.0
+# Bounded skew drain: after SIGKILL, how long to wait for each group to be reaped before its
+# re-fire is withheld (t_c15baa4b).
+_SKEW_CONFIRM_S = 2.0
 _WARN_EVERY_S = 3600.0
 _REFUSED_ENV = ("HERMES_MACHINE_ID", "_HERMES_CRON_EXTERNAL_WORKER")
 
@@ -70,6 +73,37 @@ def _inflight_count() -> int:
     from cron.scheduler import get_running_job_ids
 
     return len(get_running_job_ids())
+
+
+def _inflight_refire_spent() -> List[tuple]:
+    """``(job_id, elapsed_s)`` per in-flight run whose job could NOT be re-fired if killed now: the
+    same test ``request_restart_requeue`` applies (a cron/interval job under ``RESTART_REQUEUE_MAX``).
+    A run that is itself the re-fire, a job at the cap, a job on its final finite repetition, a
+    one-shot or an unreadable job counts as spent, so the bounded skew drain waits for it instead of
+    losing the run (Prism 05343ab9e749, cd1ea5071578)."""
+    import cron.scheduler as sched
+    from cron.jobs import get_job, restart_refire_refusal
+    from cron.scheduler_provider import _profile_cron_scope
+
+    with sched._running_lock:
+        keys = sorted(sched._running_job_ids | sched._running_fire_owners.keys())
+        since = {k: sched._running_since.get(k) for k in keys}
+    now = time.time()
+    spent = []
+    for key in keys:
+        home_key, job_id = key
+        try:
+            with _profile_cron_scope(sched._inflight_home_path(home_key)):
+                job = get_job(job_id)
+            # The in-flight run is not in repeat.completed yet: mark_job_run counts it.
+            available = restart_refire_refusal(job, run_counted=False) is None
+        except Exception:
+            logger.debug("re-fire lookup failed for %s", job_id, exc_info=True)
+            available = False
+        if not available:
+            started = since.get(key)
+            spent.append((job_id, round(now - started) if started else None))
+    return spent
 
 
 def _boot_code_sha() -> Optional[str]:
@@ -145,7 +179,9 @@ class ScriptRunner:
         self.tripped = False
         self.draining = False
         self.draining_since: Optional[str] = None
+        self._draining_mono = float("-inf")
         self.sigterm = False
+        self._skew_bounded = False
         self._reasons: Dict[str, Optional[str]] = {}
         self._last_ok: Dict[str, str] = {}
         self._tick_started: Dict[str, str] = {}
@@ -291,11 +327,30 @@ class ScriptRunner:
         if not self.draining and _detect_code_skew() is not None:
             self.draining = True
             self.draining_since = _now_iso()
-            logger.warning("script runner draining: code skew; exiting 0 once in-flight scripts end")
-        if self.draining and _inflight_count() == 0:
+            self._draining_mono = time.monotonic()
+            logger.warning("script runner draining: code skew; exiting 0 once in-flight scripts end "
+                           "(at most %s s, then terminate + re-queue)", lanes.RUNNER_SKEW_DRAIN_MAX_S)
+        if not self.draining:
+            return
+        if _inflight_count() == 0:
             self.exit_code = 0
             if self._stop is not None:
                 self._stop.set()
+        elif time.monotonic() - self._draining_mono >= float(lanes.RUNNER_SKEW_DRAIN_MAX_S):
+            # Bounded drain (t_c15baa4b), only while every in-flight job can still be re-fired:
+            # killing a run that is itself the re-fire (or a job at RESTART_REQUEUE_MAX) would lose
+            # it until its next schedule, so then the drain waits as before (Prism 05343ab9e749).
+            spent = _inflight_refire_spent()
+            if spent:
+                names = ", ".join(f"{job_id} {elapsed}s" for job_id, elapsed in spent)
+                self._warn_hourly("skew_wait", tuple(j for j, _ in spent),
+                                  "script runner code-skew drain waiting: re-fire spent, %s", names)
+                return
+            logger.warning("script runner code-skew drain bounded: re-fire available; %d script(s) "
+                           "in flight past %s s, terminating them (one re-fire each) and exiting 0",
+                           _inflight_count(), lanes.RUNNER_SKEW_DRAIN_MAX_S)
+            self._skew_bounded = True
+            self.request_shutdown()
 
     def _check_host(self) -> None:
         try:
@@ -622,6 +677,57 @@ class ScriptRunner:
             with contextlib.suppress(Exception):
                 os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
 
+    def _skew_kill(self) -> None:
+        """Bounded skew drain (Prism 9dde2d9f29f3, dbd507fb38d7, 96d1a12310f7): snapshot each
+        script's whole tree BEFORE signalling, TERM it, wait ≤ ``RUNNER_SKEW_KILL_GRACE_S``, KILL the
+        survivors through the timeout/cancel tree-kill, then confirm (a zombie-only tree is gone).
+        Held under ``_script_procs_lock`` so no run can set or consume its re-fire flag meanwhile; a
+        tree still alive afterwards has its re-fire withheld (keyed per profile, Prism f4526d2bb9fa),
+        because the re-fire would run beside the live copy."""
+        import cron.scheduler as sched
+        from cron import scheduler_script as ss
+
+        with sched._script_procs_lock:
+            sched.signal_shutdown("cron script runner code-skew drain bound")
+            trees = [(key, proc, ss._script_tree_snapshot(proc))
+                     for key, proc in sched._active_script_procs.items() if proc.returncode is None]
+            # Every run cut off here is a failure flagged for its re-fire, whatever it exits with
+            # (Prism b86087faa72f); consumed by _run_job_script once the run returns.
+            sched._skew_interrupted_job_ids.update(
+                {sched._script_proc_job_ids.get(key) for key, _p, _s in trees} - {None})
+            for _key, proc, snap in trees:
+                ss._signal_script_tree(proc, snap, signal.SIGTERM)
+            alive = trees
+            deadline = time.monotonic() + float(lanes.RUNNER_SKEW_KILL_GRACE_S)
+            while True:
+                alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
+                if not alive or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            # Re-snapshot before KILL and before the confirm: a descendant forked during the TERM
+            # grace is in neither the first snapshot nor the reaped leader's tree (Prism 361a15209668).
+            trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
+            alive = [t for t in trees if ss._script_tree_alive(t[1], t[2])]
+            for _key, proc, snap in alive:
+                ss._signal_script_tree(proc, snap, signal.SIGKILL)
+            alive = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in alive]
+            for _key, proc, snap in alive:
+                ss._signal_script_tree(proc, snap, signal.SIGKILL)
+            deadline = time.monotonic() + _SKEW_CONFIRM_S
+            while True:
+                alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
+                if not alive or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            withheld = {sched._script_proc_job_ids.get(key) for key, _p, _s in alive} - {None}
+            sched._refire_withheld_job_ids.update(withheld)
+            sched._restart_killed_job_ids.difference_update(withheld)
+        if alive:
+            logger.error("script runner code-skew drain: %d script tree(s) survived SIGKILL (%s); "
+                         "re-fire withheld for %s", len(alive),
+                         ", ".join(str(proc.pid) for _k, proc, _s in alive),
+                         ", ".join(sorted(f"{j}@{h}" for h, j in withheld)) or "-")
+
     # --- SIGTERM shutdown (§5.4) -----------------------------------------------------------
 
     def request_shutdown(self) -> None:
@@ -638,8 +744,11 @@ class ScriptRunner:
         for _name, home in self._last_homes:
             with contextlib.suppress(Exception):
                 self._write(home, "draining")
-        sched.signal_shutdown("cron script runner SIGTERM")
-        sched.terminate_running_scripts("cron script runner SIGTERM")
+        if self._skew_bounded:
+            self._skew_kill()
+        else:
+            sched.signal_shutdown("cron script runner SIGTERM")
+            sched.terminate_running_scripts("cron script runner SIGTERM")
         deadline = time.monotonic() + _SHUTDOWN_WAIT_S
         while _inflight_count() and time.monotonic() < deadline:
             time.sleep(0.1)
