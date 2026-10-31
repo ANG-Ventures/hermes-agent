@@ -691,6 +691,11 @@ class ScriptRunner:
             sched.signal_shutdown("cron script runner code-skew drain bound")
             trees = [(key, proc, ss._script_tree_snapshot(proc))
                      for key, proc in sched._active_script_procs.items() if proc.returncode is None]
+            # returncode stays None until the worker reaps its script, so an exited run reads as in
+            # flight. Keep only trees alive on a fresh check (Prism 934ec5f4046f): a zombie-only
+            # tree finished on its own and keeps its own result, with no interruption flag.
+            trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
+            trees = [t for t in trees if ss._script_tree_alive(t[1], t[2])]
             # Every run cut off here is a failure flagged for its re-fire, whatever it exits with
             # (Prism b86087faa72f); consumed by _run_job_script once the run returns.
             sched._skew_interrupted_job_ids.update(

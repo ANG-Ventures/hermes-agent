@@ -883,6 +883,126 @@ def test_d_skew_kill_reaches_a_descendant_forked_during_the_term_grace(root, tmp
         leader.wait(timeout=10)
 
 
+# The escapee leaves the pytest subtree (setsid + its parent exits); the conftest kill guard would
+# block the very SIGKILL under test.
+@pytest.mark.live_system_guard_bypass
+def test_d_skew_kill_reaches_a_setsid_escapee_of_an_exited_parent(root, tmp_path, monkeypatch):
+    """Prism 85c0395583d8: the TERM handler forks a child that calls setsid() and exits. The child
+    is in no snapshot, descends from no surviving member and is outside the script's process group,
+    so every refresh missed it and the re-fire ran beside it. The run's env token finds it: it is
+    killed and, because it was found, nothing survives to withhold."""
+    import uuid
+    import psutil
+    import cron.scheduler as sched
+    from cron import lanes
+    from cron import scheduler_script as ss
+
+    env_name = getattr(ss, "SCRIPT_RUN_TOKEN_ENV", "_HERMES_CRON_SCRIPT_RUN")
+    token = uuid.uuid4().hex
+    gpid = tmp_path / "g.pid"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import os, signal, subprocess, sys, time\n"
+        "def on_term(*_):\n"
+        "    g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'],\n"
+        "                         start_new_session=True, stdin=subprocess.DEVNULL,\n"
+        "                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"    open({str(gpid)!r}, 'w').write(str(g.pid))\n"
+        "    os._exit(0)\n"
+        "signal.signal(signal.SIGTERM, on_term)\n"
+        "while True:\n    time.sleep(0.1)\n")
+    env = dict(os.environ, **{env_name: token})
+    leader = subprocess.Popen([sys.executable, str(child)], start_new_session=True, env=env)
+    leader._hermes_script_run_token = token
+    g = None
+    try:
+        time.sleep(1.0)  # the handler is installed
+        key = sched._inflight_key("escapee", root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        runner = _skew_kill_runner(root, monkeypatch)
+        monkeypatch.setattr(lanes, "RUNNER_SKEW_KILL_GRACE_S", 1.0)
+        runner._skew_kill()
+        g = int(_wait_for(lambda: gpid.exists() and gpid.read_text().strip(), 5, what="escapee"))
+        assert _wait_for(lambda: not psutil.pid_exists(g)
+                         or psutil.Process(g).status() == psutil.STATUS_ZOMBIE, 3,
+                         what="setsid escapee killed")
+    finally:
+        sched.clear_shutdown()
+        if g is not None:
+            with contextlib.suppress(Exception):
+                os.kill(g, signal.SIGKILL)  # windows-footgun: ok — POSIX-only test
+        with contextlib.suppress(Exception):
+            leader.kill()
+        leader.wait(timeout=10)
+
+
+def test_d_skew_kill_withholds_the_refire_when_the_escapee_scan_fails(root, monkeypatch):
+    """Prism 85c0395583d8, conservative leg: when the run-token scan cannot run, an escaped copy
+    cannot be ruled out, so the tree counts as alive and the re-fire is withheld."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+
+    class _Proc:
+        pid, returncode, _hermes_script_run_token = 10**7 + 3, None, "tok"
+
+        def poll(self):
+            return None
+
+    proc = _Proc()
+    key = sched._inflight_key("scanfail", root)
+    monkeypatch.setattr(sched, "_active_script_procs", {1: proc})
+    monkeypatch.setattr(sched, "_script_proc_job_ids", {1: key})
+    monkeypatch.setattr(sched, "_restart_killed_job_ids", {key})
+    monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+    monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+    monkeypatch.setattr(ss, "_script_tree_snapshot", lambda _p: [])
+    monkeypatch.setattr(ss, "_signal_script_tree", lambda *_a: None)
+    import psutil
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("process table unreadable")
+
+    monkeypatch.setattr(psutil, "process_iter", _boom)
+    try:
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+    finally:
+        sched.clear_shutdown()
+    assert sched._refire_withheld_job_ids == {key}
+    assert sched._restart_killed_job_ids == set()
+
+
+def test_d_skew_kill_does_not_flag_a_zombie_only_tree_interrupted(root, monkeypatch):
+    """Prism 934ec5f4046f: an exited but unreaped script still has returncode None, so the drain
+    flagged a run that had already finished as interrupted; its worker then overrode the success
+    and re-fired the job. A fresh liveness check keeps a zombie-only tree out of the flag set."""
+    import cron.scheduler as sched
+
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        if sys.platform.startswith("linux"):
+            _wait_for(lambda: Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z", 10,
+                      what="leader exited, unreaped")
+        else:
+            time.sleep(1.0)
+        assert leader.returncode is None
+        key = sched._inflight_key("zdone", root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", set())
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+        assert sched._skew_interrupted_job_ids == set()
+        assert sched._refire_withheld_job_ids == set()
+    finally:
+        sched.clear_shutdown()
+        leader.wait(timeout=10)
+
+
 def _skew_kill_runner(root, monkeypatch):
     from cron import lanes, script_runner
 
