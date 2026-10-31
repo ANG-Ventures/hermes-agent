@@ -247,18 +247,107 @@ def test_pinned_model_capped_on_all_lanes_announces_every_turn(_home, monkeypatc
         assert "claude-dtlr/claude-fable-5-1" in line and "claude-alr/claude-opus-5-5" in line, line
 
 
-def test_first_stream_byte_and_turn_end_flush(monkeypatch):
-    """The settle points are wired: a counted chunk and run_conversation's exit."""
-    import inspect
+class _SettleAgent:
+    """Records every chat line (fallback banner and diagnostic notices) in post order."""
 
+    def __init__(self):
+        self.posted = []
+        self._current_turn_id = "turn-1"
+
+    def _emit_status(self, msg):
+        self.posted.append(msg)
+
+    def _emit_diagnostic_status(self, msg):
+        self.posted.append(msg)
+
+    def _touch_activity(self, *_a, **_k):
+        pass
+
+
+def _held(agent, msg="Model fallback (relay busy): a -> b"):
+    from agent import fallback_cause as fbc
+    fbc.hold_banner(agent, msg=msg, key="busy", first_from="a", to_label="b", hops=1,
+                    label="relay busy", rider=None)
+    assert agent.posted == []
+    return msg
+
+
+def test_first_real_stream_chunk_posts_the_held_banner_and_a_ping_does_not():
     from agent import chat_completion_helpers as cch
-    from agent import chat_completion_stream_monitor as csm
-    from agent import conversation_loop as cl
-    from agent import turn_api_error as tae
 
-    assert "flush_banner" in inspect.getsource(cch._StreamingCall._count_chunk)
-    assert "flush_banner" in inspect.getsource(cch._record_successful_api_call)
-    assert "flush_banner" in inspect.getsource(cl.run_conversation)
-    # A wall-budget wait notice never posts ahead of the held fallback line.
-    assert "flush_banner" in inspect.getsource(csm.StreamingWaitMonitor._poll_wall_budget)
-    assert "flush_banner" in inspect.getsource(tae.settle_unrecovered_error)
+    agent = _SettleAgent()
+    msg = _held(agent)
+    call = object.__new__(cch._StreamingCall)
+    call.agent, call.last_chunk_time = agent, {"t": 0.0}
+    call._count_chunk({}, None, heartbeat=True)
+    assert agent.posted == []
+    call._count_chunk({}, None)
+    call._count_chunk({}, None)
+    assert agent.posted == [msg]
+
+
+def test_served_call_posts_the_held_banner(monkeypatch):
+    from agent import chat_completion_helpers as cch
+
+    monkeypatch.setattr(cch, "_note_billed_response", lambda *a, **k: None)
+    monkeypatch.setattr(cch, "_note_api_call_recording_failure", lambda *a, **k: None)
+    pooled = sorted(cch._POOLED_PROVIDERS)[0]   # no pool_headers: returns after the settle
+    monkeypatch.setattr(cch, "_serving_route", lambda a: {"provider": pooled, "api_mode": "x"})
+    agent = _SettleAgent()
+    msg = _held(agent)
+    cch._record_successful_api_call(agent, types.SimpleNamespace())
+    assert agent.posted == [msg]
+
+
+def test_turn_end_posts_the_held_banner_even_when_the_turn_raises(monkeypatch):
+    from agent import conversation_loop as cl
+
+    agent = _SettleAgent()
+    msg = _held(agent)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("terminal")
+
+    monkeypatch.setattr(cl, "_run_conversation_turn", _boom)
+    with pytest.raises(RuntimeError):
+        cl.run_conversation(agent, "hi")
+    assert agent.posted == [msg]
+
+
+def test_stream_wait_notice_posts_after_the_held_banner(monkeypatch):
+    from agent import chat_completion_stream_monitor as csm
+
+    monkeypatch.setattr(csm.wb, "notice_due", lambda a: "still waiting, 2 lanes tried")
+    monkeypatch.setattr(csm.wb, "should_cut_attempt", lambda a: False)
+    agent = _SettleAgent()
+    msg = _held(agent)
+    mon = object.__new__(csm.StreamingWaitMonitor)
+    mon.agent = agent
+    assert mon._poll_wall_budget() is False
+    assert agent.posted == [msg, "still waiting, 2 lanes tried"]
+
+
+def test_retry_backoff_wait_notice_posts_after_the_held_banner(monkeypatch):
+    from agent import fallback_wall_budget as wb
+    from agent import turn_api_error as tae
+    from agent.error_classifier import FailoverReason
+
+    monkeypatch.setattr(tae, "compute_error_backoff", lambda *a, **k: 0.0)
+    monkeypatch.setattr(tae, "interruptible_backoff_sleep", lambda *a, **k: None)
+    monkeypatch.setattr(wb, "notice_due", lambda a: "still waiting, retrying")
+    monkeypatch.setattr(wb, "note_quiet", lambda *a, **k: None)
+    agent = _SettleAgent()
+    msg = _held(agent)
+    classified = types.SimpleNamespace(reason=FailoverReason.timeout, retryable=True,
+                                       should_compress=False, should_fallback=False,
+                                       display_reason=None)
+    retry = types.SimpleNamespace(restart_with_redirected_messages=False)
+    verdict = tae.settle_unrecovered_error(
+        agent, api_error=RuntimeError("upstream timeout"), classified=classified, _retry=retry,
+        status_code=None, error_msg="upstream timeout", is_context_length_error=False,
+        is_rate_limited=False, _is_zai_coding_overload=False, _provider="p", _base="", _model="m",
+        messages=[], api_messages=[], api_kwargs={}, active_system_prompt="", conversation_history=[],
+        approx_tokens=0, retry_count=0, max_retries=3, compression_attempts=0, api_call_count=1,
+    )
+    assert verdict.action == "fallthrough"
+    assert agent.posted == [msg, "still waiting, retrying"]

@@ -89,7 +89,7 @@ class _Beat(threading.Thread):
     def run(self) -> None:
         from hermes_cli import kanban_db_dispatch as kbd
 
-        last_beat = 0.0
+        last_beat = float("-inf")
         while not self.stop.is_set():
             now = time.monotonic()
             if now - last_beat >= self.beat:

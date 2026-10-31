@@ -219,9 +219,9 @@ def run_turn(py: Path, tree: Path, env: dict, work: Path, home: Path, step: int,
         rc = subprocess.run(cmd, cwd=str(work), env=env, stdin=subprocess.DEVNULL, stdout=so, stderr=se,
                             timeout=900).returncode
     if rc or not out.exists():
-        tail = (work / f"step{step}.stderr.log").read_text(errors="replace")[-1500:]
+        tail = (work / f"step{step}.stderr.log").read_text(encoding="utf-8-sig", errors="replace")[-1500:]
         raise SystemExit(f"step {step}: turn process rc={rc}\n{tail}")
-    return json.loads(out.read_text(encoding="utf-8"))
+    return json.loads(out.read_text(encoding="utf-8-sig"))
 
 
 OUT_MARKER = ".route-notes-probe-out"
@@ -241,7 +241,7 @@ def claim_out(out: Path | None, scratch_root: Path) -> Path:
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        owner = lock.read_text(encoding="utf-8", errors="replace").strip() or "?"
+        owner = lock.read_text(encoding="utf-8-sig", errors="replace").strip() or "?"
         raise SystemExit(f"--out {work} is locked by probe pid {owner} ({lock}); refusing. "
                          f"If that pid is dead, remove the lock file.")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -291,7 +291,7 @@ def main() -> int:
     rig.one_seat_registry(seat, registry)
     home = rig.scratch_home(work, a.port, OPUS, OPUS, None)
     # Fallback ladder: the pinned model -> opus. capacity wait off; sticky off so R3 re-tries.
-    cfg = (home / "config.yaml").read_text(encoding="utf-8")
+    cfg = (home / "config.yaml").read_text(encoding="utf-8-sig")
     cfg += "agent:\n  capacity_retry_attempts: 0\n  api_max_retries: 1\nfallback:\n  sticky_policy: false\n"
     (home / "config.yaml").write_text(cfg, encoding="utf-8")
     env = rig.agent_env(home, tree, a.port)
@@ -312,7 +312,7 @@ def main() -> int:
 
     events = rig.relay_events(relay.inner.log_path)
     audit = home / "state" / "model-route-changes.log"
-    audit_all = audit.read_text(encoding="utf-8").splitlines() if audit.exists() else []
+    audit_all = audit.read_text(encoding="utf-8-sig").splitlines() if audit.exists() else []
     if audit.exists():
         shutil.copy2(audit, work / "model-route-changes.log")
     # The log also carries the existing failover/recovery rows; the note's own rows are route_note.
