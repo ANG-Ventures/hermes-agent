@@ -5091,7 +5091,6 @@ def _announce_foreign_change(
     overview instead of discovering it by accident."""
     if action not in FOREIGN_CHANGE_ACTIONS:
         return
-    sess = ", ".join(actor.session_ids) or "no-session"
     reason = actor.operator or actor.foreign_ok or ""
     with write_txn(conn, allow_nested=True):
         _append_event(conn, task_id, "foreign_change", {
@@ -5111,9 +5110,58 @@ def _announce_foreign_change(
         session_ref = None
     add_comment(
         conn, task_id, author=actor.profile or "user",
-        body=f"FOREIGN CHANGE by {sess} ({reason}) [{action}]",
+        body=_foreign_change_comment_body(actor, action),
         session_ref=session_ref,
     )
+
+
+def _foreign_change_comment_body(actor: MutationActor, action: str) -> str:
+    sess = ", ".join(actor.session_ids) or "no-session"
+    reason = actor.operator or actor.foreign_ok or ""
+    return f"FOREIGN CHANGE by {sess} ({reason}) [{action}]"
+
+
+def _takeover_new_home(action: str, actor: MutationActor) -> Optional[str]:
+    """The session a ``--takeover`` re-homes the card to, else ``None``."""
+    if (
+        _takeover_transfers_home(action, actor)
+        and actor.session_ids
+        and _can_adopt_home(actor.session_ids[0])
+    ):
+        return actor.session_ids[0]
+    return None
+
+
+def _takeover_comment_body(
+    actor: MutationActor, action: str, prev_home: Optional[str],
+    new_home: Optional[str],
+) -> str:
+    sess = ", ".join(actor.session_ids) or "no-session"
+    return (
+        f"takeover: foreign-session action by {sess} "
+        f"({actor.profile or 'unknown'}): {actor.foreign_ok} [{action}]"
+        + (
+            f" -- card re-homed to {new_home}" if new_home
+            else f" -- home kept ({prev_home})"
+            if action in REHOME_ON_TAKEOVER_ACTIONS else ""
+        )
+    )
+
+
+def _validate_foreign_action_comments(
+    actor: MutationActor, action: str, prev_home: Optional[str],
+) -> None:
+    """:func:`add_comment`'s refusals (:func:`_validate_comment_args`) for every
+    comment :func:`record_foreign_action` will write, with no database access.
+    Run where the override is ACCEPTED, so a reason those comments cannot carry
+    is refused before any guarded write journals (t_705b1458, Prism 34b90ddab22b)."""
+    author = actor.profile or "user"
+    if not actor.operator:
+        _validate_comment_args(author, _takeover_comment_body(
+            actor, action, prev_home, _takeover_new_home(action, actor),
+        ))
+    if action in FOREIGN_CHANGE_ACTIONS:
+        _validate_comment_args(author, _foreign_change_comment_body(actor, action))
 
 
 def check_home_session(
@@ -5191,9 +5239,11 @@ def check_home_session(
                 f"\"<who: why>\" (e.g. \"Ace via Aegis: ruled (a)\")."
             )
         _check_ruling_precedence(conn, task_id, action, home, actor.operator)
+        _validate_foreign_action_comments(actor, action, row["session_id"])
         return actor
     if actor.foreign_ok:
         _check_ruling_precedence(conn, task_id, action, home, actor.foreign_ok)
+        _validate_foreign_action_comments(actor, action, row["session_id"])
         return actor
     if home_guard_mode() == "warn":
         print(
@@ -5329,11 +5379,13 @@ def record_foreign_action(
     ``subscribe=False`` (the in-transaction caller) leaves the post-commit
     chat subscription to the caller.
     """
-    sess = ", ".join(actor.session_ids) or "no-session"
     prev_home = (
         _read_home_session(conn, task_id)
         if home_before is _HOME_UNREAD else home_before
     )
+    # Every comment this writes, judged before its first event: a refusal
+    # here leaves no takeover/operator_override line in the journal.
+    _validate_foreign_action_comments(actor, action, prev_home)
     if actor.operator:
         last = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -5367,13 +5419,7 @@ def record_foreign_action(
             )
         _announce_foreign_change(conn, task_id, action, actor, prev_home)
         return None
-    new_home = (
-        actor.session_ids[0]
-        if _takeover_transfers_home(action, actor)
-        and actor.session_ids
-        and _can_adopt_home(actor.session_ids[0])
-        else None
-    )
+    new_home = _takeover_new_home(action, actor)
     payload = {
         "action": action,
         "reason": actor.foreign_ok,
@@ -5416,15 +5462,7 @@ def record_foreign_action(
         conn,
         task_id,
         author=actor.profile or "user",
-        body=(
-            f"takeover: foreign-session action by {sess} "
-            f"({actor.profile or 'unknown'}): {actor.foreign_ok} [{action}]"
-            + (
-                f" -- card re-homed to {new_home}" if new_home
-                else f" -- home kept ({prev_home})"
-                if action in REHOME_ON_TAKEOVER_ACTIONS else ""
-            )
-        ),
+        body=_takeover_comment_body(actor, action, prev_home, new_home),
         session_ref=session_ref,
     )
     _announce_foreign_change(conn, task_id, action, actor, prev_home)
@@ -15183,6 +15221,18 @@ def request_changes(
 
         if handoff_error:
             return False, handoff_error
+        # A call that posts its own record was judged on that record before
+        # the txn (review_coverage_text_error); it becomes the run's newest
+        # record, so the run-scoped re-read could only repeat that verdict.
+        # Skipping it leaves no refusal after this call's first write: the
+        # journal is not rolled back, and a refusal there left ``claimed`` +
+        # ``commented`` lines replay rebuilt into a running card (t_fc9f7319).
+        coverage_error = (
+            None if operator_reason is not None or coverage_body is not None
+            else _validate_review_coverage(conn, task_id, int(current_run_id))
+        )
+        if coverage_error:
+            return False, coverage_error
         if coverage_body is not None:
             now = int(time.time())
             comment_cur = conn.execute(
@@ -15197,12 +15247,6 @@ def request_changes(
                 run_id=int(current_run_id),
             )
             posted.append((int(comment_cur.lastrowid or 0), int(current_run_id), now))
-        coverage_error = (
-            None if operator_reason is not None
-            else _validate_review_coverage(conn, task_id, int(current_run_id))
-        )
-        if coverage_error:
-            return False, coverage_error
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)

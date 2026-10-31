@@ -442,33 +442,49 @@ def _count_open_connections(executions, monkeypatch):
     return opened_ids, closed_ids
 
 
-def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
-    """Regression for #69567: every ledger call must close its connection
-    deterministically instead of relying on garbage collection."""
+def test_ledger_calls_do_not_grow_connections(monkeypatch, tmp_path):
+    """Regression for #69567 (one leaked connection + WAL/SHM fds per call) and t_e92870f8 (a
+    connection opened and closed per call made each claim ~100 ms): any number of ledger calls,
+    including an early return mid-transaction, use ONE connection per ledger file, leave no
+    transaction open, and every connection is closed on demand."""
     executions = _point_ledger(monkeypatch, tmp_path)
+    executions.close_shared_connections()
     opened, closed = _count_open_connections(executions, monkeypatch)
 
-    record = executions.create_execution("leak-check", source="builtin")
-    executions.mark_execution_running(record["id"])
-    executions.finish_execution(record["id"], success=True)
+    for _ in range(3):
+        record = executions.create_execution("leak-check", source="builtin")
+        executions.mark_execution_running(record["id"])
+        executions.finish_execution(record["id"], success=True)
+    assert executions.mark_execution_running("does-not-exist") is None  # early return
     executions.list_executions(job_id="leak-check")
     executions.latest_executions(["leak-check"])
     executions.recover_interrupted_executions()
 
-    assert opened
+    assert len(opened) == 1
+    with executions._lock:
+        assert not executions._shared_connection(executions.EXECUTIONS_FILE).in_transaction
+    executions.close_shared_connections()
     assert sorted(opened) == sorted(closed)
 
 
-def test_early_return_still_closes_connection(monkeypatch, tmp_path):
-    """mark_execution_running returns None mid-block on a bad transition;
-    the connection must still be closed rather than leaked."""
+def test_replaced_ledger_file_gets_a_fresh_connection(monkeypatch, tmp_path):
+    """A restore swaps executions.db by rename: the next call must read the restored file, not the
+    unlinked inode a cached connection still holds."""
     executions = _point_ledger(monkeypatch, tmp_path)
-    opened, closed = _count_open_connections(executions, monkeypatch)
+    path = executions.EXECUTIONS_FILE
+    executions.create_execution("kept", source="builtin")
+    with executions._lock:
+        executions._shared_connection(path).execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    restored = tmp_path / "restored.db"
+    with sqlite3.connect(restored) as snap:  # an older snapshot: same schema, no rows
+        executions._initialize_schema(snap)
+    dropped = executions.create_execution("not-in-snapshot", source="builtin")
+    with executions._lock:
+        executions._shared_connection(path).execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    os.replace(restored, path)
 
-    assert executions.mark_execution_running("does-not-exist") is None
-
-    assert len(opened) == 1
-    assert len(closed) == 1
+    assert executions.get_execution(dropped["id"]) is None
+    executions.close_shared_connections()
 
 
 

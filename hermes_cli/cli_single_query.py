@@ -133,6 +133,8 @@ def _run_kanban_goal_loop_chat(cli: "HermesCLI", first_response: str) -> None:
 def _sync_cli_session_id_from_agent(cli) -> None:
     """Keep ``cli.session_id`` in sync when mid-run compression rotated the agent's session."""
     if getattr(cli.agent, "session_id", None) and cli.agent.session_id != cli.session_id:
+        from hermes_cli.cli_agent_setup_mixin import _carry_route_known
+        _carry_route_known(cli, cli.agent.session_id)
         cli.session_id = cli.agent.session_id
 
 

@@ -339,13 +339,12 @@ class CLIChatTurnMixin:
             reset_current_session_key = None  # type: ignore[assignment]
             _approval_session_token = None
         agent_message = turn.voice_prefix + message if turn.voice_prefix else message
-        # One-shot /model and /reload-skills notes; _prepend_note_to_message also handles
-        # multimodal content-part lists (string concat raised TypeError with an image).
-        for _note_attr in ("_pending_model_switch_note", "_pending_skills_reload_note"):
-            _note = getattr(self, _note_attr, None)
-            if _note:
-                agent_message = _prepend_note_to_message(agent_message, _note)
-                setattr(self, _note_attr, None)
+        # One-shot /reload-skills note; _prepend_note_to_message also handles multimodal
+        # content-part lists (string concat raised TypeError with an image).
+        _note = getattr(self, "_pending_skills_reload_note", None)
+        if _note:
+            agent_message = _prepend_note_to_message(agent_message, _note)
+            self._pending_skills_reload_note = None
         # Barged mid-speech (VAD or record key)? Tell the model it was cut off.
         from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
         if take_speech_interrupted():
@@ -515,6 +514,8 @@ class CLIChatTurnMixin:
         if (self.agent and getattr(self.agent, "session_id", None)
                 and self.agent.session_id != self.session_id):
             self._transfer_session_yolo(self.session_id, self.agent.session_id)
+            from hermes_cli.cli_agent_setup_mixin import _carry_route_known
+            _carry_route_known(self, self.agent.session_id)
             self.session_id = self.agent.session_id
             self._write_terminal_breadcrumb()
             self._pending_title = None

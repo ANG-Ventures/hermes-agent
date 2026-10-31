@@ -620,9 +620,16 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     # Consumed in order by the heartbeat loop: loop entry, then one reading
     # per failed renewal. Trailing values keep any extra read pinned past the
     # grace boundary instead of raising StopIteration inside the thread.
+    # ``scheduler.time`` is the global ``time`` module, so other readers on the
+    # calling thread (the execution ledger's lock-wait watchdog in
+    # cron/executions.py) would drain the sequence before the loop starts;
+    # scope the scripted clock to the heartbeat thread only.
     monotonic_values = iter([0.0, 1.0, 3.0] + [3.0] * 32)
+    real_monotonic = time.monotonic
 
     def fake_monotonic():
+        if threading.current_thread().name != "cron-fire-claim-heartbeat":
+            return real_monotonic()
         try:
             return next(monotonic_values)
         except StopIteration:

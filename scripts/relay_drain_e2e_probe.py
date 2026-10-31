@@ -113,6 +113,21 @@ def http(method: str, url: str, body: dict | None = None, timeout: float = 5.0):
         return json.loads(r.read() or b"{}")
 
 
+# "degraded" still serves (eligible_count > 0): the relay reports it whenever any model is capped on
+# every seat, e.g. fleet-wide weekly caps, which is most of the week (t_cb2583dd).
+SERVING_STATUSES = ("ok", "degraded")
+
+
+def health_refusal(h: dict) -> str | None:
+    """Why a scratch relay's /health is not ready to serve, or None when it is."""
+    status, n = h.get("status"), h.get("eligible_count", 0) or 0
+    if status not in SERVING_STATUSES:
+        return f"status={status!r} (need one of {SERVING_STATUSES}), eligible_count={n}"
+    if n < 1:
+        return f"status={status!r} but eligible_count={n}"
+    return None
+
+
 def write_private(path: Path, text: str) -> None:
     """Create ``path`` 0600 from the first byte (no write-then-chmod window)."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -220,27 +235,32 @@ class ScratchRelay:
             stdout=out,
             stderr=subprocess.STDOUT,
         )
+        self.wait_ready(out.name, wait_s)
+
+    def wait_ready(self, out_name: str, wait_s: float) -> None:
+        """Poll /health until OUR relay serves; on timeout, say why it never was."""
+        why = "no /health answer yet"
         deadline = time.time() + wait_s
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise SystemExit(
-                    f"scratch relay exited rc={self.proc.returncode}; see {out.name}"
+                    f"scratch relay exited rc={self.proc.returncode}; see {out_name}"
                 )
             try:
                 h = http("GET", self.base + "/health")
-                if (
-                    h.get("status") == "ok"
-                    and h.get("eligible_count", 0) >= 1
-                    and self._serve_started_by(self.proc.pid)
-                ):
+                why = health_refusal(h) or ""
+                if not why and not self._serve_started_by(self.proc.pid):
+                    why = f"no serve_start from pid {self.proc.pid} on port {self.port} in {self.log_path}"
+                if not why:
                     log(
-                        f"scratch relay up pid={self.proc.pid} eligible={h.get('eligible_keys')}"
+                        f"scratch relay up pid={self.proc.pid} status={h.get('status')} "
+                        f"eligible={h.get('eligible_keys')}"
                     )
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                why = f"/health unreachable: {type(e).__name__}: {e}"
             time.sleep(0.5)
-        raise SystemExit("scratch relay never reported an eligible seat")
+        raise SystemExit(f"scratch relay not ready after {wait_s:.0f}s: {why}")
 
     def admin(self, action: str, **body) -> dict:
         if self.proc is None or self.proc.poll() is not None:

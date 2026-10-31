@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -173,6 +174,44 @@ def _read_pending(path: Path) -> Dict[tuple, float]:
         return {}
 
 
+SPILL_NAME = "script_runner_requeue.spill.jsonl"
+
+
+def _append_spill(rows: List[list]) -> None:
+    """Write ``rows`` to a spill file of their own, never a read-modify-write (Prism
+    e7289429e4e2). The file appears by atomic rename, complete or not at all, so a concurrent fold
+    either reads all of it or leaves it for the next start: no copy can be drained while it is
+    still being written (Prism 0e39f9048db7)."""
+    from utils import atomic_write_text
+
+    spill = _requeue_path().with_name(
+        f"{SPILL_NAME}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}")
+    atomic_write_text(spill, "".join(json.dumps(row) + "\n" for row in rows),
+                      tmp_prefix=".script_runner_requeue_spill_", mode=0o600)
+
+
+def _fold_spill(path: Path) -> None:
+    """Merge spilled rows into ``path``. Caller holds ``_file_lock(path)``. Only the spill files
+    read here are removed, and only after the merged file is written, so a failed write leaves them
+    for the next start and a spill that appears mid-fold waits for the next one."""
+    drains = sorted(path.parent.glob(SPILL_NAME + ".*"))
+    if not drains:
+        return
+    rows = []
+    for drain in drains:
+        for line in drain.read_text(encoding="utf-8-sig").splitlines():
+            with contextlib.suppress(ValueError):
+                rows.append(json.loads(line))
+    pending = _read_pending(path)
+    for key, epoch in _pending_items(rows).items():
+        pending[key] = max(pending.get(key, 0.0), epoch)
+    if pending:
+        _write_pending(path, [[h, j, e] for (h, j), e in pending.items()])
+    for drain in drains:
+        with contextlib.suppress(FileNotFoundError):
+            drain.unlink()
+
+
 def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = None,
                             lock_timeout: float = 5.0) -> None:
     """``[(home, job_id[, run_start])]`` in flight at a trip, for the restarted runner. Each row is
@@ -180,19 +219,28 @@ def record_pending_requeues(items: List[tuple], trip_epoch: Optional[float] = No
     a job whose clean completion was recorded after the run began: a worker that already marked
     ``ok`` stays listed as running until its ``finally`` releases it, so a stamp taken at the trip
     would re-fire a finished job (Prism dbe5fc2fa076). Merged with any still pending (newest
-    stamp wins), under ``_file_lock``. Never raises."""
+    stamp wins), under ``_file_lock``. On a lock timeout the rows go to the append-only spill
+    file instead: an unlocked read-modify-write of the shared file could be overwritten by a
+    replay commit holding the lock (Prism e7289429e4e2). Never raises."""
     if not items:
         return
     trip_epoch = time.time() if trip_epoch is None else float(trip_epoch)
+    rows = []
+    for h, j, *rest in items:
+        stamp = float(rest[0]) if rest and rest[0] is not None else trip_epoch
+        rows.append([str(h), str(j), stamp])
     try:
         path = _requeue_path()
-        with _file_lock(path, timeout=lock_timeout):
+        with _file_lock(path, timeout=lock_timeout) as locked:
+            if not locked:
+                _append_spill(rows)
+                logger.error("script runner: pending re-queue lock timed out; %d row(s) spilled "
+                             "to %s for the next start", len(rows), SPILL_NAME)
+                return
             pending = _read_pending(path)
-            for h, j, *rest in items:
-                stamp = float(rest[0]) if rest and rest[0] is not None else trip_epoch
+            for key, stamp in _pending_items(rows).items():
                 # Keep the NEWER stamp: an older snapshot recorded late must not lower the
                 # reconciliation threshold (Prism d37c5059edb2).
-                key = (str(h), str(j))
                 pending[key] = max(pending.get(key, 0.0), stamp)
             _write_pending(path, [[h, j, e] for (h, j), e in pending.items()])
     except Exception:
@@ -220,8 +268,17 @@ def apply_pending_requeues() -> int:
     ``RESTART_REQUEUE_MAX``). A job that completed cleanly after the snapshot, or already carries a
     re-fire marker, is skipped. Entries whose re-queue RAISED stay in the file for the next start;
     a refusal (cap, unknown or one-shot job) is final. An unreadable file is left in place.
+    Rows spilled by a record that timed out on the lock are folded in first, under the lock
+    (Prism e7289429e4e2); without the lock they stay spilled for the next start.
     Returns re-queued."""
     path = _requeue_path()
+    try:
+        with _file_lock(path) as locked:
+            if locked:
+                _fold_spill(path)
+    except (OSError, ValueError):
+        logger.error("script runner: pending re-queue spill fold failed; kept for the next start",
+                     exc_info=True)
     try:
         text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:

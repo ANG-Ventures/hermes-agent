@@ -180,7 +180,7 @@ def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
     cli.agent = agent
     cli._interrupt_queue = queue.Queue()
     cli._pending_input = queue.Queue()
-    cli._pending_model_switch_note = "[MODEL SWITCH NOTE]"
+    cli._pending_skills_reload_note = "[SKILLS RELOAD NOTE]"
 
     with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
          patch.object(cli, "_resolve_turn_agent_config", return_value={
@@ -191,7 +191,7 @@ def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
         cli.chat("clean prompt")
 
     assert agent.captured is not None
-    assert agent.captured["user_message"] == "[MODEL SWITCH NOTE]\n\nclean prompt"
+    assert agent.captured["user_message"] == "[SKILLS RELOAD NOTE]\n\nclean prompt"
     assert agent.captured["persist_user_message"] == "clean prompt"
 
 
@@ -223,7 +223,7 @@ def test_chat_preserves_clean_multimodal_input_when_note_changes_api_message():
     cli.agent = agent
     cli._interrupt_queue = queue.Queue()
     cli._pending_input = queue.Queue()
-    cli._pending_model_switch_note = "[MODEL SWITCH NOTE]"
+    cli._pending_skills_reload_note = "[SKILLS RELOAD NOTE]"
 
     with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
          patch.object(cli, "_resolve_turn_agent_config", return_value={
@@ -237,7 +237,7 @@ def test_chat_preserves_clean_multimodal_input_when_note_changes_api_message():
     assert agent.captured["persist_user_message"] == clean_parts
     assert agent.captured["persist_user_message"] is not agent.captured["user_message"]
     api_parts = agent.captured["user_message"]
-    assert api_parts[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
+    assert api_parts[0]["text"] == "[SKILLS RELOAD NOTE]\n\nDescribe this screenshot"
     assert api_parts[1] == clean_parts[1]
 
 
@@ -351,7 +351,7 @@ def test_chat_multimodal_note_persists_clean_input_once(tmp_path, monkeypatch):
     cli.agent = agent
     cli._interrupt_queue = queue.Queue()
     cli._pending_input = queue.Queue()
-    cli._pending_model_switch_note = "[MODEL SWITCH NOTE]"
+    cli._pending_skills_reload_note = "[SKILLS RELOAD NOTE]"
 
     with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
          patch.object(cli, "_resolve_turn_agent_config", return_value={
@@ -362,7 +362,7 @@ def test_chat_multimodal_note_persists_clean_input_once(tmp_path, monkeypatch):
         cli.chat(clean_parts)
 
     assert captured["persist_user_message"] == clean_parts
-    assert captured["user_message"][0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
+    assert captured["user_message"][0]["text"] == "[SKILLS RELOAD NOTE]\n\nDescribe this screenshot"
     assert [m["content"] for m in db.get_messages_as_conversation(session_id)] == [
         "Describe this screenshot\n[screenshot]"
     ]

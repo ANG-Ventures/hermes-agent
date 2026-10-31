@@ -2287,6 +2287,11 @@ DEFAULT_CONFIG = {
         # without a logged flagship override. None uses model_policy's shared
         # FLAGSHIP_MODEL_SUBSTRINGS; a non-empty list replaces that default.
         "banned_worker_model_substrings": None,
+        # Standing per-profile flagship grants: {profile: "<reason>"}. Admits
+        # ONLY that profile's resolved model.default route (no pin, no lane)
+        # without --allow-flagship, so a no_agent cron can dispatch it. Set by
+        # the operator in the root config, e.g. tiresias: Ace D1 (Fable).
+        "flagship_profile_allowances": {},
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
         # Implicit pre-spawn probe per claude relay FAMILY (used when
