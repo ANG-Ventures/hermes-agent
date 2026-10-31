@@ -50,7 +50,10 @@ type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 let rest: null | Rest = null
 let os: null | PluginOs = null
 
-/** Selected board slug ('' = the server's current board). Persisted. */
+/** The board an unselected tab addresses. The server keeps no current board (S7 D5). */
+export const DEFAULT_BOARD = 'default'
+
+/** Selected board slug ('' = {@link DEFAULT_BOARD}). Persisted. */
 export const $boardSlug = atom<string>('')
 
 /** Whether the "how this board works" intro was dismissed. Persisted. */
@@ -113,9 +116,7 @@ function eventsSince(scope: string, slug: string): number | undefined {
 function eventsUrl(slug: string, since: number | undefined): string {
   const params = new URLSearchParams()
 
-  if (slug) {
-    params.set('board', slug)
-  }
+  params.set('board', slug || DEFAULT_BOARD)
 
   if (since !== undefined) {
     params.set('since', String(since))
@@ -127,7 +128,7 @@ function eventsUrl(slug: string, since: number | undefined): string {
 }
 
 function boardSnapshotPath(slug: string): string {
-  return slug ? `/board?board=${encodeURIComponent(slug)}` : '/board'
+  return `/board?board=${encodeURIComponent(slug || DEFAULT_BOARD)}`
 }
 
 /** Cache-scope id for the active connection — the segment every query key
@@ -289,18 +290,7 @@ export function bindApi(
         })
     }
 
-    if (selectedSlug) {
-      openResolved(selectedSlug)
-
-      return
-    }
-
-    // Resolve the alias BEFORE the handshake: /events is pinned to its board
-    // when opened. Resolving on each frame could classify an old socket's
-    // events against a different server-current board's cursor.
-    void r<BoardsResponse>('/boards')
-      .then(boards => openResolved(typeof boards.current === 'string' ? boards.current : ''))
-      .catch(() => openResolved('')) // Keep live cache invalidation; notifications fail closed.
+    openResolved(selectedSlug || DEFAULT_BOARD)
   }
 
   // The local connection keeps the BARE key (the bare-local rule of
@@ -358,15 +348,9 @@ function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
 /** Append the selected board (and other params) to a path. */
 function withBoard(path: string, params: Record<string, string> = {}): string {
   const search = new URLSearchParams(params)
-  const slug = $boardSlug.get()
+  search.set('board', $boardSlug.get() || DEFAULT_BOARD)
 
-  if (slug) {
-    search.set('board', slug)
-  }
-
-  const qs = search.toString()
-
-  return qs ? `${path}?${qs}` : path
+  return `${path}?${search.toString()}`
 }
 
 // ── query keys (connection- and board-scoped; scope is always segment [2]) ────
@@ -490,7 +474,7 @@ export const updateBoard = (slug: string, patch: Record<string, unknown>) =>
 /** Archive a board to `boards/_archived/` — recoverable, and the backend
  *  refuses to touch `default`. (`?delete=true` hard-deletes; no caller yet.) */
 export const deleteBoard = (slug: string) =>
-  call<{ result: { action: string; new_path: string }; current: string }>(`/boards/${encodeURIComponent(slug)}`, {
+  call<{ result: { action: string; new_path: string } }>(`/boards/${encodeURIComponent(slug)}`, {
     method: 'DELETE'
   })
 

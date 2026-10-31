@@ -154,7 +154,7 @@ system prompt, so no profile needs to load a kanban skill.
 The final action of setup.sh is firing the kanban:
 
 ```bash
-hermes kanban create "Direct production of <video title>" \
+hermes kanban --board <board> create "Direct production of <video title>" \
     --assignee director \
     --workspace dir:"$HOME/projects/video-pipeline/${PROJECT_SLUG}" \
     --tenant ${PROJECT_SLUG} \

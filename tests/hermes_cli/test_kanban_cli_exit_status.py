@@ -42,7 +42,7 @@ def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(kanban_i
     """A printed Kanban mutation refusal must not look like CLI success."""
     home = kanban_identity.home
 
-    created = _run_hermes(home, "kanban", "create", "exit status probe", "--json")
+    created = _run_hermes(home, "kanban", "--board", "default", "create", "exit status probe", "--json")
     assert created.returncode == 0, created.stderr
     task_id = json.loads(created.stdout)["id"]
 
