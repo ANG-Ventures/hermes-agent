@@ -737,7 +737,9 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
                                 close_record_fn: Optional[CloseRecordFn] = None,
                                 abandon_reason: Optional[str] = None,
                                 terminal_record_fn: Optional[CloseRecordFn] = None,
-                                abandoned_out: Optional[list] = None) -> list:
+                                abandoned_out: Optional[list] = None,
+                                card_cover: Optional[Callable[[list], list]] = None,
+                                card_covered_out: Optional[list] = None) -> list:
     """Raise :class:`ClosedUnmergedPrError` when the card's own PR is closed-unmerged (or unreadable) and
     the handoff (``texts`` + ``superseded_by``) carries no SUPERSEDED-BY/RE-CARRIED-AS token naming merged
     work for it. ``decision_texts`` (archive only: card comments) may instead record an explicit
@@ -764,6 +766,14 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
     uncovered = [c for c in uncovered if not any(_decision_covers(c, t, sole=sole) for t in decision_texts)]
     if not uncovered:
         return closed
+    if card_cover is not None:
+        # ``--superseded-by <card>`` (t_6a853d1c): covered only when ALL of :func:`card_supersession`'s
+        # rules hold for EVERY uncovered closed PR; anything less falls through to the refusal below.
+        covers = card_cover(uncovered)
+        if covers:
+            if card_covered_out is not None:
+                card_covered_out.extend(covers)
+            return closed
     if verb == "archive" or (isinstance(abandon_reason, str) and abandon_reason.strip()):
         if terminal_record_fn is None:
             terminal_record_fn = _default_terminal_record()
@@ -797,6 +807,120 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
             return closed
     raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], verb=verb,
                                 untokened=untokened, survivors=[f"{r.repo}#{r.number}" for r in survivors])
+
+
+# --------------------------------------------------------------------------- superseded by ANOTHER card
+# t_6a853d1c (2026-10-31): t_eb5bf009's fos#350 was closed ``CLOSED: SUPERSEDED-BY #351``; #351 is card
+# t_be729571's PR, merged, and edits the same spawn() block a different way. No commit carries #350's
+# content and #351 does not name t_eb5bf009, so every close form refused and the card could only be
+# archived. ``--superseded-by <card>`` now covers the card's closed own PR when ALL of these hold:
+#   1. that card is done;
+#   2. one of its own PRs merged, merge commit on the default branch;
+#   3. the closed PR's own GitHub thread carries ``CLOSED: SUPERSEDED-BY <that PR>``;
+#   4. the two PRs' changed files intersect.
+# Anything unreadable refuses (the ordinary closed-unmerged refusal stands).
+CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+_SUPERSEDED_LINE_RE = re.compile(r"^\s*CLOSED: SUPERSEDED-BY\s+(" + _TARGET + r")\b", re.MULTILINE)
+FilesFn = Callable[[str, int], Optional[set]]
+SupersedeTargetsFn = Callable[[str, int], Optional[list]]
+
+
+def superseding_card(superseded_by: Optional[str]) -> Optional[str]:
+    """The ONE card id a ``--superseded-by`` pointer names, else None (none, or ambiguous)."""
+    ids = set(CARD_ID_RE.findall(superseded_by)) if isinstance(superseded_by, str) else set()
+    return ids.pop() if len(ids) == 1 else None
+
+
+def pr_files(repo: str, number: int) -> Optional[set]:
+    """Paths a PR changes (new and previous names); None when GitHub cannot be read."""
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "--hostname", "github.com", "--paginate",
+             f"repos/{repo}/pulls/{number}/files?per_page=100",
+             "--jq", ".[] | .filename, (.previous_filename // empty)"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=QUERY_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {line.strip() for line in (proc.stdout or "").splitlines() if line.strip()}
+
+
+def pr_superseded_targets(repo: str, number: int) -> Optional[list]:
+    """Targets of every ``CLOSED: SUPERSEDED-BY <ref>`` line on the PR's own thread; None if unreadable."""
+    out: list = []
+
+    def _collect(body):
+        if isinstance(body, str):
+            out.extend(_SUPERSEDED_LINE_RE.findall(body))
+        return False
+    if pr_close_record(repo, number, match=_collect) is None:
+        return None
+    return out
+
+
+def _default_files() -> Optional[FilesFn]:
+    return None if os.environ.get("PYTEST_CURRENT_TEST") else pr_files
+
+
+def _default_superseded_targets() -> Optional[SupersedeTargetsFn]:
+    return None if os.environ.get("PYTEST_CURRENT_TEST") else pr_superseded_targets
+
+
+def _target_key(closed_ref, target: str) -> Optional[tuple]:
+    m = _BARE_PR_RE.match(target)
+    if m:
+        return closed_ref.repo.lower(), int(m.group(1))
+    refs = extract_pr_refs(target) if ("#" in target or "/pull/" in target) else []
+    return (refs[0].repo.lower(), refs[0].number) if refs else None
+
+
+def card_supersession(closed, *, card: str, card_status: Optional[str], card_prs, query_fn: Optional[QueryFn],
+                      sha_check: Optional[ShaCheckFn] = None, targets_fn: Optional[SupersedeTargetsFn] = None,
+                      files_fn: Optional[FilesFn] = None) -> list:
+    """Cover entries for every closed ref in ``closed`` that ``card``'s merged work superseded (rules 1-4
+    above); ``[]`` unless EVERY closed ref is covered. Each entry is the survivor-ref shape
+    :func:`kanban_survivor.preserve` records, plus ``supersedes`` (the closed PR) and ``card``."""
+    if card_status != "done" or not closed or query_fn is None:
+        return []
+    sha_check = sha_check or _default_sha_check()
+    targets_fn = targets_fn or _default_superseded_targets()
+    files_fn = files_fn or _default_files()
+    if sha_check is None or targets_fn is None or files_fn is None:
+        return []
+    merged = {(r.repo.lower(), r.number): r for r in merged_survivors(
+        split_fleet(extract_pr_refs(*card_prs))[0], query_fn=query_fn, sha_check=sha_check)}
+    if not merged:
+        return []
+    covers: list = []
+    for c in closed:
+        try:
+            targets = targets_fn(c.repo, c.number)
+            hits = [merged[k] for k in dict.fromkeys(_target_key(c, t) for t in (targets or [])) if k in merged]
+            mine = files_fn(c.repo, c.number) if hits else None
+        except Exception as exc:
+            _log.warning("kanban card supersession: %s#%s lookup failed: %s", c.repo, c.number, exc)
+            return []
+        sup = None
+        for s in hits:
+            try:
+                theirs = files_fn(s.repo, s.number)
+            except Exception as exc:
+                _log.warning("kanban card supersession: %s#%s files failed: %s", s.repo, s.number, exc)
+                theirs = None
+            if mine and theirs and mine & theirs:
+                sup = s
+                break
+        if sup is None:
+            return []
+        payload = query_fn(sup.repo, sup.number) or {}
+        covers.append({"remote": f"https://github.com/{sup.repo}.git", "branch": f"refs/pull/{sup.number}/head",
+                       "sha": str(payload.get("merge_commit_sha") or ""), "pr": f"{sup.repo}#{sup.number}",
+                       "state": "MERGED", "external": True, "corroborated_by": "superseded-card",
+                       "card": card, "supersedes": f"{c.repo}#{c.number}"})
+    return covers
 
 
 # --------------------------------------------------------------------------- routed-PR survivor gate

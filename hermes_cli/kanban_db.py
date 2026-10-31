@@ -11816,14 +11816,26 @@ def complete_task(
     if content_survivors:
         metadata = dict(metadata or {}, superseded_content=content_survivors)
     closed_abandoned: list = []
+    card_covers: list = []
+    _closed_query = _pr_query or _open_pr.memo_query()
+    card_cover = None
+    sup_card = _open_pr.superseding_card(superseded_by)
+    if sup_card and sup_card != task_id:
+        def card_cover(uncovered):
+            # --superseded-by <card> (t_6a853d1c): that card's merged work superseded this card's PR.
+            other = get_task(conn, sup_card)
+            return _open_pr.card_supersession(
+                uncovered, card=sup_card, card_status=other.status if other else None,
+                card_prs=_card_recorded_pr_refs(conn, sup_card), query_fn=_closed_query)
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, result, summary, metadata=metadata,
             survivor_pr=survivor_pr, superseded_by=superseded_by,
-            query_fn=_pr_query or _open_pr.memo_query(),
+            query_fn=_closed_query,
             recorded=_card_recorded_pr_refs(conn, task_id),
             abandon_reason=None if _overlong(str(abandon_routed_pr or "").strip()) else abandon_routed_pr,
             abandoned_out=closed_abandoned,
+            card_cover=card_cover, card_covered_out=card_covers,
         )
     except _open_pr.ClosedUnmergedPrError as closed_err:
         with write_txn(conn):
@@ -11848,8 +11860,13 @@ def complete_task(
         survivor_unbound=survivor_unbound,
         survivor_none=survivor_none, survivor_reason=survivor_reason,
         evidence=[t for t in (summary, result) if t],
-        content_survivor=content_survivors[0] if content_survivors else None,
+        content_survivor=(content_survivors[0] if content_survivors
+                          else card_covers[0] if card_covers else None),
     )
+    if card_covers:
+        metadata = dict(metadata or {}, superseded_by_card={
+            "card": sup_card,
+            "prs": [{"closed": c["supersedes"], "merged": c["pr"], "sha": c["sha"]} for c in card_covers]})
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
         if survivor['kind'] == 'patch':
@@ -12011,6 +12028,8 @@ def complete_task(
             # Read by the gateway notifier to say "premise superseded by X"
             # instead of the generic done ping.
             completed_payload["superseded_by"] = superseded_by
+            if isinstance(metadata, dict) and metadata.get("superseded_by_card"):
+                completed_payload["superseded_by_card"] = metadata["superseded_by_card"]
         if external:
             completed_payload["external"] = {"url": external, "watcher": watcher}
         if verified_cards:
