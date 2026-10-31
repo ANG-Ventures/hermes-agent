@@ -56,6 +56,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
@@ -302,6 +303,66 @@ def _owner(claim: Any) -> Optional[str]:
     return None
 
 
+# One idle connection per database file per process (t_e92870f8). Closing the LAST connection to
+# a WAL database checkpoints the WAL into the main file (with checkpoint_fullfsync on macOS), and
+# every ``connect`` here is the last one: measured on a copy of the live store, close() was ~57 ms
+# of a ~95 ms row write, paid under ``_jobs_lock``. An anchor that has read once keeps the WAL
+# index open, so close() is a plain close and SQLite's ordinary auto-checkpoint (on commit, past
+# 1000 pages) does the folding instead. The anchor never runs a transaction or holds a lock. It is
+# re-opened when the file was replaced or after a fork, and closed before the database is dropped.
+# path -> (connection, owning pid, (st_dev, st_ino))
+_anchors: Dict[str, tuple] = {}
+_anchors_lock = threading.Lock()
+_MAX_ANCHORS = 16
+
+
+def _file_identity(path: Path) -> Optional[tuple]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _close_anchor(key: str) -> None:
+    entry = _anchors.pop(key, None)
+    if entry is not None and entry[1] == os.getpid():
+        with contextlib.suppress(sqlite3.Error):
+            entry[0].close()
+
+
+def release_anchor(cron_dir: Path) -> None:
+    """Close this process's anchor on *cron_dir*'s database before the file is unlinked (Windows
+    refuses to unlink a file SQLite holds open)."""
+    with _anchors_lock:
+        _close_anchor(str(db_path(cron_dir)))
+
+
+def _ensure_anchor(path: Path) -> None:
+    with _anchors_lock:
+        _ensure_anchor_locked(path)
+
+
+def _ensure_anchor_locked(path: Path) -> None:
+    key = str(path)
+    ident = _file_identity(path)
+    entry = _anchors.get(key)
+    if entry is not None and entry[1] == os.getpid() and ident is not None and entry[2] == ident:
+        return
+    if entry is not None and entry[1] != os.getpid():
+        _anchors.pop(key, None)  # a forked child never closes its parent's handle
+    else:
+        _close_anchor(key)
+    try:
+        anchor = sqlite3.connect(str(path), timeout=0, check_same_thread=False)
+        anchor.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+    except sqlite3.Error:
+        return  # an optimisation only: a busy or odd file just pays the close checkpoint
+    while len(_anchors) >= _MAX_ANCHORS:
+        _close_anchor(next(iter(_anchors)))
+    _anchors[key] = (anchor, os.getpid(), ident)
+
+
 @contextlib.contextmanager
 def connect(cron_dir: Path, *, create: bool = True) -> Iterator[Optional[sqlite3.Connection]]:
     """Short-lived connection (open per operation: no per-thread fd caches in a long-lived
@@ -329,6 +390,7 @@ def connect(cron_dir: Path, *, create: bool = True) -> Iterator[Optional[sqlite3
             os.close(os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     conn = open_db(path, db_label=f"cron/{DB_NAME}", busy_timeout_ms=30000,
                    synchronous_full=True, row_factory=None)
+    _ensure_anchor(path)
     try:
         conn.isolation_level = None  # explicit BEGIN/COMMIT only (see ``transaction``)
         conn.executescript(_SCHEMA)
@@ -811,6 +873,7 @@ def drop_database(cron_dir: Path) -> None:
     ``journal_mode: delete`` database leaves after a crash, Prism 15391e1b7adf) after a fold back
     into jobs.json."""
     base = db_path(cron_dir)
+    release_anchor(cron_dir)
     for suffix in SIDECAR_SUFFIXES:
         with contextlib.suppress(FileNotFoundError):
             Path(str(base) + suffix).unlink()
