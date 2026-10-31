@@ -287,11 +287,42 @@ def test_failed_declared_delivery_is_not_recorded(monkeypatch):
     assert len(sent) == 2  # the dropped one is retried; the delivered one is not repeated
 
 
-def test_undeclared_fallback_stays_loud_every_run(monkeypatch):
+# t_f238d060: 2026-10-25 a retrying job hit the same undeclared switch every ~10 min and paged
+# #alerts 11x with the same line. The first page is still loud; repeats of the same pair that day
+# are dropped; a new pair or a new day pages again.
+
+def test_undeclared_fallback_pages_once_per_job_per_pair_per_day(monkeypatch):
     calls = _capture_deliver(monkeypatch)
     for _ in range(3):
         sched._emit_cron_fallback_alert(UNDECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    assert len(calls) == 1
+    assert "🚨" in calls[0]["content"]
+    assert calls[0]["job"]["deliver"] == sched._DEFAULT_FALLBACK_ALERT_DELIVER
+
+
+def test_undeclared_fallback_repages_on_new_pair_or_new_day(monkeypatch):
+    from cron.fork_ext import fallback_notice_gate as gate
+    calls = _capture_deliver(monkeypatch)
+    monkeypatch.setattr(gate, "_today", lambda: "2026-10-25")
+    sched._emit_cron_fallback_alert(UNDECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    other_pair = dict(FALLBACK_EVENT, new_provider="openai-codex", new_model="gpt-5.5-mini")
+    sched._emit_cron_fallback_alert(UNDECLARED_JOB, _FakeAgent(other_pair))
+    monkeypatch.setattr(gate, "_today", lambda: "2026-10-26")
+    sched._emit_cron_fallback_alert(UNDECLARED_JOB, _FakeAgent(other_pair))
     assert len(calls) == 3
+
+
+def test_failed_undeclared_delivery_is_retried(monkeypatch):
+    sent = []
+
+    def flaky(job, content, success=True, adapters=None, loop=None, wrap_override=None):
+        sent.append(content)
+        return "discord down" if len(sent) == 1 else None
+
+    monkeypatch.setattr(sched, "_deliver_result", flaky)
+    for _ in range(3):
+        sched._emit_cron_fallback_alert(UNDECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    assert len(sent) == 2  # a dropped page is not recorded as noticed
 
 
 # --- concurrent writers (Prism P1 on #1807, t_55458885) ----------------------

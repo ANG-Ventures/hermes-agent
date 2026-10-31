@@ -1,4 +1,4 @@
-"""One DECLARED-fallback notice per cron job per local day (t_2efae1cd).
+"""One fallback notice per cron job per primary->fallback pair per local day (t_2efae1cd, t_f238d060).
 
 A declared fallback firing is the safety net working, and the notice says "no action needed".
 While a primary is walled for days (xai-oauth 403 spending-limit, 2026-10-06), every run and every
@@ -7,7 +7,8 @@ retry of the same job walked the same chain, and #logs got the same line once pe
 the day carries all the information. Later ones in the same day for the same job and the same
 primary -> fallback pair are dropped. A different pair is new information and still posts.
 
-UNDECLARED fallbacks never come here: they stay loud on every run.
+UNDECLARED fallbacks use the same gate (pair prefixed ``undeclared: ``): the first one of the day
+still pages #alerts, but a job retrying every ~10 min on the same switch paged 12x on 2026-10-25.
 State: ``<home>/cron/fallback_notice_day.json`` = {job_id: {"day": "YYYY-MM-DD", "pair": "a -> b"}}.
 Fail-open: any error reading the state means "post it".
 """
