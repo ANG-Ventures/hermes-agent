@@ -395,3 +395,38 @@ def test_supersession_close_never_removes_the_workspace_itself(board, monkeypatc
         held = ks._state(conn, tid)[1]
         assert held and "superseded_by_card" in held
         assert "workspace_held" in [e.kind for e in kb.list_events(conn, tid)]
+
+
+def test_supersession_hold_commits_with_done_and_survives_a_crash_after_commit(board, monkeypatch):
+    """Prism ff7e3c99981d: the hold is the only protection on the no-claim path, so it must be
+    durable together with ``done``. A crash at the first step after the done commit must leave
+    ``held_reason`` set, and a later archive must keep the loose file."""
+    from hermes_cli import kanban_db_workspace as kbw
+    from hermes_cli import kanban_survivor as ks
+
+    _stub(monkeypatch)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", ('{"pr_url": "%s"}' % CLOSED_PR, run))
+        conn.commit()
+        ws = kbw.resolve_workspace(kb.get_task(conn, tid))
+        kbw.set_workspace_path(conn, tid, ws)
+        ks.record_baseline(conn, tid, ws)
+        (ws / "draft.py").write_text(f"DRAFT_{tid}", encoding="utf-8")
+
+        real = kb._clear_failure_counter
+
+        def crash(*_a, **_k):
+            raise RuntimeError("simulated crash right after the done commit")
+        monkeypatch.setattr(kb, "_clear_failure_counter", crash)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            kb.complete_task(conn, tid, expected_run_id=run, superseded_by=sup)
+        monkeypatch.setattr(kb, "_clear_failure_counter", real)
+
+    with kb.connect() as conn:
+        assert _status(conn, tid) == "done"
+        held = ks._state(conn, tid)[1]
+        assert held and "superseded_by_card" in held, "done committed without its retention hold"
+        kb.archive_task(conn, tid)
+    assert (ws / "draft.py").exists(), "archive deleted the unpublished file of a held workspace"
+    assert (ws / "draft.py").read_text(encoding="utf-8") == f"DRAFT_{tid}"

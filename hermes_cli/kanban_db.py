@@ -11971,6 +11971,15 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if card_covers:
+            # --superseded-by <card> (Prism 20f49b2e3092, ff7e3c99981d): the cover proves another
+            # card's merged PR replaced this one, not that anything holds this workspace's bytes.
+            # The retention hold commits in THIS transaction, so `done` and `held_reason` become
+            # visible together or not at all (preserve(cleanup=True) refuses while it is set).
+            from hermes_cli.kanban_survivor import _hold_in_txn
+            _hold_in_txn(conn, task_id, f"survivor_unavailable: superseded_by_card {sup_card} is an "
+                                        "unbound cover, not a copy of this workspace; recover or "
+                                        "remove it by hand")
         if routed_abandon:
             _append_event(conn, task_id, "routed_pr_abandoned", routed_abandon)
         if approve_head_sha:
@@ -12083,15 +12092,8 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
-    if card_covers:
-        # --superseded-by <card> (Prism 20f49b2e3092): the cover proves another card's merged PR
-        # replaced this one, not that anything holds this workspace's bytes. It never removes the
-        # workspace itself: record the same retention hold an unbound claim falls into
-        # (kanban_survivor._hold; preserve(cleanup=True) refuses while held_reason is set).
-        from hermes_cli.kanban_survivor import _hold
-        _hold(conn, task_id, f"survivor_unavailable: superseded_by_card {sup_card} is an unbound "
-                             "cover, not a copy of this workspace; recover or remove it by hand")
-    else:
+    if not card_covers:
+        # A supersession close never removes the workspace itself; its hold was written with done.
         # Clean up the scratch workspace and any stale tmux session for the worker.
         _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
