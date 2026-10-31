@@ -1282,6 +1282,31 @@ def test_record_after_a_lock_timeout_survives_a_concurrent_replay_commit(root, m
     assert rr.apply_pending_requeues() == 0  # drained: nothing fires twice
 
 
+def test_spilled_rows_survive_repeated_concurrent_folds(root, monkeypatch):
+    """Prism 0e39f9048db7 (t_d8d149fc): a fold that runs every time the spill writer opens its
+    file, five times over, must not leave the spilled row in no reachable file."""
+    from cron import script_runner_rearm as rr
+
+    b = _job(root, "B", "b.sh")
+    path = root / "cron" / rr.REQUEUE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    real_open, folds = os.open, []
+
+    def racing_open(file, flags, *args, **kwargs):
+        fd = real_open(file, flags, *args, **kwargs)
+        if "spill" in os.path.basename(os.fsdecode(file)) and len(folds) < 5:
+            folds.append(file)
+            rr._fold_spill(path)  # drains between the writer's open and its write
+        return fd
+
+    monkeypatch.setattr(os, "open", racing_open)
+    rr._append_spill([[str(root), b["id"], 1.0]])
+    monkeypatch.setattr(os, "open", real_open)
+    assert folds
+    assert rr.apply_pending_requeues() == 1  # B reached a file the replay reads
+    assert rr.apply_pending_requeues() == 0
+
+
 def test_concurrent_trip_records_lose_no_line(root):
     """Prism 2777c74d0091: two writers of the trip history must not drop each other's line."""
     from cron import script_runner_rearm as rr

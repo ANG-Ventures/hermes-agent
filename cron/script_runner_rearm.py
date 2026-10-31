@@ -175,45 +175,26 @@ def _read_pending(path: Path) -> Dict[tuple, float]:
 
 
 SPILL_NAME = "script_runner_requeue.spill.jsonl"
-_DRAIN_TAG = ".drain."
-
-
-def _spill_path() -> Path:
-    return _requeue_path().with_name(SPILL_NAME)
 
 
 def _append_spill(rows: List[list]) -> None:
-    """Append ``rows`` to the spill file: append-only, never a read (Prism e7289429e4e2). If a
-    drain renamed the file away during the write, append again to the new file, so a row is never
-    left only in a drained copy; a duplicate row merges away (max stamp)."""
-    data = "".join(json.dumps(row) + "\n" for row in rows).encode("utf-8")
-    path = _spill_path()
-    for _ in range(5):
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            view = memoryview(data)
-            while view:
-                view = view[os.write(fd, view):]
-            st = os.fstat(fd)
-        finally:
-            os.close(fd)
-        try:
-            now = os.stat(path)
-            if (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino):
-                return
-        except FileNotFoundError:
-            pass
-    logger.error("script runner: pending re-queue spill raced 5 drains; rows may wait a start")
+    """Write ``rows`` to a spill file of their own, never a read-modify-write (Prism
+    e7289429e4e2). The file appears by atomic rename, complete or not at all, so a concurrent fold
+    either reads all of it or leaves it for the next start: no copy can be drained while it is
+    still being written (Prism 0e39f9048db7)."""
+    from utils import atomic_write_text
+
+    spill = _requeue_path().with_name(
+        f"{SPILL_NAME}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}")
+    atomic_write_text(spill, "".join(json.dumps(row) + "\n" for row in rows),
+                      tmp_prefix=".script_runner_requeue_spill_", mode=0o600)
 
 
 def _fold_spill(path: Path) -> None:
-    """Merge spilled rows into ``path``. Caller holds ``_file_lock(path)``. The spill is renamed to
-    a drain file first (a late appender sees the rename and re-appends), drain files are removed
-    only after the merged file is written, so a failed write leaves them for the next start."""
-    spill = _spill_path()
-    with contextlib.suppress(FileNotFoundError):
-        spill.replace(spill.with_name(f"{SPILL_NAME}{_DRAIN_TAG}{os.getpid()}.{time.time_ns()}"))
-    drains = sorted(spill.parent.glob(SPILL_NAME + _DRAIN_TAG + "*"))
+    """Merge spilled rows into ``path``. Caller holds ``_file_lock(path)``. Only the spill files
+    read here are removed, and only after the merged file is written, so a failed write leaves them
+    for the next start and a spill that appears mid-fold waits for the next one."""
+    drains = sorted(path.parent.glob(SPILL_NAME + ".*"))
     if not drains:
         return
     rows = []
