@@ -241,6 +241,22 @@ def _retire_agent(cli) -> None:
     cli.agent = None
 
 
+def _bind_route_known(cli) -> None:
+    """Seed the new agent with this session's route-note ``Known`` and keep it on the CLI.
+
+    The CLI twin of the gateway's SessionEntry sink: every /model retires and rebuilds the agent,
+    and a fresh ``Known`` would make the next note compare against the new pin (a switch reads as
+    "fell back", or as nothing). Held per session id, so /new and /resume start from no baseline."""
+    from agent.route_identity import seed_known
+    agent = cli.agent
+    held = getattr(cli, "_route_known_held", None)
+    data = held[1] if isinstance(held, tuple) and held[0] == cli.session_id else None
+
+    def _sink(known):
+        cli._route_known_held = (agent.session_id, known)
+    seed_known(agent, data, _sink)
+
+
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
 
@@ -826,6 +842,7 @@ class CLIAgentSetupMixin:
             except Exception:
                 pass
             self._active_agent_route_signature = _route_signature(effective_model, runtime)
+            _bind_route_known(self)
 
             # Force-create DB row on /title intent, then apply title.
             if self._pending_title and self._session_db:

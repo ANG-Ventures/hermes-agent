@@ -41,6 +41,7 @@ def _make_cli():
             cli = _cli_mod.HermesCLI()
     cli.model, cli.provider, cli.requested_provider = T.OPUS, "custom", "custom"
     cli.base_url, cli.api_key, cli.api_mode = "https://example.invalid/v1", "k-abcdef12", None
+    cli._fallback_model = [{"provider": "custom", "model": T.OPUS, "base_url": "https://example.invalid/v1"}]
     cli._interrupt_queue = queue.Queue()
     cli._pending_input = queue.Queue()
     return cli
@@ -71,17 +72,6 @@ class CliLadder:
         return model, str(content)
 
 
-def _init_agent(cli):
-    from hermes_cli.cli_agent_setup_mixin import _current_runtime, _route_signature
-
-    def build(**_kw):
-        if cli.agent is None:
-            cli.agent = T._make_agent(model=cli.model, fallbacks=(T.OPUS,), session_id=cli.session_id)
-            cli._active_agent_route_signature = _route_signature(cli.model, _current_runtime(cli))
-        return True
-    return build
-
-
 def _turn(cli, ladder, text):
     from agent import fallback_policy
     from run_agent import AIAgent
@@ -90,8 +80,9 @@ def _turn(cli, ladder, text):
     with ExitStack() as st:
         for p in (
             patch.object(cli, "_ensure_runtime_credentials", return_value=True),
-            patch.object(cli, "_init_agent", side_effect=_init_agent(cli)),
             patch.object(cli, "_sync_fallback_chain_with_config"),
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
             patch.object(AIAgent, "_interruptible_api_call", side_effect=ladder),
             patch.object(AIAgent, "_save_trajectory"),
             patch.object(AIAgent, "_cleanup_task_resources"),
