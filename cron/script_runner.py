@@ -252,6 +252,9 @@ class ScriptRunner:
                                    "trip marker removed")
         self.tripped = trip_marker_path().exists()
         if self.tripped:
+            # A trip seen by this process opens a new episode: the next ADMITTED tick closes it
+            # again even if the marker goes away off the self-rearm path (Prism ce116ff61d38).
+            self._episode_cleared = False
             self._maybe_self_rearm()
         if self.tripped:
             self._warn_hourly("tripped", True, "script runner standby: watchdog tripped (%s); "

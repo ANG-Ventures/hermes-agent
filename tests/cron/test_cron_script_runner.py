@@ -1578,6 +1578,34 @@ def test_first_admitted_tick_closes_an_episode_left_by_a_rearm_off_the_self_rear
     assert clears == [1, 1]
 
 
+def test_trip_after_an_admitted_tick_rearms_the_episode_close(root, monkeypatch):
+    """Prism ce116ff61d38 (premature latch): a runner that already admitted a tick, then sees a
+    trip whose marker is removed by hand (no ``_rearmed``), still closes the episode."""
+    from cron import lanes, script_runner, script_runner_rearm as rr
+
+    clears = []
+    monkeypatch.setattr(rr, "clear_alerts", lambda: clears.append(1) or True)
+    monkeypatch.setattr(lanes, "write_runner_heartbeat", lambda *a, **k: None)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    admitted = lanes.TickOutcome.ADMITTED
+
+    r.enumerate_homes()
+    r.on_home_cycle("default", root, True, admitted)  # healthy tick, no trip yet
+    assert clears == []
+
+    rr.record_trip({"epoch": time.time(), "at": "x"})
+    marker = script_runner.trip_marker_path()
+    marker.write_text(json.dumps({"at": "x"}))
+    r.enumerate_homes()
+    assert r.tripped and r._rearmed is None  # fresh marker: no self re-arm
+    marker.unlink()  # hand re-arm, off the self-rearm path
+    r.enumerate_homes()
+    assert not r.tripped
+    r.on_home_cycle("default", root, True, admitted)
+    r.on_home_cycle("default", root, True, admitted)
+    assert clears == [1]
+
+
 def test_replay_commit_keeps_the_file_without_the_lock(root, monkeypatch):
     """Apollo item 5: when the commit cannot take the file lock it does not rewrite the file."""
     import contextlib as _cl
