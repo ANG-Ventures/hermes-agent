@@ -1574,3 +1574,71 @@ def test_refused_send_back_opens_no_review_run(flagship_profiles, proven_operato
                            (task_id,)).fetchone()
         assert tuple(row) == ("review", None, None)
     assert _journal_kinds(board, task_id)[before:] == []
+
+
+# --- standing per-profile grant: kanban.flagship_profile_allowances (t_a81e4e8a) ---
+# Tiresias runs on Fable by Ace's ruling (PRD-astrology-tiresias D1) and is
+# dispatched by a no_agent cron with no flagship authority. The root config
+# grants that ONE profile's default route; every other flagship profile, a
+# flagship pin, and a profile's own config granting itself stay refused.
+
+D1 = "Ace PRD-astrology-tiresias D1: Tiresias on Fable"
+
+
+@pytest.fixture
+def tiresias_grant(flagship_profiles):
+    _profile(flagship_profiles, "tiresias", _default(FABLE))
+    (flagship_profiles / "config.yaml").write_text(
+        f"kanban:\n  flagship_profile_allowances:\n    tiresias: '{D1}'\n", encoding="utf-8")
+    return flagship_profiles
+
+
+def _as_cron_script(monkeypatch):
+    """A no_agent cron's process: no operator label, not a dispatched worker."""
+    from hermes_cli import model_policy
+
+    monkeypatch.setenv("HERMES_CRON_JOB_ID", "tiresias-daily")
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda _actor: False)
+
+
+def test_granted_profile_creates_and_dispatches_without_authority(tiresias_grant, monkeypatch):
+    _as_cron_script(monkeypatch)
+    out = kc.run_slash("create 'tiresias daily' --assignee tiresias")
+    task_id = _created_id(out)
+    assert _comments(task_id) == []  # no per-card override needed or written
+    assert not _refused_at_dispatch(task_id)
+    other = _card("daedalus-opus")
+    assert kc.run_slash(f"reassign {other} tiresias").startswith("Reassigned")
+
+
+@pytest.mark.parametrize("assignee", ["daedalus-fable", "daedalus-astra"])
+def test_grant_covers_no_other_flagship_profile(tiresias_grant, monkeypatch, assignee):
+    _as_cron_script(monkeypatch)
+    out = kc.run_slash(f"create 'GATE-PROBE' --assignee {assignee}")
+    assert "assignee profile default" in out and "--allow-flagship" in out, out
+    assert _card_count() == 0
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, task_id))
+        conn.commit()
+    assert _refused_at_dispatch(task_id)
+
+
+def test_grant_does_not_cover_a_flagship_pin_or_a_self_grant(tiresias_grant, monkeypatch):
+    _as_cron_script(monkeypatch)
+    # A flagship pin on the granted profile still needs --allow-flagship.
+    out = kc.run_slash(f"create 'pin' --assignee tiresias --model {FABLE}")
+    assert "orchestrator-only" in out, out
+    # A profile's own config.yaml cannot grant its own route.
+    _profile(tiresias_grant, "daedalus-fable", _default(FABLE)
+             + "kanban:\n  flagship_profile_allowances:\n    daedalus-fable: self\n")
+    assert "assignee profile default" in kc.run_slash("create 'self' --assignee daedalus-fable")
+    assert _card_count() == 0
+
+
+def test_no_grant_configured_keeps_the_refusal(flagship_profiles, monkeypatch):
+    _profile(flagship_profiles, "tiresias", _default(FABLE))
+    _as_cron_script(monkeypatch)
+    out = kc.run_slash("create 'tiresias daily' --assignee tiresias")
+    assert "assignee profile default of 'tiresias'" in out, out
+    assert _card_count() == 0

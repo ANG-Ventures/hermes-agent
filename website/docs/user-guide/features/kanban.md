@@ -437,6 +437,10 @@ kanban:
                                    # for human-only review boards.
   # Optional replacement for the built-in [fable, astra] worker-model ban.
   banned_worker_model_substrings: [fable, astra]
+  # Standing per-profile grants (root config only): the named profile's
+  # resolved model.default may be a flagship with no --allow-flagship.
+  # Pins and lanes are not covered.
+  # flagship_profile_allowances: {tiresias: "Ace D1: Tiresias on Fable"}
   # dispatch_profiles: [sage]       # unset (key omitted): this home may claim
                                    # cards for any existing profile. Set to a
                                    # list (or comma-separated string) of profile
