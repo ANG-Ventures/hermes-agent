@@ -148,8 +148,8 @@ def test_comment_body_file_alone_and_missing_body_rc(kanban_home, tmp_path, caps
 @pytest.mark.parametrize(
     "argv",
     [
-        ["create", "t", "--body", "opening post", "--assignee", "alice", "--json"],
-        ["create", "--assignee", "alice", "--body", "opening post", "t", "--json"],
+        ["--board", "default", "create", "t", "--body", "opening post", "--assignee", "alice", "--json"],
+        ["create", "--board", "default", "--assignee", "alice", "--body", "opening post", "t", "--json"],
     ],
 )
 def test_create_body_either_order(kanban_home, argv, capsys):

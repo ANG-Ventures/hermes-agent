@@ -95,7 +95,7 @@ def test_dry_run_dispatch_orders_by_priority_and_shows_prio(kanban_home, capsys)
         newer = kb.create_task(conn, title="newer", assignee="default")
     assert _run("priority", newer, "200") == 0
     capsys.readouterr()
-    _run("dispatch", "--dry-run", "--max", "1")
+    _run("dispatch", "--board", "default", "--dry-run", "--max", "1")
     out = capsys.readouterr().out
     spawned = [ln for ln in out.splitlines() if ln.strip().startswith("- t_")]
     assert len(spawned) == 1, out

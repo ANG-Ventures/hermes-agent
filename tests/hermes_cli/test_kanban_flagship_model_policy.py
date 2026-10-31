@@ -63,7 +63,7 @@ def test_create_refuses_flagship_model_without_override(
     kanban_home, capsys, model,
 ):
     rc = kc.kanban_command(
-        _parse("create", "guarded", "--assignee", "worker", "--model", model)
+        _parse("create", "--board", "default", "guarded", "--assignee", "worker", "--model", model)
     )
 
     captured = capsys.readouterr()
@@ -81,7 +81,7 @@ def test_create_refuses_flagship_model_without_override(
 def test_create_override_records_comment(kanban_home, capsys):
     rc = kc.kanban_command(
         _parse(
-            "create",
+            "create", "--board", "default",
             "incident",
             "--assignee",
             "worker",
@@ -107,7 +107,7 @@ def test_create_validates_resolved_alias_and_records_override(
     kanban_home, flagship_alias, capsys,
 ):
     rc = kc.kanban_command(
-        _parse("create", "blocked alias", "--assignee", "worker", "--model", "fast")
+        _parse("create", "--board", "default", "blocked alias", "--assignee", "worker", "--model", "fast")
     )
     captured = capsys.readouterr()
     assert rc == 2
@@ -117,7 +117,7 @@ def test_create_validates_resolved_alias_and_records_override(
 
     rc = kc.kanban_command(
         _parse(
-            "create",
+            "create", "--board", "default",
             "allowed alias",
             "--assignee",
             "worker",
@@ -241,7 +241,7 @@ def test_configured_ban_is_used_by_create(kanban_home, capsys):
 
     rc = kc.kanban_command(
         _parse(
-            "create",
+            "create", "--board", "default",
             "custom policy",
             "--assignee",
             "worker",

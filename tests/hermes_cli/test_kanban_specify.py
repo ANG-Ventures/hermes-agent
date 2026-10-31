@@ -122,7 +122,7 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
     content = jsonlib.dumps({"title": "spec", "body": "body"})
     p, _ = _patch_aux_client(content)
     with p:
-        rc = _run_cli("specify", "--all", "--tenant", "proj-a", "--json")
+        rc = _run_cli("specify", "--board", "default", "--all", "--tenant", "proj-a", "--json")
     assert rc == 0
     lines = [
         jsonlib.loads(l)

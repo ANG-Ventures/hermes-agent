@@ -310,7 +310,7 @@ def test_cli_create_with_boomerang_wake_subscribes_and_shows_level(kanban_home, 
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "c1")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
     run = _cli()
-    assert run("create", "cli card", "--assignee", "peer", "--boomerang-wake", "--home", "operator") == 0
+    assert run("create", "--board", "default", "cli card", "--assignee", "peer", "--boomerang-wake", "--home", "operator") == 0
     with kbc.connect_closing() as conn:
         tid = conn.execute("SELECT id FROM tasks WHERE title='cli card'").fetchone()["id"]
         assert kb.get_task(conn, tid).boomerang_wake is True
