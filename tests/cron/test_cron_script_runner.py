@@ -1307,6 +1307,30 @@ def test_spilled_rows_survive_repeated_concurrent_folds(root, monkeypatch):
     assert rr.apply_pending_requeues() == 0
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores mode 000")
+def test_fold_keeps_an_unreadable_pending_file_and_its_spill(root):
+    """Prism 1ebc8b2c23f9 (t_d8d149fc): a pending file that exists but cannot be read must not
+    count as empty, or the fold rewrites it with only the spilled rows. Both A and B survive the
+    failed start and fire once the file is readable again."""
+    from cron import script_runner_rearm as rr
+
+    a = _job(root, "A", "a.sh")
+    b = _job(root, "B", "b.sh")
+    rr.record_pending_requeues([(str(root), a["id"])], trip_epoch=1.0)
+    rr._append_spill([[str(root), b["id"], 1.0]])
+    path = root / "cron" / rr.REQUEUE_NAME
+    before = path.read_bytes()
+    path.chmod(0)
+    try:
+        assert rr.apply_pending_requeues() == 0
+    finally:
+        path.chmod(0o600)
+    assert path.read_bytes() == before  # A's file unchanged
+    assert list(path.parent.glob(rr.SPILL_NAME + ".*"))  # spill kept for the next start
+    assert rr.apply_pending_requeues() == 2  # A was not overwritten, B was not dropped
+    assert rr.apply_pending_requeues() == 0
+
+
 def test_concurrent_trip_records_lose_no_line(root):
     """Prism 2777c74d0091: two writers of the trip history must not drop each other's line."""
     from cron import script_runner_rearm as rr
