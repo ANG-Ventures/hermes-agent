@@ -1590,6 +1590,13 @@ def _current_turn_tail_tool_index(
     synthetic mid-turn user nudges (length continuation, Codex incomplete,
     verify/kanban stop guards) that follow this turn's tool results.
     Without a valid index the scan stops at the first ``role:"user"``.
+
+    A completed ``assistant`` response (it carries ``finish_reason``: a stop-gate
+    candidate or a truncation partial) newer than every tool row means that round
+    was already answered and sent: inserting after its tool result rewrites
+    history the provider has seen (t_3f6a01ee: a steer landed before the final
+    reply after a kanban stop nudge, and the bridge reseeded on the diverged
+    replay). A redirect placeholder has no ``finish_reason`` and is passed over.
     """
     bound_known = (
         isinstance(turn_start_idx, int)
@@ -1606,7 +1613,7 @@ def _current_turn_tail_tool_index(
         role = msg.get("role")
         if role == "tool":
             return i
-        if role == "user" and not bound_known:
+        if (role == "assistant" and msg.get("finish_reason")) or (role == "user" and not bound_known):
             return None
     return None
 

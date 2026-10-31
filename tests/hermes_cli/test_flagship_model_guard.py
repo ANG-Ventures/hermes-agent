@@ -916,3 +916,661 @@ def test_override_body_write_gate_proves_the_claimed_author(flagship_profiles, m
         _assert_authorized(card)
     else:
         assert _comments(card) == [] and _refused_at_dispatch(card)
+
+
+# --- follow-ups t_b5dfd04f (Prism 40019830ac27, e25e5d877449, cd10822b8d6e) ---------
+
+
+def _no_worker_card(assignee: str) -> str:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="nw", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = ?, no_worker = 1 WHERE id = ?", (assignee, task_id))
+        conn.commit()
+    return task_id
+
+
+def test_worker_ok_on_an_unchanged_flagship_assignee_is_gated_at_assign(flagship_profiles):
+    """Clearing no_worker releases the card to dispatch on its profile route:
+    a flagship default is refused here, not parked flagship_refused later."""
+    task_id = _no_worker_card("daedalus-fable")
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            kb.assign_task(conn, task_id, "daedalus-fable", worker_ok=True)
+        assert kb.get_task(conn, task_id).no_worker
+    assert _comments(task_id) == []
+    plain = _no_worker_card("daedalus-opus")
+    with kb.connect() as conn:
+        assert kb.assign_task(conn, plain, "daedalus-opus", worker_ok=True)
+        assert not kb.get_task(conn, plain).no_worker
+    assert _comments(plain) == []
+
+
+def test_batch_pin_clear_rechecks_the_route_inside_the_write_txn(flagship_profiles):
+    """A reassign that lands between the CLI precheck and the batch commit
+    (legal: a pinned card's route is its pin) cannot carry the clear onto a
+    flagship profile default. The whole batch unwinds."""
+    task_id = _card("daedalus-opus", "claude-opus-5-5")
+    other = _card("daedalus-opus", "claude-opus-5-5")
+    with kb.connect() as conn:
+        assert kb.clear_pin_flagship_reason(conn, task_id, None) is None   # the precheck passes
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-fable' WHERE id = ?", (task_id,))
+        conn.commit()
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="cannot clear the model pin"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=other, touch_model=True),
+                kb.BatchRouteWrite(task_id=task_id, touch_model=True),
+            ])
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+        assert kb.get_task(conn, other).model_override == "claude-opus-5-5"
+    assert _comments(task_id) == [] and _comments(other) == []
+
+
+def test_reassign_worker_ok_reclaim_refuses_before_signalling(flagship_profiles, monkeypatch):
+    """Prism 5df499a16242: reassign --worker-ok --reclaim on an unchanged
+    flagship-default assignee is refused BEFORE the reclaim, so the live
+    worker is never signalled and its claim stays intact."""
+    reclaimed = []
+    monkeypatch.setattr(kb, "reclaim_task", lambda *a, **k: reclaimed.append(a) or True)
+    task_id = _card("daedalus-opus")
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task_id)
+        conn.execute(
+            "UPDATE tasks SET assignee = 'daedalus-fable', no_worker = 1 WHERE id = ?", (task_id,),
+        )
+        conn.commit()
+        receipt: dict = {}
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            kb.reassign_task(conn, task_id, "daedalus-fable", reclaim_first=True,
+                             worker_ok=True, receipt=receipt)
+        assert reclaimed == [] and receipt == {}
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running" and task.claim_lock and task.no_worker
+    assert _comments(task_id) == []
+
+
+def test_assign_reason_on_a_flagship_pin_is_recorded(flagship_profiles, proven_operator):
+    """Prism 0cfef50d081b (#2425 r16): a card whose PIN itself is flagship (no
+    alias remap) is a flagship route; an operator reason given on assign is
+    recorded, not dropped, so the card is no longer refused at dispatch."""
+    task_id = _legacy_flagship_card()
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-opus', model_override = ? WHERE id = ?",
+                     (FABLE, task_id))
+        conn.commit()
+    assert _refused_at_dispatch(task_id)
+    with kb.connect() as conn:
+        assert kb.assign_task(conn, task_id, "daedalus-opus", flagship_override_reason=REASON)
+    _assert_authorized(task_id)
+
+
+def test_assign_rejudges_the_route_inside_the_write_txn(flagship_profiles, monkeypatch):
+    """Prism 5df499a16242 (carried, Stale Validation): the pre-txn check can
+    pass on a pin that a concurrent clear removes before the assignment
+    commits. The route is judged again on the locked row; the assignment
+    unwinds instead of landing a flagship default with no override."""
+    task_id = _card("daedalus-opus", "claude-opus-5-5")
+    real = kb._assignee_flagship_reason
+    calls = []
+
+    def racing(conn, tid, *a, **k):
+        calls.append(tid)
+        out = real(conn, tid, *a, **k)
+        if len(calls) == 1:   # the preflight passed; the pin is cleared before the txn
+            conn.execute("UPDATE tasks SET model_override = NULL WHERE id = ?", (tid,))
+            conn.commit()
+        return out
+
+    monkeypatch.setattr(kb, "_assignee_flagship_reason", racing)
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            kb.assign_task(conn, task_id, "daedalus-fable")
+        assert kb.get_task(conn, task_id).assignee == "daedalus-opus"
+    assert len(calls) == 2
+    assert _comments(task_id) == []
+
+
+def _review_card(reviewer: str, implementer: str) -> str:
+    """A ``review`` card parked on ``reviewer`` whose recorded implementer is ``implementer``."""
+    with kb.connect() as conn:
+        # Raw assignee write: a flagship-default implementer reached its
+        # profile by a path the gate never saw (as _legacy_flagship_card).
+        task_id = kb.create_task(conn, title="review", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (implementer, task_id))
+        conn.commit()
+        run = kb.claim_task(conn, task_id, claimer=f"{implementer}:1")
+        assert kb.request_review(conn, task_id, summary="ready", reviewer="human",
+                                 expected_run_id=run.current_run_id) is True
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (reviewer, task_id))
+        conn.commit()
+    return task_id
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_request_changes_judges_the_post_send_back_route_before_committing(
+    flagship_profiles, proven_operator, monkeypatch, verb,
+):
+    """Prism 8b7984d6e364: assigning a review card to its current reviewer with
+    --request-changes looks unchanged, but the send-back restores the
+    implementer first, so the card really moves implementer -> profile. That
+    route is judged BEFORE the send-back commits: refused, still in review,
+    hold intact, nothing written."""
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            fn(conn, task_id, "daedalus-fable", request_changes_reason="rework", operator="apollo")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee) == ("review", "daedalus-fable")
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
+        ).fetchone()
+    assert _comments(task_id) == []
+    # The same send-back onto a non-flagship profile still lands.
+    with kb.connect() as conn:
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee) == ("ready", "daedalus-sonnet")
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_request_changes_and_route_judge_are_one_txn(flagship_profiles, proven_operator, monkeypatch, verb):
+    """Prism 95da6539e615 (Partial Send-back): the send-back and the final
+    route judge commit together. A pin cleared after the preflight passed
+    makes the in-txn judge refuse, and that refusal rolls the send-back back
+    too: still in review on the reviewer, no changes_requested."""
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    task_id = _review_card("daedalus-opus", "daedalus-sonnet")
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET model_override = 'claude-opus-5-5' WHERE id = ?", (task_id,))
+        conn.commit()
+    real = kb._assignee_flagship_reason
+    calls = []
+    preflights = 1 if verb == "assign" else 2   # reassign_task runs its own before assign_task's
+
+    def racing(conn, tid, *a, **k):
+        calls.append(tid)
+        out = real(conn, tid, *a, **k)
+        if len(calls) == preflights:   # every preflight passed on the pin; it is cleared before the txn
+            conn.execute("UPDATE tasks SET model_override = NULL WHERE id = ?", (tid,))
+            conn.commit()
+        return out
+
+    monkeypatch.setattr(kb, "_assignee_flagship_reason", racing)
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            fn(conn, task_id, "daedalus-fable", request_changes_reason="rework", operator="apollo")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee) == ("review", "daedalus-opus")
+        assert len(calls) == preflights + 1
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
+        ).fetchone()
+    assert _comments(task_id) == []
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_send_back_onto_the_implementer_is_a_route_change(flagship_profiles, proven_operator, monkeypatch, verb):
+    """Prism f550c8b6cc77: profile == recorded implementer is NOT an unchanged
+    assignee when a send-back moves the card reviewer -> implementer. A
+    flagship-default implementer with no override is refused, still in review."""
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    task_id = _review_card("daedalus-opus", "daedalus-fable")
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="assignee profile default"):
+            fn(conn, task_id, "daedalus-fable", request_changes_reason="rework", operator="apollo")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.assignee) == ("review", "daedalus-opus")
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
+        ).fetchone()
+    assert _comments(task_id) == []
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_refused_send_back_journals_nothing(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 3935fbf11941: the savepoint rollback must also roll back the
+    mutation journal. A refused nested send-back (pin cleared after the
+    preflight) leaves zero journal lines for the card, and a journal replay
+    leaves it in review with no changes_requested. An accepted send-back still
+    journals once the outer txn commits."""
+    import sqlite3
+
+    from hermes_cli import kanban_journal, kanban_journal_replay
+
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    task_id = _review_card("daedalus-opus", "daedalus-sonnet")
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET model_override = 'claude-opus-5-5' WHERE id = ?", (task_id,))
+        conn.commit()
+        board = kb._journal_board_slug(conn)
+    real = kb._assignee_flagship_reason
+    calls = []
+    preflights = 1 if verb == "assign" else 2
+
+    def racing(conn, tid, *a, **k):
+        calls.append(tid)
+        out = real(conn, tid, *a, **k)
+        if len(calls) == preflights:   # the pin is cleared after every preflight passed
+            conn.execute("UPDATE tasks SET model_override = NULL WHERE id = ?", (tid,))
+            conn.commit()
+        return out
+
+    monkeypatch.setattr(kb, "_assignee_flagship_reason", racing)
+    snapshot = tmp_path / "snapshot.db"
+    with kb.connect() as conn, sqlite3.connect(str(snapshot)) as snap:
+        conn.backup(snap)
+    before = [e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused):
+            fn(conn, task_id, "daedalus-fable", request_changes_reason="rework", operator="apollo")
+        assert kb.get_task(conn, task_id).status == "review"
+    after = [e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
+    assert [e["kind"] for e in after[len(before):]] == []
+    out = tmp_path / "replayed.db"
+    kanban_journal_replay.replay_into(board, snapshot, out, since=0)
+    rconn = sqlite3.connect(str(out))
+    try:
+        assert rconn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] == "review"
+        assert not rconn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (task_id,),
+        ).fetchone()
+    finally:
+        rconn.close()
+    # An accepted send-back journals its records after the outer commit.
+    monkeypatch.setattr(kb, "_assignee_flagship_reason", real)
+    with kb.connect() as conn:
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+    kinds = [e["kind"] for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
+    assert {"claimed", "changes_requested", "operator_override"} <= set(kinds[len(before):])
+
+
+def _journal_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_send_back_assignment_journals_in_event_order(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 49c7edaaed90: with --request-changes, every journal record of the
+    assignment flushes after the outer commit, in event order, so replay never
+    puts the send-back after the ``assigned`` that superseded it."""
+    import sqlite3
+
+    from hermes_cli import kanban_journal, kanban_journal_replay
+
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    snapshot = tmp_path / "snapshot.db"
+    with kb.connect() as conn, sqlite3.connect(str(snapshot)) as snap:
+        conn.backup(snap)
+    before = len([e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id])
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        db_kinds = [r[0] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND kind IN "
+            "('changes_requested', 'operator_override', 'assigned') ORDER BY id", (task_id,),
+        )]
+    journal = [e["kind"] for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id][before:]
+    assert db_kinds[-1] == "assigned"
+    assert [k for k in journal if k in set(db_kinds)] == db_kinds
+    out = tmp_path / "replayed.db"
+    kanban_journal_replay.replay_into(board, snapshot, out, since=0)
+    rconn = sqlite3.connect(str(out))
+    try:
+        rows = rconn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN "
+            "('changes_requested', 'assigned') ORDER BY id", (task_id,),
+        ).fetchall()
+    finally:
+        rconn.close()
+    assert rows[-1][0] == "assigned"
+    assert json.loads(rows[-1][1])["assignee"] == "daedalus-sonnet"
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_deferred_journal_keeps_the_event_timestamp(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism c3dc62f26dbe: a record flushed after commit carries the ts its
+    event row was stamped with. A commit that crosses a second boundary (clock
+    +2 s at flush) must not journal a different ts, or replay over a
+    post-commit snapshot inserts duplicates."""
+    import sqlite3
+    import time as _time
+
+    from hermes_cli import kanban_db_connect, kanban_journal, kanban_journal_replay
+
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    before = len([e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id])
+    real_time = _time.time
+    shift = [0.0]
+    monkeypatch.setattr(_time, "time", lambda: real_time() + shift[0])
+    real_run = kanban_db_connect._post_commit_run
+
+    def late_flush(conn):
+        shift[0] = 2.0
+        return real_run(conn)
+
+    monkeypatch.setattr(kanban_db_connect, "_post_commit_run", late_flush)
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        created = {r[0]: r[1] for r in conn.execute(
+            "SELECT kind, created_at FROM task_events WHERE task_id = ? AND kind IN "
+            "('changes_requested', 'operator_override', 'assigned')", (task_id,),
+        )}
+    monkeypatch.setattr(kanban_db_connect, "_post_commit_run", real_run)
+    journal = [e for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id][before:]
+    stamped = {e["kind"]: int(e["ts"]) for e in journal if e["kind"] in created}
+    assert stamped == created
+    snapshot = tmp_path / "post-commit.db"
+    with kb.connect() as conn, sqlite3.connect(str(snapshot)) as snap:
+        conn.backup(snap)
+    result = kanban_journal_replay.replay_into(board, snapshot, tmp_path / "replayed.db")
+    assert result.events_restored == 0
+
+
+def _journal_kinds(board: str, task_id: str) -> list[str]:
+    from hermes_cli import kanban_journal
+
+    return [e["kind"] for e in kanban_journal.read_entries(board) if e.get("task_id") == task_id]
+
+
+def _db_kinds_after(conn, task_id: str, after_id: int) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? AND id > ? ORDER BY id", (task_id, after_id),
+    )]
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_foreign_send_back_journals_in_event_order(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 1ce4d22df5a6: a send-back on a card homed to another session also
+    writes write_txn's foreign-action audit. Every journal record of the call
+    (send-back, override audit, assigned) lands in task_events order."""
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET session_id = 'home-sess' WHERE id = ?", (task_id,))
+        conn.commit()
+        board = kb._journal_board_slug(conn)
+        last = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+                            (task_id,)).fetchone()[0]
+    before = len(_journal_kinds(board, task_id))
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    with kb.connect() as conn:
+        with kb.mutation_actor(session_ids=("away",), profile="apollo", operator="Ace: rework",
+                               foreign_ok="rework"):
+            assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        db_kinds = _db_kinds_after(conn, task_id, last)
+    assert "changes_requested" in db_kinds and db_kinds.count("operator_override") >= 1
+    journal = _journal_kinds(board, task_id)[before:]
+    assert [k for k in journal if k in set(db_kinds)] == db_kinds
+
+
+def test_refused_batch_journals_nothing(flagship_profiles, monkeypatch, tmp_path):
+    """Prism 0b1cb4a34ceb: a batch the in-txn judge refuses on a later card
+    wrote nothing for the earlier card, journal included (replay must not
+    resurrect a clear that never committed)."""
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _card("daedalus-opus", "claude-opus-5-5")
+    other = _card("daedalus-opus", "claude-opus-5-5")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-fable' WHERE id = ?", (task_id,))
+        conn.commit()
+    before = len(_journal_kinds(board, other))
+    with kb.connect() as conn:
+        with pytest.raises(kb.FlagshipAssigneeRefused, match="cannot clear the model pin"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=other, touch_model=True),
+                kb.BatchRouteWrite(task_id=task_id, touch_model=True),
+            ])
+        assert kb.get_task(conn, other).model_override == "claude-opus-5-5"
+    assert _journal_kinds(board, other)[before:] == []
+
+
+def test_batch_with_a_duplicate_task_id_writes_nothing(flagship_profiles, monkeypatch, tmp_path):
+    """Prism e36efbedf0a2: two entries for one card both passed the judge
+    against the original row and the second write silently overwrote the
+    first. The judge refuses the batch on the repeated id, before any write."""
+    _journal_env(monkeypatch, tmp_path)
+    first = _card("daedalus-opus")
+    dup = _card("daedalus-opus", "claude-opus-5-5")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    before = {t: len(_journal_kinds(board, t)) for t in (first, dup)}
+    with kb.connect() as conn:
+        with pytest.raises(RuntimeError, match=f"duplicate task id {dup} in batch; no cards were changed"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=first, touch_effort=True, effort="low"),
+                kb.BatchRouteWrite(task_id=dup, touch_effort=True, effort="low"),
+                kb.BatchRouteWrite(task_id=dup, touch_effort=True, effort="high"),
+            ])
+        assert kb.get_task(conn, first).reasoning_effort is None
+        assert kb.get_task(conn, dup).reasoning_effort is None
+        assert kb.get_task(conn, dup).model_override == "claude-opus-5-5"
+    assert {t: _journal_kinds(board, t)[before[t]:] for t in (first, dup)} == {first: [], dup: []}
+
+
+@pytest.mark.parametrize("touch", ["touch_model", "touch_effort", "touch_brain"])
+def test_batch_with_an_archived_card_journals_nothing(flagship_profiles, monkeypatch, tmp_path, touch):
+    """Prism e6f355767f2f: the batch judges every refusal the locked writers
+    raise (an archived card) before the first write, so a valid earlier card
+    journals nothing when a later one is archived."""
+    _journal_env(monkeypatch, tmp_path)
+    ok = _card("daedalus-opus")
+    gone = _card("daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (gone,))
+        conn.commit()
+    before = len(_journal_kinds(board, ok))
+    with kb.connect() as conn:
+        with pytest.raises(RuntimeError, match="archived task"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=ok, **{touch: True}),
+                kb.BatchRouteWrite(task_id=gone, **{touch: True}),
+            ])
+    assert _journal_kinds(board, ok)[before:] == []
+
+
+@pytest.mark.parametrize("model", [None, FABLE])
+def test_set_model_on_an_archived_card_journals_no_authorization(flagship_profiles, proven_operator, monkeypatch, tmp_path, model):
+    """Prism 324c92ac41be: single-card set_model_override refuses an archived
+    card BEFORE authorize_flagship journals the override comment, so replay
+    never restores an authorization the failed call did not commit."""
+    _journal_env(monkeypatch, tmp_path)
+    assignee = "daedalus-fable" if model is None else "daedalus-opus"
+    task_id = _card(assignee, "claude-opus-5-5")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,))
+        conn.commit()
+    before = len(_journal_kinds(board, task_id))
+    with kb.connect() as conn:
+        with pytest.raises(RuntimeError, match="archived task"):
+            kb.set_model_override(conn, task_id, model, flagship_override_reason=REASON)
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+    assert _journal_kinds(board, task_id)[before:] == []
+    assert _comments(task_id) == []
+
+
+@pytest.mark.parametrize("author", [" ", "\t"])
+def test_set_model_with_a_bad_audit_comment_journals_no_authorization(flagship_profiles, proven_operator, monkeypatch, tmp_path, author):
+    """Prism b7477c45a580 (r15): single-card set_model_override judges the audit
+    comment with add_comment's refusals BEFORE authorize_flagship journals the
+    override, so a blank author leaves zero journal lines and no comment."""
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _card("daedalus-fable", "claude-opus-5-5")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    before = len(_journal_kinds(board, task_id))
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="comment author is required"):
+            kb.set_model_override(conn, task_id, None, flagship_override_reason=REASON,
+                                  audit_comment_author=author, audit_comment_body="audit")
+        assert kb.get_task(conn, task_id).model_override == "claude-opus-5-5"
+    assert _journal_kinds(board, task_id)[before:] == []
+    assert _comments(task_id) == []
+
+
+def _refuse_release_line_comments(monkeypatch):
+    """The fleet release-line guard, on: any comment body naming the release-line
+    token is refused (CloseOnLineRefused), like a real malformed close gate."""
+    from hermes_cli import kanban_close_on_guard as guard
+
+    def check(author, body):
+        if "close-on" in (body or ""):
+            raise guard.CloseOnLineRefused("close-on token in prose")
+
+    monkeypatch.setattr(guard, "check_comment", check)
+
+
+BAD_REASON = "fixing the close-on parser"
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign", "set_model", "create"])
+def test_a_refused_override_comment_journals_nothing(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 8b7984d6e364 (r14): the override COMMENT is judged with every
+    add_comment refusal before the first write. A reason the release-line guard
+    rejects raises with the card unchanged and zero journal lines (a send-back
+    stays in review; a create writes no card)."""
+    from hermes_cli import kanban_journal
+
+    _journal_env(monkeypatch, tmp_path)
+    if verb in ("assign", "reassign"):
+        task_id = _review_card("daedalus-opus", "daedalus-sonnet")
+    elif verb == "set_model":
+        task_id = _card("daedalus-fable", "claude-opus-5-5")
+    else:
+        task_id = _card("daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    _refuse_release_line_comments(monkeypatch)
+    before = len(list(kanban_journal.read_entries(board)))
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="close-on token"):
+            if verb == "assign":
+                kb.assign_task(conn, task_id, "daedalus-fable", request_changes_reason="rework",
+                               operator="apollo", flagship_override_reason=BAD_REASON)
+            elif verb == "reassign":
+                kb.reassign_task(conn, task_id, "daedalus-fable", request_changes_reason="rework",
+                                 operator="apollo", flagship_override_reason=BAD_REASON)
+            elif verb == "set_model":
+                kb.set_model_override(conn, task_id, None, flagship_override_reason=BAD_REASON)
+            else:
+                kb.create_task(conn, title="bad", assignee="daedalus-fable",
+                               flagship_override_reason=BAD_REASON)
+        task = kb.get_task(conn, task_id)
+        if verb in ("assign", "reassign"):
+            assert (task.status, task.assignee) == ("review", "daedalus-opus")
+        elif verb == "set_model":
+            assert task.model_override == "claude-opus-5-5"
+    assert [e["kind"] for e in list(kanban_journal.read_entries(board))[before:]] == []
+
+
+@pytest.mark.parametrize("verb", ["assign", "reassign"])
+def test_send_back_journals_under_the_writer_lock(flagship_profiles, proven_operator, monkeypatch, tmp_path, verb):
+    """Prism 268821347bd4: every journal record of a send-back assignment is
+    appended while the writer lock is held, so the journal's order across
+    processes is the commit order (no post-commit flush another writer can
+    overtake)."""
+    from hermes_cli import kanban_journal
+
+    _journal_env(monkeypatch, tmp_path)
+    task_id = _review_card("daedalus-fable", "daedalus-opus")
+    fn = kb.assign_task if verb == "assign" else kb.reassign_task
+    real = kanban_journal.append
+    outside: list[str] = []
+    with kb.connect() as conn:
+        def watched(board, tid, kind, *a, **k):
+            if tid == task_id and not conn.in_transaction:
+                outside.append(kind)
+            return real(board, tid, kind, *a, **k)
+
+        monkeypatch.setattr(kanban_journal, "append", watched)
+        assert fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+    assert outside == []
+
+
+@pytest.mark.parametrize("author", [" ", "\t"])
+def test_batch_with_a_bad_audit_comment_journals_nothing(flagship_profiles, monkeypatch, tmp_path, author):
+    """Prism d0b2bf482d38: the batch judges add_comment's refusals for every
+    audit comment the write pass will insert, before the first write, so a
+    valid earlier card journals nothing when a later card's comment is bad."""
+    _journal_env(monkeypatch, tmp_path)
+    ok = _card("daedalus-opus")
+    bad = _card("daedalus-opus")
+    with kb.connect() as conn:
+        board = kb._journal_board_slug(conn)
+    before = len(_journal_kinds(board, ok))
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="comment author is required"):
+            kb.apply_batch_route_writes(conn, [
+                kb.BatchRouteWrite(task_id=ok, touch_model=True, model="claude-sonnet-5",
+                                   audit_comment_author="apollo", audit_comment_body="audit"),
+                kb.BatchRouteWrite(task_id=bad, touch_model=True, model="claude-sonnet-5",
+                                   audit_comment_author=author, audit_comment_body="audit"),
+            ])
+        assert kb.get_task(conn, ok).model_override is None
+    assert _journal_kinds(board, ok)[before:] == []
+    assert _comments(ok) == []
+
+
+@pytest.mark.parametrize("target", [None, "human", "human:ace"])
+def test_unassign_or_park_a_legacy_flagship_pin_needs_no_permission(flagship_profiles, target):
+    """Prism cc3a960e76a8: a target nothing can run (unassigned, human) is not
+    a route, so unassigning or parking a card pinned to a flagship with no
+    override succeeds and writes no override."""
+    task_id = _legacy_flagship_card()
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-opus', model_override = ? WHERE id = ?",
+                     (FABLE, task_id))
+        conn.commit()
+    with kb.connect() as conn:
+        assert kb.assign_task(conn, task_id, target)
+        assert kb.get_task(conn, task_id).assignee == target
+    assert _comments(task_id) == []
+
+
+@pytest.mark.parametrize("verb", ["request_changes", "assign", "reassign"])
+@pytest.mark.parametrize("missing", ["review_requested", "implementer"])
+def test_refused_send_back_opens_no_review_run(flagship_profiles, proven_operator, monkeypatch, tmp_path,
+                                               verb, missing):
+    """Prism ce26bdc8d833: every _SendBackRefused precondition is judged
+    before _open_review_run, so a refused send-back journals no ``claimed``
+    (replay would rebuild a running card holding a claim_lock)."""
+    _journal_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review", assignee=None)
+        conn.execute("UPDATE tasks SET assignee = 'daedalus-sonnet', status = 'review' WHERE id = ?",
+                     (task_id,))
+        if missing == "implementer":
+            kb._append_event(conn, task_id, "review_requested", {"implementer": " "})
+        conn.commit()
+        board = kb._journal_board_slug(conn)
+    before = len(_journal_kinds(board, task_id))
+    with kb.connect() as conn:
+        if verb == "request_changes":
+            ok, detail = kb.request_changes(conn, task_id, reason="rework", claimer="apollo",
+                                            operator="apollo: rework")
+            assert ok is False and detail
+        else:
+            fn = kb.assign_task if verb == "assign" else kb.reassign_task
+            with pytest.raises(kb.ReviewHoldRequired):
+                fn(conn, task_id, "daedalus-sonnet", request_changes_reason="rework", operator="apollo")
+        row = conn.execute("SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+                           (task_id,)).fetchone()
+        assert tuple(row) == ("review", None, None)
+    assert _journal_kinds(board, task_id)[before:] == []

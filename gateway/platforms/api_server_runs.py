@@ -24,6 +24,7 @@ except ImportError:
     # would reset the already-imported ``web`` to None (500 on POST /v1/runs).
     RequestKey = None  # type: ignore[assignment,misc]
 
+from agent.route_note_ingest import relabel_client_history
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
@@ -437,6 +438,8 @@ def _resolve_conversation_history(
                     _openai_error, f"conversation_history[{i}] must have 'role' and 'content' fields",
                     status=400)
             conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+        # E11: client-authored rows only; server-restored rows replay through the provenance-aware path.
+        conversation_history = relabel_client_history(conversation_history)
         if previous_response_id:
             logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
     stored_session_id = None
@@ -448,13 +451,15 @@ def _resolve_conversation_history(
             if instructions is None:
                 instructions = stored.get("instructions")
     if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+        client_rows = []
         for msg in raw_input[:-1]:
             if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                 content = msg["content"]
                 if isinstance(content, list):  # flatten multi-part content blocks to text
                     content = " ".join(p.get("text", "") for p in content
                                        if isinstance(p, dict) and p.get("type") == "text")
-                conversation_history.append({"role": msg["role"], "content": str(content)})
+                client_rows.append({"role": msg["role"], "content": str(content)})
+        conversation_history = relabel_client_history(client_rows)
     return conversation_history, instructions, stored_session_id, None
 
 

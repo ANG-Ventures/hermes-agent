@@ -25,8 +25,8 @@ from agent.message_sanitization import _INTERRUPT_CLOSE_FINISH_REASON
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.message_metadata import (
-    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID, copy_identity_fields,
-    tool_call_uid_from_history)
+    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, PENDING_USER_CONTENT_REWRITE, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID,
+    copy_identity_fields, tool_call_uid_from_history)
 from agent.transcript_repair import sync_flushed_message_markers
 
 
@@ -166,9 +166,14 @@ def adopt_unanswered_turn(history: List[Dict[str, Any]], query: Any, agent: Any)
     answer lands after them as a valid continuation). Anything else declines — no user row at the tail, or a
     different text there — so a person's deliberate re-send of the same text is never swallowed.
     """
+    from agent.route_note_ingest import relabel_route_note_content
+    from agent.turn_context import STAGED_TURN_RAW_KEY
+
     idx = next((i for i in range(len(history) - 1, -1, -1)
                 if isinstance(history[i], dict) and history[i].get("role") == "user"), None)
-    if idx is None or history[idx].get("content") != query:
+    # E11: the first attempt stored the DM relabelled; the dispatcher re-sends the raw query. Both
+    # sides are the same submission here by construction (the dispatcher vouches for the re-run).
+    if idx is None or history[idx].get("content") not in (query, relabel_route_note_content(query)):
         return False
     if not all(isinstance(row, dict) and (row.get("role") == "tool" or (row.get("role") == "assistant" and row.get("tool_calls")))
                for row in history[idx + 1:]):
@@ -176,6 +181,7 @@ def adopt_unanswered_turn(history: List[Dict[str, Any]], query: Any, agent: Any)
     tail = history[idx]
     del history[idx:]
     tail[_DB_PERSISTED_MARKER] = True
+    tail[STAGED_TURN_RAW_KEY] = query  # staging matches on the raw turn text
     agent._pending_cli_user_message = tail
     return True
 
@@ -228,7 +234,7 @@ def _db_flush_fork_state(agent) -> Tuple[Dict[int, int], Dict[int, Any], set]:
 # these must never be skipped as part of the matched prefix, or the in-place
 # stamp is silently lost on re-flush (an interrupted turn then reads back as a
 # clean one). Keep this list in sync with any new in-place mutation site.
-_MUTABLE_FLUSH_STATE_FIELDS = ("finish_reason",)
+_MUTABLE_FLUSH_STATE_FIELDS = ("finish_reason", PENDING_USER_CONTENT_REWRITE)
 
 
 def _has_mutable_flush_state(msg: Any) -> bool:
@@ -301,7 +307,7 @@ def _db_flush_scan_start(agent, messages: List[Dict]) -> int:
 
 
 def _db_flush_repersist_in_place(agent, msg: Dict, flushed_row_ids: Dict[int, int], content_refs: Dict[int, Any],
-                                 repersisted_ids: set) -> None:
+                                 repersisted_ids: set) -> Any:
     """Re-persist the two fields the fork stamps onto an ALREADY-FLUSHED dict in place.
 
     * ``finish_reason="interrupt_close"`` (``close_interrupted_tool_sequence`` on a plain-text assistant
@@ -309,8 +315,12 @@ def _db_flush_repersist_in_place(agent, msg: Dict, flushed_row_ids: Dict[int, in
     * A flushed ``tool`` row whose content was replaced (the /steer marker or run-budget notice appended
       after the per-result flush): stamp the sent bytes as the row's ``api_content`` sidecar so replay
       sends what was sent and keeps the steer (t_a17e2305).
+
+    Returns the content to APPEND as a new row when a pending user-row rewrite cannot land on its row
+    (row confirmed absent, or still pending after the retry bound), else ``None``.
     """
     msg_id = id(msg)
+    append_content = _retry_pending_user_rewrite(agent, msg)
     if _tool_content_mutated_since_flush(msg, content_refs):
         row_id = msg["_db_persisted_row_id"]
         sent = _persisted_content_projection(msg, msg.get("content"))
@@ -328,6 +338,102 @@ def _db_flush_repersist_in_place(agent, msg: Dict, flushed_row_ids: Dict[int, in
                 repersisted_ids.add(msg_id)
             except Exception as e:
                 logger.warning("interrupt_close re-persist failed (row=%s): %s", row_id, e)
+    return append_content
+
+
+def write_user_row_content(agent, msg: Dict, session_id: str, row_id: int, content: Any, *,
+                           api_content: Optional[str] = None,
+                           display_metadata_patch: Optional[Dict[str, Any]] = None) -> int:
+    """THE committer of a live user row's full content (and optional ``api_content`` sidecar) onto its
+    durable row. A write that lands RETIRES any pending rewrite addressed to that row: the pending
+    bytes are older than what was just committed, and a later flush retrying them would overwrite it.
+
+    While a rewrite is pending the stored ``content`` is still the pre-rewrite bytes, so the sidecar's
+    content-guarded update would match nothing: the current content is committed first, in the same
+    lock the caller holds. The pending entry is the WHOLE update (content, sidecar, metadata patch), so a
+    write that lands only partly is retried in full, and the entry clears only when all of it has landed."""
+    db = agent._session_db
+    pending = msg.get(PENDING_USER_CONTENT_REWRITE)
+    if pending is not None:
+        # Never older than the content being committed now: if this write does not land, the flush
+        # retries THESE bytes, not the ones staged before them.
+        attempts = pending[2] if len(pending) > 2 else 0
+        update = {k: v for k, v in (("api_content", api_content),
+                                    ("display_metadata_patch", display_metadata_patch)) if v is not None}
+        msg[PENDING_USER_CONTENT_REWRITE] = (pending[0], content, attempts, update) if update \
+            else (pending[0], content, attempts)
+    written = _write_user_row_update(db, session_id, row_id, content, api_content=api_content,
+                                     display_metadata_patch=display_metadata_patch, content_pending=pending is not None)
+    if written > 0:
+        msg.pop(PENDING_USER_CONTENT_REWRITE, None)
+    return written
+
+
+def _landed(written: Any) -> bool:
+    return isinstance(written, int) and not isinstance(written, bool) and written > 0
+
+
+def _write_user_row_update(db, session_id: str, row_id: int, content: Any, *, api_content: Optional[str],
+                           display_metadata_patch: Optional[Dict[str, Any]], content_pending: bool) -> int:
+    """Write one user-row update; the row count when ALL of it landed, else 0. ``content_pending``: the
+    stored content may still be older bytes, so it is committed before the content-guarded sidecar."""
+    if api_content is None:
+        written = db.set_user_message_content(session_id, row_id, content,
+                                              display_metadata_patch=display_metadata_patch)
+        return written if _landed(written) else 0
+    if content_pending and not _landed(db.set_user_message_content(session_id, row_id, content)):
+        return 0
+    written = db.set_message_api_content(session_id, row_id, content, api_content,
+                                         display_metadata_patch=display_metadata_patch)
+    return written if _landed(written) else 0
+
+
+# Flushes a pending user-row rewrite may stay unresolved before the flush appends the row instead.
+# A duplicate row is recoverable; a submission that is never stored is not.
+_PENDING_USER_REWRITE_MAX_FLUSHES = 3
+
+
+def _retry_pending_user_rewrite(agent, msg: Dict) -> Any:
+    """Retry a staged user row's deferred rewrite (turn_context E11 relabel) on the row it addresses.
+
+    Terminates: a lookup that SUCCEEDS with no active row (row confirmed absent), or a rewrite still
+    pending after ``_PENDING_USER_REWRITE_MAX_FLUSHES`` flushes, drops the row identity and returns the
+    content so the caller appends it. Only a raised error keeps the row addressed for the next flush.
+    The pending field itself is cleared once the rewrite or the append commits."""
+    pending = msg.get(PENDING_USER_CONTENT_REWRITE)
+    if pending is None:
+        return None
+    session_id, content, *rest = pending
+    attempts = (rest[0] if rest else 0) + 1
+    update = rest[1] if len(rest) > 1 and isinstance(rest[1], dict) else {}
+    row_id = msg.get("_row_id")
+    if isinstance(row_id, int):
+        try:
+            active_id = agent._session_db.resolve_active_row_id(session_id, row_id)
+            # The whole update is replayed (content, then sidecar + metadata); it clears only when all landed.
+            if active_id is not None and _write_user_row_update(
+                    agent._session_db, session_id, active_id, content, api_content=update.get("api_content"),
+                    display_metadata_patch=update.get("display_metadata_patch"), content_pending=True) > 0:
+                msg["_row_id"] = active_id
+                msg.pop(PENDING_USER_CONTENT_REWRITE, None)
+                return None
+            if active_id is None:
+                attempts = _PENDING_USER_REWRITE_MAX_FLUSHES  # confirmed absent: append now
+        except Exception as e:
+            logger.warning("pending user-row rewrite failed (row=%s, flush %d): %s", row_id, attempts, e)
+        if attempts < _PENDING_USER_REWRITE_MAX_FLUSHES:
+            msg[PENDING_USER_CONTENT_REWRITE] = (session_id, content, attempts, *([update] if update else []))
+            return None
+        logger.warning("pending user-row rewrite of row=%s did not land after %d flush(es); appending the "
+                       "relabelled row (a duplicate is possible, a lost submission is not)", row_id, attempts)
+        msg.pop("_row_id", None)
+        msg.pop(DB_ROW_SNAPSHOT, None)
+    # The appended row carries the whole update too: its sidecar and metadata ride the live dict.
+    if update.get("api_content") is not None:
+        msg["api_content"] = update["api_content"]
+    if update.get("display_metadata_patch"):
+        msg["display_metadata"] = {**(msg.get("display_metadata") or {}), **update["display_metadata_patch"]}
+    return content
 
 
 def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any]:
@@ -421,13 +527,15 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
         # drop cannot un-write. Skip regardless of position.
         if not isinstance(msg, dict) or _is_ephemeral_scaffolding(msg):
             continue
+        rewrite_append = None
         if msg.get(_DB_PERSISTED_MARKER):
             # Already durable by marker; the fork may still have stamped a field in place.
-            _db_flush_repersist_in_place(agent, msg, flushed_row_ids, content_refs, repersisted_ids)
-            continue
+            rewrite_append = _db_flush_repersist_in_place(agent, msg, flushed_row_ids, content_refs, repersisted_ids)
+            if rewrite_append is None:
+                continue
         # Already durable (history copy or caller-seeded): stamp so future flushes skip it.
         is_history = id(msg) in history_ids
-        if (
+        if rewrite_append is None and (
             (is_history and not replay_history) or id(msg) in seed_ids
         ) and not msg.get(_PERSIST_AFTER_ADMISSION_INTERRUPT):
             msg[_DB_PERSISTED_MARKER] = True
@@ -468,7 +576,11 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
             # minted (same-batch pairing happens inside the insert).
             if (tool_uid := tool_call_uid_from_history(messages, msg_idx, tool_uid_owners)) is not None:
                 msg[TOOL_CALL_UID] = tool_uid
-        batch_rows.append(_db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message))
+        row = _db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message)
+        if rewrite_append is not None:
+            # The deferred rewrite's row is gone: store exactly the content it would have written.
+            row["content"] = rewrite_append
+        batch_rows.append(row)
         batch_msgs.append(msg)
     if suppressed_superseded_rows:
         logger.info(
@@ -519,6 +631,8 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
     )
     sync_flushed_message_markers(batch_msgs, batch_rows)
+    for written in batch_msgs:
+        written.pop(PENDING_USER_CONTENT_REWRITE, None)  # an appended rewrite fallback has now landed
     _db_flush_record_row_ids(agent, batch_rows, batch_msgs, batch_row_ids)
     if _newest_checkpoint_carrier(batch_msgs, "codex_reasoning_items") >= 0:
         # The insert already rewrote the older rows (SessionDB._drop_shadowed_checkpoint_rows); mirror it on

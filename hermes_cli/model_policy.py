@@ -316,15 +316,30 @@ def assignee_pinned_model(assignee: Optional[str], model: Optional[str]) -> Opti
         return f"{UNRESOLVED_ROUTE_PREFIX} {type(exc).__name__} reading {name} config>"
 
 
+def _runs_as_worker(assignee: Optional[str]) -> bool:
+    """The dispatcher's own test (``kanban_db.is_worker_assignee``)."""
+    from hermes_cli.kanban_db import is_worker_assignee
+
+    return is_worker_assignee(assignee)
+
+
 def pin_run_route_error(
     assignee: Optional[str],
     model: Optional[str],
     config: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
-    """Error text when the pin ``model`` RUNS as a flagship (or an unknown
-    route) under ``assignee``'s aliases, else ``None``. The pin string itself
-    is the caller's check (:func:`validate_worker_model`)."""
+    """Error text when the pin ``model`` is a flagship itself, or RUNS as one
+    (or an unknown route) under ``assignee``'s aliases, else ``None``. The
+    dispatcher refuses either without the card's override, so an assign
+    reason must be judged (and recorded) on both (Prism 0cfef50d081b).
+    ``None`` for a target nothing can run (unassigned, ``human``,
+    ``human:<name>``): unassigning or parking needs no flagship permission
+    (Prism cc3a960e76a8)."""
+    if not _runs_as_worker(assignee):
+        return None
     pin = str(model or "").strip()
+    if flagship_model_match(pin, config):
+        return flagship_model_error(pin)
     run = assignee_pinned_model(assignee, pin)
     if not run or run.casefold() == pin.casefold() or not assignee_route_gated(run, config):
         return None
@@ -404,7 +419,10 @@ def validate_assignee_route(
     route is not flagship, or raises :class:`FlagshipAssigneeRefused` when a
     flagship route has no reason. The reason's authority is the caller's
     check (:func:`require_flagship_authority`, before any mutation).
+    A target nothing can run is never judged (:func:`pin_run_route_error`).
     """
+    if not _runs_as_worker(assignee):
+        return None
     if str(model_override or "").strip():
         error = pin_run_route_error(assignee, model_override, config)
         if error is None:

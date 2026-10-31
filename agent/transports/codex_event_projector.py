@@ -14,6 +14,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from agent.route_note_ingest import relabel_route_note_text
+
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
     """Stable tool_call id: the codex item id, else a hash so replay keeps prefix caches valid."""
@@ -86,6 +88,9 @@ class CodexEventProjector:
             for fragment in item.get("content") or []
             if isinstance(fragment, dict) and (fragment.get("type") == "text" or "text" in fragment)
         ]
+        # E11: mirrored as Codex received it. Every Codex input is relabelled SEND-side (turn/start
+        # carries the ingest-relabelled turn text, turn/steer the relabelled redirect), so a harness
+        # prefix on the echo is preserved instead of being restated as quoted text.
         return ProjectionResult(messages=[{"role": "user", "content": "\n".join(text_parts)}])
 
     def _project_tool_item(
@@ -98,6 +103,10 @@ class CodexEventProjector:
             None,
             tool_calls=[{"id": call_id, "type": "function", "function": {"name": name, "arguments": _format_tool_args(args)}}],
         )
+        # E11: tool output is mirrored byte-for-byte as the Codex model received it, never relabelled
+        # here. hermes-tools results were already relabelled at the MCP server (remote tools only);
+        # a foreign MCP server or Codex-native result reached Codex raw, so it is persisted raw, with
+        # the server in the row's tool name (``mcp.<server>.<tool>``) as its provenance.
         tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
         return ProjectionResult(messages=[assistant_msg, tool_msg], is_tool_iteration=True)
 
@@ -168,4 +177,5 @@ class CodexEventProjector:
             payload = json.dumps(item, ensure_ascii=False)[:1500]
         except (TypeError, ValueError):
             payload = repr(item)[:1500]
-        return ProjectionResult(messages=[{"role": "assistant", "content": f"[codex {item_type}] {payload}"}])
+        return ProjectionResult(messages=[{"role": "assistant",
+                                           "content": f"[codex {item_type}] {relabel_route_note_text(payload)}"}])
