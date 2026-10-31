@@ -355,3 +355,33 @@ def test_env_without_root_vars_inherits_the_process_suffix(monkeypatch, tmp_path
     assert _env_kanban_root({"HOME": str(home)}) is None
     assert _env_kanban_root({"HOME": str(home), "HERMES_DATA_DIR_SUFFIX": ""}) == home / ".hermes"
     assert _env_kanban_root({"HERMES_DATA_DIR_SUFFIX": "-qa"}) == home / ".hermes-qa"
+
+
+def test_env_on_our_home_is_not_our_root_when_hermes_home_moved_it(monkeypatch, tmp_path):
+    """Prism 2be710857d51: ``None`` only when the root the env describes EQUALS the process root.
+    A process rooted by ``HERMES_HOME=/x`` and an env with our ``HOME`` but no ``HERMES_HOME``
+    describe different roots, so the env's default root is returned and its pin names its board."""
+    from hermes_cli.kanban_identity import _env_kanban_root, resolve_kanban_worker_chat_identity
+
+    home = tmp_path / "alice"
+    default_root = home / ".hermes"
+    custom_root = tmp_path / "x"
+    for root in (default_root, custom_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    for var in ("HERMES_KANBAN_HOME", "HERMES_KANBAN_DB", "HERMES_DATA_DIR_SUFFIX"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(default_root))
+    kb.create_board("alpha")  # board alpha exists ONLY under the default root
+    alpha_db = default_root / "kanban" / "boards" / "alpha" / "kanban.db"
+    assert alpha_db.parent.is_dir()
+    monkeypatch.setenv("HERMES_HOME", str(custom_root))  # the process root is now /x
+
+    env = {"HOME": str(home), "HERMES_KANBAN_DB": str(alpha_db), "HERMES_KANBAN_TASK": "t_example"}
+    assert _env_kanban_root(env) == default_root
+    assert resolve_kanban_worker_chat_identity(env=env) == ("t_example", "kanban / alpha / t_example")
+    # An env describing exactly the process root is the process root.
+    assert _env_kanban_root({"HERMES_HOME": str(custom_root)}) is None
+    assert _env_kanban_root({"HOME": str(home), "HERMES_HOME": str(custom_root)}) is None
+    assert _env_kanban_root({"HERMES_KANBAN_HOME": str(custom_root)}) is None
