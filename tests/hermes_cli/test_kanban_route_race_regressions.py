@@ -98,7 +98,7 @@ def test_status_selector_skips_cards_that_left_the_set_before_the_lock(
 
     fired = _after_selection(monkeypatch, race)
     command = (
-        "set-model --effort high --where status=ready assignee=worker"
+        "--board default set-model --effort high --where status=ready assignee=worker"
         if effort_only else
         "set-model standard-model --provider batch-provider "
         "--where status=ready assignee=worker"
@@ -123,7 +123,7 @@ def test_assignee_selector_skips_a_card_reassigned_before_the_lock(kanban_home, 
     moved = _create("moved", "worker")
     _after_selection(monkeypatch, lambda: _other_conn(lambda c: kb.assign_task(c, moved, "other")))
 
-    out = kc.run_slash("set-model standard-model --where assignee=worker")
+    out = kc.run_slash("--board default set-model standard-model --where assignee=worker")
 
     assert _row(keep)[2] == "standard-model"
     assert _row(moved)[2] is None
@@ -137,7 +137,7 @@ def test_all_active_skips_a_card_completed_before_the_lock(kanban_home, monkeypa
         monkeypatch, lambda: _other_conn(lambda c: kb.complete_task(c, done, result="x")),
     )
 
-    out = kc.run_slash("set-model standard-model --all-active")
+    out = kc.run_slash("--board default set-model standard-model --all-active")
 
     assert _row(keep)[2] == "standard-model"
     assert _row(done)[:3] == ("done", None, None)
@@ -167,7 +167,7 @@ def test_selector_where_every_card_left_is_a_failure_not_a_receipt(kanban_home, 
     code = kc.kanban_command(
         kc.build_parser(
             __import__("argparse").ArgumentParser().add_subparsers(dest="_t")
-        ).parse_args("set-model standard-model --where status=ready".split())
+        ).parse_args("--board default set-model standard-model --where status=ready".split())
     )
     assert code == 1
     assert _row(only)[2] is None

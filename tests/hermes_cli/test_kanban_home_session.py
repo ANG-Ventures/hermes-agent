@@ -640,7 +640,7 @@ async def test_gateway_slash_binds_invoking_session(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     home_runner = _slash_runner(HOME)
     out = await GatewayRunner._handle_kanban_command(
-        home_runner, _slash_event("/kanban create 'mine' --assignee worker-a --json"))
+        home_runner, _slash_event("/kanban --board default create 'mine' --assignee worker-a --json"))
     tid = json.loads(out)["id"]
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).session_id == HOME
@@ -672,7 +672,7 @@ async def test_gateway_slash_session_resolution_failure_is_logged(
     runner = _slash_runner(RuntimeError("store offline"))
     with caplog.at_level(logging.WARNING):
         out = await GatewayRunner._handle_kanban_command(
-            runner, _slash_event("/kanban create 'x' --json"))
+            runner, _slash_event("/kanban --board default create 'x' --json"))
     assert "session-unresolved" in out, out
     with kb.connect_closing() as conn:
         assert kb.list_tasks(conn) == []
@@ -691,7 +691,7 @@ async def test_gateway_slash_unresolved_session_refuses_guarded_mutation(
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     out = await GatewayRunner._handle_kanban_command(
-        _slash_runner(HOME), _slash_event("/kanban create 'homed' --assignee worker-a --json"))
+        _slash_runner(HOME), _slash_event("/kanban --board default create 'homed' --assignee worker-a --json"))
     tid = json.loads(out)["id"]
     out = await GatewayRunner._handle_kanban_command(
         _slash_runner(None), _slash_event(f"/kanban block {tid} 'no session'"))
