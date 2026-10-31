@@ -98,6 +98,7 @@ def test_servable_labels_pass():
           a: {runs-on: ubuntu-latest, steps: [{run: "true"}]}
           b: {runs-on: [self-hosted, X64], steps: [{run: "true"}]}
           c: {runs-on: blacksmith-4vcpu-ubuntu-2404-arm, steps: [{run: "true"}]}
+          e: {runs-on: [self-hosted, universal-ci], steps: [{run: "true"}]}
           d: {runs-on: "${{ fromJSON(vars.CI_RUNNER_LABELS || '[\\"ubuntu-latest\\"]') }}", steps: [{run: "true"}]}
     """)
     assert lint_mod.lint({"w.yml": wf}) == []
