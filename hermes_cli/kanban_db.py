@@ -12083,8 +12083,17 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    if card_covers:
+        # --superseded-by <card> (Prism 20f49b2e3092): the cover proves another card's merged PR
+        # replaced this one, not that anything holds this workspace's bytes. It never removes the
+        # workspace itself: record the same retention hold an unbound claim falls into
+        # (kanban_survivor._hold; preserve(cleanup=True) refuses while held_reason is set).
+        from hermes_cli.kanban_survivor import _hold
+        _hold(conn, task_id, f"survivor_unavailable: superseded_by_card {sup_card} is an unbound "
+                             "cover, not a copy of this workspace; recover or remove it by hand")
+    else:
+        # Clean up the scratch workspace and any stale tmux session for the worker.
+        _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_kanban_lifecycle_hook(

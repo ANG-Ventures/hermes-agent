@@ -367,3 +367,31 @@ def test_supersession_cover_completes_but_buys_no_workspace_deletion(board, monk
         assert (a / "lost_impl.py").read_text(encoding="utf-8") == f"UNPUBLISHED_{tid}\n"
         assert "unbound" in ks._state(conn, tid)[1]
         assert kb.list_runs(conn, tid)[-1].metadata["survivor"]["refs"][0]["unbound"] is True
+
+
+def test_supersession_close_never_removes_the_workspace_itself(board, monkeypatch):
+    """Prism 20f49b2e3092: no changed_files claim, a ``{}`` baseline and a loose file with no
+    ``.git``. preserve() takes the no-claim path and would hand the workspace to the reaper.
+    complete_task skips the removal for a card-covered close and records a retention hold."""
+    from hermes_cli import kanban_db_workspace as kbw
+    from hermes_cli import kanban_survivor as ks
+
+    _stub(monkeypatch)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", ('{"pr_url": "%s"}' % CLOSED_PR, run))
+        conn.commit()
+        ws = kbw.resolve_workspace(kb.get_task(conn, tid))
+        kbw.set_workspace_path(conn, tid, ws)
+        ks.record_baseline(conn, tid, ws)
+        assert ks._state(conn, tid)[0] == {}
+        (ws / "draft.py").write_text(f"DRAFT_{tid}", encoding="utf-8")
+        assert not (ws / ".git").exists()
+
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=sup) is True
+        assert _status(conn, tid) == "done"
+        assert (ws / "draft.py").exists(), "supersession completion deleted the workspace"
+        assert (ws / "draft.py").read_text(encoding="utf-8") == f"DRAFT_{tid}"
+        held = ks._state(conn, tid)[1]
+        assert held and "superseded_by_card" in held
+        assert "workspace_held" in [e.kind for e in kb.list_events(conn, tid)]
