@@ -618,13 +618,16 @@ def recorded_pr_refs(metadata) -> list:
 
 
 def authored_pr_refs(metadata) -> list:
-    """:func:`recorded_pr_refs` without survivor evidence (``survivor.refs[].pr`` / ``claims[].pr``): the PRs
-    a run declared as its OWN work. A survivor names someone else's merged PR by design (a card closed
-    ``--superseded-by`` records the superseding PR there), so it must never make that PR the card's own
-    (Prism 7004158a070b: supersession would chain transitively)."""
+    """The PRs a run declared as its OWN work: ``pr_url`` and ``own_prs`` only. Never survivor evidence
+    (``survivor.refs[].pr`` / ``claims[].pr``): a card closed ``--superseded-by`` records the superseding PR
+    there, so supersession would chain transitively (Prism 7004158a070b). Never ``auto_routed_open_prs``:
+    it lists PRs the handoff prose merely mentions (Prism 4cacc8c8c4b5)."""
     if not isinstance(metadata, dict):
         return []
-    return recorded_pr_refs({k: v for k, v in metadata.items() if k != "survivor"})
+    out: list = []
+    for key in ("pr_url", "own_prs"):
+        out.extend(_iter_strings(metadata.get(key)))
+    return out
 
 
 # --------------------------------------------------------------------------- close-record + merged survivor
@@ -827,7 +830,7 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
 # archived. ``--superseded-by <card>`` now covers the card's closed own PR when ALL of these hold:
 #   1. that card is done;
 #   2. one of its own PRs merged, merge commit on the default branch. "Own" = a PR its runs declared
-#      (:func:`authored_pr_refs`, never survivor evidence) whose head branch names no OTHER card;
+#      (:func:`authored_pr_refs`: pr_url / own_prs) whose head branch names THAT card;
 #   3. the closed PR's own GitHub thread carries ``CLOSED: SUPERSEDED-BY <that PR>``;
 #   4. both PRs are in the same repo and their changed files (verbatim paths) intersect.
 # Anything unreadable refuses (the ordinary closed-unmerged refusal stands).
@@ -925,7 +928,9 @@ def card_supersession(closed, *, card: str, card_status: Optional[str], card_prs
             _log.warning("kanban card supersession: %s#%s lookup failed: %s", r.repo, r.number, exc)
             continue
         head_ref = payload.get("head_ref") if isinstance(payload, dict) else None
-        if not branch_names_other_card(head_ref, card):
+        # Positive ownership, as the open-PR route: the head branch must name ``card``. An operator
+        # or no-card branch is nobody's own PR (Prism fe296d065135 / 4cacc8c8c4b5).
+        if branch_names_card(head_ref, card) and not branch_is_operators(head_ref):
             merged[(r.repo.lower(), r.number)] = r
     if not merged:
         return []

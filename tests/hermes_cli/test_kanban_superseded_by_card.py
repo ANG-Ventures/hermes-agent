@@ -39,17 +39,23 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return home
 
 
+_SUP: dict = {}
+
+
 def _stub(monkeypatch, *, merged=True, on_default=True, record=RECORD, files=None, head_ref=None):
     """The t_eb5bf009 shape on GitHub, every oracle stubbed. Each kwarg breaks one condition.
-    #352 is a third card's closed PR with the same record and files as #350 (the chain case)."""
+    #351's head branch names the superseding card unless ``head_ref`` overrides it (fos#351 is on
+    ``daedalus/t_be729571-spawn-path``). #352 is a third card's closed PR with the same record and
+    files as #350 (the chain case)."""
     files = dict(FILES if files is None else files)
     files.setdefault(352, files.get(350, set()))
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    _SUP.clear()
 
     def query(repo, n):
         if n == 351:
             out = {"state": "MERGED", "merge_commit_sha": MERGE_SHA} if merged else {"state": "CLOSED"}
-            return dict(out, head_ref=head_ref) if head_ref else out
+            return dict(out, head_ref=head_ref or f"daedalus/{_SUP.get('id')}-spawn-path")
         return {"state": "CLOSED"} if n in (350, 352) else {"state": op.NOT_FOUND}
     monkeypatch.setattr(op, "_default_query", lambda: query)
     monkeypatch.setattr(op, "sha_on_default", lambda repo, sha: on_default)
@@ -67,6 +73,7 @@ def _cards(conn, *, superseder_status="done"):
     run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (sup,)).fetchone()[0]
     conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", ('{"pr_url": "%s"}' % MERGED_PR, run))
     conn.execute("UPDATE tasks SET status=? WHERE id=?", (superseder_status, sup))
+    _SUP["id"] = sup
     tid = kb.create_task(conn, title="pacer", assignee="worker")
     kb.claim_task(conn, tid)
     run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
@@ -176,15 +183,45 @@ def test_superseding_card_parses_one_card_only():
     assert op.superseding_card(None) is None
 
 
-@pytest.mark.parametrize("head_ref", ["daedalus/t_be729571-spawn-path", "feature/no-card-id"])
-def test_merged_pr_on_the_superseding_cards_branch_or_no_card_branch_still_covers(board, monkeypatch, head_ref):
+def _renamed_superseder(conn, sup, new="t_be729571"):
+    conn.execute("UPDATE tasks SET id=? WHERE id=?", (new, sup))
+    conn.execute("UPDATE task_runs SET task_id=? WHERE task_id=?", (new, sup))
+    conn.commit()
+    return new
+
+
+def test_merged_pr_on_the_superseding_cards_branch_covers(board, monkeypatch):
+    """The real case: fos#351's head is ``daedalus/t_be729571-spawn-path``."""
+    _stub(monkeypatch, head_ref="daedalus/t_be729571-spawn-path")
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        sup = _renamed_superseder(conn, sup)
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=sup) is True
+
+
+@pytest.mark.parametrize("head_ref", ["feature/no-card-id", "apollo/x", "aegis/fix-thing"])
+def test_merged_pr_on_a_no_card_or_operator_branch_is_nobodys_own_and_refuses(board, monkeypatch, head_ref):
+    """Prism fe296d065135: rule 2 needs POSITIVE ownership, the head branch names the superseding card
+    (branch_names_card, as the open-PR route). A no-card or operator branch belongs to no card."""
     _stub(monkeypatch, head_ref=head_ref)
     with kb.connect() as conn:
         sup, tid, run = _cards(conn)
-        conn.execute("UPDATE tasks SET id=? WHERE id=?", ("t_be729571", sup))
-        conn.execute("UPDATE task_runs SET task_id=? WHERE task_id=?", ("t_be729571", sup))
-        conn.commit()
-        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by="t_be729571") is True
+        sup = _renamed_superseder(conn, sup)
+        _refused(conn, tid, run, sup)
+
+
+@pytest.mark.parametrize("head_ref", ["feature/no-card-id", "daedalus/t_be729571-spawn-path"])
+def test_auto_routed_only_mention_is_not_the_superseders_own_pr(board, monkeypatch, head_ref):
+    """Prism 4cacc8c8c4b5: a legacy run whose only record of #351 is ``auto_routed_open_prs`` (handoff prose
+    merely mentioned it) never makes #351 that card's own work. The no-card branch is refused by the branch
+    test; the card's own branch by authored_pr_refs reading pr_url / own_prs only."""
+    _stub(monkeypatch, head_ref=head_ref)
+    with kb.connect() as conn:
+        sup, tid, run = _cards(conn)
+        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?",
+                     ('{"auto_routed_open_prs": ["%s"]}' % MERGED_PR, sup))
+        sup = _renamed_superseder(conn, sup)
+        _refused(conn, tid, run, sup)
 
 
 def test_merged_pr_whose_branch_names_another_card_is_not_the_superseders_own(board, monkeypatch):
@@ -218,6 +255,7 @@ def test_authored_pr_refs_drops_survivor_evidence_only():
     md = {"pr_url": "o/r#1", "own_prs": ["o/r#2"],
           "survivor": {"refs": [{"pr": "o/r#3"}], "claims": [{"pr": "o/r#4"}]}}
     assert op.authored_pr_refs(md) == ["o/r#1", "o/r#2"]
+    assert op.authored_pr_refs({"auto_routed_open_prs": ["o/r#5"]}) == []
     assert set(op.recorded_pr_refs(md)) == {"o/r#1", "o/r#2", "o/r#3", "o/r#4"}
     assert op.authored_pr_refs(None) == []
 
