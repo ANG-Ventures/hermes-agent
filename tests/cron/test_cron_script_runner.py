@@ -1233,6 +1233,55 @@ def test_replay_commit_keeps_the_file_without_the_lock(root, monkeypatch):
     assert [row[1] for row in json.loads(path.read_text())] == [j["id"]]
 
 
+def test_record_after_a_lock_timeout_survives_a_concurrent_replay_commit(root, monkeypatch):
+    """Prism e7289429e4e2 (t_d8d149fc): the replay pauses after its commit-stage read with the
+    lock held; a record that times out on that lock must not rewrite the shared file from its own
+    snapshot, or the resumed commit drops the new row. The row spills and the next start fires it."""
+    import cron.jobs as jobs_mod
+    from cron import script_runner_rearm as rr
+    from cron.runtime_state import merged_jobs
+
+    a = _job(root, "A", "a.sh")
+    b = _job(root, "B", "b.sh")
+
+    def count(job_id):
+        rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job_id]
+        return int(rec.get("restart_requeue_count") or 0)
+
+    rr.record_pending_requeues([(str(root), a["id"])], trip_epoch=time.time())
+    requeued, paused, resume = threading.Event(), threading.Event(), threading.Event()
+    real_requeue, real_read = jobs_mod.request_restart_requeue, rr._read_pending
+
+    def requeue(job_id, *args, **kwargs):
+        ok = real_requeue(job_id, *args, **kwargs)
+        requeued.set()
+        return ok
+
+    def read_pending(path):
+        out = real_read(path)
+        if requeued.is_set() and not paused.is_set() and threading.current_thread() is replay:
+            paused.set()  # the commit-stage read, lock held
+            assert resume.wait(10)
+        return out
+
+    monkeypatch.setattr(jobs_mod, "request_restart_requeue", requeue)
+    monkeypatch.setattr(rr, "_read_pending", read_pending)
+    result = []
+    replay = threading.Thread(target=lambda: result.append(rr.apply_pending_requeues()))
+    replay.start()
+    try:
+        assert paused.wait(10)
+        rr.record_pending_requeues([(str(root), b["id"])], lock_timeout=1)  # times out
+    finally:
+        resume.set()
+        replay.join(10)
+    assert result == [1] and count(a["id"]) == 1
+    monkeypatch.setattr(rr, "_read_pending", real_read)
+    assert rr.apply_pending_requeues() == 1  # B was not lost
+    assert count(b["id"]) == 1 and count(a["id"]) == 1
+    assert rr.apply_pending_requeues() == 0  # drained: nothing fires twice
+
+
 def test_concurrent_trip_records_lose_no_line(root):
     """Prism 2777c74d0091: two writers of the trip history must not drop each other's line."""
     from cron import script_runner_rearm as rr
