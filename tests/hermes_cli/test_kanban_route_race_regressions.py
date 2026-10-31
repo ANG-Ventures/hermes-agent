@@ -296,7 +296,7 @@ def test_clear_racing_a_replacement_reports_the_row_it_actually_deleted(
         ))
 
     fired = _before_lock_of(monkeypatch, "clear_lane_model_override", replace)
-    out = kc.run_slash("lane-model clear")
+    out = kc.run_slash("--board default lane-model clear")
 
     assert fired["n"] == 1
     assert "was openai-codex/model-new" in out and "model-old" not in out
@@ -386,6 +386,6 @@ def test_clearing_a_scoped_lane_under_a_board_wide_lane_names_the_survivor(kanba
             conn, provider="openai-codex", model="model-scoped",
             expires_at=10**10, reason="scoped", assignee="worker",
         )
-    out = kc.run_slash("lane-model clear --assignee worker")
+    out = kc.run_slash("--board default lane-model clear --assignee worker")
     assert "was openai-codex/model-scoped" in out
     assert "now routes via board-wide lane openai-codex/model-global" in out

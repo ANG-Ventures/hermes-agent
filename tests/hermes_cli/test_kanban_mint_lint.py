@@ -253,11 +253,11 @@ def test_cli_time_gate_refuses_then_until_and_override(kanban_home, tmp_path):
 
 
 def test_cli_open_duplicate_refuses_then_not_a_duplicate(kanban_home):
-    first = json.loads(kc.run_slash(f"create {shlex.quote(MOMUS2_OPEN)} --assignee momus --json"))
-    refused = kc.run_slash(f"create {shlex.quote(MOMUS2_REFILE)} --assignee momus --json")
+    first = json.loads(kc.run_slash(f"--board default create {shlex.quote(MOMUS2_OPEN)} --assignee momus --json"))
+    refused = kc.run_slash(f"--board default create {shlex.quote(MOMUS2_REFILE)} --assignee momus --json")
     assert first["id"] in refused and "assignee momus" in refused
     forced = json.loads(kc.run_slash(
-        f"create {shlex.quote(MOMUS2_REFILE)} --assignee momus "
+        f"--board default create {shlex.quote(MOMUS2_REFILE)} --assignee momus "
         "--not-a-duplicate 'pass 2 of the next fold' --json"))
     with kb.connect_closing() as conn:
         assert _events(conn, forced["id"], "near_duplicate_forced")[0]["reason"] == (

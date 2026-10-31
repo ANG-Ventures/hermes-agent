@@ -37,7 +37,7 @@ HOSTILE = "run `whoami` then $(date -u)\n"
 def test_create_body_file_path_is_byte_exact(kanban_home, tmp_path):
     f = tmp_path / "body.md"
     f.write_text(HOSTILE, encoding="utf-8")
-    created = json.loads(kc.run_slash(f"create 't' --assignee alice --body-file {f} --json"))
+    created = json.loads(kc.run_slash(f"--board default create 't' --assignee alice --body-file {f} --json"))
     with kb.connect() as conn:
         # create_task prepends an origin stamp; the payload itself is literal.
         assert HOSTILE.strip() in kb.get_task(conn, created["id"]).body
@@ -46,7 +46,7 @@ def test_create_body_file_path_is_byte_exact(kanban_home, tmp_path):
 def test_create_body_file_stdin(kanban_home, monkeypatch):
     import io
     monkeypatch.setattr("sys.stdin", io.StringIO(HOSTILE))
-    created = json.loads(kc.run_slash("create 't' --assignee alice --body-file - --json"))
+    created = json.loads(kc.run_slash("--board default create 't' --assignee alice --body-file - --json"))
     with kb.connect() as conn:
         # create_task prepends an origin stamp; the payload itself is literal.
         assert HOSTILE.strip() in kb.get_task(conn, created["id"]).body
@@ -55,7 +55,7 @@ def test_create_body_file_stdin(kanban_home, monkeypatch):
 def test_create_body_and_body_file_conflict(kanban_home, tmp_path):
     f = tmp_path / "body.md"
     f.write_text("x", encoding="utf-8")
-    out = kc.run_slash(f"create 't' --assignee alice --body y --body-file {f}")
+    out = kc.run_slash(f"--board default create 't' --assignee alice --body y --body-file {f}")
     assert "mutually exclusive" in out
     with kb.connect() as conn:
         assert kb.list_tasks(conn) == []
@@ -63,7 +63,7 @@ def test_create_body_and_body_file_conflict(kanban_home, tmp_path):
 
 def test_comment_body_file_stdin(kanban_home, monkeypatch):
     import io
-    tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
+    tid = json.loads(kc.run_slash("--board default create 't' --assignee alice --json"))["id"]
     monkeypatch.setattr("sys.stdin", io.StringIO(HOSTILE))
     kc.run_slash(f"comment {tid} --body-file -")
     with kb.connect() as conn:
@@ -72,7 +72,7 @@ def test_comment_body_file_stdin(kanban_home, monkeypatch):
 
 
 def test_comment_requires_exactly_one_body_source(kanban_home, tmp_path):
-    tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
+    tid = json.loads(kc.run_slash("--board default create 't' --assignee alice --json"))["id"]
     f = tmp_path / "c.md"
     f.write_text("hi", encoding="utf-8")
     assert "not both" in kc.run_slash(f"comment {tid} words --body-file {f}")
@@ -82,7 +82,7 @@ def test_comment_requires_exactly_one_body_source(kanban_home, tmp_path):
 
 
 def test_comment_positional_text_unchanged(kanban_home):
-    tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
+    tid = json.loads(kc.run_slash("--board default create 't' --assignee alice --json"))["id"]
     kc.run_slash(f"comment {tid} plain words here")
     with kb.connect() as conn:
         assert [c.body for c in kb.list_comments(conn, tid)] == ["plain words here"]
@@ -121,20 +121,20 @@ def _bodies(tid):
     ],
 )
 def test_comment_author_either_side_of_text(kanban_home, argv_tail):
-    tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
+    tid = json.loads(kc.run_slash("--board default create 't' --assignee alice --json"))["id"]
     assert _cli(["comment", tid, *argv_tail]) == 0
     assert _bodies(tid) == [("bot-x", "before text")]
 
 
 def test_comment_author_before_text_via_slash(kanban_home):
-    tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
+    tid = json.loads(kc.run_slash("--board default create 't' --assignee alice --json"))["id"]
     out = kc.run_slash(f"comment {tid} --author bot-x 'hello world'")
     assert "unrecognized" not in out
     assert _bodies(tid) == [("bot-x", "hello world")]
 
 
 def test_comment_body_file_alone_and_missing_body_rc(kanban_home, tmp_path, capsys):
-    tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
+    tid = json.loads(kc.run_slash("--board default create 't' --assignee alice --json"))["id"]
     f = tmp_path / "c.md"
     f.write_text("from file", encoding="utf-8")
     assert _cli(["comment", tid, "--author", "bot-x", "--body-file", str(f)]) == 0

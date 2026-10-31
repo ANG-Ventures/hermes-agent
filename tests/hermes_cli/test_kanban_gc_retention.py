@@ -104,7 +104,7 @@ def test_slash_kanban_gc_retention_bounds(board, days, expected):
     with kbc.connect_closing() as conn:
         tid = _done_task_with_old_event(conn)
     log = _old_log_file()
-    out = kanban.run_slash(f"gc --event-retention-days {days} --log-retention-days {days}")
+    out = kanban.run_slash(f"--board default gc --event-retention-days {days} --log-retention-days {days}")
     assert expected in out
     with kbc.connect_closing() as conn:
         assert _event_rows(conn, tid) > 0

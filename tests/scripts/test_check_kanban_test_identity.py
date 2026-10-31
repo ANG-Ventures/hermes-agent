@@ -49,7 +49,7 @@ def test_an_explicit_identity_on_the_spawn_is_green():
 def test_in_process_calls_and_non_guarded_verbs_are_not_spawns():
     in_process = ('def test_x(parser, kc):\n'
                   '    parser.parse_args(["kanban", "create", "T"])\n'
-                  '    kc.run_slash("create T")\n'
+                  '    kc.run_slash("--board default create T")\n'
                   '    event("/kanban create T")\n')
     assert lint.check_source(in_process, "t.py") == []
     assert lint.check_source(BARE.replace('"create"', '"list"'), "t.py") == []

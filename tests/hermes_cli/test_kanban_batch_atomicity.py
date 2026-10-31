@@ -41,7 +41,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _create(title: str, assignee: str = "worker") -> str:
-    out = kc.run_slash(f"create '{title}' --assignee {assignee}")
+    out = kc.run_slash(f"--board default create '{title}' --assignee {assignee}")
     match = re.search(r"t_[a-f0-9]+", out)
     assert match, out
     return match.group(0)

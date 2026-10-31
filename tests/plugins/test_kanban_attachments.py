@@ -316,7 +316,7 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
     listed = run_slash(f"attachments {task_id}")
     assert "upload.txt" in listed
 
-    removed = run_slash(f"attach-rm {att_id}")
+    removed = run_slash(f"--board default attach-rm {att_id}")
     assert "Deleted attachment" in removed
     conn = kbc.connect()
     try:

@@ -29,7 +29,7 @@ def kanban_home(tmp_path, monkeypatch, proven_operator):
 
 def _create(title: str, assignee: str, *, initial_status: str | None = None) -> str:
     suffix = f" --initial-status {initial_status}" if initial_status else ""
-    out = kc.run_slash(f"create '{title}' --assignee {assignee}{suffix}")
+    out = kc.run_slash(f"--board default create '{title}' --assignee {assignee}{suffix}")
     match = re.search(r"t_[a-f0-9]+", out)
     assert match, out
     return match.group(0)

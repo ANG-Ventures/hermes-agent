@@ -33,7 +33,7 @@ def board(tmp_path, monkeypatch):
     kb.init_db()
     (home / "kanban").mkdir(exist_ok=True)
     kb.operator_token_path().write_text(TOKEN + "\n", encoding="utf-8")
-    tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
+    tid = json.loads(kc.run_slash("--board default create 't' --assignee alice --json"))["id"]
     return tid
 
 

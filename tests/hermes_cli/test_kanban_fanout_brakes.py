@@ -159,7 +159,7 @@ def test_cli_create_parks_worker_created_card(kanban_home, monkeypatch):
         "hermes_cli.kanban_worker_policy._load_config", lambda: {}
     )
     payload = json.loads(
-        kcli.run_slash("create 'cli child' --assignee argus --json")
+        kcli.run_slash("--board default create 'cli child' --assignee argus --json")
     )
     assert payload["status"] == "triage", payload
 
@@ -172,7 +172,7 @@ def test_cli_create_non_worker_stays_ready(kanban_home, monkeypatch):
         "hermes_cli.kanban_worker_policy._load_config", lambda: {}
     )
     payload = json.loads(
-        kcli.run_slash("create 'human card' --assignee argus --json")
+        kcli.run_slash("--board default create 'human card' --assignee argus --json")
     )
     assert payload["status"] == "ready", payload
 

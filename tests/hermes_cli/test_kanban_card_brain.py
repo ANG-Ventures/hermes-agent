@@ -77,7 +77,7 @@ def test_migration_adds_nullable_column(kanban_home):
 
 
 def test_create_brain_persists_and_is_on_created_event(kanban_home):
-    out = kc.run_slash("create 'x' --assignee cc-worker --brain clxf:25")
+    out = kc.run_slash("--board default create 'x' --assignee cc-worker --brain clxf:25")
     tid = _created_id(out)
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).brain == "clxf-25"
@@ -88,14 +88,14 @@ def test_create_brain_persists_and_is_on_created_event(kanban_home):
 
 
 def test_create_refuses_bad_brain_without_creating(kanban_home):
-    out = kc.run_slash("create 'x' --assignee cc-worker --brain clr")
+    out = kc.run_slash("--board default create 'x' --assignee cc-worker --brain clr")
     assert "use clrf" in out
     with kb.connect() as conn:
         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
 
 
 def test_set_model_brain_with_model_and_effort(kanban_home):
-    tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker"))
+    tid = _created_id(kc.run_slash("--board default create 'x' --assignee cc-worker"))
     res = kc.run_slash(f"set-model {tid} claude-sonnet-5-5 --effort high --brain clrf")
     assert "Set brain on" in res and "clrf" in res
     with kb.connect() as conn:
@@ -105,7 +105,7 @@ def test_set_model_brain_with_model_and_effort(kanban_home):
 
 
 def test_brain_alone_leaves_model_untouched(kanban_home):
-    tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker --model claude-sonnet-5-5"))
+    tid = _created_id(kc.run_slash("--board default create 'x' --assignee cc-worker --model claude-sonnet-5-5"))
     res = kc.run_slash(f"set-model {tid} --brain dtlrf")
     assert "model override" not in res
     with kb.connect() as conn:
@@ -115,7 +115,7 @@ def test_brain_alone_leaves_model_untouched(kanban_home):
 
 
 def test_clear_brain(kanban_home):
-    tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker --brain clrf"))
+    tid = _created_id(kc.run_slash("--board default create 'x' --assignee cc-worker --brain clrf"))
     res = kc.run_slash(f"set-model {tid} --clear-brain")
     assert "Cleared brain" in res
     with kb.connect() as conn:
@@ -125,7 +125,7 @@ def test_clear_brain(kanban_home):
 
 
 def test_clearing_model_keeps_brain(kanban_home):
-    tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker --model claude-sonnet-5-5 --brain clrf"))
+    tid = _created_id(kc.run_slash("--board default create 'x' --assignee cc-worker --model claude-sonnet-5-5 --brain clrf"))
     kc.run_slash(f"set-model {tid} none")
     with kb.connect() as conn:
         t = kb.get_task(conn, tid)
@@ -133,7 +133,7 @@ def test_clearing_model_keeps_brain(kanban_home):
 
 
 def test_set_model_refuses_bad_brain_writes_nothing(kanban_home):
-    tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker"))
+    tid = _created_id(kc.run_slash("--board default create 'x' --assignee cc-worker"))
     res = kc.run_slash(f"set-model {tid} claude-sonnet-5-5 --brain bogus")
     assert "brain must be one of" in res
     with kb.connect() as conn:
@@ -143,7 +143,7 @@ def test_set_model_refuses_bad_brain_writes_nothing(kanban_home):
 
 
 def test_brain_and_clear_brain_exclusive(kanban_home):
-    tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker --brain clrf"))
+    tid = _created_id(kc.run_slash("--board default create 'x' --assignee cc-worker --brain clrf"))
     res = kc.run_slash(f"set-model {tid} --brain dtlrf --clear-brain")
     assert "usage error" in res or "not allowed with" in res
     with kb.connect() as conn:
@@ -151,7 +151,7 @@ def test_brain_and_clear_brain_exclusive(kanban_home):
 
 
 def test_live_refuses_brain(kanban_home):
-    tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker"))
+    tid = _created_id(kc.run_slash("--board default create 'x' --assignee cc-worker"))
     res = kc.run_slash(f"set-model {tid} claude-sonnet-5-5 --brain clrf --live")
     assert "next dispatch" in res
     with kb.connect() as conn:
@@ -168,7 +168,7 @@ def test_set_card_brain_refuses_archived(kanban_home):
 
 
 def test_show_json_carries_brain(kanban_home):
-    tid = _created_id(kc.run_slash("create 'x' --assignee cc-worker --brain alrf"))
+    tid = _created_id(kc.run_slash("--board default create 'x' --assignee cc-worker --brain alrf"))
     out = kc.run_slash(f"show {tid} --json")
     assert json.loads(out)["task"]["brain"] == "alrf"
 

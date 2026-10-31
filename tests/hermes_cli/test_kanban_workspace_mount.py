@@ -453,7 +453,7 @@ def test_mount_loss_e2e_reset_lets_dispatcher_recreate(home, monkeypatch):
         assert task_id in stuck.stranded_by_mount_loss
         assert not calls and not path.exists()
 
-        out = kc.run_slash(f'workspace reset {task_id}')
+        out = kc.run_slash(f'--board default workspace reset {task_id}')
         assert 'reset' in out.lower() and task_id in out, out
         task = kb.get_task(conn, task_id)
         assert task.workspace_path is None
@@ -551,11 +551,11 @@ def test_reset_all_stranded_touches_only_eligible_cards(home, monkeypatch):
         )
         kbw.set_workspace_path(conn, alive, alive_path)
 
-        dry = kc.run_slash('workspace reset --all-stranded --dry-run')
+        dry = kc.run_slash('--board default workspace reset --all-stranded --dry-run')
         assert lost_a in dry and lost_b in dry
         assert kb.get_task(conn, lost_a).workspace_path is not None
 
-        out = kc.run_slash('workspace reset --all-stranded')
+        out = kc.run_slash('--board default workspace reset --all-stranded')
         assert lost_a in out and lost_b in out
         assert kb.get_task(conn, lost_a).workspace_path is None
         assert kb.get_task(conn, lost_b).workspace_path is None
@@ -564,7 +564,7 @@ def test_reset_all_stranded_touches_only_eligible_cards(home, monkeypatch):
 
 
 def test_reset_cli_needs_exactly_one_target(home):
-    out = kc.run_slash('workspace reset')
+    out = kc.run_slash('--board default workspace reset')
     assert '--all-stranded' in out
 
 
