@@ -349,3 +349,50 @@ def test_credential_bearing_fallback_chain_is_not_persisted_and_spec_survives():
     assert spec is not None
     assert spec["execution"]["fallback_chain"] is None
     assert "MUST-NOT-PERSIST" not in json.dumps(spec)
+
+
+# ── Prism 3de445560b2a: recovery keeps the route owner's fallback POLICY, not only the chain ──
+# A per-call ``credentials_cfg`` (``/review`` -> ``auxiliary.review``) is not replayed on recovery, so the
+# recovered children took the GLOBAL delegation block's policy: with ``fallback_providers: auto`` a pinned
+# review child failed over onto the parent's lanes its own block never named.
+
+_GLOBAL_AUTO = {"resume_on_restart": True, "fallback_providers": "auto"}
+_REVIEW_CFG = {"provider": "claude-bpr", "model": "claude-haiku-4-5", "base_url": "", "api_key": "", "api_mode": ""}
+_CHAIN = [{"provider": "claude-dtlr", "model": "claude-opus-5-5"}, {"provider": "openrouter", "model": "x/y"}]
+
+
+def _recovered_routing_cfg(parent, *, creds, routing_cfg):
+    tokens = set_session_vars(platform="telegram", chat_id="123", session_key="agent:main:telegram:dm:123",
+                              session_id="sess-parent", profile="work", async_delivery=True)
+    try:
+        with patch("gateway.status.get_current_boot_id", return_value="100:1.0"):
+            spec, _ = dt._build_durable_background_spec(
+                task_list=[{"goal": "review", "context": None}], shared_context=None, top_role="leaf",
+                inherit_context=False, cfg=dict(_GLOBAL_AUTO), creds=creds, parent_agent=parent,
+                session_key="agent:main:telegram:dm:123", parent_session_id="sess-parent",
+                origin_ui_session_id="", max_iterations=45, routing_cfg=routing_cfg)
+    finally:
+        restore_session_vars(tokens)
+    record = json.loads(json.dumps(spec))  # the durable round-trip
+    with patch.object(dt, "_load_config", return_value=dict(_GLOBAL_AUTO)):
+        got = _resolved_recovery_creds(record, _BPR_RUNTIME)
+    return got["cfg"], _real_parent(record["execution"]["fallback_chain"])
+
+
+def test_recovered_pinned_child_keeps_its_owners_no_fallback_policy():
+    parent = _real_parent(_CHAIN)
+    in_process = _resolve_child_fallback_chain(parent, _REVIEW_CFG, True, child_provider="claude-bpr",
+                                               child_model="claude-haiku-4-5")
+    assert in_process is None
+    cfg, rebuilt = _recovered_routing_cfg(
+        parent, creds={"model": "claude-haiku-4-5", "provider": "claude-bpr"}, routing_cfg=_REVIEW_CFG)
+    assert _resolve_child_fallback_chain(rebuilt, cfg, True, child_provider="claude-bpr",
+                                         child_model="claude-haiku-4-5") is None
+
+
+def test_recovered_unpinned_child_still_inherits_the_parent_chain():
+    parent = _real_parent(_CHAIN)
+    in_process = _resolve_child_fallback_chain(parent, _GLOBAL_AUTO, False, child_model="parent-model")
+    assert in_process
+    cfg, rebuilt = _recovered_routing_cfg(parent, creds={"model": None}, routing_cfg=_GLOBAL_AUTO)
+    assert _resolve_child_fallback_chain(rebuilt, cfg, False, child_model="parent-model") == in_process

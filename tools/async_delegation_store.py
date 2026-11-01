@@ -861,6 +861,23 @@ def persistable_fallback_chain(chain: Any) -> list[dict[str, Any]] | None:
     return rungs or None
 
 
+def persistable_fallback_policy(routing_cfg: Any) -> dict[str, Any]:
+    """``execution.fallback_policy``: the ``fallback_providers`` of the block that owned the route.
+
+    A recovered unit is rebuilt without its dispatch-time ``credentials_cfg`` (e.g. ``auxiliary.review``),
+    so without this its children would take the GLOBAL delegation block's fallback policy, and a pinned
+    child under ``fallback_providers: auto`` would fail over onto the parent's lanes that its own block
+    excluded (Prism 3de445560b2a). ``None`` and ``"auto"`` persist as-is. A declared chain persists
+    through the same credential filter as the parent chain. If that filter withholds it, ``[]`` is
+    recorded (no fallback), never ``None``, which would widen the policy to the inherited chain."""
+    declared = routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None
+    if declared is None or isinstance(declared, str) or declared == []:
+        return {"fallback_providers": declared}
+    if isinstance(declared, dict):
+        declared = [declared]
+    return {"fallback_providers": persistable_fallback_chain(declared) or []}
+
+
 def _sensitive_query_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
     return any(part in normalized for part in _SECRET_FIELD_PARTS) or normalized in {"key", "token"}

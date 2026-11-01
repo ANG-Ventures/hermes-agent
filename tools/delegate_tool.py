@@ -3554,6 +3554,7 @@ def _build_durable_background_spec(
     task_images: Optional[List[Optional[List[str]]]] = None,
     task_schemas: Optional[List[Optional[Dict[str, Any]]]] = None,
     skills: Optional[List[str]] = None,
+    routing_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Build the non-secret restart intent for a routable gateway session. Call-level inputs that
     delegate_task applies outside ``task_list`` (top-level ``images`` / ``output_schema`` / ``skills``)
@@ -3576,7 +3577,7 @@ def _build_durable_background_spec(
         return None, None
 
     from gateway.status import get_current_boot_id
-    from tools.async_delegation_store import persistable_fallback_chain
+    from tools.async_delegation_store import persistable_fallback_chain, persistable_fallback_policy
 
     boot_id = get_current_boot_id()
     if not boot_id or str(boot_id).endswith(":"):
@@ -3658,6 +3659,9 @@ def _build_durable_background_spec(
         # children derive theirs from it, as in-process (AIAgent has no ``fallback_model`` attribute).
         "fallback_chain": persistable_fallback_chain(
             copy.deepcopy(getattr(parent_agent, "_fallback_chain", None))),
+        # The fallback policy of the block that owned the route (``credentials_cfg`` or delegation):
+        # recovery restores it so a pinned child resolves the same chain as at dispatch.
+        "fallback_policy": persistable_fallback_policy(cfg if routing_cfg is None else routing_cfg),
         "service_tier": getattr(effective_agent, "service_tier", None),
         "providers_allowed": copy.deepcopy(getattr(effective_agent, "providers_allowed", None)),
         "providers_ignored": copy.deepcopy(getattr(effective_agent, "providers_ignored", None)),
@@ -4021,6 +4025,12 @@ def delegate_task(
                 _execution.get("max_iterations") or DEFAULT_MAX_ITERATIONS
             ),
         })
+        # The dispatch-time route owner's fallback policy (a per-call ``credentials_cfg`` is not
+        # replayed): without it a pinned child would take the global block's policy. Older records
+        # carry none and keep the global policy.
+        _fallback_policy = _execution.get("fallback_policy")
+        if isinstance(_fallback_policy, dict):
+            cfg["fallback_providers"] = copy.deepcopy(_fallback_policy.get("fallback_providers"))
     if model:
         cfg = dict(cfg)
         cfg["model"] = model
@@ -4742,6 +4752,7 @@ def delegate_task(
                 task_images=task_images,
                 task_schemas=task_schemas,
                 skills=skills,
+                routing_cfg=routing_cfg,
             )
         except Exception as exc:
             logger.error(
