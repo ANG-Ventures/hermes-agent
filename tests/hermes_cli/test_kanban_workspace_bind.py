@@ -415,13 +415,13 @@ def test_ac13_kanban_create_tool_accepts_workspace_of(home):
     with kb.connect_closing() as conn:
         x = _mk(conn, "X")
         ws = _scratch(conn, x)
-    out = json.loads(kt._handle_create({"title": "reader", "assignee": "alpha",
+    out = json.loads(kt._handle_create({"board": "default", "title": "reader", "assignee": "alpha",
                                         "workspace_of": x, "unhomed": True}))
     tid = out.get("task_id") or out.get("id")
     with kb.connect_closing() as conn:
         assert _row(conn, tid)["workspace_of"] == x
         assert _row(conn, tid)["workspace_path"] == str(ws)
-    bad = json.loads(kt._handle_create({"title": "r2", "assignee": "alpha",
+    bad = json.loads(kt._handle_create({"board": "default", "title": "r2", "assignee": "alpha",
                                         "workspace_of": "t_nope", "unhomed": True}))
     assert "no such task" in json.dumps(bad)
 

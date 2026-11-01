@@ -55,7 +55,7 @@ def _created_id(out: str) -> str:
 
 def test_set_effort_alone_leaves_model_untouched(kanban_home):
     out = kc.run_slash(
-        "create 'opus task' --assignee coder "
+        "--board default create 'opus task' --assignee coder "
         "--model claude-opus-4-8 --provider anthropic"
     )
     tid = _created_id(out)
@@ -70,7 +70,7 @@ def test_set_effort_alone_leaves_model_untouched(kanban_home):
 
 
 def test_set_effort_normalizes_case(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder")
+    out = kc.run_slash("--board default create 'x' --assignee coder")
     tid = _created_id(out)
     kc.run_slash(f"set-model {tid} --effort XHigh")
     with kb.connect() as conn:
@@ -78,7 +78,7 @@ def test_set_effort_normalizes_case(kanban_home):
 
 
 def test_set_effort_none_is_a_value(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder")
+    out = kc.run_slash("--board default create 'x' --assignee coder")
     tid = _created_id(out)
     res = kc.run_slash(f"set-model {tid} --effort none")
     assert "Set reasoning effort" in res
@@ -90,7 +90,7 @@ def test_set_effort_none_is_a_value(kanban_home):
 
 
 def test_clear_effort_resets_to_profile(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder --effort high")
+    out = kc.run_slash("--board default create 'x' --assignee coder --effort high")
     tid = _created_id(out)
     res = kc.run_slash(f"set-model {tid} --clear-effort")
     assert "Cleared reasoning effort" in res
@@ -102,7 +102,7 @@ def test_clear_effort_resets_to_profile(kanban_home):
 
 
 def test_effort_and_clear_effort_mutually_exclusive(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder --effort high")
+    out = kc.run_slash("--board default create 'x' --assignee coder --effort high")
     tid = _created_id(out)
     res = kc.run_slash(f"set-model {tid} --effort low --clear-effort")
     assert "usage error" in res or "not allowed with" in res
@@ -112,7 +112,7 @@ def test_effort_and_clear_effort_mutually_exclusive(kanban_home):
 
 def test_clearing_model_keeps_effort(kanban_home):
     out = kc.run_slash(
-        "create 'x' --assignee coder --model glm-5 --effort max"
+        "--board default create 'x' --assignee coder --model glm-5 --effort max"
     )
     tid = _created_id(out)
     res = kc.run_slash(f"set-model {tid} none")
@@ -124,7 +124,7 @@ def test_clearing_model_keeps_effort(kanban_home):
 
 
 def test_set_model_and_effort_together(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder")
+    out = kc.run_slash("--board default create 'x' --assignee coder")
     tid = _created_id(out)
     res = kc.run_slash(f"set-model {tid} claude-opus-4-8 --effort high")
     assert "Set model override" in res
@@ -137,7 +137,7 @@ def test_set_model_and_effort_together(kanban_home):
 
 def test_set_model_without_effort_still_clears(kanban_home):
     """The historical contract: bare ``set-model <id>`` clears the model."""
-    out = kc.run_slash("create 'x' --assignee coder --model glm-5")
+    out = kc.run_slash("--board default create 'x' --assignee coder --model glm-5")
     tid = _created_id(out)
     res = kc.run_slash(f"set-model {tid}")
     assert "Cleared model override" in res
@@ -146,7 +146,7 @@ def test_set_model_without_effort_still_clears(kanban_home):
 
 
 def test_set_effort_rejects_unknown_level(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder --effort high")
+    out = kc.run_slash("--board default create 'x' --assignee coder --effort high")
     tid = _created_id(out)
     res = kc.run_slash(f"set-model {tid} --effort turbo")
     # Loud rejection naming the field — never a silent profile fallback.
@@ -156,12 +156,12 @@ def test_set_effort_rejects_unknown_level(kanban_home):
 
 
 def test_set_effort_nonexistent_task(kanban_home):
-    res = kc.run_slash("set-model t_nope --effort high")
+    res = kc.run_slash("--board default set-model t_nope --effort high")
     assert "no such task" in res
 
 
 def test_provider_with_effort_but_no_model_rejected(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder")
+    out = kc.run_slash("--board default create 'x' --assignee coder")
     tid = _created_id(out)
     res = kc.run_slash(f"set-model {tid} --provider anthropic --effort high")
     assert "--provider requires a model" in res
@@ -177,14 +177,14 @@ def test_provider_with_effort_but_no_model_rejected(kanban_home):
 
 
 def test_create_effort_alias_persists(kanban_home):
-    out = kc.run_slash("create 'deep task' --assignee coder --effort xhigh")
+    out = kc.run_slash("--board default create 'deep task' --assignee coder --effort xhigh")
     tid = _created_id(out)
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).reasoning_effort == "xhigh"
 
 
 def test_create_effort_alias_normalizes_case(kanban_home):
-    out = kc.run_slash("create 'deep task' --assignee coder --effort XHIGH")
+    out = kc.run_slash("--board default create 'deep task' --assignee coder --effort XHIGH")
     tid = _created_id(out)
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).reasoning_effort == "xhigh"
@@ -196,22 +196,22 @@ def test_create_effort_alias_normalizes_case(kanban_home):
 
 
 def test_show_renders_set_effort(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder --effort xhigh")
+    out = kc.run_slash("--board default create 'x' --assignee coder --effort xhigh")
     tid = _created_id(out)
     show = kc.run_slash(f"show {tid}")
     assert "reasoning: xhigh" in show
 
 
 def test_show_json_carries_reasoning_effort(kanban_home):
-    out = kc.run_slash("create 'x' --assignee coder --effort minimal")
+    out = kc.run_slash("--board default create 'x' --assignee coder --effort minimal")
     tid = _created_id(out)
     payload = json.loads(kc.run_slash(f"show {tid} --json"))
     assert payload["task"]["reasoning_effort"] == "minimal"
 
 
 def test_list_json_carries_reasoning_effort(kanban_home):
-    kc.run_slash("create 'x' --assignee coder --effort low")
-    rows = json.loads(kc.run_slash("list --json"))
+    kc.run_slash("--board default create 'x' --assignee coder --effort low")
+    rows = json.loads(kc.run_slash("--board default list --json"))
     assert any(row.get("reasoning_effort") == "low" for row in rows)
 
 
@@ -223,7 +223,7 @@ def test_list_json_carries_reasoning_effort(kanban_home):
 def test_cli_set_effort_reaches_spawn_argv(kanban_home, monkeypatch):
     import subprocess
 
-    out = kc.run_slash("create 'x' --assignee coder")
+    out = kc.run_slash("--board default create 'x' --assignee coder")
     tid = _created_id(out)
     kc.run_slash(f"set-model {tid} --effort xhigh")
 

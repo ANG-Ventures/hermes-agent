@@ -113,7 +113,7 @@ def test_list_filters_tasks(monkeypatch, worker_env):
         conn.close()
 
     from tools import kanban_tools as kt
-    out = kt._handle_list({"assignee": "factory", "status": "ready", "limit": 10})
+    out = kt._handle_list({"board": "default", "assignee": "factory", "status": "ready", "limit": 10})
     d = json.loads(out)
     ids = [t["id"] for t in d["tasks"]]
     assert ids == [a, c]
@@ -122,7 +122,7 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert d["tasks"][0]["parent_count"] == 0
     assert b not in ids
 
-    tenant_out = kt._handle_list({
+    tenant_out = kt._handle_list({"board": "default", 
         "assignee": "factory",
         "status": "ready",
         "tenant": "other",
@@ -731,7 +731,7 @@ def test_comment_rejects_caller_supplied_author(worker_env):
 
 def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "child task",
         "assignee": "peer",
         "parents": [worker_env],
@@ -768,7 +768,7 @@ def test_create_worker_default_assignee_remapped_to_knob(worker_env, monkeypatch
     """A worker's literal assignee='default' goes to kanban.default_assignee (t_4424c05d)."""
     _pin_kanban_cfg(monkeypatch, {"default_assignee": "daedalus"})
     from tools import kanban_tools as kt
-    d = json.loads(kt._handle_create({"title": "derived", "assignee": "default"}))
+    d = json.loads(kt._handle_create({"board": "default", "title": "derived", "assignee": "default"}))
     assert d["ok"] is True
     assert d["assignee_remapped"]["from"] == "default"
     assert d["assignee_remapped"]["to"] == "daedalus"
@@ -789,7 +789,7 @@ def test_create_worker_default_assignee_remapped_to_knob(worker_env, monkeypatch
 def test_create_worker_default_assignee_refused_without_knob(worker_env, monkeypatch):
     _pin_kanban_cfg(monkeypatch, {"default_assignee": ""})
     from tools import kanban_tools as kt
-    d = json.loads(kt._handle_create({"title": "derived", "assignee": "default"}))
+    d = json.loads(kt._handle_create({"board": "default", "title": "derived", "assignee": "default"}))
     assert "error" in d
     assert "kanban.default_assignee" in d["error"]
 
@@ -800,7 +800,7 @@ def test_create_operator_default_assignee_untouched(worker_env, monkeypatch):
     _pin_kanban_cfg(monkeypatch, {"default_assignee": "daedalus"})
     monkeypatch.delenv(kwp.WORKER_ENV_MARKER, raising=False)
     from tools import kanban_tools as kt
-    d = json.loads(kt._handle_create({"title": "mine", "assignee": "default"}))
+    d = json.loads(kt._handle_create({"board": "default", "title": "mine", "assignee": "default"}))
     assert d["ok"] is True
     assert "assignee_remapped" not in d
     from hermes_cli import kanban_db as kb
@@ -816,7 +816,7 @@ def test_create_persists_model_override(worker_env):
     at 327/372 already surfaces it)."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
-    d = json.loads(kt._handle_create({
+    d = json.loads(kt._handle_create({"board": "default", 
         "title": "opus child", "assignee": "peer",
         "model_override": "claude-opus-4-8",
     }))
@@ -847,7 +847,7 @@ def test_create_tool_stamps_session_and_origin(worker_env, monkeypatch):
         _db.create_session(session_id="20260924_000000_toolsess", source="discord")
     finally:
         _db.close()
-    d = json.loads(kt._handle_create({"title": "tool card", "assignee": "peer",
+    d = json.loads(kt._handle_create({"board": "default", "title": "tool card", "assignee": "peer",
                                       "body": "work"}))
     assert d["ok"] is True
     conn = kb.connect()
@@ -865,7 +865,7 @@ def test_create_tool_without_session_is_unhomed(worker_env, monkeypatch):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
-    d = json.loads(kt._handle_create({"title": "orphan", "assignee": "peer"}))
+    d = json.loads(kt._handle_create({"board": "default", "title": "orphan", "assignee": "peer"}))
     assert d["ok"] is True
     conn = kb.connect()
     try:
@@ -879,7 +879,7 @@ def test_create_tool_without_session_is_unhomed(worker_env, monkeypatch):
 def test_create_no_model_override_is_null(worker_env):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
-    d = json.loads(kt._handle_create({"title": "plain child", "assignee": "peer"}))
+    d = json.loads(kt._handle_create({"board": "default", "title": "plain child", "assignee": "peer"}))
     assert d["ok"] is True
     conn = kb.connect()
     try:
@@ -891,7 +891,7 @@ def test_create_no_model_override_is_null(worker_env):
 
 def test_create_rejects_non_string_model_override(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "t", "assignee": "a", "model_override": 42,
     })
     assert json.loads(out).get("error")
@@ -899,14 +899,14 @@ def test_create_rejects_non_string_model_override(worker_env):
 
 def test_create_rejects_non_list_parents(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_create({"title": "t", "assignee": "a", "parents": 42})
+    out = kt._handle_create({"board": "default", "title": "t", "assignee": "a", "parents": 42})
     assert json.loads(out).get("error")
 
 
 def test_create_parses_triage_string_false(worker_env):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "not triage",
         "assignee": "peer",
         "triage": "false",
@@ -933,7 +933,7 @@ def test_create_parses_triage_string_false(worker_env):
 def test_create_parses_triage_string_true(worker_env):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "needs triage",
         "assignee": "peer",
         "triage": "true",
@@ -954,7 +954,7 @@ def test_create_parses_triage_string_true(worker_env):
 
 def test_create_rejects_bad_triage(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "bad triage",
         "assignee": "peer",
         "triage": "sometimes",
@@ -965,7 +965,7 @@ def test_create_rejects_bad_triage(worker_env):
 def test_create_accepts_string_parent(worker_env):
     """Convenience: a single parent id as string is coerced to [id]."""
     from tools import kanban_tools as kt
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "t", "assignee": "a", "parents": worker_env,
     })
     assert json.loads(out)["ok"]
@@ -975,7 +975,7 @@ def test_create_accepts_skills_list(worker_env):
     """Tool writes the per-task skills through to the kernel."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "skilled",
         "assignee": "linguist",
         "skills": ["translation", "github-code-review"],
@@ -991,7 +991,7 @@ def test_create_accepts_skills_string(worker_env):
     """Convenience: a single skill name as string is coerced to [name]."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "one-skill",
         "assignee": "a",
         "skills": "translation",
@@ -1006,7 +1006,7 @@ def test_create_accepts_skills_string(worker_env):
 def test_create_rejects_non_list_skills(worker_env):
     """skills: 42 must be rejected, not silently dropped."""
     from tools import kanban_tools as kt
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "t", "assignee": "a", "skills": 42,
     })
     assert json.loads(out).get("error")
@@ -1016,7 +1016,7 @@ def test_create_forwards_reasoning_effort(worker_env):
     from tools import kanban_tools as kt
 
     created = json.loads(
-        kt._handle_create({
+        kt._handle_create({"board": "default", 
             "title": "deep child task",
             "assignee": "peer",
             "reasoning_effort": "high",
@@ -1037,7 +1037,7 @@ def test_create_preserves_none_reasoning_effort(worker_env):
     from tools import kanban_tools as kt
 
     created = json.loads(
-        kt._handle_create({
+        kt._handle_create({"board": "default", 
             "title": "non-reasoning child task",
             "assignee": "peer",
             "reasoning_effort": "none",
@@ -1057,7 +1057,7 @@ def test_create_omitted_reasoning_effort_inherits(worker_env):
     from tools import kanban_tools as kt
 
     created = json.loads(
-        kt._handle_create({
+        kt._handle_create({"board": "default", 
             "title": "inheriting child task",
             "assignee": "peer",
         })
@@ -1070,7 +1070,7 @@ def test_create_rejects_invalid_reasoning_effort(worker_env):
     from tools import kanban_tools as kt
 
     result = json.loads(
-        kt._handle_create({
+        kt._handle_create({"board": "default", 
             "title": "invalid child task",
             "assignee": "peer",
             "reasoning_effort": "extremely-hard",
@@ -1244,7 +1244,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     }))["ok"]
 
     # 4. spawn a child task for follow-up
-    child_out = json.loads(kt._handle_create({
+    child_out = json.loads(kt._handle_create({"board": "default", 
         "title": "write integration test",
         "assignee": "qa",
         "parents": [worker_env],
@@ -1526,7 +1526,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "alt-user-9")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
 
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "auto-sub gateway",
         "assignee": "peer",
     })
@@ -1556,7 +1556,7 @@ def test_create_wake_false_opts_gateway_session_out_of_wake(monkeypatch, worker_
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
 
-    d = json.loads(kt._handle_create({
+    d = json.loads(kt._handle_create({"board": "default", 
         "title": "auto-sub notify only", "assignee": "peer", "wake": False,
     }))
     assert d["ok"] is True and d["subscribed"] is True, d
@@ -1574,7 +1574,7 @@ def test_create_wake_true_opts_gateway_session_into_wake(monkeypatch, worker_env
     monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "alt-user-9")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
 
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "auto-sub gateway",
         "assignee": "peer",
         "wake": True,
@@ -1609,7 +1609,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-abc")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "auto-sub tui",
         "assignee": "peer",
     })
@@ -1635,7 +1635,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "no sub cli",
         "assignee": "peer",
     })
@@ -1664,7 +1664,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 
     from tools import kanban_tools as kt
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "no sub gated",
         "assignee": "peer",
     })
@@ -1691,7 +1691,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
     monkeypatch.setattr(kbn, "add_notify_sub", _boom)
 
-    out = kt._handle_create({
+    out = kt._handle_create({"board": "default", 
         "title": "auto-sub tolerates add_notify_sub failure",
         "assignee": "peer",
     })
@@ -2119,7 +2119,7 @@ def test_create_flagship_profile_assignee_needs_allow_flagship(worker_env):
     from tools import kanban_tools as kt
 
     _write_fable_profile()
-    refused = json.loads(kt._handle_create({
+    refused = json.loads(kt._handle_create({"board": "default", 
         "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
     }))
     assert "assignee profile default" in refused.get("error", ""), refused
@@ -2142,7 +2142,7 @@ def test_allow_flagship_without_authority_is_refused(worker_env, monkeypatch, ac
         monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
         monkeypatch.setenv("HERMES_PROFILE", "apollo" if actor == "unverified" else "daedalus-opus")
     before = _card_count()
-    refused = json.loads(kt._handle_create({
+    refused = json.loads(kt._handle_create({"board": "default", 
         "title": "fable job", "parents": [worker_env], "allow_flagship": "delicate infra", **route,
     }))
     assert "allow_flagship is operator/orchestrator-only" in refused.get("error", ""), refused
@@ -2162,7 +2162,7 @@ def test_operator_allow_flagship_creates_and_audits(worker_env, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: True)
-    ok = json.loads(kt._handle_create({
+    ok = json.loads(kt._handle_create({"board": "default", 
         "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
         "allow_flagship": "delicate infra",
     }))

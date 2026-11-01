@@ -117,7 +117,6 @@ async def test_decompose_loop_scopes_its_board_to_its_own_thread(loop):
     assert "HERMES_KANBAN_BOARD" not in os.environ
 
 
-@pytest.mark.kanban_bare_verb_refuse
 def test_shipped_dispatcher_unit_names_its_board(tmp_path, monkeypatch):
     """Prism 56158c7d096a: under the shipped bare-verb refusal the standalone dispatcher unit's
     ExecStart must resolve a board on its own (no pin, no current-board file), else the unit

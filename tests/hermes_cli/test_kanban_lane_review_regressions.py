@@ -79,12 +79,12 @@ def test_model_flag_and_provider_only_json_preserve_model(kanban_home):
 
 def test_lane_json_round_trip_and_firepower_guard(kanban_home):
     payload = '{"model":"claude-fable-5","provider":"batch-provider","ttl":"2h","reasoning_effort":"high"}'
-    out = kc.run_slash(f"lane-model set --model-json '{payload}' --reason capacity")
+    out = kc.run_slash(f"--board default lane-model set --model-json '{payload}' --reason capacity")
     assert 'firepower' in out.lower()
     with kb.connect() as conn:
         assert kb.get_lane_model_override(conn) is None
     payload = '{"model":"model-a","provider":"batch-provider","ttl":"2h","reasoning_effort":"high"}'
-    out = kc.run_slash(f"lane-model set --model-json '{payload}' --reason capacity")
+    out = kc.run_slash(f"--board default lane-model set --model-json '{payload}' --reason capacity")
     assert 'route=batch-provider/model-a' in out
     with kb.connect() as conn:
         assert kb.get_lane_model_override(conn).reasoning_effort == 'high'
@@ -121,7 +121,7 @@ def test_card_alias_to_flagship_requires_firepower(kanban_home, route_arg):
 def test_lane_alias_to_flagship_requires_firepower(kanban_home, route_arg):
     with (kanban_home / 'config.yaml').open('a') as config:
         config.write('model:\n  aliases:\n    astra: batch-provider/gpt-6-astra-900k\n')
-    out = kc.run_slash(f'lane-model set {route_arg} --reason capacity')
+    out = kc.run_slash(f'--board default lane-model set {route_arg} --reason capacity')
     assert 'orchestrator-only' in out
     with kb.connect() as conn:
         assert kb.get_lane_model_override(conn) is None
@@ -129,7 +129,7 @@ def test_lane_alias_to_flagship_requires_firepower(kanban_home, route_arg):
         authorised = '''--model-json '{"model":"astra","provider":"batch-provider","ttl":"2h","firepower":"urgent task"}' '''
     else:
         authorised = f'{route_arg} --firepower "urgent task"'
-    out = kc.run_slash(f'lane-model set {authorised} --reason capacity')
+    out = kc.run_slash(f'--board default lane-model set {authorised} --reason capacity')
     assert 'route=batch-provider/gpt-6-astra-900k' in out
     with kb.connect() as conn:
         row = kb.get_lane_model_override(conn)
@@ -145,7 +145,7 @@ def test_provider_only_alias_in_profile_requires_firepower(kanban_home):
     (profile / 'config.yaml').write_text('model:\n  provider: batch-provider\n  default: astra\n')
     # The profile default `astra` is itself a flagship route, so the create is
     # gated too (t_9e7ba884); authorize it so the set-model path is what's tested.
-    out = kc.run_slash("create 'provider-only alias' --assignee worker --allow-flagship 'profile route ok'")
+    out = kc.run_slash("--board default create 'provider-only alias' --assignee worker --allow-flagship 'profile route ok'")
     assert 'orchestrator-only' not in out, out
     card = re.search(r't_[a-f0-9]+', out).group(0)
     out = kc.run_slash(f'set-model {card} --provider batch-provider')
@@ -162,11 +162,11 @@ def test_provider_only_alias_in_profile_requires_firepower(kanban_home):
 
 
 def test_lane_reason_and_effort_round_trip(kanban_home):
-    out = kc.run_slash('lane-model set --provider batch-provider --model model-a --ttl 2h')
+    out = kc.run_slash('--board default lane-model set --provider batch-provider --model model-a --ttl 2h')
     assert 'reason' in out.lower()
     with kb.connect() as conn:
         assert kb.list_lane_model_overrides(conn) == []
-    out = kc.run_slash('lane-model set --provider batch-provider --model model-a --ttl 2h --reason test --effort high')
+    out = kc.run_slash('--board default lane-model set --provider batch-provider --model model-a --ttl 2h --reason test --effort high')
     assert 'unrecognized arguments' not in out
     with kb.connect() as conn:
         row = kb.get_lane_model_override(conn)
@@ -175,7 +175,7 @@ def test_lane_reason_and_effort_round_trip(kanban_home):
 
 def test_clear_reports_effective_lane_route(kanban_home):
     first = _create('first', 'worker')
-    kc.run_slash('lane-model set batch-provider/model-a --ttl 2h --reason test')
+    kc.run_slash('--board default lane-model set batch-provider/model-a --ttl 2h --reason test')
     kc.run_slash(f'set-model {first} model-b --provider batch-provider')
     out = kc.run_slash(f'set-model {first} none')
     assert 'batch-provider/model-a' in out

@@ -188,14 +188,14 @@ def test_library_callers_unguarded_by_default(kanban_home):
 
 def test_cli_create_refuses_then_force_succeeds(kanban_home):
     first = json.loads(kc.run_slash(
-        f"create '{TITLE}' --body 'first copy of the spec' --assignee alice --json"
+        f"--board default create '{TITLE}' --body 'first copy of the spec' --assignee alice --json"
     ))
     refused = kc.run_slash(
-        f"create '{TITLE}' --body 'first copy of the spec' --assignee alice --json"
+        f"--board default create '{TITLE}' --body 'first copy of the spec' --assignee alice --json"
     )
     assert "near-duplicate" in refused and first["id"] in refused
     forced = json.loads(kc.run_slash(
-        f"create '{TITLE}' --body 'first copy of the spec' --assignee alice "
+        f"--board default create '{TITLE}' --body 'first copy of the spec' --assignee alice "
         "--force 'second host needs its own card' --json"
     ))
     with kb.connect_closing() as conn:
@@ -210,14 +210,14 @@ def test_tool_create_refuses_then_force_reason_succeeds(kanban_home, monkeypatch
     from tools import kanban_tools as kt
 
     first = json.loads(kt._handle_create(
-        {"title": TITLE, "body": BODY_A, "assignee": "peer"}
+        {"board": "default", "title": TITLE, "body": BODY_A, "assignee": "peer"}
     ))
     assert first["ok"] is True
     refused = json.loads(kt._handle_create(
-        {"title": TITLE, "body": BODY_B, "assignee": "peer"}
+        {"board": "default", "title": TITLE, "body": BODY_B, "assignee": "peer"}
     ))
     assert "near-duplicate" in refused["error"]
-    forced = json.loads(kt._handle_create({
+    forced = json.loads(kt._handle_create({"board": "default",
         "title": TITLE, "body": BODY_B, "assignee": "peer",
         "force_reason": "not a duplicate: different host",
     }))

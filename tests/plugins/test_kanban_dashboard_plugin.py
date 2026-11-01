@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from tests.plugins._kanban_board_client import naming_board
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
@@ -57,7 +58,7 @@ def kanban_home(tmp_path, monkeypatch):
 def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
-    return TestClient(app)
+    return naming_board(TestClient(app))
 
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
@@ -1331,7 +1332,7 @@ def test_specify_resolves_each_profiles_key_under_multiplex(kanban_home, tmp_pat
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban",
                        dependencies=[Depends(_plugin_route_secret_scope)])
-    client = TestClient(app)
+    client = naming_board(TestClient(app))
 
     def _specify(profile=None):
         params = {"profile": profile} if profile else None

@@ -29,7 +29,7 @@ def _task_id(output: str) -> str:
 
 
 def _create(title: str, *, assignee: str = "worker") -> str:
-    return _task_id(kc.run_slash(f"create '{title}' --assignee {assignee}"))
+    return _task_id(kc.run_slash(f"--board default create '{title}' --assignee {assignee}"))
 
 
 def _configure_provider(home: Path, provider: str = "test-lane") -> None:
@@ -197,21 +197,21 @@ def test_stats_include_active_lane_override(kanban_home, monkeypatch):
 def test_cli_lane_model_set_show_clear(kanban_home):
     _configure_provider(kanban_home)
     out = kc.run_slash(
-        "lane-model set test-lane/model-a --ttl 2h --reason 'capacity' --assignee worker"
+        "--board default lane-model set test-lane/model-a --ttl 2h --reason 'capacity' --assignee worker"
     )
     assert "route=test-lane/model-a" in out
     assert "assignee=worker" in out
-    shown = kc.run_slash("lane-model show")
+    shown = kc.run_slash("--board default lane-model show")
     assert "test-lane/model-a" in shown
     assert "capacity" in shown
-    cleared = kc.run_slash("lane-model clear --assignee worker")
+    cleared = kc.run_slash("--board default lane-model clear --assignee worker")
     assert "Cleared" in cleared
-    assert "(no active lane-model overrides)" in kc.run_slash("lane-model show")
+    assert "(no active lane-model overrides)" in kc.run_slash("--board default lane-model show")
 
 
 def test_cli_lane_model_refuses_unknown_provider(kanban_home):
     out = kc.run_slash(
-        "lane-model set typo-provider/model-a --ttl 2h --reason 'capacity'"
+        "--board default lane-model set typo-provider/model-a --ttl 2h --reason 'capacity'"
     )
     assert "unknown provider" in out.lower()
     with kb.connect() as conn:
@@ -232,7 +232,7 @@ def test_cli_lane_model_refuses_unvalidated_provider_when_registry_unavailable(
     else:
         monkeypatch.setattr(providers, "list_providers", lambda: [])
     out = kc.run_slash(
-        "lane-model set typo-provider-zz/model-a --ttl 2h --reason capacity"
+        "--board default lane-model set typo-provider-zz/model-a --ttl 2h --reason capacity"
     )
     assert "provider" in out.lower() and ("unknown" in out.lower() or "discover" in out.lower()), out
     with kb.connect() as conn:
@@ -248,18 +248,18 @@ def test_cli_lane_model_accepts_configured_provider_when_registry_fails(
     def broken_registry():
         raise RuntimeError("registry unavailable")
     monkeypatch.setattr(providers, "list_providers", broken_registry)
-    out = kc.run_slash("lane-model set test-lane/model-a --ttl 2h --reason capacity")
+    out = kc.run_slash("--board default lane-model set test-lane/model-a --ttl 2h --reason capacity")
     assert "route=test-lane/model-a" in out
 
 
 def test_cli_lane_model_firepower_requires_reason_beyond_reason_flag(kanban_home):
     _configure_provider(kanban_home)
     out = kc.run_slash(
-        "lane-model set test-lane/gpt-6-astra-900k --ttl 2h --reason 'capacity'"
+        "--board default lane-model set test-lane/gpt-6-astra-900k --ttl 2h --reason 'capacity'"
     )
     assert "orchestrator-only" in out
     ok = kc.run_slash(
-        "lane-model set test-lane/gpt-6-astra-900k --ttl 2h --reason 'capacity' "
+        "--board default lane-model set test-lane/gpt-6-astra-900k --ttl 2h --reason 'capacity' "
         "--firepower 'approved burst'"
     )
     assert "route=test-lane/gpt-6-astra-900k" in ok
@@ -282,7 +282,7 @@ def test_lane_clear_all_removes_every_lane_in_one_transaction(kanban_home):
             assignee="worker", expires_at=expires,
         )
 
-    out = kc.run_slash("lane-model clear --all")
+    out = kc.run_slash("--board default lane-model clear --all")
 
     assert "m-board" in out and "m-worker" in out
     with kb.connect() as conn:
@@ -299,7 +299,7 @@ def test_lane_clear_all_reports_only_rows_it_actually_deleted(kanban_home):
         )
         kb.clear_lane_model_override(conn, assignee="worker")
 
-    out = kc.run_slash("lane-model clear --all")
+    out = kc.run_slash("--board default lane-model clear --all")
 
     assert "m-worker" not in out
     assert "no lane-model override set for any lane" in out

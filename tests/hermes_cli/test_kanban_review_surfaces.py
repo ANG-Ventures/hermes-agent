@@ -405,7 +405,7 @@ def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
             expected_run_id=parent.current_run_id,
         )
 
-    payload = json.loads(kc.run_slash(f"diagnostics --task {parent_id} --json"))
+    payload = json.loads(kc.run_slash(f"--board default diagnostics --task {parent_id} --json"))
     assert any(
         item["kind"] == "review_dependency_deadlock"
         for item in payload[0]["diagnostics"]

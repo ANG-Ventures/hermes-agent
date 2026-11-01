@@ -714,7 +714,7 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
         user_id_alt="union-id",
     )
     event = SimpleNamespace(
-        text='/kanban create "hello" --assignee alice',
+        text='/kanban --board default create "hello" --assignee alice',
         source=source,
     )
 

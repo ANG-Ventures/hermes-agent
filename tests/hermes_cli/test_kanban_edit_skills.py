@@ -54,7 +54,7 @@ def _events(tid: str, kind: str) -> list[dict]:
 # -- 1. edit --skill / --clear-skills ----------------------------------------
 
 def test_edit_skill_appends_dedupes_and_audits(kanban_home):
-    tid = _created_id(kc.run_slash("create 'plain' --assignee alice --skill a"))
+    tid = _created_id(kc.run_slash("--board default create 'plain' --assignee alice --skill a"))
     out = kc.run_slash(f"edit {tid} --skill b --skill a --skill c")
     assert f"{tid}: skills: a, b, c" in out
     assert _skills(tid) == ["a", "b", "c"]
@@ -64,13 +64,13 @@ def test_edit_skill_appends_dedupes_and_audits(kanban_home):
 
 
 def test_edit_skill_noop_writes_no_event(kanban_home):
-    tid = _created_id(kc.run_slash("create 'plain' --assignee alice --skill a"))
+    tid = _created_id(kc.run_slash("--board default create 'plain' --assignee alice --skill a"))
     kc.run_slash(f"edit {tid} --skill a")
     assert _events(tid, "skills_set") == []
 
 
 def test_edit_clear_skills_then_add(kanban_home):
-    tid = _created_id(kc.run_slash("create 'plain' --assignee alice --skill a --skill b"))
+    tid = _created_id(kc.run_slash("--board default create 'plain' --assignee alice --skill a --skill b"))
     kc.run_slash(f"edit {tid} --clear-skills --skill c")
     assert _skills(tid) == ["c"]
     kc.run_slash(f"edit {tid} --clear-skills")
@@ -81,7 +81,7 @@ def test_edit_clear_skills_then_add(kanban_home):
 
 
 def test_edit_skill_refuses_toolset_name_and_comma(kanban_home):
-    tid = _created_id(kc.run_slash("create 'plain' --assignee alice"))
+    tid = _created_id(kc.run_slash("--board default create 'plain' --assignee alice"))
     with kb.connect() as conn:
         with pytest.raises(ValueError, match="toolset"):
             kb.set_task_skills(conn, tid, add=["terminal"])
@@ -98,7 +98,7 @@ def test_edit_skill_unknown_id(kanban_home):
 # -- 2. create auto-attaches sdlc-review to [milestone] QA --------------------
 
 def test_create_milestone_qa_auto_adds_sdlc_review(kanban_home):
-    out = kc.run_slash("create '[milestone] QA: thing' --assignee argus")
+    out = kc.run_slash("--board default create '[milestone] QA: thing' --assignee argus")
     tid = _created_id(out)
     assert "Added skill sdlc-review" in out
     assert _skills(tid) == ["sdlc-review"]
@@ -106,12 +106,12 @@ def test_create_milestone_qa_auto_adds_sdlc_review(kanban_home):
 
 
 def test_create_milestone_qa_keeps_given_skills(kanban_home):
-    out = kc.run_slash("create '[Milestone] qa x' --assignee argus --skill qa")
+    out = kc.run_slash("--board default create '[Milestone] qa x' --assignee argus --skill qa")
     assert _skills(_created_id(out)) == ["qa", "sdlc-review"]
 
 
 def test_create_milestone_qa_explicit_skill_not_duplicated(kanban_home):
-    out = kc.run_slash("create '[milestone] QA: y' --assignee argus --skill sdlc-review")
+    out = kc.run_slash("--board default create '[milestone] QA: y' --assignee argus --skill sdlc-review")
     tid = _created_id(out)
     assert "Added skill" not in out
     assert _skills(tid) == ["sdlc-review"]
@@ -119,7 +119,7 @@ def test_create_milestone_qa_explicit_skill_not_duplicated(kanban_home):
 
 
 def test_create_milestone_qa_whitespace_skill_no_false_notice(kanban_home):
-    out = kc.run_slash("create '[milestone] QA: z' --assignee argus --skill ' sdlc-review '")
+    out = kc.run_slash("--board default create '[milestone] QA: z' --assignee argus --skill ' sdlc-review '")
     assert "Added skill" not in out
     assert _skills(_created_id(out)) == ["sdlc-review"]
 
@@ -130,7 +130,7 @@ def test_idempotent_hit_on_legacy_card_no_false_notice(kanban_home):
                              idempotency_key="k1")
         conn.execute("UPDATE tasks SET skills = NULL WHERE id = ?", (tid,))
         conn.commit()
-    out = kc.run_slash("create '[milestone] QA: old' --assignee argus --idempotency-key k1")
+    out = kc.run_slash("--board default create '[milestone] QA: old' --assignee argus --idempotency-key k1")
     assert _created_id(out) == tid
     assert "Added skill" not in out
     assert _skills(tid) == []
@@ -140,9 +140,9 @@ def test_idempotent_hit_on_card_with_skill_no_false_notice(kanban_home):
     for i, (title, skill) in enumerate(
         (("[milestone] QA: had", ""), ("plain had", " --skill sdlc-review"))
     ):
-        first = kc.run_slash(f"create '{title}' --assignee argus --idempotency-key k{i}{skill}")
+        first = kc.run_slash(f"--board default create '{title}' --assignee argus --idempotency-key k{i}{skill}")
         tid = _created_id(first)
-        again = kc.run_slash(f"create '{title}' --assignee argus --idempotency-key k{i}")
+        again = kc.run_slash(f"--board default create '{title}' --assignee argus --idempotency-key k{i}")
         assert _created_id(again) == tid
         assert "Added skill" not in again, title
 

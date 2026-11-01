@@ -253,11 +253,11 @@ def test_cli_time_gate_refuses_then_until_and_override(kanban_home, tmp_path):
 
 
 def test_cli_open_duplicate_refuses_then_not_a_duplicate(kanban_home):
-    first = json.loads(kc.run_slash(f"create {shlex.quote(MOMUS2_OPEN)} --assignee momus --json"))
-    refused = kc.run_slash(f"create {shlex.quote(MOMUS2_REFILE)} --assignee momus --json")
+    first = json.loads(kc.run_slash(f"--board default create {shlex.quote(MOMUS2_OPEN)} --assignee momus --json"))
+    refused = kc.run_slash(f"--board default create {shlex.quote(MOMUS2_REFILE)} --assignee momus --json")
     assert first["id"] in refused and "assignee momus" in refused
     forced = json.loads(kc.run_slash(
-        f"create {shlex.quote(MOMUS2_REFILE)} --assignee momus "
+        f"--board default create {shlex.quote(MOMUS2_REFILE)} --assignee momus "
         "--not-a-duplicate 'pass 2 of the next fold' --json"))
     with kb.connect_closing() as conn:
         assert _events(conn, forced["id"], "near_duplicate_forced")[0]["reason"] == (
@@ -272,17 +272,17 @@ def test_tool_time_gate_and_open_duplicate(kanban_home):
     args = {"title": GATED_TITLE, "body": GATED_BODY, "assignee": "argus", "parents": [parent]}
     refused = json.loads(kt._handle_create(dict(args)))
     assert "reads time-gated" in refused["error"]
-    parked = json.loads(kt._handle_create({**args, "until": "+24h"}))
+    parked = json.loads(kt._handle_create({"board": "default", **args, "until": "+24h"}))
     assert parked["ok"] is True and parked["status"] == "scheduled"
     forced = json.loads(kt._handle_create(
         {**args, "i_mean_blocks": True, "not_a_duplicate": "second arm"}))
     assert forced["ok"] is True
 
-    first = json.loads(kt._handle_create({"title": MOMUS1_OPEN, "assignee": "momus"}))
-    dup = json.loads(kt._handle_create({"title": MOMUS1_REFILE, "assignee": "momus"}))
+    first = json.loads(kt._handle_create({"board": "default", "title": MOMUS1_OPEN, "assignee": "momus"}))
+    dup = json.loads(kt._handle_create({"board": "default", "title": MOMUS1_REFILE, "assignee": "momus"}))
     assert first["task_id"] in dup["error"]
     ok = json.loads(kt._handle_create(
-        {"title": MOMUS1_REFILE, "assignee": "momus", "not_a_duplicate": "new spec version"}))
+        {"board": "default", "title": MOMUS1_REFILE, "assignee": "momus", "not_a_duplicate": "new spec version"}))
     assert ok["ok"] is True
     with kb.connect_closing() as conn:
         assert len(_events(conn, forced["task_id"], "time_gate_forced")) == 1

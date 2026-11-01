@@ -167,9 +167,9 @@ def test_dispatch_dry_run_cli_never_lists_flagged(kanban_home, capsys):
     with kb.connect_closing() as conn:
         tid = _flagged(conn, assignee="default")
     capsys.readouterr()
-    _run("dispatch", "--dry-run")
+    _run("dispatch", "--board", "default", "--dry-run")
     assert tid not in capsys.readouterr().out
-    _run("dispatch", "--dry-run", "--json")
+    _run("dispatch", "--board", "default", "--dry-run", "--json")
     out = capsys.readouterr().out
     assert tid not in out and '"skipped_no_worker_count": 1' in out
 

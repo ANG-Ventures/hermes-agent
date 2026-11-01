@@ -54,7 +54,7 @@ def test_tool_list_groups_this_session_first(monkeypatch, board):
     monkeypatch.setenv("HERMES_SESSION_ID", MINE)
     from tools import kanban_tools as kt
 
-    d = json.loads(kt._handle_list({}))
+    d = json.loads(kt._handle_list({"board": "default", }))
     assert d["grouped"] is True
     assert [t["id"] for t in d["tasks"]] == [board["mine"]]
     assert d["this_session_count"] == 1
@@ -73,7 +73,7 @@ def test_tool_list_all_is_flat(monkeypatch, board, flag):
     monkeypatch.setenv("HERMES_SESSION_ID", MINE)
     from tools import kanban_tools as kt
 
-    d = json.loads(kt._handle_list({"all": flag}))
+    d = json.loads(kt._handle_list({"board": "default", "all": flag}))
     assert "grouped" not in d and "other_sessions" not in d
     assert {t["id"] for t in d["tasks"]} == set(board.values())
 
@@ -81,6 +81,6 @@ def test_tool_list_all_is_flat(monkeypatch, board, flag):
 def test_tool_list_without_caller_session_is_flat(board):
     from tools import kanban_tools as kt
 
-    d = json.loads(kt._handle_list({}))
+    d = json.loads(kt._handle_list({"board": "default", }))
     assert "grouped" not in d
     assert {t["id"] for t in d["tasks"]} == set(board.values())

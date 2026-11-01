@@ -42,7 +42,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 def test_kanban_create_forwards_reasoning_effort(kanban_home):
     created = json.loads(
-        kc.run_slash("create 'deep task' --assignee alice --reasoning high --json")
+        kc.run_slash("--board default create 'deep task' --assignee alice --reasoning high --json")
     )
 
     assert created["reasoning_effort"] == "high"
@@ -54,7 +54,7 @@ def test_kanban_create_forwards_reasoning_effort(kanban_home):
 
 def test_kanban_create_without_reasoning_inherits(kanban_home):
     created = json.loads(
-        kc.run_slash("create 'inheriting task' --assignee alice --json")
+        kc.run_slash("--board default create 'inheriting task' --assignee alice --json")
     )
 
     assert created["reasoning_effort"] is None
@@ -62,7 +62,7 @@ def test_kanban_create_without_reasoning_inherits(kanban_home):
 
 def test_kanban_create_invalid_reasoning_errors(kanban_home):
     output = kc.run_slash(
-        "create 'invalid task' --assignee alice --reasoning extremely-hard"
+        "--board default create 'invalid task' --assignee alice --reasoning extremely-hard"
     )
 
     assert "reasoning_effort must be one of" in output
@@ -104,7 +104,7 @@ def test_kanban_list_json_includes_session_id(kanban_home):
         kb.create_task(
             conn, title="acp task", assignee="alice", session_id="acp-x"
         )
-    raw = kc.run_slash("list --json")
+    raw = kc.run_slash("--board default list --json")
     payload = json.loads(raw)
     assert any(
         row.get("title") == "acp task"
@@ -269,7 +269,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import secrets
     from hermes_cli import kanban_db_connect as kbc
 
-    out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
+    out1 = kc.run_slash("--board default create 'stuck worker task' --assignee broken-model")
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m
     tid = m.group(1)

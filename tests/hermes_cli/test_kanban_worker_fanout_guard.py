@@ -45,7 +45,7 @@ def worker_env(tmp_path, monkeypatch):
 
 
 def _create(title, parents=None):
-    args = {"title": title, "assignee": "argus"}
+    args = {"board": "default", "title": title, "assignee": "argus"}
     if parents:
         args["parents"] = parents
     return json.loads(kt._handle_create(args))["task_id"]

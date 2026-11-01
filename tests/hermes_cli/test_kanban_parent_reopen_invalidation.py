@@ -20,6 +20,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from tests.plugins._kanban_board_client import naming_board
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -175,7 +176,7 @@ def test_dashboard_and_db_paths_produce_identical_outcomes(tmp_path, monkeypatch
     spec.loader.exec_module(mod)
     app = fastapi.FastAPI()
     app.include_router(mod.router, prefix="/api/plugins/kanban")
-    client = TestClient(app)
+    client = naming_board(TestClient(app))
 
     def build_graph(tag: str):
         with kbc.connect() as c:

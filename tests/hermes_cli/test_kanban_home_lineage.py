@@ -165,7 +165,7 @@ def test_cli_list_home_spans_lineage(lineage, monkeypatch):
         theirs = _card(conn, X1)
         lone = _card(conn, LONE)
     monkeypatch.setenv("HERMES_SESSION_ID", B)
-    ids = {t["id"] for t in json.loads(kc.run_slash("list --home --json"))}
+    ids = {t["id"] for t in json.loads(kc.run_slash("--board default list --home --json"))}
     assert {mine_old, mine_new} <= ids
     assert theirs not in ids and lone not in ids
 
@@ -189,13 +189,13 @@ def test_cli_list_default_view_spans_lineage(lineage, monkeypatch):
         theirs = _card(conn, X1)
         lone = _card(conn, LONE)
     monkeypatch.setenv("HERMES_SESSION_ID", C)
-    out = kc.run_slash("list")
+    out = kc.run_slash("--board default list")
     this, _, other = out.partition("OTHER SESSIONS")
     assert "THIS SESSION (2)" in this
     assert mine_old in this and mine_new in this
     assert theirs in other and lone in other
     assert theirs not in this and lone not in this
-    home_view = {t["id"] for t in json.loads(kc.run_slash("list --home --json"))}
+    home_view = {t["id"] for t in json.loads(kc.run_slash("--board default list --home --json"))}
     shown = {tid for tid in (mine_old, mine_new, theirs, lone) if tid in this}
     assert shown == home_view & {mine_old, mine_new, theirs, lone}
 
