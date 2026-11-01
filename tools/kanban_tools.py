@@ -866,6 +866,21 @@ def _handle_show(args: dict, **kw) -> str:
                                      ("runs", len(runs) - _SHOW_MAX_RUNS)) if n > 0}
         if omitted:
             out["omitted"] = omitted
+        # Rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83): counts + the newest of each,
+        # capped like the live rows; every archived row is in ``hermes kanban show``.
+        from hermes_cli import kanban_archive_read as kar
+
+        arch = kar.archived_rows(conn, tid)
+        if kar.present(arch):
+            c_last = arch["comments"][-1] if arch["comments"] else None
+            r_last = arch["runs"][-1] if arch["runs"] else None
+            out["archived"] = {
+                "comments": len(arch["comments"]), "runs": len(arch["runs"]),
+                "newest_comment": c_last and {**c_last, "body": _cap_text(c_last["body"], _SHOW_COMMENT_CHARS)},
+                "newest_run": r_last and {**r_last, "summary": _cap_text(r_last["summary"], _SHOW_FIELD_CHARS),
+                                          "error": _cap_text(r_last["error"], _SHOW_FIELD_CHARS)},
+                "note": "moved to %s; full text: hermes kanban show %s" % (kar.ARCHIVE_NAME, tid),
+                **({"error": arch["error"]} if arch.get("error") else {})}
         return json.dumps(_bounded_show(out), ensure_ascii=False, default=str)
 
 
