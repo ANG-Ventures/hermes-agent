@@ -206,11 +206,13 @@ def handoff_check(verb: str, card: Optional[str], assignee: Optional[str], *,
     if mod is None:
         return None, None
     try:
-        profile = str(mod.HANDOFF_PROFILE).lower()
+        from hermes_cli.profiles import normalize_profile_name
+        profile = str(mod.HANDOFF_PROFILE)
         if profile not in profiles:
             return None, None
-        target = str(assignee).strip().lower()
-        if target not in {str(a).lower() for a in mod.APOLLO_ASSIGNEES}:
+        # The exact bytes the board stores for this assignee (kanban_db._canonical_assignee).
+        target = normalize_profile_name(assignee)
+        if target not in {str(a) for a in mod.APOLLO_ASSIGNEES}:
             return None, None
         env_name, minimum = str(mod.HANDOFF_ENV), int(mod.HANDOFF_MIN)
         offered = _handoff_quote(env_name)
