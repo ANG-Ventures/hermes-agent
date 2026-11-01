@@ -174,6 +174,21 @@ _FORK_ON_TERM = (
 )
 
 
+def test_group_born_during_a_slow_scan_is_reaped(monkeypatch):
+    """t_db02e9c8: under load one session scan outlasts the forker's 1 s
+    linger (ps over 15k procs at load1 387), so no two snapshots share a
+    member. The group it created must still be reaped."""
+    real = kb._worker_session_members
+
+    def slow(sid):
+        found = real(sid)
+        time.sleep(1.5)  # snapshot taken, returned after the forker exited
+        return found
+
+    monkeypatch.setattr(kb, "_worker_session_members", slow)
+    test_group_born_during_reap_is_reaped()
+
+
 def test_group_born_during_reap_is_reaped():
     """Prism: a member that answers SIGTERM by forking into a NEW process
     group must not escape the reap."""
@@ -205,12 +220,21 @@ def test_group_born_during_reap_is_reaped():
 
 def test_reap_stops_when_session_continuity_breaks(monkeypatch):
     """Prism: ownership must hold for every rescan, not just the first. A
-    rescan sharing no (pid, create_time) with the previous one is a reused
-    sid; nothing in it may be signalled."""
+    rescan whose members were all born after every earlier member died is a
+    reused sid; nothing in it may be signalled."""
     signalled: list = []
-    scans = iter([[(111, 111)], [(222, 222)]])
-    monkeypatch.setattr(kb, "_worker_session_members", lambda sid: next(scans, []))
-    births = {111: 100.0, 222: 10_000.0}
+    births = {111: 100.0}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:
+            return [(111, 111)]
+        births.pop(111, None)       # the original session emptied ...
+        births[222] = time.time()   # ... and a later process reused its sid
+        return [(222, 222)] if len(calls) == 2 else []
+
+    monkeypatch.setattr(kb, "_worker_session_members", scan)
     monkeypatch.setattr(kb, "_member_birth", lambda pid: births.get(pid))
     monkeypatch.setattr(kb.os, "killpg", lambda pg, sig: signalled.append(pg))
     assert kb._reap_worker_session(99_999, born_after=50.0, born_before=200.0,

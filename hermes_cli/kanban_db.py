@@ -18611,8 +18611,9 @@ def _reap_worker_session(
     proved to be the recorded run's (:func:`_session_owned_by_run`, with
     ``born_after`` = claim time and ``born_before`` = the last moment the
     worker was known alive); unknown bounds mean no reap. Every later scan
-    must share a ``(pid, create_time)`` member with the scan before it, so a
-    session that empties and has its sid reused mid-reap is never signalled.
+    must hold a member born before a moment some earlier-proved member was
+    seen alive (re-checked during each scan), so a session that empties and
+    has its sid reused mid-reap is never signalled.
     Groups that appear DURING the reap (a member forking into a new group on
     SIGTERM) are signalled while that continuity holds. Never targets sid <= 1, the caller's own session, or the
     caller's own process group. POSIX only; a no-op elsewhere.
@@ -18657,20 +18658,41 @@ def _reap_worker_session(
                 out.add((pid, created))
         return out
 
+    proved_at = time.time()  # every member of ``members`` was in the snapshot, so alive now
     known = _identities(members)
 
-    def _left() -> set[int]:
-        # Ownership is re-established on EVERY snapshot, never assumed: a
-        # snapshot is the same session only if it still holds a member
-        # (same pid AND create time) of the previous one. A session holding
-        # any original member has not emptied, so its sid cannot have been
-        # reused; groups a member created in answer to SIGTERM ride along.
-        # No overlap -> the session emptied (or is unprovable): stop.
+    def _scan() -> list[tuple[int, int]]:
+        # One snapshot, re-proving a known member alive every 50 ms while it
+        # runs: under load a scan takes over a second (ps over 15k procs at
+        # load1 387, t_db02e9c8), long enough for a member to fork a new
+        # group on SIGTERM and exit before the next snapshot sees both.
+        nonlocal proved_at
+        box: list = []
+        scan = threading.Thread(
+            target=lambda: box.append(_worker_session_members(sid)), daemon=True,
+        )
+        scan.start()
+        while True:
+            scan.join(0.05)
+            checked = time.time()
+            if any(_member_birth(pid) == created for pid, created in known):
+                proved_at = checked
+            if not scan.is_alive():
+                return box[0] if box else []
+
+    def _left() -> Optional[set[int]]:
+        # Ownership is re-established on EVERY snapshot, never assumed. While
+        # a proven member lives the session cannot empty, so its sid cannot
+        # be reused; a process in that sid born before ``proved_at`` was born
+        # into this session. A snapshot holding such a member is this
+        # session, groups created in answer to SIGTERM included.
+        # None -> unprovable and no member was seen alive meanwhile: stop.
         nonlocal known
-        current = _worker_session_members(sid)
+        before = proved_at
+        current = _scan()
         ids = _identities(current)
-        if not current or not (ids & known):
-            return set()
+        if not any(created <= proved_at for _, created in ids):
+            return set() if proved_at > before else None
         known = ids
         return {pgid for _, pgid in current}
 
@@ -18678,11 +18700,12 @@ def _reap_worker_session(
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         left = _left()
-        if not left:
+        if left is None:
             break
-        _term(left)  # groups born during the reap get their SIGTERM too
+        if left:  # empty while a member lived: its fork may postdate the snapshot, rescan
+            _term(left)  # groups born during the reap get their SIGTERM too
         time.sleep(0.1)
-    for pgid in sorted(_left()):
+    for pgid in sorted(_left() or ()):
         try:
             os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
         except OSError:
