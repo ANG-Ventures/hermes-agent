@@ -401,11 +401,10 @@ _EPHEMERAL_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/de
 
 def _is_ephemeral_path(path: Path) -> bool:
     """Under a temp/pytest/scratch root: a store there is pruned out from under any launcher."""
-    import tempfile
-
+    # TMPDIR may be HOME (or even /); it says where to allocate, not what is prunable.
     try:
         resolved = Path(path).resolve()
-        roots = {Path(root).resolve() for root in (*_EPHEMERAL_ROOTS, tempfile.gettempdir())}
+        roots = {Path(root).resolve() for root in _EPHEMERAL_ROOTS}
     except (OSError, RuntimeError):
         return False
     if any(resolved.is_relative_to(root) for root in roots):

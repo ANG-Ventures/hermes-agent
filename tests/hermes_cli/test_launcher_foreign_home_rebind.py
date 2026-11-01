@@ -7,8 +7,11 @@ tmp_path, every `hermes` on the host exited 127 for ~7 h.
 """
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
@@ -142,6 +145,54 @@ def test_launcher_bound_to_another_real_home_is_kept(install, ephemeral, tmp_pat
     monkeypatch.setenv("HERMES_HOME", str(other_home))
     _launchers.ensure_install_launchers(repo, local)
     assert _bytes(local) == before
+
+
+def test_tmpdir_home_repairs_dead_launcher_in_fresh_process():
+    """An environment-selected temp root is not evidence that a store is disposable."""
+    # Outside pytest/scratch roots so the real classifier sees persistent paths.
+    source = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(prefix=".launcher-regression-", dir=source) as directory:
+        root = Path(directory)
+        home = root / "user"
+        home.mkdir()
+        repo = root / "checkout"
+        repo.mkdir()
+        (repo / "hermes_constants.py").write_text(
+            "import os\nfrom pathlib import Path\n"
+            "def get_default_hermes_root(): return Path(os.environ['HERMES_HOME'])\n")
+        (repo / "hermes_bootstrap.py").write_text("")
+        (repo / "launcher_probe.py").write_text("print('fixture-launcher-ok')\n")
+        python = _store(home / ".hermes", "python-new")
+        env = {**os.environ, "HOME": str(home), "TMPDIR": str(home),
+               "HERMES_HOME": str(home / ".hermes")}
+        env.pop("HERMES_RUNTIME_DIR", None)
+        script = dedent("""\
+            import sys
+            import tempfile
+            from pathlib import Path
+            sys.path.insert(0, sys.argv[1])
+            from hermes_cli import _launchers
+            repo, python = map(Path, sys.argv[2:])
+            assert Path(tempfile.gettempdir()) == Path.home()
+            local = repo / '.hermes' / 'bin'
+            local.mkdir(parents=True)
+            old = Path.home() / '.hermes' / 'tools' / 'python-old' / 'bin' / 'python3'
+            for name in _launchers.ENTRY_POINTS:
+                _launchers.mint_launcher(name, repo, local, old, None)
+            assert not old.exists()
+            _launchers.ensure_install_launchers(repo, local)
+            for name in _launchers.ENTRY_POINTS:
+                assert _launchers._shell_launcher_python(local / name) == python
+            """)
+        repaired = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(source), str(repo), str(python)],
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        assert repaired.returncode == 0, repaired.stdout + repaired.stderr
+        launched = subprocess.run(
+            [str(repo / ".hermes" / "bin" / "hermes"), "--run-module", "launcher_probe"],
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        assert launched.returncode == 0, launched.stdout + launched.stderr
+        assert launched.stdout.strip() == "fixture-launcher-ok"
 
 
 @pytest.mark.parametrize("path, expected", [
