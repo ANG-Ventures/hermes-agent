@@ -394,6 +394,7 @@ def _shell_launcher_python(target: Path) -> Path | None:
     return None
 
 
+# no-tmp: ok — detect prunable stores; never create temporary files at these paths.
 _EPHEMERAL_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/dev/shm",
                     "/var/folders", "/private/var/folders")
 
