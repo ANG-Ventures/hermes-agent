@@ -293,7 +293,7 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
     task_id = None
     try:
         model, provider = _execution_route(delegation_id, profile_home)
-        if _granted_inherited_default(profile, model, flagship_reason):
+        if _granted_inherited_default(profile, model, provider, flagship_reason):
             # The unit runs the profile default the operator's standing grant covers: leave the
             # card unpinned so create_task's default-route branch applies that grant (Prism
             # f226ee06e5ba round 3); a pin plus a reason would demand per-call operator authority.
@@ -359,21 +359,54 @@ def _execution_route(delegation_id: str, profile_home: Path) -> Tuple[Optional[s
     return model, provider
 
 
-def _granted_inherited_default(profile: str, model: Optional[str], audited: Optional[str]) -> bool:
-    """True when the unit inherits ``profile``'s own resolved default route (no audited per-call
-    flagship pin) and ``kanban.flagship_profile_allowances`` grants that default. Compared on the
-    bare model id: a ``lane/model`` default and the runtime's ``model`` + provider split name the same
-    route. An explicit pin (``audited`` set) is never covered, the same as the grant itself."""
+def _granted_inherited_default(profile: str, model: Optional[str], provider: Optional[str],
+                               audited: Optional[str]) -> bool:
+    """True when the unit inherits ``profile``'s own resolved default ROUTE (no audited per-call
+    flagship pin) and ``kanban.flagship_profile_allowances`` grants that default. The whole route must
+    match, model id AND provider: an unpinned card runs the profile default, so a same-id unit on
+    another provider would be silently re-routed onto the granted lane (Prism cbbaea6f30b8). An
+    explicit pin (``audited`` set) is never covered, the same as the grant itself."""
     from hermes_cli.model_policy import assignee_default_model, profile_flagship_allowance
 
-    if not model or (audited or "").strip():
+    if not model or not provider or (audited or "").strip():
         return False
     default = assignee_default_model(profile)
-    if not default:
-        return False
-    if default.strip().rsplit("/", 1)[-1] != model.strip().rsplit("/", 1)[-1]:
+    route = _default_route(profile, default)
+    if route is None or route != _route_key(provider, model):
         return False
     return bool(profile_flagship_allowance(profile, default))
+
+
+def _route_key(provider: str, model: str) -> Tuple[str, str]:
+    """``(provider, model id)`` normalized; a ``provider/`` prefix on the id is the provider itself."""
+    provider, model = provider.strip().casefold(), model.strip()
+    if model.casefold().startswith(provider + "/"):
+        model = model[len(provider) + 1:]
+    return provider, model
+
+
+def _default_route(profile: str, default: Optional[str]) -> Optional[Tuple[str, str]]:
+    """The provider + model the profile's default resolves to the way startup reads it: the
+    ``lane/`` prefix of the default when present, else the profile's ``model.provider``. ``None``
+    when either half is unknown (fail closed: the pinned path decides)."""
+    default = str(default or "").strip()
+    if not default or default.startswith("<"):
+        return None
+    if "/" in default:
+        lane, _, rest = default.partition("/")
+        return _route_key(lane, rest) if lane and rest else None
+    from hermes_cli.model_policy import _profile_effective_config
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        cfg = _profile_effective_config(Path(resolve_profile_env(profile)) / "config.yaml")
+    except Exception:
+        return None
+    section = cfg.get("model") if isinstance(cfg, dict) else None
+    lane = str((section.get("provider") if isinstance(section, dict) else None) or "").strip()
+    if not lane or lane.casefold() == "auto":
+        return None
+    return _route_key(lane, default)
 
 
 def _flagship_reason(delegation_id: str, model: Optional[str], audited: Optional[str]) -> Optional[str]:

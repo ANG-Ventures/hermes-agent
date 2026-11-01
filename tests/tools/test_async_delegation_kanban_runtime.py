@@ -359,6 +359,22 @@ def test_standing_grant_admits_an_inherited_flagship_default_without_authority(h
     assert card.model_override is None and kinds.count("spawned") == 1
 
 
+def test_standing_grant_never_unpins_the_same_model_on_another_provider(home, monkeypatch, tmp_path, spawner):
+    """Prism cbbaea6f30b8: a grant on ``claude-alr/claude-fable-5-1`` names that ROUTE. A unit on
+    ``claude-fable-5-1`` via ``custom:other`` is not the default: unpinning it would run it on the granted
+    lane instead. It stays pinned to its own route, the guard refuses it, and the fallback says so."""
+    from hermes_cli import model_policy
+
+    (home / "config.yaml").write_text("model:\n  default: claude-alr/claude-fable-5-1\n"
+                                      "kanban:\n  flagship_profile_allowances:\n    default: standing grant (test)\n")
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda actor: False)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="claude-fable-5-1",
+                              provider="custom:other")
+    assert len(calls) == 1
+    assert ad.kanban_launch_runtime(handle["delegation_id"], timeout=0) == \
+        "in_process (kanban spawn failed: FlagshipAssigneeRefused)"
+
+
 def test_unit_pin_keeps_the_delegations_provider_and_no_lane_catalog_refuses_it(home, monkeypatch, tmp_path,
                                                                                 spawner):
     """Prism f226ee06e5ba round 2: a ``lane/model`` id on a named custom endpoint is pinned with that
