@@ -65,3 +65,43 @@ def test_without_a_window_the_6h_ceiling_still_holds(wired):
     cooldown = st.until_epoch - time.time()
     assert cooldown == pytest.approx(fp.WINDOW_CEILING_DEFAULT_S,
                                      rel=0.11), cooldown
+
+
+DTLR_FABLE = ("claude-dtlr", "claude-fable-5-1")
+
+
+def test_chain_walk_on_quota_model_advances_the_resume_target(wired, monkeypatch):
+    """t_fc121c8e: primary Fable benched quota_model, fallback[0] is Fable on
+    another relay and refuses quota_model too, the walk lands on Opus. The
+    next rebuild resumes on Opus with no call to fallback[0]; the primary's
+    until/n/cls are untouched by the walk (B1)."""
+    from agent import fallback_wiring as fw
+    from tests.agent.test_fallback_policy import FABLE
+
+    home, calls = wired
+    # Fable is capped everywhere: the primary is not eligible, so the
+    # fallback_failed return is refused and the chain walks.
+    monkeypatch.setattr(fw, "_eligibility_fn", lambda agent: (lambda: None))
+    chain = [{"provider": DTLR_FABLE[0], "model": DTLR_FABLE[1]},
+             {"provider": OPUS[0], "model": OPUS[1]}]
+    a = _wired_agent()
+    a._fallback_chain = list(chain)
+    assert _fail(a, _model_scope_503(), reason=FailoverReason.rate_limit) is True
+    assert (a.provider, a.model) == DTLR_FABLE
+    before = _state(a)
+    assert (before.fallback_provider, before.fallback_model) == DTLR_FABLE
+    assert _fail(a, _model_scope_503(), reason=FailoverReason.rate_limit) is True
+    assert (a.provider, a.model) == OPUS
+    after = _state(a)
+    assert (after.until_epoch, after.n, after.cls) == (before.until_epoch, before.n, before.cls)
+    assert (after.fallback_provider, after.fallback_model, after.fallback_index) == (*OPUS, 1)
+
+    b = _wired_agent()
+    b._fallback_chain = list(chain)
+    n_resolved = len(calls["resolve"])
+    assert fw.decide_rebuild_for_agent(b) == "resume"
+    assert (b.provider, b.model) == OPUS
+    assert calls["resolve"][n_resolved:] == [OPUS]  # fallback[0] never called
+    assert (b._primary_runtime["provider"], b._primary_runtime["model"]) == FABLE
+    final = _state(b)
+    assert (final.until_epoch, final.n, final.cls) == (before.until_epoch, before.n, before.cls)
