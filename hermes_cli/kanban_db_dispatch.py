@@ -1371,7 +1371,8 @@ def _card_repo(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     if ws and os.path.isdir(ws):
         try:
             url = subprocess.run(["git", "-C", ws, "remote", "get-url", "origin"],
-                                 capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                 timeout=10, check=False).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             return None
         m = _GH_REMOTE_RE.search(url)
