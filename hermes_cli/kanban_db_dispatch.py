@@ -6778,8 +6778,10 @@ def _dispatch_once_locked(
         configured_box_health, configured_pool_health_urls, configured_probes,
         configured_pool_shed, configured_pool_spawns_per_eligible, effective_provider,
         pool_budget_eligible, pool_key, pool_route, shed_priority,
+        configured_pool_relay_capacity, relay_free_slots,
     )
     health_probes = configured_probes()
+    relay_capacity = configured_pool_relay_capacity()
     min_eligible = configured_min_eligible()
     shed_tiers = configured_pool_shed()
     pool_urls = configured_pool_health_urls()
@@ -6855,7 +6857,19 @@ def _dispatch_once_locked(
 
     def pool_budget(provider):
         pool = pool_key(provider)
-        if pool is None or pool_spawns_per_eligible == 0:
+        if pool is None:
+            return None
+        relay = (relay_free_slots(provider, health_probes, health_cache, pool_urls)
+                 if relay_capacity else None)
+        if relay is not None:
+            # The relay's own ceiling covers ALL its traffic (gateways, crons,
+            # other boards), not just kanban workers (t_6b917840).
+            admitted = admitted_this_tick.get(pool, 0)
+            reserved = review_pool_reserve.get(pool, 0)
+            if admitted + reserved >= relay["free"]:
+                return {"reason": "relay_capacity", "provider": provider, "pool": pool,
+                        "admitted": admitted, **relay}
+        if pool_spawns_per_eligible == 0:
             return None
         eligible = pool_budget_eligible(provider, health_probes, health_cache, pool_urls,
                                         box_health=box_health)

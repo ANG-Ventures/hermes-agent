@@ -2642,6 +2642,10 @@ DEFAULT_CONFIG = {
         # Per-tick pool admission budget: eligible relay subs * this value.
         # Pinned apx/bpx lanes each spend one sub's budget. 0 = unlimited.
         "pool_spawns_per_eligible": 2,
+        # Relay-family pools (claude-apr/bpr): admit at most the relay's own
+        # free turn slots (max_inflight - active_turns); an unreadable
+        # /health admits none (fail closed). false = off.
+        "pool_relay_capacity": True,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create
