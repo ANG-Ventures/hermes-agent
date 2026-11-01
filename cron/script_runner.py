@@ -706,6 +706,22 @@ class ScriptRunner:
             sched.signal_shutdown("cron script runner code-skew drain bound")
             trees = [(key, proc, ss._script_tree_snapshot(proc))
                      for key, proc in sched._active_script_procs.items() if proc.returncode is None]
+            # returncode stays None until the worker reaps its script, so an exited run reads as in
+            # flight. Keep only trees alive on a fresh check (Prism 934ec5f4046f): a zombie-only
+            # tree finished on its own and keeps its own result, with no interruption flag.
+            trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
+            # A scan marker (an unreadable same-user process, Prism 952be3262777, or a failed token
+            # scan) only withholds a re-fire; it never makes a run that already finished on its own
+            # count as cut off (Prism dae50bba8939). A tree alive ONLY through markers is not flagged
+            # or signalled, but it is still checked at the end and its re-fire withheld.
+            cut, unsure = [], []
+            for t in trees:
+                if ss._script_tree_alive(t[1], None if t[2] is None else [
+                        m for m in t[2] if not isinstance(m, ss._SCAN_MARKERS)]):
+                    cut.append(t)
+                elif ss._script_tree_alive(t[1], t[2]):
+                    unsure.append(t)
+            trees = cut
             # Every run cut off here is a failure flagged for its re-fire, whatever it exits with
             # (Prism b86087faa72f); consumed by _run_job_script once the run returns.
             sched._skew_interrupted_job_ids.update(
@@ -735,6 +751,8 @@ class ScriptRunner:
                 if not alive or time.monotonic() >= deadline:
                     break
                 time.sleep(0.05)
+            unsure = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in unsure]
+            alive += [t for t in unsure if ss._script_tree_alive(t[1], t[2])]
             withheld = {sched._script_proc_job_ids.get(key) for key, _p, _s in alive} - {None}
             sched._refire_withheld_job_ids.update(withheld)
             sched._restart_killed_job_ids.difference_update(withheld)

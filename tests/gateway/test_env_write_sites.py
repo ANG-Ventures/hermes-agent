@@ -317,7 +317,11 @@ def test_hermes_gateway_marker_is_child_only_in_the_runner(starts):
 
 def test_i5_script_child_env_is_identical(starts):
     gw, rn = starts["gateway"]["child"], starts["runner"]["child"]
-    keys = {k for k in set(gw) | set(rn) if not k.startswith("XPC_")}
+    # The per-run token (t_d34a3900, Prism 85c0395583d8) is unique per script run by design: it must
+    # be PRESENT on both sides, and its value is excluded from the parity check.
+    from cron.scheduler_script import SCRIPT_RUN_TOKEN_ENV
+    assert (SCRIPT_RUN_TOKEN_ENV in gw) == (SCRIPT_RUN_TOKEN_ENV in rn), "run token on one side only"
+    keys = {k for k in set(gw) | set(rn) if not k.startswith("XPC_") and k != SCRIPT_RUN_TOKEN_ENV}
     diff = {k: (gw.get(k), rn.get(k)) for k in sorted(keys) if gw.get(k) != rn.get(k)}
     assert not diff, f"script child env (gateway, runner) differ: {diff}"
 
