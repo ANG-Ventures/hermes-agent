@@ -134,9 +134,11 @@ def test_non_pool_primary_is_untouched(home, apr, bpr):
 
 
 def test_unknown_pool_health_fails_open(home):
-    """No reachable relay = unknown eligible = no shed (never shed on a blind probe)."""
+    """No reachable relay = unknown eligible = no shed (never shed on a blind probe).
+    The relay-capacity gate is off: with it on, a blind relay holds/reroutes the
+    card as 0 free slots (t_6b917840), which is not the shed path under test."""
     _config(home, pool_health_urls=_urls("http://127.0.0.1:9/health", "http://127.0.0.1:9/health"),
-            pool_shed=SHED)
+            pool_shed=SHED, pool_relay_capacity=False)
     _worker(home)
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="x", assignee="w")
