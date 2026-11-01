@@ -82,6 +82,23 @@ def test_show_lists_archived_rows_labelled(kanban_home):
     assert out["task"]["status"] == "done"                # the tasks row stayed
 
 
+def test_archive_path_with_uri_characters(tmp_path):
+    from hermes_cli import kanban_archive_read as kar
+
+    directory = tmp_path / "board?#% name"
+    directory.mkdir()
+    conn = sqlite3.connect(directory / "kanban.db")
+    arch = sqlite3.connect(directory / kar.ARCHIVE_NAME)
+    arch.execute("CREATE TABLE task_comments (id INTEGER, task_id TEXT, author TEXT, body TEXT, created_at INTEGER, run_id INTEGER)")
+    arch.execute("INSERT INTO task_comments VALUES (1, 't_old', 'apollo', 'preserved', 1, NULL)")
+    arch.commit()
+    arch.close()
+    try:
+        assert kar.archived_rows(conn, "t_old")["comments"][0]["body"] == "preserved"
+    finally:
+        conn.close()
+
+
 def test_no_archive_file_changes_nothing(kanban_home):
     tid = _done_card()
     assert "Archived" not in kc.run_slash(f"show {tid}")

@@ -39,7 +39,7 @@ def archived_rows(conn: sqlite3.Connection, task_id: str) -> dict[str, list[dict
     path = _archive_path(conn)
     if path is None or not path.is_file():
         return {"comments": [], "runs": []}
-    arch = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+    arch = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     try:
         return {"comments": _rows(arch, "task_comments", _COMMENT_COLS, task_id, "created_at, id"),
                 "runs": _rows(arch, "task_runs", _RUN_COLS, task_id, "started_at, id")}
