@@ -803,6 +803,84 @@ def _kanban_bare_verb_policy_cache_reset():
     _kbsel._POLICY_CACHE.clear()
 
 
+def _kanban_test_call_site() -> str:
+    """The innermost frame in a test file (not a conftest/helper module) on the current stack."""
+    tests_dir = os.path.dirname(os.path.abspath(__file__)) + os.sep
+    frame = sys._getframe(2)
+    while frame is not None:
+        path = frame.f_code.co_filename
+        if path.startswith(tests_dir) and os.path.basename(path).startswith("test_"):
+            return f"{os.path.relpath(path, os.path.dirname(tests_dir.rstrip(os.sep)))}:{frame.f_lineno}"
+        frame = frame.f_back
+    return "<no test frame on the stack>"
+
+
+@pytest.fixture(autouse=True)
+def _kanban_unnamed_board_guard(request, monkeypatch):
+    """S7 §6: fail AT THE CALL SITE when a test reaches board resolution with no board and no pin.
+
+    Under the shipped ``kanban.bare_verb: refuse`` such a call is refused, and the surface turns
+    the refusal into an rc 2, a tool error or an HTTP 400 that some assertion trips over several
+    frames later. This guard fails the test with the test line that made the call instead. Tests
+    that exercise the refusal itself opt out with ``@pytest.mark.kanban_board_refusal``.
+    ``pytest.fail`` raises a BaseException, so the surfaces' ``except Exception`` cannot eat it.
+    """
+    if request.node.get_closest_marker("kanban_board_refusal"):
+        yield
+        return
+    try:
+        from hermes_cli import kanban_board_select as _kbsel
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        yield
+        return
+
+    def _fail(verb: str) -> None:
+        pytest.fail(
+            f"kanban {verb} reached board resolution with no board and no pin at "
+            f"{_kanban_test_call_site()}: pass board=\"default\" (tool dict), --board default (CLI) "
+            f"or ?board=default (dashboard), or mark the test kanban_board_refusal if the refusal "
+            f"is what it tests.",
+            pytrace=False,
+        )
+
+    real_resolve_slug = _kbsel.resolve_slug
+
+    def _guarded_resolve_slug(board, *, verb, card_ids=()):
+        try:
+            return real_resolve_slug(board, verb=verb, card_ids=card_ids)
+        except _kbsel.BoardRequired:
+            if not _kb.raw_db_pin():
+                _fail(verb)
+            raise
+
+    real_policy = _kbsel.bare_verb_policy
+    dashboard_hits: list[str] = []
+
+    def _guarded_policy():
+        policy = real_policy()
+        # The dashboard's _resolve_board reads the policy directly for an omitted ?board=. It runs
+        # on the TestClient's portal thread, so record the request and fail at teardown instead of
+        # raising through the ASGI stack.
+        caller = sys._getframe(1)
+        if policy != _kbsel.BARE_VERB_DEFAULT and caller.f_code.co_name == "_resolve_board":
+            endpoint = caller.f_back.f_code.co_name if caller.f_back else "?"
+            dashboard_hits.append(endpoint)
+        return policy
+
+    monkeypatch.setattr(_kbsel, "resolve_slug", _guarded_resolve_slug)
+    monkeypatch.setattr(_kbsel, "bare_verb_policy", _guarded_policy)
+    yield
+    if dashboard_hits:
+        pytest.fail(
+            f"kanban dashboard request(s) named no board ({len(dashboard_hits)}x, endpoints: "
+            f"{sorted(set(dashboard_hits))}) in {request.node.nodeid}: request with ?board=default "
+            f"(tests/plugins/_kanban_board_client.naming_board), or mark the test "
+            f"kanban_board_refusal if the 400 is what it tests.",
+            pytrace=False,
+        )
+
+
 @pytest.fixture(autouse=True)
 def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.
@@ -1671,6 +1749,11 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         # still runs per-file under CI where the default limit suffices.
         pass
 
+    config.addinivalue_line(
+        "markers",
+        "kanban_board_refusal: test exercises the S7 board refusal itself (opts out of the "
+        "unnamed-board call-site guard)",
+    )
     config.addinivalue_line(
         "markers",
         "allow_sys_modules_purge: test intentionally leaves sys.modules purged "

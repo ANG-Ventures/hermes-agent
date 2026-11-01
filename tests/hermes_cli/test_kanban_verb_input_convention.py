@@ -256,7 +256,7 @@ def test_argparse_refusal_puts_the_cause_on_the_last_line(board, monkeypatch):
     """The schema is context; the refusal is the answer. A reader (or a `tail`) that sees only
     the last line must see WHY the call was refused, not the example invocation."""
     monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
-    out = cli.run_slash('create "x" --board default --priority high')
+    out = cli.run_slash('create --board default "x" --priority high')
     last = out.rstrip().splitlines()[-1]
     assert "error:" in last and "--priority" in last, out
     assert "example:" in out.lower(), out
