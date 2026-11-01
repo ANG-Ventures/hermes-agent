@@ -1,4 +1,4 @@
-"""One DECLARED-fallback notice per cron job per local day (t_2efae1cd).
+"""One fallback notice per cron job per primary->fallback pair per local day (t_2efae1cd, t_f238d060).
 
 A declared fallback firing is the safety net working, and the notice says "no action needed".
 While a primary is walled for days (xai-oauth 403 spending-limit, 2026-10-06), every run and every
@@ -7,8 +7,11 @@ retry of the same job walked the same chain, and #logs got the same line once pe
 the day carries all the information. Later ones in the same day for the same job and the same
 primary -> fallback pair are dropped. A different pair is new information and still posts.
 
-UNDECLARED fallbacks never come here: they stay loud on every run.
-State: ``<home>/cron/fallback_notice_day.json`` = {job_id: {"day": "YYYY-MM-DD", "pair": "a -> b"}}.
+UNDECLARED fallbacks use the same gate (pair prefixed ``undeclared: ``): the first one of the day
+still pages #alerts, but a job retrying every ~10 min on the same switch paged 12x on 2026-10-25.
+State: ``<home>/cron/fallback_notice_day.json`` = {job_id: {"day": "YYYY-MM-DD", "pairs": ["a -> b"]}}.
+All pairs for the job's current day are retained, so alternating routes cannot evict each other.
+Legacy single-``pair`` records are read and migrated on the next successful delivery.
 Fail-open: any error reading the state means "post it".
 """
 
@@ -52,11 +55,22 @@ def _load(path: Path) -> dict:
         return {}
 
 
+def _pairs(rec: dict) -> list[str]:
+    """Read today's pairs, including the pre-migration single-pair record."""
+    pairs = rec.get("pairs", [])
+    pairs = [p for p in pairs if isinstance(p, str)] if isinstance(pairs, list) else []
+    legacy = rec.get("pair")
+    if isinstance(legacy, str) and legacy not in pairs:
+        pairs.append(legacy)
+    return pairs
+
+
 def already_noticed(home: Path, job_id: str, pair: str, day: Optional[str] = None) -> bool:
     """True when this job already posted a notice for this pair today."""
     try:
         rec = _load(Path(home) / "cron" / _STATE_NAME).get(str(job_id))
-        return isinstance(rec, dict) and rec.get("day") == (day or _today()) and rec.get("pair") == pair
+        return (isinstance(rec, dict) and rec.get("day") == (day or _today())
+                and pair in _pairs(rec))
     except Exception as e:  # never cost a notice
         logger.debug("fallback notice gate read failed (posting): %r", e)
         return False
@@ -114,7 +128,12 @@ def mark_noticed(home: Path, job_id: str, pair: str, day: Optional[str] = None) 
             if not held:  # best effort: the notice may repost once; the job result must not wait
                 return
             data = _load(path)
-            data[str(job_id)] = {"day": day or _today(), "pair": pair}
+            today = day or _today()
+            rec = data.get(str(job_id))
+            pairs = _pairs(rec) if isinstance(rec, dict) and rec.get("day") == today else []
+            if pair not in pairs:
+                pairs.append(pair)
+            data[str(job_id)] = {"day": today, "pairs": pairs}
             fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
