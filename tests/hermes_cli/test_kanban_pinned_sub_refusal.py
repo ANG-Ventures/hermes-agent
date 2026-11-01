@@ -99,7 +99,7 @@ def test_lane_model_cli_refuses_pin_with_pool_hint(kanban_home, capsys):
     (kanban_home / "config.yaml").write_text(
         "providers:\n  claude-apx-0:\n    base_url: http://127.0.0.1:9999/v1\n    api_key: t\n",
         encoding="utf-8")
-    out = kc.run_slash("lane-model set claude-apx-0/claude-opus-5-5 --ttl 1h --reason cap")
+    out = kc.run_slash("--board default lane-model set claude-apx-0/claude-opus-5-5 --ttl 1h --reason cap")
     captured = capsys.readouterr()
     text = (out or "") + captured.out + captured.err
     assert "claude-apr" in text, text

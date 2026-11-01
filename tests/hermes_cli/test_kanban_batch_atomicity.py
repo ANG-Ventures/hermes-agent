@@ -41,7 +41,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _create(title: str, assignee: str = "worker") -> str:
-    out = kc.run_slash(f"create '{title}' --assignee {assignee}")
+    out = kc.run_slash(f"--board default create '{title}' --assignee {assignee}")
     match = re.search(r"t_[a-f0-9]+", out)
     assert match, out
     return match.group(0)
@@ -163,7 +163,7 @@ def test_selector_batch_skips_and_names_a_card_archived_mid_batch(
         monkeypatch, lambda: _archive_from_another_connection(second),
     )
     out = kc.run_slash(
-        "set-model standard-model --provider batch-provider "
+        "--board default set-model standard-model --provider batch-provider "
         "--where status=ready assignee=worker"
     )
 

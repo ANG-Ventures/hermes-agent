@@ -27,13 +27,12 @@ def test_red_key_names_card_pr_head_and_red_set_order_free():
         assert other != k
 
 
-def test_red_noise_order_stale_then_inherited_then_duplicate():
+def test_red_noise_order_stale_then_duplicate():
     seen = {"k": 1.0}
-    assert ns.red_handback_noise(["k"], True, seen, "ready") == ns.REASON_STALE_HANDBACK
-    assert ns.red_handback_noise(["k"], True, seen, "review") == ns.REASON_INHERITED_RED
-    assert ns.red_handback_noise(["k"], False, seen, "review") == ns.REASON_DUPLICATE_RED
-    assert ns.red_handback_noise(["k", "new"], False, seen, "review") is None, "one new red is news"
-    assert ns.red_handback_noise(["k"], False, {}, None) is None
+    assert ns.red_handback_noise(["k"], seen, "ready") == ns.REASON_STALE_HANDBACK
+    assert ns.red_handback_noise(["k"], seen, "review") == ns.REASON_DUPLICATE_RED
+    assert ns.red_handback_noise(["k", "new"], seen, "review") is None, "one new red is news"
+    assert ns.red_handback_noise(["k"], {}, None) is None
 
 
 def test_red_seen_prunes_by_ttl():

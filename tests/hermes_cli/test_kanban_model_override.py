@@ -113,7 +113,7 @@ def _created_id(out: str) -> str:
 
 
 def test_cli_create_model_shows_in_show(kanban_home):
-    out = kc.run_slash("create 'opus task' --assignee alice --model claude-opus-4-8")
+    out = kc.run_slash("--board default create 'opus task' --assignee alice --model claude-opus-4-8")
     tid = _created_id(out)
     show = kc.run_slash(f"show {tid}")
     assert "model:" in show
@@ -121,14 +121,14 @@ def test_cli_create_model_shows_in_show(kanban_home):
 
 
 def test_cli_create_no_model_no_model_line(kanban_home):
-    out = kc.run_slash("create 'plain' --assignee alice")
+    out = kc.run_slash("--board default create 'plain' --assignee alice")
     tid = _created_id(out)
     show = kc.run_slash(f"show {tid}")
     assert "model:" not in show
 
 
 def test_cli_edit_clear_model_removes_line(kanban_home):
-    out = kc.run_slash("create 'opus' --assignee alice --model claude-opus-4-8")
+    out = kc.run_slash("--board default create 'opus' --assignee alice --model claude-opus-4-8")
     tid = _created_id(out)
     assert "claude-opus-4-8" in kc.run_slash(f"show {tid}")
     edited = kc.run_slash(f"edit {tid} --clear-model")
@@ -138,7 +138,7 @@ def test_cli_edit_clear_model_removes_line(kanban_home):
 
 
 def test_cli_edit_set_model(kanban_home):
-    out = kc.run_slash("create 'plain' --assignee alice")
+    out = kc.run_slash("--board default create 'plain' --assignee alice")
     tid = _created_id(out)
     edited = kc.run_slash(f"edit {tid} --model claude-opus-4-8")
     assert "Set model override" in edited
@@ -149,7 +149,7 @@ def test_cli_edit_set_model(kanban_home):
 def test_cli_edit_unrelated_field_leaves_model_untouched(kanban_home):
     """Editing without --model must leave an existing override intact
     (the None sentinel means 'unchanged', not 'clear')."""
-    out = kc.run_slash("create 'opus' --assignee alice --model claude-opus-4-8")
+    out = kc.run_slash("--board default create 'opus' --assignee alice --model claude-opus-4-8")
     tid = _created_id(out)
     # An edit that touches nothing model-related: pass only --result.
     # (result-backfill needs a done task; we don't assert it succeeds — we
@@ -160,14 +160,14 @@ def test_cli_edit_unrelated_field_leaves_model_untouched(kanban_home):
 
 
 def test_cli_edit_model_and_clear_model_mutually_exclusive(kanban_home):
-    out = kc.run_slash("create 'x' --assignee alice")
+    out = kc.run_slash("--board default create 'x' --assignee alice")
     tid = _created_id(out)
     res = kc.run_slash(f"edit {tid} --model claude-opus-4-8 --clear-model")
     assert "mutually exclusive" in res
 
 
 def test_cli_edit_nonexistent_id_reports_failure(kanban_home):
-    res = kc.run_slash("edit t_nope --model claude-opus-4-8")
+    res = kc.run_slash("--board default edit t_nope --model claude-opus-4-8")
     assert "cannot set model" in res
 
 
@@ -234,7 +234,7 @@ def test_argv_injection_via_cli_create(kanban_home, monkeypatch):
     """Same round-trip but the write enters through the CLI create flag,
     proving CLI arg parsing doesn't split the value either."""
     # shlex in run_slash handles quoting; embed a metachar string.
-    out = kc.run_slash("create 'inj' --assignee worker --model 'x ; y'")
+    out = kc.run_slash("--board default create 'inj' --assignee worker --model 'x ; y'")
     tid = _created_id(out)
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)

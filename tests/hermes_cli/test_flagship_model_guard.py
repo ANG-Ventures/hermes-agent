@@ -143,7 +143,7 @@ def test_dispatch_tick_records_route_for_each_spawn(kanban_home, monkeypatch):
 
 @pytest.mark.parametrize("assignee", ["daedalus-fable", "daedalus-astra"])
 def test_create_refuses_flagship_profile_assignee_without_reason(flagship_profiles, assignee):
-    out = kc.run_slash(f"create 'GATE-PROBE' --assignee {assignee}")
+    out = kc.run_slash(f"--board default create 'GATE-PROBE' --assignee {assignee}")
     assert "--allow-flagship" in out and "assignee profile default" in out, out
     assert _card_count() == 0
 
@@ -193,7 +193,7 @@ def test_set_model_flagship_pin_refuses_without_reason(flagship_profiles):
 
 
 def test_swarm_flagship_child_without_reason_is_refused(flagship_profiles):
-    out = kc.run_slash("swarm 'probe' --worker 'daedalus-fable:w1' "
+    out = kc.run_slash("--board default swarm 'probe' --worker 'daedalus-fable:w1' "
                        "--verifier daedalus-opus --synthesizer daedalus-opus")
     assert "assignee profile default of 'daedalus-fable'" in out, out
     assert _card_count() == 0
@@ -212,8 +212,8 @@ def test_dispatch_refuses_a_legacy_flagship_profile_card(flagship_profiles):
 
 @pytest.mark.parametrize("assignee", ["daedalus-opus", "daedalus-sonnet", "worker"])
 def test_non_flagship_routes_need_no_reason(flagship_profiles, assignee):
-    task_id = _created_id(kc.run_slash(f"create 'plain' --assignee {assignee}"))
-    pinned = _created_id(kc.run_slash(f"create 'pinned' --assignee daedalus-fable --model claude-opus-5-5"))
+    task_id = _created_id(kc.run_slash(f"--board default create 'plain' --assignee {assignee}"))
+    pinned = _created_id(kc.run_slash(f"--board default create 'pinned' --assignee daedalus-fable --model claude-opus-5-5"))
     with kb.connect() as conn:
         assert kb.get_task(conn, pinned).model_override == "claude-opus-5-5"
         assert kb.set_model_override(conn, pinned, "claude-sonnet-5")
@@ -356,7 +356,7 @@ def test_pin_set_with_reason(actor):
 @pytest.mark.parametrize("actor", ACTORS, indirect=True)
 def test_lane_override_with_firepower(actor):
     name, _parent = actor
-    out = kc.run_slash("lane-model set openai-codex/gpt-6-astra-900k --assignee daedalus-opus "
+    out = kc.run_slash("--board default lane-model set openai-codex/gpt-6-astra-900k --assignee daedalus-opus "
                        f"--ttl 2h --reason capacity --firepower '{REASON}'")
     with kb.connect() as conn:
         lane = kb.get_lane_model_override(conn, assignee="daedalus-opus")
@@ -405,7 +405,7 @@ def test_swarm_with_reason(actor):
     before = _card_count()
     # --created-by names the bookkeeping root's assignee; the actor the gate
     # judges is still the caller's own identity.
-    out = kc.run_slash("swarm 'probe' --worker 'daedalus-fable:w1' --verifier daedalus-opus "
+    out = kc.run_slash("--board default swarm 'probe' --worker 'daedalus-fable:w1' --verifier daedalus-opus "
                        f"--synthesizer daedalus-opus --created-by daedalus-opus "
                        f"--allow-flagship '{REASON}' --json")
     if name != "operator":
@@ -474,7 +474,7 @@ def test_untrusted_override_comment_admits_nowhere(flagship_profiles, author, ru
 
 
 def _assert_gated(assignee: str, message: str = "assignee profile default") -> None:
-    out = kc.run_slash(f"create 'GATE-PROBE' --assignee {assignee}")
+    out = kc.run_slash(f"--board default create 'GATE-PROBE' --assignee {assignee}")
     assert message in out and "--allow-flagship" in out, out
     assert _card_count() == 0
     with kb.connect() as conn:
@@ -485,7 +485,7 @@ def _assert_gated(assignee: str, message: str = "assignee profile default") -> N
 
 
 def _assert_not_gated(assignee: str) -> None:
-    task_id = _created_id(kc.run_slash(f"create 'plain' --assignee {assignee}"))
+    task_id = _created_id(kc.run_slash(f"--board default create 'plain' --assignee {assignee}"))
     assert _comments(task_id) == [] and not _refused_at_dispatch(task_id)
 
 
@@ -516,7 +516,7 @@ def test_pin_remapped_to_flagship_by_the_assignee_aliases_is_gated(flagship_prof
     (single + batch), reassign and the dispatcher's pin branch all refuse it
     without ``--allow-flagship``; with one, the override is recorded."""
     _profile(flagship_profiles, "worker-remap", _REMAP)
-    out = kc.run_slash("create 'x' --assignee worker-remap --model claude-opus-5-5")
+    out = kc.run_slash("--board default create 'x' --assignee worker-remap --model claude-opus-5-5")
     assert "--allow-flagship" in out and "worker-remap" in out and FABLE in out, out
     assert _card_count() == 0
 
@@ -542,7 +542,7 @@ def test_pin_remapped_to_flagship_by_the_assignee_aliases_is_gated(flagship_prof
     assert _refused_at_dispatch(legacy)
 
     ok = _created_id(kc.run_slash(
-        "create 'x' --assignee worker-remap --model claude-opus-5-5 --allow-flagship 'known lane'"))
+        "--board default create 'x' --assignee worker-remap --model claude-opus-5-5 --allow-flagship 'known lane'"))
     assert [b for _a, b in _comments(ok)] == ["flagship override: known lane"]
     assert not _refused_at_dispatch(ok)
     with kb.connect() as conn:
@@ -626,7 +626,7 @@ def test_unresolved_or_unreadable_default_fails_closed(flagship_profiles, monkey
     monkeypatch.delenv("T9E_UNSET_MODEL", raising=False)
     _profile(flagship_profiles, name, body)
     _assert_gated(name, f"cannot resolve {name} model default")
-    ok = _created_id(kc.run_slash(f"create 'x' --assignee {name} --allow-flagship 'known lane'"))
+    ok = _created_id(kc.run_slash(f"--board default create 'x' --assignee {name} --allow-flagship 'known lane'"))
     assert [b for _a, b in _comments(ok)] == ["flagship override: known lane"]
 
 
@@ -778,7 +778,7 @@ def test_worker_ancestry_denies_authority_even_without_the_env_marker(flagship_p
         out = kc.run_slash(f"set-model {task_id} --allow-flagship '{REASON}'")
         _assert_untouched(task_id, "daedalus-fable", "claude-opus-5-5", count + 1)
     else:
-        out = kc.run_slash("lane-model set openai-codex/gpt-6-astra-900k --assignee daedalus-opus "
+        out = kc.run_slash("--board default lane-model set openai-codex/gpt-6-astra-900k --assignee daedalus-opus "
                            f"--ttl 2h --reason capacity --firepower '{REASON}'")
         with kb.connect() as conn:
             assert kb.get_lane_model_override(conn, assignee="daedalus-opus") is None
@@ -792,7 +792,7 @@ def test_operator_outside_any_worker_keeps_authority(flagship_profiles, monkeypa
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: True)
     monkeypatch.setattr(kanban_identity, "worker_ancestor_profile", lambda: None)
-    out = kc.run_slash(f"create 'GATE' --assignee daedalus-fable --allow-flagship '{REASON}'")
+    out = kc.run_slash(f"--board default create 'GATE' --assignee daedalus-fable --allow-flagship '{REASON}'")
     _assert_authorized(_created_id(out))
 
 
@@ -1603,7 +1603,7 @@ def _as_cron_script(monkeypatch):
 
 def test_granted_profile_creates_and_dispatches_without_authority(tiresias_grant, monkeypatch):
     _as_cron_script(monkeypatch)
-    out = kc.run_slash("create 'tiresias daily' --assignee tiresias")
+    out = kc.run_slash("--board default create 'tiresias daily' --assignee tiresias")
     task_id = _created_id(out)
     assert _comments(task_id) == []  # no per-card override needed or written
     assert not _refused_at_dispatch(task_id)
@@ -1614,7 +1614,7 @@ def test_granted_profile_creates_and_dispatches_without_authority(tiresias_grant
 @pytest.mark.parametrize("assignee", ["daedalus-fable", "daedalus-astra"])
 def test_grant_covers_no_other_flagship_profile(tiresias_grant, monkeypatch, assignee):
     _as_cron_script(monkeypatch)
-    out = kc.run_slash(f"create 'GATE-PROBE' --assignee {assignee}")
+    out = kc.run_slash(f"--board default create 'GATE-PROBE' --assignee {assignee}")
     assert "assignee profile default" in out and "--allow-flagship" in out, out
     assert _card_count() == 0
     with kb.connect() as conn:
@@ -1627,18 +1627,18 @@ def test_grant_covers_no_other_flagship_profile(tiresias_grant, monkeypatch, ass
 def test_grant_does_not_cover_a_flagship_pin_or_a_self_grant(tiresias_grant, monkeypatch):
     _as_cron_script(monkeypatch)
     # A flagship pin on the granted profile still needs --allow-flagship.
-    out = kc.run_slash(f"create 'pin' --assignee tiresias --model {FABLE}")
+    out = kc.run_slash(f"--board default create 'pin' --assignee tiresias --model {FABLE}")
     assert "orchestrator-only" in out, out
     # A profile's own config.yaml cannot grant its own route.
     _profile(tiresias_grant, "daedalus-fable", _default(FABLE)
              + "kanban:\n  flagship_profile_allowances:\n    daedalus-fable: self\n")
-    assert "assignee profile default" in kc.run_slash("create 'self' --assignee daedalus-fable")
+    assert "assignee profile default" in kc.run_slash("--board default create 'self' --assignee daedalus-fable")
     assert _card_count() == 0
 
 
 def test_no_grant_configured_keeps_the_refusal(flagship_profiles, monkeypatch):
     _profile(flagship_profiles, "tiresias", _default(FABLE))
     _as_cron_script(monkeypatch)
-    out = kc.run_slash("create 'tiresias daily' --assignee tiresias")
+    out = kc.run_slash("--board default create 'tiresias daily' --assignee tiresias")
     assert "assignee profile default of 'tiresias'" in out, out
     assert _card_count() == 0

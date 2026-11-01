@@ -390,8 +390,10 @@ def test_env_on_our_home_is_not_our_root_when_hermes_home_moved_it(monkeypatch, 
 def _our_home(monkeypatch, tmp_path):
     home = tmp_path / "alice"
     (home / ".hermes").mkdir(parents=True)
+    # The sandbox is cleared on purpose: this helper tests root resolution itself, and HERMES_HOME is the tmp_path
+    # home set below, never the live root.
     for var in ("HERMES_KANBAN_HOME", "HERMES_KANBAN_DB", "HERMES_DATA_DIR_SUFFIX", "HERMES_KANBAN_SANDBOX"):
-        monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(var, raising=False)  # kanban-sandbox: off — root-resolution test under a tmp_path HERMES_HOME
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
     return home

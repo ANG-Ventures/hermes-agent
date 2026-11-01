@@ -20,9 +20,6 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_board_registry as reg
 from hermes_cli import kanban_db_connect as kbc
 
-pytestmark = pytest.mark.kanban_bare_verb_refuse
-
-
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     h = tmp_path / "home"
@@ -364,6 +361,7 @@ def test_locate_parses_from_argv(home, capsys):
 
 # --- D2 behind the flag ------------------------------------------------------------------------
 
+@pytest.mark.kanban_board_refusal
 def test_flag_on_bare_non_derivable_verb_is_refused_with_the_next_command(home, capsys):
     _policy(home, "refuse")
     with pytest.raises(kbsel.BoardRequired, match=r"create needs a board.*or --parent <card>\.$"):
@@ -614,6 +612,7 @@ def test_resolve_selector_refuses_malformed_and_the_pin_sentinel(home):
         kbsel.resolve_selector(" Override ")
 
 
+@pytest.mark.kanban_board_refusal
 def test_blank_board_flag_is_omitted_on_the_cli_path(home):
     """``--board ' '`` is the bare verb: refused under ``refuse`` (rc 2 BoardRequired), never an
     error about an empty slug and never a silent default."""

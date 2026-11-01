@@ -15,7 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from hermes_cli import kanban_db as kb
 
 OK = 200
-BOARD_PATH = "/api/plugins/kanban/board"
+BOARD_PATH = "/api/plugins/kanban/board?board=default"  # S7: the SPA always names the board
 STATUS_PATH = "/probe"
 BURST_SIZE = 8
 

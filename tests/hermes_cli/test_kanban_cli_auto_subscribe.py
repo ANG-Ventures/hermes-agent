@@ -70,7 +70,7 @@ def _set_session_env(monkeypatch) -> None:
 
 
 def _create_and_get_task_id(title: str = "hello") -> tuple[str, str]:
-    out = kc.run_slash(f'create "{title}" --assignee worker1')
+    out = kc.run_slash(f'--board default create "{title}" --assignee worker1')
     m = re.search(r"Created\s+(t_[0-9a-f]+)\b", out)
     assert m, f"create output did not include a task id: {out!r}"
     return m.group(1), out

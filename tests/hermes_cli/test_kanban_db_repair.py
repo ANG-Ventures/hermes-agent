@@ -277,7 +277,7 @@ def test_cli_repair_json_shape(cli_home, capsys):
     _build_board_db(db_path)
     _corrupt_index(db_path, "idx_tasks_status")
 
-    rc = _run_kanban_cli(["repair", "--json"])
+    rc = _run_kanban_cli(["repair", "--board", "default", "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["status"] == "repaired"

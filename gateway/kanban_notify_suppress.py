@@ -82,12 +82,11 @@ class SuppressConfig:
 # --- S5: actionable-only wakes (t_4f6afb67) -----------------------------------
 #
 # 2026-10-12, two operator sessions: one red PR woke t_1ac4c83b four times (two
-# of them citing a run already handled), a red main had inherited into PRs woke
-# their owners to "fix" a PR with nothing wrong, and the operator's own
-# request-changes woke the operator. Each of these is a ledger row now (a
-# ``notify_suppressed`` receipt, shown by ``kanban show``), not a turn.
-# ``kanban.notify_suppress.actionable_only: false`` turns all four off.
-REASON_INHERITED_RED = "inherited-red"      # every red is main's; nothing to do on the PR
+# of them citing a run already handled), and the operator's own request-changes
+# woke the operator. Each of these is a ledger row now (a ``notify_suppressed``
+# receipt, shown by ``kanban show``), not a turn. The inherited-from-main red
+# rule was retired with hermes-home#8100 (a PR lands on its own checks).
+# ``kanban.notify_suppress.actionable_only: false`` turns them all off.
 REASON_DUPLICATE_RED = "duplicate-red"      # same (card, PR, head, red-set) already woke
 REASON_STALE_HANDBACK = "stale-handback"    # the card left review before the wake ran
 REASON_OWN_ECHO = "own-session-echo"        # the home session made this transition itself
@@ -97,15 +96,13 @@ OWN_ECHO_KINDS = frozenset({"changes_requested", "review_requested", "blocked", 
 RED_SEEN_TTL_S = 24 * 3600
 
 
-def red_handback_noise(keys: Iterable[str], inherited_only: bool, seen: Optional[dict],
+def red_handback_noise(keys: Iterable[str], seen: Optional[dict],
                        card_status: Optional[str] = None) -> Optional[str]:
     """Why a red/dirty review handback is NOT actionable, or None (wake).
     ``seen``: red keys already delivered (key -> epoch); ``card_status``: the card now."""
     keys = [k for k in keys or () if k]
     if card_status is not None and card_status != "review":
         return REASON_STALE_HANDBACK
-    if inherited_only:
-        return REASON_INHERITED_RED
     if keys and all(k in (seen or {}) for k in keys):
         return REASON_DUPLICATE_RED
     return None

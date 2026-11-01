@@ -376,6 +376,10 @@ def post_failover(agent: Any, plan: FailoverPlan, *, failing: Tuple[Any, Any],
         if state is not None:
             extra["sticky_until_epoch"] = state.until_epoch
             extra["cooldown_s"] = max(0.0, state.until_epoch - time.time())
+        else:
+            fp.advance_sticky_fallback(
+                store(), key, cls=plan.cls, now=time.time(), failing=failing,
+                fallback=fallback, fallback_index=fallback_index)
     except Exception:  # noqa: BLE001
         logger.debug("sticky arm failed (best-effort)", exc_info=True)
     return extra

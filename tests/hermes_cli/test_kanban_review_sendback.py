@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.plugins._kanban_board_client import naming_board
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
@@ -407,7 +408,7 @@ def test_dashboard_request_changes_route_sends_back_parked_review(board: Path) -
 
     app = FastAPI()
     app.include_router(plugin_api.router, prefix="/api/plugins/kanban")
-    client = TestClient(app)
+    client = naming_board(TestClient(app))
     with kb.connect() as conn:
         tid = _parked_review(conn)
         before, runs_before = _snapshot(conn, tid)
@@ -684,7 +685,7 @@ def test_dashboard_operator_send_back(
 
     app = FastAPI()
     app.include_router(plugin_api.router, prefix="/api/plugins/kanban")
-    client = TestClient(app)
+    client = naming_board(TestClient(app))
     with kb.connect() as conn:
         tid = _parked_review(conn)
         before, runs_before = _snapshot(conn, tid)

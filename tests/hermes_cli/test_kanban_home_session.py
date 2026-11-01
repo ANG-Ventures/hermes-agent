@@ -226,11 +226,11 @@ def test_batch_set_model_refuses_whole_batch(kanban_home):
 
 def test_cli_create_stamps_env_session_by_default(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", HOME)
-    created = json.loads(kc.run_slash("create 'x' --assignee a --json"))
+    created = json.loads(kc.run_slash("--board default create 'x' --assignee a --json"))
     assert created["session_id"] == HOME
-    explicit = json.loads(kc.run_slash(f"create 'y' --session {OTHER} --json"))
+    explicit = json.loads(kc.run_slash(f"--board default create 'y' --session {OTHER} --json"))
     assert explicit["session_id"] == OTHER
-    unstamped = json.loads(kc.run_slash("create 'z' --session none --json"))
+    unstamped = json.loads(kc.run_slash("--board default create 'z' --session none --json"))
     assert unstamped["session_id"] is None
 
 
@@ -238,20 +238,20 @@ def test_cli_create_without_env_is_refused_unless_homed(kanban_home, monkeypatch
     # t_09fea045: an implicit unhomed card is undrivable -> refused.
     monkeypatch.delenv(kb.ALLOW_UNHOMED_CREATE_ENV, raising=False)  # arm the refusal
     # A non-TTY ``hermes kanban create`` (script class) is refused ...
-    assert "refused create" in kc._run_slash("create 'x' --json")
-    created = json.loads(kc._run_slash("create 'x' --home operator --json"))
+    assert "refused create" in kc._run_slash("--board default create 'x' --json")
+    created = json.loads(kc._run_slash("--board default create 'x' --home operator --json"))
     assert created["session_id"] == kb.OPERATOR_HOME_SESSION
     # ... a typed ``/kanban create`` is hand-typed: allowed (t_6281f908 D-O2).
-    assert json.loads(kc.run_slash("create 'typed' --json"))["unhomed"] is True
+    assert json.loads(kc.run_slash("--board default create 'typed' --json"))["unhomed"] is True
 
 
 def test_cli_list_home(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         mine = _card(conn, session_id=HOME, blocked=False)
         theirs = _card(conn, session_id=OTHER, blocked=False)
-    assert "HERMES_SESSION_ID" in kc.run_slash("list --home")
+    assert "HERMES_SESSION_ID" in kc.run_slash("--board default list --home")
     monkeypatch.setenv("HERMES_SESSION_ID", HOME)
-    ids = {t["id"] for t in json.loads(kc.run_slash("list --home --json"))}
+    ids = {t["id"] for t in json.loads(kc.run_slash("--board default list --home --json"))}
     assert mine in ids and theirs not in ids
 
 
@@ -640,7 +640,7 @@ async def test_gateway_slash_binds_invoking_session(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     home_runner = _slash_runner(HOME)
     out = await GatewayRunner._handle_kanban_command(
-        home_runner, _slash_event("/kanban create 'mine' --assignee worker-a --json"))
+        home_runner, _slash_event("/kanban --board default create 'mine' --assignee worker-a --json"))
     tid = json.loads(out)["id"]
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).session_id == HOME
@@ -672,7 +672,7 @@ async def test_gateway_slash_session_resolution_failure_is_logged(
     runner = _slash_runner(RuntimeError("store offline"))
     with caplog.at_level(logging.WARNING):
         out = await GatewayRunner._handle_kanban_command(
-            runner, _slash_event("/kanban create 'x' --json"))
+            runner, _slash_event("/kanban --board default create 'x' --json"))
     assert "session-unresolved" in out, out
     with kb.connect_closing() as conn:
         assert kb.list_tasks(conn) == []
@@ -691,7 +691,7 @@ async def test_gateway_slash_unresolved_session_refuses_guarded_mutation(
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     out = await GatewayRunner._handle_kanban_command(
-        _slash_runner(HOME), _slash_event("/kanban create 'homed' --assignee worker-a --json"))
+        _slash_runner(HOME), _slash_event("/kanban --board default create 'homed' --assignee worker-a --json"))
     tid = json.loads(out)["id"]
     out = await GatewayRunner._handle_kanban_command(
         _slash_runner(None), _slash_event(f"/kanban block {tid} 'no session'"))
@@ -788,7 +788,7 @@ def test_dispatcher_tick_still_claims_stamped_card(kanban_home, monkeypatch):
 
 
 def test_run_slash_session_does_not_leak(kanban_home):
-    kc.run_slash("list", session_id=HOME)
+    kc.run_slash("--board default list", session_id=HOME)
     assert kc._SLASH_SESSION_ID.get() is None
 
 
@@ -1044,7 +1044,7 @@ def test_cli_create_stamps_session_and_origin_line(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "#sub-vps-n")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "1550")
-    out = kc.run_slash("create 'cli card' --body 'do the thing' --json")
+    out = kc.run_slash("--board default create 'cli card' --body 'do the thing' --json")
     tid = json.loads(out[out.index("{"):])["id"]
     with kb.connect_closing() as conn:
         t = kb.get_task(conn, tid)
@@ -1056,7 +1056,7 @@ def test_cli_create_stamps_session_and_origin_line(kanban_home, monkeypatch):
 def test_cli_create_session_none_is_unhomed(kanban_home):
     # Implicit sessionless create is refused (t_09fea045); the explicit
     # ``--session none`` opt-out still stamps the sentinel, never NULL.
-    out = kc.run_slash("create 'cron card' --session none --json")
+    out = kc.run_slash("--board default create 'cron card' --session none --json")
     tid = json.loads(out[out.index("{"):])["id"]
     with kb.connect_closing() as conn:
         raw = conn.execute("SELECT session_id FROM tasks WHERE id = ?", (tid,)).fetchone()
@@ -1093,22 +1093,22 @@ def test_cli_list_groups_this_session_first(kanban_home, monkeypatch):
         theirs = kb.create_task(conn, title="theirs", assignee="w", session_id=OTHER)
         orphan = kb.create_task(conn, title="orphan", assignee="w")
     monkeypatch.setenv("HERMES_SESSION_ID", HOME)
-    out = kc.run_slash("list")
+    out = kc.run_slash("--board default list")
     this_at, other_at = out.index("THIS SESSION (1)"), out.index("OTHER SESSIONS (2)")
     assert this_at < out.index(mine) < other_at
     assert out.index(theirs) > other_at and out.index(orphan) > other_at
     assert f"  {theirs} \u00b7 ready \u00b7 theirs" in out
     assert f"  {orphan} \u00b7 ready \u00b7 orphan [unhomed]" in out
-    flat = kc.run_slash("list --all")
+    flat = kc.run_slash("--board default list --all")
     assert "THIS SESSION" not in flat and mine in flat and theirs in flat
-    only = kc.run_slash("list --this-session")
+    only = kc.run_slash("--board default list --this-session")
     assert mine in only and theirs not in only and orphan not in only
 
 
 def test_cli_list_without_session_is_flat(kanban_home):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="x", assignee="w", session_id=HOME)
-    out = kc.run_slash("list")
+    out = kc.run_slash("--board default list")
     assert tid in out and "THIS SESSION" not in out
 
 
@@ -1379,7 +1379,7 @@ def test_cli_create_session_flag_beats_parent(kanban_home, monkeypatch):
 
 def test_cli_create_writes_origin_line_when_body_omits_it(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", HOME)
-    out = kc.run_slash("create 'no origin here' --body 'just work' --json")
+    out = kc.run_slash("--board default create 'no origin here' --body 'just work' --json")
     tid = json.loads(out[out.index("{"):])["id"]
     with kb.connect_closing() as conn:
         first = kb.get_task(conn, tid).body.splitlines()[0]
@@ -1390,7 +1390,7 @@ def test_cli_create_child_with_session_none_stays_unhomed(kanban_home, monkeypat
     """C6 (#1118 'Unstamped child'): an explicit ``--session none`` wins over
     the parent's home instead of silently inheriting it."""
     monkeypatch.setenv("HERMES_SESSION_ID", HOME)
-    parent = json.loads(kc.run_slash("create 'parent' --json"))
+    parent = json.loads(kc.run_slash("--board default create 'parent' --json"))
     assert parent["session_id"] == HOME
     child = json.loads(kc.run_slash(f"create 'child' --parent {parent['id']} --session none --json"))
     assert child["session_id"] is None

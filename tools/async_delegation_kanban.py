@@ -22,7 +22,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tools import async_delegation_store as _store
 
@@ -274,8 +274,15 @@ def parse_card_body(body: Optional[str]) -> Dict[str, Any]:
 
 def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, profile: str,
                 goal: str, cwd: str, session_id: Optional[str],
-                spawn_fn: Optional[Callable] = None, slot_key: Optional[str] = None) -> Dict[str, Any]:
+                spawn_fn: Optional[Callable] = None, slot_key: Optional[str] = None,
+                flagship_reason: Optional[str] = None) -> Dict[str, Any]:
     """Create the unit's card and spawn its runner now (§5.2 steps 2-3).
+
+    The card is a container for an already-authorized delegation: it is pinned to the model the
+    runner will run (the durable ``execution.model``), so the flagship guard judges that route and
+    not the assignee profile's default (t_7e0f9dab). ``flagship_reason`` is delegate_task's own
+    audited ``allow_flagship_reason``, carried through create_task's override (authority still
+    judged there).
 
     Returns ``{"ok": True, "task_id", "pid"}``, or ``{"ok": False, "error"}`` after archiving any
     card it made: the caller then supersedes the attempt and runs the unit in-process (§5.2.4)."""
@@ -285,6 +292,13 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
     board = _board()
     task_id = None
     try:
+        model, provider = _execution_route(delegation_id, profile_home)
+        if _granted_inherited_default(profile, model, provider, flagship_reason):
+            # The unit runs the profile default the operator's standing grant covers: leave the
+            # card unpinned so create_task's default-route branch applies that grant (Prism
+            # f226ee06e5ba round 3); a pin plus a reason would demand per-call operator authority.
+            model = provider = None
+        reason = _flagship_reason(delegation_id, model, flagship_reason)
         kb.create_board(board)
         with kb.connect_closing(board=board) as conn:
             task_id = kb.create_task(
@@ -293,6 +307,14 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
                 assignee=profile, workspace_kind="dir", workspace_path=cwd, max_retries=1,
                 max_runtime_seconds=None, session_id=session_id or None,
                 idempotency_key=attempt_id, board=board, created_by=profile,
+                model_override=model, provider_override=provider,
+                # The runner reads its route from the delegation registry, never from this pin
+                # (K1 argv): a lane catalog that does not list the id must not refuse the container
+                # (Prism f226ee06e5ba round 2). The write leaves the ``model force:`` audit comment.
+                force_model_reason=(f"delegation {delegation_id}: container card; the unit runs "
+                                    "the route already resolved by delegate_task") if model else None,
+                flagship_override_reason=reason,
+                flagship_override_author=profile if reason else None,
             )
             # ``slot_key``: the call's shared pool slot, so a boot observer of a multi-unit call
             # holds ONE slot as the dispatching gateway did (not one per unit).
@@ -311,6 +333,95 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
             hold_launch_fence(task_id)
         fenced = not task_id or (_archive_quietly(task_id) and _runner_gone(task_id))
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "task_id": task_id, "fenced": fenced}
+
+
+def _execution_route(delegation_id: str, profile_home: Path) -> Tuple[Optional[str], Optional[str]]:
+    """``(model, provider)`` the unit's runner runs, from its durable ``execution`` block.
+
+    The provider is the delegation's named one (``credential_ref.provider``, e.g. ``custom:<name>``),
+    else ``execution.provider``, so a ``lane/model`` id is never re-split onto an inferred lane. A
+    provider the card-pin policy refuses as-is (a single-sub pin or pre-rename alias, which would need
+    ``--pin-sub``) is left off: the pin only feeds the flagship guard, it never routes the runner."""
+    with _store.locked_registry(profile_home, write=False) as registry:
+        record = registry["records"].get(delegation_id)
+    execution = record.get("execution") if isinstance(record, dict) else None
+    execution = execution if isinstance(execution, dict) else {}
+    model = str(execution.get("model") or "").strip() or None
+    ref = execution.get("credential_ref")
+    provider = str((ref.get("provider") if isinstance(ref, dict) else None)
+                   or execution.get("provider") or "").strip() or None
+    if not model:
+        return None, None
+    from hermes_cli.model_policy import pinned_sub_provider_error
+
+    if provider and pinned_sub_provider_error(model, provider):
+        provider = None
+    return model, provider
+
+
+def _granted_inherited_default(profile: str, model: Optional[str], provider: Optional[str],
+                               audited: Optional[str]) -> bool:
+    """True when the unit inherits ``profile``'s own resolved default ROUTE (no audited per-call
+    flagship pin) and ``kanban.flagship_profile_allowances`` grants that default. The whole route must
+    match, model id AND provider: an unpinned card runs the profile default, so a same-id unit on
+    another provider would be silently re-routed onto the granted lane (Prism cbbaea6f30b8). An
+    explicit pin (``audited`` set) is never covered, the same as the grant itself."""
+    from hermes_cli.model_policy import assignee_default_model, profile_flagship_allowance
+
+    if not model or not provider or (audited or "").strip():
+        return False
+    default = assignee_default_model(profile)
+    route = _default_route(profile, default)
+    if route is None or route != _route_key(provider, model):
+        return False
+    return bool(profile_flagship_allowance(profile, default))
+
+
+def _route_key(provider: str, model: str) -> Tuple[str, str]:
+    """``(provider, model id)`` normalized; a ``provider/`` prefix on the id is the provider itself."""
+    provider, model = provider.strip().casefold(), model.strip()
+    if model.casefold().startswith(provider + "/"):
+        model = model[len(provider) + 1:]
+    return provider, model
+
+
+def _default_route(profile: str, default: Optional[str]) -> Optional[Tuple[str, str]]:
+    """The provider + model the profile's default resolves to the way startup reads it: the
+    ``lane/`` prefix of the default when present, else the profile's ``model.provider``. ``None``
+    when either half is unknown (fail closed: the pinned path decides)."""
+    default = str(default or "").strip()
+    if not default or default.startswith("<"):
+        return None
+    if "/" in default:
+        lane, _, rest = default.partition("/")
+        return _route_key(lane, rest) if lane and rest else None
+    from hermes_cli.model_policy import _profile_effective_config
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        cfg = _profile_effective_config(Path(resolve_profile_env(profile)) / "config.yaml")
+    except Exception:
+        return None
+    section = cfg.get("model") if isinstance(cfg, dict) else None
+    lane = str((section.get("provider") if isinstance(section, dict) else None) or "").strip()
+    if not lane or lane.casefold() == "auto":
+        return None
+    return _route_key(lane, default)
+
+
+def _flagship_reason(delegation_id: str, model: Optional[str], audited: Optional[str]) -> Optional[str]:
+    """The override reason a flagship execution model carries onto its container card, else ``None``.
+
+    delegate_task's audited ``allow_flagship_reason`` when the caller pinned the flagship; otherwise
+    the unit inherits the delegating agent's own route (no per-call gate exists in-process either).
+    ``create_task`` still judges the author's authority (``require_flagship_authority``): this only
+    names why, it never grants."""
+    from hermes_cli.model_policy import flagship_model_match
+
+    if not flagship_model_match(model):
+        return None
+    why = (audited or "").strip() or f"inherits the delegating agent's route {model}"
+    return f"delegation {delegation_id}: {why}"
 
 
 #: Cards of failed launches whose attempt the dispatch worker is still fencing/superseding: the card-end

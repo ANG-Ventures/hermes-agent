@@ -1567,6 +1567,10 @@ def emit_soft_deadlines(conn: sqlite3.Connection, *, now: Optional[int] = None) 
     return emitted
 
 
+# kanban_db.resolve_reviewer's refusal text when the resolved reviewer is the implementer.
+_SAME_ACTOR_REFUSAL = "same-actor review is refused"
+
+
 def _route_timed_out_handback(conn: sqlite3.Connection, tid: str, handback: dict) -> bool:
     """Hand a timed-out run's pushed PR to review through :func:`kanban_db.request_review`, the
     path a worker's ``kanban_request_review`` takes (review policy, reviewer provenance, round
@@ -1574,8 +1578,11 @@ def _route_timed_out_handback(conn: sqlite3.Connection, tid: str, handback: dict
     status with the run ended ``timed_out``; True = routed (review/done, or blocked by the round
     cap), False = refused, the card stays released and retries as before.
 
-    Same-actor: the dispatcher is not the implementer, so the check is bypassed explicitly
-    (``allow_same_actor``) and the reason rides the metadata."""
+    Same-actor (Prism 6190b2739be7): the gate compares the resolved REVIEWER with the
+    IMPLEMENTER (the run profile, or the assignee once the run has ended), never with the
+    caller, so the dispatcher being the caller justifies no bypass. A refused same-actor
+    reviewer (the implementer is the configured review assignee, or the latest review
+    provenance names it) goes to the human review lane instead, never to the implementer."""
     summary = (f"timed-out handback: PR {handback['pr']} @{handback['sha']} "
                "(dispatcher: the worker hit max_runtime after pushing this head)")
     metadata = {
@@ -1584,11 +1591,17 @@ def _route_timed_out_handback(conn: sqlite3.Connection, tid: str, handback: dict
         "head_sha": handback["sha"],
         "timed_out_handback": True,
         "actor": "dispatcher",
-        "same_actor_bypass": "dispatcher timed-out handback: the dispatcher is not the implementer",
     }
     try:
         ok, reason = _kb.request_review(conn, tid, summary=summary, metadata=metadata,
-                                        allow_same_actor=True, with_reason=True)
+                                        with_reason=True)
+        if not ok and _SAME_ACTOR_REFUSAL in (reason or ""):
+            configured = _kb.configured_review_assignee()
+            human = (configured.casefold() if _kb.is_human_reviewer(configured)
+                     else _kb.HUMAN_REVIEWER_SENTINEL)
+            ok, reason = _kb.request_review(
+                conn, tid, summary=summary, reviewer=human, with_reason=True,
+                metadata={**metadata, "same_actor_fallback": human})
     except Exception as exc:
         ok, reason = False, f"{type(exc).__name__}: {exc}"
     status = _kb._task_status(conn, tid)
@@ -1641,6 +1654,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None, handback_fn
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
+    # Phase 1: signal every overdue worker before any network call.
+    terminated: list[tuple] = []
     for row in rows:
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
@@ -1663,7 +1678,6 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None, handback_fn
             owner_window=_kb._worker_owner_window(conn, tid, pid, row["current_run_id"]),
             conn=conn, task_id=tid, run_id=row["current_run_id"],
         )
-        killed = bool(termination.get("sigkill"))
         if not termination.get("terminated"):
             # Signal delivery (including SIGKILL) is not proof of death.
             # Keep the owner and run intact until a later tick proves it gone.
@@ -1685,7 +1699,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None, handback_fn
                     _kb._append_event(conn, tid, "timeout_refused", refused,
                                   run_id=current["current_run_id"])
             continue
+        terminated.append((row, termination, elapsed, limit))
 
+    # Phase 2: every overdue worker is already dead (Prism 61fefd32c672). The network-bound
+    # handback lookups (up to 30 s per gh call) run here, so they can no longer push a later
+    # overdue worker past its hard limit.
+    for row, termination, elapsed, limit in terminated:
+        pid = int(row["worker_pid"])
+        tid = row["id"]
+        killed = bool(termination.get("sigkill"))
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         # A handback already on the remote (t_e7537cb1): read outside the write txn (network).
         # Only an implementation run (source phase ready) on an ordinary board qualifies.

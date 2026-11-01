@@ -149,7 +149,7 @@ def test_refused_card_is_flagged_in_list_and_show(home, monkeypatch, capsys):
         state = kb.workspace_refusal_state(conn, [task_id])[task_id]
         assert state['reason'].startswith('workspaces_root_unmounted:')
     monkeypatch.delenv('HERMES_SESSION_ID', raising=False)
-    out = kc.run_slash('list')
+    out = kc.run_slash('--board default list')
     line = next(l for l in out.splitlines() if task_id in l)
     assert 'WORKSPACE REFUSED (workspaces_root_unmounted' in line, line
     out = kc.run_slash(f'show {task_id}')

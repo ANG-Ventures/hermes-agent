@@ -87,7 +87,7 @@ def test_notify_subscribe_cli_persists_row(kanban_home, capsys):
 
 def test_notify_subscribe_cli_unknown_task_errors(kanban_home, capsys):
     args = _parse_cli([
-        "kanban", "notify-subscribe", "t_nope",
+        "kanban", "--board", "default", "notify-subscribe", "t_nope",
         "--platform", "telegram",
         "--chat-id", "99",
     ])

@@ -167,7 +167,7 @@ def test_notify_repair_dedupe_keeps_home_chat(board, capsys):
         root = argparse.ArgumentParser(prog="hermes")
         kc.build_parser(root.add_subparsers(dest="command"))
         return kc.kanban_command(root.parse_args(
-            ["kanban", "notify-repair", "--dedupe", *extra]))
+            ["kanban", "notify-repair", "--board", "default", "--dedupe", *extra]))
 
     assert run() == 0  # dry run
     out = capsys.readouterr().out
@@ -190,7 +190,7 @@ def _run_dedupe(*extra):
     root = argparse.ArgumentParser(prog="hermes")
     kc.build_parser(root.add_subparsers(dest="command"))
     return kc.kanban_command(root.parse_args(
-        ["kanban", "notify-repair", "--dedupe", *extra]))
+        ["kanban", "notify-repair", "--board", "default", "--dedupe", *extra]))
 
 
 def _boom(conn, apply=False):

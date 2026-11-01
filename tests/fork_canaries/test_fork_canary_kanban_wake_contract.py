@@ -308,9 +308,9 @@ def test_w9_wake_only_sub_is_never_suppressed(env):
 # --- W10-W14: S5 actionable-only wakes (t_4f6afb67) -----------------------------
 
 
-def _red(env, pr, checks, *, head="a" * 40, inherited=None, state="open"):
+def _red(env, pr, checks, *, head="a" * 40, state="open"):
     env["health"][(REPO, pr)] = {"state": state, "mergeable_state": "clean", "failing": list(checks),
-                                 "head": head, "inherited_from_main": inherited}
+                                 "head": head}
 
 
 def _rehandback(tid, pr: int):
@@ -322,18 +322,6 @@ def _rehandback(tid, pr: int):
 
 def _reasons(tid) -> list:
     return [(r.payload["reason"], r.payload["path"]) for r in _receipts(tid)]
-
-
-def test_w10_inherited_only_red_handback_is_zero_turns_and_a_receipt(env):
-    """S5 (t_a716c180 05:05, 10-12): main's red inherited into the PR is not the owner's to fix.
-
-    RED-PROVABLE: drop the inherited-only rule from red_handback_noise -> 1 owner-wake turn."""
-    _red(env, 2110, ["lints-fast"], inherited="5cb9ca920abc")
-    tid = _card(env)
-    _handback(tid, 2110)
-    turns = _tick(env)
-    assert turns == [], _msg("W10", "an inherited-only red woke its owner", turns)
-    assert ("inherited-red", "owner-wake") in _reasons(tid), _reasons(tid)
 
 
 def test_w11_same_red_same_head_wakes_once(env):
@@ -384,7 +372,7 @@ def test_w13_home_session_send_back_is_no_wake_but_the_line_posts(env):
 
 def test_w14_worker_needs_input_block_still_wakes_and_kill_switch_restores(env):
     """S5 keeps the actionable set: a worker's needs_input block wakes once; with
-    actionable_only off, W10's inherited red wakes again."""
+    actionable_only off, W11's duplicate red wakes again."""
     tid = _card(env)
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn), \
@@ -395,9 +383,12 @@ def test_w14_worker_needs_input_block_still_wakes_and_kill_switch_restores(env):
     from hermes_constants import get_hermes_home
     (get_hermes_home() / "config.yaml").write_text(
         "kanban:\n  notify_suppress:\n    actionable_only: false\n")
-    _red(env, 2114, ["lints-fast"], inherited="5cb9ca920abc")
+    _red(env, 2114, ["lints-fast"])
     t2 = _card(env)
     _handback(t2, 2114)
+    turns = list(_tick(env))
+    env["runner"]._kanban_owner_wake_state.last_wake.clear()   # past the coalescing window
+    _rehandback(t2, 2114)
     more = _tick(env)[len(turns):]
     assert _paths(more) == ["owner-wake"], _msg("W14", "actionable_only:false must restore the wake", more)
 
