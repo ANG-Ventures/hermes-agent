@@ -482,6 +482,34 @@ def arm_sticky(store: StickyStore, key: StickyKey, *, cls: str, now: float,
     return state
 
 
+ADVANCE_CLASSES = frozenset({"quota_model"})
+
+
+def advance_sticky_fallback(store: StickyStore, key: StickyKey, *, cls: str, now: float,
+                            failing: Tuple[Any, Any], fallback: Tuple[Any, Any],
+                            fallback_index: Optional[int] = None) -> Optional[StickyState]:
+    """Chain walk inside an active episode (t_fc121c8e): when the STORED
+    fallback just refused with ``quota_model``, store the entry that activated
+    so the next resume skips the exhausted one. Touches only the fallback
+    fields; ``until``/``n``/``cls`` stay put (B1: a fallback failure never
+    escalates the primary's clock). ``quota_seat`` is excluded: on a pool
+    relay that is one seat the relay rotates around, not a dead entry."""
+    if cls not in ADVANCE_CLASSES:
+        return None
+    state = _load(store, key)
+    if state is None or not state.active:
+        return None
+    if _norm_pm(*failing) != _norm_pm(state.fallback_provider, state.fallback_model):
+        return None
+    fb_p, fb_m = _norm_pm(*fallback)
+    if not fb_p:
+        return None
+    state.fallback_provider, state.fallback_model = fb_p, fb_m
+    state.fallback_index = fallback_index
+    store.put(key, state, now)
+    return state
+
+
 def note_fallback_success(store: StickyStore, key: StickyKey, now: float,
                           session_id: Optional[str]) -> Optional[StickyState]:
     """Write-through of the fallback-side fields on every fallback success."""
