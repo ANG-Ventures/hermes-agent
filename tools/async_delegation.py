@@ -1380,6 +1380,8 @@ def _dispatch_admitted(
         "slot_key": slot_key or delegation_id,
         # A kanban unit is one from dispatch on: a shutdown racing its spawn must leave it running (I9).
         **({"kanban_unit": True} if kanban is not None and durable_spec is not None else {}),
+        # Set once the unit's launch settles where it runs (``kanban_runtime``); delegate_task reports it.
+        **({"_kanban_launched": threading.Event()} if kanban is not None else {}),
         **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
@@ -1437,11 +1439,13 @@ def _dispatch_admitted(
                     profile_home=_record_profile_home(record),
                 )
             except Exception as exc:
+                _note_kanban_launch(delegation_id, "none (unit did not start)")
                 _finalize(delegation_id, crash_result(
                     f"submission telemetry failed: {type(exc).__name__}: {exc}",
                     round(time.time() - dispatched_at, 2)), status)
                 return
             if not submitted:
+                _note_kanban_launch(delegation_id, "none (unit did not start)")
                 logger.info(
                     "async_delegation_start_skipped delegation_id=%s attempt_id=%s "
                     "reason=cancelled_or_superseded",
@@ -1608,7 +1612,8 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         delegation_id=delegation_id, attempt_id=old_attempt, profile_home=Path(profile_home),
         profile=str(kanban.get("profile") or "default"), goal=str(record.get("goal") or ""),
         cwd=str(kanban.get("cwd") or ""), session_id=kanban.get("session_id"),
-        spawn_fn=kanban.get("spawn_fn"), slot_key=record.get("slot_key"))
+        spawn_fn=kanban.get("spawn_fn"), slot_key=record.get("slot_key"),
+        flagship_reason=kanban.get("flagship_reason"))
     if launched.get("ok"):
         with _records_lock:
             rec = _records.get(delegation_id)
@@ -1628,13 +1633,47 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
                 logger.debug("kanban on_spawned hook failed", exc_info=True)
         logger.info("async_delegation_kanban_spawned delegation_id=%s task_id=%s pid=%s",
                     delegation_id, launched.get("task_id"), launched.get("pid"))
+        _note_kanban_launch(delegation_id, KANBAN_SPAWNED_RUNTIME)
         return True
     logger.warning("async_delegation_kanban_spawn_failed delegation_id=%s attempt_id=%s error=%s",
                    delegation_id, old_attempt, launched.get("error"))
+    error_class = str(launched.get("error") or "").split(":", 1)[0] or "unknown"
     try:
-        return _fall_back_in_process(delegation_id, record, launched, old_attempt, profile_home)
+        on_card = _fall_back_in_process(delegation_id, record, launched, old_attempt, profile_home)
+    except Exception:
+        _note_kanban_launch(delegation_id, f"none (kanban spawn failed: {error_class}; not run)")
+        raise
     finally:
         _akb.release_launch_fence(launched.get("task_id"))
+    _note_kanban_launch(delegation_id, f"in_process (kanban spawn failed: {error_class})")
+    return on_card
+
+
+#: ``runtime`` delegate_task reports for a unit whose card spawned.
+KANBAN_SPAWNED_RUNTIME = "kanban"
+
+
+def _note_kanban_launch(delegation_id: str, runtime: str) -> None:
+    """Record where a kanban-eligible unit actually runs and wake :func:`kanban_launch_runtime`."""
+    with _records_lock:
+        rec = _records.get(delegation_id) or {}
+        event = rec.get("_kanban_launched")
+        if event is None:
+            return  # not a kanban-eligible unit
+        rec["kanban_runtime"] = runtime
+    event.set()
+
+
+def kanban_launch_runtime(delegation_id: str, timeout: float) -> Optional[str]:
+    """Where a dispatched kanban-eligible unit runs (``kanban``, ``in_process (kanban spawn
+    failed: <class>)``, ...), waiting up to ``timeout`` for the launch; ``None`` while pending."""
+    with _records_lock:
+        rec = _records.get(delegation_id) or {}
+        event = rec.get("_kanban_launched")
+    if event is None or not event.wait(timeout):
+        return None
+    with _records_lock:
+        return rec.get("kanban_runtime")
 
 
 def _fall_back_in_process(delegation_id: str, record: Dict[str, Any], launched: Dict[str, Any],

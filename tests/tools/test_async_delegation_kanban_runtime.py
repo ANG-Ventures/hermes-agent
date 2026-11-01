@@ -74,15 +74,15 @@ def spawner():
     s.cleanup()
 
 
-def _spec(cwd, *, runtime="kanban"):
+def _spec(cwd, *, runtime="kanban", model="m", provider="p"):
     return {
         "profile": "default",
         "source": {"kind": "single", "tasks": [{"goal": "write the report", "role": "leaf"}],
                    "shared_context": None},
-        "execution": {"model": "m", "provider": "p", "toolsets": ["file"], "max_iterations": 5,
+        "execution": {"model": model, "provider": "p", "toolsets": ["file"], "max_iterations": 5,
                       "workspace_hint": str(cwd), "runtime": runtime,
                       "route": {"requested_provider": "custom:named", "model": "m", "explicit_base_url": None},
-                      "credential_ref": {"provider": "p"}},
+                      "credential_ref": {"provider": provider}},
         "route": {"session_key": "agent:main:telegram:dm:1", "parent_session_id": "parent-1",
                   "origin_ui_session_id": "", "platform": "telegram", "chat_id": "1", "profile": "default"},
     }
@@ -102,7 +102,8 @@ def _sync_executor(monkeypatch):
     return threads
 
 
-def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, spawned=None):
+def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, spawned=None, model="m",
+              provider="p"):
     threads = _sync_executor(monkeypatch)
     cwd = tmp_path / "cwd"
     cwd.mkdir(exist_ok=True)
@@ -116,7 +117,7 @@ def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, s
         goals=["write the report"], context=None, toolsets=None, role="leaf", model="m",
         session_key="agent:main:telegram:dm:1", parent_session_id="parent-1",
         runner=runner or _runner, max_async_children=max_children,
-        durable_spec=_spec(cwd), current_boot_id=BOOT,
+        durable_spec=_spec(cwd, model=model, provider=provider), current_boot_id=BOOT,
         kanban={"profile": "default", "cwd": str(cwd), "session_id": "parent-1", "spawn_fn": spawn_fn,
                 "on_spawned": spawned})
     for t in threads:
@@ -268,12 +269,143 @@ def test_spawn_failure_runs_once_in_process_under_the_new_attempt(monkeypatch, t
     assert len(terminal) == 1 and terminal[0]["payload"]["attempt_id"] == rec["attempt"]["attempt_id"]
     assert ad._records[did].get("kanban_unit") is None
     assert ad.active_count() == 0
+    # delegate_task reports where the unit ran, never the kanban intent (t_7e0f9dab).
+    runtime = ad.kanban_launch_runtime(did, timeout=0)
+    assert runtime.startswith("in_process (kanban spawn failed: ") and "Error" in runtime
     # The failed card is archived, never left to run.
     from hermes_cli import kanban_db as kb
 
     with kb.connect_closing(board="delegations") as conn:
         statuses = [r["status"] for r in conn.execute("SELECT status FROM tasks")]
     assert statuses == ["archived"]
+
+
+def _flagship_default_profile(home):
+    (home / "config.yaml").write_text("model:\n  default: claude-fable-5-1\n")
+
+
+def test_unit_on_a_flagship_default_profile_spawns_pinned_to_its_execution_model(home, monkeypatch, tmp_path,
+                                                                                spawner):
+    """t_7e0f9dab: the card is a container for the delegation; the guard judges the route the runner
+    runs (``execution.model``), not the assignee profile's flagship default, so the unit spawns."""
+    _flagship_default_profile(home)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    rec = _record(did)
+    assert calls == [], "no in-process fallback"
+    assert rec["execution"]["runtime"] == "kanban"
+    card, kinds = _card(rec["kanban"]["task_id"])
+    assert card.model_override == rec["execution"]["model"] and kinds.count("spawned") == 1
+    assert ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+
+
+def test_unit_inheriting_a_flagship_route_spawns_under_proven_operator_authority(home, monkeypatch, tmp_path,
+                                                                              spawner):
+    """Prism f226ee06e5ba: Apollo's children inherit its flagship route (no per-call reason). Under the
+    operator's own gateway the container card carries an override naming the delegation and spawns."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import model_policy
+
+    _flagship_default_profile(home)
+    # What _runs_under_operator_gateway proves inside the default profile's gateway process.
+    monkeypatch.setattr(model_policy, "flagship_actor", lambda explicit=None: explicit or "user")
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda actor: actor in kb.OPERATOR_PROFILES)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="claude-fable-5-1")
+    did = handle["delegation_id"]
+    rec = _record(did)
+    assert calls == [] and ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+    task_id = rec["kanban"]["task_id"]
+    card, kinds = _card(task_id)
+    assert card.model_override == "claude-fable-5-1" and kinds.count("spawned") == 1
+    with kb.connect_closing(board="delegations") as conn:
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+    assert any(b.startswith("flagship override:") and did in b for b in bodies)
+
+
+def test_unit_inheriting_a_flagship_route_without_authority_falls_back_and_says_so(home, monkeypatch, tmp_path,
+                                                                                 spawner):
+    """The guard is not weakened: no proven operator authority -> refused, run in-process, reported."""
+    _flagship_default_profile(home)
+    from hermes_cli import model_policy
+
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda actor: False)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="claude-fable-5-1")
+    assert len(calls) == 1
+    assert ad.kanban_launch_runtime(handle["delegation_id"], timeout=0) == \
+        "in_process (kanban spawn failed: FlagshipAssigneeRefused)"
+
+
+@pytest.mark.parametrize("granted", [True, False])
+def test_standing_grant_admits_an_inherited_flagship_default_without_authority(home, monkeypatch, tmp_path,
+                                                                              spawner, granted):
+    """Prism f226ee06e5ba round 3 (tiresias): a root ``kanban.flagship_profile_allowances`` grant on the
+    profile's flagship DEFAULT lets an inherited-default unit spawn with no per-call operator authority,
+    as the unpinned card did before the pin. Without the grant the guard still refuses it."""
+    from hermes_cli import model_policy
+
+    grant = "kanban:\n  flagship_profile_allowances:\n    default: standing grant (test)\n" if granted else ""
+    (home / "config.yaml").write_text("model:\n  default: claude-alr/claude-fable-5-1\n" + grant)
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda actor: False)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="claude-fable-5-1",
+                              provider="claude-alr")
+    did = handle["delegation_id"]
+    if not granted:
+        assert len(calls) == 1
+        assert ad.kanban_launch_runtime(did, timeout=0) == \
+            "in_process (kanban spawn failed: FlagshipAssigneeRefused)"
+        return
+    assert calls == [] and ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+    card, kinds = _card(_record(did)["kanban"]["task_id"])
+    assert card.model_override is None and kinds.count("spawned") == 1
+
+
+def test_standing_grant_never_unpins_the_same_model_on_another_provider(home, monkeypatch, tmp_path, spawner):
+    """Prism cbbaea6f30b8: a grant on ``claude-alr/claude-fable-5-1`` names that ROUTE. A unit on
+    ``claude-fable-5-1`` via ``custom:other`` is not the default: unpinning it would run it on the granted
+    lane instead. It stays pinned to its own route, the guard refuses it, and the fallback says so."""
+    from hermes_cli import model_policy
+
+    (home / "config.yaml").write_text("model:\n  default: claude-alr/claude-fable-5-1\n"
+                                      "kanban:\n  flagship_profile_allowances:\n    default: standing grant (test)\n")
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda actor: False)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="claude-fable-5-1",
+                              provider="custom:other")
+    assert len(calls) == 1
+    assert ad.kanban_launch_runtime(handle["delegation_id"], timeout=0) == \
+        "in_process (kanban spawn failed: FlagshipAssigneeRefused)"
+
+
+def test_unit_pin_keeps_the_delegations_provider_and_no_lane_catalog_refuses_it(home, monkeypatch, tmp_path,
+                                                                                spawner):
+    """Prism f226ee06e5ba round 2: a ``lane/model`` id on a named custom endpoint is pinned with that
+    endpoint (never re-split onto ``openai``), and a lane catalog that does not list the id cannot push
+    the container card in-process: the runner never reads its route from the pin."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import model_registry
+
+    monkeypatch.setattr(model_registry, "catalog_for", lambda provider: ("some-other-model",))
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="openai/gpt-oss-120b",
+                              provider="custom:vllm")
+    did = handle["delegation_id"]
+    assert calls == [] and ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+    task_id = _record(did)["kanban"]["task_id"]
+    card, kinds = _card(task_id)
+    assert card.provider_override == "custom:vllm" and kinds.count("spawned") == 1
+    with kb.connect_closing(board="delegations") as conn:
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+    assert any(b.startswith(kb.MODEL_FORCE_COMMENT_PREFIX) and did in b for b in bodies)
+
+
+def test_ordinary_card_on_a_flagship_default_profile_is_still_refused(home):
+    """The guard is unchanged for any card that is not a delegation unit: no pin, no reason, refused."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.model_policy import FlagshipAssigneeRefused
+
+    _flagship_default_profile(home)
+    kb.create_board("delegations")
+    with kb.connect_closing(board="delegations") as conn, pytest.raises(FlagshipAssigneeRefused):
+        kb.create_task(conn, title="ordinary card", assignee="default", board="delegations",
+                       created_by="default")
 
 
 def test_spawn_failure_with_an_unfenced_card_fails_instead_of_running_in_process(monkeypatch, tmp_path):

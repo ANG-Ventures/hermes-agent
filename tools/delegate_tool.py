@@ -926,6 +926,10 @@ class _LateCompletion:
 # (floor _CHILD_TIMEOUT_FLOOR_S). Only delivery is bounded by it: persistence teardown waits
 # for the turn to exit (docs/dev/delegate-child-lifecycle.md, I2).
 _LATE_STOP_DRAIN_SECONDS = 5.0
+
+#: How long delegate_task waits for a kanban unit's card to spawn (or fall back) before it reports
+#: the runtime as pending. A refusal is immediate; a failed spawn's fence wait is up to ~12 s.
+_KANBAN_LAUNCH_WAIT_SECONDS = 15.0
 # Children whose persistence teardown is waiting on a still-live turn.
 _deferred_teardowns = 0
 _deferred_teardowns_lock = threading.Lock()
@@ -4547,7 +4551,11 @@ def delegate_task(
     # not blocked in the meantime. This is the contract: dispatch N subagents,
     # keep chatting, get the combined summaries back together at the end.
     if background:
-        from tools.async_delegation import dispatch_async_delegation_batch
+        from tools.async_delegation import (
+            KANBAN_SPAWNED_RUNTIME,
+            dispatch_async_delegation_batch,
+            kanban_launch_runtime,
+        )
         from tools.approval import get_current_session_key
 
         # Finite sessions cannot route a detached subagent result back to the
@@ -4764,7 +4772,8 @@ def delegate_task(
                             _teardown(_c, "kanban_spawned")
 
                 _kanban = {"profile": _durable_spec.get("profile") or "default", "cwd": _unit_cwd,
-                           "session_id": _parent_session_id, "on_spawned": _on_kanban_spawned}
+                           "session_id": _parent_session_id, "on_spawned": _on_kanban_spawned,
+                           "flagship_reason": audit_reason}
             else:
                 _akb.log_ineligible(_why_not, live_deleg_id)
         # Detached mode (docs/dev/delegate-detached-background.md): a durable unit runs its children in
@@ -4859,8 +4868,13 @@ def delegate_task(
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]
+            _runtime = None
             if _kanban is not None:
-                payload["runtime"] = "kanban"
+                # Report where the unit actually runs, not the intent: a failed card spawn falls
+                # back in-process (t_7e0f9dab).
+                _runtime = kanban_launch_runtime(dispatch["delegation_id"], _KANBAN_LAUNCH_WAIT_SECONDS)
+                payload["runtime"] = _runtime or "kanban (spawn pending)"
+            if _kanban is not None and _runtime in (None, KANBAN_SPAWNED_RUNTIME):
                 payload["control_hint"] = (
                     "This background unit runs in its own process and survives a gateway restart. "
                     "steer/list are not available for it; /stop still cancels it.")
