@@ -941,7 +941,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
     pin_refusal = kanban_access_bound_pin.refusal(args.body)
     if pin_refusal:
         return _err(f"kanban create: {pin_refusal}", 2)
-    handoff = kanban_access_bound_pin.handoff_refusal("create", args.title, getattr(args, "assignee", None))
+    handoff, handoff_row = kanban_access_bound_pin.handoff_check(
+        "create", None, getattr(args, "assignee", None), title=args.title)
     if handoff:
         return _err(f"kanban create: {handoff}", 2)
     max_retries = getattr(args, "max_retries", None)
@@ -1032,6 +1033,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 time_gate_guard=True,
                 i_mean_blocks=bool(getattr(args, "i_mean_blocks", False)),
             )
+            kanban_access_bound_pin.bind_created(handoff_row, task_id)
             task = kb.get_task(conn, task_id)
             # Notice only when THIS call created the card and auto-added the
             # skill: an idempotent hit returns an older card whose created

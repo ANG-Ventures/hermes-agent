@@ -126,20 +126,31 @@ def _handoff_quote(env_name: str) -> Optional[str]:
         return None
 
 
+def _lock_module():
+    """``fcntl`` where it exists (every fleet host), else None (Windows)."""
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    return fcntl
+
+
 def _append_ledger_line(ledger: Path, line: str) -> None:
     """Append one whole line or nothing: exclusive lock, one ``os.write`` of the full line, fsync;
-    any OSError (short write, ENOSPC) truncates back to the pre-append length and re-raises."""
+    any OSError (short write, ENOSPC) truncates back to the pre-append length and re-raises. The
+    rollback is safe only under the lock, so a platform without ``fcntl`` raises before writing."""
     import os
     ledger.parent.mkdir(parents=True, exist_ok=True)
     data = line.encode("utf-8")
+    fcntl = _lock_module()
+    if fcntl is None:
+        # No flock (Windows): the truncate-on-failure rollback could erase another writer's
+        # committed row, so refuse instead; the caller fails the hand-off closed
+        # (Prism 57e574655dc8, 1671fc3d2bcc). No fleet host runs this CLI on Windows.
+        raise OSError(f"no exclusive file lock on this platform; refusing to append to {ledger}")
     fd = os.open(ledger, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
-        try:
-            import fcntl
-        except ImportError:  # Windows: no flock; the single write + truncate still applies
-            fcntl = None
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         length = os.fstat(fd).st_size
         try:
             written = os.write(fd, data)
@@ -157,49 +168,90 @@ def _append_ledger_line(ledger: Path, line: str) -> None:
         os.close(fd)  # releases the flock
 
 
+def _ledger_root() -> Path:
+    """Where the handoff ledger lives: the KANBAN home, so a sandboxed board (HERMES_KANBAN_SANDBOX /
+    HERMES_KANBAN_HOME) ledgers into its own tree, never the live fleet's (Prism 6b5a28f52a8c).
+    The hook module itself still loads from the fleet root: policy is the live one."""
+    from hermes_cli import kanban_db
+    return kanban_db.kanban_home()
+
+
 def handoff_refusal(verb: str, card: Optional[str], assignee: Optional[str]) -> Optional[str]:
     """The hook's refusal text when an aegis session hands *card* to an Apollo alias without a
     ledgered ``AEGIS_HANDOFF_APOLLO`` quote, else None (an allowed override is ledgered first)."""
+    return handoff_check(verb, card, assignee)[0]
+
+
+def handoff_check(verb: str, card: Optional[str], assignee: Optional[str], *,
+                  title: Optional[str] = None) -> tuple:
+    """``(refusal, row_id)``. ``row_id`` names the ledgered override row (None when nothing was
+    ledgered). For ``create`` the card does not exist yet: pass ``card=None`` + ``title``, then
+    :func:`bind_created` once the id is known (Prism 92795be78ffb: the card field never holds a title)."""
     import json
     import os
+    import uuid
     from datetime import datetime, timezone
 
     if not assignee:
-        return None
+        return None, None
     try:
         profiles = _acting_profiles()
     except Exception:
         _log.debug("handoff: cannot resolve the acting profile; failing open", exc_info=True)
-        return None
+        return None, None
     root = _fleet_root()
     # No OFF_MARKER check here: the hook's aegis-no-apollo-handoff rule has no off-switch of its own (the
     # ledgered Ace quote is the only override), and the CLI mirrors that. The marker disarms the pool pin only.
     mod = _load_hook(root)
     if mod is None:
-        return None
+        return None, None
     try:
         profile = str(mod.HANDOFF_PROFILE).lower()
         if profile not in profiles:
-            return None
+            return None, None
         target = str(assignee).strip().lower()
         if target not in {str(a).lower() for a in mod.APOLLO_ASSIGNEES}:
-            return None
+            return None, None
         env_name, minimum = str(mod.HANDOFF_ENV), int(mod.HANDOFF_MIN)
         offered = _handoff_quote(env_name)
         quote = (offered or "").strip()
         if len(quote) < minimum:
-            return mod.handoff_refusal(verb, target, offered is not None)
+            return mod.handoff_refusal(verb, target, offered is not None), None
         rule = str(getattr(mod, "HANDOFF_RULE", "aegis-no-apollo-handoff"))
     except Exception:
         _log.debug("handoff: hook surface unusable; failing open", exc_info=True)
-        return None
+        return None, None
+    row_id = uuid.uuid4().hex
     row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "profile": profile,
            "session_id": os.environ.get("HERMES_SESSION_ID", ""), "tool": "kanban-cli",
-           "verb": verb, "card": card, "assignee": target, "quote": quote}
-    ledger = root / HANDOFF_LEDGER
+           "verb": verb, "card": card, "assignee": target, "quote": quote, "row_id": row_id}
+    if title is not None:
+        row["title"] = title
+    try:
+        ledger = _ledger_root() / HANDOFF_LEDGER
+    except Exception as exc:  # a sandbox with nowhere isolated to go refuses; so does the handoff
+        return (f"BLOCKED by {rule}: no ledger location for this board ({exc}); an unledgered "
+                f"hand-off is not allowed."), None
     try:
         _append_ledger_line(ledger, json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError:
         return (f"BLOCKED by {rule}: the hand-off quote is valid but the ledger {ledger} could not "
-                f"be written, and an unledgered hand-off is not allowed.")
-    return None
+                f"be written, and an unledgered hand-off is not allowed."), None
+    return None, row_id
+
+
+def bind_created(row_id: Optional[str], card: str) -> None:
+    """Record the id ``create`` produced for an override ledgered as ``row_id``. Best effort: the
+    authorization row is already durable; a failed bind is logged, never un-does the card."""
+    import json
+    from datetime import datetime, timezone
+
+    if not row_id:
+        return
+    row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "verb": "create-bound",
+           "row_id": row_id, "card": card, "tool": "kanban-cli"}
+    try:
+        _append_ledger_line(_ledger_root() / HANDOFF_LEDGER,
+                            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        _log.warning("handoff ledger: cannot bind override %s to %s", row_id, card, exc_info=True)
