@@ -4,6 +4,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from gateway.session_context import get_session_env, restore_session_vars, set_session_vars
 from agent.runtime_cwd import resolve_agent_cwd
 from run_agent import AIAgent
@@ -427,7 +429,54 @@ def test_recovered_model_only_pin_keeps_no_parent_chain():
         restore_session_vars(tokens)
     record = json.loads(json.dumps(spec))
     with patch.object(dt, "_load_config", return_value=dict(global_null)):
-        cfg = _resolved_recovery_creds(record, _BPR_RUNTIME)["cfg"]
-    assert cfg["model"] == "child-model"
+        got = _recovered_child_build(record)
+    assert got["model"] == "child-model" and not got["override_provider"]
     rebuilt = _real_parent(record["execution"]["fallback_chain"])
-    assert _resolve_child_fallback_chain(rebuilt, cfg, bool(cfg["model"]), child_model=cfg["model"]) == original
+    assert _resolve_child_fallback_chain(rebuilt, global_null, bool(got["model"]),
+                                         child_model=got["model"]) == original
+
+
+def _recovered_child_build(record):
+    captured = {}
+
+    def spy(**kwargs):
+        captured.update(kwargs)
+        raise _StopAtChildBuild
+
+    with patch.object(dt, "_build_child_preserving_parent_tools", spy), pytest.raises(_StopAtChildBuild):
+        dt.delegate_task(tasks=record["source"]["tasks"], parent_agent=_parent(), _recovery_spec=record)
+    return captured
+
+
+class _StopAtChildBuild(Exception):
+    pass
+
+
+def test_recovered_model_only_pin_is_not_alias_resolved_twice():
+    # Prism 0418dcff8ba7: model_aliases.worker -> ("gpt-5.5", inherit), while "gpt-5.5" is itself an alias
+    # for openai-codex. Dispatch resolved "worker" once; recovery must reuse that result, not re-resolve it.
+    aliases = {"worker": ("gpt-5.5", None), "gpt-5.5": ("gpt-5.5", "openai-codex")}
+
+    def resolve(model, provider):
+        return (model, provider) if provider else aliases.get(model, (model, provider))
+
+    global_null = {"resume_on_restart": True, "fallback_providers": None}
+    with patch("hermes_cli.model_switch.resolve_model_pair_for_storage", side_effect=resolve):
+        dispatched = dt._resolve_delegation_credentials({"model": "worker"}, _parent())
+        assert (dispatched["model"], dispatched["provider"]) == ("gpt-5.5", None)
+        tokens = set_session_vars(platform="telegram", chat_id="123", session_key="agent:main:telegram:dm:123",
+                                  session_id="sess-parent", profile="work", async_delivery=True)
+        try:
+            with patch("gateway.status.get_current_boot_id", return_value="100:1.0"):
+                spec, _ = dt._build_durable_background_spec(
+                    task_list=[{"goal": "finish", "context": None}], shared_context=None, top_role="leaf",
+                    inherit_context=False, cfg=dict(global_null), creds=dispatched,
+                    parent_agent=_real_parent(None), session_key="agent:main:telegram:dm:123",
+                    parent_session_id="sess-parent", origin_ui_session_id="", max_iterations=45)
+        finally:
+            restore_session_vars(tokens)
+        record = json.loads(json.dumps(spec))
+        with patch.object(dt, "_load_config", return_value=dict(global_null)):
+            got = _recovered_child_build(record)
+    assert got["model"] == "gpt-5.5"
+    assert not got["override_provider"] and not got["override_base_url"]

@@ -4020,7 +4020,7 @@ def delegate_task(
         _model_pinned = bool(_credential_ref.get("model_pinned"))
         cfg = dict(cfg)
         cfg.update({
-            "model": "" if _inherited_route and not _model_pinned else (_execution.get("model") or ""),
+            "model": "" if _inherited_route else (_execution.get("model") or ""),
             "provider": "" if _inherited_route else _recovered_provider,
             "base_url": (_execution.get("base_url") or "") if _direct_endpoint and not _inherited_route else "",
             "api_key": "",
@@ -4075,6 +4075,13 @@ def delegate_task(
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+    if _recovery_spec and not model and _inherited_route and _model_pinned:
+        # A model-only pin (provider inherited) is restored AFTER resolution, as the resolved model the
+        # dispatch recorded: alias resolution is not idempotent (gpt-5.5 -> openai-codex), so it must not
+        # run twice. The child then resolves as pinned on the inherited route, as at dispatch (Prism
+        # e087e98e6bb8, 0418dcff8ba7).
+        creds = dict(creds)
+        creds["model"] = _execution.get("model") or None
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
