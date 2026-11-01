@@ -318,6 +318,59 @@ def test_group_born_during_reap_is_signalled_once_a_later_proof_covers_it(monkey
     assert set(signalled) == {111, 333}, "a group born during the reap escaped"
 
 
+def test_known_member_born_inside_the_slack_is_sigkilled(monkeypatch):
+    """Prism f5b8e6a3daaf: with grace=0, a proven member that ignores SIGTERM
+    and was born 0.05 s before the last proof is a member by identity, so the
+    birth slack must not spare it from SIGKILL."""
+    import signal
+
+    births = {111: 1000.00}
+    sids = {111: 99_999}
+    _fake_world(monkeypatch, lambda sid: [(111, 111)], births, sids)
+    sent: list = []
+    monkeypatch.setattr(kb.os, "killpg", lambda pg, sig: sent.append((pg, sig)))
+    monkeypatch.setattr(kb, "_reap_now", lambda: 1000.05)  # every proof
+    kb._reap_worker_session(99_999, born_after=999.0, born_before=1000.02, grace=0)
+    assert (111, signal.SIGKILL) in sent, f"known member left running: {sent}"
+
+
+def test_wall_clock_step_mid_reap_signals_no_member_first_seen_after_it(monkeypatch):
+    """Prism a7748c722865: on the fallback (wall) clock, a 5 s forward step
+    mid-reap moves the proof past births that follow the true proof. A
+    replacement session born after the original emptied must not be
+    signalled on the strength of that stepped proof."""
+    real_time = time.time
+    step = [0.0]
+    births = {111: real_time() - 100}
+    sids = {111: 99_999}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:             # ownership check, before the reap began
+            return [(111, 111)]
+        if len(calls) == 2:
+            step[0] = 5.0               # mid-reap the wall clock steps forward ...
+            return [(111, 111)]         # ... while 111 lives: proofs read +5 s
+        births.pop(111, None)           # the original session empties ...
+        sids.pop(111, None)
+        births[222] = real_time()       # ... and its sid is reused, unstepped birth
+        sids[222] = 99_999
+        return [(222, 222)]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    fake_time = type(sys)("fake_time")
+    fake_time.__dict__.update(vars(time))
+    fake_time.time = lambda: real_time() + step[0]
+    monkeypatch.setattr(kb, "time", fake_time)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", False)
+    monkeypatch.setattr(kb, "_reap_now", lambda: kb.time.time())
+    kb._reap_worker_session(99_999, born_after=births[111] - 1,
+                            born_before=births[111] + 1, grace=1.0)
+    assert 222 not in signalled, f"signalled a member first seen after the step: {signalled}"
+    assert signalled == [111]
+
+
 @pytest.mark.platforms("linux", "macos")
 def test_reap_birth_never_reads_earlier_than_the_slack():
     """The contract the continuity proof rests on: a process's birth, read on

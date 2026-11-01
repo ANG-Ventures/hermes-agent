@@ -18589,6 +18589,26 @@ def _reap_now() -> float:
     return time.time()
 
 
+def _reap_wall_offset() -> Optional[float]:
+    """``time.time() - time.monotonic()`` on the fallback reap clock, None on
+    Linux (CLOCK_BOOTTIME cannot step). macOS births come from p_starttime,
+    a wall reading with no monotonic twin, so a reap there cannot avoid
+    time.time(); this offset moving is how it learns the wall clock stepped
+    (Prism a7748c722865). Bracketed by two monotonic reads, tightest of three,
+    so a preempted read does not look like a step. A sleep stops monotonic on
+    macOS and reads as a step too: the safe direction."""
+    if _REAP_LINUX_CLOCK:
+        return None
+    best: Optional[tuple[float, float]] = None
+    for _ in range(3):
+        m1 = time.monotonic()
+        wall = time.time()
+        m2 = time.monotonic()
+        if best is None or m2 - m1 < best[0]:
+            best = (m2 - m1, wall - (m1 + m2) / 2)
+    return best[1]
+
+
 def _reap_birth(pid: int) -> Optional[float]:
     """Birth of ``pid`` on the :func:`_reap_now` clock, or None when gone."""
     if not _REAP_LINUX_CLOCK:
@@ -18711,6 +18731,24 @@ def _reap_worker_session(
                 return checked
         return None
 
+    wall_offset = _reap_wall_offset()
+    stepped = False
+
+    def _clock_stepped() -> bool:
+        # Latched: once the wall clock moved against monotonic by more than
+        # the slack since the reap began, no birth is ordered against a proof
+        # for the rest of this reap; continuity by identity still holds.
+        nonlocal stepped
+        if not stepped and wall_offset is not None:
+            offset = _reap_wall_offset()
+            if offset is None or abs(offset - wall_offset) > _REAP_BIRTH_SLACK_SECONDS:
+                stepped = True
+                _log.warning(
+                    "kanban: wall clock stepped during the reap of session %d; "
+                    "only already-proven members are signalled", sid,
+                )
+        return stepped
+
     known = _identities(members)
     proved = _proved(known)
     if proved is None:  # the session emptied (sid reusable) since ownership was checked
@@ -18746,12 +18784,19 @@ def _reap_worker_session(
         # "Born before" only counts with the clock's read error on the safe
         # side: a birth inside the slack may postdate the proof, so it waits
         # for a later proof (one every 50 ms while a member lives).
+        # An identity already in ``known`` (same pid, same birth) is a member
+        # by identity and needs no ordering, so a known member born inside the
+        # slack is still SIGKILLed (Prism f5b8e6a3daaf). The slack applies only
+        # to processes first seen in this snapshot, and births are not ordered
+        # at all once the wall clock stepped (:func:`_reap_wall_offset`).
         # None -> unprovable and no member was seen alive meanwhile: stop.
         nonlocal known
         before = proved_at
         current = _scan()
         ids = _identities(current)
-        if not any(created + _REAP_BIRTH_SLACK_SECONDS <= proved_at for _, created in ids):
+        if not ids & known and (_clock_stepped() or not any(
+            created + _REAP_BIRTH_SLACK_SECONDS <= proved_at for _, created in ids
+        )):
             return set() if proved_at > before else None
         known = ids
         return {pgid for _, pgid in current}
