@@ -890,11 +890,36 @@ def persistable_fallback_policy(routing_cfg: Any) -> dict[str, Any]:
         return {"fallback_providers": declared}
     entries = [declared] if isinstance(declared, dict) else declared if isinstance(declared, list) else []
     rungs = [entry for entry in entries if isinstance(entry, dict)]
-    if rungs and persistable_fallback_chain(rungs) is None:
+    # The whole declared rung is checked, nested values included (``options.base_url``), and what persists
+    # is a JSON-safe copy of exactly what was checked (Prism c6cb98245680).
+    if any(_carries_credential(rung) for rung in rungs):
+        logger.info("async_delegation fallback policy not persisted: a declared rung carries a credential")
         return {"fallback_providers": []}
-    kept = [dict(entry) if isinstance(entry, dict) else entry for entry in entries if isinstance(entry, (dict, str))]
+    kept = [_json_safe(entry) for entry in entries if isinstance(entry, (dict, str))]
     # Nothing usable resolves to the owner's default at dispatch; None resolves to the same default.
     return {"fallback_providers": kept or None}
+
+
+def _carries_credential(value: Any) -> bool:
+    """True when a credential-shaped key or a credential-bearing URL appears anywhere inside ``value``."""
+    if isinstance(value, dict):
+        return any(_sensitive_query_key(str(key)) or _carries_credential(child) for key, child in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_carries_credential(child) for child in value)
+    return isinstance(value, str) and url_has_credentials(value)
+
+
+def _json_safe(value: Any) -> Any:
+    """A copy of ``value`` holding only JSON data: dicts, lists and scalars; anything else is dropped."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(child) for key, child in value.items() if _is_json_data(child)}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(child) for child in value if _is_json_data(child)]
+    return value
+
+
+def _is_json_data(value: Any) -> bool:
+    return isinstance(value, (dict, list, tuple, str, int, float, bool, type(None)))
 
 
 def _sensitive_query_key(key: str) -> bool:

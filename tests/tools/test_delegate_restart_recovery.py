@@ -370,6 +370,18 @@ def test_unpicklable_fallback_chain_never_takes_the_durable_spec_down(caplog):
     assert "fallback chain not persisted" in caplog.text
 
 
+def test_declared_fallback_policy_never_persists_a_nested_credential():
+    """Prism c6cb98245680: the whole declared rung is checked, nested ``options`` included, and only
+    the checked JSON copy persists."""
+    from tools.async_delegation_store import persistable_fallback_policy
+
+    leaky = [{"source": "s", "options": {"base_url": "https://user:SECRET@example.com/v1"}}]
+    assert persistable_fallback_policy({"fallback_providers": leaky}) == {"fallback_providers": []}
+    clean = [{"source": "s", "options": {"base_url": "https://example.com/v1"}, "lock": threading.Lock()}, "openrouter"]
+    assert persistable_fallback_policy({"fallback_providers": clean}) == {
+        "fallback_providers": [{"source": "s", "options": {"base_url": "https://example.com/v1"}}, "openrouter"]}
+
+
 # ── Prism 3de445560b2a: recovery keeps the route owner's fallback POLICY, not only the chain ──
 # A per-call ``credentials_cfg`` (``/review`` -> ``auxiliary.review``) is not replayed on recovery, so the
 # recovered children took the GLOBAL delegation block's policy: with ``fallback_providers: auto`` a pinned
