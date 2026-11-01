@@ -280,12 +280,32 @@ def test_digest_of_a_4h_batch_is_one_message():  # t_26d7df3d
     text = render(lines)
     assert len(text) <= MAX_MESSAGE_CHARS < 2000
     assert text.startswith("🗂 **kanban lifecycle** — 80 transition(s)")
-    assert "✔ t_00000000 [subs-ace] W3-6" in text   # board shown only off default
-    assert "👀 t_00000001 W3-6" in text and "⏸ t_00000002 W3-6" in text
-    assert "more (card events" in text and text.endswith("family=digest:kanban-lifecycle")
-    assert "handoff body" not in text
+    # r142 C: titles do not fit, so every card id is listed, grouped by kind.
+    for i in range(80):
+        assert f"t_{i:08x}" in text, i
+    assert "t_00000000[subs-ace]" in text   # board shown only off default
+    assert "✔ done 27:" in text and "👀 ready 27:" in text and "⏸ blocked 26:" in text
+    assert "more (card events" not in text and text.endswith("family=digest:kanban-lifecycle")
+    assert "handoff body" not in text and "W3-6" not in text
     small = render(lines[:3])  # a short batch keeps the full header lines
     assert "@human:apollo Kanban t_00000000 done" in small
+    mid = render(lines[:12])  # a mid batch keeps titles in compact form
+    assert "✔ t_00000000 [subs-ace] W3-6" in mid and "👀 t_00000001 W3-6" in mid
+
+
+def test_digest_grouped_ids_mark_repeats_and_fit():  # r142 C
+    """A card handed back for review three times in one window reads as ONE id with x3,
+    and 400 held lines (MAX_HELD) still render to one post with a +N more tally."""
+    from gateway.kanban_lifecycle_digest import MAX_MESSAGE_CHARS, render
+
+    title = " — " + "a long card title " * 10
+    rep = [f"👀 [default] @human:apollo Kanban t_0000abcd ready for review{title}"] * 3
+    rest = [f"✔ [default] @human:apollo Kanban t_{i:08x} done{title}" for i in range(30)]
+    text = render(rep + rest)
+    assert "👀 ready 3: t_0000abcd×3" in text
+    assert text.count("t_0000abcd") == 1
+    huge = render([f"✔ [default] @human:apollo Kanban t_{i:08x} done{title}" for i in range(400)])
+    assert len(huge) <= MAX_MESSAGE_CHARS and "✔ done 400:" in huge and " more" in huge
 
 
 def _second_sub(conn, tid, chat):
