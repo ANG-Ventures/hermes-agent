@@ -886,15 +886,15 @@ def persistable_fallback_policy(routing_cfg: Any) -> dict[str, Any]:
     A bare provider name carries no credential and persists verbatim, so the recovered value resolves
     exactly as the declared one did (Prism 75587d571cd7)."""
     declared = routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None
+    # The WHOLE declared value is checked before any early return (a URL string, string or dict rungs,
+    # nested values such as ``options.base_url``), and what persists is a JSON-safe copy of exactly
+    # what was checked (Prism c6cb98245680).
+    if _carries_credential(declared):
+        logger.info("async_delegation fallback policy not persisted: a declared rung carries a credential")
+        return {"fallback_providers": []}
     if declared is None or isinstance(declared, str) or declared == []:
         return {"fallback_providers": declared}
     entries = [declared] if isinstance(declared, dict) else declared if isinstance(declared, list) else []
-    rungs = [entry for entry in entries if isinstance(entry, dict)]
-    # The whole declared rung is checked, nested values included (``options.base_url``), and what persists
-    # is a JSON-safe copy of exactly what was checked (Prism c6cb98245680).
-    if any(_carries_credential(rung) for rung in rungs):
-        logger.info("async_delegation fallback policy not persisted: a declared rung carries a credential")
-        return {"fallback_providers": []}
     kept = [_json_safe(entry) for entry in entries if isinstance(entry, (dict, str))]
     # Nothing usable resolves to the owner's default at dispatch; None resolves to the same default.
     return {"fallback_providers": kept or None}

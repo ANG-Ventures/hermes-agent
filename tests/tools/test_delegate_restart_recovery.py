@@ -382,6 +382,18 @@ def test_declared_fallback_policy_never_persists_a_nested_credential():
         "fallback_providers": [{"source": "s", "options": {"base_url": "https://example.com/v1"}}, "openrouter"]}
 
 
+def test_declared_fallback_policy_never_persists_a_credential_url_string():
+    """Prism c6cb98245680 (string form): a credential URL as a bare string, alone or in a list, is
+    withheld as []; plain names and ``"auto"`` are unchanged."""
+    from tools.async_delegation_store import persistable_fallback_policy
+
+    url = "https://user:SECRET@example.com/v1"
+    assert persistable_fallback_policy({"fallback_providers": url}) == {"fallback_providers": []}
+    assert persistable_fallback_policy({"fallback_providers": [url]}) == {"fallback_providers": []}
+    assert persistable_fallback_policy({"fallback_providers": "auto"}) == {"fallback_providers": "auto"}
+    assert persistable_fallback_policy({"fallback_providers": ["openrouter"]}) == {"fallback_providers": ["openrouter"]}
+
+
 # ── Prism 3de445560b2a: recovery keeps the route owner's fallback POLICY, not only the chain ──
 # A per-call ``credentials_cfg`` (``/review`` -> ``auxiliary.review``) is not replayed on recovery, so the
 # recovered children took the GLOBAL delegation block's policy: with ``fallback_providers: auto`` a pinned
