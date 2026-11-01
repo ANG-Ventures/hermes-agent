@@ -11274,6 +11274,18 @@ def _enforce_superseded_content(
     try:
         return _content.verify(task_id, prs, shas)
     except _content.SupersededContentError as err:
+        # t_87e32ff7: an equivalent fix worded differently. Accepted when the PR's own trusted close record names
+        # the sha and that commit touched every file that differs; the PR must also have had no other failure.
+        if err.differs and not err.unverified and not err.off_default:
+            from hermes_cli import kanban_superseded_open as _sopen
+            covered = {pr: _sopen.sha_close_covers(pr, shas) for pr in err.differs}
+            if all(covered.values()):
+                with write_txn(conn):
+                    _append_event(conn, task_id, "routed_pr_superseded",
+                                  {"close_record_sha": covered, "differs": err.differs})
+                return [{"remote": f"https://github.com/{pr.rpartition('#')[0]}", "branch": "main", "sha": sha,
+                         "pr": pr, "external": True, "corroborated_by": "close-record+file-coverage"}
+                        for pr, sha in covered.items()]
         with write_txn(conn):
             _append_event(conn, task_id, "completion_blocked_superseded_content",
                           {"differs": err.differs, "unverified": err.unverified, "shas": shas})
@@ -11852,6 +11864,26 @@ def complete_task(
             card_cover=card_cover, card_covered_out=card_covers,
         )
     except _open_pr.ClosedUnmergedPrError as closed_err:
+        # t_ec8ceae2: an explicit close whose closed PR names an OPEN superseder (trusted `CLOSED: SUPERSEDED-BY #N`,
+        # #N names this card) parks the card on #N instead of refusing: it closes when #N merges.
+        if (superseded_by or str(abandon_routed_pr or "").strip()) and closed_err.closed and not closed_err.unverified:
+            from hermes_cli import kanban_superseded_open as _sopen
+            targets = _sopen.park_targets(
+                task_id, [r for r in _open_pr.extract_pr_refs(*closed_err.closed)],
+                superseded_by=superseded_by, query_fn=_pr_query or _open_pr.memo_query())
+            if targets:
+                park_meta, staged = _stage_routed_scratch_artifacts(
+                    conn, task_id, dict(metadata or {}), summary=summary, result=result)
+                ok = False
+                try:
+                    ok = _sopen.park(conn, task_id, targets, expected_run_id=expected_run_id, force=force,
+                                     summary=summary, result=result, metadata=park_meta,
+                                     own_prs=[f"{r.repo}#{r.number}" for r in _open_pr.split_fleet(
+                                         _open_pr.extract_pr_refs(*_card_recorded_pr_refs(conn, task_id),
+                                                                  metadata=metadata, survivor_pr=survivor_pr))[0]])
+                finally:
+                    _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+                return ok
         with write_txn(conn):
             _append_event(
                 conn, task_id, "completion_blocked_closed_unmerged_pr",
