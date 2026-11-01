@@ -5,7 +5,7 @@ Monitor a running video-production kanban. Polls `hermes kanban list` and
 repeated retries, dependency deadlocks).
 
 Usage:
-    monitor.py --tenant <project-slug> [--interval 30]
+    monitor.py --tenant <project-slug> [--board <slug>] [--interval 30]
 
 Outputs a periodic snapshot to stdout. Sends alerts via stderr when issues
 are detected. Designed to run alongside the kanban — kill with Ctrl-C when
@@ -30,23 +30,35 @@ def hermes_available() -> bool:
     return shutil.which("hermes") is not None
 
 
-def kanban_list(tenant: str) -> list[dict]:
+class KanbanError(RuntimeError):
+    """`hermes kanban` exited non-zero: a refusal or failure, never "0 tasks"."""
+
+
+def _kanban(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["hermes", "kanban", *argv],
+        capture_output=True, text=True, encoding='utf-8', errors='replace', check=False,
+    )
+
+
+def kanban_list(tenant: str, board: str) -> list[dict]:
     """Returns parsed task rows. Falls back to plain stdout parsing if JSON
-    output isn't supported by the installed hermes CLI."""
+    output isn't supported by the installed hermes CLI. Raises KanbanError
+    when the CLI refuses or fails (e.g. rc 2 "needs a board"), so an empty
+    stdout is never read as an empty board."""
     try:
-        out = subprocess.run(
-            ["hermes", "kanban", "list", "--tenant", tenant, "--json"],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', check=False,
-        )
+        out = _kanban("--board", board, "list", "--tenant", tenant, "--json")
         if out.returncode == 0 and out.stdout.strip().startswith("["):
             return json.loads(out.stdout)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     # Fallback: textual parse of `hermes kanban list`
-    out = subprocess.run(
-        ["hermes", "kanban", "list", "--tenant", tenant],
-        capture_output=True, text=True, encoding='utf-8', errors='replace', check=False,
-    )
+    out = _kanban("--board", board, "list", "--tenant", tenant)
+    if out.returncode != 0:
+        raise KanbanError(
+            f"hermes kanban --board {board} list exited {out.returncode}: "
+            f"{(out.stderr or out.stdout).strip()}"
+        )
     rows = []
     for line in out.stdout.splitlines():
         line = line.strip()
@@ -66,11 +78,8 @@ def kanban_list(tenant: str) -> list[dict]:
     return rows
 
 
-def kanban_show(task_id: str) -> dict | None:
-    out = subprocess.run(
-        ["hermes", "kanban", "show", task_id, "--json"],
-        capture_output=True, text=True, encoding='utf-8', errors='replace', check=False,
-    )
+def kanban_show(task_id: str, board: str) -> dict | None:
+    out = _kanban("--board", board, "show", task_id, "--json")
     if out.returncode != 0:
         return None
     try:
@@ -131,8 +140,8 @@ def detect_issues(tasks: list[dict]) -> list[str]:
     return issues
 
 
-def snapshot(tenant: str) -> tuple[list[dict], list[str]]:
-    tasks = kanban_list(tenant)
+def snapshot(tenant: str, board: str) -> tuple[list[dict], list[str]]:
+    tasks = kanban_list(tenant, board)
     issues = detect_issues(tasks)
     return tasks, issues
 
@@ -165,6 +174,8 @@ def main():
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tenant", required=True,
                     help="Project tenant slug to monitor")
+    ap.add_argument("--board", default="default",
+                    help="Board the tenant's tasks live on (default: default)")
     ap.add_argument("--interval", type=int, default=30,
                     help="Poll interval in seconds (default: 30)")
     ap.add_argument("--once", action="store_true",
@@ -175,18 +186,21 @@ def main():
         print("ERROR: 'hermes' CLI not found in PATH", file=sys.stderr)
         sys.exit(1)
 
-    if args.once:
-        tasks, issues = snapshot(args.tenant)
-        print_snapshot(tasks, issues)
-        sys.exit(0 if not issues else 2)
-
-    print(f"Monitoring tenant '{args.tenant}' every {args.interval}s. "
-          "Ctrl-C to exit.")
     try:
+        if args.once:
+            tasks, issues = snapshot(args.tenant, args.board)
+            print_snapshot(tasks, issues)
+            sys.exit(0 if not issues else 2)
+
+        print(f"Monitoring tenant '{args.tenant}' on board '{args.board}' every "
+              f"{args.interval}s. Ctrl-C to exit.")
         while True:
-            tasks, issues = snapshot(args.tenant)
+            tasks, issues = snapshot(args.tenant, args.board)
             print_snapshot(tasks, issues)
             time.sleep(args.interval)
+    except KanbanError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nStopped.")
 

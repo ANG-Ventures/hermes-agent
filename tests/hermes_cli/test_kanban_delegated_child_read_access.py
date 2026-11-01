@@ -35,7 +35,7 @@ def _run(home: Path, *args: str, child: bool, token: str | None = None) -> subpr
     else:
         env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
     return subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban", *args],
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", *args],  # S7: name the board
         cwd=ROOT, env=env, capture_output=True, text=True, check=False, timeout=60,
     )
 

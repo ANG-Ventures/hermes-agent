@@ -11,8 +11,8 @@ the session) detect problems early and intervene effectively.
 hermes kanban watch --tenant <project-slug>
 
 # Snapshot of the board
-hermes kanban list --tenant <project-slug>
-hermes kanban list --tenant <project-slug> --json     # machine-readable
+hermes kanban --board <board> list --tenant <project-slug>
+hermes kanban --board <board> list --tenant <project-slug> --json     # machine-readable
 
 # Per-status counts + oldest-ready age
 hermes kanban stats --tenant <project-slug>
@@ -88,7 +88,7 @@ file):
 
 ```bash
 # 1. Create the new task and capture its id
-NEW_TASK_ID=$(hermes kanban create "Generate SRT captions from voiceover" \
+NEW_TASK_ID=$(hermes kanban --board <board> create "Generate SRT captions from voiceover" \
     --assignee captioner \
     --workspace dir:"$HOME/projects/video-pipeline/<slug>" \
     --tenant <slug> \
@@ -138,9 +138,9 @@ A simple polling pattern for hands-off monitoring:
 ```bash
 while true; do
     clear
-    hermes kanban list --tenant <slug>
+    hermes kanban --board <board> list --tenant <slug>
     echo "---"
-    hermes kanban stats --tenant <slug>
+    hermes kanban --board <board> stats --tenant <slug>
     sleep 30
 done
 ```

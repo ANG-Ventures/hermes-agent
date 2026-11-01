@@ -1,8 +1,7 @@
-"""S7 C1a: ``pinned_board()``, ``board_of_task()``, the ``locate`` verb, and the gated resolver.
+"""S7: ``pinned_board()``, ``board_of_task()``, the ``locate`` verb, and the surface resolver.
 
-Additive: with ``kanban.bare_verb`` absent from the root config.yaml (the shipped state) the
-pre-S7 resolution (``kanban/current``, ``HERMES_KANBAN_BOARD``) is unchanged; ``refuse`` /
-``default`` turn the S7 resolver on. Spec: hermes-home
+There is no current-board file and no board env var; ``kanban.bare_verb`` (root config.yaml,
+absent == ``refuse``) is the kill switch for step 5 only. Spec: hermes-home
 plans/2026-10-21_sdlc-simplification/S7-boards-no-global-pointer-SPEC.md (D1, D2, D3, Q2, RC-7,
 RC-11).
 """
@@ -20,6 +19,8 @@ from hermes_cli import kanban_board_select as kbsel
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_board_registry as reg
 from hermes_cli import kanban_db_connect as kbc
+
+pytestmark = pytest.mark.kanban_bare_verb_refuse
 
 
 @pytest.fixture
@@ -79,22 +80,18 @@ def test_registry_imports_first_in_a_fresh_interpreter():
     assert proc.stdout.strip() == "override"
 
 
-# --- the flag: off by default, legacy resolution untouched -------------------------------------
+# --- the kill switch: refuse by default; nothing reads a file or an env slug -------------------
 
-def test_flag_absent_keeps_the_legacy_pointer(home, monkeypatch):
-    kb.create_board("subs-ace")
-    assert kbsel.bare_verb_policy() == kbsel.BARE_VERB_LEGACY
-    kb.set_current_board("subs-ace")
-    assert kb.get_current_board() == "subs-ace"
-    kb.clear_current_board()
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", "subs-ace")
-    assert kb.get_current_board() == "subs-ace"
+def test_policy_absent_is_refuse(home):
+    assert kbsel.bare_verb_policy() == kbsel.BARE_VERB_REFUSE
 
 
 @pytest.mark.parametrize("value", ["refuse", "default"])
-def test_flag_on_makes_file_and_env_inert(home, monkeypatch, value):
+def test_file_and_env_are_inert(home, monkeypatch, value):
+    """Restore the file branch or the env branch in ``get_current_board`` -> RED."""
     kb.create_board("subs-ace")
-    kb.set_current_board("subs-ace")
+    (home / "kanban").mkdir(exist_ok=True)
+    (home / "kanban" / "current").write_text("subs-ace\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "subs-ace")
     _policy(home, value)
     assert kbsel.bare_verb_policy() == value
@@ -103,17 +100,17 @@ def test_flag_on_makes_file_and_env_inert(home, monkeypatch, value):
         assert kb.get_current_board() == "subs-ace"
 
 
-def test_unknown_policy_value_is_legacy(home):
+def test_unknown_policy_value_is_refuse(home):
     _policy(home, "maybe")
-    assert kbsel.bare_verb_policy() == kbsel.BARE_VERB_LEGACY
+    assert kbsel.bare_verb_policy() == kbsel.BARE_VERB_REFUSE
 
 
 def test_policy_is_root_only(home, monkeypatch):
     prof = home / "profiles" / "p1"
     prof.mkdir(parents=True)
-    (prof / "config.yaml").write_text("kanban:\n  bare_verb: refuse\n", encoding="utf-8")
+    (prof / "config.yaml").write_text("kanban:\n  bare_verb: default\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(prof))
-    assert kbsel.bare_verb_policy() == kbsel.BARE_VERB_LEGACY
+    assert kbsel.bare_verb_policy() == kbsel.BARE_VERB_REFUSE
 
 
 # --- D1: pinned_board ---------------------------------------------------------------------------
@@ -188,6 +185,23 @@ def test_pinned_board_error_clears_once_the_pin_is_named(home, monkeypatch):
     monkeypatch.setattr(reg, "board_db_layout", real)
     assert kb.pinned_board() == "subs-ace"
     assert kb.pinned_board_error() is None
+
+
+def test_retargeted_symlink_pin_changes_the_answer_in_process(home, monkeypatch, tmp_path):
+    """Prism 69c969208e42 (C1a #2202): a symlink pin retargeted from board a's DB to board b's
+    names b in the same process. Mutation: memoise on the raw pin string -> the second answer
+    stays ``alpha``."""
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    tid_a, tid_b = _card("alpha"), _card("beta")
+    link = tmp_path / "pin.db"
+    link.symlink_to(kb.board_dir("alpha") / "kanban.db")
+    _pin(monkeypatch, link)
+    assert reg.locate(tid_a)[0] == "alpha"
+    link.unlink()
+    link.symlink_to(kb.board_dir("beta") / "kanban.db")
+    assert reg.locate(tid_b)[0] == "beta"
+    assert kb.pinned_board() == "beta"
 
 
 def test_pinned_board_rescans_on_every_call(home, monkeypatch):
@@ -326,13 +340,12 @@ def test_locate_under_a_pin_prints_the_pins_board_and_the_pin(home, monkeypatch,
     assert capsys.readouterr().out == f"{kb.PINNED_SLUG}\t{db}\n"
 
 
-def test_locate_works_with_the_flag_off_and_ignores_the_pointer(home, capsys):
-    """``locate`` answers from the cards, never from ``kanban/current``, whatever the flag."""
+def test_locate_ignores_a_stale_pointer_file(home, capsys):
+    """``locate`` answers from the cards; a leftover ``kanban/current`` is never read."""
     kb.create_board("alpha")
     kb.create_board("beta")
     tid = _card("beta")
-    kb.set_current_board("alpha")
-    assert kbsel.bare_verb_policy() == kbsel.BARE_VERB_LEGACY
+    (home / "kanban" / "current").write_text("alpha\n", encoding="utf-8")
     assert _locate(tid) == 0
     assert capsys.readouterr().out.startswith("beta\t")
 
@@ -452,3 +465,159 @@ def test_board_of_task_and_pinned_board_cost_is_recorded(home, monkeypatch, caps
               f"(threshold 250 ms)")
     assert cpu[p95] * 1000 < 250
     assert pin_cpu_ms < 250
+
+
+
+# --- Prism 39b758962810: the pin sentinel is never a board name -------------------------------
+
+def test_sentinel_is_refused_as_a_board_name(home):
+    with pytest.raises(ValueError, match="reserved"):
+        kb._normalize_board_slug(kb.PINNED_SLUG)
+    with pytest.raises(ValueError, match="reserved"):
+        kb.create_board(kb.PINNED_SLUG)
+    assert _boards_argv(["boards", "create", kb.PINNED_SLUG]) == 2
+
+
+def test_pre_existing_override_board_is_not_found_and_never_opened_unscoped(home, capsys):
+    """A board dir literally named ``override`` (made before the sentinel was reserved) is
+    BoardNotFound-with-reason on an explicit --board, never derived, and a write never lands."""
+    kb.init_db()
+    legacy = kb.boards_root() / kb.PINNED_SLUG
+    legacy.mkdir(parents=True)
+    conn = kbc.connect(db_path=legacy / "kanban.db")
+    tid = kb.create_task(conn, title="legacy", assignee="dev")
+    conn.close()
+    (legacy / "board.json").write_text('{"slug": "override"}', encoding="utf-8")
+    _policy(home, "refuse")
+    with pytest.raises(kbsel.BoardNotFound, match="reserved for a HERMES_KANBAN_DB pin"):
+        kbsel.resolve_slug(kb.PINNED_SLUG, verb="create")
+    with pytest.raises(kb.KanbanCardNotFound):
+        kb.board_of_task(tid)  # never derived onto the sentinel
+    assert kb.PINNED_SLUG not in [b["slug"] for b in kb.list_boards()]
+    rc = kanban.kanban_command(_ns(kanban_action="create", board=kb.PINNED_SLUG, title="w",
+                                   parent=[]))
+    assert rc == 1
+    assert "reserved" in capsys.readouterr().err
+    with kbc.connect_closing(board="default") as c:
+        assert c.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_reserved_board_dir_never_breaks_discovery_or_tracebacks(home, capsys, caplog):
+    """Prism c12f81da4e1f: a pre-existing ``boards/override/`` beside ``alpha`` is skipped by
+    discovery with ONE warning line naming the migration; every other board still lists, and an
+    explicit ``--board override`` is BoardNotFound (rc 1), never a ValueError traceback."""
+    import logging
+
+    kb.init_db()
+    kb.create_board("alpha")
+    legacy = kb.boards_root() / kb.PINNED_SLUG
+    legacy.mkdir(parents=True)
+    conn = kbc.connect(db_path=legacy / "kanban.db")
+    kb.create_task(conn, title="legacy", assignee="dev")
+    conn.close()
+    (legacy / "board.json").write_text('{"slug": "override"}', encoding="utf-8")
+    kb._RESERVED_BOARD_WARNED.clear()
+    caplog.clear()
+    _policy(home, "refuse")
+    with caplog.at_level(logging.WARNING, logger=kb._log.name):
+        assert _boards_argv(["boards", "list"]) == 0
+        assert _boards_argv(["boards", "list"]) == 0
+        assert [s for s, _ in reg.board_db_layout()] == ["default", "alpha"]
+    out = capsys.readouterr().out
+    assert "alpha" in out and " override " not in out
+    warned = [r.getMessage() for r in caplog.records if "reserved" in r.getMessage()]
+    assert len(warned) == 1 and str(legacy) in warned[0] and "mv " in warned[0]
+    assert _boards_argv(["--board", kb.PINNED_SLUG, "boards", "show"]) == 1
+    assert _boards_argv(["--board", kb.PINNED_SLUG, "list"]) == 1
+    assert "reserved" in capsys.readouterr().err
+
+
+# --- Prism 7b28513d644d: boards list|show resolve like every other verb ------------------------
+
+def _boards_argv(argv: list[str]) -> int:
+    from hermes_cli.kanban_parser import build_parser
+
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers(dest="cmd"))
+    return kanban.kanban_command(parser.parse_args(["kanban", *argv]))
+
+
+def test_boards_list_malformed_board_is_a_clean_rc2(home, capsys):
+    _policy(home, "refuse")
+    assert _boards_argv(["boards", "list", "--board", "bad slug"]) == 2
+    assert "invalid board slug" in capsys.readouterr().err
+
+
+def test_boards_show_unknown_board_is_board_not_found(home, capsys):
+    _policy(home, "refuse")
+    assert _boards_argv(["--board", "typo", "boards", "show"]) == 1
+    assert "board 'typo' does not exist" in capsys.readouterr().err
+
+
+def test_boards_list_and_show_bare_still_work_under_refuse(home, capsys):
+    kb.create_board("beta")
+    _policy(home, "refuse")
+    assert _boards_argv(["boards", "list"]) == 0
+    assert "beta" in capsys.readouterr().out
+    assert _boards_argv(["boards", "show"]) == 0
+    assert "no board pinned" in capsys.readouterr().out
+    assert _boards_argv(["--board", "beta", "boards", "show"]) == 0
+    assert capsys.readouterr().out.startswith("Board: beta")
+
+
+def test_boards_ls_and_current_aliases_resolve_the_board(home, capsys):
+    """Prism ccd467f64b6a: argparse dispatches ``ls``/``current`` under the literal typed, so the
+    aliases must resolve ``--board`` exactly like ``list``/``show``."""
+    kb.create_board("alpha")
+    _policy(home, "refuse")
+    assert _boards_argv(["--board", "alpha", "boards", "current"]) == 0
+    assert capsys.readouterr().out.startswith("Board: alpha")
+    assert _boards_argv(["--board", "alpha", "boards", "list"]) == 0
+    listed = capsys.readouterr().out
+    assert _boards_argv(["--board", "alpha", "boards", "ls"]) == 0
+    assert capsys.readouterr().out == listed
+    assert _boards_argv(["--board", "typo", "boards", "current"]) == 1
+    assert "board 'typo' does not exist" in capsys.readouterr().err
+
+
+def test_boards_list_marks_only_the_resolved_board(home, capsys):
+    """Prism ee7333d7b6ff: ``--board alpha boards list`` marks alpha (not the ambient default) as
+    current, matching the footer; with no board resolved nothing is marked."""
+    import json
+
+    kb.create_board("alpha")
+    assert _boards_argv(["--board", "alpha", "boards", "list", "--json"]) == 0
+    current = {b["slug"]: b["is_current"] for b in json.loads(capsys.readouterr().out)}
+    assert current == {"default": False, "alpha": True}
+    assert _boards_argv(["--board", "alpha", "boards", "list"]) == 0
+    marked = [ln.split()[1] for ln in capsys.readouterr().out.splitlines() if ln.startswith("●")]
+    assert marked == ["alpha"]
+    assert _boards_argv(["boards", "list", "--json"]) == 0
+    assert not any(b["is_current"] for b in json.loads(capsys.readouterr().out))
+
+
+# --- resolve_selector: one normalise-then-blank-is-omitted rule (round 4, Prism b68acd4edf81) ---
+
+@pytest.mark.parametrize("raw", [None, "", " ", "\t\n "])
+def test_resolve_selector_blank_is_omitted(home, raw):
+    assert kbsel.resolve_selector(raw) is None
+
+
+def test_resolve_selector_normalises_a_real_slug(home):
+    assert kbsel.resolve_selector("  Alpha ") == "alpha"
+
+
+def test_resolve_selector_refuses_malformed_and_the_pin_sentinel(home):
+    with pytest.raises(ValueError):
+        kbsel.resolve_selector("bad slug")
+    with pytest.raises(kbsel.BoardNotFound, match="reserved"):
+        kbsel.resolve_selector(" Override ")
+
+
+def test_blank_board_flag_is_omitted_on_the_cli_path(home):
+    """``--board ' '`` is the bare verb: refused under ``refuse`` (rc 2 BoardRequired), never an
+    error about an empty slug and never a silent default."""
+    with pytest.raises(kbsel.BoardRequired):
+        kbsel.resolve(_ns(kanban_action="list", board=" "))
+    _policy(home, "default")
+    assert kbsel.resolve(_ns(kanban_action="list", board=" ")) == kb.DEFAULT_BOARD

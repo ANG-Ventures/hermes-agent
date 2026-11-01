@@ -155,8 +155,7 @@ def decompose_triage_task(
             # Resolve the board ONCE and thread it explicitly, matching
             # every other board-aware function here. Falling back to the
             # ambient get_current_board() only when no board was passed
-            # would let a concurrent `boards switch` (or an outer
-            # HERMES_KANBAN_BOARD override) point the lookup at a
+            # would let an outer scope point the lookup at a
             # different board than the caller's connection is scoped to,
             # silently upgrading children into an unrelated project dir.
             _resolved_board = board if board is not None else _kb.get_current_board()

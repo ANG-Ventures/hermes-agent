@@ -68,7 +68,7 @@ def _run(home: Path, *args: str, extra: dict | None = None) -> subprocess.Comple
     env = _base_env(home)
     env.update(extra or {})
     return subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban", *args],
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", *args],  # S7: name the board
         cwd=ROOT, env=env, capture_output=True, text=True, check=False, timeout=60,
     )
 

@@ -2,8 +2,9 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. Board resolution (S7): ``board=`` arg / the context board > ``HERMES_KANBAN_DB`` (pins the
+file path; the dispatcher injects it into workers) > ``default``. There is no current-board file and
+no board env var.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -1151,6 +1152,13 @@ def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
             f"invalid board slug {slug!r}: must be 1-64 chars, lowercase "
             f"alphanumerics / hyphens / underscores, not starting with '-' or '_'"
         )
+    if s == PINNED_SLUG:
+        # The pin sentinel is never a board name (Prism 39b758962810): a board dir called
+        # ``override`` would be indistinguishable from an unnamed pin and open unscoped.
+        raise ValueError(
+            f"invalid board slug {slug!r}: {PINNED_SLUG!r} is reserved for a HERMES_KANBAN_DB "
+            f"pin that names no board"
+        )
     return s
 
 
@@ -1514,80 +1522,26 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
-def current_board_path() -> Path:
-    """``<root>/kanban/current`` — one-line slug written by ``boards switch``; absent = ``default``."""
-    return kanban_home() / "kanban" / "current"
-
-
 def get_current_board() -> str:
-    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current``
-    (only while that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug
-    falls through — the dispatcher must never crash on a hand-edited file."""
-    def _existing(candidate: str) -> Optional[str]:
-        if not candidate:
-            return None
+    """The board THIS call is scoped to ("current" is historical; S7 D1): the context override
+    (``scoped_current_board``, installed by every surface around a verb) -> the board the
+    ``HERMES_KANBAN_DB`` pin names -> ``DEFAULT_BOARD``. No file, no env slug. A stale override
+    falls through. A pin that names no board keeps default's layout paths; every DB open still
+    takes the pin's path."""
+    candidate = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if candidate:
         try:
             normed = _normalize_board_slug(candidate)
         except ValueError:
-            return None
-        return normed if normed and board_exists(normed) else None
-
-    from hermes_cli import kanban_board_select as _kbsel
-
-    if _kbsel.s7_enabled():
-        # S7 D1 (kanban.bare_verb set): override -> the board the DB pin names -> default.
-        # No file, no env slug. A pin that names no board keeps default's layout paths; every
-        # DB open still takes the pin's path.
-        found = _existing((_CURRENT_BOARD_OVERRIDE.get() or "").strip())
-        if found:
-            return found
-        pinned = pinned_board()
-        if pinned and (pinned != PINNED_SLUG or board_exists(PINNED_SLUG)):
-            return pinned
-        return DEFAULT_BOARD
-
-    for candidate in (
-        (_CURRENT_BOARD_OVERRIDE.get() or "").strip(),
-        os.environ.get("HERMES_KANBAN_BOARD", "").strip(),
-    ):
-        found = _existing(candidate)
-        if found:
-            return found
-    try:
-        f = current_board_path()
-        if f.exists():
-            # utf-8-sig read fix (ours): tolerate BOM-persisted current-board files.
-            val = f.read_text(encoding="utf-8-sig").strip()
-            if val:
-                try:
-                    normed = _normalize_board_slug(val)
-                    if normed and board_exists(normed):
-                        return normed
-                except ValueError:
-                    pass
-    except OSError:
-        pass
+            normed = None
+        if normed and board_exists(normed):
+            return normed
+    pinned = pinned_board()
+    if pinned and pinned != PINNED_SLUG:
+        return pinned
     return DEFAULT_BOARD
 
 
-def set_current_board(slug: str) -> Path:
-    """Persist ``slug`` as the active board; returns the file written. Does NOT
-    check the board exists — callers do (so ``boards switch <typo>`` errors)."""
-    _assert_not_delegated_child_mutation()
-    normed = _require_slug(slug)
-    path = current_board_path()
-    _assert_live_board_tree_write_allowed(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(normed + "\n", encoding="utf-8")
-    return path
-
-
-def clear_current_board() -> None:
-    """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
-    _assert_not_delegated_child_mutation()
-    _assert_live_board_tree_write_allowed(current_board_path())
-    with contextlib.suppress(FileNotFoundError):
-        current_board_path().unlink()
 _BOARD_ALIAS_CACHE: tuple[Optional[tuple[int, int]], dict[str, str]] = (None, {})
 
 
@@ -2202,6 +2156,23 @@ def create_board(
 
 # Phantom board dirs already warned about in this process (see list_boards).
 _PHANTOM_BOARD_WARNED: set[str] = set()
+# Board dirs named for the pin sentinel, already warned about in this process.
+_RESERVED_BOARD_WARNED: set[str] = set()
+
+
+def skip_reserved_board_dir(child: Path) -> bool:
+    """True (after ONE warning per process per dir) when discovery must skip ``child`` because
+    its name is the pin sentinel (Prism c12f81da4e1f). A ``boards/override/`` made before the
+    sentinel was reserved never breaks discovery of the other boards; the warning names the rename
+    that makes it addressable again."""
+    if child.name.strip().lower() != PINNED_SLUG:
+        return False
+    if str(child) not in _RESERVED_BOARD_WARNED:
+        _RESERVED_BOARD_WARNED.add(str(child))
+        _log.warning("kanban: skipping board dir %s: %r is reserved for a HERMES_KANBAN_DB pin "
+                     "that names no board. Rename it to address it: mv %s %s",
+                     child, PINNED_SLUG, child, child.with_name("<new-slug>"))
+    return True
 
 
 def _board_db_is_empty(db_path: Path) -> bool:
@@ -2267,6 +2238,8 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 if not child.is_dir():
                     continue
                 slug = child.name
+                if skip_reserved_board_dir(child):
+                    continue
                 # Keep slug normalisation soft for discovery — but skip dirs
                 # that don't parse as valid slugs so we don't surface junk.
                 try:
@@ -2353,12 +2326,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     #
     # Checked BEFORE the cache invalidation below: it opens the board DB
     # (which would re-populate _INITIALIZED_PATHS) and it can abort, so no
-    # state may be torn down ahead of it -- INCLUDING the active-board pin,
-    # which used to be cleared above this gate. A refused removal that had
-    # already unlinked <root>/kanban/current left get_current_board() falling
-    # through to DEFAULT_BOARD, so every later `kanban add` / `list` /
-    # `dispatch` silently addressed the default board with nothing saying the
-    # pin had moved (FleetReview on PR #785, measured).
+    # state may be torn down ahead of it.
     live = _board_has_live_cards(normed)
     if live:
         verb = "archive" if archive else "delete"
@@ -2373,12 +2341,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             f"{verb} its directory, which contains their workspaces. "
             "Wait for the cards to finish, or stop them first."
         )
-
-    # Remember the active pin while the board still exists. It is cleared only
-    # after the archive/delete succeeds; either operation has later failure
-    # boundaries (rename errors and survivor-held hard deletes) that must leave
-    # the operator pointed at the still-present board.
-    was_current_board = get_current_board() == normed
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -2429,8 +2391,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             detail=f"board={normed} action=archive dest={target}",
             board=normed,
         )
-        if was_current_board:
-            clear_current_board()
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -2471,8 +2431,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             d, task_id=None, reason="remove_board", outcome=AUDIT_DELETE,
             detail=f"board={normed}", board=normed,
         )
-        if was_current_board:
-            clear_current_board()
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -3430,7 +3388,7 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
         return
     pins = ", ".join(
         f"{k}={os.environ[k]}"
-        for k in (*_KANBAN_PATH_PIN_ENV_VARS, "HERMES_KANBAN_BOARD")
+        for k in _KANBAN_PATH_PIN_ENV_VARS
         if os.environ.get(k, "").strip()
     ) or "<none>"
     raise LiveBoardWriteRefused(
@@ -3460,7 +3418,7 @@ def _assert_live_board_tree_write_allowed(path: Path) -> None:
     ``connect()``'s guard only sees ``kanban.db``. ``create_board()`` writes
     ``board.json`` (and mkdirs the board dir) BEFORE it reaches ``connect()``,
     so a refused create still left a board that ``list_boards()`` surfaces;
-    ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
+    ``remove_board()`` never touches the DB at all.
     That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
     landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
     Same production-root list and R1/R2 predicate as the DB guard, and the same
@@ -9594,6 +9552,14 @@ def _spawned_owner_alive(conn, task_id, row, host_prefix):
                 "needs_attention": True}
     return None
 
+
+def _live_owner_detail(alive: dict) -> str:
+    """`` (run R, pid P, identity I)`` for a refusal naming the live owner, so
+    the operator can check that exact pid (and see an ``unverified`` verdict)
+    instead of guessing which run the gate meant (t_2911d7bc)."""
+    return (f" (run {alive.get('prev_run_id')}, pid {alive.get('prev_pid')}, "
+            f"identity {alive.get('owner_identity')})")
+
 # Causal-window tolerances for owner identity, in seconds. Event timestamps
 # are integer seconds (floored), so allow 1 s before the claim and 2 s after
 # the spawned event. The window is deliberately ONE-SIDED around the spawn:
@@ -11854,14 +11820,36 @@ def complete_task(
     if content_survivors:
         metadata = dict(metadata or {}, superseded_content=content_survivors)
     closed_abandoned: list = []
+    card_covers: list = []
+    _closed_query = _pr_query or _open_pr.memo_query()
+    card_cover = None
+    sup_card = _open_pr.superseding_card(superseded_by)
+    if sup_card and sup_card != task_id:
+        def card_cover(uncovered):
+            # --superseded-by <card> (t_6a853d1c): that card's merged work superseded this card's PR.
+            # Refused on a shared workspace (Prism fad0ffab0ac9): this card is a --workspace-of reader,
+            # or a live card reads this card's workspace. The retention hold covers this card's id only.
+            me = get_task(conn, task_id)
+            if (me is not None and me.workspace_of) or conn.execute(
+                    "SELECT 1 FROM tasks WHERE workspace_of=? AND id<>? AND status NOT IN ('done','archived') "
+                    "LIMIT 1", (task_id, task_id)).fetchone():
+                raise _open_pr.SharedWorkspaceSupersessionError(
+                    task_id, [f"{c.repo}#{c.number}" for c in uncovered], sup_card)
+            other = get_task(conn, sup_card)
+            return _open_pr.card_supersession(
+                uncovered, card=sup_card, card_status=other.status if other else None,
+                card_prs=[pr for run in list_runs(conn, sup_card)
+                          for pr in _open_pr.authored_pr_refs(run.metadata)],
+                query_fn=_closed_query)
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, result, summary, metadata=metadata,
             survivor_pr=survivor_pr, superseded_by=superseded_by,
-            query_fn=_pr_query or _open_pr.memo_query(),
+            query_fn=_closed_query,
             recorded=_card_recorded_pr_refs(conn, task_id),
             abandon_reason=None if _overlong(str(abandon_routed_pr or "").strip()) else abandon_routed_pr,
             abandoned_out=closed_abandoned,
+            card_cover=card_cover, card_covered_out=card_covers,
         )
     except _open_pr.ClosedUnmergedPrError as closed_err:
         with write_txn(conn):
@@ -11886,8 +11874,13 @@ def complete_task(
         survivor_unbound=survivor_unbound,
         survivor_none=survivor_none, survivor_reason=survivor_reason,
         evidence=[t for t in (summary, result) if t],
-        content_survivor=content_survivors[0] if content_survivors else None,
+        content_survivor=(content_survivors[0] if content_survivors
+                          else card_covers[0] if card_covers else None),
     )
+    if card_covers:
+        metadata = dict(metadata or {}, superseded_by_card={
+            "card": sup_card,
+            "prs": [{"closed": c["supersedes"], "merged": c["pr"], "sha": c["sha"]} for c in card_covers]})
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
         if survivor['kind'] == 'patch':
@@ -11990,6 +11983,15 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if card_covers:
+            # --superseded-by <card> (Prism 20f49b2e3092, ff7e3c99981d): the cover proves another
+            # card's merged PR replaced this one, not that anything holds this workspace's bytes.
+            # The retention hold commits in THIS transaction, so `done` and `held_reason` become
+            # visible together or not at all (preserve(cleanup=True) refuses while it is set).
+            from hermes_cli.kanban_survivor import _hold_in_txn
+            _hold_in_txn(conn, task_id, f"survivor_unavailable: superseded_by_card {sup_card} is an "
+                                        "unbound cover, not a copy of this workspace; recover or "
+                                        "remove it by hand")
         if routed_abandon:
             _append_event(conn, task_id, "routed_pr_abandoned", routed_abandon)
         if approve_head_sha:
@@ -12049,6 +12051,8 @@ def complete_task(
             # Read by the gateway notifier to say "premise superseded by X"
             # instead of the generic done ping.
             completed_payload["superseded_by"] = superseded_by
+            if isinstance(metadata, dict) and metadata.get("superseded_by_card"):
+                completed_payload["superseded_by_card"] = metadata["superseded_by_card"]
         if external:
             completed_payload["external"] = {"url": external, "watcher": watcher}
         if verified_cards:
@@ -12100,8 +12104,10 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    if not card_covers:
+        # A supersession close never removes the workspace itself; its hold was written with done.
+        # Clean up the scratch workspace and any stale tmux session for the worker.
+        _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_kanban_lifecycle_hook(
@@ -15167,8 +15173,12 @@ def request_changes(
             if coverage_body is None and operator_reason is None:
                 # Same message the gate gives; refused before any claim churn.
                 return False, _REVIEW_COVERAGE_MISSING
-            if _prior_worker_still_alive(conn, task_id) is not None:
-                return False, "a prior worker run on this task is still alive"
+            alive = _prior_worker_still_alive(conn, task_id)
+            if alive is not None:
+                return False, (
+                    "a prior worker run on this task is still alive"
+                    + _live_owner_detail(alive)
+                )
             if handoff_error:
                 return False, handoff_error
             now = int(time.time())
@@ -15195,13 +15205,16 @@ def request_changes(
             # of which run it owns (``claimer`` is a reusable profile name, not
             # a run credential), so it may close only a lapsed run: claim
             # expired and no live owner. A live run is closed with its run id.
-            if (
+            claim_live = bool(
                 task_row["claim_lock"]
                 and int(task_row["claim_expires"] or 0) > int(time.time())
-            ) or _prior_worker_still_alive(conn, task_id) is not None:
+            )
+            alive = None if claim_live else _prior_worker_still_alive(conn, task_id)
+            if claim_live or alive is not None:
                 return False, (
                     "a live review run holds this task; pass its run id "
                     "(expected_run_id) to close it"
+                    + (_live_owner_detail(alive) if alive else "")
                 )
 
         if handoff_error:
@@ -21698,7 +21711,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
-    _ctx_header(lines, task)
+    run_started_at = None
+    if task.status == "running" and task.current_run_id is not None:
+        row = conn.execute("SELECT started_at FROM task_runs WHERE id = ?",
+                           (int(task.current_run_id),)).fetchone()
+        run_started_at = int(row["started_at"]) if row and row["started_at"] is not None else None
+    _ctx_header(lines, task, run_started_at)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_sendbacks(lines, conn, task_id, now)
@@ -21745,7 +21763,7 @@ def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
     )
 
 
-def _ctx_header(lines: list[str], task: Task) -> None:
+def _ctx_header(lines: list[str], task: Task, run_started_at: Optional[int] = None) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
@@ -21761,6 +21779,9 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append(f"Max runtime: {task.max_runtime_seconds}s")
         if effective_terminal_timeout:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+        if run_started_at is not None and task.max_runtime_seconds > 0:
+            from hermes_cli.kanban_worker_policy import deadline_line
+            lines.append(f"Deadline: {deadline_line(run_started_at, task.max_runtime_seconds)}")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")

@@ -20,7 +20,8 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env hermes kanban daemon --force --interval 60 --pidfile %t/hermes-kanban-dispatcher.pid
+# --board names the one board this daemon serves: bare kanban verbs are refused (S7 D7).
+ExecStart=/usr/bin/env hermes kanban --board default daemon --force --interval 60 --pidfile %t/hermes-kanban-dispatcher.pid
 Restart=on-failure
 RestartSec=5
 # Log to the journal via stdout/stderr; the dispatcher also writes per-task

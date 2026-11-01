@@ -42,6 +42,24 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns2.accept_hooks is True
 
 
+def test_cron_tick_lane_reaches_the_scheduler(monkeypatch):
+    """t_5b3f3a3e: the boot catch-up tick must be able to leave the script lane (and its
+    .tick-script.lock) to the script runner; `cron tick --lane agent` reaches tick(lane=)."""
+    import importlib
+
+    import cron.scheduler as sched
+
+    cli = importlib.import_module("hermes_cli.cron")
+    seen = []
+    monkeypatch.setattr(sched, "tick", lambda verbose=True, lane="all", **_kw: seen.append(lane) or 0)
+    monkeypatch.setattr("hermes_cli.observability.shared_metrics_process.begin_process",
+                        lambda *_a, **_k: None)
+    parser = _build()
+    assert cli.cron_command(parser.parse_args(["cron", "tick", "--lane", "agent"])) == 0
+    assert cli.cron_command(parser.parse_args(["cron", "tick"])) == 0
+    assert seen == ["agent", "all"]
+
+
 def test_cron_pause_reason_reaches_the_store(monkeypatch):
     """t_6b72ef98: `cron pause` had no way to record WHY, so c5ae0c293f14 was paused
     "until the PR lands" with paused_reason=None and silently missed its first window."""

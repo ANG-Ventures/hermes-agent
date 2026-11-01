@@ -29,7 +29,15 @@ from agent.skill_utils import (
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
-from utils import atomic_json_write, file_signature
+# Stale-module bridge: this module binds ``utils.file_signature`` at import time and is reached
+# from post-update restart targets (hermes_cli.backup -> hermes_state_dbfile -> ... ->
+# agent.route_note_ingest), so a pre-handoff updater's cached ``utils`` must be dropped first.
+# See hermes_cli.stale_modules.
+from hermes_cli.stale_modules import drop_stale_root_modules
+
+drop_stale_root_modules()
+
+from utils import atomic_json_write, file_signature  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

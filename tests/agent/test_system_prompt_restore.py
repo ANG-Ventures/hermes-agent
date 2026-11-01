@@ -308,6 +308,33 @@ class TestStoredPromptReuse:
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
 
+    def test_provider_only_flip_rewrites_the_line_and_never_rebuilds(self):
+        """A turn that starts on another relay face for the same model (claude-alr <-> claude-dtlr,
+        t_d1f61f76) must not rebuild: a rebuild drifts the dynamic sections and re-prefills the
+        whole transcript on every flip. Only the trailer's Provider line may differ, so flipping
+        back reproduces the stored bytes exactly; Provider: lines in earlier prose stay put."""
+        stored = (
+            "You are Hermes Agent.\n\nMemory: Provider: claude-alr is the a-family lane\n\n"
+            "Conversation started: Tuesday, June 16, 2026\n"
+            "Model: claude-fable-5-1\nProvider: claude-alr\nPlatform: discord"
+        )
+
+        def _turn(provider):
+            db = MagicMock()
+            db.get_session.return_value = {"system_prompt": stored}
+            agent = _make_agent(session_db=db)
+            agent.model, agent.provider = "claude-fable-5-1", provider
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+            agent._build_system_prompt.assert_not_called()
+            db.update_system_prompt.assert_not_called()
+            return agent._cached_system_prompt
+
+        flipped = _turn("claude-dtlr")
+        assert identity_line_value(flipped, "Provider") == "claude-dtlr"
+        assert flipped == stored.replace("\nProvider: claude-alr\n", "\nProvider: claude-dtlr\n")
+        assert "Memory: Provider: claude-alr is the a-family lane" in flipped
+        assert _turn("claude-alr") == stored
+
 
     def test_rebuilding_an_existing_sessions_prompt_keeps_its_pinned_tools(self, tmp_path):
         """A continuing session whose stored prompt goes stale (model switch, cwd drift) is rebuilt

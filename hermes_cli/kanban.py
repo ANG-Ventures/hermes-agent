@@ -303,6 +303,15 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 
 # --- Command dispatch ---
 
+# `boards` sub-verbs that report the call's board and so go through kbsel.resolve. argparse sets
+# `boards_action` to the literal typed, so the `ls`/`current` aliases are listed too (Prism ccd467f64b6a).
+_BOARDS_RESOLVED = frozenset({"list", "ls", "show", "current"})
+
+
+def _boards_sub(args: argparse.Namespace) -> str:
+    return getattr(args, "boards_action", None) or "list"
+
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
     action = getattr(args, "kanban_action", None)
@@ -335,9 +344,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         _record_refused_block(args, refusal)
         return _err(f"kanban: {refusal}")
 
-    # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
-    # the `--board` routing override (else `--board beta boards show` reports beta).
-    if action == "boards":
+    # `boards create|rm|rename|…` name their board positionally and are filesystem-only. `boards
+    # list|show` REPORT the scoped board, so they resolve it like every other verb below (Prism
+    # 7b28513d644d): a malformed or unknown --board gets the same refusal, never a traceback.
+    if action == "boards" and _boards_sub(args) not in _BOARDS_RESOLVED:
         return _dispatch_boards(args)
 
     # `locate` reads every board read-only; it must not initialise (or depend on) any one board.
@@ -346,40 +356,24 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     from hermes_cli import kanban_board_select as kbsel
 
-    # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
-    # exact resolution the dispatcher uses for workers.
-    board_override = getattr(args, "board", None)
+    # S7 D2: the verb names its board, or the DB pin or its card id does; otherwise it is refused
+    # with the next command. The resolved slug is the context board for the whole verb, so library
+    # callers see the board the connection is on.
+    try:
+        resolved = kbsel.resolve(args)
+    except kbsel.BoardRequired as exc:
+        return _err(str(exc), 2)
+    except kbsel.BoardNotFound as exc:
+        return _err(str(exc))
+    except (ValueError, kb.KanbanPinDivergenceError) as exc:
+        msg = str(exc)
+        return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
+    if action == "boards":  # list|show: filesystem-only, reported against the resolved board
+        args._resolved_board = resolved
+        return _dispatch_boards(args)
     board_scope = contextlib.nullcontext()
-    if kbsel.s7_enabled():
-        # S7 D2 (kanban.bare_verb set): the verb names its board, or the DB pin or its card id
-        # does; otherwise it is refused with the next command. The resolved slug is the context
-        # board for the whole verb, so library callers see the board the connection is on.
-        try:
-            resolved = kbsel.resolve(args)
-        except kbsel.BoardRequired as exc:
-            return _err(str(exc), 2)
-        except kbsel.BoardNotFound as exc:
-            return _err(str(exc))
-        except (ValueError, kb.KanbanPinDivergenceError) as exc:
-            msg = str(exc)
-            return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
-        if resolved and resolved != kb.PINNED_SLUG:
-            board_scope = kb.scoped_current_board(resolved)
-    # `is not None`: an explicit empty selector (empty $BOARD in a script) is refused below,
-    # never treated as "no selector" and routed to the current board.
-    elif board_override is not None:
-        try:
-            normed = kb._normalize_board_slug(board_override)
-        except ValueError as exc:
-            return _err(f"kanban: {exc}", 2)
-        if not normed:
-            return _err("kanban: --board requires a slug", 2)
-        # Boards other than 'default' must already exist — typoed slugs would otherwise silently
-        # create an empty board.
-        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
-            return _err(f"kanban: board {normed!r} does not exist. "
-                        f"Create it with `hermes kanban boards create {normed}`.")
-        board_scope = kb.scoped_current_board(normed)
+    if resolved and resolved != kb.PINNED_SLUG:
+        board_scope = kb.scoped_current_board(resolved)
 
     with board_scope:
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises

@@ -256,3 +256,69 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+
+
+def test_decompose_explicit_board_reads_that_board(kanban_home):
+    """Prism a12a6d915a8b: ``decompose_task(tid, board="beta")`` loads the triage task from beta,
+    not from the ambient board, even when the same id exists on both with different bodies."""
+    kb.create_board("beta")
+    with kbc.connect_closing(board="beta") as conn:
+        tid = kb.create_task(conn, title="beta title", body="BETA-BODY", triage=True)
+    with kbc.connect_closing() as conn:
+        other = kb.create_task(conn, title="default title", body="DEFAULT-BODY", triage=True)
+        conn.execute("UPDATE tasks SET id = ? WHERE id = ?", (tid, other))
+        conn.commit()
+        assert "DEFAULT-BODY" in kb.get_task(conn, tid).body
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [{"title": "only", "body": "x", "assignee": "engineer", "parents": []}],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload) as call_llm, _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me", board="beta")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    prompt = jsonlib.dumps(call_llm.call_args.kwargs.get("messages") or call_llm.call_args)
+    assert "BETA-BODY" in prompt
+    assert "DEFAULT-BODY" not in prompt
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "triage"  # default's copy untouched
+
+
+def test_decompose_on_beta_uses_beta_default_workdir(kanban_home, tmp_path):
+    """Prism 1624662320c5: ``_apply_fanout`` passes ``board=`` to ``decompose_triage_task``, so a
+    scratch root on beta inherits BETA's default_workdir, not the ambient (default) board's."""
+    proj_a, proj_b = tmp_path / "projects" / "A", tmp_path / "projects" / "B"
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+    kb.write_board_metadata(kb.DEFAULT_BOARD, default_workdir=str(proj_a))
+    kb.create_board("beta", default_workdir=str(proj_b))
+    with kbc.connect_closing(board="beta") as conn:
+        tid = kb.create_task(conn, title="ship it", triage=True, workspace_kind="scratch")
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True, "rationale": "split",
+        "tasks": [{"title": "only", "body": "x", "assignee": "engineer", "parents": []}],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me", board="beta")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect_closing(board="beta") as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert (child.workspace_kind, child.workspace_path) == ("dir", str(proj_b))

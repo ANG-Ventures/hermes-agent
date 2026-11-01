@@ -3138,14 +3138,19 @@ def _artifact_survivor(conn, task, metadata, workspace, bases, previous):
     return {"kind": "artifact", "artifacts": artifacts} if artifacts else None
 
 
+def _hold_in_txn(conn, task_id, reason):
+    """Write the hold into the caller's OPEN transaction; never commits (Prism ff7e3c99981d)."""
+    conn.execute(
+        "INSERT INTO task_workspace_survivors(task_id, held_reason) VALUES (?, ?) "
+        "ON CONFLICT(task_id) DO UPDATE SET held_reason = excluded.held_reason",
+        (task_id, reason),
+    )
+    kb._append_event(conn, task_id, "workspace_held", {"reason": reason})
+
+
 def _hold(conn, task_id, reason):
     with kb.write_txn(conn):
-        conn.execute(
-            "INSERT INTO task_workspace_survivors(task_id, held_reason) VALUES (?, ?) "
-            "ON CONFLICT(task_id) DO UPDATE SET held_reason = excluded.held_reason",
-            (task_id, reason),
-        )
-        kb._append_event(conn, task_id, "workspace_held", {"reason": reason})
+        _hold_in_txn(conn, task_id, reason)
     _log.warning("Workspace HELD for task %s: %s", task_id, reason)
 
 

@@ -436,6 +436,30 @@ def _owner_liveness() -> Optional[Callable[[Any, Any], bool]]:
     return alive
 
 
+# Evidence-less terminal records already reported this boot (warned once, then DEBUG).
+_NO_EVIDENCE_WARNED: set[str] = set()
+
+
+def _cancel_terminal_evidence(canonical: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Terminal facts of a durably ``cancelled`` record, which the runner never finalizes: the
+    cancel time from ``cancel_attribution`` (else the last ``cancelled`` lifecycle event), or None
+    when the record carries neither. Derived here, not written into ``terminal``: the fleet's
+    self-heal sweep reads a dict ``terminal`` as "delivered" and would stop salvaging the child."""
+    if canonical.get("state") != "cancelled":
+        return None
+    attribution = canonical.get("cancel_attribution")
+    attribution = attribution if isinstance(attribution, dict) else {}
+    cancelled_at = attribution.get("cancelled_at")
+    if type(cancelled_at) not in (int, float):
+        trail = canonical.get("lifecycle")
+        cancelled_at = next((entry.get("ts") for entry in reversed(trail if isinstance(trail, list) else [])
+                             if isinstance(entry, dict) and entry.get("event") == "cancelled"), None)
+        if type(cancelled_at) not in (int, float):
+            return None
+    return {"status": "cancelled", "completed_at": cancelled_at,
+            "error": str(attribution.get("reason") or "unspecified")}
+
+
 def recover_abandoned_delegations(*, invalid_ids: Optional[set[str]] = None) -> int:
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
     recorded (``record_unit_child``) are replayed with their real results. Canonical JSON terminal evidence
@@ -481,6 +505,8 @@ def _recover_abandoned_delegations(registry, invalid_ids=None) -> int:
                 continue  # its child (or kanban unit) outlives the owner; that unit owns the outcome
             if canonical.get("state") in {"done", "failed", "cancelled"}:
                 metadata = canonical.get("terminal")
+                if metadata is None or metadata.get("completed_at") is None:
+                    metadata = _cancel_terminal_evidence(canonical) or metadata
                 if metadata is not None and metadata.get("completed_at") is not None:
                     # No envelope means no delivery or acceptance to synthesize.
                     # Only an unbound dispatch mirror can receive these facts;
@@ -498,10 +524,12 @@ def _recover_abandoned_delegations(registry, invalid_ids=None) -> int:
                     )
                     conn.commit()
                     continue
-                logger.warning(
+                # Recovery sweeps every ~30 s; nothing changes this record until it is pruned.
+                (logger.debug if delegation_id in _NO_EVIDENCE_WARNED else logger.warning)(
                     "Terminal delegation %s lacks execution evidence; retaining mirror",
                     delegation_id,
                 )
+                _NO_EVIDENCE_WARNED.add(delegation_id)
                 continue
             if last_state not in {"running", "finalizing"} or disposition != "pending":
                 continue
