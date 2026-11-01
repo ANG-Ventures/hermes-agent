@@ -879,7 +879,8 @@ def _handle_show(args: dict, **kw) -> str:
                 "newest_comment": c_last and {**c_last, "body": _cap_text(c_last["body"], _SHOW_COMMENT_CHARS)},
                 "newest_run": r_last and {**r_last, "summary": _cap_text(r_last["summary"], _SHOW_FIELD_CHARS),
                                           "error": _cap_text(r_last["error"], _SHOW_FIELD_CHARS)},
-                "note": "moved to %s; full text: hermes kanban show %s" % (kar.ARCHIVE_NAME, tid)}
+                "note": "moved to %s; full text: hermes kanban show %s" % (kar.ARCHIVE_NAME, tid),
+                **({"error": arch["error"]} if arch.get("error") else {})}
         return json.dumps(_bounded_show(out), ensure_ascii=False, default=str)
 
 

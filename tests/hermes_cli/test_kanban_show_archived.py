@@ -125,3 +125,48 @@ def test_kanban_show_tool_reports_archived_counts(kanban_home, monkeypatch):
     assert arch["newest_comment"]["body"] == "review_coverage: approve, moved later"
     assert arch["newest_run"]["summary"] == "shipped the thing in o/r#7"
     assert f"hermes kanban show {tid}" in arch["note"]
+
+
+def test_locked_archive_is_surfaced_not_empty(kanban_home, monkeypatch):
+    """A failed/locked archive read must not look like a card with no archived history."""
+    from hermes_cli import kanban_archive_read as kar
+    from tools import kanban_tools as kt
+
+    tid = _done_card()
+    arch = _move_out(tid)
+    monkeypatch.setattr(kar, "_TIMEOUT_S", 0.2, raising=False)
+    holder = sqlite3.connect(arch, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")   # held past the reader's timeout
+    try:
+        text = kc.run_slash(f"show {tid}")
+        out = json.loads(kc.run_slash(f"show {tid} --json"))
+        monkeypatch.setenv("HERMES_PROFILE", "daedalus")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        shown = json.loads(kt._handle_show({"task_id": tid}))
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert "archived history unreadable: OperationalError" in text
+    assert out["archived"]["error"].startswith("OperationalError")
+    assert out["archived"]["comments"] == [] and out["archived"]["runs"] == []
+    assert shown["archived"]["error"].startswith("OperationalError")
+
+
+def test_state_filter_applies_to_archived_runs(kanban_home):
+    tid = _done_card()
+    arch = _move_out(tid)
+    a = sqlite3.connect(arch)
+    cols = [r[1] for r in a.execute("PRAGMA table_info(task_runs)") if r[1] != "id"]
+    a.execute("INSERT INTO task_runs (%s) SELECT %s FROM task_runs WHERE task_id=?"
+              % (", ".join(cols), ", ".join(cols)), (tid,))
+    a.execute("UPDATE task_runs SET outcome='crashed', summary='died' WHERE id=(SELECT max(id) FROM task_runs)")
+    a.commit()
+    assert sorted(r[0] for r in a.execute("SELECT outcome FROM task_runs WHERE task_id=?", (tid,))) == \
+        ["completed", "crashed"]
+    a.close()
+    out = json.loads(kc.run_slash(f"show {tid} --state-type outcome --state-name crashed --json"))
+    assert [r["outcome"] for r in out["archived"]["runs"]] == ["crashed"]
+    text = kc.run_slash(f"show {tid} --state-type outcome --state-name crashed")
+    assert "Archived runs (1, kanban-archive.db):" in text and "shipped the thing" not in text
+    allruns = json.loads(kc.run_slash(f"show {tid} --json"))
+    assert sorted(r["outcome"] for r in allruns["archived"]["runs"]) == ["completed", "crashed"]

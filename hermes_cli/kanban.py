@@ -1415,7 +1415,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         comments = kb.list_comments(conn, args.task_id)
         # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived
         from hermes_cli import kanban_archive_read as kar
-        archived = kar.archived_rows(conn, args.task_id)
+        archived = kar.archived_rows(conn, args.task_id, **rsk)
         events = kb.list_events(conn, args.task_id)
         parent_links = kb.parent_links(conn, args.task_id)
         child_links = kb.child_links(conn, args.task_id)

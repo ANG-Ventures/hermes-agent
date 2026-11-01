@@ -25,37 +25,56 @@ def _archive_path(conn: sqlite3.Connection) -> Path | None:
     return None
 
 
-def _rows(arch: sqlite3.Connection, table: str, cols: tuple, task_id: str, order: str) -> list[dict[str, Any]]:
+_TIMEOUT_S = 5.0
+
+
+def _rows(arch: sqlite3.Connection, table: str, cols: tuple, task_id: str, order: str,
+          where: str = "", params: tuple = ()) -> list[dict[str, Any]]:
     have = {r[1] for r in arch.execute("PRAGMA table_info(%s)" % table)}
     if not have:
         return []
     sel = ", ".join(c if c in have else "NULL AS %s" % c for c in cols)
-    cur = arch.execute("SELECT %s FROM %s WHERE task_id = ? ORDER BY %s" % (sel, table, order), (task_id,))
+    cur = arch.execute("SELECT %s FROM %s WHERE task_id = ?%s ORDER BY %s" % (sel, table, where, order),
+                       (task_id, *params))
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def archived_rows(conn: sqlite3.Connection, task_id: str) -> dict[str, list[dict[str, Any]]]:
-    """``{"comments": [...], "runs": [...]}`` from the board's archive file, empty when there is none."""
+def archived_rows(conn: sqlite3.Connection, task_id: str, *, state_type: str | None = None,
+                  state_name: str | None = None) -> dict[str, Any]:
+    """``{"comments": [...], "runs": [...]}`` from the board's archive file, empty when there is none.
+
+    ``state_type``/``state_name`` filter the runs exactly like ``kanban_db.list_runs``. An archive that
+    exists but cannot be read (locked, corrupt) adds ``"error": "<sqlite3 error class>: <message>"``
+    so a failed read never looks like a card with no archived history."""
+    if (state_type is None) ^ (state_name is None):
+        raise ValueError("state_type and state_name must both be set or both omitted")
+    if state_type is not None and state_type not in ("status", "outcome"):
+        raise ValueError("state_type must be 'status' or 'outcome'")
     path = _archive_path(conn)
     if path is None or not path.is_file():
         return {"comments": [], "runs": []}
-    arch = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    run_where, run_params = ("", ()) if state_type is None else (" AND %s = ?" % state_type, (state_name,))
+    arch = None
     try:
+        arch = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=_TIMEOUT_S)
         return {"comments": _rows(arch, "task_comments", _COMMENT_COLS, task_id, "created_at, id"),
-                "runs": _rows(arch, "task_runs", _RUN_COLS, task_id, "started_at, id")}
-    except sqlite3.Error:
-        return {"comments": [], "runs": []}
+                "runs": _rows(arch, "task_runs", _RUN_COLS, task_id, "started_at, id", run_where, run_params)}
+    except sqlite3.Error as exc:
+        return {"comments": [], "runs": [], "error": "%s: %s" % (type(exc).__name__, exc)}
     finally:
-        arch.close()
+        if arch is not None:
+            arch.close()
 
 
 def present(archived: dict) -> bool:
-    return bool(archived.get("comments") or archived.get("runs"))
+    return bool(archived.get("comments") or archived.get("runs") or archived.get("error"))
 
 
 def text_lines(archived: dict, fmt_ts) -> list[str]:
     """The ``kanban show`` text block; every line says archived."""
     out = []
+    if archived.get("error"):
+        out += ["", "archived history unreadable: %s (%s)" % (archived["error"], ARCHIVE_NAME)]
     if archived.get("comments"):
         out += ["", "Archived comments (%d, %s):" % (len(archived["comments"]), ARCHIVE_NAME)]
         out += ["  [%s] [archived] %s: %s" % (fmt_ts(c["created_at"]), c["author"], c["body"])
