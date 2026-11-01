@@ -308,6 +308,52 @@ def pool_budget_eligible(provider, probes: dict, cache: dict, pool_urls: dict,
     return int(eligible)
 
 
+def configured_pool_relay_capacity() -> bool:
+    """``kanban.pool_relay_capacity`` (default True): cap relay-family admissions
+    at the relay's own free turn slots. Non-bool -> default."""
+    from hermes_cli.config import load_config
+    try:
+        value = load_config().get("kanban", {}).get("pool_relay_capacity", True)
+    except Exception:
+        return True
+    return value if isinstance(value, bool) else True
+
+
+def _num(value) -> bool:
+    return type(value) in (int, float) and 0 <= value < float("inf")
+
+
+def relay_free_slots(provider, probes: dict, cache: dict, pool_urls: dict) -> dict | None:
+    """Free turn slots on the relay that serves ``provider`` (t_6b917840).
+
+    ``max_inflight`` on a relay /health is the POOL-wide ceiling (the summed
+    box capacity of its eligible seats), so free = max_inflight - active_turns;
+    a relay-published numeric ``free`` wins. An unreadable /health is 0 free:
+    the work waits instead of 503ing at max_inflight (Apollo ruling, measured
+    11-01: apr 1 eligible, 4/4 active, 334 rejects while kanban kept placing).
+    None = no ceiling: not a relay-family route, probe disabled, or a relay
+    that answers without the figures.
+    """
+    route = pool_route(provider)
+    if route is None or route[1] is not None:
+        return None
+    url = (probes or {}).get(provider)
+    if url is None:
+        url = (pool_urls or {}).get(route[0])
+    if not _valid_url(url):
+        return None
+    data = _fetch(url, cache, provider)
+    if data is None:
+        return {"free": 0, "unreadable": True}
+    if _num(data.get("free")):
+        return {"free": int(data["free"])}
+    cap, active = data.get("max_inflight"), data.get("active_turns")
+    if not (_num(cap) and _num(active)):
+        return None
+    return {"free": max(0, int(cap) - int(active)), "max_inflight": int(cap),
+            "active_turns": int(active), "eligible": data.get("eligible_count")}
+
+
 def effective_provider(task) -> str | None:
     _, provider = model_override(task)
     if provider:
