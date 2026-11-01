@@ -22,7 +22,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tools import async_delegation_store as _store
 
@@ -292,7 +292,7 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
     board = _board()
     task_id = None
     try:
-        model = _execution_model(delegation_id, profile_home)
+        model, provider = _execution_route(delegation_id, profile_home)
         reason = _flagship_reason(delegation_id, model, flagship_reason)
         kb.create_board(board)
         with kb.connect_closing(board=board) as conn:
@@ -302,7 +302,13 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
                 assignee=profile, workspace_kind="dir", workspace_path=cwd, max_retries=1,
                 max_runtime_seconds=None, session_id=session_id or None,
                 idempotency_key=attempt_id, board=board, created_by=profile,
-                model_override=model, flagship_override_reason=reason,
+                model_override=model, provider_override=provider,
+                # The runner reads its route from the delegation registry, never from this pin
+                # (K1 argv): a lane catalog that does not list the id must not refuse the container
+                # (Prism f226ee06e5ba round 2). The write leaves the ``model force:`` audit comment.
+                force_model_reason=(f"delegation {delegation_id}: container card; the unit runs "
+                                    "the route already resolved by delegate_task") if model else None,
+                flagship_override_reason=reason,
                 flagship_override_author=profile if reason else None,
             )
             # ``slot_key``: the call's shared pool slot, so a boot observer of a multi-unit call
@@ -324,13 +330,28 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "task_id": task_id, "fenced": fenced}
 
 
-def _execution_model(delegation_id: str, profile_home: Path) -> Optional[str]:
-    """The model the unit's runner runs: its durable record's ``execution.model``."""
+def _execution_route(delegation_id: str, profile_home: Path) -> Tuple[Optional[str], Optional[str]]:
+    """``(model, provider)`` the unit's runner runs, from its durable ``execution`` block.
+
+    The provider is the delegation's named one (``credential_ref.provider``, e.g. ``custom:<name>``),
+    else ``execution.provider``, so a ``lane/model`` id is never re-split onto an inferred lane. A
+    provider the card-pin policy refuses as-is (a single-sub pin or pre-rename alias, which would need
+    ``--pin-sub``) is left off: the pin only feeds the flagship guard, it never routes the runner."""
     with _store.locked_registry(profile_home, write=False) as registry:
         record = registry["records"].get(delegation_id)
     execution = record.get("execution") if isinstance(record, dict) else None
-    model = execution.get("model") if isinstance(execution, dict) else None
-    return str(model or "").strip() or None
+    execution = execution if isinstance(execution, dict) else {}
+    model = str(execution.get("model") or "").strip() or None
+    ref = execution.get("credential_ref")
+    provider = str((ref.get("provider") if isinstance(ref, dict) else None)
+                   or execution.get("provider") or "").strip() or None
+    if not model:
+        return None, None
+    from hermes_cli.model_policy import pinned_sub_provider_error
+
+    if provider and pinned_sub_provider_error(model, provider):
+        provider = None
+    return model, provider
 
 
 def _flagship_reason(delegation_id: str, model: Optional[str], audited: Optional[str]) -> Optional[str]:

@@ -74,7 +74,7 @@ def spawner():
     s.cleanup()
 
 
-def _spec(cwd, *, runtime="kanban", model="m"):
+def _spec(cwd, *, runtime="kanban", model="m", provider="p"):
     return {
         "profile": "default",
         "source": {"kind": "single", "tasks": [{"goal": "write the report", "role": "leaf"}],
@@ -82,7 +82,7 @@ def _spec(cwd, *, runtime="kanban", model="m"):
         "execution": {"model": model, "provider": "p", "toolsets": ["file"], "max_iterations": 5,
                       "workspace_hint": str(cwd), "runtime": runtime,
                       "route": {"requested_provider": "custom:named", "model": "m", "explicit_base_url": None},
-                      "credential_ref": {"provider": "p"}},
+                      "credential_ref": {"provider": provider}},
         "route": {"session_key": "agent:main:telegram:dm:1", "parent_session_id": "parent-1",
                   "origin_ui_session_id": "", "platform": "telegram", "chat_id": "1", "profile": "default"},
     }
@@ -102,7 +102,8 @@ def _sync_executor(monkeypatch):
     return threads
 
 
-def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, spawned=None, model="m"):
+def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, spawned=None, model="m",
+              provider="p"):
     threads = _sync_executor(monkeypatch)
     cwd = tmp_path / "cwd"
     cwd.mkdir(exist_ok=True)
@@ -116,7 +117,7 @@ def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, s
         goals=["write the report"], context=None, toolsets=None, role="leaf", model="m",
         session_key="agent:main:telegram:dm:1", parent_session_id="parent-1",
         runner=runner or _runner, max_async_children=max_children,
-        durable_spec=_spec(cwd, model=model), current_boot_id=BOOT,
+        durable_spec=_spec(cwd, model=model, provider=provider), current_boot_id=BOOT,
         kanban={"profile": "default", "cwd": str(cwd), "session_id": "parent-1", "spawn_fn": spawn_fn,
                 "on_spawned": spawned})
     for t in threads:
@@ -332,6 +333,27 @@ def test_unit_inheriting_a_flagship_route_without_authority_falls_back_and_says_
     assert len(calls) == 1
     assert ad.kanban_launch_runtime(handle["delegation_id"], timeout=0) == \
         "in_process (kanban spawn failed: FlagshipAssigneeRefused)"
+
+
+def test_unit_pin_keeps_the_delegations_provider_and_no_lane_catalog_refuses_it(home, monkeypatch, tmp_path,
+                                                                                spawner):
+    """Prism f226ee06e5ba round 2: a ``lane/model`` id on a named custom endpoint is pinned with that
+    endpoint (never re-split onto ``openai``), and a lane catalog that does not list the id cannot push
+    the container card in-process: the runner never reads its route from the pin."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import model_registry
+
+    monkeypatch.setattr(model_registry, "catalog_for", lambda provider: ("some-other-model",))
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="openai/gpt-oss-120b",
+                              provider="custom:vllm")
+    did = handle["delegation_id"]
+    assert calls == [] and ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+    task_id = _record(did)["kanban"]["task_id"]
+    card, kinds = _card(task_id)
+    assert card.provider_override == "custom:vllm" and kinds.count("spawned") == 1
+    with kb.connect_closing(board="delegations") as conn:
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+    assert any(b.startswith(kb.MODEL_FORCE_COMMENT_PREFIX) and did in b for b in bodies)
 
 
 def test_ordinary_card_on_a_flagship_default_profile_is_still_refused(home):
