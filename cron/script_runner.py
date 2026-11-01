@@ -745,6 +745,10 @@ class ScriptRunner:
                     {sched._script_proc_job_ids.get(key) for key, _p, _s in confirmed} - {None})
                 alive += self._skew_terminate(confirmed)
             alive += [t for t in unsure if ss._script_tree_alive(t[1], t[2])]
+            # The confirmed pass can spend a whole TERM/KILL grace; a first-pass survivor that exited
+            # meanwhile must not withhold its re-fire (Prism ecfb7394bfc6). Recheck on a fresh scan.
+            alive = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in alive]
+            alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
             withheld = {sched._script_proc_job_ids.get(key) for key, _p, _s in alive} - {None}
             sched._refire_withheld_job_ids.update(withheld)
             sched._restart_killed_job_ids.difference_update(withheld)

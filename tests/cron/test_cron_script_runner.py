@@ -1418,6 +1418,59 @@ def test_d_skew_kill_withholds_only_the_surviving_profiles_refire(root, tmp_path
     assert sched._restart_killed_job_ids == {key_b}
 
 
+def test_d_skew_kill_rechecks_first_pass_survivors_after_the_confirmed_pass(root, monkeypatch):
+    """Prism ecfb7394bfc6: tree A survives the first pass; unsure tree B is confirmed and goes
+    through its own TERM/KILL. A exits during B's grace, so A's stale survivor entry must not
+    withhold A's re-fire. Only B, still alive, is withheld."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss, script_runner
+
+    class _Proc:
+        def __init__(self, pid, tag):
+            self.pid, self.returncode, self.tag = pid, None, tag
+
+    proc_a, proc_b = _Proc(10**7 + 51, "A"), _Proc(10**7 + 52, "B")
+    key_a, key_b = sched._inflight_key("ja", root), sched._inflight_key("jb", root)
+    state = {"a_dead": False, "b_refresh": 0}
+
+    def _refresh(p, snap):
+        if p is proc_b:
+            state["b_refresh"] += 1
+            return ["B-marker"] if state["b_refresh"] == 1 else ["B"]
+        return snap
+
+    def _alive(p, members):
+        if not members:
+            return False
+        if p is proc_a:
+            return not state["a_dead"]
+        return True  # B (marker or real) ignores TERM and KILL
+
+    def _signal(p, _snap, sig):
+        if p is proc_b and sig == signal.SIGTERM:
+            state["a_dead"] = True  # A finishes its uninterruptible I/O during B's TERM grace
+
+    monkeypatch.setattr(sched, "_active_script_procs", {1: proc_a, 2: proc_b})
+    monkeypatch.setattr(sched, "_script_proc_job_ids", {1: key_a, 2: key_b})
+    monkeypatch.setattr(sched, "_restart_killed_job_ids", {key_a, key_b})
+    monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+    monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+    monkeypatch.setattr(ss, "_script_tree_snapshot", lambda p: [p.tag])
+    monkeypatch.setattr(ss, "_script_tree_refresh", _refresh)
+    monkeypatch.setattr(ss, "_script_tree_alive", _alive)
+    monkeypatch.setattr(ss, "_signal_script_tree", _signal)
+    monkeypatch.setattr(script_runner, "_real_members",
+                        lambda s: None if s is None else [m for m in s if m != "B-marker"])
+    try:
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+    finally:
+        sched.clear_shutdown()
+    assert state["b_refresh"] >= 2  # B was unsure, then confirmed and terminated
+    assert sched._skew_interrupted_job_ids == {key_a, key_b}
+    assert sched._refire_withheld_job_ids == {key_b}
+    assert sched._restart_killed_job_ids == {key_a}
+
+
 @pytest.mark.slow_test(180, reason="real runner subprocess")
 def test_d_code_skew_drain_waits_on_a_jobs_final_repetition(root, tmp_path, procs):
     """Prism cd1ea5071578: a run on its job's last finite repetition (repeat times 1, completed 0)
