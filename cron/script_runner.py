@@ -69,6 +69,14 @@ def _detect_code_skew():
         return None
 
 
+def _real_members(snapshot: Optional[list]) -> Optional[list]:
+    """``snapshot`` without scan markers (``_SCAN_MARKERS``): the members that prove a running copy
+    and may be signalled. None stays None (the process-group fallback)."""
+    from cron import scheduler_script as ss
+
+    return None if snapshot is None else [m for m in snapshot if not isinstance(m, ss._SCAN_MARKERS)]
+
+
 def _inflight_count() -> int:
     from cron.scheduler import get_running_job_ids
 
@@ -716,8 +724,7 @@ class ScriptRunner:
             # or signalled, but it is still checked at the end and its re-fire withheld.
             cut, unsure = [], []
             for t in trees:
-                if ss._script_tree_alive(t[1], None if t[2] is None else [
-                        m for m in t[2] if not isinstance(m, ss._SCAN_MARKERS)]):
+                if ss._script_tree_alive(t[1], _real_members(t[2])):
                     cut.append(t)
                 elif ss._script_tree_alive(t[1], t[2]):
                     unsure.append(t)
@@ -726,32 +733,17 @@ class ScriptRunner:
             # (Prism b86087faa72f); consumed by _run_job_script once the run returns.
             sched._skew_interrupted_job_ids.update(
                 {sched._script_proc_job_ids.get(key) for key, _p, _s in trees} - {None})
-            for _key, proc, snap in trees:
-                ss._signal_script_tree(proc, snap, signal.SIGTERM)
-            alive = trees
-            deadline = time.monotonic() + float(lanes.RUNNER_SKEW_KILL_GRACE_S)
-            while True:
-                alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
-                if not alive or time.monotonic() >= deadline:
-                    break
-                time.sleep(0.1)
-            # Re-snapshot before KILL and before the confirm: a descendant forked during the TERM
-            # grace is in neither the first snapshot nor the reaped leader's tree (Prism 361a15209668).
-            trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
-            alive = [t for t in trees if ss._script_tree_alive(t[1], t[2])]
-            kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
-            for _key, proc, snap in alive:
-                ss._signal_script_tree(proc, snap, kill_sig)
-            alive = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in alive]
-            for _key, proc, snap in alive:
-                ss._signal_script_tree(proc, snap, kill_sig)
-            deadline = time.monotonic() + _SKEW_CONFIRM_S
-            while True:
-                alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
-                if not alive or time.monotonic() >= deadline:
-                    break
-                time.sleep(0.05)
+            alive = self._skew_terminate(trees)
+            # An "unsure" tree a later refresh confirms (a real member alive, not only a scan
+            # marker) is a running copy: it goes through the same TERM/KILL (Prism 662cc8e0a1ae).
+            # One still alive only through markers is never signalled; its re-fire is withheld.
             unsure = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in unsure]
+            confirmed = [t for t in unsure if ss._script_tree_alive(t[1], _real_members(t[2]))]
+            unsure = [t for t in unsure if not any(t is c for c in confirmed)]
+            if confirmed:
+                sched._skew_interrupted_job_ids.update(
+                    {sched._script_proc_job_ids.get(key) for key, _p, _s in confirmed} - {None})
+                alive += self._skew_terminate(confirmed)
             alive += [t for t in unsure if ss._script_tree_alive(t[1], t[2])]
             withheld = {sched._script_proc_job_ids.get(key) for key, _p, _s in alive} - {None}
             sched._refire_withheld_job_ids.update(withheld)
@@ -761,6 +753,38 @@ class ScriptRunner:
                          "re-fire withheld for %s", len(alive),
                          ", ".join(str(proc.pid) for _k, proc, _s in alive),
                          ", ".join(sorted(f"{j}@{h}" for h, j in withheld)) or "-")
+
+    @staticmethod
+    def _skew_terminate(trees: list) -> list:
+        """TERM every tree, wait ≤ ``RUNNER_SKEW_KILL_GRACE_S``, re-snapshot (a descendant forked
+        during the TERM grace, Prism 361a15209668), KILL the survivors twice, confirm ≤
+        ``_SKEW_CONFIRM_S``. Returns the trees still alive."""
+        from cron import scheduler_script as ss
+
+        for _key, proc, snap in trees:
+            ss._signal_script_tree(proc, snap, signal.SIGTERM)
+        alive = trees
+        deadline = time.monotonic() + float(lanes.RUNNER_SKEW_KILL_GRACE_S)
+        while True:
+            alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
+            if not alive or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
+        alive = [t for t in trees if ss._script_tree_alive(t[1], t[2])]
+        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for _key, proc, snap in alive:
+            ss._signal_script_tree(proc, snap, kill_sig)
+        alive = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in alive]
+        for _key, proc, snap in alive:
+            ss._signal_script_tree(proc, snap, kill_sig)
+        deadline = time.monotonic() + _SKEW_CONFIRM_S
+        while True:
+            alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
+            if not alive or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        return alive
 
     # --- SIGTERM shutdown (§5.4) -----------------------------------------------------------
 

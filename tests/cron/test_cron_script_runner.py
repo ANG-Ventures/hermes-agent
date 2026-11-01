@@ -1226,6 +1226,126 @@ def test_d_skew_kill_failed_scan_does_not_flag_a_finished_run_interrupted(root, 
         leader.wait(timeout=10)
 
 
+class _FakeEscapee:
+    """A token-carrying member the scan finds: running until it is signalled with one of ``dies_on``."""
+
+    def __init__(self, pid, dies_on=()):
+        import psutil
+        self.pid, self.signals, self._dies_on, self._zombie = pid, [], set(dies_on), psutil.STATUS_ZOMBIE
+        self._running = True
+
+    def is_running(self):
+        return self._running
+
+    def status(self):
+        return "sleeping" if self._running else self._zombie
+
+    def children(self, recursive=False):
+        return []
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+        if sig in self._dies_on:
+            self._running = False
+
+
+def test_d_skew_kill_scans_for_escapees_without_a_snapshot(root, monkeypatch):
+    """Prism 57280310926d: with no snapshot (the leader already gone), ``_script_tree_refresh``
+    returned before the run-token scan, so a setsid escapee of the reaped leader was never found and
+    the re-fire ran beside it. The scan runs anyway and its members are signalled and counted."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+
+    class _Proc:
+        pid, returncode, _hermes_script_run_token = 10**7 + 31, None, "tok"
+
+        def poll(self):
+            return None
+
+    esc = _FakeEscapee(10**7 + 32)  # survives TERM and KILL
+    key = sched._inflight_key("nosnap", root)
+    monkeypatch.setattr(sched, "_active_script_procs", {1: _Proc()})
+    monkeypatch.setattr(sched, "_script_proc_job_ids", {1: key})
+    monkeypatch.setattr(sched, "_restart_killed_job_ids", {key})
+    monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+    monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+    monkeypatch.setattr(ss, "_script_tree_snapshot", lambda _p: None)
+    monkeypatch.setattr(ss, "_terminate_cron_script_tree", lambda _p: None)  # the leader is gone
+    monkeypatch.setattr(ss, "_script_run_token_members", lambda _p: [esc])
+    try:
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+    finally:
+        sched.clear_shutdown()
+    assert signal.SIGTERM in esc.signals
+    assert sched._refire_withheld_job_ids == {key}
+    assert sched._restart_killed_job_ids == set()
+
+
+def test_d_skew_kill_signals_an_unsure_tree_a_later_refresh_confirms(root, monkeypatch):
+    """Prism 662cc8e0a1ae: a tree alive at first only through a scan marker (unreadable environ) is
+    "unsure"; when the final refresh reads the escapee's token it is a real running copy, but it was
+    only appended to ``alive``, never TERMed or KILLed. It now goes through the termination path."""
+    import cron.scheduler as sched
+    from cron import scheduler_script as ss
+
+    esc = _FakeEscapee(10**7 + 41, dies_on={signal.SIGTERM})
+    calls = {"n": 0}
+
+    def _scan(_p):
+        calls["n"] += 1
+        return [ss._UnreadableMember(esc)] if calls["n"] == 1 else [esc]
+
+    leader = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        if sys.platform.startswith("linux"):
+            _wait_for(lambda: Path(f"/proc/{leader.pid}/stat").read_text().split()[2] == "Z", 10,
+                      what="leader exited, unreaped")
+        else:
+            time.sleep(1.0)
+        key = sched._inflight_key("unsure2real", root)
+        monkeypatch.setattr(sched, "_active_script_procs", {id(leader): leader})
+        monkeypatch.setattr(sched, "_script_proc_job_ids", {id(leader): key})
+        monkeypatch.setattr(sched, "_restart_killed_job_ids", {key})
+        monkeypatch.setattr(sched, "_refire_withheld_job_ids", set())
+        monkeypatch.setattr(sched, "_skew_interrupted_job_ids", set(), raising=False)
+        monkeypatch.setattr(ss, "_script_run_token_members", _scan)
+        _skew_kill_runner(root, monkeypatch)._skew_kill()
+        assert esc.signals[:1] == [signal.SIGTERM]
+        assert sched._skew_interrupted_job_ids == {key}  # a running copy was cut, like a cut tree
+        assert sched._refire_withheld_job_ids == set()  # it died on TERM: the re-fire may run
+        assert sched._restart_killed_job_ids == {key}
+    finally:
+        sched.clear_shutdown()
+        leader.wait(timeout=10)
+
+
+@pytest.mark.skipif(os.getppid() <= 1, reason="needs a parent that is not init")
+def test_d_is_orphaned_does_not_trust_the_parent_name(monkeypatch):
+    """Prism f21e0ce565ea: "subreaper" was decided by the parent's NAME, so an unreadable same-user
+    escapee adopted by a subreaper with another name (or whose parent could not be read) counted as
+    unrelated and the re-fire ran beside it. An ancestor of the runner (where an orphan of the
+    script is adopted), or an unreadable or vanished parent, leaves it unsure: counted. A live
+    readable parent outside the runner's ancestry (here: the runner's own child) does not."""
+    from cron import scheduler_script as ss
+
+    class _Cand:
+        def __init__(self, ppid):
+            self._ppid = ppid
+
+        def ppid(self):
+            return self._ppid
+
+    now = time.time()
+    assert ss._is_orphaned(_Cand(os.getppid()), now)  # an ancestor, whatever its name
+    assert ss._is_orphaned(_Cand(2**22 + 12345), now)  # parent gone: unsure
+    sib = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert not ss._is_orphaned(_Cand(sib.pid), now)  # live, readable, not an ancestor
+    finally:
+        sib.kill()
+        sib.wait(timeout=10)
+
+
 def _skew_kill_runner(root, monkeypatch):
     from cron import lanes, script_runner
 

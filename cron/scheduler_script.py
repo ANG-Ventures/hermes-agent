@@ -354,18 +354,22 @@ _SCAN_MARKERS = (_UnprovenMember, _UnreadableMember)
 
 
 def _is_orphaned(cand, started: float) -> bool:
-    """Whether ``cand``'s parent is init or a subreaper: pid 1, or a parent that predates the script
-    and is named like one. Unreadable parent: not proven orphaned."""
+    """Whether ``cand`` may be an adopted escapee: its parent is init, or an ancestor of this runner.
+    An orphan of the script is adopted by the nearest living child subreaper among its ancestors,
+    which are the runner's ancestors, else init; so the test is ancestry, never the parent's name
+    (Prism f21e0ce565ea: a custom-named subreaper). A parent that cannot be read, or that is gone,
+    leaves the candidate unsure, which counts it. Only a live readable parent outside the runner's
+    ancestry (an unrelated sudo, ssh) proves it unrelated."""
     ppid = cand.ppid()
     if ppid <= 1:
         return True
     import psutil
     try:
         parent = psutil.Process(ppid)
-        return (parent.create_time() < started
-                and parent.name() in ("systemd", "init", "launchd", "tini", "s6-svscan"))
+        parent.create_time()  # unreadable or gone: unsure
+        return any(a.pid == ppid for a in psutil.Process(os.getpid()).parents())
     except psutil.Error:
-        return False
+        return True
 
 
 def _script_run_token_members(proc: subprocess.Popen) -> list:
@@ -382,6 +386,9 @@ def _script_run_token_members(proc: subprocess.Popen) -> list:
     started = getattr(proc, _SCRIPT_RUN_STARTED_ATTR, None)
     try:
         import psutil
+    except ImportError:
+        return []  # no psutil: no scan is possible, and no snapshot was taken either
+    try:
         found = []
         uid = os.getuid()  # windows-footgun: ok — POSIX-only caller (cron script runner)
         for cand in psutil.process_iter():
@@ -412,8 +419,16 @@ def _script_tree_refresh(proc: subprocess.Popen, snapshot: Optional[list]) -> Op
     during the TERM grace is signalled and counted even after the leader is reaped. Also every
     process carrying the run's env token (Prism 85c0395583d8: a setsid escapee of an exited
     parent)."""
+    tokened = None
     if snapshot is None:
-        return _script_tree_snapshot(proc)
+        # No snapshot (psutil missing, or the leader already gone) still runs the token scan
+        # (Prism 57280310926d): a setsid escapee outlives a reaped leader.
+        snapshot = _script_tree_snapshot(proc)
+        tokened = _script_run_token_members(proc)
+        if not tokened:
+            return snapshot
+        # Leader gone: the process-group scan below still finds its group.
+        snapshot = snapshot or []
     # A marker from an earlier scan says nothing about now: drop it, the scan below re-adds it only
     # if it still applies (Prism 06a05538f9a0).
     snapshot = [m for m in snapshot if not isinstance(m, _SCAN_MARKERS)]
@@ -428,7 +443,9 @@ def _script_tree_refresh(proc: subprocess.Popen, snapshot: Optional[list]) -> Op
             with contextlib.suppress(Exception):
                 if os.getpgid(cand.pid) == proc.pid:
                     group.append(cand)
-    for member in list(snapshot) + (fresh or []) + group + _script_run_token_members(proc):
+    if tokened is None:
+        tokened = _script_run_token_members(proc)
+    for member in list(snapshot) + (fresh or []) + group + tokened:
         found = [member] if member not in merged else []
         with contextlib.suppress(Exception):
             if member.is_running():
