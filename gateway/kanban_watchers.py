@@ -2408,7 +2408,7 @@ class GatewayKanbanWatchersMixin:
                                             red_state[_ev.id] = _verdict["state"]
                                             red_keys[_ev.id] = _verdict["keys"]
                                             _why_red = _ns.red_handback_noise(
-                                                _verdict["keys"], _verdict["inherited_only"], _red_seen,
+                                                _verdict["keys"], _red_seen,
                                             ) if _s5 else None
                                             if _why_red:
                                                 wake_noise[_ev.id] = _why_red
