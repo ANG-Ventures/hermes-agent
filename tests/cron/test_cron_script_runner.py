@@ -1078,7 +1078,8 @@ def test_d_tree_refresh_counts_an_unreadable_same_user_process_alive(monkeypatch
     mine = _Cand(10**7 + 11, os.getuid(), now + 0.5)
     other = _Cand(10**7 + 12, os.getuid() + 1, now + 0.5)
     older = _Cand(10**7 + 13, os.getuid(), now - 3600)
-    parented = _Cand(10**7 + 14, os.getuid(), now + 0.5, ppid=os.getpid())  # parent: pytest
+    sib = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    parented = _Cand(10**7 + 14, os.getuid(), now + 0.5, ppid=sib.pid)  # live, not an ancestor
 
     class _Proc:
         pid, returncode = 10**7 + 10, 0
@@ -1088,7 +1089,11 @@ def test_d_tree_refresh_counts_an_unreadable_same_user_process_alive(monkeypatch
             return 0
 
     monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: iter([mine, other, older, parented]))
-    tree = ss._script_tree_refresh(_Proc(), [])
+    try:
+        tree = ss._script_tree_refresh(_Proc(), [])
+    finally:
+        sib.kill()
+        sib.wait(timeout=10)
     assert [m.pid for m in tree] == [mine.pid]
     assert ss._script_tree_alive(_Proc(), tree)
     ss._signal_script_tree(_Proc(), tree, signal.SIGTERM)
@@ -1337,6 +1342,7 @@ def test_d_is_orphaned_does_not_trust_the_parent_name(monkeypatch):
 
     now = time.time()
     assert ss._is_orphaned(_Cand(os.getppid()), now)  # an ancestor, whatever its name
+    assert ss._is_orphaned(_Cand(os.getpid()), now)  # Prism 5c769fe73b89: the runner as subreaper
     assert ss._is_orphaned(_Cand(2**22 + 12345), now)  # parent gone: unsure
     sib = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:

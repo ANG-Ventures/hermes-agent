@@ -354,7 +354,7 @@ _SCAN_MARKERS = (_UnprovenMember, _UnreadableMember)
 
 
 def _is_orphaned(cand, started: float) -> bool:
-    """Whether ``cand`` may be an adopted escapee: its parent is init, or an ancestor of this runner.
+    """Whether ``cand`` may be an adopted escapee: its parent is init, this runner, or its ancestor.
     An orphan of the script is adopted by the nearest living child subreaper among its ancestors,
     which are the runner's ancestors, else init; so the test is ancestry, never the parent's name
     (Prism f21e0ce565ea: a custom-named subreaper). A parent that cannot be read, or that is gone,
@@ -367,6 +367,8 @@ def _is_orphaned(cand, started: float) -> bool:
     try:
         parent = psutil.Process(ppid)
         parent.create_time()  # unreadable or gone: unsure
+        if ppid == os.getpid():  # the runner as a child subreaper (Prism 5c769fe73b89)
+            return True
         return any(a.pid == ppid for a in psutil.Process(os.getpid()).parents())
     except psutil.Error:
         return True
