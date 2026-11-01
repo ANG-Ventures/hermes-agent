@@ -268,12 +268,46 @@ def test_spawn_failure_runs_once_in_process_under_the_new_attempt(monkeypatch, t
     assert len(terminal) == 1 and terminal[0]["payload"]["attempt_id"] == rec["attempt"]["attempt_id"]
     assert ad._records[did].get("kanban_unit") is None
     assert ad.active_count() == 0
+    # delegate_task reports where the unit ran, never the kanban intent (t_7e0f9dab).
+    runtime = ad.kanban_launch_runtime(did, timeout=0)
+    assert runtime.startswith("in_process (kanban spawn failed: ") and "Error" in runtime
     # The failed card is archived, never left to run.
     from hermes_cli import kanban_db as kb
 
     with kb.connect_closing(board="delegations") as conn:
         statuses = [r["status"] for r in conn.execute("SELECT status FROM tasks")]
     assert statuses == ["archived"]
+
+
+def _flagship_default_profile(home):
+    (home / "config.yaml").write_text("model:\n  default: claude-fable-5-1\n")
+
+
+def test_unit_on_a_flagship_default_profile_spawns_pinned_to_its_execution_model(home, monkeypatch, tmp_path,
+                                                                                spawner):
+    """t_7e0f9dab: the card is a container for the delegation; the guard judges the route the runner
+    runs (``execution.model``), not the assignee profile's flagship default, so the unit spawns."""
+    _flagship_default_profile(home)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    rec = _record(did)
+    assert calls == [], "no in-process fallback"
+    assert rec["execution"]["runtime"] == "kanban"
+    card, kinds = _card(rec["kanban"]["task_id"])
+    assert card.model_override == rec["execution"]["model"] and kinds.count("spawned") == 1
+    assert ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+
+
+def test_ordinary_card_on_a_flagship_default_profile_is_still_refused(home):
+    """The guard is unchanged for any card that is not a delegation unit: no pin, no reason, refused."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.model_policy import FlagshipAssigneeRefused
+
+    _flagship_default_profile(home)
+    kb.create_board("delegations")
+    with kb.connect_closing(board="delegations") as conn, pytest.raises(FlagshipAssigneeRefused):
+        kb.create_task(conn, title="ordinary card", assignee="default", board="delegations",
+                       created_by="default")
 
 
 def test_spawn_failure_with_an_unfenced_card_fails_instead_of_running_in_process(monkeypatch, tmp_path):
