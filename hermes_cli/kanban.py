@@ -1413,6 +1413,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not task:
             return _err(f"no such task: {args.task_id}")
         comments = kb.list_comments(conn, args.task_id)
+        # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived
+        from hermes_cli import kanban_archive_read as kar
+        archived = kar.archived_rows(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
         parent_links = kb.parent_links(conn, args.task_id)
         child_links = kb.child_links(conn, args.task_id)
@@ -1467,6 +1470,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "withheld_notifications": kss.suppressed_rows(events),
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+            **({"archived": archived} if kar.present(archived) else {}),
             "placement": placement,
         })
         return 0
@@ -1572,6 +1576,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+    for line in kar.text_lines(archived, _fmt_ts):
+        print(line)
     return 0
 
 
