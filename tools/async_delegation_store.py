@@ -869,13 +869,19 @@ def persistable_fallback_policy(routing_cfg: Any) -> dict[str, Any]:
     child under ``fallback_providers: auto`` would fail over onto the parent's lanes that its own block
     excluded (Prism 3de445560b2a). ``None`` and ``"auto"`` persist as-is. A declared chain persists
     through the same credential filter as the parent chain. If that filter withholds it, ``[]`` is
-    recorded (no fallback), never ``None``, which would widen the policy to the inherited chain."""
+    recorded (no fallback), never ``None``, which would widen the policy to the inherited chain.
+    A bare provider name carries no credential and persists verbatim, so the recovered value resolves
+    exactly as the declared one did (Prism 75587d571cd7)."""
     declared = routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None
     if declared is None or isinstance(declared, str) or declared == []:
         return {"fallback_providers": declared}
-    if isinstance(declared, dict):
-        declared = [declared]
-    return {"fallback_providers": persistable_fallback_chain(declared) or []}
+    entries = [declared] if isinstance(declared, dict) else declared if isinstance(declared, list) else []
+    rungs = [entry for entry in entries if isinstance(entry, dict)]
+    if rungs and persistable_fallback_chain(rungs) is None:
+        return {"fallback_providers": []}
+    kept = [dict(entry) if isinstance(entry, dict) else entry for entry in entries if isinstance(entry, (dict, str))]
+    # Nothing usable resolves to the owner's default at dispatch; None resolves to the same default.
+    return {"fallback_providers": kept or None}
 
 
 def _sensitive_query_key(key: str) -> bool:

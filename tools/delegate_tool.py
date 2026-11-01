@@ -3636,6 +3636,9 @@ def _build_durable_background_spec(
             # The children inherited the parent's route (no delegation.provider/base_url pin): on
             # reconstruction they must inherit it again, routing filters included, not become a pin.
             "inherited_route": not creds.get("provider") and not cfg.get("base_url"),
+            # A model-only pin (``delegation.model``, provider inherited) is still a pin: recovery restores
+            # the model so the child resolves its fallback chain as pinned, as at dispatch (Prism e087e98e6bb8).
+            "model_pinned": bool(creds.get("model")),
         }
     session_parts = str(session_key or "").split(":")
     chat_type = session_parts[3] if len(session_parts) > 4 else None
@@ -4014,9 +4017,10 @@ def delegate_task(
         # The model is inherited with it: the parent was rebuilt on the persisted resolved model, and
         # a model without its provider re-runs alias resolution (gpt-5.5 -> openai-codex).
         _inherited_route = bool(_credential_ref.get("inherited_route"))
+        _model_pinned = bool(_credential_ref.get("model_pinned"))
         cfg = dict(cfg)
         cfg.update({
-            "model": "" if _inherited_route else (_execution.get("model") or ""),
+            "model": "" if _inherited_route and not _model_pinned else (_execution.get("model") or ""),
             "provider": "" if _inherited_route else _recovered_provider,
             "base_url": (_execution.get("base_url") or "") if _direct_endpoint and not _inherited_route else "",
             "api_key": "",

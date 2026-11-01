@@ -396,3 +396,38 @@ def test_recovered_unpinned_child_still_inherits_the_parent_chain():
     assert in_process
     cfg, rebuilt = _recovered_routing_cfg(parent, creds={"model": None}, routing_cfg=_GLOBAL_AUTO)
     assert _resolve_child_fallback_chain(rebuilt, cfg, False, child_model="parent-model") == in_process
+
+
+# ── Prism 75587d571cd7 / e087e98e6bb8: the recovered policy and pin match the dispatched ones ──
+
+def test_provider_name_fallback_list_round_trips_intact():
+    from tools.async_delegation_store import persistable_fallback_policy
+
+    declared = ["openrouter", {"provider": "claude-dtlr", "model": "claude-opus-5-5"}]
+    persisted = json.loads(json.dumps(persistable_fallback_policy({"fallback_providers": declared})))
+    assert persisted == {"fallback_providers": declared}
+
+
+def test_recovered_model_only_pin_keeps_no_parent_chain():
+    # Custom endpoint parent, delegation.model set, provider inherited, fallback_providers null.
+    global_null = {"resume_on_restart": True, "fallback_providers": None}
+    parent = _real_parent([{"provider": "openrouter", "model": "x/y"}])
+    original = _resolve_child_fallback_chain(parent, global_null, True, child_model="child-model")
+    assert original is None
+    tokens = set_session_vars(platform="telegram", chat_id="123", session_key="agent:main:telegram:dm:123",
+                              session_id="sess-parent", profile="work", async_delivery=True)
+    try:
+        with patch("gateway.status.get_current_boot_id", return_value="100:1.0"):
+            spec, _ = dt._build_durable_background_spec(
+                task_list=[{"goal": "finish", "context": None}], shared_context=None, top_role="leaf",
+                inherit_context=False, cfg=dict(global_null), creds={"model": "child-model"},
+                parent_agent=parent, session_key="agent:main:telegram:dm:123", parent_session_id="sess-parent",
+                origin_ui_session_id="", max_iterations=45)
+    finally:
+        restore_session_vars(tokens)
+    record = json.loads(json.dumps(spec))
+    with patch.object(dt, "_load_config", return_value=dict(global_null)):
+        cfg = _resolved_recovery_creds(record, _BPR_RUNTIME)["cfg"]
+    assert cfg["model"] == "child-model"
+    rebuilt = _real_parent(record["execution"]["fallback_chain"])
+    assert _resolve_child_fallback_chain(rebuilt, cfg, bool(cfg["model"]), child_model=cfg["model"]) == original
