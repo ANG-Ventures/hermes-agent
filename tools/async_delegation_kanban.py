@@ -274,8 +274,15 @@ def parse_card_body(body: Optional[str]) -> Dict[str, Any]:
 
 def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, profile: str,
                 goal: str, cwd: str, session_id: Optional[str],
-                spawn_fn: Optional[Callable] = None, slot_key: Optional[str] = None) -> Dict[str, Any]:
+                spawn_fn: Optional[Callable] = None, slot_key: Optional[str] = None,
+                flagship_reason: Optional[str] = None) -> Dict[str, Any]:
     """Create the unit's card and spawn its runner now (§5.2 steps 2-3).
+
+    The card is a container for an already-authorized delegation: it is pinned to the model the
+    runner will run (the durable ``execution.model``), so the flagship guard judges that route and
+    not the assignee profile's default (t_7e0f9dab). ``flagship_reason`` is delegate_task's own
+    audited ``allow_flagship_reason``, carried through create_task's override (authority still
+    judged there).
 
     Returns ``{"ok": True, "task_id", "pid"}``, or ``{"ok": False, "error"}`` after archiving any
     card it made: the caller then supersedes the attempt and runs the unit in-process (§5.2.4)."""
@@ -285,6 +292,7 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
     board = _board()
     task_id = None
     try:
+        reason = (flagship_reason or "").strip()
         kb.create_board(board)
         with kb.connect_closing(board=board) as conn:
             task_id = kb.create_task(
@@ -293,6 +301,8 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
                 assignee=profile, workspace_kind="dir", workspace_path=cwd, max_retries=1,
                 max_runtime_seconds=None, session_id=session_id or None,
                 idempotency_key=attempt_id, board=board, created_by=profile,
+                model_override=_execution_model(delegation_id, profile_home),
+                flagship_override_reason=f"delegation {delegation_id}: {reason}" if reason else None,
             )
             # ``slot_key``: the call's shared pool slot, so a boot observer of a multi-unit call
             # holds ONE slot as the dispatching gateway did (not one per unit).
@@ -311,6 +321,15 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
             hold_launch_fence(task_id)
         fenced = not task_id or (_archive_quietly(task_id) and _runner_gone(task_id))
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "task_id": task_id, "fenced": fenced}
+
+
+def _execution_model(delegation_id: str, profile_home: Path) -> Optional[str]:
+    """The model the unit's runner runs: its durable record's ``execution.model``."""
+    with _store.locked_registry(profile_home, write=False) as registry:
+        record = registry["records"].get(delegation_id)
+    execution = record.get("execution") if isinstance(record, dict) else None
+    model = execution.get("model") if isinstance(execution, dict) else None
+    return str(model or "").strip() or None
 
 
 #: Cards of failed launches whose attempt the dispatch worker is still fencing/superseding: the card-end
