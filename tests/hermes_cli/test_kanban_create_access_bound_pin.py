@@ -40,8 +40,8 @@ def fleet(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     (home / "fleet").mkdir(parents=True)
     (home / "hooks").mkdir()
-    (home / "fleet" / "kanban-pool.json").write_text(json.dumps({"priority": ["ci-box"]}))
-    (home / "hooks" / "access_bound_create_policy.py").write_text(HOOK)
+    (home / "fleet" / "kanban-pool.json").write_text(json.dumps({"priority": ["ci-box"]}), encoding="utf-8")
+    (home / "hooks" / "access_bound_create_policy.py").write_text(HOOK, encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

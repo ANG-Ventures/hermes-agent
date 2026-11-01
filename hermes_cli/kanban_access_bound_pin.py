@@ -86,9 +86,75 @@ def refusal(body: Optional[str]) -> Optional[str]:
 HANDOFF_LEDGER = Path("state") / "aegis-apollo-handoffs.jsonl"
 
 
-def _acting_profile() -> str:
+def _acting_profiles() -> set:
+    """Every identity source's profile name for this session. The rule applies when ANY says aegis:
+    ``current_profile_name()`` (override / env pin / home), the raw ``HERMES_PROFILE_NAME`` /
+    ``HERMES_PROFILE`` pins, the resolved ``HERMES_HOME``, and the home the active secret scope
+    is stamped with (the routed profile on an in-process gateway /kanban). A caller-set env pin can
+    only ADD the rule: ``HERMES_PROFILE=default`` under ``profiles/aegis`` still resolves aegis."""
+    import os
     from hermes_cli.profiles import current_profile_name
-    return (current_profile_name(default="default") or "default").strip().lower()
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    names = {current_profile_name(default="default") or "default"}
+    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        names.add(os.environ.get(env_name) or "")
+    names.add(profile_name_for_home(get_hermes_home()) or "")
+    try:
+        from agent.secret_scope import current_secret_scope_home
+        names.add(profile_name_for_home(current_secret_scope_home()) or "")
+    except ImportError:
+        pass
+    return {str(n).strip().lower() for n in names if n and str(n).strip()}
+
+
+def _handoff_quote(env_name: str) -> Optional[str]:
+    """The ``AEGIS_HANDOFF_APOLLO`` quote for the ACTING profile. With a profile secret scope bound
+    (a gateway turn, incl. the in-process /kanban path) only that scope's mapping counts: the
+    process ``os.environ`` is the launch profile's. No scope (plain CLI): ``get_secret`` reads
+    ``os.environ``; an unscoped multiplexed read counts as no quote."""
+    try:
+        from agent.secret_scope import UnscopedSecretError, current_secret_scope, get_secret
+    except ImportError:
+        import os
+        return os.environ.get(env_name)
+    scope = current_secret_scope()
+    if scope is not None:
+        return scope.get(env_name)
+    try:
+        return get_secret(env_name)
+    except UnscopedSecretError:
+        return None
+
+
+def _append_ledger_line(ledger: Path, line: str) -> None:
+    """Append one whole line or nothing: exclusive lock, one ``os.write`` of the full line, fsync;
+    any OSError (short write, ENOSPC) truncates back to the pre-append length and re-raises."""
+    import os
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    data = line.encode("utf-8")
+    fd = os.open(ledger, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        try:
+            import fcntl
+        except ImportError:  # Windows: no flock; the single write + truncate still applies
+            fcntl = None
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        length = os.fstat(fd).st_size
+        try:
+            written = os.write(fd, data)
+            if written != len(data):
+                raise OSError(f"short write to {ledger}: {written}/{len(data)} bytes")
+            os.fsync(fd)
+        except OSError:
+            try:
+                os.ftruncate(fd, length)
+                os.fsync(fd)
+            except OSError:
+                _log.warning("handoff ledger: cannot roll %s back to %d bytes", ledger, length)
+            raise
+    finally:
+        os.close(fd)  # releases the flock
 
 
 def handoff_refusal(verb: str, card: Optional[str], assignee: Optional[str]) -> Optional[str]:
@@ -101,7 +167,7 @@ def handoff_refusal(verb: str, card: Optional[str], assignee: Optional[str]) -> 
     if not assignee:
         return None
     try:
-        profile = _acting_profile()
+        profiles = _acting_profiles()
     except Exception:
         _log.debug("handoff: cannot resolve the acting profile; failing open", exc_info=True)
         return None
@@ -112,13 +178,14 @@ def handoff_refusal(verb: str, card: Optional[str], assignee: Optional[str]) -> 
     if mod is None:
         return None
     try:
-        if profile != str(mod.HANDOFF_PROFILE).lower():
+        profile = str(mod.HANDOFF_PROFILE).lower()
+        if profile not in profiles:
             return None
         target = str(assignee).strip().lower()
         if target not in {str(a).lower() for a in mod.APOLLO_ASSIGNEES}:
             return None
         env_name, minimum = str(mod.HANDOFF_ENV), int(mod.HANDOFF_MIN)
-        offered = os.environ.get(env_name)
+        offered = _handoff_quote(env_name)
         quote = (offered or "").strip()
         if len(quote) < minimum:
             return mod.handoff_refusal(verb, target, offered is not None)
@@ -131,9 +198,7 @@ def handoff_refusal(verb: str, card: Optional[str], assignee: Optional[str]) -> 
            "verb": verb, "card": card, "assignee": target, "quote": quote}
     ledger = root / HANDOFF_LEDGER
     try:
-        ledger.parent.mkdir(parents=True, exist_ok=True)
-        with open(ledger, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        _append_ledger_line(ledger, json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError:
         return (f"BLOCKED by {rule}: the hand-off quote is valid but the ledger {ledger} could not "
                 f"be written, and an unledgered hand-off is not allowed.")

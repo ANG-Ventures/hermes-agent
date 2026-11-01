@@ -41,7 +41,7 @@ QUOTE = "Ace: hand t_x to Apollo, he owns that lane now"
 def fleet(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     (home / "hooks").mkdir(parents=True)
-    (home / "hooks" / "access_bound_create_policy.py").write_text(HOOK)
+    (home / "hooks" / "access_bound_create_policy.py").write_text(HOOK, encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     for name in ("HERMES_PROFILE", "HERMES_PROFILE_NAME", "AEGIS_HANDOFF_APOLLO"):
@@ -75,7 +75,7 @@ def _count() -> int:
 
 def _ledger(home: Path) -> list:
     p = home / "state" / "aegis-apollo-handoffs.jsonl"
-    return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+    return [json.loads(x) for x in p.read_text(encoding="utf-8-sig").splitlines()] if p.exists() else []
 
 
 def test_aegis_reassign_to_apollo_is_refused_and_nothing_written(fleet, monkeypatch, capsys):
@@ -144,10 +144,76 @@ def test_missing_hook_module_fails_open(fleet, monkeypatch):
 def test_policy_off_marker_does_not_disarm_the_handoff_rule(fleet, monkeypatch, capsys):
     """The marker disarms the pool pin only; the handoff rule's only override is the ledgered quote (as in the hook)."""
     (fleet / "state").mkdir(exist_ok=True)
-    (fleet / "state" / "access-bound-create-policy-off").write_text("")
+    (fleet / "state" / "access-bound-create-policy-off").write_text("", encoding="utf-8")
     tid = _card()
     monkeypatch.setenv("HERMES_PROFILE", "aegis")
     assert _run("reassign", tid, "human:apollo") == 2
     assert "aegis-no-apollo-handoff" in capsys.readouterr().err
     assert _assignee(tid) == "daedalus"
 
+
+
+def test_torn_ledger_write_is_rolled_back_and_refused(fleet, monkeypatch, capsys):
+    """ENOSPC mid-append: the half line is truncated away, the call refused, the next append is valid JSONL."""
+    import os
+    ledger = fleet / "state" / "aegis-apollo-handoffs.jsonl"
+    ledger.parent.mkdir(exist_ok=True)
+    ledger.write_text('{"seed": 1}\n', encoding="utf-8")
+    before = ledger.read_bytes()
+    tid = _card()
+    monkeypatch.setenv("HERMES_PROFILE", "aegis")
+    monkeypatch.setenv("AEGIS_HANDOFF_APOLLO", QUOTE)
+    real_write = os.write
+
+    def torn(fd, data):
+        real_write(fd, bytes(data)[: len(data) // 2])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "write", torn)
+    assert _run("reassign", tid, "human:apollo") == 2
+    assert "could not be written" in capsys.readouterr().err
+    assert ledger.read_bytes() == before
+    assert _assignee(tid) == "daedalus"
+    monkeypatch.setattr(os, "write", real_write)
+    assert _run("reassign", tid, "human:apollo") == 0
+    rows = _ledger(fleet)
+    assert len(rows) == 2 and rows[1]["card"] == tid
+
+
+def _scoped(fleet, mapping):
+    from agent.secret_scope import set_secret_scope
+    return set_secret_scope(mapping, profile_home=str(fleet / "profiles" / "aegis"))
+
+
+def test_quote_is_read_from_the_acting_profile_scope_not_launch_env(fleet, monkeypatch, capsys):
+    """In-process gateway /kanban: os.environ is the launch profile's; only the routed scope's quote counts."""
+    from agent.secret_scope import reset_secret_scope
+    tid = _card()
+    monkeypatch.setenv("HERMES_PROFILE", "aegis")
+    monkeypatch.setenv("AEGIS_HANDOFF_APOLLO", QUOTE)  # launch profile's env
+    token = _scoped(fleet, {})
+    try:
+        assert _run("reassign", tid, "human:apollo") == 2
+    finally:
+        reset_secret_scope(token)
+    assert "aegis-no-apollo-handoff" in capsys.readouterr().err
+    assert _assignee(tid) == "daedalus" and _ledger(fleet) == []
+    monkeypatch.delenv("AEGIS_HANDOFF_APOLLO")
+    token = _scoped(fleet, {"AEGIS_HANDOFF_APOLLO": QUOTE})
+    try:
+        assert _run("reassign", tid, "human:apollo") == 0
+    finally:
+        reset_secret_scope(token)
+    assert _assignee(tid) == "human:apollo" and len(_ledger(fleet)) == 1
+
+
+def test_env_pin_cannot_unname_an_aegis_home(fleet, monkeypatch, capsys):
+    """HERMES_PROFILE=default under HERMES_HOME=<root>/profiles/aegis is still an aegis session."""
+    tid = _card()
+    aegis_home = fleet / "profiles" / "aegis"
+    aegis_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(aegis_home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    assert _run("reassign", tid, "human:apollo") == 2
+    assert "aegis-no-apollo-handoff" in capsys.readouterr().err
+    assert _assignee(tid) == "daedalus"
