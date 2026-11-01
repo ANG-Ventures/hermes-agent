@@ -217,3 +217,55 @@ def test_env_pin_cannot_unname_an_aegis_home(fleet, monkeypatch, capsys):
     assert _run("reassign", tid, "human:apollo") == 2
     assert "aegis-no-apollo-handoff" in capsys.readouterr().err
     assert _assignee(tid) == "daedalus"
+
+
+def test_create_override_ledgers_the_created_id_not_the_title(fleet, monkeypatch):
+    """Prism 92795be78ffb: the ledger's ``card`` is a task id for every verb, create included."""
+    monkeypatch.setenv("HERMES_PROFILE", "aegis")
+    monkeypatch.setenv("AEGIS_HANDOFF_APOLLO", QUOTE)
+    assert _run("create", "t_lookalike title", "--assignee", "human:apollo", "--unhomed") == 0
+    with kbc.connect_closing() as conn:
+        (task,) = kb.list_tasks(conn)
+    rows = _ledger(fleet)
+    auth = [r for r in rows if r["verb"] == "create"]
+    bound = [r for r in rows if r["verb"] == "create-bound"]
+    assert len(auth) == 1 and auth[0]["card"] is None and auth[0]["title"] == "t_lookalike title"
+    assert len(bound) == 1 and bound[0]["card"] == task.id and bound[0]["row_id"] == auth[0]["row_id"]
+
+
+def test_ledger_follows_the_kanban_home_not_the_fleet_root(fleet, monkeypatch):
+    """Prism 6b5a28f52a8c: the ledger lives where the board resolved (kanban_home), not at the fleet
+    root the hook policy loads from (a sandbox under the native root resolved to the live fleet)."""
+    from hermes_cli import kanban_access_bound_pin as pin
+    other = fleet.parent / "elsewhere"
+    monkeypatch.setattr(pin, "_fleet_root", lambda: fleet)
+    monkeypatch.setattr(pin, "_ledger_root", lambda: other)
+    tid = _card()
+    monkeypatch.setenv("HERMES_PROFILE", "aegis")
+    monkeypatch.setenv("AEGIS_HANDOFF_APOLLO", QUOTE)
+    assert _run("reassign", tid, "human:apollo") == 0
+    assert _ledger(fleet) == []
+    assert [r["card"] for r in _ledger(other)] == [tid]
+
+
+def test_ledger_root_is_kanban_home(fleet, monkeypatch):
+    """_ledger_root() is kanban_db.kanban_home(), the sandbox-aware resolver, not _fleet_root()."""
+    from hermes_cli import kanban_access_bound_pin as pin
+    from hermes_cli import kanban_db
+    sentinel = fleet.parent / "resolved-board"
+    monkeypatch.setattr(kanban_db, "kanban_home", lambda: sentinel)
+    monkeypatch.setattr(pin, "_fleet_root", lambda: fleet)
+    assert pin._ledger_root() == sentinel
+
+
+def test_no_file_lock_platform_refuses_the_handoff(fleet, monkeypatch, capsys):
+    """Prism 57e574655dc8 / 1671fc3d2bcc: without fcntl the rollback is unsafe, so nothing is written
+    and the hand-off fails closed."""
+    tid = _card()
+    monkeypatch.setenv("HERMES_PROFILE", "aegis")
+    monkeypatch.setenv("AEGIS_HANDOFF_APOLLO", QUOTE)
+    from hermes_cli import kanban_access_bound_pin as pin
+    monkeypatch.setattr(pin, "_lock_module", lambda: None)
+    assert _run("reassign", tid, "human:apollo") == 2
+    assert "could not be written" in capsys.readouterr().err
+    assert _assignee(tid) == "daedalus" and _ledger(fleet) == []
