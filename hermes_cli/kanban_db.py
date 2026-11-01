@@ -18568,6 +18568,42 @@ def _member_birth(pid: int) -> Optional[float]:
         return None
 
 
+# The session reap orders member births against moments a member was proved
+# alive, so both must come from one clock whose birth reading cannot run early
+# by more than the slack (Prism fe32a904b73f). Linux psutil adds /proc/stat
+# ``btime``, an INTEGER second, so its epoch create_time reads up to ~1 s early
+# (ACE-AI: 0.093 s). /proc/<pid>/stat starttime against CLOCK_BOOTTIME has no
+# btime term and floors only to one tick (1/CLK_TCK, 10 ms). macOS reports
+# create_time from p_starttime in microseconds. Unverified platforms keep the
+# 2 s bound (integer btime + one tick, operator ruling 2026-11-01).
+_REAP_LINUX_CLOCK = sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME")
+_REAP_BIRTH_SLACK_SECONDS = (
+    0.1 if _REAP_LINUX_CLOCK or sys.platform == "darwin" else 2.0
+)
+
+
+def _reap_now() -> float:
+    """Now, on the clock :func:`_reap_birth` reads."""
+    if _REAP_LINUX_CLOCK:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    return time.time()
+
+
+def _reap_birth(pid: int) -> Optional[float]:
+    """Birth of ``pid`` on the :func:`_reap_now` clock, or None when gone."""
+    if not _REAP_LINUX_CLOCK:
+        return _member_birth(pid)
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            stat = fh.read()
+        # comm may hold spaces and parens; fields resume after the LAST ')'.
+        # starttime is field 22, i.e. index 19 counting from field 3.
+        ticks = int(stat[stat.rindex(b")") + 2:].split()[19])
+        return ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _session_owned_by_run(
     members: list[tuple[int, int]], born_after: float, born_before: float,
 ) -> bool:
@@ -18653,7 +18689,7 @@ def _reap_worker_session(
     def _identities(found: list[tuple[int, int]]) -> set[tuple[int, float]]:
         out = set()
         for pid, _ in found:
-            created = _member_birth(pid)
+            created = _reap_birth(pid)
             if created is not None:
                 out.add((pid, created))
         return out
@@ -18664,14 +18700,14 @@ def _reap_worker_session(
         # time) after getsid means that pid was this process at getsid, so it
         # was a member at ``checked``. A member that setsid()'d away proves
         # nothing about the session it left.
-        checked = time.time()
+        checked = _reap_now()
         for pid, created in found:
             try:
                 if os.getsid(pid) != sid:
                     continue
             except OSError:
                 continue
-            if _member_birth(pid) == created:
+            if _reap_birth(pid) == created:
                 return checked
         return None
 
@@ -18707,12 +18743,15 @@ def _reap_worker_session(
         # be reused; a process in that sid born before ``proved_at`` was born
         # into this session. A snapshot holding such a member is this
         # session, groups created in answer to SIGTERM included.
+        # "Born before" only counts with the clock's read error on the safe
+        # side: a birth inside the slack may postdate the proof, so it waits
+        # for a later proof (one every 50 ms while a member lives).
         # None -> unprovable and no member was seen alive meanwhile: stop.
         nonlocal known
         before = proved_at
         current = _scan()
         ids = _identities(current)
-        if not any(created <= proved_at for _, created in ids):
+        if not any(created + _REAP_BIRTH_SLACK_SECONDS <= proved_at for _, created in ids):
             return set() if proved_at > before else None
         known = ids
         return {pgid for _, pgid in current}

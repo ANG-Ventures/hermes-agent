@@ -256,9 +256,83 @@ def _fake_world(monkeypatch, scan, births, sids) -> list:
 
     monkeypatch.setattr(kb, "_worker_session_members", scan)
     monkeypatch.setattr(kb, "_member_birth", lambda pid: births.get(pid))
+    monkeypatch.setattr(kb, "_reap_birth", lambda pid: births.get(pid))
+    monkeypatch.setattr(kb, "_reap_now", time.time)
     monkeypatch.setattr(kb.os, "getsid", getsid)
     monkeypatch.setattr(kb.os, "killpg", lambda pg, sig: signalled.append(pg))
     return signalled
+
+
+def test_birth_read_early_never_vouches_for_a_reused_sid(monkeypatch):
+    """Prism fe32a904b73f: a birth clock that reads early (Linux epoch
+    create_time floors btime to a whole second) must not let a replacement
+    born AFTER the last proof pass as born before it. Last proof 1000.006;
+    the sid is reused at 1000.009 and that birth reads 1000.000."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:
+            return [(111, 111)]
+        births.pop(111, None)       # the original session emptied ...
+        sids.pop(111, None)
+        births[222] = 1000.000      # ... reused at 1000.009, read 9 ms early
+        sids[222] = 99_999
+        return [(222, 222)]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    monkeypatch.setattr(kb, "_reap_now", lambda: 1000.006)  # every proof
+    kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.5)
+    assert signalled == [111], "a birth read early vouched for a reused sid"
+
+
+def test_group_born_during_reap_is_signalled_once_a_later_proof_covers_it(monkeypatch):
+    """The slack only delays: a group born during the reap, first seen after
+    the member that forked it is gone, is signalled once that member was
+    proved alive more than the slack after the group's birth."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    clock = [1000.0]
+    calls: list = []
+
+    def now():
+        clock[0] += 0.05
+        return clock[0]
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:         # 111 forks 333 into a new group on SIGTERM
+            births[333] = clock[0]
+            sids[333] = 99_999
+        if len(calls) < 5:          # four proofs: 0.15 s past 333's birth
+            return [(111, 111)]
+        births.pop(111, None)
+        sids.pop(111, None)
+        return [(333, 333)]         # first seen alone, after its parent exited
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    monkeypatch.setattr(kb, "_reap_now", now)
+    kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=1.0)
+    assert set(signalled) == {111, 333}, "a group born during the reap escaped"
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_reap_birth_never_reads_earlier_than_the_slack():
+    """The contract the continuity proof rests on: a process's birth, read on
+    the reap clock, is never earlier than the moment before it was spawned by
+    more than the slack (Linux epoch create_time reads up to ~1 s early)."""
+    before = kb._reap_now()
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        after = kb._reap_now()
+        born = kb._reap_birth(p.pid)
+        assert born is not None
+        assert before - kb._REAP_BIRTH_SLACK_SECONDS <= born <= after
+    finally:
+        p.kill()
+        p.wait(timeout=5)
 
 
 def test_reap_refuses_a_session_that_empties_before_the_proof(monkeypatch):
@@ -280,6 +354,7 @@ def test_reap_refuses_a_session_that_empties_before_the_proof(monkeypatch):
     signalled = _fake_world(monkeypatch, lambda sid: [(111, 111)] if not lookups
                             else [(222, 222)], births, sids)
     monkeypatch.setattr(kb, "_member_birth", birth)
+    monkeypatch.setattr(kb, "_reap_birth", birth)
     assert kb._reap_worker_session(99_999, born_after=50.0, born_before=200.0,
                                    grace=0.5) == 0
     assert signalled == []
