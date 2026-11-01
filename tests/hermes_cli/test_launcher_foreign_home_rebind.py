@@ -117,6 +117,23 @@ def test_tmp_home_leaves_the_shared_launcher_byte_identical(install, ephemeral, 
     assert _bytes(local) == before
 
 
+def test_tmp_home_can_publish_its_own_isolated_launcher(install, ephemeral, monkeypatch):
+    repo, local, _ = install
+    before = _bytes(local)
+    test_home = ephemeral / "home"
+    test_python = _store(test_home)
+    monkeypatch.setenv("HERMES_HOME", str(test_home))
+    isolated = ephemeral / "bin"
+    isolated.mkdir(parents=True)
+
+    for name in _launchers.ENTRY_POINTS:
+        target = _launchers.stage_launcher(name, repo, isolated)
+        assert target == isolated / name
+        assert _launchers._shell_launcher_python(target) == test_python
+        assert os.access(target, os.X_OK)
+    assert _bytes(local) == before
+
+
 def test_launcher_bound_to_another_real_home_is_kept(install, ephemeral, tmp_path, monkeypatch):
     repo, local, _ = install
     before = _bytes(local)

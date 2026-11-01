@@ -453,9 +453,10 @@ def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     store_python = resolve_store_python(repo_root)
     if store_python is not None and not _is_windows():
         target = Path(out_dir) / name
-        # A temp/pytest/scratch home never writes a real install's launcher, live or dead.
+        # A temp home may publish its own temporary output, never a real install's launcher.
         # (The store dir, not store_python: the interpreter may be a symlink out of it.)
-        if _is_ephemeral_path(store_root(repo_root)) and not _is_ephemeral_path(repo_root):
+        if (_is_ephemeral_path(store_root(repo_root))
+                and not _is_ephemeral_path(repo_root) and not _is_ephemeral_path(target)):
             import logging
 
             logging.getLogger(__name__).warning(
