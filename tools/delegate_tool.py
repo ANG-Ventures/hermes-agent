@@ -3660,8 +3660,7 @@ def _build_durable_background_spec(
         "reasoning_config": copy.deepcopy(getattr(effective_agent, "reasoning_config", None)),
         # The DISPATCHING parent's chain: reconstruction gives it to the rebuilt parent and the
         # children derive theirs from it, as in-process (AIAgent has no ``fallback_model`` attribute).
-        "fallback_chain": persistable_fallback_chain(
-            copy.deepcopy(getattr(parent_agent, "_fallback_chain", None))),
+        "fallback_chain": persistable_fallback_chain(getattr(parent_agent, "_fallback_chain", None)),
         # The fallback policy of the block that owned the route (``credentials_cfg`` or delegation):
         # recovery restores it so a pinned child resolves the same chain as at dispatch.
         "fallback_policy": persistable_fallback_policy(cfg if routing_cfg is None else routing_cfg),

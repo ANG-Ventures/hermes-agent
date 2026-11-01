@@ -852,8 +852,21 @@ def persistable_fallback_chain(chain: Any) -> list[dict[str, Any]] | None:
     that parent exactly as the in-process children do (``fallback_providers: auto``). A chain with a
     credential-shaped field or a credential-bearing ``base_url`` is not persisted (None, the unit
     runs without fallback): recording it would fail the whole spec closed and force the call
-    synchronous."""
-    rungs = [dict(rung) for rung in (chain or []) if isinstance(rung, dict)]
+    synchronous.
+
+    Rungs are copied field by field, keeping only JSON scalars: a live chain is never deep-copied,
+    because a rung may hold client/lock-bearing objects and a raise here would take the durable
+    spec down with it. A chain that cannot be represented records None with a warning."""
+    if chain is None:
+        return None
+    if not isinstance(chain, (list, tuple)):
+        logger.warning("async_delegation fallback chain not persisted: %s is not a list", type(chain).__name__)
+        return None
+    rungs = [
+        {str(key): value for key, value in rung.items() if isinstance(value, (str, int, float, bool, type(None)))}
+        for rung in chain
+        if isinstance(rung, dict)
+    ]
     for rung in rungs:
         if any(_sensitive_query_key(str(key)) for key in rung) or url_has_credentials(rung.get("base_url")):
             logger.info("async_delegation fallback chain not persisted: a rung carries a credential")

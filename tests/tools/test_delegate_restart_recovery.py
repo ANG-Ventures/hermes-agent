@@ -1,8 +1,9 @@
 """Shared live/resume adapter coverage for delegate_task."""
 
 import json
+import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -351,6 +352,22 @@ def test_credential_bearing_fallback_chain_is_not_persisted_and_spec_survives():
     assert spec is not None
     assert spec["execution"]["fallback_chain"] is None
     assert "MUST-NOT-PERSIST" not in json.dumps(spec)
+
+
+def test_unpicklable_fallback_chain_never_takes_the_durable_spec_down(caplog):
+    """A live chain may hold lock/client-bearing objects: the spec still builds (a deepcopy raised
+    ``cannot pickle '_thread.lock'`` and every background delegation ran synchronously)."""
+    parent = _real_parent([dict(rung) for rung in _CHAIN])
+    parent._fallback_chain[0]["client_lock"] = threading.Lock()
+    spec = _spec_for(parent)
+    assert spec is not None
+    assert spec["execution"]["fallback_chain"] == _CHAIN
+    json.dumps(spec)
+    parent._fallback_chain = MagicMock()  # not a list: not representable
+    with caplog.at_level("WARNING", logger="tools.async_delegation_store"):
+        spec = _spec_for(parent)
+    assert spec is not None and spec["execution"]["fallback_chain"] is None
+    assert "fallback chain not persisted" in caplog.text
 
 
 # ── Prism 3de445560b2a: recovery keeps the route owner's fallback POLICY, not only the chain ──
