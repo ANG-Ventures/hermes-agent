@@ -1158,6 +1158,10 @@ def _build_replay_entry(
             if (_rval is None) if _rkey == "reasoning_content" else (not _rval):
                 continue
             entry[_rkey] = _rval
+    # These fields carry harness-note provenance into the agent's replay trust boundary.
+    for key in ("display_kind", "display_metadata"):
+        if key in msg:
+            entry[key] = msg[key]
     if preserve_timestamp and msg.get("timestamp"):
         entry["timestamp"] = msg["timestamp"]
     # Replay rebuilds the SAME conversation for its next turn: every role keeps its uid and merge witness, so a
@@ -1328,8 +1332,9 @@ def _build_gateway_agent_history(
     Observed context stays out of ``conversation_history`` so consecutive-user repair can't merge it in."""
     from hermes_time import get_timezone as _get_msg_tz
     from agent.compaction_stats import is_standalone_summary_content
-    from agent.message_metadata import MERGED_TURN_PREFIX
+    from agent.message_metadata import MERGED_TURN_PREFIX, recorded_route_note_prefix
     from agent.prompt_builder import STEER_DISPLAY_KIND
+    from agent.route_identity import ROUTE_NOTE_DISPLAY_KIND
     from gateway.message_timestamps import (
         render_user_content_with_timestamp as _render_msg_ts,
         strip_leading_message_timestamps as _strip_msg_ts,
@@ -1377,12 +1382,12 @@ def _build_gateway_agent_history(
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
             # A compaction summary is synthesized, never received: the compaction turn sends
             # it bare, so a rendered stamp here rewrote msg[0] by +30 B next turn (t_f98bc0c5).
-            # A /steer row is sent bare mid-turn (steer_user_row); stamping it on replay rewrote
-            # it by +30 B on the next request (class A, t_91b6a4c4).
+            # A /steer or standalone route-note row is sent bare mid-turn; stamping
+            # either on replay rewrites its cached prefix (t_4e9fb53b).
             if (
                 inject_timestamps and role == "user" and isinstance(content, str)
                 and not is_standalone_summary_content(content)
-                and msg.get("display_kind") != STEER_DISPLAY_KIND
+                and msg.get("display_kind") not in (STEER_DISPLAY_KIND, ROUTE_NOTE_DISPLAY_KIND)
                 and content  # a sidecar-only row replays its sidecar as sent, unstamped
             ):
                 rendered = _render_msg_ts(content, replay_timestamp, tz=_msg_tz)
@@ -1390,11 +1395,17 @@ def _build_gateway_agent_history(
                 # optionally followed by the normal context separator. Cleanup
                 # above already invalidated sidecars containing stripped content.
                 sidecar = entry.get("api_content")
+                # Route notes prepend the already-rendered turn. Validate the rest against
+                # that turn before deciding its exact sent sidecar is stale.
+                note_prefix = recorded_route_note_prefix(msg)
+                rendered_sidecar = sidecar
+                if note_prefix and isinstance(sidecar, str) and sidecar.startswith(note_prefix):
+                    rendered_sidecar = sidecar[len(note_prefix):]
                 # A row the alternation repair merged carries its parts' sent bytes joined
                 # (_merge_consecutive_users): one stamp over the joined text never matches them.
                 # Presence, not truthiness: an empty resume row merges with prefix ''.
-                if rendered != content and sidecar and MERGED_TURN_PREFIX not in msg and not (
-                    _sidecar_carries_rendered_turn(sidecar, rendered, content)
+                if rendered != content and isinstance(rendered_sidecar, str) and sidecar and MERGED_TURN_PREFIX not in msg and not (
+                    _sidecar_carries_rendered_turn(rendered_sidecar, rendered, content)
                 ):
                     entry.pop("api_content", None)
                 entry["content"] = rendered
