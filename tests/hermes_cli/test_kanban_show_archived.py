@@ -34,8 +34,9 @@ def _db_path(conn) -> Path:
     return Path(next(p for _s, n, p in conn.execute("PRAGMA database_list") if n == "main"))
 
 
-def _move_out(tid: str) -> Path:
-    """What R8 does to one card: copy its rows (all columns + moved_at) to the archive, then delete them."""
+def _move_out(tid: str, delete: bool = True) -> Path:
+    """What R8 does to one card: copy its rows (all columns + moved_at) to the archive, then delete them.
+    ``delete=False`` stops after the archive commit (the window before R8 deletes the live rows)."""
     conn = kbc.connect()
     try:
         arch = _db_path(conn).parent / "kanban-archive.db"
@@ -47,7 +48,8 @@ def _move_out(tid: str) -> Path:
             cl = ", ".join(cols)
             conn.execute("INSERT INTO march.%s (%s, moved_at) SELECT %s, 1 FROM main.%s WHERE task_id=?"
                          % (tbl, cl, cl, tbl), (tid,))
-            conn.execute("DELETE FROM main.%s WHERE task_id=?" % tbl, (tid,))
+            if delete:
+                conn.execute("DELETE FROM main.%s WHERE task_id=?" % tbl, (tid,))
         conn.commit()
         conn.execute("DETACH DATABASE march")
         return arch
@@ -170,3 +172,50 @@ def test_state_filter_applies_to_archived_runs(kanban_home):
     assert "Archived runs (1, kanban-archive.db):" in text and "shipped the thing" not in text
     allruns = json.loads(kc.run_slash(f"show {tid} --json"))
     assert sorted(r["outcome"] for r in allruns["archived"]["runs"]) == ["completed", "crashed"]
+
+
+# ---- live/archive race (t_f06682ef, Prism c17963c19b03): live rows are read first, the archive after,
+# deduped by id, so a move committing between the reads can neither empty nor double the history.
+
+def test_move_between_reads_keeps_the_run(kanban_home, monkeypatch):
+    """R8 commits right after the live events read (between the comment and run reads)."""
+    tid = _done_card()
+    real = kb.list_events
+    fired = []
+
+    def list_events_then_move(conn, task_id, *a, **k):
+        out = real(conn, task_id, *a, **k)
+        if task_id == tid and not fired:
+            fired.append(1)
+            _move_out(tid)
+        return out
+    monkeypatch.setattr(kb, "list_events", list_events_then_move)
+    out = json.loads(kc.run_slash(f"show {tid} --json"))
+    assert fired
+    runs = [r["summary"] for r in out["runs"]] + [r["summary"] for r in out.get("archived", {}).get("runs", [])]
+    assert runs == ["shipped the thing in o/r#7"]
+    comments = [c["body"] for c in out["comments"]] + \
+        [c["body"] for c in out.get("archived", {}).get("comments", [])]
+    assert comments == ["review_coverage: approve, moved later"]
+
+
+def test_row_in_live_and_archive_listed_once_cli(kanban_home):
+    tid = _done_card()
+    _move_out(tid, delete=False)
+    out = json.loads(kc.run_slash(f"show {tid} --json"))
+    assert [c["body"] for c in out["comments"]] == ["review_coverage: approve, moved later"]
+    assert [r["summary"] for r in out["runs"]] == ["shipped the thing in o/r#7"]
+    assert "archived" not in out
+    assert "Archived" not in kc.run_slash(f"show {tid}")
+
+
+def test_row_in_live_and_archive_listed_once_tool(kanban_home, monkeypatch):
+    from tools import kanban_tools as kt
+
+    tid = _done_card()
+    _move_out(tid, delete=False)
+    monkeypatch.setenv("HERMES_PROFILE", "daedalus")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    shown = json.loads(kt._handle_show({"task_id": tid}))
+    assert len(shown["comments"]) == 1 and len(shown["runs"]) == 1
+    assert "archived" not in shown

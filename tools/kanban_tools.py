@@ -870,7 +870,8 @@ def _handle_show(args: dict, **kw) -> str:
         # capped like the live rows; every archived row is in ``hermes kanban show``.
         from hermes_cli import kanban_archive_read as kar
 
-        arch = kar.archived_rows(conn, tid)
+        arch = kar.archived_rows(conn, tid, live_comment_ids=[c.id for c in comments],   # live read first
+                                 live_run_ids=[r.id for r in runs])
         if kar.present(arch):
             c_last = arch["comments"][-1] if arch["comments"] else None
             r_last = arch["runs"][-1] if arch["runs"] else None

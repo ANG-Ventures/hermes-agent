@@ -1413,15 +1413,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not task:
             return _err(f"no such task: {args.task_id}")
         comments = kb.list_comments(conn, args.task_id)
-        # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived
-        from hermes_cli import kanban_archive_read as kar
-        archived = kar.archived_rows(conn, args.task_id, **rsk)
         events = kb.list_events(conn, args.task_id)
         parent_links = kb.parent_links(conn, args.task_id)
         child_links = kb.child_links(conn, args.task_id)
         parents = [pid for pid, _kind in parent_links]
         children = [cid for cid, _kind in child_links]
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        # rows the fleet retention job moved to kanban-archive.db (t_d1b5fc83), labelled archived. Read AFTER the
+        # live comments and runs, deduped by id, so a move committing in between cannot empty the history.
+        from hermes_cli import kanban_archive_read as kar
+        archived = kar.archived_rows(conn, args.task_id, **rsk, live_comment_ids=[c.id for c in comments],
+                                     live_run_ids=[r.id for r in runs])
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
         refusal = (

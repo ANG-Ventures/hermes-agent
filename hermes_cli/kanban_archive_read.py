@@ -40,12 +40,16 @@ def _rows(arch: sqlite3.Connection, table: str, cols: tuple, task_id: str, order
 
 
 def archived_rows(conn: sqlite3.Connection, task_id: str, *, state_type: str | None = None,
-                  state_name: str | None = None) -> dict[str, Any]:
+                  state_name: str | None = None, live_comment_ids=(), live_run_ids=()) -> dict[str, Any]:
     """``{"comments": [...], "runs": [...]}`` from the board's archive file, empty when there is none.
 
     ``state_type``/``state_name`` filter the runs exactly like ``kanban_db.list_runs``. An archive that
     exists but cannot be read (locked, corrupt) adds ``"error": "<sqlite3 error class>: <message>"``
-    so a failed read never looks like a card with no archived history."""
+    so a failed read never looks like a card with no archived history.
+
+    Call this AFTER reading the live comments and runs, and pass their ids (t_f06682ef). R8 commits the
+    archive before it deletes the live rows, so a move that lands between the two reads leaves a row in
+    both, never in neither; an archived row whose id is live is dropped here so it is not listed twice."""
     if (state_type is None) ^ (state_name is None):
         raise ValueError("state_type and state_name must both be set or both omitted")
     if state_type is not None and state_type not in ("status", "outcome"):
@@ -57,8 +61,11 @@ def archived_rows(conn: sqlite3.Connection, task_id: str, *, state_type: str | N
     arch = None
     try:
         arch = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=_TIMEOUT_S)
-        return {"comments": _rows(arch, "task_comments", _COMMENT_COLS, task_id, "created_at, id"),
-                "runs": _rows(arch, "task_runs", _RUN_COLS, task_id, "started_at, id", run_where, run_params)}
+        live_c, live_r = set(live_comment_ids), set(live_run_ids)
+        return {"comments": [c for c in _rows(arch, "task_comments", _COMMENT_COLS, task_id, "created_at, id")
+                             if c["id"] not in live_c],
+                "runs": [r for r in _rows(arch, "task_runs", _RUN_COLS, task_id, "started_at, id", run_where,
+                                          run_params) if r["id"] not in live_r]}
     except sqlite3.Error as exc:
         return {"comments": [], "runs": [], "error": "%s: %s" % (type(exc).__name__, exc)}
     finally:
