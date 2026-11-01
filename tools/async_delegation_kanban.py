@@ -293,6 +293,11 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
     task_id = None
     try:
         model, provider = _execution_route(delegation_id, profile_home)
+        if _granted_inherited_default(profile, model, flagship_reason):
+            # The unit runs the profile default the operator's standing grant covers: leave the
+            # card unpinned so create_task's default-route branch applies that grant (Prism
+            # f226ee06e5ba round 3); a pin plus a reason would demand per-call operator authority.
+            model = provider = None
         reason = _flagship_reason(delegation_id, model, flagship_reason)
         kb.create_board(board)
         with kb.connect_closing(board=board) as conn:
@@ -352,6 +357,23 @@ def _execution_route(delegation_id: str, profile_home: Path) -> Tuple[Optional[s
     if provider and pinned_sub_provider_error(model, provider):
         provider = None
     return model, provider
+
+
+def _granted_inherited_default(profile: str, model: Optional[str], audited: Optional[str]) -> bool:
+    """True when the unit inherits ``profile``'s own resolved default route (no audited per-call
+    flagship pin) and ``kanban.flagship_profile_allowances`` grants that default. Compared on the
+    bare model id: a ``lane/model`` default and the runtime's ``model`` + provider split name the same
+    route. An explicit pin (``audited`` set) is never covered, the same as the grant itself."""
+    from hermes_cli.model_policy import assignee_default_model, profile_flagship_allowance
+
+    if not model or (audited or "").strip():
+        return False
+    default = assignee_default_model(profile)
+    if not default:
+        return False
+    if default.strip().rsplit("/", 1)[-1] != model.strip().rsplit("/", 1)[-1]:
+        return False
+    return bool(profile_flagship_allowance(profile, default))
 
 
 def _flagship_reason(delegation_id: str, model: Optional[str], audited: Optional[str]) -> Optional[str]:

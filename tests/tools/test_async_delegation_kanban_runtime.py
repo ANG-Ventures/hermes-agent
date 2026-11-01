@@ -335,6 +335,30 @@ def test_unit_inheriting_a_flagship_route_without_authority_falls_back_and_says_
         "in_process (kanban spawn failed: FlagshipAssigneeRefused)"
 
 
+@pytest.mark.parametrize("granted", [True, False])
+def test_standing_grant_admits_an_inherited_flagship_default_without_authority(home, monkeypatch, tmp_path,
+                                                                              spawner, granted):
+    """Prism f226ee06e5ba round 3 (tiresias): a root ``kanban.flagship_profile_allowances`` grant on the
+    profile's flagship DEFAULT lets an inherited-default unit spawn with no per-call operator authority,
+    as the unpinned card did before the pin. Without the grant the guard still refuses it."""
+    from hermes_cli import model_policy
+
+    grant = "kanban:\n  flagship_profile_allowances:\n    default: standing grant (test)\n" if granted else ""
+    (home / "config.yaml").write_text("model:\n  default: claude-alr/claude-fable-5-1\n" + grant)
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda actor: False)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="claude-fable-5-1",
+                              provider="claude-alr")
+    did = handle["delegation_id"]
+    if not granted:
+        assert len(calls) == 1
+        assert ad.kanban_launch_runtime(did, timeout=0) == \
+            "in_process (kanban spawn failed: FlagshipAssigneeRefused)"
+        return
+    assert calls == [] and ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+    card, kinds = _card(_record(did)["kanban"]["task_id"])
+    assert card.model_override is None and kinds.count("spawned") == 1
+
+
 def test_unit_pin_keeps_the_delegations_provider_and_no_lane_catalog_refuses_it(home, monkeypatch, tmp_path,
                                                                                 spawner):
     """Prism f226ee06e5ba round 2: a ``lane/model`` id on a named custom endpoint is pinned with that
