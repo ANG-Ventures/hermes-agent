@@ -91,7 +91,7 @@ def test_aegis_reassign_to_apollo_is_refused_and_nothing_written(fleet, monkeypa
 
 def test_aegis_create_with_apollo_assignee_is_refused(fleet, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_PROFILE", "aegis")
-    assert _run("create", "probe", "--assignee", "human:apollo", "--unhomed") == 2
+    assert _run("--board", "default", "create", "probe", "--assignee", "human:apollo", "--unhomed") == 2
     assert "aegis-no-apollo-handoff" in capsys.readouterr().err
     assert _count() == 0
 
@@ -138,7 +138,7 @@ def test_missing_hook_module_fails_open(fleet, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "aegis")
     assert _run("reassign", tid, "human:apollo") == 0
     assert _assignee(tid) == "human:apollo"
-    assert _run("create", "probe2", "--assignee", "human:apollo", "--unhomed") == 0
+    assert _run("--board", "default", "create", "probe2", "--assignee", "human:apollo", "--unhomed") == 0
 
 
 def test_policy_off_marker_does_not_disarm_the_handoff_rule(fleet, monkeypatch, capsys):
@@ -223,7 +223,7 @@ def test_create_override_ledgers_the_created_id_not_the_title(fleet, monkeypatch
     """Prism 92795be78ffb: the ledger's ``card`` is a task id for every verb, create included."""
     monkeypatch.setenv("HERMES_PROFILE", "aegis")
     monkeypatch.setenv("AEGIS_HANDOFF_APOLLO", QUOTE)
-    assert _run("create", "t_lookalike title", "--assignee", "human:apollo", "--unhomed") == 0
+    assert _run("--board", "default", "create", "t_lookalike title", "--assignee", "human:apollo", "--unhomed") == 0
     with kbc.connect_closing() as conn:
         (task,) = kb.list_tasks(conn)
     rows = _ledger(fleet)
