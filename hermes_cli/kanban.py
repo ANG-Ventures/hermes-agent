@@ -5131,7 +5131,7 @@ _SLASH_KANBAN_HELP = """\
 **/kanban** — manage the shared task board.
 
 Common subcommands:
-  `list` (alias `ls`)   List tasks on the current board
+  `list` (alias `ls`)   List tasks on a board (`--board <slug>`)
   `show <id>`           Task details + comments + events
   `stats`               Per-status / per-assignee counts
   `create <title>…`     Create a task (auto-subscribes you to events)

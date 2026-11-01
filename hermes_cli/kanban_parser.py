@@ -551,7 +551,7 @@ _SPECS = [
         _arg("--fleet", action="store_true",
              help="With --placement: the fleet view (alias of `kanban placement --fleet`)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
-    ], aliases=["diag"], help="List active diagnostics on the current board"),
+    ], aliases=["diag"], help="List active diagnostics on the board named by --board or the DB pin"),
     _cmd("placement", [
         _arg("task_id", nargs="?", help="One card: its Placement block only"),
         _arg("--fleet", action="store_true",
