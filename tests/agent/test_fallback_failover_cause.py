@@ -218,6 +218,17 @@ def test_rate_limit_label_names_the_window_the_response_named():
     assert fp.head_label_override(rb) == "Fable weekly (7d_oi) limit"
 
 
+@pytest.mark.parametrize("window,word", [("five_hour", "5h limit"), ("seven_day", "weekly limit")])
+def test_no_eligible_rider_keeps_the_response_quota_window(window, word):
+    a = _agent()
+    fbe.stash_api_error(a, RelayError(503, {"error": "no eligible sub"},
+                                      {"x-relay-error-class": "quota_seat",
+                                       "x-relay-quota-window": window,
+                                       "x-relay-eligible": "0"}), 503, None)
+    row = _row(a, reason="rate_limit")
+    assert word in fp.format_cause_rider(row, tz=UTC)
+
+
 def test_genuine_rate_upstream_with_no_window_keeps_rate_limit():
     a = _agent()
     fbe.stash_api_error(a, RelayError(429, {"type": "error", "error": {
