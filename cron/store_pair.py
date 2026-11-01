@@ -106,6 +106,7 @@ def _restore_db(src: Path, dst: Path) -> bool:
 
 def _unlink_db_files(cron_dir: Path) -> None:
     """Every ``runtime_state.db*`` directly in *cron_dir* (main, sidecars, stray copies)."""
+    _rs.release_anchor(cron_dir)
     with contextlib.suppress(FileNotFoundError):
         for entry in os.scandir(cron_dir):
             if entry.name.startswith(DB_NAME) and not entry.is_dir(follow_symlinks=False):
@@ -117,6 +118,7 @@ def _unlink_created_db(db_file: Path) -> None:
     """Failed-restore cleanup in a LIVE store (Prism daf60a454f51): only the main db this attempt
     created and its SQLite sidecars. Never a ``runtime_state.db.bak`` / ``.pre-restore-*`` copy
     someone keeps beside it; prefix-wide removal is ``scrub``'s, on a staged tree only."""
+    _rs.release_anchor(Path(db_file).parent)
     for suffix in ("", "-wal", "-shm", "-journal"):
         with contextlib.suppress(FileNotFoundError):
             os.unlink(f"{db_file}{suffix}")

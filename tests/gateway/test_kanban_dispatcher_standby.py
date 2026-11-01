@@ -20,7 +20,13 @@ from hermes_cli import kanban_db_dispatch as kbd
 
 
 class Clock:
-    """Advance watcher sleeps explicitly, without patching the asyncio module."""
+    """Advance watcher sleeps explicitly, without patching the asyncio module.
+
+    Waits here end on an event (the watcher reaches its next sleep, or exits), never on a
+    wall-clock deadline: between two sleeps a leader runs real ``dispatch_once`` work in
+    ``asyncio.to_thread``, which took >5 s at load1 168 on ci (t_a6aa1730). A real hang is
+    caught by the runner's per-file idle timeout.
+    """
 
     def __init__(self):
         self.sleeps = {}
@@ -36,7 +42,7 @@ class Clock:
         waiter = asyncio.create_task(queue.get())
         try:
             done, _ = await asyncio.wait(
-                (task, waiter), timeout=5, return_when=asyncio.FIRST_COMPLETED,
+                (task, waiter), return_when=asyncio.FIRST_COMPLETED,
             )
             assert task not in done, "dispatcher exited instead of remaining on standby"
             assert waiter in done, "watcher did not reach a bounded sleep"
@@ -127,7 +133,8 @@ async def test_standby_takes_over_without_restart(harness, owner_dies, caplog):
             env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
         )
         assert process.stdout is not None
-        assert await asyncio.wait_for(process.stdout.readline(), 5) == b"held\n"
+        # EOF (b"") if the child dies, so no deadline is needed on its interpreter start-up.
+        assert await process.stdout.readline() == b"held\n"
     else:
         owner, state = watchers._acquire_singleton_lock(h.path)
         assert state == "held"
@@ -148,7 +155,7 @@ async def test_standby_takes_over_without_restart(harness, owner_dies, caplog):
             assert sum("standing by" in record.message for record in caplog.records) == 1
             assert len(h.handles) >= 3
             process.terminate()
-            await asyncio.wait_for(process.wait(), 5)
+            await process.wait()
         else:
             watchers._release_singleton_lock(owner)
         resume.set_result(None)
@@ -273,7 +280,7 @@ async def test_cancel_does_not_release_while_service_thread_is_running(harness, 
     def blocking_work(*args, **kwargs):
         loop.call_soon_threadsafe(entered.set)
         try:
-            assert finish.wait(5), "test did not release service thread"
+            finish.wait()  # the test's finally always sets it
             return original(*args, **kwargs) if original else []
         finally:
             loop.call_soon_threadsafe(work_done.set)
@@ -290,7 +297,7 @@ async def test_cancel_does_not_release_while_service_thread_is_running(harness, 
     try:
         _, resume = await h.clock.paused(task)
         resume.set_result(None)
-        await asyncio.wait_for(entered.wait(), 5)
+        await entered.wait()  # after the tick's earlier service threads; no deadline
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 5)
@@ -301,13 +308,13 @@ async def test_cancel_does_not_release_while_service_thread_is_running(harness, 
         finally:
             watchers._release_singleton_lock(other)
         finish.set()
-        await asyncio.wait_for(released.wait(), 5)
+        await released.wait()  # the real dispatch_once finishes first
         assert not b._owns_kanban_dispatcher_lock()
         assert all(handle.closed for handle in h.handles)
     finally:
         finish.set()
         if entered.is_set():
-            await asyncio.wait_for(work_done.wait(), 5)
+            await work_done.wait()
         await cancel(task, b)
 
 

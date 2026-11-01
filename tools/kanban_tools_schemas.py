@@ -11,12 +11,10 @@ _DESC_TASK_ID_DEFAULT = (
 )
 
 _DESC_BOARD = (
-    "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: the board database path and board slug "
-    "from the process env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "Kanban board slug to target. When omitted: a dispatched worker uses "
+    "its own board; a call naming a card id uses that card's board; "
+    "kanban_create with parents uses the parent's board. Otherwise the "
+    "call is refused: there is no current board, so pass board explicitly."
 )
 
 
@@ -542,6 +540,12 @@ KANBAN_CREATE_SCHEMA = _schema(
         "force_model": _prop("string", (
                 "Reason to pin a 'model' id the provider's live model list does not "
                 "know. Without it an unknown id is refused with the valid list."
+        )),
+        "allow_flagship": _prop("string", (
+                "Reason for a flagship route (a flagship 'model', or an assignee "
+                "whose profile default is flagship). Without it such a card is "
+                "refused. Recorded as a 'flagship override:' comment. "
+                "Operator-only: honoured from an operator label outside a dispatched worker."
         )),
     },
     ["title", "assignee"],

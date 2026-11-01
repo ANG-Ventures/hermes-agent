@@ -94,6 +94,7 @@ on:   # ARMED 2026-10-09 20:06 PT by Apollo on Ace's word ("let's arm it"); Supp
         type: boolean
         default: false
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   # merge_group: the merge queue creates a temporary batched branch and fires
@@ -167,6 +168,7 @@ jobs:
   # tag is not a meaningful applicability signal.
   # ─────────────────────────────────────────────────────────────────────
   detect:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1' }}
     name: Detect affected areas
     # Unblock all lanes without waiting for a self-hosted test slot.
     runs-on: ubuntu-latest
@@ -511,7 +513,7 @@ jobs:
   review-labels:
     name: Review label gate
     needs: [detect, supply-chain]
-    if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')) }}
     uses: ./.github/workflows/review-labels.yml
     with:
       ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
@@ -569,7 +571,7 @@ jobs:
       # its own check. It was never required here, because it is too slow
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
-    if: always()
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (always()) }}
     # A completed matrix must not wait for the pool to report its verdict.
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -609,7 +611,7 @@ jobs:
   ci-timings:
     name: CI timing report
     needs: [all-checks-pass]
-    if: always()
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1') && (always()) }}
     # GitHub API/cache/artifacts only; reserve pool slots for tests.
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -879,7 +879,20 @@ def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
 
 
-def handle_function_call(
+def handle_function_call(function_name: str, function_args: Dict[str, Any], *args: Any, **kwargs: Any) -> str:
+    """Route a tool call through hooks/middleware to the registry; returns a JSON string.
+
+    THE E11 boundary for tool output (spec 2026-10-29 route notes): every caller (the agent loop, the
+    execute_code RPC, the hermes-tools MCP server, connector batches) receives this result, so remote
+    output carries no ``[Route note:`` marker and local output is byte-identical. The relabel is
+    idempotent, so a consumer that applies it again (make_tool_result_message) is byte-stable.
+    Arguments: see ``_handle_function_call``."""
+    from agent.tool_dispatch_helpers import relabel_tool_output
+    result = _handle_function_call(function_name, function_args, *args, **kwargs)
+    return relabel_tool_output(_LEGACY_TOOL_ALIASES.get(function_name, function_name), result)
+
+
+def _handle_function_call(
     function_name: str, function_args: Dict[str, Any], task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None, user_task: Optional[str] = None, enabled_tools: Optional[List[str]] = None,

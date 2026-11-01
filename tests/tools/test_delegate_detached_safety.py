@@ -1320,7 +1320,11 @@ def test_a_cancelled_attempts_surviving_tool_is_killed_by_a_fresh_boot(_isolated
 def test_with_detached_background_off_file_state_stays_process_local(_isolated, tmp_path):
     from tools import file_state
 
-    assert not (tmp_path / "config.yaml").exists(), "the default must be OFF"
+    # Both knobs that enable the cross-process layer are pinned off: background_runtime defaults to
+    # "kanban" since option C P3 (#2470), so an absent config.yaml no longer means "off".
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n  detached_background: false\n  background_runtime: in_process\n", encoding="utf-8")
+    assert not file_state._cross_process_enabled(), "both knobs off must disable the cross-process layer"
     target = tmp_path / "shared.txt"
     target.write_text("v1")
     reg = file_state.FileStateRegistry()

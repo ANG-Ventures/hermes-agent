@@ -116,21 +116,16 @@ def _merge_preflight_warning(cli, result, custom_providers) -> None:
 
 
 def _print_switch_summary(cli, result, old_model, *, one_turn: bool, strict_context: bool) -> None:
-    """Record the next-turn switch note and print the "Model switched" block.
+    """Print the "Model switched" block.
 
-    The note is prepended to the next user message (a mid-history system message would break
-    providers and prompt caching). ``strict_context``: the typed /model path lets
+    The model learns of the switch from the agent's route note on the call that serves it
+    (``agent/route_identity.py``), never from a CLI note: a second note here contradicted it when
+    the selected model was unavailable (t_53ad66c4). ``strict_context``: the typed /model path lets
     context-resolution errors propagate; the picker path swallows them.
     """
     from cli import _cprint
     from hermes_cli.model_switch import format_model_for_display, resolve_display_context_length
-    _display_old = format_model_for_display(old_model)
     _display_new = format_model_for_display(result.new_model)
-    cli._pending_model_switch_note = (
-        f"[Note: model was just switched from {_display_old} to {_display_new} "
-        f"via {result.provider_label or result.target_provider}. "
-        f"{'This override applies to the next turn only. ' if one_turn else ''}"
-        f"Adjust your self-identification accordingly.]")
     _cprint(f"  {t('cli.model.switched', model=_display_new)}")
     _cprint(f"    {t('gateway.model.provider_label', provider=result.provider_label or result.target_provider)}")
     if result.target_provider == "moa":

@@ -205,9 +205,13 @@ def build_store(src_jobs: list, durations: dict, home: Path, minute: datetime, t
             clean["schedule"] = dict(job["schedule"], run_at=nxt)
         clean["next_run_at"] = nxt
         out_jobs.append(clean)
-    (home / "cron" / "jobs.json").write_text(
-        json.dumps({"jobs": out_jobs, "updated_at": datetime.now(timezone.utc).isoformat()},
-                   indent=1), encoding="utf-8")
+    from cron import store_pair
+
+    def _seed(jobs: list) -> bool:
+        jobs[:] = out_jobs
+        return True
+
+    store_pair.publish_definitions(home, _seed)
     (home / "config.yaml").write_text(
         "timezone: UTC\ncron:\n  oneshot_catchup_s: 0\n  script_runner:\n    enabled: true\n", encoding="utf-8")
     # due_first_minute = script-lane jobs due in t0's minute: what the runner must dispatch.
@@ -321,7 +325,7 @@ def child_control(lock_path: Path, hold_s: float, marker: Path) -> int:
         marker.write_text(json.dumps({"held_at": time.time()}), encoding="utf-8")
         time.sleep(hold_s)
         fcntl.flock(fh, fcntl.LOCK_UN)
-    data = json.loads(marker.read_text(encoding="utf-8"))
+    data = json.loads(marker.read_text(encoding="utf-8-sig"))
     data["released_at"] = time.time()
     marker.write_text(json.dumps(data), encoding="utf-8")
     return 0
@@ -353,7 +357,8 @@ def _kill(procs: list) -> None:
         if p.poll() is not None:
             continue  # reaped: its pid (and pgid) may already belong to someone else
         with contextlib.suppress(Exception):
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            # start_new_session made each child a group leader: kill the whole group on POSIX.
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL) if hasattr(os, "killpg") else p.kill()
     for p in procs:
         with contextlib.suppress(Exception):
             p.wait(timeout=10)
@@ -361,7 +366,7 @@ def _kill(procs: list) -> None:
 
 def _load_dump(path: Path) -> dict:
     with contextlib.suppress(OSError, ValueError):
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     return {"lock_waits": [], "ticks": []}
 
 
@@ -477,7 +482,7 @@ def evaluate(run_dir: Path, home: Path, manifest: dict) -> dict:
                 tick_rows.append({"role": role, "t": t["t"], "after_t0": t["t"] >= t0_epoch - 1.0,
                                   "label": t["ring"][0], "duration_s": t["ring"][1],
                                   "outcome": t.get("outcome"), "lane": t.get("lane")})
-    logs = "".join((run_dir / f"{r}.log").read_text(encoding="utf-8", errors="replace")
+    logs = "".join((run_dir / f"{r}.log").read_text(encoding="utf-8-sig", errors="replace")
                    for r in ("runner", "gateway") if (run_dir / f"{r}.log").exists())
     measured = {
         "max_section_wait_s": max((s["max_s"] for s in sections.values()), default=0.0),
@@ -510,7 +515,7 @@ def evaluate(run_dir: Path, home: Path, manifest: dict) -> dict:
         # the control proves the probe trips the < 5 s threshold, and that the section that
         # tripped it overlapped the hold (reported, spec ambiguity flagged on the card).
         with contextlib.suppress(OSError, ValueError):
-            result["control_hold"] = json.loads((run_dir / "control.json").read_text())
+            result["control_hold"] = json.loads((run_dir / "control.json").read_text(encoding="utf-8-sig"))
         result["control_pass"] = (
             "released_at" in (result.get("control_hold") or {})
             and measured["max_section_wait_s"] >= THRESHOLDS["max_section_wait_s"])
@@ -556,7 +561,7 @@ def main(argv=None) -> int:
     from zoneinfo import ZoneInfo
 
     tz = ZoneInfo(args.tz)
-    data = json.loads(Path(args.jobs).read_text(encoding="utf-8"))
+    data = json.loads(Path(args.jobs).read_text(encoding="utf-8-sig"))
     src_jobs = data["jobs"] if isinstance(data, dict) else data
     durations = median_durations(src_jobs, Path(args.executions_db) if args.executions_db else None)
     out = Path(args.out).expanduser()

@@ -237,16 +237,6 @@
    "why": "prefilter on PROSE/JSON (no identifier key in the pattern; the literal is a constant marker); every matched row is re-parsed and checked exactly in Python.",
    "where": "hermes_cli/kanban_db_connect.py:1183 backfill_workspace_of"
   },
-  "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.fallback_flagship_banned::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
-   "verdict": "kept",
-   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
-   "where": "hermes_cli/kanban_db_dispatch.py:5683 _dispatch_once_locked.fallback_flagship_banned"
-  },
-  "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.flagship_refused::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
-   "verdict": "kept",
-   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
-   "where": "hermes_cli/kanban_db_dispatch.py:5723 _dispatch_once_locked.flagship_refused"
-  },
   "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.provider_admission::fold::route_provider::\"until\": cooling[(route_provider or \"\").strip().lower()]}": {
    "verdict": "kept",
    "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
@@ -502,11 +492,6 @@
    "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
    "where": "hermes_cli/kanban_worker_route.py:187 _is_sibling_pool_same_model"
   },
-  "hermes_cli/kanban_worker_route.py::_live_route_gate_error::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
-   "verdict": "kept",
-   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
-   "where": "hermes_cli/kanban_worker_route.py:411 _live_route_gate_error"
-  },
   "hermes_cli/kanban_worker_route.py::apply_pending_live_route::fold::provider::(agent.provider or \"\").strip().lower() or None if provider else None,": {
    "verdict": "kept",
    "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
@@ -621,6 +606,26 @@
    "verdict": "kept",
    "why": "`%<number>%` is a candidate prefilter on run-metadata JSON; each matched row is re-parsed by _run_meta_pr_keys and intersected with the exact `owner/repo#N` key, so the LIKE cannot admit a wrong PR.",
    "where": "hermes_cli/kanban_sign_grants.py:188 authored_pr_keys"
+  },
+  "hermes_cli/kanban_open_pr.py::_target_key::fold::repo::return closed_ref.repo.lower(), int(m.group(1))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
+   "where": "hermes_cli/kanban_open_pr.py:902 _target_key"
+  },
+  "hermes_cli/kanban_open_pr.py::_target_key::fold::repo::return (refs[0].repo.lower(), refs[0].number) if refs else None": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
+   "where": "hermes_cli/kanban_open_pr.py:904 _target_key"
+  },
+  "hermes_cli/kanban_open_pr.py::card_supersession::fold::repo::merged[(r.repo.lower(), r.number)] = r": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
+   "where": "hermes_cli/kanban_open_pr.py:929 card_supersession"
+  },
+  "hermes_cli/kanban_open_pr.py::card_supersession::fold::repo::if s.repo.lower() != c.repo.lower():": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
+   "where": "hermes_cli/kanban_open_pr.py:945 card_supersession"
   }
  }
 }

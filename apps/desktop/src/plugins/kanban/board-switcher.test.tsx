@@ -14,14 +14,15 @@ import { KANBAN_LOCALES } from './i18n'
 vi.mock('./api', async importOriginal => ({
   ...(await importOriginal<typeof KanbanApi>()),
   fetchBoards: vi.fn(async () => ({
-    boards: [{ name: 'Shipping', project_id: null, slug: 'shipping', total: 3 }],
-    current: 'shipping'
+    boards: [{ name: 'Shipping', project_id: null, slug: 'shipping', total: 3 }]
   }))
 }))
 
 let disposeLocales: () => void = () => undefined
 
 beforeEach(() => {
+  // S7 D5: no server-side current board; the tab's selection names it.
+  $boardSlug.set('shipping')
   disposeLocales = registerPluginLocales('kanban', KANBAN_LOCALES)
 })
 

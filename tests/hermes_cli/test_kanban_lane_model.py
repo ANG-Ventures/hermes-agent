@@ -12,7 +12,8 @@ from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
+# proven_operator: flagship overrides need operator authority (t_9e7ba884).
+def kanban_home(tmp_path, monkeypatch, proven_operator):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))

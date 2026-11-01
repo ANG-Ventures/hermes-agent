@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -39,16 +40,77 @@ _PROCESS_ID = uuid.uuid4().hex
 
 # --- executions ledger --------------------------------------------------------------------------
 
-def _connect() -> sqlite3.Connection:
+def _ledger_path() -> Path:
+    return EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+
+
+def _connect(*, path: Optional[Path] = None, shared: bool = False) -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
     # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
     # not at import time (the guarantee cron/ledger.py used to carry, see e24c8499).
     from cron.jobs import _ensure_cron_dir
     from hermes_cli.sqlite_util import open_db
 
-    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    path = path or _ledger_path()
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    return open_db(path, db_label="cron/executions.db", synchronous_full=True,
+                   check_same_thread=not shared, initialize=_initialize_schema)
+
+
+# One long-lived connection per ledger file per process (t_e92870f8). Opening per call cost a
+# connect + WAL probe + config deepcopy, and closing the last connection to a WAL database runs a
+# checkpoint: ~50 ms of a ~80-100 ms claim, 4 ledger transactions per claim, all under ``_lock``.
+# The connection is only used under ``_lock`` (so one thread at a time), keyed by path because one
+# process ticks many profile homes, and re-opened when the file was replaced (a restore must not
+# write into an unlinked inode), after a fork, or after any SQLite error.
+# Bounded so homes that left the ticked set (and test tmp dirs) do not pin fds forever.
+# path -> (connection, owning pid, (st_dev, st_ino) at open)
+MAX_SHARED_CONNECTIONS = 16
+_shared: Dict[str, tuple] = {}
+_depth = threading.local()
+
+
+def _file_identity(path: Path) -> Optional[tuple]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _drop_shared(key: str) -> None:
+    entry = _shared.pop(key, None)
+    if entry is not None and entry[1] == os.getpid():
+        try:
+            entry[0].close()
+        except sqlite3.Error:
+            pass
+
+
+def _shared_connection(path: Path) -> sqlite3.Connection:
+    """The process's connection to *path* (caller holds ``_lock``)."""
+    key = str(path)
+    entry = _shared.get(key)
+    if entry is not None:
+        conn, pid, ident = entry
+        if pid == os.getpid() and ident is not None and _file_identity(path) == ident:
+            return conn
+        if pid != os.getpid():
+            _shared.pop(key, None)  # a forked child must never close or use its parent's handle
+        else:
+            _drop_shared(key)
+    conn = _connect(path=path, shared=True)
+    while len(_shared) >= MAX_SHARED_CONNECTIONS:  # oldest first: dicts keep insertion order
+        _drop_shared(next(iter(_shared)))
+    _shared[key] = (conn, os.getpid(), _file_identity(path))
+    return conn
+
+
+def close_shared_connections() -> None:
+    """Close this process's cached ledger connections (tests, shutdown)."""
+    with _lock:
+        for key in list(_shared):
+            _drop_shared(key)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -95,12 +157,81 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+# What each thread's ledger transaction is doing right now, and who holds ``_lock``: the script
+# runner's watchdog reads both when a tick trips (t_302ab1e8). Four trips in 36 h all stopped in
+# this function with nothing saying whether the tick waited on ``_lock`` or on SQLite.
+# thread ident -> [caller label, stage, tx start (monotonic), stage start (monotonic)].
+_inflight: Dict[int, List[Any]] = {}
+# (thread name, caller label, held since (monotonic)) of the ``_lock`` owner, or None.
+_lock_holder: Optional[tuple] = None
+LEDGER_LOCK_WAIT_NOTE_S = 0.1
+
+
+def ledger_activity() -> Dict[str, Any]:
+    """Snapshot of ``_inflight`` and ``_lock_holder`` with ages in seconds. Never raises."""
+    now = time.monotonic()
+    names = {t.ident: t.name for t in threading.enumerate()}
+    holder = _lock_holder
+    return {
+        "inflight": {
+            names.get(ident, f"thread-{ident}"): {
+                "label": s[0], "stage": s[1], "tx_s": round(now - s[2], 3),
+                "stage_s": round(now - s[3], 3)}
+            for ident, s in _inflight.copy().items()},  # dict.copy is atomic under the GIL
+        "lock_holder": None if holder is None else {
+            "thread": holder[0], "label": holder[1], "held_s": round(now - holder[2], 3)},
+    }
+
+
+def _stage(state: List[Any], stage: str) -> None:
+    state[1], state[3] = stage, time.monotonic()
+
+
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
+    global _lock_holder
+    from cron.lanes import caller_section_label, record_lock_wait
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
-        yield conn
+    label = caller_section_label(sys._getframe(1))
+    ident = threading.get_ident()
+    started = time.monotonic()
+    state = _inflight[ident] = [label, "lock_wait", started, started]
+    try:
+        with _lock:
+            waited = time.monotonic() - started
+            if waited >= LEDGER_LOCK_WAIT_NOTE_S:
+                record_lock_wait(f"ledger_lock:{label}", waited)
+            prev, _lock_holder = _lock_holder, (threading.current_thread().name, label,
+                                                time.monotonic())
+            depth = getattr(_depth, "n", 0)
+            _depth.n = depth + 1
+            try:
+                _stage(state, "connect")
+                if depth:
+                    # Re-entered from inside a ledger transaction on this thread: the shared
+                    # connection's transaction belongs to the outer caller, so use a private one.
+                    with transaction(_connect()) as conn:
+                        _stage(state, "body")
+                        yield conn
+                        _stage(state, "commit")
+                else:
+                    path = _ledger_path()
+                    conn = _shared_connection(path)
+                    try:
+                        with conn:  # commit on success, roll back on error; stays open
+                            _stage(state, "body")
+                            yield conn
+                            _stage(state, "commit")
+                    except sqlite3.Error:
+                        _drop_shared(str(path))
+                        raise
+            finally:
+                _depth.n = depth
+                _lock_holder = prev
+    finally:
+        if _inflight.get(ident) is state:
+            _inflight.pop(ident, None)
 
 
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[Dict[str, Any]]:

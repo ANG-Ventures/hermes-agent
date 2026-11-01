@@ -5120,7 +5120,7 @@ DELEGATE_TASK_SCHEMA = {
                             "object",
                             "Optional scoped board-signing grant (needs kanban.sign_grants: on, inherit_context, "
                             "background=false, and an operator session): {cards: [t_...], verbs: [verdict, approve, "
-                            "request_changes, release], expires_in_min: <=120 (default 45), by: 'apollo'}. The child "
+                            "request_changes, release], expires_in_min: <=120 (default 45), by: 'reviewer'}. The child "
                             "may sign comments as `by` on those cards only; the grant is revoked when its run ends.",
                         ),
                     },

@@ -303,6 +303,15 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 
 # --- Command dispatch ---
 
+# `boards` sub-verbs that report the call's board and so go through kbsel.resolve. argparse sets
+# `boards_action` to the literal typed, so the `ls`/`current` aliases are listed too (Prism ccd467f64b6a).
+_BOARDS_RESOLVED = frozenset({"list", "ls", "show", "current"})
+
+
+def _boards_sub(args: argparse.Namespace) -> str:
+    return getattr(args, "boards_action", None) or "list"
+
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
     action = getattr(args, "kanban_action", None)
@@ -335,9 +344,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         _record_refused_block(args, refusal)
         return _err(f"kanban: {refusal}")
 
-    # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
-    # the `--board` routing override (else `--board beta boards show` reports beta).
-    if action == "boards":
+    # `boards create|rm|rename|…` name their board positionally and are filesystem-only. `boards
+    # list|show` REPORT the scoped board, so they resolve it like every other verb below (Prism
+    # 7b28513d644d): a malformed or unknown --board gets the same refusal, never a traceback.
+    if action == "boards" and _boards_sub(args) not in _BOARDS_RESOLVED:
         return _dispatch_boards(args)
 
     # `locate` reads every board read-only; it must not initialise (or depend on) any one board.
@@ -346,40 +356,24 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     from hermes_cli import kanban_board_select as kbsel
 
-    # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
-    # exact resolution the dispatcher uses for workers.
-    board_override = getattr(args, "board", None)
+    # S7 D2: the verb names its board, or the DB pin or its card id does; otherwise it is refused
+    # with the next command. The resolved slug is the context board for the whole verb, so library
+    # callers see the board the connection is on.
+    try:
+        resolved = kbsel.resolve(args)
+    except kbsel.BoardRequired as exc:
+        return _err(str(exc), 2)
+    except kbsel.BoardNotFound as exc:
+        return _err(str(exc))
+    except (ValueError, kb.KanbanPinDivergenceError) as exc:
+        msg = str(exc)
+        return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
+    if action == "boards":  # list|show: filesystem-only, reported against the resolved board
+        args._resolved_board = resolved
+        return _dispatch_boards(args)
     board_scope = contextlib.nullcontext()
-    if kbsel.s7_enabled():
-        # S7 D2 (kanban.bare_verb set): the verb names its board, or the DB pin or its card id
-        # does; otherwise it is refused with the next command. The resolved slug is the context
-        # board for the whole verb, so library callers see the board the connection is on.
-        try:
-            resolved = kbsel.resolve(args)
-        except kbsel.BoardRequired as exc:
-            return _err(str(exc), 2)
-        except kbsel.BoardNotFound as exc:
-            return _err(str(exc))
-        except (ValueError, kb.KanbanPinDivergenceError) as exc:
-            msg = str(exc)
-            return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
-        if resolved and resolved != kb.PINNED_SLUG:
-            board_scope = kb.scoped_current_board(resolved)
-    # `is not None`: an explicit empty selector (empty $BOARD in a script) is refused below,
-    # never treated as "no selector" and routed to the current board.
-    elif board_override is not None:
-        try:
-            normed = kb._normalize_board_slug(board_override)
-        except ValueError as exc:
-            return _err(f"kanban: {exc}", 2)
-        if not normed:
-            return _err("kanban: --board requires a slug", 2)
-        # Boards other than 'default' must already exist — typoed slugs would otherwise silently
-        # create an empty board.
-        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
-            return _err(f"kanban: board {normed!r} does not exist. "
-                        f"Create it with `hermes kanban boards create {normed}`.")
-        board_scope = kb.scoped_current_board(normed)
+    if resolved and resolved != kb.PINNED_SLUG:
+        board_scope = kb.scoped_current_board(resolved)
 
     with board_scope:
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
@@ -1120,6 +1114,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
             created_by=_comment_author(args.created_by)[0], priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            flagship_override_reason=getattr(args, "allow_flagship", None),
         )
     if getattr(args, "json", False):
         _print_json(created.as_dict())
@@ -1604,8 +1599,10 @@ def _cmd_assign(args: argparse.Namespace) -> int:
                 request_changes_reason=getattr(args, "request_changes", None),
                 operator=_profile_author(),
                 worker_ok=bool(getattr(args, "worker_ok", False)),
+                flagship_override_reason=getattr(args, "allow_flagship", None),
             )
-        except (kb.ReviewHoldRequired, kb.NoWorkerFlagSet) as exc:
+        except (kb.ReviewHoldRequired, kb.NoWorkerFlagSet,
+                kb.FlagshipAssigneeRefused) as exc:
             return _err(str(exc))
     rc = _ok_or_err(ok, f"no such task: {args.task_id}",
                     f"Assigned {args.task_id} to {profile or '(unassigned)'}")
@@ -2091,9 +2088,19 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                 )
             writes: list[kb.BatchRouteWrite] = []
             for task in tasks:
+                clear_reason = None
                 if touch_model and not model and not provider:
                     lane = kb.get_lane_model_override(conn, assignee=task.assignee)
                     cleared_routes[task.id] = lane.route if lane else "profile-default"
+                    # The clear lands on the profile route: judge it BEFORE
+                    # any write or --reclaim (Prism f6a54f1196fd).
+                    try:
+                        clear_reason = kb.clear_pin_flagship_reason(
+                            conn, task.id, firepower_reason, _profile_author(),
+                        )
+                    except ValueError as exc:
+                        print(f"kanban: {exc}; no cards were changed", file=sys.stderr)
+                        return 2
                 write = kb.BatchRouteWrite(
                     task_id=task.id,
                     require_statuses=require_statuses,
@@ -2101,9 +2108,20 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     skip_if_unmatched=not task_ids,
                     live=live,
                 )
+                pin_reason = None
                 if touch_model:
                     effective_model = model or inherited_models.get(task.id)
                     firepower = is_firepower_model(effective_model)
+                    if effective_model and not firepower:
+                        # The pin as the assignee RUNS it (its own aliases,
+                        # Prism a1f3096286e2); judged before any write.
+                        try:
+                            pin_reason = kb.pin_flagship_reason(
+                                conn, task.id, effective_model, firepower_reason, _profile_author(),
+                            )
+                        except ValueError as exc:
+                            print(f"kanban: {exc}; no cards were changed", file=sys.stderr)
+                            return 2
                     write.touch_model = True
                     write.model = effective_model
                     write.provider = provider
@@ -2112,12 +2130,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.force_model_reason = getattr(args, "force_model", None)
                     if write.pin_sub_reason:
                         write.pin_sub_author = _profile_author()
-                    if firepower:
+                    if firepower or clear_reason or pin_reason:
                         write.audit_comment_author = _profile_author()
                         # Same comment main's create/set-model writes, so
                         # the dispatcher's flagship gate authorizes it.
                         write.audit_comment_body = override_comment(
-                            firepower_reason,
+                            clear_reason or pin_reason or firepower_reason,
                         )
                 if effort is not None or clear_effort:
                     write.touch_effort = True
@@ -2368,19 +2386,23 @@ def _cmd_lane_model_set(args: argparse.Namespace) -> int:
         return 2
     now = int(time.time())
     with kb.connect_closing() as conn:
-        override = kb.set_lane_model_override(
-            conn,
-            provider=provider,
-            model=model,
-            expires_at=now + ttl_seconds,
-            reasoning_effort=reasoning_effort,
-            reason=reason,
-            assignee=assignee,
-            firepower=firepower_reason,
-            created_by=_profile_author(),
-            now=now,
-            pin_sub_reason=pin_sub_reason,
-        )
+        try:
+            override = kb.set_lane_model_override(
+                conn,
+                provider=provider,
+                model=model,
+                expires_at=now + ttl_seconds,
+                reasoning_effort=reasoning_effort,
+                reason=reason,
+                assignee=assignee,
+                firepower=firepower_reason,
+                created_by=_profile_author(),
+                now=now,
+                pin_sub_reason=pin_sub_reason,
+            )
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
     scope = f"assignee={assignee}" if assignee else "assignee=(board-wide)"
     print(
         f"lane-model set: route={override.route} {scope} "
@@ -2592,8 +2614,9 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
                 request_changes_reason=getattr(args, "request_changes", None),
                 operator=_profile_author(),
                 worker_ok=bool(getattr(args, "worker_ok", False)),
+                flagship_override_reason=getattr(args, "allow_flagship", None),
             )
-        except kb.NoWorkerFlagSet as exc:
+        except (kb.NoWorkerFlagSet, kb.FlagshipAssigneeRefused) as exc:
             print(str(exc), file=sys.stderr)
             return 1
     reclaimed = bool(receipt.get("reclaimed"))
@@ -2959,6 +2982,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             )
         except ReleaseSuperseded as exc:
             return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
+        except kb.FlagshipAssigneeRefused as exc:
+            # A `flagship override:` body is the authorization record itself;
+            # only flagship authority writes one (Prism 7a9e431141ad).
+            return _err(f"kanban: comment not posted: {exc}", 2)
     print(f"Comment added to {args.task_id}")
     return 0
 

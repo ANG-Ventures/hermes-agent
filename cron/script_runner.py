@@ -37,6 +37,9 @@ TRIP_MARKER_NAME = "script_runner_tripped"
 EXIT_CONFIG = 78
 EXIT_WATCHDOG = 70
 _SHUTDOWN_WAIT_S = 20.0
+# Bounded skew drain: after SIGKILL, how long to wait for each group to be reaped before its
+# re-fire is withheld (t_c15baa4b).
+_SKEW_CONFIRM_S = 2.0
 _WARN_EVERY_S = 3600.0
 _REFUSED_ENV = ("HERMES_MACHINE_ID", "_HERMES_CRON_EXTERNAL_WORKER")
 
@@ -70,6 +73,37 @@ def _inflight_count() -> int:
     from cron.scheduler import get_running_job_ids
 
     return len(get_running_job_ids())
+
+
+def _inflight_refire_spent() -> List[tuple]:
+    """``(job_id, elapsed_s)`` per in-flight run whose job could NOT be re-fired if killed now: the
+    same test ``request_restart_requeue`` applies (a cron/interval job under ``RESTART_REQUEUE_MAX``).
+    A run that is itself the re-fire, a job at the cap, a job on its final finite repetition, a
+    one-shot or an unreadable job counts as spent, so the bounded skew drain waits for it instead of
+    losing the run (Prism 05343ab9e749, cd1ea5071578)."""
+    import cron.scheduler as sched
+    from cron.jobs import get_job, restart_refire_refusal
+    from cron.scheduler_provider import _profile_cron_scope
+
+    with sched._running_lock:
+        keys = sorted(sched._running_job_ids | sched._running_fire_owners.keys())
+        since = {k: sched._running_since.get(k) for k in keys}
+    now = time.time()
+    spent = []
+    for key in keys:
+        home_key, job_id = key
+        try:
+            with _profile_cron_scope(sched._inflight_home_path(home_key)):
+                job = get_job(job_id)
+            # The in-flight run is not in repeat.completed yet: mark_job_run counts it.
+            available = restart_refire_refusal(job, run_counted=False) is None
+        except Exception:
+            logger.debug("re-fire lookup failed for %s", job_id, exc_info=True)
+            available = False
+        if not available:
+            started = since.get(key)
+            spent.append((job_id, round(now - started) if started else None))
+    return spent
 
 
 def _boot_code_sha() -> Optional[str]:
@@ -145,13 +179,19 @@ class ScriptRunner:
         self.tripped = False
         self.draining = False
         self.draining_since: Optional[str] = None
+        self._draining_mono = float("-inf")
         self.sigterm = False
+        self._skew_bounded = False
         self._reasons: Dict[str, Optional[str]] = {}
         self._last_ok: Dict[str, str] = {}
         self._tick_started: Dict[str, str] = {}
         self._last_homes: List[tuple] = []
         self._warned: Dict[str, tuple] = {}
         self._recovered: set = set()
+        # Set by a self re-arm; consumed by the first ADMITTED tick, which posts the receipt.
+        self._rearmed: Optional[dict] = None
+        # The first ADMITTED tick of this process closes a still-open trip episode (t_b6454aff).
+        self._episode_cleared = False
         self._timer: Optional[threading.Timer] = None
         self._deadline: Optional[threading.Timer] = None
         self._tick_thread: Optional[threading.Thread] = None
@@ -212,20 +252,110 @@ class ScriptRunner:
                                    "trip marker removed")
         self.tripped = trip_marker_path().exists()
         if self.tripped:
+            # A trip seen by this process opens a new episode: the next ADMITTED tick closes it
+            # again even if the marker goes away off the self-rearm path (Prism ce116ff61d38).
+            self._episode_cleared = False
+            self._maybe_self_rearm()
+        if self.tripped:
             self._warn_hourly("tripped", True, "script runner standby: watchdog tripped (%s); "
-                              "run 'hermes cron runner rearm'", trip_marker_path())
+                              "self re-arm pending, or run 'hermes cron runner rearm'",
+                              trip_marker_path())
         self._check_host()
         return homes
+
+    def _maybe_self_rearm(self) -> None:
+        """Delete the trip marker once it is ``rearm_delay_s(trips in 24 h)`` old (t_302ab1e8).
+        The receipt waits for the first ADMITTED tick (``on_home_cycle``)."""
+        from cron import script_runner_rearm as rearm_policy
+
+        marker = trip_marker_path()
+        try:
+            age = time.time() - marker.stat().st_mtime
+        except OSError:
+            return
+        trips = len(rearm_policy.recent_trips())
+        delay = rearm_policy.rearm_delay_s(trips)
+        if age < delay:
+            return
+        probe_s = self._ledger_probe_s()
+        budget = lanes.RUNNER_TICK_WATCHDOG_S / 2
+        if probe_s is None or probe_s > budget:
+            self._warn_hourly("rearm_probe", None, "script runner self re-arm held: ledger probe "
+                              "%s (budget %.0f s); lane stays parked",
+                              "failed" if probe_s is None else f"took {probe_s:.1f} s", budget)
+            return
+        try:
+            content = marker.read_text(encoding="utf-8-sig")
+            marker.unlink()
+        except OSError:
+            logger.warning("script runner self re-arm: marker removal failed", exc_info=True)
+            return
+        try:
+            info = json.loads(content)
+        except ValueError:
+            info = None
+        if not isinstance(info, dict):
+            info = {}
+        self.tripped = False
+        self._rearmed = {"trip_at": info.get("at"), "phase": info.get("phase"),
+                         "age_s": round(age), "trips_24h": trips}
+        logger.warning("script runner re-armed itself: trip at %s (%s) is %d s old, %d trip(s) in "
+                       "24 h, delay %d s", info.get("at"), info.get("phase"), age, trips, delay)
+
+    @staticmethod
+    def _ledger_probe_s() -> Optional[float]:
+        """Seconds for one ledger ``_transaction`` round-trip (connect + ``SELECT 1``), or None on
+        error. Run on a daemon thread, joined for at most the watchdog budget, so a still-wedged
+        ledger keeps the lane parked instead of re-tripping and killing in-flight jobs again."""
+        from cron import executions
+
+        out: List[Optional[float]] = [None]
+
+        def probe() -> None:
+            started = time.monotonic()
+            try:
+                with executions._transaction() as conn:
+                    conn.execute("SELECT 1").fetchone()
+                out[0] = time.monotonic() - started
+            except Exception:
+                logger.warning("script runner self re-arm: ledger probe failed", exc_info=True)
+
+        t = threading.Thread(target=probe, name="script-runner-rearm-probe", daemon=True)
+        started = time.monotonic()
+        t.start()
+        t.join(float(lanes.RUNNER_TICK_WATCHDOG_S))
+        if t.is_alive():
+            return time.monotonic() - started
+        return out[0]
 
     def _check_skew(self) -> None:
         if not self.draining and _detect_code_skew() is not None:
             self.draining = True
             self.draining_since = _now_iso()
-            logger.warning("script runner draining: code skew; exiting 0 once in-flight scripts end")
-        if self.draining and _inflight_count() == 0:
+            self._draining_mono = time.monotonic()
+            logger.warning("script runner draining: code skew; exiting 0 once in-flight scripts end "
+                           "(at most %s s, then terminate + re-queue)", lanes.RUNNER_SKEW_DRAIN_MAX_S)
+        if not self.draining:
+            return
+        if _inflight_count() == 0:
             self.exit_code = 0
             if self._stop is not None:
                 self._stop.set()
+        elif time.monotonic() - self._draining_mono >= float(lanes.RUNNER_SKEW_DRAIN_MAX_S):
+            # Bounded drain (t_c15baa4b), only while every in-flight job can still be re-fired:
+            # killing a run that is itself the re-fire (or a job at RESTART_REQUEUE_MAX) would lose
+            # it until its next schedule, so then the drain waits as before (Prism 05343ab9e749).
+            spent = _inflight_refire_spent()
+            if spent:
+                names = ", ".join(f"{job_id} {elapsed}s" for job_id, elapsed in spent)
+                self._warn_hourly("skew_wait", tuple(j for j, _ in spent),
+                                  "script runner code-skew drain waiting: re-fire spent, %s", names)
+                return
+            logger.warning("script runner code-skew drain bounded: re-fire available; %d script(s) "
+                           "in flight past %s s, terminating them (one re-fire each) and exiting 0",
+                           _inflight_count(), lanes.RUNNER_SKEW_DRAIN_MAX_S)
+            self._skew_bounded = True
+            self.request_shutdown()
 
     def _check_host(self) -> None:
         try:
@@ -294,6 +424,18 @@ class ScriptRunner:
             label = outcome.value
             if gated_in and outcome is lanes.TickOutcome.ADMITTED:
                 self._last_ok[key] = _now_iso()
+                if self._rearmed is not None:
+                    self._post_rearm_receipt(home)
+                elif not self._episode_cleared:
+                    # A re-arm off the self-rearm path (`hermes cron runner rearm`, a hand
+                    # unlink, the knob toggle) also ends the trip; close any open episode once.
+                    # Gated on ANY recorded trip, not the 24 h window: a runner parked longer
+                    # than the window still has an open episode (Prism ce116ff61d38).
+                    from cron import script_runner_rearm as rearm_policy
+
+                    if rearm_policy.trips_path().exists():
+                        rearm_policy.clear_alerts()
+                self._episode_cleared = True
         elif isinstance(outcome, BaseException):
             label = type(outcome).__name__
         else:
@@ -304,6 +446,18 @@ class ScriptRunner:
             self._write(home, "active", outcome=label)
         else:
             self._write(home, "standby", self._reasons.get(key) or "gated", outcome=label)
+
+    def _post_rearm_receipt(self, home) -> None:
+        """One #logs line for a self re-arm, on the first ADMITTED tick after it."""
+        from cron import script_runner_rearm as rearm_policy
+
+        info, self._rearmed = self._rearmed or {}, None
+        rearm_policy.post_logs(
+            f"🔁 cron script runner re-armed itself after a watchdog trip at {info.get('trip_at')} "
+            f"({info.get('phase') or 'phase unknown'}); first tick on {_home_label(home)} under "
+            f"budget. Trips in 24 h: {info.get('trips_24h')}. History: "
+            f"{rearm_policy.trips_path()}")
+        rearm_policy.clear_alerts()  # closes the 2nd-trip episode; ``quiet`` when none is open
 
     # --- tick watchdog (§5.5) --------------------------------------------------------------
 
@@ -331,6 +485,7 @@ class ScriptRunner:
 
     def _watchdog_fire(self, home, tick_started_at) -> None:
         grace = float(lanes.RUNNER_WATCHDOG_KILL_GRACE_S)
+        hard_exit_at = time.monotonic() + grace + 2
         # 1. Hard deadline: the exit happens even if a step below blocks.
         self._deadline = threading.Timer(grace + 2, self._exit_fn, args=(EXIT_WATCHDOG,))
         self._deadline.daemon = True
@@ -347,12 +502,89 @@ class ScriptRunner:
             for _name, h in self._last_homes or [(None, home)]:
                 with contextlib.suppress(Exception):
                     self._write(h, "standby", "watchdog_tripped")
+            # Trip record + notice run beside the recovery, never ahead of it: a stalled history
+            # write or sender start must not let the hard deadline fire before the requeue
+            # snapshot and the tree kill (Prism eb08fba97ed9).
+            notify = threading.Thread(target=self._record_and_notify_trip,
+                                      args=(home, tick_started_at, diag), daemon=True,
+                                      name="cron-runner-trip-notify")
+            notify.start()
+            # A script killed below is the runner's own doing, not a job failure: with the
+            # scheduler marked shutting down, a worker that records the -15 before the exit takes
+            # the restart-kill path (no failure page, one re-fire request), as on a gateway
+            # restart drain (t_302ab1e8).
+            with contextlib.suppress(Exception):
+                import cron.scheduler as sched
+
+                sched.signal_shutdown("cron script runner watchdog trip")
+            # Before the kill: snapshot what was in flight while the pool still lists it.
+            with contextlib.suppress(Exception):
+                self._requeue_inflight()
             self._tree_kill(grace)
+            self._await_inflight(min(time.monotonic() + 1.5, hard_exit_at - 0.5))
+            notify.join(max(0.0, hard_exit_at - 0.3 - time.monotonic()))
             for handler in logging.getLogger().handlers:
                 with contextlib.suppress(Exception):
                     handler.flush()
         finally:
             self._exit_fn(EXIT_WATCHDOG)
+
+    def _record_and_notify_trip(self, home, tick_started_at, diag: dict) -> None:
+        """Trip history line; #alerts page on the 2nd trip in 24 h (the 1st is self-healing and
+        posts its #logs receipt when the re-armed runner ticks). Never raises."""
+        try:
+            from cron import script_runner_rearm as rearm_policy
+
+            entry = {"epoch": time.time(), "at": _now_iso(), "home": str(home), "pid": self._pid,
+                     "code_sha": self._code_sha, "tick_started_at": tick_started_at,
+                     "phase": diag.get("phase"), "ledger": diag.get("ledger"),
+                     "lock_waits": diag.get("lock_waits")}
+            rearm_policy.record_trip(entry)
+            trips = rearm_policy.recent_trips()
+            if len(trips) >= 2:
+                rearm_policy.page_alerts(
+                    f"🔴 cron script runner watchdog: {len(trips)} trips in 24 h; latest "
+                    f"{rearm_policy.trip_summary(entry)}. In-flight scripts were killed and "
+                    f"re-queued; the gateway runs the script lane until the runner re-arms itself "
+                    f"in {round(rearm_policy.rearm_delay_s(len(trips)) / 60)} min. History: "
+                    f"{rearm_policy.trips_path()}")
+        except Exception:
+            logger.error("script runner: trip record/notify failed", exc_info=True)
+
+    @staticmethod
+    def _requeue_inflight() -> None:
+        """Record every job in flight at the trip for one re-fire (t_302ab1e8). Not written to
+        jobs.json here: the trip usually means the tick is stuck inside a ``_jobs_lock`` section
+        waiting on the ledger, so the restarted runner applies the file
+        (``script_runner_rearm.apply_pending_requeues``)."""
+        import cron.scheduler as sched
+        from cron import script_runner_rearm as rearm_policy
+
+        # Stamped BEFORE the snapshot (Prism 29502ffb3d71), and each row carries its run's start
+        # (Prism dbe5fc2fa076): a worker that already marked ``ok`` is still listed until its
+        # ``finally`` releases it, so only a stamp no later than the run's start is safe.
+        trip_epoch = time.time()
+        got = sched._running_lock.acquire(timeout=0.2)
+        try:
+            keys = list(sched._running_job_ids)
+            since = dict(sched._running_since)
+            if not got:  # unlocked reads (Prism aa167090b0a2): no start = released = finished
+                keys = [key for key in keys if key in since]
+        except RuntimeError:
+            keys, since = [], {}
+        finally:
+            if got:
+                sched._running_lock.release()
+        rearm_policy.record_pending_requeues(
+            [(str(sched._inflight_home_path(key[0])), key[1], since.get(key)) for key in keys],
+            trip_epoch=trip_epoch, lock_timeout=1.0)
+
+    @staticmethod
+    def _await_inflight(deadline: float) -> None:
+        """Give killed scripts' workers until ``deadline`` to record their run before the exit."""
+        with contextlib.suppress(Exception):
+            while _inflight_count() and time.monotonic() < deadline:
+                time.sleep(0.05)
 
     def _stack_diagnosis(self) -> dict:
         """Every thread's stack plus the tick thread's innermost ``cron.*`` frame (``phase``), so a
@@ -384,6 +616,11 @@ class ScriptRunner:
                             break
                         f = f.f_back
             diag["lock_waits"] = [[label, round(s, 3)] for label, s in lanes.lock_waits()[-20:]]
+            # Which thread holds the ledger lock and what every ledger transaction is doing
+            # (t_302ab1e8). Only when already imported: a trip must not import anything.
+            executions = sys.modules.get("cron.executions")
+            if executions is not None:
+                diag["ledger"] = executions.ledger_activity()
         except Exception as exc:  # noqa: BLE001 - diagnostics must not block the trip
             diag["error"] = f"{type(exc).__name__}: {exc}"
         return diag
@@ -455,6 +692,58 @@ class ScriptRunner:
             with contextlib.suppress(Exception):
                 os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
 
+    def _skew_kill(self) -> None:
+        """Bounded skew drain (Prism 9dde2d9f29f3, dbd507fb38d7, 96d1a12310f7): snapshot each
+        script's whole tree BEFORE signalling, TERM it, wait ≤ ``RUNNER_SKEW_KILL_GRACE_S``, KILL the
+        survivors through the timeout/cancel tree-kill, then confirm (a zombie-only tree is gone).
+        Held under ``_script_procs_lock`` so no run can set or consume its re-fire flag meanwhile; a
+        tree still alive afterwards has its re-fire withheld (keyed per profile, Prism f4526d2bb9fa),
+        because the re-fire would run beside the live copy."""
+        import cron.scheduler as sched
+        from cron import scheduler_script as ss
+
+        with sched._script_procs_lock:
+            sched.signal_shutdown("cron script runner code-skew drain bound")
+            trees = [(key, proc, ss._script_tree_snapshot(proc))
+                     for key, proc in sched._active_script_procs.items() if proc.returncode is None]
+            # Every run cut off here is a failure flagged for its re-fire, whatever it exits with
+            # (Prism b86087faa72f); consumed by _run_job_script once the run returns.
+            sched._skew_interrupted_job_ids.update(
+                {sched._script_proc_job_ids.get(key) for key, _p, _s in trees} - {None})
+            for _key, proc, snap in trees:
+                ss._signal_script_tree(proc, snap, signal.SIGTERM)
+            alive = trees
+            deadline = time.monotonic() + float(lanes.RUNNER_SKEW_KILL_GRACE_S)
+            while True:
+                alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
+                if not alive or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            # Re-snapshot before KILL and before the confirm: a descendant forked during the TERM
+            # grace is in neither the first snapshot nor the reaped leader's tree (Prism 361a15209668).
+            trees = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in trees]
+            alive = [t for t in trees if ss._script_tree_alive(t[1], t[2])]
+            kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+            for _key, proc, snap in alive:
+                ss._signal_script_tree(proc, snap, kill_sig)
+            alive = [(key, proc, ss._script_tree_refresh(proc, snap)) for key, proc, snap in alive]
+            for _key, proc, snap in alive:
+                ss._signal_script_tree(proc, snap, kill_sig)
+            deadline = time.monotonic() + _SKEW_CONFIRM_S
+            while True:
+                alive = [t for t in alive if ss._script_tree_alive(t[1], t[2])]
+                if not alive or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            withheld = {sched._script_proc_job_ids.get(key) for key, _p, _s in alive} - {None}
+            sched._refire_withheld_job_ids.update(withheld)
+            sched._restart_killed_job_ids.difference_update(withheld)
+        if alive:
+            logger.error("script runner code-skew drain: %d script tree(s) survived SIGKILL (%s); "
+                         "re-fire withheld for %s", len(alive),
+                         ", ".join(str(proc.pid) for _k, proc, _s in alive),
+                         ", ".join(sorted(f"{j}@{h}" for h, j in withheld)) or "-")
+
     # --- SIGTERM shutdown (§5.4) -----------------------------------------------------------
 
     def request_shutdown(self) -> None:
@@ -471,8 +760,11 @@ class ScriptRunner:
         for _name, home in self._last_homes:
             with contextlib.suppress(Exception):
                 self._write(home, "draining")
-        sched.signal_shutdown("cron script runner SIGTERM")
-        sched.terminate_running_scripts("cron script runner SIGTERM")
+        if self._skew_bounded:
+            self._skew_kill()
+        else:
+            sched.signal_shutdown("cron script runner SIGTERM")
+            sched.terminate_running_scripts("cron script runner SIGTERM")
         deadline = time.monotonic() + _SHUTDOWN_WAIT_S
         while _inflight_count() and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -534,6 +826,12 @@ def main(argv: Optional[list] = None) -> int:
 
         record_boot_fingerprint()
     runner = ScriptRunner()
+    with contextlib.suppress(Exception):
+        # Jobs a watchdog trip killed get their one re-fire now, from a process whose locks are
+        # fresh (the tripped one could not take ``_jobs_lock``; t_302ab1e8).
+        from cron import script_runner_rearm
+
+        script_runner_rearm.apply_pending_requeues()
     stop = threading.Event()
     kwargs = runner.start_kwargs(stop)
     signal.signal(signal.SIGTERM, lambda *_a: runner.request_shutdown())

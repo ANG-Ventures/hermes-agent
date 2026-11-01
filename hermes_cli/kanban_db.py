@@ -2,8 +2,9 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. Board resolution (S7): ``board=`` arg / the context board > ``HERMES_KANBAN_DB`` (pins the
+file path; the dispatcher injects it into workers) > ``default``. There is no current-board file and
+no board env var.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -1151,6 +1152,13 @@ def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
             f"invalid board slug {slug!r}: must be 1-64 chars, lowercase "
             f"alphanumerics / hyphens / underscores, not starting with '-' or '_'"
         )
+    if s == PINNED_SLUG:
+        # The pin sentinel is never a board name (Prism 39b758962810): a board dir called
+        # ``override`` would be indistinguishable from an unnamed pin and open unscoped.
+        raise ValueError(
+            f"invalid board slug {slug!r}: {PINNED_SLUG!r} is reserved for a HERMES_KANBAN_DB "
+            f"pin that names no board"
+        )
     return s
 
 
@@ -1514,80 +1522,26 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
-def current_board_path() -> Path:
-    """``<root>/kanban/current`` — one-line slug written by ``boards switch``; absent = ``default``."""
-    return kanban_home() / "kanban" / "current"
-
-
 def get_current_board() -> str:
-    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current``
-    (only while that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug
-    falls through — the dispatcher must never crash on a hand-edited file."""
-    def _existing(candidate: str) -> Optional[str]:
-        if not candidate:
-            return None
+    """The board THIS call is scoped to ("current" is historical; S7 D1): the context override
+    (``scoped_current_board``, installed by every surface around a verb) -> the board the
+    ``HERMES_KANBAN_DB`` pin names -> ``DEFAULT_BOARD``. No file, no env slug. A stale override
+    falls through. A pin that names no board keeps default's layout paths; every DB open still
+    takes the pin's path."""
+    candidate = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if candidate:
         try:
             normed = _normalize_board_slug(candidate)
         except ValueError:
-            return None
-        return normed if normed and board_exists(normed) else None
-
-    from hermes_cli import kanban_board_select as _kbsel
-
-    if _kbsel.s7_enabled():
-        # S7 D1 (kanban.bare_verb set): override -> the board the DB pin names -> default.
-        # No file, no env slug. A pin that names no board keeps default's layout paths; every
-        # DB open still takes the pin's path.
-        found = _existing((_CURRENT_BOARD_OVERRIDE.get() or "").strip())
-        if found:
-            return found
-        pinned = pinned_board()
-        if pinned and (pinned != PINNED_SLUG or board_exists(PINNED_SLUG)):
-            return pinned
-        return DEFAULT_BOARD
-
-    for candidate in (
-        (_CURRENT_BOARD_OVERRIDE.get() or "").strip(),
-        os.environ.get("HERMES_KANBAN_BOARD", "").strip(),
-    ):
-        found = _existing(candidate)
-        if found:
-            return found
-    try:
-        f = current_board_path()
-        if f.exists():
-            # utf-8-sig read fix (ours): tolerate BOM-persisted current-board files.
-            val = f.read_text(encoding="utf-8-sig").strip()
-            if val:
-                try:
-                    normed = _normalize_board_slug(val)
-                    if normed and board_exists(normed):
-                        return normed
-                except ValueError:
-                    pass
-    except OSError:
-        pass
+            normed = None
+        if normed and board_exists(normed):
+            return normed
+    pinned = pinned_board()
+    if pinned and pinned != PINNED_SLUG:
+        return pinned
     return DEFAULT_BOARD
 
 
-def set_current_board(slug: str) -> Path:
-    """Persist ``slug`` as the active board; returns the file written. Does NOT
-    check the board exists — callers do (so ``boards switch <typo>`` errors)."""
-    _assert_not_delegated_child_mutation()
-    normed = _require_slug(slug)
-    path = current_board_path()
-    _assert_live_board_tree_write_allowed(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(normed + "\n", encoding="utf-8")
-    return path
-
-
-def clear_current_board() -> None:
-    """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
-    _assert_not_delegated_child_mutation()
-    _assert_live_board_tree_write_allowed(current_board_path())
-    with contextlib.suppress(FileNotFoundError):
-        current_board_path().unlink()
 _BOARD_ALIAS_CACHE: tuple[Optional[tuple[int, int]], dict[str, str]] = (None, {})
 
 
@@ -2202,6 +2156,23 @@ def create_board(
 
 # Phantom board dirs already warned about in this process (see list_boards).
 _PHANTOM_BOARD_WARNED: set[str] = set()
+# Board dirs named for the pin sentinel, already warned about in this process.
+_RESERVED_BOARD_WARNED: set[str] = set()
+
+
+def skip_reserved_board_dir(child: Path) -> bool:
+    """True (after ONE warning per process per dir) when discovery must skip ``child`` because
+    its name is the pin sentinel (Prism c12f81da4e1f). A ``boards/override/`` made before the
+    sentinel was reserved never breaks discovery of the other boards; the warning names the rename
+    that makes it addressable again."""
+    if child.name.strip().lower() != PINNED_SLUG:
+        return False
+    if str(child) not in _RESERVED_BOARD_WARNED:
+        _RESERVED_BOARD_WARNED.add(str(child))
+        _log.warning("kanban: skipping board dir %s: %r is reserved for a HERMES_KANBAN_DB pin "
+                     "that names no board. Rename it to address it: mv %s %s",
+                     child, PINNED_SLUG, child, child.with_name("<new-slug>"))
+    return True
 
 
 def _board_db_is_empty(db_path: Path) -> bool:
@@ -2267,6 +2238,8 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 if not child.is_dir():
                     continue
                 slug = child.name
+                if skip_reserved_board_dir(child):
+                    continue
                 # Keep slug normalisation soft for discovery — but skip dirs
                 # that don't parse as valid slugs so we don't surface junk.
                 try:
@@ -2353,12 +2326,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     #
     # Checked BEFORE the cache invalidation below: it opens the board DB
     # (which would re-populate _INITIALIZED_PATHS) and it can abort, so no
-    # state may be torn down ahead of it -- INCLUDING the active-board pin,
-    # which used to be cleared above this gate. A refused removal that had
-    # already unlinked <root>/kanban/current left get_current_board() falling
-    # through to DEFAULT_BOARD, so every later `kanban add` / `list` /
-    # `dispatch` silently addressed the default board with nothing saying the
-    # pin had moved (FleetReview on PR #785, measured).
+    # state may be torn down ahead of it.
     live = _board_has_live_cards(normed)
     if live:
         verb = "archive" if archive else "delete"
@@ -2373,12 +2341,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             f"{verb} its directory, which contains their workspaces. "
             "Wait for the cards to finish, or stop them first."
         )
-
-    # Remember the active pin while the board still exists. It is cleared only
-    # after the archive/delete succeeds; either operation has later failure
-    # boundaries (rename errors and survivor-held hard deletes) that must leave
-    # the operator pointed at the still-present board.
-    was_current_board = get_current_board() == normed
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -2429,8 +2391,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             detail=f"board={normed} action=archive dest={target}",
             board=normed,
         )
-        if was_current_board:
-            clear_current_board()
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -2471,8 +2431,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             d, task_id=None, reason="remove_board", outcome=AUDIT_DELETE,
             detail=f"board={normed}", board=normed,
         )
-        if was_current_board:
-            clear_current_board()
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -3430,7 +3388,7 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
         return
     pins = ", ".join(
         f"{k}={os.environ[k]}"
-        for k in (*_KANBAN_PATH_PIN_ENV_VARS, "HERMES_KANBAN_BOARD")
+        for k in _KANBAN_PATH_PIN_ENV_VARS
         if os.environ.get(k, "").strip()
     ) or "<none>"
     raise LiveBoardWriteRefused(
@@ -3460,7 +3418,7 @@ def _assert_live_board_tree_write_allowed(path: Path) -> None:
     ``connect()``'s guard only sees ``kanban.db``. ``create_board()`` writes
     ``board.json`` (and mkdirs the board dir) BEFORE it reaches ``connect()``,
     so a refused create still left a board that ``list_boards()`` surfaces;
-    ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
+    ``remove_board()`` never touches the DB at all.
     That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
     landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
     Same production-root list and R1/R2 predicate as the DB guard, and the same
@@ -5091,7 +5049,6 @@ def _announce_foreign_change(
     overview instead of discovering it by accident."""
     if action not in FOREIGN_CHANGE_ACTIONS:
         return
-    sess = ", ".join(actor.session_ids) or "no-session"
     reason = actor.operator or actor.foreign_ok or ""
     with write_txn(conn, allow_nested=True):
         _append_event(conn, task_id, "foreign_change", {
@@ -5111,9 +5068,58 @@ def _announce_foreign_change(
         session_ref = None
     add_comment(
         conn, task_id, author=actor.profile or "user",
-        body=f"FOREIGN CHANGE by {sess} ({reason}) [{action}]",
+        body=_foreign_change_comment_body(actor, action),
         session_ref=session_ref,
     )
+
+
+def _foreign_change_comment_body(actor: MutationActor, action: str) -> str:
+    sess = ", ".join(actor.session_ids) or "no-session"
+    reason = actor.operator or actor.foreign_ok or ""
+    return f"FOREIGN CHANGE by {sess} ({reason}) [{action}]"
+
+
+def _takeover_new_home(action: str, actor: MutationActor) -> Optional[str]:
+    """The session a ``--takeover`` re-homes the card to, else ``None``."""
+    if (
+        _takeover_transfers_home(action, actor)
+        and actor.session_ids
+        and _can_adopt_home(actor.session_ids[0])
+    ):
+        return actor.session_ids[0]
+    return None
+
+
+def _takeover_comment_body(
+    actor: MutationActor, action: str, prev_home: Optional[str],
+    new_home: Optional[str],
+) -> str:
+    sess = ", ".join(actor.session_ids) or "no-session"
+    return (
+        f"takeover: foreign-session action by {sess} "
+        f"({actor.profile or 'unknown'}): {actor.foreign_ok} [{action}]"
+        + (
+            f" -- card re-homed to {new_home}" if new_home
+            else f" -- home kept ({prev_home})"
+            if action in REHOME_ON_TAKEOVER_ACTIONS else ""
+        )
+    )
+
+
+def _validate_foreign_action_comments(
+    actor: MutationActor, action: str, prev_home: Optional[str],
+) -> None:
+    """:func:`add_comment`'s refusals (:func:`_validate_comment_args`) for every
+    comment :func:`record_foreign_action` will write, with no database access.
+    Run where the override is ACCEPTED, so a reason those comments cannot carry
+    is refused before any guarded write journals (t_705b1458, Prism 34b90ddab22b)."""
+    author = actor.profile or "user"
+    if not actor.operator:
+        _validate_comment_args(author, _takeover_comment_body(
+            actor, action, prev_home, _takeover_new_home(action, actor),
+        ))
+    if action in FOREIGN_CHANGE_ACTIONS:
+        _validate_comment_args(author, _foreign_change_comment_body(actor, action))
 
 
 def check_home_session(
@@ -5191,9 +5197,11 @@ def check_home_session(
                 f"\"<who: why>\" (e.g. \"Ace via Aegis: ruled (a)\")."
             )
         _check_ruling_precedence(conn, task_id, action, home, actor.operator)
+        _validate_foreign_action_comments(actor, action, row["session_id"])
         return actor
     if actor.foreign_ok:
         _check_ruling_precedence(conn, task_id, action, home, actor.foreign_ok)
+        _validate_foreign_action_comments(actor, action, row["session_id"])
         return actor
     if home_guard_mode() == "warn":
         print(
@@ -5329,11 +5337,13 @@ def record_foreign_action(
     ``subscribe=False`` (the in-transaction caller) leaves the post-commit
     chat subscription to the caller.
     """
-    sess = ", ".join(actor.session_ids) or "no-session"
     prev_home = (
         _read_home_session(conn, task_id)
         if home_before is _HOME_UNREAD else home_before
     )
+    # Every comment this writes, judged before its first event: a refusal
+    # here leaves no takeover/operator_override line in the journal.
+    _validate_foreign_action_comments(actor, action, prev_home)
     if actor.operator:
         last = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? "
@@ -5367,13 +5377,7 @@ def record_foreign_action(
             )
         _announce_foreign_change(conn, task_id, action, actor, prev_home)
         return None
-    new_home = (
-        actor.session_ids[0]
-        if _takeover_transfers_home(action, actor)
-        and actor.session_ids
-        and _can_adopt_home(actor.session_ids[0])
-        else None
-    )
+    new_home = _takeover_new_home(action, actor)
     payload = {
         "action": action,
         "reason": actor.foreign_ok,
@@ -5416,15 +5420,7 @@ def record_foreign_action(
         conn,
         task_id,
         author=actor.profile or "user",
-        body=(
-            f"takeover: foreign-session action by {sess} "
-            f"({actor.profile or 'unknown'}): {actor.foreign_ok} [{action}]"
-            + (
-                f" -- card re-homed to {new_home}" if new_home
-                else f" -- home kept ({prev_home})"
-                if action in REHOME_ON_TAKEOVER_ACTIONS else ""
-            )
-        ),
+        body=_takeover_comment_body(actor, action, prev_home, new_home),
         session_ref=session_ref,
     )
     _announce_foreign_change(conn, task_id, action, actor, prev_home)
@@ -6044,8 +6040,14 @@ def create_task(
     continues: Optional[str] = None,
     workspace_of: Optional[str] = None,
     boomerang_wake: Optional[bool] = None,
+    no_worker: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
+
+    ``no_worker=True`` mints the card operator-only (the ``no_worker`` flag,
+    see :func:`set_no_worker`): it never reaches a worker, so the assignee
+    flagship gate does not judge its route (a swarm's bookkeeping root,
+    Prism d1a3754ac7e5).
 
     New cards are portable unless a constraint says otherwise; a parent link
     is not a constraint. ``workspace_of`` (``--workspace-of X``) is the
@@ -6148,11 +6150,15 @@ def create_task(
         model_override, provider_override
     )
     validate_route_provider(model_override, provider_override, pin_sub_reason=pin_sub_reason)
-    from hermes_cli.model_policy import validate_worker_model
+    from hermes_cli.model_policy import require_flagship_authority, validate_worker_model
 
+    # Flagship authority is judged ONCE, here, before any write (t_9e7ba884).
+    flagship_override_author, _raw_flagship_reason = require_flagship_authority(
+        flagship_override_reason, flagship_override_author,
+    )
     flagship_override_reason = validate_worker_model(
         model_override,
-        allow_flagship_reason=flagship_override_reason,
+        allow_flagship_reason=_raw_flagship_reason,
     )
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
@@ -6470,6 +6476,21 @@ def create_task(
                 if assignee_err:
                     raise ValueError(assignee_err)
                 assignee = _canonical_assignee(assignee) if assignee else assignee
+                if not flagship_override_reason and not no_worker:
+                    # The assignee is a route choice too (t_9e7ba884): an
+                    # unpinned card on a flagship-default profile needs the same
+                    # --allow-flagship reason. Judged on the FINAL (post-remap)
+                    # assignee (Prism 311c94f92990); a refusal rolls back the txn.
+                    from hermes_cli.model_policy import validate_assignee_route
+
+                    flagship_override_reason = validate_assignee_route(
+                        assignee,
+                        model_override=model_override,
+                        allow_flagship_reason=_raw_flagship_reason,
+                    )
+                # The override comment is written after the card's first
+                # journaled event; judge it before the INSERT (Prism 8b7984d6e364 r14).
+                flagship_override_comment(flagship_override_author, flagship_override_reason)
 
                 if tenant is None and parents:
                     # Parent order breaks ties in this soft namespace; an
@@ -6694,13 +6715,12 @@ def create_task(
                             append_event=_append_event, add_comment=add_comment,
                         )
                 if flagship_override_reason:
-                    from hermes_cli.model_policy import override_comment
-
-                    add_comment(
-                        conn,
-                        task_id,
-                        flagship_override_author or created_by or "operator",
-                        override_comment(flagship_override_reason),
+                    authorize_flagship(
+                        conn, task_id, flagship_override_author, flagship_override_reason,
+                    )
+                if no_worker:
+                    _set_no_worker_locked(
+                        conn, task_id, True, source="create", operator=created_by,
                     )
                 if ruled_mint is not None:
                     _append_event(
@@ -6973,6 +6993,9 @@ def _reassign_request_changes(
 ) -> Optional[str]:
     """Route a reassign of a ``review`` card through :func:`request_changes`.
 
+    Runs inside assign_task's write txn (``nested``): the send-back and the
+    final route judge commit or roll back together (Prism 95da6539e615).
+
     Same event and payload as ``request-changes --operator``: the review run is
     opened and closed as the caller, ``changes_requested`` carries
     ``"operator": "<who>: <why>"`` (hermes-home changes_hold.py keys on it), the
@@ -6983,6 +7006,7 @@ def _reassign_request_changes(
     ok, detail = request_changes(
         conn, task_id, reason=reason, claimer=who,
         operator=f"{who}: reassign to {profile or '(unassigned)'}: {reason}",
+        nested=True,
     )
     if not ok:
         raise ReviewHoldRequired(
@@ -7021,6 +7045,217 @@ def _no_worker_refusal(
         f"refused: {task_id} is no-worker (dispatch: operator-only); "
         f"assigning worker {profile!r} needs --worker-ok on the same call "
         "(clears the flag)"
+    )
+
+
+from hermes_cli.model_policy import FlagshipAssigneeRefused  # noqa: E402,F401  (re-export; CLI + dashboard catch it here)
+
+
+def authorize_flagship(
+    conn: sqlite3.Connection, task_id: str, actor: Optional[str], reason: Optional[str],
+) -> None:
+    """THE flagship override writer (t_9e7ba884).
+
+    Records ``reason`` as the ``flagship override:`` comment under ``actor``
+    (resolved and judged by :func:`model_policy.require_flagship_authority`:
+    an operator label outside a dispatched worker), else raises
+    :class:`FlagshipAssigneeRefused` having written nothing. Every path that
+    grants a flagship route writes through here (create, assign/reassign,
+    set-model pin and pin clear, swarm children, the kanban_create tool), so
+    the only comment ever recorded is one :func:`_card_flagship_authorized`
+    reads back. A caller that mutates before this call checks
+    ``require_flagship_authority`` first.
+    """
+    comment = flagship_override_comment(actor, reason)
+    if comment:
+        add_comment(conn, task_id, *comment)
+
+
+def flagship_override_comment(
+    actor: Optional[str], reason: Optional[str],
+) -> Optional[tuple[str, str]]:
+    """The ``(author, body)`` :func:`authorize_flagship` would write, judged
+    with no database access: the authority (:func:`model_policy.require_flagship_authority`)
+    and every refusal :func:`add_comment` applies to that author and body
+    (:func:`_validate_comment_args`). ``None`` when no reason was given. Each
+    caller that writes before ``authorize_flagship`` calls this first, so the
+    override comment can never refuse after a journaled write (Prism 8b7984d6e364 r14).
+    """
+    from hermes_cli.model_policy import override_comment, require_flagship_authority
+
+    actor, reason = require_flagship_authority(reason, actor)
+    if not reason:
+        return None
+    body = override_comment(reason)
+    _validate_comment_args(actor, body)
+    return actor, body
+
+
+def _check_flagship_override_body(author: str, body: str) -> None:
+    """The WRITE gate on the override comment (Prism 7a9e431141ad).
+
+    A body that starts with ``flagship override:`` is only ever written under
+    an author with :func:`model_policy.flagship_authority` (an operator label,
+    outside a dispatched worker); otherwise :class:`FlagshipAssigneeRefused`
+    and nothing is written. Runs in :func:`add_comment`, so ``kanban_comment``
+    on ANOTHER card (whose provenance stores ``run_id`` NULL) cannot plant the
+    row :func:`_card_flagship_authorized` reads back. ``authorize_flagship``
+    is the intended writer; this makes it the only one.
+
+    ``author`` is a CLAIM: it is judged through :func:`model_policy.flagship_actor`
+    (Prism eaff1b1213a3 / 8fb42c6aeb7e), which keeps an operator label only
+    when the caller can prove it (``operator_label_proven``) and otherwise
+    coerces it to the caller's own verified identity. A coerced actor never
+    equals the claimed label, so an unproven non-worker process naming
+    ``apollo`` is refused before the row exists.
+    """
+    from hermes_cli.model_policy import (
+        FLAGSHIP_AUTHORITY_ERROR,
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+        flagship_actor,
+        flagship_authority,
+    )
+
+    if not (body or "").lstrip().casefold().startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
+        return
+    actor = flagship_actor(author)
+    if actor != author or not flagship_authority(actor):
+        raise FlagshipAssigneeRefused(FLAGSHIP_AUTHORITY_ERROR)
+
+
+def _card_flagship_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
+    """THE flagship override reader: the card carries a ``flagship override:``
+    comment whose author is an operator label (``is_operator_label``) and that
+    was not written from a worker run (``run_id`` NULL). Exactly the authors
+    :func:`authorize_flagship` admits; a worker's own ``kanban_comment`` body,
+    an ``unverified:<name>`` author or a literal ``operator`` never count.
+    Prefix test in Python, as _validate_route does (#1921)."""
+    from hermes_cli.kanban_identity import is_operator_label
+    from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+
+    rows = conn.execute(
+        "SELECT author, body, run_id FROM task_comments WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    return any(
+        (r["body"] or "").lstrip().casefold().startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX)
+        and r["run_id"] is None
+        and is_operator_label(r["author"])
+        for r in rows
+    )
+
+
+def _route_flagship_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+    reason: Optional[str],
+    actor: Optional[str],
+    *,
+    model_override: Optional[str] = None,
+    verb: str,
+) -> Optional[str]:
+    """The reason to record for a card landing on ``assignee``'s profile
+    route (a reassign, or a pin clear), or ``None`` when nothing is needed.
+
+    Authority first, before any write or reclaim: a reason the actor may not
+    grant raises :class:`FlagshipAssigneeRefused`. A flagship/unresolved
+    route with no reason is refused unless the card already carries an
+    operator-authored override; with a reason, an already-authorized card
+    records nothing new (Prism 70a0613a6b24: no duplicate overrides).
+    """
+    from hermes_cli.model_policy import require_flagship_authority, validate_assignee_route
+
+    try:
+        _actor, reason = require_flagship_authority(reason, actor)
+        allowed = validate_assignee_route(
+            assignee, model_override=model_override, allow_flagship_reason=reason,
+        )
+    except FlagshipAssigneeRefused as exc:
+        if not reason and _card_flagship_authorized(conn, task_id):
+            return None
+        raise FlagshipAssigneeRefused(f"cannot {verb} {task_id}: {exc}") from None
+    if allowed and _card_flagship_authorized(conn, task_id):
+        return None
+    # The override comment this reason will be written as, judged with every
+    # add_comment refusal before the caller's first write (Prism 8b7984d6e364 r14).
+    flagship_override_comment(actor, allowed)
+    return allowed
+
+
+def _assignee_flagship_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    reason: Optional[str],
+    actor: Optional[str],
+    *,
+    releases_dispatch: bool = False,
+    sends_back: bool = False,
+) -> Optional[str]:
+    """Flagship gate for assign/reassign (t_9e7ba884): the route only changes
+    when the assignee does and the card has no model pin, but an explicit
+    reason on the same assignee still authorizes a legacy flagship card.
+    ``releases_dispatch`` (``--worker-ok`` clearing ``no_worker``) judges an
+    unchanged assignee too: the card becomes dispatchable on that route
+    (Prism 40019830ac27). ``sends_back`` (``--request-changes``) is never
+    "unchanged": the send-back moves the card off its reviewer, so the route
+    is judged whoever the stored assignee is (Prism 8b7984d6e364, f550c8b6cc77).
+    assign_task judges it again in the send-back's own txn (95da6539e615)."""
+    row = conn.execute(
+        "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    if (
+        row["assignee"] == profile and not sends_back and not releases_dispatch
+        and not (reason or "").strip()
+    ):
+        return None
+    return _route_flagship_reason(
+        conn, task_id, profile, reason, actor,
+        model_override=row["model_override"], verb="reassign",
+    )
+
+
+def pin_flagship_reason(
+    conn: sqlite3.Connection, task_id: str, model: Optional[str], reason: Optional[str],
+    actor: Optional[str] = None,
+) -> Optional[str]:
+    """Flagship gate for SETTING a card's model pin, judged as the card's
+    assignee RUNS it (Prism a1f3096286e2: the worker resolves ``-m <pin>``
+    through its own profile aliases, so an Opus pin on a profile aliasing
+    Opus to Fable runs Fable). The pin string itself is
+    :func:`_validate_model_override_args`' check; this is the remap. Judged
+    before anything is written; ``None`` when nothing needs recording."""
+    if not str(model or "").strip():
+        return None
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["assignee"]:
+        return None
+    return _route_flagship_reason(
+        conn, task_id, row["assignee"], reason, actor,
+        model_override=model, verb="pin the model on",
+    )
+
+
+def clear_pin_flagship_reason(
+    conn: sqlite3.Connection, task_id: str, reason: Optional[str], actor: Optional[str] = None,
+) -> Optional[str]:
+    """Flagship gate for CLEARING a card's model pin (Prism f6a54f1196fd): the
+    card lands on its assignee's profile route (a lane override is the
+    dispatcher's to gate). Judged before anything is written or reclaimed."""
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["assignee"]:
+        return None
+    if get_lane_model_override(conn, assignee=row["assignee"]) is not None:
+        return None
+    return _route_flagship_reason(
+        conn, task_id, row["assignee"], reason, actor, verb="clear the model pin on",
     )
 
 
@@ -7109,8 +7344,14 @@ def assign_task(
     operator: Optional[str] = None,
     pr_query=None,
     worker_ok: bool = False,
+    flagship_override_reason: Optional[str] = None,
 ) -> bool:
     """Assign or reassign a task.  Returns True on success.
+
+    A new ``profile`` whose ``model.default`` is a flagship route, on a card
+    with no model pin, needs ``flagship_override_reason`` (``--allow-flagship``),
+    recorded as the ``flagship override:`` comment the dispatcher accepts;
+    without it :class:`FlagshipAssigneeRefused` is raised (t_9e7ba884).
 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
@@ -7130,8 +7371,16 @@ def assign_task(
     if refusal and not worker_ok:
         raise NoWorkerFlagSet(refusal)
     clear_no_worker = bool(refusal)
+    # ``operator`` (the CLI's verified author) is the actor; authority is
+    # judged in here before any write or reclaim (fast refusal; the
+    # authoritative judge runs again on the locked row below).
     changes_reason = str(request_changes_reason or "").strip()
-    if not changes_reason:
+    sends_back = bool(changes_reason)
+    _assignee_flagship_reason(
+        conn, task_id, profile, flagship_override_reason, operator,
+        releases_dispatch=clear_no_worker, sends_back=sends_back,
+    )
+    if not sends_back:
         held = review_hold_open_prs(conn, task_id, query_fn=pr_query)
         if held:
             raise ReviewHoldRequired(
@@ -7140,19 +7389,20 @@ def assign_task(
                 f"worker. Pass --request-changes \"<reason>\" to send it back "
                 f"(changes_requested, status ready) or land/close the PR first."
             )
-    else:
-        implementer = _reassign_request_changes(
-            conn, task_id, profile, changes_reason, operator,
-        )
-        if implementer == profile:
-            if clear_no_worker:
-                with write_txn(conn):
-                    _set_no_worker_locked(
-                        conn, task_id, False, source="worker_ok", operator=operator,
-                    )
-            notify_task_updated(conn, task_id, ("assignee", "status"))
-            return True
+    implementer = None
     with write_txn(conn):
+        # Judge before any write, under the writer lock: the route the card
+        # ends on is ``profile``'s (a send-back only moves the assignee), and
+        # a pin cleared since the preflight is seen here (Prism 5df499a16242,
+        # 95da6539e615). A refusal leaves nothing written, so nothing to unwind.
+        flagship_reason = _assignee_flagship_reason(
+            conn, task_id, profile, flagship_override_reason, operator,
+            releases_dispatch=clear_no_worker, sends_back=sends_back,
+        )
+        if sends_back:
+            implementer = _reassign_request_changes(
+                conn, task_id, profile, changes_reason, operator,
+            )
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -7163,7 +7413,12 @@ def assign_task(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        if row["assignee"] != profile:
+        # The send-back already restored ``profile``: no assignee write and no
+        # ``assigned`` event, as before the send-back joined this txn.
+        restored = sends_back and implementer == profile
+        if restored:
+            pass
+        elif row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
@@ -7175,13 +7430,18 @@ def assign_task(
             _set_no_worker_locked(
                 conn, task_id, False, source="worker_ok", operator=operator,
             )
-        # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
-        # a no-op re-assign or an unassign, which must not lift ``active_pr``.
-        _append_event(
-            conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
-        )
+        if flagship_reason:
+            # Same txn as the assignee write: never a flagship route without
+            # the comment the dispatcher's gate authorizes on.
+            authorize_flagship(conn, task_id, operator, flagship_reason)
+        if not restored:
+            # ``from`` lets the respawn guard tell a real handoff (dev→closer) from
+            # a no-op re-assign or an unassign, which must not lift ``active_pr``.
+            _append_event(
+                conn, task_id, "assigned", {"assignee": profile, "from": row["assignee"]},
+            )
     # Observer fires AFTER commit so subscribers see durable state.
-    notify_task_updated(conn, task_id, ("assignee",))
+    notify_task_updated(conn, task_id, ("assignee", "status") if sends_back else ("assignee",))
     return True
 
 
@@ -7218,6 +7478,16 @@ def set_model_override(
     ``--allow-flagship``) is translated into the ``flagship override:``
     comment the dispatcher's flagship gate looks for. Returns True on success.
     """
+    from hermes_cli.model_policy import (
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
+        require_flagship_authority,
+    )
+
+    # Authority once, before any write (the batch path gets the same check in
+    # _validate_model_override_args on the comment author it hands in).
+    flagship_override_author, flagship_override_reason = require_flagship_authority(
+        flagship_override_reason, flagship_override_author,
+    )
     audit_comment_author, audit_comment_body = _flagship_reason_to_audit(
         model, provider,
         audit_comment_author=audit_comment_author,
@@ -7233,7 +7503,43 @@ def set_model_override(
         pin_sub_fallback=pin_sub_fallback,
         force_model_reason=force_model_reason,
     )
+    # add_comment's refusals on every comment the locked writer inserts, judged
+    # before authorize_flagship journals (Prism b7477c45a580; batch: d0b2bf482d38).
+    for author, body in _model_override_comments(
+        model, provider,
+        audit_comment_author=audit_comment_author,
+        audit_comment_body=audit_comment_body,
+        pin_sub_reason=pin_sub_reason,
+        pin_sub_fallback=pin_sub_fallback,
+        pin_sub_author=pin_sub_author,
+        force_model_reason=force_model_reason,
+    ):
+        _validate_comment_args(author, body)
+    # Only a flagship override may stand in for the clear-route check; any
+    # other audit comment does not (Prism r9 aed001cfb920).
+    validated_override = (audit_comment_body or "").lstrip().casefold().startswith(
+        FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+    )
     with write_txn(conn):
+        # The locked writer's refusals come before authorize_flagship, whose
+        # comment journals outside the txn (Prism 324c92ac41be).
+        status = _task_status(conn, task_id)
+        if status is None:
+            return False
+        if status == "archived":
+            raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        if not validated_override:
+            # A clear lands on the profile route; a pin runs through the
+            # assignee's aliases (Prism a1f3096286e2): gate both in this txn.
+            if model:
+                needed = pin_flagship_reason(
+                    conn, task_id, model, flagship_override_reason, flagship_override_author,
+                )
+            else:
+                needed = clear_pin_flagship_reason(
+                    conn, task_id, flagship_override_reason, flagship_override_author,
+                )
+            authorize_flagship(conn, task_id, flagship_override_author, needed)
         if not _set_model_override_locked(
             conn, task_id, model, provider,
             audit_comment_author=audit_comment_author,
@@ -7313,10 +7619,16 @@ def _validate_model_override_args(
         FLAGSHIP_OVERRIDE_COMMENT_PREFIX,
         flagship_model_error,
         is_firepower_model,
+        require_flagship_authority,
     )
 
+    body = (audit_comment_body or "").lstrip().casefold()
+    if body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
+        # An override body is only writable under an author with flagship
+        # authority: the set-model batch (apply_batch_route_writes) hands its
+        # comment in here, not through set_model_override.
+        require_flagship_authority(audit_comment_body, audit_comment_author)
     if is_firepower_model(model):
-        body = (audit_comment_body or "").lstrip().casefold()
         if not body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
             raise ValueError(flagship_model_error(str(model)))
     _require_known_model(model, provider, force_model_reason=force_model_reason)
@@ -7347,7 +7659,7 @@ def _flagship_reason_to_audit(
     )
     if not is_firepower_model(resolved):
         return audit_comment_author, audit_comment_body
-    return flagship_override_author or "operator", override_comment(reason)
+    return flagship_override_author, override_comment(reason)
 
 
 def _set_model_override_locked(
@@ -7396,29 +7708,54 @@ def _set_model_override_locked(
     if pin_sub_reason:
         payload.update(pin_sub_reason=pin_sub_reason, pin_sub_fallback=pin_sub_fallback)
     _append_event(conn, task_id, "model_override_set", payload)
+    for author, body in _model_override_comments(
+        model, provider,
+        audit_comment_author=audit_comment_author,
+        audit_comment_body=audit_comment_body,
+        pin_sub_reason=pin_sub_reason,
+        pin_sub_fallback=pin_sub_fallback,
+        pin_sub_author=pin_sub_author,
+        force_model_reason=force_model_reason,
+    ):
+        add_comment(conn, task_id, author, body)
+    return True
+
+
+def _model_override_comments(
+    model: Optional[str],
+    provider: Optional[str],
+    *,
+    audit_comment_author: Optional[str] = None,
+    audit_comment_body: Optional[str] = None,
+    pin_sub_reason: Optional[str] = None,
+    pin_sub_fallback: bool = False,
+    pin_sub_author: Optional[str] = None,
+    force_model_reason: Optional[str] = None,
+) -> list[tuple[str, str]]:
+    """The ``(author, body)`` comments :func:`_set_model_override_locked`
+    writes, in order. One list for the writer and the batch judge, so the
+    judge validates exactly what the write pass inserts (Prism d0b2bf482d38)."""
+    pin_sub_reason = (pin_sub_reason or "").strip() or None
+    pin_sub_fallback = bool(pin_sub_reason and pin_sub_fallback)
+    out: list[tuple[str, str]] = []
     if audit_comment_body:
-        add_comment(
-            conn,
-            task_id,
-            audit_comment_author or "",
-            audit_comment_body,
-        )
+        out.append((audit_comment_author or "", audit_comment_body))
     if pin_sub_reason:
         from hermes_cli.model_policy import sub_pin_comment
 
-        add_comment(
-            conn, task_id, pin_sub_author or audit_comment_author or "operator",
+        out.append((
+            pin_sub_author or audit_comment_author or "operator",
             sub_pin_comment(provider, pin_sub_reason, fallback=pin_sub_fallback),
-        )
+        ))
     if model and (force_model_reason or "").strip():
         from hermes_cli.model_registry import resolve
 
         if resolve(provider, model, force_reason=force_model_reason, resolve_aliases=False).reason == "forced":
-            add_comment(
-                conn, task_id, pin_sub_author or audit_comment_author or "operator",
+            out.append((
+                pin_sub_author or audit_comment_author or "operator",
                 _model_force_comment(provider, model, force_model_reason or ""),
-            )
-    return True
+            ))
+    return out
 
 
 def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optional[str]) -> bool:
@@ -7635,6 +7972,8 @@ def apply_batch_route_writes(
     up front so an argument error also cannot reach the transaction
     half-applied.
     """
+    from hermes_cli.model_policy import FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+
     prepared: list[tuple[BatchRouteWrite, Optional[str], Optional[str], Optional[str]]] = []
     for write in writes:
         model, provider = (None, None)
@@ -7665,7 +8004,19 @@ def apply_batch_route_writes(
     skipped_now: dict[str, str] = {}
     live_now: dict[str, int] = {}
     with write_txn(conn):
+        # Judge every card before the first write, under the writer lock: a
+        # refusal leaves nothing written (Prism 0b1cb4a34ceb).
+        apply: list[tuple[BatchRouteWrite, Optional[str], Optional[str], Optional[str]]] = []
+        seen: set[str] = set()
         for write, model, provider, effort in prepared:
+            # Each entry is judged against the ORIGINAL row, so a repeated id
+            # would pass twice and the later write silently overwrite the
+            # earlier one (Prism e36efbedf0a2).
+            if write.task_id in seen:
+                raise RuntimeError(
+                    f"duplicate task id {write.task_id} in batch; no cards were changed"
+                )
+            seen.add(write.task_id)
             mismatch = _batch_write_mismatch(conn, write)
             if mismatch is not None:
                 if not write.skip_if_unmatched:
@@ -7674,6 +8025,40 @@ def apply_batch_route_writes(
                     )
                 skipped_now[write.task_id] = mismatch
                 continue
+            # The locked writers' own refusal, judged before any card is
+            # written: a rollback cannot unwrite the journal (Prism e6f355767f2f).
+            if (write.touch_model or write.touch_effort or write.touch_brain) and conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (write.task_id,),
+            ).fetchone()["status"] == "archived":
+                raise RuntimeError(f"cannot set route on archived task {write.task_id}")
+            if write.touch_model:
+                # add_comment's refusals for every comment the write pass will
+                # insert, judged before the first write (Prism d0b2bf482d38).
+                for author, body in _model_override_comments(
+                    model, provider,
+                    audit_comment_author=write.audit_comment_author,
+                    audit_comment_body=write.audit_comment_body,
+                    pin_sub_reason=write.pin_sub_reason,
+                    pin_sub_fallback=write.pin_sub_fallback,
+                    pin_sub_author=write.pin_sub_author or write.audit_comment_author,
+                    force_model_reason=write.force_model_reason,
+                ):
+                    _validate_comment_args(author, body)
+            if write.touch_model and not (write.audit_comment_body or "").lstrip().casefold().startswith(
+                FLAGSHIP_OVERRIDE_COMMENT_PREFIX
+            ):
+                if model:
+                    # The pin as the assignee RUNS it (its aliases), under
+                    # the same lock the write commits against (a1f3096286e2).
+                    # Raises unless the card already carries an override.
+                    pin_flagship_reason(conn, write.task_id, model, None)
+                else:
+                    # The CLI judged the clear before the lock; re-judge it on
+                    # the locked row so a reassign onto a flagship default in
+                    # between refuses the batch (Prism e25e5d877449/cd10822b8d6e).
+                    clear_pin_flagship_reason(conn, write.task_id, None)
+            apply.append((write, model, provider, effort))
+        for write, model, provider, effort in apply:
             changed: tuple[str, ...] = ()
             if write.touch_model:
                 if not _set_model_override_locked(
@@ -7994,6 +8379,23 @@ def _validate_comment_provenance(
     return run_id, session_ref
 
 
+def _validate_comment_args(author: str, body: str, *, kernel_approve: bool = False) -> None:
+    """:func:`add_comment`'s author/body refusals, with no database access, so a
+    batch can judge every comment it will insert before its first write
+    (Prism d0b2bf482d38)."""
+    if not body or not body.strip():
+        raise ValueError("comment body is required")
+    if not author or not author.strip():
+        raise ValueError("comment author is required")
+    # The one place every comment writer shares, so the body is exact (t_ebc8eb87).
+    from hermes_cli.kanban_close_on_guard import check_approve_stamp, check_comment
+
+    check_comment(author, body)
+    if not kernel_approve:
+        check_approve_stamp(author, body)
+    _check_flagship_override_body(author, body)
+
+
 # Bound on an unhonoured ``--author`` label kept for forensics (see add_comment).
 _CLAIMED_AUTHOR_MAX = 200
 
@@ -8041,16 +8443,7 @@ def add_comment(
     card, author, verb and session inside the insert's transaction; else
     :class:`~hermes_cli.kanban_sign_grants.GrantRefused` and nothing is written.
     """
-    if not body or not body.strip():
-        raise ValueError("comment body is required")
-    if not author or not author.strip():
-        raise ValueError("comment author is required")
-    # The one place every comment writer shares, so the body is exact (t_ebc8eb87).
-    from hermes_cli.kanban_close_on_guard import check_approve_stamp, check_comment
-
-    check_comment(author, body)
-    if not _kernel_approve:
-        check_approve_stamp(author, body)
+    _validate_comment_args(author, body, kernel_approve=_kernel_approve)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")
@@ -8427,6 +8820,7 @@ def _insert_comment(
     from hermes_cli.kanban_close_on_guard import check_comment
 
     check_comment(author, body)
+    _check_flagship_override_body(author, body)
     run_id, session_ref = _inline_comment_provenance(task_id)
     conn.execute(
         "INSERT INTO task_comments (task_id, author, body, run_id, session_ref, created_at) "
@@ -10244,6 +10638,7 @@ def reassign_task(
     operator: Optional[str] = None,
     pr_query=None,
     worker_ok: bool = False,
+    flagship_override_reason: Optional[str] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -10275,10 +10670,18 @@ def reassign_task(
     The ``no_worker`` refusal (:class:`NoWorkerFlagSet`) is checked BEFORE
     the reclaim, so a refused reassign never signals a live worker.
     """
-    if not worker_ok:
-        refusal = _no_worker_refusal(conn, task_id, _canonical_assignee(profile))
-        if refusal:
-            raise NoWorkerFlagSet(refusal)
+    refusal = _no_worker_refusal(conn, task_id, _canonical_assignee(profile))
+    if refusal and not worker_ok:
+        raise NoWorkerFlagSet(refusal)
+    # Flagship assignee gate BEFORE the reclaim, for the same reason: a refused
+    # reassign must never signal a live worker (t_9e7ba884). ``--worker-ok``
+    # clearing no_worker is judged here exactly as assign_task judges it
+    # (Prism 5df499a16242).
+    _assignee_flagship_reason(
+        conn, task_id, _canonical_assignee(profile), flagship_override_reason, operator,
+        releases_dispatch=bool(refusal),
+        sends_back=bool(str(request_changes_reason or "").strip()),
+    )
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         try:
@@ -10302,6 +10705,7 @@ def reassign_task(
         return assign_task(
             conn, task_id, profile, request_changes_reason=request_changes_reason,
             operator=operator, pr_query=pr_query, worker_ok=worker_ok,
+            flagship_override_reason=flagship_override_reason,
         )
     except ReviewHoldRequired as exc:
         if receipt is None:
@@ -11408,14 +11812,36 @@ def complete_task(
     if content_survivors:
         metadata = dict(metadata or {}, superseded_content=content_survivors)
     closed_abandoned: list = []
+    card_covers: list = []
+    _closed_query = _pr_query or _open_pr.memo_query()
+    card_cover = None
+    sup_card = _open_pr.superseding_card(superseded_by)
+    if sup_card and sup_card != task_id:
+        def card_cover(uncovered):
+            # --superseded-by <card> (t_6a853d1c): that card's merged work superseded this card's PR.
+            # Refused on a shared workspace (Prism fad0ffab0ac9): this card is a --workspace-of reader,
+            # or a live card reads this card's workspace. The retention hold covers this card's id only.
+            me = get_task(conn, task_id)
+            if (me is not None and me.workspace_of) or conn.execute(
+                    "SELECT 1 FROM tasks WHERE workspace_of=? AND id<>? AND status NOT IN ('done','archived') "
+                    "LIMIT 1", (task_id, task_id)).fetchone():
+                raise _open_pr.SharedWorkspaceSupersessionError(
+                    task_id, [f"{c.repo}#{c.number}" for c in uncovered], sup_card)
+            other = get_task(conn, sup_card)
+            return _open_pr.card_supersession(
+                uncovered, card=sup_card, card_status=other.status if other else None,
+                card_prs=[pr for run in list_runs(conn, sup_card)
+                          for pr in _open_pr.authored_pr_refs(run.metadata)],
+                query_fn=_closed_query)
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, result, summary, metadata=metadata,
             survivor_pr=survivor_pr, superseded_by=superseded_by,
-            query_fn=_pr_query or _open_pr.memo_query(),
+            query_fn=_closed_query,
             recorded=_card_recorded_pr_refs(conn, task_id),
             abandon_reason=None if _overlong(str(abandon_routed_pr or "").strip()) else abandon_routed_pr,
             abandoned_out=closed_abandoned,
+            card_cover=card_cover, card_covered_out=card_covers,
         )
     except _open_pr.ClosedUnmergedPrError as closed_err:
         with write_txn(conn):
@@ -11440,8 +11866,13 @@ def complete_task(
         survivor_unbound=survivor_unbound,
         survivor_none=survivor_none, survivor_reason=survivor_reason,
         evidence=[t for t in (summary, result) if t],
-        content_survivor=content_survivors[0] if content_survivors else None,
+        content_survivor=(content_survivors[0] if content_survivors
+                          else card_covers[0] if card_covers else None),
     )
+    if card_covers:
+        metadata = dict(metadata or {}, superseded_by_card={
+            "card": sup_card,
+            "prs": [{"closed": c["supersedes"], "merged": c["pr"], "sha": c["sha"]} for c in card_covers]})
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
         if survivor['kind'] == 'patch':
@@ -11544,6 +11975,15 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if card_covers:
+            # --superseded-by <card> (Prism 20f49b2e3092, ff7e3c99981d): the cover proves another
+            # card's merged PR replaced this one, not that anything holds this workspace's bytes.
+            # The retention hold commits in THIS transaction, so `done` and `held_reason` become
+            # visible together or not at all (preserve(cleanup=True) refuses while it is set).
+            from hermes_cli.kanban_survivor import _hold_in_txn
+            _hold_in_txn(conn, task_id, f"survivor_unavailable: superseded_by_card {sup_card} is an "
+                                        "unbound cover, not a copy of this workspace; recover or "
+                                        "remove it by hand")
         if routed_abandon:
             _append_event(conn, task_id, "routed_pr_abandoned", routed_abandon)
         if approve_head_sha:
@@ -11603,6 +12043,8 @@ def complete_task(
             # Read by the gateway notifier to say "premise superseded by X"
             # instead of the generic done ping.
             completed_payload["superseded_by"] = superseded_by
+            if isinstance(metadata, dict) and metadata.get("superseded_by_card"):
+                completed_payload["superseded_by_card"] = metadata["superseded_by_card"]
         if external:
             completed_payload["external"] = {"url": external, "watcher": watcher}
         if verified_cards:
@@ -11654,8 +12096,10 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    if not card_covers:
+        # A supersession close never removes the workspace itself; its hold was written with done.
+        # Clean up the scratch workspace and any stale tmux session for the worker.
+        _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_kanban_lifecycle_hook(
@@ -14606,6 +15050,7 @@ def request_changes(
     session_ref: Optional[str] = None,
     operator: Optional[str] = None,
     operator_kind: Optional[str] = None,
+    nested: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -14651,7 +15096,15 @@ def request_changes(
     a FIELD, not on the operator string, to tell a human CHANGES REQUESTED
     (holds a landing) from a machine send-back (never holds; t_86ca5b3d).
     Without ``operator`` it is refused.
+
+    ``nested`` composes the send-back into the caller's open write txn (a
+    savepoint): nothing is durable until the caller commits, so the caller's
+    own refusal rolls the send-back back too (``assign_task --request-changes``,
+    Prism 95da6539e615). It carries no ``coverage`` (that journals post-commit)
+    and a fleet pause hold is returned as a refusal, not recorded.
     """
+    if nested and coverage:
+        return False, "a nested send-back carries no coverage"
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -14695,12 +15148,27 @@ def request_changes(
         if task_row is None:
             return False, "task not found"
         current_run_id = task_row["current_run_id"]
+        # Read before the claim below (which adds no review_requested): a
+        # refused handoff is judged before _open_review_run journals its
+        # ``claimed`` (Prism ce26bdc8d833).
+        requested_event = _latest_event(conn, task_id, "review_requested")
+        implementer = (
+            None if requested_event is None
+            else _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+        )
+        handoff_error = (
+            "no prior review_requested event" if requested_event is None
+            else "review handoff has no valid implementer provenance" if implementer is None
+            else None
+        )
         if claimer and expected_run_id is None and task_row["status"] == "review":
             if coverage_body is None and operator_reason is None:
                 # Same message the gate gives; refused before any claim churn.
                 return False, _REVIEW_COVERAGE_MISSING
             if _prior_worker_still_alive(conn, task_id) is not None:
                 return False, "a prior worker run on this task is still alive"
+            if handoff_error:
+                return False, handoff_error
             now = int(time.time())
             run_id = _open_review_run(
                 conn, task_id, lock=str(claimer),
@@ -14734,12 +15202,20 @@ def request_changes(
                     "(expected_run_id) to close it"
                 )
 
-        requested_event = _latest_event(conn, task_id, "review_requested")
-        if requested_event is None:
-            return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
-        if implementer is None:
-            return False, "review handoff has no valid implementer provenance"
+        if handoff_error:
+            return False, handoff_error
+        # A call that posts its own record was judged on that record before
+        # the txn (review_coverage_text_error); it becomes the run's newest
+        # record, so the run-scoped re-read could only repeat that verdict.
+        # Skipping it leaves no refusal after this call's first write: the
+        # journal is not rolled back, and a refusal there left ``claimed`` +
+        # ``commented`` lines replay rebuilt into a running card (t_fc9f7319).
+        coverage_error = (
+            None if operator_reason is not None or coverage_body is not None
+            else _validate_review_coverage(conn, task_id, int(current_run_id))
+        )
+        if coverage_error:
+            return False, coverage_error
         if coverage_body is not None:
             now = int(time.time())
             comment_cur = conn.execute(
@@ -14754,12 +15230,6 @@ def request_changes(
                 run_id=int(current_run_id),
             )
             posted.append((int(comment_cur.lastrowid or 0), int(current_run_id), now))
-        coverage_error = (
-            None if operator_reason is not None
-            else _validate_review_coverage(conn, task_id, int(current_run_id))
-        )
-        if coverage_error:
-            return False, coverage_error
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)
@@ -14823,7 +15293,7 @@ def request_changes(
         return True, implementer
 
     try:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=nested):
             ok, detail = _in_txn()
             # A refusal rolls back everything this call wrote: the opened
             # claim AND a posted coverage comment the gate just rejected
@@ -14833,6 +15303,9 @@ def request_changes(
     except _SendBackRefused as exc:
         return False, exc.detail
     except PauseHeld as exc:
+        if nested:
+            # The caller's txn is still open; its refusal rolls everything back.
+            return False, f"{exc}: resume or abandon the pause first"
         # Fleet pause layer 2 (t_133d6efd): the review card stays ``review``, held.
         from hermes_cli.kanban_pause_hold import record_refusal
         record_refusal(conn, exc, stage="request_changes")
@@ -20762,6 +21235,16 @@ class LaneModelOverride:
     def route(self) -> str:
         return f"{self.provider}/{self.model}"
 
+    def flagship_authorized(self) -> bool:
+        """THE lane-row flagship reader (Prism 89f43d1114a4): a non-empty
+        ``firepower`` reason recorded under an operator-label actor, exactly
+        what ``set_lane_model_override`` persists after
+        ``require_flagship_authority``. A legacy row with an empty, worker or
+        ``unverified:<name>`` actor fails closed; it is not migrated."""
+        from hermes_cli.kanban_identity import is_operator_label
+
+        return bool((self.firepower or "").strip()) and is_operator_label(self.created_by)
+
     def ttl_remaining(self, now: Optional[int] = None) -> int:
         """Seconds left before the dispatcher stops applying this row."""
 
@@ -20809,8 +21292,21 @@ def set_lane_model_override(
     upsert, so an operator extending a window never stacks duplicate rows.
     """
 
-    from hermes_cli.model_policy import pin_sub_arg_error, validate_route_provider
+    from hermes_cli.model_policy import (
+        pin_sub_arg_error,
+        require_flagship_authority,
+        validate_route_provider,
+    )
 
+    # A lane's firepower text authorizes every card on the lane at dispatch,
+    # so only flagship authority may write one (same actor rule as a card),
+    # and the row records the RESOLVED actor: the dispatcher admits a lane
+    # only when ``created_by`` is an operator label, so a row persisted before
+    # this gate (or planted by hand) under a worker/unverified/empty actor
+    # authorizes nothing (Prism 89f43d1114a4).
+    actor, _reason = require_flagship_authority(firepower, created_by)
+    if actor:
+        created_by = actor
     pin_sub_error = pin_sub_arg_error(model, provider, pin_sub_reason)
     if pin_sub_error:
         raise ValueError(pin_sub_error)

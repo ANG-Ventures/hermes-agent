@@ -75,6 +75,7 @@ def _build_server() -> Any:
     except ImportError as exc:  # pragma: no cover - install hint
         raise ImportError(f"hermes-tools MCP server requires the 'mcp' package: {exc}") from exc
 
+    from agent.route_note_ingest import relabel_route_note_text
     from model_tools import get_tool_definitions, handle_function_call
 
     mcp = MCPServer(
@@ -102,10 +103,12 @@ def _build_server() -> Any:
         def _dispatch(**kwargs: Any) -> str:
             try:
                 # Drop None so unset optionals aren't forwarded to the handler.
+                # handle_function_call returns through the E11 boundary (model_tools), so its result is final.
                 return handle_function_call(tool_name, {k: v for k, v in kwargs.items() if v is not None})
             except Exception as exc:
                 logger.exception("tool %s raised", tool_name)
-                return json.dumps({"error": str(exc), "tool": tool_name})
+                # An exception message is harness/handler text, never file content: relabel always.
+                return json.dumps({"error": relabel_route_note_text(str(exc)), "tool": tool_name})
 
         _dispatch.__name__ = tool_name
         _dispatch.__doc__ = description

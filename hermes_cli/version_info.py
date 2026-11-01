@@ -217,7 +217,11 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
         # -uno: skip the untracked-file scan. This runs on the startup-banner
         # path, and a full working-tree walk costs real time on large or cold
         # checkouts. Same semantics as write_install_stamp.py.
-        status_command = ["git", "status", "--porcelain"]
+        # --no-optional-locks: a read must not take .git/index.lock. Plain status holds it
+        # while it refreshes the index, and the timeout below SIGKILLs git, which leaves a
+        # 0-byte orphan lock that blocks every later write to the tree (the live runtime
+        # tree collected ~15 a day and a deploy died on one, t_45508cb8).
+        status_command = ["git", "--no-optional-locks", "status", "--porcelain"]
         if not include_untracked:
             status_command.append("-uno")
         dirty_result = subprocess.run(

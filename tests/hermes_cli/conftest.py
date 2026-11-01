@@ -47,11 +47,30 @@ def _no_dangling_staged_refs(request, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _quiet_host_loadavg(monkeypatch):
-    """Pin host load to idle: `kanban dispatch` consults the real load gate
-    (t_689b81b7), so an unpinned test would pause on a busy CI runner.
-    Gate tests override this with their own sample_loadavg patch."""
+    """Pin host load AND host CPU to idle: `kanban dispatch` consults the real
+    load gate (t_689b81b7), so an unpinned test would pause on a busy CI runner.
+    CPU too (t_37e65918): DEFAULT_CONFIG takes the spill keys from the host's
+    CPU-line registry at import, so on a pool host the gate pauses on a real
+    ``psutil.cpu_times()`` sample (cpu_busy 0.91 >= cpu_pause 0.90) with load1
+    pinned to 0. The fake advances idle ticks only, so every delta reads 0.0
+    busy. Gate tests override this with their own sample_* or psutil patch."""
+    import itertools
     import os
     monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0), raising=False)
+    try:
+        import psutil
+    except ImportError:
+        return
+    base, base_per = psutil.cpu_times(), psutil.cpu_times(percpu=True)
+    ticks = itertools.count(1)
+
+    def idle_cpu_times(percpu=False):
+        idle = 100.0 * next(ticks)
+        if percpu:
+            return [t._replace(idle=t.idle + idle) for t in base_per]
+        return base._replace(idle=base.idle + idle)
+
+    monkeypatch.setattr(psutil, "cpu_times", idle_cpu_times)
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +101,18 @@ def all_assignees_spawnable(monkeypatch):
     """
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+
+
+@pytest.fixture
+def proven_operator(monkeypatch):
+    """The CLI/DB caller is a PROVEN operator (Apollo's gateway tree, or the
+    operator token), so its env-derived label persists as itself and holds
+    flagship authority (t_9e7ba884). Unproven, the label is
+    ``unverified:<name>``: no override it writes is one dispatch honours.
+    """
+    from hermes_cli import kanban_identity
+
+    monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: True)
 
 
 @pytest.fixture(autouse=True)

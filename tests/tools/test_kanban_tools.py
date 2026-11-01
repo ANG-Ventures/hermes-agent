@@ -2093,3 +2093,85 @@ def test_attach_path_rejects_invalid_supplied_digest(worker_env, tmp_path, monke
         assert kb.list_attachments(conn, worker_env) == []
     finally:
         conn.close()
+
+
+def _write_fable_profile():
+    import os
+    from pathlib import Path as _Path
+
+    prof = _Path(os.environ["HERMES_HOME"]) / "profiles" / "daedalus-fable"
+    prof.mkdir(parents=True)
+    (prof / "config.yaml").write_text("model:\n  default: claude-fable-5-1\n", encoding="utf-8")
+
+
+def _card_count() -> int:
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        return conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_create_flagship_profile_assignee_needs_allow_flagship(worker_env):
+    """kanban_create on a flagship-default profile is gated like --model (t_9e7ba884)."""
+    from tools import kanban_tools as kt
+
+    _write_fable_profile()
+    refused = json.loads(kt._handle_create({
+        "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
+    }))
+    assert "assignee profile default" in refused.get("error", ""), refused
+
+
+@pytest.mark.parametrize("actor", ["worker", "orchestrator", "unverified"])
+@pytest.mark.parametrize("route", [
+    {"assignee": "daedalus-fable"},                        # the profile-default route
+    {"assignee": "test-worker", "model": "claude-fable-5-1"},  # a flagship pin
+])
+def test_allow_flagship_without_authority_is_refused(worker_env, monkeypatch, actor, route):
+    """ONE authority (t_9e7ba884): allow_flagship is honoured only from an operator
+    label outside a dispatched worker. A worker, a non-operator orchestrator profile
+    and an unproven operator name are refused before any write."""
+    from tools import kanban_tools as kt
+
+    _write_fable_profile()
+    if actor != "worker":
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        monkeypatch.setenv("HERMES_PROFILE", "apollo" if actor == "unverified" else "daedalus-opus")
+    before = _card_count()
+    refused = json.loads(kt._handle_create({
+        "title": "fable job", "parents": [worker_env], "allow_flagship": "delicate infra", **route,
+    }))
+    assert "allow_flagship is operator/orchestrator-only" in refused.get("error", ""), refused
+    assert _card_count() == before
+
+
+def test_operator_allow_flagship_creates_and_audits(worker_env, monkeypatch):
+    """A proven operator session: the reason is honoured, recorded under the
+    operator label, and the card dispatches."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_identity
+
+    _write_fable_profile()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    monkeypatch.setattr(kanban_identity, "operator_label_proven", lambda _n: True)
+    ok = json.loads(kt._handle_create({
+        "title": "fable job", "assignee": "daedalus-fable", "parents": [worker_env],
+        "allow_flagship": "delicate infra",
+    }))
+    assert ok.get("ok") is True, ok
+    conn = kb.connect()
+    try:
+        comments = [(c.author, c.body) for c in kb.list_comments(conn, ok["task_id"])]
+        refused = kbd.dispatch_once(conn, dry_run=True).flagship_refused
+    finally:
+        conn.close()
+    assert comments == [("apollo", "flagship override: delicate infra")], comments
+    assert ok["task_id"] not in refused

@@ -1680,7 +1680,8 @@ DEFAULT_CONFIG = {
         # Where a restart-durable gateway background unit runs: "in_process" (gateway threads) or
         # "kanban" (one card on the internal `delegations` board, its own process; survives a gateway
         # restart, docs/dev/delegate-background-on-kanban-runtime.md). "in_process" is the kill switch.
-        "background_runtime": "in_process",
+        # Default "kanban" since option C P3 (t_3646c28e: drills + daedalus canary).
+        "background_runtime": "kanban",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
@@ -2286,6 +2287,11 @@ DEFAULT_CONFIG = {
         # without a logged flagship override. None uses model_policy's shared
         # FLAGSHIP_MODEL_SUBSTRINGS; a non-empty list replaces that default.
         "banned_worker_model_substrings": None,
+        # Standing per-profile flagship grants: {profile: "<reason>"}. Admits
+        # ONLY that profile's resolved model.default route (no pin, no lane)
+        # without --allow-flagship, so a no_agent cron can dispatch it. Set by
+        # the operator in the root config, e.g. tiresias: Ace D1 (Fable).
+        "flagship_profile_allowances": {},
         # Optional provider -> health URL admission probes; disabled by default.
         "provider_health_probes": {},
         # Implicit pre-spawn probe per claude relay FAMILY (used when

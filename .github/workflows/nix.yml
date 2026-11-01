@@ -16,6 +16,7 @@ on:
   # a merge. A source-only change that breaks the flake is caught by the full
   # run on push to main below, which fleet-ci-fail-alert.yml pages on.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - flake.nix
       - flake.lock
@@ -59,6 +60,7 @@ jobs:
   # A workflow_call run (stable release, inputs.release) forces the lane
   # and checks an isolated release source tree instead of the checkout.
   detect:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft || vars.CI_RUN_ON_DRAFTS == '1' }}
     name: Detect affected areas
     runs-on: ubuntu-latest
     timeout-minutes: 10

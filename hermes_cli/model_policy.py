@@ -48,6 +48,46 @@ def banned_worker_model_substrings(
     return normalized or FLAGSHIP_MODEL_SUBSTRINGS
 
 
+def profile_flagship_allowance(
+    assignee: Optional[str],
+    model: Optional[str],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """The standing reason ``kanban.flagship_profile_allowances`` records for
+    ``assignee``'s profile DEFAULT route, or ``None``.
+
+    A per-profile grant written once by the operator in the root config (a
+    file no caller can write through a kanban verb), e.g. Tiresias on Fable
+    per Ace's PRD-astrology-tiresias D1 ruling. It admits only a RESOLVED
+    flagship default: an unresolved route still fails closed, and a pin or
+    lane model is never covered (callers consult it on the profile-default
+    branch only). Every other flagship-default profile stays refused.
+    """
+    if assignee_route_unresolved(model) or not flagship_model_match(model, config):
+        return None
+    if config is None:
+        # The ROOT config (the dispatcher's), never the caller's profile
+        # config: a profile cannot grant its own route.
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            config = _profile_effective_config(get_default_hermes_root() / "config.yaml")
+        except Exception:
+            config = {}
+    kanban = config.get("kanban", {}) if isinstance(config, Mapping) else {}
+    grants = (
+        kanban.get("flagship_profile_allowances")
+        if isinstance(kanban, Mapping)
+        else None
+    )
+    if not isinstance(grants, Mapping):
+        return None
+    name = str(assignee or "").strip()
+    reason = grants.get(name) if name else None
+    reason = str(reason).strip() if isinstance(reason, str) else ""
+    return reason or None
+
+
 def flagship_model_match(
     model: Optional[str],
     config: Optional[Mapping[str, Any]] = None,
@@ -88,6 +128,358 @@ def validate_worker_model(
 
 def override_comment(reason: str) -> str:
     return f"{FLAGSHIP_OVERRIDE_COMMENT_PREFIX} {reason.strip()}"
+
+
+FLAGSHIP_AUTHORITY_ERROR = (
+    "allow_flagship is operator/orchestrator-only; ask Apollo to assign"
+)
+
+
+class FlagshipAssigneeRefused(ValueError):
+    """A flagship route (a flagship ``--model``, or an assignee whose profile
+    default is one) was asked for without an authorized reason."""
+
+
+def flagship_actor(explicit: Optional[str] = None) -> str:
+    """The ONE actor definition (t_9e7ba884): the explicit override author a
+    caller passes, else the acting identity the way ``kanban comment``
+    persists it (``verified_profile_author``: a dispatched worker is its own
+    profile; an unproven operator name is ``unverified:<name>``). Never a
+    literal ``operator``.
+
+    An explicit actor is a CLAIM, not a proof: it is accepted only when the
+    caller could persist that label as itself (``operator_label_proven``,
+    the same proof ``verified_profile_author`` demands of an implicit one).
+    Otherwise it is discarded and the caller's own verified identity is used,
+    so an unproven process cannot mint a trusted row by naming ``apollo``
+    (Prism c5514fd79fb5)."""
+    from hermes_cli.kanban_identity import operator_label_proven, verified_profile_author
+    from hermes_cli.profiles import current_profile_name
+
+    claimed = str(explicit or "").strip()
+    if claimed and operator_label_proven(claimed):
+        return claimed
+    return verified_profile_author(current_profile_name("user") or "user")
+
+
+def flagship_authority(actor: Optional[str]) -> bool:
+    """The ONE definition of flagship authority: ``actor`` is an operator
+    label (``is_operator_label``) and this process is not a dispatched worker.
+    A worker is recognised by EITHER signal: the env marker (so an inheriting
+    subprocess fails closed) OR a dispatched worker in the process ancestry
+    (``worker_ancestor_profile``: the ``task_runs`` row whose ``worker_pid``
+    is this process, a parent, or its session id). The env marker alone is
+    removable (``env -u HERMES_KANBAN_TASK``, Prism 5e978e7740dd); the
+    ancestry is the same evidence ``verified_profile_author`` already walks.
+    Every write path grants a reason through it; the read side
+    (``kanban_db._card_flagship_authorized``) trusts exactly the authors it
+    admits, so a recorded override is always one dispatch honours."""
+    from hermes_cli.kanban_identity import is_operator_label, worker_ancestor_profile
+    from hermes_cli.kanban_worker_policy import is_dispatched_worker
+
+    if not is_operator_label(actor) or is_dispatched_worker():
+        return False
+    return worker_ancestor_profile() is None
+
+
+def require_flagship_authority(
+    reason: Optional[str], actor: Optional[str] = None,
+) -> tuple[str, str]:
+    """``(actor, reason)`` a flagship override may be recorded under, or
+    ``("", "")`` when no reason was given. ``actor`` is resolved with
+    :func:`flagship_actor`; raises :class:`FlagshipAssigneeRefused` when it
+    holds no flagship authority. Call it BEFORE any mutation."""
+    reason = (reason or "").strip()
+    if not reason:
+        return "", ""
+    actor = flagship_actor(actor)
+    if not flagship_authority(actor):
+        raise FlagshipAssigneeRefused(FLAGSHIP_AUTHORITY_ERROR)
+    return actor, reason
+
+
+def _profile_effective_config(config_path: Any) -> dict:
+    """``config_path`` the way worker startup (``load_cli_config``) sees it:
+    root-model normalization, ``${VAR}`` expansion, then the managed overlay.
+    The parsed file is mtime-cached; expansion and overlay run per call so an
+    env or managed-scope change is never served stale."""
+    import copy
+
+    from hermes_cli.config import (
+        _expand_env_vars,
+        _normalize_root_model_keys,
+        read_user_config_raw,
+    )
+    from hermes_cli import managed_scope
+    from hermes_cli.profiles import _cached_profile_read
+
+    parsed = _cached_profile_read(
+        config_path, "config-effective-src",
+        lambda: _normalize_root_model_keys(read_user_config_raw(config_path)),
+    )
+    cfg = _expand_env_vars(copy.deepcopy(parsed or {}))
+    return managed_scope.apply_managed_overlay(cfg if isinstance(cfg, dict) else {})
+
+
+def assignee_default_model(assignee: Optional[str]) -> Optional[str]:
+    """The model an unpinned worker on ``assignee`` will RUN (fail-soft ``None``).
+
+    The profile's effective ``model.default`` (``${VAR}`` expanded, managed
+    overlay applied), resolved through that profile's own ``model_aliases`` /
+    ``model.aliases`` the way worker startup does (Prism 22663f69a1d3,
+    9e7596b4c0ed). ``${VAR}`` refs and aliases resolve under the ASSIGNEE's
+    secret scope (its ``.env`` + secret sources), bound by the same helper the
+    dispatcher uses for the worker's spawn env, never the caller's env
+    (Prism 858c7319e28f, 13a34c96f1e2). A missing profile or the human
+    sentinel resolves to ``None`` (no route to gate). Any error reading an
+    EXISTING profile (OSError, bad YAML, scope bind) is an unknown route and
+    returns the unresolved sentinel, which the gate fails closed on (Prism r8
+    7018f089fcce): "could not read" must never mean "nothing to gate".
+    """
+    name = str(assignee or "").strip()
+    if not name or name == "human" or name.startswith("human:"):
+        return None
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        home = resolve_profile_env(name)
+    except (FileNotFoundError, ValueError):
+        return None  # no such (or no valid) profile: no route to gate
+    try:
+        from hermes_cli.kanban_db_dispatch import _worker_profile_scope
+
+        with _worker_profile_scope(home, bind_home=False):
+            return _resolve_profile_default_model(home)
+    except Exception as exc:
+        return f"{UNRESOLVED_ROUTE_PREFIX} {type(exc).__name__} reading {name} config>"
+
+
+def _resolve_profile_default_model(profile_home: str) -> Optional[str]:
+    from pathlib import Path
+
+    from hermes_cli.model_switch import _load_direct_aliases
+
+    cfg = _profile_effective_config(Path(profile_home) / "config.yaml")
+    section = cfg.get("model")
+    if isinstance(section, str):
+        model = section
+    elif isinstance(section, dict):
+        model = section.get("default") or section.get("model")
+    else:
+        model = None
+    model = str(model or "").strip()
+    provider = section.get("provider") if isinstance(section, dict) else None
+    provider = str(provider or "").strip()
+    if not model or _names_the_provider(cfg, model, provider):
+        # Worker startup adopts the named provider's default_model when
+        # model.default is empty (cli_agent_setup_mixin), so that IS the route
+        # (Prism r6 7018f089fcce). It does the same when model.default is
+        # just the provider's slug / display name (Prism 10d1b746c9aa:
+        # ``default: fleet, provider: fleet`` runs the entry's default_model,
+        # not a model called "fleet"). A provider with no findable default is
+        # an unknown route and fails closed.
+        if not provider or provider.casefold() == "auto":
+            return None
+        model = _provider_default_model(cfg, provider)
+        if not model:
+            return f"{UNRESOLVED_ROUTE_PREFIX} provider {provider!r} names no default_model>"
+        # Startup adopts default_model literally, never through model aliases
+        # (Prism r9 00f1687144ac).
+        return model
+    return _alias_target(cfg, model)
+
+
+def _names_the_provider(cfg: Mapping[str, Any], model: str, provider: str) -> bool:
+    """True when ``model`` is the provider's own name rather than a model id:
+    the configured ``provider`` string itself, or any identity of the custom
+    entry startup resolves it to (display name, config key, ``custom:`` slug;
+    ``custom_provider_aliases``), the test ``cli_agent_setup_mixin`` applies
+    before substituting the entry's ``default_model``."""
+    if not provider or provider.casefold() == "auto":
+        return False
+    if model.casefold() == provider.casefold():
+        return True
+    from hermes_cli.providers import custom_provider_aliases
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+
+    entry = _get_named_custom_provider(provider, dict(cfg))
+    if not entry:
+        return False
+    return model.strip().lower() in custom_provider_aliases(
+        str(entry.get("name") or ""), str(entry.get("provider_key") or ""))
+
+
+def _alias_target(cfg: Mapping[str, Any], model: str) -> str:
+    """``model`` after the profile's ``model_aliases`` / ``model.aliases``
+    (the DIRECT_ALIASES table worker startup resolves ``-m`` through)."""
+    from hermes_cli.model_switch import _load_direct_aliases
+
+    aliases, _ok = _load_direct_aliases(cfg)
+    hit = aliases.get(model.lower())
+    if hit is not None and str(hit.model or "").strip():
+        return str(hit.model).strip()
+    return model
+
+
+def assignee_pinned_model(assignee: Optional[str], model: Optional[str]) -> Optional[str]:
+    """The model a worker on ``assignee`` RUNS for the stored pin ``model``.
+
+    The dispatcher passes a pin as ``-m <model>`` and worker startup resolves
+    it through the WORKER's own ``model_aliases`` / ``model.aliases``
+    (``resolve_startup_model_route``), so a profile aliasing
+    ``claude-opus-5-5`` to a flagship runs the flagship from an Opus pin
+    (Prism a1f3096286e2). Resolved in the assignee's scope exactly like
+    :func:`assignee_default_model`; returns the pin itself when nothing remaps
+    it, ``None`` for no pin, and the unresolved sentinel (fail closed) when an
+    existing profile's config cannot be read.
+    """
+    pin = str(model or "").strip()
+    if not pin:
+        return None
+    name = str(assignee or "").strip()
+    if not name or name == "human" or name.startswith("human:"):
+        return pin
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        home = resolve_profile_env(name)
+    except (FileNotFoundError, ValueError):
+        return pin
+    try:
+        from pathlib import Path
+
+        from hermes_cli.kanban_db_dispatch import _worker_profile_scope
+
+        with _worker_profile_scope(home, bind_home=False):
+            return _alias_target(_profile_effective_config(Path(home) / "config.yaml"), pin)
+    except Exception as exc:
+        return f"{UNRESOLVED_ROUTE_PREFIX} {type(exc).__name__} reading {name} config>"
+
+
+def _runs_as_worker(assignee: Optional[str]) -> bool:
+    """The dispatcher's own test (``kanban_db.is_worker_assignee``)."""
+    from hermes_cli.kanban_db import is_worker_assignee
+
+    return is_worker_assignee(assignee)
+
+
+def pin_run_route_error(
+    assignee: Optional[str],
+    model: Optional[str],
+    config: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Error text when the pin ``model`` is a flagship itself, or RUNS as one
+    (or an unknown route) under ``assignee``'s aliases, else ``None``. The
+    dispatcher refuses either without the card's override, so an assign
+    reason must be judged (and recorded) on both (Prism 0cfef50d081b).
+    ``None`` for a target nothing can run (unassigned, ``human``,
+    ``human:<name>``): unassigning or parking needs no flagship permission
+    (Prism cc3a960e76a8)."""
+    if not _runs_as_worker(assignee):
+        return None
+    pin = str(model or "").strip()
+    if flagship_model_match(pin, config):
+        return flagship_model_error(pin)
+    run = assignee_pinned_model(assignee, pin)
+    if not run or run.casefold() == pin.casefold() or not assignee_route_gated(run, config):
+        return None
+    if assignee_route_unresolved(run):
+        return (
+            f"cannot resolve the model pin {pin!r} under {assignee} ({run!r}); "
+            "pass --allow-flagship \"<reason>\" or reassign"
+        )
+    return (
+        f"model pin {pin!r} runs as {run!r} through the profile aliases of "
+        f"'{assignee}': {flagship_model_error(run)}"
+    )
+
+
+UNRESOLVED_ROUTE_PREFIX = "<unresolved:"
+
+
+def _provider_default_model(cfg: Mapping[str, Any], provider: str) -> Optional[str]:
+    """The ``default_model`` of the entry worker startup resolves ``provider``
+    to, through the SAME lookup startup uses
+    (``runtime_provider_custom._get_named_custom_provider`` on ``cfg``), never
+    a parallel scan (Prism 8aa2ca1bca8a: a ``providers:`` entry with no
+    endpoint is skipped by startup, which then runs the legacy
+    ``custom_providers`` entry of the same name; a side lookup that accepted
+    the endpoint-less entry read Opus while the worker ran Fable)."""
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+
+    entry = _get_named_custom_provider(provider, dict(cfg))
+    if not entry:
+        return None
+    return str(entry.get("model") or "").strip() or None
+
+
+def assignee_flagship_error(assignee: str, model: str) -> str:
+    if assignee_route_unresolved(model):
+        return (
+            f"cannot resolve {assignee} model default ({model!r}); pass "
+            "--allow-flagship \"<reason>\" or pin a model"
+        )
+    return (
+        f"assignee profile default of '{assignee}' is a flagship route: "
+        f"{flagship_model_error(model)}"
+    )
+
+
+def assignee_route_unresolved(model: Optional[str]) -> bool:
+    """A default still carrying ``${...}`` after the assignee's scope was bound
+    (an unhydrated secret source) is an UNKNOWN route; the gate fails closed on
+    it instead of running a foreign profile's secret commands (Prism
+    69a5d42a9476). So is a provider-only default with no findable
+    ``default_model`` (Prism r6 7018f089fcce)."""
+    text = str(model or "")
+    return "${" in text or text.startswith(UNRESOLVED_ROUTE_PREFIX)
+
+
+def assignee_route_gated(
+    model: Optional[str], config: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """True when an unpinned card on this profile route needs a reason."""
+    return assignee_route_unresolved(model) or bool(flagship_model_match(model, config))
+
+
+def validate_assignee_route(
+    assignee: Optional[str],
+    *,
+    model_override: Optional[str] = None,
+    allow_flagship_reason: Optional[str] = None,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Flagship gate for the route an ASSIGNEE implies (t_9e7ba884).
+
+    With ``model_override`` set the route is that pin AS THE ASSIGNEE RUNS
+    IT (:func:`pin_run_route_error`: the pin string itself went through
+    :func:`validate_worker_model`; here only the assignee's alias remap of it
+    is judged). Otherwise the assignee's profile default is held to the same
+    ban as ``--model``. Returns the normalized reason, ``None`` when the
+    route is not flagship, or raises :class:`FlagshipAssigneeRefused` when a
+    flagship route has no reason. The reason's authority is the caller's
+    check (:func:`require_flagship_authority`, before any mutation).
+    A target nothing can run is never judged (:func:`pin_run_route_error`).
+    """
+    if not _runs_as_worker(assignee):
+        return None
+    if str(model_override or "").strip():
+        error = pin_run_route_error(assignee, model_override, config)
+        if error is None:
+            return None
+    else:
+        model = assignee_default_model(assignee)
+        if not assignee_route_gated(model, config):
+            return None
+        if profile_flagship_allowance(assignee, model):
+            # Standing operator grant for this profile's default route: no
+            # caller authority and no per-card override comment needed.
+            return None
+        error = assignee_flagship_error(str(assignee), str(model))
+    reason = (allow_flagship_reason or "").strip()
+    if not reason:
+        raise FlagshipAssigneeRefused(error)
+    return reason
 
 
 # ---------------------------------------------------------------------------

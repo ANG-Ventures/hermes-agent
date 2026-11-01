@@ -29,7 +29,15 @@ from agent.skill_utils import (
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
-from utils import atomic_json_write, file_signature
+# Stale-module bridge: this module binds ``utils.file_signature`` at import time and is reached
+# from post-update restart targets (hermes_cli.backup -> hermes_state_dbfile -> ... ->
+# agent.route_note_ingest), so a pre-handoff updater's cached ``utils`` must be dropped first.
+# See hermes_cli.stale_modules.
+from hermes_cli.stale_modules import drop_stale_root_modules
+
+drop_stale_root_modules()
+
+from utils import atomic_json_write, file_signature  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -573,6 +581,7 @@ STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 CONTROL_FRAME_OPENERS = (
     "/?OUT-OF-BAND USER MESSAGE", "CONTEXT COMPACTION", "CONTEXT SUMMARY]", "PRIOR CONTEXT", "Runtime note:",
     "System note:", "System:", "SYSTEM]", "IMPORTANT:", "Planning state preserved", "ASYNC DELEGATION",
+    "Route note:",
 )
 
 
@@ -589,7 +598,10 @@ def steer_user_row(steer_text: str) -> Dict[str, Any]:
     result). Its own row — never smeared onto the already-persisted tool row, which append-only
     persistence would leave divergent from the live request — and typed so the alternation repair
     never merges the next real prompt into it and history renderers can label it."""
-    return {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
+    from agent.route_note_ingest import relabel_route_note_text  # late: route_note_ingest imports this module
+
+    # E11: the steer is received text; relabel before the genuine steering wrapper is added.
+    return {"role": "user", "content": format_steer_marker(relabel_route_note_text(steer_text)).lstrip(),
             "display_kind": STEER_DISPLAY_KIND}
 
 
