@@ -845,6 +845,22 @@ def _assert_nonsecret_settings(durable_spec: dict[str, Any]) -> None:
                 raise RegistryError(f"credential-bearing route.{field} cannot be persisted")
 
 
+def persistable_fallback_chain(chain: Any) -> list[dict[str, Any]] | None:
+    """The dispatching parent's fallback chain for ``execution.fallback_chain``, or None.
+
+    A recovered unit rebuilds its parent from this field, and its children resolve their chain from
+    that parent exactly as the in-process children do (``fallback_providers: auto``). A chain with a
+    credential-shaped field or a credential-bearing ``base_url`` is not persisted (None, the unit
+    runs without fallback): recording it would fail the whole spec closed and force the call
+    synchronous."""
+    rungs = [dict(rung) for rung in (chain or []) if isinstance(rung, dict)]
+    for rung in rungs:
+        if any(_sensitive_query_key(str(key)) for key in rung) or url_has_credentials(rung.get("base_url")):
+            logger.info("async_delegation fallback chain not persisted: a rung carries a credential")
+            return None
+    return rungs or None
+
+
 def _sensitive_query_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
     return any(part in normalized for part in _SECRET_FIELD_PARTS) or normalized in {"key", "token"}

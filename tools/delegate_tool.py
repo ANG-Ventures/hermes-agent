@@ -3576,6 +3576,7 @@ def _build_durable_background_spec(
         return None, None
 
     from gateway.status import get_current_boot_id
+    from tools.async_delegation_store import persistable_fallback_chain
 
     boot_id = get_current_boot_id()
     if not boot_id or str(boot_id).endswith(":"):
@@ -3653,7 +3654,10 @@ def _build_durable_background_spec(
             creds.get("args") or getattr(effective_agent, "acp_args", None) or []
         ),
         "reasoning_config": copy.deepcopy(getattr(effective_agent, "reasoning_config", None)),
-        "fallback_chain": copy.deepcopy(getattr(effective_agent, "fallback_model", None)),
+        # The DISPATCHING parent's chain: reconstruction gives it to the rebuilt parent and the
+        # children derive theirs from it, as in-process (AIAgent has no ``fallback_model`` attribute).
+        "fallback_chain": persistable_fallback_chain(
+            copy.deepcopy(getattr(parent_agent, "_fallback_chain", None))),
         "service_tier": getattr(effective_agent, "service_tier", None),
         "providers_allowed": copy.deepcopy(getattr(effective_agent, "providers_allowed", None)),
         "providers_ignored": copy.deepcopy(getattr(effective_agent, "providers_ignored", None)),

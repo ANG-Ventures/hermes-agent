@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from gateway.session_context import get_session_env, restore_session_vars, set_session_vars
 from agent.runtime_cwd import resolve_agent_cwd
+from run_agent import AIAgent
 from tools import delegate_tool as dt
+from tools.delegate_tool_config import _resolve_child_fallback_chain
 
 
 def _parent():
@@ -299,3 +301,51 @@ def test_config_provider_with_foreign_base_url_stays_custom():
             _parent(),
         )
     assert creds["provider"] == "custom"
+
+
+# ── t_620dc5cd: a background unit's child keeps the parent's fallback chain ─────
+# The spec read ``fallback_model`` (no such AIAgent attribute), so every kanban/detached unit rebuilt
+# its parent with no chain and its ``fallback_providers: auto`` child ran without fallback: under a
+# saturated lane it sat through 15 x 503 where the in-process child failed over.
+
+def _real_parent(fallback_model):
+    return AIAgent(base_url="http://127.0.0.1:9/v1", api_key="k", provider="custom", model="parent-model",
+                   quiet_mode=True, skip_memory=True, skip_context_files=True, enabled_toolsets=["file"],
+                   fallback_model=fallback_model)
+
+
+def _spec_for(parent):
+    tokens = set_session_vars(platform="telegram", chat_id="123", session_key="agent:main:telegram:dm:123",
+                              session_id="sess-parent", profile="work", async_delivery=True)
+    try:
+        with patch("gateway.status.get_current_boot_id", return_value="100:1.0"):
+            spec, _ = dt._build_durable_background_spec(
+                task_list=[{"goal": "finish", "context": None}], shared_context=None, top_role="leaf",
+                inherit_context=False, cfg={"resume_on_restart": True}, creds={"model": "child-model"},
+                parent_agent=parent, session_key="agent:main:telegram:dm:123", parent_session_id="sess-parent",
+                origin_ui_session_id="", max_iterations=45)
+    finally:
+        restore_session_vars(tokens)
+    return spec
+
+
+def test_rebuilt_parent_gives_the_child_the_in_process_fallback_chain():
+    chain = [{"provider": "claude-dtlr", "model": "claude-opus-5-5"}, {"provider": "openrouter", "model": "x/y"}]
+    parent = _real_parent(chain)
+    spec = _spec_for(parent)
+    rebuilt = _real_parent(spec["execution"]["fallback_chain"])
+    for pinned in (False, True):
+        in_process = _resolve_child_fallback_chain(parent, {"fallback_providers": "auto"}, pinned,
+                                                   child_provider="claude-alr", child_model="child-model")
+        assert in_process
+        assert _resolve_child_fallback_chain(rebuilt, {"fallback_providers": "auto"}, pinned,
+                                             child_provider="claude-alr", child_model="child-model") == in_process
+
+
+def test_credential_bearing_fallback_chain_is_not_persisted_and_spec_survives():
+    parent = _real_parent([{"provider": "custom", "model": "m", "base_url": "https://x.invalid/v1",
+                            "api_key": "MUST-NOT-PERSIST"}])
+    spec = _spec_for(parent)
+    assert spec is not None
+    assert spec["execution"]["fallback_chain"] is None
+    assert "MUST-NOT-PERSIST" not in json.dumps(spec)
