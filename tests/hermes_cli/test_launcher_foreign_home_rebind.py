@@ -120,6 +120,25 @@ def test_tmp_home_leaves_the_shared_launcher_byte_identical(install, ephemeral, 
     assert _bytes(local) == before
 
 
+def test_tmp_home_reports_a_dead_shared_launcher_as_not_published(
+        install, ephemeral, tmp_path, monkeypatch):
+    """Prism 265fc36efda1: a dead shared launcher is not success, so healthy PATH commands stay."""
+    repo, local, real_python = install
+    healthy_python = _store(tmp_path / "other-live")
+    path_bin = tmp_path / "path-bin"
+    path_bin.mkdir()
+    for name in _launchers.ENTRY_POINTS:
+        _launchers.mint_launcher(name, repo, path_bin, healthy_python, None)
+    healthy = _bytes(path_bin)
+    real_python.unlink()
+    test_home = ephemeral / "pytest-of-ace" / "home"
+    _store(test_home)
+    monkeypatch.setenv("HERMES_HOME", str(test_home))
+    assert _launchers.stage_launcher("hermes", repo, local) is None
+    assert _launchers.ensure_install_launchers(repo, path_bin) == []
+    assert _bytes(path_bin) == healthy
+
+
 def test_tmp_home_can_publish_its_own_isolated_launcher(install, ephemeral, monkeypatch):
     repo, local, _ = install
     before = _bytes(local)

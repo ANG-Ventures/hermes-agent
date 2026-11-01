@@ -447,6 +447,18 @@ def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> 
     return current
 
 
+def _launcher_usable(target: Path) -> bool:
+    """The launcher exists and, for a shell wrapper, the interpreter it execs is still on disk.
+
+    A dangling symlink or a wrapper whose Python was pruned is not a published command: reporting
+    it as one lets the caller replace healthy PATH launchers with forwarders to it.
+    """
+    if not target.exists():  # missing, or a dangling symlink
+        return False
+    python = _shell_launcher_python(target)
+    return python is None or python.is_file()
+
+
 def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     """Publish one launcher bound to store Python, or refuse missing tools."""
     repo_root = Path(repo_root)
@@ -462,7 +474,7 @@ def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
             logging.getLogger(__name__).warning(
                 "launchers: %s not written; %s is a temp/scratch store (test HERMES_HOME)",
                 target, store_python)
-            return target if target.exists() or target.is_symlink() else None
+            return target if _launcher_usable(target) else None  # Prism 265fc36efda1
         kept = _foreign_store_rebind(target, store_python, repo_root)
         if kept is not None:
             import logging
