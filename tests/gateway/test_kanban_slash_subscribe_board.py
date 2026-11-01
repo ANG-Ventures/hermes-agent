@@ -35,3 +35,35 @@ def test_subscription_lands_on_the_cards_board_when_the_slash_named_none(tmp_pat
         assert [s["chat_id"] for s in kbn.list_notify_subs(conn, task)] == ["post"]
     with kbc.connect_closing(board="default") as conn:
         assert kbn.list_notify_subs(conn, task) == []
+
+
+def test_tilde_pin_subscribes_into_the_expanded_db_not_under_cwd(tmp_path, monkeypatch):
+    """Prism ab54f29e6449: ``locate()`` returns a ``~`` pin raw; the subscribe must expand it like
+    ``kanban_db_path()`` does, not open ``<cwd>/~/x.db``."""
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kbn
+
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    for var in ("HERMES_KANBAN_HOME", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_DB", "~/x.db")
+    monkeypatch.chdir(cwd)
+    kb._INITIALIZED_PATHS.clear()
+    with kbc.connect_closing() as conn:
+        task = kb.create_task(conn, title="pinned card")
+    assert (home / "x.db").exists()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._kanban_notifier_profile = "default"
+    source = SessionSource(platform=Platform.DISCORD, chat_id="post", chat_type="thread",
+                           thread_id="post", profile="default")
+    event = MessageEvent(text="/kanban create pinned card", source=source)
+    assert asyncio.run(runner._kanban_auto_subscribe(event, task, None))
+
+    assert not (cwd / "~").exists()
+    with kbc.connect_closing() as conn:
+        assert [s["chat_id"] for s in kbn.list_notify_subs(conn, task)] == ["post"]
