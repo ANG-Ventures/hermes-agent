@@ -76,7 +76,9 @@ def test_timed_out_run_with_pushed_pr_goes_to_review(home):
         assert timed.summary.startswith("timed-out handback: PR ANG-Ventures/hermes-home#7842 @")
         routed = next(r for r in runs if r.outcome == "review_requested")
         assert routed.metadata["own_prs"] == ["ANG-Ventures/hermes-home#7842"]
-        assert routed.metadata["same_actor_bypass"].startswith("dispatcher timed-out handback")
+        # No same-actor bypass (Prism 6190b2739be7): the gate ran.
+        assert "same_actor_bypass" not in routed.metadata
+        assert "allow_same_actor" not in rr.payload
         # The failure counter is not charged for a delivered handback.
         assert int(conn.execute("SELECT consecutive_failures FROM tasks WHERE id=?",
                                 (tid,)).fetchone()[0] or 0) == 0
@@ -366,3 +368,65 @@ def test_fork_head_with_same_branch_name_uses_push_time_not_base_start_head(home
         kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=kbd.timed_out_handback_pr)
         assert kb.get_task(conn, tid).status == "review"
         assert seen and "someone/fork/activity" in seen[0]
+
+
+def _implementer_is_review_assignee(monkeypatch):
+    """A real fleet board where the configured review assignee IS the implementing profile."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(kb, "configured_review_assignee", lambda: "daedalus-opus")
+    monkeypatch.setattr(kb, "spawnable_reviewer_profiles", lambda: ["daedalus-opus"])
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "daedalus-opus")
+
+
+def test_timed_out_handback_never_self_reviews(home, monkeypatch):
+    """Prism 6190b2739be7: the implementer is kanban.review_assignee. Base called request_review with
+    allow_same_actor=True and assigned the review to the profile that wrote the code. The gate now runs
+    and the refused same-actor reviewer falls back to the human lane, still not a retry."""
+    _implementer_is_review_assignee(monkeypatch)
+    with kbc.connect_closing() as conn:
+        tid, _ = _running(conn, limit=60, started_ago=120)
+        kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=lambda *a: {
+            "pr": "o/r#1", "sha": "d" * 40, "url": None})
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.assignee != "daedalus-opus"
+        assert task.assignee == kb.HUMAN_REVIEWER_SENTINEL
+        rr = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
+        assert len(rr) == 1
+        assert rr[0].payload["implementer"] == "daedalus-opus"
+        assert rr[0].payload["reviewer"] == kb.HUMAN_REVIEWER_SENTINEL
+        assert "allow_same_actor" not in rr[0].payload
+        assert int(conn.execute("SELECT consecutive_failures FROM tasks WHERE id=?",
+                                (tid,)).fetchone()[0] or 0) == 0
+
+
+def test_same_actor_refusal_text_matches_the_gate(home, monkeypatch):
+    """The fallback keys on resolve_reviewer's refusal text; pin it so a reword can't silently disable it."""
+    _implementer_is_review_assignee(monkeypatch)
+    reviewer, error = kb.resolve_reviewer(None, "daedalus-opus")
+    assert reviewer is None and kbd._SAME_ACTOR_REFUSAL in (error or "")
+
+
+def test_all_overdue_workers_are_killed_before_any_handback_lookup(home, monkeypatch):
+    """Prism 61fefd32c672: base looked up task A's handback (network, up to 30 s per gh call) before it
+    signalled task B, so a GitHub outage kept later overdue workers alive past their hard limit."""
+    order = []
+
+    def fake_terminate(pid, claim_lock, **kw):
+        order.append(("kill", kw["task_id"]))
+        return {"terminated": True, "sigkill": False}
+
+    def lookup(conn, tid, run_started_at):
+        order.append(("lookup", tid))
+        return None
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+    with kbc.connect_closing() as conn:
+        a, _ = _running(conn, limit=60, started_ago=120)
+        b, _ = _running(conn, limit=60, started_ago=120)
+        out = kbd.enforce_max_runtime(conn, signal_fn=_sig, handback_fn=lookup)
+        assert sorted(out) == sorted([a, b])
+        kinds = [k for k, _ in order]
+        assert kinds == ["kill", "kill", "lookup", "lookup"], order
+        assert kb.get_task(conn, a).status == "ready" and kb.get_task(conn, b).status == "ready"
