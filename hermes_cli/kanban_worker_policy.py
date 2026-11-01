@@ -298,3 +298,48 @@ def ruled_mint_event_payload(ruled: dict) -> dict:
                 "only an explicit 'NEEDS RULING:' line parks in triage",
         "worker_task_id": (os.environ.get(WORKER_ENV_MARKER) or "").strip() or None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Worker deadline (t_e7537cb1): the worker gets the clock the dispatcher kills it on.
+# ---------------------------------------------------------------------------
+
+DEADLINE_ENV = "KANBAN_DEADLINE_EPOCH"
+MAX_RUNTIME_ENV = "KANBAN_MAX_RUNTIME_S"
+SOFT_DEADLINE_MIN_MARGIN_SECONDS = 600
+SOFT_DEADLINE_MARGIN_FRACTION = 0.15
+SOFT_DEADLINE_COMMENT_PREFIX = "SOFT DEADLINE: hand back now"
+
+
+def soft_margin_seconds(max_runtime_seconds: int) -> int:
+    """``max(10 min, 15% of max_runtime)``, never more than the runtime itself."""
+    limit = int(max_runtime_seconds)
+    margin = max(SOFT_DEADLINE_MIN_MARGIN_SECONDS, int(limit * SOFT_DEADLINE_MARGIN_FRACTION))
+    return max(0, min(margin, limit))
+
+
+def deadline_env(started_at: int, max_runtime_seconds: Optional[int]) -> dict:
+    """``{KANBAN_DEADLINE_EPOCH, KANBAN_MAX_RUNTIME_S}`` for a run, or ``{}`` with no cap."""
+    if not max_runtime_seconds or int(max_runtime_seconds) <= 0:
+        return {}
+    limit = int(max_runtime_seconds)
+    return {DEADLINE_ENV: str(int(started_at) + limit), MAX_RUNTIME_ENV: str(limit)}
+
+
+def _local_hm(epoch: int) -> str:
+    import time as _time
+
+    return _time.strftime("%H:%M %Z", _time.localtime(int(epoch)))
+
+
+def deadline_line(started_at: int, max_runtime_seconds: int) -> str:
+    """The one line the worker brief renders: hard limit + hand-back-by time."""
+    limit = int(max_runtime_seconds)
+    hard = int(started_at) + limit
+    soft = hard - soft_margin_seconds(limit)
+    return (f"Hard limit at {_local_hm(hard)}; hand back by {_local_hm(soft)} "
+            "(push, then kanban_request_review with what exists; list residue).")
+
+
+def soft_deadline_comment(hard_epoch: int) -> str:
+    return f"{SOFT_DEADLINE_COMMENT_PREFIX} (hard kill at {_local_hm(hard_epoch)})"

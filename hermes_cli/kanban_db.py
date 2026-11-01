@@ -21711,7 +21711,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
-    _ctx_header(lines, task)
+    run_started_at = None
+    if task.status == "running" and task.current_run_id is not None:
+        row = conn.execute("SELECT started_at FROM task_runs WHERE id = ?",
+                           (int(task.current_run_id),)).fetchone()
+        run_started_at = int(row["started_at"]) if row and row["started_at"] is not None else None
+    _ctx_header(lines, task, run_started_at)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_sendbacks(lines, conn, task_id, now)
@@ -21758,7 +21763,7 @@ def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
     )
 
 
-def _ctx_header(lines: list[str], task: Task) -> None:
+def _ctx_header(lines: list[str], task: Task, run_started_at: Optional[int] = None) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
@@ -21774,6 +21779,9 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append(f"Max runtime: {task.max_runtime_seconds}s")
         if effective_terminal_timeout:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+        if run_started_at is not None and task.max_runtime_seconds > 0:
+            from hermes_cli.kanban_worker_policy import deadline_line
+            lines.append(f"Deadline: {deadline_line(run_started_at, task.max_runtime_seconds)}")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
