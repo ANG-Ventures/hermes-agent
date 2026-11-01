@@ -61,6 +61,20 @@ def identity_line_value(prompt: str, label: str) -> str:
     return matches[-1] if matches else ""
 
 
+def rewrite_identity_line(prompt: str, label: str, value: str) -> str:
+    """``prompt`` with the trailer's LAST ``Label:`` line set to ``value``; every other byte
+    kept.  Same scope as ``identity_line_value``; unchanged when the trailer has no such line."""
+    identity, runtime_marker, runtime = split_runtime_boundary(prompt)
+    head, sep, trailer = identity.rpartition("\n\n")
+    lines = trailer.split("\n")
+    prefix = f"{label}:"
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].startswith(prefix):
+            lines[idx] = f"{label}: {value}"
+            return head + sep + "\n".join(lines) + runtime_marker + runtime
+    return prompt
+
+
 def _last_announced_surface(conversation_history: Any) -> str:
     """The surface named by the NEWEST switch note in the transcript ("" when none).
 
