@@ -222,8 +222,8 @@ def test_reap_stops_when_session_continuity_breaks(monkeypatch):
     """Prism: ownership must hold for every rescan, not just the first. A
     rescan whose members were all born after every earlier member died is a
     reused sid; nothing in it may be signalled."""
-    signalled: list = []
     births = {111: 100.0}
+    sids = {111: 99_999}
     calls: list = []
 
     def scan(sid):
@@ -231,15 +231,79 @@ def test_reap_stops_when_session_continuity_breaks(monkeypatch):
         if len(calls) == 1:
             return [(111, 111)]
         births.pop(111, None)       # the original session emptied ...
+        sids.pop(111, None)
         births[222] = time.time()   # ... and a later process reused its sid
+        sids[222] = 99_999
         return [(222, 222)] if len(calls) == 2 else []
 
-    monkeypatch.setattr(kb, "_worker_session_members", scan)
-    monkeypatch.setattr(kb, "_member_birth", lambda pid: births.get(pid))
-    monkeypatch.setattr(kb.os, "killpg", lambda pg, sig: signalled.append(pg))
+    signalled = _fake_world(monkeypatch, scan, births, sids)
     assert kb._reap_worker_session(99_999, born_after=50.0, born_before=200.0,
                                    grace=0.5) == 1
     assert signalled == [111], "signalled a group from a non-continuous rescan"
+
+
+def _fake_world(monkeypatch, scan, births, sids) -> list:
+    """Wire the reaper to a fake process table; returns the signalled pgids."""
+    signalled: list = []
+    real_getsid = os.getsid
+
+    def getsid(pid):
+        if pid == 0:
+            return real_getsid(0)
+        if pid not in sids:
+            raise ProcessLookupError(pid)
+        return sids[pid]
+
+    monkeypatch.setattr(kb, "_worker_session_members", scan)
+    monkeypatch.setattr(kb, "_member_birth", lambda pid: births.get(pid))
+    monkeypatch.setattr(kb.os, "getsid", getsid)
+    monkeypatch.setattr(kb.os, "killpg", lambda pg, sig: signalled.append(pg))
+    return signalled
+
+
+def test_reap_refuses_a_session_that_empties_before_the_proof(monkeypatch):
+    """Prism 049b2dc2550d: ownership checked, then the last member exits and
+    the sid is reused before the reap starts. Nothing may be signalled."""
+    births = {111: 100.0}
+    sids = {111: 99_999}
+    lookups: list = []
+
+    def birth(pid):
+        lookups.append(pid)
+        if len(lookups) > 1:        # gone right after the ownership check
+            births.pop(111, None)
+            sids.pop(111, None)
+            births[222] = 150.0     # reused sid, born before any later cutoff
+            sids[222] = 99_999
+        return births.get(pid)
+
+    signalled = _fake_world(monkeypatch, lambda sid: [(111, 111)] if not lookups
+                            else [(222, 222)], births, sids)
+    monkeypatch.setattr(kb, "_member_birth", birth)
+    assert kb._reap_worker_session(99_999, born_after=50.0, born_before=200.0,
+                                   grace=0.5) == 0
+    assert signalled == []
+
+
+def test_member_that_left_the_session_proves_nothing(monkeypatch):
+    """Prism 0c8eea80150d: a member that setsid()s away and stays alive must not
+    keep vouching for its old sid once another session reuses it."""
+    births = {111: 100.0}
+    sids = {111: 99_999}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:
+            return [(111, 111)]
+        sids[111] = 55_555          # still alive, now in its own session
+        births[222] = time.time()   # the old sid reused by an unrelated process
+        sids[222] = 99_999
+        return [(222, 222)]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    kb._reap_worker_session(99_999, born_after=50.0, born_before=200.0, grace=0.5)
+    assert 222 not in signalled, "a detached member vouched for a reused sid"
 
 
 def test_reap_refuses_init_and_own_session():

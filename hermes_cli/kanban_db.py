@@ -18658,8 +18658,29 @@ def _reap_worker_session(
                 out.add((pid, created))
         return out
 
-    proved_at = time.time()  # every member of ``members`` was in the snapshot, so alive now
+    def _proved(found: set[tuple[int, float]]) -> Optional[float]:
+        # A moment some identified member was alive AND still in ``sid``, or
+        # None. getsid first, then the birth check: the same (pid, create
+        # time) after getsid means that pid was this process at getsid, so it
+        # was a member at ``checked``. A member that setsid()'d away proves
+        # nothing about the session it left.
+        checked = time.time()
+        for pid, created in found:
+            try:
+                if os.getsid(pid) != sid:
+                    continue
+            except OSError:
+                continue
+            if _member_birth(pid) == created:
+                return checked
+        return None
+
     known = _identities(members)
+    proved = _proved(known)
+    if proved is None:  # the session emptied (sid reusable) since ownership was checked
+        _log.info("kanban: session %d emptied before the reap; not reaped", sid)
+        return 0
+    proved_at = proved
 
     def _scan() -> list[tuple[int, int]]:
         # One snapshot, re-proving a known member alive every 50 ms while it
@@ -18674,9 +18695,9 @@ def _reap_worker_session(
         scan.start()
         while True:
             scan.join(0.05)
-            checked = time.time()
-            if any(_member_birth(pid) == created for pid, created in known):
-                proved_at = checked
+            proved = _proved(known)
+            if proved is not None:
+                proved_at = proved
             if not scan.is_alive():
                 return box[0] if box else []
 
