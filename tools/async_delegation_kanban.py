@@ -292,7 +292,8 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
     board = _board()
     task_id = None
     try:
-        reason = (flagship_reason or "").strip()
+        model = _execution_model(delegation_id, profile_home)
+        reason = _flagship_reason(delegation_id, model, flagship_reason)
         kb.create_board(board)
         with kb.connect_closing(board=board) as conn:
             task_id = kb.create_task(
@@ -301,8 +302,8 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
                 assignee=profile, workspace_kind="dir", workspace_path=cwd, max_retries=1,
                 max_runtime_seconds=None, session_id=session_id or None,
                 idempotency_key=attempt_id, board=board, created_by=profile,
-                model_override=_execution_model(delegation_id, profile_home),
-                flagship_override_reason=f"delegation {delegation_id}: {reason}" if reason else None,
+                model_override=model, flagship_override_reason=reason,
+                flagship_override_author=profile if reason else None,
             )
             # ``slot_key``: the call's shared pool slot, so a boot observer of a multi-unit call
             # holds ONE slot as the dispatching gateway did (not one per unit).
@@ -330,6 +331,21 @@ def _execution_model(delegation_id: str, profile_home: Path) -> Optional[str]:
     execution = record.get("execution") if isinstance(record, dict) else None
     model = execution.get("model") if isinstance(execution, dict) else None
     return str(model or "").strip() or None
+
+
+def _flagship_reason(delegation_id: str, model: Optional[str], audited: Optional[str]) -> Optional[str]:
+    """The override reason a flagship execution model carries onto its container card, else ``None``.
+
+    delegate_task's audited ``allow_flagship_reason`` when the caller pinned the flagship; otherwise
+    the unit inherits the delegating agent's own route (no per-call gate exists in-process either).
+    ``create_task`` still judges the author's authority (``require_flagship_authority``): this only
+    names why, it never grants."""
+    from hermes_cli.model_policy import flagship_model_match
+
+    if not flagship_model_match(model):
+        return None
+    why = (audited or "").strip() or f"inherits the delegating agent's route {model}"
+    return f"delegation {delegation_id}: {why}"
 
 
 #: Cards of failed launches whose attempt the dispatch worker is still fencing/superseding: the card-end

@@ -74,12 +74,12 @@ def spawner():
     s.cleanup()
 
 
-def _spec(cwd, *, runtime="kanban"):
+def _spec(cwd, *, runtime="kanban", model="m"):
     return {
         "profile": "default",
         "source": {"kind": "single", "tasks": [{"goal": "write the report", "role": "leaf"}],
                    "shared_context": None},
-        "execution": {"model": "m", "provider": "p", "toolsets": ["file"], "max_iterations": 5,
+        "execution": {"model": model, "provider": "p", "toolsets": ["file"], "max_iterations": 5,
                       "workspace_hint": str(cwd), "runtime": runtime,
                       "route": {"requested_provider": "custom:named", "model": "m", "explicit_base_url": None},
                       "credential_ref": {"provider": "p"}},
@@ -102,7 +102,7 @@ def _sync_executor(monkeypatch):
     return threads
 
 
-def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, spawned=None):
+def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, spawned=None, model="m"):
     threads = _sync_executor(monkeypatch)
     cwd = tmp_path / "cwd"
     cwd.mkdir(exist_ok=True)
@@ -116,7 +116,7 @@ def _dispatch(monkeypatch, tmp_path, *, spawn_fn, runner=None, max_children=3, s
         goals=["write the report"], context=None, toolsets=None, role="leaf", model="m",
         session_key="agent:main:telegram:dm:1", parent_session_id="parent-1",
         runner=runner or _runner, max_async_children=max_children,
-        durable_spec=_spec(cwd), current_boot_id=BOOT,
+        durable_spec=_spec(cwd, model=model), current_boot_id=BOOT,
         kanban={"profile": "default", "cwd": str(cwd), "session_id": "parent-1", "spawn_fn": spawn_fn,
                 "on_spawned": spawned})
     for t in threads:
@@ -296,6 +296,42 @@ def test_unit_on_a_flagship_default_profile_spawns_pinned_to_its_execution_model
     card, kinds = _card(rec["kanban"]["task_id"])
     assert card.model_override == rec["execution"]["model"] and kinds.count("spawned") == 1
     assert ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+
+
+def test_unit_inheriting_a_flagship_route_spawns_under_proven_operator_authority(home, monkeypatch, tmp_path,
+                                                                              spawner):
+    """Prism f226ee06e5ba: Apollo's children inherit its flagship route (no per-call reason). Under the
+    operator's own gateway the container card carries an override naming the delegation and spawns."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import model_policy
+
+    _flagship_default_profile(home)
+    # What _runs_under_operator_gateway proves inside the default profile's gateway process.
+    monkeypatch.setattr(model_policy, "flagship_actor", lambda explicit=None: explicit or "user")
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda actor: actor in kb.OPERATOR_PROFILES)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="claude-fable-5-1")
+    did = handle["delegation_id"]
+    rec = _record(did)
+    assert calls == [] and ad.kanban_launch_runtime(did, timeout=0) == ad.KANBAN_SPAWNED_RUNTIME
+    task_id = rec["kanban"]["task_id"]
+    card, kinds = _card(task_id)
+    assert card.model_override == "claude-fable-5-1" and kinds.count("spawned") == 1
+    with kb.connect_closing(board="delegations") as conn:
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+    assert any(b.startswith("flagship override:") and did in b for b in bodies)
+
+
+def test_unit_inheriting_a_flagship_route_without_authority_falls_back_and_says_so(home, monkeypatch, tmp_path,
+                                                                                 spawner):
+    """The guard is not weakened: no proven operator authority -> refused, run in-process, reported."""
+    _flagship_default_profile(home)
+    from hermes_cli import model_policy
+
+    monkeypatch.setattr(model_policy, "flagship_authority", lambda actor: False)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner, model="claude-fable-5-1")
+    assert len(calls) == 1
+    assert ad.kanban_launch_runtime(handle["delegation_id"], timeout=0) == \
+        "in_process (kanban spawn failed: FlagshipAssigneeRefused)"
 
 
 def test_ordinary_card_on_a_flagship_default_profile_is_still_refused(home):
