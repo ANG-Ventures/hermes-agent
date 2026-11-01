@@ -1459,12 +1459,12 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
             return EXTRA_USAGE_EXHAUSTED_CAUSE
         if "budget" in t and "capped" in t:
             return "model budget capped"
-        if "no eligible sub" in t:
-            return "no eligible sub for the model"
         windowed = _window_cause(row, t)
         if windowed and quota_window_from_text(t) is None:
-            # The text names no window; the response headers did (t_94a2b0e4).
+            # A synthetic no-eligible refusal can still carry the rejected window.
             return windowed
+        if "no eligible sub" in t:
+            return "no eligible sub for the model"
         weekly = quota_window_from_text(t) == "7d"
         if "fable" in t:
             return "Fable weekly limit" if weekly else "Fable limit"
