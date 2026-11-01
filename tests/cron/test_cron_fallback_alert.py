@@ -312,6 +312,34 @@ def test_undeclared_fallback_repages_on_new_pair_or_new_day(monkeypatch):
     assert len(calls) == 3
 
 
+@pytest.mark.parametrize("alternate_declared", [False, True])
+def test_alternating_fallbacks_do_not_evict_notices(monkeypatch, alternate_declared):
+    calls = _capture_deliver(monkeypatch)
+    other_pair = dict(FALLBACK_EVENT, new_model="other-model")
+    for _ in range(6):
+        sched._emit_cron_fallback_alert(UNDECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+        sched._emit_cron_fallback_alert(
+            DECLARED_JOB if alternate_declared else UNDECLARED_JOB,
+            _FakeAgent(FALLBACK_EVENT if alternate_declared else other_pair),
+        )
+    assert len(calls) == 2
+
+
+def test_gate_preserves_legacy_pair_when_adding_another(tmp_path):
+    import json
+    from cron.fork_ext import fallback_notice_gate as gate
+
+    path = tmp_path / "cron" / gate._STATE_NAME
+    path.parent.mkdir()
+    path.write_text(json.dumps({"md": {"day": "2026-10-25", "pair": "a -> b"}}))
+    gate.mark_noticed(tmp_path, "md", "undeclared: a -> b", "2026-10-25")
+    assert gate.already_noticed(tmp_path, "md", "a -> b", "2026-10-25")
+    assert gate.already_noticed(tmp_path, "md", "undeclared: a -> b", "2026-10-25")
+    gate.mark_noticed(tmp_path, "md", "a -> c", "2026-10-26")
+    assert not gate.already_noticed(tmp_path, "md", "a -> b", "2026-10-26")
+    assert gate.already_noticed(tmp_path, "md", "a -> c", "2026-10-26")
+
+
 def test_failed_undeclared_delivery_is_retried(monkeypatch):
     sent = []
 
