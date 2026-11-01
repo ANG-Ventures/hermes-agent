@@ -448,12 +448,13 @@ def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> 
 
 
 def _launcher_usable(target: Path) -> bool:
-    """The launcher exists and, for a shell wrapper, the interpreter it execs is still on disk.
+    """The launcher is an executable file and, for a shell wrapper, its interpreter is on disk.
 
-    A dangling symlink or a wrapper whose Python was pruned is not a published command: reporting
-    it as one lets the caller replace healthy PATH launchers with forwarders to it.
+    A dangling symlink, a non-executable file or a wrapper whose Python was pruned is not a
+    published command: reporting it as one lets the caller replace healthy PATH launchers with
+    forwarders to it (Prism 265fc36efda1, 2a8ad7804198).
     """
-    if not target.exists():  # missing, or a dangling symlink
+    if not (target.is_file() and os.access(target, os.X_OK)):
         return False
     python = _shell_launcher_python(target)
     return python is None or python.is_file()
@@ -466,9 +467,11 @@ def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     if store_python is not None and not _is_windows():
         target = Path(out_dir) / name
         # A temp home may publish its own temporary output, never a real install's launcher.
-        # (The store dir, not store_python: the interpreter may be a symlink out of it.)
+        # (The store dir, not store_python: the interpreter may be a symlink out of it.
+        # out_dir, not target: the write replaces a symlinked entry, so classify where it
+        # lives, not where it points; Prism 4deaff8b0b6d.)
         if (_is_ephemeral_path(store_root(repo_root))
-                and not _is_ephemeral_path(repo_root) and not _is_ephemeral_path(target)):
+                and not _is_ephemeral_path(repo_root) and not _is_ephemeral_path(Path(out_dir))):
             import logging
 
             logging.getLogger(__name__).warning(

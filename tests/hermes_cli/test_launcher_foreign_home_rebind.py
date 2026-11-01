@@ -139,6 +139,39 @@ def test_tmp_home_reports_a_dead_shared_launcher_as_not_published(
     assert _bytes(path_bin) == healthy
 
 
+def test_tmp_home_reports_a_non_executable_shared_launcher_as_not_published(
+        install, ephemeral, tmp_path, monkeypatch):
+    """Prism 2a8ad7804198: a 0644 launcher with a live interpreter is not a published command."""
+    repo, local, _ = install
+    healthy_python = _store(tmp_path / "other-live")
+    path_bin = tmp_path / "path-bin"
+    path_bin.mkdir()
+    for name in _launchers.ENTRY_POINTS:
+        _launchers.mint_launcher(name, repo, path_bin, healthy_python, None)
+    healthy = _bytes(path_bin)
+    (local / "hermes").chmod(0o644)
+    test_home = ephemeral / "home"
+    _store(test_home)
+    monkeypatch.setenv("HERMES_HOME", str(test_home))
+    assert _launchers.stage_launcher("hermes", repo, local) is None
+    assert "hermes" not in _launchers.ensure_install_launchers(repo, path_bin)
+    assert _bytes(path_bin) == healthy
+
+
+def test_tmp_home_never_replaces_a_shared_entry_symlinked_into_tmp(
+        install, ephemeral, monkeypatch):
+    """Prism 4deaff8b0b6d: classify where the entry lives, not where its symlink points."""
+    repo, local, _ = install
+    entry = local / "hermes"
+    entry.unlink()
+    entry.symlink_to(ephemeral / "old-hermes")
+    test_home = ephemeral / "home"
+    _store(test_home)
+    monkeypatch.setenv("HERMES_HOME", str(test_home))
+    assert _launchers.stage_launcher("hermes", repo, local) is None
+    assert entry.is_symlink() and os.readlink(entry) == str(ephemeral / "old-hermes")
+
+
 def test_tmp_home_can_publish_its_own_isolated_launcher(install, ephemeral, monkeypatch):
     repo, local, _ = install
     before = _bytes(local)
