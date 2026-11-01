@@ -18,9 +18,7 @@ default/aegis), these events enqueue one handoff turn into it:
     with a stale heartbeat;
 (d) ``completed`` of a card that was the LAST ``blocks`` parent of one or more
     open children;
-(e) ``review_requested`` whose fleet PR is red (a failed check-run) or dirty; a red
-    the fleet's main-red watcher proved is inherited from the base branch carries
-    ``inherited-from-main <sha>`` (t_85639cbc), so the owner fixes main, not the PR;
+(e) ``review_requested`` whose fleet PR is red (a failed check-run) or dirty;
 (f) ``skipped_nonspawnable`` right after a ``schedule_elapsed`` (t_affb1951): the
     scheduled wake fired on a card whose assignee the dispatcher never spawns
     (apollo / human:*). The dispatcher writes that event once per wake, so this is
@@ -204,56 +202,8 @@ def label_pending(health: Optional[dict]) -> bool:
     return all(v is True for v in verdicts)
 
 
-# t_85639cbc: the fleet's main-red watcher (hermes-home scripts/main-red-summary.py, lib main_red_gate.py) writes
-# <fleet root>/state/main-red-inherited.json every 5 min while the base branch is red on a gate lint: per open PR
-# head, the failed (workflow|job|step) keys it shares with main (`inherited`) and its own (`own`). Same predicate as
-# hermes-home main_red_gate.pr_red_kind, which the merge pass and the overview's "Blocked by main" read.
-MAIN_RED_STATE = "main-red-inherited.json"
-MAIN_RED_FRESH_S = 1800
-
-
-def main_red_inherited(state: Optional[dict], repo: str, number: int, head: str, failing: list,
-                       now: Optional[float] = None, failing_ids: Optional[list] = None) -> Optional[str]:
-    """The base-branch sha this PR's red is inherited from, or None. Inherited only when the watcher's state is
-    fresh, names this exact head, the PR has NO red step of its own, every failing check is a job main fails, AND
-    every failing check-run id is one the watcher judged (``red_ids``): a check re-run on the same head after the
-    snapshot can fail a PR-specific step under the same job name, and is never labelled inherited."""
-    now = time.time() if now is None else now
-    if not isinstance(state, dict) or not state.get("open") or str(state.get("repo") or "").lower() != repo.lower():
-        return None
-    try:
-        if now - float(state.get("as_of") or 0) > MAIN_RED_FRESH_S:
-            return None
-    except (TypeError, ValueError):
-        return None
-    v = (state.get("prs") or {}).get(str(number))
-    if not isinstance(v, dict) or not head or v.get("head") != head or not v.get("done") or v.get("own"):
-        return None
-    jobs = {str(k).split("|")[1] for k in v.get("inherited") or [] if str(k).count("|") >= 2}
-    if not jobs or not failing or not set(failing) <= jobs:
-        return None
-    try:
-        judged = {int(i) for i in v.get("red_ids") or []}
-        ids = [int(i) for i in failing_ids or []]
-    except (TypeError, ValueError):
-        return None
-    if not ids or len(ids) != len(failing) or not set(ids) <= judged:
-        return None
-    return str((state.get("episode") or {}).get("sha") or "") or None
-
-
-def _read_main_red_state() -> Optional[dict]:
-    from hermes_constants import get_default_hermes_root
-
-    try:
-        return json.loads((get_default_hermes_root() / "state" / MAIN_RED_STATE).read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return None
-
-
 def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
-    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown).
-    An inherited red reads ``"red (inherited-from-main <sha>: fix main, not this PR): a, b"``."""
+    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown)."""
     if not health or str(health.get("state") or "").lower() != "open":
         return None
     parts = []
@@ -262,10 +212,7 @@ def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
     failing = [f"{n} <{u}>" if u else str(n)
                for n, u in zip(names, urls + [""] * (len(names) - len(urls))) if n]
     if failing:
-        inh = health.get("inherited_from_main")
-        head = f"red (inherited-from-main {str(inh)[:9]}: fix main, not this PR; clears when main is green): " \
-            if inh else "red: "
-        parts.append(head + ", ".join(failing[:6]))
+        parts.append("red: " + ", ".join(failing[:6]))
     if str(health.get("mergeable_state") or "").lower() == "dirty":
         parts.append("dirty (merge conflict)")
     return "; ".join(parts) or None
@@ -483,9 +430,6 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         out["failing"] = [str(r.get("name") or "?") for r in red]
         # the run each verdict came from, so the wake is verifiable in one click (t_121bd42e)
         out["failing_urls"] = [str(r.get("html_url") or "") for r in red]
-        if red:
-            out["inherited_from_main"] = main_red_inherited(_read_main_red_state(), repo, number, sha, out["failing"],
-                                                            failing_ids=[r.get("id") for r in red])
         if red and REVIEW_LABEL not in [x.strip().lower() for x in out["labels"]] and any(_LABEL_GATE_RE.match(n) for n in out["failing"]) \
                 and all(_LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in out["failing"]):
             # only when label_pending could hold: verify EVERY failing run's own annotations (unreadable -> False)
@@ -520,10 +464,8 @@ def red_key(task_id: str, ref: str, health: dict) -> str:
 def handback_pr_verdict(kb: Any, conn: Any, task: dict, payload: Optional[dict],
                         run_id: Optional[int], pr_health: Optional[PrHealthFn],
                         memo: dict) -> dict:
-    """``{"state": str|None, "keys": [red_key...], "inherited_only": bool}`` for a review handback.
-    ``inherited_only``: every bad PR is red ONLY on checks main fails at the same head (no own red,
-    not dirty), so the owner has nothing to do on the PR (S5). Raises :class:`PrHealthUnknown`."""
-    out = {"state": None, "keys": [], "inherited_only": False}
+    """``{"state": str|None, "keys": [red_key...]}`` for a review handback. Raises :class:`PrHealthUnknown`."""
+    out = {"state": None, "keys": []}
     if pr_health is None:
         return out
     from hermes_cli import kanban_open_pr as _op
@@ -537,7 +479,7 @@ def handback_pr_verdict(kb: Any, conn: Any, task: dict, payload: Optional[dict],
             meta = None
     refs = _op.extract_pr_refs((payload or {}).get("summary"), task.get("result"),
                                metadata=meta if isinstance(meta, dict) else None)
-    states, inherited = [], []
+    states = []
     for ref in refs:
         if not _op.is_fleet_ref(ref):
             continue
@@ -555,10 +497,7 @@ def handback_pr_verdict(kb: Any, conn: Any, task: dict, payload: Optional[dict],
             label = f"{ref.repo}#{ref.number}"
             states.append(f"{label} {bad}")
             out["keys"].append(red_key(str(task.get("id") or ""), label, health))
-            inherited.append(bool(health.get("inherited_from_main"))
-                             and str(health.get("mergeable_state") or "").lower() != "dirty")
     out["state"] = "; ".join(states) or None
-    out["inherited_only"] = bool(inherited) and all(inherited)
     return out
 
 
@@ -665,15 +604,14 @@ def _record_noise(card: dict, items: list[dict], why: str) -> list[dict]:
 
 def actionable_red_items(card: dict, items: list[dict], status: Optional[str],
                          seen: dict) -> list[dict]:
-    """S5: red handbacks minus the non-actionable ones (inherited-only red, a (card, PR, head,
-    red-set) that already woke, a card no longer in review). Withheld ones get a receipt.
+    """S5: red handbacks minus the non-actionable ones (a (card, PR, head, red-set) that already
+    woke, a card no longer in review). Withheld ones get a receipt.
     Blocking; worker thread."""
     keep, noise = [], {}
     for i in items:
         why = None
         if i.get("trigger") == TRIGGER_RED_HANDBACK:
-            why = _ns.red_handback_noise(i.get("red_keys") or (), bool(i.get("inherited_only")),
-                                         seen, status)
+            why = _ns.red_handback_noise(i.get("red_keys") or (), seen, status)
         if why:
             noise.setdefault(why, []).append(i)
         else:
@@ -877,7 +815,7 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
         if not verdict["state"]:
             return None
         item.update(trigger=TRIGGER_RED_HANDBACK, pr_state=verdict["state"],
-                    red_keys=verdict["keys"], inherited_only=verdict["inherited_only"])
+                    red_keys=verdict["keys"])
     elif kind == "review_deadman":
         # t_1e0ffee4: the review deadman's tier-1 page as an event (hermes-home kanban-review-deadman.py)
         item.update(trigger=TRIGGER_REVIEW_DEADMAN, waiting_min=(payload or {}).get("waiting_min"))
