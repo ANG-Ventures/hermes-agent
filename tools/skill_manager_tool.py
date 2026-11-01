@@ -664,17 +664,25 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 
 # --- Core actions -------------------------------------------------------------
 
-def _create_skill(name: str, content: str, category: str = None, *, local: bool = False) -> Dict[str, Any]:
+def _create_skill(name: str, content: str, category: str = None, *, local: bool = False,
+                  justification: Optional[str] = None) -> Dict[str, Any]:
     """Create a new user skill. By default (when a git-backed skills-shared/ tree exists) authors
     into skills-shared/<group>/ so the skill is backed up and fleet-shareable; ``local=True`` for a
     genuine single-agent skill in the gitignored local tree. Validation runs BEFORE mkdir, so a
-    frontmatter/size failure can never leave an orphan directory behind on either tree."""
+    frontmatter/size failure can never leave an orphan directory behind on either tree.
+    A near-duplicate of an existing skill is refused unless ``justification`` says why it is distinct
+    (tools/skill_manager_neardup.py)."""
     if err := (_validate_name(name) or _validate_category(category)
                or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
         return _err(err)
     # Name collisions across all directories AND every shared group (subscribed or not).
     if existing := _find_existing_skill_anywhere(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
+    from tools import skill_manager_neardup as _neardup
+    refusal, payload, content, neardup_row = _neardup.check_create(
+        name, content, justification, shared_root=_shared_skills_root(), profile=_active_profile_name())
+    if refusal:
+        return _err(refusal, **payload)
     # A bad/missing group in shared mode fails loud here, BEFORE any directory is created.
     try:
         skill_dir = _resolve_skill_dir(name, category, local=local)
@@ -706,6 +714,7 @@ def _create_skill(name: str, content: str, category: str = None, *, local: bool 
     root = _shared_skills_root() if authored_shared else _skills_dir()
     display = skill_dir.relative_to(root) if skill_dir.is_relative_to(root) else skill_dir
     _record_create_metric(name, category, shared=authored_shared)
+    _neardup.record_justified(neardup_row, _shared_skills_root())
     result = {
         "success": True, "message": f"Skill '{name}' created.", "path": str(display),
         "skill_md": str(skill_md), "_change": {"description": _description_preview(content)},
@@ -931,7 +940,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 
 
 _FLAT_OP_KEYS = ("content", "category", "file_path", "file_content", "old_string", "new_string",
-                 "absorbed_into", "local", "operations")
+                 "absorbed_into", "local", "justification", "operations")
 
 
 def _skill_manage_from(payload: Dict[str, Any], **extra) -> str:
@@ -999,7 +1008,8 @@ def _act_patch(a):
 # action -> handler(args dict) returning a result dict, or a tool_error JSON string for
 # argument-shape errors. "edit" is a legacy alias for a full rewrite (not in the schema).
 _ACTION_HANDLERS = {
-    "create": lambda a: _create_skill(a["name"], a["content"], a["category"], local=bool(a.get("local"))),
+    "create": lambda a: _create_skill(a["name"], a["content"], a["category"], local=bool(a.get("local")),
+                                      justification=a.get("justification")),
     "edit": lambda a: _edit_skill(a["name"], a["content"]),
     "patch": _act_patch,
     "delete": lambda a: _delete_skill(a["name"], absorbed_into=a["absorbed_into"]),
@@ -1051,7 +1061,7 @@ def skill_manage(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
     replace_all: bool = False, absorbed_into: str = None, local: bool = False, task_id: str = None,
-    session_id: str = None, operations=None) -> str:
+    session_id: str = None, operations=None, justification: str = None) -> str:
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
     if operations is not None:
@@ -1063,7 +1073,8 @@ def skill_manage(
     # of origin; bypassed when replaying an approved staged write.
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
                 old_string=old_string, new_string=new_string, replace_all=replace_all,
-                absorbed_into=absorbed_into, local=True if local else None)
+                absorbed_into=absorbed_into, local=True if local else None,
+                justification=justification)
     if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
         return gate_result
     if (shape_err := _op_shape_error(action, args)) is not None:
@@ -1179,6 +1190,11 @@ SKILL_MANAGE_SCHEMA = {
                                       "authored into skills-shared/<category>/ (git-backed, shared across "
                                       "agents). Set true ONLY for a genuine single-agent skill in the local "
                                       "(gitignored, not-backed-up) tree.")},
+                        "justification": {"type": "string",
+                                          "description": (
+                                              "Only after a create was refused as a near-duplicate: why this "
+                                              "skill is distinct from the listed matches. Recorded in its "
+                                              "frontmatter (metadata.hermes.distinct_from).")},
                     }, ("content",)),
                     _op_schema("patch", {
                         "old_string": _OLD_STRING, "new_string": _NEW_STRING,

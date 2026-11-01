@@ -422,7 +422,8 @@ async def create_skill(body: SkillCreate):
     from tools.skill_manager_tool import _create_skill
 
     result = await scoped_to_thread(
-        body.profile, lambda: _create_skill(body.name, body.content, body.category or None))
+        body.profile, lambda: _create_skill(body.name, body.content, body.category or None,
+                                            justification=body.justification))
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to create skill."))
     _clear_skills_prompt_cache()
