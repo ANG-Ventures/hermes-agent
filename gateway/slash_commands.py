@@ -714,7 +714,8 @@ class GatewaySlashCommandsMixin(
                 # --board after the verb); the card itself says where it landed (Prism 35e770f2b096).
                 from pathlib import Path
                 from hermes_cli import kanban_db_board_registry as _kbr
-                conn = _kbc.connect(db_path=Path(_kbr.locate(task_id)[1]))
+                # locate() returns a pin raw; expand ~ as kanban_db_path() does (Prism ab54f29e6449).
+                conn = _kbc.connect(db_path=Path(_kbr.locate(task_id)[1]).expanduser())
             try:
                 _kbn.add_notify_sub(
                     conn, task_id=task_id, platform=platform_str, chat_id=chat_id, chat_type=chat_type,
