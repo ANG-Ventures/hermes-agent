@@ -172,6 +172,27 @@ def test_tmp_home_never_replaces_a_shared_entry_symlinked_into_tmp(
     assert entry.is_symlink() and os.readlink(entry) == str(ephemeral / "old-hermes")
 
 
+def test_tmp_home_reports_a_dead_shebang_console_script_as_not_published(
+        install, ephemeral, tmp_path, monkeypatch):
+    """Prism 2a8ad7804198: an executable legacy script whose shebang interpreter is gone is not a launcher."""
+    repo, local, _ = install
+    healthy_python = _store(tmp_path / "other-live")
+    path_bin = tmp_path / "path-bin"
+    path_bin.mkdir()
+    for name in _launchers.ENTRY_POINTS:
+        _launchers.mint_launcher(name, repo, path_bin, healthy_python, None)
+        (local / name).unlink()
+        (local / name).write_text("#!/deleted/venv/bin/python\nimport sys\n")
+        (local / name).chmod(0o755)
+    healthy = _bytes(path_bin)
+    test_home = ephemeral / "pytest-of-ace" / "home"
+    _store(test_home)
+    monkeypatch.setenv("HERMES_HOME", str(test_home))
+    assert _launchers.stage_launcher("hermes", repo, local) is None
+    assert _launchers.ensure_install_launchers(repo, path_bin) == []
+    assert _bytes(path_bin) == healthy
+
+
 def test_tmp_home_can_publish_its_own_isolated_launcher(install, ephemeral, monkeypatch):
     repo, local, _ = install
     before = _bytes(local)

@@ -457,7 +457,9 @@ def _launcher_usable(target: Path) -> bool:
     if not (target.is_file() and os.access(target, os.X_OK)):
         return False
     python = _shell_launcher_python(target)
-    return python is None or python.is_file()
+    # An unrecognized launcher (legacy console script, foreign shebang) proves nothing: unpublished
+    # is the safe answer, it only stops publication (Prism 2a8ad7804198, dead shebang).
+    return python is not None and python.is_file()
 
 
 def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
