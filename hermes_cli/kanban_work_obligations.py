@@ -331,6 +331,7 @@ def open_obligation(conn: sqlite3.Connection, task_id: str, source_key: str, *,
 def claim(conn: sqlite3.Connection, ob_id: str, *, session: str, now: Optional[int] = None,
           lease_s: Optional[int] = None, expected_gen: Optional[int] = None,
           non_home: bool = False) -> Obligation:
+    require_operator_authority("claim")
     t = _now(now)
     with kb.write_txn(conn):
         ob = _load_for_cas(conn, ob_id, expected_gen)
@@ -378,6 +379,7 @@ def set_executor(conn: sqlite3.Connection, ob_id: str, holder_ref: str, *, rule:
 
     The binding is written ONCE: a ``holder_ref`` already bound to another row, or a row already
     held by another ``holder_ref``, is refused (P6-RC4: never retargeted)."""
+    require_operator_authority("executor")
     t = _now(now)
     ref = (holder_ref or "").strip()
     if not ref:
@@ -408,12 +410,13 @@ def _check_binding_free(conn: sqlite3.Connection, ob: Obligation, ref: str) -> N
 def release_executor(conn: sqlite3.Connection, ob_id: str, *, now: Optional[int] = None,
                      expected_gen: Optional[int] = None, why: str = "") -> Obligation:
     """The bound job ended with an outcome that opens no row: the decision is pending again.
-    ``bound_ref`` keeps the binding; ``holder_kind`` returns to operator."""
+    ``bound_ref`` keeps the binding; ``holder_kind`` returns to operator and ``holder_ref`` clears."""
+    require_operator_authority("release")
     t = _now(now)
     with kb.write_txn(conn):
         ob = _load_for_cas(conn, ob_id, expected_gen)
         _require_state(ob, OPEN_EXECUTOR, verb="release")
-        _cas(conn, ob, t, state=OPEN_UNCLAIMED, holder_kind="operator", state_since=t)
+        _cas(conn, ob, t, state=OPEN_UNCLAIMED, holder_kind="operator", holder_ref=None, state_since=t)
         kb._append_event(conn, ob.task_id, "obligation_released",
                          {"id": ob.id, "holder_ref": ob.holder_ref, "why": why[:300]})
         return get(conn, ob_id)
@@ -493,6 +496,8 @@ def resolve(conn: sqlite3.Connection, ob_id: str, resolution: str, *, now: Optio
             non_home: bool = False) -> Obligation:
     t = _now(now)
     res = validate_resolution(resolution)
+    if resolution_kind(res) in OPERATOR_RESOLUTIONS:
+        require_operator_authority(f"resolve {resolution_kind(res)}:")
     with kb.write_txn(conn):
         ob = _load_for_cas(conn, ob_id, expected_gen)
         _require_state(ob, *OPEN_STATES, verb="resolve")
@@ -529,6 +534,7 @@ def supersede(conn: sqlite3.Connection, ob_id: str, successor_source_key: str, *
 
     If the CAS on ``ob_id`` fails, nothing commits (successor included); the caller retries next
     tick. It never falls back to ``open_unclaimed`` (P6-RC8)."""
+    require_operator_authority("supersede")
     t = _now(now)
     with kb.write_txn(conn):
         ob = _load_for_cas(conn, ob_id, expected_gen)
@@ -754,6 +760,27 @@ def operator_refusal(actor: Actor) -> Optional[str]:
     if not session_in_operator_state(actor.session):
         return f"session {actor.session} is not in any operator profile's state.db"
     return None
+
+
+def require_operator_authority(verb: str) -> None:
+    """Gate for the restricted public mutators, checked INSIDE them so a direct import gets no
+    more authority than the CLI: no worker (env marker or process ancestry, fail closed) AND a
+    positive operator proof, ``kanban_identity.operator_label_proven`` (operator token, or a live
+    operator gateway ancestor with no dispatched worker between). An orphaned setsid helper has
+    neither, so it is refused."""
+    from hermes_cli import kanban_identity as ki
+
+    actor = current_actor()
+    why = worker_refusal(actor)
+    if why:
+        raise ObligationRefused(f"{verb} refused: {why}")
+    name = actor.profile if actor.profile in kb.OPERATOR_PROFILES else None
+    if kb._operator_token_state() == "ok":
+        return
+    if name and ki.operator_label_proven(name):
+        return
+    raise ObligationRefused(f"{verb} refused: no operator proof ({kb.OPERATOR_TOKEN_ENV} or a live "
+                            "operator gateway ancestor with no worker between)")
 
 
 def is_home_session(conn: sqlite3.Connection, task_id: str, session: Optional[str]) -> bool:

@@ -30,9 +30,9 @@ Refusals print `obligation: <why>` on stderr.
 | `resolve <id> <resolution> [--expected-gen G]` | `handed:*` / `dropped:*`: operator only. Observed outcomes: any non-worker | any open state -> `resolved` |
 | `receipt <id> --wake-outcome O` | any (drainer, reconciler) | ONLY `wake_attempts`, `first_wake_at`, `last_wake_at`, `last_wake_outcome`. Never `state`, never `holder_gen` |
 | `bind <card> --lands yes\|no [--job-name J] [--repo O/R --pr N] [--obligation ID] [--worker-owned] [--holder-ref R]` | anyone, read-only | nothing. Prints the binding decision (below); rc 2 when refused |
-| `executor <id> --holder-ref R [--rule X] [--expected-gen G]` | non-worker | `open_unclaimed`/`open_claimed` -> `open_executor`. The binding is written ONCE to `bound_ref` (unique across the board), which release, claim, expiry and board transfer never clear: rc 2 if R is bound to another row or the row to another R |
-| `release <id> [--why W] [--expected-gen G]` | non-worker | `open_executor` -> `open_unclaimed` (bound job ended opening no row: `--stop`, signal, `=ok`, queue row retired other than merged) |
-| `supersede <id> --successor-key K [--created-at E] [--summary S] [--repo/--pr/--job-name] [--expected-gen G]` | non-worker | ONE transaction: open K (idempotent) AND resolve `<id>` as `superseded:K`. A lost CAS commits nothing (successor included) and never falls back to `open_unclaimed` |
+| `executor <id> --holder-ref R [--rule X] [--expected-gen G]` | non-worker with operator proof | `open_unclaimed`/`open_claimed` -> `open_executor`. The binding is written ONCE to `bound_ref` (unique across the board), which release, claim, expiry and board transfer never clear: rc 2 if R is bound to another row or the row to another R |
+| `release <id> [--why W] [--expected-gen G]` | non-worker with operator proof | `open_executor` -> `open_unclaimed` (bound job ended opening no row: `--stop`, signal, `=ok`, queue row retired other than merged). Clears `holder_ref`; `bound_ref` keeps the binding |
+| `supersede <id> --successor-key K [--created-at E] [--summary S] [--repo/--pr/--job-name] [--expected-gen G]` | non-worker with operator proof | ONE transaction: open K (idempotent) AND resolve `<id>` as `superseded:K`. A lost CAS commits nothing (successor included) and never falls back to `open_unclaimed` |
 | `expire` | non-worker | every `open_claimed` row past `claim_expires` -> `open_unclaimed`, claimed time banked AT `claim_expires`, `lease_expiries + 1` |
 | `list [--card T] [--open]` | anyone | nothing |
 | `audit [--card T]` | anyone | nothing; rc 1 when any open row's `bound_violation` is set (computed from the clocks vs policy, independent of `escalated_at`: an acknowledged escalation is still overdue) |
@@ -58,6 +58,17 @@ run on the caller's ancestry with an unverifiable fingerprint (`unverified`), an
 ancestry or board, a live run whose CURRENT process fingerprint is unavailable, or an exception
 refuses claim/resolve with "worker ancestry indeterminate".
 The profile compare is byte-exact (`Default` is not `default`).
+
+Mutator-level proof (the Python API, not only the CLI): `claim`, `set_executor` (`executor`),
+`release_executor` (`release`), `supersede`, and `resolve` with `handed:`/`dropped:` call
+`require_operator_authority` INSIDE the function, so a direct import gets no more authority than
+the CLI. It refuses (rc 2, `ObligationRefused`) on any worker marker or worker ancestry (above),
+and otherwise requires a POSITIVE operator proof: `KANBAN_OPERATOR_TOKEN` matching
+`<root>/kanban/operator-token`, or `kanban_identity.operator_label_proven(<operator profile>)` (a
+live operator gateway ancestor with no dispatched worker between). Operator env alone (profile +
+session) is not proof; an orphaned setsid'd helper has neither and is refused. In-process callers
+that mutate legitimately (reconciler, drainer) run with the token. `open`, `progress`, `receipt`,
+`expire` and observed-outcome resolves are not gated here.
 
 A claim from a session that is not the card's home is accepted and returned with
 `"non_home": true` (the `obligation_claimed` event carries it). A `dropped:*` resolve and any

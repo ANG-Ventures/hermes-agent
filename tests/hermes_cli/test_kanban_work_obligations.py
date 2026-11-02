@@ -31,6 +31,7 @@ WORKER_MARKERS = ob.WORKER_ENV_MARKERS + ("HERMES_KANBAN_DB", "HERMES_KANBAN_OWN
 # fork never parses job text (Apollo ruling, Prism round 2 on #2533).
 LANDER = True
 WATCHER = False
+TOKEN = "obligations-drill-operator-token"
 
 
 @pytest.fixture
@@ -43,6 +44,11 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for m in WORKER_MARKERS + ("OBLIGATIONS",):
         monkeypatch.delenv(m, raising=False)
     kb.create_board(BOARD)
+    # In-process mutators (reconciler, drainer) run with the operator token; the authority
+    # tests below remove it.
+    (h / "kanban").mkdir(exist_ok=True)
+    kb.operator_token_path().write_text(TOKEN)
+    monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, TOKEN)
     return h
 
 
@@ -182,6 +188,8 @@ def test_executor_suspends_the_clock_and_release_resumes_it(conn):
     assert ob.escalation_due(a, T0 + 99_999) is None               # 27 h under a lander: no page
     a = ob.release_executor(conn, a.id, now=T0 + 99_999, why="operator --stop")
     assert a.state == ob.OPEN_UNCLAIMED and a.unclaimed_s == 300 and a.state_since == T0 + 99_999
+    # 08c3db594e35: the holder is gone, the binding is kept.
+    assert a.holder_ref is None and a.holder_kind == "operator" and a.bound_ref == "land-8012l-9"
 
 
 def test_resolve_needs_a_real_resolution(conn):
@@ -365,7 +373,8 @@ def test_cas_race_claim_vs_repair_exactly_one_wins(conn, home, tmp_path):
     a, _ = ob.open_obligation(conn, tid, "detached:race", now=T0)
     go = tmp_path / "go"
     env = {k: v for k, v in os.environ.items() if k not in WORKER_MARKERS}
-    env.update(HERMES_HOME=str(home), HOME=str(tmp_path), PYTHONPATH=str(REPO_ROOT))
+    env.update(HERMES_HOME=str(home), HOME=str(tmp_path), PYTHONPATH=str(REPO_ROOT),
+               KANBAN_OPERATOR_TOKEN=TOKEN)
     procs = [subprocess.Popen([sys.executable, "-c", _RACER, who, a.id, str(a.holder_gen), str(go)],
                               env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                               cwd=REPO_ROOT)
@@ -385,7 +394,7 @@ def test_cas_race_claim_vs_repair_exactly_one_wins(conn, home, tmp_path):
 def _cli(home: Path, tmp_path: Path, *argv: str, env_extra=None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in WORKER_MARKERS}
     env.update(HERMES_HOME=str(home), HOME=str(tmp_path), PYTHONPATH=str(REPO_ROOT),
-               HERMES_KANBAN_SANDBOX="1")
+               HERMES_KANBAN_SANDBOX="1", KANBAN_OPERATOR_TOKEN=TOKEN)
     env.update(env_extra or {})
     return subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", "--board", BOARD,
                            "obligation", *argv], env=env, capture_output=True, text=True,
@@ -661,3 +670,87 @@ def test_executor_after_an_unswept_expiry_keeps_the_unclaimed_time(conn):
     a = ob.release_executor(conn, a.id, now=T0 + 3660)
     assert (a.claimed_s, a.unclaimed_s, a.lease_expiries) == (1800, 1800, 1)
     assert ob.escalation_due(a, T0 + 3660) == "unclaimed >= escalate_min (30 min)"
+
+
+# --- Prism round 3 on #2533 (Apollo 03:1x: authority inside the mutators, cascade, release) -----
+
+_RESTRICTED = (
+    ("claim", lambda c, i: ob.claim(c, i, session="s-op", now=T0 + 1)),
+    ("executor", lambda c, i: ob.set_executor(c, i, "run-x", rule="explicit", now=T0 + 1)),
+    ("resolve dropped:", lambda c, i: ob.resolve(c, i, "dropped:dupe", now=T0 + 1)),
+    ("resolve handed:", lambda c, i: ob.resolve(c, i, "handed:ace", now=T0 + 1)),
+    ("supersede", lambda c, i: ob.supersede(c, i, "blocked:9", now=T0 + 1)),
+)
+
+
+@pytest.mark.parametrize("verb,call", _RESTRICTED, ids=[v for v, _ in _RESTRICTED])
+def test_direct_import_from_a_worker_is_refused_inside_the_mutator(conn, home, monkeypatch, verb, call):
+    """c1b6fe03cdb8: a direct import with HERMES_KANBAN_TASK set gets no more than the CLI,
+    even holding the operator token."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:w", now=T0)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    with pytest.raises(ob.ObligationRefused, match="worker-run marker"):
+        call(conn, a.id)
+    assert ob.get(conn, a.id).state == ob.OPEN_UNCLAIMED and ob.get(conn, a.id).holder_gen == 0
+
+
+def test_release_from_a_worker_is_refused_inside_the_mutator(conn, home, monkeypatch):
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:w", now=T0)
+    ob.set_executor(conn, a.id, "run-1", rule="explicit", now=T0 + 1)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    with pytest.raises(ob.ObligationRefused, match="worker-run marker"):
+        ob.release_executor(conn, a.id, now=T0 + 2)
+    assert ob.get(conn, a.id).state == ob.OPEN_EXECUTOR
+
+
+@pytest.mark.parametrize("verb,call", _RESTRICTED, ids=[v for v, _ in _RESTRICTED])
+def test_no_token_and_no_live_operator_gateway_is_refused(conn, home, monkeypatch, verb, call):
+    """849c3be13734: operator env (profile + a session in an operator state.db) is not proof."""
+    _operator_state_db(home, "s-op")
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setenv("HERMES_SESSION_ID", "s-op")
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:w", now=T0)
+    with pytest.raises(ob.ObligationRefused, match="no operator proof"):
+        call(conn, a.id)
+    assert ob.get(conn, a.id).state == ob.OPEN_UNCLAIMED
+    ob.resolve(conn, a.id, "merged:abc", now=T0 + 2)   # an observed outcome needs no proof
+
+
+_ORPHAN = textwrap.dedent("""
+    from hermes_cli import kanban_db_connect as kbc, kanban_work_obligations as ob
+    import sys
+    conn = kbc.connect(board="obligations-drill")
+    try:
+        ob.resolve(conn, sys.argv[1], "dropped:orphan helper")
+        print("RESOLVED")
+    except ob.ObligationRefused as exc:
+        print("REFUSED", exc)
+""")
+
+
+def test_setsid_orphan_helper_without_token_cannot_drop(conn, home, tmp_path):
+    """849c3be13734 repro: a setsid'd helper (no worker ancestor, no token, no live operator
+    gateway) setting operator env is refused by the mutator itself."""
+    _operator_state_db(home, "s-op")
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:orphan", now=T0)
+    env = {k: v for k, v in os.environ.items() if k not in WORKER_MARKERS + (kb.OPERATOR_TOKEN_ENV,)}
+    env.update(HERMES_HOME=str(home), HOME=str(tmp_path), PYTHONPATH=str(REPO_ROOT),
+               HERMES_KANBAN_SANDBOX="1", HERMES_PROFILE="default", HERMES_SESSION_ID="s-op")
+    r = subprocess.run([sys.executable, "-c", _ORPHAN, a.id], env=env, capture_output=True, text=True,
+                       cwd=REPO_ROOT, timeout=120, start_new_session=True)
+    assert r.stdout.startswith("REFUSED") and "no operator proof" in r.stdout, (r.stdout, r.stderr)
+    assert ob.get(conn, a.id).state == ob.OPEN_UNCLAIMED
+
+
+def test_hard_delete_of_a_card_leaves_no_obligation_row(conn):
+    """69225d94e7a7: the delete cascade includes obligations."""
+    tid = _card(conn)
+    ob.open_obligation(conn, tid, "detached:gone", now=T0)
+    kb.archive_task(conn, tid)
+    assert kb.delete_archived_task(conn, tid)
+    assert conn.execute("SELECT count(*) FROM obligations WHERE task_id = ?", (tid,)).fetchone()[0] == 0
