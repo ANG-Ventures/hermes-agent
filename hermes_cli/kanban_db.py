@@ -18571,10 +18571,44 @@ def _member_birth(pid: int) -> Optional[float]:
 # Boot epoch for _ownership_birth, measured ONCE (like psutil's cached btime) so
 # repeated reads of one process return the same value. Unlike /proc/stat btime
 # it is not floored to an integer second.
-_BOOT_EPOCH = (
-    time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
+#
+# The epoch is wall - BOOTTIME at one instant, but the two clocks are read at
+# two instants, and a pause between the reads shifts the epoch by its length
+# (Prism 43625d259e07: wall first, then a 500 ms pause, backdates every birth
+# by 500 ms and a recycled session passes ownership). So each sample BRACKETS
+# the wall read between two BOOTTIME reads: the true BOOTTIME at the wall read
+# lies in [b1, b2], so the epoch is wall - (b1 + b2) / 2, give or take
+# (b2 - b1) / 2. We keep the tightest of a bounded number of samples and add
+# its measured half-span to the early-read margin below. A span that never
+# gets under _BOOT_EPOCH_MAX_SPAN_S gives no precise epoch: psutil, 2 s margin.
+_BOOT_EPOCH_SAMPLES = 32
+_BOOT_EPOCH_MAX_SPAN_S = 0.005
+
+
+def _sample_boot_epoch(
+    wall=time.time, boot=lambda: time.clock_gettime(time.CLOCK_BOOTTIME),
+) -> Optional[tuple[float, float]]:
+    """``(epoch, uncertainty)`` from the tightest bracketed sample, or None."""
+    best: Optional[tuple[float, float]] = None
+    for _ in range(_BOOT_EPOCH_SAMPLES):
+        b1 = boot()
+        w = wall()
+        b2 = boot()
+        span = b2 - b1
+        if span < 0:
+            continue
+        if best is None or span / 2 < best[1]:
+            best = (w - (b1 + b2) / 2, span / 2)
+    if best is None or best[1] * 2 > _BOOT_EPOCH_MAX_SPAN_S:
+        return None
+    return best
+
+
+_BOOT_SAMPLE = (
+    _sample_boot_epoch()
     if sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME") else None
 )
+_BOOT_EPOCH = None if _BOOT_SAMPLE is None else _BOOT_SAMPLE[0]
 
 
 def _ownership_birth(pid: int) -> Optional[float]:
@@ -18609,13 +18643,13 @@ _REAP_LINUX_CLOCK = sys.platform.startswith("linux") and hasattr(time, "CLOCK_BO
 _REAP_BIRTH_SLACK_SECONDS = (
     0.1 if _REAP_LINUX_CLOCK or sys.platform == "darwin" else 2.0
 )
-# The most an EPOCH birth (_member_birth, compared with the run's epoch event
-# times) can read early. Linux: _ownership_birth adds starttime to a boot
-# epoch measured once (not floored), so one starttime tick (10 ms) plus the
-# clock read; 0.02 s. macOS: microseconds from p_starttime. Unverified
-# platforms (psutil's integer btime): the same 2 s bound as above.
+# The most an EPOCH birth (_ownership_birth, compared with the run's epoch
+# event times) can read early. Linux with a precise boot epoch: one starttime
+# tick (10 ms) plus the epoch sample's MEASURED uncertainty (see
+# _sample_boot_epoch). macOS: microseconds from p_starttime. Otherwise
+# (psutil's integer btime): the same 2 s bound as above.
 _EPOCH_BIRTH_EARLY_S = (
-    0.02 if sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME")
+    0.01 + _BOOT_SAMPLE[1] if _BOOT_SAMPLE is not None
     else 0.01 if sys.platform == "darwin" else 2.0
 )
 

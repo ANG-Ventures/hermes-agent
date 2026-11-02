@@ -971,3 +971,42 @@ def test_ownership_birth_is_tick_precise_on_linux():
     finally:
         child.kill()
         child.wait()
+
+
+def test_boot_epoch_sample_never_backdates_across_a_pause():
+    """Prism 43625d259e07: a 500 ms pause between the two clock reads used to
+    shift the boot epoch 500 ms early (wall read, pause, BOOTTIME read). The
+    bracketed sample must either land within its stated uncertainty of the
+    truth or refuse to give a precise epoch."""
+    import itertools
+
+    true_epoch = 1_000_000.0
+    clock = {"boot": 500.0}
+
+    def boot():
+        clock["boot"] += 0.000_01
+        return clock["boot"]
+
+    pause_once = itertools.chain([0.5], itertools.repeat(0.0))
+
+    def wall():
+        w = true_epoch + clock["boot"]
+        clock["boot"] += next(pause_once)   # the pause lands right after a wall read
+        return w
+
+    got = kb._sample_boot_epoch(wall=wall, boot=boot)
+    assert got is not None
+    epoch, unc = got
+    assert abs(epoch - true_epoch) <= unc + 1e-9, (epoch - true_epoch, unc)
+    assert unc < 0.001
+
+
+def test_boot_epoch_sample_refuses_when_every_sample_is_paused():
+    """No tight sample: no precise epoch (psutil and the 2 s margin instead)."""
+    clock = {"boot": 500.0}
+
+    def boot():
+        clock["boot"] += 0.25   # every BOOTTIME read is 250 ms after the last
+        return clock["boot"]
+
+    assert kb._sample_boot_epoch(wall=lambda: 1_000_500.0, boot=boot) is None
