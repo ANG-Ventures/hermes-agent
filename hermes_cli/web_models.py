@@ -482,6 +482,7 @@ class SkillCreate(BaseModel):
     content: str
     category: Optional[str] = None
     profile: Optional[str] = None
+    justification: Optional[str] = None  # why a refused near-duplicate is distinct
 
 class SkillContentUpdate(BaseModel):
     name: str
