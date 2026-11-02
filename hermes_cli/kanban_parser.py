@@ -9,6 +9,7 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from hermes_cli import kanban_db as kb
@@ -151,6 +152,34 @@ def priority_value(text: str) -> int:
 
 _PRIORITY = _arg("--priority", type=priority_value, default=0,
                  help="Priority tiebreaker: int (higher = first) or p0..p3 (p0 = highest)")
+# Bands (hermes-home config/kanban-priority-bands.json, spec 2026-11-02, Ace Q1 A): a human's bare
+# `kanban create` lands at human_default (100 = p2), above every machine minter (those cap at 59 and pass
+# --created-by <minter> --priority band(...)). KANBAN_PRIORITY_BANDS=off restores the old default 0.
+HUMAN_DEFAULT_PRIORITY = 100
+HUMAN_CREATED_BY = "user"
+
+
+# A cron script, a dispatched worker or a TTY-less script that omits --created-by still records "user";
+# the minter-origin class (kb.classify_create_origin) keeps those at 0 so no machine minter lands above 59.
+_MINTER_ORIGINS = frozenset({kb.CREATE_ORIGIN_CRON, kb.CREATE_ORIGIN_WORKER, kb.CREATE_ORIGIN_SCRIPT})
+
+
+def create_default_priority(created_by: str | None, origin: str | None = None) -> int:
+    """The priority of a ``create`` with no ``--priority``: 100 for a human (no ``--created-by`` minter id, and
+    not a cron/worker/script process), else 0. Kill switch ``KANBAN_PRIORITY_BANDS=off`` -> 0 (read per call)."""
+    if (os.environ.get("KANBAN_PRIORITY_BANDS") or "").strip().lower() == "off":
+        return 0
+    if (created_by or HUMAN_CREATED_BY) != HUMAN_CREATED_BY:
+        return 0
+    return 0 if (origin or kb.classify_create_origin()) in _MINTER_ORIGINS else HUMAN_DEFAULT_PRIORITY
+
+
+_CREATE_PRIORITY = _arg(
+    "--priority", type=priority_value, default=None,
+    help="Dispatch priority, higher = first: int or tier p0=300 p1=200 p2=100 p3=0. Bands: ace_direct 300, "
+         "operator_fix 200, human_default 100, prism_sendback 60, pager_unowned 40, ci_red 30, "
+         "ci_housekeeping 0; a minter (--created-by <id>) stays <= 59. Default: 100 for a human, 0 for a "
+         "minter (KANBAN_PRIORITY_BANDS=off: 0).")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -330,7 +359,7 @@ _SPECS = [
                   "worktree under the project's primary repo with a "
                   "deterministic branch. See `hermes project list`."),
         _TENANT,
-        _PRIORITY,
+        _CREATE_PRIORITY,
         _arg("--triage", action="store_true",
              help="Park in triage — a specifier will flesh out the spec and promote to todo"),
         _arg("--idempotency-key",

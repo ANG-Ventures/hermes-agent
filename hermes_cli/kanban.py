@@ -43,6 +43,7 @@ from hermes_cli import kanban_access_bound_pin
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
 from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
+from hermes_cli.kanban_parser import create_default_priority
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
@@ -993,7 +994,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 branch_name=branch_name,
                 project_id=getattr(args, "project", None),
                 tenant=args.tenant,
-                priority=args.priority,
+                priority=(args.priority if args.priority is not None
+                          else create_default_priority(args.created_by)),
                 parents=tuple(args.parent or ()),
                 parents_kind=getattr(args, "parent_kind", None),
                 continues=getattr(args, "continues", None),
