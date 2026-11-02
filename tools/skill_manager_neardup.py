@@ -77,10 +77,17 @@ def add_distinct_from(content: str, entries: List[Dict[str, Any]]) -> str:
     end = _FRONTMATTER_END_RE.search(content[3:])
     body_start = 3 + end.start()  # validation already required the fence
     fm = yaml.safe_load(content[3:body_start]) or {}
-    meta = fm.get("metadata") if isinstance(fm.get("metadata"), dict) else {}
-    fm["metadata"] = meta
-    hermes = meta.get("hermes") if isinstance(meta.get("hermes"), dict) else {}
-    meta["hermes"] = hermes
+    # A non-mapping container is the author's data: refuse rather than replace it with {} (346629c28142).
+    meta = fm.get("metadata")
+    if meta is not None and not isinstance(meta, dict):
+        raise DistinctFromError(
+            f"metadata must be a mapping, got {type(meta).__name__}; fix it in the content and retry.")
+    meta = fm["metadata"] = meta or {}
+    hermes = meta.get("hermes")
+    if hermes is not None and not isinstance(hermes, dict):
+        raise DistinctFromError(
+            f"metadata.hermes must be a mapping, got {type(hermes).__name__}; fix it in the content and retry.")
+    hermes = meta["hermes"] = hermes or {}
     prior = hermes.get("distinct_from")
     if prior is not None and not isinstance(prior, list):
         raise DistinctFromError(

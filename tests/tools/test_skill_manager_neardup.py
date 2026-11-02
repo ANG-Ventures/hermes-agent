@@ -8,6 +8,7 @@ create path end to end (operations shape, flat shape, config, frontmatter, ledge
 """
 
 import json
+import pytest
 from contextlib import contextmanager
 from unittest.mock import patch
 
@@ -278,4 +279,28 @@ def test_justification_cannot_push_skill_md_past_the_size_limit(tmp_path):
         res = _create("pg-autovacuum", NEAR, justification="x" * 500)
         assert res["success"] is False, res
         assert "limit" in res["error"]
+        assert not (shared / "general" / "pg-autovacuum").exists()
+
+
+@pytest.mark.parametrize("frontmatter, field", [
+    ("metadata:\n  hermes: existing-value\n", "metadata.hermes"),
+    ("metadata: existing-value\n", "metadata"),
+])
+def test_non_mapping_metadata_container_is_refused_not_replaced(frontmatter, field):
+    """346629c28142: a non-mapping metadata / metadata.hermes is the author's data; a justified create
+    must refuse it, never silently replace it with {} and report success. Prism repro, verbatim."""
+    from tools.skill_manager_neardup import DistinctFromError, add_distinct_from
+    content = f"---\nname: example\n{frontmatter}---\nbody\n"
+    with pytest.raises(DistinctFromError, match=field):
+        add_distinct_from(content, [{"name": "other"}])
+
+
+def test_justified_create_with_scalar_hermes_metadata_fails_and_keeps_nothing(tmp_path):
+    """The tool path: the same malformed container fails the create; no skill dir is written."""
+    content = NEAR.replace("bloated tables.\n---", "bloated tables.\nmetadata:\n  hermes: existing-value\n---", 1)
+    with _fleet_home(tmp_path) as (home, shared):
+        res = json.loads(skill_manage(action="create", name="pg-autovacuum", content=content,
+                                      category="general", justification="different audience"))
+        assert res["success"] is False, res
+        assert "metadata.hermes" in json.dumps(res)
         assert not (shared / "general" / "pg-autovacuum").exists()
