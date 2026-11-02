@@ -683,6 +683,9 @@ def _create_skill(name: str, content: str, category: str = None, *, local: bool 
         name, content, justification, shared_root=_shared_skills_root(), profile=_active_profile_name())
     if refusal:
         return _err(refusal, **payload)
+    # The justification rewrote the frontmatter: the written bytes must pass the same checks.
+    if neardup_row and (err := _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
+        return _err(err)
     # A bad/missing group in shared mode fails loud here, BEFORE any directory is created.
     try:
         skill_dir = _resolve_skill_dir(name, category, local=local)

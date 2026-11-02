@@ -12,6 +12,7 @@ install) has no gate: creation behaves as before.
 
 import importlib.util
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 
 _SCORER_REL = ("scripts", "lib", "skill_similarity.py")
 _scorer_cache: Dict[Tuple[str, int], Any] = {}
+# Same closing fence as skill_manager_tool._validate_frontmatter: a whole ``---`` line, not a ``---key``.
+_FRONTMATTER_END_RE = re.compile(r"\n---\s*\n")
+
+
+class DistinctFromError(ValueError):
+    """The existing ``metadata.hermes.distinct_from`` is not a list, so it cannot be extended."""
 
 
 def _load_scorer(root: Path):
@@ -67,13 +74,19 @@ def _skill_roots(shared_root: Path) -> List[Path]:
 def add_distinct_from(content: str, entries: List[Dict[str, Any]]) -> str:
     """Return ``content`` with ``entries`` appended to ``metadata.hermes.distinct_from``."""
     content = content.lstrip("\ufeff")
-    body_start = content.find("\n---", 3)
+    end = _FRONTMATTER_END_RE.search(content[3:])
+    body_start = 3 + end.start()  # validation already required the fence
     fm = yaml.safe_load(content[3:body_start]) or {}
     meta = fm.get("metadata") if isinstance(fm.get("metadata"), dict) else {}
     fm["metadata"] = meta
     hermes = meta.get("hermes") if isinstance(meta.get("hermes"), dict) else {}
     meta["hermes"] = hermes
-    hermes["distinct_from"] = list(hermes.get("distinct_from") or []) + entries
+    prior = hermes.get("distinct_from")
+    if prior is not None and not isinstance(prior, list):
+        raise DistinctFromError(
+            f"metadata.hermes.distinct_from must be a list, got {type(prior).__name__}; "
+            "fix it in the content and retry.")
+    hermes["distinct_from"] = list(prior or []) + entries
     dumped = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True, width=1_000_000)
     return "---\n" + dumped + content[body_start + 1:]
 
@@ -105,14 +118,23 @@ def check_create(name: str, content: str, justification: Optional[str], *, share
         _append_ledger(scorer, root, {**row, "event": "refuse"})
         return scorer.refusal_message(name, verdict), {"near_duplicates": verdict["matches"]}, content, None
     entries = scorer.distinct_from_entries(verdict, why)
-    return None, None, add_distinct_from(content, entries), {**row, "event": "justified_create", "why": why}
+    try:
+        content = add_distinct_from(content, entries)
+    except DistinctFromError as e:
+        return str(e), {}, content, None
+    return None, None, content, {**row, "event": "justified_create", "why": why}
 
 
 def record_justified(row: Optional[Dict[str, Any]], shared_root: Path) -> None:
     if row is None:
         return
     root = shared_root.parent
-    scorer = _load_scorer(root)
+    try:  # audit only: the skill is already on disk, so nothing here may fail the create
+        scorer = _load_scorer(root)
+    except Exception:  # noqa: BLE001
+        logger.warning("near-duplicate ledger skipped for %s: scorer reload failed", row.get("name"),
+                       exc_info=True)
+        return
     if scorer is not None:
         _append_ledger(scorer, root, row)
 

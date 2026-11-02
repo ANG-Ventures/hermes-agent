@@ -218,3 +218,64 @@ def test_root_without_a_scorer_has_no_gate(tmp_path):
     with _fleet_home(tmp_path, scorer=False) as (home, shared):
         res = _create("pg-autovacuum", NEAR)
         assert res["success"] is True, res
+
+
+# --- Prism r1 on agent#2513 (64302917a09b) ---------------------------------------------------
+
+def test_dash_prefixed_key_does_not_split_frontmatter(tmp_path):
+    """cf115a6ad9aa: split on the validator's closing fence, never on any line starting '---'."""
+    content = NEAR.replace("bloated tables.\n---", "bloated tables.\n---custom: keep\nmetadata: {owner: ops}\n---", 1)
+    with _fleet_home(tmp_path) as (home, shared):
+        res = _create("pg-autovacuum", content, justification="ops runbook")
+        assert res["success"] is True, res
+        text = (shared / "general" / "pg-autovacuum" / "SKILL.md").read_text()
+        fm_text = text[3:text.find("\n---\n", 3)]
+        assert [ln for ln in fm_text.splitlines() if ln.startswith("metadata:")] == ["metadata:"]
+        fm = yaml.safe_load(fm_text)
+        assert fm["---custom"] == "keep"
+        assert fm["metadata"]["owner"] == "ops"
+        assert fm["metadata"]["hermes"]["distinct_from"][0]["name"] == "postgres-vacuum-tuning"
+
+
+def test_non_list_distinct_from_fails_and_batch_rolls_back(tmp_path):
+    """d92a62873586: a malformed existing annotation is an ordinary failure, so the batch rolls back."""
+    content = NEAR.replace("bloated tables.\n---", "bloated tables.\nmetadata: {hermes: {distinct_from: 1}}\n---", 1)
+    with _fleet_home(tmp_path) as (home, shared):
+        existing = shared / "devops" / "postgres-vacuum-tuning" / "SKILL.md"
+        ops = [{"action": "patch", "name": "postgres-vacuum-tuning",
+                "old_string": "watch freeze age.", "new_string": "watch freeze age closely."},
+               {"action": "create", "name": "pg-autovacuum", "content": content, "category": "general",
+                "justification": "different audience"}]
+        res = json.loads(skill_manage(action="", name="", operations=ops))
+        assert res["success"] is False, res
+        assert "distinct_from" in json.dumps(res)
+        assert existing.read_text() == EXISTING
+        assert not (shared / "general" / "pg-autovacuum").exists()
+
+
+def test_scorer_reload_failure_after_write_keeps_the_create(tmp_path):
+    """bab2ff5781b7: the ledger step is audit only; a scorer that breaks after the write cannot fail it."""
+    from tools import skill_manager_neardup as nd
+    real = nd._load_scorer
+    calls = []
+
+    def flaky(root):
+        calls.append(root)
+        if len(calls) > 1:
+            raise SyntaxError("scorer replaced mid-create")
+        return real(root)
+
+    with _fleet_home(tmp_path) as (home, shared), patch.object(nd, "_load_scorer", flaky):
+        res = _create("pg-autovacuum", NEAR, justification="ops runbook")
+        assert res["success"] is True, res
+        assert (shared / "general" / "pg-autovacuum" / "SKILL.md").is_file()
+        assert len(calls) == 2
+
+
+def test_justification_cannot_push_skill_md_past_the_size_limit(tmp_path):
+    """90ee9a3bba3e: the rewritten content is validated again before anything is written."""
+    with _fleet_home(tmp_path) as (home, shared), patch.object(smt, "MAX_SKILL_CONTENT_CHARS", len(NEAR) + 50):
+        res = _create("pg-autovacuum", NEAR, justification="x" * 500)
+        assert res["success"] is False, res
+        assert "limit" in res["error"]
+        assert not (shared / "general" / "pg-autovacuum").exists()
