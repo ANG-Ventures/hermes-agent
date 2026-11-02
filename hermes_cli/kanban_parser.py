@@ -394,7 +394,9 @@ _SPECS = [
                   "review). Best for open-ended cards one shot rarely finishes."),
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
-        _arg("--boomerang-wake", action="store_true", dest="boomerang_wake",
+        _arg("--no-boomerang-wake", action="store_false", default=None, dest="boomerang_wake",
+             help="Opt out of the default boomerang subscription."),
+        _arg("--boomerang-wake", action="store_true", default=None, dest="boomerang_wake",
              help="Subscription level 'boomerang wake': mechanical wakes on this card are "
                   "handled by a background boomerang child (the calling chat subscribes "
                   "--boomerang-wake). Omit for notify / wake."),

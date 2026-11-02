@@ -2695,6 +2695,7 @@ DEFAULT_CONFIG = {
         # session: notify+wake (Ace 2026-10-03, t_74bf5296). One waker per
         # card is enforced in the store; false = notify-only.
         "auto_subscribe_wake": True,
+        "auto_subscribe_boomerang": True,  # operator auto-subscriptions use a child by default
         # Wake -> notify downgrade per EVENT under contention (t_74bf5296).
         # Unset thresholds inherit dispatch_load_gate. lane_headroom: also
         # downgrade while the waker profile's model lane is capped.

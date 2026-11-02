@@ -981,6 +981,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             return 2
     try:
         with kb.connect_closing() as conn:
+            from tools.kanban_tools import _auto_boomerang, _resolve_notify_target
+            boomerang = _auto_boomerang(
+                getattr(args, "boomerang_wake", None),
+                worker=is_dispatcher_owned_worker_context(),
+                subscribed=bool(_resolve_notify_target(require_platform_identity=True)))
             _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,
@@ -1015,7 +1020,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
-                boomerang_wake=True if getattr(args, "boomerang_wake", False) else None,
+                boomerang_wake=boomerang,
                 initial_status=getattr(args, "initial_status", "running"),
                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                  if is_dispatcher_owned_worker_context() else None),
@@ -1042,7 +1047,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 conn, task_id, after_event_id=_event_mark))
             dup_warning = kb.near_duplicate_warning(conn, task_id)
             auto_subscribed = _maybe_cli_auto_subscribe(
-                conn, task_id, boomerang_wake=bool(getattr(args, "boomerang_wake", False)))
+                conn, task_id, boomerang_wake=bool(boomerang))
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2

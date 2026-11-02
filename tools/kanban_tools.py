@@ -1533,6 +1533,11 @@ def _handle_create(args: dict, **kw) -> str:
                 and not args.get("workspace_of")):
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        boomerang = _auto_boomerang(
+            args.get("boomerang_wake"), worker=_is_dispatcher_owned_worker(),
+            subscribed=bool(not unhomed and args.get("wake") is not False
+                            and _resolve_notify_target()
+                            and cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True)))
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), parents_kind=parents_kind, continues=args.get("continues"),
@@ -1554,9 +1559,7 @@ def _handle_create(args: dict, **kw) -> str:
             reasoning_effort=reasoning_effort,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
-            # Subscription level "boomerang wake": absent = NULL (not boomerang).
-            boomerang_wake=(None if args.get("boomerang_wake") is None
-                            else _parse_bool_arg(args, "boomerang_wake")),
+            boomerang_wake=boomerang,
             initial_status=str(args.get("initial_status") or "running"),
             # Fan-out brake: worker-created cards park per kanban.worker_created_status.
             forced_status=_worker_policy.resolve_park_status(
@@ -1580,7 +1583,7 @@ def _handle_create(args: dict, **kw) -> str:
                    subscribed=_maybe_auto_subscribe(
                        conn, new_tid,
                        # boomerang wake is a wake level: it always subscribes as a waker.
-                       wake=(True if _parse_bool_arg(args, "boomerang_wake")
+                       wake=(True if boomerang
                              else args.get("wake") if isinstance(args.get("wake"), bool) else None)),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
@@ -1653,6 +1656,15 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
         # api_server, whose only delivery mechanism is the wake self-post.
         delivery_mode="notify+wake" if (_auto_wake(wake) and platform != "tui") else None,
         delivery_metadata=delivery_metadata or None)
+
+
+def _auto_boomerang(value: Optional[bool], *, worker: bool, subscribed: bool) -> Optional[bool]:
+    """Only operator-created auto-subscriptions inherit the runtime default."""
+    if value is not None:
+        return bool(value)
+    if worker or not subscribed:
+        return None
+    return cfg_get(load_config(), "kanban", "auto_subscribe_boomerang", default=True) is True
 
 
 def _auto_wake(wake: Optional[bool]) -> bool:

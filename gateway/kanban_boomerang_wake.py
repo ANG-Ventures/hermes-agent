@@ -1,7 +1,8 @@
 """Boomerang wake: persisted state, auto-dispatch, verdict executor, reconciler (Boomerang v2).
 
 A card at subscription level ``boomerang wake`` (``tasks.boomerang_wake``; its waker row stays
-``notify+wake`` / ``wake``) lets a background boomerang child take its mechanical wakes. The card is the ONLY setting: there is no config knob, session toggle or board default.
+``notify+wake`` / ``wake``) lets a background boomerang child take its mechanical wakes. The card stores the level; operator auto-subscriptions default to it via
+``kanban.auto_subscribe_boomerang`` (false restores plain wake).
 The emergency stop is the file ``<HERMES_HOME>/state/boomerang-wake.disabled`` (:func:`enabled`).
 
 ``<HERMES_HOME>/gateway/kanban_boomerang_wake.json`` holds ``retries[task_id]``: how many
@@ -906,6 +907,50 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
 
 # --- delivery (event loop) ----------------------------------------------------------------
 
+def deadman_owner_acted(entry: dict) -> bool:
+    """Check operator provenance since review began, not merely since child dispatch."""
+    if entry.get("row") != ROW_REVIEW_DEADMAN:
+        return False
+    from hermes_cli import kanban_db as kb
+    from gateway.kanban_wake_defer import owner_acted
+
+    conn = _readonly(kb, entry.get("board"))
+    try:
+        task = kb.get_task(conn, entry["task_id"])
+        review = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+            "AND id <= ? ORDER BY id DESC LIMIT 1",
+            (entry["task_id"], entry.get("event_id") or 0)).fetchone()
+        return bool(owner_acted(conn, {"task_id": entry["task_id"],
+                                     "owner": _field(task, "assignee"),
+                                     "home_sid": entry.get("home_sid"),
+                                     "cursor": review[0] if review else entry.get("event_id", 0)}))
+    finally:
+        conn.close()
+
+
+async def report_handled(runner: Any, entry: dict, result: dict, *, stale: bool = False) -> bool:
+    """A deduplicated card breadcrumb and one passive line, never a system wake/page."""
+    from hermes_cli import kanban_db as kb
+
+    summary = _first_line(result.get("summary")) or result.get("action") or "handled"
+    row = entry.get("row") or entry.get("kind") or "wake"
+    tag = f"(delegation {entry['delegation_id']})"
+    body = f"boomerang: {row} {summary} {tag}"
+    conn = kb.connect(board=entry.get("board"))
+    try:
+        if any(c.author == AUTHOR and c.body.startswith("boomerang: ") and c.body.endswith(tag)
+               for c in kb.list_comments(conn, entry["task_id"])):
+            return False
+        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+            kb.add_comment(conn, entry["task_id"], AUTHOR, body)
+    finally:
+        conn.close()
+    if stale:
+        return False
+    return await post_line(runner, entry, f"boomerang handled {entry['task_id']} ({row}): {summary}")
+
+
 async def post_line(runner: Any, entry: dict, text: str) -> bool:
     """One line to the claim's origin chat (the subscription's chat, or the home session's)."""
     route = entry.get("route") or {}
@@ -1139,23 +1184,25 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
     if status != "completed":
         await _fail(runner, live, f"child {status}: {_first_line(final, 200)}", state)
         return
+    if await asyncio.to_thread(deadman_owner_acted, live):
+        await report_handled(runner, live, {"summary": "operator already acted; stale wake ignored"}, stale=True)
+        await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="stale")
+        return
     result = await asyncio.to_thread(execute_verdict, live, final, state=state)
     if result.get("noop"):
         return
     if result["ok"]:
-        detail = "".join(f"\n> {e}" for e in result.get("evidence") or [])
-        await post_line(runner, live, f"[boomerang-wake] {live['task_id']} — {result['summary']}{detail}")
+        await report_handled(runner, live, result, stale=await asyncio.to_thread(deadman_owner_acted, live))
         logger.info("kanban boomerang-wake: %s handled action=%s delegation=%s",
                     live["task_id"], result["action"], live["delegation_id"])
         return
     if result.get("surface"):
-        if result.get("degraded"):
-            await post_line(runner, live, f"⚠️ boomerang-wake {live['task_id']}: {result['reason']}")
         try:
             await asyncio.to_thread(record_surface, live, result.get("summary") or "")
         except Exception as exc:
             logger.warning("kanban boomerang-wake: surfaced comment on %s not written: %s", live["task_id"], exc)
-        ok = await resurface(runner, live, finding_text(live, result, "child surfaced"))
+        ok = await report_handled(runner, live, result,
+                                  stale=await asyncio.to_thread(deadman_owner_acted, live))
         await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="surfaced",
                                 resurfaced=True, resurface_delivered=ok)
         return
