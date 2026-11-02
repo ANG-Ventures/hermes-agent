@@ -237,6 +237,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           DESKTOP_JOBS: ${{ vars.CI_DESKTOP_JOBS }}
           PR_OS_TESTS: ${{ vars.CI_PR_OS_TESTS }}
+          PR_E2E_UPGRADE: ${{ vars.CI_PR_E2E_UPGRADE }}
           HOSTED_OS_JOBS: ${{ vars.CI_HOSTED_OS_JOBS }}
           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
         run: |
@@ -246,6 +247,11 @@ jobs:
           release = os.environ['RELEASE'] == 'true'
           if os.environ['EVENT_NAME'] == 'merge_group':
               values.update(e2e_upgrade='true', bootstrap='true')
+          # CI_PR_E2E_UPGRADE=off skips the install/update e2e lane on pull_request only: on the
+          # private mirror those shards need the 2-runner ci-priv class and queued every PR
+          # behind it (Ace 2026-11-01, t_38da7416). push:main and merge_group still run them.
+          if os.environ['EVENT_NAME'] == 'pull_request' and os.environ.get('PR_E2E_UPGRADE') == 'off':
+              values['e2e_upgrade'] = 'false'
           if not release and os.environ['DESKTOP_JOBS'] != 'on':
               values['desktop'] = 'false'
           # macOS + Windows unit lanes: path-gated on pull_request only

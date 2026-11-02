@@ -751,6 +751,38 @@ def test_gate_lanes_hosted_os_follows_the_repo_var_except_on_release(
     assert lanes["hosted_os"] == expected
 
 
+@pytest.mark.parametrize("orchestrator", [".github/workflows/ci.yaml", ".github/workflows/ci-local.yaml"])
+@pytest.mark.parametrize(
+    "event,toggle,classified,expected",
+    [
+        ("pull_request", "", "true", "true"),
+        ("pull_request", "off", "true", "false"),
+        ("pull_request", "off", "false", "false"),
+        ("push", "off", "true", "true"),
+        ("merge_group", "off", "false", "true"),
+    ],
+)
+def test_gate_lanes_pr_e2e_upgrade_off_skips_only_pull_requests(
+    orchestrator, event, toggle, classified, expected, tmp_path
+):
+    """CI_PR_E2E_UPGRADE=off drops the install/update e2e lane on pull_request only; push and
+    merge_group keep it, and unset keeps today's classifier result."""
+    out = tmp_path / "out"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "RELEASE": "false",
+        "EVENT_NAME": event,
+        "DESKTOP_JOBS": "",
+        "PR_OS_TESTS": "",
+        "PR_E2E_UPGRADE": toggle,
+        "CLASSIFIED": json.dumps({"python": "true", "e2e_upgrade": classified}),
+        "GITHUB_OUTPUT": str(out),
+    }
+    subprocess.run([sys.executable, "-c", _gate_lanes_script(orchestrator)], env=env, check=True)
+    lanes = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
+    assert lanes["e2e_upgrade"] == expected
+
+
 def test_hosted_os_lane_reaches_every_hosted_os_job():
     """detect.hosted_os gates tests-os and the windows-latest bootstrap job, in both orchestrators."""
     boot = _yaml(".github/workflows/bootstrap-installer.yml")
