@@ -5,6 +5,10 @@ name: Fleet SAST (semgrep)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # t_c8ef8daa: workflow admission follows the scanners' actual input union.
+    paths:
+      - 'hermes/**'
+      - '.github/workflows/fleet-sast.yml'
   push:
     branches: [main]
   # merge_group: required by the merge queue — the batched candidate must get a
