@@ -172,6 +172,25 @@ def _non_public_host(host: str) -> bool:
     return False
 
 
+# Listing-probe budget for the /model verifier. A loopback/LAN relay forwards GET /v1/models
+# upstream: 15 probes on the Claude ALR relay (2026-11-01 17:40) answered 12 under 0.1 s and 3
+# in 2.5-7.1 s while healthy, so 5 s failed some verifies. Public catalogs keep 5 s.
+VERIFY_PROBE_TIMEOUT_S = 5.0
+SELF_HOSTED_VERIFY_PROBE_TIMEOUT_S = 15.0
+
+
+def _verify_probe_timeout(req: _Request) -> float:
+    """15 s for a self-hosted provider or a loopback / LAN / single-label base URL, else 5 s."""
+    if _is_self_hosted_provider(req.normalized) or _is_self_hosted_provider(req.provider):
+        return SELF_HOSTED_VERIFY_PROBE_TIMEOUT_S
+    from utils import base_url_hostname
+
+    host = base_url_hostname(str(req.base_url or "").strip()) if req.base_url else ""
+    if host and _non_public_host(host):
+        return SELF_HOSTED_VERIFY_PROBE_TIMEOUT_S
+    return VERIFY_PROBE_TIMEOUT_S
+
+
 def _stock_host(provider: str) -> str:
     """Vendor host for *provider*, offline. Empty when this install cannot name one.
 
@@ -361,7 +380,8 @@ def _validate_custom(req: _Request) -> dict[str, Any]:
     # Probe with the auth shape the api_mode expects.
     anthropic_style = req.api_mode == "anthropic_messages"
     probe_kwargs = {"api_mode": req.api_mode} if anthropic_style else {}
-    probe = _m.probe_api_models(req.api_key, req.base_url, request_headers=req.headers, **probe_kwargs)
+    probe = _m.probe_api_models(req.api_key, req.base_url, request_headers=req.headers,
+                                timeout=_verify_probe_timeout(req), **probe_kwargs)
     api_models = probe.get("models")
     if api_models is not None:
         match = _match_in_catalog(req.lookup, api_models, suggest_query=req.requested)
@@ -547,7 +567,8 @@ def _validate_anthropic_messages(req: _Request) -> dict[str, Any]:
     # failure means the endpoint may well implement /v1/models and simply didn't answer in
     # time — a different situation from a proxy that never exposes it (fork: honest wording;
     # TestAnthropicMessagesWarningHonesty).
-    probe = _m.probe_api_models(req.api_key, req.base_url, api_mode=req.api_mode)
+    probe = _m.probe_api_models(req.api_key, req.base_url, api_mode=req.api_mode,
+                                timeout=_verify_probe_timeout(req))
     models = probe.get("models")
     failure = probe.get("failure")
     # Name the ACTIVE provider and endpoint: the user may have typed a non-Anthropic-looking
@@ -557,8 +578,11 @@ def _validate_anthropic_messages(req: _Request) -> dict[str, Any]:
     endpoint_str = (req.base_url or "").strip() or "the configured endpoint"
     if models is None:
         if failure in ("timeout", "connection"):
+            # Name every URL tried: the first (``<base>/models``) is often the 404
+            # half; a relay at ``.../anthropic`` serves ``.../anthropic/v1/models``.
+            urls = [u for u in (probe.get("tried_urls") or [probe.get("probed_url")]) if u]
             reason = (
-                f"The probe of {probe.get('probed_url')} failed with a "
+                f"The probe of {' and '.join(urls)} failed with a "
                 f"{'timeout' if failure == 'timeout' else 'connection error'} "
                 f"(retried once) — the endpoint may be busy or unreachable."
             )
