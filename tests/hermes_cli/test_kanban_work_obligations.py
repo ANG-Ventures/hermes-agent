@@ -797,6 +797,19 @@ def test_progress_from_the_obligations_own_card_worker_is_allowed(conn, monkeypa
     assert r.claim_expires == T0 + 60 + 600 and _events(conn, a_card)[-1] == "obligation_progress"
 
 
+def test_progress_from_an_ended_run_of_the_own_card_is_refused_not_operator(conn, monkeypatch):
+    """Prism cd0277d58f56 / eb486e7de5ab: an ended run is no longer the card's worker, and its
+    worker identity still bars the operator fallback (the fixture holds the operator token)."""
+    a_card, a, _b_card, _b = _claimed_pair(conn)
+    _become_worker_of(conn, monkeypatch, a_card)
+    conn.execute("UPDATE task_runs SET ended_at = ? WHERE task_id = ?", (T0 + 30, a_card))
+    conn.commit()
+    before = ob.get(conn, a.id).claim_expires
+    with pytest.raises(ob.ObligationRefused, match="progress refused: .*ended"):
+        ob.progress(conn, a.id, "still alive after my run ended", now=T0 + 60, lease_s=600)
+    assert ob.get(conn, a.id).claim_expires == before
+
+
 def test_progress_from_an_operator_with_token_is_allowed_and_without_proof_refused(conn, home, monkeypatch):
     _a_card, a, _b_card, _b = _claimed_pair(conn)
     assert ob.progress(conn, a.id, "operator moved it", now=T0 + 60, lease_s=600).claim_expires == T0 + 660

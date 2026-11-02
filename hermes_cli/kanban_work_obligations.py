@@ -674,12 +674,14 @@ def _live_run_rows(chain: list[int]) -> tuple[list[tuple[int, str, Any, Any, str
 
 def worker_ancestry() -> tuple[Optional[str], Optional[str]]:
     """``(worker_profile, refusal)`` from process identity, authorization-grade."""
-    profile, _task, refusal = worker_ancestry_run()
+    profile, _task, _live, refusal = worker_ancestry_run()
     return profile, refusal
 
 
-def worker_ancestry_run() -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """``(worker_profile, worker_task_id, refusal)`` from process identity, authorization-grade.
+def worker_ancestry_run() -> tuple[Optional[str], Optional[str], bool, Optional[str]]:
+    """``(worker_profile, worker_task_id, run_live, refusal)`` from process identity,
+    authorization-grade. ``run_live`` is False when the matched run has ``ended_at`` set: the
+    process is still that card's worker by identity, but no longer holds a live run.
 
     A run whose ``worker_pid`` is in our ancestry and whose spawn fingerprint matches makes us that
     worker. A LIVE run on our ancestry with no verifiable fingerprint (``unverified``, legacy), an
@@ -691,7 +693,7 @@ def worker_ancestry_run() -> tuple[Optional[str], Optional[str], Optional[str]]:
     try:
         chain = ki._ancestry()
         if not chain:
-            return None, None, "worker ancestry indeterminate: process ancestry unreadable"
+            return None, None, False, "worker ancestry indeterminate: process ancestry unreadable"
         rows, complete = _live_run_rows(chain)
         unverified = None
         for pid in chain:  # nearest worker ancestor wins; the session id is last
@@ -701,7 +703,7 @@ def worker_ancestry_run() -> tuple[Optional[str], Optional[str], Optional[str]]:
                 if isinstance(started, str) and "|" in started:
                     current = _process_fingerprint(pid)
                     if current is not None and _fingerprints_agree(started, current):
-                        return str(profile), str(task_id), None
+                        return str(profile), str(task_id), ended is None, None
                     if current is None and ended is None and unverified is None:
                         unverified = (f"worker ancestry indeterminate: live run of {profile} on pid "
                                       f"{pid}: current process fingerprint unavailable")
@@ -709,12 +711,12 @@ def worker_ancestry_run() -> tuple[Optional[str], Optional[str], Optional[str]]:
                     unverified = (f"worker ancestry indeterminate: live run of {profile} on pid {pid} "
                                   f"has an unverified spawn fingerprint ({started!r})")
         if unverified:
-            return None, None, unverified
+            return None, None, False, unverified
         if not complete:
-            return None, None, "worker ancestry indeterminate: a board was unreadable"
-        return None, None, None
+            return None, None, False, "worker ancestry indeterminate: a board was unreadable"
+        return None, None, False, None
     except Exception as exc:
-        return None, None, f"worker ancestry indeterminate: {type(exc).__name__}: {exc}"
+        return None, None, False, f"worker ancestry indeterminate: {type(exc).__name__}: {exc}"
 
 
 def current_actor() -> Actor:
@@ -800,11 +802,13 @@ def require_progress_authority(task_id: str) -> None:
     child, or an unverifiable ancestry is refused."""
     from agent.delegation_context import is_delegated_child_process_context
 
-    _worker, worker_task, refusal = worker_ancestry_run()
+    _worker, worker_task, run_live, refusal = worker_ancestry_run()
     if worker_task is not None:
         if worker_task != task_id:
             raise ObligationRefused(f"progress refused: runs under the worker of {worker_task}, "
                                     f"not of {task_id}")
+        if not run_live:  # identity kept: an ended worker never falls through to operator
+            raise ObligationRefused(f"progress refused: the worker run of {task_id} has ended")
         if is_delegated_child_process_context():
             raise ObligationRefused("progress refused: delegated child of the card's worker")
         return
