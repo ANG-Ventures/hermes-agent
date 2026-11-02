@@ -849,10 +849,10 @@ def persistable_fallback_chain(chain: Any) -> list[dict[str, Any]] | None:
     """The dispatching parent's fallback chain for ``execution.fallback_chain``, or None.
 
     A recovered unit rebuilds its parent from this field, and its children resolve their chain from
-    that parent exactly as the in-process children do (``fallback_providers: auto``). A chain with a
-    credential-shaped field or a credential-bearing ``base_url`` is not persisted (None, the unit
-    runs without fallback): recording it would fail the whole spec closed and force the call
-    synchronous.
+    that parent exactly as the in-process children do (``fallback_providers: auto``). A rung carrying a
+    credential-shaped key or a credential-bearing URL in any field is dropped (a chain left empty is
+    None, the unit runs without fallback): recording it would fail the whole spec closed and force
+    the call synchronous.
 
     Rungs are copied field by field, keeping only JSON scalars: a live chain is never deep-copied,
     because a rung may hold client/lock-bearing objects and a raise here would take the durable
@@ -867,11 +867,12 @@ def persistable_fallback_chain(chain: Any) -> list[dict[str, Any]] | None:
         for rung in chain
         if isinstance(rung, dict)
     ]
-    for rung in rungs:
-        if any(_sensitive_query_key(str(key)) for key in rung) or url_has_credentials(rung.get("base_url")):
-            logger.info("async_delegation fallback chain not persisted: a rung carries a credential")
-            return None
-    return rungs or None
+    # The same sanitizer as the declared policy, over every kept field (not just ``base_url``): a
+    # credential URL in any scalar (``proxy_url``, ``endpoint``, ...) drops its rung (Prism a2c6b8a0230f).
+    kept = [rung for rung in rungs if not _carries_credential(rung)]
+    if len(kept) != len(rungs):
+        logger.info("async_delegation fallback chain: %d rung(s) carrying a credential not persisted", len(rungs) - len(kept))
+    return kept or None
 
 
 def persistable_fallback_policy(routing_cfg: Any) -> dict[str, Any]:

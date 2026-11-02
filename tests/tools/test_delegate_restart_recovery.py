@@ -394,6 +394,63 @@ def test_declared_fallback_policy_never_persists_a_credential_url_string():
     assert persistable_fallback_policy({"fallback_providers": ["openrouter"]}) == {"fallback_providers": ["openrouter"]}
 
 
+# ── Prism a2c6b8a0230f: ONE sanitizer for both persisted fallback surfaces ──
+# {declared policy, parent chain} x the eight shapes a credential (or an unpicklable value) can take.
+# Policy: any credential withholds the whole declared value as [] (never None, which widens).
+# Chain: only JSON scalars are kept per rung, then a rung carrying a credential is dropped; a clean
+# sibling rung survives, and an empty chain is None.
+_CRED_URL = "https://alice:p4ss@proxy.invalid/v1"
+_CLEAN = {"provider": "openrouter", "model": "x/y"}
+_LOCK = threading.Lock()
+_SURFACE = [
+    ("bare_string_url", _CRED_URL, []),
+    ("string_in_list", [_CRED_URL], []),
+    ("cred_key", [{"provider": "custom", "model": "m", "api_key": "S"}], []),
+    ("cred_url_base_url", [{"provider": "custom", "model": "m", "base_url": _CRED_URL}], []),
+    ("cred_url_arbitrary_scalar", [{"provider": "custom", "model": "m", "proxy_url": _CRED_URL}], []),
+    ("nested_dict", [{"provider": "custom", "model": "m", "options": {"base_url": _CRED_URL}}], []),
+    ("nested_list", [{"provider": "custom", "model": "m", "urls": ["https://ok.invalid", _CRED_URL]}], []),
+    ("non_scalar_lock", [{"provider": "openrouter", "model": "x/y", "lock": _LOCK}], [_CLEAN]),
+]
+_CHAIN_EXPECTED = {
+    "bare_string_url": None,  # not a list
+    "string_in_list": None,  # no dict rung
+    "cred_key": [_CLEAN],
+    "cred_url_base_url": [_CLEAN],
+    "cred_url_arbitrary_scalar": [_CLEAN],
+    "nested_dict": [{"provider": "custom", "model": "m"}, _CLEAN],  # non-scalar field dropped, never persisted
+    "nested_list": [{"provider": "custom", "model": "m"}, _CLEAN],
+    "non_scalar_lock": [_CLEAN, _CLEAN],
+}
+
+
+@pytest.mark.parametrize(("shape", "declared", "expected"), _SURFACE, ids=[row[0] for row in _SURFACE])
+def test_declared_policy_surface(shape, declared, expected):
+    from tools.async_delegation_store import persistable_fallback_policy
+
+    result = persistable_fallback_policy({"fallback_providers": declared})
+    assert result == {"fallback_providers": expected}
+    assert "p4ss" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(("shape", "declared", "_policy"), _SURFACE, ids=[row[0] for row in _SURFACE])
+def test_parent_chain_surface(shape, declared, _policy):
+    from tools.async_delegation_store import persistable_fallback_chain
+
+    chain = declared + [dict(_CLEAN)] if isinstance(declared, list) and isinstance(declared[0], dict) else declared
+    result = persistable_fallback_chain(chain)
+    assert result == _CHAIN_EXPECTED[shape]
+    assert "p4ss" not in json.dumps(result)
+
+
+def test_fallback_surface_controls_pass_unchanged():
+    from tools.async_delegation_store import persistable_fallback_chain, persistable_fallback_policy
+
+    for declared in ("auto", ["openrouter"], None, []):
+        assert persistable_fallback_policy({"fallback_providers": declared}) == {"fallback_providers": declared}
+    assert persistable_fallback_chain([dict(rung) for rung in _CHAIN]) == _CHAIN
+
+
 # ── Prism 3de445560b2a: recovery keeps the route owner's fallback POLICY, not only the chain ──
 # A per-call ``credentials_cfg`` (``/review`` -> ``auxiliary.review``) is not replayed on recovery, so the
 # recovered children took the GLOBAL delegation block's policy: with ``fallback_providers: auto`` a pinned
