@@ -69,6 +69,27 @@ def test_spares_fresh_debris_and_real_packs(tmp_path, monkeypatch):
     assert fresh.exists() and real_pack.exists() and real_idx.exists()
 
 
+def test_spares_tmp_pack_named_in_the_multi_pack_index(tmp_path, monkeypatch):
+    """Regression for t_81c1f1b8: a midx that adopted a killed repack's ``.tmp-<pid>-pack``
+    resolves objects through it; deleting it loses those objects."""
+    repo = _mkrepo(tmp_path)
+    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
+    pack = repo / ".git" / "objects" / "pack"
+    adopted = ".tmp-60122-pack-58dd8b56"
+    orphan = ".tmp-60122-pack-0badf00d"
+    (pack / "multi-pack-index").write_bytes(
+        b"MIDX\x01\x01\x04\x00" + b"pack-aaaa.idx\x00" + f"{adopted}.idx\x00".encode())
+    files = [pack / f"{stem}{ext}" for stem in (adopted, orphan) for ext in (".pack", ".idx", ".rev")]
+    for p in files:
+        p.write_bytes(b"x")
+        _age(p, STALE_TMP_PACK_MIN_AGE_SECONDS + 60)
+
+    removed = clear_stale_tmp_packs(repo)
+
+    assert sorted(Path(p).name for p in removed) == sorted(f"{orphan}{ext}" for ext in (".pack", ".idx", ".rev"))
+    assert all((pack / f"{adopted}{ext}").exists() for ext in (".pack", ".idx", ".rev"))
+
+
 def test_skips_sweep_while_git_is_running(tmp_path, monkeypatch):
     repo = _mkrepo(tmp_path)
     monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: True)

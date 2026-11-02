@@ -193,6 +193,12 @@ def _maintain_pack_health(repo_root: str) -> None:
         packs = len(list(pack_dir.glob("*.pack")))
         if packs < _PACK_SPRAWL_THRESHOLD:
             return
+        # A store whose owner pinned maintenance.auto=false (live-tree-git-maint) runs its own
+        # incremental-repack; a concurrent geometric repack lets that midx adopt our in-flight
+        # .tmp-<pid>-pack files and expire the real packs (t_81c1f1b8, 344 objects lost).
+        if _git_out(["config", "--local", "--type=bool", "--get", "maintenance.auto"], repo_root) == "false":
+            logger.info("git pack sprawl (%d packs) — store has its own maintenance owner; not repacking", packs)
+            return
         if not _claim_repack_slot(pack_dir.parent.parent):
             return
         from hermes_cli.gitlock import clear_stale_tmp_packs

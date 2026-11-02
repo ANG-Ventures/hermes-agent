@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -134,8 +135,16 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
     pack_dir = _pack_dir(repo_root)
 
     def _candidates():
+        # A midx can adopt a killed repack's .tmp-<pid>-pack; its objects resolve only through
+        # those files, so a .tmp pack the midx names is live data, not debris (t_81c1f1b8).
         try:
-            return [e for e in pack_dir.iterdir() if e.name.startswith(_TMP_PACK_PREFIXES)]
+            midx = (pack_dir / "multi-pack-index").read_bytes()
+        except OSError:
+            midx = b""
+        adopted = {m.decode("utf-8", "replace") for m in re.findall(rb"\.tmp-[^\x00/]+(?=\.idx\x00)", midx)}
+        try:
+            return [e for e in pack_dir.iterdir()
+                    if e.name.startswith(_TMP_PACK_PREFIXES) and Path(e.name).stem not in adopted]
         except OSError:
             return []
 

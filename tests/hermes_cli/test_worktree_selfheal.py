@@ -164,6 +164,28 @@ class TestRepackStampede:
         worktree_ops._maintain_pack_health(str(repo))
         assert len(runs) == 2
 
+    def test_store_with_its_own_maintenance_owner_is_never_repacked(self, repo, monkeypatch):
+        """Regression for t_81c1f1b8: a store whose owner pinned ``maintenance.auto=false`` runs its
+        own incremental-repack; a concurrent geometric repack let the owner's midx adopt in-flight
+        ``.tmp-<pid>-pack`` files and expire the real packs (344 objects lost)."""
+        from hermes_cli import worktree_ops
+
+        pack_dir = repo / ".git" / "objects" / "pack"
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(20):
+            (pack_dir / f"pack-{i:040x}.pack").write_bytes(b"")
+        _git(repo, "config", "--local", "maintenance.auto", "false")
+        monkeypatch.setattr(worktree_ops, "_REPACK_MIN_INTERVAL", 0)
+        runs: list = []
+        monkeypatch.setattr(worktree_ops, "_run_bounded_repack", lambda root: runs.append(root))
+
+        worktree_ops._maintain_pack_health(str(repo))
+        assert runs == []
+
+        _git(repo, "config", "--local", "maintenance.auto", "true")
+        worktree_ops._maintain_pack_health(str(repo))
+        assert runs == [str(repo)], "an unowned store with the same sprawl still repacks"
+
     @pytest.mark.platforms("linux")
     def test_timeout_kills_the_whole_repack_tree(self, tmp_path, monkeypatch):
         import os
