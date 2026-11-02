@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Hermetic stand-in for ssh (t_db46f06b identity probe tests): runs the remote command locally as the "remote" user
 # would see it: HOME=$FAKE_SSH_HOME, a clean env, plus only the SendEnv names (sshd AcceptEnv) with the CLIENT's
 # values. Never touches the network.
