@@ -32,7 +32,7 @@ def isolated_worker_board(monkeypatch, tmp_path):
             "CREATE TABLE tasks(current_run_id INTEGER, worker_pid INTEGER);"
             "CREATE TABLE task_runs(id INTEGER, worker_pid INTEGER, worker_started_at TEXT, ended_at INTEGER);"
         )
-    monkeypatch.setattr(kb, "kanban_db_path", lambda: db)
+    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: db)
 
 
 def _record_worker(tmp_path, pid, *, fingerprint=None, ended_at=None):
