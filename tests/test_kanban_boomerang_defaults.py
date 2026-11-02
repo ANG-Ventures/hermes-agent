@@ -58,7 +58,7 @@ def test_handback_shape(tmp_path, monkeypatch, surface, stale):
     assert comments[0].body.startswith("boomerang: review_deadman CI is pending")
 
 
-@pytest.mark.parametrize("opt_out", [False, True])
+@pytest.mark.parametrize("opt_out", [False, True, "false"])
 def test_gateway_create_persists_level(tmp_path, monkeypatch, opt_out):
     from tools import kanban_tools as kt
     from gateway import session_context as sc
@@ -71,12 +71,37 @@ def test_gateway_create_persists_level(tmp_path, monkeypatch, opt_out):
     monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: False)
     args = dict(board="default", title="gateway scratch", assignee="peer")
     if opt_out:
-        args["boomerang_wake"] = False
+        args["boomerang_wake"] = False if opt_out is True else opt_out  # "false": Prism a8e263caef71
     created = json.loads(kt._handle_create(args))
     assert created["ok"], created
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, created["task_id"]).boomerang_wake is (not opt_out)
         assert kbn.list_notify_subs(conn, created["task_id"])[0]["delivery_mode"] == "notify+wake"
+
+
+def test_failed_chat_delivery_is_retried_once(tmp_path, monkeypatch):
+    """Prism 9f1fead40170: post_line False then True on one delegation -> exactly one chat line."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="scratch", assignee="human:apollo")
+    entry = dict(task_id=tid, board=None, row="review_deadman", delegation_id="d1", route={})
+    outcomes, sent = [False, True, True], []
+    async def post(runner, entry, text):
+        ok = outcomes.pop(0)
+        if ok:
+            sent.append(text)
+        return ok
+    monkeypatch.setattr(bw, "post_line", post)
+    result = dict(summary="CI is pending", action="comment_why_waits")
+    assert asyncio.run(bw.report_handled(None, entry, result)) is False
+    assert asyncio.run(bw.report_handled(None, entry, result)) is True
+    assert asyncio.run(bw.report_handled(None, entry, result)) is False
+    assert sent == [f"boomerang handled {tid} (review_deadman): CI is pending"]
+    assert outcomes == [True]  # third call never reached post_line
+    with kb.connect_closing() as conn:
+        assert len(kb.list_comments(conn, tid)) == 1
 
 
 @pytest.mark.parametrize("owner", [False, True])

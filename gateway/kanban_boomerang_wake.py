@@ -210,6 +210,7 @@ MAX_MINUTES = 45            # ledger max_minutes; the reconciler cancels a live 
 PARENT_BUSY_WAIT_S = 30.0   # §5.5: wait for a mid-turn parent, off the notifier loop
 CANCEL_WAIT_S = 60.0        # §5.7: bounded wait for a cancelled child to exit
 RECEIPT_KIND = "boomerang_wake_executed"
+DELIVERED_KIND = "boomerang_handback_delivered"  # chat-line delivered marker (per delegation)
 VIA = "boomerang-wake"
 # Compat: receipts written before the rename (a claim left EXECUTING across the deploy).
 LEGACY_RECEIPTS = frozenset({("auto_handle_executed", "auto-handle")})
@@ -939,16 +940,29 @@ async def report_handled(runner: Any, entry: dict, result: dict, *, stale: bool 
     body = f"boomerang: {row} {summary} {tag}"
     conn = kb.connect(board=entry.get("board"))
     try:
-        if any(c.author == AUTHOR and c.body.startswith("boomerang: ") and c.body.endswith(tag)
-               for c in kb.list_comments(conn, entry["task_id"])):
-            return False
-        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
-            kb.add_comment(conn, entry["task_id"], AUTHOR, body)
+        if not any(c.author == AUTHOR and c.body.startswith("boomerang: ") and c.body.endswith(tag)
+                   for c in kb.list_comments(conn, entry["task_id"])):
+            with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+                kb.add_comment(conn, entry["task_id"], AUTHOR, body)
+        # Prism 9f1fead40170: the chat send dedupes on its OWN marker, written only after delivery,
+        # so a failed send stays retryable instead of being suppressed by the breadcrumb.
+        delivered = stale or any(
+            ev.kind == DELIVERED_KIND and (ev.payload or {}).get("delegation_id") == entry["delegation_id"]
+            for ev in kb.list_events(conn, entry["task_id"]))
     finally:
         conn.close()
-    if stale:
+    if delivered:
         return False
-    return await post_line(runner, entry, f"boomerang handled {entry['task_id']} ({row}): {summary}")
+    ok = await post_line(runner, entry, f"boomerang handled {entry['task_id']} ({row}): {summary}")
+    if ok:
+        conn = kb.connect(board=entry.get("board"))
+        try:
+            with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"), kb.write_txn(conn):
+                kb._append_event(conn, entry["task_id"], DELIVERED_KIND,  # noqa: SLF001 -- the one event writer
+                                 {"delegation_id": entry["delegation_id"], "via": VIA})
+        finally:
+            conn.close()
+    return ok
 
 
 async def post_line(runner: Any, entry: dict, text: str) -> bool:

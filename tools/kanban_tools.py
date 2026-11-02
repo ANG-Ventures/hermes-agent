@@ -1534,7 +1534,9 @@ def _handle_create(args: dict, **kw) -> str:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
         boomerang = _auto_boomerang(
-            args.get("boomerang_wake"), worker=_is_dispatcher_owned_worker(),
+            # Prism a8e263caef71: "false" is a truthy string; normalise before the default helper.
+            None if args.get("boomerang_wake") is None else _parse_bool_arg(args, "boomerang_wake"),
+            worker=_is_dispatcher_owned_worker(),
             subscribed=bool(not unhomed and _auto_wake(args.get("wake"))
                             and _resolve_notify_target()
                             and cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True)))
