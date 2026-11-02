@@ -1010,3 +1010,32 @@ def test_boot_epoch_sample_refuses_when_every_sample_is_paused():
         return clock["boot"]
 
     assert kb._sample_boot_epoch(wall=lambda: 1_000_500.0, boot=boot) is None
+
+
+@pytest.mark.platforms("linux")
+def test_ownership_birth_follows_a_wall_clock_step_after_import(monkeypatch):
+    """Prism 0b2ea4c3282f / 0bf3a31c1041: a boot epoch cached at import stays
+    behind a later forward wall-clock step and backdates every birth by the
+    step, so a recycled session passes ownership. Births must be dated in the
+    wall clock as it is NOW, the clock the run's event times are written in.
+    Red at 2436619758 (the birth stays ~10 s behind)."""
+    child = subprocess.Popen(["/bin/sleep", "5"])
+    try:
+        before = kb._ownership_birth(child.pid)
+        assert before is not None
+        real = time.time
+        monkeypatch.setattr(kb.time, "time", lambda: real() + 10.0)   # NTP steps the wall clock +10 s
+        after = kb._ownership_birth(child.pid)
+        assert after is not None
+        assert abs((after - before) - 10.0) <= 2 * kb._EPOCH_BIRTH_EARLY_S, after - before
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_ownership_birth_is_unknown_without_a_tight_epoch_sample(monkeypatch):
+    """A read with no tight boot-epoch sample is UNKNOWN (no witness), never a guess."""
+    if not kb._PRECISE_BIRTH:
+        pytest.skip("precise birth is Linux-only")
+    monkeypatch.setattr(kb, "_sample_boot_epoch", lambda *a, **k: None)
+    assert kb._ownership_birth(os.getpid()) is None

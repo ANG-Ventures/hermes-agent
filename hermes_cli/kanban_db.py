@@ -18568,27 +18568,30 @@ def _member_birth(pid: int) -> Optional[float]:
         return None
 
 
-# Boot epoch for _ownership_birth, measured ONCE (like psutil's cached btime) so
-# repeated reads of one process return the same value. Unlike /proc/stat btime
-# it is not floored to an integer second.
+# Boot epoch for _ownership_birth: wall - CLOCK_BOOTTIME, SAMPLED AT EVERY READ.
+# Not cached: a wall-clock step after import (NTP) would leave a cached epoch
+# permanently off by the step and backdate every birth (Prism 43625d259e07's
+# sibling 0b2ea4c3282f / 0bf3a31c1041). A fresh sample tracks the wall clock the
+# run's event times are written in, like psutil's per-read btime but not
+# floored to a second.
 #
-# The epoch is wall - BOOTTIME at one instant, but the two clocks are read at
-# two instants, and a pause between the reads shifts the epoch by its length
-# (Prism 43625d259e07: wall first, then a 500 ms pause, backdates every birth
-# by 500 ms and a recycled session passes ownership). So each sample BRACKETS
+# One sample reads the two clocks at two instants, and a pause between them
+# shifts the epoch by its length (Prism 43625d259e07). So each sample BRACKETS
 # the wall read between two BOOTTIME reads: the true BOOTTIME at the wall read
-# lies in [b1, b2], so the epoch is wall - (b1 + b2) / 2, give or take
-# (b2 - b1) / 2. We keep the tightest of a bounded number of samples and add
-# its measured half-span to the early-read margin below. A span that never
-# gets under _BOOT_EPOCH_MAX_SPAN_S gives no precise epoch: psutil, 2 s margin.
+# lies in [b1, b2], the epoch is wall - (b1 + b2) / 2 give or take
+# (b2 - b1) / 2. The tightest of a bounded number of samples is kept; if none
+# spans under _BOOT_EPOCH_MAX_SPAN_S the read is UNKNOWN (no ownership, no
+# reap), never a guess. The early-read margin below therefore uses the bound
+# _BOOT_EPOCH_MAX_SPAN_S / 2, which every accepted sample is within.
 _BOOT_EPOCH_SAMPLES = 32
 _BOOT_EPOCH_MAX_SPAN_S = 0.005
 
 
-def _sample_boot_epoch(
-    wall=time.time, boot=lambda: time.clock_gettime(time.CLOCK_BOOTTIME),
-) -> Optional[tuple[float, float]]:
-    """``(epoch, uncertainty)`` from the tightest bracketed sample, or None."""
+def _sample_boot_epoch(wall=None, boot=None) -> Optional[tuple[float, float]]:
+    """``(epoch, uncertainty)`` from the tightest bracketed sample, or None.
+    The clocks are resolved at call time (``time.time`` / CLOCK_BOOTTIME)."""
+    wall = wall or time.time
+    boot = boot or (lambda: time.clock_gettime(time.CLOCK_BOOTTIME))
     best: Optional[tuple[float, float]] = None
     for _ in range(_BOOT_EPOCH_SAMPLES):
         b1 = boot()
@@ -18604,30 +18607,30 @@ def _sample_boot_epoch(
     return best
 
 
-_BOOT_SAMPLE = (
-    _sample_boot_epoch()
-    if sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME") else None
-)
-_BOOT_EPOCH = None if _BOOT_SAMPLE is None else _BOOT_SAMPLE[0]
+_PRECISE_BIRTH = sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME")
 
 
 def _ownership_birth(pid: int) -> Optional[float]:
     """Epoch birth of ``pid`` for the ownership window, or None when gone/unreadable.
 
-    Linux: /proc/<pid>/stat starttime (CLOCK_BOOTTIME ticks) + _BOOT_EPOCH, so
+    Linux: /proc/<pid>/stat starttime (CLOCK_BOOTTIME ticks) + a boot epoch
+    sampled now (_sample_boot_epoch; None when no tight sample), so
     it reads at most one tick (10 ms) early instead of psutil's up to ~1 s
     (integer btime): Prism 44b9db65242a / 85caf8bcd837. Elsewhere _member_birth.
     Only _owned_identities uses it; _member_birth's other callers compare
     births for equality and keep psutil's value.
     """
-    if _BOOT_EPOCH is not None:
+    if _PRECISE_BIRTH:
         try:
             with open(f"/proc/{pid}/stat", "rb") as fh:
                 stat = fh.read()
             ticks = int(stat[stat.rindex(b")") + 2:].split()[19])
-            return _BOOT_EPOCH + ticks / os.sysconf("SC_CLK_TCK")
         except (OSError, ValueError, IndexError):
             return None
+        sample = _sample_boot_epoch()
+        if sample is None:
+            return None   # no tight sample now: unknown, so not an ownership witness
+        return sample[0] + ticks / os.sysconf("SC_CLK_TCK")
     return _member_birth(pid)
 
 
@@ -18644,12 +18647,12 @@ _REAP_BIRTH_SLACK_SECONDS = (
     0.1 if _REAP_LINUX_CLOCK or sys.platform == "darwin" else 2.0
 )
 # The most an EPOCH birth (_ownership_birth, compared with the run's epoch
-# event times) can read early. Linux with a precise boot epoch: one starttime
-# tick (10 ms) plus the epoch sample's MEASURED uncertainty (see
-# _sample_boot_epoch). macOS: microseconds from p_starttime. Otherwise
-# (psutil's integer btime): the same 2 s bound as above.
+# event times) can read early. Linux: one starttime tick (10 ms) plus the
+# largest uncertainty an accepted boot-epoch sample can have
+# (_BOOT_EPOCH_MAX_SPAN_S / 2). macOS: microseconds from p_starttime.
+# Otherwise (psutil's integer btime): the same 2 s bound as above.
 _EPOCH_BIRTH_EARLY_S = (
-    0.01 + _BOOT_SAMPLE[1] if _BOOT_SAMPLE is not None
+    0.01 + _BOOT_EPOCH_MAX_SPAN_S / 2 if _PRECISE_BIRTH
     else 0.01 if sys.platform == "darwin" else 2.0
 )
 
