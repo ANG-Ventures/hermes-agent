@@ -8,6 +8,7 @@ closed for them without mutating the process-global environment.
 from __future__ import annotations
 
 import os
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
@@ -40,20 +41,47 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 )
 
 
+# The title hermes_cli/main.py ``_set_process_title`` gives a worker; mirrors
+# ``kanban_db.KANBAN_WORKER_PROCTITLE`` (not imported: kill paths stay light).
+_WORKER_PROCTITLE_RE = re.compile(r"hermes kanban-worker t_[0-9a-f]+")
+
+
 def _is_dispatched_worker_root(proc) -> bool:
     """A dispatcher-spawned Kanban worker: its own session leader whose LAUNCH env
     still carries the unclaimed grant. psutil reads the exec-time env (macOS
     KERN_PROCARGS2, Linux /proc/<pid>/environ), so the worker's in-process claim
-    does not change it, and every child of the worker inherits a resolved pid."""
+    does not change it, and every child of the worker inherits a resolved pid.
+
+    ``setproctitle`` overwrites that env block (and argv) once the worker boots,
+    so the worker's canonical title is the fallback identity (Prism c3557f4f9c71).
+    """
     try:
         if os.getsid(proc.pid) != proc.pid:
             return False
-        env = proc.environ()
     except Exception:
         return False
-    return bool(env.get("HERMES_KANBAN_TASK")) and (
-        env.get(KANBAN_OWNER_PID_ENV) == KANBAN_OWNER_PID_PENDING
-    )
+    try:
+        env = proc.environ()
+    except Exception:
+        env = {}
+    if env.get("HERMES_KANBAN_TASK") and env.get(KANBAN_OWNER_PID_ENV) == KANBAN_OWNER_PID_PENDING:
+        return True
+    title = _proc_title(proc)
+    if not _WORKER_PROCTITLE_RE.fullmatch(title):
+        return False
+    # A nested hermes CLI under a worker inherits the task id and takes the same title;
+    # only the topmost one is the dispatched worker.
+    try:
+        return not any(_proc_title(a) == title for a in proc.parents())
+    except Exception:
+        return False
+
+
+def _proc_title(proc) -> str:
+    try:
+        return " ".join(str(a) for a in (proc.cmdline() or ()) if a).strip()
+    except Exception:
+        return ""
 
 
 def spare_dispatched_workers(procs: list) -> list:

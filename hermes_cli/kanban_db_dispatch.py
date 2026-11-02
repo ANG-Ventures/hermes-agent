@@ -8790,6 +8790,10 @@ def _default_spawn(
     # own session-id stamping relies on them). Pop it here — mirrors the restart
     # watcher (gateway/run.py) which pops it for the same reason.
     env.pop("_HERMES_GATEWAY", None)
+    # A worker is the board's, not the cron script that ran the dispatch: drop the script's
+    # run token (cron.scheduler_script.SCRIPT_RUN_TOKEN_ENV) so a detached daemon the worker
+    # starts is never swept as a script member (Prism 6a32bf9b7440, t_4d4b30ff).
+    env.pop("_HERMES_CRON_SCRIPT_RUN", None)
     # INV-A7: the operator token is presented inline by a human operator and
     # must never ride into a worker by inheritance from the dispatcher's env.
     env.pop(_kb.OPERATOR_TOKEN_ENV, None)
