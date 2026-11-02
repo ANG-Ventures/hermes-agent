@@ -148,22 +148,29 @@ runs:
     # every entry (ensure explicit=True => verify), so a stale or partial seed
     # only costs the downloads it lacks. Measured on ci-box /srv/ci XFS: copy
     # 0.9 s + install 5.7-9.5 s vs 23.5 s cold. Any seed failure is a miss, never a red job.
+    # The host publishes immutable generations (<target>/gen-*/{tools,provenance.json}) behind a
+    # `current` symlink it switches by rename; resolve it ONCE and copy from that generation, so a
+    # publish racing this copy can never mix two generations.
     - name: Seed verified PM tools from the host store
       id: tools-host-seed
       if: inputs.cache == 'true' && runner.environment == 'self-hosted' && inputs.save-on-self-hosted != 'true'
       shell: bash
       env:
-        _PM_SEED: /ci-cache/setup-pm/${{ steps.prepare.outputs.target }}/tools
+        _PM_SEED: /ci-cache/setup-pm/${{ steps.prepare.outputs.target }}
         _PM_STORE: ${{ steps.prepare.outputs.store }}
       run: |
         set -uo pipefail
         hit=false
-        if [ -f "$_PM_SEED/facts.json" ] && [ ! -e "$_PM_STORE" ]; then
+        gen=$(readlink "$_PM_SEED/current" 2>/dev/null || true)
+        # Only a bare gen-* name inside this dir; anything else (absent, absolute, ../) is a miss.
+        case "$gen" in */*) gen= ;; gen-*) ;; *) gen= ;; esac
+        src="$_PM_SEED/$gen/tools"
+        if [ -n "$gen" ] && [ -f "$src/facts.json" ] && [ ! -e "$_PM_STORE" ]; then
           flags=-a
           [ "$RUNNER_OS" = Linux ] && flags='-a --reflink=auto'
           # shellcheck disable=SC2086  # flags is a word list on purpose
           # prepare only names the home; nothing has created it yet.
-          if mkdir -p "$(dirname "$_PM_STORE")" && cp $flags "$_PM_SEED" "$_PM_STORE" && chmod -R u+w "$_PM_STORE"; then
+          if mkdir -p "$(dirname "$_PM_STORE")" && cp $flags "$src" "$_PM_STORE" && chmod -R u+w "$_PM_STORE"; then
             hit=true
           else
             printf '%s\n' "::warning::host PM seed copy failed; taking a cold install"
@@ -171,7 +178,7 @@ runs:
           fi
         fi
         printf 'hit=%s\n' "$hit" >> "$GITHUB_OUTPUT"
-        printf 'PM host seed: %s (%s)\n' "$hit" "$_PM_SEED"
+        printf 'PM host seed: %s (%s)\n' "$hit" "$_PM_SEED/${gen:-<none>}"
 
     - name: Restore verified PM tools without saving
       id: tools-cache-restore
