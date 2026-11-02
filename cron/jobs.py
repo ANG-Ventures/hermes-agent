@@ -4144,6 +4144,43 @@ def _next_run_or_reject_past_oneshot(
     return next_run_at
 
 
+# A-lane ruling (Ace 2026-10-02, sharpened 2026-10-20): an A-family Claude lane (proxy bytes,
+# ``claude-a<mode?><p|l><x|r>...``: claude-alr, claude-apr, claude-alrf, ...) falls back to the
+# D-lane first, then a B-lane. A job pinned to an A-lane with no chain of its own is otherwise
+# pin-filtered by the scheduler (``_filter_fallback_chain_for_pinned_job``) down to alr->alr,
+# which lane-fallback-census pages (t_6c0138c7; hand fixes t_a23f5558, t_edf30aab, t_c10eb59a).
+_A_LANE_RE = re.compile(r"claude-a[thsa]?[pl][xr][fs]?(?:-\d+)?")
+_A_LANE_DEFAULT_FALLBACK_PROVIDERS = ("claude-dtlr", "claude-btpr")
+
+
+def _apply_a_lane_default_fallback(job: Dict[str, Any]) -> None:
+    """Give a new A-lane-pinned job the ruling's chain (dtlr, then btpr, same model) plus
+    ``allow_cross_provider_fallback`` so the scheduler's pin filter keeps it. A job that already
+    carries a ``fallback`` or the opt-in is left alone. A rung whose lane list refuses the model
+    is dropped (never a route the job cannot fire on); an unreadable list is admitted, as
+    ``_require_known_job_route`` does."""
+    provider = str(job.get("provider") or "").strip().lower()
+    model = job.get("model")
+    if (job.get("no_agent") or not model or not _A_LANE_RE.fullmatch(provider)
+            or job.get("fallback") or "allow_cross_provider_fallback" in job):
+        return
+    from hermes_cli.model_registry import resolve
+
+    chain = []
+    for lane in _A_LANE_DEFAULT_FALLBACK_PROVIDERS:
+        try:
+            ok = resolve(lane, model, resolve_aliases=False).ok
+        except Exception:
+            ok = True
+        if ok:
+            chain.append({"provider": lane, "model": model})
+        else:
+            logger.warning("cron create: A-lane default fallback skips %s (does not serve %s)", lane, model)
+    if chain:
+        job["fallback"] = chain
+        job["allow_cross_provider_fallback"] = True
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -4298,6 +4335,7 @@ def create_job(
         job["reasoning_effort"] = normalized_reasoning_effort
     if flagship_reason:
         job["allow_flagship_reason"] = flagship_reason
+    _apply_a_lane_default_fallback(job)
     if job["enabled"]:
         _run_cron_write_guard(job, "create")
 
