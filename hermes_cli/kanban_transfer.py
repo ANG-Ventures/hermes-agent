@@ -102,21 +102,28 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     )
     conn.execute("UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL")
     # Obligation holders are sessions / jobs on the exporting machine: the decision is pending
-    # again here. bound_ref (the binding record) and resolved history travel unchanged.
+    # again here. bound_ref (the binding record) and resolved history travel unchanged. Time is
+    # banked by the one clock helper: a claim is claimed only up to claim_expires, the rest is
+    # unclaimed and the expiry counts.
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'obligations'").fetchone():
-        conn.execute(
-            """
-            UPDATE obligations
-               SET claimed_s = claimed_s + CASE WHEN state = 'open_claimed'
-                                                THEN MAX(0, ? - state_since) ELSE 0 END,
-                   state = 'open_unclaimed', state_since = ?, holder_kind = 'operator',
-                   holder_ref = NULL, claim_session = NULL, claim_expires = NULL,
-                   holder_gen = holder_gen + 1
-             WHERE state IN ('open_claimed', 'open_executor')
-            """,
-            (int(time.time()), int(time.time())),
-        )
+        from hermes_cli import kanban_work_obligations as kwo
 
+        now = int(time.time())
+        cur = conn.execute("SELECT * FROM obligations WHERE state IN ('open_claimed', 'open_executor')")
+        cols = [d[0] for d in cur.description]
+        for ob in [kwo.Obligation.from_row(dict(zip(cols, r))) for r in cur.fetchall()]:
+            cl, un, expired = kwo.split_stint(ob, now)
+            conn.execute(
+                """
+                UPDATE obligations
+                   SET claimed_s = ?, unclaimed_s = ?, lease_expiries = ?,
+                       state = 'open_unclaimed', state_since = ?, holder_kind = 'operator',
+                       holder_ref = NULL, claim_session = NULL, claim_expires = NULL,
+                       holder_gen = holder_gen + 1
+                 WHERE id = ?
+                """,
+                (ob.claimed_s + cl, ob.unclaimed_s + un, ob.lease_expiries + int(expired), now, ob.id),
+            )
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

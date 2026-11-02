@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import sqlite3
 import subprocess
@@ -203,12 +202,33 @@ def list_obligations(conn: sqlite3.Connection, *, task_id: Optional[str] = None,
     return [Obligation.from_row(r) for r in conn.execute(q, args).fetchall()]
 
 
+def split_stint(ob: Obligation, now: int) -> tuple[int, int, bool]:
+    """``(claimed_add, unclaimed_add, expired)`` for the current stint, split at ``claim_expires``.
+
+    The ONE place time is attributed: a claimed stint counts as claimed only up to
+    ``claim_expires``; after it the decision is unclaimed again and the expiry counts, whether or
+    not ``expire_leases`` has swept yet. Executor and resolved stints bank nothing."""
+    stint = max(0, now - ob.state_since)
+    if ob.state == OPEN_UNCLAIMED:
+        return 0, stint, False
+    if ob.state != OPEN_CLAIMED:
+        return 0, 0, False
+    if ob.claim_expires is None or now <= ob.claim_expires:
+        return stint, 0, False
+    exp = max(int(ob.claim_expires), ob.state_since)
+    return exp - ob.state_since, now - exp, True
+
+
 def unclaimed_total(ob: Obligation, now: int) -> int:
-    return ob.unclaimed_s + (max(0, now - ob.state_since) if ob.state == OPEN_UNCLAIMED else 0)
+    return ob.unclaimed_s + split_stint(ob, now)[1]
 
 
 def claimed_total(ob: Obligation, now: int) -> int:
-    return ob.claimed_s + (max(0, now - ob.state_since) if ob.state == OPEN_CLAIMED else 0)
+    return ob.claimed_s + split_stint(ob, now)[0]
+
+
+def lease_expiries_total(ob: Obligation, now: int) -> int:
+    return ob.lease_expiries + int(split_stint(ob, now)[2])
 
 
 def escalation_due(ob: Obligation, now: int, policy: Optional[dict] = None) -> Optional[str]:
@@ -226,7 +246,7 @@ def bound_violation(ob: Obligation, now: int, policy: Optional[dict] = None) -> 
     knobs = (policy or load_policy())["classes"]["decision"]
     if ob.state == OPEN_EXECUTOR:
         return None  # an executor suspends both lease and escalation
-    if ob.lease_expiries >= 2:
+    if lease_expiries_total(ob, now) >= 2:
         return "second lease expiry"
     if claimed_total(ob, now) >= knobs["max_claim_min"] * 60:
         return f"claimed >= max_claim_min ({knobs['max_claim_min']} min)"
@@ -235,14 +255,15 @@ def bound_violation(ob: Obligation, now: int, policy: Optional[dict] = None) -> 
     return None
 
 
-def _bank(ob: Obligation, now: int) -> tuple[int, int]:
-    """``(unclaimed_s, claimed_s)`` with the current stint banked (executor time is never banked)."""
-    stint = max(0, now - ob.state_since)
-    if ob.state == OPEN_UNCLAIMED:
-        return ob.unclaimed_s + stint, ob.claimed_s
-    if ob.state == OPEN_CLAIMED:
-        return ob.unclaimed_s, ob.claimed_s + stint
-    return ob.unclaimed_s, ob.claimed_s
+def _bank(conn: sqlite3.Connection, ob: Obligation, now: int) -> dict[str, int]:
+    """Clock columns with the current stint banked via :func:`split_stint`. An unswept lease
+    expiry is counted (and its event appended) in the caller's transaction."""
+    cl, un, expired = split_stint(ob, now)
+    if expired:
+        kb._append_event(conn, ob.task_id, "obligation_lease_expired", {
+            "id": ob.id, "session": ob.claim_session, "lease_expiries": ob.lease_expiries + 1})
+    return {"unclaimed_s": ob.unclaimed_s + un, "claimed_s": ob.claimed_s + cl,
+            "lease_expiries": ob.lease_expiries + int(expired)}
 
 
 def _cas(conn: sqlite3.Connection, ob: Obligation, now: int, **cols: Any) -> None:
@@ -315,10 +336,8 @@ def claim(conn: sqlite3.Connection, ob_id: str, *, session: str, now: Optional[i
         ob = _load_for_cas(conn, ob_id, expected_gen)
         _require_state(ob, OPEN_UNCLAIMED, verb="claim")
         lease = lease_s if lease_s is not None else load_policy()["classes"][ob.cls]["lease_min"] * 60
-        un, cl = _bank(ob, t)
         _cas(conn, ob, t, state=OPEN_CLAIMED, holder_kind="operator", holder_ref=session,
-             claim_session=session, claim_expires=t + lease, unclaimed_s=un, claimed_s=cl,
-             state_since=t)
+             claim_session=session, claim_expires=t + lease, state_since=t, **_bank(conn, ob, t))
         kb._append_event(conn, ob.task_id, "obligation_claimed", {
             "id": ob.id, "session": session, "claim_expires": t + lease, "non_home": non_home})
         return get(conn, ob_id)
@@ -369,9 +388,8 @@ def set_executor(conn: sqlite3.Connection, ob_id: str, holder_ref: str, *, rule:
         if ob.state == OPEN_EXECUTOR and ob.holder_ref == ref:
             return ob
         _require_state(ob, OPEN_UNCLAIMED, OPEN_CLAIMED, verb="executor")
-        un, cl = _bank(ob, t)
         _cas(conn, ob, t, state=OPEN_EXECUTOR, holder_kind="executor", holder_ref=ref, bound_ref=ref,
-             claim_session=None, claim_expires=None, unclaimed_s=un, claimed_s=cl, state_since=t)
+             claim_session=None, claim_expires=None, state_since=t, **_bank(conn, ob, t))
         kb._append_event(conn, ob.task_id, "obligation_executor",
                          {"id": ob.id, "holder_ref": ref, "rule": rule})
         return get(conn, ob_id)
@@ -416,10 +434,11 @@ def expire_leases(conn: sqlite3.Connection, *, now: Optional[int] = None) -> lis
 
 
 def _expire_one(conn: sqlite3.Connection, ob: Obligation, t: int) -> None:
-    """One claimed row back to unclaimed, claimed time banked AT ``claim_expires``. In-txn."""
-    exp = int(ob.claim_expires or t)
+    """One expired claimed row back to unclaimed: claimed time banked AT ``claim_expires`` (via
+    :func:`split_stint`) and the unclaimed clock resumes from there. In-txn."""
+    cl, _un, _expired = split_stint(ob, t)
     _cas(conn, ob, t, state=OPEN_UNCLAIMED, holder_ref=None, claim_expires=None,
-         claimed_s=ob.claimed_s + max(0, exp - ob.state_since), state_since=exp,
+         claimed_s=ob.claimed_s + cl, state_since=ob.state_since + cl,  # = claim_expires
          lease_expiries=ob.lease_expiries + 1)
     kb._append_event(conn, ob.task_id, "obligation_lease_expired", {
         "id": ob.id, "session": ob.claim_session, "lease_expiries": ob.lease_expiries + 1})
@@ -491,9 +510,11 @@ def resolve(conn: sqlite3.Connection, ob_id: str, resolution: str, *, now: Optio
                 raise ObligationRefused(
                     f"{res}: no successor row {succ_key!r} on {ob.task_id}; use supersede, which "
                     "opens the successor and resolves this row in one transaction")
-        un, cl = _bank(ob, t)
-        _cas(conn, ob, t, state=RESOLVED, resolution=res, unclaimed_s=un, claimed_s=cl,
-             claim_expires=None, state_since=t)
+            if succ.state == RESOLVED:
+                raise ObligationRefused(f"{res}: successor {succ.id} is already resolved "
+                                        "(a supersession never points at a closed row)")
+        _cas(conn, ob, t, state=RESOLVED, resolution=res, claim_expires=None, state_since=t,
+             **_bank(conn, ob, t))
         kb._append_event(conn, ob.task_id, "obligation_resolved", {
             "id": ob.id, "resolution": res, "actor_session": actor_session, "non_home": non_home})
         return get(conn, ob_id)
@@ -519,47 +540,18 @@ def supersede(conn: sqlite3.Connection, ob_id: str, successor_source_key: str, *
             job_name=successor_job_name or None)
         if succ.id == ob.id:
             raise ObligationRefused("a row cannot supersede itself")
+        if succ.state == RESOLVED:
+            raise ObligationRefused(f"successor {succ.id} ({successor_source_key}) is already resolved "
+                                    "(a supersession never points at a closed row)")
         res = f"superseded:{successor_source_key}"
-        un, cl = _bank(ob, t)
-        _cas(conn, ob, t, state=RESOLVED, resolution=res, unclaimed_s=un, claimed_s=cl,
-             claim_expires=None, state_since=t)
+        _cas(conn, ob, t, state=RESOLVED, resolution=res, claim_expires=None, state_since=t,
+             **_bank(conn, ob, t))
         kb._append_event(conn, ob.task_id, "obligation_resolved",
                          {"id": ob.id, "resolution": res, "successor": succ.id})
         return get(conn, ob_id), succ
 
 
 # --- binding (§4.3, P6-B1 / P6-RC4 / P6-RC5) ----------------------------------------------------
-
-# Binding/resolving eligibility is ACTUAL landing code, never the job name and never
-# ``--allow-lander`` (P6-B1). The wide D-7 gating test (name ``^land``) lives in detached-run.
-_LANDING_CODE_RES = (
-    re.compile(r"(?<![\w-])(?:fleet-merge(?:\.sh)?|apollo-land(?:\.py)?|land-handback(?:\.py)?)(?![\w.-])"),
-    re.compile(r"\bgh\s+pr\s+merge\b"),
-    re.compile(r"/pulls/[^/\s'\"]+/merge\b"),
-    re.compile(r"(?<![\w-])(?:landing_queue|land_request)\.py\b"),
-)
-
-
-def _strip_shell_comment(line: str) -> str:
-    """``line`` up to an unquoted ``#`` that starts a word. Line-based, not a tokenizer."""
-    quote = None
-    for i, ch in enumerate(line):
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
-            return line[:i]
-    return line
-
-
-def is_landing_code(code: Optional[str]) -> bool:
-    """True when ``code`` (the job's script/argv text) actually lands a PR. Shell comments
-    never count: a watcher whose comment mentions ``gh pr merge`` stays a receipt."""
-    text = "\n".join(_strip_shell_comment(ln) for ln in (code or "").splitlines())
-    return any(rx.search(text) for rx in _LANDING_CODE_RES)
-
 
 @dataclass(frozen=True)
 class Binding:
@@ -581,26 +573,28 @@ def _identity(repo: Optional[str], pr: Optional[int]) -> Optional[tuple[str, int
 
 
 def decide_binding(conn: sqlite3.Connection, task_id: str, *, job_name: Optional[str],
-                   code: Optional[str], repo: Optional[str] = None, pr: Optional[int] = None,
+                   lands: bool, repo: Optional[str] = None, pr: Optional[int] = None,
                    obligation_id: Optional[str] = None, operator_owned: bool = True,
                    holder_ref: Optional[str] = None) -> Binding:
     """Which open row (if any) a job queued with ``--card task_id`` binds to. Read-only.
 
     Decided ONCE at enqueue; the caller persists it (job.json ``obligation``, or
     :func:`set_executor` for a queue row). A ``holder_ref`` that is already bound returns that
-    binding unchanged, so a row opening later cannot retarget it."""
+    binding unchanged, so a row opening later cannot retarget it.
+
+    ``lands`` is DECLARED by the producer (detached-run's lander gate, apollo-land, the landing
+    queue), which already knows whether the job lands. The fork never parses job text."""
     if holder_ref:
         row = conn.execute("SELECT id FROM obligations WHERE bound_ref = ?",
                            (holder_ref,)).fetchone()
         if row is not None:
             return Binding("bound", row[0], "persisted", f"{holder_ref} was bound to {row[0]} at first sight")
-    lander = is_landing_code(code)
-    if not lander:
+    if not lands:
         if obligation_id:
             return Binding("refused", None, None,
                            "a job that does not land (watcher, CI wait, readback) cannot bind a "
                            "decision; drop --obligation (it runs as an unbound receipt)")
-        return Binding("unbound", None, None, "not landing code: receipt only")
+        return Binding("unbound", None, None, "producer declared lands=false: receipt only")
     if not operator_owned:
         return Binding("unbound", None, None, "worker-owned re-queue: receipt only")
     rows = [o for o in list_obligations(conn, task_id=task_id, open_only=True)]
@@ -689,8 +683,12 @@ def worker_ancestry() -> tuple[Optional[str], Optional[str]]:
                 if int(wpid) != pid or not profile:
                     continue
                 if isinstance(started, str) and "|" in started:
-                    if _fingerprints_agree(started, _process_fingerprint(pid)):
+                    current = _process_fingerprint(pid)
+                    if current is not None and _fingerprints_agree(started, current):
                         return str(profile), None
+                    if current is None and ended is None and unverified is None:
+                        unverified = (f"worker ancestry indeterminate: live run of {profile} on pid "
+                                      f"{pid}: current process fingerprint unavailable")
                 elif ended is None and unverified is None:
                     unverified = (f"worker ancestry indeterminate: live run of {profile} on pid {pid} "
                                   f"has an unverified spawn fingerprint ({started!r})")
@@ -837,7 +835,9 @@ def setup_parser(p) -> None:
     b = sub.add_parser("bind", help="Decide (read-only) which row a job queued on a card binds to")
     b.add_argument("task_id")
     b.add_argument("--job-name")
-    b.add_argument("--code-file", help="the job's script; '-' reads stdin")
+    b.add_argument("--lands", required=True, choices=("yes", "no"),
+                   help="declared by the producer: does this job land the PR? The fork never "
+                        "parses job text")
     b.add_argument("--repo")
     b.add_argument("--pr", type=int)
     b.add_argument("--obligation", dest="bind_obligation")
@@ -935,12 +935,8 @@ def _dispatch(conn: sqlite3.Connection, action: str, args, t: int, board: Option
         _print({"obligation": receipt(conn, args.obligation_id, args.wake_outcome, now=t).to_dict(t)})
         return RC_OK
     if action == "bind":
-        code = None
-        if args.code_file == "-":
-            code = sys.stdin.read()
-        elif args.code_file:
-            code = Path(args.code_file).read_text(encoding="utf-8", errors="replace")
-        b = decide_binding(conn, args.task_id, job_name=args.job_name, code=code, repo=args.repo,
+        b = decide_binding(conn, args.task_id, job_name=args.job_name, lands=args.lands == "yes",
+                           repo=args.repo,
                            pr=args.pr, obligation_id=args.bind_obligation,
                            operator_owned=not args.worker_owned, holder_ref=args.holder_ref)
         _print(b.to_dict())

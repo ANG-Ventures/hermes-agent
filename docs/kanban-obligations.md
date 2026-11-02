@@ -29,7 +29,7 @@ Refusals print `obligation: <why>` on stderr.
 | `progress <id> <line...>` | operator, or the worker of that card itself | renews the lease of a CLAIMED row. rc 2 "claim first" on an unclaimed row. rc 3 "lease expired" when past `claim_expires`: the expiry is banked (row back to `open_unclaimed`, `lease_expiries + 1`) and the lease is NOT renewed; claim again. Not a holder change: `holder_gen` unchanged |
 | `resolve <id> <resolution> [--expected-gen G]` | `handed:*` / `dropped:*`: operator only. Observed outcomes: any non-worker | any open state -> `resolved` |
 | `receipt <id> --wake-outcome O` | any (drainer, reconciler) | ONLY `wake_attempts`, `first_wake_at`, `last_wake_at`, `last_wake_outcome`. Never `state`, never `holder_gen` |
-| `bind <card> [--job-name J] [--code-file F\|-] [--repo O/R --pr N] [--obligation ID] [--worker-owned] [--holder-ref R]` | anyone, read-only | nothing. Prints the binding decision (below); rc 2 when refused |
+| `bind <card> --lands yes\|no [--job-name J] [--repo O/R --pr N] [--obligation ID] [--worker-owned] [--holder-ref R]` | anyone, read-only | nothing. Prints the binding decision (below); rc 2 when refused |
 | `executor <id> --holder-ref R [--rule X] [--expected-gen G]` | non-worker | `open_unclaimed`/`open_claimed` -> `open_executor`. The binding is written ONCE to `bound_ref` (unique across the board), which release, claim, expiry and board transfer never clear: rc 2 if R is bound to another row or the row to another R |
 | `release <id> [--why W] [--expected-gen G]` | non-worker | `open_executor` -> `open_unclaimed` (bound job ended opening no row: `--stop`, signal, `=ok`, queue row retired other than merged) |
 | `supersede <id> --successor-key K [--created-at E] [--summary S] [--repo/--pr/--job-name] [--expected-gen G]` | non-worker | ONE transaction: open K (idempotent) AND resolve `<id>` as `superseded:K`. A lost CAS commits nothing (successor included) and never falls back to `open_unclaimed` |
@@ -42,7 +42,8 @@ Source keys: `detached:<run_id>`, `queue:<repo>#<pr>@<head>#<gen>`, `blocked:<ev
 
 Resolutions: `requeued-green:<run_id>` (only when the row's executor `holder_ref` IS that run:
 a watcher's green never resolves a lander decision), `superseded:<source_key>` (only when that
-successor row already exists on the same card; otherwise rc 2, use `supersede`), `merged:<sha>`,
+successor row already exists on the same card and is still open; otherwise rc 2, use `supersede`.
+`supersede` likewise refuses a successor key whose row is already resolved, so no cycle can form), `merged:<sha>`,
 `card-closed`, `handed:ace`, `dropped:<why>`. Empty or bare (`dropped:`) is rc 2.
 
 ## Authority
@@ -54,7 +55,8 @@ then the in-process session, then `HERMES_SESSION_ID`); that session exists in a
 (`kanban_work_obligations.worker_ancestry`, read from `task_runs.worker_pid` + spawn fingerprint),
 so stripping the env does not make a worker an operator. The ancestry check fails CLOSED: a live
 run on the caller's ancestry with an unverifiable fingerprint (`unverified`), an unreadable
-ancestry or board, or an exception refuses claim/resolve with "worker ancestry indeterminate".
+ancestry or board, a live run whose CURRENT process fingerprint is unavailable, or an exception
+refuses claim/resolve with "worker ancestry indeterminate".
 The profile compare is byte-exact (`Default` is not `default`).
 
 A claim from a session that is not the card's home is accepted and returned with
@@ -70,10 +72,10 @@ Decided ONCE at enqueue; the caller persists it (job.json `obligation: <id>`, or
 queue row). First match wins:
 
 0. `--holder-ref` already bound to a row -> that row, `persisted` (a later row never retargets it).
-1. Not LANDING CODE -> `unbound` (a receipt). With `--obligation` -> `refused`. Landing code is
-   what the job actually runs: `fleet-merge(.sh)`, `apollo-land(.py)`, `land-handback(.py)`,
-   `gh pr merge`, a REST `.../pulls/<n>/merge`, `landing_queue.py`, `land_request.py`. The job
-   name (`^land`) and `--allow-lander` do NOT qualify; that wide test is detached-run's D-7 gate only.
+1. `--lands no` -> `unbound` (a receipt). With `--obligation` -> `refused`. **The producer declares
+   `lands`; the fork never parses job text.** detached-run decides it from its own lander gate;
+   apollo-land and the landing queue already know. The job name (`^land`) and `--allow-lander`
+   are not a declaration; that wide test is detached-run's D-7 gate only.
 2. `--worker-owned` -> `unbound`.
 3. `--obligation ID` -> `bound`/`explicit` if ID is open on the card and not a different known PR.
 4. Exactly one open `detached:*` row with the same KNOWN `repo#pr` -> `same-pr`.
@@ -91,10 +93,9 @@ resolution, bound_ref, unclaimed_total_s, claimed_total_s` (`*_total_s` include 
 `audit` rows add `escalation_due` (reason string or null; null once escalated), `bound_violation`
 (reason string or null, ignores `escalated_at`) and `lease_expired`.
 
-Landing code ignores shell comments (an unquoted `#` starting a word, line-based).
-
 Board export/import (`kanban_transfer`) returns every `open_claimed` / `open_executor` row to
-`open_unclaimed` (holder cleared, clock restarted at import); `bound_ref` and resolved rows travel.
+`open_unclaimed` (holder cleared, clock restarted at import, the stint banked by `split_stint`);
+`bound_ref` and resolved rows travel.
 
 ## Events
 
@@ -107,5 +108,12 @@ They are NOT owner-wake `SCAN_KINDS` (a test pins that); the reconciler is the o
 Numbers come from `<root>/fleet/obligations-policy.json`; absent or invalid file -> the compiled
 `POLICY_DEFAULTS` (decision: rewake 10, escalate 30, lease 30, max_claim 120 min). Escalation is
 due when banked + current UNCLAIMED time >= `escalate_min`, on the 2nd lease expiry, or when
-claimed time >= `max_claim_min`. An executor holder suspends both. Review rows use the deadman's
+claimed time >= `max_claim_min`. An executor holder suspends both.
+
+One helper attributes time: `split_stint(ob, now) -> (claimed_add, unclaimed_add, expired)`. A
+claimed stint is claimed only up to `claim_expires`; after it the time is UNCLAIMED and the expiry
+counts, whether or not `expire` has swept. Every banking transition (claim, executor, resolve,
+supersede, expire, board transfer) and every reader (`*_total_s`, `audit`, `escalation_due`) uses it,
+so sweep timing never changes the clocks. A banking transition that crosses an unswept expiry also
+appends `obligation_lease_expired`. Review rows use the deadman's
 clock, never this one.

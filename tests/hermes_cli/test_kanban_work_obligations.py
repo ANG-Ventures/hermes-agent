@@ -27,8 +27,10 @@ T0 = 1_793_000_000
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKER_MARKERS = ob.WORKER_ENV_MARKERS + ("HERMES_KANBAN_DB", "HERMES_KANBAN_OWNER_PID")
 
-LANDER = "bash ~/.hermes/scripts/fleet-merge.sh ANG-Ventures/hermes-home 8012 --card t_x\n"
-WATCHER = "python3 ~/.hermes/scripts/wait-land-ci.py --repo ANG-Ventures/hermes-home --pr 8012\n"
+# The producer (detached-run / apollo-land / landing queue) declares whether a job lands; the
+# fork never parses job text (Apollo ruling, Prism round 2 on #2533).
+LANDER = True
+WATCHER = False
 
 
 @pytest.fixture
@@ -206,38 +208,26 @@ def test_p6b1_land_named_watcher_is_an_unbound_receipt_and_cannot_resolve_green(
     tid = _card(conn)
     a, _ = ob.open_obligation(conn, tid, "detached:land-8012d-1", repo="ANG-Ventures/hermes-home",
                               pr=8012, job_name="land-8012d", now=T0)
-    kw = dict(job_name="land-8012-ci-wait", code=WATCHER)
+    kw = dict(job_name="land-8012-ci-wait", lands=WATCHER)
     assert ob.decide_binding(conn, tid, **kw).status == "unbound"                              # --card
     assert ob.decide_binding(conn, tid, repo="ANG-Ventures/hermes-home", pr=8012, **kw).status == "unbound"
     assert ob.decide_binding(conn, tid, obligation_id=a.id, **kw).status == "refused"         # explicit
-    # Name alone and --allow-lander alone are not landing code (the old wide predicate).
-    assert not ob.is_landing_code("")
-    assert not ob.is_landing_code(WATCHER)
     # The watcher exits green: its run id never holds A, so a green resolve on it is refused.
     with pytest.raises(ob.ObligationRefused, match="not bound"):
         ob.resolve(conn, a.id, "requeued-green:land-8012-ci-wait-77", now=T0 + 5)
     assert ob.get(conn, a.id).state == ob.OPEN_UNCLAIMED
     # Only a bound lander resolves green.
-    b = ob.decide_binding(conn, tid, job_name="land-8012l", code=LANDER,
+    b = ob.decide_binding(conn, tid, job_name="land-8012l", lands=LANDER,
                           repo="ANG-Ventures/hermes-home", pr=8012)
     assert (b.status, b.obligation_id, b.rule) == ("bound", a.id, "same-pr")
     ob.set_executor(conn, a.id, "land-8012l-88", rule=b.rule, now=T0 + 6)
     assert ob.resolve(conn, a.id, "requeued-green:land-8012l-88", now=T0 + 9).state == ob.RESOLVED
 
 
-@pytest.mark.parametrize("code", [
-    LANDER, "gh pr merge 8012 --squash", "gh api -X PUT repos/o/r/pulls/8012/merge",
-    "python3 scripts/lib/landing_queue.py enqueue --repo o/r --pr 1", "apollo-land.py t_x",
-    "python3 land_request.py --pr 3",
-])
-def test_landing_code_shapes_qualify(code):
-    assert ob.is_landing_code(code)
-
-
 def test_worker_owned_lander_requeue_is_a_receipt(conn):
     tid = _card(conn)
     ob.open_obligation(conn, tid, "detached:x1", repo="o/r", pr=1, now=T0)
-    b = ob.decide_binding(conn, tid, job_name="land-x", code=LANDER, repo="o/r", pr=1, operator_owned=False)
+    b = ob.decide_binding(conn, tid, job_name="land-x", lands=LANDER, repo="o/r", pr=1, operator_owned=False)
     assert b.status == "unbound"
 
 
@@ -247,7 +237,7 @@ def test_p6rc4_binding_is_persisted_once_and_never_retargeted(conn):
     ob.set_executor(conn, a.id, "queue:o/r#5@aaa#2", rule="queue-reenqueue", now=T0 + 1)
     # A row opening later never changes what the queue row is bound to.
     c, _ = ob.open_obligation(conn, tid, "detached:late", repo="o/r", pr=5, now=T0 + 2)
-    b = ob.decide_binding(conn, tid, job_name=None, code="landing_queue.py", repo="o/r", pr=5,
+    b = ob.decide_binding(conn, tid, job_name=None, lands=LANDER, repo="o/r", pr=5,
                           holder_ref="queue:o/r#5@aaa#2")
     assert (b.status, b.obligation_id, b.rule) == ("bound", a.id, "persisted")
     with pytest.raises(ob.ObligationRefused, match="never retargeted"):
@@ -261,18 +251,18 @@ def test_p6rc4_binding_is_persisted_once_and_never_retargeted(conn):
 def test_p6rc5_null_identity_never_matches(conn):
     tid = _card(conn)
     ob.open_obligation(conn, tid, "detached:u1", now=T0)                   # unparsed repo/pr
-    b = ob.decide_binding(conn, tid, job_name="land-other", code=LANDER)   # also unparsed
+    b = ob.decide_binding(conn, tid, job_name="land-other", lands=LANDER)   # also unparsed
     assert b.status == "refused" and "--obligation" in b.reason             # not bound NULL==NULL
     tid2 = _card(conn, "two unrelated PRs")
     r1, _ = ob.open_obligation(conn, tid2, "detached:p1", job_name="land-a", now=T0)
     ob.open_obligation(conn, tid2, "detached:p2", job_name="land-b", now=T0)
-    assert ob.decide_binding(conn, tid2, job_name="land-c", code=LANDER).status == "refused"
+    assert ob.decide_binding(conn, tid2, job_name="land-c", lands=LANDER).status == "refused"
     # same-name still binds under its own contract
-    b = ob.decide_binding(conn, tid2, job_name="land-a", code=LANDER)
+    b = ob.decide_binding(conn, tid2, job_name="land-a", lands=LANDER)
     assert (b.status, b.obligation_id, b.rule) == ("bound", r1.id, "same-name")
     # explicit bind across a KNOWN different PR is refused
     r3, _ = ob.open_obligation(conn, tid2, "detached:p3", repo="o/r", pr=3, now=T0)
-    assert ob.decide_binding(conn, tid2, job_name="j", code=LANDER, repo="o/r", pr=4,
+    assert ob.decide_binding(conn, tid2, job_name="j", lands=LANDER, repo="o/r", pr=4,
                              obligation_id=r3.id).status == "refused"
 
 
@@ -477,21 +467,23 @@ def test_binding_survives_release_and_claim_and_is_never_retargeted(conn):
     assert a.bound_ref == "run-1" and a.holder_ref == "s-op"
     with pytest.raises(ob.ObligationRefused, match="never retargeted"):
         ob.set_executor(conn, a.id, "run-2", rule="explicit", now=T0 + 6)
-    assert ob.decide_binding(conn, tid, job_name=None, code=LANDER, holder_ref="run-1").obligation_id == a.id
+    assert ob.decide_binding(conn, tid, job_name=None, lands=LANDER, holder_ref="run-1").obligation_id == a.id
     # the original job re-holding its own row is allowed
     assert ob.set_executor(conn, a.id, "run-1", rule="explicit", now=T0 + 7).state == ob.OPEN_EXECUTOR
 
 
-def test_shell_comment_mentioning_a_lander_is_not_landing_code(conn):
-    """2d470c0e95d3."""
-    assert not ob.is_landing_code("# gh pr merge\ntrue")
-    assert not ob.is_landing_code("true  # then fleet-merge.sh o/r 1")
-    assert ob.is_landing_code("echo '#x' && gh pr merge 1")
-    assert ob.is_landing_code('echo "a # b"; gh pr merge 1')
+def test_producer_declares_lands_and_the_fork_never_reads_job_text(conn):
+    """9870151e9903 + 23635639de47 (Apollo ROOT 2): lands=False is an unbound receipt and refuses
+    --obligation; lands=True follows the binding rules. There is no text input to misread."""
     tid = _card(conn)
-    o, _ = ob.open_obligation(conn, tid, "detached:c1", now=T0)
-    b = ob.decide_binding(conn, tid, job_name="watch", code="# gh pr merge\ntrue", obligation_id=o.id)
-    assert b.status == "refused"
+    o, _ = ob.open_obligation(conn, tid, "detached:c1", repo="o/r", pr=1, job_name="land-1", now=T0)
+    assert ob.decide_binding(conn, tid, job_name="land-1", lands=False, repo="o/r", pr=1).status == "unbound"
+    assert ob.decide_binding(conn, tid, job_name="w", lands=False, obligation_id=o.id).status == "refused"
+    b = ob.decide_binding(conn, tid, job_name="w", lands=True, repo="o/r", pr=1)
+    assert (b.status, b.obligation_id, b.rule) == ("bound", o.id, "same-pr")
+    assert not hasattr(ob, "is_landing_code")
+    with pytest.raises(TypeError):
+        ob.decide_binding(conn, tid, job_name="w", code="echo land")  # no text path left
 
 
 def test_progress_after_lease_expiry_is_refused_and_the_expiry_is_banked(conn):
@@ -581,3 +573,91 @@ def test_board_transfer_clears_obligation_holders_and_keeps_the_binding(conn, ho
     assert rows["detached:z"].state == ob.RESOLVED and rows["detached:z"].resolution == "merged:abc"
     # the destination's clock runs again: 30 min after import with no holder it escalates
     assert ob.escalation_due(rows["detached:x"], int(time.time()) + 31 * 60) is not None
+
+
+# --- Prism round 2 on #2533 (Apollo ruling: ROOT 1 clocks, ROOT 2 lands, fingerprint) ---------
+
+LEASE = 1800
+# (offset from claim, claimed_s, unclaimed_s, lease_expiries): before, at, after claim_expires.
+_STINT_CASES = [(1000, 1000, 0, 0), (LEASE, LEASE, 0, 0), (3660, LEASE, 1860, 1)]
+
+
+@pytest.mark.parametrize("off,want_cl,want_un,want_exp", _STINT_CASES)
+@pytest.mark.parametrize("path", ["bank-executor", "bank-resolve", "bank-supersede", "total", "transfer"])
+def test_claimed_stint_splits_at_claim_expires_everywhere(conn, monkeypatch, path, off, want_cl,
+                                                          want_un, want_exp):
+    """c3dbaa56c41a / 7d4c51761297 / 5bc956bf76fd: time after claim_expires is UNCLAIMED time and
+    the expiry is counted, whichever path banks or reads it first (sweep timing never matters)."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:s", created_at=T0, now=T0)
+    a = ob.claim(conn, a.id, session="s", now=T0, lease_s=LEASE)
+    t = T0 + off
+    assert ob.split_stint(a, t) == (want_cl, want_un, bool(want_exp))
+    if path == "total":
+        got = (ob.claimed_total(a, t), ob.unclaimed_total(a, t), a.lease_expiries + ob.split_stint(a, t)[2])
+    else:
+        if path == "bank-executor":
+            ob.set_executor(conn, a.id, "run-x", rule="explicit", now=t)
+        elif path == "bank-resolve":
+            ob.resolve(conn, a.id, "merged:abc", now=t)
+        elif path == "bank-supersede":
+            ob.supersede(conn, a.id, "blocked:next", now=t)
+        else:
+            from hermes_cli import kanban_transfer as kt
+            monkeypatch.setattr(kt.time, "time", lambda: float(t))
+            kt._scrub_local_state(conn)
+            conn.commit()
+        r = ob.get(conn, a.id)
+        got = (r.claimed_s, r.unclaimed_s, r.lease_expiries)
+    assert got == (want_cl, want_un, want_exp)
+
+
+def test_audit_sees_unclaimed_time_after_an_unswept_expiry(conn):
+    """5bc956bf76fd repro: open+claim at 100 with a 60 s lease, no sweep, read at 2000."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:u", created_at=100, now=100)
+    ob.claim(conn, a.id, session="s", now=100, lease_s=60)
+    assert ob.bound_violation(ob.get(conn, a.id), 2000) == "unclaimed >= escalate_min (30 min)"
+
+
+def test_live_run_with_unavailable_current_fingerprint_is_indeterminate(conn, home, monkeypatch):
+    """7e667df77683: a live candidate run whose CURRENT fingerprint cannot be read refuses."""
+    from hermes_cli import kanban_db_dispatch as kdd
+
+    _operator_state_db(home, "s-op")
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setenv("HERMES_SESSION_ID", "s-op")
+    wt = _card(conn, "leader exited")
+    kb.claim_task(conn, wt)
+    conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ?, profile = 'daedalus' "
+                 "WHERE task_id = ?", (os.getpid(), kdd._process_fingerprint(os.getpid()), wt))
+    conn.commit()
+    monkeypatch.setattr(kdd, "_process_fingerprint", lambda pid: None)
+    why = ob.operator_refusal(ob.current_actor())
+    assert why and "indeterminate" in why
+    conn.execute("UPDATE task_runs SET ended_at = ? WHERE task_id = ?", (T0, wt))
+    conn.commit()
+    assert ob.operator_refusal(ob.current_actor()) is None   # an ended run is history
+
+
+def test_supersession_never_targets_a_resolved_row(conn):
+    """2d470c0e95d3 (round-2 text): B superseding back to resolved A would close a cycle."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:a", now=T0)
+    _, b = ob.supersede(conn, a.id, "blocked:b", now=T0 + 1)
+    with pytest.raises(ob.ObligationRefused, match="resolved"):
+        ob.supersede(conn, b.id, "detached:a", now=T0 + 2)
+    with pytest.raises(ob.ObligationRefused, match="resolved"):
+        ob.resolve(conn, b.id, "superseded:detached:a", now=T0 + 2)
+    assert ob.get(conn, b.id).state == ob.OPEN_UNCLAIMED
+
+
+def test_executor_after_an_unswept_expiry_keeps_the_unclaimed_time(conn):
+    """6c403d160479 repro: claim at 0, executor at 3600, release at 3660 -> escalation due."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:x6", created_at=T0, now=T0)
+    ob.claim(conn, a.id, session="s", now=T0)
+    ob.set_executor(conn, a.id, "run-6", rule="explicit", now=T0 + 3600)
+    a = ob.release_executor(conn, a.id, now=T0 + 3660)
+    assert (a.claimed_s, a.unclaimed_s, a.lease_expiries) == (1800, 1800, 1)
+    assert ob.escalation_due(a, T0 + 3660) == "unclaimed >= escalate_min (30 min)"
