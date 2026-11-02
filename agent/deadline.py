@@ -367,8 +367,9 @@ def _process_tree_snapshot(pid: int, *, hard_kill: bool):
     try:
         try:
             import psutil
+            from agent.delegation_context import spare_dispatched_workers
             root = psutil.Process(pid)
-            descendants = root.children(recursive=True)
+            descendants = spare_dispatched_workers(root.children(recursive=True))
             if hard_kill:
                 pending = [root]
                 seen = {os.getpid()}
@@ -396,7 +397,7 @@ def _process_tree_snapshot(pid: int, *, hard_kill: bool):
                             continue
                     # Rescan after stopping the discovered generation. A child
                     # may have forked while that generation was being stopped.
-                    for process in root.children(recursive=True):
+                    for process in spare_dispatched_workers(root.children(recursive=True)):
                         known.setdefault(process.pid, process)
                     descendants = list(known.values())
                     pending = [process for process in descendants if process.pid not in seen]

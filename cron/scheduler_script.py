@@ -289,7 +289,8 @@ def _script_tree_snapshot(proc: subprocess.Popen) -> Optional[list]:
     except Exception:
         return None
     try:
-        return [root] + root.children(recursive=True)
+        from agent.delegation_context import spare_dispatched_workers
+        return [root] + spare_dispatched_workers(root.children(recursive=True))
     except Exception:
         # A zombie leader has no live children of its own to list; anything else falls back.
         with contextlib.suppress(Exception):
@@ -408,7 +409,9 @@ def _script_run_token_members(proc: subprocess.Popen) -> list:
                         found.append(_UnreadableMember(cand))
             except psutil.Error:
                 continue
-        return found
+        # A Kanban worker a dispatch in the script spawned inherits the token; it is not the script's.
+        from agent.delegation_context import spare_dispatched_workers
+        return spare_dispatched_workers(found)
     except Exception:
         logger.warning("cron script run-token scan failed for pid %s; treating the tree as alive",
                        getattr(proc, "pid", None), exc_info=True)
@@ -453,7 +456,8 @@ def _script_tree_refresh(proc: subprocess.Popen, snapshot: Optional[list]) -> Op
             if member.is_running():
                 found += member.children(recursive=True)
         merged += [m for m in found if m not in merged]
-    return merged
+    from agent.delegation_context import spare_dispatched_workers
+    return spare_dispatched_workers(merged)
 
 
 def _script_tree_alive(proc: subprocess.Popen, snapshot: Optional[list]) -> bool:

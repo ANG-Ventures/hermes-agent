@@ -893,7 +893,8 @@ def _kill_process_group_posix(proc) -> None:
             raise
     try:  # psutil children snapshot; empty on any failure (must never break the kill)
         import psutil
-        descendants = psutil.Process(proc.pid).children(recursive=True)
+        from agent.delegation_context import spare_dispatched_workers
+        descendants = spare_dispatched_workers(psutil.Process(proc.pid).children(recursive=True))
     except Exception:
         descendants = []
     if pgid == os.getpgrp():

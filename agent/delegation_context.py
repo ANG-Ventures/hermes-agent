@@ -40,6 +40,53 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 )
 
 
+def _is_dispatched_worker_root(proc) -> bool:
+    """A dispatcher-spawned Kanban worker: its own session leader whose LAUNCH env
+    still carries the unclaimed grant. psutil reads the exec-time env (macOS
+    KERN_PROCARGS2, Linux /proc/<pid>/environ), so the worker's in-process claim
+    does not change it, and every child of the worker inherits a resolved pid."""
+    try:
+        if os.getsid(proc.pid) != proc.pid:
+            return False
+        env = proc.environ()
+    except Exception:
+        return False
+    return bool(env.get("HERMES_KANBAN_TASK")) and (
+        env.get(KANBAN_OWNER_PID_ENV) == KANBAN_OWNER_PID_PENDING
+    )
+
+
+def spare_dispatched_workers(procs: list) -> list:
+    """Drop dispatched Kanban workers and their subtrees from a tree-kill snapshot.
+
+    A worker is a child of whatever process ran the dispatcher tick: a
+    ``hermes kanban dispatch`` started from a terminal-tool call, a cron script,
+    code_execution. ``start_new_session=True`` keeps it out of that process's
+    group, but every tree-kill that snapshots ``children(recursive=True)`` still
+    finds it by ancestry, so a timed-out dispatch call SIGKILLed the 47 workers it
+    had spawned (2026-11-02 07:08, t_4d4b30ff). A worker outlives its spawner;
+    its own lifecycle (max_runtime, reclaim, reap) belongs to the board.
+    """
+    roots: set[int] = set()
+    for proc in procs:
+        if _is_dispatched_worker_root(proc):
+            roots.add(proc.pid)
+    if not roots:
+        return procs
+
+    def protected(proc) -> bool:
+        if proc.pid in roots:
+            return True
+        try:
+            if os.getsid(proc.pid) in roots:
+                return True
+            return any(a.pid in roots for a in proc.parents())
+        except Exception:
+            return False
+
+    return [proc for proc in procs if not protected(proc)]
+
+
 @contextmanager
 def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity. Even a context

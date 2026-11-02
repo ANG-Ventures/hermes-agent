@@ -1135,8 +1135,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return
         # Snapshot before signalling: once the parent exits, psutil can no longer
         # reliably find children that it failed to reap.
+        from agent.delegation_context import spare_dispatched_workers
         try:
-            descendants = parent.children(recursive=True)
+            descendants = spare_dispatched_workers(parent.children(recursive=True))
         except gone:
             descendants = []
 
@@ -1186,7 +1187,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         with suppress(gone):
             if cls._proc_alive(parent):
                 known = {proc.pid for proc in targets}
-                targets.extend(p for p in parent.children(recursive=True) if p.pid not in known)
+                targets.extend(p for p in spare_dispatched_workers(parent.children(recursive=True))
+                               if p.pid not in known)
         for proc in targets:
             with suppress(gone):
                 if cls._proc_alive(proc):
