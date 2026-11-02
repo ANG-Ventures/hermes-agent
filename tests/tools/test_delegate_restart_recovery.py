@@ -408,6 +408,8 @@ _SURFACE = [
     ("cred_key", [{"provider": "custom", "model": "m", "api_key": "S"}], []),
     ("cred_url_base_url", [{"provider": "custom", "model": "m", "base_url": _CRED_URL}], []),
     ("cred_url_arbitrary_scalar", [{"provider": "custom", "model": "m", "proxy_url": _CRED_URL}], []),
+    ("signed_url", [{"provider": "custom", "model": "m", "base_url": "https://proxy.invalid/v1?signature=p4ss"}], []),
+    ("cred_url_dict_key", [{"provider": "custom", "model": "m", _CRED_URL: 1}], []),
     ("nested_dict", [{"provider": "custom", "model": "m", "options": {"base_url": _CRED_URL}}], []),
     ("nested_list", [{"provider": "custom", "model": "m", "urls": ["https://ok.invalid", _CRED_URL]}], []),
     ("non_scalar_lock", [{"provider": "openrouter", "model": "x/y", "lock": _LOCK}], [_CLEAN]),
@@ -418,6 +420,8 @@ _CHAIN_EXPECTED = {
     "cred_key": [_CLEAN],
     "cred_url_base_url": [_CLEAN],
     "cred_url_arbitrary_scalar": [_CLEAN],
+    "signed_url": [_CLEAN],
+    "cred_url_dict_key": [_CLEAN],
     "nested_dict": [{"provider": "custom", "model": "m"}, _CLEAN],  # non-scalar field dropped, never persisted
     "nested_list": [{"provider": "custom", "model": "m"}, _CLEAN],
     "non_scalar_lock": [_CLEAN, _CLEAN],

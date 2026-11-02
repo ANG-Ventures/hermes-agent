@@ -904,7 +904,7 @@ def persistable_fallback_policy(routing_cfg: Any) -> dict[str, Any]:
 def _carries_credential(value: Any) -> bool:
     """True when a credential-shaped key or a credential-bearing URL appears anywhere inside ``value``."""
     if isinstance(value, dict):
-        return any(_sensitive_query_key(str(key)) or _carries_credential(child) for key, child in value.items())
+        return any(_sensitive_query_key(str(key)) or url_has_credentials(str(key)) or _carries_credential(child) for key, child in value.items())
     if isinstance(value, (list, tuple)):
         return any(_carries_credential(child) for child in value)
     return isinstance(value, str) and url_has_credentials(value)
@@ -935,12 +935,14 @@ def url_has_credentials(url: Any) -> bool:
         return False
     from urllib.parse import parse_qsl, urlsplit
 
+    from tools.url_safety import sensitive_query_param_name
+
     try:
         parsed = urlsplit(text)
         userinfo = bool(parsed.username or parsed.password)
     except ValueError:
         return True  # unparseable: fail closed
-    return userinfo or any(_sensitive_query_key(k) for k, _ in parse_qsl(parsed.query, keep_blank_values=True))
+    return userinfo or sensitive_query_param_name(text) is not None or any(_sensitive_query_key(k) for k, _ in parse_qsl(parsed.query, keep_blank_values=True))
 
 
 def redact_url(url: Any) -> str:
