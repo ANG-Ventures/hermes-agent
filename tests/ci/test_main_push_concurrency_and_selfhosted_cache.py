@@ -157,7 +157,11 @@ def test_setup_pm_host_seed_only_on_self_hosted_with_the_cache_on():
     assert not _cond(seed["if"], hosted)
     assert not _cond(seed["if"], off)
     # The seed path is the read-only bind ci-runner-pool.sh provides, per native target.
-    assert seed["env"]["_PM_SEED"] == "/ci-cache/setup-pm/${{ steps.prepare.outputs.target }}/tools"
+    assert seed["env"]["_PM_SEED"] == "/ci-cache/setup-pm/${{ steps.prepare.outputs.target }}"
+    # One generation is pinned before the copy (host publishes gen-* behind a `current` symlink).
+    assert 'gen=$(readlink "$_PM_SEED/current"' in seed["run"]
+    assert 'src="$_PM_SEED/$gen/tools"' in seed["run"]
+    assert 'cp $flags "$src" "$_PM_STORE"' in seed["run"]
     assert seed["env"]["_PM_STORE"] == "${{ steps.prepare.outputs.store }}"
     order = list(_setup_steps())
     assert order.index("tools-host-seed") < order.index("install")
