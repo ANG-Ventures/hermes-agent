@@ -149,6 +149,7 @@ class Obligation:
     updated_at: int
     holder_gen: int
     resolution: Optional[str]
+    bound_ref: Optional[str]
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> "Obligation":
@@ -211,8 +212,16 @@ def claimed_total(ob: Obligation, now: int) -> int:
 
 
 def escalation_due(ob: Obligation, now: int, policy: Optional[dict] = None) -> Optional[str]:
-    """Why ``ob`` must escalate now, or None (§4.3 clock). Review rows use the deadman's clock."""
-    if ob.state == RESOLVED or ob.escalated_at is not None or ob.cls != "decision":
+    """Why ``ob`` must escalate now, or None (§4.3 clock). Review rows use the deadman's clock.
+    None once ``escalated_at`` is set: the page went out once."""
+    if ob.escalated_at is not None:
+        return None
+    return bound_violation(ob, now, policy)
+
+
+def bound_violation(ob: Obligation, now: int, policy: Optional[dict] = None) -> Optional[str]:
+    """Why ``ob`` is past its bound, whether or not the escalation was already sent (audit)."""
+    if ob.state == RESOLVED or ob.cls != "decision":
         return None
     knobs = (policy or load_policy())["classes"]["decision"]
     if ob.state == OPEN_EXECUTOR:
@@ -317,7 +326,10 @@ def claim(conn: sqlite3.Connection, ob_id: str, *, session: str, now: Optional[i
 
 def progress(conn: sqlite3.Connection, ob_id: str, line: str, *, now: Optional[int] = None,
              lease_s: Optional[int] = None) -> Obligation:
-    """Renew the lease of a CLAIMED row. Not a holder change: no gen bump, no banking."""
+    """Renew the lease of a CLAIMED row. Not a holder change: no gen bump, no banking.
+
+    A lease already past ``claim_expires`` is not revived: the expiry is banked (committed) and
+    the renewal is refused rc 3, so a delayed sweep never changes lease semantics."""
     t = _now(now)
     line = (line or "").strip()
     if not line:
@@ -327,12 +339,18 @@ def progress(conn: sqlite3.Connection, ob_id: str, line: str, *, now: Optional[i
         if ob.state == OPEN_UNCLAIMED:
             raise ObligationRefused(f"obligation {ob_id} is unclaimed: claim first")
         _require_state(ob, OPEN_CLAIMED, verb="progress")
-        lease = lease_s if lease_s is not None else load_policy()["classes"][ob.cls]["lease_min"] * 60
-        conn.execute("UPDATE obligations SET claim_expires = ?, updated_at = ? WHERE id = ?",
-                     (t + lease, t, ob_id))
-        kb._append_event(conn, ob.task_id, "obligation_progress", {
-            "id": ob.id, "line": line[:500], "claim_expires": t + lease})
-        return get(conn, ob_id)
+        expired = ob.claim_expires is not None and ob.claim_expires < t
+        if expired:
+            _expire_one(conn, ob, t)
+        else:
+            lease = lease_s if lease_s is not None else load_policy()["classes"][ob.cls]["lease_min"] * 60
+            conn.execute("UPDATE obligations SET claim_expires = ?, updated_at = ? WHERE id = ?",
+                         (t + lease, t, ob_id))
+            kb._append_event(conn, ob.task_id, "obligation_progress", {
+                "id": ob.id, "line": line[:500], "claim_expires": t + lease})
+    if expired:
+        raise ObligationConflict(f"obligation {ob_id}: lease expired at {ob.claim_expires}; claim again")
+    return get(conn, ob_id)
 
 
 def set_executor(conn: sqlite3.Connection, ob_id: str, holder_ref: str, *, rule: str,
@@ -352,7 +370,7 @@ def set_executor(conn: sqlite3.Connection, ob_id: str, holder_ref: str, *, rule:
             return ob
         _require_state(ob, OPEN_UNCLAIMED, OPEN_CLAIMED, verb="executor")
         un, cl = _bank(ob, t)
-        _cas(conn, ob, t, state=OPEN_EXECUTOR, holder_kind="executor", holder_ref=ref,
+        _cas(conn, ob, t, state=OPEN_EXECUTOR, holder_kind="executor", holder_ref=ref, bound_ref=ref,
              claim_session=None, claim_expires=None, unclaimed_s=un, claimed_s=cl, state_since=t)
         kb._append_event(conn, ob.task_id, "obligation_executor",
                          {"id": ob.id, "holder_ref": ref, "rule": rule})
@@ -360,19 +378,19 @@ def set_executor(conn: sqlite3.Connection, ob_id: str, holder_ref: str, *, rule:
 
 
 def _check_binding_free(conn: sqlite3.Connection, ob: Obligation, ref: str) -> None:
-    other = conn.execute(
-        "SELECT id FROM obligations WHERE holder_kind = 'executor' AND holder_ref = ? AND id != ?",
-        (ref, ob.id)).fetchone()
+    """``bound_ref`` is write-once: release, claim and expiry never clear it (P6-RC4)."""
+    other = conn.execute("SELECT id FROM obligations WHERE bound_ref = ? AND id != ?",
+                         (ref, ob.id)).fetchone()
     if other is not None:
         raise ObligationRefused(f"{ref} is already bound to {other[0]}; a binding is never retargeted")
-    if ob.holder_kind == "executor" and ob.holder_ref and ob.holder_ref != ref:
-        raise ObligationRefused(f"obligation {ob.id} is bound to {ob.holder_ref}; never retargeted")
+    if ob.bound_ref and ob.bound_ref != ref:
+        raise ObligationRefused(f"obligation {ob.id} is bound to {ob.bound_ref}; never retargeted")
 
 
 def release_executor(conn: sqlite3.Connection, ob_id: str, *, now: Optional[int] = None,
                      expected_gen: Optional[int] = None, why: str = "") -> Obligation:
     """The bound job ended with an outcome that opens no row: the decision is pending again.
-    ``holder_ref`` stays as the binding record; ``holder_kind`` returns to operator."""
+    ``bound_ref`` keeps the binding; ``holder_kind`` returns to operator."""
     t = _now(now)
     with kb.write_txn(conn):
         ob = _load_for_cas(conn, ob_id, expected_gen)
@@ -392,14 +410,19 @@ def expire_leases(conn: sqlite3.Connection, *, now: Optional[int] = None) -> lis
                             (OPEN_CLAIMED, t)).fetchall()
         for r in rows:
             ob = Obligation.from_row(r)
-            exp = int(ob.claim_expires or t)
-            _cas(conn, ob, t, state=OPEN_UNCLAIMED, holder_ref=None, claim_expires=None,
-                 claimed_s=ob.claimed_s + max(0, exp - ob.state_since), state_since=exp,
-                 lease_expiries=ob.lease_expiries + 1)
-            kb._append_event(conn, ob.task_id, "obligation_lease_expired", {
-                "id": ob.id, "session": ob.claim_session, "lease_expiries": ob.lease_expiries + 1})
+            _expire_one(conn, ob, t)
             out.append(get(conn, ob.id))
     return out
+
+
+def _expire_one(conn: sqlite3.Connection, ob: Obligation, t: int) -> None:
+    """One claimed row back to unclaimed, claimed time banked AT ``claim_expires``. In-txn."""
+    exp = int(ob.claim_expires or t)
+    _cas(conn, ob, t, state=OPEN_UNCLAIMED, holder_ref=None, claim_expires=None,
+         claimed_s=ob.claimed_s + max(0, exp - ob.state_since), state_since=exp,
+         lease_expiries=ob.lease_expiries + 1)
+    kb._append_event(conn, ob.task_id, "obligation_lease_expired", {
+        "id": ob.id, "session": ob.claim_session, "lease_expiries": ob.lease_expiries + 1})
 
 
 def mark_escalated(conn: sqlite3.Connection, ob_id: str, *, now: Optional[int] = None,
@@ -461,6 +484,13 @@ def resolve(conn: sqlite3.Connection, ob_id: str, resolution: str, *, now: Optio
                 raise ObligationRefused(
                     f"{res}: {ob.id} is not bound to {run} (holder {ob.holder_kind}:{ob.holder_ref}); "
                     "only the bound lander's green resolves it")
+        if resolution_kind(res) == "superseded":
+            succ_key = res.partition(":")[2].strip()
+            succ = get_by_source(conn, ob.task_id, succ_key)
+            if succ is None or succ.id == ob.id:
+                raise ObligationRefused(
+                    f"{res}: no successor row {succ_key!r} on {ob.task_id}; use supersede, which "
+                    "opens the successor and resolves this row in one transaction")
         un, cl = _bank(ob, t)
         _cas(conn, ob, t, state=RESOLVED, resolution=res, unclaimed_s=un, claimed_s=cl,
              claim_expires=None, state_since=t)
@@ -510,9 +540,24 @@ _LANDING_CODE_RES = (
 )
 
 
+def _strip_shell_comment(line: str) -> str:
+    """``line`` up to an unquoted ``#`` that starts a word. Line-based, not a tokenizer."""
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
+            return line[:i]
+    return line
+
+
 def is_landing_code(code: Optional[str]) -> bool:
-    """True when ``code`` (the job's script/argv text) actually lands a PR."""
-    text = code or ""
+    """True when ``code`` (the job's script/argv text) actually lands a PR. Shell comments
+    never count: a watcher whose comment mentions ``gh pr merge`` stays a receipt."""
+    text = "\n".join(_strip_shell_comment(ln) for ln in (code or "").splitlines())
     return any(rx.search(text) for rx in _LANDING_CODE_RES)
 
 
@@ -545,9 +590,8 @@ def decide_binding(conn: sqlite3.Connection, task_id: str, *, job_name: Optional
     :func:`set_executor` for a queue row). A ``holder_ref`` that is already bound returns that
     binding unchanged, so a row opening later cannot retarget it."""
     if holder_ref:
-        row = conn.execute(
-            "SELECT id FROM obligations WHERE holder_kind = 'executor' AND holder_ref = ?",
-            (holder_ref,)).fetchone()
+        row = conn.execute("SELECT id FROM obligations WHERE bound_ref = ?",
+                           (holder_ref,)).fetchone()
         if row is not None:
             return Binding("bound", row[0], "persisted", f"{holder_ref} was bound to {row[0]} at first sight")
     lander = is_landing_code(code)
@@ -591,18 +635,79 @@ class Actor:
     session: Optional[str]
     worker_profile: Optional[str]      # worker ancestry, read from process identity
     worker_env: tuple[str, ...]        # worker markers present in env
+    ancestry_refusal: Optional[str] = None  # ancestry could not be proven worker-free
+
+
+def _live_run_rows(chain: list[int]) -> tuple[list[tuple[int, str, Any, Any]], bool]:
+    """``[(worker_pid, profile, worker_started_at, ended_at)]`` for every ``task_runs`` row whose
+    pid is in ``chain``, on every board at its physical path; ``complete`` is False when the board
+    list or any board was unreadable (absence is then not proven)."""
+    try:
+        with kb.enumerating_boards():
+            paths = {str(kb._board_db_path_ignoring_pin(b["slug"]))
+                     for b in kb.list_boards() if b.get("slug")}
+        paths.add(str(kb.kanban_db_path()))
+    except Exception:
+        return [], False
+    rows: list[tuple[int, str, Any, Any]] = []
+    complete = True
+    marks = ",".join("?" * len(chain))
+    for raw in sorted(paths):
+        path = Path(raw)
+        if not path.is_file():
+            continue
+        try:
+            c = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+            try:
+                rows += c.execute(f"SELECT worker_pid, profile, worker_started_at, ended_at FROM task_runs "
+                                  f"WHERE worker_pid IN ({marks}) ORDER BY id DESC", tuple(chain)).fetchall()
+            finally:
+                c.close()
+        except sqlite3.Error:
+            complete = False
+    return rows, complete
+
+
+def worker_ancestry() -> tuple[Optional[str], Optional[str]]:
+    """``(worker_profile, refusal)`` from process identity, authorization-grade.
+
+    A run whose ``worker_pid`` is in our ancestry and whose spawn fingerprint matches makes us that
+    worker. A LIVE run on our ancestry with no verifiable fingerprint (``unverified``, legacy), an
+    unreadable ancestry or board, or any exception is a refusal: absence of a worker is never
+    assumed from an incomplete scan. An ended run with an unverifiable fingerprint is history."""
+    from hermes_cli import kanban_identity as ki
+    from hermes_cli.kanban_db_dispatch import _fingerprints_agree, _process_fingerprint
+
+    try:
+        chain = ki._ancestry()
+        if not chain:
+            return None, "worker ancestry indeterminate: process ancestry unreadable"
+        rows, complete = _live_run_rows(chain)
+        unverified = None
+        for pid in chain:  # nearest worker ancestor wins; the session id is last
+            for wpid, profile, started, ended in rows:
+                if int(wpid) != pid or not profile:
+                    continue
+                if isinstance(started, str) and "|" in started:
+                    if _fingerprints_agree(started, _process_fingerprint(pid)):
+                        return str(profile), None
+                elif ended is None and unverified is None:
+                    unverified = (f"worker ancestry indeterminate: live run of {profile} on pid {pid} "
+                                  f"has an unverified spawn fingerprint ({started!r})")
+        if unverified:
+            return None, unverified
+        if not complete:
+            return None, "worker ancestry indeterminate: a board was unreadable"
+        return None, None
+    except Exception as exc:
+        return None, f"worker ancestry indeterminate: {type(exc).__name__}: {exc}"
 
 
 def current_actor() -> Actor:
-    from hermes_cli.kanban_identity import worker_ancestor_profile
-
     profile, session = kb._event_actor()
     markers = tuple(m for m in WORKER_ENV_MARKERS if (os.environ.get(m) or "").strip())
-    try:
-        worker = worker_ancestor_profile()
-    except Exception:
-        worker = None
-    return Actor(profile, session, worker, markers)
+    worker, refusal = worker_ancestry()
+    return Actor(profile, session, worker, markers, refusal)
 
 
 def _operator_state_dbs() -> list[Path]:
@@ -636,7 +741,7 @@ def worker_refusal(actor: Actor) -> Optional[str]:
         return f"worker-run marker present ({', '.join(actor.worker_env)})"
     if actor.worker_profile:
         return f"runs under dispatched worker {actor.worker_profile} (process ancestry)"
-    return None
+    return actor.ancestry_refusal
 
 
 def operator_refusal(actor: Actor) -> Optional[str]:
@@ -644,7 +749,7 @@ def operator_refusal(actor: Actor) -> Optional[str]:
     why = worker_refusal(actor)
     if why:
         return why
-    if (actor.profile or "").strip().lower() not in kb.OPERATOR_PROFILES:
+    if (actor.profile or "").strip() not in kb.OPERATOR_PROFILES:
         return f"profile {actor.profile!r} is not an operator profile"
     if not actor.session:
         return "no session id (HERMES_SESSION_ID)"
@@ -820,9 +925,10 @@ def _dispatch(conn: sqlite3.Connection, action: str, args, t: int, board: Option
         for o in list_obligations(conn, task_id=args.task_id, open_only=True):
             d = o.to_dict(t)
             d["escalation_due"] = escalation_due(o, t, policy)
+            d["bound_violation"] = bound_violation(o, t, policy)
             d["lease_expired"] = o.state == OPEN_CLAIMED and (o.claim_expires or 0) < t
             rows.append(d)
-        overdue = [d["id"] for d in rows if d["escalation_due"]]
+        overdue = [d["id"] for d in rows if d["bound_violation"]]
         _print({"open": len(rows), "overdue": overdue, "obligations": rows})
         return RC_ERROR if overdue else RC_OK
     if action == "receipt":

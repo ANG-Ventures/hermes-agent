@@ -3067,9 +3067,11 @@ CREATE TABLE IF NOT EXISTS obligations (
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL,
     holder_gen     INTEGER NOT NULL DEFAULT 0,
-    resolution     TEXT
+    resolution     TEXT,
+    bound_ref      TEXT  -- executor binding: written once, never cleared or retargeted
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_obligations_source ON obligations(task_id, source_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_obligations_bound ON obligations(bound_ref) WHERE bound_ref IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_obligations_open ON obligations(task_id) WHERE state != 'resolved';
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);

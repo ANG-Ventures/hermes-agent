@@ -26,22 +26,23 @@ Refusals print `obligation: <why>` on stderr.
 |---|---|---|
 | `open <card> --source-key K [--created-at EPOCH] [--summary S] [--repo O/R --pr N] [--job-name J]` | anyone (drainer, reconciler) | inserts `open_unclaimed`, or nothing if K exists. `--created-at` is the EVENT time and starts the clock. With `OBLIGATIONS=0` or registry `enabled: false`: `{"disabled": true, "opened": false}`, rc 0 |
 | `claim <id> [--expected-gen G]` | operator only (below) | `open_unclaimed` -> `open_claimed`, lease = `classes.<c>.lease_min` |
-| `progress <id> <line...>` | operator, or the worker of that card itself | renews the lease of a CLAIMED row. rc 2 "claim first" on an unclaimed row. Not a holder change: `holder_gen` unchanged |
+| `progress <id> <line...>` | operator, or the worker of that card itself | renews the lease of a CLAIMED row. rc 2 "claim first" on an unclaimed row. rc 3 "lease expired" when past `claim_expires`: the expiry is banked (row back to `open_unclaimed`, `lease_expiries + 1`) and the lease is NOT renewed; claim again. Not a holder change: `holder_gen` unchanged |
 | `resolve <id> <resolution> [--expected-gen G]` | `handed:*` / `dropped:*`: operator only. Observed outcomes: any non-worker | any open state -> `resolved` |
 | `receipt <id> --wake-outcome O` | any (drainer, reconciler) | ONLY `wake_attempts`, `first_wake_at`, `last_wake_at`, `last_wake_outcome`. Never `state`, never `holder_gen` |
 | `bind <card> [--job-name J] [--code-file F\|-] [--repo O/R --pr N] [--obligation ID] [--worker-owned] [--holder-ref R]` | anyone, read-only | nothing. Prints the binding decision (below); rc 2 when refused |
-| `executor <id> --holder-ref R [--rule X] [--expected-gen G]` | non-worker | `open_unclaimed`/`open_claimed` -> `open_executor`. The binding is written once: rc 2 if R is bound to another row or the row to another R |
+| `executor <id> --holder-ref R [--rule X] [--expected-gen G]` | non-worker | `open_unclaimed`/`open_claimed` -> `open_executor`. The binding is written ONCE to `bound_ref` (unique across the board), which release, claim, expiry and board transfer never clear: rc 2 if R is bound to another row or the row to another R |
 | `release <id> [--why W] [--expected-gen G]` | non-worker | `open_executor` -> `open_unclaimed` (bound job ended opening no row: `--stop`, signal, `=ok`, queue row retired other than merged) |
 | `supersede <id> --successor-key K [--created-at E] [--summary S] [--repo/--pr/--job-name] [--expected-gen G]` | non-worker | ONE transaction: open K (idempotent) AND resolve `<id>` as `superseded:K`. A lost CAS commits nothing (successor included) and never falls back to `open_unclaimed` |
 | `expire` | non-worker | every `open_claimed` row past `claim_expires` -> `open_unclaimed`, claimed time banked AT `claim_expires`, `lease_expiries + 1` |
 | `list [--card T] [--open]` | anyone | nothing |
-| `audit [--card T]` | anyone | nothing; rc 1 when any open row's `escalation_due` is set |
+| `audit [--card T]` | anyone | nothing; rc 1 when any open row's `bound_violation` is set (computed from the clocks vs policy, independent of `escalated_at`: an acknowledged escalation is still overdue) |
 
 Source keys: `detached:<run_id>`, `queue:<repo>#<pr>@<head>#<gen>`, `blocked:<event id>`,
 `review:<episode event id>` (class `review`), `holderless:<...>`. Everything else is `decision`.
 
 Resolutions: `requeued-green:<run_id>` (only when the row's executor `holder_ref` IS that run:
-a watcher's green never resolves a lander decision), `superseded:<source_key>`, `merged:<sha>`,
+a watcher's green never resolves a lander decision), `superseded:<source_key>` (only when that
+successor row already exists on the same card; otherwise rc 2, use `supersede`), `merged:<sha>`,
 `card-closed`, `handed:ace`, `dropped:<why>`. Empty or bare (`dropped:`) is rc 2.
 
 ## Authority
@@ -50,8 +51,11 @@ Operator = ALL of: profile in `OPERATOR_PROFILES` (default/apollo/aegis); a sess
 then the in-process session, then `HERMES_SESSION_ID`); that session exists in an operator profile's
 `state.db` `sessions`; NO worker-run env marker (`HERMES_KANBAN_TASK`, `HERMES_KANBAN_RUN_ID`,
 `HERMES_KANBAN_LINEAGE`); and NO dispatched worker in the process ancestry
-(`kanban_identity.worker_ancestor_profile`, read from `task_runs.worker_pid` + spawn fingerprint),
-so stripping the env does not make a worker an operator.
+(`kanban_work_obligations.worker_ancestry`, read from `task_runs.worker_pid` + spawn fingerprint),
+so stripping the env does not make a worker an operator. The ancestry check fails CLOSED: a live
+run on the caller's ancestry with an unverifiable fingerprint (`unverified`), an unreadable
+ancestry or board, or an exception refuses claim/resolve with "worker ancestry indeterminate".
+The profile compare is byte-exact (`Default` is not `default`).
 
 A claim from a session that is not the card's home is accepted and returned with
 `"non_home": true` (the `obligation_claimed` event carries it). A `dropped:*` resolve and any
@@ -83,8 +87,14 @@ A NULL repo or pr never equals anything, NULL included.
 `id, task_id, source_key, repo, pr, job_name, class, holder_kind, holder_ref, state, claim_session,
 claim_expires, lease_expiries, unclaimed_s, claimed_s, state_since, wake_attempts, first_wake_at,
 last_wake_at, last_wake_outcome, escalated_at, summary, created_at, updated_at, holder_gen,
-resolution, unclaimed_total_s, claimed_total_s` (`*_total_s` include the current stint).
-`audit` rows add `escalation_due` (reason string or null) and `lease_expired`.
+resolution, bound_ref, unclaimed_total_s, claimed_total_s` (`*_total_s` include the current stint).
+`audit` rows add `escalation_due` (reason string or null; null once escalated), `bound_violation`
+(reason string or null, ignores `escalated_at`) and `lease_expired`.
+
+Landing code ignores shell comments (an unquoted `#` starting a word, line-based).
+
+Board export/import (`kanban_transfer`) returns every `open_claimed` / `open_executor` row to
+`open_unclaimed` (holder cleared, clock restarted at import); `bound_ref` and resolved rows travel.
 
 ## Events
 

@@ -626,6 +626,11 @@
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two. card_supersession (t_6a853d1c): matching a SUPERSEDED-BY target to the superseding card's merged PR, and refusing a cross-repo pair, must treat case variants of one repo as the same repo.",
    "where": "hermes_cli/kanban_open_pr.py:945 card_supersession"
+  },
+  "hermes_cli/kanban_work_obligations.py::_identity::fold::repo::return (str(repo).strip().lower(), int(pr))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, pr) tuple IS the canonical PR identity for binding; byte-exact would let one PR fail to bind its own obligation.",
+   "where": "hermes_cli/kanban_work_obligations.py:580 _identity"
   }
  }
 }

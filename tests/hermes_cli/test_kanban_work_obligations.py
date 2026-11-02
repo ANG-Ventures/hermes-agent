@@ -456,3 +456,128 @@ def test_cli_audit_exits_1_on_an_overdue_row(conn, home, tmp_path):
     ob.open_obligation(conn, tid, "detached:old", created_at=int(time.time()) - 31 * 60)
     r = _cli(home, tmp_path, "audit")
     assert r.returncode == 1 and len(json.loads(r.stdout)["overdue"]) == 1
+
+
+# --- Prism round 1 on #2533 (Apollo ruling: all P1s, one push) --------------------------------
+
+def test_binding_survives_release_and_claim_and_is_never_retargeted(conn):
+    """15a74715fd28 + 6c403d160479: bound_ref is write-once, independent of holder_kind."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:A", now=T0)
+    b, _ = ob.open_obligation(conn, tid, "detached:B", now=T0)
+    ob.set_executor(conn, a.id, "run-1", rule="explicit", now=T0 + 1)
+    a = ob.release_executor(conn, a.id, now=T0 + 2)
+    assert a.bound_ref == "run-1" and a.holder_kind == "operator"
+    with pytest.raises(ob.ObligationRefused, match="never retargeted"):
+        ob.set_executor(conn, b.id, "run-1", rule="explicit", now=T0 + 3)
+    with pytest.raises(ob.ObligationRefused):
+        ob.resolve(conn, b.id, "requeued-green:run-1", now=T0 + 4)
+    # a claim overwrites holder_ref with the session; the binding stays
+    a = ob.claim(conn, a.id, session="s-op", now=T0 + 5)
+    assert a.bound_ref == "run-1" and a.holder_ref == "s-op"
+    with pytest.raises(ob.ObligationRefused, match="never retargeted"):
+        ob.set_executor(conn, a.id, "run-2", rule="explicit", now=T0 + 6)
+    assert ob.decide_binding(conn, tid, job_name=None, code=LANDER, holder_ref="run-1").obligation_id == a.id
+    # the original job re-holding its own row is allowed
+    assert ob.set_executor(conn, a.id, "run-1", rule="explicit", now=T0 + 7).state == ob.OPEN_EXECUTOR
+
+
+def test_shell_comment_mentioning_a_lander_is_not_landing_code(conn):
+    """2d470c0e95d3."""
+    assert not ob.is_landing_code("# gh pr merge\ntrue")
+    assert not ob.is_landing_code("true  # then fleet-merge.sh o/r 1")
+    assert ob.is_landing_code("echo '#x' && gh pr merge 1")
+    assert ob.is_landing_code('echo "a # b"; gh pr merge 1')
+    tid = _card(conn)
+    o, _ = ob.open_obligation(conn, tid, "detached:c1", now=T0)
+    b = ob.decide_binding(conn, tid, job_name="watch", code="# gh pr merge\ntrue", obligation_id=o.id)
+    assert b.status == "refused"
+
+
+def test_progress_after_lease_expiry_is_refused_and_the_expiry_is_banked(conn):
+    """084b6e67d069."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:e1", created_at=T0, now=T0)
+    ob.claim(conn, a.id, session="s", now=T0, lease_s=60)
+    with pytest.raises(ob.ObligationConflict, match="lease expired") as exc:
+        ob.progress(conn, a.id, "update", now=T0 + 120, lease_s=60)
+    assert exc.value.rc == ob.RC_CONFLICT
+    a = ob.get(conn, a.id)
+    assert (a.state, a.lease_expiries, a.claimed_s, a.state_since) == (ob.OPEN_UNCLAIMED, 1, 60, T0 + 60)
+    assert _events(conn, tid)[-1] == "obligation_lease_expired"
+
+
+def test_audit_counts_an_escalated_row_still_past_its_bound(conn, home, tmp_path):
+    """0b614a798c3e: escalated_at acknowledges the page, it does not clear the violation."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "blocked:e1", created_at=int(time.time()) - 31 * 60)
+    ob.mark_escalated(conn, a.id)
+    assert ob.escalation_due(ob.get(conn, a.id), int(time.time())) is None
+    assert ob.bound_violation(ob.get(conn, a.id), int(time.time())) is not None
+    r = _cli(home, tmp_path, "audit")
+    assert r.returncode == 1 and json.loads(r.stdout)["overdue"] == [a.id]
+
+
+def test_resolve_superseded_needs_an_existing_successor(conn):
+    """5a66819210c2."""
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:s1", now=T0)
+    with pytest.raises(ob.ObligationRefused, match="supersede"):
+        ob.resolve(conn, a.id, "superseded:blocked:missing", now=T0 + 1)
+    with pytest.raises(ob.ObligationRefused, match="supersede"):
+        ob.resolve(conn, a.id, "superseded:detached:s1", now=T0 + 1)   # itself
+    assert ob.get(conn, a.id).state == ob.OPEN_UNCLAIMED
+    ob.open_obligation(conn, tid, "blocked:present", now=T0)
+    assert ob.resolve(conn, a.id, "superseded:blocked:present", now=T0 + 2).state == ob.RESOLVED
+
+
+def test_unverifiable_worker_ancestry_fails_closed(conn, home, monkeypatch):
+    """f799f2e773a9: a live run row on our ancestry with an `unverified` fingerprint, an
+    unreadable board, or an exception refuses; an operator outside any worker tree passes."""
+    _operator_state_db(home, "s-op")
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setenv("HERMES_SESSION_ID", "s-op")
+    assert ob.operator_refusal(ob.current_actor()) is None          # outside any worker tree
+    wt = _card(conn, "unverified worker")
+    kb.claim_task(conn, wt)
+    conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = 'unverified', "
+                 "profile = 'daedalus' WHERE task_id = ?", (os.getpid(), wt))
+    conn.commit()
+    why = ob.operator_refusal(ob.current_actor())
+    assert why and "unverif" in why
+    conn.execute("UPDATE task_runs SET ended_at = ? WHERE task_id = ?", (T0, wt))
+    conn.commit()
+    assert ob.operator_refusal(ob.current_actor()) is None          # an ended run is history
+    from hermes_cli import kanban_identity as ki
+    monkeypatch.setattr(ob, "_live_run_rows", lambda chain: ([], False))
+    assert "indeterminate" in ob.operator_refusal(ob.current_actor())
+    monkeypatch.setattr(ki, "_ancestry", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert "indeterminate" in ob.operator_refusal(ob.current_actor())
+
+
+def test_operator_profile_compare_is_byte_exact(home):
+    _operator_state_db(home, "s-op")
+    assert "not an operator" in ob.operator_refusal(_actor(profile="Default"))
+
+
+def test_board_transfer_clears_obligation_holders_and_keeps_the_binding(conn, home, tmp_path):
+    """5e52d26c2578."""
+    from hermes_cli import kanban_transfer as kt
+
+    tid = _card(conn)
+    a, _ = ob.open_obligation(conn, tid, "detached:x", now=T0)
+    ob.set_executor(conn, a.id, "source-host-run", rule="explicit", now=T0 + 1)
+    c, _ = ob.open_obligation(conn, tid, "detached:y", now=T0)
+    ob.claim(conn, c.id, session="s-src", now=T0 + 1)
+    done, _ = ob.open_obligation(conn, tid, "detached:z", now=T0)
+    ob.resolve(conn, done.id, "merged:abc", now=T0 + 2)
+    archive = kt.export_board(BOARD, str(tmp_path / "out"))["archive"]
+    slug = kt.import_board(archive, slug="obl-imported")["board"]
+    with kbc.connect_closing(board=slug) as c2:
+        rows = {o.source_key: o for o in ob.list_obligations(c2)}
+    assert rows["detached:x"].state == ob.OPEN_UNCLAIMED and rows["detached:x"].holder_ref is None
+    assert rows["detached:x"].bound_ref == "source-host-run"
+    assert rows["detached:y"].state == ob.OPEN_UNCLAIMED and rows["detached:y"].claim_session is None
+    assert rows["detached:z"].state == ob.RESOLVED and rows["detached:z"].resolution == "merged:abc"
+    # the destination's clock runs again: 30 min after import with no holder it escalates
+    assert ob.escalation_due(rows["detached:x"], int(time.time()) + 31 * 60) is not None

@@ -101,6 +101,21 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
         (int(time.time()),),
     )
     conn.execute("UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL")
+    # Obligation holders are sessions / jobs on the exporting machine: the decision is pending
+    # again here. bound_ref (the binding record) and resolved history travel unchanged.
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'obligations'").fetchone():
+        conn.execute(
+            """
+            UPDATE obligations
+               SET claimed_s = claimed_s + CASE WHEN state = 'open_claimed'
+                                                THEN MAX(0, ? - state_since) ELSE 0 END,
+                   state = 'open_unclaimed', state_since = ?, holder_kind = 'operator',
+                   holder_ref = NULL, claim_session = NULL, claim_expires = NULL,
+                   holder_gen = holder_gen + 1
+             WHERE state IN ('open_claimed', 'open_executor')
+            """,
+            (int(time.time()), int(time.time())),
+        )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
