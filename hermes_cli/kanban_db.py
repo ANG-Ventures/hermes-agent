@@ -18568,6 +18568,42 @@ def _member_birth(pid: int) -> Optional[float]:
         return None
 
 
+# The session reap orders member births against moments a member was proved
+# alive, so both must come from one clock whose birth reading cannot run early
+# by more than the slack (Prism fe32a904b73f). Linux psutil adds /proc/stat
+# ``btime``, an INTEGER second, so its epoch create_time reads up to ~1 s early
+# (ACE-AI: 0.093 s). /proc/<pid>/stat starttime against CLOCK_BOOTTIME has no
+# btime term and floors only to one tick (1/CLK_TCK, 10 ms). macOS reports
+# create_time from p_starttime in microseconds. Unverified platforms keep the
+# 2 s bound (integer btime + one tick, operator ruling 2026-11-01).
+_REAP_LINUX_CLOCK = sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME")
+_REAP_BIRTH_SLACK_SECONDS = (
+    0.1 if _REAP_LINUX_CLOCK or sys.platform == "darwin" else 2.0
+)
+
+
+def _reap_now() -> float:
+    """Now, on the clock :func:`_reap_birth` reads."""
+    if _REAP_LINUX_CLOCK:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    return time.time()
+
+
+def _reap_birth(pid: int) -> Optional[float]:
+    """Birth of ``pid`` on the :func:`_reap_now` clock, or None when gone."""
+    if not _REAP_LINUX_CLOCK:
+        return _member_birth(pid)
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            stat = fh.read()
+        # comm may hold spaces and parens; fields resume after the LAST ')'.
+        # starttime is field 22, i.e. index 19 counting from field 3.
+        ticks = int(stat[stat.rindex(b")") + 2:].split()[19])
+        return ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _session_owned_by_run(
     members: list[tuple[int, int]], born_after: float, born_before: float,
 ) -> bool:
@@ -18611,8 +18647,9 @@ def _reap_worker_session(
     proved to be the recorded run's (:func:`_session_owned_by_run`, with
     ``born_after`` = claim time and ``born_before`` = the last moment the
     worker was known alive); unknown bounds mean no reap. Every later scan
-    must share a ``(pid, create_time)`` member with the scan before it, so a
-    session that empties and has its sid reused mid-reap is never signalled.
+    must hold a member born before a moment some earlier-proved member was
+    seen alive (re-checked during each scan), so a session that empties and
+    has its sid reused mid-reap is never signalled.
     Groups that appear DURING the reap (a member forking into a new group on
     SIGTERM) are signalled while that continuity holds. Never targets sid <= 1, the caller's own session, or the
     caller's own process group. POSIX only; a no-op elsewhere.
@@ -18652,25 +18689,70 @@ def _reap_worker_session(
     def _identities(found: list[tuple[int, int]]) -> set[tuple[int, float]]:
         out = set()
         for pid, _ in found:
-            created = _member_birth(pid)
+            created = _reap_birth(pid)
             if created is not None:
                 out.add((pid, created))
         return out
 
-    known = _identities(members)
+    def _proved(found: set[tuple[int, float]]) -> Optional[float]:
+        # A moment some identified member was alive AND still in ``sid``, or
+        # None. getsid first, then the birth check: the same (pid, create
+        # time) after getsid means that pid was this process at getsid, so it
+        # was a member at ``checked``. A member that setsid()'d away proves
+        # nothing about the session it left.
+        checked = _reap_now()
+        for pid, created in found:
+            try:
+                if os.getsid(pid) != sid:
+                    continue
+            except OSError:
+                continue
+            if _reap_birth(pid) == created:
+                return checked
+        return None
 
-    def _left() -> set[int]:
-        # Ownership is re-established on EVERY snapshot, never assumed: a
-        # snapshot is the same session only if it still holds a member
-        # (same pid AND create time) of the previous one. A session holding
-        # any original member has not emptied, so its sid cannot have been
-        # reused; groups a member created in answer to SIGTERM ride along.
-        # No overlap -> the session emptied (or is unprovable): stop.
+    known = _identities(members)
+    proved = _proved(known)
+    if proved is None:  # the session emptied (sid reusable) since ownership was checked
+        _log.info("kanban: session %d emptied before the reap; not reaped", sid)
+        return 0
+    proved_at = proved
+
+    def _scan() -> list[tuple[int, int]]:
+        # One snapshot, re-proving a known member alive every 50 ms while it
+        # runs: under load a scan takes over a second (ps over 15k procs at
+        # load1 387, t_db02e9c8), long enough for a member to fork a new
+        # group on SIGTERM and exit before the next snapshot sees both.
+        nonlocal proved_at
+        box: list = []
+        scan = threading.Thread(
+            target=lambda: box.append(_worker_session_members(sid)), daemon=True,
+        )
+        scan.start()
+        while True:
+            scan.join(0.05)
+            proved = _proved(known)
+            if proved is not None:
+                proved_at = proved
+            if not scan.is_alive():
+                return box[0] if box else []
+
+    def _left() -> Optional[set[int]]:
+        # Ownership is re-established on EVERY snapshot, never assumed. While
+        # a proven member lives the session cannot empty, so its sid cannot
+        # be reused; a process in that sid born before ``proved_at`` was born
+        # into this session. A snapshot holding such a member is this
+        # session, groups created in answer to SIGTERM included.
+        # "Born before" only counts with the clock's read error on the safe
+        # side: a birth inside the slack may postdate the proof, so it waits
+        # for a later proof (one every 50 ms while a member lives).
+        # None -> unprovable and no member was seen alive meanwhile: stop.
         nonlocal known
-        current = _worker_session_members(sid)
+        before = proved_at
+        current = _scan()
         ids = _identities(current)
-        if not current or not (ids & known):
-            return set()
+        if not any(created + _REAP_BIRTH_SLACK_SECONDS <= proved_at for _, created in ids):
+            return set() if proved_at > before else None
         known = ids
         return {pgid for _, pgid in current}
 
@@ -18678,11 +18760,12 @@ def _reap_worker_session(
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         left = _left()
-        if not left:
+        if left is None:
             break
-        _term(left)  # groups born during the reap get their SIGTERM too
+        if left:  # empty while a member lived: its fork may postdate the snapshot, rescan
+            _term(left)  # groups born during the reap get their SIGTERM too
         time.sleep(0.1)
-    for pgid in sorted(_left()):
+    for pgid in sorted(_left() or ()):
         try:
             os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok (POSIX-gated above)
         except OSError:
