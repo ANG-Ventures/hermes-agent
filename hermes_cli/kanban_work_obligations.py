@@ -349,7 +349,11 @@ def progress(conn: sqlite3.Connection, ob_id: str, line: str, *, now: Optional[i
     """Renew the lease of a CLAIMED row. Not a holder change: no gen bump, no banking.
 
     A lease already past ``claim_expires`` is not revived: the expiry is banked (committed) and
-    the renewal is refused rc 3, so a delayed sweep never changes lease semantics."""
+    the renewal is refused rc 3, so a delayed sweep never changes lease semantics.
+
+    Authority is checked HERE, not only in the CLI (Prism 337337e7c32a): the verified worker of the
+    row's own card, or an operator with positive proof. A worker of another card is refused."""
+    require_progress_authority(get(conn, ob_id).task_id)
     t = _now(now)
     line = (line or "").strip()
     if not line:
@@ -638,8 +642,8 @@ class Actor:
     ancestry_refusal: Optional[str] = None  # ancestry could not be proven worker-free
 
 
-def _live_run_rows(chain: list[int]) -> tuple[list[tuple[int, str, Any, Any]], bool]:
-    """``[(worker_pid, profile, worker_started_at, ended_at)]`` for every ``task_runs`` row whose
+def _live_run_rows(chain: list[int]) -> tuple[list[tuple[int, str, Any, Any, str]], bool]:
+    """``[(worker_pid, profile, worker_started_at, ended_at, task_id)]`` for every ``task_runs`` row whose
     pid is in ``chain``, on every board at its physical path; ``complete`` is False when the board
     list or any board was unreadable (absence is then not proven)."""
     try:
@@ -649,7 +653,7 @@ def _live_run_rows(chain: list[int]) -> tuple[list[tuple[int, str, Any, Any]], b
         paths.add(str(kb.kanban_db_path()))
     except Exception:
         return [], False
-    rows: list[tuple[int, str, Any, Any]] = []
+    rows: list[tuple[int, str, Any, Any, str]] = []
     complete = True
     marks = ",".join("?" * len(chain))
     for raw in sorted(paths):
@@ -659,7 +663,7 @@ def _live_run_rows(chain: list[int]) -> tuple[list[tuple[int, str, Any, Any]], b
         try:
             c = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
             try:
-                rows += c.execute(f"SELECT worker_pid, profile, worker_started_at, ended_at FROM task_runs "
+                rows += c.execute(f"SELECT worker_pid, profile, worker_started_at, ended_at, task_id FROM task_runs "
                                   f"WHERE worker_pid IN ({marks}) ORDER BY id DESC", tuple(chain)).fetchall()
             finally:
                 c.close()
@@ -669,7 +673,13 @@ def _live_run_rows(chain: list[int]) -> tuple[list[tuple[int, str, Any, Any]], b
 
 
 def worker_ancestry() -> tuple[Optional[str], Optional[str]]:
-    """``(worker_profile, refusal)`` from process identity, authorization-grade.
+    """``(worker_profile, refusal)`` from process identity, authorization-grade."""
+    profile, _task, refusal = worker_ancestry_run()
+    return profile, refusal
+
+
+def worker_ancestry_run() -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """``(worker_profile, worker_task_id, refusal)`` from process identity, authorization-grade.
 
     A run whose ``worker_pid`` is in our ancestry and whose spawn fingerprint matches makes us that
     worker. A LIVE run on our ancestry with no verifiable fingerprint (``unverified``, legacy), an
@@ -681,17 +691,17 @@ def worker_ancestry() -> tuple[Optional[str], Optional[str]]:
     try:
         chain = ki._ancestry()
         if not chain:
-            return None, "worker ancestry indeterminate: process ancestry unreadable"
+            return None, None, "worker ancestry indeterminate: process ancestry unreadable"
         rows, complete = _live_run_rows(chain)
         unverified = None
         for pid in chain:  # nearest worker ancestor wins; the session id is last
-            for wpid, profile, started, ended in rows:
+            for wpid, profile, started, ended, task_id in rows:
                 if int(wpid) != pid or not profile:
                     continue
                 if isinstance(started, str) and "|" in started:
                     current = _process_fingerprint(pid)
                     if current is not None and _fingerprints_agree(started, current):
-                        return str(profile), None
+                        return str(profile), str(task_id), None
                     if current is None and ended is None and unverified is None:
                         unverified = (f"worker ancestry indeterminate: live run of {profile} on pid "
                                       f"{pid}: current process fingerprint unavailable")
@@ -699,12 +709,12 @@ def worker_ancestry() -> tuple[Optional[str], Optional[str]]:
                     unverified = (f"worker ancestry indeterminate: live run of {profile} on pid {pid} "
                                   f"has an unverified spawn fingerprint ({started!r})")
         if unverified:
-            return None, unverified
+            return None, None, unverified
         if not complete:
-            return None, "worker ancestry indeterminate: a board was unreadable"
-        return None, None
+            return None, None, "worker ancestry indeterminate: a board was unreadable"
+        return None, None, None
     except Exception as exc:
-        return None, f"worker ancestry indeterminate: {type(exc).__name__}: {exc}"
+        return None, None, f"worker ancestry indeterminate: {type(exc).__name__}: {exc}"
 
 
 def current_actor() -> Actor:
@@ -781,6 +791,26 @@ def require_operator_authority(verb: str) -> None:
         return
     raise ObligationRefused(f"{verb} refused: no operator proof ({kb.OPERATOR_TOKEN_ENV} or a live "
                             "operator gateway ancestor with no worker between)")
+
+
+def require_progress_authority(task_id: str) -> None:
+    """Gate for ``progress``: the verified worker of ``task_id`` itself (a live run of THAT card on
+    our process ancestry, fingerprint-matched; env markers are never proof), else an operator with
+    positive proof via :func:`require_operator_authority`. A worker of any other card, a delegated
+    child, or an unverifiable ancestry is refused."""
+    from agent.delegation_context import is_delegated_child_process_context
+
+    _worker, worker_task, refusal = worker_ancestry_run()
+    if worker_task is not None:
+        if worker_task != task_id:
+            raise ObligationRefused(f"progress refused: runs under the worker of {worker_task}, "
+                                    f"not of {task_id}")
+        if is_delegated_child_process_context():
+            raise ObligationRefused("progress refused: delegated child of the card's worker")
+        return
+    if refusal:
+        raise ObligationRefused(f"progress refused: {refusal}")
+    require_operator_authority("progress")
 
 
 def is_home_session(conn: sqlite3.Connection, task_id: str, session: Optional[str]) -> bool:

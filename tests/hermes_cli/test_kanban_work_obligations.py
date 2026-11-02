@@ -754,3 +754,56 @@ def test_hard_delete_of_a_card_leaves_no_obligation_row(conn):
     kb.archive_task(conn, tid)
     assert kb.delete_archived_task(conn, tid)
     assert conn.execute("SELECT count(*) FROM obligations WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+
+
+# --- Prism 337337e7c32a residue of #2533: progress() checks the caller's card ----------------
+
+def _claimed_pair(conn):
+    """Two cards, each with a CLAIMED row (claimed while the fixture holds the operator token)."""
+    a_card, b_card = _card(conn, "card A"), _card(conn, "card B")
+    a, _ = ob.open_obligation(conn, a_card, "detached:pa", now=T0)
+    b, _ = ob.open_obligation(conn, b_card, "detached:pb", now=T0)
+    ob.claim(conn, a.id, session="s-op", now=T0 + 1)
+    ob.claim(conn, b.id, session="s-op", now=T0 + 1)
+    return a_card, a, b_card, b
+
+
+def _become_worker_of(conn, monkeypatch, task_id, env_task=None):
+    """This process is the verified live worker of ``task_id`` (run row pid + fingerprint)."""
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+
+    kb.claim_task(conn, task_id)
+    conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ?, profile = 'daedalus' "
+                 "WHERE task_id = ?", (os.getpid(), _process_fingerprint(os.getpid()), task_id))
+    conn.commit()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", env_task or task_id)
+
+
+@pytest.mark.parametrize("forged_env", [False, True], ids=["own-env", "env-forged-to-B"])
+def test_progress_direct_import_from_another_cards_worker_is_refused(conn, monkeypatch, forged_env):
+    a_card, _a, b_card, b = _claimed_pair(conn)
+    _become_worker_of(conn, monkeypatch, a_card, env_task=b_card if forged_env else None)
+    before = ob.get(conn, b.id).claim_expires
+    with pytest.raises(ob.ObligationRefused, match="progress refused"):
+        ob.progress(conn, b.id, "renewing someone else's claim", now=T0 + 60)
+    assert ob.get(conn, b.id).claim_expires == before
+    assert _events(conn, b_card)[-1] == "obligation_claimed"
+
+
+def test_progress_from_the_obligations_own_card_worker_is_allowed(conn, monkeypatch):
+    a_card, a, _b_card, _b = _claimed_pair(conn)
+    _become_worker_of(conn, monkeypatch, a_card)
+    r = ob.progress(conn, a.id, "own card moved", now=T0 + 60, lease_s=600)
+    assert r.claim_expires == T0 + 60 + 600 and _events(conn, a_card)[-1] == "obligation_progress"
+
+
+def test_progress_from_an_operator_with_token_is_allowed_and_without_proof_refused(conn, home, monkeypatch):
+    _a_card, a, _b_card, _b = _claimed_pair(conn)
+    assert ob.progress(conn, a.id, "operator moved it", now=T0 + 60, lease_s=600).claim_expires == T0 + 660
+    _operator_state_db(home, "s-op")
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setenv("HERMES_SESSION_ID", "s-op")
+    with pytest.raises(ob.ObligationRefused, match="progress refused"):
+        ob.progress(conn, a.id, "no proof", now=T0 + 120, lease_s=600)
+    assert ob.get(conn, a.id).claim_expires == T0 + 660
