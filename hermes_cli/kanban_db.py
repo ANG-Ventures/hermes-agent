@@ -3037,6 +3037,40 @@ CREATE TABLE IF NOT EXISTS sign_grants (
     revoked_at         INTEGER,
     PRIMARY KEY (grant_id, task_id)
 );
+
+-- Durable work obligations: one row per pending DECISION on a card, keyed by
+-- an immutable source key that stays unique once resolved
+-- (hermes_cli/kanban_work_obligations.py; docs/kanban-obligations.md).
+CREATE TABLE IF NOT EXISTS obligations (
+    id             TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL,
+    source_key     TEXT NOT NULL,
+    repo           TEXT,
+    pr             INTEGER,
+    job_name       TEXT,
+    class          TEXT NOT NULL,
+    holder_kind    TEXT NOT NULL,
+    holder_ref     TEXT,
+    state          TEXT NOT NULL,
+    claim_session  TEXT,
+    claim_expires  INTEGER,
+    lease_expiries INTEGER NOT NULL DEFAULT 0,
+    unclaimed_s    INTEGER NOT NULL DEFAULT 0,
+    claimed_s      INTEGER NOT NULL DEFAULT 0,
+    state_since    INTEGER NOT NULL,
+    wake_attempts  INTEGER NOT NULL DEFAULT 0,
+    first_wake_at  INTEGER,
+    last_wake_at   INTEGER,
+    last_wake_outcome TEXT,
+    escalated_at   INTEGER,
+    summary        TEXT,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    holder_gen     INTEGER NOT NULL DEFAULT 0,
+    resolution     TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_obligations_source ON obligations(task_id, source_key);
+CREATE INDEX IF NOT EXISTS idx_obligations_open ON obligations(task_id) WHERE state != 'resolved';
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);

@@ -107,6 +107,11 @@ def _base_check_setup(p: argparse.ArgumentParser) -> None:
     add_arguments(p)
 
 
+def _obligation_setup(p: argparse.ArgumentParser) -> None:
+    from hermes_cli.kanban_work_obligations import setup_parser
+    setup_parser(p)
+
+
 _TASK_ID = _arg("task_id")
 # Operator-Surface S2 (t_cd1bcea4): ONE convention on every lifecycle verb that takes prose /
 # structured input / can refuse. Mapping to each verb's historic field is in the handler.
@@ -1069,6 +1074,9 @@ _SPECS = [
              "declared scope, or is more than --max-behind commits behind. Prints the re-port "
              "remediation."
          )),
+    _cmd("obligation", setup=_obligation_setup,
+         help="Durable work obligations: open/claim/progress/resolve decision rows on a card",
+         description="See docs/kanban-obligations.md for verbs, JSON shapes and exit codes."),
     _cmd("home-lint", [
         _arg("--backfill", action="store_true", help="Stamp each homeless open card 'unhomed' + comment"),
         _arg("--dry-run", action="store_true", help="With --backfill: list what would be stamped"),

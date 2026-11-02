@@ -5103,6 +5103,12 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _cmd_obligation(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_work_obligations import cmd_obligation
+
+    return cmd_obligation(args)
+
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "budget": _cmd_budget, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "locate": _cmd_locate,
@@ -5129,7 +5135,7 @@ _HANDLERS = {
     "notify-unsubscribe": _cmd_notify_unsubscribe,
     "notify-repair": _cmd_notify_repair,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc, "home-lint": _cmd_home_lint,
+    "gc": _cmd_gc, "home-lint": _cmd_home_lint, "obligation": _cmd_obligation,
 }
 
 
