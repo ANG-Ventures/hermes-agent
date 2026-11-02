@@ -33,7 +33,7 @@ route it through `CI_RUNNER_LABELS`.
 Only an **explicit, ledgered operator write**:
 
     scripts/ci_routing_ledger.py set ANG-Ventures/hermes-agent CI_RUNNER_LABELS \
-      '["self-hosted","hermes-ci"]' --who <operator/session> --why '<reason + rollback>'
+      '["self-hosted","universal-ci"]' --who <operator/session> --why '<reason + rollback>'
 
 (hermes-home). Automation never makes this write:
 

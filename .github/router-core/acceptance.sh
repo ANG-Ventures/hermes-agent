@@ -59,7 +59,7 @@ printf 'name: planted\non: [pull_request]\njobs:\n  t:\n    runs-on: p0\n    ste
   > "$tmp/tree/.github/workflows/planted-pr-p0.yml"
 expect 1 "p0-label: planted PR job requesting p0 is red" "${PY[@]}" "$p0" --root "$tmp/tree"
 rm "$tmp/tree/.github/workflows/planted-pr-p0.yml"
-printf 'name: planted\non:\n  push:\n    branches: [main]\njobs:\n  t:\n    runs-on: hermes-ci\n    steps: [{run: "true"}]\n' \
+printf 'name: planted\non:\n  push:\n    branches: [main]\njobs:\n  t:\n    runs-on: universal-ci\n    steps: [{run: "true"}]\n' \
   > "$tmp/tree/.github/workflows/planted-main-pool.yml"
 expect 1 "p0-label: planted main job on the pool without p0 is red" "${PY[@]}" "$p0" --root "$tmp/tree"
 if [ -s "$root/fleet/p0-label-allowlist.json" ] && "${PY[@]}" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["jobs"] else 1)' "$root/fleet/p0-label-allowlist.json"; then

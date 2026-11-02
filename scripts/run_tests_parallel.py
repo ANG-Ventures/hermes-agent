@@ -2054,7 +2054,7 @@ def main() -> int:
         default=_HOSTED_RUNNER_LABELS,
         help=(
             "JSON array of runner labels for the self-hosted slices, e.g. "
-            '\'["self-hosted","hermes-ci"]\'. Empty or unset falls back to '
+            '\'["self-hosted","universal-ci"]\'. Empty or unset falls back to '
             f"{_HOSTED_RUNNER_LABELS} so every slice is GitHub-hosted. "
             "Env/CI source: vars.CI_RUNNER_LABELS."
         ),

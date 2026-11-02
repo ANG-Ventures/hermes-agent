@@ -69,7 +69,7 @@ BLACKSMITH = re.compile(r"^blacksmith-\d+vcpu-ubuntu-(2204|2404)(-arm)?$")
 # Self-hosted pool labels (opt-in lanes; CI_RUNNER_LABELS / placement plan).
 # ace-e2e-vm: the bwrap-capable e2e class on ACE-AI/ACE-MEDIA (t_78d851d1).
 # ci-priv: the root+docker KVM-guest class on ACE-AI/ACE-MEDIA (t_df855b2a).
-SELF_HOSTED = frozenset({"self-hosted", "linux", "Linux", "X64", "ARM64", "hermes-ci", "ace-e2e-vm", "ci-priv"})
+SELF_HOSTED = frozenset({"self-hosted", "linux", "Linux", "X64", "ARM64", "hermes-ci", "universal-ci", "ace-e2e-vm", "ci-priv"})
 
 # Quoted tokens inside expressions that look like a runner label.
 LABEL_SHAPE = re.compile(r"^(ubuntu|windows|macos|blacksmith)-[A-Za-z0-9._-]+$|^[A-Za-z0-9._-]+-core$")
