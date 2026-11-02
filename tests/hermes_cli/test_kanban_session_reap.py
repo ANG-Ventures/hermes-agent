@@ -174,6 +174,7 @@ _FORK_ON_TERM = (
 )
 
 
+@pytest.mark.platforms("linux")
 def test_group_born_during_a_slow_scan_is_reaped(monkeypatch):
     """t_db02e9c8: under load one session scan outlasts the forker's 1 s
     linger (ps over 15k procs at load1 387), so no two snapshots share a
@@ -189,9 +190,11 @@ def test_group_born_during_a_slow_scan_is_reaped(monkeypatch):
     test_group_born_during_reap_is_reaped()
 
 
+@pytest.mark.platforms("linux")
 def test_group_born_during_reap_is_reaped():
     """Prism: a member that answers SIGTERM by forking into a NEW process
-    group must not escape the reap."""
+    group must not escape the reap (Linux clock; on the wall clock a group
+    first seen after the reap began is left alone by design)."""
     leader = subprocess.Popen(
         [sys.executable, "-c",
          "import subprocess, sys, time\n"
@@ -242,10 +245,17 @@ def test_reap_stops_when_session_continuity_breaks(monkeypatch):
     assert signalled == [111], "signalled a group from a non-continuous rescan"
 
 
-def _fake_world(monkeypatch, scan, births, sids) -> list:
+def _fake_world(monkeypatch, scan, births, sids, pgids=None) -> list:
     """Wire the reaper to a fake process table; returns the signalled pgids."""
     signalled: list = []
     real_getsid = os.getsid
+    pgids = {} if pgids is None else pgids
+
+    def record(pid, sid):  # one observation: sid, pgid and birth together
+        if sids.get(pid) != sid:
+            return None
+        born = kb._reap_birth(pid)
+        return None if born is None else (pgids.get(pid, pid), born)
 
     def getsid(pid):
         if pid == 0:
@@ -257,6 +267,7 @@ def _fake_world(monkeypatch, scan, births, sids) -> list:
     monkeypatch.setattr(kb, "_worker_session_members", scan)
     monkeypatch.setattr(kb, "_member_birth", lambda pid: births.get(pid))
     monkeypatch.setattr(kb, "_reap_birth", lambda pid: births.get(pid))
+    monkeypatch.setattr(kb, "_reap_record", record, raising=False)
     monkeypatch.setattr(kb, "_reap_now", time.time)
     monkeypatch.setattr(kb.os, "getsid", getsid)
     monkeypatch.setattr(kb.os, "killpg", lambda pg, sig: signalled.append(pg))
@@ -283,6 +294,7 @@ def test_birth_read_early_never_vouches_for_a_reused_sid(monkeypatch):
         return [(222, 222)]
 
     signalled = _fake_world(monkeypatch, scan, births, sids)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
     monkeypatch.setattr(kb, "_reap_now", lambda: 1000.006)  # every proof
     kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.5)
     assert signalled == [111], "a birth read early vouched for a reused sid"
@@ -313,9 +325,330 @@ def test_group_born_during_reap_is_signalled_once_a_later_proof_covers_it(monkey
         return [(333, 333)]         # first seen alone, after its parent exited
 
     signalled = _fake_world(monkeypatch, scan, births, sids)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
     monkeypatch.setattr(kb, "_reap_now", now)
     kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=1.0)
     assert set(signalled) == {111, 333}, "a group born during the reap escaped"
+
+
+def test_known_member_born_inside_the_slack_is_sigkilled(monkeypatch):
+    """Prism f5b8e6a3daaf: with grace=0, a proven member that ignores SIGTERM
+    and was born 0.05 s before the last proof is a member by identity, so the
+    birth slack must not spare it from SIGKILL."""
+    import signal
+
+    births = {111: 1000.00}
+    sids = {111: 99_999}
+    _fake_world(monkeypatch, lambda sid: [(111, 111)], births, sids)
+    sent: list = []
+    monkeypatch.setattr(kb.os, "killpg", lambda pg, sig: sent.append((pg, sig)))
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
+    monkeypatch.setattr(kb, "_reap_now", lambda: 1000.05)  # every proof
+    kb._reap_worker_session(99_999, born_after=999.0, born_before=1000.02, grace=0)
+    assert (111, signal.SIGKILL) in sent, f"known member left running: {sent}"
+
+
+def test_wall_clock_step_mid_reap_signals_no_member_first_seen_after_it(monkeypatch):
+    """Prism a7748c722865: on the fallback (wall) clock, a 5 s forward step
+    mid-reap moves the proof past births that follow the true proof. A
+    replacement session born after the original emptied must not be
+    signalled on the strength of that stepped proof."""
+    real_time = time.time
+    step = [0.0]
+    births = {111: real_time() - 100}
+    sids = {111: 99_999}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:             # ownership check, before the reap began
+            return [(111, 111)]
+        if len(calls) == 2:
+            step[0] = 5.0               # mid-reap the wall clock steps forward ...
+            return [(111, 111)]         # ... while 111 lives: proofs read +5 s
+        births.pop(111, None)           # the original session empties ...
+        sids.pop(111, None)
+        births[222] = real_time()       # ... and its sid is reused, unstepped birth
+        sids[222] = 99_999
+        return [(222, 222)]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    fake_time = type(sys)("fake_time")
+    fake_time.__dict__.update(vars(time))
+    fake_time.time = lambda: real_time() + step[0]
+    monkeypatch.setattr(kb, "time", fake_time)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", False)
+    monkeypatch.setattr(kb, "_reap_now", lambda: kb.time.time())
+    kb._reap_worker_session(99_999, born_after=births[111] - 1,
+                            born_before=births[111] + 1, grace=1.0)
+    assert 222 not in signalled, f"signalled a member first seen after the step: {signalled}"
+    assert signalled == [111]
+
+
+def test_wall_clock_excursion_during_known_member_proofs_is_latched(monkeypatch, caplog):
+    """Prism be979415d495: the wall clock steps +5 s while proofs re-see a
+    known member, then steps back before the first disjoint snapshot. The
+    excursion future-dated ``proved_at``, so it must be latched at the proof
+    even though the offset reads normal again by the time the replacement is
+    seen."""
+    real_time = time.time
+    step = [0.0]
+    births = {111: real_time() - 100}
+    sids = {111: 99_999}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:             # ownership check, before the reap began
+            return [(111, 111)]
+        if len(calls) == 2:
+            step[0] = 5.0               # forward excursion while 111 lives ...
+            time.sleep(0.12)            # ... long enough for in-scan proofs
+            return [(111, 111)]
+        step[0] = 0.0                   # ... and back before the next snapshot
+        births.pop(111, None)
+        sids.pop(111, None)
+        births[222] = real_time()       # sid reused after the true proof
+        sids[222] = 99_999
+        return [(222, 222)]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    fake_time = type(sys)("fake_time")
+    fake_time.__dict__.update(vars(time))
+    fake_time.time = lambda: real_time() + step[0]
+    monkeypatch.setattr(kb, "time", fake_time)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", False)
+    monkeypatch.setattr(kb, "_reap_now", lambda: kb.time.time())
+    with caplog.at_level("INFO", logger=kb._log.name):
+        kb._reap_worker_session(99_999, born_after=births[111] - 1,
+                                born_before=births[111] + 1, grace=1.0)
+    assert 222 not in signalled, f"a reverted excursion vouched for a reused sid: {signalled}"
+    assert signalled == [111]
+    assert "first seen after the reap began" in caplog.text
+
+
+def test_pid_reused_outside_the_session_is_not_a_member(monkeypatch):
+    """Prism 8c1178a4f868: A (111) forks group leader B (222) during a scan
+    that captures both; B exits and pid 222 becomes an unrelated group leader
+    in another session; A is proved alive past the slack, then exits before
+    the snapshot is read. B's stale pgid must not be signalled."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    clock = [1000.0]
+    calls: list = []
+
+    def now():
+        clock[0] += 0.05
+        return clock[0]
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 2:
+            births[222] = clock[0]          # B, a member, captured below ...
+            sids[222] = 99_999
+            snap = [(111, 111), (222, 222)]
+            births[222] = clock[0] + 0.01   # ... exits; 222 reused outside S
+            sids[222] = 55_555
+            time.sleep(0.4)                 # A proved alive meanwhile
+            births.pop(111, None)           # A exits before the snapshot is read
+            sids.pop(111, None)
+            return snap
+        return [(111, 111)] if len(calls) == 1 else []
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
+    monkeypatch.setattr(kb, "_REAP_BIRTH_SLACK_SECONDS", 0.1)
+    monkeypatch.setattr(kb, "_reap_now", now)
+    kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=1.0)
+    assert 222 not in signalled, f"signalled a reused pid's group: {signalled}"
+    assert signalled == [111]
+
+
+def _overlap_world(monkeypatch, *, original_empties: bool) -> list:
+    """Known member 111; the second snapshot also holds new pid 222, born
+    after every proof so only a continuity proof can admit it. When 222's
+    record is read, 111 has exited (``original_empties``) or still lives."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        return [(111, 111)] if len(calls) != 2 else [(111, 111), (222, 222)]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    plain = kb._reap_record
+
+    def record(pid, sid):
+        if pid == 222 and 222 not in sids:
+            if original_empties:          # the last known member exits ...
+                births.pop(111, None)
+                sids.pop(111, None)
+            births[222] = 1000.5          # ... before 222's record is read
+            sids[222] = 99_999
+        return plain(pid, sid)
+
+    monkeypatch.setattr(kb, "_reap_record", record)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
+    monkeypatch.setattr(kb, "_reap_now", lambda: 1000.0)
+    kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.5)
+    return signalled
+
+
+def test_overlap_without_a_later_proof_admits_no_new_identity(monkeypatch):
+    """Prism 023d7bc5df9b: an overlapping known identity does not vouch for
+    a new identity whose record was read after the original session emptied."""
+    signalled = _overlap_world(monkeypatch, original_empties=True)
+    assert 222 not in signalled, f"overlap admitted a replacement's group: {signalled}"
+    assert signalled == [111]
+
+
+def test_overlap_with_a_later_proof_admits_the_new_identity(monkeypatch):
+    """The same snapshot while 111 still lives: re-reading 111 after 222's
+    record proves the session was continuous, so 222's group is reaped."""
+    signalled = _overlap_world(monkeypatch, original_empties=False)
+    assert set(signalled) == {111, 222}, f"a covered member escaped: {signalled}"
+
+
+def test_pid_replaced_during_the_ownership_read_signals_nothing(monkeypatch):
+    """Prism 3dfe1baa6ab0: the owned birth and the record that enters
+    ``known`` must be one observation. 111 passes the run window, then its pid
+    is reused by a process in the same sid (group 777) before the record is
+    read again: the bracket fails, nothing is signalled."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    signalled = _fake_world(monkeypatch, lambda sid: [(111, 111)], births, sids,
+                            pgids={})
+
+    def birth(pid):
+        born = births.get(pid)
+        if pid == 111 and born == 900.0:   # the ownership read sees the original ...
+            births[111] = 1000.5           # ... then the pid is reused
+            kb_pgids[111] = 777
+        return born
+
+    kb_pgids: dict = {}
+    plain = kb._reap_record
+    monkeypatch.setattr(kb, "_member_birth", birth)
+    monkeypatch.setattr(kb, "_reap_record", lambda pid, sid: (
+        None if (rec := plain(pid, sid)) is None else (kb_pgids.get(pid, rec[0]), rec[1])))
+    assert kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0,
+                                   grace=0) == 0
+    assert signalled == [], f"signalled a replacement read after ownership: {signalled}"
+
+
+def test_wall_clock_never_adopts_a_member_first_seen_later(monkeypatch, caplog):
+    """Fallback clock (operator ruling on Prism a7748c722865/be979415d495):
+    no birth is ordered against a proof, so a reused sid's process reading
+    as born long before every proof (a stepped wall clock) is never
+    signalled."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:
+            return [(111, 111)]
+        births.pop(111, None)
+        sids.pop(111, None)
+        births[222] = 500.0          # reads as born before any proof
+        sids[222] = 99_999
+        return [(222, 222)]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", False)
+    with caplog.at_level("INFO", logger=kb._log.name):
+        kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.5)
+    assert signalled == [111], f"wall clock adopted a later process: {signalled}"
+    assert "first seen after the reap began" in caplog.text
+
+
+def test_member_replaced_before_its_signal_is_not_signalled(monkeypatch):
+    """The last-moment revalidation: an identity read and proved, then
+    replaced by another session's process before its group is signalled."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    reads: list = []
+    signalled = _fake_world(monkeypatch, lambda sid: [(111, 111)], births, sids)
+
+    def record(pid, sid):
+        reads.append(pid)
+        if len(reads) > 3:            # after the bracketed identity read and the proof
+            return None               # 111 is now another session's process
+        return (pid, births[pid]) if sids.get(pid) == sid else None
+
+    monkeypatch.setattr(kb, "_reap_record", record)
+    kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0)
+    assert signalled == [], f"signalled a replaced member: {signalled}"
+
+
+_BSD = (4242, 4242, 1_000_000, 123_456)  # pid, pgid, start sec, start usec
+
+
+def _bracket(monkeypatch, reads, sid=7, pgid=4242):
+    it = iter(reads)
+
+    def getsid(pid):
+        if isinstance(sid, BaseException):
+            raise sid
+        return sid
+
+    monkeypatch.setattr(kb.os, "getsid", getsid)
+    monkeypatch.setattr(kb.os, "getpgid", lambda pid: pgid)
+    return kb._bracketed_member(4242, 7, read=lambda pid: next(it))
+
+
+def test_bracketed_member_accepts_a_stable_member(monkeypatch):
+    assert _bracket(monkeypatch, [_BSD, _BSD]) == (4242, 1_000_000.123456)
+
+
+@pytest.mark.parametrize("reads, kw", [
+    pytest.param([_BSD, (4242, 4242, 1_000_001, 0)], {}, id="pid-replaced-between-reads"),
+    pytest.param([_BSD, _BSD], {"pgid": 4243}, id="pgid-mismatch"),
+    pytest.param([(4242, 4243, 1_000_000, 123_456)] * 2, {}, id="record-pgid-mismatch"),
+    pytest.param([(4241, 4242, 1_000_000, 123_456)] * 2, {}, id="record-names-another-pid"),
+    pytest.param([_BSD, _BSD], {"sid": 8}, id="sid-mismatch"),
+    pytest.param([_BSD, None], {}, id="disappeared"),
+    pytest.param([None, None], {}, id="no-record"),
+    pytest.param([_BSD, _BSD], {"sid": PermissionError(1, "denied")}, id="permission"),
+])
+def test_bracketed_member_is_unknown_on_any_inconclusive_read(monkeypatch, reads, kw):
+    assert _bracket(monkeypatch, reads, **kw) is None
+
+
+def test_inconclusive_bracket_signals_nothing_and_proves_nothing(monkeypatch):
+    """A member whose pid is replaced between the two native reads is UNKNOWN:
+    the reap neither signals it nor counts it as proof the session lives."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    signalled = _fake_world(monkeypatch, lambda sid: [(111, 111)], births, sids)
+    flip = [0]
+
+    def read(pid):
+        flip[0] += 1
+        return (pid, pid, 900 + flip[0] % 2, 0)  # births disagree on every pair
+
+    monkeypatch.setattr(kb.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(kb, "_reap_record",
+                        lambda pid, sid: kb._bracketed_member(pid, sid, read=read))
+    assert kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0,
+                                   grace=0.5) == 0
+    assert signalled == []
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_reap_record_reads_a_real_member_and_refuses_another_session():
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                         start_new_session=True)
+    try:
+        rec = kb._reap_record(p.pid, p.pid)
+        assert rec is not None and rec[0] == p.pid
+        assert kb._reap_record(p.pid, os.getsid(0)) is None
+    finally:
+        p.kill()
+        p.wait(timeout=5)
+    assert kb._reap_record(p.pid, p.pid) is None
 
 
 @pytest.mark.platforms("linux", "macos")
