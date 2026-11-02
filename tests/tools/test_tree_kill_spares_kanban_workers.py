@@ -7,6 +7,8 @@ spawner started through the real LocalEnvironment spawns a worker the way
 ``_default_spawn`` does, then the tool call times out.
 """
 import os
+import pathlib
+import sqlite3
 import shlex
 import sys
 import time
@@ -21,9 +23,39 @@ from tools.environments.local import LocalEnvironment
 pytestmark = [pytest.mark.platforms("posix"), pytest.mark.live_system_guard_bypass]
 
 
-def _spawner(tmp_path, *, worker_env: dict, grandchild: bool = False) -> str:
+@pytest.fixture(autouse=True)
+def isolated_worker_board(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    db = tmp_path / "workers.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            "CREATE TABLE tasks(current_run_id INTEGER, worker_pid INTEGER);"
+            "CREATE TABLE task_runs(id INTEGER, worker_pid INTEGER, worker_started_at TEXT, ended_at INTEGER);"
+        )
+    monkeypatch.setattr(kb, "kanban_db_path", lambda: db)
+
+
+def _record_worker(tmp_path, pid, *, fingerprint=None, ended_at=None):
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+    with sqlite3.connect(tmp_path / "workers.db") as conn:
+        conn.execute("INSERT INTO tasks VALUES (?, ?)", (1, pid))
+        conn.execute("INSERT INTO task_runs VALUES (?, ?, ?, ?)",
+                     (1, pid, fingerprint or _process_fingerprint(pid), ended_at))
+
+
+def _spawner(tmp_path, *, worker_env: dict, grandchild: bool = False, recorded=True, titled=False) -> str:
     """Python source of a spawner that starts a setsid'd 'worker' and then hangs."""
     worker = "import time; time.sleep(60)"
+    if titled:
+        spt = pytest.importorskip("setproctitle")
+        worker = (
+            "import sys,time\n"
+            f"sys.path[:0]={[str(pathlib.Path(__file__).resolve().parents[2]), str(pathlib.Path(spt.__file__).resolve().parent.parent)]!r}\n"
+            "from hermes_cli.main import _set_process_title\n"
+            "_set_process_title()\n"
+            f"open({str(tmp_path / 'titled')!r},'w').write('1')\n"
+            "time.sleep(60)\n"
+        )
     if grandchild:
         worker = (
             "import subprocess,sys,time\n"
@@ -31,11 +63,22 @@ def _spawner(tmp_path, *, worker_env: dict, grandchild: bool = False) -> str:
             f"open({str(tmp_path / 'grandchild.pid')!r},'w').write(str(g.pid))\n"
             "time.sleep(60)\n"
         )
+    register = ""
+    if recorded:
+        register = (
+            f"sys.path.insert(0,{str(pathlib.Path(__file__).resolve().parents[2])!r})\n"
+            "from hermes_cli.kanban_db_dispatch import _process_fingerprint\n"
+            f"c=sqlite3.connect({str(tmp_path / 'workers.db')!r})\n"
+            "c.execute('INSERT INTO tasks VALUES (1, ?)',(p.pid,))\n"
+            "c.execute('INSERT INTO task_runs VALUES (1, ?, ?, NULL)',(p.pid,_process_fingerprint(p.pid)))\n"
+            "c.commit();c.close()\n"
+        )
     return (
-        "import os,subprocess,sys,time\n"
+        "import os,subprocess,sys,time,sqlite3\n"
         f"env=dict(os.environ,**{worker_env!r})\n"
         f"p=subprocess.Popen([sys.executable,'-c',{worker!r}],start_new_session=True,"
-        "env=env,stdin=subprocess.DEVNULL)\n"
+        "env=env,stdin=subprocess.DEVNULL)\n" +
+        register +
         f"open({str(tmp_path / 'worker.pid')!r},'w').write(str(p.pid))\n"
         "time.sleep(60)\n"
     )
@@ -76,7 +119,8 @@ DISPATCHED = {"HERMES_KANBAN_TASK": "t_replay", "HERMES_KANBAN_RUN_ID": "1",
 
 def _run_timed_out_call(tmp_path, worker_env, *, grandchild=False):
     env = LocalEnvironment(cwd=str(tmp_path), timeout=2)
-    src = _spawner(tmp_path, worker_env=worker_env, grandchild=grandchild)
+    src = _spawner(tmp_path, worker_env=worker_env, grandchild=grandchild,
+                   recorded=grandchild)
     result = env.execute(f"{shlex.quote(sys.executable)} -c {shlex.quote(src)}", timeout=2)
     assert result.get("returncode") == 124, result
     time.sleep(0.5)
@@ -110,7 +154,8 @@ def test_terminal_timeout_still_sweeps_a_plain_setsid_escapee(tmp_path):
 def test_kill_process_tree_spares_dispatched_worker(tmp_path):
     import subprocess
     src = _spawner(tmp_path, worker_env=DISPATCHED)
-    spawner = subprocess.Popen([sys.executable, "-c", src], start_new_session=True)
+    spawner = subprocess.Popen([sys.executable, "-c", src], start_new_session=True,
+                               stdin=subprocess.DEVNULL)
     worker = _wait_pid(tmp_path / "worker.pid")
     try:
         kill_process_tree(spawner.pid)
@@ -157,6 +202,7 @@ def test_terminal_timeout_spares_worker_after_setproctitle_clobbers_its_env(tmp_
     pid = _wait_pid(tmp_path / "worker.pid", timeout=20)
     try:
         _wait_pid(tmp_path / "titled", timeout=40)
+        _record_worker(tmp_path, pid)
         proc = psutil.Process(pid)
         # The premise: the grant is gone from what psutil reads; the title is what is left.
         assert proc.environ().get("HERMES_KANBAN_OWNER_PID") != "pending"
@@ -174,32 +220,21 @@ BOOTED = {"HERMES_KANBAN_TASK": "t_4d4b30ff", "HERMES_KANBAN_RUN_ID": "1",
           "HERMES_KANBAN_OWNER_PID": "pending"}
 
 
-class _FakeProc:
-    def __init__(self, pid, title, parents=()):
-        self.pid, self._title, self._parents = pid, title, list(parents)
-
-    def environ(self):
-        return {}
-
-    def cmdline(self):
-        return [self._title]
-
-    def parents(self):
-        return self._parents
-
-
-def test_title_fallback_names_only_the_topmost_titled_process(monkeypatch):
-    """A nested hermes CLI under a worker inherits the task id and takes the same title; it
-    is not a second worker root (its session is not the worker's, so it would escape the sweep)."""
-    from agent import delegation_context as dc
-
-    monkeypatch.setattr(dc.os, "getsid", lambda pid: pid)
-    title = "hermes kanban-worker t_4d4b30ff"
-    worker = _FakeProc(101, title)
-    nested = _FakeProc(202, title, parents=[_FakeProc(150, "bash"), worker])
-    assert dc._is_dispatched_worker_root(worker)
-    assert not dc._is_dispatched_worker_root(nested)
-    assert not dc._is_dispatched_worker_root(_FakeProc(303, "hermes kanban-worker t_xyz"))
+@pytest.mark.parametrize("owner,titled", [("pending", False), ("12345", True)])
+def test_forged_worker_is_killed_without_a_live_board_row(tmp_path, owner, titled):
+    import subprocess
+    src = _spawner(tmp_path, worker_env=dict(BOOTED, HERMES_KANBAN_OWNER_PID=owner), recorded=False, titled=titled)
+    spawner = subprocess.Popen([sys.executable, "-c", src], start_new_session=True,
+                               stdin=subprocess.DEVNULL)
+    worker = _wait_pid(tmp_path / "worker.pid")
+    try:
+        if titled:
+            _wait_pid(tmp_path / "titled", timeout=20)
+        kill_process_tree(spawner.pid)
+        spawner.wait(timeout=5)
+        assert not _alive(worker), "child-controlled worker markers bypassed tree cleanup"
+    finally:
+        _cleanup(spawner.pid, worker)
 
 
 def test_spawned_worker_env_drops_the_cron_script_run_token(monkeypatch, tmp_path):
@@ -232,3 +267,33 @@ def test_spawned_worker_env_drops_the_cron_script_run_token(monkeypatch, tmp_pat
         kbd._default_spawn(task, str(workspace))
     assert SCRIPT_RUN_TOKEN_ENV not in captured["env"]
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_4d4b30ff"
+
+
+@pytest.mark.parametrize("state", ["recycled", "ended", "missing", "locked"])
+def test_unverified_board_worker_is_not_spared(tmp_path, state):
+    import subprocess
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              start_new_session=True, stdin=subprocess.DEVNULL)
+    lock = None
+    try:
+        if state == "recycled":
+            _record_worker(tmp_path, child.pid, fingerprint="other-boot|1")
+        elif state == "ended":
+            _record_worker(tmp_path, child.pid, ended_at=1)
+        elif state == "missing":
+            (tmp_path / "workers.db").unlink()
+        else:
+            _record_worker(tmp_path, child.pid)
+            lock = sqlite3.connect(tmp_path / "workers.db")
+            lock.execute("BEGIN EXCLUSIVE")
+        from agent.delegation_context import spare_dispatched_workers
+        import psutil
+        procs = [psutil.Process(child.pid)]
+        assert spare_dispatched_workers(procs) == procs
+        assert (tmp_path / "workers.db").exists() == (state != "missing")
+    finally:
+        if lock is not None:
+            lock.rollback()
+            lock.close()
+        _cleanup(child.pid)
+        child.wait(timeout=5)
