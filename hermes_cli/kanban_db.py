@@ -18875,7 +18875,7 @@ def _reap_worker_session(
         # start are signalled, and later ones are left alone and logged
         # (operator ruling, Prism a7748c722865 / be979415d495).
         # None -> unprovable and no member was seen alive meanwhile: stop.
-        nonlocal known
+        nonlocal known, proved_at
         before = proofs
         current = _scan()
         ids = _identities(current)
@@ -18892,11 +18892,18 @@ def _reap_worker_session(
         # its record was read: a known identity re-read as a member now
         # covers every record above (Prism 023d7bc5df9b). Without one, only
         # known identities and births before the pre-snapshot proof count.
-        if _proved({i: pg for i, pg in ids.items() if i in known}) is None:
+        post = _proved({i: pg for i, pg in ids.items() if i in known})
+        if post is None:
             ids = {
                 i: pg for i, pg in ids.items()
                 if i in known or i[1] + _REAP_BIRTH_SLACK_SECONDS <= proved_at
             }
+        else:
+            # The proof's own moment is the newest continuity witness: later
+            # snapshots order births against it, not an older one (Prism
+            # 7e958a6f57d4: a descendant forked between the last in-scan proof
+            # and this one was otherwise rejected once its parents exited).
+            proved_at = max(proved_at, post)
         if not ids:
             return {} if proofs > before else None
         known = ids

@@ -867,3 +867,51 @@ def test_initial_snapshot_member_is_not_adopted_when_no_owned_member_proves_cont
     monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
     assert kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.3) == 0
     assert signalled == []
+
+
+def test_descendant_forked_before_the_post_record_proof_is_reaped(monkeypatch):
+    """Prism 7e958a6f57d4: the post-record continuity proof's moment must advance
+    proved_at. Owned 111 and a new member 222 are in a later snapshot; 222 forks
+    group 333 at 1000.20, after the snapshot; the post-record proof of 111 succeeds
+    at 1000.50; then 111 and 222 exit. 333 was born before a proof that showed the
+    session continuous, so it is this session's and must be signalled. Red at
+    3e9c908ed0 (333 judged against the stale 1000.05)."""
+    births = {111: 900.0}
+    sids = {111: 99_999}
+    pgids = {111: 111}
+    calls: list = []
+    clock = {"t": 1000.05}
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:
+            return [(111, 111)]
+        if len(calls) == 2:
+            births[222], sids[222], pgids[222] = 1000.10, 99_999, 222
+            births[333], sids[333], pgids[333] = 1000.20, 99_999, 333
+            return [(111, 111), (222, 222)]
+        # 111 and 222 exited; only 333 is left in the session
+        for p in (111, 222):
+            births.pop(p, None)
+            sids.pop(p, None)
+        return [(333, 333)]
+
+    def now():
+        # in-scan proofs read 1000.05; the post-record proof of scan 2 reads 1000.50
+        return clock["t"]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids, pgids)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
+    real_record = kb._reap_record
+
+    def record(pid, sid):
+        # _identities() reads 222 only AFTER scan 2 returned (every in-scan proof
+        # already ran at 1000.05): the next proof, the post-record one, reads 1000.50
+        if pid == 222 and len(calls) == 2:
+            clock["t"] = 1000.50
+        return real_record(pid, sid)
+
+    monkeypatch.setattr(kb, "_reap_record", record)
+    monkeypatch.setattr(kb, "_reap_now", now)
+    kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.5)
+    assert 333 in signalled, f"descendant born before the post-record proof left running: {signalled}"
