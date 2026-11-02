@@ -220,6 +220,58 @@ def test_flat_form_head_reads_legacy_routed_pr(board, monkeypatch):
     assert seen == [("ANG-Ventures/hermes-agent", 41)]
 
 
+@pytest.mark.parametrize("routed", [True, False])
+@pytest.mark.parametrize("lensed", [True, False])
+@pytest.mark.parametrize("verdict", ["APPROVE", "CHANGES_REQUESTED"])
+def test_coverage_stamps_only_the_routed_pr(board, monkeypatch, routed, lensed, verdict):
+    from hermes_cli import kanban_handback_head as hh
+
+    pr = "ANG-Ventures/hermes-agent#41"
+    monkeypatch.setattr(hh, "_default_reader", lambda: lambda repo, number: {"head": HEAD})
+    overrides = {"verdict": verdict}
+    if lensed:
+        overrides["lenses"] = {lens: "done" for lens in REQUIRED_REVIEW_LENSES}
+    with kb.connect() as conn:
+        if routed:
+            run = kb.latest_run(conn, board)
+            conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                         (json.dumps({"pr_url": "https://github.com/ANG-Ventures/hermes-agent/pull/41"}), run.id))
+            conn.commit()
+        text, error = kvi.build_coverage(
+            conn, board, findings=["one finding"],
+            lens_specs=[] if lensed else ["all=done"], overrides=overrides)
+    assert error is None, error
+    record = json.loads(text)
+    if routed:
+        assert record["pr"] == pr
+        assert record["head_sha"] == HEAD
+    else:
+        assert "pr" not in record
+        assert record["head_sha"] == "n/a: card routes no PR"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"head_sha": "explicit-head"},
+    {"pr": "ANG-Ventures/hermes-agent#99"},
+    {"head_sha": "explicit-head", "pr": "ANG-Ventures/hermes-agent#99"},
+])
+def test_coverage_pr_and_head_overrides_are_independent(board, monkeypatch, overrides):
+    from hermes_cli import kanban_handback_head as hh
+
+    monkeypatch.setattr(hh, "_default_reader", lambda: lambda repo, number: {"head": HEAD})
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, board)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                     (json.dumps({"pr_url": "https://github.com/ANG-Ventures/hermes-agent/pull/41"}), run.id))
+        conn.commit()
+        text, error = kvi.build_coverage(
+            conn, board, findings=["one finding"], lens_specs=["all=done"], overrides=overrides)
+    assert error is None, error
+    record = json.loads(text)
+    assert record["pr"] == overrides.get("pr", "ANG-Ventures/hermes-agent#41")
+    assert record["head_sha"] == overrides.get("head_sha", HEAD)
+
+
 # --- --priority accepts p0..p3; the argparse refusal ends on the cause (2026-10-24) -------------
 
 @pytest.mark.parametrize("text,expected", [("p0", 300), ("P1", 200), ("p2", 100), ("p3", 0), ("7", 7), ("-2", -2)])

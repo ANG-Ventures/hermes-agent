@@ -9,7 +9,9 @@ Refusals:    ``--why`` prints what would refuse this call and the command that c
              example (:func:`schema_text`), never one field.
 Coverage:    ``request-changes --finding TEXT`` (repeatable) + ``--lens NAME=STATE`` BUILD the
              review_coverage JSON (findings = count, items, review_minutes from the review run's
-             clock, head_sha from the card's routed PR, batch_id). The JSON is an output.
+             clock, head_sha and pr (owner/repo#N) from the card's routed PR, batch_id).
+             hermes-home's review_of_record.other_pr reads pr to scope send-backs to their PR.
+             The JSON is an output; explicit --json keys override computed defaults.
 """
 
 from __future__ import annotations
@@ -189,15 +191,18 @@ def build_coverage(conn, task_id: str, *, findings: list, lens_specs: list,
     items = [str(f).strip() for f in findings or [] if str(f).strip()]
     if items:
         record["findings"], record["items"] = len(items), items
-    if "head_sha" not in overrides:
+    if "head_sha" not in overrides or "pr" not in overrides:
         head, pr = _routed_pr_head(conn, task_id)
-        if head:
-            record["head_sha"] = head
-        elif pr is None:
-            record["head_sha"] = "n/a: card routes no PR"
-        else:
-            errors.append(f"head_sha: could not read the head of {pr} (gh REST); "
-                          f"pass --json '{{\"head_sha\": \"<sha>\"}}'")
+        if pr is not None and "pr" not in overrides:
+            record["pr"] = pr
+        if "head_sha" not in overrides:
+            if head:
+                record["head_sha"] = head
+            elif pr is None:
+                record["head_sha"] = "n/a: card routes no PR"
+            else:
+                errors.append(f"head_sha: could not read the head of {pr} (gh REST); "
+                              f"pass --json '{{\"head_sha\": \"<sha>\"}}'")
     if "review_minutes" not in overrides:
         record["review_minutes"] = _review_minutes(conn, task_id)
     record.setdefault("batch_id", "n/a: request-changes flat form, no delegate_task batch")
