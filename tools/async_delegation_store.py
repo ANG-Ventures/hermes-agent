@@ -924,22 +924,23 @@ def _is_json_data(value: Any) -> bool:
 def _sensitive_query_key(key: str) -> bool:
     """True when a field or query-parameter NAME is credential-shaped.
 
-    One vocabulary, the house one (``tools.url_safety.SENSITIVE_QUERY_PARAM_NAMES``): a name trips when
-    a vocabulary name occurs in it as a whole run of ``_``/``-``-separated words (``auth_token``,
+    One vocabulary, the house persistence one (``tools.url_safety.SENSITIVE_PERSIST_PARAM_NAMES``, the
+    browsing set plus signing names such as SAS ``sig``, Prism 6690b5ad7061): a name trips when a
+    vocabulary name occurs in it as a whole run of ``_``/``-``/``.``-separated words (``auth_token``,
     ``x-api-key``, ``options.passwd``, ``credentials``, ``client_secret_value``), so nobody lists one more
-    name here again (Prism c01c5615ab04). Word runs, not raw substrings, so ``max_tokens`` stays clean.
-    The store's own identifier fields are the only exemption: they are references, not secrets."""
+    name here again (Prism c01c5615ab04, eb64a1dae508). Word runs, not raw substrings, so ``max_tokens``
+    stays clean. The store's own identifier fields are the only exemption: they are references, not secrets."""
     from urllib.parse import unquote
 
-    from tools.url_safety import SENSITIVE_QUERY_PARAM_NAMES
+    from tools.url_safety import SENSITIVE_PERSIST_PARAM_NAMES
 
-    normalized = unquote(key).lower().replace("-", "_")
+    normalized = unquote(key).lower().replace("-", "_").replace(".", "_")
     if normalized in _NONSECRET_IDENTIFIER_FIELDS:
         return False
     if normalized == "key":
         return True
     words = f"_{normalized}_"
-    return any(f"_{name.replace('-', '_')}_" in words for name in SENSITIVE_QUERY_PARAM_NAMES)
+    return any(f"_{name.replace('-', '_')}_" in words for name in SENSITIVE_PERSIST_PARAM_NAMES)
 
 
 def url_has_credentials(url: Any) -> bool:

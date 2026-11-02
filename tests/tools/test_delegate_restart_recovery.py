@@ -417,6 +417,10 @@ _SURFACE = [
     ("auth_token_nested", [{"source": "dynamic", "provider": "custom", "model": "m", "options": {"auth_token": "p4ss"}}], []),
     ("passwd_key", [{"provider": "custom", "model": "m", "passwd": "p4ss"}], []),
     ("credentials_key", [{"provider": "custom", "model": "m", "credentials": "p4ss"}], []),
+    # Prism eb64a1dae508: a dot is a word boundary; Prism 6690b5ad7061: persistence uses the strict set (SAS sig).
+    ("dotted_cred_key", [{"provider": "custom", "model": "m", "options.password": "p4ss"}], []),
+    ("sas_signed_url", [{"provider": "custom", "model": "m",
+                         "base_url": "https://acct.blob.core.windows.net/c?sv=2022-11-02&sp=r&se=2030-01-01&sig=p4ss"}], []),
 ]
 _CHAIN_EXPECTED = {
     "bare_string_url": None,  # not a list
@@ -432,6 +436,8 @@ _CHAIN_EXPECTED = {
     "auth_token_nested": [{"source": "dynamic", "provider": "custom", "model": "m"}, _CLEAN],  # nested dict never persisted
     "passwd_key": [_CLEAN],
     "credentials_key": [_CLEAN],
+    "dotted_cred_key": [_CLEAN],
+    "sas_signed_url": [_CLEAN],
 }
 
 

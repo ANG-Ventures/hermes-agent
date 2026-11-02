@@ -76,6 +76,11 @@ SENSITIVE_QUERY_PARAM_NAMES = frozenset({
     "session_id", "signature", "token", "x_amz_security_token", "x_amz_signature",
     "x-amz-security-token", "x-amz-signature"})
 
+# Stricter set for a PERSISTENCE boundary (nothing secret may reach durable storage): adds the
+# signing names browsing deliberately tolerates (Azure SAS ``sig``, GCS/S3 signatures).
+SENSITIVE_PERSIST_PARAM_NAMES = SENSITIVE_QUERY_PARAM_NAMES | frozenset({
+    "sig", "signature", "x-amz-signature", "x-goog-signature", "sas", "sastoken"})
+
 
 def sensitive_query_param_name(url: str) -> Optional[str]:
     """First credential-named query parameter in ``url`` (with a value), if any. Checked before
