@@ -18720,7 +18720,13 @@ def _reap_worker_session(
         # time) after getsid means that pid was this process at getsid, so it
         # was a member at ``checked``. A member that setsid()'d away proves
         # nothing about the session it left.
+        # The step guard is sampled here, after ``checked`` is read, so a step
+        # that future-dates this proof is latched before the proof is used,
+        # even if the clock steps back before the next snapshot (Prism
+        # be979415d495). Once latched no proof moment is trusted again.
         checked = _reap_now()
+        if _clock_stepped():
+            return None
         for pid, created in found:
             try:
                 if os.getsid(pid) != sid:
@@ -18794,7 +18800,8 @@ def _reap_worker_session(
         before = proved_at
         current = _scan()
         ids = _identities(current)
-        if not ids & known and (_clock_stepped() or not any(
+        stepped_now = _clock_stepped()  # every snapshot, before the overlap test
+        if not ids & known and (stepped_now or not any(
             created + _REAP_BIRTH_SLACK_SECONDS <= proved_at for _, created in ids
         )):
             return set() if proved_at > before else None

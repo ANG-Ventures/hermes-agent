@@ -371,6 +371,48 @@ def test_wall_clock_step_mid_reap_signals_no_member_first_seen_after_it(monkeypa
     assert signalled == [111]
 
 
+def test_wall_clock_excursion_during_known_member_proofs_is_latched(monkeypatch, caplog):
+    """Prism be979415d495: the wall clock steps +5 s while proofs re-see a
+    known member, then steps back before the first disjoint snapshot. The
+    excursion future-dated ``proved_at``, so it must be latched at the proof
+    even though the offset reads normal again by the time the replacement is
+    seen."""
+    real_time = time.time
+    step = [0.0]
+    births = {111: real_time() - 100}
+    sids = {111: 99_999}
+    calls: list = []
+
+    def scan(sid):
+        calls.append(sid)
+        if len(calls) == 1:             # ownership check, before the reap began
+            return [(111, 111)]
+        if len(calls) == 2:
+            step[0] = 5.0               # forward excursion while 111 lives ...
+            time.sleep(0.12)            # ... long enough for in-scan proofs
+            return [(111, 111)]
+        step[0] = 0.0                   # ... and back before the next snapshot
+        births.pop(111, None)
+        sids.pop(111, None)
+        births[222] = real_time()       # sid reused after the true proof
+        sids[222] = 99_999
+        return [(222, 222)]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids)
+    fake_time = type(sys)("fake_time")
+    fake_time.__dict__.update(vars(time))
+    fake_time.time = lambda: real_time() + step[0]
+    monkeypatch.setattr(kb, "time", fake_time)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", False)
+    monkeypatch.setattr(kb, "_reap_now", lambda: kb.time.time())
+    with caplog.at_level("WARNING", logger=kb._log.name):
+        kb._reap_worker_session(99_999, born_after=births[111] - 1,
+                                born_before=births[111] + 1, grace=1.0)
+    assert 222 not in signalled, f"a reverted excursion vouched for a reused sid: {signalled}"
+    assert signalled == [111]
+    assert "wall clock stepped" in caplog.text
+
+
 @pytest.mark.platforms("linux", "macos")
 def test_reap_birth_never_reads_earlier_than_the_slack():
     """The contract the continuity proof rests on: a process's birth, read on
