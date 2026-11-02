@@ -37,7 +37,7 @@ def test_status_policy(job, result, ordinary, excluded, release):
 
 def test_release_exclusion_policy():
     assert required_results.EXCLUDED_JOBS == {
-        "history-check", "lockfile-diff", "supply-chain", "review-labels", "e2e-desktop",
+        "history-check", "lockfile-diff", "supply-chain", "review-labels", "e2e-desktop", "secret-scan",
     }
 
 
@@ -51,7 +51,9 @@ def test_empty_needs_fails_closed(needs, release):
 
 
 @pytest.mark.parametrize("release,results,code,report", [
-    (True, {"detect": "success", "e2e-desktop": "skipped"}, 0, "All checks passed"),
+    (True, {"detect": "success", "e2e-desktop": "skipped", "secret-scan": "skipped"},
+     0, "All checks passed"),
+    (False, {"secret-scan": "failure"}, 1, "::error::1 job(s) failed: secret-scan"),
     (True, {"tests": "skipped", "history-check": "skipped", "lint": "failure"},
      1, "::error::2 job(s) failed: lint, tests"),
     (False, {"tests": "failure"}, 1, "::error::1 job(s) failed: tests"),

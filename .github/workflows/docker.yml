@@ -16,6 +16,21 @@ on:
   # controller moves stable/latest from the receipt-bound registry digest.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # t_c8ef8daa: same inputs as classify_changes._DOCKER_PATHS, plus classifier/action changes.
+    paths:
+      - 'docker/**'
+      - '.hadolint.yaml'
+      - 'Dockerfile*'
+      - '.dockerignore'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'setup.py'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'pm/**'
+      - 'tests/docker/**'
+      - 'scripts/ci/classify_changes.py'
+      - '.github/**'
   push:
     branches: [main]
   workflow_call:
