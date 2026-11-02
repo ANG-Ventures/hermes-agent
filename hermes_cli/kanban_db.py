@@ -18830,11 +18830,20 @@ def _reap_worker_session(
                 return checked
         return None
 
-    proved = _proved(known)  # after every ownership record was read
+    # Every validated member of the initial snapshot, its record read BEFORE the
+    # proof below (Prism 72790abed13c / 0d19e75007b0).
+    snapshot = _identities(members)
+    proved = _proved(known)  # after every ownership AND snapshot record was read
     if proved is None:  # the session emptied (sid reusable) since ownership was checked
         _log.info("kanban: session %d emptied before the reap; not reaped", sid)
         return 0
     proved_at = proved
+    # An owned identity read as a member AFTER the snapshot's records (the proof
+    # above) was alive across them, so the session never emptied and its sid was
+    # never reusable in between: every snapshot member is this session's, born
+    # inside the run window or not (a child started after the last heartbeat).
+    # Only identities FIRST seen after this point stay restricted (_left).
+    known = {**snapshot, **known}
 
     def _scan() -> list[tuple[int, int]]:
         # One snapshot, re-proving a known member alive every 50 ms while it

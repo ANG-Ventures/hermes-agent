@@ -818,3 +818,52 @@ def test_terminated_run_reap_never_targets_the_cards_newer_run(conn):
                 p.kill(); p.wait(timeout=5)
             except Exception:
                 pass
+
+
+@pytest.mark.parametrize("linux_clock", [True, False], ids=["linux-clock", "wall-clock"])
+def test_initial_member_born_after_the_last_heartbeat_is_reaped_with_its_session(monkeypatch, linux_clock):
+    """Prism 72790abed13c / 0d19e75007b0: a child the worker started AFTER its last
+    heartbeat (born after born_before) but already in the INITIAL snapshot, in its own
+    process group, is this session's: an owned member read alive after the snapshot
+    proves the sid was never reused in between. It must get SIGTERM with its session,
+    on either clock. Red at 293a10412d: only group 111 is signalled."""
+    births = {111: 900.0, 222: 960.0}       # 222 born after born_before=950
+    sids = {111: 99_999, 222: 99_999}
+    pgids = {111: 111, 222: 222}
+
+    def scan(sid):
+        return [(pid, pgids[pid]) for pid in sorted(sids) if sids[pid] == sid]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids, pgids)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", linux_clock)
+    kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.3)
+    assert 222 in signalled, f"initial child born after the heartbeat left running: {signalled}"
+    assert 111 in signalled
+
+
+def test_initial_snapshot_member_is_not_adopted_when_no_owned_member_proves_continuity(monkeypatch):
+    """The widened initial set rides ONLY on the post-snapshot proof: if the owned
+    member is gone by then (the session may have emptied and the sid been reused),
+    nothing is reaped, the later-born member included."""
+    births = {111: 900.0, 222: 960.0}
+    sids = {111: 99_999, 222: 99_999}
+    pgids = {111: 111, 222: 222}
+    reads = {"n": 0}
+    real = {}
+
+    def scan(sid):
+        return [(pid, pgids[pid]) for pid in sorted(sids) if sids[pid] == sid]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids, pgids)
+    real["record"] = kb._reap_record
+
+    def record(pid, sid):
+        reads["n"] += 1
+        if pid == 111 and reads["n"] > 4:   # 111 dies after ownership + snapshot reads
+            return None
+        return real["record"](pid, sid)
+
+    monkeypatch.setattr(kb, "_reap_record", record)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
+    assert kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.3) == 0
+    assert signalled == []
