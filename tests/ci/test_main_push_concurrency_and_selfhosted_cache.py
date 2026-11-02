@@ -132,15 +132,35 @@ _CACHE_ON = {"cache": "true", "cache-python": "true", "cache-node": "true", "too
 
 
 @pytest.mark.parametrize("save", ["true", "false"])
-def test_setup_pm_self_hosted_restores_and_never_saves(save):
+def test_setup_pm_self_hosted_never_saves_and_seeds_tools_from_the_host(save):
+    """t_85cd80ac: a self-hosted GitHub-cache restore of tools or uv is slower than a
+    miss (ci-box p50 45 s both-hit vs 32 s both-miss), so self-hosted jobs copy the
+    host seed instead and restore uv from GitHub only on the explicit-save path,
+    which needs the key output for save-pm-cache."""
     inputs = {**_CACHE_ON, "save-tools-cache": save, "save-python-cache": save, "save-node-cache": save}
     steps = _setup_steps()
     ctx = {"inputs": inputs, "runner": {"environment": "self-hosted"}, "steps": {}}
     saving = [i for i, s in steps.items() if str(s.get("uses", "")).startswith("actions/cache@") and _cond(s["if"], ctx)]
     assert saving == []
+    assert _cond(steps["tools-host-seed"]["if"], ctx)
+    assert not _cond(steps["tools-cache-restore"]["if"], ctx)
+    assert bool(_cond(steps["python-cache-restore"]["if"], ctx)) is (save == "false")
     npm_restore = "node-cache-self-hosted" if save == "true" else "node-cache-restore"
-    for restore in ("tools-cache-restore", "python-cache-restore", npm_restore):
-        assert _cond(steps[restore]["if"], ctx), restore
+    assert _cond(steps[npm_restore]["if"], ctx), npm_restore
+
+
+def test_setup_pm_host_seed_only_on_self_hosted_with_the_cache_on():
+    steps = _setup_steps()
+    seed = steps["tools-host-seed"]
+    hosted = {"inputs": _CACHE_ON, "runner": {"environment": "github-hosted"}, "steps": {}}
+    off = {"inputs": {**_CACHE_ON, "cache": "false"}, "runner": {"environment": "self-hosted"}, "steps": {}}
+    assert not _cond(seed["if"], hosted)
+    assert not _cond(seed["if"], off)
+    # The seed path is the read-only bind ci-runner-pool.sh provides, per native target.
+    assert seed["env"]["_PM_SEED"] == "/ci-cache/setup-pm/${{ steps.prepare.outputs.target }}/tools"
+    assert seed["env"]["_PM_STORE"] == "${{ steps.prepare.outputs.store }}"
+    order = list(_setup_steps())
+    assert order.index("tools-host-seed") < order.index("install")
 
 
 def test_setup_pm_self_hosted_npm_restore_reads_the_namespace_hosted_saves():
@@ -212,6 +232,7 @@ def test_save_on_self_hosted_turns_every_save_back_on():
         assert _cond(steps[save]["if"], ctx), save
     for restore in ("tools-cache-restore", "python-cache-restore", "node-cache-restore", "node-cache-self-hosted"):
         assert not _cond(steps[restore]["if"], ctx), restore
+    assert not _cond(steps["tools-host-seed"]["if"], ctx)
 
 
 def test_save_on_self_hosted_defaults_off():

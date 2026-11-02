@@ -421,3 +421,49 @@ async def test_internal_event_never_reuses_prompt_pin_from_another_privacy_polic
 
     assert calls[0]["context_prompt"] != "UNREDACTED CONTEXT"
     assert calls[0]["channel_prompt"] == "Channel hint."
+
+
+@pytest.mark.asyncio
+async def test_internal_event_after_agent_eviction_reuses_durable_pin(monkeypatch):
+    """t_d38720a8: a fallback-activation eviction clears ``ephemeral_pin`` but keeps ``channel_pin``.
+    The next internal wake used to re-render from its chat_name-less source (``#chan`` -> chat id),
+    and the next human turn rendered it back: two cold system-prefix writes per wake. The wake must
+    adopt the durable snapshot instead, so the prompt is byte-identical across all three turns."""
+    durable: dict = {}
+    runner = _make_runner(monkeypatch, durable_prompt_pin=durable)
+    calls: list[dict] = []
+    _capture(runner, calls)
+
+    await _drive(runner, ((False, _human_source()),))
+    assert isinstance(durable.get("value"), dict)
+    runner._evict_cached_agent(KEY)  # what _run_agent_evict_on_fallback does after a fallback turn
+    state = runner._peek_session_state(KEY).conversation
+    assert state.ephemeral_pin is None and state.channel_pin is not None
+
+    await _drive(runner, ((True, _wake_source()), (False, _human_source())))
+
+    seen = [kw["context_prompt"] for kw in calls]
+    assert len(seen) == 3, f"_run_agent reached {len(seen)}/3 turns"
+    assert "Guild / #general" in seen[0]
+    assert seen[0] == seen[1] == seen[2], "evicted-agent wake re-rendered the session-context block"
+    effective = [_effective_ephemeral(runner, kw) for kw in calls]
+    assert effective[0] == effective[1] == effective[2]
+
+
+@pytest.mark.asyncio
+async def test_human_turn_after_eviction_still_renders_its_own_metadata(monkeypatch):
+    """The rehydrate is internal-only: a human turn after an eviction keeps the key-miss rule, so a
+    real metadata change (channel rename) still reaches the prompt."""
+    durable: dict = {}
+    runner = _make_runner(monkeypatch, durable_prompt_pin=durable)
+    calls: list[dict] = []
+    _capture(runner, calls)
+
+    await _drive(runner, ((False, _human_source()),))
+    runner._evict_cached_agent(KEY)
+    renamed = SessionSource(**_ORIGIN, chat_name="Guild / #renamed", user_name="Ace",
+                            message_id="1552671843494666339")
+    await _drive(runner, ((False, renamed),))
+
+    assert "Guild / #renamed" in calls[1]["context_prompt"]
+    assert durable["value"]["context_prompt"] == calls[1]["context_prompt"]
