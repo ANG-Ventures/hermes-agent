@@ -425,16 +425,28 @@ def _is_residue(path):
         not path.endswith("/") and any(fnmatch.fnmatchcase(parts[-1], f) for f in _RESIDUE_FILES)))
 
 
+def _holds_repo(d):
+    """A `dir/` status record is collapsed: git does not descend into a nested repository (a vendored
+    checkout or editable install under .venv/node_modules), so its unpushed work is invisible. Walk it
+    (no symlinks) and treat any `.git`, dir or file, as work."""
+    for _here, dirs, files in os.walk(d):
+        if ".git" in dirs or ".git" in files:
+            return True
+    return False
+
+
 def _residue_only(repo):
     """True when `repo` is dirty ONLY with untracked residue: no tracked change, no other untracked
-    entry, no skip-worktree / assume-unchanged flag (status cannot see edits behind those)."""
+    entry, no nested repository under a residue dir, no skip-worktree / assume-unchanged flag (status
+    cannot see edits behind those)."""
     flags = _git(repo, "ls-files", "-v", "-z").stdout.decode("utf-8", "surrogateescape")
     if any(rec[:1] == "S" or rec[:1].islower() for rec in flags.split("\0") if len(rec) > 2):
         return False
     out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all",
                "--ignore-submodules=none").stdout.decode("utf-8", "surrogateescape")
     recs = [rec for rec in out.split("\0") if rec]
-    return bool(recs) and all(rec[:2] == "??" and _is_residue(rec[3:]) for rec in recs)
+    return bool(recs) and all(rec[:2] == "??" and _is_residue(rec[3:]) and not (
+        rec.endswith("/") and _holds_repo(Path(repo) / rec[3:])) for rec in recs)
 
 # Hard ceiling on directories inspected by one enumeration. A gate that cannot
 # finish must SAY so rather than hang: unbounded, this walk visited 850,853
@@ -3831,11 +3843,13 @@ def res(s):
  q=[x for x in s.rstrip('/').split('/') if x]
  ds=q if s.endswith('/') else q[:-1]
  return bool(q) and (any(x in R for x in ds) or (not s.endswith('/') and any(fnmatch.fnmatchcase(q[-1],f) for f in F)))
+def h(d):
+ return any('.git' in a or '.git' in b for _,a,b in os.walk(d))
 def prove(d):
  if (d/'.git').exists():
   if (d/'.git').is_file(): raise RuntimeError('registered worktree requires git worktree remove')
   st=[r for r in git(d,'status','--porcelain=v1','-z','--untracked-files=all','--ignored','--ignore-submodules=none').split('\0') if r]
-  if st and not all(r[:2] in('??','!!') and res(r[3:]) for r in st): raise RuntimeError('dirty, ignored or untracked work')
+  if st and not all(r[:2] in('??','!!') and res(r[3:]) and not(r.endswith('/') and h(d/r[3:])) for r in st): raise RuntimeError('dirty, ignored or untracked work')
   if st and any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2): raise RuntimeError('skip-worktree or assume-unchanged files')
   if git(d,'stash','list'): raise RuntimeError('stashes')
   if git(d,'rev-list','--branches','--tags','--not','--remotes'): raise RuntimeError('local commits not on any remote')

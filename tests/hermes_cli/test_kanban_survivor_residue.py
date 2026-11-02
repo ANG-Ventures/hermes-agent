@@ -189,6 +189,60 @@ def test_remote_mutation_without_residue_branch_holds(db, tmp_path, monkeypatch)
     assert ws.exists()
 
 
+# ------------------------------------------------------------------ nested repo under a residue dir
+
+def nested_repo(ws, tmp_path, unpushed):
+    """A vendored checkout / editable install inside .venv: its own repo, optionally with work."""
+    inner = ws / ".venv" / "src" / "vendored"
+    make_repo(inner, tmp_path / f"inner-{unpushed}.git")
+    if unpushed:
+        (inner / "code.py").write_text("value = 2\n")
+        git(inner, "commit", "-qam", "unpushed work")
+    return inner
+
+
+@pytest.mark.parametrize("unpushed", [True, False])
+def test_local_residue_dir_holding_a_nested_repo_is_held(board, tmp_path, unpushed):
+    tid, ws = local_card(board)
+    residue(ws)
+    nested_repo(ws, tmp_path, unpushed)
+    assert not ks._residue_only(ws)
+    kb.complete_task(board, tid)
+    survivor = kb.latest_run(board, tid).metadata.get("survivor") or {}
+    assert survivor.get("kind") != "ref", survivor
+
+
+def test_local_residue_without_nested_repo_is_still_deleted(board):
+    tid, ws = local_card(board)
+    residue(ws)
+    (ws / ".venv" / "src" / "vendored").mkdir(parents=True)
+    (ws / ".venv" / "src" / "vendored" / "code.py").write_text("plain file, no .git\n")
+    assert ks._residue_only(ws)
+    assert ks.remove_workspace_dir(board, tid, ws)
+    assert not ws.exists()
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_remote_residue_dir_holding_a_nested_repo_is_held(db, tmp_path, ignored):
+    ws = remote_ws(tmp_path)
+    residue(ws)
+    if ignored:  # `!! .venv/` is reported collapsed; the walk must still find the nested .git
+        (ws / ".git" / "info" / "exclude").write_text(".venv/\n")
+    inner = nested_repo(ws, tmp_path, unpushed=True)
+    assert not ks.remove_workspace_dir(db, "t_11111111", ws, remote_host=HOST)
+    assert (inner / ".git").exists()
+
+
+def test_remote_residue_without_nested_repo_is_deleted(db, tmp_path):
+    ws = remote_ws(tmp_path)
+    residue(ws)
+    (ws / ".git" / "info" / "exclude").write_text(".venv/\n")
+    (ws / ".venv" / "src" / "vendored").mkdir(parents=True)
+    (ws / ".venv" / "src" / "vendored" / "code.py").write_text("plain file, no .git\n")
+    assert ks.remove_workspace_dir(db, "t_11111111", ws, remote_host=HOST)
+    assert not ws.exists()
+
+
 # ------------------------------------------------------------------ pins
 
 def _literal(script, name):
