@@ -82,12 +82,12 @@ def add_distinct_from(content: str, entries: List[Dict[str, Any]]) -> str:
     if meta is not None and not isinstance(meta, dict):
         raise DistinctFromError(
             f"metadata must be a mapping, got {type(meta).__name__}; fix it in the content and retry.")
-    meta = fm["metadata"] = meta or {}
+    meta = fm["metadata"] = dict(meta or {})  # copy: a YAML alias must not receive distinct_from too (b8f3589b6894)
     hermes = meta.get("hermes")
     if hermes is not None and not isinstance(hermes, dict):
         raise DistinctFromError(
             f"metadata.hermes must be a mapping, got {type(hermes).__name__}; fix it in the content and retry.")
-    hermes = meta["hermes"] = hermes or {}
+    hermes = meta["hermes"] = dict(hermes or {})
     prior = hermes.get("distinct_from")
     if prior is not None and not isinstance(prior, list):
         raise DistinctFromError(
@@ -120,6 +120,10 @@ def check_create(name: str, content: str, justification: Optional[str], *, share
         return None, None, content, None
     row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "path": "skill_manage", "name": name,
            "profile": profile, "threshold": verdict["threshold"], "matches": verdict["matches"]}
+    if justification is not None and not isinstance(justification, str):
+        # An ordinary operation failure (never an exception): a batch must roll back its earlier ops.
+        return (f"justification must be a string, got {type(justification).__name__}.",
+                {"near_duplicates": verdict["matches"]}, content, None)
     why = (justification or "").strip()
     if not why:
         _append_ledger(scorer, root, {**row, "event": "refuse"})

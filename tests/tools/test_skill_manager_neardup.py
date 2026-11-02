@@ -304,3 +304,31 @@ def test_justified_create_with_scalar_hermes_metadata_fails_and_keeps_nothing(tm
         assert res["success"] is False, res
         assert "metadata.hermes" in json.dumps(res)
         assert not (shared / "general" / "pg-autovacuum").exists()
+
+
+def test_non_string_justification_is_a_structured_failure_and_the_batch_rolls_back(tmp_path):
+    """fa7fa70165e2: a truthy non-string justification must be an ordinary operation failure, so an atomic
+    batch rolls back its earlier ops instead of escaping with AttributeError past _rollback."""
+    with _fleet_home(tmp_path) as (home, shared):
+        target = shared / "devops" / "postgres-vacuum-tuning" / "SKILL.md"
+        before = target.read_text()
+        res = json.loads(skill_manage("", "", operations=[
+            {"action": "patch", "name": "postgres-vacuum-tuning",
+             "old_string": "watch freeze age", "new_string": "watch freeze age closely"},
+            {"action": "create", "name": "pg-autovacuum", "category": "general", "content": NEAR,
+             "justification": ["different audience"]}]))
+        assert res["success"] is False, res
+        assert "justification" in json.dumps(res)
+        assert target.read_text() == before, "earlier op not rolled back"
+        assert not (shared / "general" / "pg-autovacuum").exists()
+
+
+def test_distinct_from_does_not_leak_through_yaml_aliases():
+    """b8f3589b6894: metadata.hermes aliased to another mapping must not receive distinct_from twice."""
+    from tools.skill_manager_neardup import add_distinct_from
+    out = add_distinct_from("---\nname: demo\ndescription: demo\nmetadata:\n  template: &h {tag: keep}\n  hermes: *h\n---\nbody\n",
+                            [{"name": "existing"}])
+    fm = yaml.safe_load(out.split("---")[1])
+    assert "distinct_from" not in fm["metadata"]["template"], out
+    assert fm["metadata"]["hermes"]["distinct_from"] == [{"name": "existing"}]
+    assert fm["metadata"]["template"] == {"tag": "keep"}
