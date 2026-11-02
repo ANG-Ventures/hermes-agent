@@ -266,6 +266,7 @@ def _fake_world(monkeypatch, scan, births, sids, pgids=None) -> list:
 
     monkeypatch.setattr(kb, "_worker_session_members", scan)
     monkeypatch.setattr(kb, "_member_birth", lambda pid: births.get(pid))
+    monkeypatch.setattr(kb, "_ownership_birth", lambda pid: births.get(pid))
     monkeypatch.setattr(kb, "_reap_birth", lambda pid: births.get(pid))
     monkeypatch.setattr(kb, "_reap_record", record, raising=False)
     monkeypatch.setattr(kb, "_reap_now", time.time)
@@ -530,6 +531,7 @@ def test_pid_replaced_during_the_ownership_read_signals_nothing(monkeypatch):
     kb_pgids: dict = {}
     plain = kb._reap_record
     monkeypatch.setattr(kb, "_member_birth", birth)
+    monkeypatch.setattr(kb, "_ownership_birth", birth)
     monkeypatch.setattr(kb, "_reap_record", lambda pid, sid: (
         None if (rec := plain(pid, sid)) is None else (kb_pgids.get(pid, rec[0]), rec[1])))
     assert kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0,
@@ -687,6 +689,7 @@ def test_reap_refuses_a_session_that_empties_before_the_proof(monkeypatch):
     signalled = _fake_world(monkeypatch, lambda sid: [(111, 111)] if not lookups
                             else [(222, 222)], births, sids)
     monkeypatch.setattr(kb, "_member_birth", birth)
+    monkeypatch.setattr(kb, "_ownership_birth", birth)
     monkeypatch.setattr(kb, "_reap_birth", birth)
     assert kb._reap_worker_session(99_999, born_after=50.0, born_before=200.0,
                                    grace=0.5) == 0
@@ -951,3 +954,20 @@ def test_member_born_well_inside_the_run_still_owns_under_the_epoch_margin(monke
     monkeypatch.setattr(kb, "_EPOCH_BIRTH_EARLY_S", 1.02, raising=False)
     kb._reap_worker_session(99_999, born_after=1005.0, born_before=1010.0, grace=0.2)
     assert 111 in signalled
+
+
+@pytest.mark.platforms("linux")
+def test_ownership_birth_is_tick_precise_on_linux():
+    """Prism 85caf8bcd837 / d0dce3cdc219: the ownership margin is only small if the
+    epoch birth is precise. A child spawned between t0 and t1 must read inside
+    [t0 - margin, t1 + margin], not up to a second early (psutil's integer btime)."""
+    t0 = time.time()
+    child = subprocess.Popen(["/bin/sleep", "5"])
+    t1 = time.time()
+    try:
+        born = kb._ownership_birth(child.pid)
+        assert born is not None
+        assert t0 - kb._EPOCH_BIRTH_EARLY_S <= born <= t1 + kb._EPOCH_BIRTH_EARLY_S, (t0, born, t1)
+    finally:
+        child.kill()
+        child.wait()

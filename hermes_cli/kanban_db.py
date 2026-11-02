@@ -18568,6 +18568,35 @@ def _member_birth(pid: int) -> Optional[float]:
         return None
 
 
+# Boot epoch for _ownership_birth, measured ONCE (like psutil's cached btime) so
+# repeated reads of one process return the same value. Unlike /proc/stat btime
+# it is not floored to an integer second.
+_BOOT_EPOCH = (
+    time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
+    if sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME") else None
+)
+
+
+def _ownership_birth(pid: int) -> Optional[float]:
+    """Epoch birth of ``pid`` for the ownership window, or None when gone/unreadable.
+
+    Linux: /proc/<pid>/stat starttime (CLOCK_BOOTTIME ticks) + _BOOT_EPOCH, so
+    it reads at most one tick (10 ms) early instead of psutil's up to ~1 s
+    (integer btime): Prism 44b9db65242a / 85caf8bcd837. Elsewhere _member_birth.
+    Only _owned_identities uses it; _member_birth's other callers compare
+    births for equality and keep psutil's value.
+    """
+    if _BOOT_EPOCH is not None:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                stat = fh.read()
+            ticks = int(stat[stat.rindex(b")") + 2:].split()[19])
+            return _BOOT_EPOCH + ticks / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError, IndexError):
+            return None
+    return _member_birth(pid)
+
+
 # The session reap orders member births against moments a member was proved
 # alive, so both must come from one clock whose birth reading cannot run early
 # by more than the slack (Prism fe32a904b73f). Linux psutil adds /proc/stat
@@ -18580,12 +18609,14 @@ _REAP_LINUX_CLOCK = sys.platform.startswith("linux") and hasattr(time, "CLOCK_BO
 _REAP_BIRTH_SLACK_SECONDS = (
     0.1 if _REAP_LINUX_CLOCK or sys.platform == "darwin" else 2.0
 )
-# The most an EPOCH birth (_member_birth: psutil create_time, compared with
-# the run's epoch event times) can read early. Linux: btime is an integer
-# second (< 1 s) plus one starttime tick (10 ms). macOS: microseconds from
-# p_starttime. Unverified platforms: the same 2 s bound as above.
+# The most an EPOCH birth (_member_birth, compared with the run's epoch event
+# times) can read early. Linux: _ownership_birth adds starttime to a boot
+# epoch measured once (not floored), so one starttime tick (10 ms) plus the
+# clock read; 0.02 s. macOS: microseconds from p_starttime. Unverified
+# platforms (psutil's integer btime): the same 2 s bound as above.
 _EPOCH_BIRTH_EARLY_S = (
-    1.02 if sys.platform.startswith("linux") else 0.01 if sys.platform == "darwin" else 2.0
+    0.02 if sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME")
+    else 0.01 if sys.platform == "darwin" else 2.0
 )
 
 
@@ -18731,14 +18762,14 @@ def _owned_identities(
         first = _reap_record(pid, sid)
         if first is None:
             continue
-        created = _member_birth(pid)
+        created = _ownership_birth(pid)
         if _reap_record(pid, sid) != first:
             _log.info("kanban: reap skips pid %d: replaced during the ownership read", pid)
             continue
         # A recycled leader (and every child of it) is created after the
         # worker died, i.e. strictly after its last evidence, and event times
         # are floored, so its TRUE birth is > born_before. Its epoch birth can
-        # read up to _EPOCH_BIRTH_EARLY_S early (Linux integer btime), so the
+        # read up to _EPOCH_BIRTH_EARLY_S early (see _ownership_birth), so the
         # upper bound subtracts that error: an early-read replacement can never
         # pass (Prism 44b9db65242a). The cost is the safe direction: a member
         # born in that last interval before the evidence is not an ownership
