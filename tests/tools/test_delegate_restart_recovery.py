@@ -1,12 +1,17 @@
 """Shared live/resume adapter coverage for delegate_task."""
 
 import json
+import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from gateway.session_context import get_session_env, restore_session_vars, set_session_vars
 from agent.runtime_cwd import resolve_agent_cwd
+from run_agent import AIAgent
 from tools import delegate_tool as dt
+from tools.delegate_tool_config import _resolve_child_fallback_chain
 
 
 def _parent():
@@ -299,3 +304,277 @@ def test_config_provider_with_foreign_base_url_stays_custom():
             _parent(),
         )
     assert creds["provider"] == "custom"
+
+
+# ── t_620dc5cd: a background unit's child keeps the parent's fallback chain ─────
+# The spec read ``fallback_model`` (no such AIAgent attribute), so every kanban/detached unit rebuilt
+# its parent with no chain and its ``fallback_providers: auto`` child ran without fallback: under a
+# saturated lane it sat through 15 x 503 where the in-process child failed over.
+
+def _real_parent(fallback_model):
+    return AIAgent(base_url="http://127.0.0.1:9/v1", api_key="k", provider="custom", model="parent-model",
+                   quiet_mode=True, skip_memory=True, skip_context_files=True, enabled_toolsets=["file"],
+                   fallback_model=fallback_model)
+
+
+def _spec_for(parent):
+    tokens = set_session_vars(platform="telegram", chat_id="123", session_key="agent:main:telegram:dm:123",
+                              session_id="sess-parent", profile="work", async_delivery=True)
+    try:
+        with patch("gateway.status.get_current_boot_id", return_value="100:1.0"):
+            spec, _ = dt._build_durable_background_spec(
+                task_list=[{"goal": "finish", "context": None}], shared_context=None, top_role="leaf",
+                inherit_context=False, cfg={"resume_on_restart": True}, creds={"model": "child-model"},
+                parent_agent=parent, session_key="agent:main:telegram:dm:123", parent_session_id="sess-parent",
+                origin_ui_session_id="", max_iterations=45)
+    finally:
+        restore_session_vars(tokens)
+    return spec
+
+
+def test_rebuilt_parent_gives_the_child_the_in_process_fallback_chain():
+    chain = [{"provider": "claude-dtlr", "model": "claude-opus-5-5"}, {"provider": "openrouter", "model": "x/y"}]
+    parent = _real_parent(chain)
+    spec = _spec_for(parent)
+    rebuilt = _real_parent(spec["execution"]["fallback_chain"])
+    for pinned in (False, True):
+        in_process = _resolve_child_fallback_chain(parent, {"fallback_providers": "auto"}, pinned,
+                                                   child_provider="claude-alr", child_model="child-model")
+        assert in_process
+        assert _resolve_child_fallback_chain(rebuilt, {"fallback_providers": "auto"}, pinned,
+                                             child_provider="claude-alr", child_model="child-model") == in_process
+
+
+def test_credential_bearing_fallback_chain_is_not_persisted_and_spec_survives():
+    parent = _real_parent([{"provider": "custom", "model": "m", "base_url": "https://x.invalid/v1",
+                            "api_key": "MUST-NOT-PERSIST"}])
+    spec = _spec_for(parent)
+    assert spec is not None
+    assert spec["execution"]["fallback_chain"] is None
+    assert "MUST-NOT-PERSIST" not in json.dumps(spec)
+
+
+def test_unpicklable_fallback_chain_never_takes_the_durable_spec_down(caplog):
+    """A live chain may hold lock/client-bearing objects: the spec still builds (a deepcopy raised
+    ``cannot pickle '_thread.lock'`` and every background delegation ran synchronously)."""
+    parent = _real_parent([dict(rung) for rung in _CHAIN])
+    parent._fallback_chain[0]["client_lock"] = threading.Lock()
+    spec = _spec_for(parent)
+    assert spec is not None
+    assert spec["execution"]["fallback_chain"] == _CHAIN
+    json.dumps(spec)
+    parent._fallback_chain = MagicMock()  # not a list: not representable
+    with caplog.at_level("WARNING", logger="tools.async_delegation_store"):
+        spec = _spec_for(parent)
+    assert spec is not None and spec["execution"]["fallback_chain"] is None
+    assert "fallback chain not persisted" in caplog.text
+
+
+def test_declared_fallback_policy_never_persists_a_nested_credential():
+    """Prism c6cb98245680: the whole declared rung is checked, nested ``options`` included, and only
+    the checked JSON copy persists."""
+    from tools.async_delegation_store import persistable_fallback_policy
+
+    leaky = [{"source": "s", "options": {"base_url": "https://user:SECRET@example.com/v1"}}]
+    assert persistable_fallback_policy({"fallback_providers": leaky}) == {"fallback_providers": []}
+    clean = [{"source": "s", "options": {"base_url": "https://example.com/v1"}, "lock": threading.Lock()}, "openrouter"]
+    assert persistable_fallback_policy({"fallback_providers": clean}) == {
+        "fallback_providers": [{"source": "s", "options": {"base_url": "https://example.com/v1"}}, "openrouter"]}
+
+
+def test_declared_fallback_policy_never_persists_a_credential_url_string():
+    """Prism c6cb98245680 (string form): a credential URL as a bare string, alone or in a list, is
+    withheld as []; plain names and ``"auto"`` are unchanged."""
+    from tools.async_delegation_store import persistable_fallback_policy
+
+    url = "https://user:SECRET@example.com/v1"
+    assert persistable_fallback_policy({"fallback_providers": url}) == {"fallback_providers": []}
+    assert persistable_fallback_policy({"fallback_providers": [url]}) == {"fallback_providers": []}
+    assert persistable_fallback_policy({"fallback_providers": "auto"}) == {"fallback_providers": "auto"}
+    assert persistable_fallback_policy({"fallback_providers": ["openrouter"]}) == {"fallback_providers": ["openrouter"]}
+
+
+# ── Prism a2c6b8a0230f: ONE sanitizer for both persisted fallback surfaces ──
+# {declared policy, parent chain} x the eight shapes a credential (or an unpicklable value) can take.
+# Policy: any credential withholds the whole declared value as [] (never None, which widens).
+# Chain: only JSON scalars are kept per rung, then a rung carrying a credential is dropped; a clean
+# sibling rung survives, and an empty chain is None.
+_CRED_URL = "https://alice:p4ss@proxy.invalid/v1"
+_CLEAN = {"provider": "openrouter", "model": "x/y"}
+_LOCK = threading.Lock()
+_SURFACE = [
+    ("bare_string_url", _CRED_URL, []),
+    ("string_in_list", [_CRED_URL], []),
+    ("cred_key", [{"provider": "custom", "model": "m", "api_key": "S"}], []),
+    ("cred_url_base_url", [{"provider": "custom", "model": "m", "base_url": _CRED_URL}], []),
+    ("cred_url_arbitrary_scalar", [{"provider": "custom", "model": "m", "proxy_url": _CRED_URL}], []),
+    ("nested_dict", [{"provider": "custom", "model": "m", "options": {"base_url": _CRED_URL}}], []),
+    ("nested_list", [{"provider": "custom", "model": "m", "urls": ["https://ok.invalid", _CRED_URL]}], []),
+    ("non_scalar_lock", [{"provider": "openrouter", "model": "x/y", "lock": _LOCK}], [_CLEAN]),
+]
+_CHAIN_EXPECTED = {
+    "bare_string_url": None,  # not a list
+    "string_in_list": None,  # no dict rung
+    "cred_key": [_CLEAN],
+    "cred_url_base_url": [_CLEAN],
+    "cred_url_arbitrary_scalar": [_CLEAN],
+    "nested_dict": [{"provider": "custom", "model": "m"}, _CLEAN],  # non-scalar field dropped, never persisted
+    "nested_list": [{"provider": "custom", "model": "m"}, _CLEAN],
+    "non_scalar_lock": [_CLEAN, _CLEAN],
+}
+
+
+@pytest.mark.parametrize(("shape", "declared", "expected"), _SURFACE, ids=[row[0] for row in _SURFACE])
+def test_declared_policy_surface(shape, declared, expected):
+    from tools.async_delegation_store import persistable_fallback_policy
+
+    result = persistable_fallback_policy({"fallback_providers": declared})
+    assert result == {"fallback_providers": expected}
+    assert "p4ss" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(("shape", "declared", "_policy"), _SURFACE, ids=[row[0] for row in _SURFACE])
+def test_parent_chain_surface(shape, declared, _policy):
+    from tools.async_delegation_store import persistable_fallback_chain
+
+    chain = declared + [dict(_CLEAN)] if isinstance(declared, list) and isinstance(declared[0], dict) else declared
+    result = persistable_fallback_chain(chain)
+    assert result == _CHAIN_EXPECTED[shape]
+    assert "p4ss" not in json.dumps(result)
+
+
+def test_fallback_surface_controls_pass_unchanged():
+    from tools.async_delegation_store import persistable_fallback_chain, persistable_fallback_policy
+
+    for declared in ("auto", ["openrouter"], None, []):
+        assert persistable_fallback_policy({"fallback_providers": declared}) == {"fallback_providers": declared}
+    assert persistable_fallback_chain([dict(rung) for rung in _CHAIN]) == _CHAIN
+
+
+# ── Prism 3de445560b2a: recovery keeps the route owner's fallback POLICY, not only the chain ──
+# A per-call ``credentials_cfg`` (``/review`` -> ``auxiliary.review``) is not replayed on recovery, so the
+# recovered children took the GLOBAL delegation block's policy: with ``fallback_providers: auto`` a pinned
+# review child failed over onto the parent's lanes its own block never named.
+
+_GLOBAL_AUTO = {"resume_on_restart": True, "fallback_providers": "auto"}
+_REVIEW_CFG = {"provider": "claude-bpr", "model": "claude-haiku-4-5", "base_url": "", "api_key": "", "api_mode": ""}
+_CHAIN = [{"provider": "claude-dtlr", "model": "claude-opus-5-5"}, {"provider": "openrouter", "model": "x/y"}]
+
+
+def _recovered_routing_cfg(parent, *, creds, routing_cfg):
+    tokens = set_session_vars(platform="telegram", chat_id="123", session_key="agent:main:telegram:dm:123",
+                              session_id="sess-parent", profile="work", async_delivery=True)
+    try:
+        with patch("gateway.status.get_current_boot_id", return_value="100:1.0"):
+            spec, _ = dt._build_durable_background_spec(
+                task_list=[{"goal": "review", "context": None}], shared_context=None, top_role="leaf",
+                inherit_context=False, cfg=dict(_GLOBAL_AUTO), creds=creds, parent_agent=parent,
+                session_key="agent:main:telegram:dm:123", parent_session_id="sess-parent",
+                origin_ui_session_id="", max_iterations=45, routing_cfg=routing_cfg)
+    finally:
+        restore_session_vars(tokens)
+    record = json.loads(json.dumps(spec))  # the durable round-trip
+    with patch.object(dt, "_load_config", return_value=dict(_GLOBAL_AUTO)):
+        got = _resolved_recovery_creds(record, _BPR_RUNTIME)
+    return got["cfg"], _real_parent(record["execution"]["fallback_chain"])
+
+
+def test_recovered_pinned_child_keeps_its_owners_no_fallback_policy():
+    parent = _real_parent(_CHAIN)
+    in_process = _resolve_child_fallback_chain(parent, _REVIEW_CFG, True, child_provider="claude-bpr",
+                                               child_model="claude-haiku-4-5")
+    assert in_process is None
+    cfg, rebuilt = _recovered_routing_cfg(
+        parent, creds={"model": "claude-haiku-4-5", "provider": "claude-bpr"}, routing_cfg=_REVIEW_CFG)
+    assert _resolve_child_fallback_chain(rebuilt, cfg, True, child_provider="claude-bpr",
+                                         child_model="claude-haiku-4-5") is None
+
+
+def test_recovered_unpinned_child_still_inherits_the_parent_chain():
+    parent = _real_parent(_CHAIN)
+    in_process = _resolve_child_fallback_chain(parent, _GLOBAL_AUTO, False, child_model="parent-model")
+    assert in_process
+    cfg, rebuilt = _recovered_routing_cfg(parent, creds={"model": None}, routing_cfg=_GLOBAL_AUTO)
+    assert _resolve_child_fallback_chain(rebuilt, cfg, False, child_model="parent-model") == in_process
+
+
+# ── Prism 75587d571cd7 / e087e98e6bb8: the recovered policy and pin match the dispatched ones ──
+
+def test_provider_name_fallback_list_round_trips_intact():
+    from tools.async_delegation_store import persistable_fallback_policy
+
+    declared = ["openrouter", {"provider": "claude-dtlr", "model": "claude-opus-5-5"}]
+    persisted = json.loads(json.dumps(persistable_fallback_policy({"fallback_providers": declared})))
+    assert persisted == {"fallback_providers": declared}
+
+
+def test_recovered_model_only_pin_keeps_no_parent_chain():
+    # Custom endpoint parent, delegation.model set, provider inherited, fallback_providers null.
+    global_null = {"resume_on_restart": True, "fallback_providers": None}
+    parent = _real_parent([{"provider": "openrouter", "model": "x/y"}])
+    original = _resolve_child_fallback_chain(parent, global_null, True, child_model="child-model")
+    assert original is None
+    tokens = set_session_vars(platform="telegram", chat_id="123", session_key="agent:main:telegram:dm:123",
+                              session_id="sess-parent", profile="work", async_delivery=True)
+    try:
+        with patch("gateway.status.get_current_boot_id", return_value="100:1.0"):
+            spec, _ = dt._build_durable_background_spec(
+                task_list=[{"goal": "finish", "context": None}], shared_context=None, top_role="leaf",
+                inherit_context=False, cfg=dict(global_null), creds={"model": "child-model"},
+                parent_agent=parent, session_key="agent:main:telegram:dm:123", parent_session_id="sess-parent",
+                origin_ui_session_id="", max_iterations=45)
+    finally:
+        restore_session_vars(tokens)
+    record = json.loads(json.dumps(spec))
+    with patch.object(dt, "_load_config", return_value=dict(global_null)):
+        got = _recovered_child_build(record)
+    assert got["model"] == "child-model" and not got["override_provider"]
+    rebuilt = _real_parent(record["execution"]["fallback_chain"])
+    assert _resolve_child_fallback_chain(rebuilt, global_null, bool(got["model"]),
+                                         child_model=got["model"]) == original
+
+
+def _recovered_child_build(record):
+    captured = {}
+
+    def spy(**kwargs):
+        captured.update(kwargs)
+        raise _StopAtChildBuild
+
+    with patch.object(dt, "_build_child_preserving_parent_tools", spy), pytest.raises(_StopAtChildBuild):
+        dt.delegate_task(tasks=record["source"]["tasks"], parent_agent=_parent(), _recovery_spec=record)
+    return captured
+
+
+class _StopAtChildBuild(Exception):
+    pass
+
+
+def test_recovered_model_only_pin_is_not_alias_resolved_twice():
+    # Prism 0418dcff8ba7: model_aliases.worker -> ("gpt-5.5", inherit), while "gpt-5.5" is itself an alias
+    # for openai-codex. Dispatch resolved "worker" once; recovery must reuse that result, not re-resolve it.
+    aliases = {"worker": ("gpt-5.5", None), "gpt-5.5": ("gpt-5.5", "openai-codex")}
+
+    def resolve(model, provider):
+        return (model, provider) if provider else aliases.get(model, (model, provider))
+
+    global_null = {"resume_on_restart": True, "fallback_providers": None}
+    with patch("hermes_cli.model_switch.resolve_model_pair_for_storage", side_effect=resolve):
+        dispatched = dt._resolve_delegation_credentials({"model": "worker"}, _parent())
+        assert (dispatched["model"], dispatched["provider"]) == ("gpt-5.5", None)
+        tokens = set_session_vars(platform="telegram", chat_id="123", session_key="agent:main:telegram:dm:123",
+                                  session_id="sess-parent", profile="work", async_delivery=True)
+        try:
+            with patch("gateway.status.get_current_boot_id", return_value="100:1.0"):
+                spec, _ = dt._build_durable_background_spec(
+                    task_list=[{"goal": "finish", "context": None}], shared_context=None, top_role="leaf",
+                    inherit_context=False, cfg=dict(global_null), creds=dispatched,
+                    parent_agent=_real_parent(None), session_key="agent:main:telegram:dm:123",
+                    parent_session_id="sess-parent", origin_ui_session_id="", max_iterations=45)
+        finally:
+            restore_session_vars(tokens)
+        record = json.loads(json.dumps(spec))
+        with patch.object(dt, "_load_config", return_value=dict(global_null)):
+            got = _recovered_child_build(record)
+    assert got["model"] == "gpt-5.5"
+    assert not got["override_provider"] and not got["override_base_url"]

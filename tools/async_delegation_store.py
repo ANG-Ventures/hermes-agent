@@ -845,6 +845,84 @@ def _assert_nonsecret_settings(durable_spec: dict[str, Any]) -> None:
                 raise RegistryError(f"credential-bearing route.{field} cannot be persisted")
 
 
+def persistable_fallback_chain(chain: Any) -> list[dict[str, Any]] | None:
+    """The dispatching parent's fallback chain for ``execution.fallback_chain``, or None.
+
+    A recovered unit rebuilds its parent from this field, and its children resolve their chain from
+    that parent exactly as the in-process children do (``fallback_providers: auto``). A rung carrying a
+    credential-shaped key or a credential-bearing URL in any field is dropped (a chain left empty is
+    None, the unit runs without fallback): recording it would fail the whole spec closed and force
+    the call synchronous.
+
+    Rungs are copied field by field, keeping only JSON scalars: a live chain is never deep-copied,
+    because a rung may hold client/lock-bearing objects and a raise here would take the durable
+    spec down with it. A chain that cannot be represented records None with a warning."""
+    if chain is None:
+        return None
+    if not isinstance(chain, (list, tuple)):
+        logger.warning("async_delegation fallback chain not persisted: %s is not a list", type(chain).__name__)
+        return None
+    rungs = [
+        {str(key): value for key, value in rung.items() if isinstance(value, (str, int, float, bool, type(None)))}
+        for rung in chain
+        if isinstance(rung, dict)
+    ]
+    # The same sanitizer as the declared policy, over every kept field (not just ``base_url``): a
+    # credential URL in any scalar (``proxy_url``, ``endpoint``, ...) drops its rung (Prism a2c6b8a0230f).
+    kept = [rung for rung in rungs if not _carries_credential(rung)]
+    if len(kept) != len(rungs):
+        logger.info("async_delegation fallback chain: %d rung(s) carrying a credential not persisted", len(rungs) - len(kept))
+    return kept or None
+
+
+def persistable_fallback_policy(routing_cfg: Any) -> dict[str, Any]:
+    """``execution.fallback_policy``: the ``fallback_providers`` of the block that owned the route.
+
+    A recovered unit is rebuilt without its dispatch-time ``credentials_cfg`` (e.g. ``auxiliary.review``),
+    so without this its children would take the GLOBAL delegation block's fallback policy, and a pinned
+    child under ``fallback_providers: auto`` would fail over onto the parent's lanes that its own block
+    excluded (Prism 3de445560b2a). ``None`` and ``"auto"`` persist as-is. A declared chain persists
+    through the same credential filter as the parent chain. If that filter withholds it, ``[]`` is
+    recorded (no fallback), never ``None``, which would widen the policy to the inherited chain.
+    A bare provider name carries no credential and persists verbatim, so the recovered value resolves
+    exactly as the declared one did (Prism 75587d571cd7)."""
+    declared = routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None
+    # The WHOLE declared value is checked before any early return (a URL string, string or dict rungs,
+    # nested values such as ``options.base_url``), and what persists is a JSON-safe copy of exactly
+    # what was checked (Prism c6cb98245680).
+    if _carries_credential(declared):
+        logger.info("async_delegation fallback policy not persisted: a declared rung carries a credential")
+        return {"fallback_providers": []}
+    if declared is None or isinstance(declared, str) or declared == []:
+        return {"fallback_providers": declared}
+    entries = [declared] if isinstance(declared, dict) else declared if isinstance(declared, list) else []
+    kept = [_json_safe(entry) for entry in entries if isinstance(entry, (dict, str))]
+    # Nothing usable resolves to the owner's default at dispatch; None resolves to the same default.
+    return {"fallback_providers": kept or None}
+
+
+def _carries_credential(value: Any) -> bool:
+    """True when a credential-shaped key or a credential-bearing URL appears anywhere inside ``value``."""
+    if isinstance(value, dict):
+        return any(_sensitive_query_key(str(key)) or _carries_credential(child) for key, child in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_carries_credential(child) for child in value)
+    return isinstance(value, str) and url_has_credentials(value)
+
+
+def _json_safe(value: Any) -> Any:
+    """A copy of ``value`` holding only JSON data: dicts, lists and scalars; anything else is dropped."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe(child) for key, child in value.items() if _is_json_data(child)}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(child) for child in value if _is_json_data(child)]
+    return value
+
+
+def _is_json_data(value: Any) -> bool:
+    return isinstance(value, (dict, list, tuple, str, int, float, bool, type(None)))
+
+
 def _sensitive_query_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
     return any(part in normalized for part in _SECRET_FIELD_PARTS) or normalized in {"key", "token"}
