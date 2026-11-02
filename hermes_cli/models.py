@@ -3111,7 +3111,7 @@ def _classify_probe_failure(exc: Exception) -> tuple[str, bool]:
 
 def _probe_result(
     models, probed_url, resolved_base_url, suggested_base_url=None, used_fallback=False,
-    failure: Optional[str] = None,
+    failure: Optional[str] = None, tried_urls: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     return {
         "models": models,
@@ -3119,7 +3119,11 @@ def _probe_result(
         "resolved_base_url": resolved_base_url,
         "suggested_base_url": suggested_base_url,
         "used_fallback": used_fallback,
-        "failure": failure}
+        "failure": failure,
+        # Every listing URL requested, in order. ``probed_url`` on a failure is
+        # the FIRST; a relay mounted at ``.../anthropic`` serves the second
+        # (``.../anthropic/v1/models``), so a warning must name both.
+        "tried_urls": list(tried_urls) if tried_urls else ([probed_url] if probed_url else [])}
 
 
 def probe_api_models(
@@ -3151,7 +3155,8 @@ def probe_api_models(
             # (fork: TestAnthropicMessagesWarningHonesty), never "no GET /v1/models".
             return _probe_result(
                 None, normalized.rstrip("/") + "/models", normalized,
-                alternate_base if alternate_base != normalized else None, failure="timeout")
+                alternate_base if alternate_base != normalized else None, failure="timeout",
+                tried_urls=[c.rstrip("/") + "/models" for c, _fb in candidates])
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
     if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
         headers["X-Goog-Api-Client"] = f"hermes-agent/{get_version_info().base_version}"
@@ -3211,7 +3216,8 @@ def probe_api_models(
             probed.append(item.get("id", ""))
         return _probe_result(
             probed, url, candidate_base.rstrip("/"),
-            alternate_base if alternate_base != candidate_base else normalized, is_fallback)
+            alternate_base if alternate_base != candidate_base else normalized, is_fallback,
+            tried_urls=tried)
 
     if _neg_key is not None and all_timed_out:
         _probe_neg_cache[_neg_key] = time.monotonic()
@@ -3224,7 +3230,8 @@ def probe_api_models(
     )
     return _probe_result(
         None, tried[0] if tried else normalized.rstrip("/") + "/models", normalized,
-        alternate_base if alternate_base != normalized else None, failure=overall_failure)
+        alternate_base if alternate_base != normalized else None, failure=overall_failure,
+        tried_urls=tried)
 
 
 # Legacy id-regex filter for items with no surface tag; unreachable (deletable) once every catalog

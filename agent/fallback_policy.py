@@ -511,10 +511,23 @@ def advance_sticky_fallback(store: StickyStore, key: StickyKey, *, cls: str, now
 
 
 def note_fallback_success(store: StickyStore, key: StickyKey, now: float,
-                          session_id: Optional[str]) -> Optional[StickyState]:
-    """Write-through of the fallback-side fields on every fallback success."""
+                          session_id: Optional[str],
+                          route: Optional[Tuple[Any, Any]] = None) -> Optional[StickyState]:
+    """Write-through of the fallback-side fields on every fallback success.
+
+    ``route`` is the (provider, model) that served the call. Only a call on the
+    STORED fallback warms it: ``last_fallback_call_epoch`` feeds the
+    ``fallback_cold`` gate that keeps a rebuilt session on that fallback, and a
+    chain-walk target serving calls (2026-11-01 00:16:50: alr/opus calls kept
+    the dtlr/fable episode "warm", the rebuild resumed dtlr at 7% cache) says
+    nothing about the stored fallback's cache."""
     state = _load(store, key)
     if state is None or not state.active:
+        return state
+    if route is not None and _norm_pm(*route) != _norm_pm(state.fallback_provider,
+                                                          state.fallback_model):
+        state.turns_on_fallback += 1
+        store.put(key, state, now)
         return state
     state.last_fallback_call_epoch = now
     state.last_fallback_session_id = str(session_id or "") or None

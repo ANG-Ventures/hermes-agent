@@ -148,6 +148,38 @@ def key_for(agent: Any) -> StickyKey:
     return StickyKey.build(fss.lineage_root_for_agent(agent), p, m)
 
 
+def primary_is_chain_fallback(agent: Any, key: StickyKey) -> bool:
+    """True when writing ``key`` would record a FALLBACK route of this session
+    as a primary. Two shapes:
+
+    * an active episode on the same lineage (another primary) currently has
+      this route as its fallback;
+    * the agent is a persistence-detached fork (``_persist_disabled``: review
+      / btw forks share the parent's session id but are built on the parent's
+      LIVE route, with no chain of their own). It may update an existing row,
+      never create one.
+
+    Measured: lineage 20261031_172840_87d0796c holds primary_provider=claude-dtlr
+    rows (2026-11-01 02:14 / 04:33) written by review forks of a parent that
+    was on its dtlr fallback. The configured chain alone is not the test: a
+    same-provider ``/model`` switch keeps its own route in the chain."""
+    if getattr(agent, "_persist_disabled", False) is True and _state(key) is None:
+        return True
+    want = (key.primary_provider, key.primary_model)
+    try:
+        keys = store().keys_for_lineage(key.lineage_root)
+    except Exception:  # noqa: BLE001 — I3: unreadable store never blocks a write
+        return False
+    for other in keys:
+        if other == key:
+            continue
+        st = _state(other)
+        if (st is not None and st.active
+                and fp._norm_pm(st.fallback_provider, st.fallback_model) == want):
+            return True
+    return False
+
+
 def on_fallback(agent: Any) -> bool:
     """True when the live route is a fallback, not the primary."""
     if getattr(agent, "_fallback_activated", False) is not True:
@@ -368,6 +400,10 @@ def post_failover(agent: Any, plan: FailoverPlan, *, failing: Tuple[Any, Any],
         key = key_for(agent)
         if not key.lineage_root:
             return extra  # no session identity: nothing to key the episode on
+        if primary_is_chain_fallback(agent, key):
+            logger.warning("sticky arm skipped: %s/%s is a fallback route of this session, "
+                           "not its primary", key.primary_provider, key.primary_model)
+            return extra
         state = fp.arm_sticky(
             store(), key, cls=plan.cls, now=time.time(), failing=failing,
             fallback=fallback, fallback_index=fallback_index,
@@ -453,7 +489,9 @@ def note_success(agent: Any, headers: Optional[Dict[str, str]]) -> None:
             return
         if on_fallback(agent):
             fp.note_fallback_success(store(), key, now,
-                                     str(getattr(agent, "session_id", "") or "") or None)
+                                     str(getattr(agent, "session_id", "") or "") or None,
+                                     route=(getattr(agent, "provider", ""),
+                                            getattr(agent, "model", "")))
             return
         seat = fp.seat_from_response(getattr(agent, "provider", ""), headers)
         with _note_lock:
@@ -463,6 +501,8 @@ def note_success(agent: Any, headers: Optional[Dict[str, str]]) -> None:
             _last_primary_note[key] = (now, seat)
             if len(_last_primary_note) > fss.MAX_ENTRIES:
                 _last_primary_note.pop(next(iter(_last_primary_note)))
+        if primary_is_chain_fallback(agent, key):
+            return
         fp.note_primary_success(store(), key, now, provider=getattr(agent, "provider", ""),
                                 headers=headers)
     except Exception:  # noqa: BLE001
@@ -507,6 +547,19 @@ def resume_sticky_fallback(agent: Any, state: StickyState) -> bool:
     chain = list(getattr(agent, "_fallback_chain", None) or [])
     if not chain:
         return False
+    # A fallback activation always carries a primary failure: an episode with no
+    # recorded failure class / time is not evidence the primary failed, so the
+    # rebuilt session starts on its primary.
+    if not state.cls or state.last_failure_epoch is None:
+        logger.warning("sticky resume refused: episode on %s/%s has no recorded primary "
+                       "failure (class=%r); starting on primary", rt.get("provider"),
+                       rt.get("model"), state.cls)
+        return False
+    logger.info("sticky resume: primary %s/%s failed (%s) at %s, cooldown until %s; resuming "
+                "fallback %s/%s", rt.get("provider"), rt.get("model"), state.cls,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.last_failure_epoch)),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.until_epoch or 0)),
+                state.fallback_provider, state.fallback_model)
     idx, walked = fp.resume_target_index(chain, state)
     saved = {a: getattr(agent, a, None) for a in _RESUME_UNTOUCHED if hasattr(agent, a)}
     from_p, from_m = getattr(agent, "provider", None), getattr(agent, "model", None)
