@@ -981,11 +981,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             return 2
     try:
         with kb.connect_closing() as conn:
-            from tools.kanban_tools import _auto_boomerang, _resolve_notify_target
+            from tools.kanban_tools import _auto_boomerang, _auto_wake, _resolve_notify_target
             boomerang = _auto_boomerang(
                 getattr(args, "boomerang_wake", None),
                 worker=is_dispatcher_owned_worker_context(),
-                subscribed=bool(_resolve_notify_target(require_platform_identity=True)))
+                subscribed=bool(_auto_wake(None) and
+                                _resolve_notify_target(require_platform_identity=True)))
             _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,

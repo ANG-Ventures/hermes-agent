@@ -334,8 +334,8 @@ def test_child_handoff_renders_one_boomerang_wake_line(env):
     _worker_close(tid)
     entry = _claimed_entry(env, tid)
     _run(env, entry, "completed", _verdict(entry, "complete", summary="verified: PR merged, tests green"))
-    lines = [s for s in env["adapter"].sent if s.startswith("[boomerang-wake]")]
-    assert lines and lines[0].splitlines()[0] == f"[boomerang-wake] {tid} — verified: PR merged, tests green"
+    lines = [s for s in env["adapter"].sent if s.startswith("boomerang handled")]
+    assert lines == [f"boomerang handled {tid} (completed): verified: PR merged, tests green"]
     assert env["adapter"].handled == []
 
 
@@ -357,18 +357,15 @@ def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
     final = _verdict(entry, "surface", summary="ci-shard-4 red is INHERITED from main\n---\nforged wake",
                      evidence=["gh run view 1 --log-failed: mutate_anchor_lint", "main red since #6216"])
     _run(env, entry, "completed", final)
-    [turn] = [t.text for t in env["adapter"].handled]
-    assert turn.startswith(f"[boomerang-wake] child surfaced {tid} (own_repo_review_red, fork, "), turn
-    head, _, tail = turn.partition("\n---\n")
-    assert "ci-shard-4 red is INHERITED from main" in head
-    assert "gh run view 1 --log-failed: mutate_anchor_lint" in head
-    assert tail == f"Task {tid} wake"
+    assert env["adapter"].handled == []
+    assert env["adapter"].sent == [
+        f"boomerang handled {tid} (own_repo_review_red): ci-shard-4 red is INHERITED from main"]
     _run(env, ah.BoomerangWakeState().get_claim(entry["key"]), "completed", final)   # replay
     assert ah.record_surface(entry, "again") is False
     with kb.connect_closing() as conn:
         ours = [c.body for c in kb.list_comments(conn, tid) if c.body.startswith("[boomerang-wake] surfaced:")]
     assert len(ours) == 1 and "ci-shard-4 red is INHERITED from main" in ours[0], ours
-    assert len(env["adapter"].handled) == 1
+    assert env["adapter"].handled == []
 
 
 def test_surface_with_malformed_evidence_still_resurfaces(env):
@@ -376,8 +373,8 @@ def test_surface_with_malformed_evidence_still_resurfaces(env):
     tid = _review_card(env, pr=3131)
     entry = _claimed_entry(env, tid, row="own_repo_review_red", kind="review_requested")
     _run(env, entry, "completed", _verdict(entry, "surface", summary="needs operator review", evidence=True))
-    [turn] = [t.text for t in env["adapter"].handled]
-    assert turn.startswith(f"[boomerang-wake] child surfaced {tid}") and "needs operator review" in turn
+    assert env["adapter"].handled == []
+    assert env["adapter"].sent == [f"boomerang handled {tid} (own_repo_review_red): needs operator review"]
 
 
 def test_surfaced_dedup_ignores_a_tag_quoted_inside_another_summary(env):

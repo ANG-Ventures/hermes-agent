@@ -399,7 +399,8 @@ _SPECS = [
         _arg("--boomerang-wake", action="store_true", default=None, dest="boomerang_wake",
              help="Subscription level 'boomerang wake': mechanical wakes on this card are "
                   "handled by a background boomerang child (the calling chat subscribes "
-                  "--boomerang-wake). Omit for notify / wake."),
+                  "--boomerang-wake). Defaults to kanban.auto_subscribe_boomerang "
+                   "for operator creates with a gateway origin."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "

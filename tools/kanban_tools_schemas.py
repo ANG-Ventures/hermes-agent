@@ -506,7 +506,9 @@ KANBAN_CREATE_SCHEMA = _schema(
             "(completed, changes requested, a red own-repo handback, a first crash) are "
             "handled by a background boomerang child instead of a turn in the home "
             "session; the calling chat subscribes as the card's waker. Judgment events and "
-            "cards tagged irreversible/spend/outbound always surface. Default false."
+            "cards tagged irreversible/spend/outbound always surface. Operator auto-subscriptions "
+            "default to kanban.auto_subscribe_boomerang (true); false opts out. Worker creates "
+            "do not inherit this default."
         )),
         "unhomed": _prop("boolean", (
             "Mint the card with no home session on purpose. Without "
