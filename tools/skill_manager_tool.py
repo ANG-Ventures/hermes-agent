@@ -1197,7 +1197,7 @@ SKILL_MANAGE_SCHEMA = {
                                           "description": (
                                               "Only after a create was refused as a near-duplicate: why this "
                                               "skill is distinct from the listed matches. Recorded in its "
-                                              "frontmatter (metadata.hermes.distinct_from).")},
+                                              "frontmatter under distinct_from.")},
                     }, ("content",)),
                     _op_schema("patch", {
                         "old_string": _OLD_STRING, "new_string": _NEW_STRING,
