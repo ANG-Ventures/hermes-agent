@@ -2265,7 +2265,7 @@ def test_concurrent_trip_records_lose_no_line(root):
 
 
 def test_g_watchdog_recovers_before_a_stalled_trip_notice(root, monkeypatch, procs):
-    """Prism eb08fba97ed9: a trip record/notice that stalls past the hard deadline must not
+    """Prism eb08fba97ed9: a trip notice that stalls past the hard deadline must not
     cost the requeue snapshot or the tree kill."""
     import cron.scheduler as sched
     from cron import lanes, script_runner, script_runner_rearm as rr
@@ -2280,7 +2280,7 @@ def test_g_watchdog_recovers_before_a_stalled_trip_notice(root, monkeypatch, pro
     with sched._running_lock:
         sched._running_job_ids.add(key)
     release = threading.Event()
-    monkeypatch.setattr(rr, "record_trip", lambda *_a, **_k: release.wait(10))
+    monkeypatch.setattr(rr, "recent_trips", lambda *_a, **_k: release.wait(10) and [])
     exits = []
     done = threading.Event()
 
@@ -2307,6 +2307,37 @@ def test_g_watchdog_recovers_before_a_stalled_trip_notice(root, monkeypatch, pro
     assert exits[0] == 70
 
 
+def test_trip_line_is_on_disk_when_the_hard_deadline_exits(root, monkeypatch):
+    """t_db4c9214: 3 of 8 live trips left no history line, because the record ran on a daemon
+    thread that ``os._exit`` killed once the standby writes and tree kill ate the grace. The line
+    must already be on disk when the hard deadline fires."""
+    from cron import lanes, script_runner, script_runner_rearm as rr
+
+    monkeypatch.setattr(lanes, "RUNNER_WATCHDOG_KILL_GRACE_S", 1)  # deadline = 3 s
+    release = threading.Event()
+    seen = []
+    done = threading.Event()
+
+    def fake_exit(code):
+        if not done.is_set():
+            seen.append((code, [e.get("phase") for e in rr.recent_trips()]))
+            done.set()
+
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)], exit_fn=fake_exit)
+    r.enumerate_homes()
+    monkeypatch.setattr(r, "_write", lambda *_a, **_k: release.wait(10))  # slow standby writes
+    fire = threading.Thread(target=r._watchdog_fire, args=(root, _now_iso()), daemon=True)
+    try:
+        fire.start()
+        assert done.wait(8)
+    finally:
+        release.set()
+        fire.join(10)
+        r.cancel_deadline()
+    assert seen[0][0] == 70
+    assert len(seen[0][1]) == 1, seen  # the line existed at the moment of the exit
+
+
 def test_second_trip_in_24h_pages_alerts_and_backs_off(root, tmp_path, monkeypatch):
     from cron import lanes, script_runner, script_runner_rearm
 
@@ -2316,10 +2347,15 @@ def test_second_trip_in_24h_pages_alerts_and_backs_off(root, tmp_path, monkeypat
                                    exit_fn=lambda _c: None)
     diag = {"phase": "cron.executions:_transaction:102",
             "ledger": {"lock_holder": {"thread": "w1", "label": "finish_execution", "held_s": 31}}}
-    r._record_and_notify_trip(root, _now_iso(), diag)
+    def trip():
+        entry = r._trip_entry(root, _now_iso(), diag)
+        script_runner_rearm.record_trip(entry)
+        r._notify_trip(entry)
+
+    trip()
     time.sleep(0.5)
     assert not _calls(calls)  # the first trip in 24 h is self-healing: silent
-    r._record_and_notify_trip(root, _now_iso(), diag)
+    trip()
     pages = _wait_for(lambda: _calls(calls), 10, what="#alerts page")
     assert "episode_pager" in pages[0][0] and pages[0][1] == "page", pages
     text = pages[0][pages[0].index("--text") + 1]

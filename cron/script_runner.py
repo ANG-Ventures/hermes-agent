@@ -506,15 +506,21 @@ class ScriptRunner:
             logger.critical("script runner tick exceeded %s s on %s (tick thread in %s); tripping "
                             "(one strike) and exiting %d", lanes.RUNNER_TICK_WATCHDOG_S, home,
                             diag.get("phase"), EXIT_WATCHDOG)
+            # The history line is one O_APPEND write on THIS thread: on the notify thread it lost
+            # the race with the exit on 3 of 8 live trips (t_db4c9214).
+            entry = self._trip_entry(home, tick_started_at, diag)
+            with contextlib.suppress(Exception):
+                from cron import script_runner_rearm as rearm_policy
+
+                rearm_policy.record_trip(entry)
             self._write_trip_marker(home, tick_started_at, diag)
             for _name, h in self._last_homes or [(None, home)]:
                 with contextlib.suppress(Exception):
                     self._write(h, "standby", "watchdog_tripped")
-            # Trip record + notice run beside the recovery, never ahead of it: a stalled history
-            # write or sender start must not let the hard deadline fire before the requeue
-            # snapshot and the tree kill (Prism eb08fba97ed9).
-            notify = threading.Thread(target=self._record_and_notify_trip,
-                                      args=(home, tick_started_at, diag), daemon=True,
+            # The notice runs beside the recovery, never ahead of it: a stalled sender start must
+            # not let the hard deadline fire before the requeue snapshot and the tree kill
+            # (Prism eb08fba97ed9).
+            notify = threading.Thread(target=self._notify_trip, args=(entry,), daemon=True,
                                       name="cron-runner-trip-notify")
             notify.start()
             # A script killed below is the runner's own doing, not a job failure: with the
@@ -537,17 +543,20 @@ class ScriptRunner:
         finally:
             self._exit_fn(EXIT_WATCHDOG)
 
-    def _record_and_notify_trip(self, home, tick_started_at, diag: dict) -> None:
-        """Trip history line; #alerts page on the 2nd trip in 24 h (the 1st is self-healing and
-        posts its #logs receipt when the re-armed runner ticks). Never raises."""
+    def _trip_entry(self, home, tick_started_at, diag: dict) -> dict:
+        return {"epoch": time.time(), "at": _now_iso(), "home": str(home), "pid": self._pid,
+                "code_sha": self._code_sha, "tick_started_at": tick_started_at,
+                "phase": diag.get("phase"), "ledger": diag.get("ledger"),
+                "lock_waits": diag.get("lock_waits")}
+
+    def _notify_trip(self, entry: dict) -> None:
+        """#alerts page on the 2nd trip in 24 h (the 1st is self-healing and posts its #logs
+        receipt when the re-armed runner ticks); ``entry`` is already in the history. Never
+        raises."""
         try:
             from cron import script_runner_rearm as rearm_policy
 
-            entry = {"epoch": time.time(), "at": _now_iso(), "home": str(home), "pid": self._pid,
-                     "code_sha": self._code_sha, "tick_started_at": tick_started_at,
-                     "phase": diag.get("phase"), "ledger": diag.get("ledger"),
-                     "lock_waits": diag.get("lock_waits")}
-            rearm_policy.record_trip(entry)
+            rearm_policy.trim_trips()
             trips = rearm_policy.recent_trips()
             if len(trips) >= 2:
                 rearm_policy.page_alerts(

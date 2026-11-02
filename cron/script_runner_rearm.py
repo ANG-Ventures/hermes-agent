@@ -99,22 +99,40 @@ def _file_lock(path: Path, timeout: float = 5.0):
             tlock.release()
 
 
-def record_trip(entry: Dict[str, Any], lock_timeout: float = 1.0) -> None:
-    """Append one trip line (trimmed to the last ``_KEEP_LINES``), the read-modify-write under
-    ``_file_lock`` so two writers cannot drop each other's line (Prism 2777c74d0091). Never
-    raises."""
+def record_trip(entry: Dict[str, Any]) -> None:
+    """Append one trip line with a single ``O_APPEND`` write: no lock, no read, so it is cheap
+    enough for the watchdog thread to finish before its hard ``os._exit`` (t_db4c9214: on a daemon
+    thread 3 of 8 trips lost their line), and two writers cannot drop each other's line (Prism
+    2777c74d0091). ``trim_trips`` bounds the file off that path. Never raises."""
     try:
         path = trips_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with _file_lock(path, timeout=lock_timeout):
-            lines = path.read_text(encoding="utf-8-sig").splitlines() if path.exists() else []
-            lines = lines[-(_KEEP_LINES - 1):] + [json.dumps(entry, sort_keys=True, default=str)]
-            from utils import atomic_write_text
-
-            atomic_write_text(path, "\n".join(lines) + "\n", tmp_prefix=".script_runner_trips_",
-                              mode=0o600)
+        line = (json.dumps(entry, sort_keys=True, default=str) + "\n").encode("utf-8")
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
     except Exception:
         logger.error("script runner: trip history write failed", exc_info=True)
+
+
+def trim_trips(lock_timeout: float = 1.0) -> None:
+    """Keep the last ``_KEEP_LINES`` lines; a no-op below that. Never raises."""
+    try:
+        path = trips_path()
+        with _file_lock(path, timeout=lock_timeout):
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
+            if len(lines) <= _KEEP_LINES:
+                return
+            from utils import atomic_write_text
+
+            atomic_write_text(path, "\n".join(lines[-_KEEP_LINES:]) + "\n",
+                              tmp_prefix=".script_runner_trips_", mode=0o600)
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.error("script runner: trip history trim failed", exc_info=True)
 
 
 def recent_trips(now: Optional[float] = None) -> List[Dict[str, Any]]:
