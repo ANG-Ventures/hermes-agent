@@ -457,6 +457,16 @@ def _residue_only(repo):
     return bool(recs) and all(rec[:2] in ("??", "!!") and _is_residue(rec[3:])
                              and not _holds_repo(Path(repo) / rec[3:]) for rec in recs)
 
+
+def _residue_nested_repo(repo):
+    """The first untracked/ignored residue path of `repo` that holds a nested repository, or None.
+    `_repos` prunes residue dirs, so such a repository is in no capture; reclamation must refuse
+    (Prism 324b848c219b)."""
+    out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored",
+               "--ignore-submodules=none").stdout.decode("utf-8", "surrogateescape")
+    return next((rec[3:] for rec in out.split("\0") if rec[:2] in ("??", "!!")
+                 and _is_residue(rec[3:]) and _holds_repo(Path(repo) / rec[3:])), None)
+
 # Hard ceiling on directories inspected by one enumeration. A gate that cannot
 # finish must SAY so rather than hang: unbounded, this walk visited 850,853
 # directories in 227 s on an idle disk for a `dir` workspace rooted at the
@@ -3530,6 +3540,14 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         if nested is not None:
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
+        if cleanup:
+            stage = "residue nested repository scan"
+            for repo in repos:
+                inner = _residue_nested_repo(repo)
+                if inner is not None:
+                    raise SurvivorUnavailable(
+                        "survivor_unavailable: nested repository requires separate recovery "
+                        f"({str((repo / inner).relative_to(workspace))})")
         keys = {str(r.relative_to(workspace)) for r in repos}
         carried, carried_bundles = [], []
         missing = set(bases) - keys

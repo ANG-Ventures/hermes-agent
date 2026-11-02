@@ -205,11 +205,14 @@ def nested_repo(ws, tmp_path, unpushed):
 def test_local_residue_dir_holding_a_nested_repo_is_held(board, tmp_path, unpushed):
     tid, ws = local_card(board)
     residue(ws)
-    nested_repo(ws, tmp_path, unpushed)
+    inner = nested_repo(ws, tmp_path, unpushed)
     assert not ks._residue_only(ws)
     kb.complete_task(board, tid)
     survivor = kb.latest_run(board, tid).metadata.get("survivor") or {}
     assert survivor.get("kind") != "ref", survivor
+    assert (inner / ".git").exists()  # Prism 324b848c219b: the cleanup refuses, the inner repo survives
+    assert not ks.remove_workspace_dir(board, tid, ws)
+    assert (inner / ".git").exists()
 
 
 def test_local_residue_without_nested_repo_is_still_deleted(board):
@@ -253,12 +256,19 @@ def test_local_ignored_repository_beside_visible_residue_is_held(board, tmp_path
     inner = ws / ".venv" / "src" / "hidden"
     if bare:
         git(ws, "clone", "-q", "--bare", str(ws), str(inner))
+        marker = inner / "HEAD"
     else:
-        nested_repo(ws, tmp_path, unpushed=True)
+        marker = nested_repo(ws, tmp_path, unpushed=True) / ".git"
     assert not ks._residue_only(ws)
     kb.complete_task(board, tid)
     survivor = kb.latest_run(board, tid).metadata.get("survivor") or {}
     assert survivor.get("kind") != "ref", survivor
+    # Prism 324b848c219b: the patch excludes the ignored inner repo, so cleanup must not rmtree it
+    assert marker.exists()
+    assert not ks.remove_workspace_dir(board, tid, ws)
+    assert marker.exists()
+    held = board.execute("SELECT held_reason FROM task_workspace_survivors WHERE task_id=?", (tid,)).fetchone()
+    assert held and "nested repository" in (held[0] or ""), held
 
 
 @pytest.mark.parametrize("ignored", [False, True])
