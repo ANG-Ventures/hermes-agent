@@ -394,6 +394,26 @@ def _shell_launcher_python(target: Path) -> Path | None:
     return None
 
 
+# no-tmp: ok — detect prunable stores; never create temporary files at these paths.
+_EPHEMERAL_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/dev/shm",
+                    "/var/folders", "/private/var/folders")
+
+
+def _is_ephemeral_path(path: Path) -> bool:
+    """Under a temp/pytest/scratch root: a store there is pruned out from under any launcher."""
+    # TMPDIR may be HOME (or even /); it says where to allocate, not what is prunable.
+    try:
+        resolved = Path(path).resolve()
+        roots = {Path(root).resolve() for root in _EPHEMERAL_ROOTS}
+    except (OSError, RuntimeError):
+        return False
+    if any(resolved.is_relative_to(root) for root in roots):
+        return True
+    parts = resolved.parts
+    return (any(part.startswith("pytest-of-") or part == "hermes-pytest" for part in parts)
+            or any(parts[i:i + 2] == ("cache", "scratch") for i in range(len(parts) - 1)))
+
+
 def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> Path | None:
     """The live interpreter ``target`` already execs when ``store_python`` is in another store.
 
@@ -402,9 +422,11 @@ def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> 
     launcher self-heal must not rebind the install's shared launcher there:
     the tmp store is deleted and every command exits 127 (t_968b018f). A
     repin inside the same store, or a launcher whose interpreter is gone,
-    still republishes. Only a launcher bound to a real PM store (its
-    ``<store>/<entry>/bin/python3`` has the store's facts.json) is kept;
-    legacy venv and developer interpreters migrate as before.
+    still republishes. Only a launcher bound to another real PM store (its
+    ``<store>/<entry>/bin/python3`` has the store's facts.json, outside any
+    temp/scratch root) is kept; a launcher a test home already bound to its
+    tmp store is rebound by the real install (Prism 57e9a766ab86). Legacy venv
+    and developer interpreters migrate as before.
     """
     current = _shell_launcher_python(target)
     if current is None or not current.is_file():
@@ -418,9 +440,26 @@ def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> 
             return None
         if store_python.resolve().is_relative_to(old_store.resolve()):
             return None
+        if _is_ephemeral_path(old_store) and not _is_ephemeral_path(repo_root):
+            return None
     except (IndexError, OSError, RuntimeError, ValueError):
         return None
     return current
+
+
+def _launcher_usable(target: Path) -> bool:
+    """The launcher is an executable file and, for a shell wrapper, its interpreter is on disk.
+
+    A dangling symlink, a non-executable file or a wrapper whose Python was pruned is not a
+    published command: reporting it as one lets the caller replace healthy PATH launchers with
+    forwarders to it (Prism 265fc36efda1, 2a8ad7804198).
+    """
+    if not (target.is_file() and os.access(target, os.X_OK)):
+        return False
+    python = _shell_launcher_python(target)
+    # An unrecognized launcher (legacy console script, foreign shebang) proves nothing: unpublished
+    # is the safe answer, it only stops publication (Prism 2a8ad7804198, dead shebang).
+    return python is not None and python.is_file()
 
 
 def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
@@ -429,6 +468,18 @@ def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     store_python = resolve_store_python(repo_root)
     if store_python is not None and not _is_windows():
         target = Path(out_dir) / name
+        # A temp home may publish its own temporary output, never a real install's launcher.
+        # (The store dir, not store_python: the interpreter may be a symlink out of it.
+        # out_dir, not target: the write replaces a symlinked entry, so classify where it
+        # lives, not where it points; Prism 4deaff8b0b6d.)
+        if (_is_ephemeral_path(store_root(repo_root))
+                and not _is_ephemeral_path(repo_root) and not _is_ephemeral_path(Path(out_dir))):
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "launchers: %s not written; %s is a temp/scratch store (test HERMES_HOME)",
+                target, store_python)
+            return target if _launcher_usable(target) else None  # Prism 265fc36efda1
         kept = _foreign_store_rebind(target, store_python, repo_root)
         if kept is not None:
             import logging
