@@ -798,15 +798,14 @@ def _attempt_id(delegation_id: str, generation: int) -> str:
     return f"{delegation_id}:g{generation}:{uuid.uuid4().hex[:8]}"
 
 
-_SECRET_FIELD_PARTS = (
-    "api_key",
-    "apikey",
-    "password",
-    "secret",
-    "authorization",
-    "access_token",
-    "refresh_token",
-)
+# Identifier fields this store writes itself. Their names contain vocabulary words (``credential``,
+# ``session_id``), but they hold references and ids, never a secret.
+_NONSECRET_IDENTIFIER_FIELDS = frozenset({
+    "credential_ref",
+    "parent_session_id",
+    "origin_session_id",
+    "origin_ui_session_id",
+})
 
 
 def _assert_nonsecret_settings(durable_spec: dict[str, Any]) -> None:
@@ -816,8 +815,7 @@ def _assert_nonsecret_settings(durable_spec: dict[str, Any]) -> None:
     def _walk(value: Any, path: str) -> None:
         if isinstance(value, dict):
             for key, child in value.items():
-                normalized = str(key).lower().replace("-", "_")
-                if any(part in normalized for part in _SECRET_FIELD_PARTS):
+                if _sensitive_query_key(str(key)):
                     raise RegistryError(
                         f"secret-shaped field cannot be persisted: {path}.{key}"
                     )
@@ -924,8 +922,24 @@ def _is_json_data(value: Any) -> bool:
 
 
 def _sensitive_query_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    return any(part in normalized for part in _SECRET_FIELD_PARTS) or normalized in {"key", "token"}
+    """True when a field or query-parameter NAME is credential-shaped.
+
+    One vocabulary, the house one (``tools.url_safety.SENSITIVE_QUERY_PARAM_NAMES``): a name trips when
+    a vocabulary name occurs in it as a whole run of ``_``/``-``-separated words (``auth_token``,
+    ``x-api-key``, ``options.passwd``, ``credentials``, ``client_secret_value``), so nobody lists one more
+    name here again (Prism c01c5615ab04). Word runs, not raw substrings, so ``max_tokens`` stays clean.
+    The store's own identifier fields are the only exemption: they are references, not secrets."""
+    from urllib.parse import unquote
+
+    from tools.url_safety import SENSITIVE_QUERY_PARAM_NAMES
+
+    normalized = unquote(key).lower().replace("-", "_")
+    if normalized in _NONSECRET_IDENTIFIER_FIELDS:
+        return False
+    if normalized == "key":
+        return True
+    words = f"_{normalized}_"
+    return any(f"_{name.replace('-', '_')}_" in words for name in SENSITIVE_QUERY_PARAM_NAMES)
 
 
 def url_has_credentials(url: Any) -> bool:

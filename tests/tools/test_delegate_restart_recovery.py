@@ -413,6 +413,10 @@ _SURFACE = [
     ("nested_dict", [{"provider": "custom", "model": "m", "options": {"base_url": _CRED_URL}}], []),
     ("nested_list", [{"provider": "custom", "model": "m", "urls": ["https://ok.invalid", _CRED_URL]}], []),
     ("non_scalar_lock", [{"provider": "openrouter", "model": "x/y", "lock": _LOCK}], [_CLEAN]),
+    # Prism c01c5615ab04: credential NAMES come from the house vocabulary (tools.url_safety), not a local list.
+    ("auth_token_nested", [{"source": "dynamic", "provider": "custom", "model": "m", "options": {"auth_token": "p4ss"}}], []),
+    ("passwd_key", [{"provider": "custom", "model": "m", "passwd": "p4ss"}], []),
+    ("credentials_key", [{"provider": "custom", "model": "m", "credentials": "p4ss"}], []),
 ]
 _CHAIN_EXPECTED = {
     "bare_string_url": None,  # not a list
@@ -425,7 +429,23 @@ _CHAIN_EXPECTED = {
     "nested_dict": [{"provider": "custom", "model": "m"}, _CLEAN],  # non-scalar field dropped, never persisted
     "nested_list": [{"provider": "custom", "model": "m"}, _CLEAN],
     "non_scalar_lock": [_CLEAN, _CLEAN],
+    "auth_token_nested": [{"source": "dynamic", "provider": "custom", "model": "m"}, _CLEAN],  # nested dict never persisted
+    "passwd_key": [_CLEAN],
+    "credentials_key": [_CLEAN],
 }
+
+
+def test_spec_guard_uses_the_house_credential_vocabulary():
+    from tools.async_delegation_store import RegistryError, _assert_nonsecret_settings
+
+    leaked = {"execution": {"fallback_policy": {"fallback_providers": [{"options": {"auth_token": "p4ss"}}]}}}
+    with pytest.raises(RegistryError):
+        _assert_nonsecret_settings(leaked)
+    # The store's own reference/id fields and ordinary names that merely contain a vocabulary word stay clean.
+    clean = {"execution": {"credential_ref": {"model_pinned": True}, "route": {"parent_session_id": "s"},
+                           "origin_session_id": "o", "origin_ui_session_id": "u", "session_key": "k",
+                           "reasoning_config": {"max_tokens": 1}, "fallback_chain": [dict(_CLEAN)]}}
+    _assert_nonsecret_settings(clean)
 
 
 @pytest.mark.parametrize(("shape", "declared", "expected"), _SURFACE, ids=[row[0] for row in _SURFACE])

@@ -70,7 +70,7 @@ def normalize_url_for_request(url: str) -> str:
 # Unambiguously credential-bearing query param names. Deliberately narrow: bare
 # English words that double as page facets (``code``, ``key``, ``auth``,
 # ``session``, ``sig``) are EXCLUDED so ordinary browsing is not blocked.
-_SENSITIVE_QUERY_PARAM_NAMES = frozenset({
+SENSITIVE_QUERY_PARAM_NAMES = frozenset({
     "access_token", "api_key", "apikey", "auth_token", "authorization", "awsaccesskeyid",
     "client_secret", "credential", "credentials", "jwt", "password", "passwd", "secret",
     "session_id", "signature", "token", "x_amz_security_token", "x_amz_signature",
@@ -90,7 +90,7 @@ def sensitive_query_param_name(url: str) -> Optional[str]:
     if parsed.scheme.lower() not in _HTTP_SCHEMES or not parsed.query:
         return None
     return next((key for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-                 if value and unquote(key).lower() in _SENSITIVE_QUERY_PARAM_NAMES), None)
+                 if value and unquote(key).lower() in SENSITIVE_QUERY_PARAM_NAMES), None)
 
 
 # Cloud metadata hostnames — always blocked regardless of DNS or config toggle.
