@@ -429,8 +429,17 @@ def _holds_repo(d):
     """A `dir/` status record is collapsed: git does not descend into a nested repository (a vendored
     checkout or editable install under .venv/node_modules), so its unpushed work is invisible. Walk it
     (no symlinks) and treat any `.git`, dir or file, as work."""
-    for _here, dirs, files in os.walk(d):
-        if ".git" in dirs or ".git" in files:
+    # --untracked-files=all can enumerate individual files inside a bare repo.
+    # Inspect the entire residue ancestor, not just collapsed dir/ records.
+    d = Path(d)
+    roots = [p for p in (d, *d.parents) if p.name in _RESIDUE_DIRS]
+    if not roots:
+        return False
+    def unreadable(error):
+        raise error  # an incomplete walk is not proof of absence
+    for _here, dirs, files in os.walk(roots[-1], onerror=unreadable):
+        if (".git" in dirs or ".git" in files
+                or ("HEAD" in files and "objects" in dirs and "refs" in dirs)):
             return True
     return False
 
@@ -442,11 +451,11 @@ def _residue_only(repo):
     flags = _git(repo, "ls-files", "-v", "-z").stdout.decode("utf-8", "surrogateescape")
     if any(rec[:1] == "S" or rec[:1].islower() for rec in flags.split("\0") if len(rec) > 2):
         return False
-    out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+    out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored",
                "--ignore-submodules=none").stdout.decode("utf-8", "surrogateescape")
     recs = [rec for rec in out.split("\0") if rec]
-    return bool(recs) and all(rec[:2] == "??" and _is_residue(rec[3:]) and not (
-        rec.endswith("/") and _holds_repo(Path(repo) / rec[3:])) for rec in recs)
+    return bool(recs) and all(rec[:2] in ("??", "!!") and _is_residue(rec[3:])
+                             and not _holds_repo(Path(repo) / rec[3:]) for rec in recs)
 
 # Hard ceiling on directories inspected by one enumeration. A gate that cannot
 # finish must SAY so rather than hang: unbounded, this walk visited 850,853
@@ -3836,20 +3845,29 @@ p=Path(sys.argv[1])
 if not p.is_absolute() or str(p.resolve())!=str(p) or p.is_symlink(): sys.exit(12)
 if not p.exists(): sys.exit(0)
 def git(repo,*args):
- r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,text=True,timeout=12,stdin=subprocess.DEVNULL)
+ r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,timeout=12,stdin=subprocess.DEVNULL)
  if r.returncode: raise RuntimeError('git proof failed')
- return r.stdout
+ return r.stdout.decode('utf-8','surrogateescape')
 def res(s):
  q=[x for x in s.rstrip('/').split('/') if x]
  ds=q if s.endswith('/') else q[:-1]
  return bool(q) and (any(x in R for x in ds) or (not s.endswith('/') and any(fnmatch.fnmatchcase(q[-1],f) for f in F)))
+def bad(e):
+ raise e
+seen=set()
 def h(d):
- return any('.git' in a or '.git' in b for _,a,b in os.walk(d))
+ roots=[x for x in (d,*d.parents) if x.name in R]
+ if not roots or roots[-1] in seen: return False
+ root=roots[-1]
+ for _,a,b in os.walk(root,onerror=bad):
+  if '.git' in a or '.git' in b or ('HEAD' in b and 'objects' in a and 'refs' in a): return True
+ seen.add(root)
+ return False
 def prove(d):
  if (d/'.git').exists():
   if (d/'.git').is_file(): raise RuntimeError('registered worktree requires git worktree remove')
   st=[r for r in git(d,'status','--porcelain=v1','-z','--untracked-files=all','--ignored','--ignore-submodules=none').split('\0') if r]
-  if st and not all(r[:2] in('??','!!') and res(r[3:]) and not(r.endswith('/') and h(d/r[3:])) for r in st): raise RuntimeError('dirty, ignored or untracked work')
+  if st and not all(r[:2] in('??','!!') and res(r[3:]) and not h(d/r[3:]) for r in st): raise RuntimeError('dirty, ignored or untracked work')
   if st and any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2): raise RuntimeError('skip-worktree or assume-unchanged files')
   if git(d,'stash','list'): raise RuntimeError('stashes')
   if git(d,'rev-list','--branches','--tags','--not','--remotes'): raise RuntimeError('local commits not on any remote')

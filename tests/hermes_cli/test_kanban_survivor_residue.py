@@ -243,6 +243,43 @@ def test_remote_residue_without_nested_repo_is_deleted(db, tmp_path):
     assert not ws.exists()
 
 
+# ------------------------------------------------------------------ follow-up safety regressions
+
+@pytest.mark.parametrize("bare", [False, True])
+def test_local_ignored_repository_beside_visible_residue_is_held(board, tmp_path, bare):
+    tid, ws = local_card(board)
+    residue(ws)
+    (ws / ".git" / "info" / "exclude").write_text(".venv/\n")
+    inner = ws / ".venv" / "src" / "hidden"
+    if bare:
+        git(ws, "clone", "-q", "--bare", str(ws), str(inner))
+    else:
+        nested_repo(ws, tmp_path, unpushed=True)
+    assert not ks._residue_only(ws)
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_remote_bare_repository_under_residue_is_held(db, tmp_path, ignored):
+    ws = remote_ws(tmp_path)
+    residue(ws)
+    if ignored:
+        (ws / ".git" / "info" / "exclude").write_text(".venv/\n")
+    inner = ws / ".venv" / "bare.git"
+    git(ws, "clone", "-q", "--bare", str(ws), str(inner))
+    assert not ks.remove_workspace_dir(db, "t_11111111", ws, remote_host=HOST)
+    assert (inner / "HEAD").exists()
+
+
+def test_remote_carriage_return_in_residue_path_cannot_hide_repository(db, tmp_path):
+    ws = remote_ws(tmp_path)
+    inner = ws / ".venv" / "vendor\rcheckout"
+    make_repo(inner, tmp_path / "inner.git")
+    (inner / "code.py").write_text("unpushed = 1\n")
+    git(inner, "commit", "-qam", "unpushed")
+    assert not ks.remove_workspace_dir(db, "t_11111111", ws, remote_host=HOST)
+    assert (inner / ".git").exists()
+
+
 # ------------------------------------------------------------------ pins
 
 def _literal(script, name):
