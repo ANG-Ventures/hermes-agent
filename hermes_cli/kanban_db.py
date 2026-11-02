@@ -18580,6 +18580,13 @@ _REAP_LINUX_CLOCK = sys.platform.startswith("linux") and hasattr(time, "CLOCK_BO
 _REAP_BIRTH_SLACK_SECONDS = (
     0.1 if _REAP_LINUX_CLOCK or sys.platform == "darwin" else 2.0
 )
+# The most an EPOCH birth (_member_birth: psutil create_time, compared with
+# the run's epoch event times) can read early. Linux: btime is an integer
+# second (< 1 s) plus one starttime tick (10 ms). macOS: microseconds from
+# p_starttime. Unverified platforms: the same 2 s bound as above.
+_EPOCH_BIRTH_EARLY_S = (
+    1.02 if sys.platform.startswith("linux") else 0.01 if sys.platform == "darwin" else 2.0
+)
 
 
 def _reap_now() -> float:
@@ -18728,11 +18735,16 @@ def _owned_identities(
         if _reap_record(pid, sid) != first:
             _log.info("kanban: reap skips pid %d: replaced during the ownership read", pid)
             continue
-        # No upper slack: a recycled leader (and every child of it) is
-        # created after the worker died, i.e. strictly after its last
-        # evidence, and event times are floored, so ``<= born_before`` can
-        # never admit one. The lower bound only needs claim-time slack.
-        if created is not None and born_after - 1.0 <= created <= born_before:
+        # A recycled leader (and every child of it) is created after the
+        # worker died, i.e. strictly after its last evidence, and event times
+        # are floored, so its TRUE birth is > born_before. Its epoch birth can
+        # read up to _EPOCH_BIRTH_EARLY_S early (Linux integer btime), so the
+        # upper bound subtracts that error: an early-read replacement can never
+        # pass (Prism 44b9db65242a). The cost is the safe direction: a member
+        # born in that last interval before the evidence is not an ownership
+        # witness. The lower bound only needs claim-time slack.
+        if created is not None and born_after - 1.0 <= created and \
+                created + _EPOCH_BIRTH_EARLY_S <= born_before:
             owned[(pid, first[1])] = first[0]
     return owned
 

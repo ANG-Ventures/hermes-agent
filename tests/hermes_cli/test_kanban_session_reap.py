@@ -915,3 +915,39 @@ def test_descendant_forked_before_the_post_record_proof_is_reaped(monkeypatch):
     monkeypatch.setattr(kb, "_reap_now", now)
     kb._reap_worker_session(99_999, born_after=850.0, born_before=950.0, grace=0.5)
     assert 333 in signalled, f"descendant born before the post-record proof left running: {signalled}"
+
+
+def test_early_read_epoch_birth_never_passes_ownership(monkeypatch):
+    """Prism 44b9db65242a: Linux psutil epoch births read up to ~1 s early (integer
+    btime). Last evidence 1010.0; the sid is reused and its group 222 is truly born
+    at 1010.1, but psutil reads 1009.3. Ownership must subtract the epoch error, so
+    222 is no witness and nothing is reaped. Red at d1dcb20b9d (222 signalled)."""
+    births = {222: 1009.3}
+    sids = {222: 99_999}
+    pgids = {222: 222}
+
+    def scan(sid):
+        return [(pid, pgids[pid]) for pid in sorted(sids) if sids[pid] == sid]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids, pgids)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
+    monkeypatch.setattr(kb, "_EPOCH_BIRTH_EARLY_S", 1.02, raising=False)
+    assert kb._reap_worker_session(99_999, born_after=1005.0, born_before=1010.0, grace=0.2) == 0
+    assert signalled == [], f"an early-read replacement passed ownership: {signalled}"
+
+
+def test_member_born_well_inside_the_run_still_owns_under_the_epoch_margin(monkeypatch):
+    """The margin only narrows the top of the window: a member born more than the
+    epoch error before the last evidence is still a witness."""
+    births = {111: 1007.0}
+    sids = {111: 99_999}
+    pgids = {111: 111}
+
+    def scan(sid):
+        return [(pid, pgids[pid]) for pid in sorted(sids) if sids[pid] == sid]
+
+    signalled = _fake_world(monkeypatch, scan, births, sids, pgids)
+    monkeypatch.setattr(kb, "_REAP_LINUX_CLOCK", True)
+    monkeypatch.setattr(kb, "_EPOCH_BIRTH_EARLY_S", 1.02, raising=False)
+    kb._reap_worker_session(99_999, born_after=1005.0, born_before=1010.0, grace=0.2)
+    assert 111 in signalled
