@@ -137,6 +137,13 @@ def _os_open_writes(call):
 
 def scan_source(src, rel):
     tree = ast.parse(src)
+    # Taint is seeded only by a mention (needle literal or sentinel name/attr), and a finding needs
+    # a mentioned or tainted operand, so a tree with no mention has no finding. One walk instead
+    # of a taint fixpoint per function keeps the whole-tree gate inside the 60 s per-test clock on
+    # a loaded CI slice (125-131 s per file there, t_0fcbd3fa). Decided on the AST, so a split or
+    # escaped spelling of the needle still reaches the full check.
+    if not _mentions(tree, set()):
+        return []
     findings = []
     funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     for func in [tree] + funcs:
