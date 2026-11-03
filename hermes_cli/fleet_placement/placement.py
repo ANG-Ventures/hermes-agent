@@ -627,17 +627,23 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
             # reads the host's 32): the VM's own measurement is authoritative (Prism c6575b98633e)
             own_thr = int(f["threads"]) if "cores" in f and "threads" in f else None
             vm_cpus = min(own_thr, vm) if own_thr is not None and vm is not None else (vm if vm is not None else own_thr)
-        if root in doc["hosts"] and ("cores" not in f or "threads" not in f):
-            # a pressure_from guest with no discovered row of its own (studio-arm: no sampler) is sized from its
-            # host's DISCOVERED facts, resolved with the host's own row (count_cores): it is judged on that host's
-            # sample, so its capacity is that host's too, like sample_for() and the cpu_saturable inheritance.
+        if root in doc["hosts"]:
+            # EVERY pressure_from guest is sized from its host's DISCOVERED facts, resolved with the host's own row
+            # (count_cores): it is judged on that host's sample, so its capacity is that host's too, like
+            # sample_for() and the cpu_saturable inheritance. Its own facts only set vm_cpus above: a 16-vCPU VM on
+            # an 8-thread box is never scored as 16 threads of capacity (Prism 8060dffe2210, t_b9ed3796).
             # Never a typed table fact (R2a); with no discovered host row the guest is left out like any host.
-            f = host_facts(root, doc["hosts"][root], inv)
+            own_f, f = f, host_facts(root, doc["hosts"][root], inv)
+        else:
+            own_f = f
         why = None
         if "cores" not in f or "threads" not in f:
             why = "cores/threads neither discovered (var/placement/host-inventory.json) nor in the table"
         elif f["threads"] < f["cores"]:
             why = f"threads {f['threads']} < cores {f['cores']}"
+        elif "cores" in own_f and "threads" in own_f and own_f["threads"] < own_f["cores"]:
+            # a guest's own row that contradicts itself is still bad data: closed (Prism c2f0087775e6)
+            why = f"threads {own_f['threads']} < cores {own_f['cores']}"
         elif float(h["cores_reserve"]) >= f["cores"]:
             why = f"cores_reserve {h['cores_reserve']:g} >= cores {f['cores']}"
         if why:
@@ -1392,7 +1398,20 @@ def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: s
     if util:
         raw, cpus = ctx, float(ctx.need(spec.name).cpus)
     else:
-        raw = AdmitContext("", need_of(fp), (), (), reservations=((spec.name, reserved),) if reserved else ())
+        # legacy too reads the live guest leases (``ctx`` as given, else the ledger's), never an empty list: a full
+        # guest is hot whether or not ``reserved`` is passed (Prism 3b1a9e851d14, t_b9ed3796)
+        # ``reserved`` is the caller's per-host total (live_reservations), i.e. the same rows the ledger leases
+        # carry: a context built HERE from the ledger already holds it, so it is never appended again (Prism
+        # cadbb61dcd6a); a caller-supplied ``ctx`` (admit() under its lock, tests) brings its own lease set, and
+        # ``reserved`` is added only when that set does not already book the guest.
+        raw = ctx if ctx is not None else admit_context(consumer, fp, now=_now(now), root=root, table=table)
+        if reserved:
+            # one rule for both branches (Prism 05227baeb76d): an explicit ``reserved`` is kept whenever nothing in
+            # the context already books the guest (an empty ledger, a caller ctx without it), never added twice.
+            names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
+            booked = any(str(le.host).lower() in names for le in raw.leases) or raw.reserved_on(spec.name) is not None
+            if not booked:
+                raw = dataclasses.replace(raw, reservations=tuple(raw.reservations) + ((spec.name, reserved),))
         cpus = float(fp.threads)
     one = guest_vm_refusal(spec, raw, cpus)
     if one:
