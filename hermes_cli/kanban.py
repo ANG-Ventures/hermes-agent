@@ -928,6 +928,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             args.body = _read_body_file(body_file)
         except OSError as exc:
             return kvi.refuse("create", f"--body-file: {exc}")
+    else:
+        inline = kvi.inline_prose_refusal("create", "--body", args.body)
+        if inline:
+            return kvi.refuse("create", inline)
     if getattr(args, "why", False):
         problems = [] if (args.title or "").strip() else ["title: missing or empty"]
         if not getattr(args, "assignee", None):
