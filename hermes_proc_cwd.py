@@ -55,6 +55,14 @@ def _abandon(child: subprocess.Popen) -> None:
     threading.Thread(target=child.wait, name="cwd-probe-reap", daemon=True).start()
 
 
+def _reap(child: subprocess.Popen, timeout: float) -> None:
+    """Wait up to *timeout* for a child that should be exiting, else abandon it."""
+    try:
+        child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _abandon(child)
+
+
 def _pump(stream, out: "queue.Queue[str | None]") -> None:
     try:
         for line in stream:
@@ -69,8 +77,10 @@ def _run_batch(pids: list[int], timeout: float, found: dict[int, str]) -> list[i
     pid itself excluded), or [] when the batch finished or could not run at all."""
     try:
         child = subprocess.Popen(
-            [sys.executable, "-c", _PROBE_CHILD, *map(str, pids)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            # -P and cwd="/": a module in the caller's cwd (a worker workspace) must not
+            # shadow json/psutil and run inside the probe; "/" is also never a dead mount.
+            [sys.executable, "-P", "-c", _PROBE_CHILD, *map(str, pids)],
+            cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace",
         )
     except OSError as exc:
@@ -87,7 +97,7 @@ def _run_batch(pids: list[int], timeout: float, found: dict[int, str]) -> list[i
         _abandon(child)
         return []
     if first is None or first.strip() != "ready":
-        child.wait()
+        _reap(child, timeout)
         logger.warning("cwd probe: probe child failed to start; %d pid(s) skipped", len(pids))
         return []
     for index, pid in enumerate(pids):
@@ -108,7 +118,7 @@ def _run_batch(pids: list[int], timeout: float, found: dict[int, str]) -> list[i
             continue
         if cwd:
             found[int(got)] = cwd
-    child.wait()
+    _reap(child, timeout)
     return []
 
 

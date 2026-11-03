@@ -79,3 +79,19 @@ def test_prune_finishes_and_still_reaps_when_one_cwd_probe_hangs(tmp_path, monke
         for p in (hung, victim):
             p.kill()
             p.wait()
+
+
+def test_probe_child_does_not_import_modules_from_the_callers_cwd(tmp_path, monkeypatch):
+    """A worker's cwd is its workspace; a json.py/psutil.py there must not run in the probe."""
+    marker = tmp_path / "shadow-ran"
+    for name in ("json", "psutil"):
+        (tmp_path / f"{name}.py").write_text(f"open({str(marker)!r}, 'a').write({name!r})\n")
+    monkeypatch.chdir(tmp_path)
+    sleeper = _sleeper(tmp_path)
+    try:
+        got = hermes_proc_cwd.probe_cwds([sleeper.pid])
+        assert not marker.exists(), f"probe child imported {marker.read_text()}.py from the caller's cwd"
+        assert os.path.realpath(got[sleeper.pid]) == os.path.realpath(tmp_path)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
