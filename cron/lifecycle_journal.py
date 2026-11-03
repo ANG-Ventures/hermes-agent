@@ -243,6 +243,27 @@ def _default_actor() -> str:
     return f"{os.path.basename(os.environ.get('HERMES_ACTOR', '') or 'hermes')}:{os.getpid()}"
 
 
+def caller_attribution() -> str:
+    """Who asked, in words that survive the asking process: kanban card, session, parent command line.
+
+    A bare ``hermes:<pid>`` names a process that is gone by the time anyone reads the journal
+    (t_9da8a02b: ten unowned pauses of one row). Best effort: any part that cannot be read is left out.
+    """
+    parts = [f"{label} {value}" for label, value in (
+        ("card", (os.environ.get("HERMES_KANBAN_TASK") or "").strip()),
+        ("session", (os.environ.get("HERMES_SESSION_ID") or "").strip()),
+    ) if value]
+    ppid = os.getppid()
+    try:
+        import psutil
+
+        cmdline = " ".join(psutil.Process(ppid).cmdline()).strip()
+    except Exception:
+        cmdline = ""
+    parts.append(f"parent pid {ppid}" + (f": {cmdline[:300]}" if cmdline else ""))
+    return "; ".join(parts)
+
+
 def read_entries(*, window_hours: float = DEFAULT_WINDOW_HOURS) -> List[Dict[str, Any]]:
     """Return journal entries inside the window, oldest first (append order).
 

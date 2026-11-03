@@ -4671,9 +4671,13 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
         return None
     # Never write a silent disable: enabled=false with no reason reads as "forgotten" to every
     # audit, and a caller who paused "until X lands" has nothing left to remind it (t_6b72ef98).
-    reason = (reason or "").strip() or (
-        f"Paused with no reason given; resume with `hermes cron resume {job['id']}`."
-    )
+    # A reasonless pause still names its caller: a bare pid in the journal is untraceable (t_9da8a02b).
+    reason = (reason or "").strip()
+    if not reason:
+        from cron.lifecycle_journal import caller_attribution
+
+        reason = (f"Paused with no reason given by {caller_attribution()}; "
+                  f"resume with `hermes cron resume {job['id']}`.")
     return update_job(
         job["id"],
         {
