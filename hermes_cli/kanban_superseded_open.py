@@ -30,6 +30,12 @@ _FLEET_BOT = re.compile(r"^ang-[a-z0-9-]+\[bot\]$")
 ThreadFn = Callable[[str, int], Optional[dict]]
 
 
+def _pr_key(repo, number) -> tuple:
+    """The canonical ``(owner/repo, number)`` key: GitHub owner/repo names are case-insensitive, so the one fold
+    lives here and every compare below is exact on this key."""
+    return (str(repo).lower() if repo is not None else None), int(number)
+
+
 def trusted(login, assoc=None) -> bool:
     """The author set scripts/lib/superseded_by.py trusts: a fleet ``ang-*[bot]`` App, Kyzcreig, or a repo
     OWNER/MEMBER/COLLABORATOR."""
@@ -99,7 +105,7 @@ def successor(closed_ref, task_id: str, *, thread_fn: ThreadFn, query_fn) -> Opt
         return None
     repo = m.group(1) or m.group(3) or closed_ref.repo
     number = int(m.group(2) or m.group(4) or m.group(5))
-    if (repo.lower(), number) == (closed_ref.repo.lower(), closed_ref.number):
+    if _pr_key(repo, number) == _pr_key(closed_ref.repo, closed_ref.number):
         return None
     if repo.split("/", 1)[0].lower() not in _open_pr.FLEET_OWNERS:
         return None
@@ -123,7 +129,7 @@ def park_targets(task_id: str, closed, *, superseded_by: Optional[str], query_fn
     thread_fn = thread_fn or _default_thread()
     if thread_fn is None or query_fn is None or not closed:
         return None
-    named = {(r.repo.lower(), r.number) for r in _open_pr.extract_pr_refs(superseded_by)} if superseded_by else set()
+    named = {_pr_key(r.repo, r.number) for r in _open_pr.extract_pr_refs(superseded_by)} if superseded_by else set()
     if superseded_by and not named:
         named |= {(None, int(n)) for n in re.findall(r"(?<![\w/])#(\d+)\b", superseded_by)}
     out = []
@@ -132,7 +138,7 @@ def park_targets(task_id: str, closed, *, superseded_by: Optional[str], query_fn
         if hit is None:
             return None
         repo, number, token = hit
-        if named and (repo.lower(), number) not in named and (None, number) not in named:
+        if named and _pr_key(repo, number) not in named and (None, number) not in named:
             return None
         out.append({"closed": f"{ref.repo}#{ref.number}", "successor": f"{repo}#{number}", "token": token})
     return out
@@ -227,7 +233,7 @@ def _implementer(conn: sqlite3.Connection, task_id: str, trow, kb) -> Optional[s
     ev = kb._latest_event(conn, task_id, "review_requested")
     payload = kb._json_dict(kb._row_get(ev, "payload")) if ev is not None else {}
     handed = kb._nonblank_str(payload.get("implementer"))
-    if handed and str(payload.get("reviewer") or "").casefold() == str(trow["assignee"] or "").casefold():
+    if handed and str(payload.get("reviewer") or "") == str(trow["assignee"] or ""):
         return handed
     if trow["current_run_id"] is not None:
         arow = conn.execute("SELECT profile FROM task_runs WHERE id = ?", (trow["current_run_id"],)).fetchone()
