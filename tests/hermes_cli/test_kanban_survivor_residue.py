@@ -177,6 +177,32 @@ def test_remote_real_dirt_beside_residue_holds(db, tmp_path, dirt):
     assert (ws / "code.py").exists()
 
 
+def test_remote_skip_worktree_edit_with_clean_status_holds(db, tmp_path):
+    """Prism 49a3a3d4127d: the flag check must not depend on `status` being non-empty. A tree whose only
+    change hides behind --skip-worktree reports an EMPTY status, and the old proof deleted it."""
+    ws = remote_ws(tmp_path)
+    git(ws, "update-index", "--skip-worktree", "code.py")
+    (ws / "code.py").write_text("hidden = 1\n")
+    assert git(ws, "status", "--porcelain").strip() == ""
+    assert not ks.remove_workspace_dir(db, "t_11111111", ws, remote_host=HOST)
+    assert (ws / "code.py").read_text() == "hidden = 1\n"
+
+
+def test_remote_dot_git_symlink_holds(db, tmp_path):
+    """Prism 93928f6bdfed: a `.git` that is a symlink (a redirected or half-registered worktree) is not a
+    plain dir; `.exists()` on a dangling link is False and the old proof treated the tree as a non-repo."""
+    ws = remote_ws(tmp_path)
+    real = ws / ".git"
+    moved = tmp_path / "moved-gitdir"
+    real.rename(moved)
+    real.symlink_to(moved)
+    assert not ks.remove_workspace_dir(db, "t_11111111", ws, remote_host=HOST)
+    assert ws.exists() and (ws / "code.py").exists()
+    moved.rename(tmp_path / "gone-gitdir")          # now dangling: still not a deletable tree
+    assert not ks.remove_workspace_dir(db, "t_11111111", ws, remote_host=HOST)
+    assert ws.exists()
+
+
 def test_remote_mutation_without_residue_branch_holds(db, tmp_path, monkeypatch):
     """Mutation: the remote proof with its residue test removed holds the residue fixture again."""
     script = ks._REMOTE_PROOF

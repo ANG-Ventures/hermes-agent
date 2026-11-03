@@ -3882,11 +3882,12 @@ def h(d):
  seen.add(root)
  return False
 def prove(d):
- if (d/'.git').exists():
-  if (d/'.git').is_file(): raise RuntimeError('registered worktree requires git worktree remove')
+ g=d/'.git'
+ if g.is_symlink() or g.exists():
+  if g.is_symlink() or g.is_file(): raise RuntimeError('registered worktree or redirected .git requires git worktree remove')
   st=[r for r in git(d,'status','--porcelain=v1','-z','--untracked-files=all','--ignored','--ignore-submodules=none').split('\0') if r]
   if st and not all(r[:2] in('??','!!') and res(r[3:]) and not h(d/r[3:]) for r in st): raise RuntimeError('dirty, ignored or untracked work')
-  if st and any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2): raise RuntimeError('skip-worktree or assume-unchanged files')
+  if any(r[:1]=='S' or r[:1].islower() for r in git(d,'ls-files','-v','-z').split('\0') if len(r)>2): raise RuntimeError('skip-worktree or assume-unchanged files')
   if git(d,'stash','list'): raise RuntimeError('stashes')
   if git(d,'rev-list','--branches','--tags','--not','--remotes'): raise RuntimeError('local commits not on any remote')
   sha=git(d,'rev-parse','HEAD').strip()
