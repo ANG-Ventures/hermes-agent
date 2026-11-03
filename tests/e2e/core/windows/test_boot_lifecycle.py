@@ -21,6 +21,7 @@ import queue
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -40,6 +41,7 @@ from tests.e2e.core.windows._helpers import (
     nonce,
     owned_processes,
     owned_survivors,
+    Phases,
     run,
     taskkill_tree,
     wait_until,
@@ -167,7 +169,9 @@ def _gateway_state(home: WinHome) -> dict:
         return {}
 
 
+@pytest.mark.slow_test(300, reason="DIAG t_3ce93d8c: measure phases on hosted windows-latest")
 def test_gateway_stop_drains_gracefully(tmp_path: Path) -> None:
+    ph = Phases("gateway_stop")
     with FakeLLMServer() as srv:
         home = make_home(tmp_path, srv.base_url)
         log = tmp_path / "gateway.log"
@@ -178,17 +182,23 @@ def test_gateway_stop_drains_gracefully(tmp_path: Path) -> None:
         try:
             wait_until(lambda: _gateway_state(home).get("gateway_state") == "running" or gw.poll() is not None,
                        READY_TIMEOUT, "gateway_state.json to report running")
+            ph.mark("gateway boot->running")
             assert gw.poll() is None, f"gateway exited {gw.returncode} during boot:\n{log.read_text(errors='replace')}"
 
             res = hermes(home, "gateway", "stop")
+            ph.mark("gateway stop cli")
             assert res.returncode == 0 and "Stopped" in res.stdout, res.tail()
             code = gw.wait(timeout=60)
+            ph.mark("gw.wait exit")
             state = _gateway_state(home)
             assert state.get("gateway_state") == "stopped", (
                 f"gateway did not drain through its graceful path (rc={code}); last state {state}\n"
                 f"{log.read_text(errors='replace')[-3000:]}")
             assert not (home.hermes_home / "gateway.pid").exists(), "gateway.pid left behind after stop"
             left = owned_survivors(home, since=started, timeout=30)
+            ph.mark("owned_survivors")
             assert not left, f"processes of the gateway survived stop: {left}"
         finally:
             kill_owned(home, since=started)
+            ph.mark("cleanup")
+            print(log.read_text(errors='replace')[-6000:], file=sys.stderr, flush=True)

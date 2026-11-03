@@ -344,3 +344,17 @@ class KnownBugSymptom(Exception):
 def expect(ok: bool, message: str) -> None:
     if not ok:
         raise KnownBugSymptom(message)
+
+
+class Phases:
+    """DIAG t_3ce93d8c (not for landing): print per-phase wall time to stderr."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.t0 = self.last = time.monotonic()
+
+    def mark(self, label: str) -> None:
+        now = time.monotonic()
+        print(f"PHASE {self.name} {label}: +{now - self.last:.1f}s (total {now - self.t0:.1f}s)",
+              file=sys.stderr, flush=True)
+        self.last = now

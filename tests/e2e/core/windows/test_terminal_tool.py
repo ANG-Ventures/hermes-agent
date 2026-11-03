@@ -12,6 +12,9 @@ replays). The Git Bash case also proves the shell is MSYS/MinGW, not WSL.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -19,6 +22,7 @@ import pytest
 from tests.e2e.core.windows._helpers import (
     hermes,
     make_home,
+    Phases,
     nonce,
     parse_tool_json,
     persisted_messages,
@@ -38,8 +42,15 @@ SHELLS: dict[str, tuple[str, int, str]] = {
 }
 
 
+@pytest.mark.slow_test(300, reason="DIAG t_3ce93d8c: measure phases on hosted windows-latest")
 @pytest.mark.parametrize("shell", list(SHELLS))
 def test_terminal_round_trip_persists_output_and_exit_code(shell: str, tmp_path: Path) -> None:
+    ph = Phases(f"terminal[{shell}]")
+    if shell == "powershell":
+        t = time.monotonic()
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "exit 5"], timeout=120)
+        print(f"PHASE bare powershell.exe: {time.monotonic() - t:.1f}s", file=sys.stderr, flush=True)
+        ph.mark("bare powershell")
     template, code, extra = SHELLS[shell]
     marker, answer = nonce(shell.upper()), nonce("DONE")
     with FakeLLMServer([ToolCall("terminal", {"command": template.format(marker=marker)}), Text(answer)]) as srv:
@@ -47,6 +58,8 @@ def test_terminal_round_trip_persists_output_and_exit_code(shell: str, tmp_path:
         # -q blocks it. The documented opt-in keeps this about the tool round trip, not approvals.
         home = make_home(tmp_path, srv.base_url, extra_config="approvals:\n  single_query_mode: approve\n")
         res = hermes(home, "chat", "-q", f"Run the {shell} check.", "-Q")
+        ph.mark("hermes chat -q turn")
+        print(res.stderr[-4000:], file=sys.stderr, flush=True)
         assert res.returncode == 0, res.tail()
         assert answer in res.stdout, f"final answer not delivered:\n{res.tail()}"
         results = tool_results(srv)

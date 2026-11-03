@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from tests.e2e.core.windows._helpers import (
     hermes_argv,
     kill_tree,
     make_home,
+    Phases,
     process_tree,
     wait_until,
 )
@@ -37,7 +39,9 @@ def _running(home) -> bool:
     return state.get("gateway_state") == "running"
 
 
+@pytest.mark.slow_test(300, reason="DIAG t_3ce93d8c: measure phases on hosted windows-latest")
 def test_optimize_storage_refuses_while_gateway_holds_store(tmp_path: Path) -> None:
+    ph = Phases("state_db_guard")
     with FakeLLMServer() as srv:
         home = make_home(tmp_path, srv.base_url)
         log = tmp_path / "gateway.log"
@@ -47,16 +51,21 @@ def test_optimize_storage_refuses_while_gateway_holds_store(tmp_path: Path) -> N
         tree: list = []
         try:
             wait_until(lambda: _running(home) or gw.poll() is not None, 120, "the gateway to report running")
+            ph.mark("gateway boot->running")
             assert gw.poll() is None, f"gateway exited during boot:\n{log.read_text(errors='replace')}"
             tree = process_tree(gw.pid)
             assert home.db_path.exists(), "the running gateway never opened state.db"
 
             held = hermes(home, "sessions", "optimize-storage")
+            ph.mark("optimize-storage (held)")
             refused = held.returncode != 0 and "Refusing" in held.stdout
             stop = hermes(home, "gateway", "stop")
+            ph.mark("gateway stop cli")
             assert stop.returncode == 0, stop.tail()
             gw.wait(timeout=60)
+            ph.mark("gw.wait exit")
             quiet = hermes(home, "sessions", "optimize-storage")
+            ph.mark("optimize-storage (quiet)")
             assert quiet.returncode == 0, f"optimize-storage fails even with no holder:\n{quiet.tail()}"
             # venv launcher OR its interpreter child; whole-number match (pid 12 is not in 4123).
             named = any(re.search(rf"\b{p.pid}\b", held.stdout) for p in tree)
@@ -64,3 +73,5 @@ def test_optimize_storage_refuses_while_gateway_holds_store(tmp_path: Path) -> N
                    f"optimize-storage ran under a live gateway (pid {gw.pid}) instead of refusing:\n{held.tail()}")
         finally:
             kill_tree(tree or process_tree(gw.pid))
+            ph.mark("cleanup")
+            print(log.read_text(errors='replace')[-6000:], file=sys.stderr, flush=True)
