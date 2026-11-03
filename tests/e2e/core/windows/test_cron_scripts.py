@@ -13,7 +13,6 @@ the canonical resolver (``tools/environments/local.py::_find_bash``) handles.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -21,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from cron.runtime_state import merged_jobs
 from tests.e2e.core._pending_fixes import known_gate
 from tests.e2e.core.windows._helpers import KnownBugSymptom, WinHome, expect, hermes, make_home, nonce
 
@@ -61,8 +61,9 @@ def _run_script_job(home: WinHome, script: str, env_extra: dict[str, str] | None
     job_id = match.group(1)
     ran = hermes(home, "cron", "run", job_id, cwd=home.profile, env_extra=env_extra)
     assert ran.returncode == 0 and "Ran now:" in ran.stdout, f"job did not run synchronously:\n{ran.tail()}"
-    jobs = json.loads((home.hermes_home / "cron" / "jobs.json").read_text(encoding="utf-8"))["jobs"]
-    job = next(j for j in jobs if j["id"] == job_id)
+    # Runtime fields (last_status, last_error) live in cron/runtime_state.db since t_94e91559;
+    # jobs.json is a coalesced mirror a short-lived `cron run` exits before flushing.
+    job = next(j for j in merged_jobs(home.hermes_home / "cron" / "jobs.json") if j["id"] == job_id)
     outputs = sorted((home.hermes_home / "cron" / "output" / job_id).glob("*.md"))
     return job, outputs[-1].read_text(encoding="utf-8") if outputs else ""
 
