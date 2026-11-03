@@ -9,6 +9,7 @@ the gateway because the only ceiling was the global
 from __future__ import annotations
 
 import os
+import re
 import signal
 import time
 from datetime import datetime, timezone
@@ -152,7 +153,14 @@ def test_term_ignoring_script_is_killed_at_its_interval(hermes_env, monkeypatch,
         time.sleep(0.05)
     assert not _pid_alive(grandchild), "process group survivor"
     phase = [r.getMessage() for r in caplog.records if "PHASE=cron_script_timeout" in r.getMessage()]
-    assert phase and "job=wedge-job" in phase[0] and "elapsed=3" in phase[0], phase
+    assert phase and "job=wedge-job" in phase[0] and "timeout=3" in phase[0], phase
+    # The line's elapsed= is stamped AFTER the TERM->KILL escalation and the pipe drain, so under load
+    # it reads 5-7 (ci at load 400 posted elapsed=5/6/7 on four main sweeps, 2026-11-02); the same
+    # 3 + 8 budget as the stopwatch above, not the literal 3.
+    m = re.search(r"elapsed=(\d+)", phase[0])
+    assert m, phase
+    logged = int(m.group(1))
+    assert 3 <= logged < 3 + 8, phase
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX")
