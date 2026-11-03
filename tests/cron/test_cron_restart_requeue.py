@@ -296,10 +296,10 @@ def test_sigterm_outside_shutdown_still_pages(env, monkeypatch):
     assert "-15" in content or "exited with code" in content
 
 
-def _make_named_job(name):
+def _make_named_job(name, schedule="0 3 * * *"):
     from cron.jobs import create_job, get_job
     job = create_job(
-        prompt=None, schedule="0 3 * * *", name=name,
+        prompt=None, schedule=schedule, name=name,
         script="long.sh", no_agent=True, deliver="local",
     )
     return get_job(job["id"])
@@ -358,7 +358,11 @@ def test_stagger_never_defers_past_the_jobs_own_cadence(env, monkeypatch):
     from datetime import datetime
     from cron import jobs as cj
 
-    daily = [_make_named_job(f"heavy-{i}") for i in range(29)]
+    # Daily at 12 h from now: a fixed 03:00 put the natural run inside the 29-slot spread
+    # (8,400 s) whenever the suite ran 00:40-03:00 in the cron TZ, and the cadence cap then
+    # (correctly) clamped several slots to the same instant (3/12 mirror main runs, t_0fcbd3fa).
+    daily_at = f"0 {(cj._hermes_now().hour + 12) % 24} * * *"
+    daily = [_make_named_job(f"heavy-{i}", daily_at) for i in range(29)]
     fast = cj.create_job(prompt=None, schedule="every 1m", name="prism-container-status",
                          script="long.sh", no_agent=True, deliver="local")
     killed = daily + [cj.get_job(fast["id"])]
