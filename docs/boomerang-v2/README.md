@@ -139,7 +139,9 @@ session `/autohandle` toggle and no board default (Ace 2026-10-22, t_7be18632).
 originating gateway auto-subscription use boomerang wake. The tool's `boomerang_wake: false`
 or `kanban create --no-boomerang-wake` opts out for one card. Set the config knob to `false`
 to restore plain notify+wake for future cards; existing cards are unchanged. Worker-created
-cards and origin-less CLI/scripts do not inherit this default. The knob is read on create;
+cards do not inherit this default. A CLI create (`hermes kanban create`, which scripts and
+cron also drive) inherits it only when `kanban.cli_auto_subscribe` (default `false`) would
+subscribe it; `--boomerang-wake` still sets it explicitly. The knob is read on create;
 once this code is loaded, flipping it needs no restart. Loading this code into a running
 gateway does require a restart.
 
@@ -167,8 +169,17 @@ Scope: boomerang wake is armed for the `default` (Apollo) profile only (spec §2
 
 **`boomerang handled <card> (<row>): <summary>`**
 One passive line when a child resolves or surfaces a wake, plus a card comment
-`boomerang: <row> <summary>`. This is not a deadman page or a system wake. If the operator
-already commented since review began, only the card breadcrumb is written; chat stays silent.
+`boomerang: <row> <summary>`. This is not a deadman page or a system wake. A `surface` verdict
+also delivers the child's finding to the home session as a turn (`[boomerang-wake] child
+surfaced ...`). If the operator already commented since review began, only the card breadcrumb
+is written; chat stays silent.
+
+Delivery is durable: the gateway writes a pending handback (`handbacks[<delegation>]` in
+`gateway/kanban_boomerang_wake.json`) before any send. A line counts as delivered only on the
+adapter's `SendResult.success`, and a turn only when it is enqueued. Each delivered part writes a
+`boomerang_handback_delivered` event (`part: line|turn`). Every notifier tick retries the parts
+that are still pending, and a replayed verdict retries rather than doing nothing. A failed
+surface turn leaves the claim at `resurface_delivered: false` until a retry lands it.
 
 **`[boomerang-waking…]`**
 The passive event line for a wake that went to a child. A matching `[boomerang-wake]` or `⚠️` line

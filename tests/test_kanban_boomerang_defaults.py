@@ -36,26 +36,142 @@ def test_create_cli_opt_out():
     assert parser.parse_args(["kanban", "create", "c", "--assignee", "peer"]).boomerang_wake is None
 
 
-@pytest.mark.parametrize("surface,stale", [(False, False), (True, False), (True, True)])
-def test_handback_shape(tmp_path, monkeypatch, surface, stale):
+def _board(tmp_path, monkeypatch, title="scratch"):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     kb.init_db()
     with kb.connect_closing() as conn:
-        tid = kb.create_task(conn, title="scratch", assignee="human:apollo")
-    entry = dict(task_id=tid, board=None, row="review_deadman", delegation_id="d1", route={})
-    sent = []
+        return kb.create_task(conn, title=title, assignee="human:apollo")
+
+
+def _runner(outcomes, sent):
+    """Adapter whose send follows ``outcomes``: True -> receipt, False -> success=False, Exception -> raise."""
+    from gateway.platforms.base import SendResult
+
     async def send(chat_id, text, metadata=None):
-        sent.append(text)
-    runner = SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send))
-    result = dict(summary="CI is pending\nnot a page", action="surface" if surface else "comment_why_waits")
-    assert asyncio.run(bw.report_handled(runner, entry, result, stale=stale)) is (not stale)
-    assert asyncio.run(bw.report_handled(runner, entry, result, stale=stale)) is False
+        o = outcomes.pop(0) if outcomes else True
+        if isinstance(o, Exception):
+            raise o
+        if o:
+            sent.append(text)
+        return SendResult(success=bool(o), error=None if o else "injected")
+    return SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send))
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_handback_shape(tmp_path, monkeypatch, stale):
+    tid = _board(tmp_path, monkeypatch)
+    state = bw.BoomerangWakeState(tmp_path / "claims.json")
+    entry = dict(task_id=tid, board=None, row="review_deadman", delegation_id="d1", route={})
+    result = dict(summary="CI is pending\nnot a page", action="comment_why_waits")
+    sent = []
+    for _ in range(2):   # idempotent per delegation
+        bw.enqueue_handback(entry, result, state=state, stale=stale)
+        asyncio.run(bw.deliver_handbacks(_runner([], sent), state))
     assert sent == ([] if stale else [f"boomerang handled {tid} (review_deadman): CI is pending"])
+    assert state.handbacks() == {}
     with kb.connect_closing() as conn:
         comments = kb.list_comments(conn, tid)
-    assert len(comments) == 1
-    assert comments[0].body.startswith("boomerang: review_deadman CI is pending")
+    assert len(comments) == 1 and comments[0].body.startswith("boomerang: review_deadman CI is pending")
+
+
+@pytest.mark.parametrize("failure", ["raises", "success_false"])
+def test_undelivered_line_stays_pending_and_the_tick_delivers_it_once(tmp_path, monkeypatch, failure):
+    """Shape tests (1)+(2): no receipt -> the row stays pending; the next tick (reconcile) sends it;
+    later ticks never resend."""
+    tid = _board(tmp_path, monkeypatch)
+    state = bw.BoomerangWakeState(tmp_path / "claims.json")
+    entry = dict(task_id=tid, board=None, row="review_deadman", delegation_id="d1", route={})
+    bw.enqueue_handback(entry, dict(summary="CI is pending"), state=state)
+    first = RuntimeError("adapter down") if failure == "raises" else False
+    outcomes, sent = [first, True, True], []
+    runner = _runner(outcomes, sent)
+    assert asyncio.run(bw.deliver_handbacks(runner, state)) == 0
+    pending = state.handbacks()["d1"]
+    assert pending["parts"] == ["line"] and pending["attempts"] == 1
+    with kb.connect_closing() as conn:
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == bw.DELIVERED_KIND]
+    for _ in range(3):   # next ticks
+        asyncio.run(bw.reconcile(runner, state=state))
+    assert sent == [f"boomerang handled {tid} (review_deadman): CI is pending"]
+    assert state.handbacks() == {}
+    with kb.connect_closing() as conn:
+        [ev] = [e for e in kb.list_events(conn, tid) if e.kind == bw.DELIVERED_KIND]
+    assert ev.payload["delegation_id"] == "d1" and ev.payload["part"] == "line"
+
+
+def test_surface_with_failed_resurface_is_retried_by_the_tick(tmp_path, monkeypatch):
+    """Shape test (4): a surface verdict keeps its operator turn; a failed resurface leaves
+    resurface_delivered False + a pending turn the tick retries; the turn lands exactly once."""
+    tid = _board(tmp_path, monkeypatch, "surface")
+    with kb.connect_closing() as conn:
+        kb._append_event(conn, tid, "review_requested", {})
+        kb._append_event(conn, tid, "review_deadman", {})
+        event_id = kb.max_event_id(conn)
+    state = bw.BoomerangWakeState(tmp_path / "claims.json")
+    entry = dict(key="claim", task_id=tid, board=None, row="review_deadman", kind="review_deadman",
+                 event_id=event_id, delegation_id="d4", verdict_nonce="abcd", route={}, mode="fork")
+    state.claim("claim", entry)
+    turns, turn_ok = [], [False, True, True]
+    async def resurface(runner, e, text=None):
+        ok = turn_ok.pop(0)
+        if ok:
+            turns.append(text)
+        return ok
+    async def parent(*args):
+        return object(), "fork"
+    monkeypatch.setattr(bw, "resurface", resurface)
+    monkeypatch.setattr(bw, "parent_resolver", parent)
+    monkeypatch.setattr(bw, "ledger_append", lambda *a: None)
+    monkeypatch.setattr(bw, "build_goal", lambda entry: "scratch")
+    final = "<<<BOOMERANG-VERDICT nonce=abcd>>>\n" + json.dumps(
+        {"action": "surface", "summary": "operator decision needed"}) + "\n<<<END-VERDICT>>>"
+    monkeypatch.setattr(bw, "run_child", lambda *args: ("completed", final))
+    sent = []
+    runner = _runner([], sent)
+    asyncio.run(bw.run_entry(runner, entry, state))
+    claim = state.get_claim("claim")
+    assert claim["state"] == bw.STATE_TERMINAL and claim["resurface_delivered"] is False
+    assert state.handbacks()["d4"]["parts"] == ["turn"]
+    assert sent == [f"boomerang handled {tid} (review_deadman): operator decision needed"]
+    for _ in range(3):
+        asyncio.run(bw.reconcile(runner, state=state))
+    assert len(turns) == 1 and turns[0].startswith(f"[boomerang-wake] child surfaced {tid}")
+    assert "operator decision needed" in turns[0]
+    assert state.get_claim("claim")["resurface_delivered"] is True
+    assert state.handbacks() == {} and len(sent) == 1
+
+
+@pytest.mark.parametrize("cli_auto_subscribe", [False, True])
+def test_cli_create_boomerang_follows_cli_auto_subscribe(tmp_path, monkeypatch, cli_auto_subscribe):
+    """Shape test (5), Prism 1aec29b63c57: scripts/cron drive the CLI, so the boomerang default
+    applies to a CLI create only when kanban.cli_auto_subscribe is on, identity or not."""
+    import re
+    from pathlib import Path
+    from hermes_cli import kanban as kc
+    from gateway.session_context import reset_session_vars
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    # an operator CLI, not a worker (a dispatched worker running this suite would otherwise count)
+    import agent.delegation_context as dc
+    monkeypatch.setattr(dc, "is_dispatcher_owned_worker_context", lambda: False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    reset_session_vars()
+    if cli_auto_subscribe:
+        (home / "config.yaml").write_text("kanban:\n  cli_auto_subscribe: true\n")
+    for k, v in {"HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_CHAT_ID": "chat1", "HERMES_SESSION_CHAT_TYPE": "dm",
+                 "HERMES_SESSION_USER_ID": "user1", "HERMES_SESSION_MESSAGE_ID": "462"}.items():
+        monkeypatch.setenv(k, v)
+    kb.init_db()
+    out = kc.run_slash('--board default create "cli scratch" --assignee worker1')
+    tid = re.search(r"Created\s+(t_[0-9a-f]+)\b", out).group(1)
+    with kb.connect_closing() as conn:
+        assert bool(kb.get_task(conn, tid).boomerang_wake) is cli_auto_subscribe
+        assert bool(kbn.list_notify_subs(conn, tid)) is cli_auto_subscribe
 
 
 @pytest.mark.parametrize("opt_out", [False, True, "false"])
@@ -77,31 +193,6 @@ def test_gateway_create_persists_level(tmp_path, monkeypatch, opt_out):
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, created["task_id"]).boomerang_wake is (not opt_out)
         assert kbn.list_notify_subs(conn, created["task_id"])[0]["delivery_mode"] == "notify+wake"
-
-
-def test_failed_chat_delivery_is_retried_once(tmp_path, monkeypatch):
-    """Prism 9f1fead40170: post_line False then True on one delegation -> exactly one chat line."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
-    kb.init_db()
-    with kb.connect_closing() as conn:
-        tid = kb.create_task(conn, title="scratch", assignee="human:apollo")
-    entry = dict(task_id=tid, board=None, row="review_deadman", delegation_id="d1", route={})
-    outcomes, sent = [False, True, True], []
-    async def post(runner, entry, text):
-        ok = outcomes.pop(0)
-        if ok:
-            sent.append(text)
-        return ok
-    monkeypatch.setattr(bw, "post_line", post)
-    result = dict(summary="CI is pending", action="comment_why_waits")
-    assert asyncio.run(bw.report_handled(None, entry, result)) is False
-    assert asyncio.run(bw.report_handled(None, entry, result)) is True
-    assert asyncio.run(bw.report_handled(None, entry, result)) is False
-    assert sent == [f"boomerang handled {tid} (review_deadman): CI is pending"]
-    assert outcomes == [True]  # third call never reached post_line
-    with kb.connect_closing() as conn:
-        assert len(kb.list_comments(conn, tid)) == 1
 
 
 @pytest.mark.parametrize("owner", [False, True])
@@ -142,11 +233,14 @@ def test_run_entry_deadman_passive_delivery(tmp_path, monkeypatch, stale):
     final = '<<<BOOMERANG-VERDICT nonce=abcd>>>\n' + json.dumps({
         "action": "surface", "summary": "operator decision needed"}) + '\n<<<END-VERDICT>>>'
     monkeypatch.setattr(bw, "run_child", lambda *args: ("completed", final))
+    turns = []
+    async def resurface(runner, e, text=None):
+        turns.append(text)
+        return True
+    monkeypatch.setattr(bw, "resurface", resurface)
     sent = []
-    async def send(chat_id, text, metadata=None):
-        sent.append(text)
-    runner = SimpleNamespace(_kanban_route_adapter=lambda *a: SimpleNamespace(send=send))
-    asyncio.run(bw.run_entry(runner, entry, state))
+    asyncio.run(bw.run_entry(_runner([], sent), entry, state))
     assert sent == ([] if stale else [f"boomerang handled {tid} (review_deadman): operator decision needed"])
+    assert len(turns) == (0 if stale else 1)
     with kb.connect_closing() as conn:
         assert any(c.body.startswith("boomerang: review_deadman ") for c in kb.list_comments(conn, tid))

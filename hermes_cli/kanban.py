@@ -981,12 +981,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             return 2
     try:
         with kb.connect_closing() as conn:
+            from hermes_cli.config import cfg_get as _cfg_get, load_config as _load_config
             from tools.kanban_tools import _auto_boomerang, _auto_wake, _resolve_notify_target
+            # Scripts and cron drive the CLI: the boomerang default only follows a CLI create
+            # that kanban.cli_auto_subscribe (default False) would subscribe (Prism 1aec29b63c57).
             boomerang = _auto_boomerang(
                 getattr(args, "boomerang_wake", None),
                 worker=is_dispatcher_owned_worker_context(),
-                subscribed=bool(_auto_wake(None) and
-                                _resolve_notify_target(require_platform_identity=True)))
+                subscribed=bool(_cfg_get(_load_config(), "kanban", "cli_auto_subscribe", default=False)
+                                and _auto_wake(None)
+                                and _resolve_notify_target(require_platform_identity=True)))
             _event_mark = kb.max_event_id(conn)
             task_id = kb.create_task(
                 conn,

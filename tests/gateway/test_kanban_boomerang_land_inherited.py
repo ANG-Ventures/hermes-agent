@@ -137,7 +137,7 @@ def test_6313_replay_through_run_entry_posts_one_line_no_turn(env, fio, monkeypa
     tid, entry = _card_6313(env)
     _run(env, entry, "completed", _final(entry, FIXTURE["child_verdict"]))
     assert len(fio.enqueued) == 1
-    assert [s for s in env["adapter"].sent if s.startswith(f"[boomerang-wake] {tid}")]
+    assert len([s for s in env["adapter"].sent if s.startswith(f"boomerang handled {tid} (own_repo_review_red): ")]) == 1
     assert env["adapter"].handled == []
 
 
