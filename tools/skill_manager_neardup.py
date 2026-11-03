@@ -11,6 +11,7 @@ install) has no gate: creation behaves as before.
 """
 
 import importlib.util
+import inspect
 import logging
 import re
 import sys
@@ -126,6 +127,14 @@ def create_lock(shared_root: Path):
         yield
 
 
+def _accepts_corpus(fn) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "corpus" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def check_create(name: str, content: str, justification: Optional[str], *, shared_root: Path,
                  profile: str, overlay_roots: Sequence[Path] = (), exclude_names: Sequence[str] = ()
                  ) -> Tuple[Optional[str], Optional[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
@@ -145,11 +154,14 @@ def check_create(name: str, content: str, justification: Optional[str], *, share
         if not enabled:
             return None, None, content, None
         roots = _skill_roots(shared_root, overlay_roots)
-        corpus = None
-        if exclude_names:
+        kwargs = {"roots": roots, "threshold": threshold}
+        # 370d9676504e: the scorer is the ROOT's file, which may predate check(corpus=). Pass corpus only when a
+        # batch deletes skills AND check() accepts it; an older scorer then scores the on-disk tree (stricter: the
+        # deleted copy still counts) instead of raising TypeError and failing the whole gate open.
+        if exclude_names and _accepts_corpus(scorer.check) and hasattr(scorer, "Corpus"):
             gone = set(exclude_names)
-            corpus = scorer.Corpus([d for d in scorer.Corpus.load(roots).docs if d["name"] not in gone])
-        verdict = scorer.check(name, content, roots=roots, threshold=threshold, corpus=corpus)
+            kwargs["corpus"] = scorer.Corpus([d for d in scorer.Corpus.load(roots).docs if d["name"] not in gone])
+        verdict = scorer.check(name, content, **kwargs)
     except Exception:  # noqa: BLE001
         logger.warning("near-duplicate gate unavailable for create of %s; allowing", name, exc_info=True)
         return None, None, content, None

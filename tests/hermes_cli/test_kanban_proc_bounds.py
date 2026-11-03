@@ -22,6 +22,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_proc_bounds as kpb
+from tests._fixtures.bounds import uncapped_argv
 
 POSIX = hasattr(os, "getsid") and hasattr(os, "killpg")
 
@@ -417,10 +418,10 @@ _CHROME_WORKER = (
 )
 
 
-def _chrome_procs(profile: str) -> list[int]:
+def _chrome_procs(profile: str, exclude: int | None = None) -> list[int]:
     out = []
     for p in kb.psutil.process_iter():
-        if any(profile in a for a in kb._safe_cmdline(p)):
+        if p.pid != exclude and any(profile in a for a in kb._safe_cmdline(p)):
             out.append(p.pid)
     return out
 
@@ -438,8 +439,11 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     env = dict(os.environ, HERMES_KANBAN_TASK=tid,
                HERMES_KANBAN_RUN_ID=str(task.current_run_id))
     spawned_at = time.time()
+    # A real worker is not under the harness's 6 GiB RLIMIT_AS, and the harness's browser
+    # exemption only wraps Popen in THIS process: a Chrome the worker starts inherits the cap
+    # and is a zombie within 0.5 s (measured in ci-runner-ang-hermes:5, t_b92e2833).
     worker = subprocess.Popen(
-        [sys.executable, "-c", _CHROME_WORKER, chrome, profile],
+        uncapped_argv([sys.executable, "-c", _CHROME_WORKER, chrome, profile]),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env,
         start_new_session=True,
     )
@@ -450,9 +454,10 @@ def test_drill_worker_chrome_is_reaped_with_the_card(conn, tmp_path):
     browser = int(worker.stdout.readline())
     _track(browser)
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and len(_chrome_procs(profile)) < 2:
+    # The worker's own argv carries the profile path: count only Chrome's processes.
+    while time.monotonic() < deadline and len(_chrome_procs(profile, worker.pid)) < 2:
         time.sleep(0.2)
-    leaked = _chrome_procs(profile)
+    leaked = _chrome_procs(profile, worker.pid)
     assert len(leaked) >= 2, "Chrome did not start its helpers; drill proves nothing"
     _track(*leaked)
     # The live per-run census sees the browser too (Linux Chrome erases its

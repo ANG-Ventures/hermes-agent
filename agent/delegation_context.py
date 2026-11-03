@@ -43,24 +43,50 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 def _live_dispatched_worker_roots(procs: list) -> set[int]:
     """Only dispatcher-recorded live runs can escape a caller's tree cleanup.
 
-    Environment and argv are child-controlled, not lifecycle authority. Read the
-    board once, without migrations or writes, and fail closed on unavailable state.
+    Environment and argv are child-controlled, not lifecycle authority. Read every
+    board once (a worker dispatched with ``--board <other>`` is recorded only on
+    that board), without migrations or writes; an unreadable board contributes
+    nothing (fail closed).
     """
+    if not procs:
+        return set()
     try:
         import sqlite3
-        from hermes_cli.kanban_db import kanban_db_path
+        from hermes_cli.kanban_db import (
+            _board_db_path_ignoring_pin, _normalize_board_slug, boards_root, kanban_db_path,
+            skip_reserved_board_dir,
+        )
         from hermes_cli.kanban_db_dispatch import _fingerprints_agree, _process_fingerprint
 
-        uri = kanban_db_path().resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+        paths = {kanban_db_path().resolve()}
+        # Prism f67814337e1f: per-directory discovery. list_boards() reads every board.json first and one
+        # malformed file would hide every other board; here a bad entry costs only itself.
         try:
-            rows = conn.execute(
-                "SELECT r.worker_pid, r.worker_started_at FROM task_runs r "
-                "JOIN tasks t ON t.current_run_id = r.id "
-                "WHERE r.ended_at IS NULL AND r.worker_pid = t.worker_pid"
-            ).fetchall()
-        finally:
-            conn.close()
+            root = boards_root()
+            children = sorted(root.iterdir()) if root.is_dir() else []
+        except Exception:
+            children = []
+        for child in children:
+            try:
+                if not child.is_dir() or skip_reserved_board_dir(child):
+                    continue
+                paths.add(_board_db_path_ignoring_pin(_normalize_board_slug(child.name)).resolve())
+            except Exception:
+                continue
+        rows = []
+        for path in paths:
+            try:
+                conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.5)
+                try:
+                    rows += conn.execute(
+                        "SELECT r.worker_pid, r.worker_started_at FROM task_runs r "
+                        "JOIN tasks t ON t.current_run_id = r.id "
+                        "WHERE r.ended_at IS NULL AND r.worker_pid = t.worker_pid"
+                    ).fetchall()
+                finally:
+                    conn.close()
+            except Exception:
+                continue
         candidates = {proc.pid for proc in procs}
         return {
             pid for pid, started_at in rows

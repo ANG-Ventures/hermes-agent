@@ -355,6 +355,26 @@ def run_bounded_sync(
 # --- Whole-tree process termination --------------------------------------------
 
 
+def _drop_spared(known: dict, stopped: list, spare) -> dict:
+    """Filter ``known`` through ``spare``; resume (SIGCONT) any dropped process we stopped."""
+    kept = {process.pid: process for process in spare(list(known.values()))}
+    for process in [p for p in stopped if p.pid in known and p.pid not in kept]:
+        # Prism bcc2c5280b8c: leave `stopped` only once the SIGCONT took (or the process is gone), so a
+        # transient resume failure keeps the suspended worker tracked for the final cleanup.
+        try:
+            process.resume()
+        except Exception:
+            try:
+                still_there = process.is_running()
+            except Exception:
+                still_there = False
+            if still_there:
+                logger.debug("kill_process_tree: spared target resume refused; still tracked", exc_info=True)
+                continue
+        stopped.remove(process)
+    return kept
+
+
 @contextmanager
 def _process_tree_snapshot(pid: int, *, hard_kill: bool):
     """Stop each hard-kill target before discovering its children: a running
@@ -397,10 +417,17 @@ def _process_tree_snapshot(pid: int, *, hard_kill: bool):
                             continue
                     # Rescan after stopping the discovered generation. A child
                     # may have forked while that generation was being stopped.
-                    for process in spare_dispatched_workers(root.children(recursive=True)):
+                    # Re-filter the ACCUMULATED set, not just additions: a worker
+                    # snapshotted before its board row committed is protected now.
+                    for process in root.children(recursive=True):
                         known.setdefault(process.pid, process)
+                    known = _drop_spared(known, stopped, spare_dispatched_workers)
                     descendants = list(known.values())
                     pending = [process for process in descendants if process.pid not in seen]
+            # Last look immediately before the caller signals.
+            descendants = list(_drop_spared(
+                {process.pid: process for process in descendants}, stopped,
+                spare_dispatched_workers).values())
         except Exception:
             # Preserve the existing best-effort group fallback when discovery or
             # stopping is unavailable; never strand a successfully stopped target.

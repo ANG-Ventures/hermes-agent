@@ -194,6 +194,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         outcomes = []
+        operator_candidate = None
         app_ids: dict[str, int | None] = {}
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
@@ -206,6 +207,13 @@ def collect_acceptance(contract: str, published_pr: str | None,
             if not selected:
                 outcomes.append("missing")
                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
+                if context == _ATTR_CONTEXT:
+                    # Operator-lane fleet-merge posts this status as the operator's USER, not the
+                    # pinned app (t_653fa01f). Evidence only; accepted below on a MERGED PR.
+                    users = [s for s in statuses if s["context"] == context
+                             and (s.get("creator") or {}).get("type") == "User"]
+                    if users:
+                        operator_candidate = max(users, key=lambda s: s["id"])
             for check in selected:
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
@@ -229,6 +237,16 @@ def collect_acceptance(contract: str, published_pr: str | None,
             # Transferred/renamed repo: GitHub resolved the contract's name to this repository.
             # Recorded for audit only; the contract itself is never rewritten.
             receipt["canonical_repo"] = canonical
+        if current.get("merged") and operator_candidate and current["head"]["sha"] == sha:
+            stage = "verify operator-lane attribution"
+            accepted = _operator_lane_attribution(repo, number, sha, operator_candidate, profile_home)
+            if accepted:
+                for entry in receipt["checks"]:
+                    if entry["name"] == _ATTR_CONTEXT and entry["classification"] == "missing":
+                        entry.update(accepted)
+                        outcomes.remove("missing")
+                        outcomes.append("success")
+                        break
         if current.get("merged") and "missing" in outcomes and set(outcomes) <= {"success", "missing"}:
             stage = "verify break-glass landing evidence"
             waiver = _break_glass_waiver(repo, canonical or repo, number, sha, current, receipt["checks"], profile_home)
@@ -261,6 +279,59 @@ def collect_acceptance(contract: str, published_pr: str | None,
 
 
 _RECEIPT_RCS = ("ruff_rc", "pytest_rc", "semgrep_rc", "gitleaks_rc")
+_ATTR_CONTEXT = "fleet/attribution"
+_OPERATOR_LANES = ("review", "operator")
+# fleet-merge.sh set_attr_status: "by $AGENT lane $LANE gate $GATE_KIND" (cut at 140 chars).
+_ATTR_DESC = re.compile(r"by (\S+) lane (\S+) gate \S")
+_MERGED_BY = re.compile(r"\U0001f916 merged-by: (\S+) · lane: (\S+) · ")
+
+
+def _operator_lane_attribution(repo: str, number: int, sha: str, status: dict,
+                               profile_home: str | None) -> dict | None:
+    """Accept a USER-posted ``fleet/attribution`` on a MERGED PR as the operator lane's (t_653fa01f).
+
+    fleet-merge on the operator/review lane posts the status as the operator's GitHub user, not
+    the pinned lander app, so the pin reads it as absent and an admin-merged card can never close.
+    Every link must hold, else None (the context stays ``missing``):
+    - the latest user-posted status for the context is ``success`` on this head;
+    - its description is fleet-merge's ``by <agent> lane <review|operator> gate <kind>``;
+    - ``<agent>`` is in ``<hermes root>/config/operator-approvers.json`` ``approvers`` AND the posting
+      GitHub login is in its ``operator_logins`` (Prism de7aacbaa810: the text alone is spoofable);
+    - the SAME account posted fleet-merge's ``🤖 merged-by: <agent> · lane: <lane> ·`` comment.
+    The caller only asks when GitHub says the PR is merged at this head.
+    """
+    from hermes_constants import get_default_hermes_root
+    login = (status.get("creator") or {}).get("login")
+    match = _ATTR_DESC.match(status.get("description") or "")
+    if (not login or not match or match[2] not in _OPERATOR_LANES
+            or _classify(status, sha, status.get("state"), False) != "success"):
+        return None
+    agent, lane = match[1], match[2]
+    try:
+        cfg = json.loads((Path(get_default_hermes_root()) / "config" / "operator-approvers.json")
+                         .read_text(encoding="utf-8"))
+        approvers = cfg.get("approvers") if isinstance(cfg, dict) else None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(approvers, list) or agent not in approvers:
+        return None
+    # Prism de7aacbaa810: bind the GitHub LOGIN to the operator, not just the agent name in the text any
+    # write-access user could post. `operator_logins` lists the accounts fleet-merge posts as on the
+    # operator lanes; absent or empty -> no user-posted attribution is ever accepted (fail closed).
+    logins = cfg.get("operator_logins") if isinstance(cfg, dict) else None
+    if not isinstance(logins, list) or login not in logins:
+        return None
+    pages = _api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True, profile_home=profile_home)
+    for comment in (c for page in pages for c in page):
+        found = _MERGED_BY.match(comment.get("body") or "")
+        if ((comment.get("user") or {}).get("login") == login and found
+                and found[1] == agent and found[2] == lane):
+            return {"id": status["id"], "url": status.get("target_url"), "head_sha": sha,
+                    "classification": "success", "conclusion": "success",
+                    "satisfied_by": f"operator-lane status({login})",
+                    "operator_lane": {"agent": agent, "lane": lane, "login": login,
+                                      "comment_id": comment.get("id"), "comment_url": comment.get("html_url")}}
+    return None
 
 
 def _break_glass_waiver(repo: str, canonical: str, number: int, sha: str, current: dict,

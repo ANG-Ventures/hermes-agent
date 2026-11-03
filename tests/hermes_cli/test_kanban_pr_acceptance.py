@@ -667,3 +667,97 @@ def test_context_without_app_binding_fails_closed_and_impostor_cannot_satisfy_pi
         "checks": [{"context": "required", "app_id": 2}], "contexts": ["required"]}})
     receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
     assert receipt["ok"] is False and receipt["classification"] == "missing", receipt
+
+
+# --- t_653fa01f: operator-lane fleet-merge posts fleet/attribution as the operator's USER ---
+# Measured on t_7c67781d (home#8485 @0db5a318): status creator Kyzcreig (User), app pin 5078363,
+# merged_by ang-fleet-lander[bot], comment "🤖 merged-by: apollo · lane: review · ..." by Kyzcreig.
+
+_ATTR = "fleet/attribution"
+
+
+def _operator_lane(tmp_path, *, desc="by apollo lane review gate ADVISORY", state="success",
+                   creator="Kyzcreig", author="Kyzcreig", comment_lane="review", comment_agent="apollo",
+                   approvers=("apollo", "apollo/operator"), retracted=False, logins=("Kyzcreig",)):
+    cfg = tmp_path / "home" / "config" / "operator-approvers.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    if approvers is not None:
+        body_cfg = {"approvers": list(approvers)}
+        if logins is not None:
+            body_cfg["operator_logins"] = list(logins)
+        cfg.write_text(json.dumps(body_cfg), encoding="utf-8")
+    statuses = [{"id": 10, "context": _ATTR, "state": state, "description": desc, "target_url": None,
+                 "creator": {"login": creator, "type": "User", "id": 9063726}}]
+    if retracted:
+        statuses.append({**statuses[0], "id": 11, "state": "failure", "description": "refused: re-run"})
+    body = (f"\U0001f916 merged-by: {comment_agent} · lane: {comment_lane} · gate: ADVISORY"
+            " · why: x · decide: break-glass override")
+    return {"conclusion": "success", "head": _HEAD, "missing": True, "pr_state": "MERGED",
+            "merged_by": "ang-fleet-lander[bot]", "statuses": statuses, "apps": {},
+            "protection": {"required_status_checks": {
+                "checks": [{"context": _ATTR, "app_id": 5078363}], "contexts": [_ATTR]}},
+            "comments": [{"id": 77, "user": {"login": author}, "body": body,
+                          "html_url": "https://github.com/acme/repo/pull/7#c77"}]}
+
+
+@pytest.mark.platforms("posix")
+def test_operator_lane_attribution_on_merged_pr_is_accepted(github, tmp_path):
+    """RED on main ('missing'): the admin-merged t_7c67781d shape completes."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(_operator_lane(tmp_path))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is True and receipt["classification"] == "success", receipt
+    check = receipt["checks"][0]
+    assert check["satisfied_by"] == "operator-lane status(Kyzcreig)"
+    assert check["operator_lane"]["agent"] == "apollo" and check["operator_lane"]["comment_id"] == 77
+    assert "waiver" not in receipt
+
+
+@pytest.mark.platforms("posix")
+def test_operator_lane_card_completes_through_complete_task(github, tmp_path):
+    github.update(_operator_lane(tmp_path))
+    with connect() as conn:
+        tid = kb.create_task(conn, title="admin merged", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status == "done"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("case", ["open_pr", "not_approver", "no_approvers_file", "bad_lane", "not_fleet_merge_desc",
+                                  "failed_status", "retracted", "comment_by_other", "spoofed_login", "no_operator_logins", "comment_other_agent",
+                                  "comment_other_lane", "no_comment"])
+def test_operator_lane_negatives_stay_missing(github, tmp_path, case):
+    from hermes_cli import kanban_pr_acceptance as acc
+    kw = {}
+    if case == "not_approver":
+        kw["approvers"] = ("aegis/breakglass-ops",)
+    elif case == "no_approvers_file":
+        kw["approvers"] = None
+    elif case == "bad_lane":
+        kw.update(desc="by apollo lane worker gate ADVISORY", comment_lane="worker")
+    elif case == "not_fleet_merge_desc":
+        kw["desc"] = "looks good to me"
+    elif case == "failed_status":
+        kw["state"] = "failure"
+    elif case == "retracted":
+        kw["retracted"] = True
+    elif case == "comment_by_other":
+        kw["author"] = "mallory"
+    elif case == "spoofed_login":        # de7aacbaa810: a write-access user posts BOTH artifacts under its own login
+        kw.update(creator="mallory", author="mallory")
+    elif case == "no_operator_logins":
+        kw["logins"] = None
+    elif case == "comment_other_agent":
+        kw["comment_agent"] = "aegis/breakglass-ops"
+    elif case == "comment_other_lane":
+        kw["comment_lane"] = "operator"
+    state = _operator_lane(tmp_path, **kw)
+    if case == "open_pr":
+        state["pr_state"] = "OPEN"
+    if case == "no_comment":
+        state["comments"] = []
+    github.update(state)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False, receipt
+    assert receipt["classification"] == "missing", receipt

@@ -297,3 +297,101 @@ def test_unverified_board_worker_is_not_spared(tmp_path, state):
             lock.close()
         _cleanup(child.pid)
         child.wait(timeout=5)
+
+
+def test_worker_on_another_board_is_spared(tmp_path):
+    """Prism 9827115d879b: a worker dispatched with ``--board work`` is recorded on that
+    board's DB, not on the cleanup caller's current (``default``) board."""
+    import json
+    import subprocess
+    import psutil
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+    from agent.delegation_context import spare_dispatched_workers
+
+    board = kb.boards_root() / "work"
+    board.mkdir(parents=True)
+    (board / "board.json").write_text(json.dumps({"name": "work"}))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True, stdin=subprocess.DEVNULL)
+    try:
+        with sqlite3.connect(board / "kanban.db") as conn:
+            conn.executescript(
+                "CREATE TABLE tasks(current_run_id INTEGER, worker_pid INTEGER);"
+                "CREATE TABLE task_runs(id INTEGER, worker_pid INTEGER, worker_started_at TEXT, ended_at INTEGER);"
+            )
+            conn.execute("INSERT INTO tasks VALUES (1, ?)", (child.pid,))
+            conn.execute("INSERT INTO task_runs VALUES (1, ?, ?, NULL)",
+                         (child.pid, _process_fingerprint(child.pid)))
+        assert kb.get_current_board() == kb.DEFAULT_BOARD
+        assert spare_dispatched_workers([psutil.Process(child.pid)]) == []
+    finally:
+        _cleanup(child.pid)
+        child.wait(timeout=5)
+
+
+def test_malformed_sibling_board_does_not_hide_a_live_worker(tmp_path):
+    """Prism f67814337e1f: board discovery is per directory, so one board.json with invalid
+    UTF-8 costs only that board; a live worker on ``work`` is still spared."""
+    import json
+    import subprocess
+    import psutil
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+    from agent.delegation_context import spare_dispatched_workers
+
+    broken = kb.boards_root() / "broken"
+    broken.mkdir(parents=True)
+    (broken / "board.json").write_bytes(b"\xff")
+    board = kb.boards_root() / "work"
+    board.mkdir(parents=True)
+    (board / "board.json").write_text(json.dumps({"name": "work"}))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True, stdin=subprocess.DEVNULL)
+    try:
+        with sqlite3.connect(board / "kanban.db") as conn:
+            conn.executescript(
+                "CREATE TABLE tasks(current_run_id INTEGER, worker_pid INTEGER);"
+                "CREATE TABLE task_runs(id INTEGER, worker_pid INTEGER, worker_started_at TEXT, ended_at INTEGER);"
+            )
+            conn.execute("INSERT INTO tasks VALUES (1, ?)", (child.pid,))
+            conn.execute("INSERT INTO task_runs VALUES (1, ?, ?, NULL)",
+                         (child.pid, _process_fingerprint(child.pid)))
+        assert spare_dispatched_workers([psutil.Process(child.pid)]) == []
+    finally:
+        _cleanup(child.pid)
+        child.wait(timeout=5)
+
+
+def test_worker_recorded_after_first_snapshot_survives_hard_kill(tmp_path, monkeypatch):
+    """Prism daf8e5e65006: W is in the first snapshot, its board row commits, the next
+    scan recognises it. The accumulated target set must drop it, and W must be running."""
+    import subprocess
+    import psutil
+    from agent import delegation_context as dc
+
+    src = _spawner(tmp_path, worker_env=DISPATCHED, recorded=False)
+    spawner = subprocess.Popen([sys.executable, "-c", src], start_new_session=True,
+                               stdin=subprocess.DEVNULL)
+    worker = _wait_pid(tmp_path / "worker.pid")
+    real = dc.spare_dispatched_workers
+    calls = []
+
+    def spare_then_commit(procs):
+        out = real(procs)
+        if not calls:
+            assert worker in {p.pid for p in out}, "premise: W unrecorded at first snapshot"
+            _record_worker(tmp_path, worker)
+        calls.append(len(out))
+        return out
+
+    monkeypatch.setattr(dc, "spare_dispatched_workers", spare_then_commit)
+    try:
+        kill_process_tree(spawner.pid)
+        spawner.wait(timeout=5)
+        time.sleep(0.3)
+        assert len(calls) >= 2
+        assert _alive(worker), "worker recognised on a later scan was still signalled"
+        assert psutil.Process(worker).status() != psutil.STATUS_STOPPED
+    finally:
+        _cleanup(spawner.pid, worker)

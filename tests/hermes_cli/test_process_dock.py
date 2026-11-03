@@ -21,6 +21,10 @@ def test_dock_paints_processes_under_agents_and_retires_finished_rows(monkeypatc
     from tools.process_registry import process_registry
 
     monkeypatch.setattr(registry, '_active_subagents', {})
+    # spawn_local runs `bash -lic`; with no tty, Linux bash writes "no job control in this
+    # shell" into the merged output, so `sleep 30` would read as having output (t_f1a3e390).
+    # Pin the no-output-yet state the `starting` label is about.
+    monkeypatch.setattr(cli_process_dock, '_last_output_line', lambda buffer: '')
     owner = SimpleNamespace(session_id='owner')
     registry._register_subagent(dict(subagent_id='a1', owner_agent_session_id='owner',
         goal='Check module', started_at=time.time() - 5, status='running', last_tool='read_file'))
