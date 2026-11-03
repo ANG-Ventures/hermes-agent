@@ -355,10 +355,17 @@ def test_emitter_is_fast_and_does_no_io_beyond_db_and_ledger(fleet, monkeypatch)
     gap.fleet_host_onboard()  # module load is a one-time cost, not the emitter's
     conn = kb.connect()
     try:
-        t0 = time.perf_counter()
-        gap.record_capability_gap(conn, tid, run_id=run_id, host_raw="ace-ai", profile="daedalus",
-                                  gap_class="cmd_not_found", requirement_id="C5", tool="op-cached-read", message="m")
-        assert time.perf_counter() - t0 < 0.05
+        # Median of 7 calls, not one: a single call on a loaded CI slice (load 300+ on ci-box) took
+        # >50 ms once in 12 mirror main runs; one scheduler stall moves one sample, not the median
+        # (t_0fcbd3fa). The no-subprocess / no-network guards above stay exact.
+        took = []
+        for _ in range(7):
+            t0 = time.perf_counter()
+            gap.record_capability_gap(conn, tid, run_id=run_id, host_raw="ace-ai", profile="daedalus",
+                                      gap_class="cmd_not_found", requirement_id="C5", tool="op-cached-read",
+                                      message="m")
+            took.append(time.perf_counter() - t0)
+        assert sorted(took)[3] < 0.05, took
     finally:
         conn.close()
 
