@@ -53,15 +53,26 @@ def _live_dispatched_worker_roots(procs: list) -> set[int]:
     try:
         import sqlite3
         from hermes_cli.kanban_db import (
-            _board_db_path_ignoring_pin, kanban_db_path, list_boards,
+            _board_db_path_ignoring_pin, _normalize_board_slug, boards_root, kanban_db_path,
+            skip_reserved_board_dir,
         )
         from hermes_cli.kanban_db_dispatch import _fingerprints_agree, _process_fingerprint
 
         paths = {kanban_db_path().resolve()}
+        # Prism f67814337e1f: per-directory discovery. list_boards() reads every board.json first and one
+        # malformed file would hide every other board; here a bad entry costs only itself.
         try:
-            paths.update(_board_db_path_ignoring_pin(b["slug"]).resolve() for b in list_boards())
+            root = boards_root()
+            children = sorted(root.iterdir()) if root.is_dir() else []
         except Exception:
-            pass
+            children = []
+        for child in children:
+            try:
+                if not child.is_dir() or skip_reserved_board_dir(child):
+                    continue
+                paths.add(_board_db_path_ignoring_pin(_normalize_board_slug(child.name)).resolve())
+            except Exception:
+                continue
         rows = []
         for path in paths:
             try:

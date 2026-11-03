@@ -359,11 +359,19 @@ def _drop_spared(known: dict, stopped: list, spare) -> dict:
     """Filter ``known`` through ``spare``; resume (SIGCONT) any dropped process we stopped."""
     kept = {process.pid: process for process in spare(list(known.values()))}
     for process in [p for p in stopped if p.pid in known and p.pid not in kept]:
-        stopped.remove(process)
+        # Prism bcc2c5280b8c: leave `stopped` only once the SIGCONT took (or the process is gone), so a
+        # transient resume failure keeps the suspended worker tracked for the final cleanup.
         try:
             process.resume()
         except Exception:
-            logger.debug("kill_process_tree: spared target already gone or resume refused", exc_info=True)
+            try:
+                still_there = process.is_running()
+            except Exception:
+                still_there = False
+            if still_there:
+                logger.debug("kill_process_tree: spared target resume refused; still tracked", exc_info=True)
+                continue
+        stopped.remove(process)
     return kept
 
 

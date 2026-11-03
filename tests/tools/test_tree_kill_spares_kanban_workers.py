@@ -330,6 +330,39 @@ def test_worker_on_another_board_is_spared(tmp_path):
         child.wait(timeout=5)
 
 
+def test_malformed_sibling_board_does_not_hide_a_live_worker(tmp_path):
+    """Prism f67814337e1f: board discovery is per directory, so one board.json with invalid
+    UTF-8 costs only that board; a live worker on ``work`` is still spared."""
+    import json
+    import subprocess
+    import psutil
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+    from agent.delegation_context import spare_dispatched_workers
+
+    broken = kb.boards_root() / "broken"
+    broken.mkdir(parents=True)
+    (broken / "board.json").write_bytes(b"\xff")
+    board = kb.boards_root() / "work"
+    board.mkdir(parents=True)
+    (board / "board.json").write_text(json.dumps({"name": "work"}))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             start_new_session=True, stdin=subprocess.DEVNULL)
+    try:
+        with sqlite3.connect(board / "kanban.db") as conn:
+            conn.executescript(
+                "CREATE TABLE tasks(current_run_id INTEGER, worker_pid INTEGER);"
+                "CREATE TABLE task_runs(id INTEGER, worker_pid INTEGER, worker_started_at TEXT, ended_at INTEGER);"
+            )
+            conn.execute("INSERT INTO tasks VALUES (1, ?)", (child.pid,))
+            conn.execute("INSERT INTO task_runs VALUES (1, ?, ?, NULL)",
+                         (child.pid, _process_fingerprint(child.pid)))
+        assert spare_dispatched_workers([psutil.Process(child.pid)]) == []
+    finally:
+        _cleanup(child.pid)
+        child.wait(timeout=5)
+
+
 def test_worker_recorded_after_first_snapshot_survives_hard_kill(tmp_path, monkeypatch):
     """Prism daf8e5e65006: W is in the first snapshot, its board row commits, the next
     scan recognises it. The accumulated target set must drop it, and W must be running."""
