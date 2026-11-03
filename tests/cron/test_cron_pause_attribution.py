@@ -2,13 +2,15 @@
 
 The 11-03 home-reconcile-tick pause left ``paused_reason`` empty-ish and a journal actor of
 ``hermes:<pid>``, a pid nobody could trace afterwards. A reasonless pause now records the kanban card,
-the session and the parent process command line, in the row and in the lifecycle journal.
+the session and the parent process (executable + script basename only: argv can carry secrets), in the row
+and in the lifecycle journal.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -33,9 +35,9 @@ def test_reasonless_pause_names_card_session_and_parent(tmp_path):
                PYTHONPATH=str(_REPO))
     child = tmp_path / "child.py"
     child.write_text(_CHILD)
-    # A real parent whose command line carries a marker: sh forks python (a trailing command defeats exec).
-    parent = f'"{sys.executable}" "{child}" ; : parent-marker-9da8'
-    out = subprocess.run(["/bin/sh", "-c", parent], env=env, cwd=_REPO, capture_output=True,
+    # A real parent whose -c string carries a secret: bash forks python (a trailing command defeats exec).
+    parent = f'export X_TOKEN=s3cret; "{sys.executable}" "{child}" ; : parent-marker-9da8'
+    out = subprocess.run(["/bin/bash", "-c", parent], env=env, cwd=_REPO, capture_output=True,
                          text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     job_id = out.stdout.strip().splitlines()[-1]
@@ -48,8 +50,23 @@ def test_reasonless_pause_names_card_session_and_parent(tmp_path):
     for text in (row["paused_reason"], paused[0]["reason"]):
         assert "t_test" in text
         assert "sess_test" in text
-        assert "parent-marker-9da8" in text
+        assert re.search(r"parent pid \d+: bash;", text), text
+        for leaked in ("s3cret", "X_TOKEN", "parent-marker-9da8"):
+            assert leaked not in text
         assert f"hermes cron resume {job_id}" in text
+
+
+@pytest.mark.parametrize("argv,label", [
+    (["python3", "/path/to/tick.py", "--x", "y"], "python3 tick.py"),
+    (["/bin/bash", "-lc", "export X_TOKEN=s3cret; hermes cron pause J"], "bash"),
+    (["/opt/py/bin/python3.13", "-u", "-c", "import os; T='s3cret'"], "python3.13"),
+    (["zsh", "/Users/x/land-8694.sh", "--token", "s3cret"], "zsh land-8694.sh"),
+    (["/usr/local/bin/hermes", "cron", "pause", "J", "--api-key", "s3cret"], "hermes"),
+])
+def test_parent_label_keeps_no_argv_content(argv, label):
+    from cron.lifecycle_journal import parent_label
+
+    assert parent_label(argv) == label
 
 
 def test_explicit_reason_is_kept_verbatim(tmp_path, monkeypatch):

@@ -33,6 +33,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -257,11 +258,37 @@ def caller_attribution() -> str:
     try:
         import psutil
 
-        cmdline = " ".join(psutil.Process(ppid).cmdline()).strip()
+        label = parent_label(psutil.Process(ppid).cmdline())
     except Exception:
-        cmdline = ""
-    parts.append(f"parent pid {ppid}" + (f": {cmdline[:300]}" if cmdline else ""))
+        label = ""
+    parts.append(f"parent pid {ppid}" + (f": {label}" if label else ""))
     return "; ".join(parts)
+
+
+_INTERPRETER = re.compile(r"^(?:(?:ba|z|da|k)?sh|python[0-9.]*)$")
+
+
+def parent_label(argv: List[str]) -> str:
+    """Executable basename, plus the script basename when it is a shell/python interpreter.
+
+    The label is persisted (row + journal) and read by other agents, and fleet command lines carry
+    secrets (``bash -c "export X_TOKEN=..."``, tokens as argv). So no argv CONTENT is kept: never a
+    ``-c`` string, never any argument after the script.
+    """
+    if not argv or not (argv[0] or "").strip():
+        return ""
+    exe = os.path.basename(argv[0].split()[0])[:64]
+    if not _INTERPRETER.match(exe.lower()):
+        return exe
+    for arg in argv[1:]:
+        if arg == "--":
+            continue
+        if arg.startswith("-"):
+            if not arg.startswith("--") and "c" in arg[1:]:
+                return exe  # -c / -lc / -Ic: inline code, nothing recordable
+            continue
+        return f"{exe} {os.path.basename(arg)[:64]}"
+    return exe
 
 
 def read_entries(*, window_hours: float = DEFAULT_WINDOW_HOURS) -> List[Dict[str, Any]]:
