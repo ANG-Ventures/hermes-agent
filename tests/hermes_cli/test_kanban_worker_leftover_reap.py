@@ -243,3 +243,48 @@ def test_dispatch_tick_runs_both_reaps(conn, monkeypatch):
     calls.clear()
     kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=True)
     assert calls == {}, "a dry run must not signal anything"
+
+
+def test_dispatch_tick_finishes_when_an_orphan_cwd_probe_hangs(conn, tmp_path, monkeypatch,
+                                                               own_processes_only):
+    """A cwd on a dead NFS mount blocks psutil's cwd() with the GIL held (Studio
+    2026-11-03, t_68bd4f4a): the tick skips that pid and still reaps the rest."""
+    import functools
+
+    import hermes_proc_cwd
+
+    ws = kb.workspaces_root("default", stale_pin_ok=True)
+    done_id = kb.create_task(conn, title="done card", assignee="worker")
+    assert kb.claim_task(conn, done_id) is not None
+    assert kb.complete_task(conn, done_id, summary="done")
+    (ws / done_id).mkdir(parents=True)
+    (tmp_path / "nfs").mkdir()
+    hung = _spawn_orphan(tmp_path / "nfs")
+    done_orphan = _spawn_orphan(ws / done_id)
+    # Stand-in for the dead mount: the probe child's cwd() of one pid never returns.
+    monkeypatch.setenv("T68_HUNG_PID", str(hung))
+    monkeypatch.setattr(hermes_proc_cwd, "_PROBE_CHILD", (
+        "import os, time, psutil\n"
+        "_real = psutil.Process.cwd\n"
+        "def _cwd(self):\n"
+        "    if self.pid == int(os.environ['T68_HUNG_PID']):\n"
+        "        time.sleep(600)\n"
+        "    return _real(self)\n"
+        "psutil.Process.cwd = _cwd\n"
+    ) + hermes_proc_cwd._PROBE_CHILD)
+    real_cwd = kb.psutil.Process.cwd
+    # The dispatcher itself must never read that cwd: here it would block for 60 s.
+    monkeypatch.setattr(kb.psutil.Process, "cwd",
+                        lambda self: time.sleep(60) if self.pid == hung else real_cwd(self))
+    monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans", functools.partial(
+        kb.sweep_terminal_workspace_orphans, min_terminal_age=0, grace=2.0, notify=False))
+    kbd._ORPHAN_SWEEP_LAST.clear()
+
+    started = time.monotonic()
+    res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, board="default")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30, f"dispatcher tick held {elapsed:.1f}s behind one hung cwd probe"
+    assert [i["pid"] for i in res.orphans_reaped.get(done_id, [])] == [done_orphan]
+    assert _gone(done_orphan)
+    assert kb._pid_alive(hung), "the orphan with the unreadable cwd must be skipped, not killed"

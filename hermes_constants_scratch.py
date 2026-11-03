@@ -87,16 +87,23 @@ def reap_processes_rooted_in(scratch_root: Path, doomed: list[Path]) -> int:
     targets = [os.path.realpath(str(p)) for p in doomed]
     skip = _own_lineage()
     uid = os.getuid() if hasattr(os, "getuid") else None
-    victims: list[psutil.Process] = []
+    from hermes_proc_cwd import probe_cwds
+
+    mine: list[psutil.Process] = []
     for proc in psutil.process_iter(["pid"]):
         if proc.pid in skip:
             continue
         try:
             if uid is not None and proc.uids().real != uid:
                 continue
-            cwd = proc.cwd()
         except (psutil.Error, OSError):
             continue
+        mine.append(proc)
+    # Out of process: a cwd on a dead NFS mount blocks psutil's cwd() with the GIL held.
+    cwds = probe_cwds(p.pid for p in mine)
+    victims: list[psutil.Process] = []
+    for proc in mine:
+        cwd = cwds.get(proc.pid)
         if not cwd:
             continue
         deleted = cwd.endswith(" (deleted)")

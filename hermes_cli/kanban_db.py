@@ -19396,7 +19396,7 @@ def sweep_terminal_workspace_orphans(
     except Exception:
         return {}
     me, uid = os.getpid(), os.getuid()  # windows-footgun: ok (hasattr-gated above)
-    candidates: dict[str, list] = {}
+    orphans: list = []
     for proc in psutil.process_iter(["pid", "ppid", "uids"]):
         info = proc.info
         pid = info.get("pid") or 0
@@ -19405,12 +19405,17 @@ def sweep_terminal_workspace_orphans(
         # (a 12.8k-process shared host spent seconds per tick on other users' parents).
         if pid <= 1 or pid == me or uids is None or uids.real != uid:
             continue
-        if not _init_parented(proc, info.get("ppid")):
-            continue
-        try:
-            cwd = proc.cwd()
-        except (psutil.Error, OSError):
-            continue
+        if _init_parented(proc, info.get("ppid")):
+            orphans.append(proc)
+    if not orphans:
+        return {}
+    # Out of process: a cwd on a dead NFS mount blocks psutil's cwd() with the GIL held.
+    from hermes_proc_cwd import probe_cwds
+
+    cwds = probe_cwds(p.pid for p in orphans)
+    candidates: dict[str, list] = {}
+    for proc in orphans:
+        cwd = cwds.get(proc.pid)
         if not cwd:
             continue
         try:
