@@ -234,10 +234,19 @@ def test_real_container_is_stopped_by_the_sweep(kanban_home):
             kb.complete_task(conn, tid, summary="ok")
             (act,) = kres.release_finished(conn, notify=_quiet)
             assert act["action"] == "stopped"
-        ps = subprocess.run(["docker", "ps", "-q", "--filter", f"name=^{name}$"], capture_output=True, text=True)
+        ps = subprocess.run(["docker", "ps", "-q", "--filter", f"name=^{name}$"], capture_output=True, text=True,
+                            timeout=20)
         assert ps.stdout.strip() == ""
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        # Bounded: on ci-box 11-03 an untimed `docker rm -f` under a stalled daemon outlived pytest and
+        # spun at ~8 cores for 7h03m. subprocess.run kills the child on TimeoutExpired.
+        try:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            try:
+                subprocess.run(["docker", "kill", name], capture_output=True, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                pass
 
 
 def test_a_resource_another_live_card_still_owns_is_not_stopped(kanban_home):
