@@ -265,29 +265,48 @@ def caller_attribution() -> str:
     return "; ".join(parts)
 
 
-_INTERPRETER = re.compile(r"^(?:(?:ba|z|da|k)?sh|python[0-9.]*)$")
+_SHELL = re.compile(r"^(?:ba|z|da|k)?sh$")
+_PYTHON = re.compile(r"^python[0-9.]*$")
+# Value-less options only (fail closed): -c/-s/-o/-O (shell) and -c/-m/-W/-X (python) are absent on
+# purpose, they mean inline code, a script on stdin, or an option whose next argv is a VALUE.
+_SHELL_SHORT = frozenset("abefhiklmnprtuvxBCEHPT")
+_SHELL_LONG = frozenset({"--login", "--noprofile", "--norc", "--posix", "--restricted",
+                         "--verbose", "--noediting"})
+_PYTHON_SHORT = frozenset("bBdEhiIOPqsSuvVx")
+_SCRIPT_NAME = re.compile(r"^[\w.+-]+\.(?:py|sh|bash|zsh)$")
 
 
 def parent_label(argv: List[str]) -> str:
     """Executable basename, plus the script basename when it is a shell/python interpreter.
 
     The label is persisted (row + journal) and read by other agents, and fleet command lines carry
-    secrets (``bash -c "export X_TOKEN=..."``, tokens as argv). So no argv CONTENT is kept: never a
-    ``-c`` string, never any argument after the script.
+    secrets (``bash -c "export X_TOKEN=..."``, ``bash -s -- --token X``, tokens as argv). So no argv
+    CONTENT is kept. The script is named only when every option before it is a known value-less
+    option and its basename looks like a script; anything else (``-c``, ``-s``, ``-``, ``-m``, an
+    option taking a value, an unknown option) records the executable alone.
     """
     if not argv or not (argv[0] or "").strip():
         return ""
     exe = os.path.basename(argv[0].split()[0])[:64]
-    if not _INTERPRETER.match(exe.lower()):
+    if _SHELL.match(exe.lower()):
+        short, long_ok = _SHELL_SHORT, _SHELL_LONG
+    elif _PYTHON.match(exe.lower()):
+        short, long_ok = _PYTHON_SHORT, frozenset()
+    else:
         return exe
     for arg in argv[1:]:
         if arg == "--":
             continue
+        if arg.startswith("--"):
+            if arg in long_ok:
+                continue
+            return exe
         if arg.startswith("-"):
-            if not arg.startswith("--") and "c" in arg[1:]:
-                return exe  # -c / -lc / -Ic: inline code, nothing recordable
-            continue
-        return f"{exe} {os.path.basename(arg)[:64]}"
+            if len(arg) > 1 and set(arg[1:]) <= short:
+                continue
+            return exe  # "-" (stdin), -c/-s/-m, or an option that takes a value
+        name = os.path.basename(arg)
+        return f"{exe} {name}" if len(name) <= 64 and _SCRIPT_NAME.match(name) else exe
     return exe
 
 

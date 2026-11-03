@@ -62,6 +62,19 @@ def test_reasonless_pause_names_card_session_and_parent(tmp_path):
     (["/opt/py/bin/python3.13", "-u", "-c", "import os; T='s3cret'"], "python3.13"),
     (["zsh", "/Users/x/land-8694.sh", "--token", "s3cret"], "zsh land-8694.sh"),
     (["/usr/local/bin/hermes", "cron", "pause", "J", "--api-key", "s3cret"], "hermes"),
+    (["bash", "-e", "/x/land-8694.sh", "s3cret"], "bash land-8694.sh"),
+    # Script on stdin: every later argv is a positional for the piped script.
+    (["bash", "-s", "--", "--token", "s3cret"], "bash"),
+    (["sh", "-s", "s3cret"], "sh"),
+    (["python3", "-", "s3cret"], "python3"),
+    # Options whose next argv is a value, never a script.
+    (["bash", "-o", "s3cret", "x.sh"], "bash"),
+    (["bash", "--rcfile", "s3cret", "x.sh"], "bash"),
+    (["python3", "-W", "s3cret", "x.py"], "python3"),
+    (["python3", "-X", "s3cret", "x.py"], "python3"),
+    (["python3", "-m", "s3cret"], "python3"),
+    # A non-script-looking first positional is not recorded either.
+    (["bash", "/x/s3cret"], "bash"),
 ])
 def test_parent_label_keeps_no_argv_content(argv, label):
     from cron.lifecycle_journal import parent_label
