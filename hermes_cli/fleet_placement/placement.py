@@ -1403,15 +1403,24 @@ def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: s
         # ``reserved`` is the caller's per-host total (live_reservations), i.e. the same rows the ledger leases
         # carry: a context built HERE from the ledger already holds it, so it is never appended again (Prism
         # cadbb61dcd6a); a caller-supplied ``ctx`` (admit() under its lock, tests) brings its own lease set, and
-        # ``reserved`` is added only when that set does not already book the guest.
+        # ``reserved`` adds only what that set does not already book on the guest.
         raw = ctx if ctx is not None else admit_context(consumer, fp, now=_now(now), root=root, table=table)
         if reserved:
-            # one rule for both branches (Prism 05227baeb76d): an explicit ``reserved`` is kept whenever nothing in
-            # the context already books the guest (an empty ledger, a caller ctx without it), never added twice.
+            # one rule for both branches (Prism 05227baeb76d): the context's leases + reservations on the guest count
+            # first, and only the per-axis shortfall of the explicit total is added, never the whole total on top
+            # and never dropped because the context books part of it (Prism b5bf2173a5b7)
             names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
-            booked = any(str(le.host).lower() in names for le in raw.leases) or raw.reserved_on(spec.name) is not None
-            if not booked:
-                raw = dataclasses.replace(raw, reservations=tuple(raw.reservations) + ((spec.name, reserved),))
+            booked = Footprint(ram_gb=0.0, threads=0.0, scratch_gb=raw.scratch_for(names))
+            for le in raw.leases:
+                if str(le.host).lower() in names:
+                    booked = booked.plus(Footprint(ram_gb=float(le.need.ram_gb), threads=float(le.need.cpus),
+                                                   gpu_mb=float(le.need.gpu_mib)))
+            for h, f in raw.reservations:
+                if str(h).lower() in names:
+                    booked = booked.plus(f)
+            short = Footprint(*(max(0.0, getattr(reserved, k) - getattr(booked, k)) for k in FOOTPRINT_KEYS))
+            if any(getattr(short, k) > 0 for k in FOOTPRINT_KEYS):
+                raw = dataclasses.replace(raw, reservations=tuple(raw.reservations) + ((spec.name, short),))
         cpus = float(fp.threads)
     one = guest_vm_refusal(spec, raw, cpus)
     if one:
