@@ -815,6 +815,9 @@ def _run_job_script(
                     return False, "Script cancelled because cron fire ownership was lost"
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    # Elapsed at the deadline, not after the kill: tree-kill (worker-spare board
+                    # reads, TERM->KILL escalation) can take seconds on a loaded host.
+                    timed_out_after = int(time.monotonic() - _started)
                     _terminate_cron_script_tree(proc)
                     _drain_script_pipes(proc)
                     # Phase 4a (#85125): a script timeout must leave ZERO living descendants. killpg only
@@ -825,7 +828,7 @@ def _run_job_script(
                     # tree-kill (#85147, d6a5cb9725).
                     logger.warning(
                         "PHASE=cron_script_timeout job=%s elapsed=%d timeout=%d script=%s",
-                        job_name or path.name, int(time.monotonic() - _started),
+                        job_name or path.name, timed_out_after,
                         script_timeout, path.name,
                     )
                     return False, f"Script timed out after {script_timeout}s: {path}"
