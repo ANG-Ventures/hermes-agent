@@ -472,14 +472,23 @@ def _class_verdict(plan, n: str, job: Optional[placement.Job], *, now: float, le
     root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
     hid = table.resolve(n) or n
     s = sample_from_detail(plan.detail.get(n) or {})
+    stale_after = float(sig.policy.stale_after_s)
+    # t_1e097d62: the plan's sample is stamped when plan_pool ran; a take minutes later (2026-11-02 Studio: plan ->
+    # dispatch p90 119 s, max 278 s) must not refuse closed:stale on THAT age alone. When it aged out, may_start reads
+    # the collector's var/fleet-pressure.json (samples=None), re-sampled every period; a stale collector still refuses.
+    if s is not None and s.status == "fresh" and s.at is not None and now - float(s.at) > stale_after:
+        s = None
+        fallback = True
+    else:
+        fallback = False
     try:
         if leases is None:
             leases, admitted = _with_simulated(plan, hid, job, now=now, root=root)
         # the freshness bound the scorer uses (choose(stale_after_s=...) above), never a shared default:
         # a 60-120 s-old push the kanban policy calls fresh must not read closed:stale here (Prism 5113510bdb9a)
         return placement.may_start(hid, CONSUMER, job=job, table=table, now=now, root=root,
-                                   samples={hid: s} if s is not None else {},
-                                   stale_after_s=float(sig.policy.stale_after_s), leases=leases, admitted=admitted)
+                                   samples=None if fallback else ({hid: s} if s is not None else {}),
+                                   stale_after_s=stale_after, leases=leases, admitted=admitted)
     except placement.PlacementError as exc:      # corrupt ledger / table row: fail closed for that host
         return False, f"closed:{type(exc).__name__}: {exc}"
 
