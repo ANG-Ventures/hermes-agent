@@ -105,6 +105,22 @@ def test_local_write_after_the_proof_holds_the_tree(board, monkeypatch):
     assert (ws / "late.py").exists()
 
 
+def test_local_second_edit_of_already_dirty_file_after_the_proof_holds(board, monkeypatch):
+    """Prism 1717131e9d0a: a tracked file that was ALREADY dirty keeps its ` M` status line when it is edited
+    again after the proof, so a records-only comparison misses it; the lstat fingerprint (mtime_ns, size) of
+    every status entry must catch the second edit."""
+    tid, ws = local_card(board)
+    (ws / "code.py").write_text("value = 2\n")          # dirty before the proof (captured as the patch)
+    real_push = ks.push_unpushed_survivor
+
+    def late_edit(conn, task_id, workspace):
+        real_push(conn, task_id, workspace)
+        (ws / "code.py").write_text("value = 3  # edited again after the proof\n")
+    monkeypatch.setattr(ks, "push_unpushed_survivor", late_edit)
+    assert not ks.remove_workspace_dir(board, tid, ws)
+    assert (ws / "code.py").read_text().startswith("value = 3")
+
+
 def test_local_mutation_without_residue_branch_holds(board, monkeypatch):
     """Mutation: with the residue classifier dropped, the same fixture is captured as work again."""
     monkeypatch.setattr(ks, "_is_residue", lambda path: False)

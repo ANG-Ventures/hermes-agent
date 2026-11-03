@@ -460,7 +460,26 @@ def _status_records(repo):
         out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored",
                    "--ignore-submodules=none").stdout.decode("utf-8", "surrogateescape")
         hit = _STATUS_CACHE[key] = [rec for rec in out.split("\0") if rec]
+        _STAT_CACHE[key] = _status_fingerprint(repo, hit)
     return hit
+
+
+_STAT_CACHE: dict = {}
+
+
+def _status_fingerprint(repo, recs):
+    """{path: (mtime_ns, size)} of every status entry, read with lstat (no spawn). A tracked file that was
+    already dirty and is edited AGAIN after the proof keeps its status line (` M x`) but not its mtime/size
+    (Prism 1717131e9d0a); the pre-rmtree re-check compares this alongside the records."""
+    out = {}
+    for rec in recs:
+        rel = rec[3:].rstrip("/")
+        try:
+            st = os.lstat(os.path.join(repo, rel))
+            out[rel] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            out[rel] = None
+    return out
 
 
 def _residue_only(repo):
@@ -3365,6 +3384,7 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
     from hermes_cli.kanban_delegations_board import conn_is_delegations
 
     _STATUS_CACHE.clear()   # the residue status read lives for ONE preserve call, never across completions
+    _STAT_CACHE.clear()
     if conn_is_delegations(conn) and not cleanup:
         # A background unit's card works IN the session's cwd (a user's tree, often a home dir);
         # its output is the delegation registry record, never the directory's bytes.
@@ -3934,6 +3954,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
     defeat survivorship. Linked worktrees retain Git's no-force dirty check.
     """
     _STATUS_CACHE.clear()   # fresh status for this deletion decision (see _status_records)
+    _STAT_CACHE.clear()
     try:
         if remote_host is not None:
             import shlex
@@ -3977,10 +3998,13 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
             # the capture saw: a NEW or CHANGED entry is work that landed after the proof (the captured
             # dirt itself is covered by the patch just preserved, so equality is the test, not residue).
             before = {k: list(v) for k, v in _STATUS_CACHE.items()}
+            before_fp = dict(_STAT_CACHE)
             _STATUS_CACHE.clear()
+            _STAT_CACHE.clear()
             for repo in _repos(workspace):
-                seen = before.get(os.fspath(repo))
-                if seen is not None and _status_records(repo) != seen:
+                k = os.fspath(repo)
+                seen = before.get(k)
+                if seen is not None and (_status_records(repo) != seen or _STAT_CACHE.get(k) != before_fp.get(k)):
                     raise SurvivorUnavailable(
                         "survivor_unavailable: workspace changed after its proof "
                         f"({str(repo.relative_to(workspace)) or '.'})")
