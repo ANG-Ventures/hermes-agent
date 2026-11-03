@@ -90,6 +90,21 @@ def test_local_residue_removed_by_the_deleter(board):
     assert not kb.list_attachments(board, tid)  # residue is rmtree'd, never preserved
 
 
+def test_local_write_after_the_proof_holds_the_tree(board, monkeypatch):
+    """Prism 1ad439690afa: a file written AFTER the proof (during the capture / push) but before rmtree is
+    real work; the deleter re-reads status uncached right before the bytes go and holds."""
+    tid, ws = local_card(board)
+    residue(ws)
+    real_push = ks.push_unpushed_survivor
+
+    def late_write(conn, task_id, workspace):
+        real_push(conn, task_id, workspace)
+        (ws / "late.py").write_text("written after the proof\n")
+    monkeypatch.setattr(ks, "push_unpushed_survivor", late_write)
+    assert not ks.remove_workspace_dir(board, tid, ws)
+    assert (ws / "late.py").exists()
+
+
 def test_local_mutation_without_residue_branch_holds(board, monkeypatch):
     """Mutation: with the residue classifier dropped, the same fixture is captured as work again."""
     monkeypatch.setattr(ks, "_is_residue", lambda path: False)

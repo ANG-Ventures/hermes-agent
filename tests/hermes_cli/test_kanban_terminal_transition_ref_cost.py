@@ -104,7 +104,15 @@ def _spawns_during(monkeypatch, fn):
 # (`git for-each-ref --contains <recorded base> refs/remotes`, in
 # `_recorded_base`). Measured flat: 40 spawns at 6 heads and 40 at 60 (main
 # was 38 at both).
-SPAWN_CEILING = 45
+#
+# Raised 45 -> 50 for t_71ed4ae8 (residue classifier in the survivor proof),
+# which added FIXED calls per `preserve`: one `git status` (cached across the
+# dirty check and both residue proofs, see `_status_records`), one
+# `git ls-files -v` (skip-worktree / assume-unchanged flags), and ONE more
+# uncached status re-read right before `rmtree` (Prism 1ad439690afa, a write
+# that lands after the proof is real work). Measured flat: 45 spawns at 6
+# heads and 45 at 60.
+SPAWN_CEILING = 50
 
 
 def test_complete_is_not_starved_by_ref_count(board, monkeypatch):

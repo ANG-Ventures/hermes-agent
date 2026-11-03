@@ -3972,6 +3972,15 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             preserve(conn, task_id, cleanup=True, workspace=workspace)
             push_unpushed_survivor(conn, task_id, workspace)
+            # Prism 1ad439690afa: the proof above ran on a status read cached for the capture; the push
+            # and the capture itself took time. Re-read every repository ONCE more, uncached, right
+            # before the bytes go: a write that landed meanwhile is real work, not residue.
+            _STATUS_CACHE.clear()
+            for repo in _repos(workspace):
+                if _status_records(repo) and not _residue_only(repo):
+                    raise SurvivorUnavailable(
+                        "survivor_unavailable: workspace changed after its proof "
+                        f"({str(repo.relative_to(workspace)) or '.'})")
         if worktree_root is not None:
             # Preserve upstream's handle-release retry, still without --force.
             result = _git(worktree_root, "worktree", "remove", str(workspace), check=False)
