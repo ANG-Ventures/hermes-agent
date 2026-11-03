@@ -430,6 +430,7 @@ def _text(content: Any) -> str:
     return content if isinstance(content, str) else json.dumps(content)
 
 
+@pytest.mark.slow_test(110, reason="x2 the worst of 54.8 and 50.0 s calls measured for [provider_hang] on the X64 e2e lane (ace-media-ang-ventures-org-27/-25, mirror runs 41579368233/41582875670): the first selected scenario waits on the module pool's gateway boots plus its own hang turn")
 @pytest.mark.parametrize("scenario_id", list(BY_ID))
 def test_agent_turn_liveness(scenario_id: str, runs: dict[str, Future]) -> None:
     sc = BY_ID[scenario_id]

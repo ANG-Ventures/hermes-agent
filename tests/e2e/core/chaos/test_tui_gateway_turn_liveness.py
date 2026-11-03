@@ -456,6 +456,7 @@ def scenario_futures(request: pytest.FixtureRequest, tmp_path_factory: pytest.Te
                 fut.cancel()
 
 
+@pytest.mark.slow_test(135, reason="x2 the worst of 67.1 and 63.0 s calls measured for [provider_hang] on the X64 e2e lane (ace-media-ang-ventures-org-27/-25, mirror runs 41579368233/41582875670): the first selected scenario waits on the module pool's gateway boots plus its own hang turn")
 @pytest.mark.parametrize("scn", [pytest.param(s, id=s.id) for s in SCENARIOS])
 def test_tui_gateway_turn_stays_live_under_fault(scn: Scenario, scenario_futures) -> None:
     stats = scenario_futures[scn.id].result(timeout=WARMUP_DEADLINE_S + 3 * TURN_DEADLINE_S + 120)
