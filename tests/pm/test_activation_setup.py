@@ -58,6 +58,9 @@ def test_activation_real_setup_pm_lifecycle(tmp_path, served):
         "HERMES_RUNTIME_DIR": str(runtime), "SHELL": bash, "TMPDIR": str(scratch),
         "XDG_CONFIG_HOME": str(home / ".config"), "XDG_CACHE_HOME": str(home / ".cache"),
         "LANG": "C.UTF-8", "PYTHONNOUSERSITE": "1", "UV_OFFLINE": "1",
+        # the hand-built env drops the session-wide MALLOC_ARENA_MAX (tests/pm/conftest.py); uv needs it
+        # under the harness RLIMIT_AS on many-core hosts or `uv sync` aborts mid-install (ace-media, 32t)
+        "MALLOC_ARENA_MAX": "2",
         "UV_CACHE_DIR": str(home / ".cache" / "uv"), "UV_PYTHON_DOWNLOADS": "never",
     }
     for name in ("activate", "setup-hermes.sh", "hermes_constants.py", "hermes_yaml.py", "utils.py"):
