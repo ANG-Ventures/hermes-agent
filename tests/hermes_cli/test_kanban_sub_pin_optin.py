@@ -334,6 +334,12 @@ def test_capped_pin_waits_by_default(kanban_home, monkeypatch):
 
 def test_capped_pin_with_fallback_rides_family_pool(kanban_home, monkeypatch):
     _cap_pinned_sub(monkeypatch)
+    # The family pool is admissible: a relay with free slots. Without this the
+    # test probes the host's real relay /health, and an unreachable relay reads
+    # as 0 free slots (relay_free_slots), which holds the pin on a CI runner
+    # (t_f1a3e390).
+    monkeypatch.setattr(ph, "_fetch", lambda url, cache, provider: {
+        "eligible_count": 4, "max_inflight": 8, "active_turns": 0})
     with kb.connect_closing() as conn:
         tid = _pinned_card(conn, fallback=True)
         seen = []
