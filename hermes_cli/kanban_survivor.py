@@ -3972,12 +3972,15 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
                 raise SurvivorUnavailable("survivor_unavailable: recovery storage inside deletion target")
             preserve(conn, task_id, cleanup=True, workspace=workspace)
             push_unpushed_survivor(conn, task_id, workspace)
-            # Prism 1ad439690afa: the proof above ran on a status read cached for the capture; the push
-            # and the capture itself took time. Re-read every repository ONCE more, uncached, right
-            # before the bytes go: a write that landed meanwhile is real work, not residue.
+            # Prism 1ad439690afa: the capture + push took time after the proof's status read. Re-read
+            # every repository ONCE more, uncached, right before the bytes go, and compare it to what
+            # the capture saw: a NEW or CHANGED entry is work that landed after the proof (the captured
+            # dirt itself is covered by the patch just preserved, so equality is the test, not residue).
+            before = {k: list(v) for k, v in _STATUS_CACHE.items()}
             _STATUS_CACHE.clear()
             for repo in _repos(workspace):
-                if _status_records(repo) and not _residue_only(repo):
+                seen = before.get(os.fspath(repo))
+                if seen is not None and _status_records(repo) != seen:
                     raise SurvivorUnavailable(
                         "survivor_unavailable: workspace changed after its proof "
                         f"({str(repo.relative_to(workspace)) or '.'})")
