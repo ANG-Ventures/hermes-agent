@@ -4850,7 +4850,7 @@ def _workspace_binds(conn, rows, *, dry_run: bool = False) -> dict:
 
 
 def _lineage_pins_mode() -> str:
-    """``kanban.placement.lineage_pins``, read per tick (default ``kinds``)."""
+    """``kanban.placement.lineage_pins``, read per tick (default ``none``)."""
     from hermes_cli import kanban_placement_reasons as _pr
     try:
         from hermes_cli.config import load_config_readonly

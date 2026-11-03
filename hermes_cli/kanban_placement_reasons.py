@@ -87,20 +87,23 @@ PLACEMENT_WAIT_EPISODE_END_KINDS = frozenset({
     "deferred", "archived", "assigned",
 })
 
-# kanban.placement.lineage_pins (read per tick). ``kinds`` (default): only a
-# link kind that can share a workspace holds a card local; ``legacy``: any
-# link does, with the bare ``linked`` reason (the pre-t_ae87edff behaviour);
-# ``none``: links never hold a card (spec Phase 2b-i), only the workspace
-# binds do. An UNKNOWN value reads as ``legacy`` (the safe side of a kill
+# kanban.placement.lineage_pins (read per tick). ``none`` (default): links
+# never hold a card (spec Phase 2b-i), only the workspace binds do
+# (``workspace_of`` / ``workspace_shared``); ``kinds`` (opt-in co-location):
+# a live link kind that can share a workspace holds a card local; ``legacy``:
+# any link does, with the bare ``linked`` reason (the pre-t_ae87edff
+# behaviour). An UNKNOWN value reads as ``legacy`` (the safe side of a kill
 # switch: pin local), with one WARN per value per 5 min. Placement only:
 # retention has its own switch (kanban.workspace.retention_key).
 LINEAGE_PINS_KINDS = "kinds"
 LINEAGE_PINS_LEGACY = "legacy"
 LINEAGE_PINS_NONE = "none"
 LINEAGE_PINS_MODES = (LINEAGE_PINS_KINDS, LINEAGE_PINS_LEGACY, LINEAGE_PINS_NONE)
-# ``none`` becomes the default only after P0-7 (spec §7 Phase 0) posts a
-# pool-profile blocks rate at or under 1%.
-LINEAGE_PINS_DEFAULT = LINEAGE_PINS_KINDS
+# ``none`` since t_6ff07b3d: under ``kinds`` a parent whose blocks child had not
+# started could run only on the Studio, whatever headroom the pool had (Ace's
+# standing rule 10-19: placement weighs every pool box, a blocks edge does not
+# pin). Kill switch: ``kanban.placement.lineage_pins: kinds``.
+LINEAGE_PINS_DEFAULT = LINEAGE_PINS_NONE
 LINEAGE_PINS_UNKNOWN = LINEAGE_PINS_LEGACY
 UNKNOWN_SWITCH_WARN_SECONDS = 300
 _unknown_switch_warned: Dict[tuple, float] = {}

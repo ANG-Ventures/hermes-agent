@@ -47,6 +47,14 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+@pytest.fixture
+def lineage_kinds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt-in co-location (``kanban.placement.lineage_pins: kinds``) for the
+    link-hold tests; the default is ``none`` (t_6ff07b3d)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    monkeypatch.setattr(kbd, "_lineage_pins_mode", lambda: _pr.LINEAGE_PINS_KINDS)
+
+
 # KWLB v0.1 contract: the Phase 1b pressure reader off (its tests live in
 # test_kanban_target_pressure.py).
 V01 = {"placement": {"read_signal": False}}
@@ -416,7 +424,7 @@ def test_rc1_pinned_worktree_waits_and_never_spawns_locally(kanban_home):
     assert spawned == [] and res.placement_waits[wt] == "not_portable:workspace_kind"
 
 
-def test_rc1_linked_card_with_host_any_is_not_placed(kanban_home):
+def test_rc1_linked_card_with_host_any_is_not_placed(kanban_home, lineage_kinds):
     with kb.connect_closing() as conn:
         (parent,) = _make(conn, 1, assignee="beta")
         (child,) = _make(conn, 1, body="host:any")
@@ -454,7 +462,7 @@ def test_derived_from_child_with_host_any_places_on_pool(kanban_home):
     assert (child, "ace-ai") in res.placed
 
 
-def test_blocks_child_is_not_portable_and_names_the_link(kanban_home):
+def test_blocks_child_is_not_portable_and_names_the_link(kanban_home, lineage_kinds):
     """(b) A gating child may read its parent's retained local workspace."""
     with kb.connect_closing() as conn:
         (parent,) = _make(conn, 1, assignee="beta")
@@ -497,7 +505,7 @@ def test_terminal_child_does_not_pin_its_live_parent(kanban_home):
         assert parent not in kbd._linked_ids(conn, [parent])
 
 
-def test_live_far_end_still_pins_beside_a_terminal_one(kanban_home):
+def test_live_far_end_still_pins_beside_a_terminal_one(kanban_home, lineage_kinds):
     """A terminal edge is skipped, never the card: a second, live blocks edge
     still holds it and is the one named."""
     with kb.connect_closing() as conn:
@@ -525,7 +533,7 @@ def test_parent_with_outgoing_after_merge_edge_is_placeable(kanban_home):
     assert (parent, "ace-ai") in spawned and parent not in res.placement_waits
 
 
-def test_child_of_unmerged_after_merge_parent_is_not_placeable(kanban_home):
+def test_child_of_unmerged_after_merge_parent_is_not_placeable(kanban_home, lineage_kinds):
     """The other direction still gates: the child is demoted to todo by the
     link (never spawned) and its incoming edge still names it linked."""
     with kb.connect_closing() as conn:
@@ -580,7 +588,7 @@ def test_human_review_lane_rows_are_dropped_before_routing(kanban_home, monkeypa
     assert (work, "ace-ai") in spawned
 
 
-def test_legacy_null_kind_link_still_holds_local(kanban_home):
+def test_legacy_null_kind_link_still_holds_local(kanban_home, lineage_kinds):
     """A NULL kind reads as ``blocks`` (normalize_link_kind), never un-holds."""
     with kb.connect_closing() as conn:
         (parent,) = _make(conn, 1, assignee="beta")
@@ -602,7 +610,7 @@ def test_parent_of_derived_from_child_is_portable(kanban_home):
         assert kbd._linked_ids(conn, [parent, _child]) == {}
 
 
-def test_dry_run_prints_the_placement_wait_reason(kanban_home, capsys, monkeypatch):
+def test_dry_run_prints_the_placement_wait_reason(kanban_home, lineage_kinds, capsys, monkeypatch):
     """(d) `kanban dispatch --dry-run` says WHY a ready card was held."""
     from hermes_cli import kanban_ops as kops
     with kb.connect_closing() as conn:
@@ -633,7 +641,7 @@ def _placement_waits(conn, tid):
         (tid,))]
 
 
-def test_placement_wait_event_written_once_then_deduplicated(kanban_home, monkeypatch):
+def test_placement_wait_event_written_once_then_deduplicated(kanban_home, lineage_kinds, monkeypatch):
     """Spec t_1cca39e1 (b): {reason, route, host, since}; a repeat within 900 s
     writes nothing, a dry run writes nothing, an aged repeat keeps ``since``."""
     with kb.connect_closing() as conn:
@@ -658,7 +666,7 @@ def test_placement_wait_event_written_once_then_deduplicated(kanban_home, monkey
     assert len(evs) == 2 and evs[1]["since"] == ev["since"]
 
 
-def test_placement_wait_new_episode_after_run_is_not_deduplicated(kanban_home, monkeypatch):
+def test_placement_wait_new_episode_after_run_is_not_deduplicated(kanban_home, lineage_kinds, monkeypatch):
     """Prism 331b10c66fe9: hold -> card runs -> back to ready with the same
     reason is a NEW wait episode: a fresh event (even inside 900 s) whose
     ``since`` is the new hold's start, never the first episode's."""
@@ -716,15 +724,23 @@ def test_lineage_pins_legacy_is_todays_routing(kanban_home, monkeypatch):
     }
 
 
-def test_lineage_pins_default_is_kinds(kanban_home, monkeypatch):
-    # Unset -> the default. (An unrecognised value now reads as ``legacy``,
-    # spec v1.2 §6 parse correction, t_6d5bc652: AC-21 owns that case.)
+def test_unset_lineage_pins_lets_a_blocks_parent_use_pool_headroom(kanban_home, monkeypatch):
+    """t_6ff07b3d (Ace 11-01 23:25): a ready parent whose ``blocks`` child has
+    not started is held by no link when ``lineage_pins`` is unset, so when the
+    Studio has no allowance it goes to the pool host with headroom. Under the
+    old ``kinds`` default it was route ``local`` and waited ``local_full``.
+    An unrecognised value reads as ``legacy`` (AC-21 owns that case)."""
     from hermes_cli import config as _config
     monkeypatch.setattr(_config, "load_config_readonly", lambda: {"kanban": {}})
     with kb.connect_closing() as conn:
-        _parent, child = _derived(conn, child_body="host: any")
-        row = conn.execute("SELECT * FROM tasks WHERE id=?", (child,)).fetchone()
+        (parent,) = _make(conn, 1)  # alpha: the pool allowlist, so only links can hold it
+        (child,) = _make(conn, 1, assignee="beta", parents=[parent])
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0] == "todo"
+        assert kbd._linked_ids(conn, [parent]) == {}
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (parent,)).fetchone()
         assert kbd._route_row(conn, row, _plan(free=2)) == ("portable", None)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert (parent, "ace-ai") in spawned and parent not in res.placement_waits
 
 
 def test_review_rows_spawn_locally_only(kanban_home, monkeypatch):
@@ -1214,7 +1230,7 @@ def test_ignored_pin_warns_once_per_card_per_5_minutes(monkeypatch, caplog):
     assert len(msgs) == 3 and all("ignored unknown host pin" in m for m in msgs)
 
 
-def test_link_scan_binds_under_the_sqlite_variable_limit(kanban_home):
+def test_link_scan_binds_under_the_sqlite_variable_limit(kanban_home, lineage_kinds):
     """(B) 1200 ids on a real sqlite capped at the historical 999 variables."""
     import sqlite3
     with kb.connect_closing() as conn:
@@ -1225,7 +1241,7 @@ def test_link_scan_binds_under_the_sqlite_variable_limit(kanban_home):
         assert kbd._linked_ids(conn, ids) == {a: ("blocks", b), b: ("blocks", a)}
 
 
-def test_link_reason_is_stable_across_ready_order_and_chunks(kanban_home):
+def test_link_reason_is_stable_across_ready_order_and_chunks(kanban_home, lineage_kinds):
     """Prism 9457394f1922: a card with two pinning links names the SAME edge
     whatever the ready-row order, even when the other endpoint lands in an
     earlier 250-id chunk than the card itself."""
