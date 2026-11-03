@@ -309,7 +309,7 @@ def _operator_lane_attribution(repo: str, number: int, sha: str, status: dict,
     agent, lane = match[1], match[2]
     try:
         cfg = json.loads((Path(get_default_hermes_root()) / "config" / "operator-approvers.json")
-                         .read_text(encoding="utf-8"))
+                         .read_text(encoding="utf-8-sig"))
         approvers = cfg.get("approvers") if isinstance(cfg, dict) else None
     except (OSError, ValueError):
         return None

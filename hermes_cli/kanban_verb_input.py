@@ -99,7 +99,7 @@ def _parent_args() -> str:
     except OSError:
         pass
     return subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(ppid)], capture_output=True,
-                          text=True, timeout=5).stdout
+                          text=True, encoding="utf-8", errors="replace", timeout=5).stdout
 
 
 def _typed_in_agent_shell() -> bool:
