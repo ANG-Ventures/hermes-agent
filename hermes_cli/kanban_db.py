@@ -16436,12 +16436,17 @@ def triage_resolve_task(
 def _card_recorded_pr_refs(conn: sqlite3.Connection, task_id: str, runs=None) -> list:
     """Every PR string any of the card's runs persisted (``kanban_open_pr.recorded_pr_refs``): pr_url /
     pr_urls / pr, auto_routed_open_prs and survivor PR evidence. The card's own PRs for the closed-unmerged
-    gates (FleetReview #1339), so neither done nor archive depends on which key carried the ref."""
+    gates (FleetReview #1339), so neither done nor archive depends on which key carried the ref.
+
+    A PR a superseded park replaced (its ``routed_pr_superseded`` event) is dropped per reference from every run,
+    ended ones included: the successor stands in for it, so ``release_merged_edges`` releases after-merge children
+    once the successor merges (Prism e9ba3e150e29)."""
     from hermes_cli import kanban_open_pr as _open_pr
+    from hermes_cli import kanban_superseded_open as _sopen
     out: list = []
     for run in (list_runs(conn, task_id) if runs is None else runs):
         out.extend(_open_pr.recorded_pr_refs(run.metadata))
-    return out
+    return _sopen.honour_successors(conn, task_id, out)
 
 
 def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=None) -> None:

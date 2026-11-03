@@ -176,7 +176,12 @@ def sha_close_covers(pr_key: str, shas, *, thread_fn: Optional[ThreadFn] = None,
                      files_fn: Optional[Callable] = None, pr_files_fn: Optional[Callable] = None) -> Optional[str]:
     """t_87e32ff7: the sha (one of ``shas``) the closed PR's own trusted ``CLOSED: SUPERSEDED-BY <sha>`` names, when
     that ONE commit touched EVERY file the PR changes (Prism 1da76026aee9: never a file that only the tip carries);
-    else None. The 4729 shape (a commit on main that touched 1 of the PR's 14 files) is still refused."""
+    else None. The 4729 shape (a commit on main that touched 1 of the PR's 14 files) is still refused.
+
+    Prism a431ad52d1d8: the EXACT sha returned must be reachable from the default branch. ``verify()`` tracks
+    unreadability per PR, not per candidate, so this sha's own content check may never have run (and with it the
+    ancestry check); False or unreadable refuses it."""
+    from hermes_cli import kanban_open_pr as _open_pr
     thread_fn = thread_fn or _default_thread()
     live = not os.environ.get("PYTEST_CURRENT_TEST")
     files_fn = files_fn or (commit_files if live else None)
@@ -199,7 +204,8 @@ def sha_close_covers(pr_key: str, shas, *, thread_fn: Optional[ThreadFn] = None,
         if not (sha.startswith(named) or named.startswith(sha)):
             continue
         got = files_fn(repo, sha)
-        if got and got[0].startswith(named) and set(paths) <= got[1]:
+        if got and got[0].startswith(named) and set(paths) <= got[1] \
+                and _open_pr.sha_on_default(repo, got[0]) is True:
             return got[0]
     return None
 
@@ -207,18 +213,30 @@ def sha_close_covers(pr_key: str, shas, *, thread_fn: Optional[ThreadFn] = None,
 _PR_KEYS = ("pr_url", "pr_urls", "pr")
 
 
+def _filter_ref_string(s, closed: set, open_pr):
+    """``s`` unchanged when it names no superseded PR; else only its unaffected refs (``owner/repo#N``, space
+    joined), or None when none remain. Filtered per REFERENCE: a string naming a superseded PR and an unaffected
+    one keeps the unaffected one only (Prism "Stale references")."""
+    refs = open_pr.extract_pr_refs(s) if isinstance(s, str) else []
+    if not any(f"{r.repo}#{r.number}".lower() in closed for r in refs):
+        return s
+    kept = [f"{r.repo}#{r.number}" for r in refs if f"{r.repo}#{r.number}".lower() not in closed]
+    return " ".join(dict.fromkeys(kept)) or None
+
+
 def _drop_closed_refs(meta: dict, closed: set, open_pr) -> dict:
     """``meta`` with every superseded PR removed from the PR declaration keys ``recorded_pr_refs`` reads first
     (Prism 41184b66e3f3), so ``_routed_pr_head`` never picks the CLOSED PR; unaffected PRs stay."""
-    def _is_closed(s) -> bool:
-        refs = open_pr.extract_pr_refs(s) if isinstance(s, str) else []
-        return bool(refs) and all(f"{r.repo}#{r.number}".lower() in closed for r in refs)
     for key in _PR_KEYS:
         val = meta.get(key)
-        if isinstance(val, str) and _is_closed(val):
-            meta.pop(key)
+        if isinstance(val, str):
+            val = _filter_ref_string(val, closed, open_pr)
+            if val:
+                meta[key] = val
+            else:
+                meta.pop(key)
         elif isinstance(val, (list, tuple)):
-            kept = [v for v in val if not _is_closed(v)]
+            kept = [k for k in (_filter_ref_string(v, closed, open_pr) for v in val) if k]
             if kept:
                 meta[key] = kept
             else:
@@ -226,14 +244,53 @@ def _drop_closed_refs(meta: dict, closed: set, open_pr) -> dict:
     return meta
 
 
+def superseded_prs(conn: sqlite3.Connection, task_id: str) -> set:
+    """Lower-cased ``owner/repo#N`` of every PR a park of this card replaced (Prism e9ba3e150e29). Read from the
+    ``routed_pr_superseded`` EVENTS :func:`park` writes, never from run metadata, which a worker controls."""
+    out: set = set()
+    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+                                   (task_id, "routed_pr_superseded")):
+        try:
+            data = json.loads(payload or "{}")
+        except ValueError:
+            continue
+        for t in (data.get("targets") or ()) if isinstance(data, dict) else ():
+            if isinstance(t, dict) and isinstance(t.get("closed"), str):
+                out.add(t["closed"].lower())
+    return out
+
+
+def honour_successors(conn: sqlite3.Connection, task_id: str, refs: list) -> list:
+    """``refs`` (recorded PR strings) with every PR a park superseded filtered out per reference, so the
+    historical readers (closed-unmerged gates, after-merge release) judge the successor, not the closed PR."""
+    from hermes_cli import kanban_open_pr as _open_pr
+    closed = superseded_prs(conn, task_id)
+    if not closed:
+        return refs
+    return [k for k in (_filter_ref_string(s, closed, _open_pr) for s in refs) if k]
+
+
+def _prior_routed_artifacts(conn: sqlite3.Connection, task_id: str) -> list:
+    """``routed_artifacts`` of the latest ``review_requested`` run (the handoff a park replaces)."""
+    row = conn.execute("SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'review_requested' "
+                       "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    try:
+        data = json.loads(row[0]) if row and row[0] else {}
+    except (TypeError, ValueError):
+        return []
+    got = data.get("routed_artifacts") if isinstance(data, dict) else None
+    return [str(a) for a in got] if isinstance(got, list) else []
+
+
 def _implementer(conn: sqlite3.Connection, task_id: str, trow, kb) -> Optional[str]:
-    """The card's implementer. A card already handed to review is assigned to its REVIEWER, so when the latest
-    ``review_requested`` names the current assignee as reviewer, its recorded implementer wins (Prism
-    3cf9606f6d32); otherwise the current run's profile, then the assignee."""
+    """The card's implementer. A card already handed to review is assigned to its REVIEWER, so its latest
+    ``review_requested`` implementer wins (Prism 3cf9606f6d32), also when the reviewer was reassigned since and the
+    assignee matches no recorded reviewer (Prism "Preserve implementer provenance across reviewer swaps");
+    otherwise the current run's profile, then the assignee."""
     ev = kb._latest_event(conn, task_id, "review_requested")
     payload = kb._json_dict(kb._row_get(ev, "payload")) if ev is not None else {}
     handed = kb._nonblank_str(payload.get("implementer"))
-    if handed and str(payload.get("reviewer") or "") == str(trow["assignee"] or ""):
+    if handed and (trow["status"] == "review" or str(payload.get("reviewer") or "") == str(trow["assignee"] or "")):
         return handed
     if trow["current_run_id"] is not None:
         arow = conn.execute("SELECT profile FROM task_runs WHERE id = ?", (trow["current_run_id"],)).fetchone()
@@ -282,6 +339,13 @@ def park(conn: sqlite3.Connection, task_id: str, targets: list, *, expected_run_
             args += (int(expected_run_id),)
         if conn.execute(sql, args).rowcount != 1:
             return False
+        # Prism 5c1df35e7d7f: the replaced handoff's deliverables ride on (prior first, deduped), since the
+        # approving `completed` event reads routed_artifacts from the LATEST review_requested run only.
+        mine = meta.get("routed_artifacts")
+        carried = list(dict.fromkeys(_prior_routed_artifacts(conn, task_id)
+                                     + ([str(a) for a in mine] if isinstance(mine, list) else [])))
+        if carried:
+            meta["routed_artifacts"] = carried
         run_id = kb._end_or_synthesize_run(conn, task_id, outcome="review_requested", status="review",
                                            summary=text, metadata=meta, synthesize=True, profile=implementer)
         kb._append_event(conn, task_id, "review_requested",
