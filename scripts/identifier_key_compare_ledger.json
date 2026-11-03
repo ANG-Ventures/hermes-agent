@@ -347,6 +347,16 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
    "where": "hermes_cli/kanban_open_pr.py:467 supersedes"
   },
+  "hermes_cli/kanban_superseded_open.py::_pr_key::fold::repo::return (str(repo).lower() if repo is not None else None), int(number)": {
+   "verdict": "kept",
+   "why": "the module's ONE canonical PR key: GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; every compare in the module is exact on it, and byte-exact would split one PR in two.",
+   "where": "hermes_cli/kanban_superseded_open.py:36 _pr_key"
+  },
+  "hermes_cli/kanban_superseded_open.py::sha_close_covers::affix::sha::if not (sha.startswith(named) or named.startswith(sha)):": {
+   "verdict": "kept",
+   "why": "abbreviated-vs-full commit id: the close record names a 7-40 hex sha and the card's shas may be short or full, and an abbreviated git sha IS a prefix of the full one. The prefix only picks a candidate; the commit is then resolved over REST and its full sha must start with the named one and cover every PR file before it is accepted.",
+   "where": "hermes_cli/kanban_superseded_open.py:199 sha_close_covers"
+  },
   "hermes_cli/kanban_open_pr.py::unmerged_refs::fold::repo::if (ref.repo.lower(), ref.number) not in primary_keys:": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
@@ -621,16 +631,6 @@
    "verdict": "kept",
    "why": "`%<number>%` is a candidate prefilter on run-metadata JSON; each matched row is re-parsed by _run_meta_pr_keys and intersected with the exact `owner/repo#N` key, so the LIKE cannot admit a wrong PR.",
    "where": "hermes_cli/kanban_sign_grants.py:188 authored_pr_keys"
-  },
-  "hermes_cli/kanban_superseded_open.py::_pr_key::fold::repo::return (str(repo).lower() if repo is not None else None), int(number)": {
-   "verdict": "kept",
-   "why": "the module's ONE canonical PR key: GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; every compare in the module is exact on it, and byte-exact would split one PR in two.",
-   "where": "hermes_cli/kanban_superseded_open.py:36 _pr_key"
-  },
-  "hermes_cli/kanban_superseded_open.py::sha_close_covers::affix::sha::if not (sha.startswith(named) or named.startswith(sha)):": {
-   "verdict": "kept",
-   "why": "abbreviated-vs-full commit id: the close record names a 7-40 hex sha and the card's shas may be short or full, and an abbreviated git sha IS a prefix of the full one. The prefix only picks a candidate; the commit is then resolved over REST and its full sha must start with the named one and cover every PR file before it is accepted.",
-   "where": "hermes_cli/kanban_superseded_open.py:199 sha_close_covers"
   }
  }
 }
