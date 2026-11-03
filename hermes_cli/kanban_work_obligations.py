@@ -92,7 +92,7 @@ def load_policy(path: Optional[Path] = None) -> dict:
     """The registry, else :data:`POLICY_DEFAULTS` when the file is absent or invalid."""
     p = path or policy_path()
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(p.read_text(encoding="utf-8-sig"))
         classes = raw["classes"]
         out = json.loads(json.dumps(POLICY_DEFAULTS))
         for cls in ("decision", "review"):

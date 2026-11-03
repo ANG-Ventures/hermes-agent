@@ -19044,7 +19044,7 @@ def _reap_worker_session(
         if left:  # empty while a member lived: its fork may postdate the snapshot, rescan
             _signal(left, signal.SIGTERM)  # groups born during the reap get their SIGTERM too
         time.sleep(0.1)
-    _signal(_left() or {}, signal.SIGKILL, again=True)
+    _signal(_left() or {}, getattr(signal, "SIGKILL", signal.SIGTERM), again=True)
     _log.warning(
         "kanban: reaped %d leftover process group(s) of worker session %d",
         len(signalled), sid,
