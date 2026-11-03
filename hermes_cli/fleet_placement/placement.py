@@ -84,7 +84,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional
+from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 if __package__:                      # hermes_cli.placement (the fork's vendored copy) / lib.placement
     from . import admission, work_estimate
@@ -229,6 +229,16 @@ class HostSpec:
     st_speed: float = 1.0
     speed_src: str = "seed"              # mt_yield: measured | seed
     st_speed_src: str = "seed"           # st_speed: measured | seed (Prism e0c016b8: tracked apart from mt_yield)
+    # a guest on another host's box with no sampler of its own (t_59943ed5: the Studio's OrbStack Prism member
+    # studio-arm): admission reads THAT host's sample (sample_for), and v1 cpu_saturable is inherited from it
+    pressure_from: Optional[str] = None
+    # a pressure_from guest is DEFAULT-DENY (Prism ae77b59991cb, t_59943ed5 r7): eligible only for the consumers its
+    # row names with ``eligible: true``; every other consumer is closed for it (``closed:guest-not-enrolled``)
+    enrolled: frozenset = frozenset()
+    # a pressure_from guest's OWN size in CPUs (its VM: OrbStack studio-arm is 12 vCPU while it is judged on the
+    # Studio's 24P/32T): the cap on the work admitted ON the guest, apart from the domain's shared headroom. None on
+    # a guest = unmeasured, and the guest is closed (guest_vm_refusal); unused on a non-guest.
+    vm_cpus: Optional[int] = None
 
     @property
     def cpu_capacity(self) -> float:
@@ -252,6 +262,21 @@ class HostTable:
     # listed keeps the consumer's own class
     profile_footprints: Mapping[str, Mapping[str, Footprint]] = dataclasses.field(default_factory=dict)
     scorer: str = DEFAULT_SCORER                 # the kill switch (v1|v2); active_scorer() applies PLACEMENT_SCORER
+    # {host id: (pressure_from or None, aliases)} for EVERY row the table declares, the ones load_hosts() left out
+    # included: resource-domain membership is the registry's, not candidate eligibility's, so a closed guest's live
+    # leases and reservations still count on its source (Prism 7e9f3e2ed307 / c2f0087775e6 / 03f3bf40fe6b)
+    declared: Mapping[str, tuple] = dataclasses.field(default_factory=dict)
+
+    def declared_id(self, name) -> Optional[str]:
+        """Canonical id for ``name`` over the admitted hosts first, then every declared row (left-out ones too)."""
+        hid = self.resolve(name)
+        if hid is not None or not isinstance(name, str):
+            return hid
+        low = name.strip().lower()
+        for d, (_src, aliases) in self.declared.items():
+            if d.lower() == low or low in (a.lower() for a in aliases):
+                return d
+        return None
 
     def resolve(self, name: str) -> Optional[str]:
         """Canonical host id for ``name`` or one of its aliases (case-folded), else None."""
@@ -411,6 +436,11 @@ def validate(doc) -> List[str]:
                                         and all(a in REQUIRED_AXES and a not in ("mem_available_gb", "load1", "load5")
                                                 for a in h.get("unmeasurable_axes", []))):
             errs.append(f"hosts.{hid}.unmeasurable_axes may list only psi_cpu_some10, psi_mem_some10, system_pct")
+        if isinstance(h, dict) and "pressure_from" in h and (not isinstance(h["pressure_from"], str)
+                                                             or h["pressure_from"] == hid or h["pressure_from"] not in hosts
+                                                             or not isinstance(hosts[h["pressure_from"]], dict)
+                                                             or "pressure_from" in hosts[h["pressure_from"]]):
+            errs.append(f"hosts.{hid}.pressure_from must name another host in hosts that has its own sample")
         if isinstance(h, dict) and h.get("default_preference", "normal") not in ("normal", "low"):
             errs.append(f"hosts.{hid}.default_preference must be normal|low (never an ordinal)")
         if isinstance(h, dict) and "cpu_saturable" in h:
@@ -575,6 +605,8 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     scorer = scorer or active_scorer(doc.get("scorer"))
     saturable = set((doc.get("scorer_v1") or {}).get("cpu_saturable", [])) \
         | {hid for hid, h in doc["hosts"].items() if h.get("cpu_saturable") is True}
+    # a pressure_from guest is judged on its host's sample, so it inherits that host's v1 cpu_saturable (t_59943ed5)
+    saturable |= {hid for hid, h in doc["hosts"].items() if h.get("pressure_from") in saturable}
     # the speed file sits next to the table's state root (var/placement/), so a test table in tmp_path never reads
     # the live fleet's measurements
     speed = read_host_speed(speed_path if speed_path is not None else p.parent.parent / SPEED_REL) \
@@ -583,6 +615,24 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     hosts = {}
     for hid, h in doc["hosts"].items():
         f = host_facts(hid, h, inv)
+        root = h.get("pressure_from")
+        vm_cpus = None
+        if root in doc["hosts"]:
+            # the guest's own size: its own facts (a typed or discovered row of its own) when it has them, else the
+            # VM size the collector discovered for it (vm_cpus, OrbStack machine config); never its host's
+            own = [inv[n] for n in [hid, *(h.get("aliases") or [])] if isinstance(inv.get(n), dict)]
+            vm = next((r["vm_cpus"] for r in own if isinstance(r.get("vm_cpus"), int)
+                       and not isinstance(r.get("vm_cpus"), bool) and r["vm_cpus"] >= 1), None)
+            # a measured vm_cpus bounds any thread fact the row carries (one inherited from the old hardware mirror
+            # reads the host's 32): the VM's own measurement is authoritative (Prism c6575b98633e)
+            own_thr = int(f["threads"]) if "cores" in f and "threads" in f else None
+            vm_cpus = min(own_thr, vm) if own_thr is not None and vm is not None else (vm if vm is not None else own_thr)
+        if root in doc["hosts"] and ("cores" not in f or "threads" not in f):
+            # a pressure_from guest with no discovered row of its own (studio-arm: no sampler) is sized from its
+            # host's DISCOVERED facts, resolved with the host's own row (count_cores): it is judged on that host's
+            # sample, so its capacity is that host's too, like sample_for() and the cpu_saturable inheritance.
+            # Never a typed table fact (R2a); with no discovered host row the guest is left out like any host.
+            f = host_facts(root, doc["hosts"][root], inv)
         why = None
         if "cores" not in f or "threads" not in f:
             why = "cores/threads neither discovered (var/placement/host-inventory.json) nor in the table"
@@ -606,15 +656,25 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
             mt_yield=meas.get("mt_yield", SEED_MT_YIELD_SMT2 if threads == 2 * cores else 1.0),
             st_speed=meas.get("st_speed", 1.0),
             speed_src="measured" if "mt_yield" in meas else "seed",
-            st_speed_src="measured" if "st_speed" in meas else "seed")
+            st_speed_src="measured" if "st_speed" in meas else "seed",
+            pressure_from=h.get("pressure_from"), vm_cpus=vm_cpus,
+            enrolled=frozenset(c for c, v in h["consumers"].items()
+                               if isinstance(v, dict) and v.get("eligible") is True))
+    for hid in [g for g, s in hosts.items() if s.pressure_from and s.pressure_from not in hosts]:
+        # the guest is judged on its host's sample and in its host's resource domain: with that host closed it would
+        # be its own root, blind to every lease and reservation on the box (Prism 54f435021b7d). Closed with it.
+        _print_once((hid, "pressure_from"), f"placement: host {hid} left out of the table (closed): its pressure_from "
+                                            f"host {hosts[hid].pressure_from} is left out")
+        del hosts[hid]
     fps = {c: Footprint.of(fp) for c, fp in doc["footprints"].items() if not c.startswith("_")}
     pfps = {c: {pn: Footprint.of(pf) for pn, pf in fp["profiles"].items() if not pn.startswith("_")}
             for c, fp in doc["footprints"].items() if not c.startswith("_") and isinstance(fp.get("profiles"), dict)}
     cw = dict(DEFAULT_CLOSED_WHEN)
     cw.update({k: float(v) for k, v in (doc.get("closed_when") or {}).items() if not k.startswith("_")})
+    declared = {hid: (h.get("pressure_from"), tuple(h.get("aliases", []))) for hid, h in doc["hosts"].items()}
     return HostTable(hosts=hosts, footprints=fps, closed_when=cw, path=p, default_first=doc.get("default_first"),
                      saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)), profile_footprints=pfps,
-                     scorer=scorer)
+                     scorer=scorer, declared=declared)
 
 
 class ExclusionsError(PlacementError):
@@ -711,6 +771,52 @@ class Sample:
         d = float(self.d_threads) if _num(self.d_threads) and self.d_threads > 0 else 0.0
         vals = [max(0.0, float(v) - d) for v in (self.load1, self.load5) if _num(v)]
         return max(vals) if vals else None
+
+
+def sample_for(table: "HostTable", samples: Mapping[str, Optional[Sample]], hid: str) -> Optional[Sample]:
+    """``hid``'s sample (any of its names). For a ``pressure_from`` guest (t_59943ed5: studio-arm has no sampler and
+    must be refused by the whole Studio's load like any worker) the source's sample, unless the guest's own (the
+    mirror) is at least as new: a mirror is never fresher than the sample it copied, so an older mirror left by a
+    failed write never masks newer source pressure (Prism 901e6ec92ac9 / f50e486852d3)."""
+    own = next((v for k, v in samples.items() if table.resolve(k) == hid and v is not None), None)
+    spec = table.hosts.get(hid)
+    src = table.resolve(spec.pressure_from) if spec is not None and spec.pressure_from else None
+    if not src or src == hid:
+        return own
+    up = sample_for(table, samples, src)
+    if up is None:
+        return own
+    if own is not None and _num(own.at) and _num(up.at) and float(own.at) >= float(up.at):
+        return own
+    return up
+
+
+def domain_of(table: "HostTable", hid: str) -> set:
+    """The resource domain ``hid`` is judged in: its root (``pressure_from`` or itself) and every guest of that root.
+    A guest borrows its host's MEASURED headroom, so a lease on any member is in-flight load on the same box
+    (Prism cb27fe636cb4, t_59943ed5). Membership is read from the table's DECLARED rows (``table.declared``), so a
+    member load_hosts() left out (closed: discovery missing or contradicting policy) stays in the domain: closing a
+    venue never erases what was already promised on the box (Prism 7e9f3e2ed307 / c2f0087775e6 / 03f3bf40fe6b)."""
+    rows = {h: s.pressure_from for h, s in table.hosts.items()}
+    rows.update({h: src for h, (src, _a) in table.declared.items() if h not in rows})
+
+    def src(h):          # the validated source id even when the table has no row for it (Prism 54f435021b7d)
+        s = rows.get(h)
+        return (table.declared_id(s) or s) if s else None
+    root = src(hid) or hid
+    return {root} | {h for h in rows if src(h) == root}
+
+
+def domain_resolve(table: "HostTable", hid: str) -> Callable[[str], Optional[str]]:
+    """A name resolver (admission_demand.read_demand's ``resolve``) that names ``hid`` for every member of its resource
+    domain: queued demand restricted to a sibling is load waiting for the same box (Prism d26743a7e1e6). A demand doc
+    is one Demand whatever members it lists, so it is counted once. Outside a domain it is table.resolve."""
+    dom = domain_of(table, hid)
+
+    def resolve(name):
+        got = table.declared_id(name) or (name if name in dom else None)
+        return hid if got in dom else table.resolve(name)
+    return resolve
 
 
 def samples_from_pressure(doc: Mapping, *, now: float, stale_after_s: Optional[float] = None) -> Dict[str, Sample]:
@@ -848,16 +954,41 @@ class Headroom:
 
 def policy_refusal(spec: HostSpec, consumer: str, excluded: Optional[str], admitted: float = 0.0) -> Optional[str]:
     """The OPERATOR controls every admission path applies before any measurement (t_e5124426 r3, Prism 26a9b46c6a7b):
-    a live exclusion row for the host, ``consumers.<c>.ceiling`` <= 0 (the consumer is not eligible there), or a
+    a live exclusion row for the host, a ``pressure_from`` guest's consumer it is not enrolled for (default-deny:
+    only ``consumers.<c>.eligible: true``), ``consumers.<c>.ceiling`` <= 0 (the consumer is not eligible there), or a
     positive ceiling already reached by ``admitted`` live admissions of this consumer (Prism 696cce63, f88f81bb2e24).
     -> the refusal reason, or None. headroom() (so choose()) and may_start() both call this; never copy the checks."""
     if excluded:
         return f"excluded:{excluded}"
+    if spec.pressure_from and consumer not in spec.enrolled:
+        return "closed:guest-not-enrolled"
     ceiling = spec.ceiling_for(consumer)
     if ceiling is not None and ceiling <= 0:
         return f"excluded:{consumer} not eligible"
     if ceiling is not None and admitted >= ceiling:
         return f"at_ceiling:{consumer} {admitted:g}/{ceiling} in use"
+    return None
+
+
+def guest_vm_refusal(spec: HostSpec, ctx: "AdmitContext", need_cpus: float,
+                     reservations: Optional[Mapping[str, "Footprint"]] = None) -> Optional[str]:
+    """A ``pressure_from`` guest's own-size cap (Apollo 10-31 08:4x, t_7361659c): the work admitted ON the guest (every
+    live lease and caller reservation booked under any of its names, settled or not: a running job holds its vCPUs)
+    plus this job never exceeds its VM's ``vm_cpus``, whatever headroom the shared domain shows. ``ctx`` is the
+    UNFOLDED context (a folded one attributes the host's own leases to the guest). ``reservations`` ({host: Footprint},
+    UNAGED: admit() passes the ledger's live rows in full) replaces ``ctx.reservations`` for this check, whose threads
+    the scorer ages out once load1 shows them (Prism f01d48b6d5c4). Unmeasured size = closed.
+    -> the refusal reason, or None (not a guest, or it fits)."""
+    if not spec.pressure_from:
+        return None
+    if spec.vm_cpus is None:
+        return "closed:guest vm size unmeasured (var/placement/host-inventory.json vm_cpus)"
+    names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
+    resv = ctx.reservations if reservations is None else tuple(reservations.items())
+    held = sum(float(le.need.cpus) for le in ctx.leases if str(le.host).lower() in names) \
+        + sum(float(f.threads) for h, f in resv if str(h).lower() in names)
+    if held + float(need_cpus) > spec.vm_cpus:
+        return f"no_headroom:vm_cpus {held:g} admitted + {float(need_cpus):g} > {spec.vm_cpus} vCPU on the guest"
     return None
 
 
@@ -1046,6 +1177,37 @@ class AdmitContext:
     history: tuple
     leases: tuple
     scratch: tuple = ()     # ((host, GB), ...): the ledger's live scratch, which admit() subtracts (Lease has none)
+    reservations: tuple = ()    # ((host, Footprint), ...): a caller's booked reservations (choose()'s ``reservations``)
+
+    # every field above that names a host: for_host() folds each of them over the resource domain, and
+    # test_every_host_attributed_context_kind_is_folded_over_the_domain fails on a new one that is not listed here
+    HOST_ATTRIBUTED = ("leases", "scratch", "reservations")
+
+    def for_host(self, table: Optional["HostTable"], hid: str) -> "AdmitContext":
+        """THE resource-domain fold (t_59943ed5 r5): a copy in which every lease, scratch GB and reservation booked on
+        a member of domain_of(hid) is attributed to ``hid``. A pressure_from guest borrows its host's MEASURED
+        headroom, so load promised to any member is in-flight load on the same box (Prism cb27fe636cb4, 07eb3f05ac19,
+        faf2f501a1d4, 394aa1f12887). may_start(), choose() and bands_from_pressure() read only this copy; the ledger
+        and decision rows keep their own host ids. A host with no guest gets ``self`` unchanged."""
+        dom = domain_of(table, hid) if table is not None else {hid}
+        if len(dom) == 1:
+            return self
+
+        def mine(h) -> bool:
+            return h != hid and (table.declared_id(h) or h) in dom
+        return dataclasses.replace(
+            self,
+            leases=tuple(dataclasses.replace(le, host=hid) if mine(le.host) else le for le in self.leases),
+            scratch=tuple((hid if mine(h) else h, gb) for h, gb in self.scratch),
+            reservations=tuple((hid if mine(h) else h, f) for h, f in self.reservations))
+
+    def reserved_on(self, hid: str) -> Optional["Footprint"]:
+        """The summed reservation booked on ``hid`` (after for_host(), on its whole domain); None when there is none."""
+        tot = None
+        for h, f in self.reservations:
+            if h == hid:
+                tot = tot.plus(f) if tot is not None else f
+        return tot
 
     def scratch_for(self, names) -> float:
         """The ledger's reserved scratch on a host (any of its lower-case ``names``), as admit()'s
@@ -1060,12 +1222,13 @@ class AdmitContext:
 def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Job"] = None,
                   history: Optional[List[dict]] = None, leases: Optional[Iterable["admission.Lease"]] = None,
                   table: Optional["HostTable"] = None, held: Optional[Mapping[str, Footprint]] = None,
-                  root=None) -> AdmitContext:
+                  root=None, host: Optional[str] = None) -> AdmitContext:
     """The ONE builder of the utilization admission context: estimate history (default the class-usage ledger over
     CLASS_USAGE_WINDOW_S), leases (default the reservation ledger's live rows) plus ``held`` footprints as leases that
     never settle (allocd's extra_reserved, band()'s ``reserved``), and the ledger's live scratch per host (a Lease
     carries cpu/ram/gpu only; admit() subtracts the ledger's scratch through ``reserved``, t_f64c6d34 r3).
-    ``root`` (default fleet_root()) is the state root the ledgers are read from (the collector's --home)."""
+    ``root`` (default fleet_root()) is the state root the ledgers are read from (the collector's --home).
+    ``host`` (with ``table``): the context comes back folded over that host's resource domain (AdmitContext.for_host)."""
     # incremental: allocd runs this under the ledger flock on every admit (t_c9fd9c5e), so parse only the appended rows
     hist = history if history is not None else admission.read_history_cached(
         class_usage_path(Path(root) / CLASS_USAGE_REL if root is not None else None), since=now - CLASS_USAGE_WINDOW_S)
@@ -1076,8 +1239,9 @@ def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Jo
     # caller-supplied leases (admit() under its lock, tests) bring their own ledger: scratch only on the default read
     scratch = () if leases is not None else tuple(
         (h, f.scratch_gb) for h, f in live_reservations(ledger, now=now, table=table).items() if f.scratch_gb > 0)
-    return AdmitContext(job_class_for(consumer, job), need_of(fp), tuple(hist),
-                        tuple(base + held_leases(held or {}, table)), scratch)
+    ctx = AdmitContext(job_class_for(consumer, job), need_of(fp), tuple(hist),
+                       tuple(base + held_leases(held or {}, table)), scratch)
+    return ctx.for_host(table, host) if host is not None else ctx
 
 
 def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footprint, *, need, leases,
@@ -1174,11 +1338,7 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
             samples = samples_from_pressure(doc, now=now, stale_after_s=stale_after_s) if isinstance(doc, dict) else {}
         except (OSError, ValueError, PlacementError):
             samples = {}
-    sample = None
-    for k, v in samples.items():
-        if table.resolve(k) == hid and v is not None:
-            sample = v
-            break
+    sample = sample_for(table, samples, hid)
     if sample is None:
         return False, "closed:no sample"
     if sample.status != "fresh":
@@ -1188,15 +1348,22 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     spec = table.hosts[hid]
     fp = table.footprint(consumer, footprint if footprint is not None else (job.footprint if job else None),
                          profile=job.profile if job else None)
-    ctx = admit_context(consumer, fp, now=now, job=job, history=history, leases=leases, table=table, root=root)
+    raw = admit_context(consumer, fp, now=now, job=job, history=history, leases=leases, table=table, root=root)
+    ctx = raw.for_host(table, hid)       # folded over hid's resource domain: leases AND scratch
+    refused = guest_vm_refusal(spec, raw, ctx.need(hid).cpus)     # the guest's own VM size, apart from the domain
+    if refused:
+        return False, refused
     if fp.scratch_gb > 0 and _num(sample.scratch_free_gb):
         left = float(sample.scratch_free_gb) - ctx.scratch_for({hid.lower(), *(a.lower() for a in spec.aliases)}) \
             - fp.scratch_gb
         if left < 0:
             return False, f"saturated:scratch_gb {left:+.2f}"
-    demand = list(demand) if demand is not None else dmd.read_demand(hid, root=root, now=now, resolve=table.resolve)
+    # demand restricted to any member of hid's resource domain is queued load on this box (Prism d26743a7e1e6)
+    demand = list(demand) if demand is not None else dmd.read_demand(hid, root=root, now=now,
+                                                                     resolve=domain_resolve(table, hid))
     priority = priority if priority is not None else dmd.load_priority(root=root)
-    v = admission.admit_class(_sample_row(spec, sample), dmd.workload_of(consumer), ctx.need(hid), ctx.leases,
+    v = admission.admit_class(_sample_row(spec, sample), dmd.workload_of(consumer), ctx.need(hid),
+                              ctx.leases,
                               demand=demand, priority=priority, limits=_limits(spec), host=hid)
     return v.ok, (v.reason or f"ok (binding {v.binding})")
 
@@ -1209,7 +1376,39 @@ def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: s
          closed_when: Mapping[str, float], reserved: Optional[Footprint] = None,
          require_axes: Iterable[str] = REQUIRED_AXES, mode: Optional[str] = None, now: Optional[float] = None,
          ctx: Optional[AdmitContext] = None, root=None,
-         stale_after_s: Optional[float] = DEFAULT_STALE_AFTER_S) -> tuple:
+         stale_after_s: Optional[float] = DEFAULT_STALE_AFTER_S, table: Optional["HostTable"] = None) -> tuple:
+    """_band_pressure() (the domain's pressure band, below), then a ``pressure_from`` guest's own VM size: one job
+    over ``vm_cpus`` is hot, a second one over it caps ok at warm, the same guest_vm_refusal() choose() and may_start()
+    apply (Prism 0b6cf97fb659). The check reads the UNFOLDED context (``ctx`` as given, or the one built here)."""
+    util = sample is not None and sample.status == "fresh" and band_basis(mode, root=root) == "utilization"
+    if util and ctx is None:
+        ctx = admit_context(consumer, fp, now=_now(now), held={spec.name: reserved} if reserved else None,
+                            root=root, table=table)
+    b, why = _band_pressure(spec, sample, fp, consumer=consumer, closed_when=closed_when, reserved=reserved,
+                            require_axes=require_axes, mode="utilization" if util else "legacy", now=now, ctx=ctx,
+                            root=root, stale_after_s=stale_after_s, table=table)
+    if not spec.pressure_from or b == "hot" or sample is None or sample.status != "fresh":
+        return b, why
+    if util:
+        raw, cpus = ctx, float(ctx.need(spec.name).cpus)
+    else:
+        raw = AdmitContext("", need_of(fp), (), (), reservations=((spec.name, reserved),) if reserved else ())
+        cpus = float(fp.threads)
+    one = guest_vm_refusal(spec, raw, cpus)
+    if one:
+        return "hot", [one]
+    two = guest_vm_refusal(spec, raw, 2 * cpus)
+    if two and b == "ok":
+        return "warm", [f"room for one {consumer} job, not two: {two}"]
+    return b, why
+
+
+def _band_pressure(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: str,
+                   closed_when: Mapping[str, float], reserved: Optional[Footprint] = None,
+                   require_axes: Iterable[str] = REQUIRED_AXES, mode: Optional[str] = None,
+                   now: Optional[float] = None, ctx: Optional[AdmitContext] = None, root=None,
+                   stale_after_s: Optional[float] = DEFAULT_STALE_AFTER_S,
+                   table: Optional["HostTable"] = None) -> tuple:
     """(band, reasons) DERIVED from headroom(): hot = headroom() refuses the footprint, warm = it admits this one
     footprint but not a second, ok = room for two, None = the sample cannot be read (absent/stale/unmeasured) and
     no measured axis already refuses. ``reasons`` names EVERY axis that fails, not only the first headroom()
@@ -1224,7 +1423,7 @@ def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: s
     if sample is None or sample.status != "fresh":
         return None, ["no sample" if sample is None else f"{sample.status}" + (f" ({sample.note})" if sample.note else "")]
     # pressure only: ceilings / exclusions are admission policy, not host pressure (Prism bfc9d97abdd5)
-    spec = dataclasses.replace(spec, ceilings={})
+    spec = dataclasses.replace(spec, ceilings={}, enrolled=frozenset(), pressure_from=None)
     if band_basis(mode, root=root) == "utilization":
         stale_after_s = _stale_after(stale_after_s)
         if stale_after_s is not None and now is not None and (
@@ -1232,9 +1431,13 @@ def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: s
             return None, ["closed:stale (sample time missing or older than %gs)" % stale_after_s]
         if ctx is None:
             ctx = admit_context(consumer, fp, now=_now(now), held={spec.name: reserved} if reserved else None,
-                                root=root)
+                                root=root, table=table)
+        if table is not None:
+            # the SAME resource-domain fold may_start() reads (idempotent on an already-folded ctx), so a lease on a
+            # parent / sibling counts here too (Prism 326e66e95630 / 10037992878c / eb5c7206c4c2)
+            ctx = ctx.for_host(table, spec.name)
         return _band_utilization(spec, sample, fp, consumer=consumer, closed_when=closed_when, ctx=ctx,
-                                 reserved=reserved, now=_now(now), root=root)
+                                 reserved=reserved, now=_now(now), root=root, table=table)
     req = tuple(a for a in require_axes if a not in spec.unmeasurable_axes)
     measured = tuple(a for a in req if _num(getattr(sample, a, None)))
     missing = [f"{a} unmeasured" for a in req if a not in measured]
@@ -1297,7 +1500,8 @@ def band_basis(mode: Optional[str] = None, root=None) -> str:
     return "legacy" if basis == "load1" else "utilization"
 
 
-def _band_class_rule(spec: HostSpec, sample: Sample, consumer: str, leases, *, now: Optional[float], root=None):
+def _band_class_rule(spec: HostSpec, sample: Sample, consumer: str, leases, *, now: Optional[float], root=None,
+                     table: Optional["HostTable"] = None):
     """The check may_start() runs for ``consumer`` on this host, as a function of the job's estimate, or None while
     the class's kill switch (``<WORKLOAD>_UNIFIED_ADMIT=0``) keeps its old rule (admit(), which headroom() runs).
     Same sample row, limits, leases, ``root`` demand and priority as may_start() (Prism b22e585970ce).
@@ -1312,9 +1516,11 @@ def _band_class_rule(spec: HostSpec, sample: Sample, consumer: str, leases, *, n
     if dmd.published_unified(workload, root=root, now=_now(now)) is False:
         return None
     names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
-    # may_start() resolves demand ``hosts`` through table.resolve; this host's own aliases are the match it needs
+    # may_start() resolves demand ``hosts`` over the resource domain (domain_resolve); with the table this is the same
+    # match, without it this host's own aliases are (Prism d26743a7e1e6)
     demand = dmd.read_demand(spec.name, root=root, now=_now(now),
-                             resolve=lambda h: spec.name if str(h).lower() in names else h)
+                             resolve=domain_resolve(table, spec.name) if table is not None and spec.name in table.hosts
+                             else (lambda h: spec.name if str(h).lower() in names else h))
     priority = dmd.load_priority(root=root)
     row, lim = _sample_row(spec, sample), _limits(spec)
 
@@ -1326,7 +1532,8 @@ def _band_class_rule(spec: HostSpec, sample: Sample, consumer: str, leases, *, n
 
 def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer: str,
                       closed_when: Mapping[str, float], ctx: AdmitContext,
-                      reserved: Optional[Footprint] = None, now: Optional[float] = None, root=None) -> tuple:
+                      reserved: Optional[Footprint] = None, now: Optional[float] = None, root=None,
+                      table: Optional["HostTable"] = None) -> tuple:
     """The band over the admitter's own verdict on the admitter's context: hot = it refuses one job of this class,
     warm = one fits but not two (the estimate AND the footprint doubled, so scratch is checked for two), ok = two fit.
     A measured refusal is hot even when another axis is unmeasured (admit() reports saturation before unmeasured).
@@ -1348,7 +1555,7 @@ def _band_utilization(spec: HostSpec, sample: Sample, fp: Footprint, *, consumer
     busy = f"cpu_busy {sample.cpu_busy:g}" if _num(sample.cpu_busy) else "cpu_busy ?"
     one = headroom(spec, sample, fp, consumer=consumer, closed_when=closed_when, mode="utilization", need=need,
                    leases=leases, reserved=reserved)
-    rule = _band_class_rule(spec, sample, consumer, leases, now=now, root=root)
+    rule = _band_class_rule(spec, sample, consumer, leases, now=now, root=root, table=table)
     v1 = rule(need) if rule else None
     if v1 is not None and not v1.ok and not v1.reason.startswith("unmeasured"):
         return "hot", [f"{v1.reason} ({busy}, utilization, admit_class)"]
@@ -1387,9 +1594,12 @@ def bands_from_pressure(table: HostTable, doc: Mapping, *, now: float,
         if hid is None:
             continue
         spec, row = table.hosts[hid], {"band": {}, "reason": {}}
+        s = sample_for(table, samples, hid) if spec.pressure_from else s   # never an older mirror (901e6ec92ac9)
         for c in names:
+            # unfolded: band() folds it over hid's domain itself and reads it raw for the guest's VM cap (0b6cf97fb659)
+            ctx = ctxs.get(c)
             b, why = band(spec, s, table.footprint(c), consumer=c, closed_when=table.closed_when, now=now,
-                          ctx=ctxs.get(c), root=home, stale_after_s=stale)
+                          ctx=ctx, root=home, stale_after_s=stale, table=table)
             row["band"][c], row["reason"][c] = b, "; ".join(why)
         out[key] = row
     return out
@@ -1503,7 +1713,8 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
            require_axes: Iterable[str] = REQUIRED_AXES, exclusions_path=None, now: Optional[float] = None,
            admitted: Optional[Mapping[str, float]] = None, stale_after_s: Optional[float] = DEFAULT_STALE_AFTER_S,
            mode: Optional[str] = None, leases: Optional[Iterable["admission.Lease"]] = None,
-           history: Optional[List[dict]] = None) -> Decision:
+           history: Optional[List[dict]] = None,
+           vm_reservations: Optional[Mapping[str, Footprint]] = None) -> Decision:
     """The three layers over ``candidates`` (default: every host in the table).
 
     1. gate: a candidate with no sample, a stale/absent one, an unmeasured axis, a tripped closed_when axis,
@@ -1530,6 +1741,9 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
         hid = table.resolve(k)
         if hid is not None and (hid not in folded or folded[hid] is None):
             folded[hid] = v
+    for hid in table.hosts:                       # a pressure_from guest reads its host's sample (t_59943ed5), its
+        if table.hosts[hid].pressure_from:        # mirror only when as new (sample_for; Prism 901e6ec92ac9)
+            folded[hid] = sample_for(table, samples, hid)
     now = _now(now)
     mode = admission_mode() if mode is None else mode     # after the input checks: a refused call reads nothing
     require_axes = tuple(require_axes)   # a generator would be exhausted by the first candidate (Prism P1 16d4270a)
@@ -1546,9 +1760,11 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
         hid = table.resolve(k) or k
         used[hid] = used.get(hid, 0.0) + float(v)
     util = mode == "utilization"
-    if util:
-        # leases replace ``reservations`` on this path (a lease ages out of the count once the sample shows its job)
-        ctx = admit_context(consumer, fp, now=now, job=job, history=history, leases=leases, table=table)
+    # leases replace ``reservations`` for cpu/ram on the utilization path (a lease ages out of the count once the
+    # sample shows its job); both paths read every host-attributed input through ONE per-host fold (for_host)
+    ctx = (admit_context(consumer, fp, now=now, job=job, history=history, leases=leases, table=table) if util
+           else AdmitContext("", need_of(fp), (), ()))
+    ctx = dataclasses.replace(ctx, reservations=tuple(resv.items()))
     rows: List[Headroom] = []
     seen = set()
     for n in names:
@@ -1559,18 +1775,26 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
         if hid in seen:
             continue
         seen.add(hid)
+        hc = ctx.for_host(table, hid)
+        need = work_estimate.estimate(ctx.job_class, hid, ctx.history, seed=ctx.seed) if util else ctx.seed
         if util:
             rows.append(headroom(table.hosts[hid], folded.get(hid), fp, consumer=consumer,
-                                 closed_when=table.closed_when, excluded=excl.get(hid), reserved=resv.get(hid),
+                                 closed_when=table.closed_when, excluded=excl.get(hid), reserved=hc.reserved_on(hid),
                                  require_axes=require_axes, admitted=used.get(hid, 0.0), now=now,
                                  stale_after_s=stale_after_s, mode="utilization",
-                                 need=work_estimate.estimate(ctx.job_class, hid, ctx.history, seed=ctx.seed),
-                                 leases=ctx.leases))
-            continue
-        rows.append(headroom(table.hosts[hid], folded.get(hid), fp, consumer=consumer,
-                             closed_when=table.closed_when, excluded=excl.get(hid), reserved=resv.get(hid),
-                             require_axes=require_axes, admitted=used.get(hid, 0.0),
-                             now=now, stale_after_s=stale_after_s))
+                                 need=need,
+                                 leases=hc.leases))
+        else:
+            rows.append(headroom(table.hosts[hid], folded.get(hid), fp, consumer=consumer,
+                                 closed_when=table.closed_when, excluded=excl.get(hid), reserved=hc.reserved_on(hid),
+                                 require_axes=require_axes, admitted=used.get(hid, 0.0),
+                                 now=now, stale_after_s=stale_after_s))
+        # ``vm_reservations`` (admit(): the ledger's live rows UNAGED) for the guest's own size, never the scorer's
+        # load1-aged ``reservations`` (Prism f01d48b6d5c4); None = the caller's reservations as given
+        vm = guest_vm_refusal(table.hosts[hid], ctx, need.cpus, reservations=vm_reservations) \
+            if rows[-1].eligible else None
+        if vm:                                     # the guest's own VM size caps it apart from the domain (t_7361659c)
+            rows[-1].eligible, rows[-1].reason = False, vm
     eligible = [r for r in rows if r.eligible]
     # speed enters the CHOICE on both paths (R2c, D2; FWA F1 t_d456e9cd): under utilization the fraction is
     # admission.score()'s binding fraction, under legacy the v2 headroom fraction
@@ -2061,8 +2285,16 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
             base = choose_kw.get("leases")
             choose_kw["leases"] = (list(base) if base is not None else ledger_leases(p, now=now, table=table)) \
                 + held_leases(extra_reserved, table)
+        # the guest VM cap's own occupancy: every live row in full (a settled job still holds its vCPUs). Under
+        # utilization the leases already carry the ledger and the held-back reserve, so nothing is added twice
+        vm_resv: Dict[str, Footprint] = {}
+        if mode != "utilization":
+            vm_resv = live_reservations(p, now=now, table=table)
+            for k, v in extra_reserved.items():
+                hid = table.resolve(k) or k
+                vm_resv[hid] = vm_resv[hid].plus(v) if hid in vm_resv else v
         d = choose(table, consumer, samples, reservations=resv, admitted=used, now=now,
-                   stale_after_s=stale_after_s, mode=mode, **choose_kw)
+                   stale_after_s=stale_after_s, mode=mode, vm_reservations=vm_resv, **choose_kw)
         if not d.host:
             ap = admissions_path_for(p, admissions_path)
             _append_admissions(ap, _deferred_line(ap, d, job_id=job_id, now=now))
