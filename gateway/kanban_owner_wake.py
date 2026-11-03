@@ -982,8 +982,11 @@ def _drop_redundant(kb: Any, card: dict, items: list[dict], own: set, owner_prof
 
 
 async def deliver_turn(runner: Any, entry: Any, text: str,
-                       cards: Optional[list[dict]] = None) -> None:
-    """Enqueue one handoff turn into ``entry``'s session. Raises on no route."""
+                       cards: Optional[list[dict]] = None) -> bool:
+    """Enqueue one handoff turn into ``entry``'s session. Raises on no route.
+
+    Returns the adapter's admission receipt (``event._gateway_accepted is True``): False when the
+    turn was not taken, e.g. a busy session whose queue is at ``_BUSY_QUEUE_MAX_PENDING``."""
     from gateway.platforms.base import MessageEvent, MessageType
 
     source = dataclasses.replace(entry.origin)
@@ -1015,7 +1018,9 @@ async def deliver_turn(runner: Any, entry: Any, text: str,
             ],
         },
     )
+    event._gateway_accepted = False
     await adapter.handle_message(event)
+    return event._gateway_accepted is True
 
 
 async def tick(runner: Any, *, now: Optional[float] = None,
