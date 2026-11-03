@@ -90,21 +90,29 @@ it('explicit npm snapshots remain replaceable and isolated from toolchain-only p
 })
 
 // Self-hosted uploads outlive timeout-minutes (mirror run 40122483687), so
-// every setup-pm save gate stays off there and its paired restore runs.
+// every setup-pm save gate stays off there. What replaces the save differs
+// (t_85cd80ac, #2525): tools copy the host seed instead of a GitHub restore,
+// uv takes a plain miss (a uv-only hit measured slower than cold), and npm
+// keeps its restore-only step. A saving caller never restores from GitHub there.
 it.each([
-  ['tools-cache', 'tools-cache-restore'],
-  ['python-cache', 'python-cache-restore'],
-  ['node-cache', 'node-cache-self-hosted'],
-])('%s never saves on self-hosted and %s restores instead', (saveId, restoreId) => {
+  ['tools-cache', 'tools-host-seed copies instead', 'tools-host-seed', ['tools-cache-restore']],
+  ['python-cache', 'plain miss, no GitHub restore', null, ['python-cache-restore']],
+  ['node-cache', 'node-cache-self-hosted restores instead', 'node-cache-self-hosted', []],
+])('%s never saves on self-hosted: %s', (saveId, _label, selfHostedId, hostedOnly) => {
   const step = id => setup.runs.steps.find(s => s.id === id)
   const inputs = { cache: 'true', 'cache-python': 'true', 'cache-node': 'true', toolchain: 'all',
     extras: 'voice', 'test-environment': 'false', 'save-tools-cache': 'true',
     'save-python-cache': 'true', 'save-node-cache': 'true' }
   const selfHosted = { inputs, runner: { environment: 'self-hosted' } }
   expect(evaluate(step(saveId).if, selfHosted)).toBe(false)
-  expect(evaluate(step(restoreId).if, selfHosted)).toBe(true)
   expect(evaluate(step(saveId).if, { inputs })).toBe(true)
-  expect(evaluate(step(restoreId).if, { inputs })).toBe(false)
+  if (selfHostedId) {
+    expect(evaluate(step(selfHostedId).if, selfHosted)).toBe(true)
+    expect(evaluate(step(selfHostedId).if, { inputs })).toBe(false)
+  }
+  for (const id of hostedOnly) {
+    expect(evaluate(step(id).if, selfHosted)).toBe(false)
+  }
 })
 
 // Key isolation, offline wheel/receipt relocation and the transport action are
