@@ -17,6 +17,7 @@ class fails here on every runner instead of intermittently on one.
 from __future__ import annotations
 
 import ast
+import unicodedata
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parents[1]
@@ -39,8 +40,19 @@ def offenders(root: Path = TESTS) -> list[str]:
     found = []
     for path in sorted(root.rglob("test_*.py")):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        # Pinning needs a .utime and a .copy2 call. Python NFKC-normalizes identifiers, so the
+        # NFKC text of a file that pins holds both words; skipping the parse elsewhere keeps the
+        # guard inside the 60 s per-test clock on a loaded CI slice (131 s for the file there,
+        # t_0fcbd3fa).
+        words = text if text.isascii() else unicodedata.normalize("NFKC", text)
+        if not ("utime" in words and "copy2" in words):
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
             continue
         for fn in ast.walk(tree):
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and _pins_mtime(fn) and not _waits_for_ctime(fn):

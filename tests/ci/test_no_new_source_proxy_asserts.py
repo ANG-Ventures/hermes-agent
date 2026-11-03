@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import json
+import unicodedata
 import warnings
 from pathlib import Path
 
@@ -50,6 +51,12 @@ def _is_proxy_test(fn: ast.AST) -> bool:
 
 
 def proxy_tests(source: str, rel: str) -> set[str]:
+    # A proxy test calls getsource. Python NFKC-normalizes identifiers, so the NFKC text of such a
+    # file holds the word; skipping the parse elsewhere keeps this whole-tree ratchet inside the
+    # 60 s per-test clock on a loaded CI slice (133 s for the file there, t_0fcbd3fa).
+    words = source if source.isascii() else unicodedata.normalize("NFKC", source)
+    if "getsource" not in words:
+        return set()
     try:
         with warnings.catch_warnings():  # scanned files' own escape warnings
             warnings.simplefilter("ignore", SyntaxWarning)
