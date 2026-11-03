@@ -572,3 +572,34 @@ def test_e2e_close_record_mutants_still_refused(board, monkeypatch, variant):
         with pytest.raises(sc.SupersededContentError):
             kb.complete_task(conn, tid, expected_run_id=run, superseded_by=SHA, summary="x")
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+
+
+# --- Prism a431ad52d1d8 (#2465 @ c4243716, t_8d8c3327): the EXACT fallback sha must be on the default branch -------
+# verify() tracks unreadability per PR, not per candidate: with `--superseded-by "<A> <B>"`, A's content check can be
+# unreadable (None) while B's reads `differs`, so the PR lands in `differs` with A's ancestry never checked. The
+# close-record fallback then returned A on close record + touched files alone.
+SHA_B = "ab" * 20
+
+
+@pytest.mark.parametrize("on_default", [False, None])
+def test_e2e_close_record_sha_off_the_default_branch_is_refused(board, monkeypatch, on_default):
+    _gate_stubs(monkeypatch, _check(**{SHA_B: {"sha": SHA_B, "default": "main", "differs": [F87]}}))  # SHA: None
+    monkeypatch.setattr(op, "sha_on_default", lambda repo, sha: on_default if sha.startswith(SHA[:11]) else True)
+    _sha_close(monkeypatch)
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        with pytest.raises(sc.SupersededContentError):
+            kb.complete_task(conn, tid, expected_run_id=run, superseded_by=f"{SHA} {SHA_B}", summary="x")
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+        assert "routed_pr_superseded" not in [e.kind for e in kb.list_events(conn, tid)]
+
+
+def test_e2e_close_record_sha_on_the_default_branch_still_closes(board, monkeypatch):
+    # control for the test above: the same unreadable-candidate shape with the named sha ON main is accepted
+    _gate_stubs(monkeypatch, _check(**{SHA_B: {"sha": SHA_B, "default": "main", "differs": [F87]}}))
+    _sha_close(monkeypatch)
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        assert kb.complete_task(conn, tid, expected_run_id=run, superseded_by=f"{SHA} {SHA_B}", summary="x") is True
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "routed_pr_superseded"]
+        assert ev and ev[0].payload["close_record_sha"] == {f"{REPO}#4736": SHA}

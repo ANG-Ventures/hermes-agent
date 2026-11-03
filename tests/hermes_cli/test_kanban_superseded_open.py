@@ -214,3 +214,102 @@ def test_e2e_repark_of_a_review_card_keeps_the_original_implementer(board, monke
         assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}") is True
         ev = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
         assert ev[-1].payload["implementer"] == "worker"
+
+
+# --- Deferred Prism P1s of #2465 @ c4243716 (t_8d8c3327) ---------------------------------------------------
+
+
+def _set_routed_run(conn, tid, meta: str):
+    """The card's last run as the routed review handoff (``review_requested``) carrying ``meta``."""
+    run = kb.list_runs(conn, tid)[-1].id
+    conn.execute("UPDATE task_runs SET outcome='review_requested', metadata=? WHERE id=?", (meta, run))
+    conn.commit()
+
+
+def test_e2e_park_carries_the_routed_artifacts(board, monkeypatch):
+    # Prism 5c1df35e7d7f: the original handoff's routed_artifacts reach the parked run, so the eventual
+    # `completed` event still delivers them (_carry_routed_artifacts reads the LATEST review_requested run)
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        _set_routed_run(conn, tid, '{"own_prs": ["%s#%d"], "routed_artifacts": ["/att/report.pdf"]}' % (REPO, OLD))
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}") is True
+        assert kb.list_runs(conn, tid)[-1].metadata.get("routed_artifacts") == ["/att/report.pdf"]
+        assert kb._carry_routed_artifacts(conn, tid, {})["artifacts"] == ["/att/report.pdf"]
+
+
+def test_e2e_repark_carries_the_routed_artifacts(board, monkeypatch):
+    # Prism 5c1df35e7d7f (re-park): #7816 is itself closed SUPERSEDED-BY #7900; the second park keeps them too
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        _set_routed_run(conn, tid, '{"own_prs": ["%s#%d"], "routed_artifacts": ["/att/report.pdf"]}' % (REPO, OLD))
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}") is True
+        states = {OLD: "CLOSED", NEW: "CLOSED", 7900: "OPEN"}
+        monkeypatch.setattr(op, "_default_query", lambda: (lambda r, n: {"state": states.get(n, op.NOT_FOUND)}))
+        first = _thread(tid)
+
+        def read(repo, n):
+            if n == NEW:
+                return {"body": f"supersedes {tid}", "comments": [
+                    {"body": "CLOSED: SUPERSEDED-BY #7900 -- re-cut", "login": BOT, "assoc": "NONE"}]}
+            if n == 7900:
+                return {"body": f"re-cut of {tid}", "comments": []}
+            return first(repo, n)
+        monkeypatch.setattr(so, "_default_thread", lambda: read)
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#7900") is True
+        assert kb.list_runs(conn, tid)[-1].metadata["own_prs"] == [f"{REPO}#7900"]
+        assert kb.list_runs(conn, tid)[-1].metadata.get("routed_artifacts") == ["/att/report.pdf"]
+
+
+def test_e2e_after_merge_child_releases_once_the_successor_merges(board, monkeypatch):
+    # Prism e9ba3e150e29: _card_recorded_pr_refs unions every run, so the ended run's CLOSED #7730 kept the
+    # after-merge gate shut forever; the park's successor map must apply to the historical readers too
+    from hermes_cli import kanban_after_merge as am
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")   # sandbox declaration: a stubbed oracle may write here
+    am._CACHE.clear()
+    am._LAST_CHECKED.clear()
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        child = kb.create_task(conn, title="acceptance drill", assignee="worker")
+        assert kb.link_tasks(conn, tid, child, kind="after-merge") is True
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}") is True
+        recorded = op.extract_pr_refs(*kb._card_recorded_pr_refs(conn, tid))
+        assert {(r.repo, r.number) for r in recorded} == {(REPO, NEW)}
+        states = {OLD: "CLOSED", NEW: "MERGED"}
+        assert am.release_merged_edges(conn, query_fn=lambda r, n: {"state": states.get(n)}) == [(tid, child)]
+
+
+def test_successor_map_is_read_from_the_park_event_not_worker_metadata(board, monkeypatch):
+    # a worker cannot hide its own closed PR by writing `routed_pr_superseded` into handoff metadata
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        _set_routed_run(conn, tid, '{"own_prs": ["%s#%d"], "routed_pr_superseded": {"targets": '
+                        '[{"closed": "%s#%d", "successor": "%s#%d"}]}}' % (REPO, OLD, REPO, OLD, REPO, NEW))
+        recorded = op.extract_pr_refs(*kb._card_recorded_pr_refs(conn, tid))
+        assert (REPO, OLD) in {(r.repo, r.number) for r in recorded}
+
+
+def test_e2e_park_filters_a_mixed_reference_string_per_reference(board, monkeypatch):
+    # Prism "Stale references": one string naming the superseded PR and an unaffected one keeps only the latter
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        mixed = f"https://github.com/{REPO}/pull/{OLD} and {REPO}#7900"
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}",
+                                metadata={"pr_url": mixed, "pr_urls": [mixed]}) is True
+        meta = kb.list_runs(conn, tid)[-1].metadata
+        for key in ("pr_url", "pr_urls"):
+            refs = {(r.repo, r.number) for r in op.extract_pr_refs(*op._iter_strings(meta[key]))}
+            assert refs == {(REPO, 7900)}, key
+
+
+def test_e2e_park_keeps_the_implementer_across_a_reviewer_swap(board, monkeypatch):
+    # Prism "Preserve implementer provenance across reviewer swaps": the reviewer was reassigned after the
+    # handoff, so the assignee matches no review_requested reviewer; the implementer is still `worker`
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "review_requested",
+                             {"summary": "x", "implementer": "worker", "reviewer": "human:apollo"})
+            conn.execute("UPDATE tasks SET status='review', assignee='human:other' WHERE id=?", (tid,))
+        assert kb.complete_task(conn, tid, superseded_by=f"{REPO}#{NEW}") is True
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
+        assert ev[-1].payload["implementer"] == "worker"
