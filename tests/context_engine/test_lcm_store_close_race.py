@@ -86,6 +86,9 @@ _HAMMER = textwrap.dedent(
 )
 
 
+@pytest.mark.slow_test(180, reason="40 rounds x 8 writer threads x 50 close() calls in a faulthandler subprocess: "
+                                   "7 s on a quiet host, ~70 s on a loaded one (ci at load 350 tripped the 60 s guard, "
+                                   "2026-11-02); the race needs the volume")
 def test_close_racing_writers_never_crashes_or_leaks_untyped_errors(tmp_path):
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env["PYTHONPATH"] = str(REPO_ROOT)
