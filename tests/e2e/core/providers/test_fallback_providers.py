@@ -29,6 +29,7 @@ from typing import Iterator
 
 import pytest
 
+from agent.route_identity import ROUTE_NOTE_OPENER
 from tests.e2e.core.providers._openai_helpers import (
     Home,
     bounded_turn,
@@ -100,8 +101,16 @@ def test_persistent_primary_503_is_answered_by_fallback_with_full_conversation(t
     want = [("user", FIRST_PROMPT), ("assistant", "FIRST-ON-PRIMARY"), ("user", PROMPT)]
     canaries = [(role, next((w for _r, w in want if w in text), None)) for role, text in _turns(fb)]
     assert [c for c in canaries if c[1]] == want, _turns(fb)
-    # Exactly what the primary was last asked, minus nothing.
-    assert _turns(fb) == _turns(primary_mains[-1]), (_turns(fb), _turns(primary_mains[-1]))
+    # Exactly what the primary was last asked, minus nothing, plus the one route note the
+    # fallback rung carries by design (model-change-notes spec R1: the note rides the
+    # OUTBOUND payload of the call that switched route, prepended to its trailing user row).
+    asked, got = _turns(primary_mains[-1]), _turns(fb)
+    assert not any(ROUTE_NOTE_OPENER in text for _r, text in asked), asked
+    assert got[:-1] == asked[:-1] and got[-1][0] == asked[-1][0] == "user", (got, asked)
+    note, sep, rest = got[-1][1].partition("\n\n")
+    assert sep and rest == asked[-1][1], (got[-1], asked[-1])
+    assert note.startswith(ROUTE_NOTE_OPENER) and FALLBACK_MODEL in note, note
+    assert sum(ROUTE_NOTE_OPENER in text for _r, text in got) == 1, got
     assert run.usage.get("model") == FALLBACK_MODEL, run.describe()
     answers = [r for r in db_messages(h, run.session_id)
                if r["role"] == "assistant" and "FROM-FALLBACK" in (r.get("content") or "")]
