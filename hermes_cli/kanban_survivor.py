@@ -444,27 +444,43 @@ def _holds_repo(d):
     return False
 
 
+_STATUS_CACHE: dict = {}
+
+
+def _status_records(repo):
+    """The one `git status` the residue proof reads (porcelain v1, every untracked + ignored entry,
+    submodules not ignored). Memoised per repo path for ONE preserve / remove_workspace_dir call
+    (cleared at their entry; a cache that outlived a completion would judge a later tree on stale
+    records): the per-repo completion path reads it for the dirty check, `_residue_only` and
+    `_residue_nested_repo`, and one extra spawn per repo pushed `complete_task` past the spawn
+    ceiling the ref-cost test pins (test_complete_is_not_starved_by_ref_count: < 45 for 60 heads)."""
+    key = os.fspath(repo)
+    hit = _STATUS_CACHE.get(key)
+    if hit is None:
+        out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored",
+                   "--ignore-submodules=none").stdout.decode("utf-8", "surrogateescape")
+        hit = _STATUS_CACHE[key] = [rec for rec in out.split("\0") if rec]
+    return hit
+
+
 def _residue_only(repo):
     """True when `repo` is dirty ONLY with untracked residue: no tracked change, no other untracked
     entry, no nested repository under a residue dir, no skip-worktree / assume-unchanged flag (status
-    cannot see edits behind those)."""
+    cannot see edits behind those). A tracked change is a non-`??`/`!!` record and fails the all()."""
+    recs = _status_records(repo)
+    if not (recs and all(rec[:2] in ("??", "!!") and _is_residue(rec[3:]) for rec in recs)):
+        return False
     flags = _git(repo, "ls-files", "-v", "-z").stdout.decode("utf-8", "surrogateescape")
     if any(rec[:1] == "S" or rec[:1].islower() for rec in flags.split("\0") if len(rec) > 2):
         return False
-    out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored",
-               "--ignore-submodules=none").stdout.decode("utf-8", "surrogateescape")
-    recs = [rec for rec in out.split("\0") if rec]
-    return bool(recs) and all(rec[:2] in ("??", "!!") and _is_residue(rec[3:])
-                             and not _holds_repo(Path(repo) / rec[3:]) for rec in recs)
+    return not any(_holds_repo(Path(repo) / rec[3:]) for rec in recs)
 
 
 def _residue_nested_repo(repo):
     """The first untracked/ignored residue path of `repo` that holds a nested repository, or None.
     `_repos` prunes residue dirs, so such a repository is in no capture; reclamation must refuse
     (Prism 324b848c219b)."""
-    out = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored",
-               "--ignore-submodules=none").stdout.decode("utf-8", "surrogateescape")
-    return next((rec[3:] for rec in out.split("\0") if rec[:2] in ("??", "!!")
+    return next((rec[3:] for rec in _status_records(repo) if rec[:2] in ("??", "!!")
                  and _is_residue(rec[3:]) and _holds_repo(Path(repo) / rec[3:])), None)
 
 # Hard ceiling on directories inspected by one enumeration. A gate that cannot
@@ -2208,7 +2224,9 @@ def _capture(repo, key, workspace, recorded=None):
     storage_cache = {}
     published = list(_published_refs(repo, workspace, storage_cache))
     head = _git(repo, "rev-parse", "--verify", "HEAD", check=False)
-    dirty = _git(repo, "status", "--porcelain", "--untracked-files=all").stdout
+    # One status read (cached, see _status_records) serves the dirty check AND the residue proof.
+    # `dirty` keeps its old meaning: tracked changes + untracked files, ignored (`!!`) entries excluded.
+    dirty = any(rec[:2] != "!!" for rec in _status_records(repo))
     if (not dirty or _residue_only(repo)) and head.returncode == 0:
         sha = head.stdout.decode().strip()
         # A rewriting mirror republishes the same content under a new sha, so
@@ -3346,6 +3364,7 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
     """`preserve`'s body, run inside its probe deadline."""
     from hermes_cli.kanban_delegations_board import conn_is_delegations
 
+    _STATUS_CACHE.clear()   # the residue status read lives for ONE preserve call, never across completions
     if conn_is_delegations(conn) and not cleanup:
         # A background unit's card works IN the session's cwd (a user's tree, often a home dir);
         # its output is the delegation registry record, never the directory's bytes.
@@ -3914,6 +3933,7 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
     a board with retained work instead: deleting its recovery artifacts would
     defeat survivorship. Linked worktrees retain Git's no-force dirty check.
     """
+    _STATUS_CACHE.clear()   # fresh status for this deletion decision (see _status_records)
     try:
         if remote_host is not None:
             import shlex
