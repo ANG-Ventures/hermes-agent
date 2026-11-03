@@ -1,6 +1,7 @@
 """The external action must never install Hermes into the plugin checkout."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
@@ -17,11 +18,13 @@ def test_external_validator_checkout_uses_requested_ref_and_preserves_caller(tmp
     # tree overran 60 s on the Studio and exited 128 on the mirror runner (t_f1a3e390). The
     # step's `prepare` needs only pm/ and the setup script. The requested ref is the FIRST of
     # two commits, so a checkout of the branch tip would fail the ref assertion.
+    # The files are copied from the working tree, not `git archive`d: on the mirror runners git
+    # against the runner's own checkout exits 128 (9/9 main runs 11-02..03, t_0fcbd3fa), so the
+    # test must not depend on that checkout's git state.
     upstream = tmp_path / "upstream"
-    upstream.mkdir()
-    archive = subprocess.run(["git", "archive", "HEAD", "pm", "scripts/ci/setup_toolchain.py"],
-                             cwd=repo, check=True, capture_output=True).stdout
-    subprocess.run(["tar", "-x", "-C", str(upstream)], input=archive, check=True)
+    shutil.copytree(repo / "pm", upstream / "pm", ignore=shutil.ignore_patterns("__pycache__"))
+    (upstream / "scripts/ci").mkdir(parents=True)
+    shutil.copy2(repo / "scripts/ci/setup_toolchain.py", upstream / "scripts/ci/setup_toolchain.py")
     git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
     subprocess.run([*git, "init", "-q"], cwd=upstream, check=True)
     subprocess.run([*git, "add", "-A"], cwd=upstream, check=True)
