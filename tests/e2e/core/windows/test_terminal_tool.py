@@ -78,4 +78,21 @@ def test_terminal_round_trip_persists_output_and_exit_code(shell: str, tmp_path:
     assert marker in (row.get("output") or "") and row.get("exit_code") == code, (
         f"{shell}: persisted tool row differs from what the model saw: {row}")
     ph.mark(f"asserts (wire duration={wire.get('duration')!r})")
+    ph.dump_logs(home)
+    if shell == "powershell":
+        import os
+        from tools.environments.local import _find_bash, _make_run_env
+        bash = _find_bash()
+        cmdline = template.format(marker=marker)
+        raw = home.env()
+        for label, env in (("bash raw env", raw), ("bash _make_run_env", _make_run_env(raw))):
+            t = time.monotonic()
+            r = subprocess.run([bash, "-c", cmdline], env=env, capture_output=True, text=True, timeout=120,
+                               stdin=subprocess.DEVNULL)
+            ph.mark(f"{label}: {time.monotonic() - t:.1f}s rc={r.returncode} out={r.stdout[-200:]!r}")
+        made = _make_run_env(raw)
+        ph.lines.append(f"keys dropped by _make_run_env: {sorted(set(raw) - set(made))}")
+        ph.lines.append(f"keys added by _make_run_env: {sorted(set(made) - set(raw))}")
+        ph.lines.append(f"PSModulePath raw={raw.get('PSModulePath')!r} made={made.get('PSModulePath')!r}")
+        ph.lines.append(f"os.environ minus raw: {sorted(set(os.environ) - set(raw))}")
     ph.report()

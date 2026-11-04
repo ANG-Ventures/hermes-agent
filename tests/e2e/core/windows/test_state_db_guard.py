@@ -63,6 +63,7 @@ def test_optimize_storage_refuses_while_gateway_holds_store(tmp_path: Path) -> N
             refused = held.returncode != 0 and "Refusing" in held.stdout
             stop = hermes(home, "gateway", "stop")
             ph.mark("gateway stop cli")
+            ph.lines.append(f"stop rc={stop.returncode} stdout={stop.stdout!r} stderr={stop.stderr[-1500:]!r}")
             assert stop.returncode == 0, stop.tail()
             gw.wait(timeout=60)
             ph.mark("gw.wait exit")
@@ -77,4 +78,5 @@ def test_optimize_storage_refuses_while_gateway_holds_store(tmp_path: Path) -> N
             kill_tree(tree or process_tree(gw.pid))
             ph.mark("cleanup")
             print(log.read_text(errors='replace')[-6000:], file=sys.stderr, flush=True)
+            ph.dump_logs(home)
             ph.report()

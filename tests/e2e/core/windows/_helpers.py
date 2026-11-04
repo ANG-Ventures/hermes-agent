@@ -361,6 +361,16 @@ class Phases:
         print(line, file=sys.stderr, flush=True)
         self.last = now
 
+    def dump_logs(self, home) -> None:
+        """DIAG: INFO-level logs with timestamps (the -6000 tail of stdout is WARNING-only)."""
+        logs = Path(home.hermes_home) / "logs"
+        for name in ("gateway.log", "agent.log", "gateway-shutdown-diag.log"):
+            f = logs / name
+            if f.exists():
+                txt = f.read_text(errors="replace")
+                self.lines.append(f"===== {name} ({len(txt)} chars, tail 9000) =====")
+                self.lines.append(txt[-9000:])
+
     def report(self) -> None:
         # The per-file runner prints output only for a FAILED file (round 1 showed nothing).
         import pytest
