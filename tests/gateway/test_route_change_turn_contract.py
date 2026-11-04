@@ -218,7 +218,9 @@ def test_pool_exhaustion_then_429_delivers_each_hop_before_final(
         assert result["completed"] is True
         assert len(adapter.messages) == 2
         assert all(chat == "test-chat" for chat, _, _ in adapter.messages)
-        assert "sub pool capped" in adapter.messages[0][1]
+        # A bare no-eligible refusal proves no quota or occupied-slot cause.
+        assert "relay unavailable" in adapter.messages[0][1]
+        assert "cause not stated" in adapter.messages[0][1]
         assert "rate limit" in adapter.messages[1][1]
         # Actual restore method, not a direct call to the formatter.
         monkeypatch.setattr(

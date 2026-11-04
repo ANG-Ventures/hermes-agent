@@ -1483,6 +1483,11 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
         if (row.get("class_source") == "text" and "no eligible sub" in t
                 and "requested model" not in t and not row.get("quota_window")
                 and "capped" not in t):
+            from agent.fork_ext.relay_quota import pool_pressure_label
+
+            pp = row.get("pool_pressure")
+            if isinstance(pp, Mapping):
+                return pool_pressure_label(pp)
             return "relay unavailable"
         if "budget" in t and "capped" in t:
             return "model budget capped"
@@ -1712,7 +1717,9 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
         return f"{prefix}{_lane_incapable_body(row, seat)}, {window}", ()
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
-    if cause in ("relay unavailable", "relay quota exhausted", "relay transport unavailable"):
+    if (cause in ("relay unavailable", "relay quota exhausted", "relay transport unavailable")
+            and not row.get("seat") and hop in (None, "relay")
+            and not is_direct_pin(row.get("from_provider"))):
         from agent.fork_ext.relay_quota import pool_pressure_text
 
         pp = row.get("pool_pressure")
@@ -1951,8 +1958,10 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     cls = row.get("trigger_class")
     relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream")
                      or bool(row.get("relay_synthetic")))
-    if _cause_phrase(row) == "relay unavailable":
-        return "relay unavailable"
+    cause = _cause_phrase(row)
+    if (cause in ("relay unavailable", "relay quota exhausted", "relay transport unavailable")
+            or (cause == "relay busy" and cls in ("quota_model", "quota_seat"))):
+        return cause
     bcode = _bridge_code(row)
     if bcode:
         # The bridge's machine code names what happened; the status-derived

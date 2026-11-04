@@ -215,3 +215,27 @@ def test_eligibility_alone_does_not_prove_busy(_home, monkeypatch, busy):
     [line] = _lines(a)
     assert "Model fallback (relay unavailable):" in line, line
     assert "relay busy" not in line and "all subs at capacity" not in line
+
+
+@pytest.mark.parametrize("reason,label", [
+    ("quota", "relay quota exhausted"),
+    ("transport", "relay transport unavailable"),
+])
+def test_text_classified_refusal_uses_counts_for_head_and_rider(reason, label):
+    row = _row({"x-pool-seats-total": "26", "x-pool-seats-eligible": "0",
+                "x-pool-ineligible-reasons": f"{reason}:26"})
+    row.update(trigger_class="quota_model", class_source="text", err_head="no eligible sub")
+    assert fp.head_label_override(row) == label
+    assert fp.format_cause_rider(row, tz=UTC).startswith(label + ":")
+
+
+@pytest.mark.parametrize("seat,hop,location", [
+    ("seat-a", "relay→bridge", "to seat-a bridge"),
+    (None, "bridge→anthropic", "from the bridge"),
+])
+def test_neutral_refusal_preserves_recorded_location(seat, hop, location):
+    row = _row({})
+    row.update(err_head="request refused", seat=seat, hop=hop)
+    rider = fp.format_cause_rider(row, tz=UTC)
+    assert rider.startswith("relay unavailable ")
+    assert location in rider
