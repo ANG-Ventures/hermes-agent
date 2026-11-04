@@ -146,3 +146,62 @@ def test_stash_keeps_the_pool_headers():
     fbe.stash_api_error(a, _E("pool at capacity"), 503)
     kept = a._pending_fallback_error["headers"]
     assert {k: kept.get(k) for k in FULL} == FULL
+
+
+@pytest.mark.parametrize("body,headers,label,detail", [
+    # Historical fallback_events row 28270 (2026-11-03 17:29:14 PT):
+    # refusal-time counts, NOT a later /health snapshot. The body and class
+    # survived in the ledger; the counts survived in its rendered notice.
+    ({"error": "no eligible sub: no subscription that serves the requested bridge mode is available; retry shortly or drop the mode"},
+     {"x-pool-seats-total": "26", "x-pool-seats-eligible": "0",
+      "x-pool-ineligible-reasons": "quota:26", "x-pool-inflight": "0",
+      "x-pool-inflight-max": "60"}, "relay quota exhausted", "quota 26"),
+    ({"error": "no eligible sub"}, {}, "relay unavailable", "no eligible subscription"),
+    ({"error": "no eligible sub"},
+     {"x-pool-seats-total": "26", "x-pool-seats-eligible": "0",
+      "x-pool-seats-busy": "0", "x-pool-ineligible-reasons": "transport:26"},
+     "relay transport unavailable", "transport 26"),
+    ({"error": "draining-for-deploy"}, {}, "relay deploying", "deploy"),
+    ({"error": "pool at capacity"}, FULL, "relay busy", "11 of 11 eligible seats full"),
+    ({"error": "no eligible sub"}, {"x-relay-error-class": "quota_seat"},
+     "seat quota", "no eligible sub for the model"),
+    ({"error": "upstream connect timed out"}, {"x-relay-error-class": "conn"},
+     "connection issue", "connect timeout"),
+])
+def test_refusal_evidence_names_the_same_cause_on_both_banners(
+        _home, monkeypatch, body, headers, label, detail):
+    from agent.chat_completion_helpers import chat_pin_own_fallback, format_chat_pin_notice
+    from tests.agent.test_fallback_rider_truth import _Err
+
+    a = _agent(monkeypatch, [("claude-btpr", OPUS)])
+    pin = {"provider": a.provider, "model": a.model}
+    a._primary_runtime = dict(pin)
+    h = _busy_headers(None)
+    h.update(headers)
+    _hop(a, _Err(body, 503, h))
+    _settle(a)
+    [line] = _lines(a)
+    own, compact_label = chat_pin_own_fallback(a, pin)
+    compact = format_chat_pin_notice(a.model, a.provider, pin,
+                                     own_fallback=own, fallback_label=compact_label)
+    assert f"Model fallback ({label}):" in line, line
+    assert detail in line, line
+    assert f"(fallback: {label})" in compact, compact
+    if label != "relay busy":
+        assert "relay busy" not in line + compact
+        assert "all subs at capacity" not in line
+    # Display attribution does not reclassify the refusal used by routing.
+    assert _rows(_home)[0]["trigger_class"] == h["x-relay-error-class"]
+
+
+@pytest.mark.parametrize("busy", [None, "0", "3"])
+def test_eligibility_alone_does_not_prove_busy(_home, monkeypatch, busy):
+    from tests.agent.test_fallback_rider_truth import _Err
+
+    a = _agent(monkeypatch, [("claude-btpr", OPUS)])
+    h = _measured(**{"x-pool-seats-busy": busy})
+    _hop(a, _Err({"error": "no eligible sub"}, 503, h))
+    _settle(a)
+    [line] = _lines(a)
+    assert "Model fallback (relay unavailable):" in line, line
+    assert "relay busy" not in line and "all subs at capacity" not in line
