@@ -184,6 +184,7 @@ def test_finish_pruning_work_is_bounded_by_history_cap_not_proof_count(monkeypat
     from datetime import datetime, timezone
 
     stamp = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 50)
     monkeypatch.setattr(executions, "_hermes_now", lambda: datetime(2026, 1, 2, tzinfo=timezone.utc))
     work = []
     for size in (100, 10000):
@@ -191,6 +192,8 @@ def test_finish_pruning_work_is_bounded_by_history_cap_not_proof_count(monkeypat
         monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / str(size) / "executions.db")
         with executions._transaction() as conn:
             # Seed the pre-upgrade schema so the reopen must migrate a real legacy ledger.
+            conn.execute("DROP TRIGGER IF EXISTS execution_proof_insert")
+            conn.execute("DROP TRIGGER IF EXISTS execution_proof_update")
             for index in conn.execute("PRAGMA index_list(executions)").fetchall():
                 if index["name"] in {"idx_executions_rewind_proof", "idx_executions_prunable_finish"}:
                     conn.execute('DROP INDEX ' + index["name"])
@@ -216,6 +219,47 @@ def test_finish_pruning_work_is_bounded_by_history_cap_not_proof_count(monkeypat
             conn.set_progress_handler(None, 0)
         work.append(steps[0])
     assert work[1] <= work[0] * 3 + 100, work
+    executions.close_shared_connections()
+
+
+def test_incremental_prune_matches_reader_predicate_and_legacy_retention(monkeypatch, tmp_path):
+    """Raw writes model an older gateway finishing during a rolling upgrade."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    from cron.occurrences import proves_slot, scheduled_instant
+    from datetime import datetime, timedelta, timezone
+    import random
+
+    rng = random.Random(17)
+    now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    with executions._transaction() as conn:
+        for i in range(120):
+            cap = (0, 1, 7, 20)[i % 4]
+            monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", cap)
+            slot = (now + timedelta(seconds=rng.randrange(-300, 300))).isoformat()
+            finished = (None, "malformed", "2026-01-02T00:00:00", now.isoformat(),
+                        now.astimezone(timezone(timedelta(hours=-5))).isoformat())[i % 5]
+            status = ("completed", "completed", "failed", "unknown", "running")[i % 5]
+            if i % 11 == 0:
+                slot = "not-an-instant"
+            conn.execute(
+                "INSERT INTO executions (id,job_id,source,process_id,pid,status,claimed_at,"
+                "finished_at,scheduled_instant) VALUES (?,?, 'test','external',1,?,?,?,?)",
+                (str(i), str(i % 9), status, now.isoformat(), finished, slot),
+            )
+            proofs = set(executions._rewind_proof_ids(conn))
+            recent = {r[0] for r in conn.execute(
+                "SELECT id FROM executions WHERE status IN ('completed','failed','unknown') "
+                "ORDER BY julianday(finished_at) DESC, finished_at DESC, "
+                "julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT ?", (cap,))}
+            inflight = {r[0] for r in conn.execute(
+                "SELECT id FROM executions WHERE status IN ('claimed','running')")}
+            executions._prune_unlocked(conn)
+            assert {r[0] for r in conn.execute("SELECT id FROM executions")} == proofs | recent | inflight
+            assert {r[0] for r in conn.execute("SELECT id FROM executions WHERE rewind_proof=1")} == proofs
+            for row in conn.execute("SELECT * FROM executions WHERE rewind_proof=1"):
+                canonical = scheduled_instant(row["scheduled_instant"])
+                assert canonical and proves_slot(row["finished_at"] or row["claimed_at"], canonical)
+    assert "rewind_proof" not in executions.list_executions(limit=1)[0]
     executions.close_shared_connections()
 
 
