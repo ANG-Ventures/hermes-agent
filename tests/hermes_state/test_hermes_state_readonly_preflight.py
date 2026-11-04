@@ -57,15 +57,19 @@ def _make_wal_db(path: Path) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("CREATE TABLE t (x)")
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    # Keep a READ-ONLY second connection open so neither close can
-    # checkpoint: the writer skips checkpoint-on-close because another
-    # connection exists, and the ro holder cannot checkpoint at all.
+    # Hold an open READ transaction on a read-only second connection while
+    # the writer closes. The holder's SHARED lock stops the writer's
+    # checkpoint-and-unlink on close (a bare open connection is not enough:
+    # stock Linux sqlite checkpoints and deletes the WAL anyway). The ro
+    # holder then closes last, and a read-only connection never checkpoints.
     # The committed row therefore lives only in the -wal file.
-    holder = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    holder.execute("SELECT 1").fetchone()
+    holder = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None)
+    holder.execute("BEGIN")
+    holder.execute("SELECT count(*) FROM t").fetchone()
     conn.execute("INSERT INTO t VALUES (42)")
     conn.commit()
     conn.close()
+    holder.execute("COMMIT")
     holder.close()
     assert path.with_name(path.name + "-wal").is_file(), (
         "fixture precondition: -wal sidecar must survive with pending frames"
