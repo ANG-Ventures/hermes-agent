@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -115,3 +115,52 @@ def test_session_store_failure_does_not_break_ledger_recovery(env, monkeypatch):
 
     assert executions_mod.recover_interrupted_executions() == 1
     assert executions_mod.get_execution(attempt["id"])["status"] == "unknown"
+
+
+def _recover(attempt, recovery):
+    if recovery == "sweep":
+        assert executions_mod.recover_interrupted_executions() == 1
+    else:
+        assert executions_mod.terminalize_dead_owner(attempt["id"], reason="worker exited 137")
+
+
+@pytest.mark.parametrize("recovery", ["sweep", "terminalize"])
+def test_post_commit_claim_is_outside_recovery_snapshot(env, monkeypatch, recovery):
+    snapshot = datetime(2026, 10, 25, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(executions_mod, "_hermes_now", lambda: snapshot)
+    dead = _attempt("jobx", age_s=60)
+    dead_sid = "cron_jobx_dead"
+    live_sid = "cron_jobx_live"
+    _session(env, dead_sid, started_at=snapshot.timestamp() - 59)
+    cleanup = executions_mod._end_orphaned_cron_sessions
+
+    def claim_after_commit(windows):
+        # Recovery committed before calling cleanup; a real subsequent claim can now win.
+        assert executions_mod.get_execution(dead["id"])["status"] == "unknown"
+        later = snapshot + timedelta(microseconds=300)
+        monkeypatch.setattr(executions_mod, "_hermes_now", lambda: later)
+        executions_mod.create_execution("jobx", source="builtin")
+        _session(env, live_sid, started_at=later.timestamp())  # deliberately no turn lease
+        return cleanup(windows)
+
+    monkeypatch.setattr(executions_mod, "_end_orphaned_cron_sessions", claim_after_commit)
+    _recover(dead, recovery)
+    assert _ended(env, dead_sid)[1] == "cron_orphaned"
+    assert _ended(env, live_sid) == (None, None)
+
+
+@pytest.mark.parametrize("recovery", ["sweep", "terminalize"])
+def test_submillisecond_next_claim_bounds_orphan_window(env, monkeypatch, recovery):
+    first = datetime(2026, 10, 25, 12, 0, 0, 100, tzinfo=timezone.utc)
+    monkeypatch.setattr(executions_mod, "_hermes_now", lambda: first)
+    dead = _attempt("jobx", age_s=0)
+    _session(env, "cron_jobx_dead", started_at=first.timestamp())
+    second = first + timedelta(microseconds=300)
+    monkeypatch.setattr(executions_mod, "_hermes_now", lambda: second)
+    executions_mod.create_execution("jobx", source="builtin")
+    _session(env, "cron_jobx_live", started_at=second.timestamp())
+    monkeypatch.setattr(executions_mod, "_hermes_now", lambda: second + timedelta(seconds=1))
+
+    _recover(dead, recovery)
+    assert _ended(env, "cron_jobx_dead")[1] == "cron_orphaned"
+    assert _ended(env, "cron_jobx_live") == (None, None)

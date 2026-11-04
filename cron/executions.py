@@ -500,16 +500,20 @@ _OWNER_WEDGED_REASON = (
 
 
 def _orphan_session_window(conn: sqlite3.Connection, record: Dict[str, Any]) -> tuple:
-    """(job_id, start, end) epoch window of the session an abandoned attempt opened: from its own
-    claim to the job's next claim (that later attempt may still be live), or open-ended."""
-    nxt = conn.execute(
-        "SELECT claimed_at FROM executions WHERE job_id=? AND id<>?"
-        " AND julianday(claimed_at) > julianday(?) ORDER BY julianday(claimed_at) LIMIT 1",
-        (record["job_id"], record["id"], record["claimed_at"]),
-    ).fetchone()
-    start = datetime.fromisoformat(record["claimed_at"]).timestamp()
-    end = datetime.fromisoformat(nxt["claimed_at"]).timestamp() if nxt else None
-    return str(record["job_id"]), start, end
+    """Epoch window from this claim to the next claim or this locked recovery snapshot.
+
+    Parse claim instants in Python: SQLite julianday() rounds away sub-millisecond
+    distinctions. The snapshot caps cleanup after the transaction releases its lock.
+    """
+    snapshot = _hermes_now()
+    start = datetime.fromisoformat(record["claimed_at"])
+    claims = conn.execute(
+        "SELECT claimed_at FROM executions WHERE job_id=? AND id<>?",
+        (record["job_id"], record["id"]),
+    ).fetchall()
+    later = (datetime.fromisoformat(row["claimed_at"]) for row in claims)
+    end = min((instant for instant in later if instant > start), default=snapshot)
+    return str(record["job_id"]), start.timestamp(), min(end, snapshot).timestamp()
 
 
 def _end_orphaned_cron_sessions(windows: List[tuple]) -> int:
