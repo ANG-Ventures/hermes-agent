@@ -1,0 +1,59 @@
+t_d3e792dd: operator recipe and remote-cleanup proposal
+
+Reaper PR: https://github.com/ANG-Ventures/ace-media-homelab/pull/647
+Reviewed implementation head for this handoff: 197398799b589e113efc54db3bc9dd097616f294
+Source: tools/disk-retention/ci-scratch-reap.py
+Expected SHA256: 51d68ad72563dd5eafb68266442ac7044b9456307c24767e7dff2c32c7914365
+Target: ACE-AI, /usr/local/bin/ci-scratch-reap.py
+Native unit: ci-scratch-reap.service (timer: ci-scratch-reap.timer)
+Observed installed SHA256 before deployment: ffced319fbb7d3f165818170e5b8ccbfff1aa469d57a152fc21f0616075442c9
+Observed old native result: success, ExecMainStatus=0, 2026-11-03 20:00:40 PST.
+This old green run is NOT acceptance of the patched reaper.
+
+Operator-only deploy after merge/approval, from verified merged checkout on ACE-AI:
+  sha256sum tools/disk-retention/ci-scratch-reap.py
+  # STOP if hash differs from expected; review new head and refresh recipe.
+  sudo systemctl stop ci-scratch-reap.timer
+  sudo systemctl stop ci-scratch-reap.service
+  sudo install -d -m 0700 /var/backups/ci-scratch-reap-t_d3e792dd
+  # Do not overwrite an existing previous.py backup; inspect it first if present.
+  sudo test ! -e /var/backups/ci-scratch-reap-t_d3e792dd/previous.py
+  sudo cp -p /usr/local/bin/ci-scratch-reap.py /var/backups/ci-scratch-reap-t_d3e792dd/previous.py
+  sudo sha256sum /var/backups/ci-scratch-reap-t_d3e792dd/previous.py
+  sudo install -o root -g root -m 0755 tools/disk-retention/ci-scratch-reap.py /usr/local/bin/ci-scratch-reap.py
+  sha256sum /usr/local/bin/ci-scratch-reap.py
+  sudo systemctl reset-failed ci-scratch-reap.service
+  sudo systemctl start ci-scratch-reap.service
+  systemctl show ci-scratch-reap.service -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp -p MemoryPeak
+  sudo journalctl -u ci-scratch-reap.service -n 80 --no-pager
+  sudo systemctl start ci-scratch-reap.timer
+Proof: installed hash equals expected AND this new one-shot has Result=success / ExecMainStatus=0. Read per-tree error/skipped lines too; rc0 intentionally does not mean every tree was removed. Confirm failed/skipped trees are named in #logs using the existing info sender. Restore timer on every deployment exit, including failed proof.
+Rollback:
+  sudo systemctl stop ci-scratch-reap.service
+  sudo install -o root -g root -m 0755 /var/backups/ci-scratch-reap-t_d3e792dd/previous.py /usr/local/bin/ci-scratch-reap.py
+  sha256sum /usr/local/bin/ci-scratch-reap.py
+  sudo systemctl start ci-scratch-reap.timer
+  # Verify hash equals saved previous.py; old recursion/path limits return on rollback.
+No deployment or live timer change was performed by this worker.
+
+Remote cleanup: implementation proposal ONLY, not a claimed fix
+
+Inventory of current launch mechanisms in task-owned Hermes checkout:
+- tools/environments/ssh.py:309-320 SSHEnvironment._run_bash spawns ssh + remote bash via _popen_bash; it forwards the browser lease allowlist, not task/run identity. No remote unit is allocated.
+- ssh.py:322-333 cleanup syncs back files and closes ControlMaster sockets. It does not kill remote descendants.
+- tools/process_registry.py:1488-1524 spawn_via_env is the existing nonlocal background launcher. It uses remote nohup bash, pid/log/exit files, and a ProcessSession with persist_on_release. Extend this rather than create another independent background launcher.
+- process_registry.py:188-197 _systemd_scope_argv and :219-253 systemd_user_bus_env supply existing local user-scope conventions. Reuse the protocol, but capability-probe on the REMOTE host; local availability is not proof of remote support.
+- hermes_cli/kanban_db.py:19308-19367 reap_exited_worker_leftovers uses local session and run-env ownership. It cannot inspect SSH-host processes.
+- tools/terminal_tool_lifecycle.py cleanup_all_environments is the environment disposal seam; terminal_tool_background.py propagates persist_on_release.
+
+Proposed minimal implementation boundaries for operator approval:
+1. New tools/environments/ssh_run_ownership.py: single remote user-unit launch/query/stop protocol shared by foreground SSH and spawn_via_env. Persist mode-0600 receipts under a private runtime directory owned by remote uid, not in a copied checkout. Receipt fields: schema, card, numeric run, host identity, remote uid, boot_id, random command instance, exact transient unit name, systemd InvocationID/ControlGroup, persist_on_release, launch time. No command strings, credentials, or full env in registry.
+2. tools/environments/ssh.py: _run_bash uses owned user unit only for dispatcher-authenticated card/run launches; non-kanban SSH unchanged. Register ownership before execution; handshake returns receipt. Failure to acquire ownership => retain/report, never fabricate ownership. cleanup stops only receipts for its exact run/host/uid/boot/InvocationID after bounded identity revalidation.
+3. tools/process_registry.py spawn_via_env and ProcessSession persistence: reuse owned launch for background commands and propagate explicit survival to remote receipt. Do not accidentally wrap remote detached commands in a foreground unit that cleanup kills. Retain survival records through environment disposal, excluding them from automatic completion reap.
+4. hermes_cli/kanban_db.py reap_exited_worker_leftovers / hermes_cli/kanban_db_dispatch.py exit path: invoke same protocol for terminal run receipts, including abrupt coordinator-worker death. Verify DB terminal-run proof, not just terminal card status. Do not stop units from next run, live coordinator, or explicitly surviving session.
+5. tests/tools/test_ssh_run_ownership.py plus existing SSH/process-registry/kanban exit tests: real user-unit child cleanup, TERM escalation bounded then KILL, run isolation, PID reuse, boot mismatch, uid mismatch, InvocationID mismatch, no bus fallback, coordinator active, explicit survive, malicious/missing receipt, crash/restart recovery. All negative identity cases retain/report.
+Use unit/cgroup stop only after exact proof; never infer from cwd/card text/PID alone. Existing local user-unit helper is a convention, not a currently deployed remote ownership mechanism. No generic backend implementation was added pending approval, per Apollo ruling.
+
+Read-only current inventory: process-inventory.json records host/boot/PID/start/uid/cgroup and named task/run fields only; no argv/secrets. On ACE-AI kanbanw could inspect 11 candidate processes (all this active card's test/shell at snapshot), but 7142 processes denied environment reads. Remote board unavailable, so no candidate has terminal-run proof. Other hosts were not accessed: this placed worker has no provided authenticated inventory path there. No process was killed. Complete privileged fleet inventory remains operator-owned; unknown ownership retained/reported.
+
+deviations: none.
