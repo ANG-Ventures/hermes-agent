@@ -37,6 +37,10 @@ def _running(home) -> bool:
     return state.get("gateway_state") == "running"
 
 
+@pytest.mark.slow_test(
+    150,
+    reason="Hosted 4-vCPU Windows: measured boot 31-34s + stop CLI 37-38s + two optimize-storage CLIs 6s",
+)
 def test_optimize_storage_refuses_while_gateway_holds_store(tmp_path: Path) -> None:
     with FakeLLMServer() as srv:
         home = make_home(tmp_path, srv.base_url)

@@ -499,6 +499,48 @@ _OWNER_WEDGED_REASON = (
 )
 
 
+def _orphan_session_window(conn: sqlite3.Connection, record: Dict[str, Any]) -> tuple:
+    """Epoch window from this claim to the next claim or this locked recovery snapshot.
+
+    Parse claim instants in Python: SQLite julianday() rounds away sub-millisecond
+    distinctions. The snapshot caps cleanup after the transaction releases its lock.
+    """
+    snapshot = _hermes_now()
+    start = datetime.fromisoformat(record["claimed_at"])
+    claims = conn.execute(
+        "SELECT claimed_at FROM executions WHERE job_id=? AND id<>?",
+        (record["job_id"], record["id"]),
+    ).fetchall()
+    later = (datetime.fromisoformat(row["claimed_at"]) for row in claims)
+    end = min((instant for instant in later if instant > start), default=snapshot)
+    return str(record["job_id"]), start.timestamp(), min(end, snapshot).timestamp()
+
+
+def _end_orphaned_cron_sessions(windows: List[tuple]) -> int:
+    """Close the state.db cron session rows of attempts just recovered as ``unknown``.
+
+    ``_finalize_cron_session`` never runs for an attempt whose owner died (kill, restart), so its
+    ``cron_<job>_*`` row kept ``ended_at IS NULL`` forever and read as live (t_fd68626f).
+    Best-effort: session bookkeeping must never fail ledger recovery."""
+    if not windows:
+        return 0
+    ended = 0
+    try:
+        from hermes_state_registry import acquire, release_or_close
+
+        db = acquire()
+        try:
+            for job_id, start, end in windows:
+                ended += len(db.end_orphaned_cron_sessions(
+                    job_id, started_since=start, started_before=end))
+        finally:
+            release_or_close(db)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).debug("Ending orphaned cron sessions failed: %s", exc)
+    return ended
+
+
 def recover_interrupted_executions() -> int:
     """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
     dead, plus rows whose live owner holds a claim older than the derived stale bound (the
@@ -506,6 +548,7 @@ def recover_interrupted_executions() -> int:
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
+    orphan_windows: List[tuple] = []
     # Derived on the first live-owned row only: the bound reads config, and the idle gateway
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
     stale_after: Optional[float] = None
@@ -564,10 +607,14 @@ def recover_interrupted_executions() -> int:
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
+                    # Only a provably dead owner: a wedged live owner may still finalize its own row.
+                    if reason == _OWNER_GONE_REASON:
+                        orphan_windows.append(_orphan_session_window(conn, record))
         if changed:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
+    _end_orphaned_cron_sessions(orphan_windows)
     return changed
 
 
@@ -621,8 +668,10 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
         if cur.rowcount != 1:
             return False
         record = _fetch(conn, execution_id)
+        window = _orphan_session_window(conn, record) if record is not None else None
         _prune_unlocked(conn)
     _emit_execution_state(record)
+    _end_orphaned_cron_sessions([window] if window else [])
     return True
 
 

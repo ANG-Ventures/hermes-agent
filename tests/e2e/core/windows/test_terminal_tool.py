@@ -38,7 +38,19 @@ SHELLS: dict[str, tuple[str, int, str]] = {
 }
 
 
-@pytest.mark.parametrize("shell", list(SHELLS))
+@pytest.mark.parametrize(
+    "shell",
+    [
+        pytest.param(
+            shell,
+            marks=pytest.mark.slow_test(
+                120,
+                reason="Hosted 4-vCPU Windows: PowerShell-through-Git-Bash round trip measured 48-53s (cmd 9s)",
+            ),
+        ) if shell == "powershell" else shell
+        for shell in SHELLS
+    ],
+)
 def test_terminal_round_trip_persists_output_and_exit_code(shell: str, tmp_path: Path) -> None:
     template, code, extra = SHELLS[shell]
     marker, answer = nonce(shell.upper()), nonce("DONE")

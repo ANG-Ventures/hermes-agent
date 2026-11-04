@@ -167,6 +167,10 @@ def _gateway_state(home: WinHome) -> dict:
         return {}
 
 
+@pytest.mark.slow_test(
+    120,
+    reason="Hosted 4-vCPU Windows: measured boot 24-25s + stop CLI 36-37s; graceful teardown itself <1s",
+)
 def test_gateway_stop_drains_gracefully(tmp_path: Path) -> None:
     with FakeLLMServer() as srv:
         home = make_home(tmp_path, srv.base_url)
