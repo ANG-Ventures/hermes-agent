@@ -288,6 +288,23 @@ def test_successor_map_is_read_from_the_park_event_not_worker_metadata(board, mo
         assert (REPO, OLD) in {(r.repo, r.number) for r in recorded}
 
 
+def test_reopened_pr_that_becomes_the_successor_again_stays_recorded(board, monkeypatch):
+    # Prism 5fe5ba707b83 / 444c161eb5e8: park OLD->NEW, then OLD is reopened and a later park goes NEW->OLD.
+    # The successor map replays in event order, so OLD (the current successor) is recorded again and NEW is not.
+    with kb.connect() as conn:
+        tid = _blocked_card(conn, monkeypatch)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "routed_pr_superseded",
+                             {"targets": [{"closed": f"{REPO}#{OLD}", "successor": f"{REPO}#{NEW}"}]})
+            kb._append_event(conn, tid, "routed_pr_superseded",
+                             {"targets": [{"closed": f"{REPO}#{NEW}", "successor": f"{REPO}#{OLD}"}]})
+        _set_routed_run(conn, tid, '{"own_prs": ["%s#%d"], "auto_routed_open_prs": ["%s#%d"]}'
+                        % (REPO, OLD, REPO, OLD))
+        assert so.superseded_prs(conn, tid) == {f"{REPO}#{NEW}".lower()}
+        recorded = op.extract_pr_refs(*kb._card_recorded_pr_refs(conn, tid))
+        assert {(r.repo, r.number) for r in recorded} == {(REPO, OLD)}
+
+
 def test_e2e_park_filters_a_mixed_reference_string_per_reference(board, monkeypatch):
     # Prism "Stale references": one string naming the superseded PR and an unaffected one keeps only the latter
     with kb.connect() as conn:

@@ -246,9 +246,11 @@ def _drop_closed_refs(meta: dict, closed: set, open_pr) -> dict:
 
 def superseded_prs(conn: sqlite3.Connection, task_id: str) -> set:
     """Lower-cased ``owner/repo#N`` of every PR a park of this card replaced (Prism e9ba3e150e29). Read from the
-    ``routed_pr_superseded`` EVENTS :func:`park` writes, never from run metadata, which a worker controls."""
+    ``routed_pr_superseded`` EVENTS :func:`park` writes, never from run metadata, which a worker controls.
+    Replayed in event order: a later park that names a PR as its successor (a reopened PR) clears it again
+    (Prism 5fe5ba707b83 / 444c161eb5e8)."""
     out: set = set()
-    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
                                    (task_id, "routed_pr_superseded")):
         try:
             data = json.loads(payload or "{}")
@@ -257,6 +259,8 @@ def superseded_prs(conn: sqlite3.Connection, task_id: str) -> set:
         for t in (data.get("targets") or ()) if isinstance(data, dict) else ():
             if isinstance(t, dict) and isinstance(t.get("closed"), str):
                 out.add(t["closed"].lower())
+                if isinstance(t.get("successor"), str):
+                    out.discard(t["successor"].lower())
     return out
 
 
