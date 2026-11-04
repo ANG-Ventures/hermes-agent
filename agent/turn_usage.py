@@ -53,8 +53,11 @@ def _fold_moa_usage(agent, canonical_usage):
     """MoA: fold advisor fan-out usage into REPORTED token counts (only aggregator usage is
     returned, so advisor spend would be invisible) and flush the full-turn trace when
     ``moa.save_traces`` is on. Returns ``(client, canonical_usage, advisor_cost, advisor_pricing_calls)``;
-    the pricing calls ledger each physical advisor call under the composite row (card t_02323499)."""
+    the pricing calls ledger each physical advisor call under the composite row (card t_02323499).
+    The advisors' own usage (or None) is returned last so billing can fold it onto a relay-adjusted
+    aggregator bill (t_9f190074)."""
     _moa_ref_cost = None
+    _ref_usage = None
     _moa_ref_pricing_calls: list[dict[str, Any]] = []
     _moa_client = getattr(agent, "client", None)
     if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
@@ -78,7 +81,7 @@ def _fold_moa_usage(agent, canonical_usage):
             )
         except Exception as _moa_trace_exc:  # pragma: no cover - defensive
             logger.debug("MoA trace flush failed: %s", _moa_trace_exc)
-    return _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls
+    return _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls, _ref_usage
 
 
 def record_response_usage(
@@ -136,11 +139,13 @@ def record_response_usage(
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage
-    _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls = _fold_moa_usage(agent, canonical_usage)
+    _moa_client, canonical_usage, _moa_ref_cost, _moa_ref_pricing_calls, _moa_ref_usage = (
+        _fold_moa_usage(agent, canonical_usage))
     # t_9f190074: a multi-request relay payload bills every request's prompt; a deferred one bills
     # zero (its tokens ride the next response). Context consumers below keep ``canonical_usage``.
+    # The relay adjustment applies to the aggregator, then the advisors' usage folds on top.
     billed_aggregator = relay_billed_usage(getattr(response, "usage", None), aggregator_usage)
-    billed_usage = billed_aggregator if aggregator_usage is canonical_usage else canonical_usage
+    billed_usage = billed_aggregator if _moa_ref_usage is None else billed_aggregator + _moa_ref_usage
     billed_flags = {key: bool(getattr(billed_usage, key)) for key in USAGE_UNKNOWN_FIELDS}
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens
@@ -293,6 +298,11 @@ def record_response_usage(
             turn_calls.append({
                 **usage_dict,
                 **billed_flags,
+                # Every token field of the row is the bill, so prompt/total agree with the buckets.
+                "prompt_tokens": billed_usage.prompt_tokens,
+                "completion_tokens": billed_usage.output_tokens,
+                "total_tokens": billed_usage.total_tokens,
+                "reasoning_tokens": billed_usage.reasoning_tokens,
                 "input_tokens": billed_usage.input_tokens,
                 "output_tokens": billed_usage.output_tokens,
                 "cache_read_tokens": billed_usage.cache_read_tokens,

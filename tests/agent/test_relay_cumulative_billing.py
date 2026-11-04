@@ -104,6 +104,69 @@ def test_agent_bills_the_cumulative_split_and_keeps_last_request_context(tmp_pat
         a.close()
 
 
+class _MoaClient:
+    """An MoA client whose advisors spent ``REF`` tokens on this call."""
+
+    def __init__(self, ref):
+        self._ref = ref
+
+    def consume_reference_usage(self):
+        ref, self._ref = self._ref, None
+        return ref, None
+
+
+REF = CanonicalUsage(input_tokens=10, output_tokens=1)
+
+
+def _assert_counters_match_rollup(agent, calls):
+    from agent.turn_finalizer import _rollup_turn_usage
+
+    rollup = _rollup_turn_usage(calls)
+    for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                "total_tokens"):
+        assert rollup[key] == getattr(agent, f"session_{key}"), key
+    for c in calls:  # each row is internally consistent: prompt/total are its own buckets
+        assert c["prompt_tokens"] == c["input_tokens"] + c["cache_read_tokens"] + c["cache_write_tokens"]
+        assert c["total_tokens"] == c["prompt_tokens"] + c["output_tokens"]
+    return rollup
+
+
+def test_turn_call_rows_carry_billed_prompt_and_total(tmp_path, monkeypatch):
+    a = _agent(tmp_path, monkeypatch)
+    try:
+        calls: list = []
+        _record(a, _response(_DEFERRED_USAGE), 1, calls)
+        _record(a, _response(_CARRYING_USAGE), 2, calls)
+        rollup = _assert_counters_match_rollup(a, calls)
+        assert rollup["total_tokens"] == sum(BILLED.values()) + OUTPUT == 429_298
+        assert a.context_compressor.last_prompt_tokens == sum(LAST.values())
+    finally:
+        a.close()
+
+
+@pytest.mark.parametrize("deferred_first", [False, True])
+def test_moa_turn_bills_relay_cumulative_aggregator_plus_advisors(tmp_path, monkeypatch, deferred_first):
+    a = _agent(tmp_path, monkeypatch)
+    try:
+        calls: list = []
+        if deferred_first:  # advisors that ran on the deferred call still bill; the aggregator bills 0
+            a.client = _MoaClient(REF)
+            _record(a, _response(_DEFERRED_USAGE), 1, calls)
+            assert a.session_input_tokens == REF.input_tokens
+            assert a.session_cache_read_tokens == 0
+        a.client = _MoaClient(None if deferred_first else REF)
+        _record(a, _response(_CARRYING_USAGE), 2, calls)
+        assert a.session_input_tokens == BILLED["input_tokens"] + REF.input_tokens
+        assert a.session_cache_read_tokens == BILLED["cache_read_tokens"]
+        assert a.session_cache_write_tokens == BILLED["cache_write_tokens"]
+        assert a.session_output_tokens == OUTPUT + REF.output_tokens
+        rollup = _assert_counters_match_rollup(a, calls)
+        assert rollup["total_tokens"] == 429_298 + REF.total_tokens
+        assert a.context_compressor.last_prompt_tokens == sum(LAST.values())
+    finally:
+        a.close()
+
+
 def test_blackbox_rows_store_billed_columns_and_mark_the_deferred_row(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from plugins import blackbox
