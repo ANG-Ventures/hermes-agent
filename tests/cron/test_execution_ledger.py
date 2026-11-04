@@ -218,6 +218,7 @@ def test_finish_pruning_work_is_bounded_by_history_cap_not_proof_count(monkeypat
         finally:
             conn.set_progress_handler(None, 0)
         work.append(steps[0])
+    print("SQLite VM callbacks at 100/10000 proofs:", work)
     assert work[1] <= work[0] * 3 + 100, work
     executions.close_shared_connections()
 
