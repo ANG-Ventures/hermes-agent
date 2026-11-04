@@ -179,6 +179,46 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     assert executions.latest_execution("live")["status"] == "running"
 
 
+def test_finish_pruning_work_is_bounded_by_history_cap_not_proof_count(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    from datetime import datetime, timezone
+
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+    monkeypatch.setattr(executions, "_hermes_now", lambda: datetime(2026, 1, 2, tzinfo=timezone.utc))
+    work = []
+    for size in (100, 10000):
+        executions.close_shared_connections()
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / str(size) / "executions.db")
+        with executions._transaction() as conn:
+            # Seed the pre-upgrade schema so the reopen must migrate a real legacy ledger.
+            for index in conn.execute("PRAGMA index_list(executions)").fetchall():
+                if index["name"] in {"idx_executions_rewind_proof", "idx_executions_prunable_finish"}:
+                    conn.execute('DROP INDEX ' + index["name"])
+            if any(r["name"] == "rewind_proof" for r in conn.execute("PRAGMA table_info(executions)")):
+                conn.execute("ALTER TABLE executions DROP COLUMN rewind_proof")
+            conn.executemany(
+                "INSERT INTO executions (id,job_id,source,process_id,pid,status,claimed_at,"
+                "finished_at,scheduled_instant) VALUES (?,?, 'test','seed',1,'completed',?,?,?)",
+                [(str(i), str(i), stamp, stamp, stamp) for i in range(size)],
+            )
+        # Reopen exercises the same migration as a pre-upgrade ledger, not a mock cache.
+        executions.close_shared_connections()
+        row = executions.create_execution("finishing", source="builtin", scheduled_instant=stamp)
+        with executions._transaction() as conn:
+            steps = [0]
+            def progress():
+                steps[0] += 1
+                return 0
+            conn.set_progress_handler(progress, 100)
+        try:
+            assert executions.finish_execution(row["id"], success=True) is not None
+        finally:
+            conn.set_progress_handler(None, 0)
+        work.append(steps[0])
+    assert work[1] <= work[0] * 3 + 100, work
+    executions.close_shared_connections()
+
+
 def test_recently_finished_long_running_execution_survives_retention(
     monkeypatch, tmp_path
 ):
