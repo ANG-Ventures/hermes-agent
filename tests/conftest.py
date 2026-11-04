@@ -683,11 +683,12 @@ def _isolate_relay_health_cache():
     except Exception:  # noqa: BLE001
         yield
         return
-    _kph._RELAY_HEALTH_CACHE.clear()
-    _kph._RELAY_UNREADABLE_LOGGED.clear()
+    caches = [getattr(_kph, n, {}) for n in ("_RELAY_HEALTH_CACHE", "_RELAY_UNREADABLE_LOGGED")]
+    for c in caches:
+        c.clear()
     yield
-    _kph._RELAY_HEALTH_CACHE.clear()
-    _kph._RELAY_UNREADABLE_LOGGED.clear()
+    for c in caches:
+        c.clear()
 
 
 @pytest.fixture(autouse=True)
