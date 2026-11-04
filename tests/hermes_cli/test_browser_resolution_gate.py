@@ -437,6 +437,8 @@ def join(home, monkeypatch):
         return dict(relay.reply)
     relay.reply = LEASE
     monkeypatch.setattr(kbd, "_browser_relay_create", relay)
+    monkeypatch.setattr("hermes_cli.kanban_browser_readiness.probe",
+                        lambda home, host: {"ok": True, "host": host})
     return calls, relay
 
 
@@ -484,6 +486,21 @@ def test_join_spawns_a_ci_box_placed_ephemeral_on_ci_box(home, ledger, join):
         assert got[tid]["env"]["BROWSER_LEASE_URL"] == LEASE["lease_url"]
         (ev,) = _events(conn, tid, "browser_lease_joined")
         assert ev["host"] == "ci-box" and ev["source_host"] == "ci-box"
+
+
+@pytest.mark.parametrize("token", ["BROWSER_IMAGE_UNAVAILABLE", "BROWSER_HOST_AT_CAP"])
+def test_unready_host_holds_without_claim_or_spawn(home, ledger, join, monkeypatch, token):
+    monkeypatch.setattr("hermes_cli.kanban_browser_readiness.probe",
+                        lambda home, host: {"ok": False, "host": host, "refusal": token,
+                                            "detail": host + ": prerequisite missing"})
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        res, got = _live_env(conn)
+        assert tid not in got and join[0] == []
+        row = conn.execute("SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert tuple(row) == ("ready", None, None)
+        assert conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
+        assert res.placement_caps[tid]["browser_wait"]["refusal"] == token
 
 
 def test_join_off_holds_the_same_card(home, ledger, join):
