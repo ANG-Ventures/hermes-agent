@@ -69,6 +69,8 @@ def test_chat_oneshot_turn_persists(tmp_path: Path) -> None:
     prompt_id, reply_id = nonce("PROMPT"), nonce("REPLY")
     with FakeLLMServer([Text(f"The answer is {reply_id}.")]) as srv:
         home = make_home(tmp_path, srv.base_url)
+        hermes(home, "--version")
+        ph.mark("bare hermes --version")
         res = run([str(hermes_exe(home)), "chat", "-q", f"Say the code {prompt_id}", "-Q"], home)
         assert res.returncode == 0, res.tail()
         assert reply_id in res.stdout, f"reply not printed:\n{res.tail()}"
@@ -202,3 +204,4 @@ def test_gateway_stop_drains_gracefully(tmp_path: Path) -> None:
             kill_owned(home, since=started)
             ph.mark("cleanup")
             print(log.read_text(errors='replace')[-6000:], file=sys.stderr, flush=True)
+            ph.report()

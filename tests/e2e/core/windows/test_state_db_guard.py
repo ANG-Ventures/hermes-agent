@@ -44,6 +44,8 @@ def test_optimize_storage_refuses_while_gateway_holds_store(tmp_path: Path) -> N
     ph = Phases("state_db_guard")
     with FakeLLMServer() as srv:
         home = make_home(tmp_path, srv.base_url)
+        hermes(home, "--version")
+        ph.mark("bare hermes --version")
         log = tmp_path / "gateway.log"
         with log.open("wb") as fh:
             gw = subprocess.Popen(hermes_argv("gateway", "run"), cwd=home.project, env=home.env(),
@@ -75,3 +77,4 @@ def test_optimize_storage_refuses_while_gateway_holds_store(tmp_path: Path) -> N
             kill_tree(tree or process_tree(gw.pid))
             ph.mark("cleanup")
             print(log.read_text(errors='replace')[-6000:], file=sys.stderr, flush=True)
+            ph.report()

@@ -57,6 +57,8 @@ def test_terminal_round_trip_persists_output_and_exit_code(shell: str, tmp_path:
         # `powershell -Command` is flagged as script execution; with no user present to approve,
         # -q blocks it. The documented opt-in keeps this about the tool round trip, not approvals.
         home = make_home(tmp_path, srv.base_url, extra_config="approvals:\n  single_query_mode: approve\n")
+        hermes(home, "--version")
+        ph.mark("bare hermes --version")
         res = hermes(home, "chat", "-q", f"Run the {shell} check.", "-Q")
         ph.mark("hermes chat -q turn")
         print(res.stderr[-4000:], file=sys.stderr, flush=True)
@@ -75,3 +77,5 @@ def test_terminal_round_trip_persists_output_and_exit_code(shell: str, tmp_path:
     row = parse_tool_json(stored[0]["content"])
     assert marker in (row.get("output") or "") and row.get("exit_code") == code, (
         f"{shell}: persisted tool row differs from what the model saw: {row}")
+    ph.mark(f"asserts (wire duration={wire.get('duration')!r})")
+    ph.report()

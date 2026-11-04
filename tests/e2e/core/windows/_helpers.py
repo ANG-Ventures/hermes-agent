@@ -352,9 +352,16 @@ class Phases:
     def __init__(self, name: str) -> None:
         self.name = name
         self.t0 = self.last = time.monotonic()
+        self.lines: list[str] = []
 
     def mark(self, label: str) -> None:
         now = time.monotonic()
-        print(f"PHASE {self.name} {label}: +{now - self.last:.1f}s (total {now - self.t0:.1f}s)",
-              file=sys.stderr, flush=True)
+        line = f"PHASE {self.name} {label}: +{now - self.last:.1f}s (total {now - self.t0:.1f}s)"
+        self.lines.append(line)
+        print(line, file=sys.stderr, flush=True)
         self.last = now
+
+    def report(self) -> None:
+        # The per-file runner prints output only for a FAILED file (round 1 showed nothing).
+        import pytest
+        pytest.fail("DIAG\n" + "\n".join(self.lines), pytrace=False)
