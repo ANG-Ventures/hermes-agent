@@ -586,7 +586,9 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
         if in_scope and os.access(p, os.R_OK | os.W_OK):
             logger.info("%s preflight: repaired read-only %s (chmod u+rw%s)", db_label, p, x)
             continue
-        if not is_dir and _sidecar_race_settles(p):
+        # Absence is a safe "sqlite recreates it" signal only for -wal/-shm; a vanished main db would be
+        # recreated EMPTY by the next connect(), so it keeps refusing.
+        if p in sidecars and _sidecar_race_settles(p):
             continue
         wal_note = (" Do NOT delete the -wal file — it contains committed data that "
                     "will be merged into the database once it is writable." if p.name.endswith("-wal") else "")

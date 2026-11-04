@@ -202,6 +202,29 @@ class TestCheckpointRace:
         finally:
             os.chmod(wal, 0o644)
 
+    def test_main_db_vanishing_mid_check_still_refuses(self, hermes_home, tmp_path, monkeypatch):
+        """Absence is safe only for -wal/-shm: a vanished main db must refuse, or the next connect() would
+        create an empty database at that path and hide the history."""
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        db = outside / "custom.db"
+        _make_db(db)
+        moved = outside / "custom.db.moved"
+        real_access = os.access
+
+        def access_then_rename(p, mode, *a, **kw):
+            if Path(p) == db and db.exists():
+                db.rename(moved)  # replaced/renamed away between is_file() and access()
+                return False
+            return real_access(p, mode, *a, **kw)
+
+        monkeypatch.setattr(hermes_state_repair.os, "access", access_then_rename)
+        monkeypatch.setattr(hermes_state_repair.time, "sleep", lambda s: None)
+        with pytest.raises(sqlite3.OperationalError, match="read-only for this user"):
+            preflight_db_writability(db, db_label="custom.db")
+        assert not db.exists(), "preflight must not create an empty database"
+        assert moved.is_file()
+
 
 class TestSkips:
 
