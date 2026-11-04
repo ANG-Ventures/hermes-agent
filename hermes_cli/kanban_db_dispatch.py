@@ -5691,12 +5691,11 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
             if join and join_on and _relay_joinable(v.plans, wh, reg.local_ephemeral):
                 from hermes_cli import kanban_browser_readiness as _kbr
                 host = v.plans[0].host
-                import time as _probe_time
-                cached = readiness.get(host)
-                if cached is None or _probe_time.monotonic() - cached[0] > 10:
-                    reply = _kbr.probe(_kb.kanban_home(), host)
-                    cached = readiness[host] = (_probe_time.monotonic(), reply)
-                reply = cached[1]
+                # One probe per host per tick, failures included: an unreachable host must not
+                # cost a 25 s timeout for every card planned onto it.
+                if host not in readiness:
+                    readiness[host] = _kbr.probe(_kb.kanban_home(), host)
+                reply = readiness[host]
                 caps["browser_readiness"] = reply
                 if reply.get("ok") is not True:
                     reason = "browser_capacity" if reply.get("refusal") == "BROWSER_HOST_AT_CAP" else "browser_not_ready"
