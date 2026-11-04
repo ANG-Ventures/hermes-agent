@@ -110,7 +110,7 @@ def test_shapes_unit():
     # Busy unknown (no fresh box reading): state eligibility, never invent "full".
     no_busy = {k: v for k, v in FULL.items() if k != "x-pool-seats-busy"}
     assert r(_row(no_busy), tz=UTC).startswith(
-        "relay busy: 11 of 26 seats eligible (15 ineligible: quota 13, transport 2), "
+        "relay unavailable: 11 of 26 seats eligible (15 ineligible: quota 13, transport 2), "
         "142/304 in flight, ")
     # Every seat eligible: no ineligible clause.
     all_elig = dict(FULL, **{"x-pool-seats-eligible": "26", "x-pool-seats-busy": "26",
@@ -157,6 +157,8 @@ def test_stash_keeps_the_pool_headers():
       "x-pool-ineligible-reasons": "quota:26", "x-pool-inflight": "0",
       "x-pool-inflight-max": "60"}, "relay quota exhausted", "quota 26"),
     ({"error": "no eligible sub"}, {}, "relay unavailable", "no eligible subscription"),
+    ({"error": "no eligible sub"}, {"x-relay-error-class": None},
+     "relay unavailable", "no eligible subscription"),
     ({"error": "no eligible sub"},
      {"x-pool-seats-total": "26", "x-pool-seats-eligible": "0",
       "x-pool-seats-busy": "0", "x-pool-ineligible-reasons": "transport:26"},
@@ -178,12 +180,14 @@ def test_refusal_evidence_names_the_same_cause_on_both_banners(
     a._primary_runtime = dict(pin)
     h = _busy_headers(None)
     h.update(headers)
+    h = {k: v for k, v in h.items() if v is not None}
     _hop(a, _Err(body, 503, h))
     _settle(a)
     [line] = _lines(a)
     own, compact_label = chat_pin_own_fallback(a, pin)
     compact = format_chat_pin_notice(a.model, a.provider, pin,
                                      own_fallback=own, fallback_label=compact_label)
+    assert compact is not None
     assert f"Model fallback ({label}):" in line, line
     assert detail in line, line
     assert f"(fallback: {label})" in compact, compact
@@ -191,7 +195,8 @@ def test_refusal_evidence_names_the_same_cause_on_both_banners(
         assert "relay busy" not in line + compact
         assert "all subs at capacity" not in line
     # Display attribution does not reclassify the refusal used by routing.
-    assert _rows(_home)[0]["trigger_class"] == h["x-relay-error-class"]
+    expected_class = h.get("x-relay-error-class", "quota_model")
+    assert _rows(_home)[0]["trigger_class"] == expected_class
 
 
 @pytest.mark.parametrize("busy", [None, "0", "3"])

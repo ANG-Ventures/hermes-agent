@@ -137,16 +137,32 @@ def pool_pressure(headers: Any) -> Optional[dict]:
         return None
 
 
+def pool_pressure_label(pp: Mapping[str, Any]) -> str:
+    """Display attribution from this refusal's counts, never a later health read."""
+    elig, busy = pp.get("eligible"), pp.get("busy")
+    if elig == 0:
+        reasons = dict(pp.get("ineligible") or ())
+        total = pp.get("total")
+        if reasons.get("quota") == total:
+            return "relay quota exhausted"
+        if reasons.get("transport") == total:
+            return "relay transport unavailable"
+    if isinstance(elig, int) and elig > 0 and busy == elig:
+        return "relay busy"
+    return "relay unavailable"
+
+
 def pool_pressure_text(pp: Mapping[str, Any]) -> str:
     """``relay busy: 11 of 11 eligible seats full (26 in pool; 15 ineligible:
     quota 13, transport 2), 142/304 in flight``."""
     total, elig, busy = int(pp["total"]), int(pp["eligible"]), pp.get("busy")
-    if isinstance(busy, int):
-        head = f"relay busy: {busy} of {elig} eligible seats full"
+    label = pool_pressure_label(pp)
+    if label == "relay busy":
+        head = f"{label}: {busy} of {elig} eligible seats full"
     else:
-        head = f"relay busy: {elig} of {total} seats eligible"
+        head = f"{label}: {elig} of {total} seats eligible"
     inel = total - elig
-    paren = f"{total} in pool" if isinstance(busy, int) else ""
+    paren = f"{total} in pool" if label == "relay busy" else ""
     if inel > 0:
         why = ", ".join(f"{name} {n}" for name, n in pp.get("ineligible") or ())
         tail = f"{inel} ineligible" + (f": {why}" if why else "")
