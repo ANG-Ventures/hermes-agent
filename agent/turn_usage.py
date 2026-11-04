@@ -307,6 +307,11 @@ def record_response_usage(
                 "output_tokens": billed_usage.output_tokens,
                 "cache_read_tokens": billed_usage.cache_read_tokens,
                 "cache_write_tokens": billed_usage.cache_write_tokens,
+                # The last request's own split: the finalizer's /context window decomposition
+                # reads these, never the multi-request bill above.
+                "context_input_tokens": usage_dict["input_tokens"],
+                "context_cache_read_tokens": usage_dict["cache_read_tokens"],
+                "context_cache_write_tokens": usage_dict["cache_write_tokens"],
                 "latency_s": api_duration,
                 "composition": call_composition,
                 "provider": _route["provider"],
@@ -372,8 +377,10 @@ def record_response_usage(
         _agg_cost_base_url = _agg_slot.get("base_url") or _route["base_url"] or None
         try:
             if _turn_call is not None:
+                # The physical aggregator row carries the relay bill: Blackbox prices these calls
+                # and sums them into the composite parent (t_9f190074).
                 _turn_call["pricing_calls"] = _loop._build_moa_pricing_calls(
-                    _moa_ref_pricing_calls, aggregator_usage, aggregator_model=_agg_cost_model,
+                    _moa_ref_pricing_calls, billed_aggregator, aggregator_model=_agg_cost_model,
                     aggregator_provider=_agg_cost_provider, aggregator_base_url=_agg_cost_base_url,
                 )
                 # Ledger each physical advisor/aggregator call as a child of this composite call's

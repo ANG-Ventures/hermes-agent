@@ -944,10 +944,16 @@ def emit_session_end(
                 # context WINDOW (occupancy) rather than the turn's SPEND. The
                 # /context "Context window" line renders this split so the
                 # window numbers are visibly different from the billed sums.
+                # The row's cache_*/input buckets are the BILL (a multi-request relay row sums
+                # every request, t_9f190074); the window split is the row's context_* fields.
                 _last_call = _turn_calls[-1]
-                _last_cache_read = int(_last_call.get("cache_read_tokens", 0) or 0)
-                _last_cache_write = int(_last_call.get("cache_write_tokens", 0) or 0)
-                _last_uncached = int(_last_call.get("input_tokens", 0) or 0)
+
+                def _last_split(key: str) -> int:
+                    return int(_last_call.get(f"context_{key}", _last_call.get(key, 0)) or 0)
+
+                _last_cache_read = _last_split("cache_read_tokens")
+                _last_cache_write = _last_split("cache_write_tokens")
+                _last_uncached = _last_split("input_tokens")
                 # Discriminator for the four FINAL-call figures (the split above
                 # plus context_used). The turn-level flags in _rollup_turn_usage
                 # are absorbing across every call, so they answer "did ANY call
