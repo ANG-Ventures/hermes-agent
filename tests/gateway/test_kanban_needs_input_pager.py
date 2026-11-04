@@ -197,13 +197,13 @@ def test_settings_default_on_and_fail_open():
     assert kw._resolve_needs_input_pager_settings(boom) == (True, False)
 
 
-def test_send_routes_origin_target_and_alerts_mirror(monkeypatch, tmp_path):
+def test_send_routes_origin_target_without_alerts_mirror(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(kw, "_alert_notify_script", lambda: tmp_path / "notify.py")
     monkeypatch.setattr(kw, "_notify_send",
                         lambda script, msg, extra: calls.append((msg, extra)) or True)
     item = {"task_id": "t_1", "title": "p4", "priority": 150, "reason": "x" * 400,
-            "channel": CHAN, "alerts": False}
+            "channel": CHAN}
     assert kw._send_needs_input_page("default", item)
     assert [c[1] for c in calls] == [["--target", CHAN]]
     msg = calls[0][0]
@@ -211,13 +211,13 @@ def test_send_routes_origin_target_and_alerts_mirror(monkeypatch, tmp_path):
     assert "x" * 301 not in msg and "`hermes kanban show t_1`" in msg
 
     calls.clear()
-    assert kw._send_needs_input_page("ops", dict(item, alerts=True), True)
-    assert [c[1] for c in calls] == [["--target", CHAN]]  # re-page: no #alerts mirror (t_d36da044)
+    assert kw._send_needs_input_page("ops", dict(item, priority=250), True)
+    assert [c[1] for c in calls] == [["--target", CHAN]]
     assert calls[0][0].startswith("⚠️ still waiting: ")
 
     calls.clear()
-    assert kw._send_needs_input_page("ops", dict(item, alerts=True))
-    assert [c[1] for c in calls] == [["--target", CHAN], ["--sev", "error"]]  # first page mirrors
+    assert kw._send_needs_input_page("ops", dict(item, priority=250))
+    assert [c[1] for c in calls] == [["--target", CHAN]]  # no p>=200 #alerts mirror (t_c5800c91)
     assert "hermes kanban --board ops show t_1" in calls[0][0]
 
     calls.clear()
