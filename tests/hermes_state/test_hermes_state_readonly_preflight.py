@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 import hermes_state
+import hermes_state_repair
 from hermes_state import SessionDB, preflight_db_writability
 
 pytestmark = [
@@ -142,6 +143,62 @@ class TestRefusalOutsideScope:
                 preflight_db_writability(db, db_label="custom.db")
             msg = str(exc_info.value)
             assert str(wal) in msg
+        finally:
+            os.chmod(wal, 0o644)
+
+
+class TestCheckpointRace:
+    """Regression for t_848a5d29: a sidecar unlinked (last-close checkpoint) or recreated by another
+    connection mid-preflight is not a read-only file; sqlite recreates it on open."""
+
+    def test_sidecar_vanishing_mid_check_does_not_refuse(self, hermes_home, tmp_path, monkeypatch):
+        outside = tmp_path / "elsewhere"  # out of repair scope: the chmod path cannot mask the race
+        outside.mkdir()
+        db = outside / "custom.db"
+        _make_wal_db(db)
+        wal = db.with_name(db.name + "-wal")
+        real_access = os.access
+
+        def access_then_checkpoint(p, mode, *a, **kw):
+            if Path(p) == wal and wal.exists():
+                wal.unlink()  # the other process's last close removes the WAL right here
+            return real_access(p, mode, *a, **kw)
+
+        monkeypatch.setattr(hermes_state_repair.os, "access", access_then_checkpoint)
+        preflight_db_writability(db, db_label="custom.db")
+
+    def test_transient_mode_flip_does_not_refuse(self, hermes_home, tmp_path, monkeypatch):
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        db = outside / "custom.db"
+        _make_wal_db(db)
+        wal = db.with_name(db.name + "-wal")
+        real_access = os.access
+        calls = {"n": 0}
+
+        def flaky_access(p, mode, *a, **kw):
+            if Path(p) == wal:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return False  # observed mid-recreate; settled by the next look
+            return real_access(p, mode, *a, **kw)
+
+        monkeypatch.setattr(hermes_state_repair.os, "access", flaky_access)
+        monkeypatch.setattr(hermes_state_repair.time, "sleep", lambda s: None)
+        preflight_db_writability(db, db_label="custom.db")
+
+    def test_persistently_readonly_wal_still_refuses(self, hermes_home, tmp_path, monkeypatch):
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        db = outside / "custom.db"
+        _make_wal_db(db)
+        wal = db.with_name(db.name + "-wal")
+        os.chmod(wal, 0o444)
+        monkeypatch.setattr(hermes_state_repair.time, "sleep", lambda s: None)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="read-only for this user"):
+                preflight_db_writability(db, db_label="custom.db")
+            assert wal.is_file(), "the WAL must never be deleted"
         finally:
             os.chmod(wal, 0o644)
 

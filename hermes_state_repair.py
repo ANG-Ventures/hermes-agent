@@ -536,6 +536,25 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
         return None, f"backup copy failed: {exc}"
 
 
+_PREFLIGHT_RECHECKS = 3
+_PREFLIGHT_RECHECK_DELAY_S = 0.2
+
+
+def _sidecar_race_settles(p: Path) -> bool:
+    """True when a refusal on ``p`` was a race, not a read-only file.
+
+    Another connection's last close checkpoints and unlinks ``-wal``/``-shm`` between our ``is_file()`` and
+    ``access()`` (``access`` on a vanished path is False), or recreates them mid-look. sqlite recreates a
+    missing sidecar itself, so absent or accessible on a bounded re-look means proceed; a file that stays
+    unwritable for every look is genuinely read-only and still refused (t_848a5d29).
+    """
+    for _ in range(_PREFLIGHT_RECHECKS):
+        if not p.exists() or os.access(p, os.R_OK | os.W_OK):
+            return True
+        time.sleep(_PREFLIGHT_RECHECK_DELAY_S)
+    return not p.exists() or os.access(p, os.R_OK | os.W_OK)
+
+
 def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> None:
     """Refuse-or-repair read-only DB files BEFORE the first connection opens.
 
@@ -566,6 +585,8 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
                 os.chmod(p, p.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | (stat.S_IXUSR if is_dir else 0))
         if in_scope and os.access(p, os.R_OK | os.W_OK):
             logger.info("%s preflight: repaired read-only %s (chmod u+rw%s)", db_label, p, x)
+            continue
+        if not is_dir and _sidecar_race_settles(p):
             continue
         wal_note = (" Do NOT delete the -wal file — it contains committed data that "
                     "will be merged into the database once it is writable." if p.name.endswith("-wal") else "")
