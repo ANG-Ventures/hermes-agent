@@ -230,3 +230,33 @@ def test_published_free_is_capped_by_eligible_seats(home, relay):
     _seat_body(r, ["sub-vps-23"], active=5)
     r.body["free"] = 40
     assert ph.relay_free_slots("claude-apr", {}, {}, _urls(r.url))["free"] == 1
+
+
+def test_admission_drops_cached_health_so_next_tick_rereads(home, relay, clock):
+    """Prism e4502a532a19: a body cached before an admission must not let the next
+    tick (inside the TTL) re-grant the same spare slots."""
+    r = relay(1, 0, 0)
+    _seat_body(r, ["sub-vps-23"], active=4)
+    _setup(home, r.url)
+    first, seen, _, _ = _dispatch(2)
+    assert seen == first  # 2 spare slots, both used
+    r.body["active_turns"] = 6  # the relay now carries the two new workers
+    clock.t += 1  # well inside the TTL
+    ids, seen, res, _ = _dispatch(2)
+    assert seen == []
+    assert all((tid, "relay_capacity") in res.respawn_guarded for tid in ids)
+    assert r.hits == 2
+
+
+@pytest.mark.parametrize("keys,free", [
+    (["sub-vps-23", "sub-vps-23"], 0),  # duplicate key is one seat (6 cap - 6 active)
+    (["sub-vps-23", 7], 150),  # 156 max_inflight - 6  # non-string key: no seat figure, max_inflight rules
+    (["sub-vps-23", ["x"]], 150),  # unhashable key: no TypeError
+])
+def test_malformed_eligible_keys_never_overcount_or_raise(home, relay, keys, free):
+    """Prism b3a5f15c6abc."""
+    r = relay(1, 0, 0)
+    _seat_body(r, ["sub-vps-23"], active=6)
+    r.body["eligible_keys"] = keys
+    r.body["active_turns"] = 6
+    assert ph.relay_free_slots("claude-apr", {}, {}, _urls(r.url))["free"] == free

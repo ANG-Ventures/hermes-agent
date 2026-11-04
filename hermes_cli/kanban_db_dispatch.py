@@ -6804,7 +6804,7 @@ def _dispatch_once_locked(
         configured_box_health, configured_pool_health_urls, configured_probes,
         configured_pool_shed, configured_pool_spawns_per_eligible, effective_provider,
         pool_budget_eligible, pool_key, pool_route, shed_priority,
-        configured_pool_relay_capacity, relay_free_slots,
+        configured_pool_relay_capacity, relay_free_slots, forget_relay_health,
     )
     health_probes = configured_probes()
     relay_capacity = configured_pool_relay_capacity()
@@ -6917,6 +6917,7 @@ def _dispatch_once_locked(
         pool = admitted_routes.pop(task_id, None)
         if pool is not None:
             admitted_this_tick[pool] = admitted_this_tick.get(pool, 0) + 1
+            forget_relay_health(pool)
             if run_id is not None:
                 _kb._stamp_run_pool(conn, int(run_id), pool)
 

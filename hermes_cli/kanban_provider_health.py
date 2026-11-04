@@ -324,24 +324,38 @@ def _num(value) -> bool:
 
 
 # Short-TTL cache of good relay /health reads, shared across ticks (t_bde7653d):
-# url -> (monotonic read time, body). Only readable bodies are cached, so an
-# unreadable relay is re-probed every tick.
+# url -> (monotonic read time, body, relay family). Only readable bodies are
+# cached, so an unreadable relay is re-probed every tick. An admission on the
+# family drops its entry (forget_relay_health), so a later tick or board never
+# reuses a body that predates turns this process just placed.
 _RELAY_HEALTH_TTL_S = 5.0
-_RELAY_HEALTH_CACHE: dict[str, tuple[float, dict]] = {}
+_RELAY_HEALTH_CACHE: dict[str, tuple[float, dict, str]] = {}
 _RELAY_UNREADABLE_LOG_EVERY_S = 60.0
 _RELAY_UNREADABLE_LOGGED: dict[str, float] = {}
 
 
-def _relay_health(url: str, cache: dict, provider):
+def _relay_health(url: str, cache: dict, provider, family: str):
     now = time.monotonic()
     hit = _RELAY_HEALTH_CACHE.get(url)
     if hit is not None and now - hit[0] < _RELAY_HEALTH_TTL_S:
         cache.setdefault(url, hit[1])
         return hit[1]
+    fresh = url not in cache  # False = this tick's body, maybe pre-admission
     data = _fetch(url, cache, provider)
-    if data is not None:
-        _RELAY_HEALTH_CACHE[url] = (now, data)
+    if data is not None and fresh:
+        _RELAY_HEALTH_CACHE[url] = (now, data, family)
     return data
+
+
+def forget_relay_health(pool) -> None:
+    """Drop the TTL-cached /health of relay family ``pool`` after an admission.
+
+    The tick that admitted still counts it in ``admitted_this_tick``; the next
+    tick (or another board's tick) re-reads the relay so its ``active_turns``
+    includes the new worker instead of a pre-admission body.
+    """
+    for url in [u for u, hit in _RELAY_HEALTH_CACHE.items() if hit[2] == pool]:
+        _RELAY_HEALTH_CACHE.pop(url, None)
 
 
 def _eligible_seat_capacity(data: dict) -> int | None:
@@ -357,7 +371,10 @@ def _eligible_seat_capacity(data: dict) -> int | None:
     keys, seats = data.get("eligible_keys"), data.get("seats")
     if not (isinstance(keys, list) and isinstance(seats, dict)):
         return None
-    caps = [(seats.get(k) or {}).get("cap") if isinstance(seats.get(k), dict) else None
+    if not all(isinstance(k, str) for k in keys):
+        return None  # malformed key list: no seat figure, never a TypeError
+    keys = list(dict.fromkeys(keys))  # a repeated key is one seat, not two
+    caps = [seats[k].get("cap") if isinstance(seats.get(k), dict) else None
             for k in keys]
     if not all(_num(c) for c in caps):
         return None
@@ -383,7 +400,7 @@ def relay_free_slots(provider, probes: dict, cache: dict, pool_urls: dict) -> di
         url = (pool_urls or {}).get(route[0])
     if not _valid_url(url):
         return None
-    data = _relay_health(url, cache, provider)
+    data = _relay_health(url, cache, provider, route[0])
     if data is None:
         now = time.monotonic()
         last = _RELAY_UNREADABLE_LOGGED.get(url)
