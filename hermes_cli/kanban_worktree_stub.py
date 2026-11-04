@@ -18,6 +18,7 @@ An automatic move is t_224e5062.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -68,10 +69,19 @@ def _registered_admin_dirs(repo_root: Path, stub: Path) -> list[Path]:
     return found
 
 
-def _aside_path(stub: Path) -> str:
-    # The shell expands the stamp: the message (the page latch's key) must not
-    # change between ticks, or the same hold pages on every tick.
-    return f"{stub.parent}/.aside/{stub.name}-stub-$(date -u +%Y%m%dT%H%M%SZ)"
+def _recovery_command(stub: Path) -> str:
+    """The paste-safe shell line that moves *stub* aside.
+
+    Every literal path is ``shlex.quote``d, so ``$(...)``, backticks and
+    apostrophes in a path stay inert. The one expansion is the stamp, kept
+    outside the quoted literal (adjacent words concatenate): the message is the
+    page latch's key and must not change between ticks.
+    """
+    aside = f"{stub.parent}/.aside"
+    return (
+        f"mkdir -p {shlex.quote(aside)} && mv {shlex.quote(str(stub))} "
+        f"{shlex.quote(f'{aside}/{stub.name}-stub-')}$(date -u +%Y%m%dT%H%M%SZ)"
+    )
 
 
 def dead_stub_hold(repo_root: Path, stub: Path, why: str = "") -> WorkspaceUnavailable:
@@ -90,15 +100,15 @@ def dead_stub_hold(repo_root: Path, stub: Path, why: str = "") -> WorkspaceUnava
     admins = list(dict.fromkeys([*registered, *([admin] if admin and admin.is_dir() else [])]))
     reg = (", registered to it: " + ", ".join(map(str, registered))) if registered else ""
     step = (
-        "; then, if " + " or ".join(f"'{a}'" for a in admins)
+        "; then, if " + " or ".join(shlex.quote(str(a)) for a in admins)
         + " still points at it, check that dir's index, HEAD and logs/ before "
         "removing ONLY that dir"
     ) if admins else ""
     return WorkspaceUnavailable(
         f"{DEAD_STUB_HELD}: {stub} is not a live worktree of {repo_root} "
         f"({why + '; ' if why else ''}{pointer}{reg}). Nothing was moved and no "
-        f"retry was charged. Recover this stub only: inspect it; mkdir -p "
-        f"'{stub.parent}/.aside' && mv '{stub}' \"{_aside_path(stub)}\"{step}. "
+        f"retry was charged. Recover this stub only: inspect it; "
+        f"{_recovery_command(stub)}{step}. "
         f"No repo-wide prune."
     )
 

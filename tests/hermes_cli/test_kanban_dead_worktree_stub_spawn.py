@@ -8,6 +8,8 @@ refused "already exists", and the card burned all 3 spawns to ``gave_up``.
 from __future__ import annotations
 
 import hashlib
+import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -119,10 +121,41 @@ def test_hold_message_names_the_stub_its_gitfile_and_a_targeted_recovery(repo):
     assert msg.startswith(f"{stubs.DEAD_STUB_HELD}: {stub} ")
     assert "its .git points at /nonexistent/admin, which does not exist" in msg
     assert f"registered to it: {admin}" in msg
-    assert f"mv '{stub}'" in msg
-    assert f"'{admin}' still points at it" in msg and "removing ONLY that dir" in msg
+    assert f"mv {shlex.quote(str(stub))} " in msg
+    assert f"{shlex.quote(str(admin))} still points at it" in msg
+    assert "removing ONLY that dir" in msg
     assert "worktree prune" not in msg
     assert msg == str(stubs.dead_stub_hold(repo, stub))  # stable: the page latch's key
+
+
+def _recovery_argv(msg: str, cwd: Path) -> list[str]:
+    """Run the message's recovery command with mkdir/mv replaced by printers."""
+    cmd = re.search(r"inspect it; (.*?)(?:; then, if |\. No repo-wide prune\.)", msg).group(1)
+    subprocess.run(["bash", "-n", "-c", cmd], check=True)
+    printers = 'mkdir() { printf "%s\\0" mkdir "$@"; }; mv() { printf "%s\\0" mv "$@"; }; '
+    out = subprocess.run(["bash", "-c", printers + cmd], cwd=cwd, capture_output=True,
+                         text=True, check=True).stdout
+    return out.split("\0")[:-1]
+
+
+@pytest.mark.parametrize("parent_name", ["repo$(touch INJECTED)", "repo`touch INJECTED`", "it's repo"])
+def test_recovery_command_is_paste_safe(tmp_path, parent_name):
+    """Prism P1 6bd05bad33ec: a path's `$(...)`, backticks or apostrophe stay literal."""
+    parent = tmp_path / parent_name
+    parent.mkdir()
+    git(parent, "init", "-q", "-b", "main")
+    stub = parent / ".worktrees" / "t_x"
+    stub.mkdir(parents=True)
+    (stub / ".git").write_text("gitdir: /nonexistent/admin\n")
+    shell_cwd = tmp_path / "cwd"
+    shell_cwd.mkdir()
+
+    argv = _recovery_argv(str(stubs.dead_stub_hold(parent, stub)), shell_cwd)
+
+    assert not list(tmp_path.rglob("INJECTED"))
+    aside = f"{stub.parent}/.aside"
+    assert argv[:5] == ["mkdir", "-p", aside, "mv", str(stub)]
+    assert len(argv) == 6 and re.fullmatch(re.escape(f"{aside}/t_x-stub-") + r"\d{8}T\d{6}Z", argv[5])
 
 
 def test_relative_gitdir_registration_is_named(repo):
