@@ -1718,7 +1718,9 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
         pp = row.get("pool_pressure")
         if isinstance(pp, Mapping):
             return f"{prefix}{pool_pressure_text(pp)}, {window}", ()
-        return f"{prefix}{cause}: no eligible subscription (cause not stated), {window}", ()
+        refusal = ("no eligible subscription" if "no eligible sub" in str(row.get("err_head") or "").lower()
+                   else "request refused")
+        return f"{prefix}{cause}: {refusal} (cause not stated), {window}", ()
     if _is_pool_wide_relay_busy(row, hop, cause):
         if cause == RELAY_DRAIN_CAUSE:
             return f"{prefix}{cause} (at the relay), {window}", ()

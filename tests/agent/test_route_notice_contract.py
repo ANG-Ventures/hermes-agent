@@ -105,13 +105,14 @@ def test_pinned_spec_examples():
         "model budget capped at the relay on all subs, 09:12:03")
 
 
-def test_pool_wide_relay_busy_names_the_relay_not_unknown():
+def test_pool_wide_refusal_requires_capacity_evidence_to_say_busy():
     """t_e17de574: the 05:44-05:45 rows (pool_pressure, 503, class_source=text,
     hop/seat NULL, err_head NULL) rendered "relay busy (hop unknown, sub unknown)"."""
     row = {"trigger_class": "pool_pressure", "class_source": "text", "http_status": 503,
            "hop": None, "seat": None, "err_head": None, "from_provider": "claude-bpr",
            "first_err_ts": _ts(12, 45, 27)}
-    assert fp.format_cause_rider(row, tz=UTC) == "relay busy: all subs at capacity (at the relay), 12:45:27"
+    assert fp.format_cause_rider(row, tz=UTC) == (
+        "relay unavailable: request refused (cause not stated), 12:45:27")
     row["err_head"] = "pool at capacity"
     assert fp.format_cause_rider(row, tz=UTC) == "relay busy: all subs at capacity (at the relay), 12:45:27"
     # A seat-attributed or upstream pool_pressure keeps its hop/seat fields.
@@ -154,7 +155,7 @@ def test_head_label_override_only_for_relay_sourced_transients():
     assert fp.head_label_override({"trigger_class": "conn", "class_source": "relay_header"}) == \
         "connection issue"
     assert fp.head_label_override({"trigger_class": "pool_pressure",
-                                   "relay_synthetic": 1}) == "relay busy"
+                                   "relay_synthetic": 1}) == "relay unavailable"
     assert fp.head_label_override({"trigger_class": "conn", "class_source": "text"}) is None
     # t_d6227140: a relay quota refusal is labelled by the quota, never "rate limit".
     assert fp.head_label_override({"trigger_class": "quota_seat",
