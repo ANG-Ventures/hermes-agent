@@ -1017,7 +1017,52 @@ class ReconcileMixin:
             str(msg.get("tool_call_id") or ""),
         )
 
+    def _cached_stored_row_identities(
+        self,
+        stored: Dict[str, Any],
+        previous_cache: dict[int, tuple[tuple[Any, ...], tuple[Any, ...], Optional[tuple[Any, ...]]]],
+        next_cache: dict[int, tuple[tuple[Any, ...], tuple[Any, ...], Optional[tuple[Any, ...]]]],
+    ) -> tuple[tuple[Any, ...], Optional[tuple[Any, ...]]]:
+        """Return (replay identity, active-cleanup identity) for one stored row.
+
+        A stored row's identity is a pure function of its own fields unless its
+        content or tool calls carry an externalized/ingest placeholder or a
+        persisted-output marker; those rows resolve payload files and are always
+        recomputed. Every other row is reused when the fields it was computed
+        from are unchanged, so a GC rewrite or reassigned row recomputes.
+        """
+        content = stored.get("content")
+        tool_calls = stored.get("tool_calls")
+        uncacheable = (isinstance(content, str) and ("xternalized" in content or "persisted-output" in content)) or (
+            bool(tool_calls) and "xternalized" in repr(tool_calls)
+        )
+        if uncacheable:
+            identity = self._message_replay_identity(stored, stored_row=True)
+            return identity, self._active_cleanup_replay_identity(identity)
+        key = (
+            self._session_id,
+            stored.get("session_id"),
+            stored.get("role"),
+            content,
+            stored.get("tool_call_id"),
+            tool_calls,
+        )
+        store_id = stored.get("store_id")
+        hit = previous_cache.get(store_id)
+        if hit is not None and hit[0] == key:
+            next_cache[store_id] = hit
+            return hit[1], hit[2]
+        identity = self._message_replay_identity(stored, stored_row=True)
+        cleanup_identity = self._active_cleanup_replay_identity(identity)
+        next_cache[store_id] = (key, identity, cleanup_identity)
+        return identity, cleanup_identity
+
     def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+        # Each active message's identity is needed up to three times per call.
+        with self._replay_identity_memo_scope():
+            return self._compute_store_id_map_for_messages(messages)
+
+    def _compute_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
         Matching starts strictly after ``_last_compacted_store_id`` so repeated
@@ -1056,16 +1101,26 @@ class ReconcileMixin:
         # the memo below) since most rows never need them.
         stored_identities: list[tuple[Any, ...]] = []
         stored_cleanup_identities: list[Optional[tuple[Any, ...]]] = []
+        # Callers re-map the whole uncompacted backlog several times per turn,
+        # so stored-row identities are kept across calls (see
+        # _cached_stored_row_identities); the dict is rebuilt from this call's
+        # candidates so it never outgrows the live backlog.
+        previous_stored_cache = getattr(self, "_stored_row_identity_cache", None) or {}
+        next_stored_cache: dict[int, tuple[tuple[Any, ...], tuple[Any, ...], Optional[tuple[Any, ...]]]] = {}
         for stored in candidates:
-            identity = self._message_replay_identity(stored, stored_row=True)
+            identity, cleanup_identity = self._cached_stored_row_identities(
+                stored,
+                previous_stored_cache,
+                next_stored_cache,
+            )
             stored_identities.append(identity)
-            cleanup_identity = self._active_cleanup_replay_identity(identity)
             stored_cleanup_identities.append(cleanup_identity)
             stored_identity_counts[identity] = stored_identity_counts.get(identity, 0) + 1
             if cleanup_identity is not None:
                 stored_cleanup_identity_counts[cleanup_identity] = (
                     stored_cleanup_identity_counts.get(cleanup_identity, 0) + 1
                 )
+        self._stored_row_identity_cache = next_stored_cache
 
         # Lazily memoize raw-placeholder identities: only the placeholder-ref
         # paths need them, and most histories have few (or none), so computing
