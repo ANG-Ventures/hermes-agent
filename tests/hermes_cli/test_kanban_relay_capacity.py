@@ -3,12 +3,19 @@
 Incident 2026-11-01: claude-apr had 1 eligible seat, max_inflight 4, active_turns 4,
 and the relay rejected 334 turns at max_inflight while the dispatcher kept placing
 apr work. Apollo ruling: the dispatcher's apr budget is the relay's effective
-capacity (max_inflight - active_turns); an unreadable /health is 0 free.
+capacity (max_inflight - active_turns).
+
+t_bde7653d (11-04): max_inflight (box_capacity) sums EVERY seat's cap, spent
+ones included, so 25/26 seats exhausted still read as ~150 free. The relay
+ceiling is now min(max_inflight, summed cap of eligible_keys seats) -
+active_turns, read through a short-TTL cache. An unreadable /health adds no
+ceiling (falls back to the slot count) and logs a WARNING.
 """
 from __future__ import annotations
 
 import http.server
 import json
+import logging
 import threading
 
 import pytest
@@ -28,10 +35,12 @@ class _Relay:
         self.body = {"status": "ok", "eligible_count": eligible,
                      "max_inflight": max_inflight, "active_turns": active_turns,
                      "exhausted": [], "capped_quota": []}
+        self.hits = 0
         relay = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
+                relay.hits += 1
                 body = json.dumps(relay.body).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -108,11 +117,15 @@ def test_admissions_stop_at_relay_free(home, relay):
     assert all((tid, "relay_capacity") in res.respawn_guarded for tid in ids[6:])
 
 
-def test_unreadable_relay_fails_closed(home):
+def test_unreadable_relay_falls_back_to_slot_count_and_logs(home, caplog):
+    """t_bde7653d: a dead relay probe never blocks dispatch; it logs loudly."""
     _setup(home, _dead_url())
-    ids, seen, res, deferred = _dispatch(2)
-    assert seen == []
-    assert deferred[ids[0]][-1]["unreadable"] is True
+    with caplog.at_level(logging.WARNING, logger=ph.__name__):
+        ids, seen, res, deferred = _dispatch(2)
+    assert seen == ids
+    assert not any(tid for tid, why in res.respawn_guarded if why == "relay_capacity")
+    assert any("PHASE=kanban_relay_capacity_unreadable" in r.getMessage()
+               and r.levelno == logging.WARNING for r in caplog.records)
 
 
 def test_relay_without_figures_adds_no_ceiling(home, relay):
@@ -128,3 +141,92 @@ def test_knob_off_restores_eligible_budget_only(home, relay):
     _setup(home, r.url, pool_relay_capacity=False)
     ids, seen, _, _ = _dispatch(3)
     assert seen == ids
+
+
+# --- t_bde7653d: spent seats are not free -------------------------------------
+
+SEATS = [f"sub-vps-{i}" for i in range(1, 27)]
+
+
+def _seat_body(r, eligible_keys, active):
+    """The live /health shape (11-01 09:37Z / 11-04): every seat cap 6, max_inflight
+    the summed box capacity of ALL seats, eligible_keys only the unspent ones."""
+    r.body.update({
+        "eligible_count": len(eligible_keys), "eligible_keys": list(eligible_keys),
+        "seats": {k: {"cap": 6, "used": 0, "fresh": True} for k in SEATS},
+        "max_inflight": 6 * len(SEATS), "active_turns": active,
+        "exhausted": [k for k in SEATS if k not in eligible_keys],
+    })
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr(ph, "time", c)
+    return c
+
+
+def test_exhausted_seats_yield_zero_free_and_no_spawn(home, relay, clock):
+    r = relay(1, 0, 0)
+    _seat_body(r, ["sub-vps-23"], active=6)  # the one live seat is full
+    assert ph.relay_free_slots("claude-apr", {}, {}, _urls(r.url))["free"] == 0
+    _setup(home, r.url)
+    ids, seen, res, deferred = _dispatch(3)
+    assert seen == []
+    for tid in ids:
+        assert (tid, "relay_capacity") in res.respawn_guarded
+        assert deferred[tid][-1]["free"] == 0
+
+
+def test_zero_eligible_is_zero_free_whatever_max_inflight_says(home, relay):
+    r = relay(0, 156, 0)
+    assert ph.relay_free_slots("claude-apr", {}, {}, _urls(r.url))["free"] == 0
+
+
+def test_one_eligible_seat_admits_only_its_spare_cap(home, relay, clock):
+    r = relay(1, 0, 0)
+    _seat_body(r, ["sub-vps-23"], active=4)
+    _setup(home, r.url)
+    ids, seen, _, _ = _dispatch(5)
+    assert seen == ids[:2]  # 6 cap - 4 active; max_inflight would have said 152
+
+
+def test_recovered_seats_restore_free(home, relay, clock):
+    r = relay(1, 0, 0)
+    _seat_body(r, ["sub-vps-23"], active=6)
+    _setup(home, r.url)
+    held, seen, _, _ = _dispatch(2)
+    assert seen == []
+    _seat_body(r, ["sub-vps-4", "sub-vps-16", "sub-vps-21", "sub-vps-22"], active=6)
+    clock.t += ph._RELAY_HEALTH_TTL_S + 0.1  # past the TTL: the next tick re-reads
+    ids, seen, _, _ = _dispatch(3)
+    assert sorted(seen) == sorted(held + ids)  # the held cards spawn too
+    assert ph.relay_free_slots("claude-apr", {}, {}, _urls(r.url))["free"] == 24 - 6
+
+
+def test_relay_health_read_is_cached_for_the_ttl(home, relay, clock):
+    r = relay(1, 0, 0)
+    _seat_body(r, ["sub-vps-23"], active=0)
+    urls = _urls(r.url)
+    assert ph.relay_free_slots("claude-apr", {}, {}, urls)["free"] == 6
+    clock.t += ph._RELAY_HEALTH_TTL_S - 1
+    assert ph.relay_free_slots("claude-apr", {}, {}, urls)["free"] == 6
+    assert r.hits == 1
+    clock.t += 2
+    ph.relay_free_slots("claude-apr", {}, {}, urls)
+    assert r.hits == 2
+
+
+def test_published_free_is_capped_by_eligible_seats(home, relay):
+    r = relay(1, 0, 0)
+    _seat_body(r, ["sub-vps-23"], active=5)
+    r.body["free"] = 40
+    assert ph.relay_free_slots("claude-apr", {}, {}, _urls(r.url))["free"] == 1

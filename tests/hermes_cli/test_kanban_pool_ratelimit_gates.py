@@ -362,16 +362,17 @@ def test_dispatch_non_pool_worker_unaffected_by_empty_pool(home, pool):
         assert pool.hits == 0
 
 
-def test_dispatch_holds_when_relay_unreachable(home):
-    """t_6b917840: an unreadable relay /health is 0 free slots (fail closed)."""
+def test_dispatch_falls_back_when_relay_unreachable(home):
+    """t_bde7653d: an unreadable relay /health adds no relay ceiling (slot count
+    decides); t_6b917840's 0-free fail-closed blocked dispatch forever."""
     _config(home, pool_health_urls=_urls(_dead_url()))
     _profile(home, "a", "claude-apr")
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="pool bound", assignee="a")
         observed = []
         res = kbd.dispatch_once(conn, spawn_fn=_spawner(observed))
-        assert observed == []
-        assert (tid, "relay_capacity") in res.respawn_guarded
+        assert observed == [tid]
+        assert (tid, "relay_capacity") not in res.respawn_guarded
 
 
 def test_dispatch_fails_open_when_pool_unreachable_and_relay_capacity_off(home):

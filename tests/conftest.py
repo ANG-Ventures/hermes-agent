@@ -675,6 +675,22 @@ def _isolate_fallback_sticky_store():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_relay_health_cache():
+    """Fresh process-global relay /health TTL cache per test (t_bde7653d): a body
+    cached in one test must not answer a reused loopback port in the next."""
+    try:
+        from hermes_cli import kanban_provider_health as _kph
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    _kph._RELAY_HEALTH_CACHE.clear()
+    _kph._RELAY_UNREADABLE_LOGGED.clear()
+    yield
+    _kph._RELAY_HEALTH_CACHE.clear()
+    _kph._RELAY_UNREADABLE_LOGGED.clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_wall_budget_registry():
     """Fresh process-global cross-session wait registry per test (t_78b5a5bb): a wait
     armed in one test must not read as a sibling session in the next."""

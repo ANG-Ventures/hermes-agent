@@ -323,16 +323,57 @@ def _num(value) -> bool:
     return type(value) in (int, float) and 0 <= value < float("inf")
 
 
-def relay_free_slots(provider, probes: dict, cache: dict, pool_urls: dict) -> dict | None:
-    """Free turn slots on the relay that serves ``provider`` (t_6b917840).
+# Short-TTL cache of good relay /health reads, shared across ticks (t_bde7653d):
+# url -> (monotonic read time, body). Only readable bodies are cached, so an
+# unreadable relay is re-probed every tick.
+_RELAY_HEALTH_TTL_S = 5.0
+_RELAY_HEALTH_CACHE: dict[str, tuple[float, dict]] = {}
+_RELAY_UNREADABLE_LOG_EVERY_S = 60.0
+_RELAY_UNREADABLE_LOGGED: dict[str, float] = {}
 
-    ``max_inflight`` on a relay /health is the POOL-wide ceiling (the summed
-    box capacity of its eligible seats), so free = max_inflight - active_turns;
-    a relay-published numeric ``free`` wins. An unreadable /health is 0 free:
-    the work waits instead of 503ing at max_inflight (Apollo ruling, measured
-    11-01: apr 1 eligible, 4/4 active, 334 rejects while kanban kept placing).
-    None = no ceiling: not a relay-family route, probe disabled, or a relay
-    that answers without the figures.
+
+def _relay_health(url: str, cache: dict, provider):
+    now = time.monotonic()
+    hit = _RELAY_HEALTH_CACHE.get(url)
+    if hit is not None and now - hit[0] < _RELAY_HEALTH_TTL_S:
+        cache.setdefault(url, hit[1])
+        return hit[1]
+    data = _fetch(url, cache, provider)
+    if data is not None:
+        _RELAY_HEALTH_CACHE[url] = (now, data)
+    return data
+
+
+def _eligible_seat_capacity(data: dict) -> int | None:
+    """Summed turn cap of the relay's ELIGIBLE seats, or None when not published.
+
+    ``max_inflight`` (source ``box_capacity``) sums the box caps of every seat,
+    exhausted ones included (live 11-04: 144 = 24 seats x 6 with 4 eligible),
+    so it overstates what the relay can actually serve. ``eligible_count`` 0
+    is 0 capacity whatever else the body says.
+    """
+    if data.get("eligible_count") == 0:
+        return 0
+    keys, seats = data.get("eligible_keys"), data.get("seats")
+    if not (isinstance(keys, list) and isinstance(seats, dict)):
+        return None
+    caps = [(seats.get(k) or {}).get("cap") if isinstance(seats.get(k), dict) else None
+            for k in keys]
+    if not all(_num(c) for c in caps):
+        return None
+    return sum(int(c) for c in caps)
+
+
+def relay_free_slots(provider, probes: dict, cache: dict, pool_urls: dict) -> dict | None:
+    """Free turn slots on the relay that serves ``provider`` (t_6b917840, t_bde7653d).
+
+    free = min(max_inflight, summed cap of the ELIGIBLE seats) - active_turns;
+    a relay-published numeric ``free`` is also capped by the eligible-seat
+    figure. Spent seats (exhausted / capped_quota) are never counted as free.
+    An unreadable /health adds no ceiling (dispatch falls back to the slot
+    count) and logs a WARNING, so a dead relay probe never blocks dispatch
+    forever. None = no ceiling: not a relay-family route, probe disabled, an
+    unreadable relay, or a relay that answers without the figures.
     """
     route = pool_route(provider)
     if route is None or route[1] is not None:
@@ -342,16 +383,36 @@ def relay_free_slots(provider, probes: dict, cache: dict, pool_urls: dict) -> di
         url = (pool_urls or {}).get(route[0])
     if not _valid_url(url):
         return None
-    data = _fetch(url, cache, provider)
+    data = _relay_health(url, cache, provider)
     if data is None:
-        return {"free": 0, "unreadable": True}
-    if _num(data.get("free")):
-        return {"free": int(data["free"])}
-    cap, active = data.get("max_inflight"), data.get("active_turns")
-    if not (_num(cap) and _num(active)):
+        now = time.monotonic()
+        last = _RELAY_UNREADABLE_LOGGED.get(url)
+        if last is None or now - last >= _RELAY_UNREADABLE_LOG_EVERY_S:
+            _RELAY_UNREADABLE_LOGGED[url] = now
+            _log.warning(
+                "PHASE=kanban_relay_capacity_unreadable provider=%s url=%s: relay /health "
+                "unreadable; relay ceiling OFF, admissions fall back to the slot count",
+                provider, url)
         return None
-    return {"free": max(0, int(cap) - int(active)), "max_inflight": int(cap),
-            "active_turns": int(active), "eligible": data.get("eligible_count")}
+    active = data.get("active_turns")
+    seat_cap = _eligible_seat_capacity(data)
+    seat_free = seat_cap
+    if seat_cap is not None and _num(active):
+        seat_free = max(0, seat_cap - int(active))
+    if _num(data.get("free")):
+        free = int(data["free"])
+        out = {"free": free if seat_free is None else min(free, seat_free)}
+    else:
+        cap = data.get("max_inflight")
+        if not (_num(cap) and _num(active)):
+            return None if seat_free is None else {"free": seat_free, "seat_cap": seat_cap}
+        out = {"free": max(0, int(cap) - int(active)), "max_inflight": int(cap),
+               "active_turns": int(active), "eligible": data.get("eligible_count")}
+        if seat_free is not None:
+            out["free"] = min(out["free"], seat_free)
+    if seat_cap is not None:
+        out["seat_cap"] = seat_cap
+    return out
 
 
 def effective_provider(task) -> str | None:
