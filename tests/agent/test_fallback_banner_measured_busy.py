@@ -161,6 +161,10 @@ def test_stash_keeps_the_pool_headers():
      "relay unavailable", "no eligible subscription"),
     ({"error": "no eligible sub"},
      {"x-pool-seats-total": "26", "x-pool-seats-eligible": "0",
+      "x-pool-ineligible-reasons": "quota:20,transport:6"},
+     "relay unavailable", "quota 20, transport 6"),
+    ({"error": "no eligible sub"},
+     {"x-pool-seats-total": "26", "x-pool-seats-eligible": "0",
       "x-pool-seats-busy": "0", "x-pool-ineligible-reasons": "transport:26"},
      "relay transport unavailable", "transport 26"),
     ({"error": "draining-for-deploy"}, {}, "relay deploying", "deploy"),
@@ -176,6 +180,7 @@ def test_refusal_evidence_names_the_same_cause_on_both_banners(
     from tests.agent.test_fallback_rider_truth import _Err
 
     a = _agent(monkeypatch, [("claude-btpr", OPUS)])
+    a.model = OPUS
     pin = {"provider": a.provider, "model": a.model}
     a._primary_runtime = dict(pin)
     h = _busy_headers(None)

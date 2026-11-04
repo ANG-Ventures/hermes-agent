@@ -143,9 +143,9 @@ def pool_pressure_label(pp: Mapping[str, Any]) -> str:
     if elig == 0:
         reasons = dict(pp.get("ineligible") or ())
         total = pp.get("total")
-        if reasons.get("quota") == total:
+        if reasons == {"quota": total}:
             return "relay quota exhausted"
-        if reasons.get("transport") == total:
+        if reasons == {"transport": total}:
             return "relay transport unavailable"
     if isinstance(elig, int) and elig > 0 and busy == elig:
         return "relay busy"
