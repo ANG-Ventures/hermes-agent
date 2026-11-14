@@ -252,7 +252,7 @@ jobs:
       # The plan read needs four .py files; generate ships them in this same
       # artifact (see "Upload local matrix for placement"), from the same SHA.
       - name: Download local matrix and plan-read script
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ci-overflow-local-matrix-${{ github.run_id }}-${{ github.run_attempt }}
           path: .
@@ -297,7 +297,7 @@ jobs:
       # fetches only the delta. Off Blacksmith (hosted / self-hosted slices)
       # BLACKSMITH_VM_ID is unset and it runs the upstream checkout code path.
       - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+        uses: useblacksmith/checkout@2b9fe87d796feea153b455ec2f3125b471a7b0e7 # v1.8.2
 
       - name: Install ripgrep (prebuilt binary)
         run: bash .github/scripts/install-ci-tool.sh ripgrep
@@ -505,7 +505,7 @@ jobs:
             test-durations-
 
       - name: Download all slice durations
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: test-durations-slice-*
           path: durations
