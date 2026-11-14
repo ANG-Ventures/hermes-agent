@@ -2665,7 +2665,7 @@ def _run_single_child(
             try:
                 from tools.terminal_tool import record_session_cwd as _rsc_pool
 
-                _rsc_pool(child_task_id, _pool_lease.workspace)
+                _rsc_pool(_pool_lease.env_key, _pool_lease.workspace)  # the key the child's bound turn reads
             except Exception as e:
                 logger.debug("pool cwd seed failed: %s", e)
         if _pool_note:
