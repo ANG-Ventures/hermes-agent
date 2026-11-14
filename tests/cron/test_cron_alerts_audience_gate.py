@@ -164,3 +164,15 @@ def test_no_fleet_library_is_inert(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler, "get_hermes_home", lambda: home)
     send = _deliver(_job(), "studio continuity: 2 checks stale")
     send.assert_called_once()
+
+
+
+@pytest.mark.parametrize("no_agent", [True, False])
+def test_inbox_text_is_redacted(fleet, no_agent):
+    key = "sk-" + "A" * 32  # synthetic; the channel payload is redacted, so must the inbox be
+    send = _deliver(_job(no_agent=no_agent), f"token {key}")
+    send.assert_not_called()
+    rows = _inbox(fleet)
+    assert len(rows) == 1
+    assert key not in rows[0]["text"]
+    assert key not in (fleet / "state" / "agent-inbox" / "events.jsonl").read_text(encoding="utf-8")

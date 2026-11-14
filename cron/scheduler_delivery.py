@@ -2137,7 +2137,7 @@ def _deliver_result(
         if alerts_audience_gate.maybe_inbox(
             job, platform=target["platform"], chat_id=target["chat_id"],
             thread_id=target.get("thread_id"), success=success,
-            has_media=bool(requested_media), text=(content or "").strip(),
+            has_media=bool(requested_media), text=mirror_text,  # redacted + unwrapped
             get_home=lambda: _sched.get_hermes_home(),
         ):
             continue
