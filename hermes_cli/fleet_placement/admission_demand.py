@@ -207,6 +207,27 @@ def _stage(label: str):
         clock(previous)
 
 
+class _SetupSplit:
+    """t_f8e29ff7: split one root setup by call. ``split(part)`` charges the time since the previous mark to the
+    OVERLAPPING span ``<setup label>.<part>`` (e.g. ``writer_root_setup.chain_fsync``), so a long root setup names the
+    call that waited. Exclusive stages_ms are unchanged. No-op without a clock that has ``spans``."""
+
+    def __init__(self):
+        clock = STAGE_MARK.get()
+        spans = getattr(clock, "spans", None)
+        self.spans = spans if isinstance(spans, dict) else None
+        self.label = getattr(clock, "setup_label", "root_setup")
+        self.t = time.monotonic()
+
+    def __call__(self, part: str) -> None:
+        if self.spans is None:
+            return
+        now = time.monotonic()
+        key = f"{self.label}.{part}"
+        self.spans[key] = self.spans.get(key, 0.0) + (now - self.t)
+        self.t = now
+
+
 def validate_active_directories():
     for directory in _ACTIVE_DIRECTORIES.get():
         directory.validate()
@@ -362,7 +383,10 @@ def _note_hold(lock: str, log_path, waited: float, held: float) -> None:
 def _atomic_at(fd, name, data, mode=0o644):
     started = time.monotonic()
     tmp = ".placement-" + secrets.token_hex(12)
-    handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=fd)
+    # t_f8e29ff7: the create of the tmp entry was unstaged (charged to the caller's ``decision``): on 11-14 10:53:55 one
+    # /demand/authorize spent 29.8 s here holding the writer and the ledger flock.
+    with _stage("store_create"):
+        handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=fd)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as fh:
             # t_2f30f5b5: one stage per syscall class, so a multi-second hold names write vs fsync vs rename
@@ -372,6 +396,8 @@ def _atomic_at(fd, name, data, mode=0o644):
                 os.fchmod(fh.fileno(), mode)
             with _stage("store_fsync"):
                 os.fsync(fh.fileno())
+            with _stage("store_close"):    # t_f8e29ff7: was unstaged too; the with-exit close is then a no-op
+                fh.close()
         with _stage("store_rename"):
             os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
         with _stage("store_dir_fsync"):
@@ -596,6 +622,7 @@ def root_directory(root, relative=Path("."), *, mode=0o755):
     # t_bb190bec: open + receipt/chain fsyncs + validate re-walks are root setup (the clock names the lock phase),
     # never the caller's stage
     resume = clock("root_setup") if clock is not None else None
+    split = _SetupSplit()   # after clock("root_setup"): the label names this setup's lock phase
     fds, rfd = [], None
     try:
         try:
@@ -615,6 +642,7 @@ def root_directory(root, relative=Path("."), *, mode=0o755):
         # Repay ready-rename sync debt even in a fresh runtime process; once per receipt version per process
         # (t_5e814402, _RECEIPT_SYNCED).
         handle = os.open(receipt.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=rfd)
+        split("receipt")
         try:
             st, pst = os.fstat(handle), os.fstat(rfd)
             synced = (st.st_dev, st.st_ino, st.st_ctime_ns, st.st_size, pst.st_dev, pst.st_ino)
@@ -624,9 +652,11 @@ def root_directory(root, relative=Path("."), *, mode=0o755):
                 _RECEIPT_SYNCED.add(synced)
         finally:
             os.close(handle)
+        split("receipt_fsync")
         fds.append(os.open(root, _DIR_FLAGS))  # NEVER create root
         directory = RootDirectory(root, receipt, rfd, doc, fds, ())
         directory.validate()
+        split("validate")
         for index, part in enumerate(parts):
             try:
                 os.mkdir(part, mode=mode if index == len(parts) - 1 else 0o755, dir_fd=fds[-1])
@@ -634,11 +664,14 @@ def root_directory(root, relative=Path("."), *, mode=0o755):
                 pass
             fds.append(os.open(part, _DIR_FLAGS, dir_fd=fds[-1]))
         directory = RootDirectory(root, receipt, rfd, doc, fds, parts)
+        split("mkdir")
         # Inodes may be reused after deletion: existence/identity is not a durable
         # proof. Re-sync the bounded descendant chain on every acknowledgement.
         for fd in reversed(fds):
             os.fsync(fd)
+        split("chain_fsync")
         directory.validate()
+        split("validate")
         context_reset = _ACTIVE_DIRECTORIES.set((*_ACTIVE_DIRECTORIES.get(), directory))
         if clock is not None:   # setup done: the body is the caller's time again
             clock(resume)
