@@ -2,7 +2,7 @@
   "_doc": "Byte copies of hermes-home files (card t_29403e19). Never edit the copies; re-vendor and update this pin. tests/hermes_cli/test_fleet_placement_vendored.py checks each sha256 and fails once vendored_at is older than max_age_days. Fork-side differences live in __init__.py (the state root), never in a copy.",
   "source_repo": "ANG-Ventures/hermes-home",
   "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b",
-  "source_note": "t_77aa2e0e: all five files re-vendored as ONE set from hermes-home main b3a93f3400 (after #11639 482dad6977: admission_demand publishes each demand row's resolved hosts; after #11542 4305794945: alloc_client returns the job_id on a deferred/fallback admit; earlier #11416 4107248b1, FWA B5-P3: the var/placement/exclusions.json read, read_exclusions and EXCLUSIONS_REL are gone, exclusions_path is accepted and ignored; kinds.json pause switches and power_policy added). No subset is coherent: placement calls admission.ceilings and admission_demand.root_directory. All five are byte-equal to hermes-home main at that ref, which also carries fleet_admission 1.0.3 (#11517); the copies track main, not a wheel. The fork cannot depend on that private wheel, so it re-vendors and pins. RUNTIME PRECONDITION (#9789): every ledger/demand/protected-marker write now needs PLACEMENT_ROOT_RECEIPT naming an operator-provisioned receipt for the kanban root, in the dispatcher's environment. load_lines.py, busy_basis.py, fwa.py and fwa_readers.py are not vendored: placement imports each late under ImportError (fleet default line, cpu_busy basis, no fwa hold read); the kanban pause gate reads fwa holds in kanban_pause_hold.",
+  "source_note": "t_b7081236 2026-11-14: admission_demand.py re-vendored byte-equal from hermes-home main 44a2a64ab2d0dc89b7d03268f95d2f489691f997 (after e5d8c1c4f7 t_f8e29ff7 root-setup split + store_create/store_close stages, instrumentation only; admission-vendor-parity-lint drift). The other four stay at b3a93f3400, where they are byte-equal to main. t_77aa2e0e: all five files re-vendored as ONE set from hermes-home main b3a93f3400 (after #11639 482dad6977: admission_demand publishes each demand row's resolved hosts; after #11542 4305794945: alloc_client returns the job_id on a deferred/fallback admit; earlier #11416 4107248b1, FWA B5-P3: the var/placement/exclusions.json read, read_exclusions and EXCLUSIONS_REL are gone, exclusions_path is accepted and ignored; kinds.json pause switches and power_policy added). No subset is coherent: placement calls admission.ceilings and admission_demand.root_directory. All five are byte-equal to hermes-home main at that ref, which also carries fleet_admission 1.0.3 (#11517); the copies track main, not a wheel. The fork cannot depend on that private wheel, so it re-vendors and pins. RUNTIME PRECONDITION (#9789): every ledger/demand/protected-marker write now needs PLACEMENT_ROOT_RECEIPT naming an operator-provisioned receipt for the kanban root, in the dispatcher's environment. load_lines.py, busy_basis.py, fwa.py and fwa_readers.py are not vendored: placement imports each late under ImportError (fleet default line, cpu_busy basis, no fwa hold read); the kanban pause gate reads fwa holds in kanban_pause_hold.",
   "vendored_at": "2026-11-14",
   "max_age_days": 21,
   "files": {
@@ -23,8 +23,8 @@
     },
     "admission_demand.py": {
       "source_path": "scripts/lib/admission_demand.py",
-      "sha256": "d0444ba4bcb955f1cbcce920fd69332688f6c2bbdd757ca9e6c91775f8c49be9",
-      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
+      "sha256": "fd7e93008c911639c74dd1a2d45c50078a6f3beda04099932244a428ed88f4fb",
+      "source_ref": "44a2a64ab2d0dc89b7d03268f95d2f489691f997"
     },
     "alloc_client.py": {
       "source_path": "scripts/lib/alloc_client.py",
