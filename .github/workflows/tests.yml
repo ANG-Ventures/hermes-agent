@@ -364,12 +364,24 @@ jobs:
         # re-ran LPT independently — redundant N times.
         run: |
           # Cross-repo vendoring contract (t_4ee9c117): the fleet runners mount the private
-          # hermes-home mirror read-only at /opt/git-mirror/2; hand its main placement.py to
-          # test_vendored_placement_matches_canonical. Hosted runners have no mirror: it skips.
-          if git -c safe.directory='*' --git-dir=/opt/git-mirror/2 show main:scripts/lib/placement.py \
+          # hermes-home mirror read-only at /opt/git-mirror/2; hand it the placement.py of the
+          # PINNED ref in VENDORED.json to test_vendored_placement_matches_canonical. Pinned, not
+          # main (t_77aa2e0e): reading main made the verdict depend on each runner's mirror age and
+          # let a hermes-home merge redden this repo's main. Drift from main is the pin's
+          # max_age_days check. A mirror without the pinned commit, or no mirror (hosted runners),
+          # is an explicit skip whose reason the test prints.
+          PLACEMENT_REF=$(python3 -c 'import json; print(json.load(open("hermes_cli/fleet_placement/VENDORED.json"))["files"]["placement.py"]["source_ref"])' 2>/dev/null || true)
+          if [ -z "$PLACEMENT_REF" ]; then
+            export PLACEMENT_CANONICAL_SKIP="VENDORED.json names no placement.py source_ref"
+          elif [ ! -d /opt/git-mirror/2 ]; then
+            export PLACEMENT_CANONICAL_SKIP="no hermes-home mirror at /opt/git-mirror/2 on this runner"
+          elif git -c safe.directory='*' --git-dir=/opt/git-mirror/2 show "$PLACEMENT_REF:scripts/lib/placement.py" \
                > "$RUNNER_TEMP/placement_canonical.py" 2>/dev/null; then
-            export PLACEMENT_CANONICAL="$RUNNER_TEMP/placement_canonical.py"
-            echo "PLACEMENT_CANONICAL from hermes-home mirror main $(git -c safe.directory='*' --git-dir=/opt/git-mirror/2 rev-parse --short main)"
+            export PLACEMENT_CANONICAL="$RUNNER_TEMP/placement_canonical.py" PLACEMENT_CANONICAL_REF="$PLACEMENT_REF"
+            echo "PLACEMENT_CANONICAL from hermes-home mirror $PLACEMENT_REF (pinned; mirror main $(git -c safe.directory='*' --git-dir=/opt/git-mirror/2 rev-parse --short main))"
+          else
+            export PLACEMENT_CANONICAL_SKIP="mirror lacks pinned ref $PLACEMENT_REF (mirror main $(git -c safe.directory='*' --git-dir=/opt/git-mirror/2 rev-parse --short main 2>/dev/null)): stale mirror"
+            echo "PLACEMENT_CANONICAL skipped: $PLACEMENT_CANONICAL_SKIP"
           fi
           # Verbose pytest output lets timeout verdicts name the last test reached.
           scripts/run_tests.sh --files '${{ matrix.slice.files }}' \

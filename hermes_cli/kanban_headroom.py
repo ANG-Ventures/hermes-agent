@@ -147,6 +147,9 @@ def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str
         out["ncpu"] = _num(doc["ncpu"])
     if isinstance(doc.get("os"), str) and doc["os"]:
         out["os"] = doc["os"]
+    # the darwin sampler's power block, for a power_policy ac_only host (Prism 24ab4994fb91): dropped here, every
+    # such host read "power unmeasured" and was closed. Malformed = None (unmeasured), placement._power_fields' rule.
+    out.update(placement._power_fields(doc.get("power")))
     at = _num(doc.get("at"))
     if at is None or remote_now is None or not math.isfinite(remote_now):
         out["sample_status"] = "stale"
@@ -169,6 +172,8 @@ def sample_from_detail(d: Mapping) -> Optional[placement.Sample]:
         note="" if status == "fresh" else str(d.get("pressure") or ""),
         ncpu=_num(d.get("ncpu")), os=d.get("os") if isinstance(d.get("os"), str) else None,
         slo_breach=d.get("slo_breach") if isinstance(d.get("slo_breach"), bool) else None,
+        power_source=d.get("power_source") if d.get("power_source") in ("ac", "battery", "ups") else None,
+        sleep_disabled=d.get("sleep_disabled") if isinstance(d.get("sleep_disabled"), bool) else None,
         **{k: _num(d.get(k)) for k in V2_FIELDS + UTIL_FIELDS})
 
 
@@ -238,11 +243,11 @@ def _inputs(plan, names):
         samples[canon[n]] = s
         if plan.slots.get(n, 0) <= 0 and (s is None or s.status == "fresh"):
             exclusions[canon[n]] = str(d.get("pressure") or "no free slot")
-    root = Path(sig.placement_reservations).parents[2] if sig.placement_reservations else None
+    # No exclusions_path: hermes-home #11416 (FWA B5-P3) retired var/placement/exclusions.json; a fleet pause closes a
+    # host through its fwa fence hold, which kanban_pause_hold reads for this dispatcher.
     kw = dict(candidates=[canon[n] for n in names],
               previous=table.resolve(plan.last_pick) if plan.last_pick else None,
-              exclusions=exclusions, require_axes=PROBE_AXES, stale_after_s=sig.policy.stale_after_s,
-              exclusions_path=None if root is None else root / placement.EXCLUSIONS_REL)
+              exclusions=exclusions, require_axes=PROBE_AXES, stale_after_s=sig.policy.stale_after_s)
     return table, samples, kw
 
 
@@ -387,6 +392,20 @@ def ledger_root() -> Path:
     """THE root of the shared reservation ledger (Prism 681e7446f5d8): the fleet root every other consumer reads
     (allocd, Prism, test-gate, LoadGate.shared_leases), never the board home. Booking, renewal and release all use it."""
     return placement.fleet_root()
+
+
+def local_kind_pause(root: Optional[Path] = None, now: Optional[float] = None) -> Optional[str]:
+    """Prism b9b45a76cc17: the ``kind_paused:kanban@<scope> <id>`` reason when a live state/fleet-pause/kinds.json row
+    pauses kanban work on THIS host (scope = this host or ``all``), else None. The pool path closes the same hosts in
+    placement.choose(); a LOCAL start (LoadGate, then book_local) must refuse too. No table / no ``local`` host = None
+    (nothing to resolve the scope against). An unreadable or malformed kinds.json raises ExclusionsError: fail closed."""
+    root = Path(root) if root is not None else ledger_root()
+    table = load_table(root)
+    hid = table.resolve(LOCAL_HOST_ALIAS) if table is not None else None
+    if hid is None:
+        return None
+    return placement.kind_exclusions(table, CONSUMER, root / placement.KINDS_REL,
+                                     now=time.time() if now is None else float(now), root=root).get(hid)
 
 
 def book_local(job_id: Optional[str], job: Optional[placement.Job] = None, *, root: Optional[Path] = None,
@@ -587,9 +606,34 @@ def allocd_admit(plan, names, job: Optional[placement.Job], job_id: Optional[str
     raises alloc_client.Refused on a terminal answer (never bypassed)."""
     from hermes_cli.fleet_placement import alloc_client
     unified = unified_active(plan)
-    return alloc_client.admit(CONSUMER, job_id=admission_key(job_id), ttl_s=RESERVE_TTL_S,
-                              unified=unified, stale_after_s=float(plan.signal.policy.stale_after_s) if unified else None,
-                              **allocd_request(plan, names, job))
+    key = _deferred_key(job_id) or admission_key(job_id)
+    r = alloc_client.admit(CONSUMER, job_id=key, ttl_s=RESERVE_TTL_S,
+                           unified=unified, stale_after_s=float(plan.signal.policy.stale_after_s) if unified else None,
+                           **allocd_request(plan, names, job))
+    if job_id is not None and getattr(r, "source", None) == "deferred" and getattr(r, "job_id", None):
+        _DEFERRED[job_id] = (r.job_id, time.time())
+    elif job_id is not None and getattr(r, "reservation_id", None):
+        _DEFERRED.pop(job_id, None)            # granted under the key: the only terminal end of a deferral
+    return r
+
+
+# Prism 6e478f43c7ea: a deferred admit (allocd slow, still healthy) may commit later. The card's next tick retries
+# with the SAME key, so allocd's reuse_job hands back that row instead of booking a second lease. {card job_id:
+# (admission key, when deferred)}; an entry older than the reservation TTL is dropped (its row has expired).
+# The key is kept across non-grant answers (409, fallback refusal, allocd_wedged_lock, a raise): none proves allocd
+# did not commit the deferred request late, so only a grant under the key clears it (Prism pr325-direct P2).
+_DEFERRED: Dict[str, Tuple[str, float]] = {}
+
+
+def _deferred_key(job_id: Optional[str]) -> Optional[str]:
+    """The key of this card's last DEFERRED admit (kept until a grant under it, or TTL), or None."""
+    if job_id is None:
+        return None
+    now = time.time()
+    for k in [k for k, (_, at) in _DEFERRED.items() if now - at > RESERVE_TTL_S]:
+        del _DEFERRED[k]
+    hit = _DEFERRED.get(job_id)
+    return hit[0] if hit else None
 
 
 def admission_key(job_id: Optional[str]) -> Optional[str]:

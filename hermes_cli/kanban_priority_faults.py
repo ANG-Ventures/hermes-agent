@@ -100,7 +100,11 @@ def fingerprint() -> str:
     """Changes when any door credential, the host table or the registry changes (path, mtime, size, mode, owner,
     ctime): a permission-only repair (chmod 000 -> 600) moves mode and ctime only (Prism 917208e77049)."""
     h = hashlib.sha256()
-    for p in (_registry_path(), _table_path(), *_door_credentials()):
+    # Root provisioning (#9789) gates every token read, so repairing it must clear the latch it caused
+    # (Prism f6e8a5c31293): the receipt env value, and the receipt file it names.
+    receipt = (os.environ.get("PLACEMENT_ROOT_RECEIPT") or "").strip()
+    h.update(f"receipt-env:{receipt};".encode())
+    for p in (_registry_path(), _table_path(), *_door_credentials(), *((Path(receipt),) if receipt else ())):
         try:
             st = p.stat()
             h.update(f"{p}:{st.st_mtime_ns}:{st.st_size}:{st.st_mode}:{st.st_uid}:{st.st_ctime_ns};".encode())

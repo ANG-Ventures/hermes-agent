@@ -123,6 +123,7 @@ EXCLUDED_FILES = {
     # Every write in them is json.dumps (ASCII), so the platform default encoding cannot garble a byte.
     "hermes_cli/fleet_placement/admission.py",
     "hermes_cli/fleet_placement/admission_demand.py",
+    "hermes_cli/fleet_placement/alloc_client.py",
     "hermes_cli/fleet_placement/placement.py",
     "hermes_cli/fleet_placement/work_estimate.py",
 }

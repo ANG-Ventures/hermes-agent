@@ -212,7 +212,10 @@ def test_a_card_that_moves_host_after_a_real_restart_is_withdrawn_from_the_old_h
     the pool enqueue got 409 invalid and the door latched."""
     tid = _card()
     door_fleet.allocd.hold = True
-    proc = subprocess.run([sys.executable, "-c", _HELD_TICK], env=dict(os.environ), timeout=120,
+    # a subprocess has no conftest: hand it this test's provisioned root receipt (hermes-home #9789)
+    from hermes_cli import fleet_placement
+    receipt = fleet_placement.admission_demand._receipt_path(Path(os.environ["PLACEMENT_HOME"]).absolute())
+    proc = subprocess.run([sys.executable, "-c", _HELD_TICK], env=dict(os.environ, PLACEMENT_ROOT_RECEIPT=str(receipt)), timeout=120,
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert _uid(tid) in door_fleet.allocd.waiting("mac-studio")
@@ -400,6 +403,21 @@ def test_a_permission_only_token_repair_clears_the_latch(door_fleet):
         assert faults.latched() is None
     finally:
         token.chmod(0o600)
+
+
+def test_a_root_receipt_repair_clears_the_latch(door_fleet, monkeypatch, tmp_path):
+    """Prism f6e8a5c31293: a latch caused by missing root provisioning clears once PLACEMENT_ROOT_RECEIPT is set,
+    and again when the receipt file it names is repaired."""
+    monkeypatch.delenv("PLACEMENT_ROOT_RECEIPT", raising=False)
+    faults.latch("PLACEMENT_ROOT_RECEIPT required")
+    assert faults.latched()
+    receipt = tmp_path / "placement-root.json"
+    monkeypatch.setenv("PLACEMENT_ROOT_RECEIPT", str(receipt))
+    assert faults.latched() is None                       # env repaired: a fresh door attempt is allowed
+    faults.latch("receipt unreadable")
+    assert faults.latched()
+    receipt.write_text("{}", encoding="utf-8")
+    assert faults.latched() is None                       # receipt file created: cleared again
 
 
 def test_an_idle_publish_does_not_clear_a_publish_outage(door_fleet):

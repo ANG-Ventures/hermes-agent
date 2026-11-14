@@ -4674,10 +4674,18 @@ def _book_local_start(conn: sqlite3.Connection, claimed: Task) -> Optional[str]:
     from hermes_cli import kanban_priority_door as door
     if door.reservation_owned(conn, claimed.id, claimed.current_run_id):
         raise door.DoorHeld("run already authorized; reconcile original start")
-    if not local_ledger_enabled():
-        return None
     from hermes_cli import kanban_headroom as _kh
     from hermes_cli.fleet_placement import placement as _placement
+    # Prism b9b45a76cc17: a kanban kind pause on this host (or scope all) refuses a local start like a pool take,
+    # whatever the LoadGate or KANBAN_LOCAL_LEDGER said; an unreadable kinds.json refuses too (fail closed)
+    try:
+        paused = _kh.local_kind_pause()
+    except _placement.PlacementError as exc:
+        raise LocalLedgerUnavailable(f"local start refused: kind pause unreadable: {exc}") from exc
+    if paused:
+        raise LocalLedgerUnavailable(f"local start refused: {paused}")
+    if not local_ledger_enabled():
+        return None
     unit = f"{claimed.id}#{claimed.current_run_id}"
     try:
         rid = _kh.book_local(unit, _placement.Job(profile=claimed.assignee or None))

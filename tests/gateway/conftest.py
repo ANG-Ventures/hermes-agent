@@ -41,6 +41,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _gateway_placement_root_receipt(_hermetic_environment, monkeypatch):
+    """A production gateway carries PLACEMENT_ROOT_RECEIPT (the allocd plist value); without it the kanban
+    dispatcher logs one ERROR at boot (t_77aa2e0e). Give the gateway suite the same env so a healthy startup
+    logs no ERROR. The root conftest's provisioning fixture treats this placeholder as unset."""
+    from tests.conftest import TEST_PLACEMENT_ROOT_RECEIPT
+
+    monkeypatch.setenv("PLACEMENT_ROOT_RECEIPT", TEST_PLACEMENT_ROOT_RECEIPT)
+
+
+@pytest.fixture(autouse=True)
 def _restore_os_environ_after_test(_hermetic_environment):
     """Snapshot ``os.environ`` at setup and diff-restore it at teardown.
 

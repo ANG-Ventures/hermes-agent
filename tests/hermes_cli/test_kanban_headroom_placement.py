@@ -261,17 +261,21 @@ def test_utilization_take_places_on_a_measured_pool_host(home):
 
 def test_vendored_placement_matches_canonical():
     """Cross-repo contract: the vendored module is a BYTE copy of hermes-home's
-    scripts/lib/placement.py (t_29403e19; fork-side differences live in
-    hermes_cli/fleet_placement/__init__.py). PLACEMENT_CANONICAL names the canonical file;
-    CI's tests.yml sets it from the runners' hermes-home mirror. Skipped where neither exists
-    (hosted runners, a bare dev box); the sha256 pin in VENDORED.json is checked everywhere."""
+    scripts/lib/placement.py at the ref VENDORED.json pins (t_29403e19; fork-side differences live in
+    hermes_cli/fleet_placement/__init__.py). PLACEMENT_CANONICAL names that file; CI's tests.yml
+    reads it from the runners' hermes-home mirror at the pinned ref (t_77aa2e0e), so every runner
+    gives the same verdict and a hermes-home merge cannot redden this repo. Where it cannot,
+    PLACEMENT_CANONICAL_SKIP says why and the test skips with that reason; the sha256 pin and its
+    max_age_days are checked everywhere (test_fleet_placement_vendored.py)."""
     # The suite's home-io guard forbids reading the real ~/.hermes, so the canonical
     # file is named explicitly: PLACEMENT_CANONICAL=<hermes-home>/scripts/lib/placement.py.
     env = os.environ.get("PLACEMENT_CANONICAL")
     if not env:
-        pytest.skip("PLACEMENT_CANONICAL not set (no hermes-home checkout to cross-read)")
+        pytest.skip("PLACEMENT_CANONICAL not set: "
+                    + (os.environ.get("PLACEMENT_CANONICAL_SKIP") or "no hermes-home checkout to cross-read"))
+    ref = os.environ.get("PLACEMENT_CANONICAL_REF") or "the named canonical file"
     assert Path(placement.__file__).read_bytes() == Path(env).read_bytes(), (
-        "hermes_cli/fleet_placement/placement.py differs from hermes-home main: re-vendor and update VENDORED.json")
+        f"hermes_cli/fleet_placement/placement.py differs from hermes-home {ref}: re-vendor and update VENDORED.json")
 
 
 # -- Prism round 1 on #1941 --------------------------------------------------
@@ -325,18 +329,18 @@ def test_unreadable_ledger_refuses_and_is_never_overwritten(home):
     assert ledger.read_text(encoding="utf-8") == "{not json"
 
 
-def test_exclusions_file_closes_a_host_and_unreadable_closes_all(home):
-    """var/placement/exclusions.json is honoured; an unreadable one refuses the pick
-    instead of re-opening the hosts (Prism dc299a3694c6)."""
-    x = home / placement.EXCLUSIONS_REL
+def test_retired_exclusions_file_neither_closes_a_host_nor_refuses(home):
+    """hermes-home #11416 (FWA B5-P3) retired var/placement/exclusions.json: a fleet pause closes a host through its
+    fwa fence hold (kanban_pause_hold for this dispatcher). A live row in the old file no longer closes its host,
+    and an unreadable file no longer refuses the pick."""
+    x = home / "var" / "placement" / "exclusions.json"
     x.parent.mkdir(parents=True, exist_ok=True)
     x.write_text(json.dumps({"hosts": {"ci": {"until": T0 + 600, "reason": "drain"}}}), encoding="utf-8")
     plan = _plan(home, Fleet())
-    assert plan.take("alpha").name != "ci-box"
-    assert _row(plan, "ci-box").reason == "excluded:drain"
+    assert plan.take("alpha").name == "ci-box"
     x.write_text("{oops", encoding="utf-8")
     plan = _plan(home, Fleet())
-    assert plan.take("alpha") is None and "ExclusionsError" in plan.refusal
+    assert plan.take("alpha").name == "ci-box"
 
 
 def test_take_reserves_before_launch_and_a_failed_spawn_refunds(home):
@@ -377,18 +381,6 @@ def test_malformed_ledger_row_refuses_and_survives(home, row):
     plan = _plan(home, Fleet())
     assert plan.take("alpha", job_id="t_x") is None and "LedgerError" in plan.refusal
     assert ledger.read_text(encoding="utf-8") == body
-
-
-@pytest.mark.parametrize("doc", [{"hosts": {"ci-box": {"until": "1791900000"}}}, {"ci-box": "drain"},
-                                 {"hosts": ["ci-box"]}])
-def test_malformed_exclusion_row_refuses(home, doc):
-    """An exclusion row the scorer would skip refuses instead of re-opening the
-    host (Prism r2 a5504de2ecfc)."""
-    x = home / placement.EXCLUSIONS_REL
-    x.parent.mkdir(parents=True, exist_ok=True)
-    x.write_text(json.dumps(doc), encoding="utf-8")
-    plan = _plan(home, Fleet())
-    assert plan.take("alpha", job_id="t_x") is None and "ExclusionsError" in plan.refusal
 
 
 # -- Apollo changes-requested on #1941: the kanban-glue P1s ------------------
@@ -589,11 +581,12 @@ _BAD_CLOCKS = [float("nan"), float("inf"), float("-inf")]
 
 @pytest.mark.parametrize("bad", _BAD_CLOCKS)
 @pytest.mark.parametrize("call", ["release", "renew", "reserve", "live_reservations", "live_admissions"])
-def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, call, bad):
+def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, monkeypatch, call, bad):
     """``release(now=nan)`` read every row as expired and rewrote the ledger
     EMPTY, even for an unknown id; the same clock made live rows vanish from
     every reader. Any non-finite ``now`` is refused before the ledger is read,
     and the file is byte-identical afterwards."""
+    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))   # a ledger lives under its fleet root (hermes-home #9789)
     led = tmp_path / "r.json"
     rid = placement.reserve("ci-box", "kanban", placement.Footprint(3, 2), ttl_s=600, path=led, now=T0,
                             admissions_path=tmp_path / "a.jsonl")
@@ -613,19 +606,14 @@ def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, call, bad):
 
 
 @pytest.mark.parametrize("bad", _BAD_CLOCKS)
-def test_non_finite_now_never_lifts_an_operator_exclusion(tmp_path, bad):
-    """``until > nan`` is False: a live exclusion row read as absent (same class)."""
-    ex = tmp_path / "exclusions.json"
-    ex.write_text(json.dumps({"ci-box": {"until": T0 + 3600, "reason": "voice session"}}), encoding="utf-8")
-    assert placement.read_exclusions(ex, now=T0) == {"ci-box": "voice session"}
-    with pytest.raises(placement.PlacementError, match="now must be a finite"):
-        placement.read_exclusions(ex, now=bad)
+def test_non_finite_now_or_stale_after_is_refused_by_choose(tmp_path, bad):
+    """``until > nan`` is False: a non-finite clock fails open, so choose() refuses it (same class)."""
     (tmp_path / "hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
     table = placement.load_hosts(tmp_path / "hosts.json")
     with pytest.raises(placement.PlacementError, match="now must be a finite"):
-        placement.choose(table, "kanban", {}, now=bad, exclusions_path=ex)
+        placement.choose(table, "kanban", {}, now=bad)
     with pytest.raises(placement.PlacementError, match="stale_after_s"):
-        placement.choose(table, "kanban", {}, now=T0, exclusions_path=ex, stale_after_s=bad)
+        placement.choose(table, "kanban", {}, now=T0, stale_after_s=bad)
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])

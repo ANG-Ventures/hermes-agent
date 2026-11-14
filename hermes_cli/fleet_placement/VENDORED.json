@@ -1,31 +1,35 @@
 {
   "_doc": "Byte copies of hermes-home files (card t_29403e19). Never edit the copies; re-vendor and update this pin. tests/hermes_cli/test_fleet_placement_vendored.py checks each sha256 and fails once vendored_at is older than max_age_days. Fork-side differences live in __init__.py (the state root), never in a copy.",
   "source_repo": "ANG-Ventures/hermes-home",
-  "source_ref": "f80cb446368ee1fdf09cb68a4d1f64c3cf6918ba",
-  "source_note": "hermes-home main 7155a6de7e (after #9369 merge f03300d924, t_3d0928f7): alloc_client + admission_demand are a PAIR (the client calls admission_demand.make_dirs_durable); admission carries cbef7a82 (t_430834ff fcfs batch order). alloc_client moved here from hermes_cli/ so its canonical _sibling package import resolves unmodified. Re-vendored by P4 t_0c5ef02e round 4; the alloc_client + admission_demand PAIR re-vendored from hermes-home main f80cb44636 (#9496, mark_protected anchor retry, Prism d50cba826e5e) by round 5. placement.py, admission.py and work_estimate.py are unchanged byte copies from 7155a6de7e (admission and work_estimate are identical at f80cb446; placement re-vendor is not this card's).",
-  "vendored_at": "2026-11-06",
+  "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b",
+  "source_note": "t_77aa2e0e: all five files re-vendored as ONE set from hermes-home main b3a93f3400 (after #11639 482dad6977: admission_demand publishes each demand row's resolved hosts; after #11542 4305794945: alloc_client returns the job_id on a deferred/fallback admit; earlier #11416 4107248b1, FWA B5-P3: the var/placement/exclusions.json read, read_exclusions and EXCLUSIONS_REL are gone, exclusions_path is accepted and ignored; kinds.json pause switches and power_policy added). No subset is coherent: placement calls admission.ceilings and admission_demand.root_directory. All five are byte-equal to hermes-home main at that ref, which also carries fleet_admission 1.0.3 (#11517); the copies track main, not a wheel. The fork cannot depend on that private wheel, so it re-vendors and pins. RUNTIME PRECONDITION (#9789): every ledger/demand/protected-marker write now needs PLACEMENT_ROOT_RECEIPT naming an operator-provisioned receipt for the kanban root, in the dispatcher's environment. load_lines.py, busy_basis.py, fwa.py and fwa_readers.py are not vendored: placement imports each late under ImportError (fleet default line, cpu_busy basis, no fwa hold read); the kanban pause gate reads fwa holds in kanban_pause_hold.",
+  "vendored_at": "2026-11-14",
   "max_age_days": 21,
   "files": {
     "placement.py": {
       "source_path": "scripts/lib/placement.py",
-      "source_ref": "7155a6de7ead5daf8978ab4b133d0092e8828ecb",
-      "sha256": "8fa68c8796322daf0568044851d15052ea407edbaa04eec920821724c69443e7"
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b",
+      "sha256": "735c635278d2b333c4c63caad574577a95bed5d61d4f50aed8cfa8777f644e0e"
     },
     "admission.py": {
       "source_path": "scripts/lib/admission.py",
-      "sha256": "58e008b8b7790727a16c18851529bed927c3a8fd5b4e4970138b9970b6bf4978"
+      "sha256": "fb3e685e579d8ad685940b23bc915b57e218816349d104d098b060d11996635b",
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
     },
     "work_estimate.py": {
       "source_path": "scripts/lib/work_estimate.py",
-      "sha256": "3cc2ade89f55c1ef8bda29c3f82029cfd9f4bf4814f722f0dc6fa6f6ef1a2311"
+      "sha256": "d4f35c67bb943b00d5f4b6bf455f8a1e114b378c6fc398915f903b33c38d7ff7",
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
     },
     "admission_demand.py": {
       "source_path": "scripts/lib/admission_demand.py",
-      "sha256": "877e19b00ed31b3992d611e7ea6bbf4bb14f838ef7e2acc9f762ce93bd759762"
+      "sha256": "d0444ba4bcb955f1cbcce920fd69332688f6c2bbdd757ca9e6c91775f8c49be9",
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
     },
     "alloc_client.py": {
       "source_path": "scripts/lib/alloc_client.py",
-      "sha256": "7235d42e39ebbe27638a3c51990b24d2419f1794404466e6853c5cdd876627f2"
+      "sha256": "d698104087d81b464e51d259b5074910c28144e039d29cb3ce5804ff09239dbc",
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
     }
   }
 }

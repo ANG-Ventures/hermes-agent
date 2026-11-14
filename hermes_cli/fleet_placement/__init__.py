@@ -33,7 +33,10 @@ def __getattr__(name):
     return mod
 
 
-def _fleet_root() -> Path:
+def _fleet_root(root=None) -> Path:
+    # The canonical fleet_root(root=None) takes an explicit root first (call-scoped, FWA-2); keep that order.
+    if root is not None:
+        return Path(root)
     env = os.environ.get("PLACEMENT_HOME")
     if env:
         return Path(env)
@@ -49,28 +52,17 @@ def _demand_root(root=None) -> Path:
 placement.fleet_root = _fleet_root
 
 
-# Second difference (t_1cfdbd7b, 2026-11-10): the pinned placement.validate() rejects an `unmeasurable_axes` name it
-# does not know. The fleet's host table gained `psi_io_some10` for its Darwin hosts, and that one name made the
-# WHOLE table unreadable here: `kanban admit --host` refused every pool host and the gateway's demand publish failed
-# on every tick. An exemption for an axis this reader never requires is a no-op, so validation sees each row without
-# the names the pinned admission.DARWIN_UNMEASURABLE already declares and this reader's REQUIRED_AXES lacks. The row
-# itself is untouched (load_hosts keeps the name, and admission is told the host cannot report it). Any other
-# unknown name, and a non-list value, are rejected exactly as before. Goes away with the copies.
-_pinned_validate = placement.validate
+#: t_77aa2e0e: the fleet-root receipt the canonical admission_demand requires for every reservation/ledger write
+#: (``_receipt_path``). Unset in a gateway env = every kanban reservation write refuses, one error per write.
+ROOT_RECEIPT_ENV = "PLACEMENT_ROOT_RECEIPT"
 
 
-def _validate(doc):
-    hosts = doc.get("hosts") if isinstance(doc, dict) else None
-    if isinstance(hosts, dict):
-        tolerated = set(admission.DARWIN_UNMEASURABLE) - set(placement.REQUIRED_AXES)
-        seen = {}
-        for hid, row in hosts.items():
-            axes = row.get("unmeasurable_axes") if isinstance(row, dict) else None
-            if isinstance(axes, list) and any(isinstance(a, str) and a in tolerated for a in axes):
-                row = dict(row, unmeasurable_axes=[a for a in axes if not (isinstance(a, str) and a in tolerated)])
-            seen[hid] = row
-        doc = dict(doc, hosts=seen)
-    return _pinned_validate(doc)
-
-
-placement.validate = _validate
+def root_receipt_missing(environ=None):
+    """One loud line for the gateway log when ``PLACEMENT_ROOT_RECEIPT`` is unset, else None. Startup check only:
+    the per-write refusal in admission_demand stays (fail closed); this names the cause once, at boot."""
+    env = os.environ if environ is None else environ
+    if (env.get(ROOT_RECEIPT_ENV) or "").strip():
+        return None
+    return (f"{ROOT_RECEIPT_ENV} is UNSET in this process: every kanban placement reservation write will refuse "
+            f"('{ROOT_RECEIPT_ENV} required'). Set it in the gateway's launchd EnvironmentVariables (the value "
+            f"ai.hermes.allocd.plist carries) and FULL-reload the gateway (kickstart does not reread plist env).")

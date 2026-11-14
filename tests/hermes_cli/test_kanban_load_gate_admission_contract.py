@@ -56,12 +56,12 @@ def test_utilization_context_learns_from_the_class_usage_ledger(placement_home):
     now = time.time()
     led = placement_home / work_estimate.CLASS_USAGE_REL
     led.parent.mkdir(parents=True)
-    for i in range(1, 9):
+    for i in range(1, 11):    # work_estimate MIN_ROWS 10, p90 (hermes-home t_d0c8e8f0)
         admission.record_actual(led, job_class=klg.UTIL_CLASS, host="any-host", cpus=float(i), ram_gb=2.0 * i,
                                 at=now - 100 + i)
     need = klg.utilization_context()["need"]
-    assert need.source.startswith(f"p75:{klg.UTIL_CLASS}@")
-    assert need.ram_gb == 12.0
+    assert need.source.startswith(f"p90:{klg.UTIL_CLASS}@")
+    assert need.ram_gb == 18.0
 
 
 def test_utilization_admit_path_runs_on_the_real_modules(placement_home, monkeypatch):

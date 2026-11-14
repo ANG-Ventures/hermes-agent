@@ -277,6 +277,9 @@ def test_a_null_stall_axis_on_a_linux_host_is_closed(pool_home, axis):
     t0 = time.time()
     f = Fleet(t0)
     f.extra["ace-media"] = {axis: None}
+    # hermes-home #11513 (t_e0fbc8c9): under cpu_busy 0.5 PSI cpu is quota throttling and exempt, measured or not;
+    # at the floor the null cpu stall axis still closes the host
+    f.busy["ace-media"] = ad.PSI_CPU_BUSY_FLOOR
     plan = _plan(pool_home, f)
     keep, held = _kh.unified_filter(plan, ["ace-media"], None)
     assert keep == [] and held["ace-media"].startswith(f"unmeasured:{axis}"), held
@@ -380,3 +383,63 @@ def test_gate_tick_renewal_control_table_at_both_roots(home, tmp_path, monkeypat
     got = _builder().renew_reservations(now=time.time() + kh.RENEW_EVERY_S + 60)
     assert got["renewed"] == 1 and got["reaped"] == 0, got
     assert _ledger(fleet)[0]["until"] > row["until"] and _ledger(home) == []
+
+
+# ---- Prism b9b45a76cc17: a kanban kind pause (state/fleet-pause/kinds.json) closes LOCAL starts too. The pool path
+# closed the paused hosts in placement.choose(); the LoadGate (admit_class) and _book_local_start -> book_local never
+# read the file, so a spawn-only all-host kanban pause still launched every Studio-local worker.
+
+def _kinds(home, **rows):
+    p = home / placement.KINDS_REL
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"rows": rows}), encoding="utf-8")
+
+
+def _row(scope="all", until=None, kind="kanban"):
+    return {"kind": kind, "scope": scope, "until": time.time() + 3600 if until is None else until, "id": "p1"}
+
+
+@pytest.mark.parametrize("ledger", ["1", "0"])
+def test_all_host_kanban_kind_pause_refuses_the_local_start(home, monkeypatch, ledger):
+    monkeypatch.setenv("KANBAN_LOCAL_LEDGER", ledger)              # the kill switch never reopens a paused host
+    _kinds(home, k1=_row())
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="local", assignee="alpha")
+        spawned: list = []
+        res = _dispatch_one(conn, spawned)
+        assert spawned == [] and res.spawned == [], res           # no worker process
+        status, fails = conn.execute("SELECT status, consecutive_failures FROM tasks WHERE id = ?",
+                                     (tid,)).fetchone()
+        assert status == "ready" and (fails or 0) == 0            # a host pause, never charged to the card
+    assert _ledger(home) == []
+    assert kh.local_kind_pause() == "kind_paused:kanban@all p1"
+
+
+def test_kanban_kind_pause_closes_the_loadgate(home, monkeypatch):
+    _kinds(home, k1=_row(scope="studio"))                         # alias of the local host
+    g = _studio_gate(monkeypatch)
+    a, why = g.admit(5.0, now=time.time(), running=0, cpu_busy=0.10)
+    assert a == 0 and why == "kind_paused:kanban@studio p1", (a, why)
+    assert g.remote_allowed is True                               # other hosts answer for their own pause
+
+
+@pytest.mark.parametrize("row", [_row(scope="ace-ai"), _row(until=1.0), _row(kind="prism")])
+def test_unrelated_or_expired_kind_pause_leaves_the_local_start(home, row):
+    _kinds(home, k1=row)
+    assert kh.local_kind_pause() is None
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="local", assignee="alpha")
+        res = _dispatch_one(conn, [])
+        assert [s[0] for s in res.spawned] == [tid], res
+
+
+def test_unreadable_kinds_file_refuses_the_local_start_and_the_gate(home, monkeypatch):
+    p = home / placement.KINDS_REL
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json", encoding="utf-8")
+    a, why = _studio_gate(monkeypatch).admit(5.0, now=time.time(), running=0, cpu_busy=0.10)
+    assert a == 0 and "kind pause unreadable" in why, why
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="local", assignee="alpha")
+        res = _dispatch_one(conn, [])
+        assert res.spawned == [], res

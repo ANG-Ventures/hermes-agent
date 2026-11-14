@@ -25,6 +25,10 @@ Demand file (one per class, atomic replace; the class's own scheduler writes it 
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import errno
+import secrets
+import stat
 import dataclasses
 import fcntl
 import hashlib
@@ -46,18 +50,29 @@ except ImportError:  # scripts/lib on sys.path
 
 SCHEMA = 1
 PRIORITY_REL = Path("fleet") / "admission-priority.json"
+# Every priority_mode priority_from_doc accepts. scripts/lib/priority_view.py MODE_TEXT describes each one;
+# scripts/tests/test_priority_view.py fails when a mode is added here without a description (t_8b071574).
+PRIORITY_MODES = ("spawn-only", "fcfs", "classes")
 DEMAND_REL = Path("var") / "placement" / "demand"
 DEFAULT_MAX_AGE_S = 120.0
 _SAID: set = set()
-_PROVEN_DIRS: dict = {}     # demand dir -> (st_dev, st_ino) whose whole chain from the store root THIS process fsync'd
-_UNPROVEN_TOP: dict = {}    # demand dir -> top of a chain whose sync failed after mkdir (retry walks up to it)
 
 
-def _root(root=None) -> Path:
+def _root(root: Optional[Path] = None) -> Path:
+    if __package__ == "fleet_admission":
+        from .roots import resolve_root
+        return resolve_root(root, source_file=__file__, package=__package__)
     if root is not None:
         return Path(root)
     env = os.environ.get("PLACEMENT_HOME")
-    return Path(env) if env else Path(__file__).resolve().parents[2]
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parents[2]
+    try:   # t_5d7db1b6: a release of the fleet home answers the home (its receipt names the home, never a release)
+        from fleet_root import release_home
+    except ImportError:   # a partial copy without the resolver is never a release
+        return here
+    return Path(release_home(here) or here)
 
 
 def _say(key: str, msg: str) -> None:
@@ -114,18 +129,17 @@ def priority_from_doc(doc: Mapping) -> admission.Priority:
         "line": lambda v: _num(v) and 0 < v <= admission.HOST_LINE,
         "holdback_units": lambda v: type(v) is int and 0 <= v <= 64,
         "demand_max_age_s": lambda v: _num(v) and v > 0,
-        "priority_mode": lambda v: v in ("spawn-only", "fcfs", "classes"),
+        "priority_mode": lambda v: v in PRIORITY_MODES,
         "door_window_units": lambda v: type(v) is int and 1 <= v <= 64,
         "door_hold_max_s": lambda v: _num(v) and v > 0,
         "verdict_trust_cpu": lambda v: _num(v) and v >= 0,
         "asap_max_units_per_host": lambda v: type(v) is int and 0 <= v <= 64,
-        "preempt_budget_per_tick": lambda v: type(v) is int and v == 0,
+        "preempt_budget_per_tick": lambda v: type(v) is int and 0 <= v <= 64,
     }
     for name, check in checks.items():
         value = doc.get(name, getattr(defaults, name))
         if not check(value):
-            _say(f"field:{name}:{value!r}", f"invalid {name}; using default (preempt not implemented)" if
-                 name == "preempt_budget_per_tick" else f"invalid {name}; using default")
+            _say(f"field:{name}:{value!r}", f"invalid {name}; using default")
             value = getattr(defaults, name)
         values[name] = tuple(value) if name == "order" else value
     classes = doc.get("classes", {})
@@ -170,91 +184,545 @@ def _name(value):
     return isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", value) is not None
 
 
-def make_dirs_durable(directory, *, mode=0o777, through=None) -> None:
-    """``mkdir -p`` whose NEW entries survive a power loss (Prism 570db39355af; shared with alloc_client).
-
-    A created directory is durable only once its entry in the parent is, so after the mkdir every created level AND
-    the deepest pre-existing ancestor (whose entry list changed) is fsync'd, and nothing above it. ``through`` names
-    an ancestor that is always synced down from, created or not (alloc_client's fleet root). An existing chain with
-    no ``through`` syncs nothing here; the caller's own leaf fsync covers its file. OSError propagates."""
-    directory = Path(directory)
-    anchor = directory
-    while not anchor.exists() and anchor.parent != anchor:
-        anchor = anchor.parent
-    directory.mkdir(parents=True, exist_ok=True, mode=mode)
-    top = anchor if through is None or anchor in Path(through).parents else Path(through)
-    if top == directory:
-        return   # leaf not fsync'd here: correct only because every caller fsyncs the leaf after its write (_replace)
-    for path in [directory] + [p for p in directory.parents if p == top or top in p.parents]:
-        fd = os.open(str(path), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_NONCE = ".placement-root-generation"
+_ACTIVE_DIRECTORIES: contextvars.ContextVar[tuple] = contextvars.ContextVar("allocation_active_directories", default=())
+#: Per-request stage clock (t_bb190bec). allocd installs a callable for one request: clock(label) charges the time
+#: since the last switch to the current label, makes ``label`` current and returns the previous one. Storage switches
+#: only at boundaries the caller cannot see (root setup with its fsyncs, writer flock wait) and restores the caller's
+#: label. Default None: every other caller and every vendored copy runs exactly as before.
+STAGE_MARK: contextvars.ContextVar = contextvars.ContextVar("allocation_stage_mark", default=None)
 
 
 @contextlib.contextmanager
-def _writer(root=None):
-    base = _root(root)
-    directory = base / DEMAND_REL
-    # before the first record (or tombstone) can be acknowledged. Existence is not durability (Prism cdecee16d1ed): a
-    # chain left by a failed sync, here or in a crashed process, is re-synced from the store root down until this
-    # process has PROVEN it; only then do later writes skip the walk and rely on _replace's leaf fsync. When mkdir
-    # creates the store root itself, the pre-mkdir anchor above it is kept until success, so a retry after a failed
-    # ancestor sync walks up to that anchor again rather than stopping at the (now existing) root.
-    # Proof is the dir's (st_dev, st_ino), not its path: a dir deleted and recreated between writes is a new inode
-    # whose parent entry was never synced (reader deleg_29a9bec5). One stat per write, replacing is_dir().
-    key = str(directory)
+def _stage(label: str):
+    clock = STAGE_MARK.get()
+    if clock is None:
+        yield
+        return
+    previous = clock(label)
     try:
-        st = os.stat(directory)
-        ident = (st.st_dev, st.st_ino)
-    except OSError:
-        ident = None
-    if ident is None or _PROVEN_DIRS.get(key) != ident:
-        _PROVEN_DIRS.pop(key, None)   # a vanished dir's old proof is void until this re-prove succeeds (Prism 324248e82c6f)
-        top = _UNPROVEN_TOP.get(key)
-        if top is None:
-            anchor = directory
-            while not anchor.exists() and anchor.parent != anchor:
-                anchor = anchor.parent
-            top = _UNPROVEN_TOP[key] = anchor if anchor in base.parents else base
-        make_dirs_durable(directory, mode=0o755, through=top)
-        st = os.stat(directory)
-        _UNPROVEN_TOP.pop(key, None)
-        _PROVEN_DIRS[key] = (st.st_dev, st.st_ino)
-    with (directory / ".writer.lock").open("a") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        yield directory
+        yield
+    finally:
+        clock(previous)
+
+
+def validate_active_directories():
+    for directory in _ACTIVE_DIRECTORIES.get():
+        directory.validate()
+
+
+def _identity(fd):
+    st = os.fstat(fd)
+    return [st.st_dev, st.st_ino]
+
+
+class RootRefused(OSError):
+    """The provisioned fleet root or its receipt no longer proves itself: a real replacement, never a transient.
+    allocd answers it 503 ``reason: root_refused`` (alloc_client raises it as a terminal Refused); the operator
+    re-proves the root (allocd.py --provision-root). Subclasses OSError so every existing storage catch still fires.
+    ``on_refused`` (one per thread, set by allocd per request) is told of every refusal, even one a route swallows."""
+
+    on_refused: contextvars.ContextVar = contextvars.ContextVar("root_refused_hook", default=None)
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        hook = RootRefused.on_refused.get()
+        if hook is not None:
+            hook(self)
+
+
+#: t_f9dd5ccc: a receipt replaced by a symlink (ELOOP under O_NOFOLLOW), a receipt parent replaced by a regular file
+#: (ENOTDIR) or a receipt replaced by a directory (EISDIR) is a structural replacement, not a transient I/O fault.
+_STRUCTURAL_ERRNOS = (errno.ELOOP, errno.ENOTDIR, errno.EISDIR)
+
+
+def _refuse_structural(exc: OSError) -> None:
+    """Re-raise a structural-replacement OSError from the receipt/root walk as RootRefused; anything else returns."""
+    if not isinstance(exc, RootRefused) and exc.errno in _STRUCTURAL_ERRNOS:
+        raise RootRefused(f"receipt path replaced ({errno.errorcode[exc.errno]}: {exc.filename or exc})") from exc
+
+def _same_across_boots(recorded, current):
+    """t_1cfb3845: a receipt's persisted [st_dev, st_ino] compared across a reboot is the INODE only.
+
+    macOS APFS (Studio 2026-11-11 17:11: 16777234 -> 16777232, same inode, same nonce), Linux anonymous devices
+    (ZFS / overlay / btrfs: major 0, numbered at mount) and NVMe partitions (259:N, N in probe order) renumber st_dev
+    at boot, so comparing it refused every write after a reboot. st_dev was there to catch a DIFFERENT filesystem
+    under the same path with a colliding inode; the root's random 192-bit generation nonce (checked right after
+    this) still catches that, as it catches any recreate. Within one process st_dev is stable, so every live
+    fd-versus-path check keeps the full [st_dev, st_ino].
+
+    Known residual (accepted, not built for): inode + nonce cannot tell a device renumber from a snapshot/clone of
+    the root mounted in its place (same inode, same nonce, different filesystem), so a rolled-back or cloned root
+    mounted at the same path is accepted. The old full-pair rule did not catch an in-place rollback either, and it
+    refused every write after every reboot. Pending provisioning (provision_root) has no nonce yet and keeps the
+    strict pair."""
+    return (isinstance(recorded, list) and len(recorded) == 2 and len(current) == 2
+            and recorded[1] == current[1])
+
+
+def _absolute(path):
+    # Do not resolve symlinks: the final component must be checked by O_NOFOLLOW.
+    path = Path(path)
+    if ".." in path.parts:
+        raise OSError("parent traversal forbidden")
+    return Path(os.path.abspath(path))
+
+
+def _read_at(fd, name, *, bounded=False):
+    handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    with os.fdopen(handle, "r", encoding="utf-8") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise OSError("regular file required")
+        text = fh.read(65537) if bounded else fh.read()
+        if bounded and len(text) > 65536:
+            raise OSError("receipt too large")
+        return text
+
+
+def _note_write(name, nbytes, started):
+    """t_2f30f5b5: tell the request's clock which whole file it rewrote, how big, and how long it took."""
+    clock = STAGE_MARK.get()
+    note = getattr(clock, "note_write", None)
+    if note is not None:
+        note(name, nbytes, time.monotonic() - started)
+
+
+#: t_1d801469: who HOLDS the ledger flock / demand writer, not only who waits. Every hold of either lock adds its held
+#: time to the current request's clock (span ``ledger_flock_held`` / ``demand_writer_held``), and any hold of
+#: HOLD_LOG_S or more, in ANY process that locks through these two functions (allocd, alloc_client's local fallback,
+#: test-gate), appends one line to var/placement/flock-holds.jsonl: {at, lock, held_ms, wait_ms, pid, proc, caller,
+#: route, consumer}. A WAIT of HOLD_LOG_S or more is logged too: a long wait with no logged hold over the same
+#: interval was held by a process with its own placement copy (the kanban dispatcher's hermes_cli.fleet_placement).
+#: Diagnostics only: no fsync, never raises.
+HOLDS_REL = Path("var") / "placement" / "flock-holds.jsonl"
+HOLD_LOG_S = 0.25
+HOLDS_MAX_BYTES = 8 * 1024 * 1024
+HOLD_LINES_DROPPED = 0      # lines dropped because another process held the log's sidecar flock (never waited for)
+_HOLD_SKIP = ("admission_demand.py:_writer", "placement.py:_locked", "admission_demand.py:_note_hold",
+              "allocd.py:door_locks")
+
+
+def _hold_caller() -> str:
+    """file:function:line of the innermost frame that is not the lock machinery (the code that held the lock)."""
+    f = sys._getframe(2)
+    while f is not None:
+        name = os.path.basename(f.f_code.co_filename)
+        if name != "contextlib.py" and f"{name}:{f.f_code.co_name}" not in _HOLD_SKIP:
+            return f"{name}:{f.f_code.co_name}:{f.f_lineno}"
+        f = f.f_back
+    return "?"
+
+
+def _note_hold(lock: str, log_path, waited: float, held: float) -> None:
+    try:
+        clock = STAGE_MARK.get()
+        spans = getattr(clock, "spans", None)
+        if isinstance(spans, dict):
+            spans[f"{lock}_held"] = spans.get(f"{lock}_held", 0.0) + held
+        if held < HOLD_LOG_S and waited < HOLD_LOG_S:
+            return
+        at = time.time()  # fixture-clock-ok: diagnostics stamp only, joins live logs; no test reads it
+        line = {"at": at, "lock": lock, "held_ms": round(held * 1000.0, 1),
+                "wait_ms": round(waited * 1000.0, 1), "pid": os.getpid(),
+                "proc": os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else sys.executable,
+                "caller": _hold_caller(), "route": getattr(clock, "route", None),
+                "consumer": getattr(clock, "consumer", None)}
+        path = Path(log_path)
+        data = (json.dumps(line, sort_keys=True) + "\n").encode()
+        # The log is shared across processes: check, rotate and append under one sidecar flock, so a second
+        # rotator cannot replace the full .1 archive with the fresh active file another process just made.
+        # Never WAIT for it (a caller may still hold the demand writer): busy = drop the line and count the drop.
+        lock_fd = os.open(path.with_name(path.name + ".lock"), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o640)
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                global HOLD_LINES_DROPPED
+                HOLD_LINES_DROPPED += 1
+                if clock is not None and hasattr(clock, "hold_lines_dropped"):
+                    clock.hold_lines_dropped += 1
+                return
+            try:
+                if os.lstat(path).st_size + len(data) > HOLDS_MAX_BYTES:
+                    os.replace(path, path.with_name(path.name + ".1"))
+            except FileNotFoundError:
+                pass
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o640)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(lock_fd)  # closing the only fd on the open file description drops the flock
+    except Exception as exc:  # noqa: BLE001 - a diagnostics fault never touches the lock holder
+        _say(f"holds:{type(exc).__name__}", f"flock hold line not written: {exc}")
+
+
+def _atomic_at(fd, name, data, mode=0o644):
+    started = time.monotonic()
+    tmp = ".placement-" + secrets.token_hex(12)
+    handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=fd)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            # t_2f30f5b5: one stage per syscall class, so a multi-second hold names write vs fsync vs rename
+            with _stage("store_write"):
+                fh.write(data)
+                fh.flush()
+                os.fchmod(fh.fileno(), mode)
+            with _stage("store_fsync"):
+                os.fsync(fh.fileno())
+        with _stage("store_rename"):
+            os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+        with _stage("store_dir_fsync"):
+            os.fsync(fd)
+        _note_write(name, len(data), started)
+    finally:
+        try:
+            os.unlink(tmp, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+
+
+def _open_receipt_parent(path):
+    """Walk from the existing filesystem anchor without following any symlink.
+
+    Only traversal fds are retained during lookup; no ancestor is read or synced.
+    """
+    flags = (getattr(os, "O_PATH", getattr(os, "O_SEARCH", os.O_RDONLY))
+             | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = os.open(path.anchor, flags)
+    try:
+        parts = path.parent.parts[1:]
+        for index, part in enumerate(parts):
+            child = os.open(part, _DIR_FLAGS if index == len(parts) - 1 else flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if not parts:
+            child = os.open(".", _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _receipt_path(root, receipt=None):
+    supplied = receipt if receipt is not None else os.environ.get("PLACEMENT_ROOT_RECEIPT")
+    if not supplied:
+        raise OSError("PLACEMENT_ROOT_RECEIPT required; provision fleet root explicitly")
+    path = _absolute(supplied)
+    if path == root or root in path.parents:
+        raise OSError("receipt must be external to fleet root")
+    return path
+
+
+def provision_root(root, *, anchor, receipt):
+    """Offline installation boundary; caller excludes runtime writers/root replacement.
+
+    Anchor and external receipt parent are operator-attested already durable directories.
+    Re-run with the SAME inputs after interruption; never promote pending from runtime.
+    """
+    root, anchor = _absolute(root), _absolute(anchor)
+    receipt = _receipt_path(root, receipt)
+    try:
+        parts = root.relative_to(anchor).parts
+    except ValueError as exc:
+        raise OSError("root must descend from explicit durable anchor") from exc
+    if not parts or len(parts) > 64:
+        raise OSError("root chain requires 1..64 components")
+    # Receipt parent must predate every directory this operation may create.
+    first = anchor / parts[0]
+    if receipt == first or first in receipt.parents:
+        raise OSError("receipt is inside provisioned ancestor chain")
+    fds = []
+    try:
+        afd = os.open(anchor, _DIR_FLAGS)
+        fds.append(afd)
+        rfd = _open_receipt_parent(receipt)
+        fds.append(rfd)
+        # Reject aliases through symlink ancestors as well as lexical containment.
+        if first.resolve() == receipt.parent.resolve() or first.resolve() in receipt.parent.resolve().parents:
+            raise OSError("receipt aliases provisioned ancestor chain")
+        intent = {"schema": 1, "state": "pending", "root": str(root), "anchor": str(anchor),
+                  "anchor_identity": _identity(afd), "generation": secrets.token_hex(24)}
+        try:
+            old = json.loads(_read_at(rfd, receipt.name, bounded=True))
+        except FileNotFoundError:
+            old = None
+        except (ValueError, TypeError) as exc:
+            raise OSError("malformed provisioning intent; operator reconciliation required") from exc
+        if old is not None and not isinstance(old, dict):
+            raise OSError("malformed provisioning intent; operator reconciliation required")
+        if old is not None and old.get("state") == "pending":
+            # Strict [st_dev, st_ino] here, on purpose (round 2): a pending intent has no nonce yet, and a mount
+            # point's inode is the same on any filesystem mounted there, so inode alone cannot bind the anchor.
+            for key in ("schema", "root", "anchor", "anchor_identity"):
+                if old.get(key) != intent[key]:
+                    raise OSError("pending intent changed; operator reconciliation required")
+            intent = old
+        _atomic_at(rfd, receipt.name, json.dumps(intent, sort_keys=True))
+        chain = [afd]
+        for part in parts:
+            try:
+                os.mkdir(part, mode=0o755, dir_fd=chain[-1])
+            except FileExistsError:
+                pass
+            child = os.open(part, _DIR_FLAGS, dir_fd=chain[-1])
+            fds.append(child)
+            chain.append(child)
+        _atomic_at(chain[-1], _NONCE, intent["generation"])
+        for fd in reversed(chain):
+            os.fsync(fd)
+        st = os.stat(root, follow_symlinks=False)
+        if _identity(chain[-1]) != [st.st_dev, st.st_ino]:
+            raise OSError("root changed during provisioning")
+        ready = {**intent, "state": "ready", "root_identity": _identity(chain[-1])}
+        _atomic_at(rfd, receipt.name, json.dumps(ready, sort_keys=True))
+        return ready
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+class RootDirectory:
+    """Retained fd chain; all mutation is relative, never mkdir -p from a path."""
+    #: t_f9dd5ccc: told of every validate() that PASSED on this thread (allocd sets it per request). A refused-root
+    #: episode closes only on a 2xx whose request proved the root here, never on a 2xx that never opened it.
+    on_validated: contextvars.ContextVar = contextvars.ContextVar("root_validated_hook", default=None)
+
+    def __init__(self, root, receipt, rfd, doc, fds, parts):
+        self.root, self.receipt, self.rfd, self.doc = root, receipt, rfd, doc
+        self.fds, self.parts = fds, parts
+        self.fd = fds[-1]
+
+    def validate(self):
+        try:
+            current = json.loads(_read_at(self.rfd, self.receipt.name, bounded=True))
+            parent_fd = _open_receipt_parent(self.receipt)
+            try:
+                if _identity(parent_fd) != _identity(self.rfd):
+                    raise RootRefused("receipt parent replaced")
+            finally:
+                os.close(parent_fd)
+            st = os.stat(self.root, follow_symlinks=False)
+            live = _identity(self.fds[0])
+            # live fd vs path: full [st_dev, st_ino]; receipt vs live: inode + nonce (_same_across_boots)
+            if (current != self.doc or [st.st_dev, st.st_ino] != live
+                    or not _same_across_boots(self.doc["root_identity"], live)):
+                raise RootRefused("provisioned root/receipt replaced")
+            if _read_at(self.fds[0], _NONCE, bounded=True) != self.doc["generation"]:
+                raise RootRefused("root generation changed")
+            for i, part in enumerate(self.parts):
+                st = os.stat(part, dir_fd=self.fds[i], follow_symlinks=False)
+                if [st.st_dev, st.st_ino] != _identity(self.fds[i + 1]):
+                    raise RootRefused("descendant chain replaced")
+        except FileNotFoundError as exc:
+            raise RootRefused(f"root or receipt missing: {exc.filename or exc}") from exc
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RootRefused("invalid root receipt") from exc
+        except OSError as exc:
+            _refuse_structural(exc)
+            raise
+        hook = RootDirectory.on_validated.get()
+        if hook is not None:
+            hook()
+
+    def __truediv__(self, name):
+        if not isinstance(name, str) or name in ("", ".", "..") or "/" in name or "\0" in name:
+            raise OSError("single filename required")
+        return RootFile(self, name)
+
+    def replace(self, name, data, mode=0o644):
+        self.validate()
+        _atomic_at(self.fd, name, data, mode)
+        self.validate()
+
+
+class RootFile:
+    """The Path operations used by demand and ledger storage, bound to a directory fd."""
+    def __init__(self, directory, name):
+        self.parent, self.name = directory, name
+
+    def __str__(self):
+        return str(self.parent.root.joinpath(*self.parent.parts, self.name))
+
+    def stat(self):
+        return os.stat(self.name, dir_fd=self.parent.fd, follow_symlinks=False)
+
+    def exists(self):
+        try:
+            self.stat()
+            return True
+        except FileNotFoundError:
+            return False
+
+    def is_symlink(self):
+        try:
+            return stat.S_ISLNK(self.stat().st_mode)
+        except FileNotFoundError:
+            return False
+
+    _MODES = {"r": os.O_RDONLY, "w": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+              "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a+": os.O_RDWR | os.O_CREAT | os.O_APPEND}
+
+    def open(self, mode="r", encoding=None):
+        if mode not in self._MODES:   # Prism 699dec37cb76/74b201659f91: never map an unknown mode onto append
+            raise ValueError(f"unsupported RootFile mode {mode!r}")
+        fd = os.open(self.name, self._MODES[mode] | os.O_NOFOLLOW, 0o644, dir_fd=self.parent.fd)
+        return os.fdopen(fd, mode, encoding=encoding)
+
+    def read_text(self, encoding="utf-8"):
+        return _read_at(self.parent.fd, self.name)
+
+
+#: t_5e814402: receipt versions whose file + parent directory THIS process has fsync'd. The receipt only changes at
+#: provisioning, by an atomic rename (a new inode and a new ctime), so a version synced once stays durable; a fresh
+#: process starts empty and repays once. Re-syncing it on every request was 4-6 of a /renew's 15 fsyncs, and on the
+#: Studio each one waits whenever other jobs saturate the Data volume. The descendant chain is still re-synced on
+#: every acknowledgement (test_every_ack_syncs_descendants_even_with_reused_identity).
+_RECEIPT_SYNCED: set = set()
+
+
+@contextlib.contextmanager
+def root_directory(root, relative=Path("."), *, mode=0o755):
+    root = _absolute(root)
+    receipt = _receipt_path(root)
+    parts = Path(relative).parts
+    if Path(relative).is_absolute() or ".." in parts or len(parts) > 64:
+        raise OSError("bounded root-relative directory required")
+    clock = STAGE_MARK.get()
+    # t_bb190bec: open + receipt/chain fsyncs + validate re-walks are root setup (the clock names the lock phase),
+    # never the caller's stage
+    resume = clock("root_setup") if clock is not None else None
+    fds, rfd = [], None
+    try:
+        try:
+            rfd = _open_receipt_parent(receipt)
+            doc = json.loads(_read_at(rfd, receipt.name, bounded=True))
+        except FileNotFoundError as exc:
+            raise RootRefused(f"root receipt missing: {receipt}") from exc
+        except (ValueError, TypeError) as exc:
+            raise RootRefused("invalid root receipt") from exc
+        except OSError as exc:
+            _refuse_structural(exc)
+            raise
+        if (not isinstance(doc, dict) or doc.get("schema") != 1 or doc.get("state") != "ready"
+                or doc.get("root") != str(root) or not isinstance(doc.get("generation"), str)
+                or not isinstance(doc.get("root_identity"), list)):
+            raise RootRefused("fleet root provisioning incomplete")
+        # Repay ready-rename sync debt even in a fresh runtime process; once per receipt version per process
+        # (t_5e814402, _RECEIPT_SYNCED).
+        handle = os.open(receipt.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=rfd)
+        try:
+            st, pst = os.fstat(handle), os.fstat(rfd)
+            synced = (st.st_dev, st.st_ino, st.st_ctime_ns, st.st_size, pst.st_dev, pst.st_ino)
+            if synced not in _RECEIPT_SYNCED:
+                os.fsync(handle)
+                os.fsync(rfd)
+                _RECEIPT_SYNCED.add(synced)
+        finally:
+            os.close(handle)
+        fds.append(os.open(root, _DIR_FLAGS))  # NEVER create root
+        directory = RootDirectory(root, receipt, rfd, doc, fds, ())
+        directory.validate()
+        for index, part in enumerate(parts):
+            try:
+                os.mkdir(part, mode=mode if index == len(parts) - 1 else 0o755, dir_fd=fds[-1])
+            except FileExistsError:
+                pass
+            fds.append(os.open(part, _DIR_FLAGS, dir_fd=fds[-1]))
+        directory = RootDirectory(root, receipt, rfd, doc, fds, parts)
+        # Inodes may be reused after deletion: existence/identity is not a durable
+        # proof. Re-sync the bounded descendant chain on every acknowledgement.
+        for fd in reversed(fds):
+            os.fsync(fd)
+        directory.validate()
+        context_reset = _ACTIVE_DIRECTORIES.set((*_ACTIVE_DIRECTORIES.get(), directory))
+        if clock is not None:   # setup done: the body is the caller's time again
+            clock(resume)
+            clock = None
+        try:
+            yield directory
+            directory.validate()
+        finally:
+            _ACTIVE_DIRECTORIES.reset(context_reset)
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+        if rfd is not None:
+            os.close(rfd)
+        if clock is not None:   # refused before the yield: hand the caller its label back
+            clock(resume)
+
+
+def make_dirs_durable(directory, *, mode=0o777, through=None) -> None:
+    """Compatibility helper: explicit provisioned root required, never infer an anchor."""
+    base = _absolute(through if through is not None else _root())
+    with root_directory(base, _absolute(directory).relative_to(base), mode=mode):
+        pass
+
+
+@contextlib.contextmanager
+def _writer(root=None, timeout_s=None, *, directory=None):
+    try:
+        scope = root_directory(_root(root), DEMAND_REL) if directory is None else contextlib.nullcontext(directory)
+        with scope as directory:
+            timing = None
+            try:
+                with (directory / ".writer.lock").open("a") as fh:
+                    t_wait = time.monotonic()
+                    with _stage("writer_wait"):
+                        if timeout_s is None:
+                            fcntl.flock(fh, fcntl.LOCK_EX)
+                        else:
+                            deadline = time.monotonic() + max(0, timeout_s)
+                            while True:
+                                try:
+                                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                    break
+                                except BlockingIOError:
+                                    if time.monotonic() >= deadline:
+                                        raise TimeoutError('demand writer busy') from None
+                                    time.sleep(0.01)
+                    t_held = time.monotonic()
+                    try:
+                        yield directory
+                        directory.validate()
+                    finally:
+                        timing = (t_held - t_wait, time.monotonic() - t_held)   # the hold ends as the fd closes below
+            finally:
+                # t_1d801469: write the hold line only after .writer.lock is closed, never while the writer is held
+                if timing is not None:
+                    _note_hold("demand_writer", _root(root) / HOLDS_REL, *timing)
+    except OwnershipRefused as refusal:
+        # Nested ledger contexts have unwound and the writer fd is closed.
+        # Delivery can block/fail, but must never hold either admission flock.
+        refusal.page()
+        raise DoorConflict("auth") from refusal
 
 
 def _replace(path, doc):
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".demand.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh, sort_keys=True, allow_nan=False)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-    # The rename is durable only once the directory is: a spend intent lost to a crash here would make a consumed
-    # id eligible again. Same rule as placement._write_ledger; a failed directory fsync raises (OSError -> 503).
-    dfd = os.open(str(path.parent), os.O_RDONLY)
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
+    with _stage("store_serialize"):
+        data = json.dumps(doc, sort_keys=True, allow_nan=False)
+    if isinstance(path, RootFile):
+        path.parent.replace(path.name, data)
+        return
+    base = _absolute(_root())
+    with root_directory(base, _absolute(path).parent.relative_to(base)) as directory:
+        directory.replace(path.name, data)
+    return
 
 
-def _owned(path, workload, root=None):
+def _owned(path, workload, root=None, *, uid=...):
     """All merged files belong to allocd's service UID; publisher identity is checked before merging.
 
     owners maps each kind to its registered filesystem service user (or numeric UID).
     Missing policy retains same-UID compatibility, never trusts a different filesystem owner.
+    ``uid``: the caller's _owner_uid(workload, root), already resolved (t_2b90a362).
     """
-    uid = _owner_uid(workload, root)
+    uid = _owner_uid(workload, root) if uid is ... else uid
     try:
         return uid is not None and path.stat().st_uid == uid and not path.is_symlink()
     except OSError:
@@ -276,23 +744,20 @@ class DemandStoreUnreadable(OSError):
     every writer refuses to replace it (allocd answers 503) instead of treating it as empty (Prism e478e39ea54b)."""
 
 
-def _existing(path, workload, root=None):
+def _existing(path, workload, root=None, *, uid=...):
+    """``uid``: _owner_uid(workload, root) resolved by the caller BEFORE it took the demand writer (t_2b90a362: the
+    policy read + passwd lookup ran twice per store_door inside the writer). Omitted = resolved here, as before."""
+    if uid is ...:
+        with _stage("owner_lookup"):
+            uid = _owner_uid(workload, root)
     absent = not path.exists() and not path.is_symlink()
     # allocd is the single writer, and _replace always leaves a file owned by THIS process's UID. If the policy names
     # another owner, read_demand would hide whatever we write, so EVERY write is refused before any mutation, whether
     # the store is absent or already exists (never accept-then-hide; t_430834ff). An existing store must also carry
     # the configured owner.
-    if _owner_uid(workload, root) != os.getuid() or (not absent and not _owned(path, workload, root)):
-        # Never erase queues or anti-replay tombstones because ownership policy changed.
-        from episode_pager import EpisodePager
-        try:
-            outcome = EpisodePager("admission-demand", state_dir=_root(root) / "state/pager").page(
-                f"unowned:{workload}", f"Admission store ownership refused: {path}; no writes permitted")
-        except Exception as exc:  # paging failure must not weaken the storage refusal
-            raise DemandStoreUnreadable(f"ownership refusal page failed for {path}: {exc}") from exc
-        if outcome == "failed":
-            raise DemandStoreUnreadable(f"ownership refusal page failed for {path}; retry next request")
-        raise DoorConflict("auth")
+    if uid != os.getuid() or (not absent and not _owned(path, workload, root, uid=uid)):
+        # Carry only immutable delivery facts through lock unwinding, never an open fd.
+        raise OwnershipRefused(str(path), workload, _root(root))
     if absent:
         return {}
     try:
@@ -302,6 +767,24 @@ def _existing(path, workload, root=None):
     if not isinstance(doc, dict) or doc.get("workload") != workload:
         raise DemandStoreUnreadable(f"{path}: malformed demand store; refusing to replace it")
     return doc
+
+
+class OwnershipRefused(Exception):
+    """Internal unwind signal: _writer delivers exactly once after releasing its flock."""
+
+    def __init__(self, path, workload, root):
+        super().__init__(path)
+        self.path, self.workload, self.root = path, workload, root
+
+    def page(self):
+        from episode_pager import EpisodePager
+        try:
+            outcome = EpisodePager("admission-demand", state_dir=self.root / "state/pager").page(
+                f"unowned:{self.workload}", f"Admission store ownership refused: {self.path}; no writes permitted")
+        except Exception as exc:
+            raise DemandStoreUnreadable(f"ownership refusal page failed for {self.path}: {exc}") from exc
+        if outcome == "failed":
+            raise DemandStoreUnreadable(f"ownership refusal page failed for {self.path}; retry next request")
 
 
 class DoorConflict(Exception):
@@ -334,6 +817,9 @@ def validate_door(req, registry=None):
         if not isinstance(req.get("id"), str) or not 0 < len(req["id"]) <= 256:
             raise ValueError("stable pending-unit id required")
         if op in ("withdraw", "mark_asap"):
+            # store_door persists any supplied verdict for these ops too: never an unchecked one (Prism 6a8c1f6cc5cd)
+            if req.get("verdict") is not None:
+                _validate_verdict(req["verdict"])
             return req
     waiting = ([{"id": req["id"], "need_cpu": req.get("need_cpu"),
                  "need_mem_gb": req.get("need_mem_gb"), "asap": req.get("asap", False),
@@ -357,13 +843,17 @@ def validate_door(req, registry=None):
             raise ValueError("client arrival timestamps forbidden")
     if op == "enqueue" and verdict is None:
         return req
+    _validate_verdict(verdict)
+    return req
+
+
+def _validate_verdict(verdict):
     if not isinstance(verdict, dict) or type(verdict.get("admittable")) is not bool:
         raise ValueError("boolean admittable required")
     if not isinstance(verdict.get("binding"), str) or len(verdict["binding"]) > 128:
         raise ValueError("binding required")
     if not _num(verdict.get("deficit_cpu")) or verdict["deficit_cpu"] < 0 or "at" in verdict:
         raise ValueError("invalid verdict deficit or timestamp")
-    return req
 
 
 def consumed_units(doc):
@@ -373,6 +863,64 @@ def consumed_units(doc):
         for unit_id, value in state.get("consumed", {}).items():
             consumed.setdefault(unit_id, value)
     return consumed
+
+
+#: allocd refuses any door lease (/demand/authorize, /demand/recover-existing) with ttl_s above this.
+DOOR_TTL_MAX_S = 1800.0
+#: How long a spent unit's tombstone outlives its lease (t_d53a92f3). Counted from the FIRST store_door that sees the
+#: reservation no longer live in the ledger (``gone_at``), never from authorization: a renewed lease protects its
+#: tombstone for as long as it lives, and an allocd outage stamps nothing. After the lease ends a holder can still
+#: present the id for a lost-reply lookup/authorize retry (test-gate's wait budget is <= 600 s, backoff cap 300 s) or
+#: a recover_existing on its next reap after a failed renew. Twice the longest lease covers both.
+CONSUMED_HORIZON_S = 2 * DOOR_TTL_MAX_S
+#: t_1d801469: a tombstone whose lease its holder RELEASED (``released: true``, set by placement.release under the
+#: writer) is kept this long after ``gone_at`` instead of CONSUMED_HORIZON_S. The holder ended that job itself, so no
+#: lost-reply authorize/lookup retry of it can still be in flight past test-gate's 600 s wait budget, and a
+#: recover_existing of a released unit is refused either way (``released`` inside the horizon, ``not_consumed`` after).
+#: Most CI units end by release, so this is what bounds ci.json (955 KB on 2026-11-13 at ~1,800 authorizes/h).
+RELEASED_HORIZON_S = 900.0
+LEDGER_REL = Path("var") / "placement" / "headroom-reservations.json"   # placement.RESERVATIONS_REL
+
+
+def _ledger_until(root):
+    """{reservation id: until} of every ledger row (live or lapsed); None when the ledger is missing or unreadable
+    (then nothing is pruned)."""
+    try:
+        doc = json.loads((_root(root) / LEDGER_REL).read_text(encoding="utf-8"))
+        rows = doc["rows"]
+        if not isinstance(rows, list):
+            return None  # Prism 711334fa5a20: a parseable but malformed ledger is unreadable, never "empty"
+        return {r["id"]: (float(r["until"]) if _num(r.get("until")) and not r.get("released") else -math.inf)
+                for r in rows if isinstance(r, dict) and isinstance(r.get("id"), str)}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def bound_consumed(consumed, *, root=None, now):
+    """Drop tombstones whose lease has been gone for CONSUMED_HORIZON_S; stamp ``gone_at`` on newly gone ones.
+
+    A tombstone whose reservation is live is never dropped. ``gone_at`` is re-stamped whenever any liveness evidence
+    postdates it (the ledger row's ``until``, a recover_existing ``observed_at``, the grant ``at``), so a lease that
+    came back after the stamp restarts the clock. No readable ledger, or a record without a reservation id, prunes
+    nothing (fail closed)."""
+    until = _ledger_until(root)
+    if until is None:
+        return consumed
+    out = {}
+    for unit_id, record in consumed.items():
+        if isinstance(record, dict) and isinstance(record.get("reservation_id"), str):
+            rid = record["reservation_id"]
+            last_live = max([until.get(rid, -math.inf)]
+                            + [record[k] for k in ("at", "observed_at") if _num(record.get(k))])
+            if last_live > now:
+                record = {k: v for k, v in record.items() if k != "gone_at"}
+            elif not _num(record.get("gone_at")) or record["gone_at"] > now or record["gone_at"] < last_live:
+                record = {**record, "gone_at": now}
+            elif now - record["gone_at"] > (RELEASED_HORIZON_S if record.get("released") is True
+                                            else CONSUMED_HORIZON_S):
+                continue
+        out[unit_id] = record
+    return out
 
 
 def store_door(req, *, owner: str, root=None, now=None):
@@ -386,13 +934,17 @@ def store_door(req, *, owner: str, root=None, now=None):
     """
     if not isinstance(owner, str) or owner.count("@") != 1 or not all(map(_name, owner.split("@"))):
         raise ValueError("authenticated owner identity required")
-    now = float(time.time() if now is None else now)
     registry = load_priority(root=root)
     validate_door(req, registry)
     workload, host = req["workload"], req["host"]
+    # t_2b90a362: the owner policy read and its passwd lookup run BEFORE the writer is taken (the policy file is
+    # config, never written under the writer); the writer then holds only read-merge-write of the store.
+    with _stage("owner_lookup"):
+        uid = _owner_uid(workload, root)
     with _writer(root) as directory:
+        now = float(time.time() if now is None else now)
         path = directory / f"{workload}.json"
-        doc = _existing(path, workload, root)
+        doc = _existing(path, workload, root, uid=uid)
         if req.get("op") == "queue":
             # Class-level aggregate (legacy holdback input), last writer wins; ``hosts`` keeps every pair host that
             # published within demand_max_age_s, so two hosts' publishers never hide each other's restriction.
@@ -422,7 +974,9 @@ def store_door(req, *, owner: str, root=None, now=None):
                    and fresh and _num(u.get("seen_at", previous.get("at")))
                    and 0 <= now - u.get("seen_at", previous["at"]) <= registry.demand_max_age_s}
         op = req.get("op", "publish")
-        consumed = consumed_units(doc)
+        # Bound FIRST (Prism 1ac0b2cc1555): an id whose tombstone just expired is a fresh unit for this very call,
+        # so the expiry must precede the waiting filter, or the enqueue is dropped with no record of either kind.
+        consumed = bound_consumed(consumed_units(doc), root=root, now=now)
         touched = [req["id"]] if op in ("enqueue", "withdraw", "mark_asap") else [u["id"] for u in req["waiting"]]
         if op in ("enqueue", "publish"):
             for other_host, state in by_host.items():
@@ -455,8 +1009,8 @@ def store_door(req, *, owner: str, root=None, now=None):
                 waiting[u["id"]] = {"id": u["id"], "owner": owner, "at": min(known.get("at", now), now),
                     "seen_at": now, "need_cpu": u["need_cpu"], "need_mem_gb": u["need_mem_gb"],
                     "asap": known.get("asap") is True}
-        consumed = {key: value for key, value in consumed.items()
-                    if isinstance(value, dict) and _num(value.get("at")) and now - value["at"] <= 7 * 86400}
+        # Consumed IDs are anti-replay/fencing records. TTL applies to the ledger charge, not to authority to start
+        # again or recover retired work; a tombstone is dropped only CONSUMED_HORIZON_S after its lease is gone.
         waiting = [u for uid, u in waiting.items() if uid not in consumed]
         verdict = ({**req["verdict"], "at": now} if req.get("verdict") is not None else previous.get("verdict"))
         if waiting and (not isinstance(verdict, dict) or not _num(verdict.get("at"))
@@ -464,7 +1018,11 @@ def store_door(req, *, owner: str, root=None, now=None):
             # No fresh capacity fact: conservatively retain strict ordering, but do
             # not fabricate positive headroom or a numeric deficit.
             verdict = {"admittable": False, "binding": "cpu", "deficit_cpu": 0, "at": now}
-        by_host[host] = {"at": now, "waiting": waiting, "verdict": verdict, "consumed": consumed}
+        # ONE workload-wide index (t_d53a92f3): legacy per-host copies were merged by consumed_units above.
+        for state in by_host.values():
+            if isinstance(state, dict):
+                state.pop("consumed", None)
+        by_host[host] = {"at": now, "waiting": waiting, "verdict": verdict}
         doc.update(schema=SCHEMA, workload=workload, by_host=by_host, consumed=consumed)
         _replace(path, doc)
     state = by_host[host]
@@ -483,6 +1041,23 @@ def waiting_window(units, registry=None):
                                         str(u.get("id", ""))))[:registry.door_window_units]
 
 
+def _spread_names(doc, now: float, max_age: float,
+                  resolve: Optional[Callable[[str], Optional[str]]] = None):
+    """The FRESH, alias-resolved, distinct host names a class queue was published for: None = any host (``hosts``
+    null), ``...`` = malformed. One rule for read_demand's spread and GET /demand's ``hosts`` list (t_e36a076f)."""
+    hosts = doc.get("hosts")
+    if hosts is None:
+        return None
+    if not isinstance(hosts, list):
+        return ...
+    host_at = doc.get("host_at")
+    if isinstance(host_at, dict):
+        # per-host freshness: a host whose own publisher stopped expires on its own clock (t_430834ff)
+        hosts = [h for h in hosts if _num(host_at.get(str(h))) and abs(now - host_at[str(h)]) <= max_age]
+    # with a resolver (placement's HostTable.resolve), an alias names its canonical host (Prism 364936434c3d)
+    return {((resolve(str(h)) if resolve else None) or str(h)).lower() for h in hosts}
+
+
 def _demand_of(doc, now: float, max_age: float, host: str,
                resolve: Optional[Callable[[str], Optional[str]]] = None) -> Optional[admission.Demand]:
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
@@ -493,31 +1068,33 @@ def _demand_of(doc, now: float, max_age: float, host: str,
         return None
     if now - float(at) > max_age or float(at) - now > max_age:
         return None
-    hosts = doc.get("hosts")
-    if hosts is not None:
-        if not isinstance(hosts, list):
-            return None
-        # with a resolver (placement's HostTable.resolve), an alias names its canonical host (Prism 364936434c3d)
+    names = _spread_names(doc, now, max_age, resolve)
+    spread = 1
+    if names is ...:
+        return None
+    if names is not None:
         want = (resolve(host) if resolve else None) or host
-        host_at = doc.get("host_at")
-        if isinstance(host_at, dict):
-            # per-host freshness: a host whose own publisher stopped expires on its own clock (t_430834ff)
-            hosts = [h for h in hosts if _num(host_at.get(str(h))) and abs(now - host_at[str(h)]) <= max_age]
-        names = {((resolve(str(h)) if resolve else None) or str(h)).lower() for h in hosts}
         if want.lower() not in names:
             return None
+        spread = len(names)      # the queue's units start on one of these hosts, never on each (t_d8103e2f)
     cpus, ram, gpu = unit.get("cpus"), unit.get("ram_gb"), unit.get("gpu_mib", 0.0)
     if not (_num(cpus) and _num(ram) and _num(gpu) and cpus >= 0 and ram >= 0 and gpu >= 0):
         return None
-    return admission.Demand(wl, q, admission.Estimate(float(cpus), float(ram), float(gpu), f"demand:{wl}"))
+    return admission.Demand(wl, q, admission.Estimate(float(cpus), float(ram), float(gpu), f"demand:{wl}"),
+                            hosts=spread)
 
 
 def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: Optional[float] = None,
                 resolve: Optional[Callable[[str], Optional[str]]] = None,
-                full_queue: bool = False) -> List[admission.Demand]:
+                full_queue: bool = False, loaded: Optional[Mapping[str, dict]] = None,
+                hosts_out: Optional[dict] = None) -> List[admission.Demand]:
     """Every FRESH class queue that may run on ``host``. ``resolve`` (name -> canonical host id or None) folds aliases
     on both sides of a ``hosts`` restriction; without it the match is case-insensitive string equality.
-    ``full_queue`` retains all fresh units for lookup/authorization; publication uses the bounded default."""
+    ``full_queue`` retains all fresh units for lookup/authorization; publication uses the bounded default.
+    ``loaded`` {workload: doc}: a store the caller already read with _existing (ownership checked) under the writer;
+    used as is instead of parsing that file a second time under the locks (t_1d801469: ci.json is ~0.9 MB).
+    ``hosts_out`` {workload: sorted host list | None}: filled for every returned row with the SAME fresh, resolved,
+    distinct names its ``hosts`` spread counts (None = any host), so GET /demand publishes the list (t_e36a076f)."""
     now = float(time.time() if now is None else now)
     max_age = max_age_s(root=root) if max_age is None else float(max_age)
     out: List[admission.Demand] = []
@@ -527,27 +1104,40 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
     except OSError:
         return out
     for p in names:
-        try:
-            doc = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            _say(f"demand:{p}", f"{p} unreadable: holds nothing back")
-            continue
-        workload = doc.get("workload") if isinstance(doc, dict) else None
-        if workload != p.stem or not _owned(p, workload, root):
-            continue
+        if loaded is not None and p.stem in loaded:
+            doc = loaded[p.stem]
+            if not isinstance(doc, dict) or doc.get("workload") != p.stem:
+                continue
+        else:
+            try:
+                doc = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                _say(f"demand:{p}", f"{p} unreadable: holds nothing back")
+                continue
+            workload = doc.get("workload") if isinstance(doc, dict) else None
+            if workload != p.stem or not _owned(p, workload, root):
+                continue
+        workload = p.stem
         dm = _demand_of(doc, now, max_age, host, resolve)
+        spread_names = _spread_names(doc, now, max_age, resolve) if dm is not None else None
         by_host = doc.get("by_host", {})
         canonical = (resolve(host) if resolve else None) or host
-        state = next((s for h, s in by_host.items()
-                      if (((resolve(h) if resolve else None) or h).lower() == canonical.lower())), None) if isinstance(by_host, dict) else None
-        if isinstance(state, dict) and _num(state.get("at")) and abs(now - state["at"]) <= max_age:
-            waiting = []
-            for u in state.get("waiting", []):
+        # EVERY fresh per-host state that resolves to ``host`` (a resource domain maps parent and guests to one id):
+        # a stale or empty parent state never hides a guest's fresh queue (Prism 3fb8f5172cf9).
+        states = [s for h, s in by_host.items()
+                  if (((resolve(h) if resolve else None) or h).lower() == canonical.lower())
+                  and isinstance(s, dict) and _num(s.get("at")) and abs(now - s["at"]) <= max_age] \
+            if isinstance(by_host, dict) else []
+        if states:
+            state = max(states, key=lambda s: s["at"])     # newest state's verdict / at
+            waiting, seen_ids = [], set()
+            consumed = consumed_units(doc)
+            for st, u in ((st, u) for st in states for u in (st.get("waiting") or [])):
                 if not isinstance(u, dict):
                     continue
-                if u.get("id") in consumed_units(doc):
+                if u.get("id") in consumed or u.get("id") in seen_ids:
                     continue
-                seen_at = u.get("seen_at", state["at"])
+                seen_at = u.get("seen_at", st["at"])
                 if not _num(seen_at) or not 0 <= now - seen_at <= max_age:
                     continue
                 # freshness is the heartbeat (seen_at, checked above); arrival is only the ordering key, so a live
@@ -555,8 +1145,10 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
                 at, cpu, mem = u.get("at"), u.get("need_cpu"), u.get("need_mem_gb")
                 if not (_num(at) and _num(cpu) and cpu > 0 and _num(mem) and mem >= 0):
                     continue
+                seen_ids.add(u.get("id"))
                 waiting.append(admission.WaitingUnit(min(at, now), admission.Estimate(cpu, mem),
                                                       u.get("asap") is True, str(u.get("id", ""))))
+            queued = len(waiting)
             waiting.sort(key=lambda u: (not u.asap, u.at, u.id))
             if not full_queue:
                 waiting = waiting[:load_priority(root=root).door_window_units]
@@ -567,10 +1159,12 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
                     and v["deficit_cpu"] >= 0 and _num(v.get("at"))):
                 verdict = admission.DoorVerdict(int(v["admittable"]), v["binding"], v["deficit_cpu"], min(v["at"], now))
             unit = dm.unit if dm else (waiting[0].need if waiting else admission.Estimate())
-            dm = admission.Demand(workload, dm.queued if dm else len(waiting), unit,
-                                  tuple(waiting), verdict, state["at"])
+            dm = admission.Demand(workload, dm.queued if dm else queued, unit,
+                                  tuple(waiting), verdict, state["at"], dm.hosts if dm else 1)
         if dm is not None:
             out.append(dm)
+            if hosts_out is not None:
+                hosts_out[workload] = sorted(spread_names) if isinstance(spread_names, set) else None
     return out
 
 
@@ -579,7 +1173,7 @@ def door_document(d: admission.Demand) -> dict:
             "unit": dataclasses.asdict(d.unit),
             "waiting": [{"id": u.id, "at": u.at, "need_cpu": u.need.cpus,
                          "need_mem_gb": u.need.ram_gb, "asap": u.asap} for u in d.waiting],
-            "verdict": dataclasses.asdict(d.verdict) if d.verdict else None}
+            "verdict": dataclasses.asdict(d.verdict) if d.verdict else None, "hosts": d.hosts}
 
 
 def doors_from_document(doc: Mapping, *, now: float) -> List[admission.Demand]:
@@ -616,7 +1210,9 @@ def doors_from_document(doc: Mapping, *, now: float) -> List[admission.Demand]:
         # the aggregate queue count is its own fact (legacy holdback), never the bounded window's length (6e3523a0dbe8)
         q = row.get("queued")
         queued = q if type(q) is int and q >= 0 else len(waiting)
-        out.append(admission.Demand(row["workload"], queued, need, tuple(waiting), verdict, at))
+        h = row.get("hosts")
+        out.append(admission.Demand(row["workload"], queued, need, tuple(waiting), verdict, at,
+                                    h if type(h) is int and h >= 1 else 1))
     return out
 
 

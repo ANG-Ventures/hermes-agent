@@ -359,6 +359,17 @@ class LoadGate:
             self.band, self.spill_reason = "proc_paused", None
             self.pool = {"planned": False, "reason": "proc_paused"}
             return 0, proc_hard
+        # Prism b9b45a76cc17: a kanban kind pause on this host closes local starts (the pool path closes it in
+        # placement.choose); remote hosts stay allowed, they answer for their own pause. Unreadable = closed.
+        from hermes_cli import kanban_headroom as _kh
+        try:
+            paused = _kh.local_kind_pause()
+        except Exception as exc:
+            paused = f"kind pause unreadable ({type(exc).__name__}: {exc}); refusing, fail closed"
+        if paused:
+            self.state, self.allowance, self.last_reason = "saturated", 0, paused
+            self.band, self.spill_reason = "spilling", "kind_paused"
+            return 0, paused
         ctx = utilization_context()
         sample = {"host": ctx["host"], "os": _os_name(), "at": now, "ncpu": self.ncpu, "cpu_busy": self.cpu_busy,
                   "mem_available_gb": ctx["mem_available_gb"], "mem_total_gb": ctx["mem_total_gb"],

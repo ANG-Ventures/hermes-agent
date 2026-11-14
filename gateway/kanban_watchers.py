@@ -3871,6 +3871,14 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        try:  # t_77aa2e0e: name a missing fleet-root receipt once at boot, not once per refused write
+            from hermes_cli.fleet_placement import root_receipt_missing
+
+            _missing = root_receipt_missing()
+        except Exception:
+            _missing = None
+        if _missing:
+            logger.error("kanban dispatcher: %s", _missing)
 
         try:
             from hermes_cli import kanban_db as _kb

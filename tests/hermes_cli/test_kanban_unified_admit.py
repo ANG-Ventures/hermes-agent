@@ -310,7 +310,7 @@ def _plan_mode(home, fleet, allocd, monkeypatch):
         from hermes_cli.fleet_placement import alloc_client
         (home / "var" / "alloc").mkdir(parents=True, exist_ok=True)
         (home / "var" / "alloc" / "router-off").write_text("", encoding="utf-8")
-        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: True)
+        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None, root=None: True)
         # the fallback scores on the collector's document, not the plan's probe: the same fleet, written there
         (home / "var" / "fleet-pressure.json").write_text(json.dumps({"at": fleet.t0, "hosts": {
             h: {**json.loads(fleet.text(h)), "age_s": fleet.age, "load1": 10.0, "load5": 10.0} for h in HOSTS}}),
@@ -369,7 +369,7 @@ def test_pinned_take_books_the_learned_estimate_it_was_admitted_on(home, monkeyp
     t0 = time.time()
     hist = home / placement.CLASS_USAGE_REL
     hist.parent.mkdir(parents=True, exist_ok=True)
-    for i in range(6):
+    for i in range(10):    # work_estimate MIN_ROWS 10 (hermes-home t_d0c8e8f0)
         ad.record_actual(hist, job_class="kanban-worker-llm-wait", host="ace-ai", cpus=6.0, ram_gb=12.0,
                          at=t0 - 600 + i, job_id=f"t_h{i}")
     plan = _plan(home, Fleet(t0))
@@ -528,7 +528,7 @@ def test_allocd_take_is_confirmed_against_the_ledger_allocd_owns(home, monkeypat
     t0 = time.time()
     f = Fleet(t0)
     plan = _plan_mode(home, f, "on", monkeypatch)
-    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: local)
+    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None, root=None: local)
     released = []
     monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
         host="ci-box", reservation_id="r_allocd_1", reason="", source="allocd", detail=detail))
@@ -555,7 +555,7 @@ def test_remote_plain_allocd_grants_cannot_overrun_the_class_rule(home, monkeypa
     f = Fleet(t0)
     f.busy = {"ci-box": 0.880, "ace-ai": 0.5, "ace-media": 0.5}
     plan = _plan_mode(home, f, "on", monkeypatch)
-    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: False)
+    monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None, root=None: False)
     n = iter(range(10))
     released = []
     monkeypatch.setattr(kh, "allocd_admit", lambda plan, cands, job, job_id: SimpleNamespace(
@@ -578,7 +578,7 @@ def remote_allocd(home, monkeypatch):
     def make(fleet, *, legacy=False):
         plan = _plan_mode(home, fleet, "on", monkeypatch)
         (home / "var" / "alloc" / "router-off").unlink()
-        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None: False)
+        monkeypatch.setattr(alloc_client, "ledger_is_local", lambda table=None, root=None: False)
         monkeypatch.setattr(kh, "unified_filter", lambda plan, names, job: (list(names), {}))
         fake = FakeAllocd()
         if legacy:                      # an allocd that predates the ask: runs placement.admit() only
@@ -711,3 +711,79 @@ def test_dry_run_replays_each_simulated_takes_own_footprint(home):
     plan.release(plan.hosts["ace-ai"])                                             # refund the 3-thread take
     assert plan._sim_leases["ace-ai"] == []
     assert plan.take("alpha", pin="ace-ai", job=small) is not None, plan.refusal    # 0.80 + 1/32 fits again
+
+
+def test_deferred_allocd_admit_retries_with_the_same_key(monkeypatch):
+    """Prism 6e478f43c7ea: a deferred admit (allocd slow but healthy) may still commit its row. The card's next tick
+    must retry under the SAME admission key, so allocd's reuse_job returns that row instead of booking a second lease;
+    a fresh key per tick leaked one reservation per slow reply until its TTL."""
+    from hermes_cli.fleet_placement import alloc_client
+    keys: list = []
+    replies = iter(["deferred", "allocd", "allocd"])
+
+    def fake_admit(consumer, *, job_id=None, **kw):
+        keys.append(job_id)
+        src = next(replies)
+        if src == "deferred":
+            return alloc_client.AdmitResult(None, None, "allocd_slow", "deferred", consumer=consumer, job_id=job_id)
+        return alloc_client.AdmitResult("ace-ai", "r1", "", "allocd", consumer=consumer, job_id=job_id)
+
+    monkeypatch.setattr(alloc_client, "admit", fake_admit)
+    monkeypatch.setattr(kh, "unified_active", lambda plan: False)
+    monkeypatch.setattr(kh, "allocd_request", lambda plan, names, job: {})
+    monkeypatch.setattr(kh, "_DEFERRED", {})
+    plan = SimpleNamespace(signal=SimpleNamespace(policy=SimpleNamespace(stale_after_s=60.0)))
+    assert kh.allocd_admit(plan, ["ace-ai"], None, "t_card").source == "deferred"
+    assert kh.allocd_admit(plan, ["ace-ai"], None, "t_card").reservation_id == "r1"
+    kh.allocd_admit(plan, ["ace-ai"], None, "t_card")             # granted: the next take is a new admission
+    assert keys[0].startswith("t_card#") and keys[1] == keys[0], keys
+    assert keys[2] != keys[0] and keys[2].startswith("t_card#"), keys
+
+
+@pytest.mark.parametrize("middle", ["409", "fallback_refused", "wedged_lock", "unreachable_remote", "raises"])
+def test_deferred_key_survives_a_non_grant_retry(monkeypatch, middle):
+    """Prism (pr325-direct) kanban_headroom.py:604: the deferred key was popped on the FIRST retry whatever it
+    returned. deferred -> 409 (or a fallback refusal / allocd_wedged_lock / a raise) -> the next tick minted a new
+    key, and allocd committing the original request late then leaked a lease or booked a second one. Only a grant
+    under that key ends it."""
+    from hermes_cli.fleet_placement import alloc_client
+    keys: list = []
+    replies = iter(["deferred", middle, "allocd"])
+
+    def fake_admit(consumer, *, job_id=None, **kw):
+        keys.append(job_id)
+        src = next(replies)
+        if src == "deferred":
+            return alloc_client.AdmitResult(None, None, "allocd_slow", "deferred", consumer=consumer, job_id=job_id)
+        if src == "409":
+            return alloc_client.AdmitResult(None, None, "saturated:cpu", "allocd", consumer=consumer, job_id=job_id)
+        if src == "fallback_refused":
+            return alloc_client.AdmitResult(None, None, "saturated:cpu", "fallback", consumer=consumer, job_id=job_id)
+        if src == "wedged_lock":
+            return alloc_client.AdmitResult(None, None, "allocd_wedged_lock", "fallback", consumer=consumer,
+                                            job_id=job_id)
+        if src == "unreachable_remote":
+            return alloc_client.AdmitResult(None, None, "allocd_unreachable_remote", "fallback", consumer=consumer,
+                                            job_id=job_id)
+        if src == "raises":
+            raise alloc_client.Refused("token unreadable")
+        return alloc_client.AdmitResult("ace-ai", "r1", "", "allocd", consumer=consumer, job_id=job_id)
+
+    monkeypatch.setattr(alloc_client, "admit", fake_admit)
+    monkeypatch.setattr(kh, "unified_active", lambda plan: False)
+    monkeypatch.setattr(kh, "allocd_request", lambda plan, names, job: {})
+    monkeypatch.setattr(kh, "_DEFERRED", {})
+    plan = SimpleNamespace(signal=SimpleNamespace(policy=SimpleNamespace(stale_after_s=60.0)))
+    assert kh.allocd_admit(plan, ["ace-ai"], None, "t_card").source == "deferred"
+    try:
+        kh.allocd_admit(plan, ["ace-ai"], None, "t_card")
+    except alloc_client.Refused:
+        assert middle == "raises"
+    assert kh.allocd_admit(plan, ["ace-ai"], None, "t_card").reservation_id == "r1"
+    assert keys[1] == keys[0] and keys[2] == keys[0], keys
+    assert kh._DEFERRED == {}                                         # granted under the key: cleared
+
+
+def test_deferred_key_expires_with_the_reservation_ttl(monkeypatch):
+    monkeypatch.setattr(kh, "_DEFERRED", {"t_card": ("t_card#old", time.time() - kh.RESERVE_TTL_S - 1)})
+    assert kh._deferred_key("t_card") is None and kh._DEFERRED == {}

@@ -47,12 +47,12 @@ def test_placement_imports_the_vendored_work_estimate():
 
 def test_utilization_need_is_keyed_on_the_profile_class(table, tmp_path):
     hist = [{"class": "kanban-worker-llm-wait:x", "host": "ci-box", "cpus": float(i), "ram_gb": 2.0 * i,
-             "gpu_mib": 0.0, "at": NOW - 100 + i} for i in range(1, 9)]
+             "gpu_mib": 0.0, "at": NOW - 100 + i} for i in range(1, 11)]
     d = _choose(table, tmp_path, hist)
     need = d.rows[0].need
     assert need is not None
-    assert need.source == "p75:kanban-worker-llm-wait:x@ci-box n=8"
-    assert need.cpus == 6.0 and need.ram_gb == 12.0      # nearest-rank p75 of 1..8
+    assert need.source == "p90:kanban-worker-llm-wait:x@ci-box n=10"
+    assert need.cpus == 9.0 and need.ram_gb == 18.0      # nearest-rank p90 of 1..10 (MIN_ROWS 10, hermes-home t_d0c8e8f0)
 
 
 def test_utilization_need_falls_back_to_the_seed_without_history(table, tmp_path):

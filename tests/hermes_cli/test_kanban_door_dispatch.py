@@ -348,7 +348,10 @@ def test_fcfs_start_consumes_one_authorization_and_survives_restart(fleet, monke
     allocd.answer = ok_door()
     monkeypatch.setenv("ALLOCD_URL", allocd.url)
     tid = _card()
-    proc = subprocess.run([sys.executable, "-c", _KILLED_TICK], env=dict(os.environ), timeout=120,
+    # a subprocess has no conftest: hand it this test's provisioned root receipt (hermes-home #9789)
+    from hermes_cli import fleet_placement
+    receipt = fleet_placement.admission_demand._receipt_path(Path(os.environ["PLACEMENT_HOME"]).absolute())
+    proc = subprocess.run([sys.executable, "-c", _KILLED_TICK], env=dict(os.environ, PLACEMENT_ROOT_RECEIPT=str(receipt)), timeout=120,
                           capture_output=True, text=True)
     assert proc.returncode == -signal.SIGKILL, proc.stderr[-2000:]
     auth = [b for p, b in allocd.calls if p == "/demand/authorize"]
@@ -468,7 +471,7 @@ def test_spawn_only_publish_slow_door_text_is_unchanged(fleet, monkeypatch):
     allocd = _spawn_only_fleet(fleet, monkeypatch, hosts, tokened=hosts)
     allocd.answer = _queue_ok(slow={"a-slow"})
     err = klg.publish_ready_demand(2)
-    assert err and err.startswith("a-slow: Unreachable"), err
+    assert err and err.startswith("a-slow: TimedOut"), err   # alloc_client.TimedOut(Unreachable), hermes-home main
     for h in ("h2", "h3"):
         assert f"{h}: skipped (publish budget {klg.PUBLISH_BUDGET_S} s spent)" in err, err
 

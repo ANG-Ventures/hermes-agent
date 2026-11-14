@@ -46,3 +46,19 @@ def test_v2_scorer_closes_on_psi_avg60_from_the_probe():
     ok = kh.sample_from_detail(_detail(procs_running=5, d_threads=25))
     h = placement.headroom(spec, ok, fp, consumer="kanban", closed_when={"psi_cpu_some10": 40.0})
     assert h.eligible and h.occupancy == 4.0      # procs_running - 1, not the raw load 30
+
+
+def test_probe_carries_the_power_block_to_an_ac_only_host():
+    """Prism 24ab4994fb91: sample_fields()/sample_from_detail() dropped the pressure document's ``power`` block, so a
+    ``power_policy: ac_only`` host read ``closed:power unmeasured`` on every pick, AC-powered and awake or not."""
+    spec = placement.HostSpec(name="mbp", cores=12, threads=18, mem_total_gb=48, mem_reserve_gb=0, cores_reserve=0,
+                              ceilings={"kanban": 4}, aliases=(), power_policy="ac_only")
+    awake = kh.sample_from_detail(_detail(power={"source": "ac", "sleep_disabled": True}))
+    assert (awake.power_source, awake.sleep_disabled) == ("ac", True)
+    assert placement.power_refusal(spec, awake) is None
+    battery = kh.sample_from_detail(_detail(power={"source": "battery", "sleep_disabled": True}))
+    assert placement.power_refusal(spec, battery) == "closed:power battery (power_policy ac_only)"
+    for bad in (None, "ac", {"source": "mains", "sleep_disabled": 1}):     # absent / malformed = unmeasured, closed
+        s = kh.sample_from_detail(_detail(**({} if bad is None else {"power": bad})))
+        assert (s.power_source, s.sleep_disabled) == (None, None)
+        assert placement.power_refusal(spec, s) == "closed:power unmeasured (power_policy ac_only)"

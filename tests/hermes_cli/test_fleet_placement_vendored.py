@@ -132,3 +132,14 @@ def test_adapter_binds_the_state_root_to_the_kanban_root(tmp_path, monkeypatch):
     assert fp.admission_demand._root() == root
     monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path / "p"))
     assert fp.admission_demand._root() == tmp_path / "p"
+
+
+def test_root_receipt_missing_names_the_env_and_the_full_reload_once():
+    """t_77aa2e0e: a gateway whose env lacks PLACEMENT_ROOT_RECEIPT gets ONE loud boot line naming the env and the
+    full reload; a set value gets none."""
+    from hermes_cli.fleet_placement import root_receipt_missing
+
+    line = root_receipt_missing({})
+    assert line and "PLACEMENT_ROOT_RECEIPT" in line and "FULL-reload" in line
+    assert root_receipt_missing({"PLACEMENT_ROOT_RECEIPT": "  "}) == line
+    assert root_receipt_missing({"PLACEMENT_ROOT_RECEIPT": "/x/placement-root.json"}) is None
