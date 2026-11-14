@@ -420,6 +420,20 @@ def test_a_root_receipt_repair_clears_the_latch(door_fleet, monkeypatch, tmp_pat
     assert faults.latched() is None                       # receipt file created: cleared again
 
 
+def test_a_root_generation_repair_clears_the_latch(door_fleet, monkeypatch, tmp_path):
+    """Prism f6e8a5c31293 (t_8400247f): root validation also refuses on the root's generation nonce ("root generation
+    changed"). Restoring that file is a provisioning repair the receipt never sees, so the fingerprint must cover it.
+    RED on 9ae3cf71fe: the fingerprint read the receipt env and file only."""
+    from hermes_cli.fleet_placement import admission_demand
+    receipt = tmp_path / "placement-root.json"
+    receipt.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("PLACEMENT_ROOT_RECEIPT", str(receipt))
+    faults.latch("root generation changed")
+    assert faults.latched()
+    (door_fleet.root / admission_demand._NONCE).write_text("restored-generation", encoding="utf-8")
+    assert faults.latched() is None                       # nonce restored: a fresh door attempt is allowed
+
+
 def test_an_idle_publish_does_not_clear_a_publish_outage(door_fleet):
     """Prism 0056dc604414. RED on 605a9c86: with nothing waiting and nothing recorded, publish_waiting made no allocd
     call yet recorded publish success, so an idle tick after the backoff cleared the outage and paged recovery."""

@@ -46,6 +46,9 @@ def _root() -> Path:
 #: test_registry_path_matches_the_vendored_library). Computed here so the fault-state and registry-read path never
 #: imports the vendored admission_demand, whose module top imports POSIX-only fcntl/pwd (Prism 3e3d55eb04a0).
 PRIORITY_REL = Path("fleet") / "admission-priority.json"
+#: admission_demand._NONCE, the root's generation file (same no-import rule; pinned by
+#: test_a_root_generation_repair_clears_the_latch).
+ROOT_GENERATION_REL = ".placement-root-generation"
 
 
 def _registry_path() -> Path:
@@ -101,10 +104,11 @@ def fingerprint() -> str:
     ctime): a permission-only repair (chmod 000 -> 600) moves mode and ctime only (Prism 917208e77049)."""
     h = hashlib.sha256()
     # Root provisioning (#9789) gates every token read, so repairing it must clear the latch it caused
-    # (Prism f6e8a5c31293): the receipt env value, and the receipt file it names.
+    # (Prism f6e8a5c31293): the receipt env value, the receipt file it names, and the root's generation file.
     receipt = (os.environ.get("PLACEMENT_ROOT_RECEIPT") or "").strip()
     h.update(f"receipt-env:{receipt};".encode())
-    for p in (_registry_path(), _table_path(), *_door_credentials(), *((Path(receipt),) if receipt else ())):
+    for p in (_registry_path(), _table_path(), *_door_credentials(), *((Path(receipt),) if receipt else ()),
+              _root() / ROOT_GENERATION_REL):
         try:
             st = p.stat()
             h.update(f"{p}:{st.st_mtime_ns}:{st.st_size}:{st.st_mode}:{st.st_uid}:{st.st_ctime_ns};".encode())
