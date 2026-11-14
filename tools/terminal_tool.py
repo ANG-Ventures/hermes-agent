@@ -324,6 +324,14 @@ _container_aliases: Dict[str, str] = {}
 _container_alias_lock = threading.Lock()
 
 
+def _cwd_record_key(session_key: Optional[str]) -> str:
+    """Store key for a cwd record. A pool-placed delegate child (delegation.pool_placement) runs in its own
+    remote workspace but inherits the parent's approval session key, so while its lease is bound every read
+    and write goes to the lease's own key; otherwise sibling children share one record (live t_30537365)."""
+    from tools.delegate_pool_placement import bound_env_key
+    return _qualify_task_key(bound_env_key() or str(session_key or "default"))
+
+
 def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """Record *cwd* as *session_key*'s working directory (after a completed
     command, or on workspace-override registration). None/empty keys collapse
@@ -331,7 +339,7 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     qualified (:func:`_qualify_task_key`); the read/clear side qualifies identically."""
     if not isinstance(cwd, str) or not cwd.strip():
         return
-    key = _qualify_task_key(str(session_key or "default"))
+    key = _cwd_record_key(session_key)
     with _session_cwd_lock:
         if _session_cwd.get(key) != cwd:
             _session_cwd[key] = cwd
@@ -340,8 +348,9 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
 def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
     """Recorded cwd for *session_key*, or None. No fallback chain on purpose:
     callers decide what an absent record means. None/empty keys read ``"default"``."""
+    key = _cwd_record_key(session_key)
     with _session_cwd_lock:
-        return _session_cwd.get(_qualify_task_key(str(session_key or "default")))
+        return _session_cwd.get(key)
 
 
 def clear_session_cwd(session_key: str) -> None:

@@ -156,6 +156,54 @@ def test_bound_scope_and_env_key_are_the_childs_only(pool, monkeypatch):
     assert terminal_env("TERMINAL_ENV") == "local"
 
 
+def test_concurrent_children_each_run_in_their_own_workspace(pool, monkeypatch, tmp_path):
+    # Live proof deleg_d964266b: three pool children of one gateway session all recorded and read their cwd
+    # under the parent's approval session key, so child 0 cd'ed into child 1's workspace. Real terminal_tool
+    # on the local backend; each lease points TERMINAL_CWD at its own directory.
+    import json
+
+    from tools.approval_context import set_current_session_key
+    from tools.terminal_tool import get_session_cwd, record_session_cwd, terminal_tool
+
+    monkeypatch.setattr(dpp, "_workspace_for", lambda cid: str(tmp_path / f"delegate-{cid}"))
+    ids = ["sa-0-aaaa", "sa-1-bbbb", "sa-2-cccc"]
+    leases = {}
+    for cid in ids:
+        lease, _ = dpp.acquire(cid, "pool")
+        (tmp_path / f"delegate-{cid}").mkdir()
+        lease.values.update(TERMINAL_ENV="local")  # same scope shape, no ssh
+        record_session_cwd(lease.env_key, lease.workspace)  # what _run_single_child seeds
+        leases[cid] = lease
+    pwds = {cid: [] for cid in ids}
+    barrier = threading.Barrier(len(ids))
+
+    def _child(cid):
+        set_current_session_key("agent:main:discord:parent-session")  # children inherit the parent's key
+        with dpp.bound(leases[cid]):
+            for _ in range(2):
+                barrier.wait()
+                out = json.loads(terminal_tool("pwd", task_id=cid))
+                pwds[cid].append(out["output"].strip())
+
+    threads = [threading.Thread(target=contextvars.copy_context().run, args=(_child, cid)) for cid in ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    try:
+        for cid in ids:
+            assert pwds[cid] == [leases[cid].workspace] * 2, (cid, pwds)
+        assert len({p[-1] for p in pwds.values()}) == 3
+        assert get_session_cwd("agent:main:discord:parent-session") is None  # the parent's record is untouched
+    finally:
+        import tools.terminal_tool as tt
+        for lease in leases.values():
+            dpp.release(lease)
+            env = tt._active_environments.pop(lease.env_key, None)  # the fixture stubs cleanup_vm
+            if env is not None:
+                env.cleanup()
+
+
 def test_refusal_scope_stays_refused(pool):
     from tools.terminal_scope import (TerminalPolicyRefusal, TerminalPolicyUnavailable, reset_terminal_scope,
                                       set_terminal_scope, terminal_env)
@@ -181,10 +229,11 @@ def test_release_is_idempotent(pool):
 
 def _child_that_reports(seen):
     from tools.terminal_scope import terminal_env
-    from tools.terminal_tool import _resolve_container_task_id
+    from tools.terminal_tool import _resolve_container_task_id, get_session_cwd
 
     def _answers(self):
         seen["key"] = _resolve_container_task_id(self._subagent_id)
+        seen["cwd"] = get_session_cwd("agent:main:discord:parent-session")  # any key: the bound lease's record
         seen["host"] = terminal_env("TERMINAL_SSH_HOST")
         seen["goal"] = self.calls[-1]
         return {"final_response": "done", "completed": True, "api_calls": 1}
@@ -201,6 +250,7 @@ def test_run_single_child_places_and_releases_on_success(fleet_home, pool):
     entry = dt._run_single_child(0, "pool goal", child, parent)
     assert entry["status"] == "completed", entry
     assert seen["key"] == "delegate-pool:sa-0-pool" and seen["host"] == "192.0.2.16"
+    assert seen["cwd"] == "/srv/ws/delegate-sa-0-pool"  # the spawn seeds the record the child's turn reads
     assert "[pool placement]" in seen["goal"] and "ace-ai" in seen["goal"]
     assert pool["release"] == ["rid-sa-0-pool"]  # released on the normal exit path
     assert dpp.bound_env_key() is None
