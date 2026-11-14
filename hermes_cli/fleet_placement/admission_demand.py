@@ -1041,6 +1041,23 @@ def waiting_window(units, registry=None):
                                         str(u.get("id", ""))))[:registry.door_window_units]
 
 
+def _spread_names(doc, now: float, max_age: float,
+                  resolve: Optional[Callable[[str], Optional[str]]] = None):
+    """The FRESH, alias-resolved, distinct host names a class queue was published for: None = any host (``hosts``
+    null), ``...`` = malformed. One rule for read_demand's spread and GET /demand's ``hosts`` list (t_e36a076f)."""
+    hosts = doc.get("hosts")
+    if hosts is None:
+        return None
+    if not isinstance(hosts, list):
+        return ...
+    host_at = doc.get("host_at")
+    if isinstance(host_at, dict):
+        # per-host freshness: a host whose own publisher stopped expires on its own clock (t_430834ff)
+        hosts = [h for h in hosts if _num(host_at.get(str(h))) and abs(now - host_at[str(h)]) <= max_age]
+    # with a resolver (placement's HostTable.resolve), an alias names its canonical host (Prism 364936434c3d)
+    return {((resolve(str(h)) if resolve else None) or str(h)).lower() for h in hosts}
+
+
 def _demand_of(doc, now: float, max_age: float, host: str,
                resolve: Optional[Callable[[str], Optional[str]]] = None) -> Optional[admission.Demand]:
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
@@ -1051,18 +1068,12 @@ def _demand_of(doc, now: float, max_age: float, host: str,
         return None
     if now - float(at) > max_age or float(at) - now > max_age:
         return None
-    hosts = doc.get("hosts")
+    names = _spread_names(doc, now, max_age, resolve)
     spread = 1
-    if hosts is not None:
-        if not isinstance(hosts, list):
-            return None
-        # with a resolver (placement's HostTable.resolve), an alias names its canonical host (Prism 364936434c3d)
+    if names is ...:
+        return None
+    if names is not None:
         want = (resolve(host) if resolve else None) or host
-        host_at = doc.get("host_at")
-        if isinstance(host_at, dict):
-            # per-host freshness: a host whose own publisher stopped expires on its own clock (t_430834ff)
-            hosts = [h for h in hosts if _num(host_at.get(str(h))) and abs(now - host_at[str(h)]) <= max_age]
-        names = {((resolve(str(h)) if resolve else None) or str(h)).lower() for h in hosts}
         if want.lower() not in names:
             return None
         spread = len(names)      # the queue's units start on one of these hosts, never on each (t_d8103e2f)
@@ -1075,12 +1086,15 @@ def _demand_of(doc, now: float, max_age: float, host: str,
 
 def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: Optional[float] = None,
                 resolve: Optional[Callable[[str], Optional[str]]] = None,
-                full_queue: bool = False, loaded: Optional[Mapping[str, dict]] = None) -> List[admission.Demand]:
+                full_queue: bool = False, loaded: Optional[Mapping[str, dict]] = None,
+                hosts_out: Optional[dict] = None) -> List[admission.Demand]:
     """Every FRESH class queue that may run on ``host``. ``resolve`` (name -> canonical host id or None) folds aliases
     on both sides of a ``hosts`` restriction; without it the match is case-insensitive string equality.
     ``full_queue`` retains all fresh units for lookup/authorization; publication uses the bounded default.
     ``loaded`` {workload: doc}: a store the caller already read with _existing (ownership checked) under the writer;
-    used as is instead of parsing that file a second time under the locks (t_1d801469: ci.json is ~0.9 MB)."""
+    used as is instead of parsing that file a second time under the locks (t_1d801469: ci.json is ~0.9 MB).
+    ``hosts_out`` {workload: sorted host list | None}: filled for every returned row with the SAME fresh, resolved,
+    distinct names its ``hosts`` spread counts (None = any host), so GET /demand publishes the list (t_e36a076f)."""
     now = float(time.time() if now is None else now)
     max_age = max_age_s(root=root) if max_age is None else float(max_age)
     out: List[admission.Demand] = []
@@ -1105,6 +1119,7 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
                 continue
         workload = p.stem
         dm = _demand_of(doc, now, max_age, host, resolve)
+        spread_names = _spread_names(doc, now, max_age, resolve) if dm is not None else None
         by_host = doc.get("by_host", {})
         canonical = (resolve(host) if resolve else None) or host
         # EVERY fresh per-host state that resolves to ``host`` (a resource domain maps parent and guests to one id):
@@ -1148,6 +1163,8 @@ def read_demand(host: str, *, root=None, now: Optional[float] = None, max_age: O
                                   tuple(waiting), verdict, state["at"], dm.hosts if dm else 1)
         if dm is not None:
             out.append(dm)
+            if hosts_out is not None:
+                hosts_out[workload] = sorted(spread_names) if isinstance(spread_names, set) else None
     return out
 
 

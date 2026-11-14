@@ -1,35 +1,35 @@
 {
   "_doc": "Byte copies of hermes-home files (card t_29403e19). Never edit the copies; re-vendor and update this pin. tests/hermes_cli/test_fleet_placement_vendored.py checks each sha256 and fails once vendored_at is older than max_age_days. Fork-side differences live in __init__.py (the state root), never in a copy.",
   "source_repo": "ANG-Ventures/hermes-home",
-  "source_ref": "5e229b33033ea544be181e8e02363cff1ac39acd",
-  "source_note": "t_77aa2e0e: all five files re-vendored as ONE set from hermes-home main 5e229b3303 (after #11542 4305794945: alloc_client returns the job_id on a deferred/fallback admit; earlier #11416 4107248b1, FWA B5-P3: the var/placement/exclusions.json read, read_exclusions and EXCLUSIONS_REL are gone, exclusions_path is accepted and ignored; kinds.json pause switches and power_policy added). No subset is coherent: placement calls admission.ceilings and admission_demand.root_directory. placement.py, admission.py, work_estimate.py and alloc_client.py are byte-equal to the fleet_admission 1.0.2 wheel (fleet-ops-scripts ci-runners/src/wheels, sha256 33cb576ea37e7155..., source hermes-home@479fb293); admission_demand.py is main's, newer than the wheel's. The fork cannot depend on that private wheel, so it re-vendors and pins. RUNTIME PRECONDITION (#9789): every ledger/demand/protected-marker write now needs PLACEMENT_ROOT_RECEIPT naming an operator-provisioned receipt for the kanban root, in the dispatcher's environment. load_lines.py, busy_basis.py, fwa.py and fwa_readers.py are not vendored: placement imports each late under ImportError (fleet default line, cpu_busy basis, no fwa hold read); the kanban pause gate reads fwa holds in kanban_pause_hold.",
+  "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b",
+  "source_note": "t_77aa2e0e: all five files re-vendored as ONE set from hermes-home main b3a93f3400 (after #11639 482dad6977: admission_demand publishes each demand row's resolved hosts; after #11542 4305794945: alloc_client returns the job_id on a deferred/fallback admit; earlier #11416 4107248b1, FWA B5-P3: the var/placement/exclusions.json read, read_exclusions and EXCLUSIONS_REL are gone, exclusions_path is accepted and ignored; kinds.json pause switches and power_policy added). No subset is coherent: placement calls admission.ceilings and admission_demand.root_directory. All five are byte-equal to hermes-home main at that ref, which also carries fleet_admission 1.0.3 (#11517); the copies track main, not a wheel. The fork cannot depend on that private wheel, so it re-vendors and pins. RUNTIME PRECONDITION (#9789): every ledger/demand/protected-marker write now needs PLACEMENT_ROOT_RECEIPT naming an operator-provisioned receipt for the kanban root, in the dispatcher's environment. load_lines.py, busy_basis.py, fwa.py and fwa_readers.py are not vendored: placement imports each late under ImportError (fleet default line, cpu_busy basis, no fwa hold read); the kanban pause gate reads fwa holds in kanban_pause_hold.",
   "vendored_at": "2026-11-14",
   "max_age_days": 21,
   "files": {
     "placement.py": {
       "source_path": "scripts/lib/placement.py",
-      "source_ref": "5e229b33033ea544be181e8e02363cff1ac39acd",
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b",
       "sha256": "735c635278d2b333c4c63caad574577a95bed5d61d4f50aed8cfa8777f644e0e"
     },
     "admission.py": {
       "source_path": "scripts/lib/admission.py",
       "sha256": "fb3e685e579d8ad685940b23bc915b57e218816349d104d098b060d11996635b",
-      "source_ref": "5e229b33033ea544be181e8e02363cff1ac39acd"
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
     },
     "work_estimate.py": {
       "source_path": "scripts/lib/work_estimate.py",
       "sha256": "d4f35c67bb943b00d5f4b6bf455f8a1e114b378c6fc398915f903b33c38d7ff7",
-      "source_ref": "5e229b33033ea544be181e8e02363cff1ac39acd"
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
     },
     "admission_demand.py": {
       "source_path": "scripts/lib/admission_demand.py",
-      "sha256": "bc22d75a2a38b0f05876e86bc21e1b86be6626b8f21e6dd76e57279b5d1c6412",
-      "source_ref": "5e229b33033ea544be181e8e02363cff1ac39acd"
+      "sha256": "d0444ba4bcb955f1cbcce920fd69332688f6c2bbdd757ca9e6c91775f8c49be9",
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
     },
     "alloc_client.py": {
       "source_path": "scripts/lib/alloc_client.py",
       "sha256": "d698104087d81b464e51d259b5074910c28144e039d29cb3ce5804ff09239dbc",
-      "source_ref": "5e229b33033ea544be181e8e02363cff1ac39acd"
+      "source_ref": "b3a93f3400a4c7f42f56798ca61d30cfc3eba34b"
     }
   }
 }
