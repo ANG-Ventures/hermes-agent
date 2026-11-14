@@ -31,10 +31,10 @@ class RecordingAdapter:
 
 def _config(channel, window):
     path = get_hermes_home() / "config.yaml"
-    cfg = (yaml.safe_load(path.read_text()) if path.exists() else {}) or {}
+    cfg = (yaml.safe_load(path.read_text(encoding="utf-8-sig")) if path.exists() else {}) or {}
     cfg.setdefault("kanban", {})["lifecycle_channel"] = channel
     cfg["kanban"]["lifecycle_digest_seconds"] = window
-    path.write_text(yaml.safe_dump(cfg))
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
 
 def _card(conn):
@@ -88,7 +88,7 @@ def _run(tmp_path, monkeypatch, channel, window):
 
 
 def _records(path):
-    return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+    return [json.loads(x) for x in path.read_text(encoding="utf-8-sig").splitlines()] if path.exists() else []
 
 
 def test_digest_run_writes_one_local_record_and_sends_nothing(tmp_path, monkeypatch):
@@ -141,3 +141,30 @@ def test_each_record_is_one_append_write(tmp_path, monkeypatch):
     asyncio.run(fs.LifecycleFileSink().send(str(out), text))
     assert len(calls) == 1 and calls[0].endswith(b"\n"), len(calls)
     assert _records(out)[0]["text"] == text
+
+
+def test_short_write_does_not_corrupt_the_next_record(tmp_path, monkeypatch):
+    """Prism c3bcc3fe76d3: a short write must not leave an unterminated fragment that the
+    next record is glued onto; the failed send raises, the next record decodes."""
+    import os
+
+    import pytest
+
+    from gateway import kanban_lifecycle_file_sink as fs
+
+    out = tmp_path / "kl.jsonl"
+    real_write = os.write
+    state = {"short": True}
+
+    def short_once(fd, data):
+        if state["short"]:
+            state["short"] = False
+            return real_write(fd, bytes(data)[: len(data) // 2])
+        return real_write(fd, data)
+
+    monkeypatch.setattr(fs.os, "write", short_once)
+    with pytest.raises(OSError):
+        asyncio.run(fs.LifecycleFileSink().send(str(out), "first"))
+    asyncio.run(fs.LifecycleFileSink().send(str(out), "next"))
+    last = out.read_text(encoding="utf-8-sig").splitlines()[-1]
+    assert json.loads(last)["text"] == "next"

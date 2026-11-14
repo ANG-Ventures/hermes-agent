@@ -46,6 +46,10 @@ class LifecycleFileSink:
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
             n = os.write(fd, data)
+            if 0 < n < len(data):
+                # Terminate the fragment so the next record starts on its own line; the
+                # caller retries the whole record, never the tail (no cross-process splice).
+                os.write(fd, b"\n")
         finally:
             os.close(fd)
         if n != len(data):
