@@ -2127,7 +2127,7 @@ def _deliver_result(
             job, platform=target["platform"], chat_id=target["chat_id"],
             thread_id=target.get("thread_id"),
             success=success, has_media=bool(requested_media),
-            demoted=bool(_host_down_prefix), text=(content or "").strip(),
+            demoted=bool(_host_down_prefix), text=mirror_text,  # redacted + unwrapped
             get_home=lambda: _sched.get_hermes_home(),
         ):
             logger.info("Job '%s': spooled for the #logs digest", job["id"])

@@ -146,3 +146,13 @@ def test_spool_rides_only_the_logs_target_of_a_fan_out(fleet):
     send.assert_called_once()
     assert str(send.call_args[0][2]) == ALERTS
     assert len(_spooled(fleet)) == 1
+
+
+def test_spooled_text_is_redacted(fleet):
+    key = "sk-" + "A" * 32  # synthetic; the channel payload is redacted, so must the #logs spool be
+    send = _deliver(_job(), f"rgb token {key}")
+    send.assert_not_called()
+    rows = _spooled(fleet)
+    assert len(rows) == 1
+    assert key not in rows[0]["text"]
+    assert key not in (fleet / "spool.jsonl").read_text(encoding="utf-8")
