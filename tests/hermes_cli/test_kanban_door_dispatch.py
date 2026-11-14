@@ -102,6 +102,14 @@ def fleet(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     pages = []
     monkeypatch.setattr(faults, "_page", lambda text: pages.append(text) or True)
+    # Provision the root now, as the operator does before any runtime: conftest's lazy provisioning otherwise writes
+    # the root generation file mid-tick, after a publish-pass latch fingerprinted it absent, so the start path reads
+    # "config changed", clears the latch and pages a second time (t_e7bb19cf).
+    from hermes_cli import fleet_placement
+    fleet_placement.admission_demand._receipt_path(root.absolute())
+    # The orphan sweep walks the HOST process table and realpath()s every init-parented process's cwd, which reads
+    # the real hermes home; this file tests the door, not the sweep.
+    monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans", lambda conn, **kw: {})
     kb.init_db()
     ns = type("Fleet", (), {})()
     ns.root, ns.pages = root, pages
