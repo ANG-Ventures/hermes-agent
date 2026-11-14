@@ -740,6 +740,50 @@ def test_deferred_allocd_admit_retries_with_the_same_key(monkeypatch):
     assert keys[2] != keys[0] and keys[2].startswith("t_card#"), keys
 
 
+@pytest.mark.parametrize("middle", ["409", "fallback_refused", "wedged_lock", "unreachable_remote", "raises"])
+def test_deferred_key_survives_a_non_grant_retry(monkeypatch, middle):
+    """Prism (pr325-direct) kanban_headroom.py:604: the deferred key was popped on the FIRST retry whatever it
+    returned. deferred -> 409 (or a fallback refusal / allocd_wedged_lock / a raise) -> the next tick minted a new
+    key, and allocd committing the original request late then leaked a lease or booked a second one. Only a grant
+    under that key ends it."""
+    from hermes_cli.fleet_placement import alloc_client
+    keys: list = []
+    replies = iter(["deferred", middle, "allocd"])
+
+    def fake_admit(consumer, *, job_id=None, **kw):
+        keys.append(job_id)
+        src = next(replies)
+        if src == "deferred":
+            return alloc_client.AdmitResult(None, None, "allocd_slow", "deferred", consumer=consumer, job_id=job_id)
+        if src == "409":
+            return alloc_client.AdmitResult(None, None, "saturated:cpu", "allocd", consumer=consumer, job_id=job_id)
+        if src == "fallback_refused":
+            return alloc_client.AdmitResult(None, None, "saturated:cpu", "fallback", consumer=consumer, job_id=job_id)
+        if src == "wedged_lock":
+            return alloc_client.AdmitResult(None, None, "allocd_wedged_lock", "fallback", consumer=consumer,
+                                            job_id=job_id)
+        if src == "unreachable_remote":
+            return alloc_client.AdmitResult(None, None, "allocd_unreachable_remote", "fallback", consumer=consumer,
+                                            job_id=job_id)
+        if src == "raises":
+            raise alloc_client.Refused("token unreadable")
+        return alloc_client.AdmitResult("ace-ai", "r1", "", "allocd", consumer=consumer, job_id=job_id)
+
+    monkeypatch.setattr(alloc_client, "admit", fake_admit)
+    monkeypatch.setattr(kh, "unified_active", lambda plan: False)
+    monkeypatch.setattr(kh, "allocd_request", lambda plan, names, job: {})
+    monkeypatch.setattr(kh, "_DEFERRED", {})
+    plan = SimpleNamespace(signal=SimpleNamespace(policy=SimpleNamespace(stale_after_s=60.0)))
+    assert kh.allocd_admit(plan, ["ace-ai"], None, "t_card").source == "deferred"
+    try:
+        kh.allocd_admit(plan, ["ace-ai"], None, "t_card")
+    except alloc_client.Refused:
+        assert middle == "raises"
+    assert kh.allocd_admit(plan, ["ace-ai"], None, "t_card").reservation_id == "r1"
+    assert keys[1] == keys[0] and keys[2] == keys[0], keys
+    assert kh._DEFERRED == {}                                         # granted under the key: cleared
+
+
 def test_deferred_key_expires_with_the_reservation_ttl(monkeypatch):
     monkeypatch.setattr(kh, "_DEFERRED", {"t_card": ("t_card#old", time.time() - kh.RESERVE_TTL_S - 1)})
     assert kh._deferred_key("t_card") is None and kh._DEFERRED == {}

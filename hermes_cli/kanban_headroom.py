@@ -612,23 +612,27 @@ def allocd_admit(plan, names, job: Optional[placement.Job], job_id: Optional[str
                            **allocd_request(plan, names, job))
     if job_id is not None and getattr(r, "source", None) == "deferred" and getattr(r, "job_id", None):
         _DEFERRED[job_id] = (r.job_id, time.time())
+    elif job_id is not None and getattr(r, "reservation_id", None):
+        _DEFERRED.pop(job_id, None)            # granted under the key: the only terminal end of a deferral
     return r
 
 
 # Prism 6e478f43c7ea: a deferred admit (allocd slow, still healthy) may commit later. The card's next tick retries
 # with the SAME key, so allocd's reuse_job hands back that row instead of booking a second lease. {card job_id:
 # (admission key, when deferred)}; an entry older than the reservation TTL is dropped (its row has expired).
+# The key is kept across non-grant answers (409, fallback refusal, allocd_wedged_lock, a raise): none proves allocd
+# did not commit the deferred request late, so only a grant under the key clears it (Prism pr325-direct P2).
 _DEFERRED: Dict[str, Tuple[str, float]] = {}
 
 
 def _deferred_key(job_id: Optional[str]) -> Optional[str]:
-    """The key of this card's last DEFERRED admit, consumed (one retry per deferral), or None."""
+    """The key of this card's last DEFERRED admit (kept until a grant under it, or TTL), or None."""
     if job_id is None:
         return None
     now = time.time()
     for k in [k for k, (_, at) in _DEFERRED.items() if now - at > RESERVE_TTL_S]:
         del _DEFERRED[k]
-    hit = _DEFERRED.pop(job_id, None)
+    hit = _DEFERRED.get(job_id)
     return hit[0] if hit else None
 
 
