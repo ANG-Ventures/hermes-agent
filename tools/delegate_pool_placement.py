@@ -274,8 +274,11 @@ def _remove_workspace(lease: PoolLease) -> None:
     import shlex
     try:
         from hermes_cli.kanban_worker_pool import _ssh_argv
+        from tools.environments.local import build_subprocess_env
+        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+        env["ALLOC_RESERVATION"] = lease.reservation_id
         subprocess.run(_ssh_argv(lease.pool_host, f"rm -rf -- {shlex.quote(lease.workspace)}"),
                        capture_output=True, timeout=_RM_TIMEOUT_S, stdin=subprocess.DEVNULL,
-                       env={**os.environ, "ALLOC_RESERVATION": lease.reservation_id})
+                       env=env)
     except Exception as exc:
         logger.debug("delegate pool placement: workspace removal on %s failed: %s", lease.host, exc)
