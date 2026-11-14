@@ -119,3 +119,25 @@ def test_chat_channel_still_posts_to_chat(tmp_path, monkeypatch):
     clock[0] += 900
     asyncio.run(runner._kanban_lifecycle_digest.flush(clock[0]))
     assert [m["chat_id"] for m in adapter.sent] == ["logs"]
+
+
+def test_each_record_is_one_append_write(tmp_path, monkeypatch):
+    """Prism e58b397d2c90: several gateways can share the file, so a record must be ONE
+    write(2) on an O_APPEND fd; a buffered text write can split and interleave lines."""
+    import os
+
+    from gateway import kanban_lifecycle_file_sink as fs
+
+    out = tmp_path / "kl.jsonl"
+    calls = []
+    real_write = os.write
+
+    def counting_write(fd, data):
+        calls.append(bytes(data))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(fs.os, "write", counting_write)
+    text = "x" * 200_000
+    asyncio.run(fs.LifecycleFileSink().send(str(out), text))
+    assert len(calls) == 1 and calls[0].endswith(b"\n"), len(calls)
+    assert _records(out)[0]["text"] == text

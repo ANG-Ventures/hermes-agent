@@ -13,14 +13,12 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 FILE_PLATFORM = "file"
 FAMILY = "digest:kanban-lifecycle"
-_LOCK = threading.Lock()
 
 
 def resolve_path(chat_id: str) -> Path:
@@ -35,23 +33,20 @@ def resolve_path(chat_id: str) -> Path:
 class LifecycleFileSink:
     """Adapter-shaped appender. ``send`` returning None = delivered (the notifier's contract)."""
 
-    def _append(self, chat_id: str, text: str) -> None:
+    async def send(self, chat_id: str, text: str, metadata: Optional[dict] = None, **_: Any) -> None:
+        # An OSError raises into the caller: the digest keeps the batch, a direct send
+        # counts as a failed delivery, exactly like a failed chat send.
         path = resolve_path(chat_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                "family": FAMILY, "text": text}
-        with _LOCK, open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-    async def send(self, chat_id: str, text: str, metadata: Optional[dict] = None, **_: Any) -> None:
-        # An OSError raises into the caller: the digest keeps the batch, a direct send
-        # counts as a failed delivery, exactly like a failed chat send.
-        self._append(chat_id, text)
-        return None
-
-
-_SINK = LifecycleFileSink()
-
-
-def sink() -> LifecycleFileSink:
-    return _SINK
+        data = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+        # One write(2) on an O_APPEND fd: gateways in other processes may append to the same
+        # file, and a buffered text write can split a record and interleave it with theirs.
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            n = os.write(fd, data)
+        finally:
+            os.close(fd)
+        if n != len(data):
+            raise OSError(f"short append to {path}: {n}/{len(data)} bytes")
