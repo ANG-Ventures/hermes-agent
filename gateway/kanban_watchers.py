@@ -3683,7 +3683,10 @@ class GatewayKanbanWatchersMixin:
     def _kanban_route_adapter(self, platform: str, profile: Optional[str]):
         """Live adapter for a lifecycle-line destination platform, or None."""
         from gateway.config import Platform
+        from gateway import kanban_lifecycle_file_sink as _fs
 
+        if platform == _fs.FILE_PLATFORM:  # t_89bfcd1f: local file, no chat
+            return _fs.sink()
         try:
             return self._authorization_adapter(Platform(platform), profile or None)
         except ValueError:

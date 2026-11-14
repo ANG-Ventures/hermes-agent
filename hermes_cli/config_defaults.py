@@ -2513,6 +2513,8 @@ DEFAULT_CONFIG = {
         # the notifier posts done / ready-for-review / blocked lines there
         # instead of the subscriber's chat; the wake still goes to the
         # subscriber. A needs_input block on a priority >= 100 card stays put.
+        # "file:<path>" (t_89bfcd1f) appends them to a local file instead, one
+        # JSON line per post/digest; a relative path is under HERMES_HOME.
         # Empty = post in the subscriber's chat.
         "lifecycle_channel": "",
         # Seconds to batch lifecycle_channel lines into one digest post
