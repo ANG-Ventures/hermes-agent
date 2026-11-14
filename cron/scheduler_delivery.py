@@ -20,7 +20,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from cron.fork_ext import logs_digest_gate
+from cron.fork_ext import alerts_audience_gate, logs_digest_gate
 
 
 # Log-record parity with the origin module.
@@ -2131,6 +2131,15 @@ def _deliver_result(
             get_home=lambda: _sched.get_hermes_home(),
         ):
             logger.info("Job '%s': spooled for the #logs digest", job["id"])
+            continue
+        # #alerts carries only what a human acts on (t_6a4c207a): an agent-audience
+        # delivery goes to the agent inbox, as notify.py's sends do.
+        if alerts_audience_gate.maybe_inbox(
+            job, platform=target["platform"], chat_id=target["chat_id"],
+            thread_id=target.get("thread_id"), success=success,
+            has_media=bool(requested_media), text=mirror_text,  # redacted + unwrapped
+            get_home=lambda: _sched.get_hermes_home(),
+        ):
             continue
         # A failure notice for a platform that hides warning notifications is a suppressed
         # disposition, not a send; requested (non-failure) results are never gated.
