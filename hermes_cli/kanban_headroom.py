@@ -902,7 +902,7 @@ def measure_run_footprint(fp: Mapping, *, runner=None) -> Dict[str, Any]:
     base = ["ssh", "-S", str(sock), "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
     if int(fp["port"]) != 22:
         base += ["-p", str(int(fp["port"]))]
-    kw = dict(capture_output=True, text=True, timeout=FOOTPRINT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    kw = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=FOOTPRINT_TIMEOUT_S, stdin=subprocess.DEVNULL)
     # a dead master would make ssh connect afresh and measure a NEW session: only a master that answers is read
     if run(base + ["-O", "check", fp["target"]], **kw).returncode != 0:
         raise RuntimeError(f"ssh master for run {fp['run_id']} is not running")
