@@ -1337,6 +1337,8 @@ class AdmitContext:
     leases: tuple
     scratch: tuple = ()     # ((host, GB), ...): the ledger's live scratch, which admit() subtracts (Lease has none)
     reservations: tuple = ()    # ((host, Footprint), ...): a caller's booked reservations (choose()'s ``reservations``)
+    start_cpus: tuple = ()  # ((host, cpus), ...): the class's measured first-90-s CPU there (consumers.<c>.ramp_cpus);
+                            # need() never prices a start below it (t_19ad08c2). Keyed per host, never folded.
 
     # every field above that names a host: for_host() folds each of them over the resource domain, and
     # test_every_host_attributed_context_kind_is_folded_over_the_domain fails on a new one that is not listed here
@@ -1374,8 +1376,13 @@ class AdmitContext:
         return sum(gb for h, gb in self.scratch if h.lower() in names)
 
     def need(self, host: str) -> "admission.Estimate":
-        """The same call choose() makes inline (test_work_estimate's lint reads it there)."""
-        return work_estimate.estimate(self.job_class, host, self.history, seed=self.seed)
+        """The same call choose() makes inline (test_work_estimate's lint reads it there), its CPU never below the
+        class's measured first-90-s CPU on ``host`` (t_19ad08c2: the CI allocator's per_runner floor 0.25 let 39 starts
+        through on nas-fleet that used ~0.69 CPU each). A lease's CPU only counts while it is unsettled, so that is
+        the number a start costs."""
+        est = work_estimate.estimate(self.job_class, host, self.history, seed=self.seed)
+        floor = dict(self.start_cpus).get(host)
+        return dataclasses.replace(est, cpus=floor) if floor is not None and est.cpus < floor else est
 
 
 def history_snapshot(root=None) -> tuple:
@@ -1458,8 +1465,11 @@ def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Jo
     # caller-supplied leases (admit() under its lock, tests) bring their own ledger: scratch only on the default read
     scratch = () if leases is not None else tuple(
         (h, f.scratch_gb) for h, f in live_reservations(ledger, now=now, table=table, root=root).items() if f.scratch_gb > 0)
-    ctx = AdmitContext(job_class_for(consumer, job), need_of(fp), tuple(hist),
-                       tuple(base + held_leases(held or {}, table)), scratch)
+    klass = job_class_for(consumer, job)
+    start = () if table is None else tuple((h, cpus) for h, spec in table.hosts.items()
+                                           for k, cpus in spec.ramp_cpus if k == klass)
+    ctx = AdmitContext(klass, need_of(fp), tuple(hist), tuple(base + held_leases(held or {}, table)), scratch,
+                       start_cpus=start)
     return ctx.for_host(table, host) if host is not None else ctx
 
 
