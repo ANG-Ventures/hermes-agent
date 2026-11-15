@@ -102,6 +102,11 @@ class FakeAllocd:
             if not ok:
                 return 410, {"gone": True}
             return 200, {"released": True, **({"actual_refused": refused} if refused else {})}
+        if path == "/demand/publish":       # the pair door's enqueue / withdraw / queue verbs (t_dd7a1b7d)
+            return 200, {"schema": 1, "workload": req.get("workload"), "host": req.get("host"), "ok": True,
+                         "door": {"at": self.clock()}}
+        if path == "/demand/authorize":
+            return self.authorize(req)
         if path == "/renew":
             ok = placement.renew(req["reservation_id"], ttl_s=req.get("ttl_s", 1800.0), now=self.clock())
             return (200, {"renewed": True}) if ok else (410, {"gone": True})
@@ -141,6 +146,21 @@ class FakeAllocd:
                 out["unified"] = True
             return 200, out
         return 409, {"refused": True, "reason": d.reason}
+
+    def authorize(self, req):
+        """allocd's door authorize with an existing capacity lease: the SAME row is retagged to the pair identity
+        ``<workload>@<host>`` (its release then names that owner) and its id comes back."""
+        rid, owner = req.get("existing_reservation_id"), f"{req['workload']}@{req['host']}"
+        rpath = placement.reservations_path()
+        with placement._locked(rpath):
+            doc = placement._read_ledger(rpath)
+            row = next((r for r in doc["rows"] if r.get("id") == rid), None)
+            if row is None:
+                return 409, {"reason": "capacity", "detail": f"no live row {rid}"}
+            row["consumer"] = owner
+            placement._write_ledger(rpath, doc)
+        return 200, {"schema": 1, "workload": req["workload"], "host": req["host"], "id": req["id"],
+                     "reservation_id": rid, "until": self.clock() + 90, "reused": False}
 
     @staticmethod
     def confirm_class(table, consumer, job, rid, samples, *, now, stale_after_s):
@@ -665,7 +685,7 @@ def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
 
 # -- t_26acfaa2: the run-end release carries the run's measured use (FWA footprints) ---------------
 
-def _dispatch_on(home):
+def _dispatch_on(home, *, door_on=False):
     f = Fleet()
     _pressure_from_fleet(home, f)
     plan = _plan(home, f, now=time.time())
@@ -676,7 +696,8 @@ def _dispatch_on(home):
                       max_spawn=4, spawn_paused=None, spawn_limit=0, spillover=plan, reconcile_orphans=False)
     run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
     rid, via = kh.run_reservation(conn, tid, run_id)
-    assert rid and via == kh.VIA_ALLOC_CLIENT
+    # with the door on the run's lease is the door's (run_reservation hands it no rid: _end_run leaves it alone)
+    assert (rid, via) == (None, None) if door_on else (rid and via == kh.VIA_ALLOC_CLIENT)
     placed = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_placed'",
                                      (tid,)).fetchone()[0])
     return conn, tid, run_id, rid, placed["host"]
@@ -743,6 +764,87 @@ def test_host_mismatch_is_the_servers_refusal_not_a_crash(home, allocd, monkeypa
     assert req["actual"]["host"] == "some-other-box"
     assert not placement.live_reservations(home / placement.RESERVATIONS_REL)   # the lease still ended
     assert _usage_rows(home) == []                                              # the measurement did not land
+    assert [m for m in caplog.messages if "actual not recorded" in m]
+
+
+# -- t_dd7a1b7d: the path live spawns take. With the door on (fcfs), the start upgrades the capacity lease to
+# kanban@<host> and writes door_authorized; _end_run then leaves the lease to the door, and the NEXT dispatcher
+# tick's lifecycle sweep (kanban_priority_door.maintain) is what releases it. That release must carry the actual.
+
+def _door_on(home):
+    (home / "fleet" / "admission-priority.json").write_text(json.dumps({"schema": 1, "priority_mode": "fcfs"}),
+                                                           encoding="utf-8")
+    d = home / alloc_client.TOKENS_REL
+    d.mkdir(parents=True, exist_ok=True)
+    for name in ("kanban", "asap-operator", "test-gate", "test-gate-local-venue",
+                 *(f"kanban@{h}" for h in TABLE["hosts"])):
+        (d / name).write_text(f"tok-{name.replace('@', '-')}\n", encoding="utf-8")
+
+
+def _door_run_ended(home, monkeypatch, measure):
+    """A pool-host spawn through the REAL dispatch tick with the door on, its run completed, then one more tick."""
+    from hermes_cli import kanban_priority_door as door
+    _door_on(home)
+    assert door.enabled()
+    monkeypatch.setattr(kh, "measure_run_footprint", measure)
+    conn, tid, run_id, _cap_rid, host = _dispatch_on(home, door_on=True)
+    try:
+        grant = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
+                                        (tid, run_id, door.EVENT)).fetchone()[0])
+        kb.complete_task(conn, tid, summary="done")
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: FAKE_PID, max_spawn=4, spawn_paused=None, spawn_limit=0,
+                          reconcile_orphans=False)
+        released = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
+                                (tid, run_id, door.RELEASED)).fetchone()[0]
+    finally:
+        conn.close()
+    return tid, run_id, grant, host, released
+
+
+def test_door_run_release_carries_actual_through_the_lifecycle_sweep(home, allocd, monkeypatch):
+    seen = []
+
+    def measure(fp):
+        seen.append(dict(fp))
+        return {"host": fp["host"], "cpus": 0.4, "ram_gb": 1.25, "gpu_mib": 0.0, "cpu_s": 120.0, "wall_s": 300.0}
+
+    tid, run_id, grant, host, released = _door_run_ended(home, monkeypatch, measure)
+    assert grant["consumer"] == f"kanban@{host}"
+    assert seen == [{"host": host, "target": f"kanbanw@{host}", "port": 22, "run_id": run_id}]
+    [req] = _releases(allocd, grant["reservation_id"])
+    assert req["consumer"] == f"kanban@{host}"
+    assert req["actual_source"] == kh.FOOTPRINT_SOURCE == "cgroup"
+    assert req["actual"]["host"] == host and req["actual"]["ram_gb"] == 1.25
+    assert released == 1
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    [row] = _usage_rows(home)
+    assert row["host"] == host and row["ram_gb"] == 1.25
+    assert row["class"] == placement.job_class_for("kanban")
+
+
+def test_door_run_measurement_failure_still_releases(home, allocd, monkeypatch, caplog):
+    def measure(fp):
+        raise RuntimeError("no live ssh master")
+
+    with caplog.at_level("INFO"):
+        tid, run_id, grant, host, released = _door_run_ended(home, monkeypatch, measure)
+    assert _releases(allocd, grant["reservation_id"]) == [
+        {"consumer": f"kanban@{host}", "reservation_id": grant["reservation_id"]}]
+    assert released == 1
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    assert [m for m in caplog.messages if "carries no actual" in m and "no live ssh master" in m]
+    assert _usage_rows(home) == []
+
+
+def test_door_run_refused_actual_is_a_warning_and_the_lease_ends(home, allocd, monkeypatch, caplog):
+    measure = lambda fp: {"host": "some-other-box", "cpus": 0.4, "ram_gb": 1.0, "gpu_mib": 0.0}
+    with caplog.at_level("WARNING"):
+        tid, run_id, grant, host, released = _door_run_ended(home, monkeypatch, measure)
+    [req] = _releases(allocd, grant["reservation_id"])
+    assert req["actual"]["host"] == "some-other-box"
+    assert released == 1                                                        # marked: never released twice
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    assert _usage_rows(home) == []
     assert [m for m in caplog.messages if "actual not recorded" in m]
 
 
