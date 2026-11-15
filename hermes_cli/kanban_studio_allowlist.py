@@ -162,8 +162,9 @@ def _spent_on_studio(conn, task_id: str, after_id: int) -> bool:
         if run_id is None:
             return True
         hosts = []
-        for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ?",
-                                   (task_id, run_id, _pr.WORKER_PLACED_EVENT)):
+        for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+                                   f"AND kind IN ({_pr.kind_marks(_pr.WORKER_PLACED_EVENT)})",
+                                   (task_id, run_id, *_pr.kind_names(_pr.WORKER_PLACED_EVENT))):
             try:
                 h = (json.loads(raw or "{}") or {}).get("host")
             except (TypeError, ValueError, AttributeError):
@@ -291,7 +292,7 @@ def _episode_events(conn, task_id: str, kinds):
     it named is over, so the next hold is a new episode (a new wake, a fresh 60-minute clock)."""
     from hermes_cli import kanban_placement_reasons as _pr
     ends = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
-    want = (*kinds, "placement_wait", *ends)
+    want = (*kinds, *_pr.kind_names("placement_wait"), *ends)
     for kind, created, raw in conn.execute(
             "SELECT kind, created_at, payload FROM task_events WHERE task_id = ? AND kind IN (%s) ORDER BY id DESC"
             % ",".join("?" * len(want)), (task_id, *want)):
@@ -300,7 +301,7 @@ def _episode_events(conn, task_id: str, kinds):
         except (TypeError, ValueError):
             p = {}
         p = p if isinstance(p, dict) else {}
-        if kind == "placement_wait":
+        if _pr.normalize_kind(kind) == "allocation_wait":
             if not p.get("cleared"):
                 continue
             kind = "placement_wait_cleared"
@@ -459,8 +460,9 @@ def override(conn, task_id: str, capability: str, why: str, *, once: bool = True
         payload["ledger"] = str(path)
     except OSError as exc:  # the board event is the record; say the ledger write failed
         payload["ledger_error"] = str(exc)
-    last = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'placement_wait' "
-                        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    from hermes_cli import kanban_placement_reasons as _pr
+    last = conn.execute(f"SELECT payload FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+                        "ORDER BY id DESC LIMIT 1", (task_id, *_pr.kind_names("placement_wait"))).fetchone()
     held = other = None
     if last:
         try:

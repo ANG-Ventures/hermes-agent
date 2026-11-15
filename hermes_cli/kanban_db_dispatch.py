@@ -92,7 +92,7 @@ _PRIORITY_STARVATION_MARKER = ".priority_starvation.json"
 # ``placement_wait`` (t_641d1ab8): the page said "Held by: none recorded" for
 # 16 h while the card carried 60 host_reach waits; the code is the reason.
 _PRIORITY_STARVATION_HOLD_KINDS = ("respawn_guarded", "deferred", "parked_by_policy",
-                                   "placement_wait")
+                                   "placement_wait", "allocation_wait")
 
 
 def find_priority_starved(
@@ -142,6 +142,7 @@ def find_priority_starved(
             % ",".join("?" * len(_PRIORITY_STARVATION_HOLD_KINDS)),
             (row["id"], since, *_PRIORITY_STARVATION_HOLD_KINDS),
         ):
+            kind = "placement_wait" if kind == "allocation_wait" else kind  # one hold, both names
             if kind in cleared_kinds:
                 continue
             try:
@@ -3618,10 +3619,11 @@ def _write_placement(conn: sqlite3.Connection, task_id: str, run_id: Optional[in
     other prior record stands, so a repeated ``_set_worker_pid`` never appends a second one (Prism 532aad7ea955)."""
     from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
     if run_id is not None:
+        from hermes_cli.kanban_placement_reasons import kind_marks, kind_names
         prior = conn.execute(
-            "SELECT id, json_extract(payload, '$.reason') FROM task_events WHERE run_id = ? AND kind = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (int(run_id), PLACEMENT_EVENT)).fetchone()
+            "SELECT id, json_extract(payload, '$.reason') FROM task_events WHERE run_id = ? "
+            f"AND kind IN ({kind_marks(PLACEMENT_EVENT)}) ORDER BY id DESC LIMIT 1",
+            (int(run_id), *kind_names(PLACEMENT_EVENT))).fetchone()
         if prior is not None:
             if prior[1] != "unrecorded" or payload.get("reason") == "unrecorded":
                 return
@@ -3670,9 +3672,9 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
                 _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
                                   run_id=int(run_id))
             # A worker is running this run; if its launcher died before the placement write, record it now.
-            from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
-            if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = ? LIMIT 1",
-                            (int(run_id), PLACEMENT_EVENT)).fetchone() is None:
+            from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT, kind_marks, kind_names
+            if conn.execute(f"SELECT 1 FROM task_events WHERE run_id = ? AND kind IN ({kind_marks(PLACEMENT_EVENT)}) "
+                            "LIMIT 1", (int(run_id), *kind_names(PLACEMENT_EVENT))).fetchone() is None:
                 _kb._append_event(conn, task_id, PLACEMENT_EVENT,
                                   _unrecorded_placement(conn, int(run_id), entry="worker_registered"),
                                   run_id=int(run_id))
@@ -3694,13 +3696,13 @@ def _record_losing_worker(conn: sqlite3.Connection, task_id: str, run_id: int, p
     card's pid is left alone: a successor may own it."""
     if conn.execute("SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?", (run_id, task_id)).fetchone() is None:
         return
-    from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+    from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT, kind_marks, kind_names
     if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind IN ('spawned', 'worker_registered') LIMIT 1",
                     (run_id,)).fetchone() is None:
         _kb._append_event(conn, task_id, "worker_registered",
                           {"pid": pid, "started_at": started_at, "claim_lost": True}, run_id=run_id)
-    if conn.execute("SELECT 1 FROM task_events WHERE run_id = ? AND kind = ? LIMIT 1",
-                    (run_id, PLACEMENT_EVENT)).fetchone() is None:
+    if conn.execute(f"SELECT 1 FROM task_events WHERE run_id = ? AND kind IN ({kind_marks(PLACEMENT_EVENT)}) LIMIT 1",
+                    (run_id, *kind_names(PLACEMENT_EVENT))).fetchone() is None:
         _kb._append_event(conn, task_id, PLACEMENT_EVENT,
                           {**_unrecorded_placement(conn, run_id, entry="worker_registered"), "claim_lost": True},
                           run_id=run_id)
@@ -5214,17 +5216,18 @@ def _wait_history(conn, tids: list, since_ts: int) -> "tuple[dict, dict]":
     from hermes_cli import kanban_placement_reasons as _pr
     hist: dict = {}
     ends: dict = {}
-    kinds = [_pr.PLACEMENT_WAIT_EVENT, *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)]
+    waits = _pr.kind_names(_pr.PLACEMENT_WAIT_EVENT)
+    kinds = [*waits, *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)]
     for i in range(0, len(tids), 400):
         chunk = tids[i:i + 400]
         for tid, eid, created, kind, payload in conn.execute(
             f"SELECT task_id, id, created_at, kind, "
-            f"CASE WHEN kind = ? THEN payload END FROM task_events "
+            f"CASE WHEN kind IN ({_pr.kind_marks(_pr.PLACEMENT_WAIT_EVENT)}) THEN payload END FROM task_events "
             f"WHERE task_id IN ({','.join('?' * len(chunk))}) "
             f"AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id DESC",
-            [_pr.PLACEMENT_WAIT_EVENT, *chunk, *kinds],
+            [*waits, *chunk, *kinds],
         ):
-            if kind != _pr.PLACEMENT_WAIT_EVENT:
+            if kind not in waits:
                 ends.setdefault(tid, eid)
                 continue
             if tid in ends or (tid in hist and int(created or 0) < since_ts):

@@ -71,10 +71,11 @@ def _running(conn) -> List[dict]:
             ev = {}
             for kind, raw in conn.execute(
                 "SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
-                "AND kind IN (?, ?) ORDER BY id",
-                (tid, run_id, _pr.WORKER_PLACED_EVENT, _pr.PLACEMENT_EVENT),
+                f"AND kind IN ({_pr.kind_marks(_pr.WORKER_PLACED_EVENT, _pr.PLACEMENT_EVENT)}) ORDER BY id",
+                (tid, run_id, *_pr.kind_names(_pr.WORKER_PLACED_EVENT, _pr.PLACEMENT_EVENT)),
             ).fetchall():
-                ev[kind] = _payload(raw)  # latest of each kind wins
+                # latest of each kind wins; an allocation-named row reads as its placement name
+                ev[_pr._KIND_OLD.get(kind, kind)] = _payload(raw)
             wp = ev.get(_pr.WORKER_PLACED_EVENT)
             pl = ev.get(_pr.PLACEMENT_EVENT) or {}
             if wp is not None:
@@ -91,10 +92,10 @@ def _held(conn) -> List[dict]:
     rows = conn.execute(
         "SELECT t.id, t.assignee, e.id, e.payload, e.created_at FROM tasks t "
         "JOIN task_events e ON e.id = (SELECT MAX(id) FROM task_events "
-        "  WHERE task_id = t.id AND kind = ?) "
+        "  WHERE task_id = t.id AND kind IN (?, ?)) "
         "WHERE t.status = 'ready' AND NOT EXISTS (SELECT 1 FROM task_events x "
         "  WHERE x.task_id = t.id AND x.id > e.id AND x.kind IN (%s))" % ",".join("?" * len(end)),
-        (_pr.PLACEMENT_WAIT_EVENT, *end),
+        (*_pr.kind_names(_pr.PLACEMENT_WAIT_EVENT), *end),
     ).fetchall()
     out = []
     for tid, assignee, _eid, raw, created in rows:
@@ -275,8 +276,8 @@ def _task_block(conn, task_id: str, now: float) -> Optional[Dict[str, Any]]:
         if r["task_id"] == task_id:
             placed = {"host": r["host"], "rule": r["rule"], "run_id": r["run_id"]}
     last = conn.execute(
-        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
-        "ORDER BY id DESC LIMIT 1", (task_id, _pr.PLACEMENT_EVENT)).fetchone()
+        f"SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks(_pr.PLACEMENT_EVENT)}) "
+        "ORDER BY id DESC LIMIT 1", (task_id, *_pr.kind_names(_pr.PLACEMENT_EVENT))).fetchone()
     held = next((h for h in _held(conn) if h["task_id"] == task_id), None)
     if held is not None and str(held["code"]).startswith("studio_affinity:") and conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind = 'edited' LIMIT 1",

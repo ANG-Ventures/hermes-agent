@@ -85,6 +85,9 @@ RESERVATION_REPLACED_EVENT = "placement_reservation_replaced"
 LOCAL_ADMITTED_EVENT = "local_admitted"
 # The run events that carry a ledger reservation the run owns (release at run end, renew while live).
 RESERVATION_EVENTS = ("worker_placed", LOCAL_ADMITTED_EVENT)
+# Every name a reservation row is READ under (rename wave 3, t_7be48220): worker_placed and worker_allocated.
+RESERVATION_READ_KINDS = ("worker_placed", "worker_allocated", LOCAL_ADMITTED_EVENT)
+_PLACED_READ_KINDS = ("worker_placed", "worker_allocated")
 LOCAL_HOST_ALIAS = "local"
 SHADOW_REL = Path("var") / "alloc" / "shadow" / f"{CONSUMER}.jsonl"
 
@@ -192,8 +195,8 @@ def previous_host(conn, task_id: str) -> Optional[str]:
     from hermes_cli import kanban_placement_reasons as _pr
     try:
         row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
-            (task_id, _pr.WORKER_PLACED_EVENT)).fetchone()
+            f"SELECT payload FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks(_pr.WORKER_PLACED_EVENT)}) "
+            "ORDER BY id DESC LIMIT 1", (task_id, *_pr.kind_names(_pr.WORKER_PLACED_EVENT))).fetchone()
         host = json.loads(row[0] or "{}").get("host") if row else None
     except Exception:
         return None
@@ -778,8 +781,8 @@ def run_reservation(conn, task_id: str, run_id: Optional[int]) -> Tuple[Optional
     from hermes_cli import kanban_placement_reasons as _pr
     try:
         row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind IN (?, ?) "
-            "ORDER BY id DESC LIMIT 1", (task_id, run_id, *RESERVATION_EVENTS)).fetchone()
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind IN (?, ?, ?) "
+            "ORDER BY id DESC LIMIT 1", (task_id, run_id, *RESERVATION_READ_KINDS)).fetchone()
         doc = json.loads(row[0] or "{}") if row else {}
     except Exception as exc:
         _log.warning("kanban pool: placement reservation lookup failed for %s run %s: %s", task_id, run_id, exc)
@@ -880,8 +883,8 @@ def run_footprint_target(conn, task_id: str, run_id: Optional[int]) -> Optional[
     if run_id is None:
         return None
     try:
-        row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? "
-                           "ORDER BY id DESC LIMIT 1", (task_id, run_id, RESERVATION_EVENTS[0])).fetchone()
+        row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind IN (?, ?) "
+                           "ORDER BY id DESC LIMIT 1", (task_id, run_id, *_PLACED_READ_KINDS)).fetchone()
         doc = json.loads(row[0] or "{}") if row else {}
     except Exception:
         return None
@@ -968,8 +971,8 @@ def running_reservations(conn) -> List[Tuple[str, str, Optional[str]]]:
     out: List[Tuple[str, str, Optional[str]]] = []
     for tid, run_id, payload in conn.execute(
             "SELECT t.id, e.run_id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
-            "WHERE t.status = 'running' AND e.kind IN (?, ?) AND e.run_id IS NOT NULL "
-            "AND e.run_id = t.current_run_id", RESERVATION_EVENTS).fetchall():
+            "WHERE t.status = 'running' AND e.kind IN (?, ?, ?) AND e.run_id IS NOT NULL "
+            "AND e.run_id = t.current_run_id", RESERVATION_READ_KINDS).fetchall():
         if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind='door_authorized'",
                         (tid, run_id)).fetchone():
             continue

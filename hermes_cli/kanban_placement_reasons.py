@@ -74,6 +74,43 @@ PLACEMENT_WAIT_EVENT = "placement_wait"
 WORKER_PLACED_EVENT = "worker_placed"
 # The task_event on every spawn, both routes (spec §4.1; written from Phase 2a).
 PLACEMENT_EVENT = "placement"
+# Rename wave 3 (t_7be48220, Fleet Work Allocation): each placement event kind gets an allocation name.
+# For one release readers accept BOTH names (historical rows are never rewritten); the writers above still
+# emit the old name until the writer step flips them. Readers query ``kind IN ({kind_marks(K)})`` with
+# ``*kind_names(K)`` and compare with ``normalize_kind(kind) == normalize_kind(K)``.
+KIND_ALIASES = {
+    "placement": "allocation",
+    "placement_wait": "allocation_wait",
+    "worker_placed": "worker_allocated",
+    "placement_hint": "allocation_hint",
+    "placement_rerouted": "allocation_rerouted",
+}
+_KIND_OLD = {new: old for old, new in KIND_ALIASES.items()}
+
+
+def normalize_kind(kind):
+    """The allocation name of an event kind: an old placement name maps to its new name, any other kind is
+    returned unchanged."""
+    return KIND_ALIASES.get(kind, kind)
+
+
+def kind_names(*kinds) -> tuple:
+    """Every name each of ``kinds`` is stored under (old placement name, then new allocation name), in order,
+    without duplicates. A kind outside :data:`KIND_ALIASES` stands for itself."""
+    out: list = []
+    for k in kinds:
+        new = KIND_ALIASES.get(k, k)
+        for name in (_KIND_OLD.get(new), new):
+            if name is not None and name not in out:
+                out.append(name)
+    return tuple(out)
+
+
+def kind_marks(*kinds) -> str:
+    """``?,?,...``: one SQL placeholder per name of :func:`kind_names` (``kinds``)."""
+    return ",".join("?" * len(kind_names(*kinds)))
+
+
 # A repeated identical reason is re-written only after this many seconds.
 PLACEMENT_WAIT_REFRESH_SECONDS = 900
 # A task_event of one of these kinds after the latest placement_wait ends that

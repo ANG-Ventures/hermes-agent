@@ -109,10 +109,10 @@ def starved_holds(conn, waits: Mapping[str, str], now: int, *,
         count, start, latched = 0, None, False
         for kind, created, raw in conn.execute(
             "SELECT kind, created_at, payload FROM task_events WHERE task_id = ? "
-            "AND kind IN (?, ?, %s) ORDER BY id DESC" % ",".join("?" * len(ends)),
-            (tid, _pr.PLACEMENT_WAIT_EVENT, STARVED_EVENT, *ends),
+            "AND kind IN (?, ?, ?, %s) ORDER BY id DESC" % ",".join("?" * len(ends)),
+            (tid, *_pr.kind_names(_pr.PLACEMENT_WAIT_EVENT), STARVED_EVENT, *ends),
         ):
-            if kind not in (_pr.PLACEMENT_WAIT_EVENT, STARVED_EVENT):
+            if kind not in (*_pr.kind_names(_pr.PLACEMENT_WAIT_EVENT), STARVED_EVENT):
                 break  # episode end
             try:
                 pl = json.loads(raw or "{}")

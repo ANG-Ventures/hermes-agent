@@ -68,7 +68,7 @@ def replay(db: Path, hours: float, fleet: Path, now: float | None = None) -> dic
     now = time.time() if now is None else now
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT task_id, payload FROM task_events WHERE kind='placement' AND created_at >= ?",
+    rows = conn.execute("SELECT task_id, payload FROM task_events WHERE kind IN ('placement', 'allocation') AND created_at >= ?",
                         (int(now - hours * 3600),)).fetchall()
     reasons = _studio_reasons(fleet)
     before, after = collections.Counter(), collections.Counter()
