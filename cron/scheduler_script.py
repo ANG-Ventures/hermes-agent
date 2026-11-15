@@ -703,6 +703,7 @@ def _run_job_script(
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
     *, timeout_seconds: Optional[int] = None, job_name: Optional[str] = None,
     job_id: Optional[str] = None, execution_id: Optional[str] = None,
+    job_env: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -718,10 +719,16 @@ def _run_job_script(
     log line and the shutdown-kill re-fire flag. execution_id: a no_agent job's attempt; when set
     the script's exit status is also written to a durable record so a run that outlives this
     process is graded by its real outcome after restart (cron/script_outcome_records.py).
+    job_env: the job's ``env`` field, overlaid on the child env after the sanitizer
+    (cron/job_env.py); an invalid one fails the run instead of being dropped.
     """
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
+    from cron.job_env import job_env_error
+    env_err = job_env_error(job_env)
+    if env_err:
+        return False, env_err
     # Refuse to START new script work once the gateway has begun draining: the ticker could
     # otherwise dispatch a fresh long-running script a second before SIGTERM and hand the drain
     # brand-new work to wait out (fork #1307).
@@ -802,6 +809,7 @@ def _run_job_script(
         from hermes_cli.process_bootstrap import apply_child_env
         apply_child_env(env)
         env.update(env_overlay)
+        env.update(job_env or {})  # the job's own `env` field (t_dbfaea4d)
         run_token = uuid.uuid4().hex
         env[SCRIPT_RUN_TOKEN_ENV] = run_token  # finds setsid escapees (Prism 85c0395583d8)
         run_started = time.time()

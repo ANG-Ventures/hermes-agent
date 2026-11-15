@@ -4492,6 +4492,16 @@ def _normalize_job_updates(job: Dict[str, Any], updates: Dict[str, Any]) -> None
     for key, norm in _UPDATE_FIELD_NORMALIZERS.items():
         if key in updates:
             updates[key] = norm(updates[key])
+    if updates.get("env") is not None:
+        # Only a script child receives `env` (cron/job_env.py); an agent turn never does.
+        from cron.job_env import job_env_error
+        env_err = job_env_error(updates["env"])
+        if env_err:
+            raise ValueError(env_err)
+        merged = {**job, **updates}
+        if updates["env"] and not (merged.get("script") or merged.get("monitor_script")):
+            raise ValueError("cron job env reaches only the job's script or monitor_script; "
+                             "this job has neither, so env would do nothing")
     if "repeat" in updates:
         _rp = updates["repeat"]
         completed = (job.get("repeat") or {}).get("completed", 0)

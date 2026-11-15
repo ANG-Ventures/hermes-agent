@@ -2278,17 +2278,20 @@ def _consume_restart_killed(job_id: Any) -> bool:
 
 
 def _job_script_kwargs(job: dict) -> dict[str, Any]:
-    """Per-job ceiling + name + id for ``_run_job_script`` (see resolve_job_script_timeout)."""
+    """Per-job ceiling + name + id (+ ``env``) for ``_run_job_script`` (see resolve_job_script_timeout)."""
     timeout, _source = scheduler_ext.resolve_job_script_timeout(
         job, _get_script_timeout()
     )
     name = job.get("name") or job.get("id") if isinstance(job, dict) else None
     job_id = job.get("id") if isinstance(job, dict) else None
-    return {
+    kwargs: dict[str, Any] = {
         "timeout_seconds": timeout,
         "job_name": str(name) if name else None,
         "job_id": str(job_id) if job_id else None,
     }
+    if isinstance(job, dict) and job.get("env") is not None:
+        kwargs["job_env"] = job["env"]  # the job's `env` field reaches its script (t_dbfaea4d)
+    return kwargs
 
 
 def _bind_cron_delivery_target_hint(prompt: str, target: Optional[dict]) -> str:
