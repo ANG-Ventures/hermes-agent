@@ -128,9 +128,14 @@ def fleet(tmp_path, monkeypatch):
         # Local capacity accounting is upgraded in place; authorization authenticates
         # the existing row's owner as well as the host/workload pair.
         (d / "kanban").write_text("capacity-owner-token\n", encoding="utf-8")
+        (d / "asap-operator").write_text("operator-token\n", encoding="utf-8")
 
     ns.registry, ns.table, ns.token = registry, table, token
     return ns
+
+
+def _latch_pages(fleet):
+    return [p for p in fleet.pages if "config fault" in p]
 
 
 def _tick(spawned, **kw):
@@ -198,14 +203,14 @@ def test_config_fault_blocks_capability_latches_and_is_not_reclaimed(fleet, monk
     task = _status(tid)
     assert spawned == []
     assert task.status == "blocked" and task.block_kind == "capability"
-    assert len(fleet.pages) == 1 and "config fault" in fleet.pages[0]
+    assert len(_latch_pages(fleet)) == 1
     n = len(allocd.calls)
     other = _card("other")
     _tick(spawned)
     assert spawned == []
     assert _status(tid).status == "blocked" and _status(other).status == "ready"
     assert len(allocd.calls) == n, "a latched door makes no door call"
-    assert len(fleet.pages) == 1
+    assert len(_latch_pages(fleet)) == 1
     # the operator fixes the config: the latch clears, the next tick starts the other card
     allocd.answer = ok_door()
     fleet.table()
@@ -500,3 +505,64 @@ def test_spawn_only_publish_logs_no_failed_line_when_every_host_answers(fleet, m
     assert errs == [None, None, None], errs
     assert not [r for r in caplog.records if "failed" in r.getMessage()], [r.getMessage() for r in caplog.records]
     assert sorted(b["host"] for p, b in allocd.calls if p == "/demand/publish") == sorted(hosts * 3)
+
+
+def _cred_pages(fleet):
+    return [p for p in fleet.pages if "kanban door credential" in p]
+
+
+def test_credential_check_present_set_is_clean(fleet, monkeypatch):
+    """t_793ef0f6: every _door_credentials() file present -> no credential page, nothing reported."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    allocd.answer = ok_door()
+    _card()
+    _tick([])
+    assert faults.check_credentials() == {}
+    assert _cred_pages(fleet) == []
+
+
+@pytest.mark.parametrize("name,problem,mint", [
+    ("kanban", "missing", "allocd.py --mint kanban "),
+    ("asap-operator", "missing", "allocd.py --mint asap-operator "),
+    ("kanban@mac-studio", "empty", "allocd.py --mint-demand kanban mac-studio "),
+])
+def test_credential_check_pages_once_per_bad_file_with_the_mint_command(fleet, monkeypatch, name, problem, mint):
+    """t_793ef0f6 (2026-11-14 18:39: unminted var/alloc/tokens/kanban latched the board 15 min): a planted bad door
+    credential pages ONCE through the pager on the armed door's tick, naming the file and its mint command; a second
+    tick does not re-page; repairing it pages once more (cleared)."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    p = fleet.root / alloc_client.TOKENS_REL / name
+    if problem == "missing":
+        p.unlink()
+    else:
+        p.write_text("\n", encoding="utf-8")
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    allocd.answer = ok_door()
+    _tick([])
+    _tick([])
+    pages = _cred_pages(fleet)
+    assert len(pages) == 1, pages
+    assert f"credential {problem}: {p}" in pages[0] and mint in pages[0]
+    assert faults.check_credentials() == {str(p): problem}
+    assert len(_cred_pages(fleet)) == 1
+    fleet.token()
+    assert faults.check_credentials() == {}
+    pages = _cred_pages(fleet)
+    assert len(pages) == 2 and "is back" in pages[1]
+
+
+def test_credential_check_is_off_while_the_door_is_spawn_only(fleet):
+    """No door call is made in spawn-only, so no credential is needed and nothing pages (pool boxes carry the host
+    table too)."""
+    fleet.registry("spawn-only")
+    fleet.table()
+    _card()
+    _tick([])
+    assert _cred_pages(fleet) == []
