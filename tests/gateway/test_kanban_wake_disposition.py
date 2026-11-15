@@ -30,7 +30,8 @@ OWNER_WAKE_TRIGGER_EVENTS = {
     ow.TRIGGER_PRECONDITION: [("blocked", {"reason": "waiting on PR#12"})],
     ow.TRIGGER_STUCK: [(k, {"error": "boom"}) for k in sorted(ow.STUCK_KINDS)],
     ow.TRIGGER_LAST_BLOCKER: [("completed", {"summary": "done"})],
-    ow.TRIGGER_RED_HANDBACK: [("review_requested", {"own_repo": True, "pr_state": "red"})],
+    ow.TRIGGER_RED_HANDBACK: [("review_requested", {"own_repo": True, "pr_state": "red"}),
+                              ("review_requested", {"own_repo": True, "pr_state": "dirty"})],
     ow.TRIGGER_WOKE_NONSPAWNABLE: [("skipped_nonspawnable", {"assignee": "apollo"})],
     ow.TRIGGER_REVIEW_DEADMAN: [("review_deadman", {"waiting_min": 25})],
     ow.TRIGGER_MECHANICAL_WAKE: [("mechanical_wake", {"source": "detached-run", "text": "rc=1"})],
@@ -89,6 +90,8 @@ def test_every_owner_wake_reason_is_dispositioned(trigger):
         verdict = wake_disposition(kind, payload, PLAIN, retries=0)
         if kind != "blocked" and trigger in (ow.TRIGGER_NEEDS_INPUT, ow.TRIGGER_PRECONDITION, ow.TRIGGER_WOKE_NONSPAWNABLE):
             assert verdict == SURFACE, (trigger, kind)
+        elif trigger == ow.TRIGGER_RED_HANDBACK and payload["pr_state"] == "red":
+            assert verdict == NONE, (trigger, kind)   # t_88864f95: an unconflicted red takes no fork
         else:
             assert verdict == AUTO, (trigger, kind)
 
@@ -133,10 +136,16 @@ def test_own_repo_green_or_pending_is_none(state):
     assert wake_disposition("review_requested", {"own_repo": True, "pr_state": state}, PLAIN) == NONE
 
 
-@pytest.mark.parametrize("state", ["red", "dirty"])
-def test_own_repo_red_is_auto(state):
+def test_own_repo_dirty_is_auto_fork():
+    d = classify("review_requested", {"own_repo": True, "pr_state": "dirty"}, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "own_repo_review_red")
+
+
+@pytest.mark.parametrize("state", ["red", "RED"])
+def test_own_repo_red_unconflicted_takes_the_no_fork_row(state):
+    """t_88864f95 (Ace 2026-11-14): a red check holds no merge, so no child proves the red is main's."""
     d = classify("review_requested", {"own_repo": True, "pr_state": state}, PLAIN)
-    assert d.verdict == AUTO and d.mode == "fork"
+    assert (d.verdict, d.mode, d.row) == (NONE, None, "own_repo_review_green_or_pending")
 
 
 # --- t_6e9f48cc: every open Prism key answered in the handback -> a mechanical fork ----------
@@ -152,7 +161,8 @@ def test_own_repo_review_all_keys_answered_is_auto_fork(state):
 @pytest.mark.parametrize("answered", [False, None, "true", 1])
 @pytest.mark.parametrize("state,row", [("green", "own_repo_review_green_or_pending"),
                                        ("pending", "own_repo_review_green_or_pending"),
-                                       ("red", "own_repo_review_red"), (None, "default")])
+                                       ("red", "own_repo_review_green_or_pending"),
+                                       ("dirty", "own_repo_review_red"), (None, "default")])
 def test_unanswered_or_unreadable_keys_keep_todays_rows(answered, state, row):
     """One key missing (False), unreadable prism state (None) or a non-bool: today's row."""
     payload = {"own_repo": True, "prism_all_answered": answered, **({"pr_state": state} if state else {})}

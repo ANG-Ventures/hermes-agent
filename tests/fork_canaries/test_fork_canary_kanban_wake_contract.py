@@ -524,18 +524,32 @@ def _auto_card(env, **kw) -> str:
     return _card(env, boomerang_wake=True, **kw)
 
 
-def test_w18_boomerang_wake_red_handback_is_one_dispatch_zero_turns(auto_env):
+def test_w18_boomerang_wake_dirty_handback_is_one_dispatch_zero_turns(auto_env):
     """One event through both paths (notifier sub + owner-wake reason e) = ONE child, no turn.
 
     RED-PROVABLE: drop the claim check in owner_wake_filter -> two dispatches."""
     env = auto_env
-    env["health"][(REPO, 2118)] = {"state": "open", "mergeable_state": "clean", "failing": ["lint"]}
+    env["health"][(REPO, 2118)] = {"state": "open", "mergeable_state": "dirty", "failing": ["lint"]}
     tid = _auto_card(env)
     _sub(tid)
     _handback(tid, 2118)
     turns = _tick(env)
-    assert turns == [], _msg("W18", "a boomerang-wake red handback still woke the owner", turns)
+    assert turns == [], _msg("W18", "a boomerang-wake dirty handback still woke the owner", turns)
     assert len(env["dispatched"]) == 1, f"FORK CANARY {FEATURE} W18: dispatches={env['dispatched']}"
+
+
+def test_w18b_boomerang_wake_unconflicted_red_handback_forks_nothing(auto_env):
+    """t_88864f95 (Ace 2026-11-14): an unconflicted red takes the green row: no child, the notifier's one turn.
+
+    RED-PROVABLE: put "red" back on the own_repo_review_red row -> one dispatch, zero turns."""
+    env = auto_env
+    env["health"][(REPO, 2119)] = {"state": "open", "mergeable_state": "clean", "failing": ["lint"]}
+    tid = _auto_card(env)
+    _sub(tid)
+    _handback(tid, 2119)
+    turns = _tick(env)
+    assert env["dispatched"] == [], f"FORK CANARY {FEATURE} W18b: dispatches={env['dispatched']}"
+    assert _paths(turns) == ["notifier"], _msg("W18b", "an unconflicted red must wake like green", turns)
 
 
 @pytest.mark.parametrize("resolved", [False, True])
