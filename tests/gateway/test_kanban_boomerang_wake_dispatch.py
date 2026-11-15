@@ -858,7 +858,58 @@ def test_child_handoff_renders_one_boomerang_wake_line(env):
     _run(env, entry, "completed", _verdict(entry, "complete", summary="verified: PR merged, tests green"))
     lines = [s for s in env["adapter"].sent if s.startswith("boomerang handled")]
     assert lines == [f"boomerang handled {tid} (completed): verified: PR merged, tests green"]
+    assert len(env["adapter"].handled) == 1   # t_aad55db4: plus one home turn (below)
+
+
+def test_complete_verdict_on_chat_home_wakes_the_home_once_per_delegation(env):
+    """t_aad55db4: a complete verdict whose home is a live chat session starts exactly one turn
+    there carrying the verdict; replaying the same delegation starts none."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    final = _verdict(entry, "complete", summary="verified; the parent files the report and posts the link")
+    _run(env, entry, "completed", final)
+    turns = env["adapter"].handled
+    assert len(turns) == 1
+    assert turns[0].metadata["gateway_session_key"] == env["group"].session_key
+    assert f"child completed {tid}" in turns[0].text and "the parent files the report" in turns[0].text
+    assert f"Task {tid} wake" in turns[0].text            # the original handback wake rides along
+    with kb.connect_closing() as conn:
+        parts = sorted((e.payload or {}).get("part") for e in kb.list_events(conn, tid)
+                       if e.kind == ah.DELIVERED_KIND)
+    assert parts == [ah.PART_LINE, ah.PART_TURN]
+    # Replay: the same delegation through run_entry again, then the reconcile drain.
+    _run(env, entry, "completed", final)
+    asyncio.run(ah.deliver_handbacks(env["runner"], ah.BoomerangWakeState()))
+    assert len(env["adapter"].handled) == 1
+    assert len([s for s in env["adapter"].sent if s.startswith("boomerang handled")]) == 1
+
+
+def test_complete_verdict_turn_honours_the_kill_switch(env):
+    from hermes_constants import get_hermes_home
+
+    stop = get_hermes_home() / "state" / ah.COMPLETE_TURN_STOP_FILE
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    try:
+        tid = _card(env)
+        _worker_close(tid)
+        entry = _claimed_entry(env, tid)
+        _run(env, entry, "completed", _verdict(entry, "complete"))
+    finally:
+        stop.unlink()
     assert env["adapter"].handled == []
+    assert [s for s in env["adapter"].sent if s.startswith("boomerang handled")]
+
+
+def test_complete_turn_needs_a_live_non_operator_home(env):
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    assert asyncio.run(ah._complete_wakes_home(env["runner"], entry)) is True
+    entry = {**entry, "home_sid": "20261019_999999_gone"}
+    assert asyncio.run(ah._complete_wakes_home(env["runner"], entry)) is False
+    assert asyncio.run(ah._complete_wakes_home(env["runner"], {**entry, "home_sid": "operator:apollo"})) is False
 
 
 def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
@@ -2146,6 +2197,7 @@ def test_restart_retry_resets_after_a_handled_wake(env, caplog):
     assert state.get_claim(redo["key"])["outcome"] == "complete"
     assert state.restart_spent(tid) == 0, "a handled wake kept the restart spent"
     sent_before = list(env["adapter"].sent)
+    turns_before = len(env["adapter"].handled)   # t_aad55db4: the handled wake's one home turn
     _new_completed_event(tid)
     second = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
     _kill(env, second)
@@ -2154,7 +2206,7 @@ def test_restart_retry_resets_after_a_handled_wake(env, caplog):
     old = state.get_claim(second["key"])
     assert old["state"] == ah.STATE_TERMINAL and old["outcome"] == "redispatched_after_restart"
     assert env["dispatched"][-1]["key"] == old["redispatched_as"]
-    assert env["adapter"].sent == sent_before and env["adapter"].handled == [], "a chat line was posted"
+    assert env["adapter"].sent == sent_before and len(env["adapter"].handled) == turns_before, "a chat line was posted"
     assert " lost reason=" not in caplog.text
 
 

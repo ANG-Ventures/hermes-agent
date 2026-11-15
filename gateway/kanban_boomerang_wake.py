@@ -83,6 +83,8 @@ CLAIM_TTL_S = 7 * 86400.0          # terminal claims older than this are pruned
 CLAIM_PRUNE_EVERY_S = 3600.0
 #: Kill switch for the backoff, dead-letter and claim pruning (present = pre-t_827d5940 behaviour).
 BACKOFF_STOP_FILE = "boomerang-handback-backoff.disabled"
+# t_aad55db4 kill switch: while it exists a ``complete`` verdict posts only the passive line again.
+COMPLETE_TURN_STOP_FILE = "boomerang-complete-turn.disabled"
 
 
 def state_path() -> Path:
@@ -1365,7 +1367,7 @@ def _stale_refusal(entry: dict, stage: str, *, fork_died: bool = False) -> Optio
 
 
 def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[BoomerangWakeState] = None,
-                    handback: bool = False) -> dict:
+                    handback: bool = False, wake_home: bool = False) -> dict:
     """Validate the child's verdict and do at most ONE allowlisted board write (§5.8, D-19).
 
     Gateway process only (never a child context). Returns ``{"ok", "action", "reason",
@@ -1442,8 +1444,13 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
             return {"ok": False, "action": action, "reason": f"write refused: {exc}", "summary": summary}
     finally:
         conn.close()
+    # t_aad55db4: a complete verdict on a live chat home also owes that session one turn, so the
+    # parent acts on whatever the verdict leaves to it (deduped per delegation like every part).
+    turn = (finding_text(live, {"summary": summary or action, **finding}, "child completed")
+            if wake_home and action == "complete" else None)
     state.update_claim(key, state=STATE_TERMINAL, outcome=action, finished_at=_time.time(),  # RC-5 (3)
-                       handback=handback_row(live, {"summary": summary or action, "action": action})
+                       handback=handback_row(live, {"summary": summary or action, "action": action},
+                                             turn_text=turn)
                        if handback else None)
     return {"ok": True, "action": action, "reason": "", "summary": summary or action, "evidence": finding["evidence"]}
 
@@ -1949,6 +1956,18 @@ async def _home_is_live(runner: Any, entry: dict) -> bool:
         return False
 
 
+async def _complete_wakes_home(runner: Any, entry: dict) -> bool:
+    """t_aad55db4: True when a ``complete`` verdict should also start a turn in the card's home: the
+    home is a real session (not ``operator:``) and a live chat origin, and the stop file is absent."""
+    from hermes_constants import get_hermes_home
+
+    if _operator_home(entry.get("home_sid")) or not str(entry.get("home_sid") or "").strip():
+        return False
+    if (get_hermes_home() / "state" / COMPLETE_TURN_STOP_FILE).exists():
+        return False
+    return await _home_is_live(runner, entry)
+
+
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
                 text: Optional[str] = None, *, fork_died: bool = False) -> None:
     """Commit the original wake obligation before any best-effort delivery. A freshness refusal
@@ -2223,7 +2242,8 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
         return
     # handback=True: the pending row commits with the terminal claim (one state write), then the
     # best-effort breadcrumb, then the send (ruling t_e98f651e-handback-first-then-everything).
-    result = await asyncio.to_thread(execute_verdict, live, final, state=state, handback=True)
+    result = await asyncio.to_thread(execute_verdict, live, final, state=state, handback=True,
+                                     wake_home=await _complete_wakes_home(runner, live))
     if result.get("stale"):
         await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="stale",
                                 reason=result["reason"])
