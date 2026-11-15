@@ -522,6 +522,23 @@ def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
     return {"action": "block", "message": f"hook {hook_display_name(spec.command)} failed closed: {reason}"}
 
 
+_STDOUT_DETAIL_LIMIT = 200
+_STDERR_DETAIL_LINES = 3
+
+
+def _output_detail(r: Dict[str, Any], stdout: str, stderr: str) -> str:
+    """``rc=… stdout=… stderr=…`` suffix for a bad-stdout refusal, so a blocked session can name the
+    cause (t_6e147ce9: the 11-14 outage refused with only ``unparseable stdout``). Bounded and
+    secret-redacted: this text reaches the model."""
+    from agent.redact import redact_sensitive_text
+
+    detail = f"rc={r.get('returncode')} stdout={stdout[:_STDOUT_DETAIL_LIMIT]!r}"
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()][:_STDERR_DETAIL_LINES]
+    if lines:
+        detail += " stderr=" + " | ".join(lines)[:_STDERR_MESSAGE_LIMIT]
+    return redact_sensitive_text(detail, force=True)
+
+
 _TRACEBACK_HEADER = "Traceback (most recent call last):"
 _MISSING_MODULE = re.compile(r"No module named ['\"]([A-Za-z0-9_.]+)['\"]")
 _EXCEPTION_LINE = re.compile(
@@ -627,12 +644,14 @@ def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any], *, page: bool = Tru
         except (ValueError, RecursionError):
             # Empty stdout / a stack trace: not JSON at all (distinct from a well-formed but
             # unknown directive, so an operator can tell a crashed hook from a typo).
-            return _fail_closed_block(spec, "unparseable stdout (expected a JSON object)")
+            return _fail_closed_block(spec, "unparseable stdout (expected a JSON object); "
+                                      + _output_detail(r, stdout, stderr))
         if isinstance(data, dict):
             actions = [data[key] for key in ("action", "decision") if key in data]
             if not data or (actions and all(action == "allow" for action in actions)):
                 return None
-        return _fail_closed_block(spec, "invalid stdout (expected allow, block, or modify)")
+        return _fail_closed_block(spec, "invalid stdout (expected allow, block, or modify); "
+                                  + _output_detail(r, stdout, stderr))
     return parsed
 
 

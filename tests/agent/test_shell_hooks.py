@@ -840,6 +840,38 @@ class TestEvaluateResult:
         assert r["action"] == "block"
         assert "unparseable stdout" in r["message"]
 
+    def test_unparseable_stdout_refusal_carries_rc_and_stderr(self):
+        """t_6e147ce9: the 11-14 rollback-shim outage refused with only `unparseable stdout`."""
+        r = shell_hooks._evaluate_result(
+            self._spec(fail_closed=True), _spawn_result(stdout="", stderr="boom\nsecond\n"),
+        )
+        assert r["action"] == "block"
+        assert r["message"].startswith("hook h.sh#")
+        assert "failed closed: unparseable stdout (expected a JSON object)" in r["message"]
+        assert "rc=0" in r["message"]
+        assert "stdout=''" in r["message"]
+        assert "boom" in r["message"] and "second" in r["message"]
+
+    def test_unparseable_invalid_directive_refusal_carries_rc_and_stderr(self):
+        secret = "sk-proj-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"
+        r = shell_hooks._evaluate_result(
+            self._spec(fail_closed=True),
+            _spawn_result(stdout='{"action": "bogus"}', stderr=f"boom {secret}\nl2\nl3\nl4-dropped\n"),
+        )
+        assert "failed closed: invalid stdout (expected allow, block, or modify)" in r["message"]
+        assert "rc=0" in r["message"]
+        assert "boom" in r["message"] and "l3" in r["message"]
+        assert "l4-dropped" not in r["message"]
+        assert secret not in r["message"], "hook stderr reached the model unredacted"
+
+    def test_unparseable_stdout_refusal_bounds_stdout(self):
+        r = shell_hooks._evaluate_result(
+            self._spec(fail_closed=True), _spawn_result(stdout="Z" * 5000),
+        )
+        assert "Z" * 200 in r["message"]
+        assert "Z" * 201 not in r["message"]
+        assert "stderr=" not in r["message"]
+
     def test_fail_closed_on_non_blocking_event_still_fails_open(self):
         """Defense in depth: even if a spec sneaks past parsing with
         fail_closed on a non-blocking event, runtime fails open."""
