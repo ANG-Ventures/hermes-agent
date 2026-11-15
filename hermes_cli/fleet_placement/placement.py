@@ -1533,7 +1533,7 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     HostTable, so a queue restricted to an alias holds work back on its host (Prism 364936434c3d).
     ``stale_after_s`` (REQUIRED, no default): the CALLER's freshness policy for the host sample, so may_start never
     refuses a sample its own caller's scorer calls fresh (Prism 5113510bdb9a: a hardcoded 60 s here dropped kanban
-    hosts its 120 s policy admitted). Kanban passes placement_policy.stale_after_s; CI, batch and test-gate pass theirs.
+    hosts its 120 s policy admitted). Kanban passes allocation_policy.stale_after_s; CI, batch and test-gate pass theirs.
     It also overrides the pressure doc's own ``stale_after_s`` when the samples are read here."""
     try:                             # noqa: PLC0415  (imported like admission / work_estimate above)
         from . import admission_demand as dmd
@@ -1618,7 +1618,7 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
 #: on ci-box / ace-ai, Ace decides) stops CI starts at that busy fraction, so the kanban class (fleet line 0.90) keeps
 #: the band between. admission.admit_class never lets a class line RAISE the fleet line.
 CLASS_LINE_LANES = {"ci": "ci"}
-POLICY_REL = Path("fleet") / "placement-policy.json"
+POLICY_REL = Path("fleet") / "allocation-policy.json"
 
 
 def class_line(workload: str, hid: str, *, root=None) -> Optional[float]:
@@ -1779,8 +1779,8 @@ def band_basis(mode: Optional[str] = None, root=None) -> str:
     procs_running are not read), "legacy" = the scorer's cores axis (cores x yield - cores_reserve - occupancy -
     reserved threads). ``mode`` (tests) decides outright. Else utilization only while config.yaml kanban.admission is
     utilization (the band names what the admitter does) AND the busy_basis kill switch for reader ``admission-band``
-    (env PLACEMENT_BAND_BASIS, else fleet/placement-policy.json busy_basis.admission-band) is cpu_busy (its default);
-    ``load1`` there restores the legacy band. ``root`` reads that root's config.yaml and fleet/placement-policy.json."""
+    (env PLACEMENT_BAND_BASIS, else fleet/allocation-policy.json busy_basis.admission-band) is cpu_busy (its default);
+    ``load1`` there restores the legacy band. ``root`` reads that root's config.yaml and fleet/allocation-policy.json."""
     if mode is not None:
         return "utilization" if mode == "utilization" else "legacy"
     if admission_mode(Path(root) / CONFIG_REL if root is not None else None, root=root) != "utilization":
@@ -1792,8 +1792,8 @@ def band_basis(mode: Optional[str] = None, root=None) -> str:
             import busy_basis  # noqa: PLC0415
         # root omitted: BUSY_BASIS_POLICY, else fleet_root()'s (PLACEMENT_HOME) policy, never busy_basis's own
         # checkout (Prism a922d9125c6e); an explicit root reads that root's file, as before
-        pol = (Path(root) / "fleet" / "placement-policy.json" if root is not None else
-               os.environ.get("BUSY_BASIS_POLICY") or fleet_root(root=root) / "fleet" / "placement-policy.json")
+        pol = (Path(root) / "fleet" / "allocation-policy.json" if root is not None else
+               os.environ.get("BUSY_BASIS_POLICY") or fleet_root(root=root) / "fleet" / "allocation-policy.json")
         basis = busy_basis.basis(BAND_BASIS_READER, BAND_BASIS_ENV, pol)
     except ImportError:
         basis = os.environ.get(BAND_BASIS_ENV) or "cpu_busy"
