@@ -1331,7 +1331,7 @@ def _provisioned_placement_roots(_hermetic_environment, monkeypatch):
     if orig is None or getattr(orig, "_t77_provisioning", False):
         return
 
-    def _receipt_path(root, receipt=None):
+    def _receipt_path(root, receipt=None, *, canonical=False):
         env_receipt = os.environ.get("PLACEMENT_ROOT_RECEIPT")
         if receipt is not None or (env_receipt and env_receipt != TEST_PLACEMENT_ROOT_RECEIPT):
             return orig(root, receipt)
