@@ -30,6 +30,6 @@ jobs:
       runner: ubuntu-latest
       # Repos whose skills live elsewhere: pass the dirs grepped for the named override (warning only).
       # docs-paths: "skills-shared skills"
-      # Reviewed no-override-by-design additions, one per line (`path:<regex> <why>` / `line:<regex> <why>`):
-      # allowlist: |
-      #   line:my refusal text reviewed in PR #N
+      # Vendored byte copies, gated at their hermes-home source.
+      allowlist: |
+        path:^hermes_cli/fleet_placement/ vendored byte copies gated at their hermes-home source
