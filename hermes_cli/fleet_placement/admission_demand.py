@@ -434,10 +434,22 @@ def _open_receipt_parent(path):
         raise
 
 
-def _receipt_path(root, receipt=None):
+def canonical_receipt(root) -> Path:
+    """t_5937c16c: the ONE receipt location a runtime reads when PLACEMENT_ROOT_RECEIPT is unset, derived from the ROOT
+    (never HOME): <root.parent>/<root.name>-root-receipt/placement-root.json. For ~/.hermes that is the Studio's
+    installed ~/.hermes-root-receipt/placement-root.json. Same validation as the env path (ready, names this root,
+    inode + nonce, no symlink component), so a wrong or replaced root still refuses."""
+    root = _absolute(root)
+    return root.parent / f"{root.name}-root-receipt" / "placement-root.json"
+
+
+def _receipt_path(root, receipt=None, *, canonical=False):
     supplied = receipt if receipt is not None else os.environ.get("PLACEMENT_ROOT_RECEIPT")
+    if not supplied and canonical and os.path.lexists(canonical_receipt(root)):
+        supplied = canonical_receipt(root)   # runtime only; provisioning always names its receipt explicitly
     if not supplied:
-        raise OSError("PLACEMENT_ROOT_RECEIPT required; provision fleet root explicitly")
+        raise OSError(f"PLACEMENT_ROOT_RECEIPT required (unset, and no receipt at {canonical_receipt(root)}); "
+                      "provision fleet root explicitly")
     path = _absolute(supplied)
     if path == root or root in path.parents:
         raise OSError("receipt must be external to fleet root")
@@ -614,7 +626,7 @@ _RECEIPT_SYNCED: set = set()
 @contextlib.contextmanager
 def root_directory(root, relative=Path("."), *, mode=0o755):
     root = _absolute(root)
-    receipt = _receipt_path(root)
+    receipt = _receipt_path(root, canonical=True)
     parts = Path(relative).parts
     if Path(relative).is_absolute() or ".." in parts or len(parts) > 64:
         raise OSError("bounded root-relative directory required")
