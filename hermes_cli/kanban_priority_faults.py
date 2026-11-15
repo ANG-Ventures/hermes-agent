@@ -77,6 +77,10 @@ def registry_state() -> str:
 #: credentials the door path reads besides the kanban@<host> pair tokens: ``kanban`` authenticates the
 #: existing-owner reservation upgrade (authorize_start existing_consumer), ``asap-operator`` the urgency verb.
 _OTHER_TOKENS = ("kanban", "asap-operator")
+#: what the fcfs flip demands of the OTHER door on this root (t_dd8c53c4, P7 re-flip 2026-11-14 21:1x): scripts/test-gate
+#: on the Studio upgrades its capacity lease with existing_consumer=test-gate, and `test-gate --local` on a host the
+#: table excludes sends the local-venue capability. Checked, never part of this door's latch fingerprint.
+_FCFS_PEER_TOKENS = ("test-gate", "test-gate-local-venue")
 
 
 def _kanban_tokens():
@@ -98,6 +102,8 @@ def _door_credentials():
 _CREDENTIAL_EFFECT = {
     "kanban": "the first reservation upgrade (authorize_start existing_consumer=kanban) latches the door",
     "asap-operator": "ASAP marks are refused and ignored (mark_asap_if_set); starts are unaffected",
+    "test-gate": "every Studio test-gate run whose lease allocd placed refuses rc 78 at the door upgrade",
+    "test-gate-local-venue": "`test-gate --local` on the Studio refuses rc 78 at the door",
 }
 
 
@@ -138,16 +144,39 @@ def _expected_pair_tokens():
             if placement.policy_refusal(spec, "kanban", None) is None]
 
 
+def credential_problems() -> dict:
+    """{path: problem} for every credential an fcfs start on this root reads: this door's, its expected pairs, and
+    the test-gate door's (_FCFS_PEER_TOKENS). Reads only; no page, no state."""
+    d = _root() / TOKENS_REL
+    bad = {}
+    for p in sorted(set(_door_credentials()) | set(_expected_pair_tokens()) | {d / n for n in _FCFS_PEER_TOKENS}):
+        problem = _credential_problem(p)
+        if problem:
+            bad[str(p)] = problem
+    return bad
+
+
+def preflight() -> int:
+    """The P7 pre-flip check (t_dd8c53c4): run it in spawn-only BEFORE setting priority_mode fcfs. Prints each bad
+    credential with its effect and mint command, never a value; no page, no state. 0 green, 1 a credential is bad."""
+    d = _root() / TOKENS_REL
+    names = sorted({p.name for p in (*_door_credentials(), *_expected_pair_tokens())} | set(_FCFS_PEER_TOKENS))
+    bad = credential_problems()
+    for path, problem in sorted(bad.items()):
+        name = Path(path).name
+        effect = _CREDENTIAL_EFFECT.get(name, "every door verb for that host is refused and latches the door")
+        print(f"{problem} {path}: {effect}; mint: {_mint_command(name)}")
+    verdict = "RED %d of %d" % (len(bad), len(names)) if bad else "GREEN %d of %d" % (len(names), len(names))
+    print(f"fcfs preflight: {verdict} credentials under {d}")
+    return 1 if bad else 0
+
+
 def check_credentials() -> dict:
     """Once per tick while the door is armed (fcfs/classes): every _door_credentials() file must exist and hold a
     token BEFORE a start needs it (t_793ef0f6: an unminted var/alloc/tokens/kanban latched the board 15 min on
     2026-11-14). Logs each problem every tick, pages ONCE per bad file naming the mint command, pages once when it is
     fixed. Returns {path: problem} for the bad files."""
-    bad = {}
-    for p in sorted(set(_door_credentials()) | set(_expected_pair_tokens())):
-        problem = _credential_problem(p)
-        if problem:
-            bad[str(p)] = problem
+    bad = credential_problems()
     if not bad and not (_root() / STATE_REL).exists():
         return bad                        # steady state: no lock, no write
     with _state() as doc:
@@ -386,3 +415,7 @@ def hold_reason():
     if left:
         return f"door transport backoff {int(left)} s"
     return None
+
+
+if __name__ == "__main__":
+    raise SystemExit(preflight())

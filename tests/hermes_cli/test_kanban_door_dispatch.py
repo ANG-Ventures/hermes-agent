@@ -129,6 +129,9 @@ def fleet(tmp_path, monkeypatch):
         # the existing row's owner as well as the host/workload pair.
         (d / "kanban").write_text("capacity-owner-token\n", encoding="utf-8")
         (d / "asap-operator").write_text("operator-token\n", encoding="utf-8")
+        # the fcfs flip's other door on this root: scripts/test-gate's base owner + --local capability (t_dd8c53c4)
+        (d / "test-gate").write_text("test-gate-owner-token\n", encoding="utf-8")
+        (d / "test-gate-local-venue").write_text("local-venue-token\n", encoding="utf-8")
 
     ns.registry, ns.table, ns.token = registry, table, token
     return ns
@@ -529,6 +532,8 @@ def test_credential_check_present_set_is_clean(fleet, monkeypatch):
     ("kanban", "missing", "allocd.py --mint kanban "),
     ("asap-operator", "missing", "allocd.py --mint asap-operator "),
     ("kanban@mac-studio", "empty", "allocd.py --mint-demand kanban mac-studio "),
+    ("test-gate", "missing", "allocd.py --mint test-gate "),
+    ("test-gate-local-venue", "missing", "allocd.py --mint test-gate-local-venue "),
 ])
 def test_credential_check_pages_once_per_bad_file_with_the_mint_command(fleet, monkeypatch, name, problem, mint):
     """t_793ef0f6 (2026-11-14 18:39: unminted var/alloc/tokens/kanban latched the board 15 min): a planted bad door
@@ -641,3 +646,32 @@ def test_credential_check_retries_a_page_the_notifier_failed_to_send(fleet, monk
 def test_credential_check_uses_the_alloc_client_token_shape():
     """Prism simplify note: no copy of alloc_client._TOKEN_SHAPE in the fault module."""
     assert "_TOKEN_SHAPE = " not in Path("hermes_cli/kanban_priority_faults.py").read_text(encoding="utf-8")
+
+
+#: the Studio's var/alloc/tokens at the 2026-11-14 21:1x P7 re-flip (t_94fec622), less the kanban door's own files
+#: the fixture writes: no bare test-gate, no test-gate-local-venue. Every no-env test-gate run then refused rc 78.
+STUDIO_FLIP_EXTRA = ("prism", "test-gate@ace-ai", "test-gate@mac-studio", "ci@ci-box")
+
+
+def test_fcfs_preflight_names_the_test_gate_tokens_the_2026_11_14_flip_lacked(fleet, capsys):
+    """t_dd8c53c4: the pre-flip check runs in spawn-only (before the flip), pages nothing, writes no state, and exits 1
+    naming the test-gate base owner and the local-venue capability with their mint commands."""
+    fleet.registry("spawn-only")
+    fleet.table()
+    fleet.token()
+    d = fleet.root / alloc_client.TOKENS_REL
+    for name in STUDIO_FLIP_EXTRA:
+        (d / name).write_text("present-token\n", encoding="utf-8")
+    (d / "test-gate").unlink()
+    (d / "test-gate-local-venue").unlink()
+    assert faults.preflight() == 1
+    out = capsys.readouterr().out
+    assert f"missing {d / 'test-gate'}" in out and "allocd.py --mint test-gate " in out, out
+    assert f"missing {d / 'test-gate-local-venue'}" in out and "allocd.py --mint test-gate-local-venue " in out, out
+    assert "fcfs preflight: RED 2 of" in out, out
+    assert "present-token" not in out and "capacity-owner-token" not in out
+    assert fleet.pages == [] and not (fleet.root / faults.STATE_REL).exists()
+    fleet.token()
+    assert faults.preflight() == 0
+    assert "fcfs preflight: GREEN" in capsys.readouterr().out
+    assert fleet.pages == []
