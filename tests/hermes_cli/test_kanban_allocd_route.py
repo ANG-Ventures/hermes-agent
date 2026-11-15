@@ -25,6 +25,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,7 +88,19 @@ class FakeAllocd:
         if path == "/admit":
             return self.admit(req)
         if path == "/release":
-            return (200, {"released": True}) if placement.release(req["reservation_id"]) else (410, {"gone": True})
+            refused = None
+            if req.get("actual") is not None:   # do_release: a refused actual still ends the lease, unrecorded
+                try:
+                    ok = placement.release(req["reservation_id"], owner=req["consumer"], actual=req["actual"],
+                                           actual_source=req.get("actual_source"))
+                except placement.ActualRefused as exc:
+                    refused = str(exc)
+                    ok = placement.release(req["reservation_id"], owner=req["consumer"])
+            else:
+                ok = placement.release(req["reservation_id"])
+            if not ok:
+                return 410, {"gone": True}
+            return 200, {"released": True, **({"actual_refused": refused} if refused else {})}
         if path == "/renew":
             ok = placement.renew(req["reservation_id"], ttl_s=req.get("ttl_s", 1800.0), now=self.clock())
             return (200, {"renewed": True}) if ok else (410, {"gone": True})
@@ -647,3 +660,143 @@ def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
     assert kh.RESERVATION_KEY in payload and kh.RESERVATION_VIA_KEY not in payload
     assert loud.requests == []
 
+
+
+# -- t_26acfaa2: the run-end release carries the run's measured use (FWA footprints) ---------------
+
+def _dispatch_on(home):
+    f = Fleet()
+    _pressure_from_fleet(home, f)
+    plan = _plan(home, f, now=time.time())
+    plan.signal.allocd = kh.ALLOCD_ON
+    conn = kb.connect()
+    tid = kb.create_task(conn, title="c", assignee="alpha")
+    kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, *, board=None, placement=None: FAKE_PID,
+                      max_spawn=4, spawn_paused=None, spawn_limit=0, spillover=plan, reconcile_orphans=False)
+    run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+    rid, via = kh.run_reservation(conn, tid, run_id)
+    assert rid and via == kh.VIA_ALLOC_CLIENT
+    placed = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_placed'",
+                                     (tid,)).fetchone()[0])
+    return conn, tid, run_id, rid, placed["host"]
+
+
+def _releases(allocd, rid):
+    return [r for p, r in allocd.requests if p == "/release" and r["reservation_id"] == rid]
+
+
+def _usage_rows(home):
+    p = placement.class_usage_path()
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()] if p.exists() else []
+
+
+def test_run_end_release_carries_actual_source_and_host(home, allocd, monkeypatch):
+    seen = []
+
+    def measure(fp):
+        seen.append(dict(fp))
+        return {"host": fp["host"], "cpus": 0.4, "ram_gb": 1.25, "gpu_mib": 0.0, "cpu_s": 120.0, "wall_s": 300.0}
+
+    monkeypatch.setattr(kh, "measure_run_footprint", measure)
+    conn, tid, run_id, rid, host = _dispatch_on(home)
+    try:
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+    assert seen == [{"host": host, "target": f"kanbanw@{host}", "port": 22, "run_id": run_id}]
+    [req] = _releases(allocd, rid)
+    assert req["actual_source"] == kh.FOOTPRINT_SOURCE == "cgroup"
+    assert req["actual"]["host"] == host and req["actual"]["ram_gb"] == 1.25
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    [row] = _usage_rows(home)
+    assert row["host"] == host and row["ram_gb"] == 1.25
+
+
+def test_measurement_failure_still_releases_without_actual(home, allocd, monkeypatch, caplog):
+    def measure(fp):
+        raise RuntimeError("no live ssh master")
+
+    monkeypatch.setattr(kh, "measure_run_footprint", measure)
+    conn, tid, run_id, rid, host = _dispatch_on(home)
+    with caplog.at_level("INFO", logger=kh.__name__):
+        try:
+            kb.complete_task(conn, tid, summary="done")
+        finally:
+            conn.close()
+    assert _releases(allocd, rid) == [{"consumer": "kanban", "reservation_id": rid}]
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+    assert [m for m in caplog.messages if "carries no actual" in m and "no live ssh master" in m]
+    assert _usage_rows(home) == []
+
+
+def test_host_mismatch_is_the_servers_refusal_not_a_crash(home, allocd, monkeypatch, caplog):
+    monkeypatch.setattr(kh, "measure_run_footprint",
+                        lambda fp: {"host": "some-other-box", "cpus": 0.4, "ram_gb": 1.0, "gpu_mib": 0.0})
+    conn, tid, run_id, rid, host = _dispatch_on(home)
+    with caplog.at_level("WARNING", logger=kh.__name__):
+        try:
+            kb.complete_task(conn, tid, summary="done")
+        finally:
+            conn.close()
+    [req] = _releases(allocd, rid)
+    assert req["actual"]["host"] == "some-other-box"
+    assert not placement.live_reservations(home / placement.RESERVATIONS_REL)   # the lease still ended
+    assert _usage_rows(home) == []                                              # the measurement did not land
+    assert [m for m in caplog.messages if "actual not recorded" in m]
+
+
+def _fake_ssh(script_out, *, check_rc=0, rc=0):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if "-O" in argv:
+            return SimpleNamespace(returncode=check_rc, stdout="", stderr="")
+        return SimpleNamespace(returncode=rc, stdout=script_out, stderr="")
+    return run, calls
+
+
+@pytest.fixture
+def sock(tmp_path, monkeypatch):
+    import tempfile
+    from tools.environments.ssh import control_socket_path
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    s = control_socket_path("kanbanw", "ace-media", 22, "run7")
+    s.parent.mkdir(parents=True, exist_ok=True)
+    s.touch()
+    return s
+
+
+FP = {"host": "ace-media", "target": "kanbanw@ace-media", "port": 22, "run_id": 7}
+
+
+def test_measure_reads_the_runs_own_master(sock):
+    run, calls = _fake_ssh("fp 1610612736 600000000   1200 512\n")
+    got = kh.measure_run_footprint(FP, runner=run)
+    assert got == {"host": "ace-media", "cpus": 0.5, "ram_gb": 1.5, "cpu_s": 600.0, "wall_s": 1200.0, "gpu_mib": 512.0}
+    assert all(c[:3] == ["ssh", "-S", str(sock)] and "ControlMaster=no" in c for c in calls)
+    assert calls[0][-3:] == ["-O", "check", "kanbanw@ace-media"]
+
+
+def test_measure_without_nvidia_smi_leaves_gpu_unmeasured(sock):
+    run, _ = _fake_ssh("fp 1073741824 1000000 10 -\n")
+    assert "gpu_mib" not in kh.measure_run_footprint(FP, runner=run)
+
+
+@pytest.mark.parametrize("out,check_rc,rc", [("", 255, 0), ("no session scope: /user.slice\n", 0, 3),
+                                             ("garbage\n", 0, 0)])
+def test_measure_refuses_a_dead_master_or_unreadable_scope(sock, out, check_rc, rc):
+    run, calls = _fake_ssh(out, check_rc=check_rc, rc=rc)
+    with pytest.raises(RuntimeError):
+        kh.measure_run_footprint(FP, runner=run)
+    if check_rc:
+        assert len(calls) == 1   # never a fresh connection that would measure a new session
+
+
+def test_measure_with_no_socket_never_runs_ssh(tmp_path, monkeypatch):
+    import tempfile
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    run, calls = _fake_ssh("fp 1 1 1 0\n")
+    with pytest.raises(RuntimeError, match="no live ssh master"):
+        kh.measure_run_footprint(FP, runner=run)
+    assert calls == []

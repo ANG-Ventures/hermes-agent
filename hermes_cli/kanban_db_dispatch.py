@@ -9038,6 +9038,8 @@ def _dispatch_once_locked(
                      "band": band, "spill_reason": spill_reason, "probe": probe,
                      "local_gate": str(spawn_paused) if spawn_paused else None,
                      "pid": pid,
+                     # t_26acfaa2: the release finds the run's ssh master by user@host:port
+                     **({"ssh_port": placed_host.ssh_port} if getattr(placed_host, "ssh_port", 22) != 22 else {}),
                      **({_kh_res.RESERVATION_KEY: _rid} if _rid else {}),
                      **({_kh_res.RESERVATION_VIA_KEY: _kh_res.VIA_ALLOC_CLIENT}
                         if _rid and spillover.reservation_via(_rid) else {}),
