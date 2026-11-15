@@ -167,6 +167,11 @@ def _red(env, pr, head="a" * 40):
     env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "clean", "failing": ["lint"], "head": head}
 
 
+def _dirty(env, pr, head="a" * 40):
+    """A conflicted PR: the only own-repo bad state that still forks (t_88864f95)."""
+    env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "dirty", "failing": ["lint"], "head": head}
+
+
 def _claims() -> dict:
     return ah.BoomerangWakeState().claims()
 
@@ -229,7 +234,7 @@ def test_stale_surface_timeline(env, arm, phase, author, cursor):
         assert bool(result.get("surface")) != blocked
 
 
-@pytest.mark.parametrize("action,turn,delivered", [("land_inherited", None, True), ("complete", None, True),
+@pytest.mark.parametrize("action,turn,delivered", [("request_changes", None, True), ("complete", None, True),
                                                     ("surface", "old handback", False)])
 def test_stale_guard_spares_write_receipts(env, action, turn, delivered):
     """Prism 0c2f7d571cd9: a land/complete receipt naming a now-merged PR (owner commented after) is
@@ -377,9 +382,9 @@ def test_stale_surface_bot_comment_does_not_hide_owner_release(env, assignee):
 
 
 def test_ac12_red_handback_through_both_paths_is_one_dispatch_and_no_turn(env):
-    """AC-12: a red own-repo handback fires the notifier sub AND owner-wake reason (e); the
+    """AC-12: a dirty own-repo handback fires the notifier sub AND owner-wake reason (e); the
     first path claims it, the second finds the claim and does nothing."""
-    _red(env, 3101)
+    _dirty(env, 3101)
     tid = _card(env)
     _sub(tid)
     _handback(tid, 3101)
@@ -394,9 +399,21 @@ def test_ac12_red_handback_through_both_paths_is_one_dispatch_and_no_turn(env):
     assert len(env["dispatched"]) == 1, "a second tick re-dispatched a claimed event"
 
 
+@pytest.mark.parametrize("sub", [True, False])
+def test_red_unconflicted_handback_forks_no_child_on_either_path(env, sub):
+    """t_88864f95 (Ace 2026-11-14): a red check holds no merge, so no child proves the red is main's."""
+    _red(env, 3103)
+    tid = _card(env)
+    if sub:
+        _sub(tid)
+    _handback(tid, 3103)
+    _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+
+
 def test_owner_wake_alone_dispatches_once(env):
     """No sub: the owner-wake path is the one that claims; a later tick does nothing."""
-    _red(env, 3102)
+    _dirty(env, 3102)
     tid = _card(env)
     _handback(tid, 3102)
     turns = _tick(env)
@@ -1063,6 +1080,24 @@ def test_surfaced_dedup_ignores_a_tag_quoted_inside_another_summary(env):
     assert ah.record_surface({"task_id": tid, "delegation_id": "a"}, "see (delegation b)") is True
     assert ah.record_surface({"task_id": tid, "delegation_id": "b"}, "finding B") is True
     assert ah.record_surface({"task_id": tid, "delegation_id": "b"}, "finding B") is False
+
+
+def test_land_inherited_verdict_is_an_unknown_action(env):
+    """t_88864f95: land_inherited is retired; a verdict carrying it is refused like any unknown action,
+    on the dirty row that once allowed it, and writes nothing to the card."""
+    assert "land_inherited" not in ah.ACTIONS
+    assert not any("land_inherited" in allowed for allowed in ah.ALLOWED.values())
+    tid = _review_card(env, pr=3132)
+    entry = _claimed_entry(env, tid, row="own_repo_review_red", kind="review_requested")
+    with pytest.raises(ah.VerdictError, match="unparseable verdict"):
+        ah.parse_verdict(entry, _verdict(entry, "land_inherited"))
+    assert "land_inherited" not in ah.build_goal(entry)
+    _run(env, entry, "completed", _verdict(entry, "land_inherited"))
+    assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}: unparseable verdict") for s in env["adapter"].sent)
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "review"
+        assert [e.kind for e in kb.list_events(conn, tid) if e.kind == ah.RECEIPT_KIND] == []
+    assert ah.BoomerangWakeState().get_claim(entry["key"])["outcome"] == "failed"
 
 
 def test_lost_child_without_verdict_keeps_the_plain_warning_and_wake(env):

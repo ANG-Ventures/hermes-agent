@@ -289,7 +289,7 @@ second restart surfaces (no second automatic redispatch).
 **The restart budget is per wake and separate (t_a256e37c).** A restart redispatch spends
 `restart_spent[task_id]`, not `retries[task_id]`, and the reconciler decides on `restart_spent` alone
 (`>= MAX_AUTO_RETRIES` means `retry spent`). When any claim on the card goes terminal with a handled
-outcome (`complete`, `request_changes`, `redispatch`, `retry`, `handled`, `land_inherited`,
+outcome (`complete`, `request_changes`, `redispatch`, `retry`, `handled`,
 `acknowledge`, `comment_why_waits`, `surfaced`, `stale`, `superseded`, `superseded-by-terminal`),
 `restart_spent` is cleared, so the next restart cut on the card is redispatched quietly again.
 `failed`, `lost`, `stopped` and `dispatch_failed` clear nothing. `retries` stays the
@@ -315,7 +315,7 @@ Instead, the child ends its final message with ONE verdict block:
 
 ```
 <<<BOOMERANG-VERDICT nonce=<hex16>>>>
-{"action": "complete" | "request_changes" | "redispatch" | "retry" | "land_inherited" | "surface",
+{"action": "complete" | "request_changes" | "redispatch" | "retry" | "surface",
  "evidence": ["<command + result>", ...], "findings": ["..."], "summary": "<line>"}
 <<<END-VERDICT>>>
 ```
@@ -328,25 +328,13 @@ board write for it:
   board, so a worker cannot pre-forge a verdict.
 - **Only allowed actions.** The action must be allowed for the wake row recorded at claim time:
   - `completed`: complete, request_changes or surface.
-  - `own_repo_review_red`: request_changes, redispatch, land_inherited or surface.
+  - `own_repo_review_red` (a dirty, conflicted PR only since t_88864f95; an unconflicted red takes
+    no fork, like green): request_changes, redispatch or surface.
   - `changes_requested`: redispatch or surface.
   - `crash_first_occurrence`: retry or surface.
   The executor never merges, approves a PR, stamps coverage, edits config or touches another card.
-- **`land_inherited` (t_47d1968c), own-repo red row only.** The child claims the PR's red is main's and adds
-  an `inherited` proof `{family, job, anchor_or_test, main_sha, pr_files, proof}`. The executor
-  (`gateway/kanban_boomerang_land_inherited.py`) treats it as a pointer and re-checks from GitHub:
-  (a) the PR's files (`pulls/N/files`) do not touch the red's owning paths. For a mutation-anchor red these
-  are the anchored source and its `mutate_*.sh` harness, both owned by the family. Otherwise they are
-  the family's `suites.json` / `main-gate-set.json` paths at main's tip. (b) the red is main's: the anchor is
-  present at the PR head, absent at main, and still named by main's harness; or the family is red in main's
-  newest grade (`state/main-green-streak.json`, fresh). It also needs an operator `review_coverage` APPROVE at
-  the head on the card, zero open Prism P0/P1 at the head, and no `--accept-open-p1` / `--bypass-fleetreview` /
-  `--break-glass` on the queue row. Any miss degrades to `surface` with the reason, and nothing is written. On
-  a pass the one write is `scripts/lib/landing_queue.py enqueue` with the row's existing fm_args plus
-  `--allow-red-ci "inherited: <family> red on main at <sha10> (...)"`. fleet-merge still refuses a NEW red
-  (rc 9) at land time. Records: a `[boomerang-wake] land_inherited` card comment with the proof, a row in
-  `state/boomerang-wake.jsonl`, and one #logs line. Kill switch: `state/boomerang-wake-land-inherited.disabled`,
-  read on every verdict.
+- **`land_inherited` is retired (t_88864f95, Ace 2026-11-14).** A red check has not held a merge since
+  2026-11-09, so no child proves a red is main's. A verdict carrying it is refused as an unknown action.
 - **Card, PR and assignee come from the board, never from the child.** If the card moved since
   the claim, nothing is written and the wake is re-surfaced (`reason: state moved`). Moved means a
   newer event other than the child's own comment, a status change, or a new PR head. Redispatch

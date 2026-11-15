@@ -6,8 +6,8 @@ card event's wake should become once ``resolve_boomerang_wake`` says the card is
 
 - ``"surface"`` — today's path (passive line + wake turn). Every judgment event, every
   event on a spend/egress card, and every kind this table does not name (INV-5).
-- ``"none"``    — no child and no wake change: the merge pass owns a green or pending
-  own-repo review handback (pass-1 B3).
+- ``"none"``    — no child and no wake change: the merge pass owns a green, pending or
+  unconflicted red own-repo review handback (pass-1 B3; red since t_88864f95).
 - ``"auto"``    — a mechanical event a boomerang child may handle. Only this exact string
   dispatches; a caller must never dispatch on ``!= "surface"`` (pass-3 residue).
 
@@ -123,12 +123,15 @@ _TABLE: tuple = (
     # the child surfaces). An unanswered key falls through to today's rows.
     _Row(3, "own_repo_review_all_keys_answered",
          lambda c: _own_review(c) and c.payload.get("prism_all_answered") is True, AUTO, MODE_FORK),
-    # Tier 3 — the merge pass owns a green/pending own-repo handback.
+    # Tier 3 — the merge pass owns a green/pending own-repo handback, and a red one without a
+    # conflict too: a red check has not held a merge since 2026-11-09, so no child proves the red
+    # is main's (Ace 2026-11-14, t_88864f95).
     _Row(3, "own_repo_review_green_or_pending",
-         lambda c: _own_review(c) and _pr_state(c) in ("green", "pending"), NONE),
-    # Tier 4 — specific mechanical rows.
+         lambda c: _own_review(c) and _pr_state(c) in ("green", "pending", "red"), NONE),
+    # Tier 4 — specific mechanical rows. The row keeps its name (claimed state + ALLOWED key) but
+    # matches a DIRTY (conflicted) PR only.
     _Row(4, "own_repo_review_red",
-         lambda c: _own_review(c) and _pr_state(c) in ("red", "dirty"), AUTO, MODE_FORK),
+         lambda c: _own_review(c) and _pr_state(c) == "dirty", AUTO, MODE_FORK),
     _Row(4, "completed", lambda c: c.kind == "completed", AUTO, MODE_FORK),
     _Row(4, "changes_requested", lambda c: c.kind == "changes_requested", AUTO, MODE_FORK),
     _Row(4, "crash_first_occurrence",
