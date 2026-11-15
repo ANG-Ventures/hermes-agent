@@ -1230,6 +1230,12 @@ def _resolve_needs_input_pager_settings(load_config: Callable[[], Any]) -> "tupl
 # Failure lines (gave_up/crashed/timed_out/stalled), changes_requested and
 # triage routing stay in the subscriber's chat: they need a human.
 LIFECYCLE_CHANNEL_KINDS = frozenset({"completed", "review_requested", "blocked"})
+# Event kinds the notifier turns into a wake turn (see ``_WAKE_KINDS`` in the loop).
+_NOTIFIER_WAKE_KINDS = (
+    "completed", "gave_up", "crashed", "timed_out",
+    "blocked", "review_requested", "changes_requested",
+    "block_loop_detected",
+)
 # A needs_input block on a card at or above this priority stays in the origin
 # chat (the needs-input pager pages there too).
 LIFECYCLE_CHANNEL_KEEP_PRIORITY = 100
@@ -2691,6 +2697,29 @@ class GatewayKanbanWatchersMixin:
                         and str(wake_downgrade).startswith(("host load", "host cpu"))
                     )
                     send_passive = mode != "wake"
+                    # t_5763e008: a card homed in a LIVE #alerts session wakes that session itself;
+                    # its wake kinds post no line anywhere. Boomerang-claimed events keep their path.
+                    _alerts_entry = None
+                    _alerts_ids: set = set()
+                    _alerts_own_ids: set = set()
+                    if wake_agent and sub["platform"] != "api_server":
+                        from gateway import kanban_alerts_home as _alh
+
+                        _alerts_home_sid = getattr(task, "session_id", None) if task else None
+                        _alerts_entry = await asyncio.to_thread(
+                            _alh.live_alerts_home, getattr(self, "session_store", None),
+                            _alerts_home_sid, _hr.read_session_row,
+                        )
+                        if _alerts_entry is not None:
+                            _alerts_ids = {
+                                ev.id for ev in d["events"]
+                                if ev.kind in _NOTIFIER_WAKE_KINDS and ev.id not in (d.get("auto") or {})
+                            }
+                            _own = _alh.own_session_ids(_alerts_entry, _alerts_home_sid)
+                            _alerts_own_ids = {
+                                ev.id for ev in d["events"]
+                                if ev.id in _alerts_ids and ev.actor_session_id in _own
+                            }
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -2969,6 +2998,8 @@ class GatewayKanbanWatchersMixin:
                             msg = _hr.format_for_platform(
                                 lifecycle_channel[0], _hr.tag_line(msg, f"suppressed:{_why_suppressed}"),
                             )
+                        elif ev.id in _alerts_ids:
+                            continue  # t_5763e008: the wake into the #alerts home is the delivery
                         # Handoff artifacts upload only beside a line posted
                         # NOW to a conversation (subscriber chat or an
                         # immediate home line). A log-channel line or a held
@@ -3218,11 +3249,7 @@ class GatewayKanbanWatchersMixin:
                         # (routed to triage) belong here for the same reason
                         # ``blocked`` does. ``status`` / ``archived`` /
                         # ``unblocked`` stay out: bookkeeping.
-                        _WAKE_KINDS = (
-                            "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
-                            "block_loop_detected",
-                        )
+                        _WAKE_KINDS = _NOTIFIER_WAKE_KINDS
                         # A transition made from this chat's own session is
                         # not news to it: post the line, skip the wake
                         # (t_a4890a77). Only for events whose passive line was
@@ -3230,7 +3257,7 @@ class GatewayKanbanWatchersMixin:
                         # (api_server) subs and events skipped without a send
                         # never land in _sent_event_ids, so their wake (the
                         # sole delivery) stays.
-                        _self_ids = set(d.get("self_event_ids") or ()) & _sent_event_ids
+                        _self_ids = (set(d.get("self_event_ids") or ()) & _sent_event_ids) | _alerts_own_ids
                         # t_4c7da648: a suppressed event never wakes, sent or not.
                         _suppressed_ids = set(d.get("suppressed") or ())
                         # S5 (t_4f6afb67): an event whose wake is no decision for the
@@ -3515,6 +3542,22 @@ class GatewayKanbanWatchersMixin:
                             """
                             from gateway.wake import deliver_wake
 
+                            if _alerts_entry is not None:
+                                # t_5763e008: the card's live #alerts home, not the sub's chat.
+                                await _alh.wake_home(
+                                    self, _alerts_entry, _synth, board=board_slug, task_id=sub["task_id"],
+                                    title=(task.title if task else "") or "", kinds=_wake_kinds,
+                                    event_ts=max((ev.created_at for ev in d["events"]), default=None),
+                                    carried_ids=_red_ids,
+                                )
+                                if _red_ids:
+                                    from gateway import kanban_owner_wake as _ow_home
+
+                                    _seen = _ow_home.runner_state(self).red_seen
+                                    for _rid in _red_ids:
+                                        _ns.note_red_seen(_seen, (d.get("red_keys") or {}).get(_rid) or (), time.time())
+                                return
+
                             _source, _wake_identity = self._build_wake_source(
                                 plat, adapter, sub,
                                 profile=sub_profile or None,
@@ -3558,8 +3601,9 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                             )
 
-                        if _is_push_adapter and not send_passive and _wake_kinds:
-                            # Wake-only (delivery_mode='wake') push sub: the
+                        if _is_push_adapter and (not send_passive or _alerts_entry is not None) and _wake_kinds:
+                            # Wake-only (delivery_mode='wake') push sub, or a card
+                            # whose #alerts home is woken (t_5763e008): the
                             # text ping was intentionally skipped above, so
                             # the wake IS the sole delivery. It must succeed
                             # BEFORE the cursor advances — advancing first
@@ -3617,7 +3661,7 @@ class GatewayKanbanWatchersMixin:
                         # before reaching here). A reopened ``done`` card is
                         # re-subscribed explicitly by its controller; leaving
                         # the row would keep waking the origin session.
-                        if _is_push_adapter and send_passive and _wake_kinds:
+                        if _is_push_adapter and send_passive and _alerts_entry is None and _wake_kinds:
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
                             # injection stays best-effort.
