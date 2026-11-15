@@ -211,8 +211,57 @@ def label_pending(health: Optional[dict]) -> bool:
     return all(v is True for v in verdicts)
 
 
-def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
-    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown)."""
+RED_LABELS_ENV = "PR_RED_LABELS"              # "0" = kill switch: the full failing list, as before
+RED_LABELS_STATE_ENV = "PR_RED_LABELS_STATE"  # path override (tests); same name hermes-home reads
+
+
+def red_labels_for(repo: str, number: int, head: Any) -> Optional[dict]:
+    """The hermes-home ``state/pr-red-labels.json`` entry (t_a4c54629) for ``repo#number`` at ``head``, or None:
+    kill switch, no head, unreadable file, no entry, another head, or an all-zero (green-again) entry."""
+    if os.environ.get(RED_LABELS_ENV, "1").strip() == "0" or not head:
+        return None
+    path = os.environ.get(RED_LABELS_STATE_ENV)
+    if not path:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None  # hermetic: no live state from pytest unless a test points at a file
+        from hermes_constants import get_default_hermes_root
+
+        path = str(get_default_hermes_root() / "state" / "pr-red-labels.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    want = f"{repo}#{number}".lower()
+    entry = next((v for k, v in data.items() if str(k).lower() == want), None)
+    if not isinstance(entry, dict) or str(entry.get("head") or "") != str(head):
+        return None
+    counts = entry.get("counts")
+    try:
+        if not isinstance(counts, dict) or not sum(int(v or 0) for v in counts.values()):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return entry
+
+
+def _labelled_red(labels: dict) -> str:
+    """``red (OWN): a, b; MAIN reds: m`` (+ ``; STALE-BASE s: rebase``); ``red: 0 own (MAIN reds: m)`` when OWN is 0."""
+    counts = labels.get("counts") or {}
+    own = [str(n) for n in labels.get("own") or [] if n]
+    n_own, n_main, n_stale = (int(counts.get(k) or 0) for k in ("OWN", "MAIN", "STALE-BASE"))
+    text = (f"red (OWN): {', '.join(own[:6]) or n_own}; MAIN reds: {n_main}" if n_own
+            else f"red: 0 own (MAIN reds: {n_main})")
+    if n_stale:
+        text += f"; STALE-BASE {n_stale}: rebase"
+    return text
+
+
+def pr_is_red_or_dirty(health: Optional[dict], labels: Optional[dict] = None) -> Optional[str]:
+    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown).
+    ``labels`` (:func:`red_labels_for` at this head) swaps the raw failing list for OWN names + the MAIN count."""
     if not health or str(health.get("state") or "").lower() != "open":
         return None
     parts = []
@@ -220,7 +269,9 @@ def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
     urls = list(health.get("failing_urls") or [])
     failing = [f"{n} <{u}>" if u else str(n)
                for n, u in zip(names, urls + [""] * (len(names) - len(urls))) if n]
-    if failing:
+    if failing and labels:
+        parts.append(_labelled_red(labels))
+    elif failing:
         parts.append("red: " + ", ".join(failing[:6]))
     if str(health.get("mergeable_state") or "").lower() == "dirty":
         parts.append("dirty (merge conflict)")
@@ -503,7 +554,7 @@ def handback_pr_verdict(kb: Any, conn: Any, task: dict, payload: Optional[dict],
         if memo[key] is None:
             raise PrHealthUnknown(f"{ref.repo}#{ref.number}")
         health = memo[key]
-        bad = pr_is_red_or_dirty(health)
+        bad = pr_is_red_or_dirty(health, red_labels_for(ref.repo, int(ref.number), health.get("head")))
         if bad:
             label = f"{ref.repo}#{ref.number}"
             states.append(f"{label} {bad}")

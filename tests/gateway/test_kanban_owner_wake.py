@@ -180,6 +180,62 @@ def test_e_red_or_dirty_handback_wakes_owner(env):
     assert "red: tests (3.11)" in text and "dirty" in text
 
 
+_HEAD = "a" * 40
+_RAW_REDS = ["suite gateway", "suite tui", "lint-x"]
+
+
+def _labels_file(tmp_path, monkeypatch, entry):
+    import json as _json
+    path = tmp_path / "pr-red-labels.json"
+    path.write_text(_json.dumps({"ANG-Ventures/hermes-agent#1710": entry}))
+    monkeypatch.setenv(ow.RED_LABELS_STATE_ENV, str(path))
+    return path
+
+
+def _labelled_wake(env, number=1710):
+    env["health"][("ANG-Ventures/hermes-agent", number)] = {
+        "state": "open", "mergeable_state": "clean", "head": _HEAD, "failing": list(_RAW_REDS)}
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, summary=f"PR ANG-Ventures/hermes-agent#{number} ready")
+    return _one_turn(env, _tick(env))
+
+
+_ENTRY = {"head": _HEAD, "line": "CI reds at aaaaaaaa: OWN 1 (suite gateway) · MAIN 2",
+          "counts": {"OWN": 1, "MAIN": 2, "STALE-BASE": 0, "FLAKE": 0}, "own": ["suite gateway"]}
+
+
+def test_red_handback_with_labels_at_head_lists_own_reds_and_main_count(env, tmp_path, monkeypatch):
+    """t_8dc6df3d: a labelled PR's wake names only the OWN reds and counts the MAIN ones."""
+    _labels_file(tmp_path, monkeypatch, _ENTRY)
+    text = _labelled_wake(env)
+    assert "red (OWN): suite gateway; MAIN reds: 2" in text
+    assert "suite tui" not in text and "lint-x" not in text
+
+
+@pytest.mark.parametrize("case", ["other_head", "missing_file", "kill_switch", "all_zero"])
+def test_red_handback_labels_fail_open_to_the_full_list(env, tmp_path, monkeypatch, case):
+    entry = dict(_ENTRY, head="b" * 40) if case == "other_head" else dict(
+        _ENTRY, counts={"OWN": 0, "MAIN": 0}) if case == "all_zero" else _ENTRY
+    path = _labels_file(tmp_path, monkeypatch, entry)
+    if case == "missing_file":
+        path.unlink()
+    if case == "kill_switch":
+        monkeypatch.setenv(ow.RED_LABELS_ENV, "0")
+    text = _labelled_wake(env)
+    assert "red: suite gateway, suite tui, lint-x" in text and "OWN" not in text
+
+
+def test_labelled_red_text_shapes():
+    health = {"state": "open", "failing": ["x"], "mergeable_state": "dirty"}
+    only_main = {"counts": {"OWN": 0, "MAIN": 3}, "own": []}
+    assert ow.pr_is_red_or_dirty(health, only_main) == "red: 0 own (MAIN reds: 3); dirty (merge conflict)"
+    stale = {"counts": {"OWN": 7, "MAIN": 0, "STALE-BASE": 2}, "own": [f"s{i}" for i in range(7)]}
+    assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["x"]}, stale) == (
+        "red (OWN): s0, s1, s2, s3, s4, s5; MAIN reds: 0; STALE-BASE 2: rebase")
+    assert ow.pr_is_red_or_dirty({"state": "open", "failing": []}, stale) is None  # green read wins
+
+
 def test_red_handback_on_review_hold_lane_does_not_wake(env):
     """t_54f4fde6: a red handback parked on kanban.review_hold_assignee is no decision yet: no owner wake."""
     _cfg(review_hold_assignee="review-hold")
