@@ -147,7 +147,8 @@ def test_automatic_wake_dispatch_to_executor(monkeypatch, tmp_path, scenario):
                 assert trace[2]["path"].endswith("/chat/completions")
                 assert [r["auth"] for r in trace] == ["ALR-KEY", "SECOND-KEY", "Bearer CPA-KEY"]
                 assert len(sent) == 1 and sentinel in sent[0]
-                assert not turns and not state.handbacks()
+                # t_aad55db4 (#372): a complete verdict on a live chat home also starts ONE home turn.
+                assert len(turns) == 1 and f"child completed {tid}" in turns[0], turns
                 with kb.connect_closing() as conn:
                     receipts = [e for e in kb.list_events(conn, tid) if e.kind == wake.RECEIPT_KIND]
                 assert len(receipts) == 1 and receipts[0].payload["action"] == "complete"
