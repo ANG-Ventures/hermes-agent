@@ -25,10 +25,11 @@ def backfill_origin_hosts(conn) -> int:
     Local legacy runs have no placement event and remain unknown. Remote
     events populate their run even when the card is terminal.
     """
+    from hermes_cli import kanban_placement_reasons as _pr
     latest = {}
     for row in conn.execute(
         "SELECT task_id, run_id, payload FROM task_events "
-        "WHERE kind='worker_placed' ORDER BY id"
+        f"WHERE kind IN ({_pr.kind_marks('worker_placed')}) ORDER BY id", _pr.kind_names("worker_placed")
     ):
         try:
             host = json.loads(row[2] or "{}").get("host")
@@ -177,9 +178,11 @@ def origin_route(conn, row, pool, *, config: dict, states: dict, caps=None,
         origin_hard_refusal(conn, row, pool, host, caps)
     now = int(time.time()) if now is None else now
     if reason is None and state == "unknown":
+        from hermes_cli import kanban_placement_reasons as _pr
         last = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' ORDER BY id DESC LIMIT 1",
-            (tid,),
+            f"SELECT payload FROM task_events WHERE task_id=? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+            "ORDER BY id DESC LIMIT 1",
+            (tid, *_pr.kind_names("placement_wait")),
         ).fetchone()
         prev = kb._json_or(last[0]) if last else {}
         prev = prev if isinstance(prev, dict) else {}

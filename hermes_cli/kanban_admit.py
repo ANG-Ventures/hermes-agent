@@ -296,8 +296,8 @@ def measure_remote(host, signal, workspaces_root: Optional[str] = None) -> Measu
 def _running_host(conn, task, canon: Callable[[str], str] = lambda w: w) -> str:
     """The host the card's current run is on, canonicalised like ``--host``."""
     row = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND run_id = ? "
-        "ORDER BY id DESC LIMIT 1", (task.id, kb._kwh.PLACED_EVENT, task.current_run_id)).fetchone()
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) AND run_id = ? "
+        "ORDER BY id DESC LIMIT 1", (task.id, "worker_placed", "worker_allocated", task.current_run_id)).fetchone()
     if row is not None:
         try:
             import json

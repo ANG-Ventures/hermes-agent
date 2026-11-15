@@ -1986,9 +1986,9 @@ def running_by_host(conn) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for row in conn.execute(
         "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
-        "WHERE t.status = 'running' AND e.kind = ? "
+        f"WHERE t.status = 'running' AND e.kind IN ({_reasons.kind_marks(PLACED_EVENT)}) "
         "AND e.run_id IS NOT NULL AND e.run_id = t.current_run_id",
-        (PLACED_EVENT,),
+        _reasons.kind_names(PLACED_EVENT),
     ).fetchall():
         try:
             name = json.loads(row[0] or "{}").get("host")

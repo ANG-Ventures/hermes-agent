@@ -291,15 +291,17 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
 
 def _last_payloads(conn, task_ids, kind: str) -> Dict[str, dict]:
     """``{task_id: latest payload}`` of ``kind`` for the given cards, one query."""
+    from hermes_cli import kanban_placement_reasons as _pr
     ids = [t for t in dict.fromkeys(task_ids) if t]
     out: Dict[str, dict] = {}
+    names, km = _pr.kind_names(kind), _pr.kind_marks(kind)
     for i in range(0, len(ids), 500):
         chunk = ids[i:i + 500]
         marks = ",".join("?" * len(chunk))
         for tid, payload in conn.execute(
-                f"SELECT task_id, payload FROM task_events e WHERE kind = ? AND task_id IN ({marks}) "
-                "AND id = (SELECT MAX(id) FROM task_events WHERE task_id = e.task_id AND kind = ?)",
-                [kind, *chunk, kind]):
+                f"SELECT task_id, payload FROM task_events e WHERE kind IN ({km}) AND task_id IN ({marks}) "
+                f"AND id = (SELECT MAX(id) FROM task_events WHERE task_id = e.task_id AND kind IN ({km}))",
+                [*names, *chunk, *names]):
             out[tid] = json.loads(payload or "{}")
     return out
 
@@ -358,8 +360,8 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
             for tid, aff in affinity.items():
                 reason = waits.get(tid)
                 last = conn.execute(
-                    "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
-                    "ORDER BY id DESC LIMIT 1", (tid, "placement_wait")).fetchone()
+                    f"SELECT id, payload FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+                    "ORDER BY id DESC LIMIT 1", (tid, *_pr.kind_names("placement_wait"))).fetchone()
                 last_payload = None if last is None else json.loads(last[1] or "{}")
                 if reason is None:
                     if tid in cleared and last_payload is not None and not last_payload.get("cleared"):

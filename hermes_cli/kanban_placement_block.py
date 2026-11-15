@@ -126,14 +126,14 @@ def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], bo
 def _latest_blocks(conn) -> list:
     return conn.execute(
         "SELECT t.id, t.body, t.status, t.assignee, t.workspace_kind, b.payload AS blk, b.run_id, b.created_at AS blocked_at, "
-        "(SELECT p.payload FROM task_events p WHERE p.run_id = b.run_id AND p.kind = ? "
+        "(SELECT p.payload FROM task_events p WHERE p.run_id = b.run_id AND p.kind IN (?, ?) "
         " ORDER BY p.id DESC LIMIT 1) AS placed, "
-        "EXISTS(SELECT 1 FROM task_events r WHERE r.task_id = t.id AND r.kind = ?) AS rerouted, "
+        "EXISTS(SELECT 1 FROM task_events r WHERE r.task_id = t.id AND r.kind IN (?, ?)) AS rerouted, "
         "EXISTS(SELECT 1 FROM task_events u WHERE u.task_id = t.id AND u.kind = ? AND u.id > b.id) AS noted "
         "FROM tasks t JOIN task_events b ON b.id = (SELECT MAX(e.id) FROM task_events e "
         " WHERE e.task_id = t.id AND e.kind IN ('blocked', 'block_loop_detected')) "
         "WHERE t.status IN ('blocked', 'triage') AND t.block_kind = 'capability'",
-        (_pr.WORKER_PLACED_EVENT, REROUTED_EVENT, UNROUTABLE_EVENT),
+        (*_pr.kind_names(_pr.WORKER_PLACED_EVENT), *_pr.kind_names(REROUTED_EVENT), UNROUTABLE_EVENT),
     ).fetchall()
 
 

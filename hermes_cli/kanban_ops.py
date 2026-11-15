@@ -148,8 +148,8 @@ def _recent_local_starts(since: float) -> list:
             with kbc.connect_closing(board=slug) as bconn:
                 out.extend(float(r[0]) for r in bconn.execute(
                     "SELECT r.started_at FROM task_runs r WHERE r.started_at >= ? AND NOT EXISTS ("
-                    "SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)",
-                    (int(since), _kwp.PLACED_EVENT)).fetchall())
+                    "SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind IN (?, ?))",
+                    (int(since), "worker_placed", "worker_allocated")).fetchall())
         except Exception:
             continue
     return out

@@ -1008,8 +1008,8 @@ def _open_none_wait(conn, tid: str) -> bool:
     """Whether the card's latest ``placement_wait`` (written by an EARLIER tick)
     is an open host=none hold."""
     from hermes_cli import kanban_placement_reasons as _pr
-    row = conn.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'placement_wait' "
-                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+    row = conn.execute(f"SELECT id, payload FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+                       "ORDER BY id DESC LIMIT 1", (tid, *_pr.kind_names("placement_wait"))).fetchone()
     if row is None:
         return False
     try:

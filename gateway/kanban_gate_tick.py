@@ -229,7 +229,7 @@ def _any_board(boards, connect, test) -> bool:
 
 _OUT_OF_TICK_SQL = (
     "SELECT r.id, r.started_at, r.claim_lock FROM task_runs r WHERE r.started_at >= ? "
-    "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)")
+    "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind IN (?, ?))")
 
 
 def out_of_tick_local_starts(boards, connect, since: float, own_claimer: str) -> list:
@@ -253,7 +253,7 @@ def out_of_tick_local_starts(boards, connect, since: float, own_claimer: str) ->
             seen.add(path)
             conn = connect(board=slug)
             for rid, started, lock in conn.execute(
-                    _OUT_OF_TICK_SQL, (int(since), kwp.PLACED_EVENT)).fetchall():
+                    _OUT_OF_TICK_SQL, (int(since), "worker_placed", "worker_allocated")).fetchall():
                 if lock != own_claimer:
                     out.append(((path, int(rid)), float(started)))
         except Exception:

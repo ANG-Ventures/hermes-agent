@@ -863,10 +863,10 @@ def _open_pause_labels(conn) -> list:
     end = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
     rows = conn.execute(
         "SELECT t.id, t.origin_host, e.payload FROM tasks t "
-        "JOIN task_events e ON e.id = (SELECT MAX(id) FROM task_events WHERE task_id = t.id AND kind = ?) "
+        "JOIN task_events e ON e.id = (SELECT MAX(id) FROM task_events WHERE task_id = t.id AND kind IN (?, ?)) "
         "WHERE t.status IN ('ready', 'review') AND NOT EXISTS (SELECT 1 FROM task_events x "
         "  WHERE x.task_id = t.id AND x.id > e.id AND x.kind IN (%s))" % ",".join("?" * len(end)),
-        (_pr.PLACEMENT_WAIT_EVENT, *end),
+        (*_pr.kind_names(_pr.PLACEMENT_WAIT_EVENT), *end),
     ).fetchall()
     out = []
     for tid, origin, raw in rows:

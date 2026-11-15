@@ -28,13 +28,15 @@ _MARKER = ".drained_pin_waits.json"
 def drained_pin_waits(conn, waits: Mapping[str, str], now: int) -> list[dict]:
     """``[{task_id, reason, since, waited}]`` for held cards whose current
     drained-pin wait episode is older than the threshold."""
+    from hermes_cli import kanban_placement_reasons as _pr
+
     hits = []
     for tid, reason in (waits or {}).items():
         if reason not in DRAINED_PIN_REASONS:
             continue
         row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'placement_wait' "
-            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+            f"SELECT payload FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+            "ORDER BY id DESC LIMIT 1", (tid, *_pr.kind_names("placement_wait"))).fetchone()
         try:
             last = json.loads(row[0] or "{}") if row else {}
         except (TypeError, ValueError):
@@ -56,8 +58,8 @@ def _episode_since(conn, task_id: str) -> Optional[int]:
     if status is None or status[0] != "ready":
         return None
     row = conn.execute(
-        "SELECT payload, id FROM task_events WHERE task_id = ? AND kind = 'placement_wait' "
-        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        f"SELECT payload, id FROM task_events WHERE task_id = ? AND kind IN ({_pr.kind_marks('placement_wait')}) "
+        "ORDER BY id DESC LIMIT 1", (task_id, *_pr.kind_names("placement_wait"))).fetchone()
     if row is None or conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN (%s) LIMIT 1"
             % ",".join("?" * len(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),

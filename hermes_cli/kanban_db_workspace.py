@@ -267,10 +267,10 @@ def bind_host(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     import json
     from hermes_cli import kanban_placement_reasons as _pr
     row = conn.execute(
-        "SELECT e.payload FROM task_events e WHERE e.task_id = ? AND e.kind = ? "
+        f"SELECT e.payload FROM task_events e WHERE e.task_id = ? AND e.kind IN ({_pr.kind_marks(_pr.WORKER_PLACED_EVENT)}) "
         "AND e.run_id = (SELECT MAX(id) FROM task_runs WHERE task_id = ?) "
         "ORDER BY e.id DESC LIMIT 1",
-        (task_id, _pr.WORKER_PLACED_EVENT, task_id),
+        (task_id, *_pr.kind_names(_pr.WORKER_PLACED_EVENT), task_id),
     ).fetchone()
     if row is None:
         return None

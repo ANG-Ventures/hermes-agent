@@ -148,7 +148,7 @@ def replay(dbs, studio_only, allow, since, now, pool_hosts=None):
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         pool_times = [r[0] for r in con.execute(
-            "SELECT created_at FROM task_events WHERE kind='worker_placed' AND created_at >= ? AND created_at < ? "
+            "SELECT created_at FROM task_events WHERE kind IN ('worker_placed', 'worker_allocated') AND created_at >= ? AND created_at < ? "
             "ORDER BY created_at", (since, now))]  # bounded like the Studio query (Prism 6c3aa1e6038d)
         cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
         nw = "no_worker" if "no_worker" in cols else "0"
@@ -157,7 +157,7 @@ def replay(dbs, studio_only, allow, since, now, pool_hosts=None):
         # (Prism c-f8d72eda4b367716). The assignee is the fallback only for a record with no run id.
         has_runs = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'").fetchone()
         run_profile = ({r[0]: r[1] for r in con.execute("SELECT id, profile FROM task_runs")} if has_runs else {})
-        for ev in con.execute("SELECT task_id, run_id, created_at, payload FROM task_events WHERE kind='placement' "
+        for ev in con.execute("SELECT task_id, run_id, created_at, payload FROM task_events WHERE kind IN ('placement', 'allocation') "
                               "AND created_at >= ? AND created_at < ? ORDER BY created_at", (since, now)):
             try:
                 p = json.loads(ev["payload"] or "{}")
