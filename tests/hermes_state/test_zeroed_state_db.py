@@ -336,3 +336,45 @@ def test_live_connection_0_byte_not_quarantined_in_process(tmp_path, monkeypatch
         conn.commit()
     finally:
         conn.close()
+
+
+def test_preflight_does_not_race_a_concurrent_quarantine(tmp_path, monkeypatch):
+    """Main CI 43663228054 (slice 11/16): test_concurrent_quarantine_no_clobber failed with
+    'state.db is not writable: file .../state.db is read-only for this user'. Opener A ran the
+    writability preflight OUTSIDE the quarantine lock; opener B quarantined (renamed) the zeroed
+    file between A's is_file() and os.access(), and the preflight reads a vanished main db as
+    read-only. Here B's quarantine is driven at exactly that point, from another thread through
+    the real cross-process lock. The preflight of a file that may be quarantined must run under
+    that lock, so B waits and A opens a fresh database."""
+    import os
+    import threading
+
+    import hermes_state as hs
+    import hermes_state_repair
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = tmp_path / "state.db"
+    db.write_bytes(bytes(4096))  # zeroed
+    real_access = os.access
+    concurrent: list = []
+
+    def access_while_b_quarantines(p, mode, *a, **kw):
+        if Path(p) == db and not concurrent:
+            t = threading.Thread(target=lambda: concurrent.append(hs.quarantine_invalid_state_db(db)))
+            concurrent.append(t)
+            t.start()
+            t.join(timeout=1.0)  # B gets the lock and renames, unless A holds it
+        return real_access(p, mode, *a, **kw)
+
+    monkeypatch.setattr(hermes_state_repair.os, "access", access_while_b_quarantines)
+    sdb = hs.SessionDB(db_path=db)
+    try:
+        assert sdb._conn.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        sdb.close()
+        if concurrent:
+            concurrent[0].join(timeout=10)
+    assert concurrent, "the preflight never probed state.db; the race was not driven"
+    backups = list(tmp_path.glob("state.db.zeroed-*.bak"))
+    assert len(backups) == 1, backups
+    assert backups[0].read_bytes() == bytes(4096)
