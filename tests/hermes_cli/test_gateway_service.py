@@ -2482,6 +2482,31 @@ class TestServiceWorkingDirIsStable:
         assert "/.worktrees/" not in m.group(1)
 
 
+@pytest.mark.parametrize("profile", ["", "apollo", "aegis", "clanker"])
+@pytest.mark.parametrize("override", [None, "/external/receipt & audit/placement-root.json"])
+def test_launchd_regeneration_keeps_placement_root_receipt(tmp_path, monkeypatch, profile, override):
+    user_home = tmp_path / "user"
+    home = user_home / ".hermes"
+    if profile:
+        home = home / "profiles" / profile
+    home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: user_home))
+    monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: profile)
+    if override is None:
+        monkeypatch.delenv("PLACEMENT_ROOT_RECEIPT", raising=False)
+    else:
+        monkeypatch.setenv("PLACEMENT_ROOT_RECEIPT", override)
+    expected = override or str(user_home / ".hermes-root-receipt" / "placement-root.json")
+    plist_path = tmp_path / "gateway.plist"
+    for _ in range(2):
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        parsed = plistlib.loads(plist_path.read_bytes())
+        assert parsed["EnvironmentVariables"]["PLACEMENT_ROOT_RECEIPT"] == expected
+        assert parsed["Label"] == (f"ai.hermes.gateway-{profile}" if profile else "ai.hermes.gateway")
+    assert not Path(expected).exists()  # generation must not provision a receipt
+
+
 class TestServiceTakeoverGovernance:
     """Supervised service definitions must never arm ``--replace`` takeover.
 
