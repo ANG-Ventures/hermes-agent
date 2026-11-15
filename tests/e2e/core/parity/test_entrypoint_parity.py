@@ -122,7 +122,8 @@ def _run_row(entrypoint: str, root: Path) -> Row:
             f"  surviving MCP-tree pids: {describe_pids(survivors)} (mcp pid log {pids})\n"
             f"  final text: {(result.final_text or '')[-300:]!r}\n"
             f"  host exit code: {result.extra.get('exit_code')}\n"
-            f"  host stderr tail: {stderr_tail[-1500:]}"
+            # A host that overstayed EOF dumped every thread's stack at the end of its log: keep all of it.
+            f"  host stderr tail: {stderr_tail[-1500 if result.graceful_exit else -20000:]}"
         )
     except Exception as exc:  # noqa: BLE001 - reported per row
         row.error = f"{type(exc).__name__}: {exc}"[:4000]
