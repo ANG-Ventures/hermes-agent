@@ -349,6 +349,30 @@ def _mark_released(conn, tid, run_id, doc):
         kb._append_event(conn, tid, RELEASED, doc, run_id=run_id)
 
 
+def _release_finished(client, conn, task_id, run_id, doc):
+    """Release a finished run's door lease with the run's use measured on its pool host as ``actual`` (t_dd7a1b7d:
+    a door run's lease is released HERE, never by ``_end_run``, so this is where #354's measurement has to ride).
+    A failed measurement still releases, unmeasured; an actual allocd refuses still ended the lease (a warning)."""
+    from hermes_cli import kanban_headroom as kh
+    rid, consumer = doc["reservation_id"], doc["consumer"]
+    actual = None
+    fp = kh.run_footprint_target(conn, task_id, run_id)
+    if fp is not None:
+        try:
+            actual = kh.measure_run_footprint(fp)
+        except Exception as exc:  # never blocks the release: the lease ends unmeasured
+            _log.info("kanban door: release of %s carries no actual (%s run %s): %s", rid, fp.get("host"), run_id, exc)
+    if actual is None:
+        return client.release(rid, consumer=consumer)
+    try:
+        return client.release(rid, consumer=consumer, actual=actual, actual_source=kh.FOOTPRINT_SOURCE)
+    except client.Refused as exc:
+        if not str(exc).startswith("actual refused after lease release"):
+            raise
+        _log.warning("kanban door: release of %s: actual not recorded: %s", rid, exc)
+        return True
+
+
 def maintain(conn, *, client=None):
     """Renew running authorizations and release finished runs, including old modes."""
     if client is None:
@@ -365,7 +389,7 @@ def maintain(conn, *, client=None):
             if row["status"] == "running" and row["current_run_id"] == row["run_id"]:
                 if not client.renew(doc["reservation_id"], consumer=doc["consumer"], ttl_s=RESERVE_TTL_S):
                     _log.warning("door lease expired: %s run %s", row["task_id"], row["run_id"])
-            elif client.release(doc["reservation_id"], consumer=doc["consumer"]):
+            elif _release_finished(client, conn, row["task_id"], row["run_id"], doc):
                 _mark_released(conn, row["task_id"], row["run_id"], doc)
         except (client.Refused, client.Unreachable):
             _log.exception("door lifecycle failed for %s; retry next tick", row["task_id"])
