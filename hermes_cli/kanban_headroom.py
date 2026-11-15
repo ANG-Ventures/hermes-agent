@@ -644,12 +644,20 @@ def admission_key(job_id: Optional[str]) -> Optional[str]:
     return None if job_id is None else f"{job_id}#{uuid.uuid4().hex[:12]}"
 
 
-def release_alloc(rid: str) -> bool:
-    """Release a reservation alloc_client booked (allocd, or its in-process fallback)."""
+def release_alloc(rid: str, actual: Optional[Mapping] = None) -> bool:
+    """Release a reservation alloc_client booked (allocd, or its in-process fallback). ``actual``: the run's
+    measured use (:func:`measure_run_footprint`), sent as ``actual_source`` :data:`FOOTPRINT_SOURCE`."""
     from hermes_cli.fleet_placement import alloc_client
     try:
-        return alloc_client.release(rid, consumer=CONSUMER)
+        if actual is None:
+            return alloc_client.release(rid, consumer=CONSUMER)
+        return alloc_client.release(rid, consumer=CONSUMER, actual=actual, actual_source=FOOTPRINT_SOURCE)
     except Exception as exc:  # Refused / an unreadable ledger: the TTL bounds the row
+        if (actual is not None and isinstance(exc, alloc_client.Refused)
+                and str(exc).startswith("actual refused after lease release")):
+            # allocd ended the lease and refused only the measurement (e.g. host-bound mismatch)
+            _log.warning("kanban pool: release of %s: actual not recorded: %s", rid, exc)
+            return True
         _log.warning("kanban pool: alloc_client release of %s failed (TTL bounds it): %s", rid, exc)
         return False
 
@@ -829,9 +837,113 @@ def reservation_for_run(conn, task_id: str, run_id: Optional[int]) -> Optional[s
     return run_reservation(conn, task_id, run_id)[0]
 
 
-def release_run_reservation(rid: str, via: Optional[str]) -> bool:
-    """End a run's reservation through whoever booked it."""
-    return release_alloc(rid) if via == VIA_ALLOC_CLIENT else release_reservation(rid)
+def release_run_reservation(rid: str, via: Optional[str], footprint: Optional[Mapping] = None) -> bool:
+    """End a run's reservation through whoever booked it. ``footprint`` (:func:`run_footprint_target`): an
+    allocd-booked run's release carries the use measured on its host as ``actual`` (t_26acfaa2)."""
+    if via != VIA_ALLOC_CLIENT:
+        return release_reservation(rid)
+    actual = None
+    if footprint is not None:
+        try:
+            actual = measure_run_footprint(footprint)
+        except Exception as exc:  # never blocks the release: the lease ends unmeasured
+            _log.info("kanban pool: release of %s carries no actual (%s run %s): %s",
+                      rid, footprint.get("host"), footprint.get("run_id"), exc)
+    return release_alloc(rid, actual=actual)
+
+
+# t_26acfaa2 (FWA footprints): a placed run's tools all ride ONE ssh ControlMaster per run
+# (kanban_worker_hosts.placement_env TERMINAL_SSH_CONTROL_SCOPE), so on the pool host every command the run made
+# ran inside that connection's logind session scope. At release one more command over the same master reads that
+# scope: memory.peak (peak RAM of the run's commands), cpu.stat usage_usec over the session's age (cpus = average
+# cores, plus cpu_s / wall_s), and nvidia-smi memory of the scope's live pids. No live master = no measurement.
+FOOTPRINT_SOURCE = "cgroup"
+FOOTPRINT_TIMEOUT_S = 8
+# g = MiB of GPU memory the scope's pids hold, or "-" (unmeasured) when nvidia-smi is absent or fails: its exit
+# status is read before awk, so a failed query is never summed into a false 0 (Prism 79ecb88fb021).
+_FOOTPRINT_GPU_SH = (
+    'g=-; if command -v nvidia-smi >/dev/null 2>&1 && '
+    'q=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null); then '
+    'g=$(printf "%s\\n" "$q" | awk -F", *" \'NR==FNR{a[$1];next} ($1 in a){s+=$2} END{print s+0}\' '
+    '"$d/cgroup.procs" -) || g=-; fi; ')
+_FOOTPRINT_SH = (
+    'c=$(sed -n "s/^0:://p" /proc/self/cgroup); d=/sys/fs/cgroup$c; '
+    'case "$c" in */session-*.scope) ;; *) echo "no session scope: $c"; exit 3;; esac; '
+    'p=$(cat "$d/memory.peak") && u=$(sed -n "s/^usage_usec //p" "$d/cpu.stat") && '
+    'e=$(ps -o etimes= -p "$(head -n1 "$d/cgroup.procs")") || exit 4; ' + _FOOTPRINT_GPU_SH +
+    'echo "fp $p $u $e ${g:--}"')
+
+
+def run_footprint_target(conn, task_id: str, run_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """``{host, target, port, run_id}`` from the run's ``worker_placed`` (the pool host it ran on and the ssh
+    target its tools used); None for a run that was not placed on a pool host."""
+    if run_id is None:
+        return None
+    try:
+        row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? "
+                           "ORDER BY id DESC LIMIT 1", (task_id, run_id, RESERVATION_EVENTS[0])).fetchone()
+        doc = json.loads(row[0] or "{}") if row else {}
+    except Exception:
+        return None
+    host, target = doc.get("host"), doc.get("target")
+    if not (isinstance(host, str) and host and isinstance(target, str) and "@" in target):
+        return None
+    port = doc.get("ssh_port", 22)
+    return {"host": host, "target": target, "port": port if isinstance(port, int) else 22, "run_id": int(run_id)}
+
+
+def measure_run_footprint(fp: Mapping, *, runner=None) -> Dict[str, Any]:
+    """The run's measured use on its pool host (``actual`` for alloc_client.release). Raises on any failure.
+
+    A placed run's commands ride a SendEnv sibling master, not only the plain one (Prism c6c346b2d8e2;
+    ``SSHEnvironment._control_socket_for``), and each master is its own session scope. Every live master of
+    the run is read and summed: ram_gb is the sum of the scopes' peaks (an upper bound of their joint peak),
+    cpu_s the sum, wall_s the oldest. A master that is gone took its scope with it and is skipped."""
+    import subprocess
+    from tools.environments.ssh import control_socket_path, control_sockets
+    run = runner or subprocess.run
+    user, _, ssh_host = str(fp["target"]).partition("@")
+    plain = control_socket_path(user, ssh_host, int(fp["port"]), f"run{int(fp['run_id'])}")
+    socks = [s for s in control_sockets(plain) if s.exists()]
+    if not socks:
+        raise RuntimeError(f"no live ssh master for run {fp['run_id']} ({plain.name})")
+    reads, errors = [], []
+    for sock in socks:
+        try:
+            reads.append(_read_master(run, sock, fp))
+        except RuntimeError as exc:
+            errors.append(f"{sock.name}: {exc}")
+    if not reads:
+        raise RuntimeError("; ".join(errors))
+    peak, usage_us, wall = sum(r[0] for r in reads), sum(r[1] for r in reads), max(r[2] for r in reads)
+    cpu_s = usage_us / 1e6
+    actual: Dict[str, Any] = {"host": fp["host"], "cpus": round(cpu_s / wall, 3), "ram_gb": round(peak / 2 ** 30, 3),
+                              "cpu_s": round(cpu_s, 3), "wall_s": float(wall)}
+    gpus = [r[3] for r in reads if r[3] is not None]
+    if gpus:
+        actual["gpu_mib"] = float(sum(gpus))
+    return actual
+
+
+def _read_master(run, sock: Path, fp: Mapping) -> Tuple[int, int, int, Optional[float]]:
+    """``(peak bytes, usage usec, session age s, gpu MiB or None)`` of one live master's session scope."""
+    import subprocess
+    base = ["ssh", "-S", str(sock), "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
+    if int(fp["port"]) != 22:
+        base += ["-p", str(int(fp["port"]))]
+    kw = dict(capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=FOOTPRINT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    # a dead master would make ssh connect afresh and measure a NEW session: only a master that answers is read
+    if run(base + ["-O", "check", fp["target"]], **kw).returncode != 0:
+        raise RuntimeError(f"ssh master for run {fp['run_id']} is not running")
+    proc = run(base + [fp["target"], _FOOTPRINT_SH], **kw)
+    out = (proc.stdout or "").strip().splitlines()
+    parts = out[-1].split() if out else []
+    if proc.returncode != 0 or len(parts) != 5 or parts[0] != "fp":
+        raise RuntimeError(f"footprint read rc={proc.returncode}: {(proc.stdout or proc.stderr or '').strip()[:160]}")
+    peak, usage_us, wall = int(parts[1]), int(parts[2]), int(parts[3])
+    if wall <= 0:
+        raise RuntimeError(f"session age {wall}s")
+    return peak, usage_us, wall, (None if parts[4] == "-" else float(parts[4]))
 
 
 def release_reservation(rid: str, root: Optional[Path] = None) -> bool:

@@ -41,6 +41,22 @@ def _placed_lease_env_names() -> tuple[str, ...]:
     return tuple(n for n in LEASE_ENV_NAMES if os.environ.get(n))
 
 
+def control_socket_path(user: str, host: str, port: int, control_scope: str = "", *, probe: str = "") -> Path:
+    """The plain ControlMaster socket for ``user@host:port`` (+ a kanban run's ``control_scope``). The kanban
+    release reads a finished run's footprint over this same master (t_26acfaa2), so both name it here."""
+    socket_key = f"{user}@{host}:{port}" + (f":{control_scope}" if control_scope else "")
+    if probe:
+        socket_key = f"{socket_key}:probe:{probe}"
+    return Path(tempfile.gettempdir()) / "hermes-ssh" / f"{hashlib.sha256(socket_key.encode()).hexdigest()[:16]}.sock"
+
+
+def control_sockets(plain: Path) -> list[Path]:
+    """``plain`` plus every SendEnv-set sibling master beside it (shared 8-char target prefix)."""
+    plain = Path(plain)
+    siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []
+    return [plain, *(s for s in siblings if s != plain)]
+
+
 def _ensure_ssh_available() -> None:
     """Fail fast with a clear error when the SSH client is unavailable."""
     for tool in ("ssh", "scp"):
@@ -82,11 +98,8 @@ class SSHEnvironment(BaseEnvironment):
         # per-instance socket so its cleanup() can never close the agent's shared master.
         # ``control_scope`` (a kanban run) gives concurrent processes to one target their own
         # master instead of racing to create the shared one.
-        socket_key = f"{user}@{host}:{port}" + (f":{control_scope}" if control_scope else "")
-        if probe_only:
-            socket_key = f"{socket_key}:probe:{self._session_id}"
-        _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
-        self.control_socket = self.control_dir / f"{_socket_id}.sock"
+        self.control_socket = control_socket_path(
+            user, host, port, control_scope, probe=self._session_id if probe_only else "")
         _ensure_ssh_available()
         self._establish_connection()
         if probe_only:
@@ -118,9 +131,7 @@ class SSHEnvironment(BaseEnvironment):
 
     def _control_sockets(self) -> list[Path]:
         """The plain socket plus every SendEnv-set sibling (shared 8-char target prefix)."""
-        plain = Path(self.control_socket)
-        siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []
-        return [plain, *(s for s in siblings if s != plain)]
+        return control_sockets(self.control_socket)
 
     def _target_flags(self, port_flag: str) -> list:
         """Port/key flags shared by ssh (``-p``) and scp (``-P``)."""

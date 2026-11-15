@@ -9393,7 +9393,9 @@ def _end_run(
     _rid, _via = _kh.run_reservation(conn, task_id, run_id)
     if _rid is not None:
         from hermes_cli.kanban_db_connect import on_commit
-        on_commit(conn, lambda: _kh.release_run_reservation(_rid, _via))
+        # t_26acfaa2: the release carries the run's use measured on its pool host (read after commit, never here)
+        _fp = _kh.run_footprint_target(conn, task_id, run_id) if _via == _kh.VIA_ALLOC_CLIENT else None
+        on_commit(conn, lambda: _kh.release_run_reservation(_rid, _via, _fp))
     return run_id
 
 
