@@ -36,6 +36,12 @@ def served(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+    # Under any systemd unit/scope (test-gate's `systemd-run --user --scope`, a systemd-hosted
+    # runner) INVOCATION_ID makes _default_spawn take the managed-dispatch path, which refuses
+    # this unclaimed task (no current run id). The test is about env/toolset parity, not topology.
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    # The fake Popen handle _default_spawn retains must not reach a later test's reaper.
+    monkeypatch.setattr(kb, "_worker_processes", {})
     set_multiplex_active(True)
     try:
         yield SimpleNamespace(root=root, alpha=alpha)
