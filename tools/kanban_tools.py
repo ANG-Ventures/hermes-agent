@@ -336,7 +336,7 @@ def _enforce_worker_task_ownership(tid: str) -> None:
     if tid != env_tid:
         raise _Reject(
             f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
-            f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
+            f"to hand off information to other tasks, or list it under `follow-ups:` in your handback.")
 
 
 def _worker_guard(tool_name: str, args: dict) -> str:
