@@ -78,6 +78,16 @@ class TestRender:
                                  run=lambda argv, **kw: subprocess.CompletedProcess(argv, rc, stdout, stderr))
         assert want in out and out.startswith("/overview:")
 
+    def test_stale_roadmap_rc3_returns_the_report(self, tmp_path):
+        _script(tmp_path, "")
+        text = "ROADMAP STALE 3d07h: rewrite plans/sessions/s-roadmap.md from live reads before relaying this overview\nx"
+        out = oc.render_overview("sid_1", root=tmp_path, python="py",
+                                 run=lambda argv, **kw: subprocess.CompletedProcess(argv, 3, text, ""))
+        assert out == text
+        assert oc.render_overview("sid_1", root=tmp_path, python="py",
+                                  run=lambda argv, **kw: subprocess.CompletedProcess(argv, 3, "", "")).startswith(
+            "/overview: session-overview.py failed (rc=3)")
+
     def test_timeout_and_missing_script_and_no_session(self, tmp_path):
         def slow(argv, **kw):
             raise subprocess.TimeoutExpired(argv, kw["timeout"])
