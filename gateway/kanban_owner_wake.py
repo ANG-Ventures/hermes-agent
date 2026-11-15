@@ -228,7 +228,7 @@ def red_labels_for(repo: str, number: int, head: Any) -> Optional[dict]:
 
         path = str(get_default_hermes_root() / "state" / "pr-red-labels.json")
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return None
