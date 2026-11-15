@@ -109,12 +109,12 @@ def main():
     extra = {}
     if args.arm == 'dispatch':
         extra['cases'] = [json.loads(line.split('DISPATCH_ARM ', 1)[1]) for line in
-                          (root / 'output.log').read_text(encoding='utf-8', errors='replace').splitlines()
+                          (root / 'output.log').read_text(encoding='utf-8-sig', errors='replace').splitlines()
                           if 'DISPATCH_ARM ' in line]
         extra['home_repo'] = str(home_repo)
     if args.arm == 'rollout':
         extra['cases'] = [json.loads(line.split('ROLLOUT_ARM ', 1)[1].strip()) for line in
-                          (root / 'output.log').read_text(encoding='utf-8', errors='replace').splitlines()
+                          (root / 'output.log').read_text(encoding='utf-8-sig', errors='replace').splitlines()
                           if 'ROLLOUT_ARM {' in line]
         extra['home_repo'] = str(home_repo)
     summary = dict(arm=args.arm, pid=child.pid, exit_code=rc, executed_verified=verified, **extra,

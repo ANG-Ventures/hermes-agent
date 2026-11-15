@@ -106,7 +106,12 @@ def fleet(tmp_path, monkeypatch):
     # the root generation file mid-tick, after a publish-pass latch fingerprinted it absent, so the start path reads
     # "config changed", clears the latch and pages a second time (t_e7bb19cf).
     from hermes_cli import fleet_placement
-    fleet_placement.admission_demand._receipt_path(root.absolute())
+    try:
+        demand = fleet_placement.admission_demand
+    except ImportError:  # POSIX-only module (fcntl/pwd): no placement root to provision on native Windows
+        pass
+    else:
+        demand._receipt_path(root.absolute())
     # The orphan sweep walks the HOST process table and realpath()s every init-parented process's cwd, which reads
     # the real hermes home; this file tests the door, not the sweep.
     monkeypatch.setattr(kb, "sweep_terminal_workspace_orphans", lambda conn, **kw: {})
