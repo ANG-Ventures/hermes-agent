@@ -566,3 +566,25 @@ def test_credential_check_is_off_while_the_door_is_spawn_only(fleet):
     _card()
     _tick([])
     assert _cred_pages(fleet) == []
+
+
+def test_an_asap_start_without_the_asap_operator_token_still_starts_and_never_latches(fleet, monkeypatch):
+    """t_793ef0f6 ask 2: the asap-operator read is reachable from a start (start -> sync_asap -> mark_asap_if_set ->
+    alloc_client.mark_asap), but its Refused is logged and swallowed: the card starts on its arrival, the door is not
+    latched, and the only page is the credential page."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    (fleet.root / alloc_client.TOKENS_REL / alloc_client.ASAP_OPERATOR).unlink()
+    allocd = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", allocd.url)
+    allocd.answer = ok_door()
+    tid, spawned = _card(), []
+    with kbc.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET asap=1 WHERE id=?", (tid,))
+        conn.commit()
+    _tick(spawned)
+    assert spawned == [tid]
+    assert faults.latched() is None and _latch_pages(fleet) == []
+    assert len(_cred_pages(fleet)) == 1 and "asap-operator" in _cred_pages(fleet)[0]
+    assert not any(b.get("op") == "mark_asap" for _, b in allocd.calls), "no operator capability, no mark_asap call"
