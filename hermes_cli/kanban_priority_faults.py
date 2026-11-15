@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -92,6 +93,68 @@ def _door_credentials():
     latch it caused. Absent files are listed too, so creating one changes the fingerprint."""
     d = _root() / TOKENS_REL
     return [*_kanban_tokens(), *(d / name for name in _OTHER_TOKENS)]
+
+
+#: what a missing credential costs, for the page (t_793ef0f6)
+_CREDENTIAL_EFFECT = {
+    "kanban": "the first reservation upgrade (authorize_start existing_consumer=kanban) latches the door",
+    "asap-operator": "ASAP marks are refused and ignored (mark_asap_if_set); starts are unaffected",
+}
+_TOKEN_SHAPE = re.compile(r"[A-Za-z0-9._~+/=-]{1,512}")   # alloc_client._TOKEN_SHAPE
+
+
+def _mint_command(name: str) -> str:
+    if name.startswith("kanban@"):
+        return (f"python3 scripts/allocd.py --mint-demand kanban {name.split('@', 1)[1]} "
+                "(on the Studio; copy the token + protected marker to that client)")
+    return f"python3 scripts/allocd.py --mint {name} (on the Studio, in the fleet root)"
+
+
+def _credential_problem(p: Path):
+    """None when ``p`` holds a usable token, else ``missing`` | ``empty`` | ``unreadable`` | ``malformed``. Reads the
+    file the way alloc_client._token does, but never records the protected marker and never returns the value."""
+    try:
+        tok = p.read_text(encoding="utf-8-sig").strip()
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, ValueError):
+        return "unreadable"
+    if not tok:
+        return "empty"
+    return None if _TOKEN_SHAPE.fullmatch(tok) else "malformed"
+
+
+def check_credentials() -> dict:
+    """Once per tick while the door is armed (fcfs/classes): every _door_credentials() file must exist and hold a
+    token BEFORE a start needs it (t_793ef0f6: an unminted var/alloc/tokens/kanban latched the board 15 min on
+    2026-11-14). Logs each problem every tick, pages ONCE per bad file naming the mint command, pages once when it is
+    fixed. Returns {path: problem} for the bad files."""
+    bad = {}
+    for p in _door_credentials():
+        problem = _credential_problem(p)
+        if problem:
+            bad[str(p)] = problem
+    if not bad and not (_root() / STATE_REL).exists():
+        return bad                        # steady state: no lock, no write
+    with _state() as doc:
+        paged = doc.get("credentials_paged")
+        paged = dict(paged) if isinstance(paged, dict) else {}
+        for path, problem in sorted(bad.items()):
+            name = Path(path).name
+            effect = _CREDENTIAL_EFFECT.get(name, "every door verb for that host is refused and latches the door")
+            _log.warning("kanban door: credential %s %s; %s; mint: %s", path, problem, effect, _mint_command(name))
+            if path not in paged:
+                _page(f"kanban door credential {problem}: {path}; {effect}. Mint: {_mint_command(name)}")
+                paged[path] = _now()
+        for path in sorted(set(paged) - set(bad)):
+            paged.pop(path)
+            _log.warning("kanban door: credential %s is back; page cleared", path)
+            _page(f"kanban door credential is back: {path}; page cleared")
+        if paged:
+            doc["credentials_paged"] = paged
+        else:
+            doc.pop("credentials_paged", None)
+    return bad
 
 
 def door_config_present() -> bool:

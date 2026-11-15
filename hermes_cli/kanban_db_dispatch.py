@@ -7299,6 +7299,10 @@ def _dispatch_once_locked(
             _kb._log.warning("kanban door: registry check failed (%s: %s)", type(exc).__name__, exc)
     route_first = _route_first_enabled() or _priority_door.enabled()
     if not dry_run and _priority_door.enabled():
+        try:
+            _door_faults.check_credentials()   # an unminted credential pages before a start needs it (t_793ef0f6)
+        except Exception as exc:
+            _kb._log.warning("kanban door: credential check failed (%s: %s)", type(exc).__name__, exc)
         # Taxonomy class 2 latch / class 3 backoff: claim nothing, call no door verb; runs already going are
         # untouched (the lifecycle sweep still renews/releases them).
         _door_hold = _door_faults.hold_reason()
