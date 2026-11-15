@@ -162,3 +162,31 @@ def test_home_sessions_own_transition_wakes_nobody(env):
     _tick(env)
     assert env["adapter"].handled == []
     assert env["adapter"].sent == []
+
+
+
+def test_subscriber_sessions_completion_still_wakes_the_alerts_home(env):
+    """Prism P2 07f3aaae5246: a completion the #apollo subscriber's own session made is no echo for
+    the #alerts home. Self-echo is judged against the home, so the home is woken once, nothing posts."""
+    from gateway import kanban_watchers as kw
+
+    apollo = env["apollo"].session_id
+    # The actor's recorded origin is the #apollo subscriber itself (chat, participant, profile).
+    env["monkeypatch"].setattr(kw, "_session_origin", lambda sid: {
+        "platform": "discord", "chat_id": APOLLO, "user_id": HUMAN, "profile": "default",
+    } if sid == apollo else None)
+    home = env["session"](ALERTS)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, boomerang_wake=False, title="alerts-born card", assignee="worker",
+                             session_id=home.session_id)
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=APOLLO, chat_type="group",
+                           user_id=HUMAN, delivery_mode="notify+wake")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "completed", {"summary": "closed from the #apollo session"})
+        conn.execute("UPDATE task_events SET actor_session_id = ? WHERE task_id = ?",
+                     (apollo, tid))
+    _tick(env)
+    adapter = env["adapter"]
+    assert _chats(adapter.handled) == [ALERTS], adapter.handled
+    assert adapter.handled[0].metadata["gateway_session_id"] == home.session_id
+    assert adapter.sent == []

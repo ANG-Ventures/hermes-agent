@@ -2720,6 +2720,10 @@ class GatewayKanbanWatchersMixin:
                                 ev.id for ev in d["events"]
                                 if ev.id in _alerts_ids and ev.actor_session_id in _own
                             }
+                            # Prism P2 07f3aaae5246: self-echo was judged against the subscriber;
+                            # the recipient is the home, so only the home's own events stay echoes.
+                            for _eid in (_alerts_ids & set(d.get("self_event_ids") or ())) - _alerts_own_ids:
+                                (d.get("suppressed") or {}).pop(_eid, None)
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
