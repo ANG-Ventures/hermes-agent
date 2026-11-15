@@ -1376,7 +1376,7 @@ class AdmitContext:
         return sum(gb for h, gb in self.scratch if h.lower() in names)
 
     def need(self, host: str) -> "admission.Estimate":
-        """The same call choose() makes inline (test_work_estimate's lint reads it there), its CPU never below the
+        """The shared estimate for admission and bands, its CPU never below the
         class's measured first-90-s CPU on ``host`` (t_19ad08c2: the CI allocator's per_runner floor 0.25 let 39 starts
         through on nas-fleet that used ~0.69 CPU each). A lease's CPU only counts while it is unsettled, so that is
         the number a start costs."""
@@ -2118,7 +2118,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
             continue
         seen.add(hid)
         hc = ctx.for_host(table, hid)
-        need = work_estimate.estimate(ctx.job_class, hid, ctx.history, seed=ctx.seed) if util else ctx.seed
+        need = hc.need(hid) if util else ctx.seed
         if util:
             rows.append(headroom(table.hosts[hid], folded.get(hid), fp, consumer=consumer,
                                  closed_when=table.closed_when, excluded=excl.get(hid), reserved=hc.reserved_on(hid),
