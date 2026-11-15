@@ -555,7 +555,7 @@ def _sidecar_race_settles(p: Path) -> bool:
     return not p.exists() or os.access(p, os.R_OK | os.W_OK)
 
 
-def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> None:
+def preflight_db_writability(db_path: Path, *, db_label: str = "state.db", dirs_only: bool = False) -> None:
     """Refuse-or-repair read-only DB files BEFORE the first connection opens.
 
     A stray read-only ``state.db`` / ``-wal`` / ``-shm`` (sudo run, restored backup, copied dotfiles) otherwise
@@ -564,6 +564,9 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
     tree (Hermes owns those files; ``chmod`` fails on files the user doesn't own, bounding the repair exactly);
     otherwise fail fast naming the file and command. Never deletes/truncates a WAL sidecar — once writable, the
     normal open checkpoints it. ``:memory:``/``file:`` skipped. Shared with ``kanban_db``.
+
+    ``dirs_only=True`` checks only the db's directory: callers that create a lock file next to the db
+    run it before taking the lock and the full check under it.
 
     Port of Kilo-Org/kilocode#12508's startup preflight. This preflight:
     """
@@ -574,7 +577,8 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
         home = Path(get_hermes_home()).resolve()
     # SQLite needs a writable directory in every journal mode (WAL/SHM sidecars, or the DELETE-mode journal).
     sidecars = (db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm"))
-    for p, is_dir in [(db_path.parent, True), *((p, False) for p in (db_path, *sidecars) if p.is_file())]:
+    files = () if dirs_only else (db_path, *sidecars)
+    for p, is_dir in [(db_path.parent, True), *((p, False) for p in files if p.is_file())]:
         if (is_dir and not p.is_dir()) or os.access(p, os.R_OK | os.W_OK):
             continue
         x = "x" if is_dir else ""
