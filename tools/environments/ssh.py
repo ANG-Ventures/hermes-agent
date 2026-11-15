@@ -50,6 +50,13 @@ def control_socket_path(user: str, host: str, port: int, control_scope: str = ""
     return Path(tempfile.gettempdir()) / "hermes-ssh" / f"{hashlib.sha256(socket_key.encode()).hexdigest()[:16]}.sock"
 
 
+def control_sockets(plain: Path) -> list[Path]:
+    """``plain`` plus every SendEnv-set sibling master beside it (shared 8-char target prefix)."""
+    plain = Path(plain)
+    siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []
+    return [plain, *(s for s in siblings if s != plain)]
+
+
 def _ensure_ssh_available() -> None:
     """Fail fast with a clear error when the SSH client is unavailable."""
     for tool in ("ssh", "scp"):
@@ -124,9 +131,7 @@ class SSHEnvironment(BaseEnvironment):
 
     def _control_sockets(self) -> list[Path]:
         """The plain socket plus every SendEnv-set sibling (shared 8-char target prefix)."""
-        plain = Path(self.control_socket)
-        siblings = sorted(plain.parent.glob(f"{plain.stem[:8]}*.sock")) if plain.parent.is_dir() else []
-        return [plain, *(s for s in siblings if s != plain)]
+        return control_sockets(self.control_socket)
 
     def _target_flags(self, port_flag: str) -> list:
         """Port/key flags shared by ssh (``-p``) and scp (``-P``)."""

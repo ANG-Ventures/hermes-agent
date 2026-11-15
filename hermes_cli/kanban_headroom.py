@@ -652,14 +652,12 @@ def release_alloc(rid: str, actual: Optional[Mapping] = None) -> bool:
         if actual is None:
             return alloc_client.release(rid, consumer=CONSUMER)
         return alloc_client.release(rid, consumer=CONSUMER, actual=actual, actual_source=FOOTPRINT_SOURCE)
-    except alloc_client.Refused as exc:
-        if actual is not None and str(exc).startswith("actual refused after lease release"):
+    except Exception as exc:  # Refused / an unreadable ledger: the TTL bounds the row
+        if (actual is not None and isinstance(exc, alloc_client.Refused)
+                and str(exc).startswith("actual refused after lease release")):
             # allocd ended the lease and refused only the measurement (e.g. host-bound mismatch)
             _log.warning("kanban pool: release of %s: actual not recorded: %s", rid, exc)
             return True
-        _log.warning("kanban pool: alloc_client release of %s failed (TTL bounds it): %s", rid, exc)
-        return False
-    except Exception as exc:  # Refused / an unreadable ledger: the TTL bounds the row
         _log.warning("kanban pool: alloc_client release of %s failed (TTL bounds it): %s", rid, exc)
         return False
 
@@ -861,14 +859,18 @@ def release_run_reservation(rid: str, via: Optional[str], footprint: Optional[Ma
 # cores, plus cpu_s / wall_s), and nvidia-smi memory of the scope's live pids. No live master = no measurement.
 FOOTPRINT_SOURCE = "cgroup"
 FOOTPRINT_TIMEOUT_S = 8
+# g = MiB of GPU memory the scope's pids hold, or "-" (unmeasured) when nvidia-smi is absent or fails: its exit
+# status is read before awk, so a failed query is never summed into a false 0 (Prism 79ecb88fb021).
+_FOOTPRINT_GPU_SH = (
+    'g=-; if command -v nvidia-smi >/dev/null 2>&1 && '
+    'q=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null); then '
+    'g=$(printf "%s\\n" "$q" | awk -F", *" \'NR==FNR{a[$1];next} ($1 in a){s+=$2} END{print s+0}\' '
+    '"$d/cgroup.procs" -) || g=-; fi; ')
 _FOOTPRINT_SH = (
     'c=$(sed -n "s/^0:://p" /proc/self/cgroup); d=/sys/fs/cgroup$c; '
     'case "$c" in */session-*.scope) ;; *) echo "no session scope: $c"; exit 3;; esac; '
     'p=$(cat "$d/memory.peak") && u=$(sed -n "s/^usage_usec //p" "$d/cpu.stat") && '
-    'e=$(ps -o etimes= -p "$(head -n1 "$d/cgroup.procs")") || exit 4; g=-; '
-    'if command -v nvidia-smi >/dev/null 2>&1; then '
-    'g=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | '
-    'awk -F", *" \'NR==FNR{a[$1];next} ($1 in a){s+=$2} END{print s+0}\' "$d/cgroup.procs" -) || g=-; fi; '
+    'e=$(ps -o etimes= -p "$(head -n1 "$d/cgroup.procs")") || exit 4; ' + _FOOTPRINT_GPU_SH +
     'echo "fp $p $u $e ${g:--}"')
 
 
@@ -891,14 +893,41 @@ def run_footprint_target(conn, task_id: str, run_id: Optional[int]) -> Optional[
 
 
 def measure_run_footprint(fp: Mapping, *, runner=None) -> Dict[str, Any]:
-    """The run's measured use on its pool host (``actual`` for alloc_client.release). Raises on any failure."""
+    """The run's measured use on its pool host (``actual`` for alloc_client.release). Raises on any failure.
+
+    A placed run's commands ride a SendEnv sibling master, not only the plain one (Prism c6c346b2d8e2;
+    ``SSHEnvironment._control_socket_for``), and each master is its own session scope. Every live master of
+    the run is read and summed: ram_gb is the sum of the scopes' peaks (an upper bound of their joint peak),
+    cpu_s the sum, wall_s the oldest. A master that is gone took its scope with it and is skipped."""
     import subprocess
-    from tools.environments.ssh import control_socket_path
+    from tools.environments.ssh import control_socket_path, control_sockets
     run = runner or subprocess.run
     user, _, ssh_host = str(fp["target"]).partition("@")
-    sock = control_socket_path(user, ssh_host, int(fp["port"]), f"run{int(fp['run_id'])}")
-    if not sock.exists():
-        raise RuntimeError(f"no live ssh master for run {fp['run_id']} ({sock.name})")
+    plain = control_socket_path(user, ssh_host, int(fp["port"]), f"run{int(fp['run_id'])}")
+    socks = [s for s in control_sockets(plain) if s.exists()]
+    if not socks:
+        raise RuntimeError(f"no live ssh master for run {fp['run_id']} ({plain.name})")
+    reads, errors = [], []
+    for sock in socks:
+        try:
+            reads.append(_read_master(run, sock, fp))
+        except RuntimeError as exc:
+            errors.append(f"{sock.name}: {exc}")
+    if not reads:
+        raise RuntimeError("; ".join(errors))
+    peak, usage_us, wall = sum(r[0] for r in reads), sum(r[1] for r in reads), max(r[2] for r in reads)
+    cpu_s = usage_us / 1e6
+    actual: Dict[str, Any] = {"host": fp["host"], "cpus": round(cpu_s / wall, 3), "ram_gb": round(peak / 2 ** 30, 3),
+                              "cpu_s": round(cpu_s, 3), "wall_s": float(wall)}
+    gpus = [r[3] for r in reads if r[3] is not None]
+    if gpus:
+        actual["gpu_mib"] = float(sum(gpus))
+    return actual
+
+
+def _read_master(run, sock: Path, fp: Mapping) -> Tuple[int, int, int, Optional[float]]:
+    """``(peak bytes, usage usec, session age s, gpu MiB or None)`` of one live master's session scope."""
+    import subprocess
     base = ["ssh", "-S", str(sock), "-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
     if int(fp["port"]) != 22:
         base += ["-p", str(int(fp["port"]))]
@@ -914,12 +943,7 @@ def measure_run_footprint(fp: Mapping, *, runner=None) -> Dict[str, Any]:
     peak, usage_us, wall = int(parts[1]), int(parts[2]), int(parts[3])
     if wall <= 0:
         raise RuntimeError(f"session age {wall}s")
-    cpu_s = usage_us / 1e6
-    actual: Dict[str, Any] = {"host": fp["host"], "cpus": round(cpu_s / wall, 3), "ram_gb": round(peak / 2 ** 30, 3),
-                              "cpu_s": round(cpu_s, 3), "wall_s": float(wall)}
-    if parts[4] != "-":
-        actual["gpu_mib"] = float(parts[4])
-    return actual
+    return peak, usage_us, wall, (None if parts[4] == "-" else float(parts[4]))
 
 
 def release_reservation(rid: str, root: Optional[Path] = None) -> bool:

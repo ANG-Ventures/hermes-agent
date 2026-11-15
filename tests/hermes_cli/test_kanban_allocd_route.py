@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import shutil
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -791,6 +792,66 @@ def test_measure_refuses_a_dead_master_or_unreadable_scope(sock, out, check_rc, 
         kh.measure_run_footprint(FP, runner=run)
     if check_rc:
         assert len(calls) == 1   # never a fresh connection that would measure a new session
+
+
+def _sibling(plain, tag="ab12cd34"):
+    s = plain.with_name(f"{plain.stem[:8]}{tag}.sock")   # SSHEnvironment._control_socket_for's SendEnv master
+    s.touch()
+    return s
+
+
+def _per_socket_ssh(outs):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        out = outs[argv[2]]
+        if "-O" in argv:
+            return SimpleNamespace(returncode=255 if out is None else 0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=out, stderr="")
+    return run, calls
+
+
+def test_measure_sums_the_execution_master_with_the_plain_one(sock):
+    sib = _sibling(sock)
+    run, calls = _per_socket_ssh({str(sock): "fp 1073741824 1000000 100 -\n",
+                                  str(sib): "fp 2147483648 199000000 400 256\n"})
+    got = kh.measure_run_footprint(FP, runner=run)
+    assert got == {"host": "ace-media", "cpus": 0.5, "ram_gb": 3.0, "cpu_s": 200.0, "wall_s": 400.0, "gpu_mib": 256.0}
+    assert {c[2] for c in calls} == {str(sock), str(sib)}
+
+
+def test_measure_reads_the_execution_master_when_the_plain_one_is_gone(sock):
+    sock.unlink()
+    sib = _sibling(sock)
+    run, _ = _per_socket_ssh({str(sib): "fp 1073741824 2000000 10 -\n"})
+    assert kh.measure_run_footprint(FP, runner=run)["ram_gb"] == 1.0
+
+
+def test_measure_skips_a_dead_sibling_master(sock):
+    sib = _sibling(sock)
+    run, calls = _per_socket_ssh({str(sock): "fp 1073741824 1000000 10 -\n", str(sib): None})
+    assert kh.measure_run_footprint(FP, runner=run)["ram_gb"] == 1.0
+    assert len([c for c in calls if c[2] == str(sib)]) == 1   # its -O check only: never a fresh connection
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash fragment")
+@pytest.mark.parametrize("smi,want", [("exit 9", "-"), ("echo '41, 300'; echo '99, 7'", "300"), (None, "-")])
+def test_gpu_fragment_never_reports_a_failed_query_as_zero(tmp_path, smi, want):
+    import subprocess
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    if smi is not None:
+        (bindir / "nvidia-smi").write_text(f"#!/bin/sh\n{smi}\n")
+        (bindir / "nvidia-smi").chmod(0o755)
+    (tmp_path / "cgroup.procs").write_text("41\n")
+    for tool in ("awk", "printf"):
+        real = shutil.which(tool)
+        if real:
+            (bindir / tool).symlink_to(real)
+    out = subprocess.run(["/bin/bash", "-c", f'd={tmp_path}; ' + kh._FOOTPRINT_GPU_SH + 'echo "$g"'],
+                         env={"PATH": str(bindir)}, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert out.stdout.strip() == want, out.stderr
 
 
 def test_measure_with_no_socket_never_runs_ssh(tmp_path, monkeypatch):
