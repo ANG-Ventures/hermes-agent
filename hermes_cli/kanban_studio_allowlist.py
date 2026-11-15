@@ -22,7 +22,8 @@ the card is ``no_worker``.
 
 Override (``hermes kanban studio-override <card> --capability <cap> --why <reason> [--once | --until <ISO>]``):
 operator token only, ``--capability`` required. One ``studio_override`` board event is written. ``--once`` (the
-default) is used up by the card's next ``spawned`` event. ``--until`` holds until that time. The override covers a held
+default) is used up by the card's next run that starts ON the Studio; a run on a pool host leaves it unspent and
+its ``worker_placed`` event says so (``studio_override_unspent``, t_a94fafef). ``--until`` holds until that time. The override covers a held
 capability only when it names one of its parts. Every override also writes one line to the capability-gap ledger
 ``<root>/state/studio-capability-gap/overrides.jsonl`` (t_b3884ae0's state dir).
 
@@ -116,11 +117,19 @@ def operator_only(row, assignee: Optional[str] = None) -> bool:
 
 def live_override(conn, task_id: str, capability: Optional[str], *, now: Optional[float] = None) -> Optional[dict]:
     """The newest ``studio_override`` on the card that still holds and names a part of ``capability``, else None.
-    ``once``: no ``spawned`` event after it. ``until``: ``now`` before it."""
+    ``once``: no Studio start after it (:func:`_spent_on_studio`). ``until``: ``now`` before it."""
     want = set(parts(capability))
     want |= {head(p) for p in want}
     if not want:
         return None
+    for p in _live_overrides(conn, task_id, now):
+        if str(p.get("capability") or "").strip().lower() in want:
+            return p
+    return None
+
+
+def _live_overrides(conn, task_id: str, now: Optional[float]):
+    """Every ``studio_override`` on the card that still holds, newest first."""
     now = time.time() if now is None else now
     for ev_id, raw in conn.execute(
             "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC",
@@ -129,18 +138,54 @@ def live_override(conn, task_id: str, capability: Optional[str], *, now: Optiona
             p = json.loads(raw or "{}")
         except (TypeError, ValueError):
             continue
-        if not isinstance(p, dict) or str(p.get("capability") or "").strip().lower() not in want:
+        if not isinstance(p, dict):
             continue
         until = p.get("until")
         if isinstance(until, (int, float)):
             if now < until:
-                return p
+                yield p
             continue
-        used = conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'spawned' AND id > ? LIMIT 1",
-                            (task_id, ev_id)).fetchone()
-        if used is None:
-            return p
-    return None
+        if not _spent_on_studio(conn, task_id, ev_id):
+            yield p
+
+
+def _spent_on_studio(conn, task_id: str, after_id: int) -> bool:
+    """True when a ``spawned`` event after ``after_id`` started ON the Studio (t_a94fafef): its run has no
+    ``worker_placed`` naming a pool host ("no worker_placed" means ran here). A spawn with no run id counts as a
+    Studio start, the old reading. A run on a pool host leaves a ``--once`` override unspent."""
+    from hermes_cli import kanban_host_capabilities as _khc
+    from hermes_cli import kanban_placement_reasons as _pr
+    studio = {_khc.STUDIO_HOST, "local", "studio"}
+    for (run_id,) in conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'spawned' AND id > ? ORDER BY id",
+            (task_id, after_id)):
+        if run_id is None:
+            return True
+        hosts = []
+        for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ?",
+                                   (task_id, run_id, _pr.WORKER_PLACED_EVENT)):
+            try:
+                h = (json.loads(raw or "{}") or {}).get("host")
+            except (TypeError, ValueError, AttributeError):
+                h = None
+            hosts.append(str(h or "").strip().lower())
+        if not any(h and h not in studio for h in hosts):
+            return True
+    return False
+
+
+def unspent_override_note(conn, task_id: str, *, now: Optional[float] = None) -> Optional[str]:
+    """For a run placed OFF the Studio: the newest override still waiting for a Studio start, as
+    ``studio-override <cap> unspent (once|until <epoch>)``, else None (t_a94fafef)."""
+    try:
+        p = next(_live_overrides(conn, task_id, now), None)
+    except Exception:
+        return None
+    if p is None:
+        return None
+    until = p.get("until")
+    kind = f"until {int(until)}" if isinstance(until, (int, float)) else "once"
+    return f"studio-override {p.get('capability')} unspent ({kind})"
 
 
 def override_command(task_id: str, reason: str) -> Optional[str]:

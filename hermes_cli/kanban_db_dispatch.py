@@ -9023,6 +9023,9 @@ def _dispatch_once_locked(
                         "band_spilling" if band == "spilling" else "overflow"))
                 probe = spillover.probe(placed_host.name)
                 from hermes_cli import kanban_headroom as _kh_res
+                from hermes_cli import kanban_studio_allowlist as _ksa_note
+                # t_a94fafef: a --once Studio override this pool run does NOT use up; the line says it still waits.
+                _ovr_note = _ksa_note.unspent_override_note(conn, claimed.id)
                 # _rid was written by take() under the ledger lock BEFORE launch.
                 _kb._append_event(
                     conn, claimed.id, _kb._kwh.PLACED_EVENT,
@@ -9034,14 +9037,16 @@ def _dispatch_once_locked(
                      **({_kh_res.RESERVATION_KEY: _rid} if _rid else {}),
                      **({_kh_res.RESERVATION_VIA_KEY: _kh_res.VIA_ALLOC_CLIENT}
                         if _rid and spillover.reservation_via(_rid) else {}),
-                     **({"rule": _decision.rule} if _rid and _decision is not None else {})},
+                     **({"rule": _decision.rule} if _rid and _decision is not None else {}),
+                     **({"studio_override_unspent": _ovr_note} if _ovr_note else {})},
                     run_id=claimed.current_run_id,
                 )
                 _kb._log.info(
                     "kanban dispatch: placed %s (%s) on worker host %s pid=%s "
-                    "band=%s spill_reason=%s reason=%s probe=%s; local gate: %s",
+                    "band=%s spill_reason=%s reason=%s probe=%s; local gate: %s%s",
                     claimed.id, claimed.assignee, placed_host.name, pid,
                     band, spill_reason, reason, probe, spawn_paused,
+                    f"; {_ovr_note}, still waiting for a Studio run" if _ovr_note else "",
                 )
 
             if admission_event is not None:
