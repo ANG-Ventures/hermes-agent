@@ -162,6 +162,62 @@ def test_once_override_releases_one_run_then_asks_again(operator):
     assert row["why"] == "reads the live board db" and row["fix_card"] is None and row["once"] is True
 
 
+def _spawn_run(conn, tid, host=None):
+    """One run's start events: ``worker_placed`` naming ``host`` (None = a Studio start, no event), then ``spawned``."""
+    run_id = conn.execute("SELECT COALESCE(MAX(run_id), 0) + 1 FROM task_events").fetchone()[0]
+    with kb.write_txn(conn):
+        if host is not None:
+            kb._append_event(conn, tid, "worker_placed", {"host": host, "pid": 1}, run_id=run_id)
+        kb._append_event(conn, tid, "spawned", {"pid": 1}, run_id=run_id)
+
+
+def test_once_override_survives_a_pool_host_run(operator):
+    """t_a94fafef: a run on ace-media never started on the Studio, so it does not use up a --once override."""
+    _cfg(operator, True, [])
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        ksa.override(conn, tid, "studio-state", "reads the live board db", actor="apollo")
+        _spawn_run(conn, tid, host="ace-media")
+        assert ksa.live_override(conn, tid, "studio-state") is not None
+        assert _route(conn, tid)[0] == "local"
+        assert ksa.unspent_override_note(conn, tid) == "studio-override studio-state unspent (once)"
+
+
+def test_once_override_spent_by_a_studio_run_and_refuses_the_second(operator):
+    _cfg(operator, True, [])
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        ksa.override(conn, tid, "studio-state", "reads the live board db", actor="apollo")
+        _spawn_run(conn, tid, host="ace-media")
+        assert _route(conn, tid)[0] == "local"
+        _spawn_run(conn, tid)                      # first Studio start: uses it up
+        assert ksa.live_override(conn, tid, "studio-state") is None
+        assert _route(conn, tid)[0] == "wait"      # a second Studio start is refused
+        assert ksa.unspent_override_note(conn, tid) is None
+
+
+def test_worker_placed_with_studio_host_name_spends_it(operator):
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        ksa.override(conn, tid, "studio-state", "reads the live board db", actor="apollo")
+        _spawn_run(conn, tid, host="mac-studio")
+        assert ksa.live_override(conn, tid, "studio-state") is None
+
+
+def test_pool_placement_names_the_unspent_override(operator, monkeypatch):
+    """t_a94fafef part 2: a card placed off the Studio while its override waits says so on worker_placed."""
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=None)               # portable: the pool takes it
+        ksa.override(conn, tid, "studio-state", "reads the live board db", actor="apollo")
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        assert spawned == [(tid, "ace-ai")], spawned
+        (raw,) = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_placed'",
+                              (tid,)).fetchone()
+        assert json.loads(raw)["studio_override_unspent"] == "studio-override studio-state unspent (once)"
+        assert ksa.live_override(conn, tid, "studio-state") is not None
+
+
 def test_until_override_holds_across_spawns_until_its_time(operator):
     _cfg(operator, True, [])
     with kb.connect_closing() as conn:
