@@ -20,7 +20,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import tempfile
 import time
@@ -100,7 +99,6 @@ _CREDENTIAL_EFFECT = {
     "kanban": "the first reservation upgrade (authorize_start existing_consumer=kanban) latches the door",
     "asap-operator": "ASAP marks are refused and ignored (mark_asap_if_set); starts are unaffected",
 }
-_TOKEN_SHAPE = re.compile(r"[A-Za-z0-9._~+/=-]{1,512}")   # alloc_client._TOKEN_SHAPE
 
 
 def _mint_command(name: str) -> str:
@@ -121,7 +119,23 @@ def _credential_problem(p: Path):
         return "unreadable"
     if not tok:
         return "empty"
-    return None if _TOKEN_SHAPE.fullmatch(tok) else "malformed"
+    # alloc_client has only stdlib imports at module top (admission_demand loads lazily), so this is safe on Windows
+    from hermes_cli.fleet_placement import alloc_client
+    return None if alloc_client._TOKEN_SHAPE.fullmatch(tok) else "malformed"
+
+
+def _expected_pair_tokens():
+    """kanban@<host> for every host the door can authorize a kanban start on: the table's hosts that pass the
+    operator policy for consumer kanban (canonical_host resolves them; policy_refusal is the eligibility rule). An
+    unreadable table yields none here: that is a class-2 config fault the start path already latches on."""
+    from hermes_cli.fleet_placement import placement
+    try:
+        table = placement.load_hosts()
+    except Exception:
+        return []
+    d = _root() / TOKENS_REL
+    return [d / f"kanban@{hid}" for hid, spec in sorted(table.hosts.items())
+            if placement.policy_refusal(spec, "kanban", None) is None]
 
 
 def check_credentials() -> dict:
@@ -130,7 +144,7 @@ def check_credentials() -> dict:
     2026-11-14). Logs each problem every tick, pages ONCE per bad file naming the mint command, pages once when it is
     fixed. Returns {path: problem} for the bad files."""
     bad = {}
-    for p in _door_credentials():
+    for p in sorted(set(_door_credentials()) | set(_expected_pair_tokens())):
         problem = _credential_problem(p)
         if problem:
             bad[str(p)] = problem
@@ -143,13 +157,19 @@ def check_credentials() -> dict:
             name = Path(path).name
             effect = _CREDENTIAL_EFFECT.get(name, "every door verb for that host is refused and latches the door")
             _log.warning("kanban door: credential %s %s; %s; mint: %s", path, problem, effect, _mint_command(name))
-            if path not in paged:
-                _page(f"kanban door credential {problem}: {path}; {effect}. Mint: {_mint_command(name)}")
+            # recorded only once the page went out: a failed notifier retries next tick (Prism a492fc587bb2)
+            if path not in paged and _page(f"kanban door credential {problem}: {path}; {effect}. "
+                                           f"Mint: {_mint_command(name)}"):
                 paged[path] = _now()
         for path in sorted(set(paged) - set(bad)):
-            paged.pop(path)
-            _log.warning("kanban door: credential %s is back; page cleared", path)
-            _page(f"kanban door credential is back: {path}; page cleared")
+            if not Path(path).exists():
+                # an extra pair file of a host the door does not use, removed: nothing is back, nothing to page
+                paged.pop(path)
+                _log.warning("kanban door: credential %s removed (host not in the door's table); page dropped", path)
+                continue
+            _log.warning("kanban door: credential %s is back", path)
+            if _page(f"kanban door credential is back: {path}; page cleared"):
+                paged.pop(path)
         if paged:
             doc["credentials_paged"] = paged
         else:

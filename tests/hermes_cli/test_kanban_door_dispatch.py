@@ -588,3 +588,56 @@ def test_an_asap_start_without_the_asap_operator_token_still_starts_and_never_la
     assert faults.latched() is None and _latch_pages(fleet) == []
     assert len(_cred_pages(fleet)) == 1 and "asap-operator" in _cred_pages(fleet)[0]
     assert not any(b.get("op") == "mark_asap" for _, b in allocd.calls), "no operator capability, no mark_asap call"
+
+
+def test_credential_check_reports_an_absent_pair_token_for_a_configured_host(fleet, monkeypatch):
+    """Prism 9de108709849: a host the door can start on whose kanban@<host> was never minted (or was deleted) is
+    reported, though no file exists to list; deleting a pair file that was paged empty keeps it paged (still bad),
+    so no "is back" page goes out."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    p = fleet.root / alloc_client.TOKENS_REL / "kanban@mac-studio"
+    p.unlink()
+    assert faults.check_credentials() == {str(p): "missing"}
+    pages = _cred_pages(fleet)
+    assert len(pages) == 1 and f"credential missing: {p}" in pages[0] and "--mint-demand kanban mac-studio" in pages[0]
+    fleet.token()
+    assert faults.check_credentials() == {}
+    fleet.pages.clear()
+    p.write_text("\n", encoding="utf-8")              # paged empty ...
+    assert faults.check_credentials() == {str(p): "empty"}
+    p.unlink()                                        # ... then deleted
+    assert faults.check_credentials() == {str(p): "missing"}
+    assert len(_cred_pages(fleet)) == 1 and not any("is back" in x for x in _cred_pages(fleet))
+
+
+def test_credential_check_retries_a_page_the_notifier_failed_to_send(fleet, monkeypatch):
+    """Prism a492fc587bb2: a failed page is not recorded as sent, so the next tick pages; a failed "is back" page
+    keeps the path paged until one goes out."""
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    p = fleet.root / alloc_client.TOKENS_REL / "kanban"
+    p.unlink()
+    sent, fail = [], [True]
+    monkeypatch.setattr(faults, "_page", lambda text: (not fail[0]) and (sent.append(text) or True))
+    faults.check_credentials()
+    assert sent == []
+    fail[0] = False
+    faults.check_credentials()
+    faults.check_credentials()
+    assert len(sent) == 1 and f"credential missing: {p}" in sent[0]
+    fleet.token()
+    fail[0] = True
+    faults.check_credentials()
+    assert len(sent) == 1
+    fail[0] = False
+    faults.check_credentials()
+    faults.check_credentials()
+    assert len(sent) == 2 and "is back" in sent[1]
+
+
+def test_credential_check_uses_the_alloc_client_token_shape():
+    """Prism simplify note: no copy of alloc_client._TOKEN_SHAPE in the fault module."""
+    assert "_TOKEN_SHAPE = " not in Path("hermes_cli/kanban_priority_faults.py").read_text(encoding="utf-8")
