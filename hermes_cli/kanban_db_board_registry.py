@@ -263,3 +263,26 @@ def locate(task_id: str) -> tuple[str, str]:
     slug = board_of_task(task_id)
     with _kb.enumerating_boards():
         return slug, str(_kb._board_db_path_ignoring_pin(slug))
+
+
+def worker_scope_refusal(own_task: str, target: str) -> str:
+    """The refusal a dispatcher-spawned worker gets for mutating a card that is not its own.
+
+    One text for the tool and CLI paths. It names the card's board when it is somewhere else
+    and the next step, because the bare "refusing to mutate" left a worker dispatched to close
+    cards (often on other boards) with no route (pc-bee29201). A worker closes only its own
+    card; closing another is the orchestrator's, so the card goes to the operator lane.
+    """
+    try:
+        where = board_of_task(target)
+    except Exception:
+        where = None
+    on = f" (on board {where})" if where else ""
+    verb = f"hermes kanban --board {where} complete {target}" if where else f"hermes kanban complete {target}"
+    return (
+        f"worker is scoped to task {own_task}; refusing to mutate {target}{on}. A worker closes "
+        f"only its own card. To get {target} closed, block your card for the operator: "
+        f"kanban_block(kind='needs_input', reason='operator: close {target}{on}: <evidence>'); "
+        f"the orchestrator runs `{verb}`. To pass information instead, kanban_comment {target}, "
+        "or list it under `follow-ups:` in your handback."
+    )
