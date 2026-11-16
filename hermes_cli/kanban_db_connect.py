@@ -1020,14 +1020,32 @@ def _initialization_signature():
 _INITIALIZATION_SIGNATURE = _initialization_signature()
 
 
+@functools.lru_cache(maxsize=1)
+def _schema_sql_columns() -> dict[str, frozenset[str]]:
+    """Columns SCHEMA_SQL declares per table, read from a throwaway in-memory build."""
+    mem = sqlite3.connect(":memory:")
+    try:
+        mem.executescript(_kb.SCHEMA_SQL)
+        tables = [r[0] for r in mem.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND substr(name, 1, 7) != 'sqlite_'")]
+        return {t: frozenset(r[1] for r in mem.execute(f"PRAGMA table_info({t})")) for t in tables}
+    finally:
+        mem.close()
+
+
 def _initialization_is_current(conn):
-    # Both checks are reads: fresh writer processes need no write transaction on
+    # All checks are reads: fresh writer processes need no write transaction on
     # an already-migrated board. SQLite invalidates the receipt on any schema DDL.
     if not _table_exists(conn, "kanban_initialization"):
         return False
     row = conn.execute("SELECT signature, schema_version FROM kanban_initialization WHERE id=1").fetchone()
-    return bool(row and row[0] == _INITIALIZATION_SIGNATURE
-                and row[1] == conn.execute("PRAGMA main.schema_version").fetchone()[0])
+    if not (row and row[0] == _INITIALIZATION_SIGNATURE
+            and row[1] == conn.execute("PRAGMA main.schema_version").fetchone()[0]):
+        return False
+    # A receipt is not proof of the schema: a board already stamped current while missing a
+    # declared column (artifact_pointer, t_7a79b915) re-initializes instead of staying broken.
+    return all(cols <= {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+               for table, cols in _schema_sql_columns().items())
 
 
 def _record_initialization(conn):
