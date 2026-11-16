@@ -16,7 +16,7 @@ by a profile in the range):
   ran at least once on a non-Studio host;
 * per card: send-back rounds (``changes_requested``), block rounds (``blocked`` other than a card created
   blocked), request-to-PR minutes (card created to the first event or run that names a GitHub PR), and with
-  ``--github`` open-to-merge minutes;
+  ``--github`` open-to-merge minutes over a fixed hashed sample of ``--github-limit`` PRs (default 200);
 * bundle bytes per card (attachments named ``evidence-*``).
 
 Every metric is reported twice: cohort ``off`` (no ``evidence-manifest.json`` attachment) and ``on``.
@@ -111,7 +111,8 @@ def _iso(s):
     return _dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
 
 
-def evaluate(conn: sqlite3.Connection, since: int, until: int, *, github: bool = False) -> dict:
+def evaluate(conn: sqlite3.Connection, since: int, until: int, *, github: bool = False,
+             github_limit: int = 200) -> dict:
     conn.row_factory = sqlite3.Row
     runs = conn.execute(
         "SELECT task_id, host FROM task_runs WHERE profile IS NOT NULL AND profile != '' "
@@ -154,7 +155,8 @@ def evaluate(conn: sqlite3.Connection, since: int, until: int, *, github: bool =
 
     gh_cache: dict = {}
     per = {}
-    for c in cards:
+    import hashlib  # a fixed pseudo-random order, so a --github-limit sample is not just the oldest cards
+    for c in sorted(cards, key=lambda t: hashlib.sha256(t.encode()).hexdigest()):
         ev = sorted(events[c], key=lambda e: e[2] or 0)
         cases = []
         for idx, (kind, payload, ts) in enumerate(ev):
@@ -174,7 +176,7 @@ def evaluate(conn: sqlite3.Connection, since: int, until: int, *, github: bool =
                       if e[0] in ("_run", "review_requested", "completed", "pr_acceptance", "commented"))
         req_to_pr = None if pr is None else max(0.0, (pr[0] - meta[c]["created_at"]) / 60.0)
         open_to_merge = None
-        if github and pr is not None:
+        if github and pr is not None and (f"{pr[1]}#{pr[2]}" in gh_cache or len(gh_cache) < github_limit):
             got = _gh_pr(pr[1], pr[2], gh_cache)
             if got and got[0] and got[1]:
                 open_to_merge = (_iso(got[1]) - _iso(got[0])) / 60.0
@@ -235,13 +237,15 @@ def main(argv=None) -> int:
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--since")
     ap.add_argument("--until")
-    ap.add_argument("--github", action="store_true", help="REST-read each first PR for open-to-merge")
+    ap.add_argument("--github", action="store_true", help="REST-read first PRs for open-to-merge")
+    ap.add_argument("--github-limit", type=int, default=200,
+                    help="at most this many PR reads (a fixed hashed sample of the cards; REST budget)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     until = _day(a.until) if a.until else int(time.time())
     since = _day(a.since) if a.since else until - a.days * 86400
     conn = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True, timeout=60)
-    out = evaluate(conn, since, until, github=a.github)
+    out = evaluate(conn, since, until, github=a.github, github_limit=a.github_limit)
     if a.json:
         print(json.dumps(out, indent=1, sort_keys=True))
         return 0
