@@ -217,7 +217,9 @@ RED_LABELS_STATE_ENV = "PR_RED_LABELS_STATE"  # path override (tests); same name
 
 def red_labels_for(repo: str, number: int, head: Any) -> Optional[dict]:
     """The hermes-home ``state/pr-red-labels.json`` entry (t_a4c54629) for ``repo#number`` at ``head``, or None:
-    kill switch, no head, unreadable file, no entry, another head, or an all-zero (green-again) entry."""
+    kill switch, no head, unreadable file, no entry, another head, or unreadable counts. An all-zero entry
+    (no CI red at this head) is returned too: :func:`pr_is_red_or_dirty` reads a failing Prism next to it as
+    the round cap or a Prism refusal, never as a red (t_265197b1)."""
     if os.environ.get(RED_LABELS_ENV, "1").strip() == "0" or not head:
         return None
     path = os.environ.get(RED_LABELS_STATE_ENV)
@@ -240,11 +242,29 @@ def red_labels_for(repo: str, number: int, head: Any) -> Optional[dict]:
         return None
     counts = entry.get("counts")
     try:
-        if not isinstance(counts, dict) or not sum(int(v or 0) for v in counts.values()):
+        if not isinstance(counts, dict):
             return None
+        sum(int(v or 0) for v in counts.values())
     except (TypeError, ValueError):
         return None
     return entry
+
+
+def _all_zero(labels: Optional[dict]) -> bool:
+    return bool(labels) and not sum(int(v or 0) for v in (labels.get("counts") or {}).values())
+
+
+# The Prism review check (app ang-prism). It is not CI: hermes-home's red labeller never counts it.
+_PRISM_CHECK_RE = re.compile(r"^(?:.+ / )?prism$", re.IGNORECASE)
+# The check-run title Prism writes when its round cap is spent at this head (home#12163 @ 94859564).
+_PRISM_CAP_RE = re.compile(r"no further review|round cap", re.IGNORECASE)
+
+
+def _prism_text(title: Any) -> str:
+    """t_265197b1: a failing Prism check at a head the labeller graded all-zero is not a red of the PR."""
+    if _PRISM_CAP_RE.search(str(title or "")):
+        return "Prism: no further review at this head (operator finalizes)"
+    return "Prism check failed"
 
 
 def _labelled_red(labels: dict) -> str:
@@ -261,18 +281,29 @@ def _labelled_red(labels: dict) -> str:
 
 def pr_is_red_or_dirty(health: Optional[dict], labels: Optional[dict] = None) -> Optional[str]:
     """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown).
-    ``labels`` (:func:`red_labels_for` at this head) swaps the raw failing list for OWN names + the MAIN count."""
+    ``labels`` (:func:`red_labels_for` at this head) swaps the raw failing list for OWN names + the MAIN count.
+    An all-zero ``labels`` names a failing Prism check as Prism's (cap / refusal), never ``red: prism``; any
+    other failing check the labeller did not count stays in the raw list."""
     if not health or str(health.get("state") or "").lower() != "open":
         return None
     parts = []
     names = [] if label_pending(health) else list(health.get("failing") or [])
-    urls = list(health.get("failing_urls") or [])
-    failing = [f"{n} <{u}>" if u else str(n)
-               for n, u in zip(names, urls + [""] * (len(names) - len(urls))) if n]
+    pad = len(names)
+    urls = list(health.get("failing_urls") or []) + [""] * pad
+    titles = list(health.get("failing_titles") or []) + [None] * pad
+    prism = []
+    if _all_zero(labels):
+        prism = [f"{_prism_text(t)} <{u}>" if u else _prism_text(t)
+                 for n, u, t in zip(names, urls, titles) if n and _PRISM_CHECK_RE.match(str(n))]
+        keep = [i for i, n in enumerate(names) if not (n and _PRISM_CHECK_RE.match(str(n)))]
+        names, urls = [names[i] for i in keep], [urls[i] for i in keep] + [""] * pad
+        labels = None
+    failing = [f"{n} <{u}>" if u else str(n) for n, u in zip(names, urls) if n]
     if failing and labels:
         parts.append(_labelled_red(labels))
     elif failing:
         parts.append("red: " + ", ".join(failing[:6]))
+    parts.extend(prism)
     if str(health.get("mergeable_state") or "").lower() == "dirty":
         parts.append("dirty (merge conflict)")
     return "; ".join(parts) or None
@@ -492,6 +523,8 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         out["failing"] = [str(r.get("name") or "?") for r in red]
         # the run each verdict came from, so the wake is verifiable in one click (t_121bd42e)
         out["failing_urls"] = [str(r.get("html_url") or "") for r in red]
+        # Prism's own verdict line (round cap vs refusal), read by pr_is_red_or_dirty (t_265197b1)
+        out["failing_titles"] = [str((r.get("output") or {}).get("title") or "") for r in red]
         if red and REVIEW_LABEL not in [x.strip().lower() for x in out["labels"]] and any(_LABEL_GATE_RE.match(n) for n in out["failing"]) \
                 and all(_LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in out["failing"]):
             # only when label_pending could hold: verify EVERY failing run's own annotations (unreadable -> False)
