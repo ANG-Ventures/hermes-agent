@@ -20,7 +20,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from cron.fork_ext import alerts_audience_gate, logs_digest_gate
+from cron.fork_ext import alerts_audience_gate, logs_audience_gate, logs_digest_gate
 
 
 # Log-record parity with the origin module.
@@ -2121,6 +2121,16 @@ def _deliver_result(
             f"{_host_down_prefix} {_unprefixed_delivery_content}"
             if _host_down_prefix else _unprefixed_delivery_content
         )
+        # #logs carries only human lines (t_2b76e2d8): an agent-audience delivery
+        # is one agent-log row (a failed run also an inbox item), as notify.py's are.
+        if logs_audience_gate.maybe_agent_log(
+            job, platform=target["platform"], chat_id=target["chat_id"],
+            thread_id=target.get("thread_id"), success=success,
+            has_media=bool(requested_media), demoted=bool(_host_down_prefix),
+            text=mirror_text,  # redacted + unwrapped
+            get_home=lambda: _sched.get_hermes_home(),
+        ):
+            continue
         # #logs is a digest, not a stream (t_42a9c32b): a green no_agent run
         # bound for #logs joins notify.py's digest spool while it is armed.
         if logs_digest_gate.maybe_spool(
