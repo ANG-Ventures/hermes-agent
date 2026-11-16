@@ -5971,7 +5971,7 @@ def _route_row_base(conn, row, plan, default_assignee: Optional[str] = None,
     skills = tuple(s for s in skills if isinstance(s, str))
     manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
-    # Studio last resort (t_e604c0f9 on top of t_c2fce87e's host_preference switch: fleet/placement-policy.json
+    # Studio last resort (t_e604c0f9 on top of t_c2fce87e's host_preference switch: fleet/allocation-policy.json
     # host_preference.consumers.kanban "on" + mac-studio in last_resort; off/absent = the old rules): a bare
     # `host: studio` with no requires: reason the Studio serves is dropped, and local_files is continuity only.
     _fleet_dir = _kb.kanban_home() / "fleet"
@@ -6250,10 +6250,10 @@ _last_resort_cache: dict = {}
 
 
 def _studio_last_resort(fleet_dir) -> bool:
-    """``placement_policy.load(fleet).is_last_resort(mac-studio)`` (t_c2fce87e's ONE switch), re-read only when the
+    """``allocation_policy.load(fleet).is_last_resort(mac-studio)`` (t_c2fce87e's ONE switch), re-read only when the
     policy file's stat changes or the env override does: ``_route_row`` asks once per ready row per tick."""
     from hermes_cli import kanban_worker_pool as _kwp
-    from hermes_cli import placement_policy as _ppol
+    from hermes_cli import allocation_policy as _ppol
     path = Path(fleet_dir) / _ppol.POLICY_FILE
     try:
         st = path.stat()

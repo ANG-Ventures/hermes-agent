@@ -52,7 +52,7 @@ from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Opt
 
 from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
-from hermes_cli import placement_policy as _policy
+from hermes_cli import allocation_policy as _policy
 
 logger = logging.getLogger(__name__)
 
@@ -446,7 +446,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             continue
         if not policy.targets(hid):
             # Placement PRD I-1: the runtime assertion, not only the lint.
-            warnings.append(f"kanban pool: {hid} is targets:false in placement-policy.json "
+            warnings.append(f"kanban pool: {hid} is targets:false in allocation-policy.json "
                             "(never a placement target; host dropped)")
             continue
         if hid not in with_role:
@@ -1102,7 +1102,7 @@ def mint_studio_pin_note(body: Optional[str], fleet_dir: Path,
     same predicate as dispatch: the host_preference switch (t_c2fce87e), the capability map's Studio row, the
     card's ``requires:`` words."""
     try:
-        from hermes_cli import placement_policy as _ppol
+        from hermes_cli import allocation_policy as _ppol
         if not _ppol.load(fleet_dir).is_last_resort(STUDIO_HOST):
             return None
         pin, _ignored = resolve_pin(body, known_host_ids(fleet_dir), pin_aliases(fleet_dir))
@@ -1910,7 +1910,7 @@ def _kanban_unified_admit(signal: Any = None) -> bool:
 class TargetSignal:
     """What ``plan()`` needs to read target pressure (read_signal = true)."""
 
-    policy: Any                       # placement_policy.PlacementPolicy
+    policy: Any                       # allocation_policy.PlacementPolicy
     ledger_dir: Path                  # <root>/var/placement
     cpu_est: Optional[float] = None   # kanban's measured slope; None = policy prior
     clock: Callable[[], float] = time.time

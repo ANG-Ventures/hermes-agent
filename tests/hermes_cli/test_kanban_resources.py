@@ -191,9 +191,25 @@ def test_sweep_refuses_a_planted_row_without_running_it(kanban_home):
 
 def test_fleet_hosts_fails_closed(tmp_path):
     assert kres.fleet_hosts(tmp_path) == frozenset()
-    (tmp_path / "placement-policy.json").write_text("{not json")
+    (tmp_path / "allocation-policy.json").write_text("{not json")
     (tmp_path / "kanban-pool.json").write_text(json.dumps({"hosts": {"ci-box": {}, "-v": {}, "a@b": {}}}))
     assert kres.fleet_hosts(tmp_path) == {"ci-box"}
+
+
+def test_fleet_hosts_reads_the_legacy_policy_name_counted(tmp_path):
+    """t_fc257547: a fleet dir holding only the pre-rename placement-policy.json still contributes its hosts,
+    and the read is counted in <kanban home>/var/ci-box/deprecated-name-reads.log."""
+    from hermes_cli import kanban_db as kb
+
+    home = kb.kanban_home()
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "placement-policy.json").write_text(json.dumps({"hosts": {"ace-media": {}}}))
+    assert kres.fleet_hosts(fleet) == {"ace-media"}
+    log = (home / "var" / "ci-box" / "deprecated-name-reads.log").read_text()
+    assert f"file:{fleet / 'placement-policy.json'}" in log
+    (fleet / "allocation-policy.json").write_text(json.dumps({"hosts": {"ace-ai": {}}}))
+    assert kres.fleet_hosts(fleet) == {"ace-ai"}          # the new name wins; the old one is not read
 
 
 def test_keep_alive_needs_a_reason():

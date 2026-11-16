@@ -2451,7 +2451,7 @@ DEFAULT_CONFIG = {
                       # studio_capability_only (t_9965b8d5; read per tick from the ROOT config): the Studio runs a
                       # card only for a named Studio-only capability; files / a worktree are carried or ported,
                       # else the card waits (studio_capability_only:<rule>); a pool refusal waits, never a
-                      # Studio last resort. Active only while placement-policy makes the Studio last resort
+                      # Studio last resort. Active only while allocation-policy makes the Studio last resort
                       # and the capability map reads. false = the behaviour before t_9965b8d5 (kill switch).
                       "studio_capability_only": True,
                       # prose_pins_advisory (t_c82eded0; read per tick from the ROOT config): a Studio need read

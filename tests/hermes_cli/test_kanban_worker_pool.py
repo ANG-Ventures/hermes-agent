@@ -325,7 +325,7 @@ def _studio_registered(fleet: Path, policy_hosts=None):
                       for h in ("mac-studio", "ace-ai", "ace-media")}}
     _write_pool(fleet, roles=roles, sidecar=side)
     if policy_hosts is not None:
-        (fleet / "placement-policy.json").write_text(
+        (fleet / "allocation-policy.json").write_text(
             json.dumps({"schema": 1, "hosts": policy_hosts}), encoding="utf-8")
 
 
@@ -476,7 +476,7 @@ def test_plan_unreachable_reason_names_probe_error(monkeypatch, tmp_path):
     def probe(host):
         return kwp.probe_host(host, runner=lambda a, **k: _Proc(255, ""), memory=mem)
 
-    from hermes_cli import placement_policy as pp
+    from hermes_cli import allocation_policy as pp
     signal = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=tmp_path, clock=lambda: 1.0)
     p = kwp.plan([h], {}, probe=probe, signal=signal)
     why = p.detail["ace-ai"]["pressure"]

@@ -10,7 +10,7 @@ local_files 173, host_studio 86 of 483 Studio spawns):
   ``kanban create`` rewrites ``.worktrees/<x>`` targets and prints the rewrite.
 
 Kill switch: the ONE shared setting (t_c2fce87e) ``host_preference.consumers.kanban`` in
-fleet/placement-policy.json; off / absent = every old pin, exactly as before.
+fleet/allocation-policy.json; off / absent = every old pin, exactly as before.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def _carry_caps_on(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _studio_last_resort_on(kanban_home, monkeypatch):
-    """The live setting (hermes-home fleet/placement-policy.json since #10047): kanban on, mac-studio last."""
+    """The live setting (hermes-home fleet/allocation-policy.json since #10047): kanban on, mac-studio last."""
     # kwp._studio_words() adds the live gethostname() short form: run on ACE-AI, ``host: ace-ai`` named
     # this machine and resolved to the Studio pin (off-box sweep red, t_c2a562c9). Pin a name no fixture holds.
     import socket

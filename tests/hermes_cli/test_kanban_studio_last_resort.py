@@ -11,7 +11,7 @@ Ace 2026-11-08 17:05: fleet work goes to every other machine first. The real
    ports to a pool host when that tree is clean and its branch is on origin,
    and stays local when it is dirty, off its branch (ahead of origin or with no
    origin ref: only under the hand list; derived mode pushes then ports it,
-   t_1d2c5939), or the shared setting is off (``host_preference`` in fleet/placement-policy.json: no key, kanban
+   t_1d2c5939), or the shared setting is off (``host_preference`` in fleet/allocation-policy.json: no key, kanban
    switch off, or env FLEET_LAST_RESORT_HOSTS empty).
 """
 
@@ -38,7 +38,7 @@ def _write_policy(fleet: Path, host_preference=HOST_PREF) -> None:
     doc = {"schema": 1, "hosts": {"mac-studio": {"class": "studio-source", "targets": False}}}
     if host_preference is not None:
         doc["host_preference"] = host_preference
-    (fleet / "placement-policy.json").write_text(json.dumps(doc), encoding="utf-8")
+    (fleet / "allocation-policy.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
 @pytest.fixture(autouse=True)
@@ -246,7 +246,7 @@ def test_shared_setting_off_keeps_the_studio_worktree_local(studio_tree, home, m
     (None, "mac-studio", False),
 ])
 def test_vendored_reader_follows_the_shared_key(tmp_path, monkeypatch, hp, env, want):
-    from hermes_cli import placement_policy as ppol
+    from hermes_cli import allocation_policy as ppol
     if env is None:
         monkeypatch.delenv("FLEET_LAST_RESORT_HOSTS", raising=False)
     else:
