@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli import placement_ledger as pledger
-from hermes_cli import placement_policy as ppolicy
+from hermes_cli import allocation_policy as ppolicy
 
 
 def _read_signal(kanban_cfg: Mapping) -> bool:

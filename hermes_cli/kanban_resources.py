@@ -27,6 +27,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from hermes_cli import allocation_policy as _ap
+
 _log = logging.getLogger(__name__)
 
 # kind -> argv builder for the stop verb (run on the resource's host). ``stop`` never deletes:
@@ -54,7 +56,7 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
 # A host is a bare fleet name (no user@, no path, no option), and must also be in the fleet registry.
 _HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,62}$")
 # Fleet files (under <kanban home>/fleet) whose host names the sweep may ssh to.
-_REGISTRY_FILES = ("kanban-reach-matrix.json", "placement-policy.json", "kanban-pool.json")
+_REGISTRY_FILES = ("kanban-reach-matrix.json", "allocation-policy.json", "kanban-pool.json")
 _KEEP_ALIVE_RE = re.compile(r"(?im)^\s*keep-alive:\s*(\S.*)$")
 _LOCAL_HOSTS = {"local", "localhost"}
 # Compact JSON so the sweep's LIKE prefilter can match the state literally.
@@ -89,7 +91,7 @@ def _is_local(host: str) -> bool:
 
 def fleet_hosts(fleet_dir: Optional[Path] = None) -> frozenset[str]:
     """Host names the sweep may stop a resource on: the ssh aliases and worker hosts of
-    ``kanban-reach-matrix.json`` plus the ``hosts`` of ``placement-policy.json`` and
+    ``kanban-reach-matrix.json`` plus the ``hosts`` of ``allocation-policy.json`` and
     ``kanban-pool.json``. Fail closed: an absent or unreadable file contributes nothing, so with no
     registry only this box (``local``) is reachable."""
     if fleet_dir is None:
@@ -98,8 +100,11 @@ def fleet_hosts(fleet_dir: Optional[Path] = None) -> frozenset[str]:
         fleet_dir = kb.kanban_home() / "fleet"
     names: set[str] = set()
     for fname in _REGISTRY_FILES:
+        path = Path(fleet_dir) / fname
+        if fname == _ap.POLICY_FILE:
+            path = _ap.policy_path(fleet_dir)   # the pre-rename name when only it exists, counted
         try:
-            doc = json.loads((Path(fleet_dir) / fname).read_text(encoding="utf-8-sig"))
+            doc = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             continue
         if not isinstance(doc, dict):

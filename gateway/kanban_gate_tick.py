@@ -20,7 +20,7 @@ from typing import Callable, Dict, Optional, Tuple
 from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli import placement_ledger as pledger
-from hermes_cli import placement_policy as ppolicy
+from hermes_cli import allocation_policy as ppolicy
 
 logger = logging.getLogger("gateway.kanban_watchers")
 

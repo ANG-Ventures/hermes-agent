@@ -503,7 +503,7 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
     at all), since the clone could not start from them (Prism 044612a3554e).
 
     ``allow_studio_tree`` (the Studio is a ``host_preference`` last-resort host
-    for kanban in ``fleet/placement-policy.json``, t_c2fce87e): the
+    for kanban in ``fleet/allocation-policy.json``, t_c2fce87e): the
     card's OWN ``<repo>/.worktrees/<id>`` (persisted path or found under the
     anchor) no longer pins it to the Studio when that tree is on the card's
     branch, clean, and the branch is fully on origin (the check below). Any
@@ -1242,7 +1242,7 @@ def mint_rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], f
     if workspace_kind != "worktree" or not workspace_path:
         return workspace_path, None
     try:
-        from hermes_cli import placement_policy as _ppol
+        from hermes_cli import allocation_policy as _ppol
         from hermes_cli.kanban_worker_pool import STUDIO_HOST
         if not _ppol.load(Path(fleet_dir)).is_last_resort(STUDIO_HOST):
             return workspace_path, None
