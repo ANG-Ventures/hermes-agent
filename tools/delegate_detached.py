@@ -28,6 +28,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from tools import macos_spawn
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1  # spec.json / heartbeat.json / result.json protocol between gateway and child
@@ -627,7 +629,8 @@ def spawn_mode() -> str:
 class DetachedSpawn:
     """A spawned detached child (gateway side)."""
 
-    def __init__(self, job_dir: Path, pid: int, create_time: Optional[float], popen: Optional[subprocess.Popen]):
+    def __init__(self, job_dir: Path, pid: int, create_time: Optional[float],
+                 popen: Optional[Any]):  # subprocess.Popen or macos_spawn.SpawnedProcess
         self.job_dir, self.pid, self.create_time, self.popen = job_dir, pid, create_time, popen
 
     def block(self, attempt_id: str) -> Dict[str, Any]:
@@ -672,13 +675,26 @@ def spawn_child(*, record: Dict[str, Any], attempt_id: str, profile_home: Path,
     env = pin_hermes_tree_on_pythonpath(env, _RUNTIME_ROOT)
     env[WORKER_BOOT_MARKER] = "1"
     workspace = (record.get("execution") or {}).get("workspace_hint")
+    cwd = workspace if workspace and os.path.isdir(workspace) else None
     log_f = open(job_dir / "child.log", "ab")
     try:
-        popen = subprocess.Popen(  # noqa: S603 -- fixed argv
-            dispatch.argv, cwd=workspace if workspace and os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT, env=env,
-            start_new_session=True,
-        )
+        popen = None
+        if macos_spawn.available():
+            # macOS charges a Popen child to the gateway (its responsible process); once the gateway
+            # restarts, Local Network Privacy refuses the orphan's LAN connections (errno 65,
+            # t_f8b497c9). Disclaimed, the child answers for itself, as the launchd-run gateway does.
+            try:
+                popen = macos_spawn.spawn_disclaimed(dispatch.argv, env=env, cwd=cwd, stdout_fd=log_f.fileno())
+            except OSError:
+                logger.warning("async_delegation_detached_disclaim_spawn_failed attempt_id=%s; "
+                               "falling back to Popen (LAN reach ends with this gateway)",
+                               attempt_id, exc_info=True)
+        if popen is None:
+            popen = subprocess.Popen(  # noqa: S603 -- fixed argv
+                dispatch.argv, cwd=cwd,
+                stdin=subprocess.DEVNULL, stdout=log_f, stderr=subprocess.STDOUT, env=env,
+                start_new_session=True,
+            )
     finally:
         log_f.close()
     spawned = DetachedSpawn(job_dir, popen.pid, process_create_time(popen.pid), popen)
@@ -768,6 +784,7 @@ def _isolate_process_checkpoint(job_dir: Path) -> None:
 
 def _child_main(job_dir: Path) -> int:
     _write_json(job_dir / "child.json", {"pid": os.getpid(), "create_time": process_create_time(os.getpid())})
+    boot_responsible = macos_spawn.responsible_pid(os.getpid())  # unreadable once that process exits
     _isolate_process_checkpoint(job_dir)
     heartbeat = _Heartbeat(job_dir)
     heartbeat.start()
@@ -838,8 +855,21 @@ def _child_main(job_dir: Path) -> int:
         heartbeat.stop()
     if not isinstance(result, dict):
         result = {"status": "error", "summary": None, "error": "runner returned a non-object result"}
+    _annotate_lan_privacy(result, boot_responsible)
     _write_json(job_dir / "result.json", {**result, "schema_version": SCHEMA_VERSION})
     return 0
+
+
+def _annotate_lan_privacy(result: Dict[str, Any], boot_responsible: Optional[int]) -> None:
+    """Append the Local Network Privacy note to a summary/error that reports errno 65 after the
+    gateway this child is charged to exited (only a Popen fallback child can be in that state)."""
+    for key in ("error", "summary"):
+        text = result.get(key)
+        note = macos_spawn.lan_privacy_note(text, boot_responsible) if isinstance(text, str) else None
+        if note:
+            logger.warning("detached_child_lan_privacy_orphan responsible_pid=%s", boot_responsible)
+            result[key] = f"{text}\n\n{note}"
+            return
 
 
 def _boot_dependencies() -> None:
