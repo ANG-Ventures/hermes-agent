@@ -38,7 +38,7 @@ def _old_kind_writes(path: Path) -> list:
     """``(line, kind)`` of every event write in ``path`` whose kind argument is an old placement name."""
     with warnings.catch_warnings():  # a module's own invalid escapes are not this test's concern
         warnings.simplefilter("ignore", SyntaxWarning)
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
     old_consts = {}  # module-level NAME = "<old kind>"
     for node in tree.body:
         if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
@@ -126,5 +126,5 @@ def test_allocation_verb_and_deprecated_placement_alias(home, capsys):
     old = capsys.readouterr()
     assert old.out == new.out  # same output under either verb
     assert old.err.count("\n") == 1 and "deprecated, use `kanban allocation`" in old.err
-    (line,) = log.read_text().splitlines()
+    (line,) = log.read_text(encoding="utf-8-sig").splitlines()
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ cli:kanban placement pid=\d+", line), line

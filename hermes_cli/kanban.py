@@ -2856,7 +2856,7 @@ def _count_deprecated_verb(verb: str, new: str) -> None:
         d = kb.kanban_home() / "var" / "ci-box"
         d.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with open(d / "deprecated-name-reads.log", "a") as fh:
+        with open(d / "deprecated-name-reads.log", "a", encoding="utf-8") as fh:
             fh.write(f"{ts} cli:kanban {verb} pid={os.getpid()}\n")
     except Exception:  # noqa: BLE001 -- a counter must never break the verb
         pass
