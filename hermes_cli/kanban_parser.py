@@ -650,7 +650,7 @@ _SPECS = [
              help="With --placement: the fleet view (alias of `kanban placement --fleet`)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the board named by --board or the DB pin"),
-    _cmd("placement", [
+    _cmd("allocation", [
         _arg("task_id", nargs="?", help="One card: its Placement block only"),
         _arg("--fleet", action="store_true",
              help="Per host in ladder order: running/slots/band/pressure and the cards there, "
@@ -658,7 +658,8 @@ _SPECS = [
         _arg("--gate", metavar="PATH",
              help="Read this load_gate.json instead of <root>/load_gate.json"),
         _json_flag(help="Emit the dict the text is printed from"),
-    ], help="Where cards run and why they wait (read-only; no probe)"),
+    ], aliases=["placement"],  # `placement`: deprecated name, one release (rename wave 3, t_7be48220)
+        help="Where cards run and why they wait (read-only; no probe)"),
     _cmd("placement-holds", [
         _arg("--clear", metavar="TASK_ID",
              help="End this card's open pause_hold label now (a live hold is re-derived next tick)"),

@@ -136,7 +136,7 @@ def test_paused_host_cards_are_held_in_both_plan_arms(home, mkplan):
         assert res.placement_waits[ids["E"]] == f"pause_hold (ci-box:{MID})"
         assert ids["E"] not in got and _runs(conn, ids["E"]) == 0
         # live tick wrote the placement_wait events (the status `held:` source)
-        n = conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='placement_wait' "
+        n = conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='allocation_wait' "
                          "AND json_extract(payload,'$.code')='pause_hold'").fetchone()[0]
         assert n >= 4
 

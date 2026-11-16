@@ -74,14 +74,14 @@ def test_ac5_paused_band_routes_every_row(kanban_home, monkeypatch):
         pin, ports, studio, rev = _ac5_board(conn)
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         assert spawned == [(pin, "ace-ai"), (ports[0], "ace-ai")]
-        routes = [e[0]["route"] for e in (_events(conn, pin, "placement"),
-                                          _events(conn, ports[0], "placement"))]
+        routes = [e[0]["route"] for e in (_events(conn, pin, "allocation"),
+                                          _events(conn, ports[0], "allocation"))]
         assert routes == ["remote-pin", "remote-policy"]
         assert res.placement_waits == {ports[1]: "pool_full", ports[2]: "pool_full",
                                        studio: "local_full"}
-        assert _count(conn, "placement") == 2
-        assert _count(conn, "placement_wait") == 3
-        assert _events(conn, rev, "placement_wait") == [] and rev not in res.placement_waits
+        assert _count(conn, "allocation") == 2
+        assert _count(conn, "allocation_wait") == 3
+        assert _events(conn, rev, "allocation_wait") == [] and rev not in res.placement_waits
         assert rev not in [t for t, _h in spawned]
 
 
@@ -106,9 +106,9 @@ def test_ac5_one_shot_path_same_table(kanban_home, monkeypatch, capsys):
     assert rc == 0
     assert spawned == [(pin, "ace-ai"), (ports[0], "ace-ai")]
     with kb.connect_closing() as conn:
-        assert _count(conn, "placement") == 2 and _count(conn, "placement_wait") == 3
-        assert _events(conn, rev, "placement_wait") == []
-        assert {e["entry"] for t in (pin, ports[0]) for e in _events(conn, t, "placement")} == {"cli"}
+        assert _count(conn, "allocation") == 2 and _count(conn, "allocation_wait") == 3
+        assert _events(conn, rev, "allocation_wait") == []
+        assert {e["entry"] for t in (pin, ports[0]) for e in _events(conn, t, "allocation")} == {"cli"}
 
 
 # -- AC-6 / AC-18 -------------------------------------------------------------
@@ -154,12 +154,12 @@ def test_ac18_total_gate_records_every_ready_row(kanban_home, monkeypatch, gate)
                           spillover=_plan(free=2), reconcile_orphans=False, **kw)
         assert spawned == []
         for tid in (pin, *ports):
-            (ev,) = _events(conn, tid, "placement_wait")
+            (ev,) = _events(conn, tid, "allocation_wait")
             assert ev["code"] == f"total:{gate}"
         # A second tick inside the window writes nothing new (dedup).
         kbd.dispatch_once(conn, spawn_fn=spawn, spawn_paused="test", spawn_limit=0,
                           spillover=_plan(free=2), reconcile_orphans=False, **kw)
-        assert _count(conn, "placement_wait", [pin, *ports]) == 3
+        assert _count(conn, "allocation_wait", [pin, *ports]) == 3
 
 
 def test_ac6_memory_critical_holds_both_routes(kanban_home, monkeypatch):
@@ -170,7 +170,7 @@ def test_ac6_memory_critical_holds_both_routes(kanban_home, monkeypatch):
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)
         assert spawned == []
         assert res.placement_waits == {local: "total:memory_critical", pin: "total:memory_critical"}
-        assert _count(conn, "placement_wait") == 2
+        assert _count(conn, "allocation_wait") == 2
 
 
 def test_ac6_memory_elevated_allows_one_total(kanban_home, monkeypatch):
@@ -190,7 +190,7 @@ def test_route_first_false_restores_the_silent_returns(kanban_home, monkeypatch)
     with kb.connect_closing() as conn:
         _make(conn, 2)
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)
-        assert spawned == [] and res.placement_waits == {} and _count(conn, "placement_wait") == 0
+        assert spawned == [] and res.placement_waits == {} and _count(conn, "allocation_wait") == 0
 
 
 def test_route_first_reads_the_root_config_per_tick(kanban_home):
@@ -225,8 +225,8 @@ def test_ac8_every_spawn_writes_one_complete_placement(kanban_home):
         (remote,) = _make(conn, 1, body="host: ace-ai")
         _res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=1)
         assert sorted(spawned, key=str) == sorted([(local, None), (remote, "ace-ai")], key=str)
-        (lp,) = _events(conn, local, "placement")
-        (rp,) = _events(conn, remote, "placement")
+        (lp,) = _events(conn, local, "allocation")
+        (rp,) = _events(conn, remote, "allocation")
         for ev in (lp, rp):
             assert set(ev) == PLACEMENT_KEYS
             assert set(ev["gate"]) == {"band", "spill_reason", "local_allowance",
@@ -245,7 +245,7 @@ def test_ac8_portable_on_studio_allowance_is_rule_default(kanban_home):
         (card,) = _make(conn, 1, body="host: any")
         _res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=1)
         assert spawned == [(card, None)]
-        (ev,) = _events(conn, card, "placement")
+        (ev,) = _events(conn, card, "allocation")
         assert (ev["route"], ev["rule"]) == ("local", "default")
 
 
@@ -256,7 +256,7 @@ def test_ac8_dry_run_writes_no_placement(kanban_home):
         res = kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1, max_spawn=64,
                                 spawn_limit=1, spillover=_plan(free=2), reconcile_orphans=False)
         assert len(res.spawned) == 2
-        assert _count(conn, "placement") == 0 and _count(conn, "placement_wait") == 0
+        assert _count(conn, "allocation") == 0 and _count(conn, "allocation_wait") == 0
 
 
 # -- AC-9 + R-B -----------------------------------------------------------------
@@ -272,17 +272,17 @@ def test_ac9_dedup_on_code_not_detail(kanban_home, monkeypatch):
         (tid,) = _make(conn, 1)
         for stale in (10, 70, 130):
             _hold(conn, monkeypatch, tid, f"pool_full (stale {stale}s)")
-        assert len(_events(conn, tid, "placement_wait")) == 1
+        assert len(_events(conn, tid, "allocation_wait")) == 1
         _hold(conn, monkeypatch, tid, "pin_host_unknown (ace-ai: stale 9s)")
-        evs = _events(conn, tid, "placement_wait")
+        evs = _events(conn, tid, "allocation_wait")
         assert [e["code"] for e in evs] == ["pool_full", "pin_host_unknown"]
         assert evs[1]["detail"] == "ace-ai: stale 9s"
         assert evs[1]["reason"] == "pin_host_unknown (ace-ai: stale 9s)"
         conn.execute("UPDATE task_events SET created_at = created_at - 901 "
-                     "WHERE task_id=? AND kind='placement_wait'", (tid,))
+                     "WHERE task_id=? AND kind='allocation_wait'", (tid,))
         conn.commit()
         _hold(conn, monkeypatch, tid, "pin_host_unknown (ace-ai: stale 99s)")
-        assert len(_events(conn, tid, "placement_wait")) == 3
+        assert len(_events(conn, tid, "allocation_wait")) == 3
 
 
 def test_rb_host_change_is_a_new_hold(kanban_home, monkeypatch):
@@ -292,7 +292,7 @@ def test_rb_host_change_is_a_new_hold(kanban_home, monkeypatch):
         _hold(conn, monkeypatch, tid, "pool_unavailable (ace-ai: stale 12s)")
         _hold(conn, monkeypatch, tid, "pool_unavailable (ace-ai: stale 40s)")
         _hold(conn, monkeypatch, tid, "pool_unavailable (ci-box: band hot)")
-        evs = _events(conn, tid, "placement_wait")
+        evs = _events(conn, tid, "allocation_wait")
         assert [e["host"] for e in evs] == ["ace-ai", "ci-box"]
 
 
@@ -304,7 +304,7 @@ def test_rb_flapping_is_capped_at_one_row(kanban_home, monkeypatch):
         _hold(conn, monkeypatch, tid, "pool_full")
         for reason in ("local_full", "local_full", "pool_full", "pool_full") * 3:
             _hold(conn, monkeypatch, tid, reason)
-        evs = _events(conn, tid, "placement_wait")
+        evs = _events(conn, tid, "allocation_wait")
         assert [e["code"] for e in evs] == ["pool_full", "local_full", "flapping"]
         assert evs[2]["detail"] == "local_full|pool_full"
 
@@ -317,7 +317,7 @@ def test_single_sample_alternation_is_not_a_flap(kanban_home, monkeypatch):
         (tid,) = _make(conn, 1)
         for reason in ("pool_full", "local_full") * 5:
             _hold(conn, monkeypatch, tid, reason)
-        assert [e["code"] for e in _events(conn, tid, "placement_wait")] == ["pool_full", "local_full"]
+        assert [e["code"] for e in _events(conn, tid, "allocation_wait")] == ["pool_full", "local_full"]
 
 
 def test_pacing_cap_is_not_a_distinct_reason_in_the_flap_key(kanban_home, monkeypatch):
@@ -328,7 +328,7 @@ def test_pacing_cap_is_not_a_distinct_reason_in_the_flap_key(kanban_home, monkey
         (tid,) = _make(conn, 1)
         for reason in ("local_full", "total:max_new", "local_full", "local_full", "total:max_new") * 3:
             _hold(conn, monkeypatch, tid, reason)
-        evs = _events(conn, tid, "placement_wait")
+        evs = _events(conn, tid, "allocation_wait")
         assert [e["code"] for e in evs] == ["local_full"]
 
 
@@ -339,7 +339,7 @@ def test_pacing_cap_alone_is_still_recorded(kanban_home, monkeypatch):
         _hold(conn, monkeypatch, tid, "total:max_new")
         _hold(conn, monkeypatch, tid, "total:max_new")
         _hold(conn, monkeypatch, tid, "local_full")
-        assert [e["code"] for e in _events(conn, tid, "placement_wait")] == ["total:max_new", "local_full"]
+        assert [e["code"] for e in _events(conn, tid, "allocation_wait")] == ["total:max_new", "local_full"]
 
 
 def test_rg_one_read_per_tick_and_no_txn_when_nothing_to_write(kanban_home, monkeypatch):
@@ -377,8 +377,8 @@ def test_ra_unassigned_and_per_profile_holds_are_recorded(kanban_home):
         conn.commit()
         (capped,) = _make(conn, 1)
         _tick(conn, spillover=None, spawn_limit=4, max_in_progress_per_profile={"alpha": 1})
-        assert [e["code"] for e in _events(conn, orphan, "placement_wait")] == ["unassigned"]
-        (ev,) = _events(conn, capped, "placement_wait")
+        assert [e["code"] for e in _events(conn, orphan, "allocation_wait")] == ["unassigned"]
+        (ev,) = _events(conn, capped, "allocation_wait")
         assert ev["code"] == "per_profile_cap" and ev["detail"] == "alpha 1/1"
 
 
@@ -393,15 +393,15 @@ def test_ra_assignment_ends_the_wait_episode(kanban_home, monkeypatch):
         conn.execute("UPDATE task_events SET created_at = created_at - 600, "
                      "payload = json_set(payload, '$.since', "
                      "json_extract(payload, '$.since') - 600) "
-                     "WHERE task_id=? AND kind='placement_wait'", (tid,))
+                     "WHERE task_id=? AND kind='allocation_wait'", (tid,))
         conn.commit()
         assert kb.assign_task(conn, tid, "alpha")
         _hold(conn, monkeypatch, tid, "unassigned")
-        evs = _events(conn, tid, "placement_wait")
+        evs = _events(conn, tid, "allocation_wait")
         assert [e["code"] for e in evs] == ["unassigned", "local_full", "unassigned"]
         assert abs(evs[-1]["since"] - int(__import__("time").time())) <= 2
         _hold(conn, monkeypatch, tid, "local_full")
-        assert "flapping" not in [e["code"] for e in _events(conn, tid, "placement_wait")]
+        assert "flapping" not in [e["code"] for e in _events(conn, tid, "allocation_wait")]
 
 
 # -- AC-10 ----------------------------------------------------------------------
@@ -448,7 +448,7 @@ def test_ac10_total_gate_rows_print_in_dry_run(kanban_home, monkeypatch, capsys)
     for tid in ids:
         assert f"  {tid}  -> holds total:memory_critical" in out
     with kb.connect_closing() as conn:
-        assert _count(conn, "placement_wait") == 0
+        assert _count(conn, "allocation_wait") == 0
 
 
 # -- AC-11 ----------------------------------------------------------------------
@@ -481,7 +481,7 @@ def test_ac16_review_rows_never_routed_or_held(kanban_home, monkeypatch):
         _status(conn, rev, "review")
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         assert spawned == [] and res.placed == []
-        assert _events(conn, rev, "placement_wait") == []
+        assert _events(conn, rev, "allocation_wait") == []
         assert rev not in res.placement_waits and rev not in [r["task_id"] for r in res.routes]
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=1)
         assert spawned == [(rev, None)]
@@ -519,7 +519,7 @@ def test_ac17_admitting_pins_only_holds_portable_local_full(kanban_home):
         res, spawned = _tick(conn, spillover=plan, spawn_limit=0)
         assert spawned == [(pin, "ace-ai")]
         assert res.placement_waits == {port: "local_full"}
-        assert [e["code"] for e in _events(conn, port, "placement_wait")] == ["local_full"]
+        assert [e["code"] for e in _events(conn, port, "allocation_wait")] == ["local_full"]
 
 
 def test_saturated_studio_sends_portable_to_free_pool_host(kanban_home):
@@ -533,7 +533,7 @@ def test_saturated_studio_sends_portable_to_free_pool_host(kanban_home):
         (studio,) = _make(conn, 1, body="host: studio", priority=1)
         res, spawned = _tick(conn, spillover=plan, spawn_limit=0)
         assert spawned == [(port, "ace-ai")]
-        assert [e["route"] for e in _events(conn, port, "placement")] == ["remote-policy"]
+        assert [e["route"] for e in _events(conn, port, "allocation")] == ["remote-policy"]
         assert res.placement_waits == {studio: "local_full"}
 
 
@@ -545,7 +545,7 @@ def test_ac19_every_row_past_the_slot_wall_is_recorded(kanban_home):
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         assert len(spawned) == 2
         held = [t for t in ids if t not in {s for s, _ in spawned}]
-        assert len(held) == 4 and all(len(_events(conn, t, "placement_wait")) == 1 for t in held)
+        assert len(held) == 4 and all(len(_events(conn, t, "allocation_wait")) == 1 for t in held)
 
 
 def test_ac19_max_new_one_records_five(kanban_home):
@@ -554,7 +554,7 @@ def test_ac19_max_new_one_records_five(kanban_home):
         res, spawned = _tick(conn, spillover=_plan(free=6), spawn_limit=0, spawn_paused="test",
                              max_new=1)
         assert len(spawned) == 1
-        codes = [e["code"] for t in ids for e in _events(conn, t, "placement_wait")]
+        codes = [e["code"] for t in ids for e in _events(conn, t, "allocation_wait")]
         assert codes == ["total:max_new"] * 5
 
 
@@ -570,7 +570,7 @@ def test_paused_tick_with_no_plan_still_records_holds(kanban_home):
 # -- local_full binding cause (t_f73c65a8) -------------------------------------
 
 def _local_full_events(conn, ids):
-    return [e for t in ids for e in _events(conn, t, "placement_wait") if e.get("code") == "local_full"]
+    return [e for t in ids for e in _events(conn, t, "allocation_wait") if e.get("code") == "local_full"]
 
 
 def test_local_full_bound_by_the_paused_gate_says_gate(kanban_home):
@@ -625,7 +625,7 @@ def test_only_local_full_rows_carry_a_binding(kanban_home):
     with kb.connect_closing() as conn:
         (pin,) = _make(conn, 1, body="host: ace-media", priority=1)
         _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="paused")
-        evs = _events(conn, pin, "placement_wait")
+        evs = _events(conn, pin, "allocation_wait")
         assert evs and all("binding" not in e for e in evs if e.get("code") != "local_full")
 
 
@@ -639,9 +639,9 @@ def test_cleared_wait_ends_the_episode_for_flap_detection(kanban_home, monkeypat
         _hold(conn, monkeypatch, tid, "pool_full")
         _hold(conn, monkeypatch, tid, "local_full")
         with kb.write_txn(conn):
-            kb._append_event(conn, tid, "placement_wait", {"cleared": True})
+            kb._append_event(conn, tid, "allocation_wait", {"cleared": True})
         _hold(conn, monkeypatch, tid, "pool_full")
-        evs = _events(conn, tid, "placement_wait")
+        evs = _events(conn, tid, "allocation_wait")
         assert [e.get("code") for e in evs] == ["pool_full", "local_full", None, "pool_full"]
         assert abs(evs[-1]["since"] - int(__import__("time").time())) <= 2
 
@@ -653,14 +653,14 @@ def test_later_gate_clears_the_open_wait(kanban_home, monkeypatch):
     with kb.connect_closing() as conn:
         (tid,) = _make(conn, 1)
         _tick(conn, spillover=None, spawn_limit=0, spawn_paused="test")
-        assert [e["code"] for e in _events(conn, tid, "placement_wait")] == ["local_full"]
+        assert [e["code"] for e in _events(conn, tid, "allocation_wait")] == ["local_full"]
         monkeypatch.setattr(kbd, "check_respawn_guard", lambda *a, **k: "active_pr")
         res, spawned = _tick(conn, spillover=None, spawn_limit=4)
         assert spawned == [] and res.respawn_guarded == [(tid, "active_pr")]
-        assert _events(conn, tid, "placement_wait")[-1] == {"cleared": True}
+        assert _events(conn, tid, "allocation_wait")[-1] == {"cleared": True}
         assert tid not in {h["task_id"] for h in kpv._held(conn)}
         _tick(conn, spillover=None, spawn_limit=4)  # guard still on: no second clear
-        assert _count(conn, "placement_wait", [tid]) == 2
+        assert _count(conn, "allocation_wait", [tid]) == 2
 
 
 def test_linked_hold_changing_edge_is_a_new_row(kanban_home, monkeypatch):
@@ -671,6 +671,6 @@ def test_linked_hold_changing_edge_is_a_new_row(kanban_home, monkeypatch):
         _hold(conn, monkeypatch, tid, "not_portable:linked(blocks->t_a)")
         _hold(conn, monkeypatch, tid, "not_portable:linked(blocks->t_a)")
         _hold(conn, monkeypatch, tid, "not_portable:linked(blocks->t_b)")
-        evs = _events(conn, tid, "placement_wait")
+        evs = _events(conn, tid, "allocation_wait")
         assert [e["detail"] for e in evs] == ["blocks->t_a", "blocks->t_b"]
         assert {e["code"] for e in evs} == {"not_portable:linked"}

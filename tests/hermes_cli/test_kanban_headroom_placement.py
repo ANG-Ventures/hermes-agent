@@ -208,7 +208,7 @@ def test_dispatch_reserves_each_spawn_and_run_end_releases_it(home):
     assert sorted(r["job_id"] for r in rows) == sorted(ids) and {r["host"] for r in rows} == {"ci-box"}
     assert placement.live_reservations(ledger)["ci-box"].ram_gb == 9
     with kb.connect_closing() as conn:
-        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_placed'",
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_allocated'",
                           (ids[0],)).fetchone()
         payload = json.loads(ev[0])
         assert payload[kh.RESERVATION_KEY] in {r["id"] for r in rows} and payload["rule"] == "default_first"

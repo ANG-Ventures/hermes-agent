@@ -356,7 +356,7 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
             for tid in cleared_wait:
                 lw = _last_payloads(conn, [tid], "placement_wait").get(tid)
                 if lw is not None and not lw.get("cleared"):
-                    _kb._append_event(conn, tid, "placement_wait", dict(CLEARED))
+                    _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, dict(CLEARED))
             for tid, aff in affinity.items():
                 reason = waits.get(tid)
                 last = conn.execute(
@@ -365,7 +365,7 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
                 last_payload = None if last is None else json.loads(last[1] or "{}")
                 if reason is None:
                     if tid in cleared and last_payload is not None and not last_payload.get("cleared"):
-                        _kb._append_event(conn, tid, "placement_wait", dict(CLEARED))
+                        _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, dict(CLEARED))
                     continue
                 payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
                 # Same episode boundary the readers use (kanban_placement_view
@@ -376,7 +376,7 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
                     "LIMIT 1" % ",".join("?" * len(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),
                     (tid, last[0], *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS))).fetchone() is not None
                 if last is None or ended or last_payload != payload:
-                    _kb._append_event(conn, tid, "placement_wait", payload)
+                    _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, payload)
     except Exception:
         _log.warning("kanban dispatch: could not record placement affinity events", exc_info=True)
 

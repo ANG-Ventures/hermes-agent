@@ -165,7 +165,7 @@ def test_body_need_card_starts_on_a_pool_host_with_the_advisory_recorded(home, m
         res, spawned = _tick(conn)
         assert [t for t, _ in spawned] == [tid] and spawned[0][1] in ("ace-ai", "ace-media")
         assert tid not in (res.placement_waits or {})
-        placement = _events(conn, tid, "placement")[-1]
+        placement = _events(conn, tid, "allocation")[-1]
         assert placement["advisory"] == [{"source": "body", "rule": "studio_needs", "need": "studio_tree",
                                           "evidence": placement["advisory"][0]["evidence"]}]
         assert "~/.hermes/scripts/" in placement["advisory"][0]["evidence"]

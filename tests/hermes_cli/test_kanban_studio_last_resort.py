@@ -88,7 +88,7 @@ def _tick(conn, plan, *, spawn_limit=4):
 
 
 def _placement(conn, tid):
-    (row,) = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement'",
+    (row,) = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='allocation'",
                           (tid,)).fetchall()
     return json.loads(row[0])
 

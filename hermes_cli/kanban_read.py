@@ -1,7 +1,7 @@
 """Pure classification shared by CLI startup and database dispatch."""
 
 READ_ACTIONS = frozenset({
-    "show", "list", "ls", "placement", "context", "runs", "attachments", "stats",
+    "show", "list", "ls", "allocation", "placement", "context", "runs", "attachments", "stats",
     "log", "tail", "locate", "notify-list", "notify-status", "placement-holds",
 })
 

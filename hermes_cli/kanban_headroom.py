@@ -84,7 +84,7 @@ RESERVATION_REPLACED_EVENT = "placement_reservation_replaced"
 # ``{"host", placement_reservation}``. Deliberately not worker_placed: "no worker_placed" still means "ran here".
 LOCAL_ADMITTED_EVENT = "local_admitted"
 # The run events that carry a ledger reservation the run owns (release at run end, renew while live).
-RESERVATION_EVENTS = ("worker_placed", LOCAL_ADMITTED_EVENT)
+RESERVATION_EVENTS = ("worker_allocated", LOCAL_ADMITTED_EVENT)
 # Every name a reservation row is READ under (rename wave 3, t_7be48220): worker_placed and worker_allocated.
 RESERVATION_READ_KINDS = ("worker_placed", "worker_allocated", LOCAL_ADMITTED_EVENT)
 _PLACED_READ_KINDS = ("worker_placed", "worker_allocated")
