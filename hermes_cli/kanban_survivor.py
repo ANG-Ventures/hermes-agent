@@ -3350,6 +3350,19 @@ def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
     ), previous)
 
 
+def _follow_up_board(conn, card):
+    """Where a ``--survivor-none`` follow-up card lives: ``""`` on this card's own board, the
+    slug of the ONE other board holding it, or ``None`` when no board does (or it is ambiguous
+    or a board is unreadable: never a guess). A follow-up is often minted on the board that owns
+    the work, not the one the closing card sits on (pc-d96e13d5)."""
+    if kb.get_task(conn, card):
+        return ""
+    try:
+        return kb.board_of_task(card)
+    except (kb.KanbanBoardDerivationError, OSError, sqlite3.Error):
+        return None
+
+
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
              survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
              survivor_none=False, survivor_reason=None, content_survivor=None):
@@ -3432,10 +3445,15 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 raise SurvivorUnavailable("survivor_unavailable: survivor-none cannot be mixed with remote claims")
             reason = (survivor_reason or "").strip()
             followups = re.findall(r"\bt_[0-9a-f]{8}\b", reason)
-            if not reason or len(followups) != 1 or not kb.get_task(conn, followups[0]):
-                raise SurvivorUnavailable("survivor_unavailable: survivor-none needs a reason naming one existing follow-up card")
-            return _record(conn, task_id, {"kind": "none", "reason": reason,
-                                            "follow_up_card": followups[0]}, previous)
+            follow_board = _follow_up_board(conn, followups[0]) if len(followups) == 1 else None
+            if not reason or follow_board is None:
+                raise SurvivorUnavailable(
+                    "survivor_unavailable: survivor-none needs a reason naming one existing follow-up "
+                    "card (on any board, e.g. 'follow-up <board>:t_xxxxxxxx')")
+            none = {"kind": "none", "reason": reason, "follow_up_card": followups[0]}
+            if follow_board:
+                none["follow_up_board"] = follow_board
+            return _record(conn, task_id, none, previous)
         stage = "remote survivor verification"
         explicit = _verified_explicit(task_id, survivor_ref, survivor_pr,
                                       unbound=survivor_unbound)
