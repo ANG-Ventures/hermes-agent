@@ -1587,9 +1587,13 @@ def test_d_code_skew_drain_waits_when_refire_is_spent(root, tmp_path, procs):
     skew = tmp_path / "skew"
     _script(root, "refire.sh", f"trap 'touch {termed}; exit 143' TERM\necho $$ > {spid}\n"
                                f"sleep 8 & wait $!\ntouch {done}")
-    job = _job(root, "refire", "refire.sh")
+    job = _job(root, "refire", "refire.sh", due_now=False)
+    # Fired the way _apply_restart_requeue fires a re-fire (manual_run_at == next_run_at): a plain
+    # scheduled occurrence starts a fresh re-fire budget (t_2b319a64), so it would not be spent.
+    stamp = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
     with _profile_cron_scope(root):
-        update_job(job["id"], {RESTART_REQUEUE_COUNT_KEY: RESTART_REQUEUE_MAX})
+        update_job(job["id"], {RESTART_REQUEUE_COUNT_KEY: RESTART_REQUEUE_MAX,
+                               "next_run_at": stamp, "manual_run_at": stamp})
     log = tmp_path / "runner.log"
     runner = _spawn_runner(procs, root, log, RUNNER_HARNESS_CYCLE_S=1,
                            RUNNER_HARNESS_SKEW=skew, RUNNER_HARNESS_SKEW_DRAIN_S=1)

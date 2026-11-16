@@ -6394,6 +6394,13 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         scan.persist(
             job["id"], last_dispatch=dispatch_stamp,
             pending_slot=pending_slot_stamp(next_run, now))
+        # A new scheduled occurrence gets its own one restart re-fire (t_2b319a64): the count bounds
+        # re-fires of ONE killed run, it is not a lifetime budget. Kept across nights it let one
+        # drain-killed re-fire spend every later night's re-fire until a run happened to succeed.
+        raw = scan.find(job["id"])
+        if job.pop(RESTART_REQUEUE_COUNT_KEY, None) is not None and raw is not None:
+            raw.pop(RESTART_REQUEUE_COUNT_KEY, None)
+            scan.needs_save = True
     return True
 
 

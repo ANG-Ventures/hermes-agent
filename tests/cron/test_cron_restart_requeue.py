@@ -118,6 +118,35 @@ def test_refire_killed_again_is_not_requeued_twice(env):
     assert not [j for j in get_due_jobs() if j["id"] == job["id"]]
 
 
+def test_next_scheduled_occurrence_gets_its_own_refire(env):
+    """t_2b319a64: a re-fire killed again spends that night's re-fire, never the next night's.
+    The count used to survive until a run succeeded, so a nightly job drain-killed two nights
+    running ('re-fire already spent on a failing streak') lost the second night outright."""
+    from cron.jobs import (get_job, get_due_jobs, update_job, RESTART_REQUEUE_KEY,
+                           RESTART_REQUEUE_COUNT_KEY, _hermes_now, create_job)
+
+    # Interval schedule: its next occurrence can be made due without a clock (a daily cron's
+    # stale instant is re-anchored/fast-forwarded instead). Same counter, same re-fire path.
+    job = get_job(create_job(prompt=None, schedule="every 15m", name="nightly-backup",
+                             script="long.sh", no_agent=True, deliver="local")["id"])
+    first_ran = env / "scripts" / "first-ran"
+    _run_and_kill_by_drain(job, first_ran)
+    due = [j for j in get_due_jobs() if j["id"] == job["id"]]
+    first_ran.unlink()
+    _run_and_kill_by_drain(due[0], first_ran)            # the re-fire is killed too: spent
+    spent = get_job(job["id"])
+    assert spent[RESTART_REQUEUE_COUNT_KEY] == 1 and spent["last_status"] == "error"
+
+    # The next night's scheduled occurrence comes due.
+    update_job(job["id"], {"next_run_at": (_hermes_now() - timedelta(seconds=5)).isoformat()})
+    due = [j for j in get_due_jobs() if j["id"] == job["id"]]
+    assert due, "next scheduled occurrence not due"
+    assert RESTART_REQUEUE_COUNT_KEY not in get_job(job["id"]), "scheduled fire must reset the count"
+    first_ran.unlink()
+    _run_and_kill_by_drain(due[0], first_ran)
+    assert get_job(job["id"]).get(RESTART_REQUEUE_KEY), "tonight's kill must be re-queued once"
+
+
 def test_sigterm_outside_shutdown_is_not_requeued(env):
     """A script killed while the scheduler is NOT draining is a real failure."""
     from cron.jobs import get_job, RESTART_REQUEUE_KEY
