@@ -1118,6 +1118,18 @@ def _first_line(text: Any, limit: int = 300) -> str:
     return lines[0][:limit] if lines else ""
 
 
+def _owner_notice_event(conn: Any, entry: dict) -> bool:
+    """t_28b3f37c: the claimed event is main-train's owner notice, news on a done/archived card."""
+    from gateway.kanban_wake_freshness import closed_card_news
+
+    row = conn.execute("SELECT kind, payload FROM task_events WHERE id = ? AND task_id = ?",
+                       (int(entry["event_id"]), entry["task_id"])).fetchone()
+    try:
+        return bool(row) and closed_card_news(row[0], json.loads(row[1] or "{}"))
+    except ValueError:
+        return False
+
+
 def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
     """The ONE allowlisted write, signed as machine (B1), then the keyed receipt event."""
     tid, action = entry["task_id"], verdict["action"]
@@ -1144,7 +1156,7 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
             if status != "review":
                 raise RuntimeError(f"{action} on a {status} card")
         elif action == "acknowledge":   # t_6a70430e: receipt + one comment, no state change; any OPEN card
-            if status is None or status in ("done", "archived"):
+            if status is None or (status in ("done", "archived") and not _owner_notice_event(conn, entry)):
                 raise RuntimeError(f"{action} on a {status} card")
         elif action == "request_changes":
             if status != "review":

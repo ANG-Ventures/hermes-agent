@@ -2153,6 +2153,38 @@ def test_acknowledge_refuses_a_card_that_moved_since_the_claim(env):
 
 
 
+def _owner_notice_card(env, *, source="main-train", episode="main-train-owner:o/r#5:mt-1", status="done") -> str:
+    """t_28b3f37c: main-train's owner notice names the merged PR's card, which is usually already closed."""
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+        kb._append_event(conn, tid, "mechanical_wake", {"by": "card-mechanical-wake", "source": source,
+                                                        "episode": episode, "text": "your PR turned main red"})
+    return tid
+
+
+@pytest.mark.parametrize("status", ["done", "archived"])
+def test_owner_notice_on_a_closed_card_is_one_child_and_acknowledge_comments_it(env, status):
+    tid = _owner_notice_card(env, status=status)
+    turns = _tick(env)
+    assert turns == [], [t.text for t in turns]
+    assert [(e["row"], e["task_id"]) for e in env["dispatched"]] == [("mechanical_wake", tid)]
+    entry = ah.BoomerangWakeState().get_claim(env["dispatched"][0]["key"])
+    res = ah.execute_verdict(entry, _verdict(entry, "acknowledge", summary="already fixed forward"))
+    assert res["ok"], res
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == status
+        assert len([e for e in kb.list_events(conn, tid) if e.kind == ah.RECEIPT_KIND]) == 1
+        assert len([c for c in kb.list_comments(conn, tid) if "acknowledge" in c.body]) == 1
+
+
+def test_detached_run_wake_on_a_done_card_is_still_dropped(env):
+    tid = _owner_notice_card(env, source="detached-run", episode="detached:r1")
+    assert _tick(env) == [] and env["dispatched"] == [] and _claims() == {}
+    with kb.connect_closing() as conn:
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == ah.RECEIPT_KIND]
+
+
 @pytest.mark.parametrize("route", ["alerts-home", "fallback"])
 def test_routed_mechanical_wake_on_boomerang_card_is_one_child_routed_to_the_recipient(env, route):
     other = "1502228850338435153"

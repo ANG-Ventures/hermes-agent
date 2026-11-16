@@ -1153,7 +1153,9 @@ async def deliver_turn(runner: Any, entry: Any, text: str,
                                   [i.get("kind") for i in c.get("items") or []],
                                   max((i.get("event_ts") or 0 for i in c.get("items") or []),
                                       default=None),
-                                  render_prompt([c]))
+                                  render_prompt([c]),
+                                  closed_news=any(_fresh.closed_card_news(i.get("kind"), i.get("payload"))
+                                                  for i in c.get("items") or []))
                 for c in cards or []
             ],
         },
@@ -1222,7 +1224,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         # needs nothing from its owner any more.
         live = []
         for i in card["items"]:
-            if _fresh.is_stale(current.get("status"), str(i.get("kind") or "")):
+            if _fresh.is_stale(current.get("status"), str(i.get("kind") or ""), i.get("payload")):
                 _fresh.log_dropped(card["task_id"], str(i.get("kind")), i.get("event_ts"),
                                    "owner-wake", current.get("status"), now)
             else:
