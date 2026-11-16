@@ -2004,6 +2004,10 @@ class Decision:
                                   "headroom_cores": None if r.cores is None else round(r.cores, 1),
                                   "score": None if not r.eligible else round(r.score, 4), "binding": r.binding or None}
                          for r in self.rows}}
+        for r in self.rows:
+            # utilization mode: the cpu_busy the PSI busy-floor exemption read, so a grader can prove it (t_5a9f9e88)
+            if r.cpu_busy is not None:
+                row["hosts"][r.host]["cpu_busy"] = r.cpu_busy
         if self.scorer == "v2":
             # v2 denominators on every host row (doctrine rule 2); a v1 row stays byte for byte what it was
             row["scorer"] = "v2"
@@ -2579,7 +2583,7 @@ def reserve(host: str, consumer: str, fp: Footprint, *, ttl_s: float, job_id: Op
 
 def _reserve_unlocked(p: Path, host: str, consumer: str, fp: Footprint, *, ttl_s: float, job_id, now: float,
                       admissions_path, decision: Optional[Decision], job_class: Optional[str] = None,
-                      reservation_id: Optional[str] = None, root=None) -> str:
+                      reservation_id: Optional[str] = None, root=None, hosts: Optional[dict] = None) -> str:
     if not _num(ttl_s) or ttl_s <= 0:
         raise PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
     if not isinstance(fp, Footprint):
@@ -2601,6 +2605,8 @@ def _reserve_unlocked(p: Path, host: str, consumer: str, fp: Footprint, *, ttl_s
     # admission_mode on every decision line, so a readback reads the mode off the ledger (t_f73c65a8); a pin booked
     # without a decision carries None (no mode decided it)
     extra = {"rule": decision.rule, "hosts": decision.as_row()["hosts"]} if decision else {}
+    if hosts is not None and not decision:
+        extra["hosts"] = hosts       # a pin's own reading (allocd door start, t_f8d7c0c2); a decision writes its own
     extra["admission_mode"] = (decision.mode or None) if decision else None
     _append_admissions(admissions_path_for(p, admissions_path), expired + [_ledger_line(
         at=now, host=host, consumer=consumer, job_id=job_id, fp=fp, decision="admitted", reservation=rid,
