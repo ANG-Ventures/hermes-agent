@@ -2591,6 +2591,8 @@ class Task:
     # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
     boomerang_wake: Optional[bool] = None
     asap: bool = False  # Explicit operator edit only; never inherited at creation.
+    # Raw ``tasks.artifact_pointer`` JSON (t_328f78fc); parse with kanban_artifact_pointer.read.
+    artifact_pointer: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2631,7 +2633,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "origin_host",
-    "workspace_of",
+    "workspace_of", "artifact_pointer",
 )
 
 # Text columns where "" is stored/read as "not set".
@@ -2888,7 +2890,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_of         TEXT,
     -- Boomerang wake level: 1 = mechanical wakes on this card are handled by a
     -- background boomerang child; 0/NULL = they surface. The card is the only setting.
-    boomerang_wake       INTEGER
+    boomerang_wake       INTEGER,
+    -- JSON list of the closed card's artifact pointers (PR/ref, attachments, URLs, doc
+    -- paths), stamped on close; retention never prunes the tasks row (t_328f78fc).
+    -- NULL = never stamped, '[]' = nothing found. hermes_cli/kanban_artifact_pointer.py.
+    artifact_pointer     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -12698,6 +12704,9 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+        # Permanent pointer on the tasks row; the run/comment rows it reads are pruned later.
+        from hermes_cli import kanban_artifact_pointer as _kap
+        _kap.stamp(conn, task_id)
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -17230,6 +17239,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
+        from hermes_cli import kanban_artifact_pointer as _kap
+        _kap.stamp(conn, task_id)   # t_328f78fc: survives retention of the rows it reads
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # Stop the worker before its workspace is reaped below. Same identity-checked
     # host-local termination the reclaim paths use. Reap ONLY on proven death:
