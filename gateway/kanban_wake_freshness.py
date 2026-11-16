@@ -99,7 +99,19 @@ def filter_obligations(event: Any, *, now: Optional[float] = None) -> bool:
     return False
 
 
-def is_stale(status: Optional[str], kind: str) -> bool:
+def closed_card_news(kind: Any, payload: Any) -> bool:
+    """t_28b3f37c: main-train's owner notice (hermes-home main_train.Kanban._boomerang through
+    card_mechanical_wake.emit) tells the session behind a merged PR that the PR turned main red. The
+    card it names is usually closed already, so a done/archived status does not make it stale."""
+    p = payload if isinstance(payload, dict) else {}
+    return (kind == "mechanical_wake" and p.get("by") == "card-mechanical-wake"
+            and p.get("source") == "main-train"
+            and str(p.get("episode") or "").startswith("main-train-owner:"))
+
+
+def is_stale(status: Optional[str], kind: str, payload: Any = None) -> bool:
+    if status in FINAL_STATUSES and closed_card_news(kind, payload):
+        return False
     return (status in FINAL_STATUSES or status == GONE) and kind not in STILL_NEWS_KINDS
 
 
@@ -129,9 +141,12 @@ def log_dropped(task_id: str, kind: str, event_ts: Any, stage: str, status: Opti
 
 
 def card_entry(board: Optional[str], task_id: str, kinds: Iterable[str], event_ts: Any,
-               text: str) -> dict:
-    return {"board": board or "", "task_id": task_id, "kinds": sorted(set(kinds)),
-            "event_ts": event_ts, "text": text}
+               text: str, closed_news: bool = False) -> dict:
+    entry = {"board": board or "", "task_id": task_id, "kinds": sorted(set(kinds)),
+             "event_ts": event_ts, "text": text}
+    if closed_news:   # t_28b3f37c: the wake carries an owner notice, news on a done/archived card
+        entry["closed_news"] = True
+    return entry
 
 
 def filter_event(event: Any, *, now: Optional[float] = None) -> bool:
@@ -158,7 +173,8 @@ def filter_event(event: Any, *, now: Optional[float] = None) -> bool:
             live.append(card)
             continue
         kinds = list(card.get("kinds") or [])
-        if kinds and all(is_stale(status, k) for k in kinds):
+        news = card.get("closed_news") is True and status in FINAL_STATUSES
+        if kinds and not news and all(is_stale(status, k) for k in kinds):
             for k in kinds:
                 log_dropped(str(card.get("task_id")), k, card.get("event_ts"), "dequeue",
                             status, now)

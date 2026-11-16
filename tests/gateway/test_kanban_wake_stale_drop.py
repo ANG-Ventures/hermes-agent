@@ -208,3 +208,67 @@ def test_drain_skips_stale_wake_and_promotes_the_next_queued_event(env):
     pending_event, pending = asyncio.run(
         runner._run_agent_drain_pending({"final_response": "x"}, Adapter(), stale.source, "k"))
     assert pending_event is human and pending == "hi"
+
+
+# --- t_28b3f37c: main-train's owner notice is news about a CLOSED card by design ----------------------------------
+
+OWNER_NOTICE = {"by": "card-mechanical-wake", "source": "main-train",
+                "episode": "main-train-owner:ANG-Ventures/hermes-home#11647:mt-12202",
+                "text": "[main-train] your PR turned main red"}
+DETACHED = {"by": "card-mechanical-wake", "source": "detached-run", "episode": "detached:r1", "text": "job x rc=1"}
+
+
+def _close(tid, status="done"):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+
+
+@pytest.mark.parametrize("status", ["done", "archived"])
+def test_owner_notice_on_a_closed_card_is_not_stale(status):
+    assert fresh.is_stale(status, "mechanical_wake", OWNER_NOTICE) is False
+    assert fresh.is_stale(status, "mechanical_wake", DETACHED) is True, "every other wake stays dropped"
+    assert fresh.is_stale(status, "mechanical_wake") is True
+    assert fresh.is_stale(status, "gave_up", OWNER_NOTICE) is True, "only the mechanical_wake kind"
+    for bad in ({**OWNER_NOTICE, "source": "detached-run"}, {**OWNER_NOTICE, "episode": "detached:r1"},
+                {**OWNER_NOTICE, "by": "someone"}):
+        assert fresh.is_stale(status, "mechanical_wake", bad) is True, bad
+    assert fresh.is_stale(fresh.GONE, "mechanical_wake", OWNER_NOTICE) is True, "a gone card stays stale"
+
+
+@pytest.mark.parametrize("status", ["done", "archived"])
+def test_owner_wake_delivers_an_owner_notice_on_a_closed_card(env, caplog, status):
+    caplog.set_level(logging.INFO)
+    tid = _card(env)
+    _close(tid, status)
+    _event(tid, "mechanical_wake", OWNER_NOTICE)
+    handled = [e for e in _tick(env) if tid in (e.text or "")]
+    assert len(handled) == 1, "one turn for the owner notice"
+    assert handled[0].metadata["gateway_session_key"] == env["owner"].session_key
+    assert not _stale_lines(caplog)
+    assert fresh.filter_event(handled[0]) is False, "the dequeue re-check keeps it too"
+
+
+def test_owner_wake_still_drops_a_detached_run_wake_on_a_done_card(env, caplog):
+    caplog.set_level(logging.INFO)
+    tid = _card(env)
+    _close(tid)
+    _event(tid, "mechanical_wake", DETACHED)
+    assert [e for e in _tick(env) if tid in (e.text or "")] == []
+    lines = _stale_lines(caplog)
+    assert len(lines) == 1 and "kind=mechanical_wake" in lines[0] and "status=done" in lines[0]
+
+
+def test_dequeue_keeps_an_owner_notice_on_a_done_card_and_drops_it_once_gone(env):
+    tid = _card(env)
+    card = fresh.card_entry("default", tid, ["mechanical_wake"], 1_000, f"[kanban wake] {tid}", closed_news=True)
+    src = SessionSource(platform=Platform.DISCORD, chat_id=CHAT, chat_type="group", user_id=HUMAN)
+    ev = MessageEvent(text=card["text"], message_type=MessageType.TEXT, source=src, internal=True,
+                      metadata={fresh.META_KEY: [card]})
+    _archive(tid)
+    assert fresh.filter_event(ev) is False
+    plain = _wake_event([tid])
+    plain.metadata[fresh.META_KEY][0]["kinds"] = ["mechanical_wake"]
+    assert fresh.filter_event(plain) is True, "a mechanical_wake that is not an owner notice is dropped"
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
+    assert fresh.filter_event(ev) is True, "a gone card stays stale"
