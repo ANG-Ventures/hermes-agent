@@ -227,6 +227,7 @@ def test_pid_file_failure_after_popen_still_returns_the_live_child(_isolated, tm
         real_write(path, data)
 
     monkeypatch.setattr(dd.subprocess, "Popen", _popen)
+    monkeypatch.setattr(dd.macos_spawn, "available", lambda: False)  # pin the Popen path on macOS too
     monkeypatch.setattr(dd, "_write_json", _write_json)
     record = _record("deleg_pidfile", owner="boot-a:1.0")
 
@@ -664,6 +665,7 @@ def test_spawned_worker_is_marked_to_boot_pm_dependencies(_isolated, tmp_path, m
         return proc
 
     monkeypatch.setattr(dd.subprocess, "Popen", _popen)
+    monkeypatch.setattr(dd.macos_spawn, "available", lambda: False)  # pin the Popen path on macOS too
     record = _record("deleg_pm", owner="boot-a:1.0")
     _REAL_SPAWN_CHILD(record=record, attempt_id=record["attempt"]["attempt_id"], profile_home=tmp_path,
                       continuation=None, live_delegation_id=None)
