@@ -236,6 +236,40 @@ def test_labelled_red_text_shapes():
     assert ow.pr_is_red_or_dirty({"state": "open", "failing": []}, stale) is None  # green read wins
 
 
+_CAP_TITLE = "ERROR: no further review: round cap reached, operator finalizes at this head"
+
+
+@pytest.mark.parametrize("title,want", [
+    (_CAP_TITLE, "Prism: no further review at this head (operator finalizes)"),
+    ("Prism errored", "Prism check failed"),
+    (None, "Prism check failed"),
+])
+def test_all_zero_label_at_head_with_failing_prism_is_never_red_prism(tmp_path, monkeypatch, title, want):
+    """t_265197b1 (home#12163 @ 94859564, 11-15 21:38): a same-head all-zero label entry plus a failing
+    Prism check is the round cap or a Prism refusal, not a red of the PR."""
+    _labels_file(tmp_path, monkeypatch, {"head": _HEAD, "counts": {"OWN": 0, "MAIN": 0, "STALE-BASE": 0,
+                                                                   "FLAKE": 0}, "own": [], "rows": []})
+    health = {"state": "open", "mergeable_state": "blocked", "head": _HEAD, "failing": ["prism"],
+              "failing_urls": ["https://github.com/o/r/runs/1"], "failing_titles": [title]}
+    labels = ow.red_labels_for("ANG-Ventures/hermes-agent", 1710, _HEAD)
+    text = ow.pr_is_red_or_dirty(health, labels)
+    assert text == f"{want} <https://github.com/o/r/runs/1>"
+    assert "red" not in text
+    # a non-Prism red next to it stays named (the label did not explain it); dirty still shows
+    mixed = dict(health, failing=["prism", "lint-x"], failing_titles=[title, None], mergeable_state="dirty")
+    assert ow.pr_is_red_or_dirty(mixed, labels) == (
+        f"red: lint-x; {want} <https://github.com/o/r/runs/1>; dirty (merge conflict)")
+
+
+def test_failing_prism_without_a_same_head_label_keeps_the_old_fallback(tmp_path, monkeypatch):
+    """Missing / other-head label entries keep the full failing list (Apollo's ruling on t_265197b1)."""
+    health = {"state": "open", "head": _HEAD, "failing": ["prism"], "failing_titles": [_CAP_TITLE]}
+    assert ow.pr_is_red_or_dirty(health, None) == "red: prism"
+    _labels_file(tmp_path, monkeypatch, {"head": "b" * 40, "counts": {"OWN": 0, "MAIN": 0}, "own": []})
+    assert ow.pr_is_red_or_dirty(health, ow.red_labels_for("ANG-Ventures/hermes-agent", 1710, _HEAD)) == (
+        "red: prism")
+
+
 def test_red_handback_on_review_hold_lane_does_not_wake(env):
     """t_54f4fde6: a red handback parked on kanban.review_hold_assignee is no decision yet: no owner wake."""
     _cfg(review_hold_assignee="review-hold")
