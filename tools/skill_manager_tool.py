@@ -120,7 +120,9 @@ MAX_DESCRIPTION_LENGTH = 1024
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')  # filesystem-safe, URL-friendly
-ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}  # for write_file/remove_file
+# sites/: browser-access site cards (sites/<domain>/SITE.md) that agents update after a browser task.
+# The exec-tier refusal is by path tier, not by subdir, so this adds no code-write path.
+ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets", "sites"}  # for write_file/remove_file/patch
 _FRONTMATTER_END_RE = re.compile(r'\n---\s*\n')
 _NAME_RULE = "Use lowercase letters, numbers, hyphens, dots, and underscores."
 
@@ -1207,7 +1209,7 @@ _FILE_PATH = {
     "type": "string",
     "description": (
         "Path RELATIVE to the skill's own directory, e.g. 'references/api.md' — no leading "
-        "slash, never absolute; first segment references/, templates/, scripts/, or assets/."
+        "slash, never absolute; first segment references/, templates/, scripts/, assets/ or sites/."
     ),
 }  # stated once (write_file); patch/remove_file point at it
 

@@ -131,6 +131,7 @@ class TestValidateFilePath:
         assert _validate_file_path("templates/config.yaml") is None
         assert _validate_file_path("scripts/train.py") is None
         assert _validate_file_path("assets/image.png") is None
+        assert _validate_file_path("sites/example.com/SITE.md") is None
 
     def test_path_traversal_blocked(self):
         assert _validate_file_path("references/../../../etc/passwd") is not None
@@ -373,6 +374,19 @@ word word
         assert result["success"] is False
         assert "escapes" in result["error"].lower()
         assert outside_file.read_text() == "old text here"
+
+    def test_patch_site_card_under_sites(self, tmp_path):
+        # browser-access tells agents to update sites/<domain>/SITE.md after a browser task;
+        # skill_manage refused the path (papercut pc-31307b1b).
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            card = tmp_path / "my-skill" / "sites" / "example.com" / "SITE.md"
+            card.parent.mkdir(parents=True)
+            card.write_text("# example.com\nlogin: unknown\n")
+            result = _patch_skill("my-skill", "login: unknown", "login: SSO",
+                                  file_path="sites/example.com/SITE.md")
+        assert result["success"] is True, result
+        assert "login: SSO" in card.read_text()
 
 
 class TestSkillMutationLock:
