@@ -100,7 +100,8 @@ def _gh_pr(repo, n, cache):
         return cache[key]
     try:
         out = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{n}", "--jq", "[.created_at,.merged_at]"],
-                             capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+                             stdin=subprocess.DEVNULL)
         cache[key] = json.loads(out.stdout) if out.returncode == 0 else None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         cache[key] = None

@@ -30,7 +30,7 @@ def board(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     policy = tmp_path / "landing-policy.json"
-    policy.write_text(json.dumps({"dispatch_evidence_bundle": "off"}))
+    policy.write_text(json.dumps({"dispatch_evidence_bundle": "off"}), encoding="utf-8")
     monkeypatch.setenv("KANBAN_LANDING_POLICY", str(policy))
     monkeypatch.setenv(eb.KILL_FILE_ENV, str(tmp_path / "kill.disabled"))
     from hermes_cli import kanban_db as kb
@@ -40,12 +40,12 @@ def board(monkeypatch, tmp_path):
     files = vhome / "var" / "oneshot"
     files.mkdir(parents=True)
     spec = files / "M1-result.md"
-    spec.write_text("# spec\nthe worker needs this text\n")
+    spec.write_text("# spec\nthe worker needs this text\n", encoding="utf-8")
     return {"home": tmp_path, "vhome": vhome, "policy": policy, "spec": spec, "kb": kb, "kbc": kbc}
 
 
 def _set_policy(board, value):
-    board["policy"].write_text(json.dumps({"dispatch_evidence_bundle": value}))
+    board["policy"].write_text(json.dumps({"dispatch_evidence_bundle": value}), encoding="utf-8")
 
 
 def _card(board, body, assignee="test-worker"):
@@ -102,7 +102,7 @@ def test_root_relative_studio_path_is_bundled_and_custody_path_refused(board):
     _set_policy(board, "on")
     key = board["vhome"] / "state" / "github-app" / "private-key.pem"
     key.parent.mkdir(parents=True)
-    key.write_text("x")
+    key.write_text("x", encoding="utf-8")
     body = ("spec at var/oneshot/M1-result.md on the Studio; key state/github-app/private-key.pem; "
             "see plans/ci-99-program/ and hermes-agent/var/other.md and state/missing.jsonl")
     tid, task = _card(board, body)
@@ -121,14 +121,15 @@ def test_root_relative_studio_path_is_bundled_and_custody_path_refused(board):
 def test_secret_like_file_is_refused_with_a_manifest_line(board):
     _set_policy(board, "on")
     env = board["vhome"] / ".env"
-    env.write_text("DISCORD_BOT_TOKEN=abc\n")
+    env.write_text("DISCORD_BOT_TOKEN=abc\n", encoding="utf-8")
     pem = board["vhome"] / "notes.txt"
-    pem.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n")
+    begin, end = "-----BEGIN " + "OPENSSH PRIVATE KEY-----", "-----END " + "OPENSSH PRIVATE KEY-----"
+    pem.write_text(f"{begin}\nfake-test-key-1234567890\n{end}\n", encoding="utf-8")  # split: no gitleaks hit
     leak = board["vhome"] / "var" / "log.txt"
-    leak.write_text("export OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD\n")
+    leak.write_text("export OPENAI_API_KEY=sk-proj-test-1234567890-fake-fixture-value\n", encoding="utf-8")
     custody = board["vhome"] / "state" / "github-app" / "app.pem"
     custody.parent.mkdir(parents=True)
-    custody.write_text("x")
+    custody.write_text("x", encoding="utf-8")
     tid, task = _card(board, f"see {env} {pem} {leak} {custody} and /home/someone-else/notes.md")
     _attach(board, task)
     items = {i["path"]: i for i in _manifest(board, tid)["items"]}
@@ -202,12 +203,12 @@ def test_toggle_off_bundles_nothing_and_reads_nothing(board, monkeypatch):
     tid, task = _card(board, f"Read {board['spec']}")
     for value in ("off", "true", None):
         if value is None:
-            board["policy"].write_text("{}")
+            board["policy"].write_text("{}", encoding="utf-8")
         else:
             _set_policy(board, value)
         assert _attach(board, task) is None
     _set_policy(board, "on")
-    (board["home"] / "kill.disabled").write_text("")
+    (board["home"] / "kill.disabled").write_text("", encoding="utf-8")
     assert _attach(board, task) is None
     assert _attachments(board, tid) == {}
     assert reads == []
