@@ -388,3 +388,113 @@ def test_outgoing_supervisor_leaves_an_adopters_record_alone(_isolated, tmp_path
     assert holder["job_dir"].exists(), "the outgoing supervisor deleted the live child's job dir"
     assert holder["proc"].poll() is None
     assert not _drain()
+
+
+def _hold_registry_lock_in_another_process(_isolated, seconds: float) -> subprocess.Popen:
+    """A sibling process (another gateway's reader) takes async-delegations.lock for ``seconds`` and
+    stamps itself the way ``locked_registry`` does."""
+    lpath = ad._registry_path().with_suffix(".lock")
+    lpath.parent.mkdir(parents=True, exist_ok=True)
+    code = ("import fcntl,os,sys,time; h=open(sys.argv[1],'a+b'); fcntl.flock(h.fileno(), fcntl.LOCK_EX);"
+            " h.truncate(0); h.write(f'pid={os.getpid()} caller=test_reader'.encode()); h.flush();"
+            " print('held', flush=True); time.sleep(float(sys.argv[2]))")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(lpath), str(seconds)],
+                            stdout=subprocess.PIPE, text=True, start_new_session=True)
+    _isolated.append(proc)
+    assert proc.stdout.readline().strip() == "held"
+    return proc
+
+
+def _dispatch_with_lock_held_at_spawn(_isolated, monkeypatch, *, hold_seconds: float, child_seconds: float):
+    """t_ad0710c9: the lock is taken by another process right after the child spawns, i.e. across
+    ``set_detached_block`` -- the 2026-11-16 deleg_5aff89ab timeline (8.06 s read hold)."""
+    holder: dict = {}
+
+    def fake_spawn(*, record, attempt_id, profile_home, continuation, live_delegation_id):
+        job_dir = dd.job_dir_for(profile_home, attempt_id)
+        proc = _fake_child(_isolated, job_dir, seconds=child_seconds, summary="ran despite the held lock")
+        holder.update(proc=proc, job_dir=job_dir,
+                      lock_holder=_hold_registry_lock_in_another_process(_isolated, hold_seconds))
+        return dd.DetachedSpawn(job_dir, proc.pid, dd.process_create_time(proc.pid), proc)
+
+    monkeypatch.setattr(dd, "spawn_child", fake_spawn)
+    spec = {k: v for k, v in _record("x", owner="boot-a:1.0").items() if k in {"profile", "source", "execution", "route"}}
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["port the module"], context=None, toolsets=None, role="leaf", model="test-model",
+        session_key="agent:main:telegram:dm:123", parent_session_id="parent-1",
+        runner=lambda: pytest.fail("a detached unit must not run in-process"),
+        durable_spec=spec, current_boot_id="boot-a:1.0", detached={"live_delegation_id": None},
+    )
+    assert handle["status"] == "dispatched"
+    return handle["delegation_id"], holder
+
+
+def test_registry_lock_held_8s_by_another_process_does_not_lose_the_detached_unit(_isolated, monkeypatch):
+    """Red on base: set_detached_block timed out after 5 s, the child was stood down and the parent got
+    'stopped before its detached child started work' with zero work done (deleg_5aff89ab)."""
+    monkeypatch.setattr(ad, "current_boot_id", lambda: "boot-a:1.0")
+    delegation_id, holder = _dispatch_with_lock_held_at_spawn(_isolated, monkeypatch, hold_seconds=8,
+                                                              child_seconds=10)
+
+    evt = _wait_for_event(delegation_id, timeout=60)
+
+    assert evt["status"] == "completed", evt.get("error")
+    assert evt["summary"] == "ran despite the held lock"
+    assert holder["lock_holder"].wait(timeout=5) == 0
+
+
+def test_registry_lock_held_past_the_budget_fails_fast_naming_the_lock_and_holder(_isolated, monkeypatch):
+    """When the hold outlasts the retry budget the parent learns within seconds, and the error names the
+    lock and the pid holding it (base: a bare 'stopped before its detached child started work')."""
+    monkeypatch.setattr(ad, "current_boot_id", lambda: "boot-a:1.0")
+    monkeypatch.setattr(ad._store, "DETACHED_BLOCK_BUDGET_SECONDS", 1.0, raising=False)
+    started = time.monotonic()
+    # 3 s: past the 1 s advertise budget, inside the stand-down's own lock wait (the 11-16 shape).
+    delegation_id, holder = _dispatch_with_lock_held_at_spawn(_isolated, monkeypatch, hold_seconds=3,
+                                                              child_seconds=30)
+
+    evt = _wait_for_event(delegation_id, timeout=25)
+
+    assert evt["status"] != "completed"
+    assert time.monotonic() - started < 20, "the parent must learn within seconds, not after the hold"
+    assert "async-delegations.lock" in (evt.get("error") or ""), evt.get("error")
+    assert f"pid={holder['lock_holder'].pid}" in evt["error"], evt["error"]
+
+
+def test_orphan_recovery_does_not_hold_the_registry_lock_while_state_db_is_busy(_isolated, tmp_path):
+    """The untagged 6-8 s write=False holds: recover_abandoned_delegations (every 30 s orphan sweep) held
+    async-delegations.lock across its whole state.db pass, so a busy state.db writer stretched the JSON
+    lock hold and a dispatch-path writer timed out behind it (t_ad0710c9 measurement)."""
+    import sqlite3
+    import threading
+
+    record = _record("deleg_done", owner=DEAD_BOOT, state="done", detached=False)
+    record["terminal"] = {"status": "completed", "completed_at": time.time(), "error": None, "result": None}
+    _write(record)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("INSERT INTO async_delegations (delegation_id, origin_session, state, delivery_state, "
+                     "dispatched_at, owner_pid, owner_started_at, task_json, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                     ("deleg_done", "k", "running", "pending", time.time(), 1, 1.0, "{}", time.time()))
+        conn.commit()
+    held = threading.Event()
+
+    def busy_state_db_writer():
+        c = sqlite3.connect(str(tmp_path / "state.db"), isolation_level=None)
+        c.execute("BEGIN IMMEDIATE")
+        held.set()
+        time.sleep(4)
+        c.execute("COMMIT")
+        c.close()
+
+    threading.Thread(target=busy_state_db_writer, daemon=True).start()
+    held.wait()
+    sweep = threading.Thread(target=ad.recover_abandoned_delegations, daemon=True)
+    sweep.start()
+    time.sleep(0.5)  # the sweep is now waiting on state.db
+
+    started = time.monotonic()
+    with ad._store.locked_registry(timeout=2.0):
+        waited = time.monotonic() - started
+    sweep.join(timeout=15)
+
+    assert waited < 1.0, f"a registry writer waited {waited:.1f}s behind the orphan sweep's state.db wait"
