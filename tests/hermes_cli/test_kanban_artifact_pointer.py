@@ -118,17 +118,68 @@ def test_backfill_dry_run_then_apply_is_idempotent(kanban_home):
         conn.commit()
 
         dry = kap.backfill(conn)
-        assert dry == {"scanned": 2, "gain": 1, "empty": 1, "applied": False}
+        assert dry == {"scanned": 2, "gain": 1, "empty": 1, "unreadable": 0, "applied": False}
         assert _pointer(conn, with_link) is None   # dry run writes nothing
 
-        assert kap.backfill(conn, apply=True) == {"scanned": 2, "gain": 1, "empty": 1, "applied": True}
+        assert kap.backfill(conn, apply=True) == {"scanned": 2, "gain": 1, "empty": 1, "unreadable": 0, "applied": True}
         assert _pointer(conn, with_link) == [DOC]
         assert _pointer(conn, bare) == []
         assert _pointer(conn, open_card) is None
 
         _prune(conn, with_link)   # rows gone later: a rerun must not touch the stamped pointer
-        assert kap.backfill(conn, apply=True) == {"scanned": 0, "gain": 0, "empty": 0, "applied": True}
+        assert kap.backfill(conn, apply=True) == {"scanned": 0, "gain": 0, "empty": 0, "unreadable": 0, "applied": True}
         assert _pointer(conn, with_link) == [DOC]
+    finally:
+        conn.close()
+
+
+def _move_to_archive(conn, tid: str) -> None:
+    """R8: copy the card's runs/comments (all columns) into kanban-archive.db, then delete them live."""
+    import sqlite3
+    db = Path([r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"][0])
+    arch = sqlite3.connect(db.parent / "kanban-archive.db")
+    try:
+        for tbl in ("task_runs", "task_comments"):
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % tbl)]
+            arch.execute("CREATE TABLE IF NOT EXISTS %s (%s, moved_at INTEGER)" % (tbl, ", ".join(cols)))
+            rows = conn.execute("SELECT %s FROM %s WHERE task_id=?" % (", ".join(cols), tbl), (tid,)).fetchall()
+            arch.executemany("INSERT INTO %s (%s) VALUES (%s)" % (tbl, ", ".join(cols), ", ".join("?" * len(cols))),
+                             rows)
+        arch.commit()
+    finally:
+        arch.close()
+    _prune(conn, tid)
+
+
+def test_backfill_reads_archived_run_metadata(kanban_home):
+    """Prism e64f5647344b: a pre-deploy card whose PR url lives only in an ARCHIVED run's metadata."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="old card, pr in metadata", assignee="daedalus")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="done", metadata={"pr_url": "https://github.com/o/r/pull/7"})
+        conn.execute("UPDATE tasks SET artifact_pointer = NULL")
+        conn.commit()
+        _move_to_archive(conn, tid)
+        assert kap.backfill(conn, apply=True)["gain"] == 1
+        assert _pointer(conn, tid) == ["https://github.com/o/r/pull/7"]
+    finally:
+        conn.close()
+
+
+def test_backfill_leaves_null_when_archive_unreadable(kanban_home):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="archive broken", assignee="daedalus")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary=f"done {DOC}")
+        conn.execute("UPDATE tasks SET artifact_pointer = NULL")
+        conn.commit()
+        db = Path([r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"][0])
+        (db.parent / "kanban-archive.db").write_bytes(b"not a sqlite file" * 100)
+        assert kap.backfill(conn, apply=True) == {"scanned": 0, "gain": 0, "empty": 0, "unreadable": 1,
+                                                  "applied": True}
+        assert _pointer(conn, tid) is None
     finally:
         conn.close()
 

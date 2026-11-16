@@ -108,18 +108,23 @@ def collect(conn: sqlite3.Connection, task_id: str, *, include_archive: bool = F
         return []
     result, ws_kind, ws_path = row[0], row[1], row[2]
     skip = ws_path.rstrip("/") + "/" if ws_kind == "scratch" and ws_path else None
-    runs = [(r[0], _meta(r[1])) for r in conn.execute(
-        "SELECT summary, metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC", (task_id,))]
-    comments = [r[0] for r in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC", (task_id,))]
+    runs = [(r[0], r[1], r[2]) for r in conn.execute(
+        "SELECT id, summary, metadata FROM task_runs WHERE task_id = ?", (task_id,))]
+    comments = [(r[0], r[1]) for r in conn.execute(
+        "SELECT id, body FROM task_comments WHERE task_id = ?", (task_id,))]
     attachments = ([r[0] for r in conn.execute(
         "SELECT filename FROM task_attachments WHERE task_id = ? ORDER BY id", (task_id,))]
         if _table_exists(conn, "task_attachments") else [])
     if include_archive:
+        # Full archived rows (metadata included); an unreadable archive raises ArchiveUnreadable so
+        # the backfill leaves the pointer NULL instead of stamping an incomplete one.
         from hermes_cli import kanban_archive_read as kar
-        arch = kar.archived_rows(conn, task_id)
-        runs += [(r.get("summary"), {}) for r in sorted(arch.get("runs", []), key=lambda r: -(r.get("id") or 0))]
-        comments += [c.get("body") for c in sorted(arch.get("comments", []), key=lambda c: -(c.get("id") or 0))]
+        runs += [(r.get("id"), r.get("summary"), r.get("metadata")) for r in kar.full_rows(
+            conn, "task_runs", task_id, live_ids=[r[0] for r in runs])]
+        comments += [(c.get("id"), c.get("body")) for c in kar.full_rows(
+            conn, "task_comments", task_id, live_ids=[c[0] for c in comments])]
+    runs = [(s, _meta(m)) for _i, s, m in sorted(runs, key=lambda r: -(r[0] or 0))]   # newest first
+    comments = [b for _i, b in sorted(comments, key=lambda c: -(c[0] or 0))]
     entries: list[str] = []
     if runs:
         entries += _survivor_entries(runs[0][1])
@@ -165,7 +170,13 @@ def backfill(conn: sqlite3.Connection, *, apply: bool = False) -> dict:
     idempotent. -> {"scanned": n, "gain": cards with >=1 entry, "empty": cards with none, "applied": bool}"""
     ids = [r[0] for r in conn.execute(
         "SELECT id FROM tasks WHERE status IN ('done', 'archived') AND artifact_pointer IS NULL ORDER BY id")]
-    plan = [(tid, collect(conn, tid, include_archive=True)) for tid in ids]
+    from hermes_cli.kanban_archive_read import ArchiveUnreadable
+    plan, unreadable = [], 0
+    for tid in ids:
+        try:
+            plan.append((tid, collect(conn, tid, include_archive=True)))
+        except ArchiveUnreadable:   # left NULL: a later run stamps it once the archive reads
+            unreadable += 1
     if apply:
         from hermes_cli.kanban_db_connect import write_txn
         with write_txn(conn):
@@ -173,7 +184,8 @@ def backfill(conn: sqlite3.Connection, *, apply: bool = False) -> dict:
                 conn.execute("UPDATE tasks SET artifact_pointer = ? WHERE id = ? AND artifact_pointer IS NULL",
                              (json.dumps(entries), tid))
     gain = sum(1 for _t, e in plan if e)
-    return {"scanned": len(plan), "gain": gain, "empty": len(plan) - gain, "applied": apply}
+    return {"scanned": len(plan), "gain": gain, "empty": len(plan) - gain, "unreadable": unreadable,
+            "applied": apply}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
