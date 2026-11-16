@@ -4737,6 +4737,10 @@ def _launch_claimed(
         return _LAUNCH_NOT_OWNED
     if host is None:
         reservation_id = _book_local_start(conn, claimed)
+    else:
+        # Off by default (landing-policy dispatch_evidence_bundle); never raises (t_978ec761).
+        from hermes_cli.kanban_evidence_bundle import maybe_attach
+        maybe_attach(conn, claimed, host=host, board=board)
     from hermes_cli.kanban_priority_door import spawn as _priority_spawn
     pid = _priority_spawn(conn, claimed, workspace, host=host, spawn=spawn,
                           spawn_kwargs=spawn_kwargs, state=state, reservation_id=reservation_id)
