@@ -312,3 +312,58 @@ def test_argparse_refusal_puts_the_cause_on_the_last_line(board, monkeypatch):
     last = out.rstrip().splitlines()[-1]
     assert "error:" in last and "--priority" in last, out
     assert "example:" in out.lower(), out
+
+
+# --- t_a54ae900: a raw --coverage send-back still stamps the routed PR head on the event --------
+
+def _raw_coverage(head_sha: str) -> str:
+    return json.dumps({
+        "lenses": {lens: "done" for lens in REQUIRED_REVIEW_LENSES},
+        "findings": 1, "items": ["Missing guard at handler:42"],
+        "review_minutes": 5, "batch_id": "batch-raw-1", "head_sha": head_sha,
+    })
+
+
+@pytest.mark.parametrize("routed", [True, False])
+def test_raw_coverage_sendback_writes_routed_head_on_event(board, monkeypatch, routed):
+    """No --finding/--lens/--json: build_coverage is skipped, the event still carries head_sha."""
+    from hermes_cli import kanban_handback_head as hh
+
+    monkeypatch.setattr(hh, "_default_reader", lambda: lambda repo, number: {"head": HEAD})
+    monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
+    if routed:
+        with kb.connect() as conn:
+            run = kb.latest_run(conn, board)
+            conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                         (json.dumps({"pr_url": "https://github.com/ANG-Ventures/hermes-agent/pull/41"}),
+                          run.id))
+            conn.commit()
+    cov = _raw_coverage("n/a: reviewer wrote none")
+    assert "Claimed" in cli.run_slash(f"claim {board} --review")
+    out = cli.run_slash(f"request-changes {board} --body fix --coverage {shlex.quote(cov)}")
+    assert "Requested changes" in out, out
+    with kb.connect() as conn:
+        payload = [e for e in kb.list_events(conn, board) if e.kind == "changes_requested"][-1].payload
+    if routed:
+        assert payload["head_sha"] == HEAD
+    else:
+        assert "head_sha" not in payload
+
+
+def test_sendback_head_read_failure_writes_nothing_and_does_not_refuse(board, monkeypatch):
+    from hermes_cli import kanban_handback_head as hh
+
+    monkeypatch.setattr(hh, "_default_reader", lambda: lambda repo, number: None)
+    monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, board)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                     (json.dumps({"pr_url": "https://github.com/ANG-Ventures/hermes-agent/pull/41"}), run.id))
+        conn.commit()
+    cov = _raw_coverage("n/a: reviewer wrote none")
+    assert "Claimed" in cli.run_slash(f"claim {board} --review")
+    out = cli.run_slash(f"request-changes {board} --body fix --coverage {shlex.quote(cov)}")
+    assert "Requested changes" in out, out
+    with kb.connect() as conn:
+        payload = [e for e in kb.list_events(conn, board) if e.kind == "changes_requested"][-1].payload
+    assert "head_sha" not in payload

@@ -15758,6 +15758,17 @@ class _SendBackRefused(Exception):
         self.detail = detail
 
 
+def _send_back_routed_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Head sha of the card's routed PR, or None (no PR, unreadable head, any fault)."""
+    try:
+        from hermes_cli.kanban_verb_input import _routed_pr_head
+
+        head, _pr = _routed_pr_head(conn, task_id)
+    except Exception:  # fail-open: the reader side holds a headless send-back
+        return None
+    return head or None
+
+
 @_home_session_guarded("request-changes")
 def request_changes(
     conn: sqlite3.Connection,
@@ -15857,6 +15868,11 @@ def request_changes(
         close_on_error = _close_on_refusal(comment_author, coverage_body)
         if close_on_error:
             return False, close_on_error
+    # The routed PR's head goes on the event whatever the coverage holds (t_a54ae900;
+    # read by hermes-home changes_hold._request_head). Read before the txn (gh REST);
+    # an unreadable head writes nothing and refuses nothing. A nested send-back is
+    # inside the caller's write txn, so it skips the network read.
+    routed_head = None if nested else _send_back_routed_head(conn, task_id)
 
     opened: list[int] = []
     posted: list[tuple[int, int, int]] = []  # (comment_id, run_id, created_at)
@@ -16000,6 +16016,7 @@ def request_changes(
                 "status": new_status,
                 **({"operator": operator_reason,
                     "operator_kind": kind or OPERATOR_KIND_HUMAN} if operator_reason else {}),
+                **({"head_sha": routed_head} if routed_head else {}),
             },
             run_id=run_id,
         )
