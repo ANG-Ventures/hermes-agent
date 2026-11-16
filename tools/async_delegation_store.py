@@ -441,9 +441,35 @@ LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_SLOW_LOG_MS = 1000.0
 #: Total time ``mark_submitted`` keeps retrying a lock timeout before the unit is failed.
 MARK_SUBMITTED_BUDGET_SECONDS = 30.0
+#: Same for ``set_detached_block``: a lock timeout there stands the spawned child down and the unit does
+#: no work, so one slow holder must not decide it (t_ad0710c9: an 8.06 s read hold, 2026-11-16).
+DETACHED_BLOCK_BUDGET_SECONDS = 30.0
 
 
-def _log_lock_timing(path: Path, write: bool, started: float, acquired_at: float | None) -> None:
+def _lock_caller() -> str:
+    """``file:line:func`` of the code that entered ``locked_registry`` (first frame outside it)."""
+    try:
+        frame = sys._getframe(1)
+        while frame is not None and (frame.f_code.co_name in {"locked_registry", "__enter__"}
+                                     or frame.f_code.co_filename.endswith("contextlib.py")):
+            frame = frame.f_back
+        if frame is None:
+            return "?"
+        return f"{Path(frame.f_code.co_filename).name}:{frame.f_lineno}:{frame.f_code.co_name}"
+    except Exception:  # pragma: no cover - attribution must never break the lock path
+        return "?"
+
+
+def _lock_holder(lpath: Path) -> str:
+    """The holder stamp ``locked_registry`` writes into the lock file ("" when none: an older build)."""
+    try:
+        return lpath.read_bytes()[:240].decode("utf-8", "replace").strip("\0 \n")
+    except OSError:
+        return ""
+
+
+def _log_lock_timing(path: Path, write: bool, started: float, acquired_at: float | None,
+                     caller: str = "?") -> None:
     """One line per acquisition: wait/hold ms and registry bytes (WARNING when either is slow).
 
     ``acquired_at`` None = the lock was never taken (timeout): wait is the whole attempt."""
@@ -458,8 +484,8 @@ def _log_lock_timing(path: Path, write: bool, started: float, acquired_at: float
         slow = acquired_at is None or wait_ms >= LOCK_SLOW_LOG_MS or hold_ms >= LOCK_SLOW_LOG_MS
         (logger.warning if slow else logger.debug)(
             "async_delegation_registry_lock acquired=%s write=%s wait_ms=%.0f hold_ms=%.0f "
-            "registry_bytes=%d path=%s",
-            acquired_at is not None, write, wait_ms, hold_ms, size, path,
+            "registry_bytes=%d caller=%s path=%s",
+            acquired_at is not None, write, wait_ms, hold_ms, size, caller, path,
         )
     except Exception:  # pragma: no cover - telemetry must never break the lock path
         pass
@@ -491,6 +517,7 @@ def locked_registry(
     started = time.monotonic()
     acquired_at: float | None = None
     deadline = started + max(0.0, timeout)
+    caller = _lock_caller()
     handle = lpath.open("a+b")
     acquired = False
     try:
@@ -523,8 +550,16 @@ def locked_registry(
                     acquired = True
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError(f"timed out acquiring {lpath}")
+                        raise TimeoutError(f"timed out acquiring {lpath} after {timeout:.1f}s; "
+                                           f"held by {_lock_holder(lpath) or 'unknown (no holder stamp)'}")
                     time.sleep(0.01)
+            # Holder stamp for a waiter that times out (cleared on release). No fsync: diagnostic only.
+            with contextlib.suppress(OSError):
+                handle.truncate(0)
+                argv = " ".join(Path(a).name for a in sys.argv[:3])[:120]
+                handle.write(f"pid={os.getpid()} write={write} caller={caller} since={time.time():.3f} "
+                             f"argv={argv}".encode("utf-8", "replace"))
+                handle.flush()
         acquired_at = time.monotonic()
         registry = _load(path, allow_invalid_records=True, private=write, verify_content=write)
         yield registry
@@ -545,7 +580,7 @@ def locked_registry(
                 with contextlib.suppress(OSError):
                     Path(sidecar).unlink()
     finally:
-        _log_lock_timing(path, write, started, acquired_at)
+        _log_lock_timing(path, write, started, acquired_at, caller)
         if acquired:
             try:
                 import fcntl  # type: ignore
@@ -560,6 +595,9 @@ def locked_registry(
                 except OSError:
                     pass
             else:
+                with contextlib.suppress(OSError):
+                    handle.truncate(0)
+                    handle.flush()
                 try:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 except OSError:
@@ -2127,8 +2165,27 @@ def set_detached_block(
     delegation_id: str, attempt_id: str, block: dict[str, Any], *, profile_home: Path | None = None,
 ) -> bool:
     """Record the spawned detached child on the current attempt (False: cancelled/superseded). A record a
-    racing shutdown already marked ``recoverable`` still takes the block: the next boot adopts it."""
-    with locked_registry(profile_home) as registry:
+    racing shutdown already marked ``recoverable`` still takes the block: the next boot adopts it.
+
+    A lock timeout is retried until ``DETACHED_BLOCK_BUDGET_SECONDS`` is spent; only the last one raises
+    (its message names the holder)."""
+    deadline = time.monotonic() + max(0.0, DETACHED_BLOCK_BUDGET_SECONDS)
+    while True:
+        try:
+            return _set_detached_block_once(
+                delegation_id, attempt_id, block, profile_home=profile_home,
+                timeout=max(0.05, min(LOCK_TIMEOUT_SECONDS, deadline - time.monotonic())))
+        except TimeoutError as exc:
+            if time.monotonic() >= deadline:
+                raise
+            logger.warning("async_delegation_detached_block_retry delegation_id=%s attempt_id=%s: %s",
+                           delegation_id, attempt_id, exc)
+
+
+def _set_detached_block_once(
+    delegation_id: str, attempt_id: str, block: dict[str, Any], *, profile_home: Path | None, timeout: float,
+) -> bool:
+    with locked_registry(profile_home, timeout=timeout) as registry:
         record = registry["records"].get(delegation_id)
         if (not isinstance(record, dict) or record.get("state") not in {"running", "recoverable"}
                 or (record.get("attempt") or {}).get("attempt_id") != attempt_id):

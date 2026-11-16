@@ -464,10 +464,14 @@ def recover_abandoned_delegations(*, invalid_ids: Optional[set[str]] = None) -> 
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
     recorded (``record_unit_child``) are replayed with their real results. Canonical JSON terminal evidence
     (fork registry) is synchronized into the mirror first."""
-    # Lock order is canonical JSON, then SQLite. Failed reads remain retryable.
+    # Failed reads remain retryable. The JSON lock covers only taking a private snapshot: the state.db
+    # pass waits on SessionDB writers (busy_timeout 10 s) and held the registry lock across that wait,
+    # 6-8 s every few sweeps, long enough to time out a dispatch-path writer (t_ad0710c9). Every
+    # mirror UPDATE below is guarded by its own WHERE clause, so a snapshot a few ms old is safe.
     try:
         with _store.locked_registry(write=False) as registry:
-            return _recover_abandoned_delegations(registry, invalid_ids)
+            snapshot = _store._copy_registry(registry)
+        return _recover_abandoned_delegations(snapshot, invalid_ids)
     except Exception:
         logger.warning("Could not recover delegation terminal mirrors", exc_info=True)
         raise
@@ -2021,15 +2025,16 @@ def _run_detached_unit(
             logger.debug("detached on_spawned hook failed", exc_info=True)
     # Flag the live record BEFORE the registry advertises the child, so a shutdown racing this spawn
     # either sees a detached unit (hand-off) or stood this one down (terminate below; re-dispatch).
+    advertise_error: Optional[BaseException] = None
     try:
         advertised = _install_detached_supervision(
             delegation_id, spawned.pid, spawned.create_time, spawned.job_dir) and _store.set_detached_block(
                 delegation_id, attempt_id, spawned.block(attempt_id), profile_home=profile_home)
-    except Exception:
+    except Exception as exc:
         # A child nobody supervises or can adopt must not run on (its side effects would repeat on retry).
         logger.warning("async_delegation_detached_supervision_failed delegation_id=%s pid=%s",
                        delegation_id, spawned.pid, exc_info=True)
-        advertised = False
+        advertised, advertise_error = False, exc
     if not advertised:
         # Cancelled, superseded or shutting down between persist and spawn: the child must not run on,
         # and its job dir must not look adoptable (a shutdown re-dispatches the unit on the next boot).
@@ -2061,7 +2066,9 @@ def _run_detached_unit(
                                delegation_id, exc_info=True)
             dd.remove_job_dir(spawned.job_dir)
         # Raise, not return: a returned payload with no per-task results classifies as a completed batch.
-        raise RuntimeError("Background delegation stopped before its detached child started work.")
+        cause = (f" Could not record the child in the delegation registry: "
+                 f"{type(advertise_error).__name__}: {advertise_error}" if advertise_error is not None else "")
+        raise RuntimeError(f"Background delegation stopped before its detached child started work.{cause}")
     abort = _handed_off_check(delegation_id)
     try:
         return dd.wait_for_result(spawned.job_dir, spawned.pid, spawned.create_time, spawned.popen,
