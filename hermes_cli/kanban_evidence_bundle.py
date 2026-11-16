@@ -62,7 +62,7 @@ _SECRET_NAMES = (
     ".env", ".env.*", "*.env", "*.pem", "*.pem.*", "*.key", "*.key.*", "*.p12", "*.pfx", "*.jks", "*.keystore",
     "*.gpg", "*.kdbx", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", ".netrc", ".npmrc", ".pypirc",
     "auth.json", "credentials", "credentials.json", "*.secret", "*.secrets", "secrets.*", "*token*.json",
-    "*.ovpn", "*.mobileconfig",
+    "*.ovpn", "*.mobileconfig", "bws_cache*", ".pgpass", ".git-credentials",
 )
 # Prism key custody (hermes-home scripts/lib/prism_custody.py, t_3d87f772): renamed or backed-up trust roots.
 _CUSTODY_NAMES = ("*priv*.pem*", "*private-key*", "*priv*.key*", "*app-key*", "token-cache*", "token_cache*",
@@ -179,17 +179,29 @@ def _name_refusal(path: Path) -> Optional[str]:
 
 
 def _content_refusal(data: bytes) -> tuple[Optional[str], str]:
-    """``(refusal or None, scan)``: ``scan`` says what was checked (``text`` / ``binary``)."""
+    """``(refusal or None, scan)``. Every item is scanned: bytes that are not clean UTF-8 (a log with one damaged
+    byte, a binary) are decoded with replacement and the recoverable text is scanned (``scan`` = ``lossy``), so a
+    decode error never passes a file unscanned (Prism 7aefee143055)."""
     if _PEM_PRIVATE.search(data):
         return "PEM private key in the content", "pem"
     try:
-        text = data.decode("utf-8")
+        text, scan = data.decode("utf-8"), "text"
     except UnicodeDecodeError:
-        return None, "binary"
+        text, scan = data.decode("utf-8", errors="replace"), "lossy"
     from agent.redact import redact_sensitive_text
     if redact_sensitive_text(text, force=True) != text:
-        return "secret scanner match", "text"
-    return None, "text"
+        return "secret scanner match", scan
+    return None, scan
+
+
+def _read_guard_refusal(path: Path) -> Optional[str]:
+    """The agent's canonical read denylist (``agent/file_safety.get_read_block_error``: credential stores such as
+    ``cache/bws_cache.json``, ``auth.json``, ``mcp-tokens/``, ``vault/``, ``browser-profile/``, ``.env``), so this
+    bundle never ships a file the agent itself may not read (Prism 5af21df77b15)."""
+    from agent.file_safety import get_read_block_error
+    if get_read_block_error(str(path)):
+        return "credential store (agent read denylist)"
+    return None
 
 
 def _hash_file(path: Path) -> tuple[int, str]:
@@ -249,7 +261,8 @@ def build_bundle(body: str, *, session_id: Optional[str], home: Path,
             item.update({k: v for k, v in first.items() if k not in ("origin", "path")}, duplicate_of=first["path"])
             continue
         seen[real] = item
-        refusal = _name_refusal(expanded) or (_name_refusal(real) if real != expanded else None)
+        refusal = (_name_refusal(expanded) or (_name_refusal(real) if real != expanded else None)
+                   or _read_guard_refusal(expanded) or (_read_guard_refusal(real) if real != expanded else None))
         if refusal:
             item.update(status="refused", reason=refusal)
             continue

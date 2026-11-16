@@ -142,6 +142,38 @@ def test_secret_like_file_is_refused_with_a_manifest_line(board):
     assert [n for n in _attachments(board, tid) if n != eb.MANIFEST_NAME] == []
 
 
+def test_secret_after_a_bad_utf8_byte_is_still_scanned(board):
+    """Prism 7aefee143055: one invalid UTF-8 byte must not let a file through unscanned."""
+    _set_policy(board, "on")
+    log = board["vhome"] / "var" / "report.log"
+    log.write_bytes(b"export OPENAI_API_KEY=sk-proj-test-1234567890-fake-fixture-value\n\xff")
+    tid, task = _card(board, f"log {log}")
+    _attach(board, task)
+    (item,) = _manifest(board, tid)["items"]
+    assert (item["status"], item["reason"], item["content_scan"]) == ("refused", "secret scanner match", "lossy")
+
+
+def test_agent_read_denylist_credential_stores_are_refused(board):
+    """Prism 5af21df77b15: files the agent's own read guard denies (bws cache, google oauth) are never shipped,
+    even when their JSON passes the content scanner."""
+    _set_policy(board, "on")
+    bws = board["vhome"] / "cache" / "bws_cache.json"
+    oauth = board["vhome"] / "auth" / "google_oauth.json"
+    for p in (bws, oauth):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"secrets": {"SERVICE_LOGIN": "correct horse battery staple"}, "fetched_at": 1}',
+                     encoding="utf-8")
+    from agent.redact import redact_sensitive_text
+    plain = oauth.read_text(encoding="utf-8")
+    assert redact_sensitive_text(plain, force=True) == plain  # the scanner alone would pass it
+    tid, task = _card(board, f"see {bws} and {oauth}")
+    _attach(board, task)
+    items = {i["path"]: i for i in _manifest(board, tid)["items"]}
+    assert {i["status"] for i in items.values()} == {"refused"}, items
+    assert items[str(oauth)]["reason"] == "credential store (agent read denylist)"
+    assert list(_attachments(board, tid)) == [eb.MANIFEST_NAME]
+
+
 def test_over_the_cap_is_listed_by_name_and_hash_only(board, monkeypatch):
     _set_policy(board, "on")
     monkeypatch.setattr(eb, "CAP_BYTES", 64)
@@ -182,7 +214,7 @@ def test_source_message_attachments_are_bundled(board):
         "discord", "1561038985004974203", "1571908845658177596", True)
     assert src["permalink"] is None and "guild" in src["permalink_note"]
     (item,) = manifest["items"]
-    assert item["origin"] == "message" and item["status"] == "bundled" and item["content_scan"] == "binary"
+    assert item["origin"] == "message" and item["status"] == "bundled" and item["content_scan"] == "lossy"
 
 
 def test_discord_permalink_in_body_is_carried():
