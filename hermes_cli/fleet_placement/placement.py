@@ -143,6 +143,10 @@ V2_PSI_CPU_SOME60 = 25.0
 # power source + pmset SleepDisabled); unmeasured = closed, like every other safety axis.
 POWER_POLICIES = ("ac_only",)
 ALPHA_DEFAULT, ALPHA_FAST, ALPHA_WIDE = 0.5, 1.0, 0.0     # D2: P0/P1 or core_class fast = 1, wide = 0
+# FWA E2E F5 (t_e3384bea): the P0/P1 / core_class fast leg under v2 with a measured st_speed. "speed" (default) takes
+# the FASTEST eligible host (st_speed first, score as the tie-break), the docstring's rule; "score" is the kill switch
+# back to the pre-F5 pick (max headroom_fraction x st_speed), which sent 49/199 fast picks to the slower ace-media.
+FAST_PICKS = ("speed", "score")
 OCCUPANCY_TAU_S = 60.0       # the sampler's EWMA time constant for procs_running - 1
 
 
@@ -289,6 +293,7 @@ class HostTable:
     # listed keeps the consumer's own class
     profile_footprints: Mapping[str, Mapping[str, Footprint]] = dataclasses.field(default_factory=dict)
     scorer: str = DEFAULT_SCORER                 # the kill switch (v1|v2); active_scorer() applies PLACEMENT_SCORER
+    fast_pick: str = "speed"                     # the F5 kill switch (speed|score), table key ``fast_pick``
     # {host id: (pressure_from or None, aliases)} for EVERY row the table declares, the ones load_hosts() left out
     # included: resource-domain membership is the registry's, not candidate eligibility's, so a closed guest's live
     # leases and reservations still count on its source (Prism 7e9f3e2ed307 / c2f0087775e6 / 03f3bf40fe6b)
@@ -505,6 +510,9 @@ def validate(doc) -> List[str]:
     sc = doc.get("scorer", DEFAULT_SCORER)
     if sc not in SCORERS:
         errs.append(f"scorer must be one of {list(SCORERS)}, not {sc!r}")
+    fp_mode = doc.get("fast_pick", "speed")
+    if fp_mode not in FAST_PICKS:
+        errs.append(f"fast_pick must be one of {list(FAST_PICKS)}, not {fp_mode!r}")
     v1 = doc.get("scorer_v1", {})
     if not isinstance(v1, dict):
         errs.append("scorer_v1 must be an object")
@@ -744,7 +752,7 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     declared = {hid: (h.get("pressure_from"), tuple(h.get("aliases", []))) for hid, h in doc["hosts"].items()}
     return HostTable(hosts=hosts, footprints=fps, closed_when=cw, path=p, default_first=doc.get("default_first"),
                      saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)), profile_footprints=pfps,
-                     scorer=scorer, declared=declared,
+                     scorer=scorer, declared=declared, fast_pick=doc.get("fast_pick", "speed"),
                      shared_budgets={hid: h["shared_budget"] for hid, h in doc["hosts"].items()
                                      if "shared_budget" in h})
 
@@ -2185,8 +2193,9 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     if core_class == "fast":
         rule = "priority" if job.core_class is None else "core_class:fast"
         if v2 and any(table.hosts[r.host].st_speed_src == "measured" for r in eligible):
-            # measured st_speed (alpha 1) replaces the lscpu clock; until R2b measures, the clock rule stands
-            return pick(max(eligible, key=lambda r: (r.score, table.hosts[r.host].clock_mhz, r.host)), rule)
+            # measured st_speed replaces the lscpu clock as the FIRST key (F5); until R2b measures, the clock rule stands
+            speed = (lambda r: table.hosts[r.host].st_speed) if table.fast_pick == "speed" else (lambda r: 0.0)
+            return pick(max(eligible, key=lambda r: (speed(r), r.score, table.hosts[r.host].clock_mhz, r.host)), rule)
         best = max(eligible, key=lambda r: (table.hosts[r.host].clock_mhz, r.score, r.host))
         return pick(best, rule)
     if core_class == "wide":
