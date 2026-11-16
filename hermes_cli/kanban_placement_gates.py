@@ -111,7 +111,8 @@ LAST_RESORT_SQL = (
 def check_i1(conn: sqlite3.Connection, since: float) -> dict:
     """AC-2: I-1 violations, the kind guard, the field guard and the
     last-resort histogram over ``placement`` events since ``since``."""
-    args = {"kind": KIND, "kind_new": _pr.normalize_kind(KIND), "since": int(since)}
+    kind_old, kind_new = _pr.kind_names(KIND)  # both stored names of the placement/allocation event
+    args = {"kind": kind_old, "kind_new": kind_new, "since": int(since)}
     violations = [{"task_id": r[0], "payload": json.loads(r[1] or "{}")}
                   for r in conn.execute(i1_violation_sql(), args)]
     kinds = conn.execute(KIND_GUARD_SQL, args).fetchone()[0]

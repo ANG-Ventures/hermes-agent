@@ -92,7 +92,7 @@ def _cards(conn, body, n=1):
 
 def _placements(conn, tid):
     return [json.loads(r[0]) for r in conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? AND kind='placement'", (tid,))]
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='allocation'", (tid,))]
 
 
 # -- AC-9: flag off is today's route ---------------------------------------------
@@ -263,7 +263,7 @@ def test_dry_run_reports_the_take_refusal(home):
 
 # -- AC-2 / I-1 query (R4) --------------------------------------------------------
 
-def _event(conn, tid, payload, kind="placement", at=None):
+def _event(conn, tid, payload, kind="allocation", at=None):
     conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
                  (tid, kind, json.dumps(payload), int(at or time.time())))
     conn.commit()
@@ -466,7 +466,7 @@ def _run(conn, tid, *, outcome, summary="", event=None, host="ace-ai", ended=Non
                        "VALUES (?,?,?,?,?,?)", (tid, "done", ended - 60, ended, outcome, summary))
     rid = cur.lastrowid
     conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
-                 (tid, rid, "worker_placed", json.dumps({"host": host}), ended - 60))
+                 (tid, rid, "worker_allocated", json.dumps({"host": host}), ended - 60))
     if event:
         conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
                      "VALUES (?,?,?,?,?)", (tid, rid, event, "{}", ended - 30))

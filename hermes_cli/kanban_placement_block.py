@@ -28,7 +28,7 @@ from typing import List, Optional, Tuple
 
 from hermes_cli import kanban_placement_reasons as _pr
 
-REROUTED_EVENT = "placement_rerouted"
+REROUTED_EVENT = _pr.PLACEMENT_REROUTED_EVENT
 UNROUTABLE_EVENT = "placement_unroutable"
 # A block older than this is not re-routed (the work may be stale): it is recorded unroutable, so the
 # watch pages it once for a human to re-pin or close.

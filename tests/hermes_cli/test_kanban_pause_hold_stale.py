@@ -29,14 +29,14 @@ def _write(home, doc):
 
 
 def _last_wait(conn, tid):
-    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' "
+    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='allocation_wait' "
                        "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
     return None if row is None else json.loads(row[0])
 
 
 def _label(conn, tid, detail):
     with kb.write_txn(conn):
-        kb._append_event(conn, tid, "placement_wait", {"code": "pause_hold", "detail": detail,
+        kb._append_event(conn, tid, "allocation_wait", {"code": "pause_hold", "detail": detail,
                                                         "reason": f"pause_hold ({detail})", "route": "wait",
                                                         "host": None, "since": int(time.time()) - 3600})
 

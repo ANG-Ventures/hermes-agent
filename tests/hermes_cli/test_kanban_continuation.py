@@ -133,7 +133,7 @@ def test_hint_is_durable_comment_and_event(db):
     with kb.write_txn(db):
         kc.create_hints(db, child["id"], 'redo ' + parent["id"])
     assert 'recreate with --continues' in db.execute("SELECT body FROM task_comments").fetchone()[0]
-    assert db.execute("SELECT COUNT(*) FROM task_events WHERE kind='placement_hint'").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM task_events WHERE kind='allocation_hint'").fetchone()[0] == 1
 
 
 def test_warn_deduplicates_observation(db):
@@ -308,7 +308,7 @@ def test_full_dispatch_retry_uses_remote_origin(tmp_path, monkeypatch):
         assert kb.get_task(conn, tid).origin_host == 'ace-media'
         assert conn.execute('SELECT host FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 'ace-media'
         placement = json.loads(conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='placement'", (tid,)).fetchone()[0])
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='allocation'", (tid,)).fetchone()[0])
         assert (placement['route'], placement['rule'], placement['host']) == ('remote-pin', 'origin', 'ace-media')
 
 

@@ -74,8 +74,8 @@ def _running(conn) -> List[dict]:
                 f"AND kind IN ({_pr.kind_marks(_pr.WORKER_PLACED_EVENT, _pr.PLACEMENT_EVENT)}) ORDER BY id",
                 (tid, run_id, *_pr.kind_names(_pr.WORKER_PLACED_EVENT, _pr.PLACEMENT_EVENT)),
             ).fetchall():
-                # latest of each kind wins; an allocation-named row reads as its placement name
-                ev[_pr._KIND_OLD.get(kind, kind)] = _payload(raw)
+                # latest of each kind wins; a placement-named (historical) row reads as its allocation name
+                ev[_pr.normalize_kind(kind)] = _payload(raw)
             wp = ev.get(_pr.WORKER_PLACED_EVENT)
             pl = ev.get(_pr.PLACEMENT_EVENT) or {}
             if wp is not None:

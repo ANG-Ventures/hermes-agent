@@ -74,10 +74,10 @@ def _ported_card(conn, *, rerouted=True, host="ace-ai", body=REROUTED_BODY):
         kb._append_event(conn, tid, kwt.PORTED_EVENT, {"host": host, "repo": "NousResearch/hermes-agent",
                                                         "mirror": "~/.hermes/mirrors/x.git",
                                                         "branch": f"wt/{tid}", "workspace": path})
-        kb._append_event(conn, tid, "worker_placed", {"host": host, "workspace": path, "reason": "overflow"})
+        kb._append_event(conn, tid, "worker_allocated", {"host": host, "workspace": path, "reason": "overflow"})
         kb._append_event(conn, tid, "blocked", {"kind": "capability", "reason": "Placed on ci-box"})
         if rerouted:
-            kb._append_event(conn, tid, "placement_rerouted", {"from_host": host, "to_host": "studio", "run_id": 1})
+            kb._append_event(conn, tid, "allocation_rerouted", {"from_host": host, "to_host": "studio", "run_id": 1})
     return tid, path
 
 
@@ -178,7 +178,7 @@ def test_full_tick_wakes_the_home_session_once_with_the_override_command(kanban_
         _tick(conn, spillover=_plan(free=2), spawn_limit=2)
         wakes = [json.loads(p) for (p,) in conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='mechanical_wake'", (tid,))]
-        wait = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' "
+        wait = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='allocation_wait' "
                                        "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
     assert tid not in [t for t, _h in spawned], spawned
     assert res.placement_waits[tid].startswith("studio_default_deny:studio-state"), res.placement_waits
@@ -263,7 +263,7 @@ def test_override_on_a_non_deny_hold_says_it_does_not_release(operator, capsys):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="x", assignee="alpha", body="requires: studio-state")
         with kb.write_txn(conn):
-            kb._append_event(conn, tid, "placement_wait", {"code": "not_portable:requires:studio-state",
+            kb._append_event(conn, tid, "allocation_wait", {"code": "not_portable:requires:studio-state",
                                                            "reason": "not_portable:requires:studio-state",
                                                            "route": "wait", "host": None})
     rc = ksa.cmd_studio_override(argparse.Namespace(task_id=tid, capability="studio-state",

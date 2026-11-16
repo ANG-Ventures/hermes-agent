@@ -376,6 +376,7 @@ def drop_origin(conn, task_id: str, *, actor: str, files: list) -> bool:
 def create_hints(conn, task_id: str, body: Optional[str], *, continues=None) -> None:
     import re
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_placement_reasons as _pr
     for source in sorted(set(re.findall(r"\bt_[0-9a-f]{8}\b", body or ""))):
         if source in (task_id, continues):
             continue
@@ -383,4 +384,4 @@ def create_hints(conn, task_id: str, body: Optional[str], *, continues=None) -> 
         if row and row[0]:
             message = f"{source} left state on {row[0]}; recreate with --continues {source} to keep it"
             kb.add_comment(conn, task_id, "dispatcher", message)
-            kb._append_event(conn, task_id, "placement_hint", {"source": source, "host": row[0]})
+            kb._append_event(conn, task_id, _pr.PLACEMENT_HINT_EVENT, {"source": source, "host": row[0]})
