@@ -184,6 +184,12 @@ def test_backfill_leaves_null_when_archive_unreadable(kanban_home):
         conn.close()
 
 
+def test_overlong_entry_skipped_not_truncated():
+    long_url = "https://example.com/" + "a" * kap._MAX_ENTRY_CHARS
+    got = kap._cap([long_url, DOC], None)
+    assert got == [DOC]   # not a 300-char prefix of long_url
+
+
 def test_scan_shapes():
     text = ("see https://x.io/a). path ~/notes/a.md, obsidian://open?vault=V&file=R "
             "and /Volumes/fleet-scratch/r.html; not relative/path or https://x.io/a again")

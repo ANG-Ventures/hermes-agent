@@ -82,12 +82,13 @@ def _cap(entries: Iterable[str], skip_prefix: Optional[str]) -> list[str]:
     seen: set[str] = set()
     size = 2   # "[]"
     for raw in entries:
-        e = str(raw).strip()[:_MAX_ENTRY_CHARS]
-        if not e or e in seen or (skip_prefix and e.startswith(skip_prefix)):
+        e = str(raw).strip()
+        # An over-long entry is skipped, never cut: a truncated URL or path is a wrong pointer.
+        if not e or len(e) > _MAX_ENTRY_CHARS or e in seen or (skip_prefix and e.startswith(skip_prefix)):
             continue
         cost = len(json.dumps(e)) + 1
         if size + cost > MAX_BYTES:
-            break
+            continue
         seen.add(e)
         out.append(e)
         size += cost
