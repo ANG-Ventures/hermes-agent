@@ -1582,6 +1582,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "boomerang_wake" not in cols:
         # After workspace_of (fresh column order). Ace 2026-10-22 (t_7be18632).
         _add_column_if_missing(conn, "tasks", "boomerang_wake", "boomerang_wake INTEGER")
+    if "artifact_pointer" not in cols:
+        # After boomerang_wake (fresh column order). t_328f78fc; backfill is the module's CLI.
+        _add_column_if_missing(conn, "tasks", "artifact_pointer", "artifact_pointer TEXT")
     # Every init while the pre-rename ``auto_handle`` column exists: pre-update code may
     # still write it after an earlier copy (Prism 4158abbc3b1b).
     _migrate_legacy_boomerang_column(conn, cols)

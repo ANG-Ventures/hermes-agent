@@ -218,6 +218,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d["pin_sub_fallback"] = bool(getattr(t, "pin_sub_fallback", False))
     d["unhomed"] = bool(getattr(t, "unhomed", False))
     d["no_worker"] = bool(getattr(t, "no_worker", False))
+    from hermes_cli.kanban_artifact_pointer import read as _read_pointer
+    d["artifact_pointer"] = _read_pointer(getattr(t, "artifact_pointer", None))
     return d
 
 
@@ -1669,6 +1671,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         _print_section("Result:", [task.result])
     elif latest_summary:
         _print_section("Latest summary:", [latest_summary])
+    if task.status in ("done", "archived"):
+        from hermes_cli.kanban_artifact_pointer import read as _read_pointer
+        pointer = _read_pointer(task.artifact_pointer)
+        if pointer is not None:   # NULL = closed before t_328f78fc and not backfilled
+            _print_section(f"Artifacts ({len(pointer)}):", [f"  {p}" for p in pointer] or ["  (none recorded)"])
     if comments:
         _print_section(f"Comments ({len(comments)}):", (
             f"  [{_fmt_ts(c.created_at)}] "
