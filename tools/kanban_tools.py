@@ -334,9 +334,8 @@ def _enforce_worker_task_ownership(tid: str) -> None:
             "delegate_task children, or in-process cron jobs. Report results to the owning "
             "worker instead.")
     if tid != env_tid:
-        raise _Reject(
-            f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
-            f"to hand off information to other tasks, or list it under `follow-ups:` in your handback.")
+        from hermes_cli.kanban_db_board_registry import worker_scope_refusal
+        raise _Reject(worker_scope_refusal(env_tid, tid))
 
 
 def _worker_guard(tool_name: str, args: dict) -> str:

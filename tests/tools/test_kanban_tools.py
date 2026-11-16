@@ -1373,6 +1373,31 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
         conn.close()
 
 
+def test_worker_foreign_close_refusal_names_board_and_operator_route(worker_env):
+    """pc-bee29201: a worker sent to close a card on another board is told where it is and
+    how to get it closed, not only that it may not."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    kb.create_board("ops")
+    conn = kbc.connect(board="ops")
+    try:
+        other = kb.create_task(conn, title="card on another board")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    err = json.loads(kt._handle_complete({"task_id": other, "summary": "close it"})).get("error", "")
+    assert "refusing to mutate" in err
+    assert f"{other} (on board ops)" in err
+    assert "kanban_block(kind='needs_input'" in err
+    assert f"hermes kanban --board ops complete {other}" in err
+    conn = kbc.connect(board="ops")
+    try:
+        assert kb.get_task(conn, other).status != "done"
+    finally:
+        conn.close()
+
+
 def test_worker_can_comment_on_foreign_task(worker_env):
     """Cross-task commenting must remain unrestricted (#19713 policy).
 
