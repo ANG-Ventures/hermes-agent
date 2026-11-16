@@ -128,6 +128,23 @@ def test_write_init_retries_held_writer(tmp_path, monkeypatch):
         writer.close()
 
 
+def test_current_receipt_with_missing_column_reinitializes(tmp_path):
+    # t_7a79b915: a board whose receipt reads current but lacks a declared column re-runs the migration.
+    from hermes_cli import kanban_artifact_pointer as kap
+    db = tmp_path / "board.db"
+    task_id = seed(db)
+    with sqlite3.connect(db) as stale:
+        stale.execute("ALTER TABLE tasks DROP COLUMN artifact_pointer")
+        kbc._record_initialization(stale)
+        assert kbc._INITIALIZATION_SIGNATURE == stale.execute(
+            "SELECT signature FROM kanban_initialization").fetchone()[0]
+    with kbc.connect_closing(db_path=db) as conn:
+        assert "artifact_pointer" in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert kbc._initialization_is_current(conn)
+        with conn:
+            assert kap.stamp(conn, task_id) == []
+
+
 def test_provider_discovery_does_not_probe_version_until_oauth_request():
     code = '''
 import subprocess
