@@ -1014,13 +1014,19 @@ def _initialization_signature():
     return digest.hexdigest()
 
 
+# Hash ONCE, at import: the bytes this process loaded. Re-reading the files per
+# call let a pre-deploy process run its OLD migrator, then stamp the NEW on-disk
+# signature, so no process re-ran the migration (artifact_pointer, t_f5019c7b).
+_INITIALIZATION_SIGNATURE = _initialization_signature()
+
+
 def _initialization_is_current(conn):
     # Both checks are reads: fresh writer processes need no write transaction on
     # an already-migrated board. SQLite invalidates the receipt on any schema DDL.
     if not _table_exists(conn, "kanban_initialization"):
         return False
     row = conn.execute("SELECT signature, schema_version FROM kanban_initialization WHERE id=1").fetchone()
-    return bool(row and row[0] == _initialization_signature()
+    return bool(row and row[0] == _INITIALIZATION_SIGNATURE
                 and row[1] == conn.execute("PRAGMA main.schema_version").fetchone()[0])
 
 
@@ -1028,7 +1034,7 @@ def _record_initialization(conn):
     conn.execute("CREATE TABLE IF NOT EXISTS kanban_initialization "
                  "(id INTEGER PRIMARY KEY CHECK(id=1), signature TEXT, schema_version INTEGER)")
     conn.execute("INSERT OR REPLACE INTO kanban_initialization VALUES (1, ?, ?)",
-                 (_initialization_signature(), conn.execute("PRAGMA main.schema_version").fetchone()[0]))
+                 (_INITIALIZATION_SIGNATURE, conn.execute("PRAGMA main.schema_version").fetchone()[0]))
 
 
 _FORCE_INITIALIZATION = ContextVar("kanban_force_initialization", default=False)

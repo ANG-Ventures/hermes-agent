@@ -250,3 +250,17 @@ def test_readonly_kill_switch(tmp_path, monkeypatch):
             conn.execute("UPDATE tasks SET title='legacy connection'")
     with kbc.connect_closing(db_path=db, readonly=True) as conn:
         assert conn.execute("SELECT title FROM tasks").fetchone()[0] == "legacy connection"
+
+
+def test_init_receipt_uses_loaded_signature_not_disk(tmp_path, monkeypatch):
+    """A process loaded at signature A must not stamp (or trust) the on-disk B (t_f5019c7b)."""
+    db = tmp_path / "board.db"
+    seed(db)
+    monkeypatch.setattr(kbc, "_INITIALIZATION_SIGNATURE", "A", raising=False)
+    monkeypatch.setattr(kbc, "_initialization_signature", lambda: "B")  # files on disk now hash to B
+    with sqlite3.connect(db) as conn:
+        kbc._record_initialization(conn)
+        assert conn.execute("SELECT signature FROM kanban_initialization").fetchone()[0] == "A"
+        conn.execute("UPDATE kanban_initialization SET signature='B'")
+        conn.commit()
+        assert not kbc._initialization_is_current(conn)
