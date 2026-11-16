@@ -1027,7 +1027,7 @@ def _schema_sql_columns() -> dict[str, frozenset[str]]:
     try:
         mem.executescript(_kb.SCHEMA_SQL)
         tables = [r[0] for r in mem.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+            "SELECT name FROM sqlite_master WHERE type='table' AND substr(name, 1, 7) != 'sqlite_'")]
         return {t: frozenset(r[1] for r in mem.execute(f"PRAGMA table_info({t})")) for t in tables}
     finally:
         mem.close()
