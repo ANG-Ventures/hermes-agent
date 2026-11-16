@@ -19,10 +19,13 @@ import ctypes
 import errno
 import os
 import re
-import shutil
 import signal
 import sys
 from typing import Dict, List, Optional
+
+import psutil
+
+from hermes_platform.resolver import LookupContext, locate_command
 
 IS_DARWIN = sys.platform == "darwin"
 
@@ -80,13 +83,8 @@ def lan_privacy_note(text: str, boot_responsible: Optional[int]) -> Optional[str
     me = os.getpid()
     if boot_responsible is None or boot_responsible == me:
         return None
-    try:
-        os.kill(boot_responsible, 0)
+    if psutil.pid_exists(boot_responsible):
         return None  # the process this child is charged to is alive: not this failure
-    except ProcessLookupError:
-        pass
-    except OSError:
-        return None
     return (f"[note: 'No route to host' (errno 65) here is macOS Local Network Privacy, not a network "
             f"outage: this detached process is charged to pid {boot_responsible} (the gateway that "
             f"spawned it), which has exited, so LAN connections from non-system binaries are refused.]")
@@ -143,10 +141,10 @@ def spawn_disclaimed(argv: List[str], *, env: Dict[str, str], cwd: Optional[str]
     lib = _lib()
     path = argv[0]
     if os.sep not in path:
-        found = shutil.which(path, path=env.get("PATH", os.defpath))
-        if found is None:
+        found = locate_command(path, LookupContext(path=env.get("PATH", os.defpath))).command
+        if not found:
             raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
-        path = found
+        path = found[0]
 
     attr = ctypes.c_void_p()  # posix_spawnattr_t is a pointer on Darwin
     actions = ctypes.c_void_p()  # so is posix_spawn_file_actions_t
@@ -156,7 +154,7 @@ def spawn_disclaimed(argv: List[str], *, env: Dict[str, str], cwd: Optional[str]
         try:
             # Popen(restore_signals=True): Python ignores SIGPIPE/SIGXFSZ; the child starts with defaults.
             sigdef = ctypes.c_uint32(0)  # sigset_t is a 32-bit mask on Darwin
-            for sig in (signal.SIGPIPE, signal.SIGXFSZ):
+            for sig in (signal.SIGPIPE, signal.SIGXFSZ):  # windows-footgun: ok — spawn_disclaimed is Darwin-only
                 sigdef.value |= 1 << (int(sig) - 1)
             _check(lib.posix_spawnattr_setsigdefault(ctypes.byref(attr), ctypes.byref(sigdef)),
                    "posix_spawnattr_setsigdefault")
