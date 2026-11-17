@@ -42,6 +42,7 @@ import dataclasses
 import json
 import math
 import sys
+import threading
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, Sequence
 
@@ -178,16 +179,54 @@ def _in_class(row_class, k: str) -> bool:
     return row_class == k or (k in POOLED_FAMILIES and isinstance(row_class, str) and row_class.startswith(k + ":"))
 
 
+def class_history(history: Iterable[Mapping], klass: str) -> list:
+    """The rows of ``history`` that estimate(klass, ...) can read: its class or its base class (_in_class), in order.
+    estimate() over this subset equals estimate() over ``history`` (t_990ca939: admit_context keeps only these)."""
+    base = klass.split(":", 1)[0]
+    return [r for r in history if _in_class(r.get("class"), klass) or (base != klass and _in_class(r.get("class"), base))]
+
+
+def _build_class_rows(history, k):
+    """(rows of class k sorted by ``at``, {host: those rows in the same order}): what _estimate reads for k."""
+    rows = sorted((r for r in history if _in_class(r.get("class"), k)), key=lambda r: float(r.get("at") or 0.0))
+    by_host: dict = {}
+    for r in rows:
+        try:
+            by_host.setdefault(r.get("host"), []).append(r)
+        except TypeError:   # an unhashable host (a malformed row) never equals a host id, as the old == scan read it
+            pass
+    return rows, by_host
+
+
+# t_990ca939: _estimate runs once per table host inside choose(), and each call used to re-filter and re-sort the whole
+# class-usage window. The filtered rows are memoized per thread on the history TUPLE object itself (one entry, held by a
+# strong reference, so its id cannot be reused while memoized). A tuple cannot change; a new snapshot is a new object
+# and misses. Any other iterable (a list a caller may mutate) is never memoized.
+_ROWS_MEMO = threading.local()
+
+
+def _class_rows(history, k):
+    if not isinstance(history, tuple):
+        return _build_class_rows(history, k)
+    memo = getattr(_ROWS_MEMO, "m", None)
+    if memo is None or memo[0] is not history:
+        memo = _ROWS_MEMO.m = (history, {})
+    hit = memo[1].get(k)
+    if hit is None:
+        hit = memo[1][k] = _build_class_rows(history, k)
+    return hit
+
+
 def _estimate(klass, host, history, seed, *, p, window, min_rows):
     """estimate() plus the axes it booked from the seed (no measurement in the window it read)."""
-    history = list(history)
+    history = history if isinstance(history, tuple) else list(history)
     seed = seed or Estimate()
     base = klass.split(":", 1)[0]
     v = dict.fromkeys((*AXES, "cpu_s", "wall_s"))
     source = "seed"
     for k in ((klass, base) if base != klass else (klass,)):
-        rows = sorted((r for r in history if _in_class(r.get("class"), k)), key=lambda r: float(r.get("at") or 0.0))
-        here = [r for r in rows if r.get("host") == host]
+        rows, by_host = _class_rows(history, k)
+        here = by_host.get(host, [])
         for pick, where in ((here, host), (rows, "fleet")):
             if len(pick) < min_rows:
                 continue

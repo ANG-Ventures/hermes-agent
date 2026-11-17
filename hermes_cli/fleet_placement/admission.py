@@ -31,7 +31,6 @@ binding free fraction after this job, PSI cpu as a penalty.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import math
 import os
@@ -592,9 +591,9 @@ def _history_row(ln) -> Optional[dict]:
     return r if isinstance(r, dict) and r.get("schema") == SCHEMA else None
 
 
-# path -> [open binary file, bytes consumed, rows parsed so far, prefix sha256, head checkpoint, (mtime_ns, size)]
-# (read_history_cached; t_c9fd9c5e). Checkpoints = a sha256 of every consumed byte (t_48cb7ec2) and the first
-# CHECKPOINT_BYTES of them: re-read before reusing the rows, so a truncate + refill to the old size or past it, or an
+# path -> [open binary file, bytes consumed, rows parsed so far, consumed bytes, head checkpoint, (mtime_ns, size)]
+# (read_history_cached; t_c9fd9c5e). Checkpoints = every consumed byte, kept and compared exactly (t_48cb7ec2,
+# t_990ca939) and the first CHECKPOINT_BYTES of them: re-read before reusing the rows, so a truncate + refill to the old size or past it, or an
 # in-place rewrite of ANY consumed row (same inode), resets the cache instead of replaying the old generation. An append always grows the file, so the same size with a moved mtime
 # is an in-place rewrite and resets too, whatever the checkpoints say (Prism e63812f5e349).
 # The file stays OPEN while its rows are cached, so its inode cannot be recycled by an unlink + recreate (Prism e2ace455c12a).
@@ -604,20 +603,22 @@ CHECKPOINT_BYTES = 256
 
 
 def _checkpoint_ok(fh, consumed: int, want) -> bool:
-    """``want`` = a running sha256 over EVERY consumed byte (Prism 001b1324e2a1, t_48cb7ec2): a same-size in-place
-    rewrite of a MIDDLE row that keeps the head + tail bytes, followed by an append (size moved, so the mtime arm is
-    blind), still resets. ~0.5 ms/MiB to hash vs ~11 ms/MiB to parse: the incremental read keeps its point."""
+    """``want`` = EVERY consumed byte, kept (Prism 001b1324e2a1, t_48cb7ec2): a same-size in-place rewrite of a MIDDLE
+    row that keeps the head + tail bytes, followed by an append (size moved, so the mtime arm is blind), still resets.
+    t_990ca939: the re-read prefix is compared byte for byte with the kept bytes instead of re-hashed (21 MB: sha256
+    ~12 ms, compare ~3 ms; 75 MB: 44 vs ~22 ms). Exact equality is at least the guarantee the digest gave; the cost is
+    one copy of the consumed bytes in memory, beside the rows parsed from them. Parsing is ~11 ms/MiB, so the
+    incremental read keeps its point."""
     if consumed <= 0:
         return True
     fh.seek(0)
-    h, left = hashlib.sha256(), consumed
-    while left > 0:
-        b = fh.read(min(left, 1 << 20))
-        if not b:
+    off = 0
+    while off < consumed:
+        b = fh.read(min(consumed - off, 1 << 20))
+        if not b or b != want[off:off + len(b)]:
             return False
-        h.update(b)
-        left -= len(b)
-    return h.digest() == want.digest()
+        off += len(b)
+    return True
 
 
 def _head_ok(fh, want: bytes) -> bool:
@@ -653,10 +654,10 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
                 hit = None
             elif (held.st_size < hit[1] or (held.st_size == hit[5][1] and held.st_mtime_ns != hit[5][0])
                   or not _checkpoint_ok(hit[0], hit[1], hit[3]) or not _head_ok(hit[0], hit[4])):
-                hit[1:5] = [0, [], hashlib.sha256(), b""]   # shrunk or rewritten in place: start over
+                hit[1:5] = [0, [], bytearray(), b""]   # shrunk or rewritten in place: start over
         if hit is None:
             try:
-                hit = [p.open("rb"), 0, [], hashlib.sha256(), b"", (None, None)]
+                hit = [p.open("rb"), 0, [], bytearray(), b"", (None, None)]
             except FileNotFoundError:
                 return []
         fh = hit[0]
@@ -670,7 +671,7 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
             if r is not None:
                 hit[2].append(r)
         if end:
-            hit[3].update(chunk[:end])
+            hit[3] += chunk[:end]
             if len(hit[4]) < CHECKPOINT_BYTES:
                 hit[4] = (hit[4] + chunk[:end])[:CHECKPOINT_BYTES]
         hit[1] += end
