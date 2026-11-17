@@ -52,6 +52,15 @@ FORK SURFACE PRESERVED (do not "clean up" — each is deliberate):
     file: 125 MB of temp writes per 3,000 replayed real rows, ~10.6 GB/day on the Studio. Canary:
     tests/context_engine/test_lcm_ingest_no_temp_spill.py. A refresh that overwrites store.py drops
     it with no error; the canary fails.
+  - Every READ connection opens through `sqlite_util.connect_read` (`PRAGMA temp_store = MEMORY`;
+    t_188b19e8, 2026-11-17). Upstream main a13e709c25 has no such helper and calls sqlite3.connect
+    directly (48 call sites, no temp_store). Callers rerouted: tools.py (lcm_grep deadline readers,
+    lcm_recall summary-source reader), retrieval_core.py, vector_store.py, assertion_store.py and
+    trajectory_store.py read_only branches, command.py, engine.py, aux_session.py,
+    lifecycle_state.py. Without it the lcm_grep hybrid/semantic FTS reader's sorts wrote 0.1-8.2 GB
+    of etilqs_* temp files per call on a copy of the Studio lcm.db. A refresh brings raw
+    sqlite3.connect back; canary tests/context_engine/test_lcm_read_connections_temp_store.py
+    (raw-connect census + temp-dir probe) fails.
 
 FORK CODE DROPPED AS SUPERSEDED BY UPSTREAM (verified, not guessed):
   - _compacted_replay_stored_tail_overlap: ReconcileMixin's _find_reconciled_cursor_for_store_tail

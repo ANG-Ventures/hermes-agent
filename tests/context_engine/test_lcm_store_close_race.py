@@ -475,6 +475,7 @@ _FUNCTION_LOCAL_CONNECTIONS = {
     ("lifecycle_state.py", "get_fragmentation_stats"): "read-only state.db probe, closed in finally",
     ("maintenance.py", "backup_database"): "backup destination, closed before return",
     ("maintenance.py", "rotate_backup_database"): "backup destination, closed before return",
+    ("sqlite_util.py", "connect_read"): "read-connection factory; each caller is checked here itself",
     ("retrieval_core.py", "hydrate_chunk_hits"): "deadline-bounded read, closed in finally",
     ("retrieval_core.py", "hydrate_semantic_nodes"): "deadline-bounded read, closed in finally",
     ("tools.py", "invoke"): "deadline-bounded lcm_grep readers, closed in finally",
@@ -497,8 +498,10 @@ def _unguarded_connects():
             return isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "guard_connection"
 
         for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "connect" and getattr(node.func.value, "id", "") == "sqlite3"):
+            if not (isinstance(node, ast.Call) and (
+                    (isinstance(node.func, ast.Attribute) and node.func.attr == "connect"
+                     and getattr(node.func.value, "id", "") == "sqlite3")
+                    or getattr(node.func, "id", "") == "connect_read")):  # sqlite_util read helper (t_188b19e8)
                 continue
             if is_guard(parents.get(node)):
                 continue
