@@ -2568,3 +2568,118 @@ def test_restart_redispatch_of_a_blocked_assessment_spends_no_budget(tmp_path):
     assert state.claim("b|t|1#restart1", {"task_id": "t", "row": "blocked_assess", "restart_redispatch": True})
     assert not state.get_claim("b|t|1#restart1").get("blocked_budget_exhausted")
     assert (state.retries("t"), state.restart_spent("t"), state.blocked_spent("t")) == before
+
+
+# --- t_efb6f435: a review handed to a human reviewer -> one first-read child, not a home-session turn ------
+
+
+def _green(env, pr, head="c" * 40):
+    env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "clean", "failing": [], "head": head}
+
+
+def _human_handback(tid, pr: int, reviewer="human:apollo"):
+    with kb.connect_closing() as conn, \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        ok = kb.request_review(conn, tid, force=True, summary=f"PR {REPO}#{pr} ready", reviewer=reviewer)
+    assert ok is True or (isinstance(ok, tuple) and ok[0]), ok
+
+
+def _turn_kinds(turns) -> list:
+    return [("owner" if (t.metadata or {}).get("kanban_owner_wake") else "notifier") for t in turns]
+
+
+@pytest.mark.parametrize("reviewer", ["human:apollo", "human"])
+def test_review_handoff_to_human_reviewer_dispatches_a_child_and_no_turn(env, reviewer):
+    _green(env, 3201)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, 3201, reviewer)
+    turns = _tick(env)
+    assert [(e["row"], e["mode"], e["task_id"]) for e in env["dispatched"]] == [("own_repo_review_human", "fork", tid)]
+    assert turns == [], [t.text for t in turns]
+    goal = ah.build_goal(env["dispatched"][0])
+    assert "allowed actions: request_changes, surface" in goal and "never approve" in goal.lower()
+
+
+def test_review_handoff_to_human_reviewer_on_a_plain_wake_card_wakes_the_session(env):
+    _green(env, 3202)
+    tid = _card(env, auto=False)
+    _sub(tid)
+    _human_handback(tid, 3202)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert _turn_kinds(turns) == ["notifier"]
+
+
+def test_review_handoff_with_no_human_reviewer_is_none(env):
+    """The pipeline-owned case: no human reviewer, no child, the wake stays as today."""
+    _green(env, 3203)
+    tid = _card(env)
+    _sub(tid)
+    _handback(tid, 3203)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert _turn_kinds(turns) == ["notifier"]
+
+
+def test_review_handoff_off_switch_restores_the_session_wake(env):
+    stop = ah.review_handoff_stop_file_path()
+    assert stop.name == "boomerang-wake-review-handoff.disabled"
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    _green(env, 3204)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, 3204)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert _turn_kinds(turns) == ["notifier"]
+    stop.unlink()   # read every tick: the next handoff takes the child again, no restart
+    _human_handback_again(tid, 3204)
+    env["adapter"].handled.clear()
+    assert _tick(env) == []
+    assert [e["row"] for e in env["dispatched"]] == ["own_repo_review_human"]
+
+
+def _human_handback_again(tid, pr):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running', assignee = 'worker' WHERE id = ?", (tid,))
+    _human_handback(tid, pr)
+
+
+def _deadman_event(tid):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "review_deadman", json.dumps({"by": "kanban-review-deadman", "waiting_min": 25}),
+                      int(time.time())))
+
+
+@pytest.mark.parametrize("outcome,delivered,deadman_child", [
+    ("surfaced", True, False),           # the handoff child surfaced its read: the episode has its one child
+    ("request_changes", None, False),    # the handoff child acted
+    ("surfaced", False, True),           # its turn never reached the home: the deadman stays as it is
+    ("failed", True, True),              # a failed child leaves the deadman as it is
+    ("lost", True, True),                # so does a lost one
+])
+def test_review_deadman_skips_its_child_when_the_handoff_child_answered(env, outcome, delivered, deadman_child):
+    _green(env, 3205)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, 3205)
+    _tick(env)
+    [handoff] = env["dispatched"]
+    fields = {"state": ah.STATE_TERMINAL, "outcome": outcome}
+    if delivered is not None:
+        fields["resurface_delivered"] = delivered
+    ah.BoomerangWakeState().update_claim(handoff["key"], **fields)
+    _kill(env, handoff)
+    _deadman_event(tid)
+    env["adapter"].handled.clear()
+    turns = _tick(env)
+    rows = [e["row"] for e in env["dispatched"][1:]]
+    if deadman_child:
+        assert rows == ["review_deadman"] and turns == []
+    else:
+        assert rows == [] and turns == [], [t.text for t in turns]
+        skipped = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+        assert [(c["state"], c["outcome"]) for c in skipped] == [(ah.STATE_TERMINAL, "episode_answered")]
