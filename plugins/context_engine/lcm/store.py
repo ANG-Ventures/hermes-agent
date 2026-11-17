@@ -392,6 +392,14 @@ class MessageStore:
         self._conn = guard_connection(sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
+        # Fork (t_ba5a93d0): keep this connection's temp storage in RAM. Every ingest INSERT runs
+        # the msg_fts_insert trigger inside the batch transaction, so SQLite gives it a statement
+        # journal, and past 64 KiB that journal spilled to an etilqs_* file: ~10.6 GB/day of SSD
+        # writes from the Studio's default gateway. Bound, measured replaying 3,000 real rows on a
+        # copy of the 14 GB lcm.db: largest single statement journal 0.44 MB; WAL bytes unchanged.
+        # Searches on this connection now sort in RAM as well: at most 75 MB per call over 24 real
+        # queries (with temp files they wrote up to 8.2 GB per call); results identical.
+        self._conn.execute("PRAGMA temp_store = MEMORY")
         # After an unclean gateway exit, read back the tail the last checkpoints
         # wrote before any schema write touches it (t_6314cc2f). Bounded, never raises.
         self.tail_health = maybe_check_store_tail(self._conn, self.db_path, self._hermes_home)

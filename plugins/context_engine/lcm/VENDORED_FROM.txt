@@ -46,6 +46,12 @@ FORK SURFACE PRESERVED (do not "clean up" — each is deliberate):
   - `_lcm_summary` marker key: DO NOT REMOVE. It looks write-only inside this plugin but the HOST
     reads it at agent/compaction_stats.py (_LCM_SUMMARY_TAG) with a COMPACTION_STATS_TAG_MISSING
     tripwire.
+  - MessageStore connection `PRAGMA temp_store = MEMORY` (store.py _init_db; t_ba5a93d0, 2026-11-17).
+    Upstream main a13e709c25 sets no temp_store anywhere. Without it every ingest INSERT's statement
+    journal (msg_fts_insert trigger inside the batch transaction) spills past 64 KiB to an etilqs_*
+    file: 125 MB of temp writes per 3,000 replayed real rows, ~10.6 GB/day on the Studio. Canary:
+    tests/context_engine/test_lcm_ingest_no_temp_spill.py. A refresh that overwrites store.py drops
+    it with no error; the canary fails.
 
 FORK CODE DROPPED AS SUPERSEDED BY UPSTREAM (verified, not guessed):
   - _compacted_replay_stored_tail_overlap: ReconcileMixin's _find_reconciled_cursor_for_store_tail

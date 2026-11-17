@@ -38,9 +38,26 @@ def test_list_tasks_sorts_keys_not_rows(kanban_home):
         assert kb.list_tasks(rec, order_by="priority-desc")[0].body.endswith("x" * 5000)
         for order in kb.VALID_SORT_ORDERS:
             kb.list_tasks(rec, order_by=order)
-        listing = [s for s in rec.statements if "FROM tasks" in s[0] and "ORDER BY" in s[0]]
+        listing = [s for s in rec.statements if "FROM tasks" in s[0]]
         assert len(listing) == 4 + len(kb.VALID_SORT_ORDERS)
         assert guard.spills(conn, listing, outer_only=True) == []
+
+
+def test_list_tasks_title_sort_has_no_sql_sort(kanban_home):
+    """--sort title sorted (title, id) in SQL: long titles spilled 4.1 MB per call on the Studio board even
+    as bare keys (t_ba5a93d0). It now sorts in Python, with SQLite's BINARY order for the same rows."""
+    titles = ["Fix forward main red mt-1: " + "x" * 300 + "b", "Fix forward main red mt-1: " + "x" * 300 + "a",
+              "Ärger", "Zeta", "zeta", "émoji 🚀", "Fix forward main red mt-1: " + "x" * 300 + "a"]
+    with kb.connect() as conn:
+        for t in titles:
+            kb.create_task(conn, title=t, body="b" * 2000)
+        rec = guard.Recorder(conn)
+        got = [t.id for t in kb.list_tasks(rec, order_by="title")]
+        want = [r[0] for r in conn.execute(
+            "SELECT id FROM tasks WHERE status != 'archived' ORDER BY title ASC, id ASC")]
+        assert got == want
+        assert [t.id for t in kb.list_tasks(rec, order_by="title", limit=3)] == want[:3]
+        assert guard.spills(conn, rec.statements) == []
 
 
 def test_list_gateway_sessions_sorts_keys_not_rows(tmp_path):
