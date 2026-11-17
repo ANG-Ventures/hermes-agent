@@ -514,6 +514,62 @@ def test_unsupported_tree(env, cow):
     assert [r["reason"] for r in ledger(env)] == ["unsupported_tree"]
 
 
+@pytest.mark.parametrize("what", ["ident", "submodule"])
+def test_target_adds_unsupported_tree(env, cow, what):
+    """T is supported; the branch C adds an ident attribute (or a .gitmodules) for files
+    that are unchanged, so the copied files would skip git's smudge path (Prism e400891faded)."""
+    work = env["work"]
+    (work / "f.txt").write_text("$Id$\n")
+    _commit(work, "id file")
+    _git("push", "-q", str(env["bare"]), "main", cwd=work)
+    _git("checkout", "-q", "-b", "tgt", cwd=work)
+    if what == "ident":
+        (work / ".gitattributes").write_text("*.txt text eol=lf\n*.bat text eol=crlf\nf.txt ident\n")
+    else:
+        (work / ".gitmodules").write_text('[submodule "x"]\n\tpath = x\n\turl = ../x.git\n')
+    _commit(work, what)
+    _git("push", "-q", str(env["bare"]), "tgt", cwd=work)
+    _git("checkout", "-q", "main", cwd=work)
+    gen = built(env)
+    assert wc.read_meta(gen)["unsupported"] is None
+    dest = env["base"] / "ws" / "cow"
+    assert wc.clone(URL, str(dest), caller="kanban_clone", branch="tgt", s=env["s"]) == 0
+    ref = plain(env, "plain", branch="tgt")
+    assert snapshot(dest) == snapshot(ref)
+    if what == "ident":
+        assert (ref / "f.txt").read_text() != "$Id$\n"        # git did expand it
+    assert [r["reason"] for r in ledger(env)] == ["unsupported_tree"]
+    assert no_staging_left(env)
+
+
+def test_pre_register_error_falls_back_with_one_row(env, cow, monkeypatch):
+    """A templates dir the creating user cannot lock: plain clone, one ledger row, no traceback."""
+    built(env)
+
+    def denied(*_a, **_k):
+        raise PermissionError(errno.EACCES, "Permission denied", "/templates/.lock")
+
+    monkeypatch.setattr(wc, "_flock", denied)
+    dest = env["base"] / "ws" / "cow"
+    assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
+    assert snapshot(dest) == snapshot(plain(env, "plain"))
+    (row,) = ledger(env)
+    assert row["reason"] == "clone_errno" and row["errno"] == "EACCES"
+    assert no_staging_left(env)
+
+
+def test_malformed_template_meta_falls_back_with_one_row(env, cow):
+    gen = built(env)
+    meta = wc.read_meta(gen)
+    meta["refreshed_at"] = "yesterday"
+    (gen / wc.META).write_text(json.dumps(meta))
+    dest = env["base"] / "ws" / "cow"
+    assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
+    assert snapshot(dest) == snapshot(plain(env, "plain"))
+    (row,) = ledger(env)
+    assert row["reason"] == "clone_errno" and row["errno"] is None
+
+
 def test_no_template(env, cow):
     dest = env["base"] / "ws" / "cow"
     assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0          # nothing built yet

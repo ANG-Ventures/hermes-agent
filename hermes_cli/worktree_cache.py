@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import fcntl
 import json
 import os
 import re
@@ -76,7 +75,7 @@ REASONS = (
     "template_dirty",    # template has modified/untracked/ignored files
     "template_moved",    # template HEAD differs from template.json
     "lock_timeout",      # LOCK_SH not granted within CREATE_LOCK_TIMEOUT_S
-    "clone_errno",       # the CoW copy failed (EXDEV / ENOTSUP / EOPNOTSUPP / other)
+    "clone_errno",       # the CoW copy or another pre-register step raised (errno when an OSError)
     "verify_failed",     # the staged copy does not equal the commit
     "far_commit",        # target commit differs from the template in > max_diff_files files, or T unreachable
 )
@@ -248,6 +247,8 @@ def _must(res: subprocess.CompletedProcess, what: str) -> str:
 @contextlib.contextmanager
 def _flock(path: Path, mode: int, timeout: float) -> Iterator[bool]:
     """Yield True with *mode* held, or False when not granted within *timeout* s."""
+    import fcntl  # POSIX only; nothing on Windows reaches the cache (no CoW primitive there)
+
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     got = False
@@ -292,7 +293,7 @@ def current_gen(rdir: Path) -> Optional[Path]:
 
 def read_meta(gen: Path) -> Optional[dict]:
     try:
-        meta = json.loads((gen / META).read_text())
+        meta = json.loads((gen / META).read_text(encoding="utf-8-sig"))
         return meta if isinstance(meta, dict) else None
     except (OSError, ValueError):
         return None
@@ -323,7 +324,7 @@ def mark_bad(gen: Path, why: str) -> Optional[Path]:
     still points into it (renaming would break their gitdir links). Caller holds LOCK_EX."""
     marker = gen / ".git" / BAD_MARKER
     with contextlib.suppress(OSError):
-        marker.write_text(f"{time.time():.0f} {why}\n")
+        marker.write_text(f"{time.time():.0f} {why}\n", encoding="utf-8")
     if _linked_worktrees(gen):
         return gen
     target = gen.with_name(f"{gen.name}.bad-{int(time.time())}")
@@ -355,8 +356,25 @@ def unsupported_reason(gen: Path, rev: str = "HEAD") -> Optional[str]:
     files = _git("ls-files", "-z", cwd=gen)
     if files.returncode != 0:
         return "ls_files_failed"
-    attrs = _git("check-attr", "-z", "--stdin", "filter", "ident", "working-tree-encoding",
-                 cwd=gen, input_=files.stdout)
+    return _attr_problem(gen, files.stdout)
+
+
+def unsupported_at(repo: Path, rev: str) -> Optional[str]:
+    """``unsupported_reason`` for commit *rev* read from the object store (no working tree):
+    the target of a create can add ``.gitmodules`` or a filter/ident attribute that the
+    template's commit does not have."""
+    if _git("cat-file", "-e", f"{rev}:.gitmodules", cwd=repo).returncode == 0:
+        return "submodules"
+    files = _git("ls-tree", "-r", "-z", "--name-only", rev, cwd=repo)
+    if files.returncode != 0:
+        return "ls_files_failed"
+    return _attr_problem(repo, files.stdout, source=rev)
+
+
+def _attr_problem(cwd: Path, files_z: bytes, source: Optional[str] = None) -> Optional[str]:
+    src = (f"--source={source}",) if source else ()
+    attrs = _git("check-attr", *src, "-z", "--stdin", "filter", "ident", "working-tree-encoding",
+                 cwd=cwd, input_=files_z)
     if attrs.returncode != 0:
         return "check_attr_failed"
     fields = attrs.stdout.decode("utf-8", "replace").split("\0")
@@ -375,9 +393,10 @@ def _assert_template_config(gen: Path) -> list:
             _must(_git("config", key, value, cwd=gen), f"setting {key} on template {gen}")
     exclude = gen / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
-    text = exclude.read_text() if exclude.exists() else ""
+    text = exclude.read_text(encoding="utf-8-sig") if exclude.exists() else ""
     if f"/{META}" not in text.splitlines():
-        exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + f"/{META}\n")
+        exclude.write_text(text + ("" if text.endswith("\n") or not text else "\n") + f"/{META}\n",
+                           encoding="utf-8")
     return drift
 
 
@@ -397,7 +416,7 @@ def _write_meta(gen: Path, slug: str, n: int) -> dict:
         "unsupported": unsupported_reason(gen), "tree_bytes": _tree_bytes(gen),
     }
     tmp = gen / f".{META}.tmp"
-    tmp.write_text(json.dumps(meta, sort_keys=True, indent=1) + "\n")
+    tmp.write_text(json.dumps(meta, sort_keys=True, indent=1) + "\n", encoding="utf-8")
     os.replace(tmp, gen / META)
     return meta
 
@@ -452,6 +471,8 @@ def refresh(slug: str, *, url: Optional[str] = None, lock_timeout: float = REFRE
     url = url or _default_url(slug)
     rdir = repo_dir(slug)
     rdir.mkdir(parents=True, exist_ok=True)
+    import fcntl
+
     with _flock(rdir / ".lock", fcntl.LOCK_EX, lock_timeout) as got:
         if not got:
             return {"repo": slug, "status": "lock_timeout"}
@@ -629,26 +650,33 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
     if slug is None or slug not in s.repos:
         return fallback("no_template")
     rdir = repo_dir(slug)
-    gen = current_gen(rdir)
-    if gen is None:
-        return fallback("no_template")
-    dest_p.parent.mkdir(parents=True, exist_ok=True)
-    if _dev(gen) != _dev(dest_p.parent):
-        return fallback("cross_volume")                      # before any copy (9.1)
-    meta = read_meta(gen) or {}
-    if time.time() - float(meta.get("refreshed_at") or 0) > s.max_lag_s:
-        with contextlib.suppress(Exception):
-            refresh(slug, url=url, lock_timeout=CREATE_LOCK_TIMEOUT_S)
+    meta: dict = {}
+    T = ""
+
+    def prepare() -> Optional[Tuple[str, Optional[int]]]:
+        """Steps 2-4 under LOCK_SH: staging holds a verified copy of T, or a fallback reason."""
+        nonlocal gen, staging, meta, T
+        import fcntl
+
         gen = current_gen(rdir)
         if gen is None:
-            return fallback("no_template")
-
-    retire: Optional[str] = None
-    reason: Optional[str] = None
-    err: Optional[int] = None
-    T = ""
-    with _flock(rdir / ".lock", fcntl.LOCK_SH, CREATE_LOCK_TIMEOUT_S) as got:
-        if got:
+            return "no_template", None
+        dest_p.parent.mkdir(parents=True, exist_ok=True)
+        if _dev(gen) != _dev(dest_p.parent):
+            return "cross_volume", None                      # before any copy (9.1)
+        meta = read_meta(gen) or {}
+        if time.time() - float(meta.get("refreshed_at") or 0) > s.max_lag_s:
+            with contextlib.suppress(Exception):
+                refresh(slug, url=url, lock_timeout=CREATE_LOCK_TIMEOUT_S)
+            gen = current_gen(rdir)
+            if gen is None:
+                return "no_template", None
+        retire: Optional[str] = None
+        reason: Optional[str] = None
+        err: Optional[int] = None
+        with _flock(rdir / ".lock", fcntl.LOCK_SH, CREATE_LOCK_TIMEOUT_S) as got:
+            if not got:
+                return "lock_timeout", None
             gen = current_gen(rdir)
             if gen is None:
                 reason = "no_template"
@@ -674,19 +702,23 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
                 else:
                     if not verify_staging(gen, staging, T, staging.with_name(staging.name + ".idx")):
                         reason = "verify_failed"
-                if reason is not None:
-                    _rm(staging)
-                    staging = None
-    if not got:
-        return fallback("lock_timeout")
-    if retire:
-        with _flock(rdir / ".lock", fcntl.LOCK_EX, 2.0) as ex:
-            if ex and gen is not None and gen == current_gen(rdir):
-                mark_bad(gen, retire)
-    if reason is not None:
+        if retire:
+            with _flock(rdir / ".lock", fcntl.LOCK_EX, 2.0) as ex:
+                if ex and gen is not None and gen == current_gen(rdir):
+                    mark_bad(gen, retire)
+        return (reason, err) if reason is not None else None
+
+    try:
+        pre = prepare()
+    except Exception as exc:  # noqa: BLE001 - a create never dies where plain git would work
+        print(f"worktree-cache: {exc!r}; falling back to plain git", file=sys.stderr)
+        pre = ("clone_errno", exc.errno if isinstance(exc, OSError) else None)
+    if pre is not None:
+        _rm(staging)
+        staging = None
         with contextlib.suppress(OSError):
             os.unlink(str(dest_p.parent / f".{dest_p.name}.cow-{os.getpid()}.idx"))
-        return fallback(reason, err=err if reason == "clone_errno" else None)
+        return fallback(pre[0], err=pre[1])
 
     # Register (step 5): an ordinary --no-checkout clone of the real remote.
     index_src = staging.with_name(staging.name + ".idx")
@@ -710,6 +742,13 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
         if not far and C != T:
             diff = _git("diff", "--name-only", "-z", T, C, cwd=dest_p)
             far = diff.returncode != 0 or diff.stdout.count(b"\0") > s.max_diff_files
+        if not far and C != T and unsupported_at(dest_p, C):
+            # C adds a submodule or a filter/ident/encoding attribute T lacks: the copied
+            # files would skip git's smudge path, so plain git writes this tree.
+            _rm(staging)
+            staging = None
+            _rm(dest_p)
+            return fallback("unsupported_tree")
         if far:
             # Finish in place exactly as plain git would: write the whole tree of C.
             _rm(staging)
@@ -772,7 +811,7 @@ def status(s: Optional[Settings] = None, *, fallbacks: int = 10) -> dict:
     ledger = ledger_path()
     if ledger is not None:
         with contextlib.suppress(OSError):
-            for line in ledger.read_text().splitlines()[-2000:]:
+            for line in ledger.read_text(encoding="utf-8-sig").splitlines()[-2000:]:
                 with contextlib.suppress(ValueError):
                     row = json.loads(line)
                     if str(row.get("caller", "")).startswith("worktree_cache:"):
