@@ -69,6 +69,8 @@ def ok_door(clock=time.time):
 
     def answer(path, body):
         base = {"schema": 1, "workload": body.get("workload"), "host": body.get("host")}
+        if path == "/demand/lookup":
+            return 200, {**base, "id": body["id"], "state": "waiting"}
         if path == "/demand/authorize":
             n[0] += 1
             return 200, {**base, "id": body["id"], "reservation_id": f"rid-{n[0]}", "until": clock() + 90,
@@ -77,6 +79,41 @@ def ok_door(clock=time.time):
             return 200, {"ok": True, "released": True, "renewed": True}
         return 200, {**base, "ok": True, "door": {"at": clock()}}
     return answer
+
+
+@pytest.mark.parametrize("owner", ["kanban", "kanban@mac-studio"])
+def test_existing_owner_through_real_client(fleet, monkeypatch, owner):
+    fleet.registry("fcfs")
+    fleet.table()
+    fleet.token()
+    server = Allocd()
+    monkeypatch.setenv("ALLOCD_URL", server.url)
+    normal = ok_door()
+
+    def answer(path, body):
+        if path == "/demand/lookup" and owner != "kanban":
+            return 200, {"schema": 1, "workload": "kanban", "host": "mac-studio",
+                         "id": body["id"], "state": "authorized", "reservation_id": "pool-row",
+                         "until": time.time() + 90}
+        if path == "/demand/authorize":
+            if body.get("existing_consumer") != owner:
+                return 409, {"reason": "invalid", "detail":
+                             f"reservation pool-row belongs to '{owner}', not '{body.get('existing_consumer')}'"}
+        return normal(path, body)
+
+    server.answer = answer
+    try:
+        tid = _card("real-owner")
+        with kbc.connect_closing() as conn:
+            task = kb.claim_task(conn, tid)
+            with door.start(conn, task, "mac-studio", reservation_id="pool-row"):
+                pass
+        request = next(body for path, body in server.calls if path == "/demand/authorize")
+        assert request["existing_consumer"] == owner
+        assert not faults.latched()
+    finally:
+        server.server.shutdown()
+        server.server.server_close()
 
 
 def _closed_port() -> str:
