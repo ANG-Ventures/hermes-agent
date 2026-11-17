@@ -1851,7 +1851,14 @@ def test_clone_script_keeps_alternates_to_a_never_prune_mirror(tmp_path):
                           ).returncode == 0
     assert (ws / "f").read_text() == "feature"
     assert _alternates(ws) == str(mirror / "objects")
+    # git ignores the extension at format version 0, so that mirror can still prune (Prism 7848e18134f2)
+    _git("config", "core.repositoryformatversion", "0", cwd=mirror)
+    ws3 = tmp_path / "ws3"
+    assert subprocess.run(["sh", "-c", kwt.clone_script(str(ws3), SLUG, str(mirror), "feature", url=str(origin))]
+                          ).returncode == 0
+    assert _alternates(ws3) == ""
     # a mirror that can prune is still dissociated (Prism 02dfd9094b97)
+    _git("config", "core.repositoryformatversion", "1", cwd=mirror)
     _git("config", "--unset", "extensions.preciousObjects", cwd=mirror)
     ws2 = tmp_path / "ws2"
     assert subprocess.run(["sh", "-c", kwt.clone_script(str(ws2), SLUG, str(mirror), "feature", url=str(origin))]

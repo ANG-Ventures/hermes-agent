@@ -733,3 +733,27 @@ def test_active_exit_code_follows_switch_scope_and_env(monkeypatch):
         assert args.func(args) == rc
     monkeypatch.setenv(wc.ENV_SWITCH, "0")
     assert args.func(args) == 1
+
+
+def test_switch_and_templates_root_come_from_the_host_root_config(tmp_path, monkeypatch):
+    """A worker runs with HERMES_HOME=<root>/profiles/<p>; the host switch and kanban.workspaces_root
+    live in <root>/config.yaml only (no Studio worker profile carries them)."""
+    import hermes_constants
+
+    root = tmp_path / "fleet-root"
+    prof = root / "profiles" / "daedalus"
+    prof.mkdir(parents=True)
+    ws = tmp_path / "scratch" / "workspaces"
+    (root / "config.yaml").write_text(
+        "worktree_cache:\n  enabled: true\n  scopes: [kanban_clone]\n"
+        f"kanban:\n  workspaces_root: {ws}\n")
+    (prof / "config.yaml").write_text("worktree_cache:\n  enabled: false\n")
+    monkeypatch.setenv("HERMES_HOME", str(prof))
+    monkeypatch.delenv(wc.ENV_TEMPLATES, raising=False)
+    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: tmp_path / "native")
+    monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+    s = wc.settings()
+    assert s.enabled is True and s.scopes == ("kanban_clone",)
+    assert wc.templates_root() == ws / ".templates"
+    (root / "config.yaml").write_text(": not yaml [")
+    assert wc.settings().enabled is False                               # unreadable host config = OFF

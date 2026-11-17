@@ -111,15 +111,28 @@ class Settings:
     max_diff_files: int = 2000
 
 
-def settings(cfg: Optional[dict] = None) -> Settings:
-    """``worktree_cache`` from config.yaml (read per call: no restart needed)."""
-    if cfg is None:
-        try:
-            from hermes_cli.config import load_config_readonly
+def host_config() -> dict:
+    """The host's ROOT config.yaml, never a profile's (t_969164a0). ``worktree_cache`` and
+    ``kanban.workspaces_root`` are host switches, and a kanban worker runs with
+    ``HERMES_HOME=<root>/profiles/<name>``: on the Studio no worker profile carries either key
+    (29 profiles read 2026-11-17), so a profile read left the cache off for every worker and put
+    its templates root on the Data volume. Unreadable -> {} (OFF)."""
+    from hermes_constants import get_default_hermes_root
 
-            cfg = load_config_readonly().get("worktree_cache") or {}
-        except Exception:  # noqa: BLE001 - an unreadable config means OFF
-            cfg = {}
+    try:
+        import yaml
+
+        with open(get_default_hermes_root() / "config.yaml", encoding="utf-8-sig") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:  # noqa: BLE001 - an unreadable config means OFF
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def settings(cfg: Optional[dict] = None) -> Settings:
+    """``worktree_cache`` from the host's root config.yaml (read per call: no restart needed)."""
+    if cfg is None:
+        cfg = host_config().get("worktree_cache") or {}
     if not isinstance(cfg, dict):
         cfg = {}
     repos = cfg.get("repos")
@@ -143,11 +156,10 @@ def templates_root() -> Path:
     override = os.environ.get(ENV_TEMPLATES, "").strip()
     if override:
         return Path(override).expanduser()
-    from hermes_cli.kanban_workspace_policy import configured_root
-
-    root, _ = configured_root()
-    if root is not None:
-        return root / ".templates"
+    kanban = host_config().get("kanban")
+    raw = kanban.get("workspaces_root") if isinstance(kanban, dict) else None
+    if isinstance(raw, str) and raw and Path(raw).expanduser().is_absolute():
+        return Path(raw).expanduser() / ".templates"
     from hermes_constants import get_default_hermes_root
 
     return get_default_hermes_root() / "kanban" / "workspaces" / ".templates"

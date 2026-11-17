@@ -1326,8 +1326,9 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
         f"chmod {WORKSPACE_MODE} -- \"$w\"; "
         # --dissociate only when the mirror can prune: a never-prune mirror (preciousObjects) is safe to
         # borrow from, and dissociating gave every port clone its own ~440 MB object store.
+        # git honours extensions.* only at core.repositoryformatversion 1 (Prism 7848e18134f2)
         f"else d=--dissociate; [ \"$(git --git-dir={m} config --bool --get extensions.preciousObjects 2>/dev/null)\" != true ] "
-        "|| d=; "
+        f"|| [ \"$(git --git-dir={m} config --get core.repositoryformatversion 2>/dev/null)\" != 1 ] || d=; "
         f"git clone -q --reference-if-able {m} $d {url} \"$w\"; fi; fi; "
         "cd \"$w\"; "
         f"if [ \"$(git branch --show-current)\" != {b} ]; then "
