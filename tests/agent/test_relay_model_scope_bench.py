@@ -72,9 +72,10 @@ DTLR_FABLE = ("claude-dtlr", "claude-fable-5-1")
 
 def test_chain_walk_on_quota_model_advances_the_resume_target(wired, monkeypatch):
     """t_fc121c8e: primary Fable benched quota_model, fallback[0] is Fable on
-    another relay and refuses quota_model too, the walk lands on Opus. The
-    next rebuild resumes on Opus with no call to fallback[0]; the primary's
-    until/n/cls are untouched by the walk (B1)."""
+    another relay face of the same pool, the walk lands on Opus. Since
+    t_5188f4ed the walk skips fallback[0] outright (quota_model is pool-wide:
+    every face shares the seats) instead of calling it for the same refusal.
+    The next rebuild resumes on Opus with no call to fallback[0]."""
     from agent import fallback_wiring as fw
     from tests.agent.test_fallback_policy import FABLE
 
@@ -87,14 +88,9 @@ def test_chain_walk_on_quota_model_advances_the_resume_target(wired, monkeypatch
     a = _wired_agent()
     a._fallback_chain = list(chain)
     assert _fail(a, _model_scope_503(), reason=FailoverReason.rate_limit) is True
-    assert (a.provider, a.model) == DTLR_FABLE
+    assert (a.provider, a.model) == OPUS  # the same-pool Fable rung is never called
     before = _state(a)
-    assert (before.fallback_provider, before.fallback_model) == DTLR_FABLE
-    assert _fail(a, _model_scope_503(), reason=FailoverReason.rate_limit) is True
-    assert (a.provider, a.model) == OPUS
-    after = _state(a)
-    assert (after.until_epoch, after.n, after.cls) == (before.until_epoch, before.n, before.cls)
-    assert (after.fallback_provider, after.fallback_model, after.fallback_index) == (*OPUS, 1)
+    assert (before.fallback_provider, before.fallback_model, before.fallback_index) == (*OPUS, 1)
 
     b = _wired_agent()
     b._fallback_chain = list(chain)

@@ -73,6 +73,9 @@ LEDGER: dict[tuple[str, str], tuple[str, str]] = {
     ("hermes_cli/auth_codex.py", "_codex_quota_probe_lock"): ("relay-excluded", "openai-codex only"),
     ("agent/agent_runtime_helpers.py", "_rate_limit_backoff_count"): (
         "relay-guarded", "escalation counter of _rate_limited_until; reset on restore"),
+    ("agent/chat_completion_helpers.py", "_pool_exhausted_models"): (
+        "relay-guarded", "per-turn model set from the relay's own quota_model answer this turn; skips "
+        "relay faces (is_relay_backed) for that model only; reset at turn start (t_5188f4ed)"),
     ("agent/chat_completion_helpers.py", "_rate_limit_backoff_count"): (
         "relay-guarded", "escalation counter of _rate_limited_until; relay quota classes skip the arm"),
     ("agent/fallback_cooldown.py", "_rate_limit_backoff_count"): ("relay-excluded", "dead helper, no caller"),

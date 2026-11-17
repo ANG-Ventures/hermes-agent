@@ -3770,8 +3770,8 @@ def _relay_drain_wait_for(exc: Exception, started_at: Optional[float]) -> Tuple[
     retry above gave it 1 s + 2 s and then raised to the caller (LCM opened its
     summary circuit and truncated at L3). Same wait the main loop uses
     (t_4349cf26): ``retry_utils.relay_drain_wait`` with the
-    ``fallback.relay_drain_wait_s`` wall-clock budget (default 150 s = relay
-    drain TTL 120 s + relaunch + health gate). ``None`` = not a drain, or the
+    ``fallback.relay_drain_wait_s`` wall-clock budget (default 300 s, sized from
+    measured drains in ``retry_utils.RELAY_DRAIN_WAIT_DEFAULT_S``). ``None`` = not a drain, or the
     budget is spent.
     """
     if not _is_relay_drain(exc):

@@ -312,6 +312,10 @@ class CompressionFacadeMixin:
                 )
             _mirror_result_onto_live_lists(self, result, messages, direct_path=direct_path)
             _rebind_caller_session_context(self)
+            if isinstance(result, tuple) and result and result[0] is not messages:
+                # History rewritten: the request a fallback lane rejected this turn is no longer
+                # the request size (context_ceilings.request_tokens, t_5188f4ed).
+                self._context_rejected_tokens = 0
             return result
         finally:
             # Remove only THIS attempt's registration. Completion order is not registration
