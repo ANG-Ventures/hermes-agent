@@ -160,3 +160,45 @@ def test_first_reconcile_tick_sweeps_leftover_temps(tmp_path, monkeypatch):
     os.utime(left, (time.time() - 3600, time.time() - 3600))
     asyncio.run(ah._maybe_prune_claims(state, time.time()))   # noqa: SLF001
     assert not left.exists() and state.path.exists()
+
+
+def test_append_after_a_torn_archive_tail_keeps_the_next_terminal_claim(tmp_path):
+    """Prism e9d482d1e7d6 / 12cc7535efb9: a crash mid-append leaves a fragment with no newline; the next
+    append must start on its own line, or the new record joins the fragment and the claim is lost."""
+    path = tmp_path / ah.STATE_FILENAME
+    state = ah.BoomerangWakeState(path)
+    state.claim(_key(8), _full(_key(8), 8))
+    state.update_claim(_key(8), state=T, outcome="surface")
+    with open(state.archive_path, "ab") as fh:
+        fh.write(b'{"key": "default|t_torn')                         # killed mid-append, no newline
+    state.claim(_key(9), _full(_key(9), 9))
+    state.update_claim(_key(9), state=T, outcome="surface")
+    fresh = ah.BoomerangWakeState(path)
+    assert fresh.has_claim(_key(8)) and fresh.has_claim(_key(9))
+    assert fresh.get_claim(_key(9))["state"] == T
+
+
+def test_failed_hot_write_on_archive_to_hot_move_keeps_the_claim(tmp_path, monkeypatch):
+    """Prism f25db40874e9: a record leaving the archive (here: a handback pins it back into the hot file)
+    must reach the hot file before the archive drops it, so a failed hot write loses nothing."""
+    path = tmp_path / ah.STATE_FILENAME
+    state = ah.BoomerangWakeState(path)
+    state.claim(_key(10), _full(_key(10), 10))
+    state.update_claim(_key(10), state=T, outcome="surfaced")
+    assert _key(10) not in _hot(state)["claims"]                     # archived
+    real = ah.BoomerangWakeState._atomic_write
+
+    def failing(self, p, blob):
+        if p == self.path:
+            raise OSError("disk full")
+        return real(self, p, blob)
+
+    monkeypatch.setattr(ah.BoomerangWakeState, "_atomic_write", failing)
+    try:
+        state.update_claim(_key(10), handback=("del-000010", {"task_id": "t_a", "claim_key": _key(10),
+                                                               "parts": ["line"]}))
+    except OSError:
+        pass
+    monkeypatch.setattr(ah.BoomerangWakeState, "_atomic_write", real)
+    fresh = ah.BoomerangWakeState(path)
+    assert fresh.has_claim(_key(10)) and fresh.get_claim(_key(10))["state"] == T

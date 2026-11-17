@@ -173,15 +173,12 @@ class BoomerangWakeState:
                 self._archived[rec["key"]] = rec
         return {k: dict(v) for k, v in self._archived.items()}
 
-    def _split(self, data: dict) -> dict:
-        """Archive the terminal claims no pending handback names; returns ``data`` with the rest.
-
-        Append-only: one line per new or changed record (fsynced before the hot file is replaced, so a
-        crash between the two leaves the claim in both and the hot copy wins). A record that left the
-        archive (pruned, or reopened) rewrites it whole, at most once per prune."""
+    def _partition(self, data: dict) -> tuple:
+        """``(hot_data, cold)``: ``cold`` is key -> archive record for the terminal claims no pending
+        handback names; ``hot_data`` is ``data`` with only the remaining claims (None = no claims dict)."""
         claims = data.get("claims")
         if not isinstance(claims, dict):
-            return data
+            return data, None
         pinned = {r.get("claim_key") for r in self._handbacks_of(data).values() if isinstance(r, dict)}
         hot, cold = {}, {}
         for k, v in claims.items():
@@ -189,19 +186,24 @@ class BoomerangWakeState:
                 cold[k] = {**{f: v[f] for f in TERMINAL_FIELDS if f in v}, "key": k}
             else:
                 hot[k] = v
-        if set(self._archived) - set(cold):
-            lines = [json.dumps(r, sort_keys=True) for r in cold.values()]
-            self._atomic_write(self.archive_path, "".join(line + "\n" for line in lines).encode("utf-8"))
-        else:
-            new = [r for k, r in cold.items() if self._archived.get(k) != r]
-            if new:
-                self.archive_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.archive_path, "ab") as fh:
-                    fh.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in new).encode("utf-8"))
-                    fh.flush()
-                    os.fsync(fh.fileno())
-        self._archived = cold
-        return {**data, "claims": hot}
+        return {**data, "claims": hot}, cold
+
+    def _append_archive(self, records: list) -> None:
+        """Append ``records`` as JSON lines, fsynced. A torn tail (crash mid-append) is closed with a
+        newline first, so a new record never joins the fragment (Prism e9d482d1e7d6 / 12cc7535efb9)."""
+        if not records:
+            return
+        payload = "".join(json.dumps(r, sort_keys=True) + "\n" for r in records).encode("utf-8")
+        self.archive_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.archive_path, "a+b") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell():
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    payload = b"\n" + payload
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def _atomic_write(self, path: Path, blob: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,14 +328,26 @@ class BoomerangWakeState:
         return data
 
     def _write(self, data: dict) -> None:
-        """Replace the hot file with ``data`` minus its archived terminal claims (:meth:`_split`); no
-        write when the bytes equal what ``_read`` just saw."""
-        blob = json.dumps(self._split(data), sort_keys=True).encode("utf-8")
+        """Persist ``data``: terminal claims no pending handback names go to the archive, the rest to the
+        hot file. Order keeps every claim on disk at every step (a crash leaves it in both; hot wins):
+        1. new/changed archive records are appended and fsynced;
+        2. the hot file is replaced (skipped when the bytes equal what ``_read`` just saw);
+        3. only then, if a record left the archive (pruned, reopened, pinned by a handback), the archive
+           is rewritten without it (Prism f25db40874e9)."""
+        hot_data, cold = self._partition(data)
+        if cold is not None:
+            new = [r for k, r in cold.items() if self._archived.get(k) != r]
+            self._append_archive(new)
+            self._archived.update({r["key"]: r for r in new})
+        blob = json.dumps(hot_data, sort_keys=True).encode("utf-8")
         sha = hashlib.sha256(blob).hexdigest()
-        if sha == self._disk_sha:
-            return
-        self._atomic_write(self.path, blob)
-        self._disk_sha = sha
+        if sha != self._disk_sha:
+            self._atomic_write(self.path, blob)
+            self._disk_sha = sha
+        if cold is not None and set(self._archived) - set(cold):
+            lines = "".join(json.dumps(r, sort_keys=True) + "\n" for r in cold.values())
+            self._atomic_write(self.archive_path, lines.encode("utf-8"))
+            self._archived = dict(cold)
 
     @staticmethod
     def _retries_of(data: dict) -> dict:
