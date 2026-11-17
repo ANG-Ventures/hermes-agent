@@ -7295,7 +7295,7 @@ def list_tasks(
 ) -> list[Task]:
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
-    query = "SELECT * FROM tasks WHERE 1=1"
+    query = " WHERE 1=1"
     params: list[Any] = []
     for col, val in (
         ("assignee", _canonical_assignee(assignee)), ("status", status), ("tenant", tenant),
@@ -7318,12 +7318,20 @@ def list_tasks(
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
             raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
-        query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
+        order_sql = VALID_SORT_ORDERS[order_by]
     else:
-        query += " ORDER BY priority DESC, created_at ASC"
+        order_sql = "priority DESC, created_at ASC"
+    # Sort only (keys, id), then join the full rows by primary key and order in Python.
+    # ``SELECT * ... ORDER BY`` sorted whole rows (bodies, results): 198 MB of etilqs
+    # temp files per ``kanban list`` on the Studio board (t_d24713d3). One statement,
+    # so still one read snapshot.
+    keyed = f"SELECT id, row_number() OVER (ORDER BY {order_sql}) AS rn FROM tasks{query}"
     if limit:
-        query += f" LIMIT {int(limit)}"
-    rows = conn.execute(query, params).fetchall()
+        keyed += f" ORDER BY rn LIMIT {int(limit)}"
+    rows = conn.execute(
+        f"SELECT k.rn AS _list_rn, t.* FROM ({keyed}) k JOIN tasks t ON t.id = k.id", params,
+    ).fetchall()
+    rows.sort(key=lambda r: r[0])
     return [Task.from_row(r) for r in rows]
 
 
