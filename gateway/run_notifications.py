@@ -314,7 +314,10 @@ class GatewayNotificationsMixin:
                 "dropping injection (#55578 fail-closed).", pinned_session_id,
             )
             return None
-        if _is_delegated_completion_target(pinned_row):
+        # A pin to the route's CURRENT session moves no route, so it cannot take one over (#140).
+        # ``_delegate_from`` survives compression/gateway_recovery onto a live human route
+        # (t_b9d81184: discord route 20261108_212456_25ca27 dropped every boomerang turn).
+        if pinned_session_id != session_entry.session_id and _is_delegated_completion_target(pinned_row):
             logger.warning("Refusing completion route pin to delegated session %s", pinned_session_id)
             return None
         target_session_id = pinned_session_id
@@ -1487,6 +1490,19 @@ class GatewayNotificationsMixin:
                 self._completion_deliveries_inflight.add(identity)
             return seen
 
+    async def _is_route_current_session(self, row: dict) -> bool:
+        """True when ``row`` is the live session its routing key points at: a human route, even
+        if ``_delegate_from`` rode in on compression/gateway_recovery (t_b9d81184)."""
+        key = str(row.get("session_key") or "").strip()
+        if not key or row.get("ended_at"):
+            return False
+        try:
+            entry = await self.async_session_store.lookup_by_session_key(key)
+        except Exception:
+            logger.debug("Route lookup failed for %s", key, exc_info=True)
+            return False
+        return entry is not None and entry.session_id == row.get("id")
+
     async def _classify_completion_target(self, parent_session_id: str) -> str:
         """Classify an async-completion target before adapter acceptance: ``"deliver"`` (spawning
         session live or compression-rotated with a live continuation; the resolver still retargets),
@@ -1506,7 +1522,7 @@ class GatewayNotificationsMixin:
         end_reason = str(parent.get("end_reason") or "")
         if parent.get("ended_at") and end_reason in _USER_BOUNDARY_END_REASONS:
             return "terminal"
-        if _is_delegated_completion_target(parent):
+        if _is_delegated_completion_target(parent) and not await self._is_route_current_session(parent):
             # Never pin a human route to a child. An ended child cannot acquire ownership;
             # a live one gets only a persisted, bounded grace (not a per-poll retry counter).
             try:

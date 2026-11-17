@@ -399,3 +399,96 @@ async def test_delegated_origin_watcher_stops_once(
         assert runner.session_store.lookup_by_session_key(entry.session_key).session_id == entry.session_id
     finally:
         db.close()
+
+
+def _delegated_route_fixture(tmp_path, monkeypatch):
+    """t_b9d81184: a live chat route whose CURRENT session carries an inherited ``_delegate_from``
+    (prod: discord thread route 20261108_212456_25ca27, created_source=gateway_recovery off a
+    subagent-created ancestor). Real runner, real SessionStore, real SessionDB."""
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from hermes_state import AsyncSessionDB, SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    entry = runner.session_store.get_or_create_session(source)
+    db = SessionDB(db_path=tmp_path / "fixture.db")
+    db.create_session(entry.session_id, source="telegram", session_key=entry.session_key,
+                      model_config={"_delegate_from": "old-subagent-ancestor"})
+    runner._session_db = AsyncSessionDB(db)
+    runner._cache_session_source = lambda *a: None
+    runner._recover_telegram_topic_thread_id = lambda s: None
+    return runner, source, entry, db
+
+
+def _kanban_wake(source, entry, pinned):
+    from gateway.platforms.base import MessageEvent
+
+    return MessageEvent(text="[boomerang-wake] child surfaced t_x", source=source, internal=True,
+                        metadata={"kanban_owner_wake": True, "card_id": "t_x",
+                                  "gateway_session_key": entry.session_key,
+                                  "gateway_session_id": pinned})
+
+
+@pytest.mark.asyncio
+async def test_kanban_wake_pinned_to_route_own_session_starts_turn(tmp_path, monkeypatch):
+    """The drop point: an owner/boomerang wake pins gateway_session_id to the route's own live
+    session; the #140 child-takeover refusal dropped it after admission (no turn, no page)."""
+    from gateway import turn_error_pager
+
+    pages = []
+    monkeypatch.setattr(turn_error_pager, "page_dropped_wake", lambda *a, **k: pages.append(a) or True,
+                        raising=False)
+    runner, source, entry, db = _delegated_route_fixture(tmp_path, monkeypatch)
+    try:
+        resolved = await runner._hmwa_resolve_session(_kanban_wake(source, entry, entry.session_id), source)
+        assert resolved is not None, "wake to the route's own session was dropped"
+        assert resolved[1].session_id == entry.session_id
+        assert pages == []
+        assert runner.session_store.lookup_by_session_key(entry.session_key).session_id == entry.session_id
+        # Same class, async-completion pre-flight: the route's own session is a human owner.
+        assert await runner._classify_completion_target(entry.session_id) == "deliver"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_kanban_wake_dropped_by_child_refusal_pages(tmp_path, monkeypatch):
+    """#140 still holds for a pin to a DIFFERENT delegated session, and an admitted kanban wake that
+    is dropped there is never silent: it pages."""
+    from gateway import turn_error_pager
+
+    pages = []
+    monkeypatch.setattr(turn_error_pager, "page_dropped_wake", lambda *a, **k: pages.append(a) or True,
+                        raising=False)
+    runner, source, entry, db = _delegated_route_fixture(tmp_path, monkeypatch)
+    db.create_session("child", source="telegram", model_config={"_delegate_from": entry.session_id})
+    try:
+        assert await runner._hmwa_resolve_session(_kanban_wake(source, entry, "child"), source) is None
+        assert runner.session_store.lookup_by_session_key(entry.session_key).session_id == entry.session_id
+        assert len(pages) == 1 and "child" in pages[0][1]
+        assert await runner._classify_completion_target("child") == "retry"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_page_dropped_wake_once_per_room_episode(monkeypatch):
+    from types import SimpleNamespace
+
+    from gateway import turn_error_pager
+
+    sent = []
+    monkeypatch.setattr(turn_error_pager, "_dispatch", lambda args, key: sent.append(args))
+    monkeypatch.setattr(turn_error_pager, "_open_episodes", {})
+    event = SimpleNamespace(source=SimpleNamespace(platform="discord", chat_id="155"),
+                            metadata={"card_id": "t_x"})
+    assert turn_error_pager.page_dropped_wake(event, "refused pin", "k") is True
+    assert turn_error_pager.page_dropped_wake(event, "refused pin", "k") is False
+    assert len(sent) == 1
+    assert sent[0][:5] == ["page", "--producer", turn_error_pager.WAKE_DROP_PRODUCER, "--key", "discord:155"]
+    assert "t_x" in sent[0][6] and "refused pin" in sent[0][6]
+    for handle in turn_error_pager._open_episodes.values():
+        handle.cancel()
