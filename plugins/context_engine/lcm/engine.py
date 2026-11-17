@@ -604,6 +604,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
+        # (len(input), len(compressed), first-row identity, last-row identity) of the
+        # last compaction, until the next ingest; see _ingest_messages_unlogged.
+        self._compaction_source: Optional[tuple] = None
         self._last_ingest_reconciliation: Dict[str, Any] = {
             "action": "none",
             "reason": "not run",
@@ -2524,6 +2527,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # only messages appended *after* this point get ingested next time.
         self._ingest_cursor = len(compressed)
         self._ingest_cursor_needs_reconcile = False
+        self._compaction_source = (
+            len(messages),
+            len(compressed),
+            self._message_replay_identity(messages[0]),
+            self._message_replay_identity(messages[-1]),
+        )
 
         # Per-event node accounting: nodes THIS compress built = current total minus
         # the pre-event snapshot. The lifetime total is kept in parens because it was
@@ -5931,6 +5940,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._session_id,
             )
             return self._redact_active_replay_messages(messages)
+
+        # The cursor indexes the list the last compaction returned. A caller that
+        # still holds the list it was given (the commit's session-end flush,
+        # t_5ce457b8) would re-store rows [len(compressed):] of rows compress()
+        # already stored, so only rows past that input are new. The cursor stays
+        # on the compacted list for the next ingest.
+        source, self._compaction_source = self._compaction_source, None
+        if (
+            source is not None
+            and not self._ingest_cursor_needs_reconcile
+            and self._ingest_cursor == source[1]
+            and len(messages) >= source[0]
+            and self._message_replay_identity(messages[0]) == source[2]
+            and self._message_replay_identity(messages[source[0] - 1]) == source[3]
+        ):
+            self._ingest_cursor = source[0]
+            try:
+                return self._ingest_messages_unlogged(messages)
+            finally:
+                self._ingest_cursor = source[1]
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
