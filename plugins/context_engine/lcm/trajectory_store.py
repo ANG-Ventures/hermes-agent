@@ -22,7 +22,7 @@ import time
 from typing import Any, Callable, Iterable, Protocol, Sequence
 from urllib.parse import quote, unquote
 
-from .sqlite_util import guard_connection
+from .sqlite_util import connect_read, guard_connection
 from .db_bootstrap import (
     configure_connection,
     get_fts_shadow_table_names,
@@ -604,7 +604,7 @@ class TrajectoryStore:
     def _open_connection(self) -> sqlite3.Connection:
         if self.read_only:
             uri = f"file:{quote(str(self.db_path), safe='/')}?mode=ro"
-            conn = sqlite3.connect(
+            conn = connect_read(
                 uri,
                 uri=True,
                 timeout=5.0,

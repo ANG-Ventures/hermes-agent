@@ -74,6 +74,25 @@ def _temporary_sqlite_busy_timeout(
             conn.execute(f"PRAGMA busy_timeout={original}")
 
 
+def connect_read(database: str, **kwargs) -> sqlite3.Connection:
+    """Open an LCM READ connection: ``sqlite3.connect`` plus ``PRAGMA temp_store = MEMORY``.
+
+    Every read connection in this plugin goes through here (contract test:
+    tests/context_engine/test_lcm_read_connections_temp_store.py). With the default temp_store a
+    search's ORDER BY / GROUP BY B-trees spill to etilqs_* files once they outgrow the page
+    cache: on a copy of the Studio's 14 GB lcm.db one lcm_grep FTS read wrote up to 7.4 GB of
+    temp files (660 MB inside the 3 s hybrid deadline; t_188b19e8). With MEMORY the same 24
+    queries wrote nothing and peak RSS rose from 310 MB to 458 MB.
+    """
+    conn = sqlite3.connect(database, **kwargs)
+    try:
+        conn.execute("PRAGMA temp_store = MEMORY")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 class StoreClosed(sqlite3.Error):
     """The connection was closed; the call never touched SQLite.
 
