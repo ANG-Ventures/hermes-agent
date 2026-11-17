@@ -78,6 +78,7 @@ REASONS = (
     "clone_errno",       # the CoW copy or another pre-register step raised (errno when an OSError)
     "verify_failed",     # the staged copy does not equal the commit
     "far_commit",        # target commit differs from the template in > max_diff_files files, or T unreachable
+    "unsupported_opts",  # `hermes kanban clone` options the cache does not reproduce (--depth, --no-checkout, ...)
 )
 
 CREATE_LOCK_TIMEOUT_S = 30.0
@@ -801,6 +802,37 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
     return 0
 
 
+# --------------------------------------------------------------------------- callers (build card 3)
+
+# `hermes kanban clone` options the cache reproduces exactly: everything else (a shallow or
+# filtered clone, --no-checkout, --single-branch, --origin, ...) asks for a .git the cache does
+# not make, so it runs plain git with an ``unsupported_opts`` row.
+_KANBAN_CLONE_OK = ("--quiet",)
+
+
+def kanban_clone_entry(url: str, dest: Optional[str], git_opts: Sequence[str] = (),
+                       s: Optional[Settings] = None) -> int:
+    """``hermes kanban clone`` (scope ``kanban_clone``). Off or out of scope: exactly
+    ``kanban_clone.clone`` as before, no ledger row."""
+    s = s or settings()
+    if not cache_active("kanban_clone", s):
+        return kanban_clone.clone(url, dest, git_opts)
+    branch: Optional[str] = None
+    other = []
+    for opt in git_opts:
+        if opt.startswith("--branch="):
+            branch = opt.split("=", 1)[1]
+        elif opt not in _KANBAN_CLONE_OK:
+            other.append(opt)
+    if other:
+        target = Path(dest or kanban_clone.default_dest(url)).absolute()
+        record_fallback("kanban_clone", "unsupported_opts", repo_slug(url), None, target)
+        _log({"ts": round(time.time(), 3), "caller": "kanban_clone", "repo": repo_slug(url), "mode": "clone",
+              "dest": str(target), "cow": False, "reason": "unsupported_opts", "opts": other})
+        return kanban_clone.clone(url, dest, git_opts)
+    return clone(url, dest, caller="kanban_clone", branch=branch, quiet="--quiet" in git_opts, s=s)
+
+
 # --------------------------------------------------------------------------- status + CLI
 
 
@@ -869,8 +901,17 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_active(args) -> int:
+    """Exit 0 when the cache is on for ``--caller`` on this host, else 1 (the port clone
+    script asks this on the pool host, whose config holds the switch)."""
+    return 0 if cache_active(args.caller, settings()) else 1
+
+
 def add_arguments(parser) -> None:
     sub = parser.add_subparsers(dest="worktree_cache_action")
+    a = sub.add_parser("active", help="Exit 0 when the cache is on for --caller here, else 1")
+    a.add_argument("--caller", required=True)
+    a.set_defaults(func=cmd_active)
     c = sub.add_parser("clone", help="Clone a repo; CoW from the template when enabled for --caller")
     c.add_argument("--url", required=True)
     c.add_argument("--dest", default=None)

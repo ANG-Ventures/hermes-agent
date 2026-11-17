@@ -1829,3 +1829,74 @@ def test_a_clean_worktree_of_repo_a_inside_repo_b_never_ports_b_in_either_persis
                       carry_out=[]) == (None, None)
     assert why == ["own_tree_repo_mismatch"], why
     assert kwt.repo_pin(tid, path, None, kanban_home / "fleet") == ("ace-ai",)
+
+
+# -- worktree cache (scope port_clone) and the never-prune mirror (t_969164a0) ---------------------------------
+
+
+def _alternates(ws: Path) -> str:
+    p = ws / ".git" / "objects" / "info" / "alternates"
+    return p.read_text().strip() if p.exists() else ""
+
+
+def test_clone_script_keeps_alternates_to_a_never_prune_mirror(tmp_path):
+    """--dissociate copied every borrowed object: on ci-box 2 of the 3 clones born in 48 h with no
+    alternates were port clones (t_d25e5125, t_1678415e: 450-580 MB .git each). A mirror that
+    cannot prune (preciousObjects) is borrowed from instead."""
+    origin, mirror = _origin_with_feature(tmp_path)
+    _git("config", "core.repositoryformatversion", "1", cwd=mirror)
+    _git("config", "extensions.preciousObjects", "true", cwd=mirror)
+    ws = tmp_path / "ws"
+    assert subprocess.run(["sh", "-c", kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url=str(origin))]
+                          ).returncode == 0
+    assert (ws / "f").read_text() == "feature"
+    assert _alternates(ws) == str(mirror / "objects")
+    # a mirror that can prune is still dissociated (Prism 02dfd9094b97)
+    _git("config", "--unset", "extensions.preciousObjects", cwd=mirror)
+    ws2 = tmp_path / "ws2"
+    assert subprocess.run(["sh", "-c", kwt.clone_script(str(ws2), SLUG, str(mirror), "feature", url=str(origin))]
+                          ).returncode == 0
+    assert _alternates(ws2) == ""
+
+
+def _fake_hermes(home: Path, active: bool) -> Path:
+    """$HOME/.local/bin/hermes that logs its argv; `clone` runs a plain git clone."""
+    b = home / ".local" / "bin"
+    b.mkdir(parents=True)
+    v = b / "hermes"
+    v.write_text(
+        "#!/bin/sh\n"
+        'echo "$*" >> "$HOME/calls"\n'
+        f'if [ "$2" = active ]; then exit {0 if active else 1}; fi\n'
+        'while [ $# -gt 0 ]; do case "$1" in --url) u=$2; shift;; --dest) d=$2; shift;; esac; shift; done\n'
+        'exec git clone -q "$u" "$d"\n')
+    v.chmod(0o755)
+    return home / "calls"
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_clone_script_goes_through_the_cache_only_when_the_host_says_on(tmp_path, monkeypatch, active):
+    origin, mirror = _origin_with_feature(tmp_path)
+    home = tmp_path / "home"
+    calls = _fake_hermes(home, active)
+    monkeypatch.delenv("HERMES_WORKTREE_CACHE", raising=False)
+    import os
+    env = dict(os.environ, HOME=str(home))
+    ws = tmp_path / "ws"
+    sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url=str(origin))
+    assert subprocess.run(["sh", "-c", sc], env=env).returncode == 0
+    lines = calls.read_text().splitlines()
+    assert lines[0] == "worktree-cache active --caller port_clone"
+    if active:
+        assert lines[1:] == [f"worktree-cache clone --url {origin} --dest {ws} --caller port_clone"]
+    else:
+        assert lines[1:] == []                       # plain git, exactly as before
+    assert (ws / "f").read_text() == "feature"
+    assert (ws.stat().st_mode & 0o7777) == 0o770
+    # the per-process switch: the CLI is never started
+    calls.unlink()
+    ws2 = tmp_path / "ws2"
+    env["HERMES_WORKTREE_CACHE"] = "0"
+    assert subprocess.run(["sh", "-c", kwt.clone_script(str(ws2), SLUG, str(mirror), "feature", url=str(origin))],
+                          env=env).returncode == 0
+    assert not calls.exists()

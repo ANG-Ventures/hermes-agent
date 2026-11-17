@@ -667,3 +667,69 @@ def test_cli_parses_clone_refresh_status():
     assert a.func is wc.cmd_clone and a.branch == "x" and a.caller == "kanban_clone"
     assert p.parse_args(["refresh", "--all"]).func is wc.cmd_refresh
     assert p.parse_args(["status", "--json"]).json is True
+
+
+# --------------------------------------------------------------------------- build card 3: `hermes kanban clone`
+
+
+def _kanban_cli(argv, settings_obj, monkeypatch):
+    """`hermes kanban clone <argv>` through the real kanban parser and dispatch."""
+    import argparse
+
+    from hermes_cli import kanban
+
+    monkeypatch.setattr(wc, "settings", lambda cfg=None: settings_obj)
+    parser = argparse.ArgumentParser()
+    kanban.build_parser(parser.add_subparsers(dest="cmd"))
+    return kanban.kanban_command(parser.parse_args(["kanban", "clone", *argv]))
+
+
+def test_kanban_clone_off_is_the_old_call_exactly(env, cow, monkeypatch):
+    calls = []
+    monkeypatch.setattr(kc, "clone", lambda url, dest, opts: calls.append((url, dest, list(opts))) or 0)
+    for s in (wc.Settings(), wc.Settings(enabled=True, scopes=("port_clone",), repos=(SLUG,))):
+        assert _kanban_cli(["-q", "--depth", "1", URL, "d"], s, monkeypatch) == 0
+    assert calls == [(URL, "d", ["--quiet", "--depth=1"])] * 2
+    assert ledger(env) == [] and log(env) == []
+
+
+def test_kanban_clone_on_copies_from_the_template(env, cow, monkeypatch):
+    built(env)
+    dest = env["base"] / "ws" / "k"
+    assert _kanban_cli(["-q", "-b", "feat", URL, str(dest)], env["s"], monkeypatch) == 0
+    assert snapshot(dest) == snapshot(plain(env, "plain", branch="feat"))
+    assert _git("rev-parse", "--abbrev-ref", "HEAD", cwd=dest) == "feat"
+    assert (dest / ".git" / "objects" / "info" / "alternates").exists()
+    assert ledger(env) == []
+    (row,) = log(env)
+    assert row["caller"] == "kanban_clone" and row["cow"] is True and row["C"] == env["c3"]
+
+
+@pytest.mark.parametrize("opts", [["--depth", "1"], ["--no-checkout"], ["--single-branch"], ["-o", "up"], ["-v"]])
+def test_kanban_clone_options_the_cache_cannot_make_run_plain_with_a_row(env, cow, monkeypatch, opts):
+    built(env)
+    seen = []
+    real = kc.clone
+    monkeypatch.setattr(kc, "clone", lambda url, dest, o: seen.append(list(o)) or real(url, dest, o))
+    dest = env["base"] / "ws" / "k"
+    assert _kanban_cli([*opts, URL, str(dest)], env["s"], monkeypatch) == 0
+    assert len(seen) == 1 and seen[0] and "--quiet" not in seen[0]      # forwarded unchanged
+    (row,) = ledger(env)
+    assert row["reason"] == "unsupported_opts" and row["caller"] == "worktree_cache:kanban_clone"
+    assert row["repo"] == SLUG and row["dst"] == str(dest)
+    assert [r["reason"] for r in log(env)] == ["unsupported_opts"]
+
+
+def test_active_exit_code_follows_switch_scope_and_env(monkeypatch):
+    import argparse
+
+    p = argparse.ArgumentParser()
+    wc.add_arguments(p)
+    args = p.parse_args(["active", "--caller", "port_clone"])
+    monkeypatch.delenv(wc.ENV_SWITCH, raising=False)
+    for s, rc in ((wc.Settings(), 1), (wc.Settings(enabled=True, scopes=("kanban_clone",)), 1),
+                  (wc.Settings(enabled=True, scopes=("port_clone",)), 0)):
+        monkeypatch.setattr(wc, "settings", lambda cfg=None, _s=s: _s)
+        assert args.func(args) == rc
+    monkeypatch.setenv(wc.ENV_SWITCH, "0")
+    assert args.func(args) == 1

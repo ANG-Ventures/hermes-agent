@@ -394,9 +394,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         # `clone` is a git operation with no board state; it must not depend
         # on (or initialize) kanban.db.
         if action == "clone":
-            from hermes_cli.kanban_clone import clone
+            # Through the worktree cache (scope kanban_clone); off = kanban_clone.clone as before.
+            from hermes_cli.worktree_cache import kanban_clone_entry
 
-            return clone(args.url, args.dest, args.git_opts)
+            return kanban_clone_entry(args.url, args.dest, args.git_opts)
         if action == "base-check":
             from hermes_cli.kanban_branch_base import run as _base_check
 
