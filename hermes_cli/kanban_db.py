@@ -7326,9 +7326,20 @@ def list_tasks(
         # 48-char prefix, outgrew the 2 MB cache and spilled etilqs files (4.1 MB per
         # call, t_ba5a93d0). No SQL sort here; Python orders (title, id), which for
         # UTF-8 text is SQLite's BINARY order, so results are identical.
-        rows = sorted(conn.execute(f"SELECT * FROM tasks{query}", params).fetchall(),
-                      key=lambda r: (r["title"], r["id"]))
-        return [Task.from_row(r) for r in (rows[:int(limit)] if limit else rows)]
+        # Keys first (t_188b19e8, Prism P2 e880279c7cf3): sort (title, id) only, cut to
+        # ``limit``, then read just those full rows, never every body and result.
+        keys = sorted(conn.execute(f"SELECT title, id FROM tasks{query}", params).fetchall(),
+                      key=lambda r: (r[0], r[1]))
+        ids = [r[1] for r in (keys[:int(limit)] if limit else keys)]
+        by_id: dict[str, Any] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for r in conn.execute(
+                f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk,
+            ):
+                by_id[r["id"]] = r
+        # A card deleted between the two reads is dropped, never returned half-read.
+        return [Task.from_row(by_id[i]) for i in ids if i in by_id]
     # Sort only (keys, id), then join the full rows by primary key and order in Python.
     # ``SELECT * ... ORDER BY`` sorted whole rows (bodies, results): 198 MB of etilqs
     # temp files per ``kanban list`` on the Studio board (t_d24713d3). One statement,

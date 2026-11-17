@@ -39,7 +39,8 @@ def test_list_tasks_sorts_keys_not_rows(kanban_home):
         for order in kb.VALID_SORT_ORDERS:
             kb.list_tasks(rec, order_by=order)
         listing = [s for s in rec.statements if "FROM tasks" in s[0]]
-        assert len(listing) == 4 + len(kb.VALID_SORT_ORDERS)
+        # --sort title reads keys, then the selected rows: two statements per call (t_188b19e8).
+        assert len(listing) == 4 + len(kb.VALID_SORT_ORDERS) + 2
         assert guard.spills(conn, listing, outer_only=True) == []
 
 
@@ -57,6 +58,22 @@ def test_list_tasks_title_sort_has_no_sql_sort(kanban_home):
             "SELECT id FROM tasks WHERE status != 'archived' ORDER BY title ASC, id ASC")]
         assert got == want
         assert [t.id for t in kb.list_tasks(rec, order_by="title", limit=3)] == want[:3]
+        assert guard.spills(conn, rec.statements) == []
+
+
+def test_list_tasks_title_limit_reads_only_selected_rows(kanban_home):
+    """--sort title with a limit read every full row (bodies, results) before cutting to the limit (Prism P2
+    e880279c7cf3 on hermes-agent#401). It now sorts (title, id) keys and reads only the rows it returns."""
+    with kb.connect() as conn:
+        ids = [kb.create_task(conn, title=f"t{n:02d}", body="b" * 5000) for n in range(30, 0, -1)]
+        rec = guard.Recorder(conn)
+        got = kb.list_tasks(rec, order_by="title", limit=4)
+        assert [t.title for t in got] == ["t01", "t02", "t03", "t04"]
+        assert got[0].body.endswith("b" * 5000)
+        full = [s for s in rec.statements if "FROM tasks" in s[0] and "SELECT *" in s[0]]
+        assert full and all("WHERE id IN" in sql for sql, _ in full), full
+        assert sum(len(params) for _, params in full) == 4
+        assert {t.id for t in kb.list_tasks(rec, order_by="title")} == set(ids)
         assert guard.spills(conn, rec.statements) == []
 
 
