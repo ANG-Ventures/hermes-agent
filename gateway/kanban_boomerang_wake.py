@@ -161,7 +161,7 @@ class BoomerangWakeState:
         """key -> archived record; later lines win, a torn line (crash mid-append) is skipped."""
         self._archived = {}
         try:
-            text = self.archive_path.read_text(encoding="utf-8")
+            text = self.archive_path.read_text(encoding="utf-8-sig")
         except (OSError, ValueError):
             return {}
         for line in text.splitlines():
