@@ -859,7 +859,9 @@ class LCMConfig:
     encryption_key_path: str = ""  # empty = HERMES_HOME/lcm-row.key
     # Retention policy reported by status/doctor. Cleanup remains explicit.
     retention_ttl_days: int = 14
-    retention_max_bytes: int = 1024 * 1024 * 1024
+    # 20 GiB (t_b81eac3d): the default profile holds ~14.7 GB of live rows after dedup+VACUUM,
+    # so 1 GiB read exceeded permanently. Report-only; LCM_RETENTION_MAX_BYTES overrides.
+    retention_max_bytes: int = 20 * 1024 * 1024 * 1024
 
     # -- Embeddings (default-off until a provider/model are configured) ---
     embeddings_enabled: bool = False

@@ -42,6 +42,7 @@ FORK SURFACE PRESERVED (do not "clean up" — each is deliberate):
     `content`, because `content` is ciphertext when encryption_enabled.
   - #465 _merge_adjacent_assistant_messages (never upstreamed) — alternation-clean active context.
   - fresh-tail token budgeting; P2 skew calibration; fork-only `retention_policy` doctor check.
+    Its report-only `retention_max_bytes` default is 20 GiB (was 1 GiB; t_b81eac3d, 2026-11-17).
   - `_lcm_summary` marker key: DO NOT REMOVE. It looks write-only inside this plugin but the HOST
     reads it at agent/compaction_stats.py (_LCM_SUMMARY_TAG) with a COMPACTION_STATS_TAG_MISSING
     tripwire.
