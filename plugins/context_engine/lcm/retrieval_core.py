@@ -25,6 +25,8 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
+from .sqlite_util import connect_read
+
 if TYPE_CHECKING:
     from .engine import LCMEngine
 
@@ -351,7 +353,7 @@ def hydrate_chunk_hits(
         db_path = Path(engine._store.db_path).resolve()
         uri = f"{db_path.as_uri()}?mode=ro"
         require_remaining("database connection")
-        conn = sqlite3.connect(
+        conn = connect_read(
             uri,
             uri=True,
             timeout=max(0.001, require_remaining("database connection")),
@@ -453,7 +455,7 @@ def hydrate_semantic_nodes(
         require_remaining("database path resolution")
         uri = f"{db_path.as_uri()}?mode=ro"
         require_remaining("database URI construction")
-        conn = sqlite3.connect(
+        conn = connect_read(
             uri,
             uri=True,
             timeout=max(0.001, require_remaining("database connection")),

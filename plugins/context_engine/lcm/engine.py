@@ -142,6 +142,7 @@ from .message_content import (
 from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
+    connect_read,
 )
 from .store import MessageStore
 from .storage_security import plaintext_path_policy, retention_status
@@ -1651,7 +1652,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
         try:
             uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = connect_read(uri, uri=True)
             try:
                 row = conn.execute(
                     """
