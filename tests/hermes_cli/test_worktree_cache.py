@@ -21,6 +21,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -540,6 +541,75 @@ def test_target_adds_unsupported_tree(env, cow, what):
         assert (ref / "f.txt").read_text() != "$Id$\n"        # git did expand it
     assert [r["reason"] for r in ledger(env)] == ["unsupported_tree"]
     assert no_staging_left(env)
+
+
+def _push_eol_crlf(env, branch="main"):
+    """A commit that changes only the eol rule of README.txt (blob unchanged)."""
+    work = env["work"]
+    (work / ".gitattributes").write_text("*.txt text eol=crlf\n*.bat text eol=crlf\n")
+    c = _commit(work, "eol crlf")
+    _git("push", "-q", str(env["bare"]), f"HEAD:{branch}", cwd=work)
+    return c
+
+
+def test_target_changes_conversion_attributes(env, cow):
+    """C changes only an eol rule: git does not rewrite the unchanged blobs on a two-tree
+    move, so the copied LF files would differ from a plain clone (Prism 035c5ac28415)."""
+    built(env)
+    _git("checkout", "-q", "-b", "crlf", cwd=env["work"])
+    _push_eol_crlf(env, "crlf")
+    _git("checkout", "-q", "main", cwd=env["work"])
+    dest = env["base"] / "ws" / "cow"
+    assert wc.clone(URL, str(dest), caller="kanban_clone", branch="crlf", s=env["s"]) == 0
+    ref = plain(env, "plain", branch="crlf")
+    assert (ref / "README.txt").read_bytes() == b"hello\r\n"         # git did convert it
+    assert snapshot(dest) == snapshot(ref)
+    assert [r["reason"] for r in ledger(env)] == ["unsupported_tree"]
+    assert no_staging_left(env)
+
+
+def test_refresh_rebuilds_when_attributes_change(env, cow):
+    """The template's own checkout T -> C has the same blind spot: an attributes change
+    builds a fresh generation instead of moving the old one."""
+    gen = built(env)
+    c = _push_eol_crlf(env)
+    res = wc.refresh(SLUG)
+    assert res["status"] == "built" and res["head"] == c, res
+    assert res["retired"]["reason"] == "attributes_changed"
+    new = Path(res["gen"])
+    assert new != gen and (new / "README.txt").read_bytes() == b"hello\r\n"
+    dest = env["base"] / "ws" / "cow"
+    assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
+    assert snapshot(dest) == snapshot(plain(env, "plain"))
+    assert ledger(env) == []
+
+
+def test_tracked_symlink_named_like_the_meta_tmp_is_not_followed(env, tmp_path):
+    """A repo tracking `.template.json.tmp -> <outside>` must not get the meta written
+    through it (Prism 216606a5a11d / da864fb31967)."""
+    victim = tmp_path / "victim"
+    victim.write_text("keep\n")
+    os.symlink(str(victim), env["work"] / f".{wc.META}.tmp")
+    _commit(env["work"], "trap")
+    _git("push", "-q", str(env["bare"]), "main", cwd=env["work"])
+    gen = built(env)
+    assert victim.read_text() == "keep\n"
+    assert wc.read_meta(gen)["head"] == _git("rev-parse", "HEAD", cwd=env["work"])
+    wc.refresh(SLUG)
+    assert victim.read_text() == "keep\n"
+
+
+def test_cli_parser_builds_without_fcntl():
+    """Native Windows has no fcntl: building the CLI parser must not import it
+    (Prism f4a156e1a646 / 63f40a41d7d6)."""
+    code = ("import sys; sys.modules['fcntl'] = None\n"
+            "from hermes_cli.main import _build_cli_parser\n"
+            "p, _ = _build_cli_parser()\n"
+            "p.parse_args(['worktree-cache', 'status'])\n"
+            "print('ok')\n")
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=str(Path(wc.__file__).resolve().parents[1]))
+    assert res.returncode == 0 and res.stdout.strip() == "ok", res.stderr[-2000:]
 
 
 def test_pre_register_error_falls_back_with_one_row(env, cow, monkeypatch):

@@ -385,6 +385,13 @@ def _attr_problem(cwd: Path, files_z: bytes, source: Optional[str] = None) -> Op
     return None
 
 
+def _attributes_changed(repo: Path, a: str, b: str) -> bool:
+    """Does a..b touch any ``.gitattributes``? A two-tree move does not re-convert files
+    whose blobs are unchanged, so new eol/text/ident rules would not reach them."""
+    res = _git("diff", "--name-only", "-z", a, b, "--", ":(glob)**/.gitattributes", cwd=repo)
+    return res.returncode != 0 or bool(res.stdout.strip(b"\0"))
+
+
 def _assert_template_config(gen: Path) -> list:
     drift = []
     for key, value in TEMPLATE_CONFIG:
@@ -415,7 +422,7 @@ def _write_meta(gen: Path, slug: str, n: int) -> dict:
         "host": socket.gethostname(), "fs_dev": _dev(gen),
         "unsupported": unsupported_reason(gen), "tree_bytes": _tree_bytes(gen),
     }
-    tmp = gen / f".{META}.tmp"
+    tmp = gen / ".git" / f"{META}.tmp"      # under .git: the repo cannot track a symlink here
     tmp.write_text(json.dumps(meta, sort_keys=True, indent=1) + "\n", encoding="utf-8")
     os.replace(tmp, gen / META)
     return meta
@@ -490,6 +497,12 @@ def refresh(slug: str, *, url: Optional[str] = None, lock_timeout: float = REFRE
         _must(_git("fetch", "--quiet", "origin", cwd=gen), f"template fetch of {slug}")
         target = _origin_head(gen)
         before = _out(_git("rev-parse", "HEAD", cwd=gen))
+        if target != before and _attributes_changed(gen, before, target):
+            # git leaves unchanged blobs alone on a move, so an eol/text rule change
+            # would not reach the files: write the new commit fresh instead.
+            retired = {"gen": str(mark_bad(gen, "attributes_changed")), "reason": "attributes_changed"}
+            gen, meta = _build_generation(rdir, slug, url)
+            return {"repo": slug, "status": "built", "gen": str(gen), "head": meta.get("head"), "retired": retired}
         if target != before:
             _must(_git("checkout", "-q", "--detach", target, cwd=gen), "template checkout")
         meta = _write_meta(gen, slug, int(_GEN_RE.match(gen.name).group(1)))
@@ -742,9 +755,9 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
         if not far and C != T:
             diff = _git("diff", "--name-only", "-z", T, C, cwd=dest_p)
             far = diff.returncode != 0 or diff.stdout.count(b"\0") > s.max_diff_files
-        if not far and C != T and unsupported_at(dest_p, C):
-            # C adds a submodule or a filter/ident/encoding attribute T lacks: the copied
-            # files would skip git's smudge path, so plain git writes this tree.
+        if not far and C != T and (_attributes_changed(dest_p, T, C) or unsupported_at(dest_p, C)):
+            # C changes attributes or adds a submodule / filter / ident / encoding T lacks:
+            # the copied files would skip git's conversion, so plain git writes this tree.
             _rm(staging)
             staging = None
             _rm(dest_p)
