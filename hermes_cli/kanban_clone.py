@@ -55,7 +55,9 @@ from typing import Iterator, Optional, Sequence, Tuple
 
 # GitHub owners whose repos get a shared mirror. Matched case-insensitively
 # (GitHub owners are); the canonical spelling here names the mirror directory.
-FLEET_OWNERS = ("ANG-Ventures", "Kyzcreig")
+# ANG-Repositories is the fleet's public-mirror org (t_19293188: the helper
+# cloned ANG-Repositories/hermes-agent with no mirror, 169 MB of own objects).
+FLEET_OWNERS = ("ANG-Ventures", "Kyzcreig", "ANG-Repositories")
 
 MIRRORS_ENV = "HERMES_KANBAN_MIRRORS_ROOT"
 
