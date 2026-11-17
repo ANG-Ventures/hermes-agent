@@ -207,6 +207,23 @@ def _receipt(conn, task, doc):
         kb._append_event(conn, task.id, EVENT, doc, run_id=task.current_run_id)
 
 
+def _cancel_unreceipted(client, rid, hid, why):
+    """Release a lease this run holds no receipt for, as its door owner ``kanban@<host>``.
+
+    A refusal here is about THIS reservation (its owner record, a row already gone), never door config: the start is
+    cancelled and the lease ends at its TTL. It must not latch the fleet door, because the latch fingerprint (token,
+    table, registry stats) cannot move when one lease expires (t_b18b346e: a lost upgrade reply left alloc_client's
+    process-local owner at 'kanban' and the release was refused client-side, latching every host twice in 10 min).
+    An unreadable credential is still a config fault and propagates to the latch."""
+    try:
+        client.release(rid, consumer=f"kanban@{hid}")
+    except client.TokenUnreadable:
+        raise
+    except client.Refused as exc:
+        raise DoorCancelled(f"{why}: release of {rid} refused ({exc}); lease ends at its TTL, "
+                            "retry with new ID") from None
+
+
 def _authorize(client, hid, uid, reservation_id, ttl_s):
     try:
         ans = client.authorize_start("kanban", hid, uid, ttl_s=ttl_s, existing_reservation_id=reservation_id,
@@ -221,7 +238,7 @@ def _authorize(client, hid, uid, reservation_id, ttl_s):
         state = seen.get("state")
         if state == "authorized":
             # No receipt exists for a start this run never made: cancel the lease, a fresh id next run.
-            client.release(seen["reservation_id"], consumer=f"kanban@{hid}")
+            _cancel_unreceipted(client, seen["reservation_id"], hid, "lost authorization reply")
             raise DoorCancelled("lost authorization reply; cancelled, retry with new ID") from None
         if state == "spent_expired":
             raise DoorCancelled(f"unit {uid} spent_expired after a lost reply; retry with new ID") from None
@@ -289,7 +306,7 @@ def start(conn, task, host=None, *, reservation_id=None, client=None):
         raise
     if ans.get("reused"):
         # spent_live with no receipt on this run: the earlier reply was lost. Cancel, never a second spawn.
-        client.release(ans["reservation_id"], consumer=f"kanban@{hid}")
+        _cancel_unreceipted(client, ans["reservation_id"], hid, "reused authorization")
         raise DoorCancelled("reconciled uncertain authorization; retry with new ID")
     import time
     doc = {"reservation_id": ans["reservation_id"], "consumer": f"kanban@{hid}",
