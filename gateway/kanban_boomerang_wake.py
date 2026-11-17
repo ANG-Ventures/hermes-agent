@@ -81,6 +81,20 @@ DEAD_LETTER_AFTER_S = 24 * 3600.0  # a part still undeliverable this long after 
 DEAD_LETTER_KEEP = 500             # newest dead-letter records kept in the state file
 CLAIM_TTL_S = 7 * 86400.0          # terminal claims older than this are pruned
 CLAIM_PRUNE_EVERY_S = 3600.0
+# t_e33a5355: every state change rewrote the whole file (11.9 MB, 6,276 of 6,281 claims terminal) into a
+# ``.boomerang-wake-*`` temp: 228 temps in 49 min, 54-80 GB/day on the Studio SSD. A terminal claim no pending
+# handback names now leaves the hot file for an append-only ``<stem>.terminal.jsonl`` (one line per claim,
+# only TERMINAL_FIELDS), so a write carries the open claims, the counters and the handback queue.
+ARCHIVE_SUFFIX = ".terminal.jsonl"
+TEMP_PREFIX = ".boomerang-wake-"
+TEMP_SWEEP_AGE_S = 600.0   # a temp this old is a dead write (killed between mkstemp and os.replace)
+#: What an archived terminal claim keeps: the dedupe/prune/migration/late-handoff reads in this module, and
+#: hermes-home scripts/lib/card_mechanical_wake.event_claims (outcome, reason, delegation_id, state).
+TERMINAL_FIELDS = frozenset({
+    "key", "task_id", "board", "event_id", "kind", "row", "state", "outcome", "reason", "action", "status",
+    "card_status", "claimed_at", "finished_at", "delegation_id", "resurfaced", "resurface_delivered",
+    "blocked_budget_exhausted", "restart_redispatch", "redispatched_as",
+})
 #: Kill switch for the backoff, dead-letter and claim pruning (present = pre-t_827d5940 behaviour).
 BACKOFF_STOP_FILE = "boomerang-handback-backoff.disabled"
 # t_aad55db4 kill switch: while it exists a ``complete`` verdict posts only the passive line again.
@@ -114,20 +128,117 @@ class BoomerangWakeState:
         self.path = Path(path) if path is not None else state_path()
         # sha256 of the bytes last read from / written to ``path`` (t_2f7fd11c: skip a no-op rewrite)
         self._disk_sha: Optional[str] = None
+        # key -> record as last read from / written to the archive (t_e33a5355)
+        self._archived: dict = {}
+
+    @property
+    def archive_path(self) -> Path:
+        return self.path.with_name(self.path.stem + ARCHIVE_SUFFIX)
 
     # --- file I/O (caller holds _LOCK) ---------------------------------------
 
     def _read(self) -> dict:
+        """The hot file with the archived terminal claims merged under ``claims`` (hot wins on a key)."""
         self._disk_sha = None
+        archived = self._read_archive()
         try:
             blob = self.path.read_bytes()
             raw = json.loads(blob.decode("utf-8-sig"))
         except (OSError, ValueError):
-            return {}
-        self._disk_sha = hashlib.sha256(blob).hexdigest()
+            raw, blob = None, None
+        if blob is not None:
+            self._disk_sha = hashlib.sha256(blob).hexdigest()
         if not isinstance(raw, dict):
+            raw = {}
+        if archived:
+            hot = raw.get("claims")
+            raw["claims"] = {**archived, **(hot if isinstance(hot, dict) else {})}
+        if not raw:
             return {}
         return self._migrate_card_text(self._migrate_blocked(self._migrate(raw)))
+
+    def _read_archive(self) -> dict:
+        """key -> archived record; later lines win, a torn line (crash mid-append) is skipped."""
+        self._archived = {}
+        try:
+            text = self.archive_path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return {}
+        for line in text.splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("key"), str):
+                self._archived[rec["key"]] = rec
+        return {k: dict(v) for k, v in self._archived.items()}
+
+    def _split(self, data: dict) -> dict:
+        """Archive the terminal claims no pending handback names; returns ``data`` with the rest.
+
+        Append-only: one line per new or changed record (fsynced before the hot file is replaced, so a
+        crash between the two leaves the claim in both and the hot copy wins). A record that left the
+        archive (pruned, or reopened) rewrites it whole, at most once per prune."""
+        claims = data.get("claims")
+        if not isinstance(claims, dict):
+            return data
+        pinned = {r.get("claim_key") for r in self._handbacks_of(data).values() if isinstance(r, dict)}
+        hot, cold = {}, {}
+        for k, v in claims.items():
+            if isinstance(v, dict) and v.get("state") == STATE_TERMINAL and k not in pinned:
+                cold[k] = {**{f: v[f] for f in TERMINAL_FIELDS if f in v}, "key": k}
+            else:
+                hot[k] = v
+        if set(self._archived) - set(cold):
+            lines = [json.dumps(r, sort_keys=True) for r in cold.values()]
+            self._atomic_write(self.archive_path, "".join(line + "\n" for line in lines).encode("utf-8"))
+        else:
+            new = [r for k, r in cold.items() if self._archived.get(k) != r]
+            if new:
+                self.archive_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.archive_path, "ab") as fh:
+                    fh.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in new).encode("utf-8"))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+        self._archived = cold
+        return {**data, "claims": hot}
+
+    def _atomic_write(self, path: Path, blob: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=TEMP_PREFIX, dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def sweep_temps(self, now: Optional[float] = None, min_age_s: float = TEMP_SWEEP_AGE_S) -> int:
+        """Delete ``.boomerang-wake-*`` temps older than ``min_age_s`` (a write killed between mkstemp and
+        os.replace leaves one; six of 3-9.5 MB sat on the Studio for a week). Returns the count removed."""
+        import time
+
+        now = time.time() if now is None else now
+        removed = 0
+        with _LOCK:
+            try:
+                names = list(self.path.parent.glob(TEMP_PREFIX + "*"))
+            except OSError:
+                return 0
+            for p in names:
+                try:
+                    if now - p.stat().st_mtime >= min_age_s:
+                        p.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+        return removed
 
     @staticmethod
     def _migrate_card_text(data: dict) -> dict:
@@ -215,26 +326,14 @@ class BoomerangWakeState:
         return data
 
     def _write(self, data: dict) -> None:
-        """Replace the file with ``data``; no write when the bytes equal what ``_read`` just saw."""
-        blob = json.dumps(data, sort_keys=True).encode("utf-8")
+        """Replace the hot file with ``data`` minus its archived terminal claims (:meth:`_split`); no
+        write when the bytes equal what ``_read`` just saw."""
+        blob = json.dumps(self._split(data), sort_keys=True).encode("utf-8")
         sha = hashlib.sha256(blob).hexdigest()
         if sha == self._disk_sha:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".boomerang-wake-", dir=str(self.path.parent))
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(blob)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
-            self._disk_sha = sha
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        self._atomic_write(self.path, blob)
+        self._disk_sha = sha
 
     @staticmethod
     def _retries_of(data: dict) -> dict:
@@ -2529,6 +2628,12 @@ async def _maybe_prune_claims(state: BoomerangWakeState, now: float) -> int:
     if now - _LAST_PRUNE.get(key, 0.0) < CLAIM_PRUNE_EVERY_S:
         return 0
     _LAST_PRUNE[key] = now
+    try:   # t_e33a5355: the first tick after startup, then hourly
+        swept = await asyncio.to_thread(state.sweep_temps)
+        if swept:
+            logger.info("kanban boomerang-wake: removed %d stale %s* temp file(s)", swept, TEMP_PREFIX)
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: temp sweep failed: %s", exc)
     try:
         if not await asyncio.to_thread(backoff_enabled):
             return 0
