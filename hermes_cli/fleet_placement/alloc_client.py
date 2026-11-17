@@ -539,6 +539,13 @@ def lookup_unit(workload, host, unit_id, *, timeout=TIMEOUT_S, root: Optional[Pa
     if (code != 200 or result.get("schema") != 1 or result.get("id") != unit_id
             or result.get("state") not in ("waiting", "authorized", "spent_expired", "unknown")):
         raise Unreachable("invalid unit lookup receipt")
+    rid = result.get("reservation_id")
+    if result["state"] == "authorized" and isinstance(rid, str) and rid:
+        # allocd's answer is the owner proof: an authorized unit's lease belongs to the pair, even when an
+        # authorize_start that upgraded this process's own booking lost its reply (t_b18b346e). Without this the
+        # cancel release is Refused on the stale base owner and the lease is stranded until its TTL.
+        _OWNER[_state_key(rid, root)] = identity
+        _FALLBACK_ISSUED.pop(_state_key(rid, root), None)
     return result
 
 
