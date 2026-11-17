@@ -522,6 +522,17 @@ class GatewayTurnMixin:
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
+
+        def _drop_wake(reason: str) -> None:
+            # An admitted kanban wake already reads "delivered" upstream; a silent drop here lost
+            # 2.5 h of boomerang handbacks (t_b9d81184). Never silent: log ERROR and page.
+            if not event_metadata.get("kanban_owner_wake"):
+                return
+            logger.error("KANBAN_WAKE_DROPPED card=%s key=%s: %s",
+                         event_metadata.get("card_id") or "?", expected_session_key or "?", reason)
+            from gateway import turn_error_pager
+            turn_error_pager.page_dropped_wake(event, reason, expected_session_key)
+
         recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
                      if not expected_session_key else None)
         if recovered is not None:
@@ -540,6 +551,7 @@ class GatewayTurnMixin:
                     "Dropping internally routed event after route recovery: expected session=%s derived=%s",
                     expected_session_key, derived_session_key,
                 )
+                _drop_wake(f"route recovery derived {derived_session_key}")
                 return
 
         strict_session = bool(event_metadata.get("gateway_session_strict"))
@@ -551,6 +563,7 @@ class GatewayTurnMixin:
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
                 )
+                _drop_wake(f"strict session {pinned_session_id or 'missing'} no longer current")
                 return
         else:
             # Internal wakes observe reset policy without counting as user activity, or periodic
@@ -562,6 +575,7 @@ class GatewayTurnMixin:
         if not strict_session and pinned_session_id:
             resolved_entry = await self._resolve_async_delegation_session(session_entry, pinned_session_id)
             if resolved_entry is None:
+                _drop_wake(f"route resolver refused pinned session {pinned_session_id} (see gateway.run WARNING)")
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)

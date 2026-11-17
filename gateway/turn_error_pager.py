@@ -93,6 +93,51 @@ def maybe_page(event: Any, error: BaseException, session_key: Optional[str] = No
         return False
 
 
+WAKE_DROP_PRODUCER = "gateway-kanban-wake-dropped"
+
+
+def page_dropped_wake(event: Any, reason: str, session_key: Optional[str] = None) -> bool:
+    """Page once per room episode when an ADMITTED kanban wake is dropped before its turn starts.
+    The admission receipt already marked the handback delivered, so this is the only witness
+    (t_b9d81184). True when a page was dispatched. Never raises."""
+    key = None
+    try:
+        room = episode_key(event)
+        if room is None:
+            return False
+        key = f"wake-drop:{room}"
+        loop = asyncio.get_running_loop()
+        handle = _open_episodes.get(key)
+        _open_episodes[key] = loop.call_later(QUIET_S, _clear_wake_episode, key, room)
+        if handle is not None:
+            handle.cancel()
+            return False
+        card = (getattr(event, "metadata", None) or {}).get("card_id") or "?"
+        why = " ".join(str(reason).split())[:REASON_CHARS] or "(no detail)"
+        text = (f"🔴 **Kanban wake dropped** · {room}\n"
+                f"card: `{card}` · reason: {why}\n"
+                f"session: `{session_key or '?'}`\n"
+                f"-# The adapter admitted the wake (its handback reads delivered) but no turn started. "
+                f"One page per room per episode.")
+        _dispatch(["page", "--producer", WAKE_DROP_PRODUCER, "--key", room, "--text", text,
+                   "--resolve-text", f"✅ **Kanban wake dropped** cleared · `{room}`: "
+                                     f"no new drop for {QUIET_S // 60} min"], key)
+        return True
+    except Exception:
+        logger.error("kanban wake-drop page for %s not dispatched", key, exc_info=True)
+        if key is not None:
+            _forget(key)
+        return False
+
+
+def _clear_wake_episode(key: str, room: str) -> None:
+    _open_episodes.pop(key, None)
+    try:
+        _dispatch(["clear", "--producer", WAKE_DROP_PRODUCER, "--key", room], None)
+    except Exception:
+        logger.error("kanban wake-drop episode clear for %s not dispatched", room, exc_info=True)
+
+
 def _forget(key: str) -> None:
     handle = _open_episodes.pop(key, None)
     if handle is not None:
