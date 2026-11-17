@@ -38,7 +38,9 @@ _memo: dict[tuple[str, Hashable], tuple[tuple, Any]] = {}
 
 def quiet_key(db_path: Path | str) -> Optional[tuple]:
     """A stat key that pins the database's committed content, or None when it cannot."""
-    p = os.fspath(db_path)
+    # SQLite keeps the -wal/-journal beside the symlink's TARGET, so check the sidecars there
+    # (Prism 558b83fbb2b9 on #405).
+    p = os.path.realpath(os.fspath(db_path))
     try:
         wal = os.stat(p + "-wal")
     except FileNotFoundError:

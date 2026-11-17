@@ -2258,6 +2258,10 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
+        # The dispatcher leader holds one idle read-only connection on every live board so other
+        # openers do not rebuild the board's -shm on disk (t_1460fa32). Env off switch:
+        # HERMES_KANBAN_BOARD_ANCHOR=0. Read when the dispatcher takes its lock.
+        "board_anchor": True,
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
