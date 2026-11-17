@@ -452,6 +452,39 @@ def _mirror_for(url: str) -> Optional[Path]:
         return None
 
 
+# kanban_clone.MIRROR_CONFIG minus the fetch refspec (an existing mirror keeps its own), in its order:
+# extensions.* is honoured only once core.repositoryformatversion is 1.
+_NEVER_PRUNE = tuple(kv for kv in kanban_clone.MIRROR_CONFIG if kv[0] != "remote.origin.fetch")
+
+
+def _is_never_prune(mirror: Path) -> bool:
+    fmt = _git("--git-dir", str(mirror), "config", "--get", "core.repositoryformatversion")
+    pre = _git("--git-dir", str(mirror), "config", "--bool", "--get", "extensions.preciousObjects")
+    return fmt.returncode == 0 and _out(fmt) == "1" and pre.returncode == 0 and _out(pre) == "true"
+
+
+def _write_never_prune_keys(mirror: Path) -> None:
+    for k, v in _NEVER_PRUNE:
+        _must(_git("--git-dir", str(mirror), "config", k, v), f"config {k} on {mirror}")
+
+
+def borrow_safe(mirror: Path) -> bool:
+    """True when a clone may keep an alternate to *mirror*: it is never-prune (format 1 AND
+    extensions.preciousObjects). A mirror that is not is repaired first, under the same flock its
+    builder and both refresh jobs take (kanban_clone._mirror_lock), so no fetch is mid-write.
+    False (the caller dissociates) when the repair cannot be made (Prism 1484b4563429, t_6de39491)."""
+    if _is_never_prune(mirror):
+        return True
+    try:
+        with kanban_clone._mirror_lock(mirror):
+            if not _is_never_prune(mirror):
+                _write_never_prune_keys(mirror)
+                print(f"worktree-cache: never-prune keys set on {mirror}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - an unrepairable mirror is still usable with --dissociate
+        print(f"worktree-cache: cannot make {mirror} never-prune ({exc}); dissociating", file=sys.stderr)
+    return _is_never_prune(mirror)
+
+
 def _clone_cmd(url: str, dest: Path, extra: Sequence[str] = ()) -> list:
     cmd = ["clone", "--quiet", "--no-checkout"]
     if kanban_clone.local_source(url) is not None:
@@ -459,6 +492,8 @@ def _clone_cmd(url: str, dest: Path, extra: Sequence[str] = ()) -> list:
     mirror = _mirror_for(url)
     if mirror is not None:
         cmd += ["--reference-if-able", str(mirror)]
+        if not borrow_safe(mirror):
+            cmd.append("--dissociate")    # a prune of the mirror must not take this clone's objects
     return cmd + list(extra) + ["--", url, str(dest)]
 
 
@@ -628,6 +663,12 @@ def plain_clone(url: str, dest: str, branch: Optional[str] = None, rev: Optional
                 quiet: bool = True) -> int:
     """Today's path: ``hermes kanban clone`` (+ ``checkout --detach <rev>``)."""
     opts = (["--quiet"] if quiet else []) + ([f"--branch={branch}"] if branch else [])
+    # kanban_clone.clone borrows from the same mirror (a local source's origin names it): only when
+    # that mirror is never-prune does the clone keep the alternate (Prism 1484b4563429).
+    local = kanban_clone.local_source(url)
+    mirror = _mirror_for(kanban_clone._source_origin(local) if local is not None else url)
+    if mirror is not None and not borrow_safe(mirror):
+        opts.append("--dissociate")
     rc = kanban_clone.clone(url, dest, opts)
     if rc == 0 and rev:
         rc = subprocess.run(["git", "-C", dest, "checkout", "-q", "--detach", rev],

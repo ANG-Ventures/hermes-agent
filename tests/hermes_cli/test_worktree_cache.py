@@ -757,3 +757,79 @@ def test_switch_and_templates_root_come_from_the_host_root_config(tmp_path, monk
     assert wc.templates_root() == ws / ".templates"
     (root / "config.yaml").write_text(": not yaml [")
     assert wc.settings().enabled is False                               # unreadable host config = OFF
+
+
+# --------------------------------------------------------------------------- never-prune mirror (t_6de39491)
+# Prism 1484b4563429: a clone that borrows from a mirror able to prune (format 0, or no
+# extensions.preciousObjects) loses objects when the mirror is pruned. The helper repairs the
+# mirror's never-prune keys under the mirror flock before it borrows, and dissociates when it cannot.
+
+
+def _prunable_mirror(env) -> Path:
+    mirror = kc.ensure_mirror(URL, "Kyzcreig", "demo")
+    _git("--git-dir", str(mirror), "config", "--unset", "extensions.preciousObjects")
+    _git("--git-dir", str(mirror), "config", "core.repositoryformatversion", "0")
+    for k in ("gc.pruneExpire", "gc.reflogExpire", "gc.reflogExpireUnreachable"):
+        _git("--git-dir", str(mirror), "config", "--unset", k)
+    return mirror
+
+
+def _prune_mirror(mirror: Path) -> None:
+    """Drop every ref, then gc --prune=now: a format-0 mirror deletes the objects; a never-prune one refuses."""
+    for sub in ("heads", "tags"):
+        shutil.rmtree(mirror / "refs" / sub, ignore_errors=True)
+        (mirror / "refs" / sub).mkdir()
+    with __import__("contextlib").suppress(FileNotFoundError):
+        (mirror / "packed-refs").unlink()
+    subprocess.run(["git", "gc", "-q", "--prune=now"], cwd=mirror, capture_output=True)
+
+
+def _readable(dest: Path) -> bool:
+    return subprocess.run(["git", "-C", str(dest), "fsck", "--connectivity-only"],
+                          capture_output=True).returncode == 0
+
+
+def _never_prune(mirror: Path) -> bool:
+    fmt = subprocess.run(["git", "--git-dir", str(mirror), "config", "--get", "core.repositoryformatversion"],
+                         capture_output=True, text=True).stdout.strip()
+    pre = subprocess.run(["git", "--git-dir", str(mirror), "config", "--bool", "--get", "extensions.preciousObjects"],
+                         capture_output=True, text=True).stdout.strip()
+    return fmt == "1" and pre == "true"
+
+
+@pytest.mark.parametrize("path", ["cow", "fallback"])
+def test_format0_mirror_is_repaired_before_a_clone_borrows(env, cow, path):
+    if path == "cow":
+        built(env)                  # the template exists before the mirror is degraded: the CLONE must repair
+    mirror = _prunable_mirror(env)
+    dest = env["base"] / "ws" / path
+    if path == "cow":
+        assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
+        assert log(env)[-1]["cow"] is True
+    else:
+        assert wc.plain_clone(URL, str(dest)) == 0
+    assert (dest / ".git" / "objects" / "info" / "alternates").exists()    # borrowing stays cheap
+    _prune_mirror(mirror)
+    assert _readable(dest)                                                 # the prune took nothing it lends
+    assert _never_prune(mirror)                                            # repaired under the mirror flock
+
+
+@pytest.mark.parametrize("path", ["cow", "fallback"])
+def test_unrepairable_mirror_is_dissociated(env, cow, path, monkeypatch):
+    if path == "cow":
+        built(env)
+    mirror = _prunable_mirror(env)
+
+    def cannot_write(_m):
+        raise OSError(errno.EACCES, "read-only mirror config")
+
+    monkeypatch.setattr(wc, "_write_never_prune_keys", cannot_write, raising=False)
+    dest = env["base"] / "ws" / path
+    if path == "cow":
+        assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
+    else:
+        assert wc.plain_clone(URL, str(dest)) == 0
+    assert not _never_prune(mirror)
+    assert not (dest / ".git" / "objects" / "info" / "alternates").exists()
+    _prune_mirror(mirror)
+    assert _readable(dest)
