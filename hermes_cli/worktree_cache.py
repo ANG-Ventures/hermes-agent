@@ -725,7 +725,7 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
             os.rename(staging / name, dest_p / name)
         staging.rmdir()
         staging = None
-        shutil.copyfile(index_src, dest_p / ".git" / "index")
+        os.replace(index_src, dest_p / ".git" / "index")     # same filesystem: a rename, not a copy
         _git("update-index", "-q", "--refresh", cwd=dest_p)
         if C != T:
             _must(_git("read-tree", "-m", "-u", T, C, cwd=dest_p), f"move {T[:10]} -> {C[:10]}")

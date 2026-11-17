@@ -236,9 +236,13 @@ def test_refresh_moves_template_and_asserts_config(env):
 
 def test_cross_volume_never_copies(env, cow, monkeypatch):
     built(env)
-    other = Path("/dev/shm")
-    if not other.is_dir() or os.stat(other).st_dev == os.stat(env["base"]).st_dev:
-        pytest.skip("no second filesystem (/dev/shm) to put the destination on")
+    import tempfile
+
+    here = os.stat(env["base"]).st_dev
+    others = [p for p in (Path("/dev/shm"), Path(tempfile.gettempdir())) if p.is_dir() and os.stat(p).st_dev != here]
+    if not others:
+        pytest.skip("no second filesystem (/dev/shm, $TMPDIR) to put the destination on")
+    other = others[0]
     dest = other / f"wc-xvol-{uuid.uuid4().hex[:8]}"
     called = []
     monkeypatch.setattr(wc, "_clone_entries", lambda *a: called.append(a))
@@ -335,6 +339,19 @@ def test_helper_never_hardlinks_or_byte_copies():
             assert "--reflink=always" in consts and "-l" not in consts and "--link" not in consts
 
 
+def no_registration(monkeypatch):
+    """Record every helper git call; the caller asserts no ``clone --no-checkout`` ran."""
+    calls = []
+    real = wc._git
+
+    def spy(*args, **kw):
+        calls.append(args)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(wc, "_git", spy)
+    return lambda: not [a for a in calls if "clone" in a and "--no-checkout" in a]
+
+
 # --------------------------------------------------------------------------- 9.5 verify failure
 
 
@@ -350,9 +367,11 @@ def test_verify_failure_falls_back_and_registers_nothing(env, cow, monkeypatch):
 
     monkeypatch.setattr(wc, "_clone_entries", corrupting)
     dest = env["base"] / "ws" / "cow"
+    unregistered = no_registration(monkeypatch)
     assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
     assert snapshot(dest) == snapshot(plain(env, "plain"))
     assert [r["reason"] for r in ledger(env)] == ["verify_failed"]
+    assert unregistered()
     assert no_staging_left(env)
     assert not list((env["base"] / "ws").glob(".*.idx"))
 
@@ -367,9 +386,11 @@ def test_extra_file_in_staging_fails_verify(env, cow, monkeypatch):
 
     monkeypatch.setattr(wc, "_clone_entries", extra)
     dest = env["base"] / "ws" / "cow"
+    unregistered = no_registration(monkeypatch)
     assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
     assert not (dest / "debug.log").exists()
     assert [r["reason"] for r in ledger(env)] == ["verify_failed"]
+    assert unregistered()
 
 
 # --------------------------------------------------------------------------- 9.6 dirty / moved template
