@@ -339,9 +339,6 @@ class HostTable:
     # included: resource-domain membership is the registry's, not candidate eligibility's, so a closed guest's live
     # leases and reservations still count on its source (Prism 7e9f3e2ed307 / c2f0087775e6 / 03f3bf40fe6b)
     declared: Mapping[str, tuple] = dataclasses.field(default_factory=dict)
-    # Optional hard reservation envelopes, keyed by the pressure-source host. Overhead is
-    # held once for the whole domain, never partitioned among consumers.
-    shared_budgets: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict)
 
     def declared_id(self, name) -> Optional[str]:
         """Canonical id for ``name`` over the admitted hosts first, then every declared row (left-out ones too)."""
@@ -480,15 +477,6 @@ def validate(doc) -> List[str]:
             errs.append(f"hosts.{hid}: mem_reserve_gb {h['mem_reserve_gb']} >= mem_total_gb {h['mem_total_gb']}")
         if _num(h.get("cores_reserve")) and isinstance(h.get("cores"), int) and h["cores_reserve"] >= h["cores"]:
             errs.append(f"hosts.{hid}: cores_reserve {h['cores_reserve']} >= cores {h['cores']}")
-        if "shared_budget" in h:
-            b = h["shared_budget"]
-            keys = {"threads", "ram_gb", "overhead_threads", "overhead_ram_gb"}
-            if not isinstance(b, dict) or set(b) != keys or any(not _num(b.get(k)) or b[k] < 0 for k in keys):
-                errs.append(f"hosts.{hid}.shared_budget needs nonnegative finite {sorted(keys)}")
-            elif b["threads"] <= b["overhead_threads"] or b["ram_gb"] <= b["overhead_ram_gb"]:
-                errs.append(f"hosts.{hid}.shared_budget overhead must leave usable capacity")
-            if h.get("pressure_from"):
-                errs.append(f"hosts.{hid}.shared_budget belongs on the pressure source only")
         cons = h.get("consumers")
         if not isinstance(cons, dict):
             errs.append(f"hosts.{hid}.consumers must be an object")
@@ -793,9 +781,7 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     declared = {hid: (h.get("pressure_from"), tuple(h.get("aliases", []))) for hid, h in doc["hosts"].items()}
     return HostTable(hosts=hosts, footprints=fps, closed_when=cw, path=p, default_first=doc.get("default_first"),
                      saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)), profile_footprints=pfps,
-                     scorer=scorer, declared=declared, fast_pick=doc.get("fast_pick", "speed"),
-                     shared_budgets={hid: h["shared_budget"] for hid, h in doc["hosts"].items()
-                                     if "shared_budget" in h})
+                     scorer=scorer, declared=declared, fast_pick=doc.get("fast_pick", "speed"))
 
 
 class ExclusionsError(PlacementError):
@@ -1089,6 +1075,10 @@ def guest_vm_refusal(spec: HostSpec, ctx: "AdmitContext", need_cpus: float,
         return None
     if spec.vm_cpus is None:
         return "closed:guest vm size unmeasured (var/placement/host-inventory.json vm_cpus)"
+    if spec.vm_cpus >= spec.threads:
+        # a guest sized to its whole source box (nas-fleet: 32 vCPU on the NAS's 32 threads) has no boundary the
+        # source's measured sample does not already enforce; its promises are not counted twice (t_292f88c0)
+        return None
     names = {spec.name.lower(), *(a.lower() for a in spec.aliases)}
     resv = ctx.reservations if reservations is None else tuple(reservations.items())
     held = sum(float(le.need.cpus) for le in ctx.leases if str(le.host).lower() in names) \
@@ -1517,7 +1507,9 @@ def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Jo
     klass = job_class_for(consumer, job)
     start = () if table is None else tuple((h, cpus) for h, spec in table.hosts.items()
                                            for k, cpus in spec.ramp_cpus if k == klass)
-    ctx = AdmitContext(klass, need_of(fp), tuple(hist), tuple(base + held_leases(held or {}, table)), scratch,
+    # need() is the only reader of history and reads only klass or its base class: keep just those rows (t_990ca939)
+    ctx = AdmitContext(klass, need_of(fp), tuple(work_estimate.class_history(hist, klass)),
+                       tuple(base + held_leases(held or {}, table)), scratch,
                        start_cpus=start)
     return ctx.for_host(table, host) if host is not None else ctx
 
@@ -1635,13 +1627,6 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
                          profile=job.profile if job else None)
     raw = admit_context(consumer, fp, now=now, job=job, history=history, leases=leases, table=table, root=root)
     ctx = raw.for_host(table, hid)       # folded over hid's resource domain: leases AND scratch
-    held = {}
-    for lease in raw.leases:
-        amount = Footprint(lease.need.ram_gb, lease.need.cpus)
-        held[lease.host] = held.get(lease.host, Footprint(0, 0)).plus(amount)
-    refused = shared_budget_refusal(table, hid, Footprint(ctx.need(hid).ram_gb, ctx.need(hid).cpus), held)
-    if refused:
-        return False, refused
     refused = guest_vm_refusal(spec, raw, ctx.need(hid).cpus)     # the guest's own VM size, apart from the domain
     if refused:
         return False, refused
@@ -2062,29 +2047,9 @@ class Decision:
         return row
 
 
-def shared_budget_refusal(table: HostTable, hid: str, need: Footprint,
-                          held: Mapping[str, Footprint]) -> Optional[str]:
-    """Strict promises, including settled jobs, over the existing pressure-source domain.
-
-    Called inside admit's ledger lock. The kernel ancestor remains the authority for
-    actual consumption (including expired holders and undeclared guest overhead).
-    """
-    domain = domain_of(table, hid)
-    budget = next((b for h, b in table.shared_budgets.items() if h in domain), None)
-    if budget is None:
-        return None
-    total = Footprint(budget["overhead_ram_gb"], budget["overhead_threads"]).plus(need)
-    for name, fp in held.items():
-        if (table.declared_id(name) or name) in domain:
-            total = total.plus(fp)
-    if total.threads > budget["threads"] or total.ram_gb > budget["ram_gb"]:
-        return f"closed:shared_budget threads={total.threads:g}/{budget['threads']:g} ram_gb={total.ram_gb:g}/{budget['ram_gb']:g}"
-    return None
-
-
 def _booked_reservations(util: bool, vm_reservations: Optional[Mapping[str, Footprint]],
                          ctx: AdmitContext) -> Dict[str, Footprint]:
-    """choose()'s reservations that count beside ``ctx.leases`` for the guest VM cap AND the shared budget: under
+    """choose()'s reservations that count beside ``ctx.leases`` for the guest VM cap: under
     utilization the leases replace the caller's reservations (only an explicit ``vm_reservations`` adds), under
     legacy ``vm_reservations`` when given, else the caller's reservations (Prism c-dd52632d2ecf3a32)."""
     if util:
@@ -2184,7 +2149,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
                                  closed_when=table.closed_when, excluded=excl.get(hid), reserved=hc.reserved_on(hid),
                                  require_axes=require_axes, admitted=used.get(hid, 0.0),
                                  now=now, stale_after_s=stale_after_s))
-        # ONE occupancy rule for the guest VM cap and the shared budget below: ``vm_reservations`` (admit(): the
+        # ONE occupancy rule for the guest VM cap: ``vm_reservations`` (admit(): the
         # ledger's live rows UNAGED), never the scorer's load1-aged ``reservations`` (Prism f01d48b6d5c4); under
         # utilization the leases replace the caller's reservations, so they are never summed on top of them
         # (admit() passes vm_reservations={}, Prism 3e890a858c01; direct callers too, Prism c-dd52632d2ecf3a32)
@@ -2193,15 +2158,6 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
             if rows[-1].eligible else None
         if vm:                                     # the guest's own VM size caps it apart from the domain (t_7361659c)
             rows[-1].eligible, rows[-1].reason = False, vm
-        if rows[-1].eligible:
-            held = dict(booked)
-            if util:    # the leases carry the ledger
-                for lease in ctx.leases:
-                    amount = Footprint(lease.need.ram_gb, lease.need.cpus)
-                    held[lease.host] = held.get(lease.host, Footprint(0, 0)).plus(amount)
-            budget = shared_budget_refusal(table, hid, Footprint(need.ram_gb, need.cpus), held)
-            if budget:
-                rows[-1].eligible, rows[-1].reason = False, budget
     eligible = [r for r in rows if r.eligible]
     # speed enters the CHOICE on both paths (R2c, D2; FWA F1 t_d456e9cd): under utilization the fraction is
     # admission.score()'s binding fraction, under legacy the v2 headroom fraction
