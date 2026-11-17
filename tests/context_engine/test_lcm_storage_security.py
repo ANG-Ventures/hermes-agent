@@ -154,3 +154,13 @@ def test_status_and_doctor_surface_retention_size_and_oldest_row(tmp_path):
     assert retention_check["detail"]["oldest_row_at"] == pytest.approx(old_ts)
 
     engine._close_storage()
+
+
+def test_retention_max_bytes_defaults_to_20_gib_and_env_still_overrides(tmp_path, monkeypatch):
+    # t_b81eac3d: report-only threshold raised from 1 GiB; LCM_RETENTION_MAX_BYTES still wins.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("LCM_RETENTION_MAX_BYTES", raising=False)
+    assert LCMConfig().retention_max_bytes == 20 * 1024 * 1024 * 1024
+    assert LCMConfig.from_env().retention_max_bytes == 20 * 1024 * 1024 * 1024
+    monkeypatch.setenv("LCM_RETENTION_MAX_BYTES", "12345")
+    assert LCMConfig.from_env().retention_max_bytes == 12345
