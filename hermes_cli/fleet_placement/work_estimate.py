@@ -198,23 +198,36 @@ def _build_class_rows(history, k):
     return rows, by_host
 
 
-# t_990ca939: _estimate runs once per table host inside choose(), and each call used to re-filter and re-sort the whole
-# class-usage window. The filtered rows are memoized per thread on the history TUPLE object itself (one entry, held by a
-# strong reference, so its id cannot be reused while memoized). A tuple cannot change; a new snapshot is a new object
-# and misses. Any other iterable (a list a caller may mutate) is never memoized.
-_ROWS_MEMO = threading.local()
+# The ONE per-snapshot memo (t_990ca939, t_71ff933a, t_f418e647): values derived from a history TUPLE, keyed on the
+# tuple's identity and held by a strong reference so the id cannot be reused while memoized. A tuple cannot change; a
+# new snapshot is a new object and misses. Any other iterable (a list a caller may mutate) is never memoized.
+# Process-wide, not per thread (allocd serves every request on a new thread). Its users: placement.history_window
+# (the snapshot's `at` index and its newest window), placement.admit_context (the class filter of a window) and
+# _class_rows below (a class's sorted rows, once per class instead of once per table host inside choose()). A few
+# snapshots, so the snapshot, its window and its class tuples of one generation do not evict each other.
+_SNAP_MEMO: dict = {}          # id(history) -> (history, {key: value})
+_SNAP_MEMO_MAX = 16
+_SNAP_LOCK = threading.Lock()
+
+
+def snap_memo(history: tuple, key, build, keep=None):
+    """The value memoized under ``key`` for the snapshot tuple ``history``, built by ``build()`` on a miss. ``keep``:
+    a cached value it rejects is rebuilt and REPLACES it (one entry per key, e.g. only the newest window)."""
+    with _SNAP_LOCK:
+        ent = _SNAP_MEMO.get(id(history))
+        if ent is None or ent[0] is not history:
+            while len(_SNAP_MEMO) >= _SNAP_MEMO_MAX:
+                _SNAP_MEMO.pop(next(iter(_SNAP_MEMO)))
+            ent = _SNAP_MEMO[id(history)] = (history, {})
+        if key not in ent[1] or (keep is not None and not keep(ent[1][key])):
+            ent[1][key] = build()
+        return ent[1][key]
 
 
 def _class_rows(history, k):
     if not isinstance(history, tuple):
         return _build_class_rows(history, k)
-    memo = getattr(_ROWS_MEMO, "m", None)
-    if memo is None or memo[0] is not history:
-        memo = _ROWS_MEMO.m = (history, {})
-    hit = memo[1].get(k)
-    if hit is None:
-        hit = memo[1][k] = _build_class_rows(history, k)
-    return hit
+    return snap_memo(history, ("rows", k), lambda: _build_class_rows(history, k))
 
 
 def _estimate(klass, host, history, seed, *, p, window, min_rows):
