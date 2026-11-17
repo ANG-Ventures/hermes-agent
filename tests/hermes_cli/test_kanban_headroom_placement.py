@@ -84,6 +84,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
+    monkeypatch.delenv("ALLOCATION_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     monkeypatch.setattr(kbd, "_default_spawn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("real spawn")))

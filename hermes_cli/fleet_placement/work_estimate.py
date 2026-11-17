@@ -65,6 +65,10 @@ CLASS_USAGE_WINDOW_S = 14 * 86400.0
 CONSUMER_CLASS = {"kanban": "kanban-worker-llm-wait", "athena": "kanban-worker-llm-wait", "test-gate": "test-gate-run",
                   "prism": "prism-review", "ci": "ci-suite-shard"}
 PROFILE_CONSUMERS = ("kanban", "athena")   # a Job.profile names a sub-class here (footprints.kanban.profiles)
+# t_7e60c0e7: a family whose BASE estimate reads its sub-classes' rows too. test-gate books test_gate_class(<files>);
+# until a sub-class has MIN_ROWS of its own it falls back to the base, and the base must stay the shared p90 it was
+# before the split (every test-gate run, light and heavy), never a number built only from the runs left unclassed.
+POOLED_FAMILIES = frozenset({CONSUMER_CLASS["test-gate"]})
 
 
 # ── class names ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -169,6 +173,11 @@ def estimate(klass: str, host: str, history: Iterable[Mapping], seed: Optional[E
     return _estimate(klass, host, history, seed, p=p, window=window, min_rows=min_rows)[0]
 
 
+def _in_class(row_class, k: str) -> bool:
+    """A ledger row counts toward ``k``: its own class, or (POOLED_FAMILIES base) any ``k:<sub>`` of the family."""
+    return row_class == k or (k in POOLED_FAMILIES and isinstance(row_class, str) and row_class.startswith(k + ":"))
+
+
 def _estimate(klass, host, history, seed, *, p, window, min_rows):
     """estimate() plus the axes it booked from the seed (no measurement in the window it read)."""
     history = list(history)
@@ -177,7 +186,7 @@ def _estimate(klass, host, history, seed, *, p, window, min_rows):
     v = dict.fromkeys((*AXES, "cpu_s", "wall_s"))
     source = "seed"
     for k in ((klass, base) if base != klass else (klass,)):
-        rows = sorted((r for r in history if r.get("class") == k), key=lambda r: float(r.get("at") or 0.0))
+        rows = sorted((r for r in history if _in_class(r.get("class"), k)), key=lambda r: float(r.get("at") or 0.0))
         here = [r for r in rows if r.get("host") == host]
         for pick, where in ((here, host), (rows, "fleet")):
             if len(pick) < min_rows:

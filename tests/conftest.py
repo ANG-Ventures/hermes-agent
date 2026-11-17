@@ -386,6 +386,9 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # (test-gate exported ~/.hermes) made tests rewrite the LIVE config/fleet-hosts.json
     # (t_dbacd1f2). Tests of PLACEMENT_HOME precedence set it themselves.
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
+    # ALLOCATION_HOME is the canonical name and wins over PLACEMENT_HOME (t_fc257547,
+    # Prism 8655eeb51c54): an inherited one would override every test's own root.
+    monkeypatch.delenv("ALLOCATION_HOME", raising=False)
     # Same for the root receipt the vendored admission_demand requires (hermes-home #9789): an inherited one names
     # the LIVE fleet root. _provisioned_placement_roots below provisions each test's own root instead.
     monkeypatch.delenv("PLACEMENT_ROOT_RECEIPT", raising=False)

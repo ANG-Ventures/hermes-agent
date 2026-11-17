@@ -1,35 +1,35 @@
 {
   "_doc": "Byte copies of hermes-home files (card t_29403e19). Never edit the copies; re-vendor and update this pin. tests/hermes_cli/test_fleet_placement_vendored.py checks each sha256 and fails once vendored_at is older than max_age_days. Fork-side differences live in __init__.py (the state root), never in a copy.",
   "source_repo": "ANG-Ventures/hermes-home",
-  "source_ref": "0b8d18ddcd0019bcdea50a39f0669784f33cf890",
-  "source_note": "Automated byte-equal five-file re-vendor from the named home main commit.",
+  "source_ref": "8bd41bb63e058969fa5ae6411accf3cc25d5c5c0",
+  "source_note": "Byte-equal five-file re-vendor from the named home main commit (t_fc257547: ALLOCATION_HOME env alias).",
   "vendored_at": "2026-11-16",
   "max_age_days": 21,
   "files": {
     "admission.py": {
       "source_path": "scripts/lib/admission.py",
-      "source_ref": "0b8d18ddcd0019bcdea50a39f0669784f33cf890",
+      "source_ref": "8bd41bb63e058969fa5ae6411accf3cc25d5c5c0",
       "sha256": "fb3e685e579d8ad685940b23bc915b57e218816349d104d098b060d11996635b"
     },
     "admission_demand.py": {
       "source_path": "scripts/lib/admission_demand.py",
-      "source_ref": "0b8d18ddcd0019bcdea50a39f0669784f33cf890",
-      "sha256": "1924990f78f29c7c7558387b75e5eecc33299c9ea3922dbaad6a712b6dc11321"
+      "source_ref": "8bd41bb63e058969fa5ae6411accf3cc25d5c5c0",
+      "sha256": "a8724c9bd7d3789413174b70e008b69db0a6bcd14ad4a88a0931784fe2f071cb"
     },
     "alloc_client.py": {
       "source_path": "scripts/lib/alloc_client.py",
-      "source_ref": "0b8d18ddcd0019bcdea50a39f0669784f33cf890",
-      "sha256": "d698104087d81b464e51d259b5074910c28144e039d29cb3ce5804ff09239dbc"
+      "source_ref": "8bd41bb63e058969fa5ae6411accf3cc25d5c5c0",
+      "sha256": "787a40baaf3211ede7618acca01528a814fc00ab84be96b564fcd36915d9074b"
     },
     "placement.py": {
       "source_path": "scripts/lib/placement.py",
-      "source_ref": "0b8d18ddcd0019bcdea50a39f0669784f33cf890",
-      "sha256": "fafbd24597b195ee3dbf0d29bad85638d526ebb45bbcf8a9c79bf85be9ecc2e0"
+      "source_ref": "8bd41bb63e058969fa5ae6411accf3cc25d5c5c0",
+      "sha256": "3db55479a6cc4caee334341a694d145d183585130918be8ca3042ea453e1b37b"
     },
     "work_estimate.py": {
       "source_path": "scripts/lib/work_estimate.py",
-      "source_ref": "0b8d18ddcd0019bcdea50a39f0669784f33cf890",
-      "sha256": "d4f35c67bb943b00d5f4b6bf455f8a1e114b378c6fc398915f903b33c38d7ff7"
+      "source_ref": "8bd41bb63e058969fa5ae6411accf3cc25d5c5c0",
+      "sha256": "7098be68c677ca88a41938c4dbf345e5fae124401428f90743cb4b3cdfddefff"
     }
   }
 }

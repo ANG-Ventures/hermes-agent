@@ -7,8 +7,8 @@ carries copies. ``VENDORED.json`` pins the source ref and each file's sha256, an
 older than ``max_age_days``. Re-vendor by copying the files byte for byte and updating ``VENDORED.json``; never edit
 the copies here. Every fork-side difference lives in this adapter.
 
-The one difference: the state root. hermes-home resolves ``PLACEMENT_HOME`` else the checkout two levels above
-``scripts/lib``; here the root is the shared kanban root (``<root>/config/fleet-hosts.json``, ``<root>/var/placement``),
+The one difference: the state root. hermes-home resolves ``ALLOCATION_HOME`` (else the old ``PLACEMENT_HOME``,
+counted) else the checkout two levels above ``scripts/lib``; here the root is the shared kanban root (``<root>/config/fleet-hosts.json``, ``<root>/var/placement``),
 resolved at call time so a test's ``HERMES_KANBAN_HOME`` binds it.
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ def _fleet_root(root=None) -> Path:
     # The canonical fleet_root(root=None) takes an explicit root first (call-scoped, FWA-2); keep that order.
     if root is not None:
         return Path(root)
-    env = os.environ.get("PLACEMENT_HOME")
+    env = placement._allocation_home_env()  # ALLOCATION_HOME, else the old PLACEMENT_HOME counted (t_fc257547)
     if env:
         return Path(env)
     from hermes_cli import kanban_db
