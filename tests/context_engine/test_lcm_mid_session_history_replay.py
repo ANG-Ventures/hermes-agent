@@ -1008,3 +1008,11 @@ class TestSessionEndFlushAfterCompaction:
         new = _turn(30, call_prefix="toolu")
         eng.ingest([dict(m) for m in compressed] + new)
         assert all(_count(tmp_path, m["content"]) >= 1 for m in new)
+
+    def test_interior_row_changed_after_the_compaction_reaches_the_store(self, tmp_path):
+        # Prism 1523c84d53e0: same length and endpoints, a corrected tool result inside -> it is stored.
+        eng, history, _compressed = self._compacted(tmp_path)
+        changed = [dict(m) for m in history]
+        changed[-2] = dict(changed[-2], content='{"output": "card 29 was corrected after compaction"}')
+        eng.on_session_end(SESSION, changed)
+        assert _count(tmp_path, changed[-2]["content"]) == 1

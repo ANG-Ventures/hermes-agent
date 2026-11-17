@@ -604,7 +604,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
-        # (len(input), len(compressed), first-row identity, last-row identity) of the
+        # (len(input), len(compressed), digest of every input row's identity) of the
         # last compaction, until the next ingest; see _ingest_messages_unlogged.
         self._compaction_source: Optional[tuple] = None
         self._last_ingest_reconciliation: Dict[str, Any] = {
@@ -2530,8 +2530,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compaction_source = (
             len(messages),
             len(compressed),
-            self._message_replay_identity(messages[0]),
-            self._message_replay_identity(messages[-1]),
+            self._replay_identity_digest(messages),
         )
 
         # Per-event node accounting: nodes THIS compress built = current total minus
@@ -5916,6 +5915,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         return result
 
+    def _replay_identity_digest(self, messages: List[Dict[str, Any]]) -> str:
+        h = hashlib.sha256()
+        for msg in messages:
+            h.update(json.dumps(self._message_replay_identity(msg)).encode())
+        return h.hexdigest()
+
     def _ingest_messages_unlogged(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -5952,8 +5957,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and not self._ingest_cursor_needs_reconcile
             and self._ingest_cursor == source[1]
             and len(messages) >= source[0]
-            and self._message_replay_identity(messages[0]) == source[2]
-            and self._message_replay_identity(messages[source[0] - 1]) == source[3]
+            and self._replay_identity_digest(messages[: source[0]]) == source[2]
         ):
             self._ingest_cursor = source[0]
             try:
