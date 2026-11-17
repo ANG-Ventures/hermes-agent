@@ -1283,7 +1283,11 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
     """Remote sh: clone origin into the (empty) workspace, then put HEAD on
     ``branch`` and PROVE it (rc 4 otherwise). The mirror only accelerates the
     clone: ``--dissociate`` copies what was borrowed, so a later mirror prune
-    cannot take objects from a running card (Prism 02dfd9094b97). The branch
+    cannot take objects from a running card (Prism 02dfd9094b97). A never-prune
+    mirror (``extensions.preciousObjects``) cannot drop them, so its clone keeps
+    the alternates instead of a ~440 MB object store of its own (t_969164a0).
+    With ``worktree_cache`` on for ``port_clone`` on the host, the fresh clone is
+    ``hermes worktree-cache clone`` (copy-on-write from the host's template). The branch
     baseline is the clone's own ``refs/remotes/origin/<branch>`` (fetched by
     the clone), never a second network call whose failure would read as
     "absent" (Prism 9b397aa5183d); else a new branch off origin/HEAD,
@@ -1314,7 +1318,18 @@ def clone_script(workspace: str, slug: str, mirror: str, branch: str, *,
         f"else if [ -d {m}/objects ]; then "
         f"git -c gc.auto=0 -c maintenance.auto=false -c fetch.prune=false --git-dir={m} "
         "fetch -q --no-write-fetch-head origin || true; fi; "
-        f"git clone -q --reference-if-able {m} --dissociate {url} \"$w\"; fi; "
+        # Worktree cache, scope port_clone (t_969164a0): asked on THIS host, whose config holds the switch.
+        "v=\"$HOME/.local/bin/hermes\"; [ -x \"$v\" ] || v=$(command -v hermes || true); "
+        "if [ \"${HERMES_WORKTREE_CACHE:-}\" != 0 ] && [ -n \"$v\" ] && \"$v\" worktree-cache active --caller port_clone >/dev/null 2>&1; then "
+        f"\"$v\" worktree-cache clone --url {url} --dest \"$w\" --caller port_clone; "
+        # a fallback inside the helper may re-create the dir: keep it never world-searchable (t_69e47673)
+        f"chmod {WORKSPACE_MODE} -- \"$w\"; "
+        # --dissociate only when the mirror can prune: a never-prune mirror (preciousObjects) is safe to
+        # borrow from, and dissociating gave every port clone its own ~440 MB object store.
+        # git honours extensions.* only at core.repositoryformatversion 1 (Prism 7848e18134f2)
+        f"else d=--dissociate; [ \"$(git --git-dir={m} config --bool --get extensions.preciousObjects 2>/dev/null)\" != true ] "
+        f"|| [ \"$(git --git-dir={m} config --get core.repositoryformatversion 2>/dev/null)\" != 1 ] || d=; "
+        f"git clone -q --reference-if-able {m} $d {url} \"$w\"; fi; fi; "
         "cd \"$w\"; "
         f"if [ \"$(git branch --show-current)\" != {b} ]; then "
         f"if git rev-parse -q --verify refs/heads/{b} >/dev/null; then git checkout -q {b}; "

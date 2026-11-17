@@ -78,6 +78,7 @@ REASONS = (
     "clone_errno",       # the CoW copy or another pre-register step raised (errno when an OSError)
     "verify_failed",     # the staged copy does not equal the commit
     "far_commit",        # target commit differs from the template in > max_diff_files files, or T unreachable
+    "unsupported_opts",  # `hermes kanban clone` options the cache does not reproduce (--depth, --no-checkout, ...)
 )
 
 CREATE_LOCK_TIMEOUT_S = 30.0
@@ -110,15 +111,24 @@ class Settings:
     max_diff_files: int = 2000
 
 
-def settings(cfg: Optional[dict] = None) -> Settings:
-    """``worktree_cache`` from config.yaml (read per call: no restart needed)."""
-    if cfg is None:
-        try:
-            from hermes_cli.config import load_config_readonly
+def host_config() -> dict:
+    """The host's ROOT config.yaml, never a profile's (t_969164a0). ``worktree_cache`` and
+    ``kanban.workspaces_root`` are host switches, and a kanban worker runs with
+    ``HERMES_HOME=<root>/profiles/<name>``: on the Studio no worker profile carries either key
+    (29 profiles read 2026-11-17), so a profile read left the cache off for every worker and put
+    its templates root on the Data volume. Unreadable -> {} (OFF)."""
+    try:
+        from hermes_cli.config import read_host_root_config
 
-            cfg = load_config_readonly().get("worktree_cache") or {}
-        except Exception:  # noqa: BLE001 - an unreadable config means OFF
-            cfg = {}
+        return read_host_root_config()
+    except Exception:  # noqa: BLE001 - an unreadable config means OFF
+        return {}
+
+
+def settings(cfg: Optional[dict] = None) -> Settings:
+    """``worktree_cache`` from the host's root config.yaml (read per call: no restart needed)."""
+    if cfg is None:
+        cfg = host_config().get("worktree_cache") or {}
     if not isinstance(cfg, dict):
         cfg = {}
     repos = cfg.get("repos")
@@ -142,11 +152,10 @@ def templates_root() -> Path:
     override = os.environ.get(ENV_TEMPLATES, "").strip()
     if override:
         return Path(override).expanduser()
-    from hermes_cli.kanban_workspace_policy import configured_root
-
-    root, _ = configured_root()
-    if root is not None:
-        return root / ".templates"
+    kanban = host_config().get("kanban")
+    raw = kanban.get("workspaces_root") if isinstance(kanban, dict) else None
+    if isinstance(raw, str) and raw and Path(raw).expanduser().is_absolute():
+        return Path(raw).expanduser() / ".templates"
     from hermes_constants import get_default_hermes_root
 
     return get_default_hermes_root() / "kanban" / "workspaces" / ".templates"
@@ -801,6 +810,37 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
     return 0
 
 
+# --------------------------------------------------------------------------- callers (build card 3)
+
+# `hermes kanban clone` options the cache reproduces exactly: everything else (a shallow or
+# filtered clone, --no-checkout, --single-branch, --origin, ...) asks for a .git the cache does
+# not make, so it runs plain git with an ``unsupported_opts`` row.
+_KANBAN_CLONE_OK = ("--quiet",)
+
+
+def kanban_clone_entry(url: str, dest: Optional[str], git_opts: Sequence[str] = (),
+                       s: Optional[Settings] = None) -> int:
+    """``hermes kanban clone`` (scope ``kanban_clone``). Off or out of scope: exactly
+    ``kanban_clone.clone`` as before, no ledger row."""
+    s = s or settings()
+    if not cache_active("kanban_clone", s):
+        return kanban_clone.clone(url, dest, git_opts)
+    branch: Optional[str] = None
+    other = []
+    for opt in git_opts:
+        if opt.startswith("--branch="):
+            branch = opt.split("=", 1)[1]
+        elif opt not in _KANBAN_CLONE_OK:
+            other.append(opt)
+    if other:
+        target = Path(dest or kanban_clone.default_dest(url)).absolute()
+        record_fallback("kanban_clone", "unsupported_opts", repo_slug(url), None, target)
+        _log({"ts": round(time.time(), 3), "caller": "kanban_clone", "repo": repo_slug(url), "mode": "clone",
+              "dest": str(target), "cow": False, "reason": "unsupported_opts", "opts": other})
+        return kanban_clone.clone(url, dest, git_opts)
+    return clone(url, dest, caller="kanban_clone", branch=branch, quiet="--quiet" in git_opts, s=s)
+
+
 # --------------------------------------------------------------------------- status + CLI
 
 
@@ -869,8 +909,17 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_active(args) -> int:
+    """Exit 0 when the cache is on for ``--caller`` on this host, else 1 (the port clone
+    script asks this on the pool host, whose config holds the switch)."""
+    return 0 if cache_active(args.caller, settings()) else 1
+
+
 def add_arguments(parser) -> None:
     sub = parser.add_subparsers(dest="worktree_cache_action")
+    a = sub.add_parser("active", help="Exit 0 when the cache is on for --caller here, else 1")
+    a.add_argument("--caller", required=True)
+    a.set_defaults(func=cmd_active)
     c = sub.add_parser("clone", help="Clone a repo; CoW from the template when enabled for --caller")
     c.add_argument("--url", required=True)
     c.add_argument("--dest", default=None)
