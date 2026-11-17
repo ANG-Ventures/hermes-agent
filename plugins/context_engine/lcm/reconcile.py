@@ -1169,6 +1169,19 @@ class ReconcileMixin:
                     # in the run matches by full identity.
                     idx += 1
                     continue
+                merged = (
+                    self._stored_user_run_merged_by_host(identity[1], stored_ids, pos)
+                    if role == stored_role == "user"
+                    else 0
+                )
+                if merged:
+                    # The host merged consecutive stored user rows into this one
+                    # (t_eebb04bf: a reboot's "[System note: ...interrupted...]"
+                    # resume row after the prompt it interrupted). Provisional
+                    # as above, over all the stored rows it absorbed.
+                    offset += merged - 1
+                    idx += 1
+                    continue
                 if (
                     role == stored_role == "tool"
                     and str(msg.get("tool_call_id") or "") == str(stored_rows[pos].get("tool_call_id") or "")
@@ -1326,6 +1339,37 @@ class ReconcileMixin:
 
         host_stamp, stored_stamp = text_stamp(host), text_stamp(stored)
         return bool(host_stamp and stored_stamp and host_stamp != stored_stamp)
+
+    @staticmethod
+    def _stored_user_run_merged_by_host(
+        host: Any,
+        stored_ids: List[tuple[Any, ...]],
+        pos: int,
+    ) -> int:
+        """How many consecutive stored user rows from ``pos`` the host row merges, or 0.
+
+        The host joins consecutive user rows with "\\n\\n" when it rebuilds its
+        history (agent_runtime_helpers._merge_consecutive_users), while the
+        store keeps each row it was given. Session 20261017_083333_13cf5395 at
+        the 00:52:04 boot (t_eebb04bf): store_ids 13918005 (the prompt) and
+        13918006 (the reboot's "[System note: ...interrupted...]" resume row)
+        came back as one host row, the walk stopped there and 225 stored rows
+        were appended again. Only runs of two or more stored user rows count,
+        compared under the single-row re-render rules.
+        """
+        parts: list[str] = []
+        end = pos
+        while end < len(stored_ids) and stored_ids[end][0] == "user":
+            parts.append(str(stored_ids[end][1] or ""))
+            end += 1
+            if len(parts) < 2:
+                continue
+            joined = "\n\n".join(parts)
+            if ReconcileMixin._user_row_rerenders_stored(host, joined) and not ReconcileMixin._user_row_stamps_differ(
+                host, joined
+            ):
+                return len(parts)
+        return 0
 
     @staticmethod
     def _strip_user_row_wrappers(text: str) -> str:

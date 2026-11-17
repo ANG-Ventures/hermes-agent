@@ -1016,3 +1016,36 @@ class TestSessionEndFlushAfterCompaction:
         changed[-2] = dict(changed[-2], content='{"output": "card 29 was corrected after compaction"}')
         eng.on_session_end(SESSION, changed)
         assert _count(tmp_path, changed[-2]["content"]) == 1
+
+
+class TestRestartResumeOfHostMergedUserRows:
+    """t_eebb04bf: session 20261017_083333_13cf5395 at the 11-17 00:50:55 boot stored
+    225 resumed rows again. The store holds a prompt (13918005) and the reboot's
+    resume note (13918006) as two consecutive user rows; the rebuilt history joins
+    them into one row ("<prompt>\\n\\n<note>"), so the walk ended at that row."""
+
+    _PROMPT = "[Mon 2026-11-16 22:14:23 PST] [safe-reboot complete | SRB-867B3873] verify the post-reboot state"
+    _NOTE = ("[System note: The previous turn was interrupted by a machine reboot; the gateway is now back "
+             "online.]")
+    _NEW = {"role": "user", "content": "[kanban] a genuinely new wake"}
+
+    def _shape(self, merged_tail):
+        before = [m for i in range(10) for m in _turn(i)]
+        after = _turn(10)[1:] + _turn(11)
+        stored = ([{"role": "system", "content": "You are Apollo."}] + before
+                  + [{"role": "user", "content": self._PROMPT}, {"role": "user", "content": self._NOTE}] + after)
+        history = before + [{"role": "user", "content": self._PROMPT + "\n\n" + merged_tail}] + after + [self._NEW]
+        return stored, history
+
+    def test_host_merged_prompt_and_resume_note_appends_only_the_new_row(self, tmp_path):
+        stored, history = self._shape(self._NOTE)
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+        assert _count(tmp_path, self._NEW["content"]) == 1
+
+    def test_host_merged_row_with_text_the_store_lacks_is_stored(self, tmp_path):
+        stored, history = self._shape("[Ace] and one more thing")
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, self._PROMPT + "\n\n[Ace] and one more thing") == 1
