@@ -57,8 +57,9 @@ FORK SURFACE PRESERVED (do not "clean up" — each is deliberate):
     directly (48 call sites, no temp_store). Callers rerouted: tools.py (lcm_grep deadline readers,
     lcm_recall summary-source reader), retrieval_core.py, vector_store.py, assertion_store.py and
     trajectory_store.py read_only branches, command.py, engine.py, aux_session.py,
-    lifecycle_state.py. Without it the lcm_grep hybrid/semantic FTS reader's sorts wrote 0.1-8.2 GB
-    of etilqs_* temp files per call on a copy of the Studio lcm.db. A refresh brings raw
+    lifecycle_state.py. Without it the lcm_grep hybrid/semantic FTS reader's sorts wrote up to
+    7.4 GB of etilqs_* temp files per call on a copy of the Studio lcm.db (660 MB inside the 3 s
+    deadline); 444 MB over the Studio's 73 real hybrid calls of 7 days. A refresh brings raw
     sqlite3.connect back; canary tests/context_engine/test_lcm_read_connections_temp_store.py
     (raw-connect census + temp-dir probe) fails.
 
