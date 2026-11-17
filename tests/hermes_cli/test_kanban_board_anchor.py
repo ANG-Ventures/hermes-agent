@@ -291,3 +291,113 @@ def test_anchor_board_list_has_live_and_phantom_boards_never_archived(tmp_path, 
     assert sorted(paths) == sorted(want)
     assert [m["slug"] for m in kb.list_boards(include_archived=False)] == ["default", "alpha"]
     assert not [p for p in opened if "_archived" in p]
+
+
+def test_live_off_file_closes_every_connection_and_removal_resumes(tmp_path, caplog):
+    dbs = [_wal_db(tmp_path / f"b{i}.db") for i in range(2)]
+    sw = tmp_path / "sw"
+    sw.mkdir()
+    anchor = kba.BoardAnchor(lambda: list(dbs), checkpoint=False, switch_dir=sw)
+    caplog.set_level("INFO", logger=kba.__name__)
+    try:
+        assert anchor.refresh()["held"] == 2
+        (sw / kba.OFF_FILE).touch()
+        r = anchor.refresh()
+        assert (r["held"], r["closed"], r["off"]) == (0, 2, True)
+        assert anchor.held_paths() == []
+        assert anchor.refresh()["held"] == 0  # stays off, nothing reopened
+        # An unanchored opener is first again: the -shm is rebuilt while the switch is on.
+        _other_process_open_close(dbs[0])
+        before = _shm_stamp(dbs[0])
+        time.sleep(0.05)
+        _other_process_open_close(dbs[0])
+        assert _shm_stamp(dbs[0]) != before
+        present = [m for m in caplog.messages if kba.OFF_FILE in m and "present" in m]
+        assert len(present) == 1  # logged once, not every pass
+        (sw / kba.OFF_FILE).unlink()
+        r = anchor.refresh()
+        assert (r["held"], r["opened"], r["off"]) == (2, 2, False)
+        assert len([m for m in caplog.messages if kba.OFF_FILE in m and "removed:" in m]) == 1
+    finally:
+        anchor.close_all()
+
+
+def test_live_checkpoint_off_file_keeps_holding_but_skips_checkpoints(tmp_path, caplog):
+    db = _wal_db(tmp_path / "board.db")
+    wal = str(db) + "-wal"
+    sw = tmp_path / "sw"
+    sw.mkdir()
+    anchor = kba.BoardAnchor(lambda: [db], wal_cap=64 * 1024, quiet_s=3600, switch_dir=sw)
+    caplog.set_level("INFO", logger=kba.__name__)
+    try:
+        anchor.refresh()
+        (sw / kba.CHECKPOINT_OFF_FILE).touch()
+        w = _grow_wal(db)
+        size = os.path.getsize(wal)
+        assert size > 64 * 1024
+        r = anchor.refresh()
+        assert (r["held"], r["truncated"], r["busy_skipped"]) == (1, 0, 0)
+        assert anchor.refresh()["truncated"] == 0
+        assert os.path.getsize(wal) == size
+        assert len([m for m in caplog.messages
+                    if kba.CHECKPOINT_OFF_FILE in m and "present" in m]) == 1
+        (sw / kba.CHECKPOINT_OFF_FILE).unlink()
+        assert anchor.refresh()["truncated"] == 1
+        assert os.path.getsize(wal) == 0
+        w.close()
+    finally:
+        anchor.close_all()
+
+
+def test_counts_line_logs_on_change_at_most_every_log_every(tmp_path, caplog):
+    dbs = [_wal_db(tmp_path / f"b{i}.db") for i in range(3)]
+    boards = [dbs[0]]
+    sw = tmp_path / "sw"
+    sw.mkdir()
+    now = [1000.0]
+    anchor = kba.BoardAnchor(lambda: list(boards), rescan_every=1, checkpoint=False,
+                             switch_dir=sw, log_every=600, clock=lambda: now[0])
+    caplog.set_level("INFO", logger=kba.__name__)
+
+    def lines():
+        return [m for m in caplog.messages if m.startswith("kanban board anchor: held=")]
+
+    try:
+        anchor.refresh()
+        assert lines() == ["kanban board anchor: held=1 opened=1 closed=0 truncated=0"
+                           " busy_skipped=0 checkpoint=off"]
+        anchor.refresh()  # no change: no line
+        boards.append(dbs[1])
+        now[0] += 300
+        anchor.refresh()  # changed, but within 10 min: no line yet
+        assert len(lines()) == 1
+        now[0] += 301
+        anchor.refresh()  # changed since the last line and 10 min passed
+        assert lines()[-1].startswith("kanban board anchor: held=2 opened=2 closed=0")
+        now[0] += 3600
+        anchor.refresh()  # an hour, no change: still no line
+        assert len(lines()) == 2
+    finally:
+        anchor.close_all()
+
+
+def test_busy_checkpoint_is_counted_as_busy_skipped(tmp_path):
+    db = _wal_db(tmp_path / "board.db")
+    anchor = kba.BoardAnchor(lambda: [db], wal_cap=1, quiet_s=3600, switch_dir=tmp_path)
+    try:
+        anchor.refresh()
+        w = sqlite3.connect(db)
+        w.execute("PRAGMA wal_autocheckpoint=0")
+        w.execute("INSERT INTO t VALUES (1)")
+        w.commit()
+        r = sqlite3.connect(db)
+        r.execute("BEGIN")
+        r.execute("SELECT COUNT(*) FROM t").fetchone()
+        res = anchor.refresh()
+        assert (res["truncated"], res["busy_skipped"]) == (0, 1)
+        assert anchor.totals["busy_skipped"] == 1
+        r.rollback()
+        r.close()
+        w.close()
+    finally:
+        anchor.close_all()

@@ -32,8 +32,19 @@ busy board is retried next pass, never waited on). That keeps idle boards at a 0
 board's ``-wal`` at ``wal_cap`` plus one pass of growth. Writers still checkpoint on their own
 (``wal_autocheckpoint``, ``journal_size_limit``, the dispatcher's PASSIVE checkpoint).
 
-Off switch: ``HERMES_KANBAN_BOARD_ANCHOR=0`` in the environment, or ``kanban.board_anchor: false``
-in config.yaml (read when the dispatcher takes the lock).
+Off switches. Read when the dispatcher takes the lock: ``HERMES_KANBAN_BOARD_ANCHOR=0`` in the
+environment, or ``kanban.board_anchor: false`` in config.yaml. Read on EVERY pass, so no restart is
+needed (``<kanban home>/kanban/``, i.e. ``~/.hermes/kanban/`` on the Studio):
+
+- ``board-anchor.off``: the pass closes every held connection and does nothing else until the file
+  is removed; the next pass after removal reopens them.
+- ``board-anchor-checkpoint.off``: keep holding the boards but run no ``wal_checkpoint`` (the
+  writers' own checkpoints still run).
+
+Each switch is logged once when it appears and once when it goes. One INFO line
+(``kanban board anchor: held=.. opened=.. closed=.. truncated=.. busy_skipped=..``, cumulative
+since start except ``held``) is logged when the counts changed, at most once every
+``log_every`` seconds (600).
 """
 
 from __future__ import annotations
@@ -53,6 +64,16 @@ DEFAULT_INTERVAL_S = 5.0
 DEFAULT_RESCAN_EVERY = 6
 DEFAULT_QUIET_S = 30.0
 DEFAULT_WAL_CAP_BYTES = 16 * 1024 * 1024
+DEFAULT_LOG_EVERY_S = 600.0
+OFF_FILE = "board-anchor.off"
+CHECKPOINT_OFF_FILE = "board-anchor-checkpoint.off"
+
+
+def default_switch_dir() -> Path:
+    """``<kanban home>/kanban``: where the live off-switch files are looked for."""
+    from hermes_cli import kanban_db as kb
+
+    return kb.kanban_home() / "kanban"
 
 
 def enabled(kanban_cfg: Optional[dict] = None) -> bool:
@@ -124,7 +145,8 @@ def _open_idle(path: str) -> Optional[sqlite3.Connection]:
 
 
 def _truncate_wal(path: str) -> bool:
-    """``wal_checkpoint(TRUNCATE)`` without waiting. True when it completed (the -wal is now 0 B)."""
+    """``wal_checkpoint(TRUNCATE)`` without waiting. True when it completed (the -wal is now 0 B);
+    False when it was busy or failed (retried on a later pass)."""
     try:
         conn = sqlite3.connect(Path(path).as_uri() + "?mode=rw", uri=True, timeout=0,
                                isolation_level=None)
@@ -135,6 +157,7 @@ def _truncate_wal(path: str) -> bool:
         row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         return bool(row) and row[0] == 0
     except sqlite3.Error:
+        _log.debug("kanban board anchor: checkpoint of %s failed", path, exc_info=True)
         return False
     finally:
         conn.close()
@@ -153,6 +176,9 @@ class BoardAnchor:
         quiet_s: float = DEFAULT_QUIET_S,
         wal_cap: int = DEFAULT_WAL_CAP_BYTES,
         checkpoint: bool = True,
+        switch_dir: Optional[Path] = None,
+        log_every: float = DEFAULT_LOG_EVERY_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._paths_fn = paths
         self.interval = max(float(interval), 0.5)
@@ -166,9 +192,68 @@ class BoardAnchor:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._switch_dir = Path(switch_dir) if switch_dir is not None else None
+        self.log_every = float(log_every)
+        self._clock = clock
+        self.totals = {"opened": 0, "closed": 0, "truncated": 0, "busy_skipped": 0}
+        self._off = False  # board-anchor.off seen on the last pass
+        self._ckpt_off = False  # board-anchor-checkpoint.off seen on the last pass
+        self._logged_counts: Optional[tuple] = None
+        self._logged_at: Optional[float] = None
+
+    # -- live switches --------------------------------------------------------------------------
+    def _switch_path(self, name: str) -> Optional[Path]:
+        if self._switch_dir is None:
+            try:
+                self._switch_dir = default_switch_dir()
+            except Exception:
+                return None
+        return self._switch_dir / name
+
+    def _switch_on(self, name: str) -> bool:
+        p = self._switch_path(name)
+        return p is not None and os.path.exists(p)
+
+    def _read_switches(self) -> tuple[bool, bool]:
+        off = self._switch_on(OFF_FILE)
+        ckpt_off = self._switch_on(CHECKPOINT_OFF_FILE)
+        if off != self._off:
+            _log.info("kanban board anchor: %s %s", self._switch_path(OFF_FILE),
+                      "present: closing every held connection until it is removed" if off
+                      else "removed: holding boards again")
+        if ckpt_off != self._ckpt_off:
+            _log.info("kanban board anchor: %s %s", self._switch_path(CHECKPOINT_OFF_FILE),
+                      "present: no -wal checkpoints until it is removed" if ckpt_off
+                      else "removed: -wal checkpoints resume")
+        self._off, self._ckpt_off = off, ckpt_off
+        return off, ckpt_off
+
+    def _maybe_log(self, held: int) -> None:
+        counts = (held, self.totals["opened"], self.totals["closed"], self.totals["truncated"],
+                  self.totals["busy_skipped"])
+        if counts == self._logged_counts:
+            return
+        now = self._clock()
+        if self._logged_at is not None and now - self._logged_at < self.log_every:
+            return
+        self._logged_counts, self._logged_at = counts, now
+        _log.info("kanban board anchor: held=%d opened=%d closed=%d truncated=%d busy_skipped=%d"
+                  " checkpoint=%s", *counts, "off" if (self._ckpt_off or not self.checkpoint)
+                  else "on")
 
     # -- one pass -------------------------------------------------------------------------------
     def refresh(self) -> dict:
+        off, ckpt_off = self._read_switches()
+        if off:
+            with self._lock:
+                closed = len(self._held)
+                for path in list(self._held):
+                    self._close(path)
+            self.totals["closed"] += closed
+            self._passes = 0  # rescan the board list on the first pass after the switch goes
+            self._maybe_log(0)
+            return {"held": 0, "opened": 0, "closed": closed, "truncated": 0, "busy_skipped": 0,
+                    "off": True}
         if self._passes % self.rescan_every == 0:
             try:
                 self._paths = [os.fspath(p) for p in self._paths_fn()]
@@ -177,7 +262,8 @@ class BoardAnchor:
                            len(self._paths), exc_info=True)
         self._passes += 1
         want = set(self._paths)
-        opened = closed = truncated = 0
+        opened = closed = truncated = busy = 0
+        do_ckpt = self.checkpoint and not ckpt_off
         with self._lock:
             for path in [p for p in self._held if p not in want]:
                 self._close(path)
@@ -200,11 +286,19 @@ class BoardAnchor:
                         continue
                     self._held[path] = (key, conn)
                     opened += 1
-                if self.checkpoint and self._wal_due(path) and _truncate_wal(path):
-                    truncated += 1
-                    _log.debug("kanban board anchor: truncated the -wal of %s", path)
+                if do_ckpt and self._wal_due(path):
+                    if _truncate_wal(path):
+                        truncated += 1
+                        _log.debug("kanban board anchor: truncated the -wal of %s", path)
+                    else:
+                        busy += 1
             held_n = len(self._held)
-        return {"held": held_n, "opened": opened, "closed": closed, "truncated": truncated}
+        for k, v in (("opened", opened), ("closed", closed), ("truncated", truncated),
+                     ("busy_skipped", busy)):
+            self.totals[k] += v
+        self._maybe_log(held_n)
+        return {"held": held_n, "opened": opened, "closed": closed, "truncated": truncated,
+                "busy_skipped": busy, "off": False}
 
     def _wal_due(self, path: str) -> bool:
         try:
@@ -268,5 +362,7 @@ def start_if_enabled(kanban_cfg: Optional[dict] = None) -> Optional[BoardAnchor]
     except Exception:
         _log.warning("kanban board anchor: could not start", exc_info=True)
         return None
-    _log.info("kanban board anchor: holding an idle read-only connection on every live board")
+    _log.info("kanban board anchor: holding an idle read-only connection on every live board;"
+              " live off switches: %s, %s", anchor._switch_path(OFF_FILE),
+              anchor._switch_path(CHECKPOINT_OFF_FILE))
     return anchor

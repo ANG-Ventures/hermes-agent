@@ -2260,7 +2260,9 @@ DEFAULT_CONFIG = {
         "dispatch_in_gateway": True,
         # The dispatcher leader holds one idle read-only connection on every live board so other
         # openers do not rebuild the board's -shm on disk (t_1460fa32). Env off switch:
-        # HERMES_KANBAN_BOARD_ANCHOR=0. Read when the dispatcher takes its lock.
+        # HERMES_KANBAN_BOARD_ANCHOR=0. Read when the dispatcher takes its lock. Live switches, read
+        # every pass with no restart: ~/.hermes/kanban/board-anchor.off (drop every held
+        # connection) and ~/.hermes/kanban/board-anchor-checkpoint.off (no -wal checkpoints).
         "board_anchor": True,
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
