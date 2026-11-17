@@ -2235,6 +2235,20 @@ DEFAULT_CONFIG = {
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
     },
+    # Copy-on-write checkouts from a per-host template (hermes_cli/worktree_cache.py; spec
+    # hermes-content plans/fleet-worktree-cache). OFF: every creator runs plain git. ``scopes``
+    # turns it on per creator: dispatcher_worktree, kanban_clone, port_clone, manual,
+    # deploy_selftest, script:<name>. Read per create, so no restart is needed.
+    "worktree_cache": {
+        "enabled": False,
+        "scopes": [],
+        "repos": [
+            "ANG-Ventures/hermes-home", "ANG-Ventures/hermes-agent", "ANG-Ventures/hermes-skills",
+            "ANG-Ventures/hermes-content", "ANG-Ventures/pipecat-house-voice", "ANG-Ventures/prism-router",
+        ],
+        "max_lag_s": 900,
+        "max_diff_files": 2000,
+    },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
