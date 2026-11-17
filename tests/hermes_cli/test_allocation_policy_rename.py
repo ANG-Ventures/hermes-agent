@@ -75,3 +75,32 @@ def test_fleet_placement_root_reads_allocation_home_and_counts_the_old_name(tmp_
     assert fp._fleet_root() == old
     log = (vh / "var" / "ci-box" / "deprecated-name-reads.log").read_text().splitlines()
     assert len(log) == 1 and " env:PLACEMENT_HOME pid=" in log[0]
+
+
+def test_sandbox_root_ignores_an_exported_allocation_home(tmp_path):
+    """Prism 8655eeb51c54: ALLOCATION_HOME wins in fleet_root, so the conftest sandbox must drop an inherited one the
+    way it drops PLACEMENT_HOME. Runs one probe under a child pytest whose environment exports it."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    live = tmp_path / "live-fleet-root"
+    repo = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "ALLOCATION_HOME": str(live), "SANDBOX_PROBE_LIVE_ROOT": str(live)}
+    env.pop("PYTEST_ADDOPTS", None)
+    probe = f"{Path(__file__).relative_to(repo)}::_sandbox_probe"
+    p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-o", "python_functions=_sandbox_probe",
+                        probe], cwd=repo, env=env, capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0 and "1 passed" in p.stdout, p.stdout[-3000:] + p.stderr[-2000:]
+
+
+def _sandbox_probe():
+    import os
+    from pathlib import Path
+
+    from hermes_cli import fleet_placement as fp
+
+    live = os.environ["SANDBOX_PROBE_LIVE_ROOT"]
+    assert os.environ.get("ALLOCATION_HOME") is None       # never repr os.environ into a CI log
+    assert Path(fp.placement.fleet_root()) != Path(live)
+    assert Path(fp.admission_demand._root()) != Path(live)
