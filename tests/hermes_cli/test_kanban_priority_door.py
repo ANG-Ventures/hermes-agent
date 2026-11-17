@@ -36,6 +36,9 @@ class Client:
     class Unreachable(Exception):
         pass
 
+    class TokenUnreadable(Refused):
+        pass
+
     class AuthorizeRefused(Refused):
         def __init__(self, reason, detail=""):
             super().__init__(f"{reason}: {detail}")
@@ -279,6 +282,64 @@ def test_lost_reply_is_reconciled_by_lookup_before_any_retry(board, monkeypatch)
             pytest.fail("unresolved unit must not spawn")
     assert not isinstance(held.value, door.DoorCancelled)                # same id kept for the retry
     assert not any(c[0] == "release" for c in client.calls)
+
+
+class _OwnerRefusingClient(Client):
+    """alloc_client as measured 2026-11-17 02:03:23 / 02:13:33 (t_b18b346e): the pool reservation was booked by this
+    process as 'kanban', the door upgraded it to 'kanban@<host>' and lost the reply, and release() then refused on the
+    stale process-local owner record before any request: "reservation <id> belongs to 'kanban', not 'kanban@<host>'"."""
+    def __init__(self, exc):
+        super().__init__()
+        self.exc = exc
+
+    def release(self, rid, **kwargs):
+        self.calls.append(("release", rid, kwargs))
+        raise self.exc
+
+
+def _upgrade_start(board, task, client):
+    with door.start(board, task, "ace-ai", reservation_id="pool-row", client=client):
+        pytest.fail("never spawn on an unreceipted lease")
+
+
+@pytest.mark.parametrize("path", ["lost_reply", "reused"])
+def test_owner_refusal_on_unreceipted_release_cancels_one_start_never_latches(board, monkeypatch, path):
+    from hermes_cli import kanban_priority_faults as faults
+    msg = "reservation pool-row belongs to 'kanban', not 'kanban@ace-ai'"
+    client = _OwnerRefusingClient(Client.Refused(msg))
+    tid, uid, task = _claimed(board, monkeypatch, f"owner-{path}")
+    if path == "lost_reply":
+        client.raise_on_authorize = Client.Unreachable("TimeoutError: POST /demand/authorize")
+        client.lookup = {"state": "authorized", "reservation_id": "pool-row", "until": 1}
+    else:
+        client.reused = True
+    with pytest.raises(door.DoorCancelled) as cancelled:
+        _upgrade_start(board, task, client)
+    assert not isinstance(cancelled.value, door.DoorFault)
+    assert msg in str(cancelled.value)
+    assert client.calls[-1][0] == "release" and client.calls[-1][2] == {"consumer": "kanban@ace-ai"}
+    assert not faults.latched()                                          # the other hosts keep starting
+    door.defer(board, task, cancelled.value)
+    assert kb.get_task(board, tid).status == "ready"                     # not blocked for a human
+    assert door.unit_id(board, tid) != uid                               # a NEW id next run
+    # the next start on the board still reaches the door
+    tid2, uid2, task2 = _claimed(board, monkeypatch, f"next-{path}")
+    plain = Client()
+    with door.start(board, task2, "ace-ai", client=plain):
+        pass
+    assert any(c[0] == "authorize" for c in plain.calls)
+
+
+def test_unreadable_credential_on_unreceipted_release_still_latches(board, monkeypatch):
+    from hermes_cli import kanban_priority_faults as faults
+    client = _OwnerRefusingClient(Client.TokenUnreadable("token file kanban@ace-ai: empty"))
+    tid, uid, task = _claimed(board, monkeypatch, "token")
+    client.raise_on_authorize = Client.Unreachable("reply lost")
+    client.lookup = {"state": "authorized", "reservation_id": "pool-row", "until": 1}
+    with pytest.raises(door.DoorFault):
+        _upgrade_start(board, task, client)
+    assert faults.latched()
+    (faults._root() / faults.STATE_REL).unlink()
 
 
 def test_asap_without_operator_capability_never_blocks_a_start(board, monkeypatch):
