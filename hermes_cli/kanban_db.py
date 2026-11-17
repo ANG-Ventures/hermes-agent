@@ -7321,6 +7321,14 @@ def list_tasks(
         order_sql = VALID_SORT_ORDERS[order_by]
     else:
         order_sql = "priority DESC, created_at ASC"
+    if order_by == "title":
+        # Titles are long (Studio board: 3.4 MB of them): even (title, id) alone, or a
+        # 48-char prefix, outgrew the 2 MB cache and spilled etilqs files (4.1 MB per
+        # call, t_ba5a93d0). No SQL sort here; Python orders (title, id), which for
+        # UTF-8 text is SQLite's BINARY order, so results are identical.
+        rows = sorted(conn.execute(f"SELECT * FROM tasks{query}", params).fetchall(),
+                      key=lambda r: (r["title"], r["id"]))
+        return [Task.from_row(r) for r in (rows[:int(limit)] if limit else rows)]
     # Sort only (keys, id), then join the full rows by primary key and order in Python.
     # ``SELECT * ... ORDER BY`` sorted whole rows (bodies, results): 198 MB of etilqs
     # temp files per ``kanban list`` on the Studio board (t_d24713d3). One statement,
