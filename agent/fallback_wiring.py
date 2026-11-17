@@ -107,7 +107,7 @@ def local_relay_restart_wait_s() -> float:
 
 
 def relay_drain_wait_s() -> float:
-    """``fallback.relay_drain_wait_s`` (default 150, see
+    """``fallback.relay_drain_wait_s`` (default 300, see
     ``retry_utils.RELAY_DRAIN_WAIT_DEFAULT_S``): how long a relay deploy-drain
     503 is waited out on the SAME model before the fallback chain. ``0``
     disables."""

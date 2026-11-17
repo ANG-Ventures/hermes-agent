@@ -141,12 +141,14 @@ class TestFloorSitesStayReasonless:
 
 
 class TestSiteCountReconciles:
-    """There are exactly 13 fallback call sites across the extracted loop family (RC3
+    """There are exactly 14 fallback call sites across the extracted loop family (RC3
     reconciliation; re-reconciled 2026-10-01: the fork's 10 + upstream's incomplete_response
     continuation site and the refusal site that the extraction split out of the shared branch;
-    2026-10-07 t_5d79bfea: + the session_busy site, which threads its reason)."""
+    2026-10-07 t_5d79bfea: + the session_busy site, which threads its reason; 2026-11-17
+    t_5188f4ed: + the fallback-rung context-ceiling site in turn_overflow, reason=context_overflow).
+    """
 
-    _EXPECTED = 13
+    _EXPECTED = 14
 
     def test_ten_sites(self):
         found = sorted(f"{p.name}:{ln}" for (p, ln) in _fallback_calls())

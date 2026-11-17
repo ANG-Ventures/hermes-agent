@@ -682,6 +682,10 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
     ("_pre_verify_nudges", 0),
     # Cross-lane no-first-byte clock (agent/fallback_wall_budget.py, t_452c6ead).
     ("_wall_budget", None),
+    # Models the relay pool said it cannot serve this turn (t_5188f4ed).
+    ("_pool_exhausted_models", None),
+    # Largest request a fallback lane rejected as too long this turn (t_5188f4ed).
+    ("_context_rejected_tokens", 0),
 )
 
 

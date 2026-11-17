@@ -385,21 +385,84 @@ def _endpoint_for_log(base_url: Any) -> str:
     return f"{parts.scheme}://{host}{port}" if parts.scheme and host else "<unset>"
 
 
-def _unexplained_rejection_kept(st: _Recovery, request_tokens: int, window: int) -> OverflowVerdict:
+def _unexplained_rejection_kept(st: _Recovery, request_tokens: int, window: int, basis: str = "estimate") -> OverflowVerdict:
     """End a turn whose explicit context rejection sits far below the known window, keeping the
     session: no ``compression_exhausted`` (``gateway/run_turn.py::_hmwa_compression_exhaustion_reset``
     would wipe it), retryable. The provider's limit may not live in this transcript at all."""
     agent = st.agent
     return st.fail_turn(
-        site_copy("provider_context_rejection", model=agent.model, tokens=request_tokens, window=window),
+        site_copy("provider_context_rejection", model=agent.model, tokens=request_tokens, window=window,
+                  basis=_BASIS_COPY[basis]),
         log=(
-            "%sProvider context rejection below the window persisted (~%s of %s tokens, %d compression "
-            "attempts); keeping the session", agent.log_prefix, f"{request_tokens:,}", f"{window:,}",
+            "%sProvider context rejection below the window persisted (~%s %s of %s tokens, %d compression "
+            "attempts); keeping the session", agent.log_prefix, f"{request_tokens:,}", basis, f"{window:,}",
             st.compression_attempts,
         ),
         compression_exhausted=False, reason=FailoverReason.server_error.value, retryable=True,
         context_overflow=False,
     )
+
+
+# How the request size was known (t_5188f4ed): ``measured`` = the provider's last reported
+# usage (prompt + completion) plus a rough count of the messages added since; ``estimate`` =
+# the local rough estimator alone, which read 244,603 for a request the provider counted at
+# 346,615 (2026-11-17 08:06, raw_ratio 1.435).
+_BASIS_COPY = {"measured": "counted by the provider", "estimate": "estimate"}
+
+
+def _rejected_request_tokens(st: _Recovery) -> Tuple[int, str]:
+    """``(tokens, basis)`` for the request the provider just rejected, output reservation included."""
+    from agent.usage_anchor import anchored_context_tokens
+
+    agent = st.agent
+    out = max(0, int(getattr(agent, "max_tokens", 0) or 0))
+    try:
+        anchored = anchored_context_tokens(st.messages, getattr(agent, "_usage_anchor", None))
+    except Exception:  # noqa: BLE001
+        anchored = None
+    if anchored:
+        return int(anchored) + out, "measured"
+    return st.request_tokens() + out, "estimate"
+
+
+def _return_to_pinned_route(agent: Any) -> bool:
+    """Put the session back on its pinned route unless that route is benched by a stated rate
+    limit or its relay says it cannot serve the model. A sticky hold is not consulted: it keeps
+    the session off a primary that failed, but this lane cannot take the request at all, and
+    the sticky policy's own ``fallback_failed`` return is the same move (spec §4.3)."""
+    from agent import fallback_policy as fp
+    from agent.fallback_wiring import _primary_capacity_hold, restore_allowed
+
+    gate = restore_allowed(agent, probe=False)  # no network; the cooldown is read here only
+    if not gate.allowed and gate.reason == "cooldown":
+        return False
+    if _primary_capacity_hold(agent):
+        return False
+    return bool(agent._restore_primary_runtime(
+        _policy_decision=fp.Decision(True, "fallback_failed", "fallback lane context ceiling")))
+
+
+def _leave_fallback_rung(st: _Recovery, _retry: TurnRetryState, request_tokens: int) -> Optional[OverflowVerdict]:
+    """A FALLBACK rung rejected the request below the window (t_5188f4ed): its own ceiling, not
+    the transcript. Record the ceiling, then go back to the pinned route if it may serve, else to
+    the next rung; never compress for it. ``None`` when neither is available."""
+    from agent.context_ceilings import record
+
+    agent = st.agent
+    record(agent.provider, agent.model, request_tokens)
+    agent._context_rejected_tokens = max(int(getattr(agent, "_context_rejected_tokens", 0) or 0), request_tokens)
+    rung = f"{agent.provider}/{agent.model}"
+    moved = _return_to_pinned_route(agent) or bool(
+        agent._try_activate_fallback(reason=FailoverReason.context_overflow))
+    if not moved:
+        return None
+    logger.warning("%sFallback %s rejected ~%s tokens as too long; moving to %s/%s without compressing",
+                   agent.log_prefix, rung, f"{request_tokens:,}", agent.provider, agent.model)
+    from agent.conversation_loop import _arm_fallback_restart
+
+    st.active_system_prompt = _arm_fallback_restart(agent, st.api_messages, st.active_system_prompt, _retry)
+    st.compression_attempts = 0
+    return st.done("break")
 
 
 def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: str) -> OverflowVerdict:
@@ -440,7 +503,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
     # loopback may be a relay to a hosted provider, so trust that rejection and
     # compress once rather than classifying it as local contention.
     window = agent.context_compressor.context_length
-    request_tokens = st.request_tokens() + max(0, int(getattr(agent, "max_tokens", 0) or 0))
+    request_tokens, basis = _rejected_request_tokens(st)
     explicit_context_rejection = "context_length_exceeded" in error_msg.lower()
     # A provider that quotes its own count ("1200000 tokens > 1000000") measured a real overflow.
     unexplained = (
@@ -453,12 +516,16 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
         # the observation in telemetry; never poison the authoritative metadata cache.
         logger.warning(
             "%sProvider context ceiling observation provider=%s model=%s endpoint=%s "
-            "observed_rejected_request_tokens=%d believed_window=%d compression_attempts=%d",
+            "observed_rejected_request_tokens=%d token_basis=%s believed_window=%d compression_attempts=%d",
             agent.log_prefix, agent.provider, agent.model, _endpoint_for_log(agent.base_url),
-            request_tokens, window, st.compression_attempts,
+            request_tokens, basis, window, st.compression_attempts,
         )
+        if getattr(agent, "_fallback_activated", False) is True:
+            moved = _leave_fallback_rung(st, _retry, request_tokens)
+            if moved is not None:
+                return moved
         if st.compression_attempts >= 1:
-            return _unexplained_rejection_kept(st, request_tokens, window)
+            return _unexplained_rejection_kept(st, request_tokens, window, basis)
     if (
         is_local_endpoint(agent.base_url)
         and not explicit_context_rejection
@@ -467,10 +534,11 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
         and request_tokens < window * _UNEXPLAINED_REJECTION_FRACTION
     ):
         return st.fail_turn(
-            site_copy("server_context_rejection", model=agent.model, tokens=request_tokens, window=window),
+            site_copy("server_context_rejection", model=agent.model, tokens=request_tokens, window=window,
+                      basis=_BASIS_COPY[basis]),
             notices=(
                 f"❌ The server rejected the request as too large, but it is only ~{request_tokens:,} "
-                f"tokens against a {window:,}-token window — not compressing.",
+                f"tokens ({_BASIS_COPY[basis]}) against a {window:,}-token window — not compressing.",
                 "   💡 Wait a moment and /retry; another request on the same server (e.g. a background "
                 "review) may have been holding its context.",
             ),
@@ -485,7 +553,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
     keep_session = explicit_context_rejection and unexplained
     exhausted = st.count_attempt()
     if exhausted is not None:
-        return _unexplained_rejection_kept(st, request_tokens, window) if keep_session else exhausted
+        return _unexplained_rejection_kept(st, request_tokens, window, basis) if keep_session else exhausted
     agent._buffer_diagnostic_status(COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE.format(
         tokens=st.approx_tokens, attempt=st.compression_attempts, cap=st.max_compression_attempts,
     ))
@@ -506,7 +574,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
         return st.done("break")
 
     if keep_session:
-        return _unexplained_rejection_kept(st, request_tokens, window)
+        return _unexplained_rejection_kept(st, request_tokens, window, basis)
     # Can't compress further and already at minimum tier.
     return st.fail_turn(
         site_copy("context_overflow", model=agent.model),

@@ -533,6 +533,10 @@ def _viable(agent: Any, fb: dict) -> bool:
         return False
     if provider in (getattr(agent, "_quota_gate_skipped_providers", None) or ()):
         return False
+    if model in (getattr(agent, "_pool_exhausted_models", None) or ()):
+        from agent.relay_lanes import is_relay_backed
+        if is_relay_backed(provider):
+            return False
     try:
         from agent.fallback_cooldown import _is_entitlement_rejected
         if _is_entitlement_rejected(agent, provider, model):

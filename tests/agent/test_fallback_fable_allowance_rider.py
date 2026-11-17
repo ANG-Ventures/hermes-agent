@@ -88,6 +88,8 @@ def test_live_failover_banner_carries_the_tail(_home, monkeypatch):
 
     _patch_resolver(monkeypatch)
     a = _alr_agent()
+    # quota_model is pool-wide: a Fable rung on another relay face is skipped (t_5188f4ed).
+    a._fallback_chain = [{"provider": "claude-btpr", "model": "claude-opus-5-5"}]
     err = _Err({"error": "no eligible sub for the requested model; this model's budget "
                          "is capped on every subscription while other models are unaffected"},
                503, {"x-relay-error-class": "quota_model", "x-relay-error-hop": "relay",

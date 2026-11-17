@@ -41,6 +41,7 @@ from agent.confab_notice import (
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
+from agent.relay_lanes import is_relay_backed, same_relay_pool
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 # Remote endpoints must never be fingerprinted: the probe waterfall is only valid for local/LM-Studio/Ollama
@@ -3753,6 +3754,26 @@ def _same_provider_entry(agent, fb: Dict[str, Any]) -> bool:
     return bool(cur_provider) and fb_provider == cur_provider
 
 
+def _note_pool_exhausted_model(agent) -> None:
+    """The failing call is the relay pool's ``quota_model`` (no seat can serve the model, via
+    the relay's own refusal or the harness's capacity probe): remember the model for this turn
+    so the walk skips every other face of the same pool for it (t_5188f4ed). Never raises."""
+    try:
+        from agent import fallback_events as _fbe
+
+        if not is_relay_backed(getattr(agent, "provider", None)):
+            return
+        if _fbe.pending_trigger_class(agent) != "quota_model":
+            return
+        model = str(getattr(agent, "model", "") or "").strip()
+        if model:
+            if not isinstance(getattr(agent, "_pool_exhausted_models", None), set):
+                agent._pool_exhausted_models = set()
+            agent._pool_exhausted_models.add(model)
+    except Exception:  # noqa: BLE001
+        logger.debug("pool-exhausted note failed open", exc_info=True)
+
+
 from agent.route_snapshot import route_mutation
 
 
@@ -3792,6 +3813,7 @@ def try_activate_fallback(
     _resuming = getattr(agent, "_sticky_resume_in_progress", False) is True
     if not _resuming:
         reason = _resolve_failover_reason(agent, reason)
+        _note_pool_exhausted_model(agent)
     # A seat-level quota (`quota_seat`: one seat's 5h / weekly / Fable limit)
     # on a pool relay is the relay's to rotate around, so it does not bench
     # the model (fallback spec §4.1 / Phase 1b); apply_quota_gate skips it at
@@ -3908,12 +3930,32 @@ def try_activate_fallback(
         # A relay deploy-drain refuses EVERY model on the failing provider, so a
         # same-provider entry (a MODEL fallback, e.g. fable -> opus on claude-bpr)
         # only collects the same 503 (2026-09-30 13:03, 5 sessions). Skip entries
-        # on the failing provider or its base_url.
-        if getattr(reason, "value", reason) == "relay_draining" and _same_provider_entry(agent, fb):
+        # on the failing provider or its base_url, and every lane of the same relay
+        # pool: one claude-pool deploy drains them all (2026-11-17 08:03, alr + dtlr).
+        if getattr(reason, "value", reason) == "relay_draining" and (
+            _same_provider_entry(agent, fb) or same_relay_pool(agent.provider, fb_provider)
+        ):
             logger.warning(
-                "Fallback skip: %s/%s is on the relay that is draining for deploy",
+                "Fallback skip: %s/%s is on the relay pool that is draining for deploy",
                 fb_provider, fb_model,
             )
+            continue
+        # The pool already said it has no capacity for this model on any seat: another
+        # face of the same pool would answer the same (2026-11-16 22:23, alr -> dtlr).
+        if fb_model in (getattr(agent, "_pool_exhausted_models", None) or ()) and is_relay_backed(fb_provider):
+            logger.warning("Fallback skip: %s/%s is on the relay pool that has no capacity for %s",
+                           fb_provider, fb_model, fb_model)
+            continue
+        # A lane that rejected a request at least this large as too long (its own ceiling,
+        # far below the model window) would reject it again (t_5188f4ed).
+        from agent.context_ceilings import too_large_for
+
+        # Request size: the last real prompt, or this turn's rejected request when larger.
+        _req = max(int(getattr(getattr(agent, "context_compressor", None), "last_prompt_tokens", 0) or 0),
+                   int(getattr(agent, "_context_rejected_tokens", 0) or 0))
+        if too_large_for(fb_provider, fb_model, _req):
+            logger.warning("Fallback skip: %s/%s rejected a request this size (%d tokens) as too long",
+                           fb_provider, fb_model, _req)
             continue
         # A card-pinned kanban worker never leaves its pinned provider mid-turn
         # (t_ed0289e3): a card pinned to openai-codex to escape a bridge fault must
