@@ -871,17 +871,25 @@ def count_notify_subs(
     query = "SELECT COUNT(*) FROM kanban_notify_subs"
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
-    try:
+    resolved = path.resolve()
+
+    def _count() -> int:
+        conn = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True)
         try:
-            row = conn.execute(query, params).fetchone()
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
-                return 0
-            raise
-        return int(row[0]) if row else 0
-    finally:
-        conn.close()
+            try:
+                row = conn.execute(query, params).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return 0
+                raise
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    # Every gateway calls this for every board every notifier tick; reopening an idle board
+    # rewrites its -shm on disk each time (t_2cfa2782). Unchanged board -> remembered count.
+    from hermes_cli import sqlite_quiet_memo
+    return sqlite_quiet_memo.read(resolved, ("count_notify_subs", query, tuple(params)), _count)
 
 
 def remove_notify_sub(

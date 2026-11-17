@@ -2223,21 +2223,24 @@ def _board_db_is_empty(db_path: Path) -> bool:
     returns 3. ``mode=ro`` still refuses to create a missing file, so this
     probe cannot itself become a phantom-creator.
     """
-    try:
-        uri = f"file:{db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
-    except sqlite3.Error:
-        return False
-    try:
-        row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
-    except sqlite3.Error:
-        return False
-    finally:
+    def _read() -> bool:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
         try:
-            conn.close()
-        except sqlite3.Error:
-            pass
-    return bool(row) and row[0] == 0
+            row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        return bool(row) and row[0] == 0
+
+    # list_boards() runs this on every watcher tick in every gateway; an unchanged DB answers
+    # from memory instead of a reopen that rewrites its -shm on disk (t_2cfa2782).
+    from hermes_cli import sqlite_quiet_memo
+    try:
+        return sqlite_quiet_memo.read(db_path, "board_db_is_empty", _read)
+    except sqlite3.Error:
+        return False
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
