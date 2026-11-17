@@ -226,8 +226,24 @@ def _cancel_unreceipted(client, rid, hid, why):
 
 def _authorize(client, hid, uid, reservation_id, ttl_s):
     try:
+        owner = None
+        if reservation_id:
+            # Pool/local capacity starts as kanban. A retry may instead carry the row this
+            # very unit already upgraded; ask the durable door, not the process owner cache.
+            seen = client.lookup_unit("kanban", hid, uid)
+            owner = (f"kanban@{hid}" if seen.get("state") == "authorized"
+                     and seen.get("reservation_id") == reservation_id else "kanban")
         ans = client.authorize_start("kanban", hid, uid, ttl_s=ttl_s, existing_reservation_id=reservation_id,
-                                     existing_consumer="kanban" if reservation_id else None)
+                                     existing_consumer=owner)
+    except client.TokenUnreadable:
+        raise
+    except client.Refused as exc:
+        # The client and allocd both use this ownership diagnostic. Scope it to
+        # the supplied reservation; unrelated auth/schema faults still latch.
+        detail = getattr(exc, "detail", None) or str(exc)
+        if reservation_id and detail.startswith(f"reservation {reservation_id} belongs to ") and ", not " in detail:
+            raise DoorCancelled(f"{detail}; retry with new ID") from exc
+        raise
     except client.Unreachable:
         # Lost reply: the server may have authorized. Read the unit before anything else.
         try:

@@ -330,6 +330,43 @@ def test_owner_refusal_on_unreceipted_release_cancels_one_start_never_latches(bo
     assert any(c[0] == "authorize" for c in plain.calls)
 
 
+@pytest.mark.parametrize("owner", ["kanban", "kanban@ace-ai"])
+def test_existing_reservation_uses_door_record_owner(board, monkeypatch, owner):
+    client = Client()
+    _, _, task = _claimed(board, monkeypatch, "existing-owner")
+    if owner != "kanban":
+        client.lookup = {"state": "authorized", "reservation_id": "pool-row", "until": 9999999999}
+    authorize = client.authorize_start
+
+    def check_owner(*args, **kwargs):
+        if kwargs["existing_consumer"] != owner:
+            raise client.AuthorizeRefused("invalid", f"reservation pool-row belongs to '{owner}', not 'kanban'")
+        return authorize(*args, **kwargs)
+
+    monkeypatch.setattr(client, "authorize_start", check_owner)
+    with door.start(board, task, "ace-ai", reservation_id="pool-row", client=client):
+        pass
+    assert next(c for c in client.calls if c[0] == "authorize")[2]["existing_consumer"] == owner
+
+
+@pytest.mark.parametrize("typed", [True, False])
+def test_authorize_owner_mismatch_only_cancels_one_card(board, monkeypatch, typed):
+    from hermes_cli import kanban_priority_faults as faults
+    client = Client()
+    tid, uid, task = _claimed(board, monkeypatch, "mismatch")
+    detail = "reservation pool-row belongs to 'kanban', not 'kanban@ace-ai'"
+    client.raise_on_authorize = (Client.AuthorizeRefused("invalid", detail) if typed else Client.Refused(detail))
+    with pytest.raises(door.DoorCancelled) as cancelled:
+        _upgrade_start(board, task, client)
+    door.defer(board, task, cancelled.value)
+    assert kb.get_task(board, tid).status == "ready"
+    assert door.unit_id(board, tid) != uid
+    assert not faults.latched()
+    _, _, next_task = _claimed(board, monkeypatch, "next-card")
+    with door.start(board, next_task, "ace-ai", client=Client()):
+        pass
+
+
 def test_unreadable_credential_on_unreceipted_release_still_latches(board, monkeypatch):
     from hermes_cli import kanban_priority_faults as faults
     client = _OwnerRefusingClient(Client.TokenUnreadable("token file kanban@ace-ai: empty"))
