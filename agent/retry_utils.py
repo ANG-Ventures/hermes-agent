@@ -399,7 +399,7 @@ LOCAL_RELAY_RESTART_WAIT_DEFAULT_S = 20.0
 # claude-dtlr, draining in the same deploy). 300 s is 1.7x the longest measured window;
 # the bound above it is the relay's 600 s TTL clamp. The other lanes of the same pool
 # drain in the same deploy, so the fallback walk skips them after the wait
-# (relay_lanes.same_relay_pool).
+# (try_activate_fallback: both lanes relay-backed).
 # Config: ``fallback.relay_drain_wait_s`` (0 disables -> pre-fix overloaded policy).
 RELAY_DRAIN_WAIT_DEFAULT_S = 300.0
 # Poll interval when the relay sends no usable Retry-After.

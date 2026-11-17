@@ -432,23 +432,29 @@ def relay_error_class(error: Any) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def pending_trigger_class(agent: Any) -> Optional[str]:
-    """Peek (do NOT consume) the §4.1 class of the stashed failing call, so
-    the failover arm/gate can branch on class before the ledger row consumes
-    the slot. None when nothing fresh is stashed. Never raises."""
+def pending_trigger(agent: Any) -> Optional[Tuple[str, str]]:
+    """Peek (do NOT consume) ``(trigger_class, class_source)`` of the stashed
+    failing call. None when nothing fresh is stashed. Never raises."""
     try:
         pending = getattr(agent, "_pending_fallback_error", None)
         if not isinstance(pending, dict):
             return None
         if time.monotonic() - float(pending.get("at") or 0) > _PENDING_MAX_AGE_S:
             return None
-        cls, _src = classify_trigger(
+        return classify_trigger(
             text=pending.get("text"), http_status=pending.get("status"),
             headers=pending.get("headers"), body=pending.get("body"),
             exc_name=pending.get("exc"), floor=pending.get("floor"))
-        return cls
     except Exception:  # noqa: BLE001
         return None
+
+
+def pending_trigger_class(agent: Any) -> Optional[str]:
+    """Peek (do NOT consume) the §4.1 class of the stashed failing call, so
+    the failover arm/gate can branch on class before the ledger row consumes
+    the slot. None when nothing fresh is stashed. Never raises."""
+    trig = pending_trigger(agent)
+    return trig[0] if trig else None
 
 
 def quota_seat_on_relay(agent: Any) -> bool:

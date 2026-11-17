@@ -385,7 +385,7 @@ def _endpoint_for_log(base_url: Any) -> str:
     return f"{parts.scheme}://{host}{port}" if parts.scheme and host else "<unset>"
 
 
-def _unexplained_rejection_kept(st: _Recovery, request_tokens: int, window: int, basis: str = "estimate") -> OverflowVerdict:
+def _unexplained_rejection_kept(st: _Recovery, request_tokens: int, window: int, basis: str) -> OverflowVerdict:
     """End a turn whose explicit context rejection sits far below the known window, keeping the
     session: no ``compression_exhausted`` (``gateway/run_turn.py::_hmwa_compression_exhaustion_reset``
     would wipe it), retryable. The provider's limit may not live in this transcript at all."""
@@ -442,6 +442,17 @@ def _return_to_pinned_route(agent: Any) -> bool:
         _policy_decision=fp.Decision(True, "fallback_failed", "fallback lane context ceiling")))
 
 
+def _active_entry_base_url(agent: Any) -> Optional[str]:
+    """The DECLARED ``base_url`` of the fallback entry now serving (the walk keys ceilings on
+    it before it resolves a client). The walk advanced ``_fallback_index`` past that entry."""
+    chain = getattr(agent, "_fallback_chain", None) or []
+    idx = int(getattr(agent, "_fallback_index", 0) or 0) - 1
+    fb = chain[idx] if 0 <= idx < len(chain) and isinstance(chain[idx], dict) else {}
+    same = (str(fb.get("provider") or "").strip().lower() == str(agent.provider or "").strip().lower()
+            and str(fb.get("model") or "").strip() == str(agent.model or "").strip())
+    return fb.get("base_url") if same else None
+
+
 def _leave_fallback_rung(st: _Recovery, _retry: TurnRetryState, request_tokens: int) -> Optional[OverflowVerdict]:
     """A FALLBACK rung rejected the request below the window (t_5188f4ed): its own ceiling, not
     the transcript. Record the ceiling, then go back to the pinned route if it may serve, else to
@@ -449,7 +460,7 @@ def _leave_fallback_rung(st: _Recovery, _retry: TurnRetryState, request_tokens: 
     from agent.context_ceilings import record
 
     agent = st.agent
-    record(agent.provider, agent.model, request_tokens)
+    record(agent.provider, agent.model, _active_entry_base_url(agent), request_tokens)
     agent._context_rejected_tokens = max(int(getattr(agent, "_context_rejected_tokens", 0) or 0), request_tokens)
     rung = f"{agent.provider}/{agent.model}"
     moved = _return_to_pinned_route(agent) or bool(

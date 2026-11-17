@@ -45,15 +45,3 @@ def is_relay_pinned(provider: Optional[str]) -> bool:
 def is_relay_backed(provider: Optional[str]) -> bool:
     """Any Claude lane whose seat state the relay owns: pooled door or seat pin."""
     return is_relay_pooled(provider) or is_relay_pinned(provider)
-
-
-def same_relay_pool(a: Optional[str], b: Optional[str]) -> bool:
-    """Both lanes are faces of the one claude-pool deploy over the one seat set (t_5188f4ed).
-
-    Families a-d are served by claude-pool relays that deploy (and drain) together and share
-    the seats: on 2026-11-17 the Studio's alr/dlr/bpr/apr relays (:18818/:18816/:18811/:18810)
-    all reported the same ``fable_allowance`` 20/26 and ``tiers.main`` 26 on /health, and the
-    08:03 deploy drained alr and dlr in the same window. Family e (API credit, its own relay)
-    is not in the pool. So a pool-wide condition (deploy drain, model exhausted) on one lane
-    holds on every other lane this returns True for."""
-    return is_relay_backed(a) and is_relay_backed(b)

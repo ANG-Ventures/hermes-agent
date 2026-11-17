@@ -537,6 +537,9 @@ def _viable(agent: Any, fb: dict) -> bool:
         from agent.relay_lanes import is_relay_backed
         if is_relay_backed(provider):
             return False
+    from agent.context_ceilings import request_tokens, too_large_for
+    if too_large_for(provider, model, fb.get("base_url"), request_tokens(agent)):
+        return False
     try:
         from agent.fallback_cooldown import _is_entitlement_rejected
         if _is_entitlement_rejected(agent, provider, model):

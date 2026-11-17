@@ -269,3 +269,63 @@ def test_message_says_estimate_without_a_provider_count(caplog):
     text = verdict.result["final_response"]
     assert "244,603 tokens (estimate)" in text, text
     assert "token_basis=estimate" in caplog.text
+
+
+# ── send-back round 2: pool-wide evidence only, endpoint-keyed ceilings, no stale size ──
+
+@pytest.mark.parametrize("headers,text,noted", [
+    ({"x-relay-error-class": "quota_model"}, "no eligible sub for the requested model", True),
+    # "no eligible sub" classed from text alone can be a lane fact (bridge mode, pool exclusion).
+    ({}, "no eligible sub", False),
+    ({"x-relay-error-class": "pool_pressure"}, "no eligible sub", False),
+])
+def test_pool_skip_keys_on_relay_stated_quota_only(headers, text, noted):
+    from agent.chat_completion_helpers import _note_pool_exhausted_model
+
+    agent = SimpleNamespace(provider="claude-dtlr", model="claude-opus-5-5", _pool_exhausted_models=None,
+                            _pending_fallback_error={"at": _real_time.monotonic(), "text": text,
+                                                     "status": 503, "headers": headers})
+    _note_pool_exhausted_model(agent)
+    assert ("claude-opus-5-5" in (agent._pool_exhausted_models or ())) is noted
+
+
+def test_ceiling_is_keyed_on_the_declared_endpoint():
+    from agent import context_ceilings as cc
+
+    cc.record("claude-dtlr", "claude-fable-5-2", "http://127.0.0.1:18816/v1/", 100_000)
+    assert cc.too_large_for("claude-dtlr", "claude-fable-5-2", "http://127.0.0.1:18816/v1", 150_000)
+    assert not cc.too_large_for("claude-dtlr", "claude-fable-5-2", None, 150_000)
+    assert not cc.too_large_for("claude-dtlr", "claude-fable-5-2", "http://other:1/v1", 150_000)
+
+
+@pytest.mark.parametrize("request_size,viable", [(150_000, False), (50_000, True)])
+def test_wall_budget_viability_honours_a_recorded_ceiling(request_size, viable):
+    from agent import context_ceilings as cc
+    from agent.fallback_wall_budget import _lane_ahead
+
+    cc.record("claude-dtlr", "claude-fable-5-2", None, 100_000)
+    agent = SimpleNamespace(_fallback_chain=[{"provider": "claude-dtlr", "model": "claude-fable-5-2"}],
+                            _fallback_index=0,
+                            context_compressor=SimpleNamespace(last_prompt_tokens=request_size))
+    assert _lane_ahead(agent) is viable
+
+
+def test_compression_clears_the_rejected_request_size():
+    from agent.context_ceilings import request_tokens
+
+    agent = _make_agent()
+    agent._context_rejected_tokens = 300_000
+    agent.context_compressor.last_prompt_tokens = 0
+    msgs = [{"role": "user", "content": "x"}]
+    with patch("agent.conversation_compression.compress_context",
+               side_effect=lambda self, m, s, **kw: (list(m[:1]), s)), \
+         patch("agent.conversation_compression.resolve_context_compression_timeouts", return_value=(0, 0)):
+        agent._compress_context(msgs, "sys")
+    assert request_tokens(agent) == 0
+    # A no-op pass (same list back) keeps it: the request did not change.
+    agent._context_rejected_tokens = 300_000
+    with patch("agent.conversation_compression.compress_context",
+               side_effect=lambda self, m, s, **kw: (m, s)), \
+         patch("agent.conversation_compression.resolve_context_compression_timeouts", return_value=(0, 0)):
+        agent._compress_context(msgs, "sys")
+    assert request_tokens(agent) == 300_000
