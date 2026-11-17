@@ -10757,6 +10757,14 @@ def run_daemon(
 
         gate_ticks = standalone_builder(load_gate, _kanban_cfg)
 
+    # The standalone daemon is the dispatcher leader too: hold the board anchor (t_1460fa32).
+    from hermes_cli import kanban_board_anchor as _kba
+    try:
+        from hermes_cli.config import load_config as _lc
+        _anchor_cfg = (_lc() or {}).get("kanban") or {}
+    except Exception:
+        _anchor_cfg = {}
+    board_anchor = _kba.start_if_enabled(_anchor_cfg if isinstance(_anchor_cfg, dict) else {})
     while not stop_event.is_set():
         try:
             # Resolve the global concurrency cap the same way the gateway
@@ -10804,6 +10812,8 @@ def run_daemon(
             import traceback
             traceback.print_exc()
         stop_event.wait(timeout=interval)
+    if board_anchor is not None:  # a daemon thread: process exit ends it on any other path
+        board_anchor.stop()
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.

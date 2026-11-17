@@ -1999,6 +1999,13 @@ class GatewayKanbanWatchersMixin:
         """Clear notifier-visible ownership before releasing the OS lock."""
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
+        anchor = getattr(self, "_kanban_board_anchor", None)
+        self._kanban_board_anchor = None
+        if anchor is not None:
+            try:
+                anchor.stop(timeout=1.0)
+            except Exception:
+                pass
         try:
             from tools.async_delegation_kanban import clear_dispatcher_heartbeat, set_dispatcher_active
             set_dispatcher_active(False)
@@ -4000,6 +4007,13 @@ class GatewayKanbanWatchersMixin:
         else:
             return
         self._kanban_dispatcher_lock_handle = _lock_handle
+        # The dispatcher leader holds an idle read-only connection on every live board, so no
+        # other opener on this host rebuilds a board's -shm on open (t_1460fa32).
+        try:
+            from hermes_cli import kanban_board_anchor as _kba
+            self._kanban_board_anchor = _kba.start_if_enabled(kanban_cfg)
+        except Exception:
+            logger.debug("kanban dispatcher: board anchor unavailable", exc_info=True)
         write_dispatcher_heartbeat = lambda _interval: None  # noqa: E731 - bound if the import fails
         try:
             from tools.async_delegation_kanban import set_dispatcher_active, write_dispatcher_heartbeat
