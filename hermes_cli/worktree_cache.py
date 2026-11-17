@@ -117,16 +117,12 @@ def host_config() -> dict:
     ``HERMES_HOME=<root>/profiles/<name>``: on the Studio no worker profile carries either key
     (29 profiles read 2026-11-17), so a profile read left the cache off for every worker and put
     its templates root on the Data volume. Unreadable -> {} (OFF)."""
-    from hermes_constants import get_default_hermes_root
-
     try:
-        import yaml
+        from hermes_cli.config import read_host_root_config
 
-        with open(get_default_hermes_root() / "config.yaml", encoding="utf-8-sig") as fh:
-            data = yaml.safe_load(fh) or {}
+        return read_host_root_config()
     except Exception:  # noqa: BLE001 - an unreadable config means OFF
         return {}
-    return data if isinstance(data, dict) else {}
 
 
 def settings(cfg: Optional[dict] = None) -> Settings:
