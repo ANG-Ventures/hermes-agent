@@ -143,7 +143,7 @@ def _allocation_home_env(now=None):
                 return v
             d = home / "var" / "ci-box"
             d.mkdir(parents=True, exist_ok=True)
-            with open(d / "deprecated-name-reads.log", "a") as fh:
+            with open(d / "deprecated-name-reads.log", "a", encoding="utf-8") as fh:
                 fh.write(f"{ts} env:PLACEMENT_HOME pid={os.getpid()}\n")
         except Exception:  # noqa: BLE001 -- a counter must never break a reader
             pass
