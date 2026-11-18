@@ -3695,6 +3695,9 @@ class GatewayKanbanWatchersMixin:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
+                from hermes_cli.kanban_db_ioerr import is_ioerr, note_board_ioerr
+                if is_ioerr(exc):
+                    await asyncio.to_thread(note_board_ioerr, exc, where="notifier")
             if len(lifecycle_digest):
                 try:
                     await lifecycle_digest.flush(time.time())
@@ -4381,6 +4384,8 @@ class GatewayKanbanWatchersMixin:
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                from hermes_cli.kanban_db_ioerr import note_board_ioerr
+                note_board_ioerr(exc, where="dispatcher", board=slug, conn=conn)
                 return None
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -4398,6 +4403,8 @@ class GatewayKanbanWatchersMixin:
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                from hermes_cli.kanban_db_ioerr import note_board_ioerr
+                note_board_ioerr(exc, where="dispatcher", board=slug, conn=conn)
                 return None
             finally:
                 if conn is not None:
