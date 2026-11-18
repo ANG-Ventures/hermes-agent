@@ -191,3 +191,69 @@ def test_skips_own_authored_comments_without_env_profile(worker_home, monkeypatc
     _unthrottle()
     assert kt.inject_new_comments_from_env(agent) is False
     assert agent.steers == []
+
+
+def _live_worker(monkeypatch, title):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title=title)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
+    agent = FakeAgent()
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False  # seed
+    return tid, agent
+
+
+def _comment(tid, author, body):
+    conn = kbc.connect()
+    try:
+        kb.add_comment(conn, tid, author=author, body=body)
+    finally:
+        conn.close()
+
+
+_SURFACED = ("[boomerang-wake] surfaced: No board action needed: worker run 78625 is live. New for the owner: "
+             "a branch made in the same command is refused by the new pr-base-drift row "
+             "(delegation del-20261118-094724-1def)")
+
+
+@pytest.mark.parametrize("author", ["boomerang-wake", "kanban", "dispatcher", "detached-run"])
+def test_owner_addressed_machine_comment_is_not_an_operator_note(worker_home, monkeypatch, author):
+    """t_718e6208: a boomerang child's read for the card OWNER reached the running worker as
+    "New notes on your kanban task from the operator" and the worker acted on it (t_949dac2e)."""
+    tid, agent = _live_worker(monkeypatch, "machine note")
+    _comment(tid, author, _SURFACED)
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False
+    assert agent.steers == []
+    # The watermark still moved past it: a later operator note is delivered alone.
+    _comment(tid, "apollo", "keep the gate unchanged")
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is True
+    assert len(agent.steers) == 1
+    assert "keep the gate unchanged" in agent.steers[0] and "pr-base-drift" not in agent.steers[0]
+
+
+@pytest.mark.parametrize("author", ["apollo", "human:apollo", "unverified:default", "default", "fleetreview-route"])
+def test_operator_and_worker_addressed_comments_still_deliver(worker_home, monkeypatch, author):
+    tid, agent = _live_worker(monkeypatch, "operator note")
+    _comment(tid, author, "change the test, keep the rest unchanged")
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is True
+    assert "keep the rest unchanged" in agent.steers[0]
+
+
+def test_off_switch_flag_file_restores_machine_delivery(worker_home, monkeypatch):
+    from hermes_constants import get_default_hermes_root
+
+    flag = get_default_hermes_root() / "state" / kt.MIDRUN_MACHINE_NOTES_FLAG
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+    tid, agent = _live_worker(monkeypatch, "off switch")
+    _comment(tid, "boomerang-wake", _SURFACED)
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is True
+    assert "pr-base-drift" in agent.steers[0]

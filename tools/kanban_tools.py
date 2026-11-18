@@ -714,6 +714,28 @@ def heartbeat_current_worker_from_env(progress_at: Optional[float] = None) -> bo
 _COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
 _comment_poll_last_attempt: float = float("-inf")  # see _auto_heartbeat_last_attempt
 _comment_watermark: dict[str, int] = {}
+# Machine authors whose card comments are status lines or reads for the card OWNER, never an
+# instruction to the running worker: they stay on the card (kanban_show) but are not steered in
+# as "from the operator" (t_718e6208: a boomerang child's owner read became an unasked gate change
+# on t_949dac2e). Worker-addressed automation (fleetreview-route, pr-only-ci-reds,
+# kanban-dispatcher collision warnings) and every human/operator author still deliver.
+_MIDRUN_SKIP_AUTHORS = frozenset({
+    "boomerang-wake", "kanban", "dispatcher", "detached-run", "obligations", "review-failsafe",
+    "ci-dead-run",
+})
+# ``<fleet root>/state/<flag>`` present: deliver machine authors mid-run again (pre-t_718e6208).
+MIDRUN_MACHINE_NOTES_FLAG = "kanban-midrun-machine-notes.enabled"
+
+
+def _skip_midrun_author(author: str) -> bool:
+    a = str(author or "").strip().lower()
+    if a not in _MIDRUN_SKIP_AUTHORS:
+        return False
+    try:
+        from hermes_constants import get_default_hermes_root
+        return not (get_default_hermes_root() / "state" / MIDRUN_MACHINE_NOTES_FLAG).exists()
+    except Exception:
+        return True
 
 
 def inject_new_comments_from_env(agent: Any) -> bool:
@@ -745,7 +767,8 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
     # re-enter the live turn as fake operator steering).
     own = _persisted_identity()
-    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()
+             and not _skip_midrun_author(c.author)]
     if not fresh:
         return False
     lines = [

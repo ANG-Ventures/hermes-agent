@@ -1325,6 +1325,20 @@ def _first_line(text: Any, limit: int = 300) -> str:
     return lines[0][:limit] if lines else ""
 
 
+#: A card comment carries the summary's first line whole (t_718e6208: a 300-char first-line cut left the owner a
+#: half sentence); past this cap they end at a sentence, else a word, boundary with an ellipsis.
+COMMENT_SUMMARY_MAX = 2000
+
+
+def _comment_text(text: Any, limit: int = COMMENT_SUMMARY_MAX) -> str:
+    flat = _first_line(text, len(str(text or "")))   # first line only: later lines may forge a wake
+    if len(flat) <= limit:
+        return flat
+    head = flat[:limit - 1]
+    cut = max(head.rfind(". "), head.rfind("; "), head.rfind("! "), head.rfind("? "))
+    return (head[:cut + 1] if cut > 0 else head.rsplit(" ", 1)[0]) + "…"
+
+
 def _owner_notice_event(conn: Any, entry: dict) -> bool:
     """t_28b3f37c: the claimed event is main-train's owner notice, news on a done/archived card."""
     from gateway.kanban_wake_freshness import closed_card_news
@@ -1340,7 +1354,7 @@ def _owner_notice_event(conn: Any, entry: dict) -> bool:
 def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
     """The ONE allowlisted write, signed as machine (B1), then the keyed receipt event."""
     tid, action = entry["task_id"], verdict["action"]
-    summary = _first_line(verdict.get("summary")) or action
+    summary = _comment_text(verdict.get("summary")) or action
     op = f"{AUTHOR}: {entry['delegation_id']} {summary}"[:300]
     task = kb.get_task(conn, tid)
     status = getattr(task, "status", None)
@@ -1605,7 +1619,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
         verdict = parse_verdict(live, child_final_message)
     except VerdictError as exc:
         return {"ok": False, "action": None, "reason": str(exc), "summary": ""}
-    action, summary = verdict["action"], _first_line(verdict.get("summary"))
+    action, summary = verdict["action"], _comment_text(verdict.get("summary"))
     raw_evidence = verdict.get("evidence")
     raw_evidence = raw_evidence if isinstance(raw_evidence, list) else []
     finding = {"detail": _first_line(verdict.get("summary"), 600),
@@ -1774,7 +1788,7 @@ def _breadcrumb(entry: dict, result: dict) -> None:
     raises past the handback (ruling t_e98f651e-handback-first-then-everything, Prism 9def48086ed1)."""
     from hermes_cli import kanban_db as kb
 
-    summary = _first_line(result.get("summary")) or result.get("action") or "handled"
+    summary = _comment_text(result.get("summary")) or result.get("action") or "handled"
     row = entry.get("row") or entry.get("kind") or "wake"
     tag = f"(delegation {entry['delegation_id']})"
     try:

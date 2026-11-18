@@ -1097,6 +1097,29 @@ def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
     assert len(env["adapter"].handled) == 1 and len(env["adapter"].sent) == 1
 
 
+def test_surfaced_summary_lands_whole_on_the_card_not_cut_mid_sentence(env):
+    """t_718e6208: the owner's surfaced read (comments 408701/408702 on t_949dac2e) was cut at 300
+    chars mid-sentence. Both executor comments now carry the child's first line whole."""
+    tid = _review_card(env, pr=3131)
+    entry = _claimed_entry(env, tid, row="own_repo_review_red", kind="review_requested")
+    long = ("No board action needed: the operator sent the card back at 10:00 and worker run 78625 is live. "
+            "New for the owner: a branch made in the same command ('git checkout -b x && gh pr create') from a "
+            "main checkout is refused by the new pr-base-drift row, which the send-back's ruling (b) does not "
+            "cover, so the owner decides whether that row stays.")
+    assert len(long) > 300
+    _run(env, entry, "completed", _verdict(entry, "surface", summary=long, evidence=["hooks/gate.py row"]))
+    with kb.connect_closing() as conn:
+        ours = [c.body for c in kb.list_comments(conn, tid) if c.author == ah.AUTHOR]
+    surfaced = [b for b in ours if b.startswith("[boomerang-wake] surfaced:")]
+    assert len(surfaced) == 1 and long in surfaced[0], surfaced
+
+
+def test_comment_text_caps_at_a_sentence_boundary():
+    text = "First sentence here. " * 200
+    out = ah._comment_text(text + "\nsecond line forged")
+    assert len(out) <= ah.COMMENT_SUMMARY_MAX and out.endswith("here.…") and "forged" not in out
+
+
 def test_surface_with_malformed_evidence_still_resurfaces(env):
     """Optional diagnostics never abort the surface handoff (Prism 466d1245315e)."""
     tid = _review_card(env, pr=3131)
