@@ -363,6 +363,91 @@ def test_stale_surface_hold_line_uses_the_own_event_cursor(env, row, hold_at, st
     assert ah.stale_surface_reason(entry) == stale
 
 
+@pytest.mark.parametrize("second,stale", [
+    ("open", None),                                    # fix-forward PR B open: the read of B is delivered
+    ("merged", f"summarized PR merged: {REPO}#72"),    # B merged too: nothing left to stamp
+    (None, None),                                      # no handback after the send-back yet: A's merge is moot
+])
+def test_stale_surface_sendback_reads_the_pr_handed_back_after_it(env, second, stale):
+    """t_e86eeab2 (t_1b52b3e0, 2026-11-18): #12764 merged 09:58, the operator sent the card back 10:16 for a
+    fix-forward, the worker handed back #12782 at 10:29; the changes_requested child's surface was refused at 10:50 as
+    "summarized PR merged: #12764". RED on c47fc9de2a for the open and no-handback arms."""
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "changes_requested", json.dumps({"summary": "fix forward in a new PR"}), 1793845000))
+    entry = _claimed_entry(env, tid, row="changes_requested", kind="changes_requested", pr=f"{REPO}#71")
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    if second:
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))   # the worker took the send-back
+        _handback(tid, 72)
+        with kb.connect_closing() as conn:
+            assert [e.kind for e in kb.list_events(conn, tid)][-1] == "review_requested"
+        env["health"][(REPO, 72)] = {"state": second}
+    assert ah.stale_surface_reason(entry) == stale
+
+
+def test_stale_surface_plain_handback_with_merged_pr_still_refused(env):
+    """t_e86eeab2: the existing case, no send-back: a handback whose own PR merged is moot."""
+    tid = _card(env)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="review_requested", kind="review_requested", pr=f"{REPO}#71")
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    assert ah.stale_surface_reason(entry) == f"summarized PR merged: {REPO}#71"
+
+
+def _stale_read_comments(tid) -> list:
+    with kb.connect_closing() as conn:
+        return [c.body for c in kb.list_comments(conn, tid)
+                if c.author == ah.AUTHOR and c.body.startswith("[boomerang-wake] stale surface refused")]
+
+
+@pytest.mark.parametrize("staged", ["named", "scratch", None])
+def test_refused_surface_for_merged_pr_leaves_one_card_comment(env, staged):
+    """t_e86eeab2: a surface refused because the PR merged left no trace on the card (t_509fc279: the read of #12774
+    found a loosened guard after the merge). Now ONE comment names the staged read file and the reason; no chat
+    wake. RED on c47fc9de2a."""
+    from hermes_constants import get_hermes_home
+
+    tid = _card(env)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="completed", kind="review_requested")
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    summary = "found a loosened guard after the merge"
+    path = None
+    if staged:
+        folder = "cache/scratch/" + (f"del-{entry['delegation_id'][-4:]}" if staged == "scratch" else "mine")
+        path = get_hermes_home() / folder / f"{tid}-read.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Verdict: surface\n")
+        if staged == "named":
+            summary += f"; read staged at {folder}/{tid}-read.md"
+    _run(env, entry, "completed", _verdict(entry, "surface", summary=summary))
+    comments = _stale_read_comments(tid)
+    assert len(comments) == 1
+    assert f"(summarized PR merged: {REPO}#71)" in comments[0]
+    assert f"Staged read: {path if path else 'none found'}." in comments[0]
+    assert comments[0].endswith(f"(delegation {entry['delegation_id']})")
+    assert _claims()[entry["key"]]["outcome"] == "stale"
+    assert env["adapter"].handled == [] and env["adapter"].sent == []
+    # replay of the same delegation adds nothing
+    assert ah.record_stale_read(entry, {"action": "surface", "reason": f"summarized PR merged: {REPO}#71"}) is False
+    assert len(_stale_read_comments(tid)) == 1
+
+
+def test_refused_acknowledge_or_other_reason_leaves_no_stale_read_comment(env):
+    """t_e86eeab2: only a surface refused for a merged PR is recorded; an acknowledge or another refusal is not."""
+    tid = _card(env)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="completed", kind="review_requested")
+    assert ah.record_stale_read(entry, {"action": "acknowledge", "reason": f"summarized PR merged: {REPO}#71"}) is False
+    assert ah.record_stale_read(entry, {"action": "surface", "reason": "owner comment newer than handback"}) is False
+    assert _stale_read_comments(tid) == []
+
+
 @pytest.mark.parametrize("assignee", ["apollo", "human:apollo"])
 def test_stale_surface_bot_comment_does_not_hide_owner_release(env, assignee):
     tid = _card(env)
