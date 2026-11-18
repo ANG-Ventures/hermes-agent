@@ -401,3 +401,71 @@ def test_busy_checkpoint_is_counted_as_busy_skipped(tmp_path):
         w.close()
     finally:
         anchor.close_all()
+
+
+def test_anchor_hold_is_tracked_so_raw_reads_of_the_board_are_refused(tmp_path):
+    """t_48b850de: with only the anchor holding a board, the in-process raw-read guards must see it.
+    A raw open()/close() of the board (header probe, corrupt-board quarantine copy) would cancel
+    every POSIX lock this process holds on the file."""
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import sqlite_safe_read as ssr
+
+    db = _wal_db(tmp_path / "board.db")
+    assert not ssr.has_live_connection(db)
+    anchor = kba.BoardAnchor(lambda: [db], checkpoint=False, switch_dir=tmp_path)
+    try:
+        assert anchor.refresh()["held"] == 1
+        assert ssr.has_live_connection(db)
+        assert ssr.has_live_connection(str(db) + "-wal")
+        assert ssr.read_header_bytes_preopen(db) is None
+        with pytest.raises(ssr.LiveConnectionError):
+            with ssr.offline_file_access(db):
+                pass
+        assert kbc._backup_corrupt_db(db) is None  # the quarantine copy refuses
+        assert not list(tmp_path.glob("board.db.corrupt.*"))
+    finally:
+        anchor.close_all()
+    assert not ssr.has_live_connection(db)
+    assert ssr.read_header_bytes_preopen(db, length=16) == b"SQLite format 3\x00"
+
+
+def test_checkpoint_connection_is_tracked_and_released(tmp_path, monkeypatch):
+    from hermes_cli import sqlite_safe_read as ssr
+
+    db = _wal_db(tmp_path / "board.db")
+    _grow_wal(db)
+    seen = []
+    real = ssr.connect_tracked
+
+    def spy(path, **kw):
+        conn = real(path, **kw)
+        seen.append((str(path).rsplit("?", 1)[-1], ssr._live_connections.get(str(db.resolve()))))
+        return conn
+
+    monkeypatch.setattr(ssr, "connect_tracked", spy)
+    anchor = kba.BoardAnchor(lambda: [db], wal_cap=1, quiet_s=3600, switch_dir=tmp_path)
+    try:
+        assert anchor.refresh()["truncated"] == 1
+        # ro hold first (count 1), then the rw checkpoint connection on top of it (count 2)
+        assert seen == [("mode=ro", 1), ("mode=rw", 2)]
+        assert ssr._live_connections.get(str(db.resolve())) == 1  # rw closed, hold remains
+    finally:
+        anchor.close_all()
+    assert not ssr.has_live_connection(db)
+
+
+def test_sidecar_identity_is_one_line_with_inode_and_birth(tmp_path):
+    db = _wal_db(tmp_path / "board.db")
+    r = sqlite3.connect(db)  # keeps the -wal/-shm on disk
+    try:
+        r.execute("SELECT COUNT(*) FROM t").fetchone()
+        line = kba.sidecar_identity(db)
+        wal = os.stat(str(db) + "-wal")
+        shm = os.stat(str(db) + "-shm")
+        assert "\n" not in line
+        assert f"-wal ino={wal.st_ino} " in line and f"-shm ino={shm.st_ino} " in line
+        assert line.count("birth=") == 2
+    finally:
+        r.close()
+    os.unlink(str(db) + "-shm") if os.path.exists(str(db) + "-shm") else None
+    assert "-shm absent" in kba.sidecar_identity(db)

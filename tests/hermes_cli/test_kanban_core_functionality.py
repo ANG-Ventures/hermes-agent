@@ -1038,6 +1038,8 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
 
     messages = [record.getMessage() for record in caplog.records]
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
+    # t_48b850de: the same line names the -wal/-shm identity (here: neither exists).
+    assert sum("sidecars: -wal absent; -shm absent" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
     # One tick reaches the stop threshold: auto-decompose triage scan, the
