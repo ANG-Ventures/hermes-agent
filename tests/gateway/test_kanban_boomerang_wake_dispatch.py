@@ -2568,3 +2568,198 @@ def test_restart_redispatch_of_a_blocked_assessment_spends_no_budget(tmp_path):
     assert state.claim("b|t|1#restart1", {"task_id": "t", "row": "blocked_assess", "restart_redispatch": True})
     assert not state.get_claim("b|t|1#restart1").get("blocked_budget_exhausted")
     assert (state.retries("t"), state.restart_spent("t"), state.blocked_spent("t")) == before
+
+
+# --- t_efb6f435: a review handed to a human reviewer -> one first-read child, not a home-session turn ------
+
+
+def _green(env, pr, head="c" * 40):
+    env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "clean", "failing": [], "head": head}
+
+
+def _human_handback(tid, pr: int, reviewer="human:apollo"):
+    with kb.connect_closing() as conn, \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        ok = kb.request_review(conn, tid, force=True, summary=f"PR {REPO}#{pr} ready", reviewer=reviewer)
+    assert ok is True or (isinstance(ok, tuple) and ok[0]), ok
+
+
+def _turn_kinds(turns) -> list:
+    return [("owner" if (t.metadata or {}).get("kanban_owner_wake") else "notifier") for t in turns]
+
+
+@pytest.mark.parametrize("reviewer", ["human:apollo", "human"])
+def test_review_handoff_to_human_reviewer_dispatches_a_child_and_no_turn(env, reviewer):
+    _green(env, 3201)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, 3201, reviewer)
+    turns = _tick(env)
+    assert [(e["row"], e["mode"], e["task_id"]) for e in env["dispatched"]] == [("own_repo_review_human", "fork", tid)]
+    assert turns == [], [t.text for t in turns]
+    goal = ah.build_goal(env["dispatched"][0])
+    assert "allowed actions: request_changes, surface" in goal and "never approve" in goal.lower()
+
+
+def test_review_handoff_to_human_reviewer_on_a_plain_wake_card_wakes_the_session(env):
+    _green(env, 3202)
+    tid = _card(env, auto=False)
+    _sub(tid)
+    _human_handback(tid, 3202)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert _turn_kinds(turns) == ["notifier"]
+
+
+def test_review_handoff_with_no_human_reviewer_is_none(env):
+    """The pipeline-owned case: no human reviewer, no child, the wake stays as today."""
+    _green(env, 3203)
+    tid = _card(env)
+    _sub(tid)
+    _handback(tid, 3203)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert _turn_kinds(turns) == ["notifier"]
+
+
+def test_review_handoff_off_switch_restores_the_session_wake(env):
+    stop = ah.review_handoff_stop_file_path()
+    assert stop.name == "boomerang-wake-review-handoff.disabled"
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    _green(env, 3204)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, 3204)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert _turn_kinds(turns) == ["notifier"]
+    stop.unlink()   # read every tick: the next handoff takes the child again, no restart
+    _human_handback_again(tid, 3204)
+    env["adapter"].handled.clear()
+    assert _tick(env) == []
+    assert [e["row"] for e in env["dispatched"]] == ["own_repo_review_human"]
+
+
+def _human_handback_again(tid, pr):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running', assignee = 'worker' WHERE id = ?", (tid,))
+    _human_handback(tid, pr)
+
+
+def _raw_event(tid, kind, payload) -> int:
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        cur = conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                           (tid, kind, json.dumps(payload), int(time.time())))
+        return int(cur.lastrowid)
+
+
+def _deadman_event(tid, episode, cycle=0):
+    """The real review_deadman payload: its key is (episode, cycle), see hermes-home review_deadman_core.EventKey."""
+    return _raw_event(tid, "review_deadman", {"by": "kanban-review-deadman", "cycle": cycle, "episode": episode,
+                                              "threshold_min": 15, "waiting_min": 16})
+
+
+@pytest.mark.parametrize("outcome,delivered,deadman_child", [
+    ("surfaced", True, False),           # the handoff child surfaced its read: the episode has its one child
+    ("request_changes", None, False),    # the handoff child acted
+    ("surfaced", False, True),           # its turn never reached the home: the deadman stays as it is
+    ("failed", True, True),              # a failed child leaves the deadman as it is
+    ("lost", True, True),                # so does a lost one
+])
+def test_review_deadman_skips_its_child_when_the_handoff_child_answered(env, outcome, delivered, deadman_child):
+    _green(env, 3205)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, 3205)
+    _tick(env)
+    [handoff] = env["dispatched"]
+    fields = {"state": ah.STATE_TERMINAL, "outcome": outcome}
+    if delivered is not None:
+        fields["resurface_delivered"] = delivered
+    ah.BoomerangWakeState().update_claim(handoff["key"], **fields)
+    _kill(env, handoff)
+    _deadman_event(tid, handoff["event_id"])
+    env["adapter"].handled.clear()
+    turns = _tick(env)
+    rows = [e["row"] for e in env["dispatched"][1:]]
+    if deadman_child:
+        assert rows == ["review_deadman"] and turns == []
+    else:
+        assert rows == [] and turns == [], [t.text for t in turns]
+        skipped = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+        assert [(c["state"], c["outcome"]) for c in skipped] == [(ah.STATE_TERMINAL, "episode_answered")]
+
+
+def _answered_handoff(env, pr):
+    """A human handoff whose first-read child surfaced its read (turn delivered): Do 3's answered episode."""
+    _green(env, pr)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, pr)
+    _tick(env)
+    [handoff] = env["dispatched"]
+    ah.BoomerangWakeState().update_claim(handoff["key"], state=ah.STATE_TERMINAL, outcome="surfaced",
+                                         resurface_delivered=True)
+    _kill(env, handoff)
+    return tid, handoff
+
+
+@pytest.mark.parametrize("case", ["first_page", "later_cycle", "ruling_wait", "stranded"])
+def test_review_deadman_skip_reads_the_pages_own_episode_and_cycle(env, case):
+    """Only cycle 0 of the answered handoff's own review_requested episode is skipped. A re-armed cycle, a
+    ruling-wait (blocked) episode and a stranded_no_worker episode are other pages: each gets its child."""
+    tid, handoff = _answered_handoff(env, 3301)
+    episode, cycle = handoff["event_id"], 0
+    if case == "later_cycle":
+        cycle = 2 * int(time.time())
+    elif case == "ruling_wait":
+        episode = _raw_event(tid, "blocked", {"reason": "operator ruling", "unblock_when": "operator ruling"})
+    elif case == "stranded":
+        episode = _raw_event(tid, "stranded_no_worker", {"by": "dispatcher"})
+    _deadman_event(tid, episode, cycle)
+    env["adapter"].handled.clear()
+    _tick(env)
+    rows = [e["row"] for e in env["dispatched"][1:]]
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    if case == "first_page":
+        assert "review_deadman" not in rows
+        assert [(c["state"], c["outcome"]) for c in deadman] == [(ah.STATE_TERMINAL, "episode_answered")]
+    else:
+        assert "review_deadman" in rows, rows
+        assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
+
+
+def test_review_deadman_page_with_no_episode_dispatches_its_child(env):
+    tid, _ = _answered_handoff(env, 3302)
+    _raw_event(tid, "review_deadman", {"by": "kanban-review-deadman", "waiting_min": 25})
+    env["adapter"].handled.clear()
+    _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+
+
+def test_review_deadman_off_switch_after_an_answered_handoff_dispatches_its_child(env):
+    """The stop file set after a handoff child answered: the first deadman page gets its child as on main."""
+    tid, handoff = _answered_handoff(env, 3303)
+    stop = ah.review_handoff_stop_file_path()
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    _deadman_event(tid, handoff["event_id"], 0)
+    env["adapter"].handled.clear()
+    _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
+
+
+@pytest.mark.parametrize("cycle", ["missing", None, "0", 0.0, False, "x"])
+def test_review_deadman_skip_needs_an_explicit_integer_cycle_zero(env, cycle):
+    """Only an explicit integer cycle 0 is the first page; a missing, null or non-integer cycle dispatches."""
+    tid, handoff = _answered_handoff(env, 3304)
+    payload = {"by": "kanban-review-deadman", "episode": handoff["event_id"], "waiting_min": 16}
+    if cycle != "missing":
+        payload["cycle"] = cycle
+    _raw_event(tid, "review_deadman", payload)
+    env["adapter"].handled.clear()
+    _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]

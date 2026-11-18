@@ -169,6 +169,33 @@ def test_unanswered_or_unreadable_keys_keep_todays_rows(answered, state, row):
     assert classify("review_requested", payload, PLAIN).row == row
 
 
+# --- t_efb6f435: a review handed to a human reviewer -> a first-read fork, not the home session ---
+
+
+@pytest.mark.parametrize("state", ["green", "pending", "red", "GREEN"])
+def test_own_repo_review_to_human_reviewer_is_auto_fork(state):
+    d = classify("review_requested", {"own_repo": True, "pr_state": state, "human_reviewer": True}, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "own_repo_review_human")
+
+
+@pytest.mark.parametrize("human", [False, None, "true", 1])
+def test_own_repo_review_without_human_reviewer_stays_none(human):
+    """The pipeline-owned case (no human reviewer): today's ``none`` row, no child."""
+    payload = {"own_repo": True, "pr_state": "green", "human_reviewer": human}
+    assert classify("review_requested", payload, PLAIN).row == "own_repo_review_green_or_pending"
+
+
+def test_human_reviewer_keeps_the_dirty_and_all_answered_rows_and_surfaces_on_spend():
+    dirty = {"own_repo": True, "pr_state": "dirty", "human_reviewer": True}
+    assert classify("review_requested", dirty, PLAIN).row == "own_repo_review_red"
+    answered = {"own_repo": True, "pr_state": "green", "human_reviewer": True, "prism_all_answered": True}
+    assert classify("review_requested", answered, PLAIN).row == "own_repo_review_all_keys_answered"
+    card = {"title": "buy", "body": "tags: spend"}
+    assert wake_disposition("review_requested", {"own_repo": True, "pr_state": "green",
+                                                 "human_reviewer": True}, card) == SURFACE
+    assert wake_disposition("review_requested", {"own_repo": False, "human_reviewer": True}, PLAIN) == SURFACE
+
+
 def test_all_answered_upstream_or_spend_card_surfaces():
     assert wake_disposition("review_requested", {"own_repo": False, "prism_all_answered": True}, PLAIN) == SURFACE
     card = {"title": "buy", "body": "tags: spend"}

@@ -27,6 +27,8 @@ its ``trigger``. The payload is the event payload, plus two keys the caller reso
 - ``prism_all_answered``: True only when the handback text answers every Prism key open at
   the handback head (``gateway/kanban_prism_answers.py``) and the row's config knob is on.
   Anything else (False / None / missing) leaves today's rows deciding (t_6e9f48cc).
+- ``human_reviewer``: True only when the handback's reviewer (the event's ``reviewer``, else the
+  card's assignee) is the human sentinel and the row's stop file is absent (t_efb6f435).
 
 Card tags are read from ``task.tags`` (an iterable) when the caller has one, else from the
 card title/body: a ``tags: a, b`` line or a ``[tag]`` marker (the ``[milestone]`` /
@@ -123,6 +125,14 @@ _TABLE: tuple = (
     # the child surfaces). An unanswered key falls through to today's rows.
     _Row(3, "own_repo_review_all_keys_answered",
          lambda c: _own_review(c) and c.payload.get("prism_all_answered") is True, AUTO, MODE_FORK),
+    # Tier 3 — a green/pending/red own-repo handback whose review was handed to a HUMAN reviewer
+    # (``human`` / ``human:<name>``): the operator owes a read, so a child does the first read
+    # (stage it and surface, or send back a plainly incomplete handback; never approve or land)
+    # instead of a bare home-session turn (t_efb6f435). The caller sets ``human_reviewer`` (False
+    # while the row's stop file is present). A dirty PR keeps its own row below.
+    _Row(3, "own_repo_review_human",
+         lambda c: _own_review(c) and c.payload.get("human_reviewer") is True
+         and _pr_state(c) in ("green", "pending", "red"), AUTO, MODE_FORK),
     # Tier 3 — the merge pass owns a green/pending own-repo handback, and a red one without a
     # conflict too: a red check has not held a merge since 2026-11-09, so no child proves the red
     # is main's (Ace 2026-11-14, t_88864f95).

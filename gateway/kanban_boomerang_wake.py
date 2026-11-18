@@ -670,6 +670,9 @@ ALLOWED = {
     # t_6e9f48cc: the child itself posts the verdict lines, the coverage and the enqueue (all
     # outside the card's state machine); ``handled`` writes only the receipt, the card stays in review.
     "own_repo_review_all_keys_answered": frozenset({"handled", "surface"}),
+    # t_efb6f435: the first read of a review handed to a human. The child stages its read and
+    # surfaces, or sends back a plainly incomplete handback; it never approves or lands.
+    "own_repo_review_human": frozenset({"request_changes", "surface"}),
     "changes_requested": frozenset({"redispatch", "surface"}),
     "blocked_assess": frozenset({"retry", "surface"}),
     "crash_first_occurrence": frozenset({"retry", "surface"}),
@@ -753,6 +756,74 @@ def enabled() -> bool:
 ROW_REVIEW_ALL_ANSWERED = "review_all_answered"
 ROW_REVIEW_DEADMAN = "review_deadman"
 ROW_MECHANICAL_WAKE = "mechanical_wake"
+#: t_efb6f435: an own-repo review handed to a human reviewer (the disposition row's name).
+ROW_REVIEW_HUMAN = "own_repo_review_human"
+#: Its stop file, read every tick: present = that handoff is ``none`` again (today's plain wake).
+REVIEW_HANDOFF_STOP_FILE = "boomerang-wake-review-handoff.disabled"
+#: Outcomes of a handoff child that answered its review episode (the deadman's child is then skipped).
+_EPISODE_ANSWERED = frozenset({"surfaced", "request_changes"})
+
+
+def review_handoff_stop_file_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / REVIEW_HANDOFF_STOP_FILE
+
+
+def human_reviewer(payload: Optional[dict], task: Any) -> bool:
+    """t_efb6f435: the handback's review went to a human (``human`` / ``human:<name>``): the event's
+    ``reviewer``, else the card's assignee. False while the row's stop file is present."""
+    from hermes_cli import kanban_db as kb
+
+    reviewer = (payload or {}).get("reviewer") or _field(task, "assignee")
+    if not kb.is_human_reviewer(reviewer):
+        return False
+    return not review_handoff_stop_file_path().exists()
+
+
+def review_episode_answered(state: "BoomerangWakeState", board: Optional[str], task_id: str,
+                            event_id: Any) -> bool:
+    """True when the review_deadman page ``event_id`` is the FIRST page (cycle 0) of an episode that
+    already got its one child. The page's own key says which page it is (hermes-home
+    review_deadman_core.EventKey: ``episode`` = its review entry event id, ``cycle`` = 0 for the first
+    tier-1 page): only a cycle-0 page whose episode is a ``review_requested`` of this card, whose
+    handoff child (or that claim's restart successor) surfaced with its turn delivered or acted, is
+    answered. A later cycle, another episode (a ruling wait, a stranded card) or a page with no episode
+    gets its child as today. A failed, lost or still-running handoff child answers nothing. The cycle
+    must be an explicit integer 0 (missing, null or non-integer dispatches), and the row's stop file
+    turns the skip off too, so with it present every page dispatches as on main."""
+    from hermes_cli import kanban_db as kb
+
+    if review_handoff_stop_file_path().exists():
+        return False
+    conn = _readonly(kb, board)
+    try:
+        page = conn.execute("SELECT payload FROM task_events WHERE id = ? AND task_id = ?",
+                            (int(event_id), task_id)).fetchone()
+        try:
+            payload = json.loads(page[0]) if page and page[0] else {}
+            episode = int(payload.get("episode") or 0)
+            cycle = payload.get("cycle")
+        except (TypeError, ValueError, AttributeError):
+            return False
+        if episode <= 0 or type(cycle) is not int or cycle != 0:
+            return False
+        row = conn.execute("SELECT id FROM task_events WHERE id = ? AND task_id = ? "
+                           "AND kind = 'review_requested'", (episode, task_id)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return False
+    base = claim_key(board, task_id, row[0])
+    for key, c in state.claims().items():
+        if key != base and not key.startswith(base + "#"):
+            continue
+        if c.get("row") != ROW_REVIEW_HUMAN or c.get("state") != STATE_TERMINAL:
+            continue
+        outcome = c.get("outcome")
+        if outcome in _EPISODE_ANSWERED and (outcome != "surfaced" or c.get("resurface_delivered") is True):
+            return True
+    return False
 
 
 def row_enabled(name: str) -> bool:
@@ -917,6 +988,7 @@ def collect_candidates(kb: Any, conn: Any, board: str, task: Any, events: list, 
         if ev.kind == "review_requested":
             payload = review_payload(kb, conn, task_id, _field(task, "result"), ev.payload, ev.run_id,
                                      pr_health, memo)
+            payload["human_reviewer"] = human_reviewer(ev.payload, task)
         disp = classify_event(ev.kind, payload, task, retries)
         if disp.verdict == "auto":
             out[ev.id] = disp
@@ -1074,6 +1146,27 @@ MECHANICAL_WAKE_STEPS = (
 )
 
 
+REVIEW_HUMAN_STEPS = (
+    "1. Read the card: `hermes kanban --board {board} show {task_id}` (the newest review run's summary and "
+    "metadata, the comment thread: any merge-hold or operator note).",
+    "2. Read the PR it names over REST, never GraphQL: `python3 {home}/scripts/gh-pr-rest.py <owner/repo> <n> "
+    "--checks` (state, head, checks, size), and its diff when the summary leaves a claim unchecked.",
+    "3. If the handback is plainly incomplete (no PR, no proof line, a claimed test or file missing from the "
+    "diff, the card's DONE list not met), return `request_changes` with one finding per gap. Otherwise return "
+    "`surface`: your summary and evidence are the staged read the operator reviews from (what changed, the "
+    "proof, PR state + head, anything that needs the operator's eye).",
+    "HARD RULE: you never approve, complete, enqueue or land; the operator owns the verdict.",
+)
+
+
+def _review_human_brief(entry: dict) -> str:
+    from hermes_constants import display_hermes_home, get_default_hermes_root
+
+    fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"],
+              "home": display_hermes_home(get_default_hermes_root())}
+    return "Do this first read:\n" + "\n".join(s.format(**fields) for s in REVIEW_HUMAN_STEPS) + "\n"
+
+
 def _mechanical_wake_brief(entry: dict) -> str:
     fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"]}
     return "Do this read:\n" + "\n".join(s.format(**fields) for s in MECHANICAL_WAKE_STEPS) + "\n"
@@ -1107,6 +1200,7 @@ def _blocked_brief(entry: dict) -> str:
 ROW_BRIEFS = {"blocked_assess": _blocked_brief,
               "own_repo_review_all_keys_answered": _review_all_answered_brief,
               "review_deadman": _review_deadman_brief,
+              ROW_REVIEW_HUMAN: _review_human_brief,
               "mechanical_wake": _mechanical_wake_brief}
 
 
@@ -2420,6 +2514,19 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
     key = key or claim_key(board, task_id, event_id)
     if await asyncio.to_thread(state.has_claim, key):
         return False
+    if (disposition.row == ROW_REVIEW_DEADMAN and not redispatch
+            and await asyncio.to_thread(review_episode_answered, state, board, task_id, event_id)):
+        # t_efb6f435: one review episode gets one child. The handoff child already surfaced its read
+        # (or acted), so this deadman page is owned here: no second child, no turn.
+        now = _time.time()
+        skip = {"key": key, "board": board, "task_id": task_id, "event_id": int(event_id), "kind": kind,
+                "row": disposition.row, "state": STATE_TERMINAL, "outcome": "episode_answered",
+                "claimed_at": now, "finished_at": now}
+        if not await asyncio.to_thread(state.claim, key, skip):
+            return False
+        logger.info("kanban notifier: boomerang-wake %s disposition=auto row=%s path=%s skipped: the review "
+                    "handoff child answered this episode", task_id, disposition.row, path)
+        return True
     snap = await asyncio.to_thread(card_snapshot, board, task_id)
     entry = {
         "key": key, "board": board, "task_id": task_id, "event_id": int(event_id), "kind": kind,
@@ -2521,7 +2628,8 @@ def _owner_candidates(board: str, task_id: str, items: list) -> dict:
             payload = dict(i.get("payload") or {})
             if i.get("kind") == "review_requested":
                 # the owner-wake queues a review handback only when its fleet PR is red/dirty
-                payload.update(own_repo=True, pr_state=_disposition_pr_state(i.get("pr_state")))
+                payload.update(own_repo=True, pr_state=_disposition_pr_state(i.get("pr_state")),
+                               human_reviewer=human_reviewer(i.get("payload"), task))
                 if row_enabled(ROW_REVIEW_ALL_ANSWERED):
                     payload["prism_all_answered"] = _owner_all_answered(kb, conn, task, i, memo)
             disp = classify_event(str(i.get("kind") or ""), payload, task, retries)
