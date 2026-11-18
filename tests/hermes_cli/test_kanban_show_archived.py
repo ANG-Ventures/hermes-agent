@@ -282,3 +282,72 @@ def test_show_names_an_unreadable_archived_description(kanban_home):
     arch.write_bytes(b"not a sqlite file" * 100)
     body = json.loads(kc.run_slash(f"show {tid} --json"))["task"]["body"]
     assert body.startswith(STUB) and "[archived description unreadable:" in body
+
+
+# ---- R10 send-back round 2 (hermes-home t_f02083a3): a card that leaves done reads its ORIGINAL description, so
+# the live-card readers (operator-read hold, declared file scope, wake flag, worker context) answer as before the cut.
+CONTRACT = ("origin: test\n" + "plain prose of the card " * 60 + "\noperator-read: required\nwake: off\n"
+            "## Declared file scope\n- scripts/precise.py\n## Readback\n- prints ok\n")
+
+
+def _readers(conn, tid: str) -> dict:
+    from gateway.kanban_owner_wake import wake_off
+
+    body = kb.get_task(conn, tid).body
+    return {"scope": kb.card_declared_scope(body), "wake_off": wake_off(body),
+            "operator_read": "operator-read: required" in body,
+            "worker_context_tail": "scripts/precise.py" in kb.build_worker_context(conn, tid)}
+
+
+def test_reopen_restores_the_archived_description(kanban_home):
+    tid = _done_card()
+    conn = kbc.connect()
+    try:
+        conn.execute("UPDATE tasks SET body=? WHERE id=?", (CONTRACT, tid))
+        conn.commit()
+        before = _readers(conn, tid)   # the done card with its whole description
+    finally:
+        conn.close()
+    _cut_body(tid, CONTRACT, CONTRACT[:400] + "\n[retention-stub: archived to kanban-archive.db]")
+    conn = kbc.connect()
+    try:
+        ok, err = kb.reopen_task(conn, tid, actor="apollo", reason="redo")
+        assert ok, err
+        assert kb.get_task(conn, tid).body == CONTRACT
+        assert _readers(conn, tid) == before == {"scope": (["scripts/precise.py"], "heading"), "wake_off": True,
+                                                 "operator_read": True, "worker_context_tail": True}
+    finally:
+        conn.close()
+
+
+def test_reopen_refuses_when_the_archived_description_is_unreadable(kanban_home):
+    tid = _done_card()
+    arch = _cut_body(tid)
+    arch.write_bytes(b"not a sqlite file" * 100)
+    conn = kbc.connect()
+    try:
+        ok, err = kb.reopen_task(conn, tid, actor="apollo", reason="redo")
+        assert not ok and "archived description unreadable" in err
+        assert kb.get_task(conn, tid).status == "done" and kb.get_task(conn, tid).body == STUB
+    finally:
+        conn.close()
+
+
+def test_ancestor_reopen_restores_a_done_descendants_description(kanban_home):
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="ancestor", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        child = kb.create_task(conn, title="child", assignee="builder", parents=[parent])
+        assert kb.complete_task(conn, child, result="done")
+    finally:
+        conn.close()
+    _cut_body(child)
+    conn = kbc.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo', completed_at = NULL WHERE id = ?", (parent,))
+        kb.invalidate_descendants_for_parent_reopen(conn, parent, author="test")
+        assert kb.get_task(conn, child).status == "todo" and kb.get_task(conn, child).body == ORIGINAL
+    finally:
+        conn.close()

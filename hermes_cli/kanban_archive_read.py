@@ -201,6 +201,21 @@ def body_or_note(conn: sqlite3.Connection, task_id: str, live_body: str | None) 
         return "%s\n[archived description unreadable: %s]" % (live_body, exc)
 
 
+def restore_body(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Put R10's archived description back on a card that leaves done/archived (reopen, dashboard drag, an ancestor's
+    reopen), so every reader of the live card (worker context, declared file scope, operator-read hold, wake flag,
+    survivor, PR intent, readback gate) reads the original, not the stub (hermes-home t_f02083a3 send-back 1).
+    Only a live body that is exactly the archived stub is replaced. -> True when restored. Call it inside the
+    caller's write transaction; an unreadable archive raises ``ArchiveUnreadable`` (the transition must not go
+    through with the stub)."""
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    live = row[0] if row else None
+    full = full_body(conn, task_id, live)
+    if full is None or full == live:
+        return False
+    return conn.execute("UPDATE tasks SET body = ? WHERE id = ? AND body = ?", (full, task_id, live)).rowcount == 1
+
+
 def text_lines(archived: dict, fmt_ts) -> list[str]:
     """The ``kanban show`` text block; every line says archived."""
     out = []

@@ -16423,6 +16423,15 @@ def reopen_task(
         if not os.path.lexists(wp) and wp.parent.is_dir():
             dead_scratch = row["workspace_path"]
 
+    # R10 (hermes-home t_f02083a3): a long-done card's description may be a
+    # retention stub; reopen puts the archived original back (below, in the
+    # txn). An unreadable archive refuses here, before anything changes.
+    from hermes_cli import kanban_archive_read as _kar
+    try:
+        _kar.full_body(conn, task_id, (conn.execute(
+            "SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone() or [None])[0])
+    except _kar.ArchiveUnreadable as exc:
+        return False, f"task {task_id}: archived description unreadable ({exc}); not reopened"
     # ``review`` (t_36d0114e): a card closed ``done`` while its PR is still
     # OPEN goes back to the review lane -- owned by kanban.review_assignee --
     # where the review-card closer completes it on REST merged=true.
@@ -16452,6 +16461,7 @@ def reopen_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
+        _kar.restore_body(conn, task_id)
         if dead_scratch is not None:
             conn.execute(
                 "UPDATE tasks SET workspace_path = NULL WHERE id = ? AND workspace_path = ?",
@@ -16939,6 +16949,9 @@ def invalidate_descendants_for_parent_reopen(
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
             )
+            if previous_status == "done":   # R10 stub -> archived original (hermes-home t_f02083a3)
+                from hermes_cli import kanban_archive_read as _kar
+                _kar.restore_body(conn, row["id"])
             entry = {
                 "id": row["id"], "prior_status": previous_status,
                 "new_status": "todo", "resume_status": resume_status,

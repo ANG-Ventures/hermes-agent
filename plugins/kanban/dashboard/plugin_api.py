@@ -980,6 +980,9 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             (effective_status,) * 4 + (task_id,))
         if cur.rowcount != 1:
             return False
+        if reopening_satisfied_parent:   # R10 stub -> archived original (hermes-home t_f02083a3)
+            from hermes_cli import kanban_archive_read as _kar
+            _kar.restore_body(conn, task_id)
         run_id = None
         if was_running and effective_status != "running" and prev["current_run_id"]:
             run_id = kanban_db._end_run(
