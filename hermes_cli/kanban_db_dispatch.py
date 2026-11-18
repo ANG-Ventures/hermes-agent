@@ -2559,6 +2559,8 @@ def detect_crashed_workers(
     # Cohort members whose pid was still in the process table: a misjudged
     # liveness check, not a kill (t_5c37ab9d). Named in the page.
     cohort_alive: list[str] = []
+    # Cohort members' pids and spawn pgids: a targeted ``kill`` names one of them (t_c6d2e782).
+    cohort_pids: set[int] = set()
     # task id -> ``_liveness_evidence``, stamped on its ``crashed`` / ``gave_up`` payloads.
     liveness: dict[str, dict] = {}
     # Worker-exit observer payloads (RFC #58548), collected inside the main
@@ -2702,9 +2704,9 @@ def detect_crashed_workers(
                     "cohort": sorted(cohort_ids)[:50],
                     "liveness": liveness[row["id"]],
                 }
-                event_payload.update(_cohort_member_evidence(
-                    pid, _spawn_group(conn, row["id"], row["current_run_id"], pid),
-                ))
+                _group = _spawn_group(conn, row["id"], row["current_run_id"], pid)
+                cohort_pids.update(p for p in (pid, _group) if p)
+                event_payload.update(_cohort_member_evidence(pid, _group))
                 if event_payload["pid_alive"]:
                     cohort_alive.append(row["id"])
                 stderr_tail = _kb._worker_log_stderr_tail(row["id"], board=board)
@@ -3178,12 +3180,14 @@ def detect_crashed_workers(
     detect_crashed_workers._last_cohort_deaths = cohort_dead  # type: ignore[attr-defined]
     detect_crashed_workers._last_system_interrupted = system_interrupted  # type: ignore[attr-defined]
     if cohort_dead:
+        # Name the sender (t_c6d2e782): a count alone left two 11-17 cohorts unexplained.
+        _sender = None if cohort_alive else _kb._cohort_death_sender(pids=cohort_pids)
         _kb._log.error(
             "kanban cohort death: %d workers ended externally in one tick "
-            "(no failure counted): %s",
-            len(cohort_dead), ", ".join(cohort_dead),
+            "(no failure counted): %s; sender: %s",
+            len(cohort_dead), ", ".join(cohort_dead), _sender or "unknown",
         )
-        _kb._page_cohort_death(conn, cohort_dead, still_alive=cohort_alive)
+        _kb._page_cohort_death(conn, cohort_dead, still_alive=cohort_alive, sender=_sender)
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always

@@ -36,6 +36,8 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    # Never read a real exec flight ring from a test (the Studio has one).
+    monkeypatch.setenv("HERMES_EXEC_FLIGHT_DIRS", str(tmp_path / "no-exec-flight"))
     kb.init_db()
     kb._recent_worker_exits.clear()
     with kb.connect_closing() as conn:
@@ -48,7 +50,7 @@ def pages(monkeypatch):
     sent = []
     monkeypatch.setattr(
         kb, "_page_cohort_death",
-        lambda conn, ids, still_alive=None: sent.append((list(ids), list(still_alive or []))),
+        lambda conn, ids, still_alive=None, **_kw: sent.append((list(ids), list(still_alive or []))),
     )
     return sent
 
