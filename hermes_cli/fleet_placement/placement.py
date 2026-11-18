@@ -73,6 +73,7 @@ Stdlib only; python3.9+.
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 import contextvars
 import dataclasses
@@ -1433,10 +1434,58 @@ def history_snapshot(root=None) -> tuple:
     ``root`` resolves exactly as admit_context(root=) does (default fleet_root(); Prism b57fa1f567bc).
     """
     path = class_usage_path(Path(root) / CLASS_USAGE_REL if root is not None else None, root=root)
-    return tuple(MappingProxyType(dict(r)) for r in admission.read_history_cached(path))
+    return admission.read_history_frozen(path)     # t_71ff933a: copied once per row, the same tuple until it grows
+
+
+# t_71ff933a: per-snapshot memos, process-wide (allocd serves each request on a new thread, so the per-thread memo of
+# t_990ca939 never carried over to the next /admit). t_f418e647: one helper, work_estimate.snap_memo.
+_snap_memo = work_estimate.snap_memo
+
+
+def _window_index(history: tuple):
+    """(rows whose ``at`` reads as a float, those floats, non-decreasing?) in history order: history_window's input."""
+    rows, ats = [], []
+    for row in history:
+        try:
+            a = float(row.get("at") or 0)
+        except (TypeError, ValueError):
+            continue
+        rows.append(row)
+        ats.append(a)
+    back = [j for j in range(1, len(ats)) if not ats[j - 1] <= ats[j]]
+    if back:
+        _log_unordered(len(back), len(ats), ats[back[0]], ats[back[0] - 1])
+    return rows, ats, not back
+
+
+# t_f418e647: an unordered snapshot is scanned per call and returns a fresh tuple, so the identity memos downstream
+# miss. Logged once per snapshot (_window_index is memoized per snapshot), at most once per _UNORDERED_LOG_EVERY_S.
+_UNORDERED_LOG_EVERY_S = 600.0
+_unordered_logged_at: Optional[float] = None
+
+
+def _log_unordered(n_back: int, n: int, at: float, prev: float) -> None:
+    global _unordered_logged_at
+    t = time.monotonic()
+    if _unordered_logged_at is not None and t - _unordered_logged_at < _UNORDERED_LOG_EVERY_S:
+        return
+    _unordered_logged_at = t
+    print(f"placement: class-usage snapshot has {n_back} of {n} rows out of order (first at={at:g} after "
+          f"at={prev:g}); history_window scans it per call", file=sys.stderr)
 
 
 def history_window(history: Iterable[Mapping], now: float) -> tuple:
+    """The rows of ``history`` inside CLASS_USAGE_WINDOW_S of ``now``, in order. A snapshot tuple whose ``at`` values
+    never decrease (the ledger is appended in time order) is cut with one bisect and the newest cut is memoized (one
+    per snapshot, t_f418e647), so two calls that keep the same rows return the same tuple object (t_71ff933a); any
+    other input is scanned (an unordered snapshot is logged, _log_unordered)."""
+    if isinstance(history, tuple):
+        rows, ats, ordered = _snap_memo(history, "window_index", lambda: _window_index(history))
+        cutoff = now - CLASS_USAGE_WINDOW_S
+        if ordered:
+            i = bisect.bisect_left(ats, cutoff)
+            return _snap_memo(history, "window", lambda: (i, tuple(rows[i:])), keep=lambda v: v[0] == i)[1]
+        return tuple(r for r, a in zip(rows, ats) if not a < cutoff)
     rows = []
     for row in history:
         try:
@@ -1495,8 +1544,7 @@ def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Jo
     ``root`` (default fleet_root()) is the state root the ledgers are read from (the collector's --home).
     ``host`` (with ``table``): the context comes back folded over that host's resource domain (AdmitContext.for_host)."""
     # Cache validation may re-hash the entire prefix; locked callers must supply a pre-acquired snapshot.
-    hist = history if history is not None else admission.read_history_cached(
-        class_usage_path(Path(root) / CLASS_USAGE_REL if root is not None else None, root=root), since=now - CLASS_USAGE_WINDOW_S)
+    hist = history if history is not None else history_window(history_snapshot(root), now)
     ledger = Path(root) / RESERVATIONS_REL if root is not None else None
     # caller-supplied leases are canonicalised like the ledger's: one booked under an alias counts on its host (c6568e9a9850)
     base = ([dataclasses.replace(le, host=table.resolve(le.host) or le.host) if table else le for le in leases]
@@ -1508,7 +1556,10 @@ def admit_context(consumer: str, fp: Footprint, *, now: float, job: Optional["Jo
     start = () if table is None else tuple((h, cpus) for h, spec in table.hosts.items()
                                            for k, cpus in spec.ramp_cpus if k == klass)
     # need() is the only reader of history and reads only klass or its base class: keep just those rows (t_990ca939)
-    ctx = AdmitContext(klass, need_of(fp), tuple(work_estimate.class_history(hist, klass)),
+    # t_71ff933a: memoized per snapshot tuple, so admit + _confirm_class and the next /admit filter it once
+    rows = (_snap_memo(hist, ("class", klass), lambda: tuple(work_estimate.class_history(hist, klass)))
+            if isinstance(hist, tuple) else tuple(work_estimate.class_history(hist, klass)))
+    ctx = AdmitContext(klass, need_of(fp), rows,
                        tuple(base + held_leases(held or {}, table)), scratch,
                        start_cpus=start)
     return ctx.for_host(table, host) if host is not None else ctx
@@ -1641,36 +1692,8 @@ def may_start(host: str, consumer: str, footprint: Optional[Mapping] = None, *, 
     priority = priority if priority is not None else dmd.load_priority(root=root)
     v = admission.admit_class(_sample_row(spec, sample), dmd.workload_of(consumer), ctx.need(hid),
                               ctx.leases,
-                              demand=demand, priority=priority, limits=_limits(spec), host=hid,
-                              class_line=class_line(dmd.workload_of(consumer), hid, root=root), now=now)
+                              demand=demand, priority=priority, limits=_limits(spec), host=hid, now=now)
     return v.ok, (v.reason or f"ok (binding {v.binding})")
-
-
-#: t_71471192: a workload class's own CPU line on a host. Only CI has one: cpu_lines lane `ci` kind `admit`, whose
-#: per-host mirror is hosts.<h>.ci_allocator.admit_ci_cpu_pct (lint-load-lines keeps the two equal), read through
-#: load_lines, the ONE reader of the registry. Shipped at 0.90 = the fleet line: no change. Lowering it (proposed 0.75
-#: on ci-box / ace-ai, Ace decides) stops CI starts at that busy fraction, so the kanban class (fleet line 0.90) keeps
-#: the band between. admission.admit_class never lets a class line RAISE the fleet line.
-CLASS_LINE_LANES = {"ci": "ci"}
-POLICY_REL = Path("fleet") / "allocation-policy.json"
-
-
-def class_line(workload: str, hid: str, *, root=None) -> Optional[float]:
-    """``workload``'s own CPU admit line on ``hid`` (0..1 of the host's CPUs) from the cpu_lines registry, or None (no
-    lane for this class, or the registry reader is absent: the fleet line alone applies)."""
-    lane = CLASS_LINE_LANES.get(workload)
-    policy = (Path(root) if root is not None else fleet_root()) / POLICY_REL
-    if lane is None or not policy.exists():
-        return None
-    try:
-        if __package__:   # the installed wheel ships the reader as a sibling module (Prism 932522213fc3)
-            from . import load_lines
-        else:
-            import load_lines  # noqa: PLC0415  (scripts/lib sibling; a vendored copy without it = the fleet line)
-    except ImportError:
-        return None
-    v = load_lines.line(hid, lane, "admit", policy=policy)
-    return float(v) if _num(v) else None
 
 
 # ── bands: a NAME for the admission vector, never a second scorer (allocation §2.2, t_260e8379) ──────

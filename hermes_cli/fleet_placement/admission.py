@@ -36,6 +36,7 @@ import math
 import os
 import threading
 from pathlib import Path
+from types import MappingProxyType
 from typing import Iterable, List, Mapping, Optional, Sequence
 
 SCHEMA = 1
@@ -448,19 +449,14 @@ def holdback(workload: str, demand: Iterable[Demand], priority: Priority, host: 
 def admit_class(sample: Mapping, workload: str, need: Estimate, leases: Iterable[Lease] = (), *,
                 demand: Iterable[Demand] = (), priority: Priority = Priority(), limits: Limits = Limits(),
                 host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S,
-                slice_mem: Optional[SliceMem] = None, class_line: Optional[float] = None,
-                now: Optional[float] = None) -> Verdict:
+                slice_mem: Optional[SliceMem] = None, now: Optional[float] = None) -> Verdict:
     """THE admission decision for any workload class on any host. ``limits`` supplies the host's own facts
     (mem_reserve_gb, unmeasurable axes); the CPU line is ``priority.line`` and the CPU / PSI cpu axes always refuse
-    (cpu_saturable is ignored: a class that can run past the line is how one decider starves the others).
-    ``class_line`` (t_71471192): this class's own CPU line on this host, a fraction of ALL the host's CPUs (the CI
-    lane's hosts.<h>.ci_allocator.admit_ci_cpu_pct / 100). It can only LOWER the fleet line, never raise it; None or
-    an unusable value = the fleet line alone.
+    (cpu_saturable is ignored: a class that can run past the line is how one decider starves the others). Every class
+    has the same line: the per-class CI line (t_71471192 class_line, admit_ci_cpu_pct) is deleted (t_31911eb0).
     A refusal caused only by higher-priority demand reads ``held_back:<class> ...`` with binding ``priority``."""
     host = host or str(sample.get("host") or "")
     line = priority.line
-    if _num(class_line) and 0 < class_line < line:
-        line = float(class_line)
     lim = dataclasses.replace(limits, cpu_busy_max=line, cpu_saturable=False)
     leases = list(leases)
     demand = list(demand)
@@ -477,13 +473,12 @@ def admit_class(sample: Mapping, workload: str, need: Estimate, leases: Iterable
 
 
 def preempt(workload: str, sample: Mapping, demand: Iterable[Demand], priority: Priority, leases: Iterable[Lease] = (),
-            *, limits: Limits = Limits(), host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S,
-            class_lines: Optional[Mapping[str, float]] = None) -> int:
+            *, limits: Limits = Limits(), host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S) -> int:
     """``priority.preempt_budget_per_tick`` (t_71471192): how many of ``workload``'s units on ``host`` its scheduler
     stops REFILLING this tick, because a class that outranks it has queued units that admit_class refuses here (e.g.
     queued kanban cards on a host that CI keeps at the line). Never a kill: a running unit finishes; only the next
     refill of an exited unit is withheld, at most the budget per tick and at most the refused queue. 0 = today's
-    behaviour (the shipped value). Pure; ``class_lines`` = {class: its admit_class class_line on this host}."""
+    behaviour (the shipped value). Pure."""
     budget = priority.preempt_budget_per_tick
     if type(budget) is not int or budget <= 0:
         return 0
@@ -493,7 +488,7 @@ def preempt(workload: str, sample: Mapping, demand: Iterable[Demand], priority: 
         if d.queued <= 0 or priority.rank(d.workload) >= mine:
             continue
         v = admit_class(sample, d.workload, d.unit, leases, demand=demand, priority=priority, limits=limits,
-                        host=host, settle_s=settle_s, class_line=(class_lines or {}).get(d.workload))
+                        host=host, settle_s=settle_s)
         if not v.ok and v.binding != "priority" and not v.reason.startswith("unmeasured"):
             refused += int(d.queued)
     return min(budget, refused)
@@ -638,6 +633,31 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
     inode it names cannot be reused while cached; each call compares stat(path) with fstat() of that descriptor, and
     a mismatch closes it and reads the path afresh from byte 0 (Prism e2ace455c12a). Reads always come from the held
     descriptor, so a rotation after the stat() returns the old file's rows once, never the old offset in a new file."""
+    rows = _read_cached(path, frozen=False)
+    if since is None:
+        return rows
+    out: List[dict] = []
+    for r in rows:
+        try:
+            if float(r.get("at") or 0) < since:
+                continue
+        except (ValueError, TypeError):
+            continue
+        out.append(r)
+    return out
+
+
+def read_history_frozen(path) -> tuple:
+    """Every row read_history_cached(path) returns, as a TUPLE of read-only copies (MappingProxyType over a private
+    dict), validated exactly as read_history_cached validates. t_71ff933a: placement.history_snapshot() copied every
+    row of the ledger on each call (77k rows: ~170 ms on the Studio's py3.9, twice per unified /admit, under
+    STATE.lock). Each row is now copied once, beside the cached rows; while the ledger has not grown every call
+    returns the SAME tuple object, so the identity memos downstream (placement.history_window, admit_context's class
+    filter, work_estimate._class_rows) hit across requests. A cache reset (rewrite, shrink, new inode) re-copies."""
+    return _read_cached(path, frozen=True)
+
+
+def _read_cached(path, *, frozen: bool):
     p = Path(path)
     key = str(p)
     with _HISTORY_LOCK:
@@ -657,9 +677,9 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
                 hit[1:5] = [0, [], bytearray(), b""]   # shrunk or rewritten in place: start over
         if hit is None:
             try:
-                hit = [p.open("rb"), 0, [], bytearray(), b"", (None, None)]
+                hit = [p.open("rb"), 0, [], bytearray(), b"", (None, None), None]
             except FileNotFoundError:
-                return []
+                return () if frozen else []
         fh = hit[0]
         fh.seek(hit[1])
         chunk = fh.read()
@@ -678,15 +698,14 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
         after = os.fstat(fh.fileno())
         hit[5] = (after.st_mtime_ns, after.st_size)
         _HISTORY_CACHE[str(p)] = hit
-        rows = list(hit[2])
-    if since is None:
-        return rows
-    out: List[dict] = []
-    for r in rows:
-        try:
-            if float(r.get("at") or 0) < since:
-                continue
-        except (ValueError, TypeError):
-            continue
-        out.append(r)
-    return out
+        if not frozen:
+            return list(hit[2])
+        # hit[6] = (the rows list it copies, [copies], tuple of them): a reset replaces hit[2] with a new list
+        fz = hit[6]
+        if fz is None or fz[0] is not hit[2]:
+            fz = hit[6] = (hit[2], [], ())
+        copies = fz[1]
+        if len(copies) < len(hit[2]):
+            copies.extend(MappingProxyType(dict(r)) for r in hit[2][len(copies):])
+            fz = hit[6] = (hit[2], copies, tuple(copies))
+        return fz[2]
