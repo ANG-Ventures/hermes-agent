@@ -132,3 +132,25 @@ def test_first_ioerr_row_names_a_deleted_wal_under_a_live_connection(tmp_path, c
     assert json.loads(logged[0].getMessage().split(": ", 1)[1])["own_fds"] == row["own_fds"]
     assert kanban_db_ioerr.note_board_ioerr(sqlite3.OperationalError("database is locked"),
                                            where="notifier", db_path=tmp_path / "other.db") is None
+
+
+def test_notifier_cursor_write_ioerr_names_its_board_and_connection(monkeypatch):
+    """The 23:05 damage was in kanban_notify_subs: the notifier's cursor write must report the board
+    it failed on and the connection it used, not the default board with no connection."""
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+    from hermes_cli import kanban_db_ioerr, kanban_db_notify
+
+    conn = sqlite3.connect(":memory:")
+    calls = []
+    monkeypatch.setattr(kbc, "connect", lambda board=None: conn)
+    exc = sqlite3.OperationalError("disk I/O error")
+
+    def _fail(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(kanban_db_notify, "advance_notify_cursor", _fail)
+    monkeypatch.setattr(kanban_db_ioerr, "note_board_ioerr", lambda e, **kw: calls.append((e, kw)))
+    sub = {"task_id": "t_x", "platform": "discord", "chat_id": "1"}
+    with pytest.raises(sqlite3.OperationalError):
+        GatewayKanbanWatchersMixin.__new__(GatewayKanbanWatchersMixin)._kanban_advance(sub, 7, "proj")
+    assert calls == [(exc, {"where": "notifier:advance_notify_cursor", "board": "proj", "conn": conn})]

@@ -74,7 +74,7 @@ def _own_fds(db: str) -> list[dict]:
             at_path = os.stat(path.removesuffix(" (deleted)")).st_ino
         except OSError:
             at_path = None
-        out.append({"fd": fd, "file": path[len(db):] or "db", "ino": st.st_ino, "nlink": st.st_nlink,
+        out.append({"fd": fd, "file": path[len(db):].removesuffix(" (deleted)") or "db", "ino": st.st_ino, "nlink": st.st_nlink,
                     "size": st.st_size, "stale": st.st_nlink == 0 or at_path != st.st_ino})
     return out
 
@@ -93,8 +93,8 @@ def _files(db: str) -> dict:
 def _lsof_holders(db: str) -> Any:
     paths = [db + s for s in _SUFFIXES if os.path.exists(db + s)]
     try:
-        proc = subprocess.run(["lsof", "-nP", "-Fpc", "--", *paths], capture_output=True, text=True,
-                              timeout=5)
+        proc = subprocess.run(["lsof", "-nP", "-Fpc", "--", *paths], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=5)
     except (OSError, subprocess.SubprocessError) as exc:
         return f"unavailable: {exc}"
     holders, pid = [], None

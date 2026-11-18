@@ -619,7 +619,7 @@ def _episode_backup(resolved: Path, fingerprint: Optional[dict]) -> Optional[Pat
     if fingerprint is None:
         return None
     try:
-        data = json.loads(_corrupt_episode_path(resolved).read_text(encoding="utf-8"))
+        data = json.loads(_corrupt_episode_path(resolved).read_text(encoding="utf-8-sig"))
         same_file = all(data[key] == fingerprint[key] for key in ("dev", "ino", "birth"))
         backup = resolved.parent / Path(str(data["backup"])).name
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
