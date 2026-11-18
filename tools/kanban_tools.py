@@ -838,6 +838,7 @@ def _handle_show(args: dict, **kw) -> str:
     """Task state, bounded: newest review first, then the row, links, the newest comments, events
     and runs (newest first), and the worker context. Full history via ``hermes kanban show``."""
     from hermes_cli.kanban_artifact_pointer import read as _read_pointer
+    from hermes_cli import kanban_archive_read as _kar
     tid = _require_task_id(args)
     with _board(args.get("board"), verb="show", card_ids=(tid,)) as (kb, conn):
         task = _existing_task(kb, conn, tid)
@@ -847,6 +848,8 @@ def _handle_show(args: dict, **kw) -> str:
         out: dict[str, Any] = {
             "latest_review": _latest_review(kb, conn, tid, runs),
             "task": {**_fields(task, _TASK_FIELDS),
+                     # R10 (hermes-home t_f02083a3): the archived description of a long-done card, not its stub
+                     "body": _kar.body_or_note(conn, tid, task.body),
                      "artifact_pointer": _read_pointer(getattr(task, "artifact_pointer", None))},
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency

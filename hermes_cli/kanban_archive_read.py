@@ -167,6 +167,40 @@ def present(archived: dict) -> bool:
     return bool(archived.get("comments") or archived.get("runs") or archived.get("error"))
 
 
+STUB_MARK = "[retention-stub"   # == hermes-home kanban-events-retention.STUB_MARK
+
+
+def full_body(conn: sqlite3.Connection, task_id: str, live_body: str | None) -> str | None:
+    """The card's description. Retention rule R10 (hermes-home t_f02083a3) cuts a long-done card's ``tasks.body``
+    to a stub and keeps the original in ``kanban-archive.db`` table ``task_bodies`` (task_id, body, stub). While the
+    live body is exactly that stub, the archived body is the description; any other live body (an edit after the
+    cut, no archive) is returned as is. Only a body carrying the stub marker opens the archive. An archive that
+    exists but cannot be read raises ``ArchiveUnreadable``: the caller says so instead of showing the stub silently."""
+    if not live_body or STUB_MARK not in live_body:
+        return live_body
+    arch = _connect_ro(conn)
+    if arch is None:
+        return live_body
+    try:
+        if not arch.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_bodies'").fetchone():
+            return live_body
+        row = arch.execute("SELECT body FROM task_bodies WHERE task_id = ? AND stub = ?",
+                           (task_id, live_body)).fetchone()
+        return row[0] if row else live_body
+    except sqlite3.Error as exc:
+        raise ArchiveUnreadable("%s: %s: %s" % (ARCHIVE_NAME, type(exc).__name__, exc)) from exc
+    finally:
+        arch.close()
+
+
+def body_or_note(conn: sqlite3.Connection, task_id: str, live_body: str | None) -> str | None:
+    """``full_body``, or the live body plus one line naming the unreadable archive (never the stub alone)."""
+    try:
+        return full_body(conn, task_id, live_body)
+    except ArchiveUnreadable as exc:
+        return "%s\n[archived description unreadable: %s]" % (live_body, exc)
+
+
 def text_lines(archived: dict, fmt_ts) -> list[str]:
     """The ``kanban show`` text block; every line says archived."""
     out = []

@@ -222,3 +222,63 @@ def test_row_in_live_and_archive_listed_once_tool(kanban_home, monkeypatch):
     shown = json.loads(kt._handle_show({"task_id": tid}))
     assert len(shown["comments"]) == 1 and len(shown["runs"]) == 1
     assert "archived" not in shown
+
+
+# ---- R10 (hermes-home t_f02083a3): the description of a long-done card is a stub; the original is in task_bodies
+ORIGINAL = "the full card description " * 60
+STUB = "the full card description\n[retention-stub: 1560 chars archived to kanban-archive.db; `restore --task`]"
+
+
+def _cut_body(tid: str, original: str = ORIGINAL, stub: str = STUB) -> Path:
+    """What R10 does to one card: archive (task_id, body, stub) first, then swap the live body for the stub."""
+    with kbc.read_scope(False):
+        conn = kbc.connect()
+    try:
+        arch = _db_path(conn).parent / "kanban-archive.db"
+        conn.execute("UPDATE tasks SET body=? WHERE id=?", (original, tid))
+        conn.commit()
+        conn.execute("ATTACH DATABASE ? AS march", (str(arch),))
+        conn.execute("CREATE TABLE IF NOT EXISTS march.task_bodies (task_id TEXT PRIMARY KEY, body TEXT NOT NULL, "
+                     "stub TEXT NOT NULL, moved_at INTEGER NOT NULL)")
+        conn.execute("INSERT INTO march.task_bodies VALUES (?,?,?,1)", (tid, original, stub))
+        conn.commit()
+        conn.execute("UPDATE main.tasks SET body=? WHERE id=?", (stub, tid))
+        conn.commit()
+        conn.execute("DETACH DATABASE march")
+        return arch
+    finally:
+        conn.close()
+
+
+def test_show_reads_the_archived_description(kanban_home, monkeypatch):
+    from tools import kanban_tools as kt
+
+    tid = _done_card()
+    _cut_body(tid)
+    text = kc.run_slash(f"show {tid}")
+    assert ORIGINAL.strip() in text and "[retention-stub" not in text
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["body"] == ORIGINAL
+    monkeypatch.setenv("HERMES_PROFILE", "daedalus")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    assert json.loads(kt._handle_show({"task_id": tid}))["task"]["body"] == ORIGINAL
+
+
+def test_show_keeps_a_body_edited_after_the_cut(kanban_home):
+    tid = _done_card()
+    _cut_body(tid)
+    with kbc.read_scope(False):
+        conn = kbc.connect()
+    try:
+        conn.execute("UPDATE tasks SET body=? WHERE id=?", (STUB + "\nedited by the operator", tid))
+        conn.commit()
+    finally:
+        conn.close()
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["body"] == STUB + "\nedited by the operator"
+
+
+def test_show_names_an_unreadable_archived_description(kanban_home):
+    tid = _done_card()
+    arch = _cut_body(tid)
+    arch.write_bytes(b"not a sqlite file" * 100)
+    body = json.loads(kc.run_slash(f"show {tid} --json"))["task"]["body"]
+    assert body.startswith(STUB) and "[archived description unreadable:" in body

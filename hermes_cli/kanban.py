@@ -1530,6 +1530,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         from hermes_cli import kanban_archive_read as kar
         archived = kar.archived_rows(conn, args.task_id, **rsk, live_comment_ids=[c.id for c in comments],
                                      live_run_ids=[r.id for r in runs])
+        # R10 (hermes-home t_f02083a3): a long-done card's description is a stub; the original is in the archive.
+        body = kar.body_or_note(conn, task.id, task.body)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
         refusal = (
@@ -1558,7 +1560,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     if want_json:
         _print_json({
-            "task": _task_to_dict(task),
+            "task": {**_task_to_dict(task), "body": body},
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "level": level,
             "latest_summary": latest_summary,
@@ -1666,8 +1668,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         from hermes_cli import kanban_placement_view as kpv
         print()
         print("\n".join(kpv.format_task(placement)))
-    if task.body:
-        _print_section("Body:", [task.body])
+    if body:
+        _print_section("Body:", [body])
     if task.result:
         _print_section("Result:", [task.result])
     elif latest_summary:
