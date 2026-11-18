@@ -18,6 +18,12 @@ The held connection is ``mode=ro`` with no open transaction: it holds only the s
 the ``-shm`` (which is the point), no read mark and no write lock, so it never blocks a writer, a
 checkpoint or a WAL reset. Cost: 3 fds per board (db, ``-wal``, ``-shm``).
 
+Both the held connection and the short checkpoint connection are opened through
+:func:`hermes_cli.sqlite_safe_read.connect_tracked` (t_48b850de), so ``has_live_connection(board)``
+is True while the anchor holds a board and this process's raw-read guards (header probe, the
+corrupt-board quarantine copy) refuse instead of an ``open()``/``close()`` that would cancel every
+POSIX lock the process holds on the file.
+
 Every ``interval`` seconds a pass stats each held board and closes the connection when the path is
 gone or its ``(dev, ino)`` changed (a board deleted, archived or replaced), then reopens on the new
 file. The board list is re-read every ``rescan_every`` passes. A deleted board's inode therefore
@@ -56,6 +62,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+from hermes_cli import sqlite_safe_read as _ssr
+from hermes_cli.sqlite_safe_read import UntrackableConnectionError
 
 _log = logging.getLogger(__name__)
 
@@ -128,12 +137,28 @@ def _ident(path: str) -> Optional[tuple[int, int]]:
     return (st.st_dev, st.st_ino)
 
 
+def _sidecar_part(path: str) -> str:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "absent"
+    return f"ino={st.st_ino} birth={getattr(st, 'st_birthtime', None)} size={st.st_size}"
+
+
+def sidecar_identity(db_path) -> str:
+    """One line naming the board's ``-wal`` and ``-shm`` inode and birth time (``stat`` only, no
+    open), for the corrupt-board log line: tells a WAL/SHM swap from damage in place.
+    ``birth`` is ``None`` where the OS does not report it (Linux before statx support)."""
+    base = os.fspath(db_path)
+    return f"-wal {_sidecar_part(base + '-wal')}; -shm {_sidecar_part(base + '-shm')}"
+
+
 def _open_idle(path: str) -> Optional[sqlite3.Connection]:
     """A ``mode=ro`` connection that has mapped the board's ``-shm`` and holds no transaction."""
     try:
-        conn = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=0,
-                               isolation_level=None, check_same_thread=False)
-    except sqlite3.Error:
+        conn = _ssr.connect_tracked(Path(path).as_uri() + "?mode=ro", tracking_path=path, uri=True,
+                                    timeout=0, isolation_level=None, check_same_thread=False)
+    except (sqlite3.Error, UntrackableConnectionError):
         return None
     try:
         # A first read maps the wal-index; autocommit ends the read transaction at once.
@@ -148,9 +173,9 @@ def _truncate_wal(path: str) -> bool:
     """``wal_checkpoint(TRUNCATE)`` without waiting. True when it completed (the -wal is now 0 B);
     False when it was busy or failed (retried on a later pass)."""
     try:
-        conn = sqlite3.connect(Path(path).as_uri() + "?mode=rw", uri=True, timeout=0,
-                               isolation_level=None)
-    except sqlite3.Error:
+        conn = _ssr.connect_tracked(Path(path).as_uri() + "?mode=rw", tracking_path=path, uri=True,
+                                    timeout=0, isolation_level=None)
+    except (sqlite3.Error, UntrackableConnectionError):
         return False
     try:
         conn.execute("PRAGMA synchronous=FULL")

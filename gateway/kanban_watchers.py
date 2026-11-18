@@ -4279,6 +4279,10 @@ class GatewayKanbanWatchersMixin:
             return (q is not None and q[0] == _board_db_fingerprint(slug)
                     and time.monotonic() - q[1] < CORRUPT_BOARD_RETRY_AFTER_SECONDS)
 
+        def _kba_sidecar_identity(db_path: str) -> str:
+            from hermes_cli import kanban_board_anchor as _kba
+            return _kba.sidecar_identity(db_path)
+
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             # The guard class lives in ``kanban_db_connect`` since upstream's
             # extraction; the facade no longer re-exports it, and a missing
@@ -4369,9 +4373,11 @@ class GatewayKanbanWatchersMixin:
                         "SQLite database; pausing dispatch for this board until "
                         "the file changes, the gateway restarts, or the "
                         "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
+                        "then run `hermes kanban init` if you need a fresh board. "
+                        "sidecars: %s",
                         slug,
                         fingerprint[0],
+                        _kba_sidecar_identity(fingerprint[0]),
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
@@ -4384,9 +4390,11 @@ class GatewayKanbanWatchersMixin:
                         "SQLite database; pausing dispatch for this board until "
                         "the file changes, the gateway restarts, or the "
                         "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
+                        "then run `hermes kanban init` if you need a fresh board. "
+                        "sidecars: %s",
                         slug,
                         fingerprint[0],
+                        _kba_sidecar_identity(fingerprint[0]),
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
