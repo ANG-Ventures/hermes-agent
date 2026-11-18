@@ -778,6 +778,45 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         cache_read_cost_per_million_above=Decimal("0.20"),
         cache_write_cost_per_million_above=Decimal("5.00"),
     ),
+    # ── OpenAI GPT-6.2 Sol / Astra ───────────────────────────────────────
+    # Rates from models.dev api.json openai.models["gpt-6.2-sol"/"gpt-6.2-astra"].cost (read
+    # 2026-11-17). Sol: $2 / $10 / $0.10 cache read / $2.50 cache write; above 272K prompt tokens
+    # (whole request) $4 / $15 / $0.20 / $5. Astra: $8 / $40 / $0.40 / $10; above 272K $16 / $60 /
+    # $0.80 / $20. Astra is CHEAPER than gpt-6-astra ($10/$50): not the gpt-6-astra row.
+    (
+        "openai",
+        "gpt-6.2-sol",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        cache_write_cost_per_million=Decimal("2.50"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="models-dev-gpt-6.2-2026-11-17",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("4.00"),
+        output_cost_per_million_above=Decimal("15.00"),
+        cache_read_cost_per_million_above=Decimal("0.20"),
+        cache_write_cost_per_million_above=Decimal("5.00"),
+    ),
+    (
+        "openai",
+        "gpt-6.2-astra",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("8.00"),
+        output_cost_per_million=Decimal("40.00"),
+        cache_read_cost_per_million=Decimal("0.40"),
+        cache_write_cost_per_million=Decimal("10.00"),
+        source="official_docs_snapshot",
+        source_url="https://models.dev/api.json",
+        pricing_version="models-dev-gpt-6.2-2026-11-17",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("16.00"),
+        output_cost_per_million_above=Decimal("60.00"),
+        cache_read_cost_per_million_above=Decimal("0.80"),
+        cache_write_cost_per_million_above=Decimal("20.00"),
+    ),
     # ── OpenAI GPT-6.1 Terra ─────────────────────────────────────────────
     # Rates from models.dev api.json openai.models["gpt-6.1-terra"].cost (read 2026-11-06):
     # $1 / $5 / $0.05 cache read / $1.25 cache write; above 272K prompt tokens (whole
@@ -2116,6 +2155,10 @@ for _base_6 in ("gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna"):
         ("openai", _base_6)
     ]
 del _base_6
+# GPT-6.2 Sol/Astra: only the "-900k" picker alias (no "-pro" SKU is known for 6.2).
+for _base_62 in ("gpt-6.2-sol", "gpt-6.2-astra"):
+    _OFFICIAL_DOCS_PRICING[("openai", f"{_base_62}-900k")] = _OFFICIAL_DOCS_PRICING[("openai", _base_62)]
+del _base_62
 
 # The direct Gemini provider currently exposes preview IDs for these two
 # models. Keep the official snapshot keyed by both their documented stable
