@@ -2647,11 +2647,17 @@ def _human_handback_again(tid, pr):
     _human_handback(tid, pr)
 
 
-def _deadman_event(tid):
+def _raw_event(tid, kind, payload) -> int:
     with kb.connect_closing() as conn, kb.write_txn(conn):
-        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
-                     (tid, "review_deadman", json.dumps({"by": "kanban-review-deadman", "waiting_min": 25}),
-                      int(time.time())))
+        cur = conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                           (tid, kind, json.dumps(payload), int(time.time())))
+        return int(cur.lastrowid)
+
+
+def _deadman_event(tid, episode, cycle=0):
+    """The real review_deadman payload: its key is (episode, cycle), see hermes-home review_deadman_core.EventKey."""
+    return _raw_event(tid, "review_deadman", {"by": "kanban-review-deadman", "cycle": cycle, "episode": episode,
+                                              "threshold_min": 15, "waiting_min": 16})
 
 
 @pytest.mark.parametrize("outcome,delivered,deadman_child", [
@@ -2673,7 +2679,7 @@ def test_review_deadman_skips_its_child_when_the_handoff_child_answered(env, out
         fields["resurface_delivered"] = delivered
     ah.BoomerangWakeState().update_claim(handoff["key"], **fields)
     _kill(env, handoff)
-    _deadman_event(tid)
+    _deadman_event(tid, handoff["event_id"])
     env["adapter"].handled.clear()
     turns = _tick(env)
     rows = [e["row"] for e in env["dispatched"][1:]]
@@ -2683,3 +2689,50 @@ def test_review_deadman_skips_its_child_when_the_handoff_child_answered(env, out
         assert rows == [] and turns == [], [t.text for t in turns]
         skipped = [c for c in _claims().values() if c.get("row") == "review_deadman"]
         assert [(c["state"], c["outcome"]) for c in skipped] == [(ah.STATE_TERMINAL, "episode_answered")]
+
+
+def _answered_handoff(env, pr):
+    """A human handoff whose first-read child surfaced its read (turn delivered): Do 3's answered episode."""
+    _green(env, pr)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, pr)
+    _tick(env)
+    [handoff] = env["dispatched"]
+    ah.BoomerangWakeState().update_claim(handoff["key"], state=ah.STATE_TERMINAL, outcome="surfaced",
+                                         resurface_delivered=True)
+    _kill(env, handoff)
+    return tid, handoff
+
+
+@pytest.mark.parametrize("case", ["first_page", "later_cycle", "ruling_wait", "stranded"])
+def test_review_deadman_skip_reads_the_pages_own_episode_and_cycle(env, case):
+    """Only cycle 0 of the answered handoff's own review_requested episode is skipped. A re-armed cycle, a
+    ruling-wait (blocked) episode and a stranded_no_worker episode are other pages: each gets its child."""
+    tid, handoff = _answered_handoff(env, 3301)
+    episode, cycle = handoff["event_id"], 0
+    if case == "later_cycle":
+        cycle = 2 * int(time.time())
+    elif case == "ruling_wait":
+        episode = _raw_event(tid, "blocked", {"reason": "operator ruling", "unblock_when": "operator ruling"})
+    elif case == "stranded":
+        episode = _raw_event(tid, "stranded_no_worker", {"by": "dispatcher"})
+    _deadman_event(tid, episode, cycle)
+    env["adapter"].handled.clear()
+    _tick(env)
+    rows = [e["row"] for e in env["dispatched"][1:]]
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    if case == "first_page":
+        assert "review_deadman" not in rows
+        assert [(c["state"], c["outcome"]) for c in deadman] == [(ah.STATE_TERMINAL, "episode_answered")]
+    else:
+        assert "review_deadman" in rows, rows
+        assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
+
+
+def test_review_deadman_page_with_no_episode_dispatches_its_child(env):
+    tid, _ = _answered_handoff(env, 3302)
+    _raw_event(tid, "review_deadman", {"by": "kanban-review-deadman", "waiting_min": 25})
+    env["adapter"].handled.clear()
+    _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]

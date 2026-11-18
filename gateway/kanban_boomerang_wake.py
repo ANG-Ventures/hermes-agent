@@ -783,15 +783,29 @@ def human_reviewer(payload: Optional[dict], task: Any) -> bool:
 
 def review_episode_answered(state: "BoomerangWakeState", board: Optional[str], task_id: str,
                             event_id: Any) -> bool:
-    """True when the review episode ``event_id`` (a review_deadman event) belongs to already got its one
-    child: the handoff child of its ``review_requested`` (or that claim's restart successor) surfaced with
-    its turn delivered, or acted. A failed, lost or still-running child answers nothing."""
+    """True when the review_deadman page ``event_id`` is the FIRST page (cycle 0) of an episode that
+    already got its one child. The page's own key says which page it is (hermes-home
+    review_deadman_core.EventKey: ``episode`` = its review entry event id, ``cycle`` = 0 for the first
+    tier-1 page): only a cycle-0 page whose episode is a ``review_requested`` of this card, whose
+    handoff child (or that claim's restart successor) surfaced with its turn delivered or acted, is
+    answered. A later cycle, another episode (a ruling wait, a stranded card) or a page with no episode
+    gets its child as today. A failed, lost or still-running handoff child answers nothing."""
     from hermes_cli import kanban_db as kb
 
     conn = _readonly(kb, board)
     try:
-        row = conn.execute("SELECT id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
-                           "AND id <= ? ORDER BY id DESC LIMIT 1", (task_id, int(event_id))).fetchone()
+        page = conn.execute("SELECT payload FROM task_events WHERE id = ? AND task_id = ?",
+                            (int(event_id), task_id)).fetchone()
+        try:
+            payload = json.loads(page[0]) if page and page[0] else {}
+            episode = int(payload.get("episode") or 0)
+            cycle = int(payload.get("cycle") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return False
+        if episode <= 0 or cycle != 0:
+            return False
+        row = conn.execute("SELECT id FROM task_events WHERE id = ? AND task_id = ? "
+                           "AND kind = 'review_requested'", (episode, task_id)).fetchone()
     finally:
         conn.close()
     if row is None:
