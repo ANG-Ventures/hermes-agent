@@ -625,3 +625,25 @@ def _looks_like_read_file_line_numbered_content(content: str) -> bool:
 def _is_internal_file_tool_content(content: str) -> bool:
     """Return True when content is file-tool display text, not intended file bytes."""
     return _is_internal_file_status_text(content) or _looks_like_read_file_line_numbered_content(content)
+
+
+_SHELL_SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".command")
+
+
+def _check_pkill_argorder_script(filepath: str, content: str) -> str | None:
+    """Refuse a shell script whose ``pkill``/``pgrep`` has an option after the pattern.
+
+    The terminal-tool guard sees only the command line; on 2026-11-17 20:57 the same
+    misordered ``sudo pkill`` reached the Studio inside a script written here and run
+    over ssh (t_c6d2e782). Shell scripts only (by suffix or shebang), so prose that
+    quotes the bad line is not refused.
+    """
+    first = content.lstrip()[:120].split("\n", 1)[0] if content else ""
+    is_shell = filepath.endswith(_SHELL_SCRIPT_SUFFIXES) or (first.startswith("#!") and "sh" in first)
+    if not is_shell:
+        return None
+    from tools.pkill_argorder_guard import find_misordered_pkill, refusal_message
+
+    hit = find_misordered_pkill(content)
+    return refusal_message(hit) if hit else None
+

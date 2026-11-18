@@ -21059,7 +21059,121 @@ def _cohort_death_ids(dead: list, *, now: float) -> set:
     return members if len(members) >= _COHORT_DEATH_MIN else set()
 
 
-def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive: Optional[list] = None) -> None:
+# Who sent the signal (t_c6d2e782). The Studio runs an exec flight recorder
+# (hermes-home fleet/exec-flight-recorder.py: one JSON line per exec(), hourly
+# ``YYYY-mm-dd-HH.jsonl`` files, ``ts`` in local time). A kill/pkill/killall exec
+# in the minutes before detection is the sender; its parents name the session.
+# On 2026-11-17 11:06:16 it was a worker's ``sudo -n pkill -f PAT -P N``.
+_EXEC_FLIGHT_DIRS_ENV = "HERMES_EXEC_FLIGHT_DIRS"
+_COHORT_SENDER_WINDOW_SECONDS = 240
+_COHORT_SENDER_TAIL_BYTES = 96 * 1024 * 1024
+_KILL_EXES = (b'/kill"', b'/pkill"', b'/killall"')
+
+
+def _exec_flight_dirs() -> list:
+    raw = os.environ.get(_EXEC_FLIGHT_DIRS_ENV)
+    if raw is not None:
+        return [Path(p) for p in raw.split(os.pathsep) if p]
+    return [Path("/Volumes/fleet-scratch/var/exec-flight"), Path.home() / ".hermes" / "var" / "exec-flight"]
+
+
+def _exec_flight_tail(path: Path, max_bytes: int) -> list:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read(max_bytes)
+    except OSError:
+        return []
+    lines = data.split(b"\n")
+    return lines[1:] if size > max_bytes else lines  # first line may be cut
+
+
+def _cohort_death_sender(*, pids: Iterable[int] = (), now: Optional[float] = None,
+                         window: float = _COHORT_SENDER_WINDOW_SECONDS) -> Optional[str]:
+    """Name the kill/pkill/killall exec(s) seen in the window before ``now``, else None.
+
+    ``pkill``/``killall`` (pattern kills) always count. A plain ``kill`` counts only when it
+    names a member pid or pgid from ``pids`` (or ``-1``): a targeted kill of some other pid
+    in the same minutes is another session's business, not the sender.
+
+    Reads only the tail of the current (and, across an hour boundary, previous)
+    hourly file. None also when no recorder ring exists or the killer did not exec
+    (``os.kill`` from inside a process, or the recorder itself was killed first).
+    Never raises.
+    """
+    try:
+        now = time.time() if now is None else now
+        lo = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - window))
+        hi = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now + 5))
+        hours = sorted({time.strftime("%Y-%m-%d-%H", time.localtime(t)) for t in (now - window, now)})
+        ring = next((d for d in _exec_flight_dirs() if d.is_dir()), None)
+        if ring is None:
+            return None
+        members = {abs(int(p)) for p in pids if p}
+        lines: list = []
+        for h in hours:
+            lines.extend(_exec_flight_tail(ring / f"{h}.jsonl", _COHORT_SENDER_TAIL_BYTES))
+        rows = []
+        for line in lines:
+            if not any(k in line for k in _KILL_EXES):
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            exe = os.path.basename(str(r.get("exe") or ""))
+            args = str(r.get("args") or "")
+            if exe not in ("kill", "pkill", "killall") or not (lo <= str(r.get("ts") or "") <= hi):
+                continue
+            if re.search(r"(?:^|\s)-0(?:\s|$)", args):
+                continue  # liveness probe, sends nothing
+            if exe == "kill":
+                targets = {abs(int(a)) for a in re.findall(r"(?:^|\s)(-?\d+)(?=\s|$)", args)}
+                if not (targets & members or "-1" in args.split()):
+                    continue
+            rows.append(r)
+        if not rows:
+            return None
+
+        def _parent(ppid, before: str) -> Optional[dict]:
+            needle = ('"pid":%d,' % int(ppid)).encode()
+            hit = None
+            for line in lines:
+                if needle in line:
+                    try:
+                        cand = json.loads(line)
+                    except ValueError:
+                        continue
+                    if cand.get("pid") == ppid and str(cand.get("ts") or "") <= before:
+                        hit = cand  # latest exec of that pid up to the kill
+            return hit
+
+        def _cmd(row: dict, n: int) -> str:
+            return " ".join(str(row.get("args") or "").split())[:n]
+
+        out = []
+        for r in reversed(rows[-3:]):  # newest first: the kill closest to the deaths
+            chain = [f"`{_cmd(r, 200)}` (pid {r.get('pid')}, uid {r.get('uid')}, {str(r.get('ts'))[11:]})"]
+            cur = r
+            for _ in range(3):
+                ppid = cur.get("ppid")
+                if not isinstance(ppid, int) or ppid <= 1:
+                    break
+                cur = _parent(ppid, str(cur.get("ts") or hi))
+                if cur is None:
+                    break
+                chain.append(f"`{_cmd(cur, 160)}` (pid {cur.get('pid')})")
+            out.append(" <- ".join(chain))
+        return "; ".join(out)
+    except Exception as exc:  # pragma: no cover - attribution must never break a tick
+        _log.debug("cohort-death sender lookup failed: %s", exc)
+        return None
+
+
+def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive: Optional[list] = None,
+                       sender: Optional[str] = None) -> None:
     """Page #alerts ONCE for a cohort death. Best-effort, never raises.
 
     Once per cohort by construction: the members are released in the same
@@ -21087,9 +21201,13 @@ def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive:
                 "`log show --predicate 'process == \"timed\"'`), so live workers may now "
                 "be running beside their own requeued card."
             )
+        elif sender:
+            cause = f"Signal sender (exec flight recorder): {sender}"
         else:
             cause = (
-                "Something outside the dispatcher killed them (reaper / OOM / signal sweep): "
+                "SENDER UNKNOWN: the exec flight recorder holds no kill/pkill/killall exec in the "
+                "4 min before detection (a kill from inside a process, or the recorder was killed "
+                "too). Something outside the dispatcher killed them (reaper / OOM / signal sweep): "
                 "the cohort_death events carry each member's spawn pgid and who else was in it; "
                 "find the sender with `log show --predicate 'eventMessage CONTAINS \"sent by\"'` "
                 "around the tick."

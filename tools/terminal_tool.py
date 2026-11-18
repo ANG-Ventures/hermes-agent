@@ -1099,7 +1099,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
-    gateway_lifecycle_block, home_deletion_block, self_repo_block,
+    gateway_lifecycle_block, home_deletion_block, pkill_argorder_block, self_repo_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
 from tools.terminal_tool_result import finalize_foreground_result
@@ -1594,8 +1594,8 @@ def _pre_exec_block(
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
-    then the dangerous-workdir check, then the protected-home delete guard and the
-    self-repo guard (both local only).
+    then the dangerous-workdir check, then the protected-home delete guard, the
+    pkill/pgrep argument-order guard (any backend), and the self-repo guard (local only).
     """
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
@@ -1612,6 +1612,9 @@ def _pre_exec_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
         background=background,
     )
+    if blocked:
+        raise _Rejected(blocked)
+    blocked = pkill_argorder_block(command=command)
     if blocked:
         raise _Rejected(blocked)
     if env_type == "local":
