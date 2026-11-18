@@ -2736,3 +2736,30 @@ def test_review_deadman_page_with_no_episode_dispatches_its_child(env):
     env["adapter"].handled.clear()
     _tick(env)
     assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+
+
+def test_review_deadman_off_switch_after_an_answered_handoff_dispatches_its_child(env):
+    """The stop file set after a handoff child answered: the first deadman page gets its child as on main."""
+    tid, handoff = _answered_handoff(env, 3303)
+    stop = ah.review_handoff_stop_file_path()
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    _deadman_event(tid, handoff["event_id"], 0)
+    env["adapter"].handled.clear()
+    _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
+
+
+@pytest.mark.parametrize("cycle", ["missing", None, "0", 0.0, False, "x"])
+def test_review_deadman_skip_needs_an_explicit_integer_cycle_zero(env, cycle):
+    """Only an explicit integer cycle 0 is the first page; a missing, null or non-integer cycle dispatches."""
+    tid, handoff = _answered_handoff(env, 3304)
+    payload = {"by": "kanban-review-deadman", "episode": handoff["event_id"], "waiting_min": 16}
+    if cycle != "missing":
+        payload["cycle"] = cycle
+    _raw_event(tid, "review_deadman", payload)
+    env["adapter"].handled.clear()
+    _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]

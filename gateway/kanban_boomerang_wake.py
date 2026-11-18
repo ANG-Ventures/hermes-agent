@@ -789,9 +789,13 @@ def review_episode_answered(state: "BoomerangWakeState", board: Optional[str], t
     tier-1 page): only a cycle-0 page whose episode is a ``review_requested`` of this card, whose
     handoff child (or that claim's restart successor) surfaced with its turn delivered or acted, is
     answered. A later cycle, another episode (a ruling wait, a stranded card) or a page with no episode
-    gets its child as today. A failed, lost or still-running handoff child answers nothing."""
+    gets its child as today. A failed, lost or still-running handoff child answers nothing. The cycle
+    must be an explicit integer 0 (missing, null or non-integer dispatches), and the row's stop file
+    turns the skip off too, so with it present every page dispatches as on main."""
     from hermes_cli import kanban_db as kb
 
+    if review_handoff_stop_file_path().exists():
+        return False
     conn = _readonly(kb, board)
     try:
         page = conn.execute("SELECT payload FROM task_events WHERE id = ? AND task_id = ?",
@@ -799,10 +803,10 @@ def review_episode_answered(state: "BoomerangWakeState", board: Optional[str], t
         try:
             payload = json.loads(page[0]) if page and page[0] else {}
             episode = int(payload.get("episode") or 0)
-            cycle = int(payload.get("cycle") or 0)
+            cycle = payload.get("cycle")
         except (TypeError, ValueError, AttributeError):
             return False
-        if episode <= 0 or cycle != 0:
+        if episode <= 0 or type(cycle) is not int or cycle != 0:
             return False
         row = conn.execute("SELECT id FROM task_events WHERE id = ? AND task_id = ? "
                            "AND kind = 'review_requested'", (episode, task_id)).fetchone()
