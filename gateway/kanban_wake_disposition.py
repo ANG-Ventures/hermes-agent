@@ -29,6 +29,8 @@ its ``trigger``. The payload is the event payload, plus two keys the caller reso
   Anything else (False / None / missing) leaves today's rows deciding (t_6e9f48cc).
 - ``human_reviewer``: True only when the handback's reviewer (the event's ``reviewer``, else the
   card's assignee) is the human sentinel and the row's stop file is absent (t_efb6f435).
+- ``park_return``: True only when the event is the board's ``lifecycle_entry_repair`` re-entry into
+  review, its reviewer is the human sentinel and the row's stop file is absent (t_ff6f4be4).
 
 Card tags are read from ``task.tags`` (an iterable) when the caller has one, else from the
 card title/body: a ``tags: a, b`` line or a ``[tag]`` marker (the ``[milestone]`` /
@@ -118,6 +120,13 @@ _TABLE: tuple = (
     _Row(1, "card_tag_surface", lambda c: bool(c.tags & SURFACE_TAGS), SURFACE),
     # Tier 2 — judgment kinds.
     _Row(2, "block_loop_detected", lambda c: c.kind == "block_loop_detected", SURFACE),
+    # Tier 3 — a card back in review from a park or schedule (the board's ``lifecycle_entry_repair``
+    # ``review_requested``: no run, no summary) for a HUMAN reviewer: a child does the attended read
+    # (why it waits, or surface) instead of a bare home-session turn (t_ff6f4be4). It never approves or
+    # lands. The caller sets ``park_return`` (False while the row's stop file is present). Above the PR
+    # rows: a returned park is not a fresh handback, whatever state its PR is in.
+    _Row(3, "review_park_return", lambda c: _is_review(c) and c.payload.get("park_return") is True,
+         AUTO, MODE_FORK),
     # Tier 3 — a mechanical own-repo handback: every open Prism key is answered in the
     # handback text, so posting those lines, the coverage and the enqueue is not a verdict
     # (t_6e9f48cc). Above the green and red rows: the queue owns CI (a red row's existing
