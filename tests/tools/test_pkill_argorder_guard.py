@@ -24,7 +24,7 @@ EVENT_1106 = (
 )
 # Last line of /Volumes/fleet-scratch/tmp/t_1d5ff6b8/t1d5_ab.sh, run 2026-11-17 20:56:34.
 EVENT_2057_SCRIPT = (
-    "#!/bin/bash\n"
+    "#!/usr/bin/env bash\n"  # original used a fixed bash path; the guard keys on any sh shebang
     "sudo -n /usr/bin/eslogger exec > \"$T/es.fifo\" 2>/dev/null & ES=$!\n"
     "wait $PY; sudo -n /bin/kill $(pgrep -P $ES) $ES 2>/dev/null; "
     "sudo -n /usr/bin/pkill -f \"^/usr/bin/eslogger exec$\" -P $ES\n"
