@@ -93,12 +93,15 @@ TEMP_SWEEP_AGE_S = 600.0   # a temp this old is a dead write (killed between mks
 TERMINAL_FIELDS = frozenset({
     "key", "task_id", "board", "event_id", "kind", "row", "state", "outcome", "reason", "action", "status",
     "card_status", "claimed_at", "finished_at", "delegation_id", "resurfaced", "resurface_delivered",
-    "blocked_budget_exhausted", "restart_redispatch", "redispatched_as",
+    "blocked_budget_exhausted", "restart_redispatch", "redispatched_as", "tried_action",
 })
 #: Kill switch for the backoff, dead-letter and claim pruning (present = pre-t_827d5940 behaviour).
 BACKOFF_STOP_FILE = "boomerang-handback-backoff.disabled"
 # t_aad55db4 kill switch: while it exists a ``complete`` verdict posts only the passive line again.
 COMPLETE_TURN_STOP_FILE = "boomerang-complete-turn.disabled"
+# t_d712444b kill switch: while it exists ``_moved`` counts every newer event again (machine comments, the
+# claim's own review_deadman and delivery markers included).
+MOVED_NOISE_STOP_FILE = "boomerang-moved-noise.disabled"
 
 
 def state_path() -> Path:
@@ -1298,16 +1301,54 @@ def board_has_receipt(board: Optional[str], task_id: str, delegation_id: str) ->
         conn.close()
 
 
+def _moved_noise_filter_on() -> bool:
+    from hermes_constants import get_hermes_home
+
+    try:
+        return not (get_hermes_home() / "state" / MOVED_NOISE_STOP_FILE).exists()
+    except Exception:   # unknown = today's strict rule
+        return False
+
+
+def _moved_noise(row: Any, episode: Optional[int]) -> bool:
+    """t_d712444b: a session-less event that changes nothing a verdict reads. A comment by kernel automation
+    (``MACHINE_AUTHORS``) or by a script with no verified identity (``unverified:*``, the authors the stale guard
+    already never reads as the owner: event-land ci-red lines, CI-red labels); the review_deadman of the claim's
+    own review episode; a boomerang delivery marker. Anything carrying a session (owner, worker, another child)
+    and every other kind still counts."""
+    from hermes_cli.kanban_close_on_guard import MACHINE_AUTHORS
+
+    if row[0] or row[1] not in ("commented", "review_deadman", DELIVERED_KIND):
+        return False
+    try:
+        payload = json.loads(row[2] or "{}")
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if row[1] == "commented":
+        author = str(payload.get("author") or "").strip().lower()
+        return author in MACHINE_AUTHORS or author.startswith("unverified:")
+    if row[1] == "review_deadman":
+        return episode is not None and payload.get("episode") == episode
+    return payload.get("via") == VIA
+
+
 def _moved(entry: dict, kb: Any, conn: Any) -> Optional[str]:
     """RC-3 freshness: an event newer than the claim's cursor (rows by this claim's own
-    child_session excepted, pass-5 RC-B), a status change, or a moved own-PR head."""
+    child_session excepted, pass-5 RC-B; machine noise excepted, :func:`_moved_noise`), a status
+    change, or a moved own-PR head."""
     child = str(entry.get("child_session") or "")
-    rows = conn.execute("SELECT actor_session_id, kind FROM task_events WHERE task_id = ? AND id > ?",
-                        (entry["task_id"], int(entry.get("cursor_event_id") or entry["event_id"]))).fetchall()
+    cursor = int(entry.get("cursor_event_id") or entry["event_id"])
+    rows = conn.execute("SELECT actor_session_id, kind, payload FROM task_events WHERE task_id = ? AND id > ?",
+                        (entry["task_id"], cursor)).fetchall()
     if entry.get("row") == "own_repo_review_all_keys_answered":
         # t_6e9f48cc: that child's own work IS comments (verdict lines + coverage), posted from a
         # terminal whose event actor is not reliably the child session; a comment moves no state.
         rows = [r for r in rows if r[1] != "commented"]
+    if rows and _moved_noise_filter_on():
+        episode = _review_entry_id(kb, conn, entry["task_id"], cursor)
+        rows = [r for r in rows if not _moved_noise(r, episode)]
     if any(not child or (r[0] or "") != child for r in rows):
         return "state moved"
     task = kb.get_task(conn, entry["task_id"])
@@ -1636,7 +1677,9 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
             return {"ok": False, "action": action, "reason": "replay", "summary": summary, "noop": True}
         why = _moved(live, kb, conn)
         if why:
-            return {"ok": False, "action": action, "reason": why, "summary": summary}
+            findings = [_first_line(f, 300) for f in verdict.get("findings") or [] if str(f).strip()][:5]
+            return {"ok": False, "action": action, "reason": why, "summary": summary, "findings": findings,
+                    **finding}
         if live.get("row") == "blocked_assess":
             from gateway.kanban_wake_disposition import card_tags, SURFACE_TAGS
 
@@ -1668,6 +1711,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     turn = (finding_text(live, {"summary": summary or action, **finding}, "child completed")
             if wake_home and action == "complete" else None)
     state.update_claim(key, state=STATE_TERMINAL, outcome=action, finished_at=_time.time(),  # RC-5 (3)
+                       tried_action=action,
                        handback=handback_row(live, {"summary": summary or action, "action": action},
                                              turn_text=turn)
                        if handback else None)
@@ -2037,6 +2081,33 @@ def finding_text(entry: dict, result: dict, header: str) -> str:
     return "\n".join(lines) + "\n---\n" + str(entry.get("wake_text") or "")
 
 
+def _scratch_dir(entry: dict) -> Optional[str]:
+    """The child's scratch folder (``cache/scratch/<delegation id>`` or the short ``del-<last 4>``), if it exists."""
+    from hermes_constants import get_hermes_home
+
+    did = str(entry.get("delegation_id") or "")
+    scratch = Path(get_hermes_home()) / "cache" / "scratch"
+    for name in (did, f"del-{did[-4:]}") if did else ():
+        if (scratch / name).is_dir():
+            return str(scratch / name)
+    return None
+
+
+def superseded_text(entry: dict, result: dict) -> str:
+    """t_d712444b: the re-delivered wake of a verdict refused as superseded carries what the child tried (action,
+    summary, findings, evidence) and where its read is staged, ahead of the original wake text."""
+    detail = result.get("detail") or result.get("summary") or ""
+    lines = finding_text(entry, {**result, "detail": f"{result.get('action')} not written ({result.get('reason')}): "
+                                                     f"{detail}"}, "child verdict superseded").split("\n---\n", 1)
+    extra = [f"- {f}" for f in result.get("findings") or []]
+    head = lines[0] + ("\nfindings:\n" + "\n".join(extra) if extra else "")
+    try:
+        staged = _scratch_dir(entry)
+    except Exception:
+        staged = None
+    return f"{head}\nstaged read: {staged or 'none found'}\n---\n{lines[1] if len(lines) > 1 else ''}"
+
+
 def _surfaced_summary(kb: Any, conn: Any, task_id: str, delegation_id: str) -> Optional[str]:
     """The summary of this delegation's executor ``surfaced:`` comment, None when there is none."""
     head, tag = f"{MARKER} surfaced:", f"(delegation {delegation_id})"
@@ -2188,7 +2259,7 @@ async def _complete_wakes_home(runner: Any, entry: dict) -> bool:
 
 
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
-                text: Optional[str] = None, *, fork_died: bool = False) -> None:
+                text: Optional[str] = None, *, fork_died: bool = False, tried: Optional[str] = None) -> None:
     """Commit the original wake obligation before any best-effort delivery. A freshness refusal
     (the card moved under the claim) is a supersede, not a fault (t_ce8bd439): the handback keeps
     only the re-delivered wake, the origin chat gets no line, and one #logs line records it.
@@ -2230,7 +2301,8 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
         handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
                             outcome="superseded" if superseded else "stopped" if stopped else "failed",
-                            reason=reason, resurfaced=True, resurface_delivered=False, handback=handback)
+                            reason=reason, resurfaced=True, resurface_delivered=False, handback=handback,
+                            **({"tried_action": tried} if tried else {}))
     if quiet:
         line = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before the wake ran; "
                 f"original wake re-delivered")
@@ -2493,8 +2565,13 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
         await asyncio.to_thread(_breadcrumb, live, result)
         await deliver_handbacks(runner, state, delegation_id=live["delegation_id"])
         return
-    text = finding_text(live, result, "child verdict refused") if result.get("refused") else None
-    await _fail(runner, live, result["reason"], state, text)
+    if result.get("refused"):
+        text = finding_text(live, result, "child verdict refused")
+    elif result.get("reason") in _SUPERSEDE_REASONS and result.get("action"):
+        text = superseded_text(live, result)   # t_d712444b: the owner gets what the child tried
+    else:
+        text = None
+    await _fail(runner, live, result["reason"], state, text, tried=result.get("action"))
 
 
 async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: int, kind: str, event_ts: Any,

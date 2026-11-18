@@ -1043,9 +1043,12 @@ def test_card_moved_before_the_verdict_is_a_quiet_supersede(env):
     assert env["adapter"].sent == [], env["adapter"].sent
     assert logs == [f"boomerang-wake superseded {tid}: card moved to ready before the wake ran; "
                     f"original wake re-delivered"], logs
-    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    turns = [t.text for t in env["adapter"].handled]   # t_d712444b: the child's read rides ahead of the wake
+    assert len(turns) == 1 and turns[0].endswith(f"\n---\nTask {tid} wake"), turns
+    assert turns[0].startswith(f"[boomerang-wake] child verdict superseded {tid} ") and "verified" in turns[0]
     claim = ah.BoomerangWakeState().get_claim(entry["key"])
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded"
+    assert claim["tried_action"] == "complete"
     assert claim["reason"] == "state moved" and claim["resurface_delivered"] is True
 
 
@@ -2763,3 +2766,93 @@ def test_review_deadman_skip_needs_an_explicit_integer_cycle_zero(env, cycle):
     env["adapter"].handled.clear()
     _tick(env)
     assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+
+
+# --- t_d712444b: machine noise during the child's read does not supersede its verdict ----------
+
+
+def _machine_noise(tid, entry) -> None:
+    """What landed on t_8f6266f4 during a 21-minute read: three event-land ci-red lines and one CI-red label by a
+    session-less script (``unverified:default``), the review episode's own deadman, another delegation's marker."""
+    with kb.connect_closing() as conn:
+        for _ in range(3):
+            kb.add_comment(conn, tid, "unverified:default",
+                           f"[event-land] ci-red at {REPO}#3120 head aaaaaaaaaaaa NOT sent back (card stays in review)")
+        kb.add_comment(conn, tid, "unverified:default", f"{REPO}#3120 CI reds at aaaaaaaa: OWN 2 (lint)")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "review_deadman", {  # noqa: SLF001
+                "by": "kanban-review-deadman", "cycle": 0, "episode": entry["event_id"], "threshold_min": 15})
+            kb._append_event(conn, tid, ah.DELIVERED_KIND, {  # noqa: SLF001
+                "delegation_id": "del-other", "part": "turn", "via": ah.VIA})
+
+
+def _human_review_claim(env):
+    tid = _review_card(env)
+    entry = _claimed_entry(env, tid, row="own_repo_review_human", kind="review_requested")
+    return tid, entry
+
+
+def test_machine_noise_during_the_read_does_not_supersede_the_send_back(env):
+    tid, entry = _human_review_claim(env)
+    _machine_noise(tid, entry)
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="5 findings",
+                                           findings=["own CI red: lint", "Prism P1 reproduced"]))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "review"
+        assert sum(e.kind == "changes_requested" for e in kb.list_events(conn, tid)) == 1
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["outcome"] == "request_changes" and claim["tried_action"] == "request_changes"
+
+
+def test_moved_noise_stop_file_restores_the_strict_rule(env):
+    from hermes_constants import get_hermes_home
+
+    tid, entry = _human_review_claim(env)
+    _machine_noise(tid, entry)
+    stop = get_hermes_home() / "state" / ah.MOVED_NOISE_STOP_FILE
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    res = ah.execute_verdict(entry, _verdict(entry, "request_changes", findings=["x"]))
+    assert not res["ok"] and res["reason"] == "state moved"
+
+
+def _another_deadman_episode(env, tid, entry):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "review_deadman", {"by": "kanban-review-deadman", "episode": 1})  # noqa: SLF001
+
+
+@pytest.mark.parametrize("how", ["owner_comment", "status_change", "moved_head", "worker_event", "other_deadman"])
+def test_real_moves_still_supersede_and_the_wake_carries_the_child_read(env, how):
+    tid, entry = _human_review_claim(env)
+    _machine_noise(tid, entry)
+    if how == "owner_comment":
+        with kb.connect_closing() as conn, \
+                kb.mutation_actor(session_ids=[env["group"].session_id], profile="default", surface="gateway"):
+            kb.add_comment(conn, tid, "default", "holding this one, I read it myself")
+    elif how == "status_change":
+        with kb.connect_closing() as conn, \
+                kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):   # session-less send-back
+            ok, detail = kb.request_changes(conn, tid, reason="CI red", claimer="ci-sendback",
+                                            operator="ci-sendback: CI red", operator_kind=kb.OPERATOR_KIND_MACHINE)
+            assert ok, detail
+    elif how == "moved_head":
+        _red(env, 3120, head="b" * 40)
+    elif how == "worker_event":
+        with kb.connect_closing() as conn, \
+                kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+            kb.add_comment(conn, tid, "unverified:default", "[event-land] posted from a worker session")
+    else:
+        _another_deadman_episode(env, tid, entry)
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="five findings on #3120",
+                                           findings=["own CI red: lint", "Prism P1 reproduced"]))
+    with kb.connect_closing() as conn:
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert ah.RECEIPT_KIND not in kinds, f"{how}: verdict written"
+    assert kinds.count("changes_requested") == (how == "status_change"), f"{how}: send-back written"
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["outcome"] == "superseded" and claim["tried_action"] == "request_changes"
+    turns = [t.text for t in env["adapter"].handled]
+    assert len(turns) == 1, turns
+    assert "child verdict superseded" in turns[0] and "five findings on #3120" in turns[0]
+    assert "- Prism P1 reproduced" in turns[0] and "staged read: " in turns[0]
+    assert turns[0].endswith(f"Task {tid} wake")
