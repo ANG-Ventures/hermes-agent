@@ -910,6 +910,10 @@ def _ensure_cron_dir(cron_dir: Path) -> None:
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     store = _current_cron_store()
+    from hermes_cli.config_home import refuse_release_root
+    refusal = refuse_release_root(store.cron_dir.parent, "keep cron state (chmod, fire locks) in")
+    if refusal:
+        raise PermissionError(refusal)
     _ensure_cron_dir(store.cron_dir)
     _ensure_cron_dir(store.output_dir)
     _secure_dir(store.cron_dir)

@@ -8,6 +8,33 @@ class HomeInitializationError(RuntimeError):
     """The home skeleton is unavailable, not an invalid YAML document."""
 
 
+def release_root_stable_home(path) -> Path | None:
+    """``<home>`` when *path* is a sealed release root (``<home>/releases/<name>/RELEASE.json``), else None.
+
+    A sealed release is r-x and verified byte-for-byte, so the runtime must never chmod or write in it
+    (t_a3367113: a job re-fired with ``HERMES_HOME=<home>/releases/<sha>`` chmodded the root, ``hooks``
+    and ``cron`` to 0700 and left ``cron/.fire-<hex>.lock`` behind).
+    """
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return None
+    if resolved.parent.name == "releases" and (resolved / "RELEASE.json").is_file():
+        return resolved.parent.parent
+    return None
+
+
+def refuse_release_root(path, what: str) -> str | None:
+    """Refusal text when *path* is a sealed release root, else None."""
+    stable = release_root_stable_home(path)
+    if stable is None:
+        return None
+    return (
+        f"Refusing to {what} {path}: it is a sealed release, which the runtime must never chmod or "
+        f"write. Run with HERMES_HOME={stable} (the stable home) instead."
+    )
+
+
 def _directory_links(path: Path) -> list[Path]:
     return [part for part in (*reversed(path.parents), path) if part.is_symlink()]
 
@@ -55,6 +82,9 @@ def _ensure_directory(path: Path, *, create: bool, secure: bool, home: Path) -> 
 def initialize_home(home: Path, subdirs: tuple[str, ...], ensured: set[str]) -> None:
     from hermes_cli.config import _ensure_default_soul_md, is_managed
 
+    refusal = refuse_release_root(home, "use as Hermes home")
+    if refusal:
+        raise HomeInitializationError(refusal)
     managed = is_managed()
     old_umask = os.umask(0o007) if managed else None
     try:
