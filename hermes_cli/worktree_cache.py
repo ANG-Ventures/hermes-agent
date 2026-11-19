@@ -17,6 +17,11 @@ Layout (spec 3.1)::
     <kanban.workspaces_root>/.templates/<owner>__<repo>/gen-<N>/   a normal clone, detached
     <kanban.workspaces_root>/.templates/<owner>__<repo>/gen-<N>/template.json
 
+``<kanban.workspaces_root>/.templates`` is the default root. A host whose checkouts land on
+another volume lists a root there in ``worktree_cache.templates_roots``; each create uses the
+root on its destination's volume (t_259301d7: nas-fleet's card workspaces are on /srv/fleet,
+a different ZFS dataset from the default root on the container rootfs).
+
 Rules this module keeps:
 
 * OFF by default (``worktree_cache.enabled: false``). Off, out of scope, or
@@ -148,17 +153,70 @@ def cache_active(caller: str, s: Settings) -> bool:
     return s.enabled and caller in s.scopes
 
 
-def templates_root() -> Path:
-    override = os.environ.get(ENV_TEMPLATES, "").strip()
-    if override:
-        return Path(override).expanduser()
-    kanban = host_config().get("kanban")
+def _default_templates_root(cfg: dict) -> Path:
+    kanban = cfg.get("kanban")
     raw = kanban.get("workspaces_root") if isinstance(kanban, dict) else None
     if isinstance(raw, str) and raw and Path(raw).expanduser().is_absolute():
         return Path(raw).expanduser() / ".templates"
     from hermes_constants import get_default_hermes_root
 
     return get_default_hermes_root() / "kanban" / "workspaces" / ".templates"
+
+
+def templates_roots() -> list:
+    """Every templates root on this host, in preference order (t_259301d7).
+
+    ``HERMES_WORKTREE_CACHE_TEMPLATES`` (tests, one-off runs) is the only root when set. Else the
+    host root config's ``worktree_cache.templates_roots`` (absolute dirs, one per volume the
+    checkouts land on), then the default ``<kanban.workspaces_root>/.templates``. A clone can only
+    share blocks within one filesystem, so each create uses the root on its destination's volume
+    (:func:`templates_root`); ``refresh`` keeps a template in every root."""
+    override = os.environ.get(ENV_TEMPLATES, "").strip()
+    if override:
+        return [Path(override).expanduser()]
+    cfg = host_config()
+    wcfg = cfg.get("worktree_cache")
+    raw = wcfg.get("templates_roots") if isinstance(wcfg, dict) else None
+    out: list = []
+    for item in raw if isinstance(raw, (list, tuple)) else ():
+        if isinstance(item, str) and item.strip() and Path(item.strip()).expanduser().is_absolute():
+            out.append(Path(item.strip()).expanduser())
+    out.append(_default_templates_root(cfg))
+    return list(dict.fromkeys(out))
+
+
+def default_templates_root() -> Path:
+    """The default root, resolved on its own: the env override, else
+    ``<kanban.workspaces_root>/.templates`` (never a position in :func:`templates_roots`, whose
+    dedupe keeps a default listed in ``templates_roots`` at its earlier place)."""
+    override = os.environ.get(ENV_TEMPLATES, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _default_templates_root(host_config())
+
+
+def _volume_dev(path: Path) -> Optional[int]:
+    """``st_dev`` of *path*, or of its nearest existing ancestor (a root or a destination that is
+    not built yet lives on the volume of the directory it will be created in)."""
+    p = Path(path).absolute()
+    for cand in (p, *p.parents):
+        dev = _dev(cand)
+        if dev is not None:
+            return dev
+    return None
+
+
+def templates_root(dest: Optional[Path] = None) -> Path:
+    """The templates root for a checkout at *dest*: the first of :func:`templates_roots` on the
+    same volume as *dest*, else the default root (the create then falls back ``cross_volume``).
+    No *dest*: the default root (``status``, the operator scripts' precheck)."""
+    roots = templates_roots()
+    if dest is not None:
+        want = _volume_dev(dest)
+        for root in roots:
+            if want is not None and _volume_dev(root) == want:
+                return root
+    return default_templates_root()
 
 
 def repo_slug(url: str) -> Optional[str]:
@@ -169,9 +227,9 @@ def repo_slug(url: str) -> Optional[str]:
     return f"{owner}/{repo[:-4] if repo.endswith('.git') else repo}"
 
 
-def repo_dir(slug: str) -> Path:
+def repo_dir(slug: str, root: Optional[Path] = None) -> Path:
     owner, repo = slug.split("/", 1)
-    return templates_root() / f"{owner}__{repo}"
+    return (root or templates_root()) / f"{owner}__{repo}"
 
 
 # --------------------------------------------------------------------------- ledger + log
@@ -516,11 +574,13 @@ def _build_generation(rdir: Path, slug: str, url: str) -> Tuple[Path, dict]:
     return gen, read_meta(gen) or {}
 
 
-def refresh(slug: str, *, url: Optional[str] = None, lock_timeout: float = REFRESH_LOCK_TIMEOUT_S) -> dict:
-    """Bring the template of *slug* to origin's default branch (spec 3.2), building a
-    new generation when there is none or the current one is dirty/moved (3.5)."""
+def refresh(slug: str, *, url: Optional[str] = None, lock_timeout: float = REFRESH_LOCK_TIMEOUT_S,
+            root: Optional[Path] = None) -> dict:
+    """Bring the template of *slug* under *root* (default: the default root) to origin's default
+    branch (spec 3.2), building a new generation when there is none or the current one is
+    dirty/moved (3.5)."""
     url = url or _default_url(slug)
-    rdir = repo_dir(slug)
+    rdir = repo_dir(slug, root)
     rdir.mkdir(parents=True, exist_ok=True)
     import fcntl
 
@@ -718,7 +778,8 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
         return plain_clone(url, dest, branch, rev, quiet, served_opts)     # git reports the real error
     if slug is None or slug not in s.repos:
         return fallback("no_template")
-    rdir = repo_dir(slug)
+    troot = templates_root(dest_p.parent)       # the root on the destination's volume (t_259301d7)
+    rdir = repo_dir(slug, troot)
     meta: dict = {}
     T = ""
 
@@ -736,7 +797,7 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
         meta = read_meta(gen) or {}
         if time.time() - float(meta.get("refreshed_at") or 0) > s.max_lag_s:
             with contextlib.suppress(Exception):
-                refresh(slug, url=url, lock_timeout=CREATE_LOCK_TIMEOUT_S)
+                refresh(slug, url=url, lock_timeout=CREATE_LOCK_TIMEOUT_S, root=troot)
             gen = current_gen(rdir)
             if gen is None:
                 return "no_template", None
@@ -899,22 +960,34 @@ def kanban_clone_entry(url: str, dest: Optional[str], git_opts: Sequence[str] = 
 # --------------------------------------------------------------------------- status + CLI
 
 
-def status(s: Optional[Settings] = None, *, fallbacks: int = 10) -> dict:
+def dest_volume(dest: Path) -> dict:
+    """The same-volume precondition for checkouts at *dest* (t_259301d7): the templates root a
+    create there would use, and whether it shares the destination's ``st_dev``."""
+    root = templates_root(Path(dest))
+    d, r = _volume_dev(Path(dest)), _volume_dev(root)
+    return {"dest": str(dest), "dest_dev": d, "templates_root": str(root), "root_dev": r,
+            "same_volume": d is not None and d == r}
+
+
+def status(s: Optional[Settings] = None, *, fallbacks: int = 10, dest: Optional[str] = None) -> dict:
     s = s or settings()
     root = templates_root()
+    roots = templates_roots()
     repos = []
-    with contextlib.suppress(FileNotFoundError):
-        for rdir in sorted(p for p in root.iterdir() if p.is_dir() and "__" in p.name):
-            gen = current_gen(rdir)
-            meta = read_meta(gen) if gen else None
-            repos.append({
-                "repo": rdir.name.replace("__", "/", 1),
-                "current": gen.name if gen else None,
-                "generations": sorted(c.name for c in rdir.iterdir() if _GEN_ANY_RE.match(c.name)),
-                "head": (meta or {}).get("head"),
-                "lag_s": round(time.time() - float(meta["refreshed_at"])) if meta else None,
-                "unsupported": (meta or {}).get("unsupported"),
-            })
+    for troot in roots:
+        with contextlib.suppress(FileNotFoundError):
+            for rdir in sorted(p for p in troot.iterdir() if p.is_dir() and "__" in p.name):
+                gen = current_gen(rdir)
+                meta = read_meta(gen) if gen else None
+                repos.append({
+                    "repo": rdir.name.replace("__", "/", 1),
+                    "root": str(troot),
+                    "current": gen.name if gen else None,
+                    "generations": sorted(c.name for c in rdir.iterdir() if _GEN_ANY_RE.match(c.name)),
+                    "head": (meta or {}).get("head"),
+                    "lag_s": round(time.time() - float(meta["refreshed_at"])) if meta else None,
+                    "unsupported": (meta or {}).get("unsupported"),
+                })
     rows = []
     ledger = ledger_path()
     if ledger is not None:
@@ -924,8 +997,12 @@ def status(s: Optional[Settings] = None, *, fallbacks: int = 10) -> dict:
                     row = json.loads(line)
                     if str(row.get("caller", "")).startswith("worktree_cache:"):
                         rows.append(row)
-    return {"enabled": s.enabled, "scopes": list(s.scopes), "repos_configured": list(s.repos),
-            "templates_root": str(root), "templates": repos, "last_fallbacks": rows[-fallbacks:]}
+    out = {"enabled": s.enabled, "scopes": list(s.scopes), "repos_configured": list(s.repos),
+           "templates_root": str(root), "templates": repos, "last_fallbacks": rows[-fallbacks:],
+           "templates_roots": [{"root": str(r), "dev": _volume_dev(r)} for r in roots]}
+    if dest:
+        out["dest"] = dest_volume(Path(dest))
+    return out
 
 
 def cmd_clone(args) -> int:
@@ -941,24 +1018,33 @@ def cmd_refresh(args) -> int:
         return 0
     slugs = list(s.repos) if args.all else [args.repo]
     rc = 0
-    for slug in slugs:
-        try:
-            print(json.dumps(refresh(slug), sort_keys=True))
-        except Exception as exc:  # noqa: BLE001 - report and continue with the next repo
-            print(json.dumps({"repo": slug, "status": "error", "error": str(exc)}), file=sys.stderr)
-            rc = 1
+    for root in templates_roots():          # one template per root: each volume its checkouts land on
+        for slug in slugs:
+            try:
+                print(json.dumps(dict(refresh(slug, root=root), root=str(root)), sort_keys=True))
+            except Exception as exc:  # noqa: BLE001 - report and continue with the next repo
+                print(json.dumps({"repo": slug, "root": str(root), "status": "error", "error": str(exc)}),
+                      file=sys.stderr)
+                rc = 1
     return rc
 
 
 def cmd_status(args) -> int:
-    data = status()
+    data = status(dest=getattr(args, "dest", None))
     if args.json:
         print(json.dumps(data, indent=1, sort_keys=True))
         return 0
     print(f"enabled={data['enabled']} scopes={','.join(data['scopes']) or '-'} root={data['templates_root']}")
+    for r in data["templates_roots"]:
+        print(f"  root {r['root']} dev={r['dev']}")
+    if "dest" in data:
+        d = data["dest"]
+        print(f"  dest {d['dest']} dev={d['dest_dev']} -> root {d['templates_root']} dev={d['root_dev']} "
+              f"same_volume={d['same_volume']}")
     for t in data["templates"]:
         print(f"  {t['repo']}: {t['current'] or 'no generation'} head={str(t['head'])[:10]} "
-              f"lag={t['lag_s']}s unsupported={t['unsupported'] or '-'} gens={len(t['generations'])}")
+              f"lag={t['lag_s']}s unsupported={t['unsupported'] or '-'} gens={len(t['generations'])} "
+              f"root={t['root']}")
     for r in data["last_fallbacks"]:
         print(f"  fallback {r.get('ts')} {r.get('caller')} {r.get('repo')} {r.get('reason')} {r.get('errno') or ''}")
     return 0
@@ -991,4 +1077,6 @@ def add_arguments(parser) -> None:
     r.set_defaults(func=cmd_refresh)
     st = sub.add_parser("status", help="Templates, generations, lag, last fallbacks")
     st.add_argument("--json", action="store_true")
+    st.add_argument("--dest", default=None,
+                    help="Also report the templates root a checkout at DEST uses and whether it is on DEST's volume")
     st.set_defaults(func=cmd_status)

@@ -2248,6 +2248,10 @@ DEFAULT_CONFIG = {
         ],
         "max_lag_s": 900,
         "max_diff_files": 2000,
+        # Extra templates roots, one per volume checkouts land on (absolute dirs; host root
+        # config). A create uses the root on its destination's volume, else
+        # <kanban.workspaces_root>/.templates; refresh keeps a template in every root.
+        "templates_roots": [],
     },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
