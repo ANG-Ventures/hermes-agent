@@ -436,8 +436,11 @@ class Demand:
 def plan(workload: str, host: str, sample: Mapping, my_units: int, door: Iterable[Demand],
          registry: Priority, leases: Iterable[Lease] = (), *, need: Estimate, now: float,
          own_cpu: float = 0.0, limits: Limits = Limits(), slice_mem: Optional[SliceMem] = None,
-         asap: bool = False, settle_s: float = DEFAULT_SETTLE_S) -> Plan:
+         asap: bool = False, settle_s: float = DEFAULT_SETTLE_S, own_unit: Optional[WaitingUnit] = None) -> Plan:
     """Pure host-door decision. my_units is requested STARTS, own_cpu is current consumer CPU.
+
+    own_unit (t_2a7a47d6, an ordered door unit): this workload's place against other workloads is that unit's own
+    first arrival, even past door_hold_max_s. Only the requester's own place: other workloads' plans still drop it.
 
     No consumer-side arrival/rank logic is needed. spawn-only preserves admit_class, including
     its refusal reason. growth is the per-class opt-out. Returned stuck identities are log events.
@@ -478,6 +481,8 @@ def plan(workload: str, host: str, sample: Mapping, my_units: int, door: Iterabl
             return (0 if urgent else 1, u.at, rank, u.id, d.workload)
 
         mine = [key(d, u) for d, u in candidates if d.workload == workload]
+        if own_unit is not None:
+            mine = [key(Demand(workload, 0, need), dataclasses.replace(own_unit, at=min(own_unit.at, now)))]
         if not mine:
             urgent = asap
             mine = [(0 if urgent else 1, now, registry.rank(workload), "", workload) if mode == "fcfs"
