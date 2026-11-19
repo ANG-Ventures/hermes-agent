@@ -2239,3 +2239,24 @@ def test_operator_allow_flagship_creates_and_audits(worker_env, monkeypatch):
         conn.close()
     assert comments == [("apollo", "flagship override: delicate infra")], comments
     assert ok["task_id"] not in refused
+
+
+def test_show_keeps_newest_sendback_behind_four_long_older_ones(worker_env):
+    """Prism 36303e1376d8 repro (t_5949eafd): four 15,000-char sendbacks, then a fifth
+    ending in FIX-FIFTH; the bounded kanban_show still carries the fifth."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        for i in range(5):
+            text = ("older line of fix text\n" * 700)[:15_000] if i < 4 else "x" * 3_990 + " FIX-FIFTH"
+            assert kb.request_sendback(conn, worker_env, payload={
+                "v": 1, "key": f"example/repo#44@{'a' * 40}:ci-red:job{i}", "repo": "example/repo",
+                "pr": 44, "head": "a" * 40, "source": "ci-red", "reason": f"ci-red:job{i}",
+                "retry": "after_change", "summary": text, "evidence": {}, "round": 1})[0]
+    finally:
+        conn.close()
+    shown = json.loads(kt._handle_show({"task_id": worker_env}))
+    assert "FIX-FIFTH" in shown["worker_context"]

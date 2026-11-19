@@ -442,7 +442,39 @@ def test_older_send_back_cut_on_a_line_and_names_the_command(kanban_home: Simple
     assert new in ctx
     assert "older LAST ITEM" not in ctx
     marker = next(i for i, line in enumerate(ctx.splitlines())
-                  if f"whole text: `hermes kanban runs {tid} --json`" in line)
+                  if f"whole text: `hermes kanban show {tid} --json --state-type outcome "
+                  "--state-name changes_requested`" in line)
     assert ctx.splitlines()[marker].startswith("… [truncated, ")
     # The line ahead of the marker is a whole line of the older send-back.
     assert ctx.splitlines()[marker - 1] in [line.rstrip() for line in old.splitlines()]
+
+
+def test_older_sendback_events_cannot_push_out_the_newest(kanban_home: SimpleNamespace) -> None:
+    """Prism 36303e1376d8: of several unanswered sendback events only the newest is whole,
+    so older ones stay within the field cap and cannot crowd it out of a bounded show."""
+    olds = [_long_sendback(f"older{i}") for i in range(4)]
+    new = _long_sendback("newest")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="many sendbacks", assignee="dev")
+        for i, text in enumerate(olds + [new]):
+            assert kb.request_sendback(conn, tid, payload=_payload(
+                key=f"example/repo#44@{'a' * 40}:ci-red:job{i}", summary=text))[0]
+        ctx = kb.build_worker_context(conn, tid)
+    assert new in ctx
+    for i in range(4):
+        assert f"older{i} LAST ITEM" not in ctx
+    assert ctx.count(f"whole text: `hermes kanban show {tid} --json`") == 4
+    assert len(ctx) < len(new) + 4 * (kb._CTX_MAX_FIELD_BYTES + 200) + 4_000
+
+
+def test_cap_lines_keeps_a_line_that_ends_exactly_at_the_cap() -> None:
+    """Prism 88adbe35004b: a cut that already falls on a line end drops no whole line."""
+    cap = kb._CTX_MAX_FIELD_BYTES
+    first = "x" * (cap - 6)
+    s = first + "\nlast!\n" + "tail line\n" * 50
+    assert s[cap] == "\n"
+    out = kb._ctx_cap_lines(s, "cmd")
+    assert out.splitlines()[:2] == [first, "last!"]
+    one_line = "word " * (cap // 2)
+    cut = kb._ctx_cap_lines(one_line, "cmd").splitlines()[0]
+    assert one_line.startswith(cut) and one_line[len(cut)] == " "
