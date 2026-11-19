@@ -55,6 +55,10 @@ PRIORITY_REL = Path("fleet") / "admission-priority.json"
 PRIORITY_MODES = ("spawn-only", "fcfs", "classes")
 DEMAND_REL = Path("var") / "placement" / "demand"
 DEFAULT_MAX_AGE_S = 120.0
+# t_2a7a47d6: door units whose id starts with one of these are NOT interchangeable with their workload's other units
+# (a main-train step run in the ci door, scripts/lib/main_train_door.py): /demand/authorize starts no LATER
+# equal-urgency unit of the workload while one waits (bounded by door_hold_max_s). Every other unit stays interchangeable.
+ORDERED_UNIT_PREFIXES = ("main-train-",)
 _SAID: set = set()
 
 
