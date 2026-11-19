@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 _live_lock = threading.RLock()
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
+# canonical main path -> thread id of a long raw copy holding that ONE database out of service
+# (:func:`database_offline`). Tracked opens of that path wait; every other database never does.
+_offline_paths: dict[str, int] = {}
+_offline_released = threading.Condition(_live_lock)
 
 
 class UntrackableConnectionError(RuntimeError):
@@ -155,6 +159,7 @@ def connect_tracked(
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
 
     with _live_lock:
+        _wait_while_offline(_key(tracking_path) if tracking_path is not None else _key(path))
         conn = opener(str(path), **kwargs)
         try:
             resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
@@ -283,12 +288,45 @@ def offline_file_access(path: Path | str, *, what: str = "read"):
     :func:`has_live_connection` and *then* doing raw I/O is a check/use race (a connection opened
     in between loses its POSIX locks to the raw ``close()``). Held only for the raw I/O."""
     with _live_lock:
-        main = _live_main_key(_key(path))
-        if main is not None:
-            subject = "it" if main == _key(path) else f"its main database {main}"
-            raise LiveConnectionError(
-                f"Refusing to {what} {path}: a connection to {subject} is still open "
-                "in this process, and raw file access would cancel that "
-                "connection's POSIX advisory locks. Close all database "
-                "handles (stop the gateway/dashboard) and retry.")
+        _refuse_if_live(path, what)
         yield
+
+
+def _refuse_if_live(path: Path | str, what: str) -> None:
+    """Raise :class:`LiveConnectionError` if *path* is live (caller holds ``_live_lock``)."""
+    main = _live_main_key(_key(path))
+    if main is not None:
+        subject = "it" if main == _key(path) else f"its main database {main}"
+        raise LiveConnectionError(
+            f"Refusing to {what} {path}: a connection to {subject} is still open "
+            "in this process, and raw file access would cancel that "
+            "connection's POSIX advisory locks. Close all database "
+            "handles (stop the gateway/dashboard) and retry.")
+
+
+def _wait_while_offline(key: str) -> None:
+    """Block while another thread holds *key* in :func:`database_offline` (caller holds
+    ``_live_lock``; the wait releases it, so other databases keep opening and closing)."""
+    while _offline_paths.get(key, threading.get_ident()) != threading.get_ident():
+        _offline_released.wait()
+
+
+@contextlib.contextmanager
+def database_offline(path: Path | str, *, what: str = "read"):
+    """:func:`offline_file_access` for long raw I/O (a multi-hundred-MB copy). Refuses if *path* is
+    live, then holds only THIS database out of service: a :func:`connect_tracked` of *path* from
+    another thread waits until the block exits, while opens and closes of any other database (and
+    the global lifecycle lock) stay free. Keyed by the resolved main path, the key tracked
+    connections use (``tracking_path`` when given); an opener that bypasses
+    :func:`connect_tracked` is not excluded."""
+    key = _key(path)
+    with _live_lock:
+        _wait_while_offline(key)
+        _refuse_if_live(path, what)
+        _offline_paths[key] = threading.get_ident()
+    try:
+        yield
+    finally:
+        with _live_lock:
+            _offline_paths.pop(key, None)
+            _offline_released.notify_all()
