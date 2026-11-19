@@ -34,6 +34,10 @@ DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 DEFAULT_MAX_SERVERS_PER_HOST = 3
 _DELTA_BASELINE_CAP = 256  # per-file pre-write snapshots; paths never written again would otherwise live forever (#62950)
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+# A server that dies on its own (V8 heap abort, OOM kill) is respawned only after this backoff, indexed by
+# consecutive crashes and held at the last value: an OOM loop must not re-walk the tree every few minutes
+# (t_c0873696).  A server later stopped healthy (idle reap) resets the count.
+CRASH_BACKOFF_SECONDS: Tuple[float, ...] = (60.0, 300.0, 900.0)
 
 _Key = Tuple[str, str]
 _Diags = List[Dict[str, Any]]
@@ -152,6 +156,7 @@ class LSPService:
         exclude_roots: Any = None,
         trusted_workspaces: Any = None,
         max_servers_per_host: int = 0,
+        crash_backoff_seconds: Tuple[float, ...] = CRASH_BACKOFF_SECONDS,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -174,6 +179,8 @@ class LSPService:
         self._operator_roots = frozenset(operator_workspace_roots())  # see _note_operator_roots
         # 0 = unlimited.  One slot per running server process, shared by every agent process of this OS user.
         self._max_servers_per_host = max(0, int(max_servers_per_host))
+        self._crash_backoff = tuple(max(0.0, float(s)) for s in crash_backoff_seconds)
+        self._crash_counts: Dict[_Key, int] = {}  # (server_id, root) → consecutive crashes
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -284,6 +291,9 @@ class LSPService:
         self._note_operator_roots()
         if self._untrusted_denied(srv, key[1], file_path, self._trusted(key[1])):
             return False
+        with self._state_lock:
+            live_key = self._live_key(srv, key[1])
+        self._drop_dead_client(live_key)  # a crash found here starts its backoff before the check below
         if self._is_broken(key):
             eventlog.log_skipped_broken(srv.server_id, key[1], file_path, retry_in=self._broken_retry_in(key))
             return False
@@ -327,6 +337,30 @@ class LSPService:
             slot = self._slots.pop(key, None)
         if slot is not None:
             slot.release()
+        if client.crashed:
+            self._note_crash(client)
+
+    def _note_crash(self, client: LSPClient) -> None:
+        """Log a client that died on its own (once: callers pass each dead client after unregistering it)
+        and hold every root it served out of respawn for the next ``CRASH_BACKOFF_SECONDS`` step."""
+        with self._state_lock:
+            keys = [(client.server_id, root) for root in client.workspace_folders]
+            crashes = max((self._crash_counts.get(key, 0) for key in keys), default=0) + 1
+            delay = self._crash_backoff[min(crashes, len(self._crash_backoff)) - 1] if self._crash_backoff else 0.0
+            deadline = time.monotonic() + delay
+            for key in keys:
+                self._crash_counts[key] = crashes
+                if delay > 0 and self._broken.get(key, 0.0) < deadline:
+                    self._broken[key] = deadline
+        from agent.async_utils import safe_schedule_threadsafe
+        if safe_schedule_threadsafe(self._log_crash(client, crashes, delay), self._loop._loop) is None:
+            eventlog.log_server_crashed(client.server_id, client.workspace_root, client.failure_details(),
+                                        crashes, delay)
+
+    @staticmethod
+    async def _log_crash(client: LSPClient, crashes: int, delay: float) -> None:
+        details = await client.exit_details()  # name the exit signal (6 = V8 heap abort), not "unknown"
+        eventlog.log_server_crashed(client.server_id, client.workspace_root, details, crashes, delay)
 
     def _note_operator_roots(self) -> None:
         """Remember this thread's ``operator_workspace_roots``.  Called where a tool thread enters (it sees
@@ -638,6 +672,10 @@ class LSPService:
         self._drop_dead_client(key)
         slot: Optional[host_slots.HostSlot] = None
         try:
+            if self._is_broken((srv.server_id, root)):
+                # The dead client just dropped had crashed: wait out its backoff instead of re-walking the tree.
+                spawning.set_result(None)
+                return None
             slot = host_slots.acquire(self._max_servers_per_host)
             if slot is None:
                 # Host is at lsp.max_servers_per_host: run without LSP, NOT broken — a later edit retries.
@@ -721,17 +759,29 @@ class LSPService:
     async def _reap_idle_once(self) -> None:
         cutoff = time.time() - self._idle_timeout
         with self._state_lock:
-            idle_keys = [key for key in self._clients if self._last_used.get(key, 0) < cutoff]
+            # Crashed clients go too, idle or not, so the crash is logged and backed off when it happens.
+            idle_keys = [key for key, c in self._clients.items()
+                         if self._last_used.get(key, 0) < cutoff or c.crashed]
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
                 self._last_used.pop(key, None)
             # Popped with the client, released after its shutdown (#30): a
             # replacement spawned meanwhile owns a NEW slot under the same key.
             slots = [s for s in (self._slots.pop(key, None) for key in idle_keys) if s is not None]
+        crashed = [c for c in clients if c.crashed]
+        clients = [c for c in clients if not any(c is d for d in crashed)]
+        for client in crashed:
+            self._note_crash(client)
+        with self._state_lock:  # stopped healthy: the next crash starts the backoff over
+            for client in clients:
+                for root in client.workspace_folders:
+                    self._crash_counts.pop((client.server_id, root), None)
         try:
             if clients:
                 eventlog.log_reaped([(c.server_id, c.workspace_root) for c in clients], self._idle_timeout)
                 await asyncio.gather(*(client.shutdown() for client in clients), return_exceptions=True)
+            if crashed:  # reap the dead process and its pipes
+                await asyncio.gather(*(client.shutdown() for client in crashed), return_exceptions=True)
         finally:
             for slot in slots:
                 slot.release()
@@ -810,6 +860,7 @@ class LSPService:
             clients = list(self._clients.values())
             self._clients.clear()
             self._broken.clear()
+            self._crash_counts.clear()
             self._last_used.clear()
             slots, self._slots = list(self._slots.values()), {}
         await asyncio.gather(*(c.shutdown() for c in clients), return_exceptions=True)

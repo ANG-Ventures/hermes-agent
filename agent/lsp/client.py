@@ -201,6 +201,12 @@ class LSPClient:
     def is_running(self) -> bool:
         return self._state == "running" and self._connection_is_open()
 
+    @property
+    def crashed(self) -> bool:
+        """True iff the server died or dropped its connection without being asked to stop (a V8 heap
+        abort, an OOM kill).  Only meaningful for a client that started; see the manager's crash backoff."""
+        return not self._stopping and self._state != "stopped" and not self._connection_is_open()
+
     def _connection_is_open(self) -> bool:
         proc, reader = self._proc, self._reader_task
         return (
@@ -324,6 +330,16 @@ class LSPClient:
         if self._stderr_tail:
             parts.append("last stderr lines: " + " | ".join(self._stderr_tail))
         return "; ".join(parts)
+
+    async def exit_details(self, timeout: float = 2.0) -> str:
+        """``failure_details()`` of a dead server once its exit status is reaped (the connection drops
+        first; the reader's cleanup records the code a moment later), or after ``timeout`` seconds."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while (self._exit_code is None and (self._proc is None or self._proc.returncode is None)
+               and loop.time() < deadline):
+            await asyncio.sleep(0.05)
+        return self.failure_details()
 
     def _dispatch(self, msg: dict) -> None:
         kind, key = classify_message(msg)
