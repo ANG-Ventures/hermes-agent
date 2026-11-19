@@ -704,14 +704,59 @@ class GatewayBusySessionMixin:
             event._gateway_accepted = True
             return
 
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+        if self._coalesce_card_wake(session_key, event, adapter):
+            return
+
+        depth = self._queue_depth(session_key, adapter=adapter)
+        refused = self.__dict__.setdefault("_wake_refusal_episodes", set())
+        if depth >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
+            # A refused wake raises WakeNotAccepted at its sender; file it ONCE per episode so a
+            # session that cannot take wakes shows as that, not as a failing cron (t_4a891379).
+            if getattr(event, "internal", False) and session_key not in refused:
+                refused.add(session_key)
+                from gateway.wake import record_wake_refusal
+                record_wake_refusal(session_key, depth, self._BUSY_QUEUE_MAX_PENDING, event)
             return
+        refused.discard(session_key)   # below the cap: the refusal episode (if any) is over
 
         self._enqueue_fifo(session_key, event, adapter)
+
+    def _coalesce_card_wake(self, session_key: str, event: MessageEvent, adapter: Any) -> bool:
+        """A kanban/boomerang wake for a card that already has a wake waiting in this session's
+        queue REPLACES it in place: the newest text wins, with a note of how many earlier notices it
+        folded. A card never holds more than one slot (t_4a891379: ~33 wakes filled the cap of 32).
+        User messages and every other wake kind are never touched."""
+        from gateway.wake_kind import CARD_ID_KEY, KANBAN
+        meta = getattr(event, "metadata", None) or {}
+        card = meta.get(CARD_ID_KEY)
+        if not (getattr(event, "internal", False) and getattr(event, "wake_kind", None) == KANBAN and card):
+            return False
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        overflow = self._overflow_queue(session_key)
+        held = [(pending_slot, session_key)] if isinstance(pending_slot, dict) and session_key in pending_slot else []
+        held += [(overflow, i) for i in range(len(overflow or ()))]
+        for store, idx in held:
+            old = store[idx]
+            old_meta = getattr(old, "metadata", None) or {}
+            if not (getattr(old, "internal", False) and getattr(old, "wake_kind", None) == KANBAN
+                    and old_meta.get(CARD_ID_KEY) == card
+                    and getattr(old, "allow_gateway_control", True) == getattr(event, "allow_gateway_control", True)
+                    and all(old_meta.get(k) == meta.get(k) for k in self._SECURITY_METADATA_KEYS)):
+                continue
+            folded = int(old_meta.get("wake_folded") or 0) + 1
+            event.metadata = {**meta, "wake_folded": folded}
+            event.text = (f"{event.text}\n\n[{folded} earlier notice{'s' if folded != 1 else ''} for this card "
+                          "folded into this one]")
+            store[idx] = event
+            event._gateway_accepted = True
+            logger.info("Coalesced kanban wake for %s into its queued slot in session %s (%d folded)",
+                        card, session_key, folded)
+            return True
+        return False
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
