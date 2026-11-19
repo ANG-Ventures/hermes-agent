@@ -3,13 +3,25 @@
 Registers ``ha_list_entities``, ``ha_get_state``, ``ha_list_services``, ``ha_call_service``.
 Auth is a Long-Lived Access Token (``HASS_TOKEN``); the instance URL comes from
 ``HASS_URL`` (default http://homeassistant.local:8123).
+
+Core restart guard (t_77e3c2f5): ``ha_call_service`` refuses ``homeassistant.restart`` /
+``homeassistant.stop`` unless the call carries a non-empty ``reason`` AND the house is idle,
+read live from ``/api/states`` at call time: ``script.find_phone_loop`` is not on, and no
+``event.*`` entity and no user-context ``light``/``switch`` change happened in the last
+5 minutes. A failed idle read refuses. ``override=true`` with a reason lets a restart through
+while busy. Every allowed restart posts one #logs line (session id, reason, ~4 min downtime).
+(``hassio.host_reboot`` / ``host_shutdown`` are unreachable: ``hassio`` is in the blocklist.)
+Kill switch: ``HERMES_HA_RESTART_GUARD=off`` (or ``0``/``false``/``no``) disables the guard
+and its #logs line.
 """
 
 import asyncio
 import json
 import logging
+import os
 import re
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.secret_scope import get_secret
 from tools.registry import registry, tool_error
@@ -170,6 +182,111 @@ def _handle_get_state(args: dict, **kw) -> str:
     return _dispatch(_async_get_state(entity_id), "ha_get_state", f"Failed to get state for {entity_id}")
 
 
+# ── Core restart guard (t_77e3c2f5) ──────────────────────────────────────────
+_GUARDED_SERVICES = frozenset({("homeassistant", "restart"), ("homeassistant", "stop")})
+_IDLE_WINDOW = timedelta(minutes=5)
+_RING_SCRIPT = "script.find_phone_loop"
+_CHEAPER_REMEDIES = (
+    "Try the cheaper remedies first: homeassistant.reload_config_entry (entity_id of one entity in "
+    "the stuck integration, or data {\"entry_id\": ...}) reloads a single integration; domain reloads "
+    "(homeassistant.reload_all, homeassistant.reload_core_config, automation.reload, script.reload, "
+    "scene.reload, template.reload, group.reload) need no downtime. A Core restart takes the house "
+    "down for about 4 minutes.")
+
+
+def _restart_guard_enabled() -> bool:
+    return os.environ.get("HERMES_HA_RESTART_GUARD", "").strip().lower() not in {"0", "off", "false", "no"}
+
+
+async def _async_fetch_states() -> list:
+    return await _api_json("GET", "/api/states", 10)
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def _busy_reasons(states: list, now: datetime) -> List[str]:
+    """What makes the house busy right now; empty list = idle."""
+    busy: List[str] = []
+    cutoff = now - _IDLE_WINDOW
+    for s in states:
+        eid = s.get("entity_id", "")
+        if eid == _RING_SCRIPT and s.get("state") != "off":
+            busy.append(f"{eid} is {s.get('state')!r} (find-phone ring running)")
+            continue
+        domain = eid.split(".", 1)[0]
+        if domain not in ("event", "light", "switch"):
+            continue
+        changed = _parse_ts(s.get("last_changed"))
+        if changed is None or changed < cutoff:
+            continue
+        if domain == "event":
+            busy.append(f"{eid} fired at {s.get('last_changed')}")
+        elif (s.get("context") or {}).get("user_id"):
+            busy.append(f"{eid} changed by a user at {s.get('last_changed')}")
+    return busy
+
+
+def _default_post_logs(text: str) -> None:
+    """One line to #logs through the gateway's notify.py sender (same path as the kanban lines)."""
+    try:
+        from gateway import kanban_watchers as _kw
+
+        script = _kw._alert_notify_script()  # noqa: SLF001
+        if script is None:
+            logger.warning("ha restart guard: notify.py not found; #logs line not sent: %s", text)
+            return
+        if not _kw._notify_send(script, text, ["--target", _kw._needs_input_channels()[1]]):  # noqa: SLF001
+            logger.warning("ha restart guard: #logs line not sent: %s", text)
+    except Exception:
+        logger.warning("ha restart guard: #logs line not sent: %s", text, exc_info=True)
+
+
+#: Seam (tests): ``(text) -> None`` posting one #logs line.
+post_logs: Callable[[str], None] = _default_post_logs
+
+
+def _session_id() -> str:
+    try:
+        from gateway.session_context import resolve_current_session_id
+
+        sid = resolve_current_session_id()
+    except Exception:
+        sid = os.environ.get("HERMES_SESSION_ID")
+    return str(sid) if sid else "unknown"
+
+
+def _restart_guard(domain: str, service: str, args: dict) -> Optional[str]:
+    """``None`` lets the call through (after one #logs line); otherwise the refusal text."""
+    name = f"{domain}.{service}"
+    reason = str(args.get("reason") or "").strip()
+    override = args.get("override") in (True, "true", "True", "1", 1)
+    if not reason:
+        return (f"Refused {name}: a Core restart needs an explicit 'reason' argument. "
+                f"{_CHEAPER_REMEDIES}")
+    try:
+        states = _run_async(_async_fetch_states())
+        if not isinstance(states, list):
+            raise ValueError(f"unexpected /api/states body: {type(states).__name__}")
+    except Exception as e:
+        return (f"Refused {name}: could not read whether the house is idle ({e}). "
+                f"{_CHEAPER_REMEDIES}")
+    busy = _busy_reasons(states, datetime.now(timezone.utc))
+    if busy and not override:
+        return (f"Refused {name}: the house is in use: {'; '.join(busy)}. {_CHEAPER_REMEDIES} "
+                "If the restart cannot wait, call again with reason and override=true.")
+    post_logs(
+        f"🏠 HA Core {service} by agent session {_session_id()}: {reason}"
+        f"{' (override while busy: ' + '; '.join(busy) + ')' if busy else ''}. "
+        "Expect Home Assistant to be down for about 4 minutes.")
+    return None
+
+
 def _handle_call_service(args: dict, **kw) -> str:
     domain = args.get("domain", "")
     service = args.get("service", "")
@@ -193,6 +310,10 @@ def _handle_call_service(args: dict, **kw) -> str:
             data = json.loads(data) if data.strip() else None
         except json.JSONDecodeError as e:
             return tool_error(f"Invalid JSON string in 'data' parameter: {e}")
+    if (domain, service) in _GUARDED_SERVICES and _restart_guard_enabled():
+        refusal = _restart_guard(domain, service, args)
+        if refusal:
+            return tool_error(refusal)
     return _dispatch(
         _async_call_service(domain, service, entity_id, data),
         "ha_call_service", f"Failed to call {domain}.{service}")
@@ -316,6 +437,20 @@ HA_CALL_SERVICE_SCHEMA = {
                     '{"brightness": 255, "color_name": "blue"} for lights, '
                     '{"temperature": 22, "hvac_mode": "heat"} for climate, '
                     '{"volume_level": 0.5} for media players.'
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Required for homeassistant.restart / homeassistant.stop: why a full Core "
+                    "restart (~4 min downtime) is needed instead of a reload."
+                ),
+            },
+            "override": {
+                "type": "boolean",
+                "description": (
+                    "homeassistant.restart / stop only: restart even though the house is in use. "
+                    "Needs a reason."
                 ),
             },
         },

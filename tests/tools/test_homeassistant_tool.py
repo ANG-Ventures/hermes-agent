@@ -342,3 +342,117 @@ class TestRegistration:
         invalidate_check_fn_cache()
         defs = registry.get_definitions({"ha_list_entities", "ha_get_state", "ha_call_service"})
         assert len(defs) == 3
+
+
+# ---------------------------------------------------------------------------
+# Core restart guard (t_77e3c2f5): faked HA client = patched /api/states read
+# ---------------------------------------------------------------------------
+
+
+def _iso(minutes_ago: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+IDLE_STATES = [
+    {"entity_id": "script.find_phone_loop", "state": "off", "last_changed": _iso(60)},
+    {"entity_id": "event.hall_button", "state": _iso(30), "last_changed": _iso(30)},
+    {"entity_id": "light.kitchen", "state": "on", "last_changed": _iso(1),
+     "context": {"id": "x", "user_id": None, "parent_id": "y"}},  # automation, not a user
+    {"entity_id": "switch.fan", "state": "off", "last_changed": _iso(20),
+     "context": {"id": "x", "user_id": "u1", "parent_id": None}},
+    {"entity_id": "sensor.temp", "state": "21", "last_changed": _iso(0)},
+]
+
+
+class TestRestartGuard:
+    @pytest.fixture(autouse=True)
+    def _fakes(self, monkeypatch):
+        monkeypatch.delenv("HERMES_HA_RESTART_GUARD", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_ID", "sess_test_123")
+        self.logs = []
+        monkeypatch.setattr("tools.homeassistant_tool.post_logs", self.logs.append)
+        self.states = AsyncMock(return_value=list(IDLE_STATES))
+        monkeypatch.setattr("tools.homeassistant_tool._async_fetch_states", self.states)
+        self.call = AsyncMock(return_value={"success": True})
+        monkeypatch.setattr("tools.homeassistant_tool._async_call_service", self.call)
+
+    def _restart(self, **extra):
+        return json.loads(_handle_call_service({"domain": "homeassistant", "service": "restart", **extra}))
+
+    def test_refused_without_reason(self):
+        out = self._restart()
+        assert "reason" in out["error"]
+        assert "reload_config_entry" in out["error"]
+        self.call.assert_not_awaited()
+        self.states.assert_not_awaited()
+        assert self.logs == []
+
+    def test_stop_is_guarded_too(self):
+        out = json.loads(_handle_call_service({"domain": "homeassistant", "service": "stop"}))
+        assert "error" in out
+        self.call.assert_not_awaited()
+
+    def test_refused_while_ring_running(self):
+        self.states.return_value = [{"entity_id": "script.find_phone_loop", "state": "on",
+                                     "last_changed": _iso(1)}] + IDLE_STATES[1:]
+        out = self._restart(reason="clear stuck entity")
+        err = out["error"]
+        assert "script.find_phone_loop" in err and "in use" in err
+        # cheaper remedies are named before the restart option
+        assert err.index("reload_config_entry") < err.index("override=true")
+        self.call.assert_not_awaited()
+        assert self.logs == []
+
+    def test_refused_on_recent_button_event(self):
+        self.states.return_value = IDLE_STATES + [
+            {"entity_id": "event.found_it", "state": _iso(2), "last_changed": _iso(2)}]
+        out = self._restart(reason="r")
+        assert "event.found_it" in out["error"]
+        self.call.assert_not_awaited()
+
+    def test_refused_on_recent_user_light_change(self):
+        self.states.return_value = IDLE_STATES + [
+            {"entity_id": "light.office", "state": "on", "last_changed": _iso(3),
+             "context": {"id": "c", "user_id": "u1", "parent_id": None}}]
+        out = self._restart(reason="r")
+        assert "light.office" in out["error"]
+        self.call.assert_not_awaited()
+
+    def test_refused_when_idle_read_errors(self):
+        self.states.side_effect = RuntimeError("connection refused")
+        out = self._restart(reason="clear stuck entity", override=True)
+        assert "could not read" in out["error"] and "connection refused" in out["error"]
+        self.call.assert_not_awaited()
+        assert self.logs == []
+
+    def test_allowed_when_idle_with_reason(self):
+        out = self._restart(reason="zwave integration wedged after reload")
+        assert out["result"]["success"] is True
+        self.call.assert_awaited_once_with("homeassistant", "restart", None, None)
+        assert len(self.logs) == 1
+        line = self.logs[0]
+        assert "sess_test_123" in line and "zwave integration wedged after reload" in line
+        assert "4 minutes" in line
+
+    def test_allowed_with_override_while_busy(self):
+        self.states.return_value = [{"entity_id": "script.find_phone_loop", "state": "on",
+                                     "last_changed": _iso(1)}]
+        out = self._restart(reason="core hung", override=True)
+        assert out["result"]["success"] is True
+        self.call.assert_awaited_once()
+        assert len(self.logs) == 1 and "override" in self.logs[0]
+
+    def test_kill_switch_disables_guard(self, monkeypatch):
+        monkeypatch.setenv("HERMES_HA_RESTART_GUARD", "off")
+        out = self._restart()
+        assert out["result"]["success"] is True
+        self.states.assert_not_awaited()
+
+    def test_other_services_untouched(self):
+        out = json.loads(_handle_call_service({"domain": "homeassistant", "service": "reload_config_entry",
+                                               "entity_id": "light.kitchen"}))
+        assert out["result"]["success"] is True
+        self.states.assert_not_awaited()
+        assert self.logs == []
