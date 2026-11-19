@@ -876,6 +876,45 @@ def test_create_tool_without_session_is_unhomed(worker_env, monkeypatch):
         conn.close()
 
 
+def test_create_rewrites_retired_model_override(worker_env):
+    """G7 (t_1e1450d1): a RETIRED id on kanban_create is stored as its successor, with a note."""
+    import os
+    from pathlib import Path as _P
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    cfg = _P(os.environ["HERMES_HOME"]) / "config"
+    cfg.mkdir(exist_ok=True)
+    (cfg / "model-retired-ids.txt").write_text("claude-opus-4-7 cutover=2026-11-18T21:52-08:00\n", encoding="utf-8")
+    (cfg / "model-successors.json").write_text(json.dumps({"successors": {"claude-opus-4-7": "claude-opus-4-8"}}), encoding="utf-8")
+    d = json.loads(kt._handle_create({"board": "default", "title": "old id", "assignee": "peer",
+                                      "model_override": "claude-opus-4-7"}))
+    assert d["ok"] is True
+    assert d["model_rewritten"].startswith("model rewritten: claude-opus-4-7 -> claude-opus-4-8")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, d["task_id"]).model_override == "claude-opus-4-8"
+    finally:
+        conn.close()
+    # An idempotency hit returns the stored card: no rewrite note unless that card holds the successor.
+    (cfg / "model-successors.json").write_text(json.dumps({"successors": {"claude-opus-4-7": "claude-opus-4-9"}}), encoding="utf-8")
+    a = json.loads(kt._handle_create({"board": "default", "title": "keyed", "assignee": "peer",
+                                      "idempotency_key": "g7-k"}))
+    b = json.loads(kt._handle_create({"board": "default", "title": "keyed", "assignee": "peer",
+                                      "idempotency_key": "g7-k", "model_override": "claude-opus-4-7"}))
+    assert b["task_id"] == a["task_id"] and "model_rewritten" not in b
+    # A lane-prefixed id is split at storage (Studio runtime: cpa/gpt-6.2-sol -> ('gpt-6.2-sol', 'cpa'));
+    # the note must still be sent.
+    orig = kb._resolve_stored_model_pair
+    kb._resolve_stored_model_pair = lambda m, p: (m.split("/", 1)[1], "cpa") if m and m.startswith("cpa/") else orig(m, p)
+    try:
+        c = json.loads(kt._handle_create({"board": "default", "title": "prefixed", "assignee": "peer",
+                                          "model_override": "cpa/claude-opus-4-7"}))
+    finally:
+        kb._resolve_stored_model_pair = orig
+    assert c["ok"] is True
+    assert "cpa/claude-opus-4-9" in c.get("model_rewritten", ""), c
+
+
 def test_create_no_model_override_is_null(worker_env):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb

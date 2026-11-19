@@ -1642,6 +1642,10 @@ def _handle_create(args: dict, **kw) -> str:
     until_raw = args.get("until")
     force_model = args.get("force_model")
     _check(force_model is None or isinstance(force_model, str), "force_model must be a reason string")
+    model_rewritten = None  # G7 (t_1e1450d1): a RETIRED id becomes its successor unless forced
+    if model_override and not (force_model or "").strip():
+        from hermes_cli.model_registry import retired_rewrite
+        model_override, model_rewritten = retired_rewrite(model_override)
     allow_flagship = args.get("allow_flagship")
     _check(allow_flagship is None or isinstance(allow_flagship, str),
            "allow_flagship must be a reason string")
@@ -1764,6 +1768,9 @@ def _handle_create(args: dict, **kw) -> str:
                    **({"placement": placement} if placement else {}),
                    **({"requires_not_inherited": not_inherited} if not_inherited else {}),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
+                   **({"model_rewritten": model_rewritten}
+                      if model_rewritten and kb.get_task(conn, new_tid).model_override
+                      in (model_override, model_override.partition("/")[2]) else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
 

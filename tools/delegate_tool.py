@@ -61,6 +61,7 @@ from tools.delegate_tool_results import (  # noqa: F401
 import contextvars
 import copy
 import enum
+import functools
 import json
 import os
 import re
@@ -4025,7 +4026,7 @@ def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
 
 # ── fork: delegate_task (whole-function; upstream's _Batch/_run_batch dispatch stays importable in
 #    tools/delegate_tool_dispatch.py — see ledger R07-delegate POLICY-DIVERGENCE) ──
-def delegate_task(
+def _delegate_task_impl(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
@@ -5185,6 +5186,33 @@ def delegate_task(
     return json.dumps(
         _execute_and_aggregate(join_late=bool(_recovery_spec)), ensure_ascii=False
     )
+
+
+@functools.wraps(_delegate_task_impl)
+def delegate_task(*args, model: Optional[str] = None, force_model: Optional[str] = None, **kwargs) -> str:
+    """:func:`_delegate_task_impl` with a RETIRED ``model`` id rewritten to its successor.
+
+    G7 (t_1e1450d1): sessions copied a retired id out of their own context; the lane still
+    served it, so the registry check passed. The provider is kept and the result says so in
+    one ``model_rewritten`` line. ``force_model`` keeps the id as given.
+    """
+    note = None
+    if model and not (force_model or "").strip():
+        from hermes_cli.model_registry import retired_rewrite
+
+        model, note = retired_rewrite(model)
+    out = _delegate_task_impl(*args, model=model, force_model=force_model, **kwargs)
+    if not note:
+        return out
+    logger.info("delegate_task: %s", note)
+    try:
+        payload = json.loads(out)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        payload["model_rewritten"] = note
+        return json.dumps(payload, ensure_ascii=False)
+    return f"{out}\n{note}"
 
 
 # ── OpenAI function-calling schema ──────────────────────────────────────────
