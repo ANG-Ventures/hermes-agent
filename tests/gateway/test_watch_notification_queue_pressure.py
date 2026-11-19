@@ -155,7 +155,10 @@ def test_human_input_merged_into_a_head_watch_notice_is_never_evicted(monkeypatc
     runner, adapter, _ = _runner(monkeypatch, tmp_path)
     runner._queue_or_replace_pending_event(KEY, _event("watch 0", watch=True))
     head = adapter._pending_messages[KEY]
-    head.text += "\n\nplease also check the logs"   # what merge_pending_message_event(merge_text=True) does
+    from gateway.platforms.base import merge_pending_message_event
+    merge_pending_message_event(adapter._pending_messages, KEY, _event("please also check the logs", internal=False),
+                                merge_text=True)   # the busy text debounce merge
+    assert adapter._pending_messages[KEY] is head and "please also check the logs" in head.text
     for n in range(runner._BUSY_QUEUE_MAX_PENDING - 1):
         runner._queue_or_replace_pending_event(KEY, _event(f"[kanban wake] t_{n}"))
     late = _event("another user message", internal=False)
@@ -163,6 +166,23 @@ def test_human_input_merged_into_a_head_watch_notice_is_never_evicted(monkeypatc
     assert getattr(late, "_gateway_accepted", False) is False   # refused, not admitted by evicting the head
     assert adapter._pending_messages[KEY] is head and "please also check the logs" in head.text
     assert len(_queued(runner, adapter)) == runner._BUSY_QUEUE_MAX_PENDING
+
+
+@pytest.mark.parametrize("internal", [True, False], ids=["kanban-wake", "user-message"])
+def test_an_unmerged_head_watch_notice_is_evicted_when_it_is_the_only_one(monkeypatch, tmp_path, internal):
+    """Prism cbbd6b0a5f80 round 2: a head watch notice that absorbed no human input holds nothing but
+    the notice, so a full queue evicts it rather than refusing a user message or a distinct-card wake."""
+    runner, adapter, _ = _runner(monkeypatch, tmp_path)
+    runner._queue_or_replace_pending_event(KEY, _event("watch 0", watch=True))
+    for n in range(runner._BUSY_QUEUE_MAX_PENDING - 1):
+        runner._queue_or_replace_pending_event(KEY, _event(f"[kanban wake] t_{n}"))
+    late = _event("[kanban wake] t_new" if internal else "a user message", internal=internal)
+    runner._queue_or_replace_pending_event(KEY, late)
+    assert late._gateway_accepted is True
+    queued = _queued(runner, adapter)
+    assert len(queued) == runner._BUSY_QUEUE_MAX_PENDING
+    assert [e.text for e in queued[:1]] == ["[kanban wake] t_0"] and queued[-1] is late
+    assert not any(e.metadata.get(WATCH_NOTIFICATION_META) for e in queued)
 
 
 def test_fold_keeps_the_newest_match_when_an_older_retry_sits_behind_it():
