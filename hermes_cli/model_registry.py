@@ -248,7 +248,7 @@ def retired_rewrite(model: Optional[str]) -> tuple[Optional[str], Optional[str]]
         current, hops = bare, 0
         while current in retired and isinstance(successors.get(current), str) and hops < 8:
             current, hops = successors[current].strip(), hops + 1
-        if not hops or not current or current == bare or current in retired:
+        if not hops or not current or current in retired:
             return model, None
     except Exception:
         return model, None

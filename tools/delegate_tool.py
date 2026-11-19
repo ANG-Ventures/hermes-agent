@@ -5197,10 +5197,10 @@ def delegate_task(*args, model: Optional[str] = None, force_model: Optional[str]
     one ``model_rewritten`` line. ``force_model`` keeps the id as given.
     """
     note = None
-    if isinstance(model, str) and model.strip() and not (force_model or "").strip():
+    if model and not (force_model or "").strip():
         from hermes_cli.model_registry import retired_rewrite
 
-        model, note = retired_rewrite(model.strip())
+        model, note = retired_rewrite(model)
     out = _delegate_task_impl(*args, model=model, force_model=force_model, **kwargs)
     if not note:
         return out

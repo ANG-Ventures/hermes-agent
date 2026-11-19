@@ -895,6 +895,13 @@ def test_create_rewrites_retired_model_override(worker_env):
         assert kb.get_task(conn, d["task_id"]).model_override == "claude-opus-4-8"
     finally:
         conn.close()
+    # An idempotency hit returns the stored card: no rewrite note unless that card holds the successor.
+    (cfg / "model-successors.json").write_text(json.dumps({"successors": {"claude-opus-4-7": "claude-opus-4-9"}}))
+    a = json.loads(kt._handle_create({"board": "default", "title": "keyed", "assignee": "peer",
+                                      "idempotency_key": "g7-k"}))
+    b = json.loads(kt._handle_create({"board": "default", "title": "keyed", "assignee": "peer",
+                                      "idempotency_key": "g7-k", "model_override": "claude-opus-4-7"}))
+    assert b["task_id"] == a["task_id"] and "model_rewritten" not in b
 
 
 def test_create_no_model_override_is_null(worker_env):

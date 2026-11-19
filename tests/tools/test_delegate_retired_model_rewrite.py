@@ -104,3 +104,14 @@ def test_delegate_task_missing_files_fail_open(home, monkeypatch):
     seen = _capture(monkeypatch, json.dumps({"status": "ok"}))
     out = json.loads(delegate_tool.delegate_task(goal="g", model="gpt-6.1-sol", parent_agent=object()))
     assert seen["model"] == "gpt-6.1-sol" and "model_rewritten" not in out
+
+
+def test_live_agent_dispatch_forwards_force_model(monkeypatch):
+    """Prism 9dbbad0141a8: the inline dispatch path (run_agent._dispatch_delegate_task) must pass force_model."""
+    import run_agent
+
+    seen = {}
+    monkeypatch.setattr(delegate_tool, "delegate_task", lambda **kw: seen.update(kw) or "{}")
+    run_agent.AIAgent._dispatch_delegate_task(object.__new__(run_agent.AIAgent),
+                                              {"goal": "g", "model": "gpt-6.1-sol", "force_model": "prism re-cert"})
+    assert seen["force_model"] == "prism re-cert"
