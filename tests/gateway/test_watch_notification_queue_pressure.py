@@ -214,6 +214,29 @@ async def test_injected_watch_event_carries_the_watch_flag_and_a_completion_does
 
 
 @pytest.mark.asyncio
+async def test_watch_notice_admitted_to_an_empty_head_slot_by_the_base_adapter_is_evictable():
+    """Prism 47043c6e828d (t_270034fa): with the pending slot empty, the busy handler leaves an internal
+    wake to the base adapter, which stores the watch notice in the head slot itself. That notice
+    must still be evictable: the wake for a 32nd distinct card evicts it, not WakeNotAccepted."""
+    from gateway.wake import admit_internal_event, deliver_wake
+    from tests.gateway.test_busy_wake_admission import busy_gateway
+    adapter, runner, source, key = busy_gateway()
+    watch = MessageEvent(text="[watch] MATCH 0", source=source, internal=True,
+                         metadata={WATCH_NOTIFICATION_META: True})
+    await admit_internal_event(adapter, watch)
+    assert adapter._pending_messages[key] is watch     # the base adapter's head-slot admission
+    for n in range(runner._BUSY_QUEUE_MAX_PENDING - 1):
+        await deliver_wake(adapter, text=f"wake t_{n:08x}", source=source, wake_kind="kanban",
+                           metadata={"card_id": f"t_{n:08x}"})
+    await deliver_wake(adapter, text="wake t_ffffffff", source=source, wake_kind="kanban",
+                       metadata={"card_id": "t_ffffffff"})
+    queued = [adapter._pending_messages.get(key), *(runner._overflow_queue(key) or ())]
+    assert len(queued) == runner._BUSY_QUEUE_MAX_PENDING
+    assert queued[0].text == "wake t_00000000" and queued[-1].text == "wake t_ffffffff"
+    assert not any(e.metadata.get(WATCH_NOTIFICATION_META) for e in queued)
+
+
+@pytest.mark.asyncio
 async def test_kanban_failsafe_wake_is_admitted_through_deliver_wake_while_watches_hold_slots(monkeypatch, tmp_path):
     """Replay of the review-deadman casualty: ``deliver_wake`` raised WakeNotAccepted at the cap."""
     from gateway.wake import deliver_wake
