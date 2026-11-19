@@ -48,6 +48,21 @@ def approval_input_words(input_key: str) -> Tuple[str, ...]:
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Metadata flag ``_inject_watch_notification`` sets on watch-match / heartbeat / watch-state wakes:
+# the lowest-priority internal events, deferred or evicted before a kanban wake or user message.
+WATCH_NOTIFICATION_META = "watch_notification"
+_WATCH_NOTIFICATION_TYPES = frozenset({
+    "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released", "heartbeat"})
+
+
+def _is_watch_notification_event(event: Any) -> bool:
+    return bool(getattr(event, "internal", False)) and bool(
+        (getattr(event, "metadata", None) or {}).get(WATCH_NOTIFICATION_META))
+
+
+def _watch_content(event: Any) -> tuple:
+    return (getattr(event, "text", None), tuple(getattr(event, "media_urls", None) or ()))
+
 # Agent attributes for steer provenance. ``_STEER_ENTRIES_ATTR`` holds one ``(text, internal)`` entry per
 # gateway steer accepted into the agent's CURRENT steer buffer. It lives on the agent because the buffer
 # does: a recursive follow-up reuses the cached agent while the session slot may still hold the previous
@@ -709,7 +724,14 @@ class GatewayBusySessionMixin:
 
         depth = self._queue_depth(session_key, adapter=adapter)
         refused = self.__dict__.setdefault("_wake_refusal_episodes", set())
-        if depth >= self._BUSY_QUEUE_MAX_PENDING:
+        if _is_watch_notification_event(event):
+            # Watch/heartbeat notices never take the last slots: kanban wakes and user messages own
+            # them. Not accepted -> the watch drain defers and folds the event (t_469a7ef8).
+            if (depth >= self._BUSY_QUEUE_MAX_PENDING - self._BUSY_QUEUE_RESERVED_SLOTS
+                    or self._queued_watch_notification_count(session_key, adapter) >= self._BUSY_QUEUE_MAX_WATCH):
+                logger.info("Deferring watch notification for busy session %s — queue depth %d.", session_key, depth)
+                return
+        elif depth >= self._BUSY_QUEUE_MAX_PENDING and not self._evict_oldest_watch_notification(session_key, adapter):
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
@@ -723,6 +745,8 @@ class GatewayBusySessionMixin:
             return
         refused.discard(session_key)   # below the cap: the refusal episode (if any) is over
 
+        if _is_watch_notification_event(event):
+            event._watch_pristine = _watch_content(event)   # what the notice held when queued
         self._enqueue_fifo(session_key, event, adapter)
 
     def _coalesce_card_wake(self, session_key: str, event: MessageEvent, adapter: Any) -> bool:
@@ -757,6 +781,40 @@ class GatewayBusySessionMixin:
                         card, session_key, folded)
             return True
         return False
+
+    # Of _BUSY_QUEUE_MAX_PENDING, the last RESERVED slots never hold a watch notification, and at
+    # most MAX_WATCH watch notifications are queued per session at once (t_469a7ef8).
+    _BUSY_QUEUE_RESERVED_SLOTS = 8
+    _BUSY_QUEUE_MAX_WATCH = 4
+
+    def _queued_watch_notification_count(self, session_key: str, adapter: Any) -> int:
+        head = (getattr(adapter, "_pending_messages", None) or {}).get(session_key)
+        queued = [head, *(self._overflow_queue(session_key) or ())]
+        return sum(1 for item in queued if item is not None and _is_watch_notification_event(item))
+
+    def _evict_oldest_watch_notification(self, session_key: str, adapter: Any) -> bool:
+        """Free one slot of a full queue by removing its oldest OVERFLOW watch notification, else a
+        watch notice in the pending head slot that still holds only what it was queued with; False
+        if neither. A head that absorbed a same-sender human follow-up (busy text debounce, photo
+        merge) is never evicted, since that would drop the input (Prism cbbd6b0a5f80); overflow
+        items are never merge targets."""
+        overflow = self._overflow_queue(session_key)
+        index = next((i for i, item in enumerate(overflow or ()) if _is_watch_notification_event(item)), None)
+        if index is not None:
+            overflow.pop(index)
+        else:
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            head = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+            if not (head is not None and _is_watch_notification_event(head)
+                    and getattr(head, "_watch_pristine", None) == _watch_content(head)):
+                return False
+            if overflow:
+                pending_slot[session_key] = overflow.pop(0)
+            else:
+                pending_slot.pop(session_key, None)
+        logger.warning("Evicted oldest queued watch notification for session %s to admit a follow-up at cap (%d).",
+                       session_key, self._BUSY_QUEUE_MAX_PENDING)
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
