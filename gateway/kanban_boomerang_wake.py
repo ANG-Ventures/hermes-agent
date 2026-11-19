@@ -838,7 +838,11 @@ def review_episode_answered(state: "BoomerangWakeState", board: Optional[str], t
     turns the skip off too, so with it present every page dispatches as on main."""
     if review_handoff_stop_file_path().exists():
         return False
+    # t_ff6f4be4 round 3: with the park-return stop file present a park-return claim answers nothing (main).
+    park_off = park_return_stop_file_path().exists()
     for c in _episode_claims(state, board, task_id, event_id) or ():
+        if park_off and c.get("row") == ROW_PARK_RETURN:
+            continue
         if c.get("state") != STATE_TERMINAL:
             continue
         outcome = c.get("outcome")

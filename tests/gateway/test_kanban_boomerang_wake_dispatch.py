@@ -2933,3 +2933,33 @@ def test_park_return_why_waits_does_not_answer_the_deadman_page(env, page_first)
     assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"] and turns == []
     deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
     assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
+
+
+@pytest.mark.parametrize("stop_files", [True, False])
+def test_park_return_off_switch_does_not_let_a_surfaced_park_return_answer_the_deadman_page(env, stop_files):
+    """With both stop files present the gateway is main again: a park-return child that already surfaced does not
+    answer the cycle-0 deadman page (main counts only own_repo_review_human), so the page gets its child. With
+    the files absent the surfaced park-return child answers the episode, unchanged."""
+    tid = _card(env)
+    _sub(tid)
+    _park_return(tid)
+    _tick(env)
+    [child] = env["dispatched"]
+    assert child["row"] == "review_park_return"
+    ah.BoomerangWakeState().update_claim(child["key"], state=ah.STATE_TERMINAL, outcome="surfaced",
+                                         resurface_delivered=True)
+    _kill(env, child)
+    if stop_files:
+        for stop in (ah.park_return_stop_file_path(), ah.deadman_wait_stop_file_path()):
+            stop.parent.mkdir(parents=True, exist_ok=True)
+            stop.write_text("")
+    _deadman_event(tid, child["event_id"], 0)
+    env["adapter"].handled.clear()
+    turns = _tick(env)
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    if stop_files:
+        assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"] and turns == []
+        assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
+    else:
+        assert env["dispatched"][1:] == [] and turns == [], [t.text for t in turns]
+        assert [(c["state"], c["outcome"]) for c in deadman] == [(ah.STATE_TERMINAL, "episode_answered")]
