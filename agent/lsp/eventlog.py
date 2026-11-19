@@ -80,6 +80,14 @@ def log_active(server_id: str, workspace_root: str) -> None:
                f"active for {workspace_root}", f"reused client for {workspace_root}")
 
 
+def log_spawned(server_id: str, workspace_root: str, pid: Optional[int], config_path: Optional[str]) -> None:
+    """A server process started.  INFO every spawn: the rootUri and config it indexes are what a
+    memory blow-up (pyright over a whole home, t_9cba3363) is diagnosed from."""
+    from pathlib import Path
+    _emit(server_id, logging.INFO,
+          f"spawned pid={pid} rootUri={Path(workspace_root).as_uri()} config={config_path or 'none'}")
+
+
 def log_diagnostics(server_id: str, file_path: str, count: int) -> None:
     """Diagnostics arrived for a file.  INFO every time — rare per edit and what users grep for."""
     _emit(server_id, logging.INFO, f"{count} diags ({_short_path(file_path)})")
