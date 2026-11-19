@@ -767,6 +767,46 @@ def test_d_code_skew_drains_only_when_a_loaded_module_changed(root, monkeypatch,
         assert r.draining is True and calls == ["b" * 40, "c" * 40]
 
 
+@pytest.mark.parametrize("switch", ["env", "file"])
+def test_d_skew_kill_switch_restores_drain_on_any_skew(root, monkeypatch, switch):
+    """The kill switch (env HERMES_CRON_SKEW_LOADED_ONLY=0 or <home>/cron/script_runner_skew_any)
+    drains a skew that touches no loaded module; it is read on each check, so setting it on a
+    running runner after a kept skew drains the next skew."""
+    from cron import script_runner
+
+    disk = {"sha": "b" * 40}
+    monkeypatch.delenv("HERMES_CRON_SKEW_LOADED_ONLY", raising=False)
+    monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: (root, "a" * 40, disk["sha"]))
+    monkeypatch.setattr(script_runner, "_skew_loaded_changes", lambda *_a: [])
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    assert r.draining is False  # switch off: unchanged-module skew is kept
+    if switch == "env":
+        monkeypatch.setenv("HERMES_CRON_SKEW_LOADED_ONLY", "0")
+    else:
+        (root / "cron" / "script_runner_skew_any").write_text("", encoding="utf-8")
+    disk["sha"] = "c" * 40
+    r.enumerate_homes()
+    assert r.draining is True
+
+
+def test_d_skew_kill_switch_marker_lookup_error_drains(tmp_path, monkeypatch):
+    """Prism bf5dfded8c79: an absent marker is off; a marker that cannot be stat'ed (a symlink
+    loop, where Path.exists() says False) counts as set, so the runner drains."""
+    from cron import script_runner
+
+    monkeypatch.delenv("HERMES_CRON_SKEW_LOADED_ONLY", raising=False)
+    monkeypatch.setattr(script_runner, "trip_marker_path",
+                        lambda: tmp_path / "script_runner_tripped")
+    marker = tmp_path / "script_runner_skew_any"
+    assert script_runner._skew_any_forced() is False
+    marker.symlink_to(marker)  # ELOOP on stat()
+    assert script_runner._skew_any_forced() is True
+
+
 @pytest.mark.parametrize("back_to_boot", [False, True], ids=["revert_commit", "checkout_boot"])
 def test_d_code_skew_diffs_against_the_last_accepted_sha(tmp_path, root, monkeypatch,
                                                          back_to_boot):

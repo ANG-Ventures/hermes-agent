@@ -161,6 +161,30 @@ def _loaded_repo_files(root: Path) -> set:
     return out
 
 
+SKEW_LOADED_ONLY_ENV = "HERMES_CRON_SKEW_LOADED_ONLY"
+SKEW_ANY_MARKER_NAME = "script_runner_skew_any"
+
+
+def _skew_any_forced() -> bool:
+    """Kill switch for the loaded-module skew filter; either one restores drain on any skew.
+
+    - the file ``<home>/cron/script_runner_skew_any``: the LIVE switch, honoured by a running
+      runner on its next skew check (``touch`` to set, ``rm`` to clear);
+    - env ``HERMES_CRON_SKEW_LOADED_ONLY=0``: a LAUNCH-time switch. The runner reads its own
+      environment, so exporting it elsewhere after start does nothing until the runner restarts.
+
+    A marker that cannot be stat'ed for any reason other than absence counts as set (drain)."""
+    if os.environ.get(SKEW_LOADED_ONLY_ENV, "").strip() == "0":
+        return True
+    try:
+        (trip_marker_path().parent / SKEW_ANY_MARKER_NAME).stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+
+
 def _skew_loaded_changes(base: Optional[str] = None) -> Optional[List[str]]:
     """Loaded module files changed between ``base`` (the last accepted sha; default the boot sha)
     and the disk sha (t_2ddabbc4): ``[]`` when the diff touches none of them, None when the diff
@@ -547,7 +571,16 @@ class ScriptRunner:
         """A code skew drains only when the base..disk diff touches a module this process loaded,
         or the diff cannot be read (t_2ddabbc4: 84 of 152 drains changed no loaded module). The
         base is the last accepted sha, so a kept skew is diffed once and a later revert of code
-        imported from it still drains."""
+        imported from it still drains.
+
+        Kill switch (no deploy needed, see ``_skew_any_forced``): the file
+        ``<home>/cron/script_runner_skew_any`` (next to the trip marker) is read on every skew
+        check and works on a running runner; env ``HERMES_CRON_SKEW_LOADED_ONLY=0`` is read from
+        the runner's own environment, so it takes effect from the next runner start."""
+        if _skew_any_forced():
+            logger.warning("script runner code skew: kill switch set (%s=0 or %s); draining",
+                           SKEW_LOADED_ONLY_ENV, SKEW_ANY_MARKER_NAME)
+            return True
         try:
             disk = _skew_shas()[2]
         except Exception:
