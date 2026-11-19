@@ -241,8 +241,9 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
             return Verdict(False, ax, f"unschedulable:{kind} {host} need {ax}={getattr(need, ax):g} "
                            f"ceiling={ceiling:g}", {ax: ceiling - getattr(need, ax)})
     leases = list(leases)
-    held = live_leases(leases, host, sample.get("at"), settle_s=settle_s, ramp=dict(limits.ramp_cpus),
-                       now=now)
+    at = sample.get("at")
+    ramp = dict(limits.ramp_cpus)
+    held = live_leases(leases, host, at, settle_s=settle_s, ramp=ramp, now=now)
     free: dict = {}
     # an unmeasured axis is noted and the rest still computed: a MEASURED saturation names the refusal ahead of it,
     # so the band reads hot, not unknown, when memory refuses and cpu_busy is missing (t_f64c6d34, Prism d60feae165ed)
@@ -291,15 +292,22 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
             missing("gpu_free_mib")
         else:
             free["gpu_mib"] = float(sample["gpu_free_mib"]) - held.gpu_mib - need.gpu_mib
-    # the fleet-work cap (t_31911eb0): measured fleet use + young leases (the same `held`) + this job <= cap
+    # Fleet use may come from a different reading than live contention. Without a separate
+    # timestamp (e.g. remote samples), use the same held leases as the contention check.
     cap_terms: dict = {}
-    for ax, (cap, spec) in _fleet_caps(sample, limits).items():
+    caps = _fleet_caps(sample, limits)
+    held_fleet = held
+    if caps:
+        fleet_at = sample.get("fleet_at")
+        if _num(fleet_at) and fleet_at != at:
+            held_fleet = live_leases(leases, host, fleet_at, settle_s=settle_s, ramp=ramp, now=now)
+    for ax, (cap, spec) in caps.items():
         key, used = f"fleet_cap_{ax}", sample.get(FLEET_CAP_AXES[ax][0])
         if cap is None or not _num(used):
             unmeasured.append((key, f"unmeasured:{key} (cap {spec!r} set, "
                                + ("no fleet measurement in the sample)" if not _num(used) else "no host total)")))
             continue
-        young, n = getattr(held, ax), getattr(need, ax)
+        young, n = getattr(held_fleet, ax), getattr(need, ax)
         free[key] = cap - float(used) - young - n
         cap_terms[key] = (ax, float(used), young, n, cap, spec)
 
