@@ -57,6 +57,13 @@ _INIT_LOCK_POLL_SECONDS = 0.05
 _INTEGRITY_STAMP_TTL_ENV = "HERMES_KANBAN_INTEGRITY_STAMP_TTL_SECONDS"
 _INTEGRITY_STAMP_TTL_SECONDS = 900
 
+# A corrupt verdict is acted on (quarantine copy, REINDEX, KanbanDbCorruptError)
+# only when a second integrity read on a fresh connection, after this pause,
+# agrees. One transient read error (SQLITE_IOERR_SHORT_READ zero-fills the page,
+# so integrity_check reports it as a damaged page instead of raising) must not
+# start the raw copy of db + -wal + -shm (t_3200d600).
+_CORRUPT_CONFIRM_DELAY_SECONDS = 0.25
+
 
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections. Kanban is the
@@ -773,6 +780,25 @@ def _probe_for_corruption(resolved: Path) -> tuple[Optional[list[str]], Optional
     return messages, f"integrity_check returned {messages[0] if messages else '<no row>'!r}"
 
 
+def _confirm_corruption(
+    resolved: Path, messages: Optional[list[str]], reason: str,
+) -> tuple[Optional[list[str]], Optional[str]]:
+    """Re-probe a corrupt verdict on a fresh connection before anything acts on
+    it. Returns the confirming probe's ``(messages, reason)``: ``reason`` is
+    ``None`` when the second read is clean (the first was transient).
+    ``OperationalError`` on the re-probe propagates raw, as in the first probe."""
+    time.sleep(_CORRUPT_CONFIRM_DELAY_SECONDS)
+    confirm_messages, confirm_reason = _probe_for_corruption(resolved)
+    if confirm_reason is None:
+        _kb._log.warning(
+            "kanban DB %s: first integrity read said %s, a fresh connection "
+            "%.2fs later reads clean; treating it as a transient read error "
+            "(no quarantine copy).",
+            resolved, reason, _CORRUPT_CONFIRM_DELAY_SECONDS,
+        )
+    return confirm_messages, confirm_reason
+
+
 def _integrity_stamp_path(resolved: Path) -> Path:
     return resolved.with_name(resolved.name + ".integrity-ok")
 
@@ -887,6 +913,8 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     checked_at = time.time()
     messages, reason = _probe_for_corruption(resolved)
+    if reason is not None:
+        messages, reason = _confirm_corruption(resolved, messages, reason)
     if reason is None:
         _write_integrity_stamp(resolved, fingerprint, checked_at)
         return
@@ -971,6 +999,8 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
 
     with _cross_process_init_lock(resolved):
         messages, reason = _probe_for_corruption(resolved)
+        if reason is not None:
+            messages, reason = _confirm_corruption(resolved, messages, reason)
         if messages is None:
             # Same quarantine the connect-time guard takes when sqlite
             # refuses to open the file at all.
