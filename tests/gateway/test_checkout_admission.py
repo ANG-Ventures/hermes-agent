@@ -1287,6 +1287,32 @@ def test_lease_thread_renews_while_serving_loop_is_stalled(store):
         g.stop_lease()
 
 
+def test_unchanged_publish_tick_writes_and_fsyncs_nothing(store, monkeypatch):
+    """t_dd40e9f2: an idle publisher re-wrote its record (mkstemp + 2 fsyncs +
+    rename) every 2 s tick, ~2.7k per 30 min on ACE-AI's OS drive. An unchanged
+    tick now writes nothing; the record is still refreshed every refresh_s (so
+    published_at never reads stale) and any change is written at once."""
+    mono = [1000.0]
+    g = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, monotonic=lambda: mono[0])
+    first = g.publish()
+    writes, fsyncs = [], []
+    real_write, real_fsync = ca._atomic_write_json, os.fsync
+    monkeypatch.setattr(ca, "_atomic_write_json", lambda p, d: (writes.append(Path(p).name), real_write(p, d))[1])
+    monkeypatch.setattr(ca.os, "fsync", lambda fd: (fsyncs.append(fd), real_fsync(fd))[1])
+    for _ in range(4):  # 8 s of 2 s ticks, nothing changed
+        mono[0] += 2
+        assert g.publish() is first
+    g.renew_lease()
+    assert (writes, fsyncs) == ([], [])
+    mono[0] += 2.5  # past refresh_s: written again, published_at advances
+    assert g.publish()["published_at"] > first["published_at"] and len(writes) == 1
+    hold = store.hold("op", [SERVE], mode="freeze")
+    del writes[:]
+    mono[0] += 0.1  # a change (the new epoch) is written on the very next tick
+    assert g.publish()["hold_epoch"] == hold.epoch and len(writes) == 1
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
 class _WriteStall:
     """Park one named thread's next consumer-record write between computing the
     record and putting it on disk: the window a descheduled, SIGSTOPped or
@@ -1315,7 +1341,8 @@ def test_interleaved_same_name_publish_never_hides_a_live_peer(store, monkeypatc
     replace B's, nothing on disk says the name is shared and evaluate reads
     QUIESCENT with both processes live."""
     store.hold("op", [SERVE], mode="freeze")
-    a = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    # refresh_s=0: the unchanged re-publish below must write (it is the write this test parks).
+    a = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, refresh_s=0)
     b = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
     a.publish()
     stall = _WriteStall(monkeypatch, "publisher-a")
@@ -1338,7 +1365,7 @@ def test_suspended_publisher_never_stalls_or_hides_a_live_peer(store, monkeypatc
     it is frozen, and after it resumes with the record it computed before
     freezing, the name never reads QUIESCENT while the peer has work."""
     store.hold("op", [SERVE], mode="freeze")
-    frozen = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    frozen = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, refresh_s=0)  # parked renew must write
     work = Work()
     healthy = AdmissionGate(store, SERVE, active_work=work, lease_s=30)
     frozen.publish()
@@ -1376,7 +1403,7 @@ def test_resumed_publisher_never_overwrites_a_busy_peer(store, monkeypatch):
     computed before the peer's writes. That write must not replace the busy
     peer's evidence: the verdict stays non-QUIESCENT while the peer has work."""
     store.hold("op", [SERVE], mode="freeze")
-    idle = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    idle = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, refresh_s=0)  # parked re-publish must write
     busy_work = Work()
     busy = AdmissionGate(store, SERVE, active_work=busy_work, lease_s=30)
     idle.publish()
