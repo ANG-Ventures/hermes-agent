@@ -527,6 +527,7 @@ def test_block_legacy_and_kill_switch(env, auto, on):
     tid = _card(env, auto=auto)
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
         kb._append_event(conn, tid, "blocked", {"kind": "transient", "reason": "offline"})
     assert _tick(env)
     assert not env["dispatched"]
@@ -580,6 +581,7 @@ def test_block_nonchat_owner_preserves_notifier_wake(env, platform):
         origin=SimpleNamespace(platform=platform, chat_id=CHAT))
     env["monkeypatch"].setattr(ow, "resolve_owner", lambda *_a: owner)
     with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
         kb._append_event(conn, tid, "blocked", {"kind": "transient"})
     assert len(_tick(env)) == 1
     assert not env["dispatched"]

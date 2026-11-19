@@ -3319,7 +3319,7 @@ class GatewayKanbanWatchersMixin:
                                 _now_status = None
                             _ev_ts = {ev.kind: ev.created_at for ev in d["events"]}
                             for _k in sorted(_wake_kinds):
-                                if _fresh.is_stale(_now_status, _k):
+                                if _fresh.is_stale_notice(_now_status, _k):
                                     _fresh.log_dropped(sub["task_id"], _k, _ev_ts.get(_k),
                                                        "notifier", _now_status)
                                     _wake_kinds.discard(_k)

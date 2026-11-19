@@ -98,6 +98,7 @@ def _handed_off(home_sid: str) -> str:
         kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=APOLLO, chat_type="group",
                            user_id=HUMAN, delivery_mode="notify+wake")
     with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))  # a hand-off notice needs a review card
         kb._append_event(conn, tid, "review_requested", {
             "summary": "review hold: checks settled, handed to human:apollo",
             "implementer": "worker", "reviewer": "human:apollo"})
