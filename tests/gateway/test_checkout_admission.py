@@ -1313,6 +1313,25 @@ def test_unchanged_publish_tick_writes_and_fsyncs_nothing(store, monkeypatch):
     assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
+def test_lease_renewals_never_hold_back_a_fresh_publish(store):
+    """Prism c706b20a36bc: a renewal rewrites the old published_at. Counting it
+    as a fresh publish let renewals faster than refresh_s skip every unchanged
+    publish, so a healthy idle gate read stale after DEFAULT_STALE_AFTER."""
+    store.hold("op", [SERVE], mode="freeze")
+    wall, mono = [5000.0], [1000.0]
+    g = AdmissionGate(store, SERVE, active_work=Work(), lease_s=2, clock=lambda: wall[0],
+                      monotonic=lambda: mono[0])
+    first = g.publish()["published_at"]
+    for _ in range(11):  # 22 s, a renewal before every publish
+        wall[0] += 2
+        mono[0] += 2
+        g.renew_lease()
+        g.publish()
+    on_disk = json.loads(store.consumer_path(SERVE, g.instance).read_text())
+    assert on_disk["published_at"] > first
+    assert ca.evaluate(store, now=wall[0])["verdict"] == QUIESCENT
+
+
 class _WriteStall:
     """Park one named thread's next consumer-record write between computing the
     record and putting it on disk: the window a descheduled, SIGSTOPped or

@@ -666,7 +666,11 @@ class AdmissionGate:
         self._seq = 0
         self._last_record: Optional[dict] = None
         self.refresh_s = float(refresh_s)  # 0 = write on every tick (the pre-t_dd40e9f2 behaviour)
-        self._last_write_at: Optional[float] = None  # our monotonic clock
+        self._last_write_at: Optional[float] = None  # our monotonic clock, any write (lease renewals too)
+        # Last write of a FRESH snapshot (a new published_at). Kept apart from
+        # _last_write_at: a renewal rewrites the old published_at, so counting
+        # it would let renewals skip every unchanged publish until it read stale.
+        self._last_publish_at: Optional[float] = None
         self._lease_stop = threading.Event()
         self._lease_thread: Optional[threading.Thread] = None
         # foreign lease token -> {"pid", "instance", "alive_at" (our monotonic), "expiry" (s)}
@@ -919,8 +923,8 @@ class AdmissionGate:
             self._last_write_at = self._mono()
             return record
 
-    def _written_within(self, seconds: float) -> bool:
-        last = self._last_write_at
+    def _written_within(self, seconds: float, last: Optional[float] = None) -> bool:
+        last = self._last_write_at if last is None else last
         return last is not None and self._mono() - last < seconds
 
     def _publish(self, record: dict) -> dict:
@@ -932,12 +936,15 @@ class AdmissionGate:
         with self._write_lock:
             record = self._marked(record)
             last = self._last_record
-            if (last is not None and self._written_within(self.refresh_s)
+            if (last is not None and self._last_publish_at is not None
+                    and self._written_within(self.refresh_s, self._last_publish_at)
                     and not last.get("lease_released")
                     and all(record.get(k) == last.get(k)
                             for k in set(record) | set(last) if k not in _VOLATILE_FIELDS)):
                 return last
-            return self._write(record, marked=True)
+            written = self._write(record, marked=True)
+            self._last_publish_at = self._last_write_at
+            return written
 
     def renew_lease(self) -> Optional[dict]:
         """Rewrite the last record so the lease stays fresh even while the
