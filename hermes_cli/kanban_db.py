@@ -16113,6 +16113,8 @@ SENDBACK_SOURCES: tuple[str, ...] = (
 )
 _SENDBACK_MAX_PAYLOAD_BYTES = 16 * 1024
 _CTX_MAX_SENDBACKS = 5
+# kanban_show cuts the worker context around this section, never inside it (t_5949eafd).
+CTX_SENDBACKS_HEADER = "## Send-backs on your PR (newest last)"
 
 
 def _sendback_payload_error(payload: Any) -> Optional[str]:
@@ -16285,7 +16287,7 @@ def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now
     ).fetchall()
     if not rows:
         return
-    lines.append("## Send-backs on your PR (newest last)")
+    lines.append(CTX_SENDBACKS_HEADER)
     lines.append(
         "A producer sent a defect on your PR straight back to you. Fix it and "
         "push (a new head clears it), or reply `prism-verdict: <id> not-a-bug "
@@ -16305,7 +16307,8 @@ def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now
         if r is newest:
             lines.append(str(p.get("summary") or "").strip())
         else:
-            lines.append(_ctx_cap_lines(p.get("summary"), f"hermes kanban show {task_id} --json"))
+            lines.append(_ctx_cap_lines(p.get("summary"), render_operator_command(
+                get_current_board(), "show", task_id, "--json")))
         if p.get("evidence"):
             lines.append("```json")
             lines.append(_ctx_cap(json.dumps(p["evidence"], ensure_ascii=False, indent=1)))
@@ -23267,9 +23270,9 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
             if sendbacks and run.id == sendbacks[-1]:
                 lines.append(run.summary.strip())
             elif run.outcome == "changes_requested":
-                lines.append(_ctx_cap_lines(
-                    run.summary, f"hermes kanban show {task_id} --json "
-                    "--state-type outcome --state-name changes_requested"))
+                lines.append(_ctx_cap_lines(run.summary, render_operator_command(
+                    get_current_board(), "show", task_id, "--json",
+                    "--state-type", "outcome", "--state-name", "changes_requested")))
             else:
                 lines.append(_ctx_cap(run.summary))
         if run.error and run.error.strip():

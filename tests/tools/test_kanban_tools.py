@@ -2260,3 +2260,32 @@ def test_show_keeps_newest_sendback_behind_four_long_older_ones(worker_env):
         conn.close()
     shown = json.loads(kt._handle_show({"task_id": worker_env}))
     assert "FIX-FIFTH" in shown["worker_context"]
+
+
+def test_show_keeps_newest_sendback_behind_long_prior_attempts(worker_env):
+    """Prism 36303e1376d8 round 2 (t_5949eafd): ten prior attempts at the 4 KiB field caps
+    push the worker context past the show budget; the cut takes them, not the newest send-back."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        long = "attempt line of old history\n" * 300
+        for i in range(10):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, "
+                "summary, error, metadata) VALUES (?, 'test-worker', 'done', ?, ?, 'crashed', ?, ?, ?)",
+                (worker_env, 1_000 + i, 1_001 + i, long, long, json.dumps({"note": long})))
+        conn.commit()
+        assert kb.request_sendback(conn, worker_env, payload={
+            "v": 1, "key": f"example/repo#44@{'a' * 40}:ci-red:job", "repo": "example/repo",
+            "pr": 44, "head": "a" * 40, "source": "ci-red", "reason": "ci-red:job",
+            "retry": "after_change", "summary": "fix line\n" * 900 + "FIX-NEWEST", "evidence": {},
+            "round": 1})[0]
+    finally:
+        conn.close()
+    raw = kt._handle_show({"task_id": worker_env})
+    shown = json.loads(raw)
+    assert "FIX-NEWEST" in shown["worker_context"]
+    assert len(raw) < 100_000

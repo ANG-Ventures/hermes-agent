@@ -442,8 +442,8 @@ def test_older_send_back_cut_on_a_line_and_names_the_command(kanban_home: Simple
     assert new in ctx
     assert "older LAST ITEM" not in ctx
     marker = next(i for i, line in enumerate(ctx.splitlines())
-                  if f"whole text: `hermes kanban show {tid} --json --state-type outcome "
-                  "--state-name changes_requested`" in line)
+                  if f"whole text: `hermes kanban --board {kb.get_current_board()} show {tid} --json "
+                  "--state-type outcome --state-name changes_requested`" in line)
     assert ctx.splitlines()[marker].startswith("… [truncated, ")
     # The line ahead of the marker is a whole line of the older send-back.
     assert ctx.splitlines()[marker - 1] in [line.rstrip() for line in old.splitlines()]
@@ -463,7 +463,7 @@ def test_older_sendback_events_cannot_push_out_the_newest(kanban_home: SimpleNam
     assert new in ctx
     for i in range(4):
         assert f"older{i} LAST ITEM" not in ctx
-    assert ctx.count(f"whole text: `hermes kanban show {tid} --json`") == 4
+    assert ctx.count(f"whole text: `hermes kanban --board {kb.get_current_board()} show {tid} --json`") == 4
     assert len(ctx) < len(new) + 4 * (kb._CTX_MAX_FIELD_BYTES + 200) + 4_000
 
 

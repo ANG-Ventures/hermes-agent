@@ -835,6 +835,23 @@ def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
             "summary": _cap_text(run.summary, _SHOW_REVIEW_CHARS)}
 
 
+def _cap_context(ctx: str, limit: int) -> str:
+    """Cut the worker context to ``limit`` around its send-back section: the history before
+    it gives way first, then what follows it; the section itself is cut last (t_5949eafd)."""
+    from hermes_cli.kanban_db import CTX_SENDBACKS_HEADER
+    start = ctx.find("\n" + CTX_SENDBACKS_HEADER)
+    if start < 0:
+        return _cap_text(ctx, limit)
+    end = ctx.find("\n## ", start + 1)
+    end = len(ctx) if end < 0 else end
+    keep = _cap_text(ctx[start:end], limit)
+    pre, post = ctx[:start], ctx[end:]
+    room = limit - len(keep)
+    if room >= len(pre):
+        return pre + keep + _cap_text(post, room - len(pre))
+    return _cap_text(pre, max(0, room)) + keep
+
+
 def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
     """Shrink the history lists, oldest entries first, until the response fits the budget."""
     def size() -> int:
@@ -849,7 +866,7 @@ def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
     if size() > _SHOW_BUDGET_CHARS:
         excess = size() - _SHOW_BUDGET_CHARS
         ctx = out.get("worker_context") or ""
-        out["worker_context"] = _cap_text(ctx, max(4_000, len(ctx) - excess - 200))
+        out["worker_context"] = _cap_context(ctx, max(4_000, len(ctx) - excess - 200))
     if not omitted:
         out.pop("omitted")
     return out
