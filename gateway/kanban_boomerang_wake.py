@@ -1325,18 +1325,24 @@ def _first_line(text: Any, limit: int = 300) -> str:
     return lines[0][:limit] if lines else ""
 
 
-#: A card comment carries the summary's first line whole (t_718e6208: a 300-char first-line cut left the owner a
-#: half sentence); past this cap they end at a sentence, else a word, boundary with an ellipsis.
-COMMENT_SUMMARY_MAX = 2000
+#: The card writes keep the 300-char first-line cap (a longer line carries child prose to proof readers that
+#: main kept it from, t_718e6208 round 2); only where the cut falls changed: never mid-word, at a sentence end
+#: when one lies past ``COMMENT_SENTENCE_MIN`` (t_718e6208: a cut mid-sentence left the owner a half read).
+COMMENT_SUMMARY_MAX = 300
+COMMENT_SENTENCE_MIN = 150
 
 
 def _comment_text(text: Any, limit: int = COMMENT_SUMMARY_MAX) -> str:
     flat = _first_line(text, len(str(text or "")))   # first line only: later lines may forge a wake
     if len(flat) <= limit:
         return flat
-    head = flat[:limit - 1]
+    head = flat[:limit - 1]   # room for the ellipsis
     cut = max(head.rfind(". "), head.rfind("; "), head.rfind("! "), head.rfind("? "))
-    return (head[:cut + 1] if cut > 0 else head.rsplit(" ", 1)[0]) + "…"
+    if cut > COMMENT_SENTENCE_MIN:
+        return head[:cut + 1] + "…"
+    if flat[limit - 1] != " " and " " in head:
+        head = head.rsplit(" ", 1)[0]
+    return head.rstrip() + "…"
 
 
 def _owner_notice_event(conn: Any, entry: dict) -> bool:

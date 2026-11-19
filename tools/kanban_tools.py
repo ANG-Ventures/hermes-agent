@@ -717,11 +717,10 @@ _comment_watermark: dict[str, int] = {}
 # Machine authors whose card comments are status lines or reads for the card OWNER, never an
 # instruction to the running worker: they stay on the card (kanban_show) but are not steered in
 # as "from the operator" (t_718e6208: a boomerang child's owner read became an unasked gate change
-# on t_949dac2e). Worker-addressed automation (fleetreview-route, pr-only-ci-reds,
-# kanban-dispatcher collision warnings) and every human/operator author still deliver.
+# on t_949dac2e). Worker-addressed automation (fleetreview-route, pr-only-ci-reds, the dispatcher's
+# SOFT DEADLINE, kanban-dispatcher collision warnings) and every human/operator author still deliver.
 _MIDRUN_SKIP_AUTHORS = frozenset({
-    "boomerang-wake", "kanban", "dispatcher", "detached-run", "obligations", "review-failsafe",
-    "ci-dead-run",
+    "boomerang-wake", "kanban", "detached-run", "obligations", "review-failsafe", "ci-dead-run",
 })
 # ``<fleet root>/state/<flag>`` present: deliver machine authors mid-run again (pre-t_718e6208).
 MIDRUN_MACHINE_NOTES_FLAG = "kanban-midrun-machine-notes.enabled"

@@ -220,7 +220,8 @@ _SURFACED = ("[boomerang-wake] surfaced: No board action needed: worker run 7862
              "(delegation del-20261118-094724-1def)")
 
 
-@pytest.mark.parametrize("author", ["boomerang-wake", "kanban", "dispatcher", "detached-run"])
+@pytest.mark.parametrize("author", ["boomerang-wake", "kanban", "detached-run", "obligations",
+                                    "review-failsafe", "ci-dead-run"])
 def test_owner_addressed_machine_comment_is_not_an_operator_note(worker_home, monkeypatch, author):
     """t_718e6208: a boomerang child's read for the card OWNER reached the running worker as
     "New notes on your kanban task from the operator" and the worker acted on it (t_949dac2e)."""
@@ -257,3 +258,40 @@ def test_off_switch_flag_file_restores_machine_delivery(worker_home, monkeypatch
     _unthrottle()
     assert kt.inject_new_comments_from_env(agent) is True
     assert "pr-base-drift" in agent.steers[0]
+
+
+def test_dispatcher_soft_deadline_reaches_the_running_worker_once(worker_home, monkeypatch):
+    """t_718e6208 round 2: the dispatcher's ``SOFT DEADLINE: hand back now`` is an instruction to the
+    running worker. Through the real writer it is steered in once, and not replayed on the next poll."""
+    import time
+
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_worker_policy as kwp
+
+    limit = 5400
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="deadline", assignee="worker-bot", max_runtime_seconds=limit)
+        assert kb.claim_task(conn, tid) is not None
+        start = int(time.time())
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_runs SET started_at = ? WHERE id = "
+                         "(SELECT current_run_id FROM tasks WHERE id = ?)", (start, tid))
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
+    agent = FakeAgent()
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False  # seed
+    conn = kbc.connect()
+    try:
+        assert kbd.emit_soft_deadlines(conn, now=start + limit - kwp.soft_margin_seconds(limit)) == [tid]
+    finally:
+        conn.close()
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is True
+    assert len(agent.steers) == 1 and kwp.SOFT_DEADLINE_COMMENT_PREFIX in agent.steers[0]
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(agent) is False
+    assert len(agent.steers) == 1
