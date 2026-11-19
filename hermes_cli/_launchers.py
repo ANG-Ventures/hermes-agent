@@ -551,6 +551,12 @@ def _in_kanban_workspace(root: Path) -> bool:
         from hermes_cli import kanban_db
 
         roots.extend(str(path) for path in kanban_db.workspace_root_candidates())
+        # Every board, not just the current one: the configured root holds
+        # <root>/<board>/..., and legacy named boards keep boards/<slug>/workspaces.
+        roots.extend(str(path) for path in kanban_db.boards_root().glob("*/workspaces"))
+        from hermes_cli.kanban_workspace_policy import configured_root
+
+        roots.append(str(configured_root()[0] or ""))
     except Exception:  # noqa: BLE001 - a broken board config must not stop an update
         pass
     for entry in filter(None, roots):

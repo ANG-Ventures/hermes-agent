@@ -170,6 +170,19 @@ class TestExposeCli:
         assert not (home / ".local" / "bin").exists()
         assert (extra / "hermes-acp").is_symlink()
 
+    def test_named_board_workspace_detected_without_worker_pin(self, monkeypatch, tmp_path):
+        """An ordinary shell (no HERMES_KANBAN_* pin) on a named board's scratch checkout."""
+        from hermes_cli import kanban_workspace_policy
+
+        for var in ("HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_DB"):
+            monkeypatch.delenv(var, raising=False)
+        scratch = tmp_path / "scratch"
+        monkeypatch.setattr(kanban_workspace_policy, "configured_root", lambda: (scratch, False))
+        tree = scratch / "release" / "t_12345678" / "wt"
+        tree.mkdir(parents=True)
+        assert _launchers._in_kanban_workspace(tree.resolve())
+        assert not _launchers._in_kanban_workspace((tmp_path / "elsewhere").resolve())
+
     @posix_only
     def test_leaves_another_installs_wrapper_alone(self, fake_install):
         home, root = fake_install
