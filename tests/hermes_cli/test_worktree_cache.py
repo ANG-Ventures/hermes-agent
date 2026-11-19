@@ -834,6 +834,20 @@ def test_create_uses_the_templates_root_on_its_destination_volume(env, cow, monk
     assert st["dest"]["same_volume"] is True
 
 
+def test_default_root_listed_first_in_templates_roots_stays_the_default(env, monkeypatch):
+    """Prism 3ff4ce2b3cbb: the default root named first in templates_roots must not lose its role
+    to the extra root (dedupe keeps the earlier position; roots[-1] was the extra root)."""
+    vol_b = _two_volumes(env, monkeypatch, extra_root=False)
+    default = env["base"] / "ws-default" / ".templates"
+    cfg = wc.host_config()
+    cfg["worktree_cache"]["templates_roots"] = [str(default), str(vol_b / "templates")]
+    assert wc.templates_root() == default
+    assert wc.status()["templates_root"] == str(default)
+    assert wc.repo_dir(SLUG) == default / SLUG.replace("/", "__")
+    assert wc.templates_root(vol_b / "ws" / "x") == vol_b / "templates"
+    assert wc.templates_root(env["base"] / "ws" / "x") == default
+
+
 def test_no_root_on_the_destination_volume_is_cross_volume(env, cow, monkeypatch):
     vol_b = _two_volumes(env, monkeypatch, extra_root=False)
     wc.refresh(SLUG)

@@ -185,6 +185,16 @@ def templates_roots() -> list:
     return list(dict.fromkeys(out))
 
 
+def default_templates_root() -> Path:
+    """The default root, resolved on its own: the env override, else
+    ``<kanban.workspaces_root>/.templates`` (never a position in :func:`templates_roots`, whose
+    dedupe keeps a default listed in ``templates_roots`` at its earlier place)."""
+    override = os.environ.get(ENV_TEMPLATES, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _default_templates_root(host_config())
+
+
 def _volume_dev(path: Path) -> Optional[int]:
     """``st_dev`` of *path*, or of its nearest existing ancestor (a root or a destination that is
     not built yet lives on the volume of the directory it will be created in)."""
@@ -206,7 +216,7 @@ def templates_root(dest: Optional[Path] = None) -> Path:
         for root in roots:
             if want is not None and _volume_dev(root) == want:
                 return root
-    return roots[-1]
+    return default_templates_root()
 
 
 def repo_slug(url: str) -> Optional[str]:
