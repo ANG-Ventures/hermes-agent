@@ -1553,6 +1553,12 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
         # t_59d62680: the merged-PR rule is about the HANDBACK (its review is moot once merged). An own-event row
         # carries its own occurrence: a deploy probe / watcher queued after the merge that failed is still owed.
         if sendback:
+            # t_e86eeab2 round 2 (Apollo): a send-back's read is finished only when nothing of the card is left open:
+            # (a) the card is done/archived, or (b) the newest handback after the send-back names a PR and EVERY PR
+            # it names merged (below). A later handback naming no PR, or no later handback, refuses nothing.
+            status = str(_field(task, "status") or "")
+            if status in ("done", "archived"):
+                return f"card {status} after send-back"
             handback = conn.execute(
                 "SELECT payload, run_id FROM task_events WHERE task_id = ? "
                 "AND kind IN ('review_requested', 'completed') AND id > ? ORDER BY id DESC LIMIT 1",
@@ -1567,7 +1573,7 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
         conn.close()
     health_fn = _health_fn()
     if health_fn is not None:
-        seen = set()
+        seen, merged = set(), []
         for ref in refs:
             key = (ref.repo.lower(), int(ref.number))
             if key in seen:
@@ -1575,7 +1581,13 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
             seen.add(key)
             health = health_fn(ref.repo, int(ref.number)) or {}
             if health.get("state") == "merged" or health.get("merged") or health.get("merged_at"):
-                return f"summarized PR merged: {ref.repo}#{ref.number}"
+                if not sendback:
+                    return f"summarized PR merged: {ref.repo}#{ref.number}"
+                merged.append(f"{ref.repo}#{ref.number}")
+            elif sendback:
+                return None   # (b) every, not any: an open or closed-unmerged PR is work left on the card
+        if merged:
+            return f"summarized PR merged: {', '.join(merged)}"
     return None
 
 
@@ -2099,13 +2111,15 @@ def _staged_read(entry: dict, texts: list) -> Optional[str]:
 def record_stale_read(entry: dict, result: dict) -> bool:
     """t_e86eeab2: ONE card comment when a child's ``surface`` was refused because the PR merged (no chat wake): the
     read can still hold a finding about what merged, and the refusal otherwise leaves no trace on the card. Names the
-    staged read file and the refusal reason. Keyed by delegation id; any other refusal or action writes nothing."""
+    staged read file and the refusal reason. Keyed by the WAKE (claim key without its ``#restartN`` suffix), not the
+    delegation: a restart redispatch of the same wake mints a new delegation id and must not add a second comment.
+    Any other refusal or action writes nothing."""
     reason = str(result.get("reason") or "")
     if result.get("action") != "surface" or not reason.startswith(_MERGED_REFUSAL):
         return False
     from hermes_cli import kanban_db as kb
 
-    tag = f"(delegation {entry['delegation_id']})"
+    tag = f"(wake {str(entry['key']).split('#restart', 1)[0]})"
     staged = _staged_read(entry, [result.get("detail"), *(result.get("evidence") or []), result.get("summary")])
     body = (f"{_STALE_READ_HEAD} ({reason}); the child's read was not delivered. "
             f"Staged read: {staged or 'none found'}. Child said: {result.get('summary') or 'no summary'} {tag}")
