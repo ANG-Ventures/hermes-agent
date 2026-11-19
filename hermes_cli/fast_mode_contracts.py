@@ -93,13 +93,32 @@ FAST_MODE_CAPABILITY_CATALOG: Mapping[str, Mapping[str, Any]] = MappingProxyType
 # per model, not per family: GPT-6 Astra is GA in the API and on the Codex
 # backend (Pro 500 / Enterprise) as of 2026-09-29; GPT-6.1 Sol is listed in the
 # guide and pricing table and advertised by the Codex backend as of 2026-10-13.
+# GPT-6.2 Sol / GPT-6.2 Astra: the guide (checked 2026-11-19) says "It supports
+# GPT-6.2 Astra, GPT-6.2 Sol, GPT-6 Astra, and GPT-6.1 Sol" and "Set model to
+# gpt-6.2-astra, gpt-6.2-sol, gpt-6-astra, or gpt-6.1-sol"; Ultrafast for both
+# 6.2 models is US data residency only. The Codex backend answered 200 to
+# service_tier=ultrafast for both on 2026-11-19 (t_1b32cc25).
 # Kept separate from FAST_MODE_CAPABILITY_CATALOG so the Priority/Fast contracts
 # (and their dated snapshot tests) stay untouched.
 ULTRAFAST_CAPABILITY_CONTRACT: Mapping[str, Any] = MappingProxyType(
     {
         "source_url": "https://developers.openai.com/api/docs/guides/ultrafast-mode",
-        "checked_date": "2026-10-13",
-        "models": ("gpt-6-astra", "gpt-6.1-sol"),
+        "checked_date": "2026-11-19",
+        "models": ("gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"),
+    }
+)
+
+#: GPT-6-generation slugs with an explicit "no Ultrafast" decision, and why.
+#: Every gpt-6* slug the curated catalogs carry must be in the contract above or
+#: here (tests/cli/test_ultrafast_tier_decisions.py), so a new model flip cannot
+#: silently drop ``agent.service_tier: ultrafast``.
+ULTRAFAST_NOT_SUPPORTED: Mapping[str, str] = MappingProxyType(
+    {
+        model: "not listed in the Ultrafast guide (checked 2026-11-19)"
+        for model in (
+            "gpt-6-sol", "gpt-6-sol-pro", "gpt-6-luna", "gpt-6-luna-pro",
+            "gpt-6.1-sol-pro", "gpt-6.1-terra", "gpt-6.1-terra-pro",
+        )
     }
 )
 

@@ -571,11 +571,12 @@ _LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "openc
 # positives are harmless. Codex-series models are excluded — the Codex Responses API doesn't
 # expose service_tier.
 _OPENAI_FAST_MODE_PREFIXES: tuple[str, ...] = ("gpt-", "o1", "o3", "o4")
-# OpenAI Ultrafast (service_tier="ultrafast", 6x Standard): GPT-6 Astra and GPT-6.1 Sol
-# (developers.openai.com/api/docs/guides/ultrafast-mode, checked 2026-10-13; the Codex backend
-# /models advertises the ultrafast tier for gpt-6.1-sol too).
+# OpenAI Ultrafast (service_tier="ultrafast"): GPT-6 Astra, GPT-6.1 Sol, GPT-6.2 Sol, GPT-6.2 Astra
+# (developers.openai.com/api/docs/guides/ultrafast-mode, checked 2026-11-19; the Codex backend
+# /models advertises the ultrafast tier for gpt-6.1-sol too, and answered 200 to it for both 6.2
+# slugs on 2026-11-19). Same list as fast_mode_contracts.ULTRAFAST_CAPABILITY_CONTRACT.
 # Exact wire slugs, matched after stripping the vendor prefix and the Hermes-side ``-900k`` alias.
-_OPENAI_ULTRAFAST_MODELS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6.1-sol"})
+_OPENAI_ULTRAFAST_MODELS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"})
 
 
 # Providers where models.dev is authoritative: the curated list is an offline fallback plus custom
