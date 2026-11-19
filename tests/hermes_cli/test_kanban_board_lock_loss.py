@@ -19,13 +19,14 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli.sqlite_safe_read import process_holds_open_fd
+from hermes_cli.sqlite_safe_read import connect_tracked, process_holds_open_fd
 
 pytestmark = pytest.mark.platforms("posix")
 
@@ -80,6 +81,41 @@ def test_quarantine_refuses_while_an_untracked_connection_is_open(tmp_path):
     finally:
         conn.close()
     assert not list(tmp_path.glob("kanban.db.corrupt.*"))
+
+
+def test_quarantine_holds_the_lifecycle_lock_against_a_concurrent_tracked_open(tmp_path, monkeypatch):
+    """A tracked connection opened between the open-handle check and the raw copy would lose its
+    POSIX locks to the copy's close(). The open must wait until the copy is done (t_b8456297)."""
+    db = tmp_path / "kanban.db"
+    seed = sqlite3.connect(db)
+    seed.execute("CREATE TABLE t(v)")
+    seed.commit()
+    seed.close()
+    opened = threading.Event()
+    conns: list = []
+    state: dict = {}
+
+    def _open():
+        conns.append(connect_tracked(db, check_same_thread=False))
+        opened.set()
+
+    real_fingerprint = kbc._db_fingerprint
+
+    def _fingerprint_then_race(path):  # runs after the checks, before the raw read and copy
+        state["thread"] = threading.Thread(target=_open, daemon=True)
+        state["thread"].start()
+        state["opened_before_copy"] = opened.wait(1.0)
+        return real_fingerprint(path)
+
+    monkeypatch.setattr(kbc, "_db_fingerprint", _fingerprint_then_race)
+    try:
+        backup = kbc._backup_corrupt_db(db)
+        state["thread"].join(30)
+        assert opened.is_set()
+        assert not state["opened_before_copy"] or backup is None
+    finally:
+        for conn in conns:
+            conn.close()
 
 
 def test_quarantine_copies_once_per_episode_until_a_clean_verdict(tmp_path):

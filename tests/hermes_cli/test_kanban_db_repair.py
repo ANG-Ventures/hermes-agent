@@ -124,6 +124,34 @@ def test_connect_auto_repairs_index_only_corruption(tmp_path):
     assert any(m.startswith("wrong # of entries in index") for m in pre)
 
 
+@pytest.mark.parametrize("repair", ["repair_db", "connect"])
+def test_each_repaired_corruption_gets_its_own_pre_repair_copy(tmp_path, monkeypatch, repair):
+    """A clean repair ends the copy episode: the next corruption of the same file is a new
+    incident and gets its own pre-repair copy, not the previous incident's (t_b8456297)."""
+    db_path = tmp_path / "kanban.db"
+    _build_board_db(db_path)
+    copies: list = []
+    real_backup = kbc._backup_corrupt_db
+    monkeypatch.setattr(kbc, "_backup_corrupt_db", lambda p: copies.append(real_backup(p)) or copies[-1])
+
+    for episode in range(2):
+        _corrupt_index(db_path, "idx_tasks_status")
+        if repair == "repair_db":
+            assert kbc.repair_db(db_path=db_path).status == "repaired"
+        else:
+            kbc.connect(db_path=db_path).close()
+        assert _integrity_messages(db_path) == ["ok"]
+        # The board takes writes between incidents. A plain connection: connect() would stamp a
+        # clean verdict, which ends the episode on its own and hides the repair paths.
+        raw = sqlite3.connect(db_path, isolation_level=None)
+        raw.execute("UPDATE tasks SET title = title || ?", (f"-after-{episode}",))
+        raw.close()
+
+    assert len(copies) == 2 and None not in copies
+    assert copies[0] != copies[1]
+    assert all(copy.is_file() for copy in copies)
+
+
 
 
 
