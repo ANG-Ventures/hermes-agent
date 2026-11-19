@@ -124,6 +124,14 @@ def log_spawn_failed(server_id: str, workspace_root: str, exc: BaseException) ->
     _emit(server_id, logging.WARNING, f"spawn/initialize failed for {workspace_root}: {type(exc).__name__}: {exc}")
 
 
+def log_server_crashed(server_id: str, workspace_root: str, details: str, crashes: int, retry_in: float) -> None:
+    """A running server died without being asked to stop (V8 heap abort, OOM kill).  WARNING once per
+    crash: the caller records each dead client exactly once, then backs off ``retry_in`` seconds."""
+    until = f"respawn in {retry_in:.0f}s" if retry_in > 0 else "respawn on the next edit"
+    _emit(server_id, logging.WARNING, f"server for {workspace_root} died unexpectedly "
+          f"({details or 'exit status unknown'}); crash {crashes} in a row, {until}")
+
+
 def log_skipped_broken(server_id: str, workspace_root: str, file_path: str, retry_in: Optional[float] = None) -> None:
     """A request was skipped because ``(server_id, root)`` is marked broken.  INFO once per root, then DEBUG:
     at default log levels a skipped file and a clean file otherwise look identical (``log_clean`` is DEBUG).

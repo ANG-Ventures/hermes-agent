@@ -190,6 +190,7 @@ def test_service_replaces_client_after_reader_failure(
         wait_mode="document",
         wait_timeout=0.5,
         install_strategy="manual",
+        crash_backoff_seconds=(),  # a dead client's respawn backoff is covered by test_crash_backoff.py
     )
     try:
         async def _break_first_client():

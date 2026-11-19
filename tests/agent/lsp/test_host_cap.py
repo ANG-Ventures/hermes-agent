@@ -147,7 +147,7 @@ def test_dead_server_gives_back_its_slot_to_a_replacement(repo):
     """C5 #48 (PR #1019): a server that died keeps no host slot; at the cap the
     next edit must spawn a replacement instead of running without LSP."""
     f = str(repo.path / "x.py")
-    svc = _service(max_servers_per_host=1)
+    svc = _service(max_servers_per_host=1, crash_backoff_seconds=())  # backoff: test_crash_backoff.py
     try:
         svc.snapshot_baseline(f)
         assert len(repo.spawns) == 1 and host_slots.held_count(1) == 1
