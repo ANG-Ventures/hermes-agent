@@ -518,12 +518,13 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         return {"ok": True, "skipped": "externally-owned"}
     if resolve_store_python(root) is None:
         return {"ok": True, "skipped": "no-store-python"}
-    if _in_kanban_workspace(root):
-        return {"ok": True, "skipped": "kanban-workspace"}
     try:
         local = root / ".hermes" / "bin"
         if len(ensure_install_launchers(root, local)) != len(WINDOWS_BIN_LAUNCHERS):
             return {"ok": False, "error": "source launcher publication failed"}
+        # The tree's own .hermes/bin is still repaired; only the PATH exposure is withheld.
+        if _in_kanban_workspace(root):
+            return {"ok": True, "skipped": "kanban-workspace"}
         dirs = [Path.home() / ".local" / "bin"]
         # Repair existing FHS/custom-home exposure, but never create new global
         # entries or reclaim a convenience that was repointed to another root.
@@ -554,6 +555,8 @@ def _in_kanban_workspace(root: Path) -> bool:
         # Every board, not just the current one: the configured root holds
         # <root>/<board>/..., and legacy named boards keep boards/<slug>/workspaces.
         roots.extend(str(path) for path in kanban_db.boards_root().glob("*/workspaces"))
+        # default's legacy root is not under boards/, so the glob misses it once another board is current.
+        roots.append(str(kanban_db.kanban_home() / "kanban" / "workspaces"))
         from hermes_cli.kanban_workspace_policy import configured_root
 
         roots.append(str(configured_root()[0] or ""))
