@@ -1310,15 +1310,55 @@ def _moved_noise_filter_on() -> bool:
         return False
 
 
-def _moved_noise(row: Any, episode: Optional[int]) -> bool:
+# t_d712444b round 2: session-less kernel bookkeeping that changes nothing a verdict reads (a reaped worker pid, the
+# dispatcher's peer collision warning, a released placement door). A worker start, a completion, a send-back, an
+# assignment and a review request are NOT here: they still refuse.
+_KERNEL_NOISE_KINDS = frozenset({"terminal_worker_reaped", "dispatch_collision_peer_warning", "door_released"})
+DERIVED_APPROVE_HEAD = "pipeline derived: APPROVE"
+
+
+def _derived_approve(conn: Any, task_id: str, payload: dict, created_at: Any) -> bool:
+    """t_d712444b: the ``commented`` event points at a pipeline-derived APPROVE record. The event carries no body, so
+    the comment row is found by task, author, time (within 2 s of the event) and length (the event's ``len`` is the
+    body before the kernel strips it). Every such candidate must be the record (first line ``pipeline derived:
+    APPROVE``, a ``review_coverage:`` line whose ``by`` is ``pipeline/derived``); none, or any other, is not noise."""
+    author, n = str(payload.get("author") or "").strip(), payload.get("len")
+    if not author or not isinstance(n, int) or not isinstance(created_at, (int, float)):
+        return False
+    rows = conn.execute("SELECT body FROM task_comments WHERE task_id = ? AND author = ? AND created_at BETWEEN ? AND ?",
+                        (task_id, author, int(created_at) - 2, int(created_at) + 2)).fetchall()
+    bodies = [str(r[0] or "") for r in rows if 0 <= n - len(str(r[0] or "")) <= 8]
+    if not bodies:
+        return False
+    for body in bodies:
+        lines = body.splitlines()
+        if not lines or not lines[0].startswith(DERIVED_APPROVE_HEAD):
+            return False
+        cov = [ln.split(":", 1)[1] for ln in lines[1:] if ln.startswith("review_coverage:")]
+        try:
+            rec = json.loads(cov[0]) if cov else None
+        except ValueError:
+            return False
+        if not isinstance(rec, dict) or rec.get("by") != "pipeline/derived" or rec.get("verdict") != "APPROVE":
+            return False
+    return True
+
+
+def _moved_noise(row: Any, episode: Optional[int], *, action: Optional[str] = None, conn: Any = None,
+                 task_id: Optional[str] = None) -> bool:
     """t_d712444b: a session-less event that changes nothing a verdict reads. A comment by kernel automation
     (``MACHINE_AUTHORS``) or by a script with no verified identity (``unverified:*``, the authors the stale guard
     already never reads as the owner: event-land ci-red lines, CI-red labels); the review_deadman of the claim's
-    own review episode; a boomerang delivery marker. Anything carrying a session (owner, worker, another child)
-    and every other kind still counts."""
+    own review episode; a boomerang delivery marker; kernel bookkeeping (:data:`_KERNEL_NOISE_KINDS`); for a
+    ``request_changes`` verdict only, a pipeline-derived APPROVE record (a reader's send-back is not refused by a
+    derived approval). Anything carrying a session (owner, worker, another child) and every other kind still counts."""
     from hermes_cli.kanban_close_on_guard import MACHINE_AUTHORS
 
-    if row[0] or row[1] not in ("commented", "review_deadman", DELIVERED_KIND):
+    if row[0]:
+        return False
+    if row[1] in _KERNEL_NOISE_KINDS:
+        return True
+    if row[1] not in ("commented", "review_deadman", DELIVERED_KIND):
         return False
     try:
         payload = json.loads(row[2] or "{}")
@@ -1328,19 +1368,22 @@ def _moved_noise(row: Any, episode: Optional[int]) -> bool:
         return False
     if row[1] == "commented":
         author = str(payload.get("author") or "").strip().lower()
-        return author in MACHINE_AUTHORS or author.startswith("unverified:")
+        if author in MACHINE_AUTHORS or author.startswith("unverified:"):
+            return True
+        return (action == "request_changes" and conn is not None and bool(task_id)
+                and _derived_approve(conn, task_id, payload, row[3] if len(row) > 3 else None))
     if row[1] == "review_deadman":
         return episode is not None and payload.get("episode") == episode
     return payload.get("via") == VIA
 
 
-def _moved(entry: dict, kb: Any, conn: Any) -> Optional[str]:
+def _moved(entry: dict, kb: Any, conn: Any, action: Optional[str] = None) -> Optional[str]:
     """RC-3 freshness: an event newer than the claim's cursor (rows by this claim's own
     child_session excepted, pass-5 RC-B; machine noise excepted, :func:`_moved_noise`), a status
     change, or a moved own-PR head."""
     child = str(entry.get("child_session") or "")
     cursor = int(entry.get("cursor_event_id") or entry["event_id"])
-    rows = conn.execute("SELECT actor_session_id, kind, payload FROM task_events WHERE task_id = ? AND id > ?",
+    rows = conn.execute("SELECT actor_session_id, kind, payload, created_at FROM task_events WHERE task_id = ? AND id > ?",
                         (entry["task_id"], cursor)).fetchall()
     if entry.get("row") == "own_repo_review_all_keys_answered":
         # t_6e9f48cc: that child's own work IS comments (verdict lines + coverage), posted from a
@@ -1348,7 +1391,7 @@ def _moved(entry: dict, kb: Any, conn: Any) -> Optional[str]:
         rows = [r for r in rows if r[1] != "commented"]
     if rows and _moved_noise_filter_on():
         episode = _review_entry_id(kb, conn, entry["task_id"], cursor)
-        rows = [r for r in rows if not _moved_noise(r, episode)]
+        rows = [r for r in rows if not _moved_noise(r, episode, action=action, conn=conn, task_id=entry["task_id"])]
     if any(not child or (r[0] or "") != child for r in rows):
         return "state moved"
     task = kb.get_task(conn, entry["task_id"])
@@ -1675,7 +1718,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
                                handback=handback_row(live, {"summary": summary, "action": action})
                                if handback else None)
             return {"ok": False, "action": action, "reason": "replay", "summary": summary, "noop": True}
-        why = _moved(live, kb, conn)
+        why = _moved(live, kb, conn, action)
         if why:
             findings = [_first_line(f, 300) for f in verdict.get("findings") or [] if str(f).strip()][:5]
             return {"ok": False, "action": action, "reason": why, "summary": summary, "findings": findings,
