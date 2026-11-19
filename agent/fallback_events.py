@@ -181,7 +181,11 @@ def relay_synthetic_error(body: Any, text: Optional[str] = None) -> Optional[str
 class CreditLaneCode(NamedTuple):
     """How a fallback row names one credit-lane relay ``error.type`` (t_4c447d32).
 
-    ``trigger_class``: the §4.1 class. ``head``: the announce head label (2-3
+    ``trigger_class``: the §4.1 class the code means (documentation; the
+    contract test pins it to the vocabulary). It is NOT returned by
+    :func:`classify_trigger`, which drives the sticky arm and the quota gate:
+    the card is labels-only, and e.g. ``quota_model`` would bench a recovered
+    primary for 6 h (Prism 16f26d03b5d4). ``head``: the announce head label (2-3
     words). ``hop``: the leg that failed (``fallback_policy.HOPS``). ``cause``:
     the rider when the message names no seat. ``seat_cause``: the rider when
     it does (``{seat}``, ``{exc}`` = `` (TimeoutError)`` or empty); None means
@@ -238,7 +242,6 @@ CREDIT_LANE_ERROR_CODES: Dict[str, CreditLaneCode] = {
         "lane_incapable", "Fable disabled", "relay",
         f"credit lane has Fable switched off {_NOT_ANTHROPIC}"),
 }
-_CREDIT_CODE_RE = re.compile(r'"type"\s*:\s*"(credit_[a-z_]+)"')
 _CREDIT_SEAT_RE = re.compile(r"\b(?:on|for) (local|sub-vps-\d+)\b")
 _CREDIT_EXC_RE = re.compile(r"\(([A-Z]\w*(?:Error|Exception|Timeout))\)")
 _CREDIT_WHY_RE = re.compile(r"no eligible credit key \(([a-z_]+)\)")
@@ -253,18 +256,12 @@ def _credit_error_obj(body: Any) -> Optional[Dict[str, Any]]:
 
 def credit_lane_code(body: Any, text: Optional[str] = None) -> Optional[str]:
     """The credit-lane relay code of an error (a key of
-    :data:`CREDIT_LANE_ERROR_CODES`), else None. Reads ``error.type`` of the
-    Anthropic-shaped body (or the inner object the SDK passes), then the
-    exception text. Never raises."""
-    try:
-        obj = _credit_error_obj(body)
-        cand = str((obj or {}).get("type") or "").strip().lower()
-        if cand not in CREDIT_LANE_ERROR_CODES and text:
-            m = _CREDIT_CODE_RE.search(str(text))
-            cand = m.group(1) if m else ""
-        return cand if cand in CREDIT_LANE_ERROR_CODES else None
-    except Exception:  # noqa: BLE001
-        return None
+    :data:`CREDIT_LANE_ERROR_CODES`), else None. Reads only ``error.type`` of
+    the Anthropic-shaped body (or the inner object the SDK passes): a
+    ``credit_*`` string elsewhere in the text is not the relay's answer.
+    ``text`` is unused; kept so callers pass the same pair as the other readers."""
+    cand = str((_credit_error_obj(body) or {}).get("type") or "").strip().lower()
+    return cand if cand in CREDIT_LANE_ERROR_CODES else None
 
 
 def _credit_message(body: Any, text: Optional[str]) -> str:
@@ -444,10 +441,6 @@ def classify_trigger(*, text: Optional[str] = None,
     entry = bridge_code_entry(bridge_error_code(body, text))
     if entry:
         return entry.trigger_class, "relay_code"
-    # The credit-lane relay's own error.type codes (t_4c447d32).
-    ccode = credit_lane_code(body, text)
-    if ccode:
-        return CREDIT_LANE_ERROR_CODES[ccode].trigger_class, "relay_code"
     cls = classify_text(text, http_status=http_status, exc_name=exc_name,
                         reason=reason)
     if (cls == "unclassified" and isinstance(floor, dict)

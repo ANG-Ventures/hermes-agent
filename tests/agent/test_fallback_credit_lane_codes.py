@@ -98,11 +98,16 @@ def test_row_shape(code):
 
 
 @pytest.mark.parametrize("code,status", sorted(RELAY_CREDIT_CODES.items()))
-def test_classify_names_the_class_from_the_relay_code(code, status):
-    body = {"type": "error", "error": {"type": code, "message": code}}
-    cls, src = fbe.classify_trigger(text=f"HTTP {status}: {body}", http_status=status,
+def test_classify_trigger_ignores_the_table(code, status):
+    # Labels only (card rail; Prism 16f26d03b5d4): classify_trigger feeds the
+    # sticky arm and the quota gate through pending_trigger_class, so a credit
+    # code must classify exactly as the same body with a non-credit type does.
+    def _cls(etype):
+        body = {"type": "error", "error": {"type": etype, "message": code}}
+        return fbe.classify_trigger(text=f"HTTP {status}: {body}", http_status=status,
                                     headers={}, body=body)
-    assert (cls, src) == (fbe.CREDIT_LANE_ERROR_CODES[code].trigger_class, "relay_code")
+
+    assert _cls(code) == _cls("api_error")
 
 
 def test_unknown_error_type_is_not_a_credit_code():
@@ -110,6 +115,8 @@ def test_unknown_error_type_is_not_a_credit_code():
     assert fbe.credit_lane_code(body) is None
     assert fbe.credit_lane_code({"error": "pool at capacity"}) is None
     assert fbe.credit_lane_code(None, "garbage") is None
+    # A credit_* string in the text alone is not the relay's answer.
+    assert fbe.credit_lane_code(None, '{"type": "credit_lane_off"}') is None
 
 
 def test_seat_and_exception_read_from_the_message():
@@ -137,7 +144,7 @@ def test_live_dead_letter_body_renders_the_target_banner(_home, monkeypatch):
         print(text)
         assert text == EXPECTED, text
         assert "unclassified" not in text and "hop unknown" not in text
-        assert row["trigger_class"] == "conn"
+        assert row["class_source"] != "relay_code"   # the policy saw what it saw before
         assert not (_home / "state" / "fallback-unclassified.jsonl").exists()
     finally:
         monkeypatch.undo()
