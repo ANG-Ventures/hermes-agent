@@ -204,7 +204,7 @@ def _pyright_config(root: str) -> Optional[str]:
         return config
     pyproject = os.path.join(root, "pyproject.toml")
     try:
-        with open(pyproject, encoding="utf-8", errors="replace") as fh:
+        with open(pyproject, encoding="utf-8-sig", errors="replace") as fh:
             return pyproject if "[tool.pyright]" in fh.read() else None
     except OSError:
         return None
