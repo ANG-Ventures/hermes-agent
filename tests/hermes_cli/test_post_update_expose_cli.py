@@ -183,6 +183,24 @@ class TestExposeCli:
         assert _launchers._in_kanban_workspace(tree.resolve())
         assert not _launchers._in_kanban_workspace((tmp_path / "elsewhere").resolve())
 
+    def test_host_root_workspaces_root_detected_under_a_profile(self, monkeypatch, tmp_path):
+        """``kanban.workspaces_root`` set only in the host's root config.yaml (the Studio's 29 worker
+        profiles carry no such key), read from an unpinned profile invocation."""
+        for var in ("HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_DB",
+                    "HERMES_KANBAN_HOME"):
+            monkeypatch.delenv(var, raising=False)
+        base = tmp_path / "base"
+        scratch = tmp_path / "scratch"
+        profile = base / "profiles" / "daedalus"
+        profile.mkdir(parents=True)
+        (base / "config.yaml").write_text(f"kanban:\n  workspaces_root: {scratch}\n", encoding="utf-8")
+        (profile / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        tree = scratch / "default" / "t_12345678" / "wt"
+        tree.mkdir(parents=True)
+        assert _launchers._in_kanban_workspace(tree.resolve())
+        assert not _launchers._in_kanban_workspace((tmp_path / "elsewhere").resolve())
+
     @posix_only
     def test_leaves_another_installs_wrapper_alone(self, fake_install):
         home, root = fake_install

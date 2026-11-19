@@ -559,6 +559,17 @@ def _in_kanban_workspace(root: Path) -> bool:
         roots.append(str(configured_root()[0] or ""))
     except Exception:  # noqa: BLE001 - a broken board config must not stop an update
         pass
+    try:
+        # configured_root() reads the active profile; a host sets workspaces_root in its root
+        # config.yaml only (no Studio worker profile carries it), so read that one as well.
+        from hermes_cli.config import read_host_root_config
+
+        host_kanban = read_host_root_config().get("kanban") or {}
+        raw = host_kanban.get("workspaces_root") if isinstance(host_kanban, dict) else None
+        if isinstance(raw, str) and Path(raw).expanduser().is_absolute():
+            roots.append(raw)
+    except Exception:  # noqa: BLE001 - an unreadable host config must not stop an update
+        pass
     for entry in filter(None, roots):
         try:
             if root.is_relative_to(Path(entry).expanduser().resolve()):
