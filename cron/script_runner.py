@@ -166,12 +166,21 @@ SKEW_ANY_MARKER_NAME = "script_runner_skew_any"
 
 
 def _skew_any_forced() -> bool:
-    """Kill switch for the loaded-module skew filter: env ``HERMES_CRON_SKEW_LOADED_ONLY=0`` or
-    the file ``<home>/cron/script_runner_skew_any`` exists. Either restores drain on any skew."""
+    """Kill switch for the loaded-module skew filter; either one restores drain on any skew.
+
+    - the file ``<home>/cron/script_runner_skew_any``: the LIVE switch, honoured by a running
+      runner on its next skew check (``touch`` to set, ``rm`` to clear);
+    - env ``HERMES_CRON_SKEW_LOADED_ONLY=0``: a LAUNCH-time switch. The runner reads its own
+      environment, so exporting it elsewhere after start does nothing until the runner restarts.
+
+    A marker that cannot be stat'ed for any reason other than absence counts as set (drain)."""
     if os.environ.get(SKEW_LOADED_ONLY_ENV, "").strip() == "0":
         return True
     try:
-        return (trip_marker_path().parent / SKEW_ANY_MARKER_NAME).exists()
+        (trip_marker_path().parent / SKEW_ANY_MARKER_NAME).stat()
+        return True
+    except FileNotFoundError:
+        return False
     except Exception:
         return True
 
@@ -564,9 +573,10 @@ class ScriptRunner:
         base is the last accepted sha, so a kept skew is diffed once and a later revert of code
         imported from it still drains.
 
-        Kill switch (read on every skew check, no deploy needed): env
-        ``HERMES_CRON_SKEW_LOADED_ONLY=0`` or the file ``<home>/cron/script_runner_skew_any``
-        (next to the trip marker) restores drain on any skew."""
+        Kill switch (no deploy needed, see ``_skew_any_forced``): the file
+        ``<home>/cron/script_runner_skew_any`` (next to the trip marker) is read on every skew
+        check and works on a running runner; env ``HERMES_CRON_SKEW_LOADED_ONLY=0`` is read from
+        the runner's own environment, so it takes effect from the next runner start."""
         if _skew_any_forced():
             logger.warning("script runner code skew: kill switch set (%s=0 or %s); draining",
                            SKEW_LOADED_ONLY_ENV, SKEW_ANY_MARKER_NAME)

@@ -793,6 +793,20 @@ def test_d_skew_kill_switch_restores_drain_on_any_skew(root, monkeypatch, switch
     assert r.draining is True
 
 
+def test_d_skew_kill_switch_marker_lookup_error_drains(tmp_path, monkeypatch):
+    """Prism bf5dfded8c79: an absent marker is off; a marker that cannot be stat'ed (a symlink
+    loop, where Path.exists() says False) counts as set, so the runner drains."""
+    from cron import script_runner
+
+    monkeypatch.delenv("HERMES_CRON_SKEW_LOADED_ONLY", raising=False)
+    monkeypatch.setattr(script_runner, "trip_marker_path",
+                        lambda: tmp_path / "script_runner_tripped")
+    marker = tmp_path / "script_runner_skew_any"
+    assert script_runner._skew_any_forced() is False
+    marker.symlink_to(marker)  # ELOOP on stat()
+    assert script_runner._skew_any_forced() is True
+
+
 @pytest.mark.parametrize("back_to_boot", [False, True], ids=["revert_commit", "checkout_boot"])
 def test_d_code_skew_diffs_against_the_last_accepted_sha(tmp_path, root, monkeypatch,
                                                          back_to_boot):
