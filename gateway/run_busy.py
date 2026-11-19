@@ -75,6 +75,9 @@ _STEER_ENTRIES_ATTR = "_gateway_steer_entries"
 _STEER_DRAINED_ATTR = "_gateway_steer_drained"
 _STEER_LOCK_ATTR = "_gateway_steer_lock"
 _STEER_ENTRIES_MAX = 64
+# The agent-side hook ``steer_user_row`` calls with the drained text (t_b8fbfc54); keep the name in step with
+# ``agent.prompt_builder.STEER_ROW_DISPLAY_METADATA_ATTR``.
+STEER_ROW_DISPLAY_METADATA_ATTR = "_steer_row_display_metadata"
 _STEER_INSTALL_LOCK = threading.Lock()
 # Set while steer_with_provenance runs its verb: the wrapped ``steer`` then records nothing itself.
 _RECORDING = threading.local()
@@ -156,11 +159,22 @@ def _provenance_lock(agent: Any) -> Optional[threading.Lock]:
         attrs["_steer_requeue_sink"] = _requeue_with_snapshot
         attrs["_steer_wipe_sink"] = _wipe_with_entries
         attrs[_STEER_LOCK_ATTR] = lock
+
+        def _row_display_metadata(text, _attrs=attrs, _lock=lock):
+            """The agent's steer row for drained *text* asks here for its ``display_metadata``
+            (``agent.prompt_builder.steer_user_row``): the inbound record of the one message it is,
+            or a merged record (t_b8fbfc54)."""
+            return _drained_display_metadata(_attrs, _lock, text)
+
+        attrs[STEER_ROW_DISPLAY_METADATA_ATTR] = _row_display_metadata
         return lock
 
 
-def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool) -> bool:
-    """``verb(text)`` (the agent's ``steer``/``redirect``) and, when accepted, record the entry."""
+def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool, event: Any) -> bool:
+    """``verb(text)`` (the agent's ``steer``/``redirect``) and, when accepted, record the entry with *event*'s
+    inbound record (``None`` for a steer with no platform message), which the steer row then carries."""
+    from gateway import inbound_record
+    record = inbound_record.display_metadata(event).get(inbound_record.KEY) if event is not None else None
     lock = _provenance_lock(agent) if agent is not None else None
     with lock if lock is not None else contextlib.nullcontext():
         fresh = _steer_buffer_empty(agent)
@@ -170,11 +184,31 @@ def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool) -
         finally:
             _RECORDING.active = False
         if accepted and lock is not None:
-            _record_steer_entry(agent, text, internal=internal, fresh=fresh)
+            _record_steer_entry(agent, text, internal=internal, fresh=fresh, record=record)
     return accepted
 
 
-def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool) -> None:
+def _drained_display_metadata(attrs: dict, lock: Any, text: Any) -> dict:
+    """``inbound_record.steer_display_metadata`` of the newest drain snapshot whose text is *text*; ``{}``
+    when none is (the text was not drained through the gateway wrapper)."""
+    from gateway import inbound_record
+    with lock:
+        for drained_text, entries in reversed(list(attrs.get(_STEER_DRAINED_ATTR) or ())):
+            if drained_text == text:
+                return inbound_record.steer_display_metadata(drained_text, entries)
+    return {}
+
+
+def leftover_steer_display_metadata(agent: Any, leftover: Optional[str]) -> dict:
+    """The record a leftover steer (``result["pending_steer"]``) carries into the next user turn. Read it
+    BEFORE :func:`leftover_steer_is_internal`, which retires the snapshots (t_b8fbfc54)."""
+    lock = getattr(agent, "__dict__", {}).get(_STEER_LOCK_ATTR) if agent is not None else None
+    if lock is None or not leftover:
+        return {}
+    return _drained_display_metadata(agent.__dict__, lock, leftover)
+
+
+def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool, record: Any = None) -> None:
     cleaned = (text or "").strip()
     if not cleaned:
         return
@@ -182,7 +216,7 @@ def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool) -
     if fresh or not isinstance(attrs.get(_STEER_ENTRIES_ATTR), list):
         attrs[_STEER_ENTRIES_ATTR] = []  # a buffer wiped without a drain (hard cancel) leaves stale entries
     ledger = attrs[_STEER_ENTRIES_ATTR]
-    ledger.append((cleaned, bool(internal)))
+    ledger.append((cleaned, bool(internal), record if isinstance(record, dict) else None))
     del ledger[:-_STEER_ENTRIES_MAX]
 
 
@@ -208,9 +242,9 @@ def leftover_steer_is_internal(agent: Any, leftover: Optional[str]) -> bool:
     if not remainder or not drained:
         return False
     text, entries = drained[-1]
-    if (text or "").strip() != remainder or not entries or not all(internal for _, internal in entries):
+    if (text or "").strip() != remainder or not entries or not all(entry[1] for entry in entries):
         return False
-    for entry_text, _ in entries:
+    for entry_text, *_ in entries:
         if entry_text not in remainder:
             return False
         remainder = remainder.replace(entry_text, "", 1)
@@ -608,14 +642,16 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str, *, internal: bool = False) -> bool:
+    def _steer_running_agent(self, running_agent: Any, text: str, *, event: Any, internal: bool = False) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it.
 
         Every accepted steer is recorded ON THE AGENT as a buffer entry with its provenance, so it
         follows the text to whichever turn drains it (see :func:`leftover_steer_is_internal`), never to
-        the context the slot held at steer time (Prism e08366573530, t_506536db)."""
-        accepted = steer_with_provenance(running_agent, running_agent.steer, text, internal=internal)
+        the context the slot held at steer time (Prism e08366573530, t_506536db). *event* is the platform
+        message being steered (its inbound record rides the entry to the steer row, t_b8fbfc54); pass
+        ``event=None`` only for a steer no platform message produced."""
+        accepted = steer_with_provenance(running_agent, running_agent.steer, text, internal=internal, event=event)
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -1049,11 +1085,11 @@ class GatewayBusySessionMixin:
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text,
+                return self._steer_running_agent(running_agent, call_text, event=event,
                                                  internal=bool(getattr(event, "internal", False)))
             # A redirect may land in the steer buffer (tool phase), so it is a buffer entry too.
             return steer_with_provenance(running_agent, getattr(running_agent, verb), call_text,
-                                         internal=bool(getattr(event, "internal", False)))
+                                         internal=bool(getattr(event, "internal", False)), event=event)
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -1554,7 +1590,8 @@ class GatewayBusySessionMixin:
         if not running_agent or not hasattr(running_agent, "steer"):
             return _queue_fallback(t("gateway.steer.queued_no_agent"))
         try:
-            accepted = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
+            accepted = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event),
+                                                 event=event)
         except Exception as exc:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)

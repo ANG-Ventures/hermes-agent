@@ -4144,7 +4144,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # user message (which persists like any other user turn).
         _requeue_pending_steer(agent, steer_text)
         return
-    messages.append(steer_user_row(steer_text))
+    messages.append(steer_user_row(steer_text, agent=agent))
     note_steer_injected(agent, steer_text)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message", len(steer_text),

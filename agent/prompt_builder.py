@@ -592,16 +592,35 @@ def format_steer_marker(steer_text: str) -> str:
 STEER_DISPLAY_KIND = "steer"
 
 
-def steer_user_row(steer_text: str) -> Dict[str, Any]:
+# Instance attribute the gateway installs on an agent it steers (gateway.run_busy): called with the drained
+# steer text, it returns that row's ``display_metadata`` (the platform message's inbound record, t_b8fbfc54).
+STEER_ROW_DISPLAY_METADATA_ATTR = "_steer_row_display_metadata"
+
+
+def steer_user_row(steer_text: str, *, agent: Any) -> Dict[str, Any]:
     """The standalone ``role:user`` row a mid-turn /steer is delivered as (after the newest tool
     result). Its own row — never smeared onto the already-persisted tool row, which append-only
     persistence would leave divergent from the live request — and typed so the alternation repair
-    never merges the next real prompt into it and history renderers can label it."""
+    never merges the next real prompt into it and history renderers can label it.
+
+    *agent* is the agent whose buffer *steer_text* was drained from (``None`` only where there is
+    none): a gateway-steered agent supplies the row's ``display_metadata``, so a Telegram "place it"
+    sent mid-turn keeps the record the chat-buy gate reads (t_b8fbfc54)."""
     from agent.route_note_ingest import relabel_route_note_text  # late: route_note_ingest imports this module
 
     # E11: the steer is received text; relabel before the genuine steering wrapper is added.
-    return {"role": "user", "content": format_steer_marker(relabel_route_note_text(steer_text)).lstrip(),
-            "display_kind": STEER_DISPLAY_KIND}
+    row = {"role": "user", "content": format_steer_marker(relabel_route_note_text(steer_text)).lstrip(),
+           "display_kind": STEER_DISPLAY_KIND}
+    hook = getattr(agent, "__dict__", {}).get(STEER_ROW_DISPLAY_METADATA_ATTR) if agent is not None else None
+    if callable(hook):
+        try:
+            meta = hook(steer_text)
+        except Exception:  # noqa: BLE001 -- a lookup failure leaves the row unrecorded (fails closed)
+            logger.debug("steer row display_metadata lookup failed", exc_info=True)
+            meta = None
+        if isinstance(meta, dict) and meta:
+            row["display_metadata"] = dict(meta)
+    return row
 
 
 STEER_CHANNEL_NOTE = (

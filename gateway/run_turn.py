@@ -51,6 +51,26 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# result key: the inbound record a leftover /steer carries into the user turn it becomes (t_b8fbfc54).
+_LEFTOVER_STEER_META = "_pending_steer_display_metadata"
+
+
+def _leftover_steer_meta(result: Any, pending: Optional[str]) -> Dict[str, Any]:
+    """``display_metadata`` of the leftover steer when *pending* is that steer's text, else ``{}``."""
+    if not isinstance(result, dict) or not pending or pending != result.get("pending_steer"):
+        return {}
+    meta = result.get(_LEFTOVER_STEER_META)
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _leftover_steer_message_id(meta: Any) -> Optional[str]:
+    """The platform message id a leftover steer's row carries (``platform_message_id``: restart dedup and the
+    chat-buy gate's ``telegram:<id>`` lookup), from its record; ``None`` when the row merged several messages."""
+    rec = meta.get("inbound_record") if isinstance(meta, dict) else None
+    if not isinstance(rec, dict) or rec.get("merged") or rec.get("message_id") is None:
+        return None
+    return str(rec["message_id"])
+
 _tool_call_logger_lock = threading.Lock()
 
 
@@ -4227,7 +4247,7 @@ class GatewayTurnMixin:
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
     def _queue_leftover_steer(self, text: str, source: SessionSource, session_key: str, *,
-                              internal: bool = False) -> None:
+                              display_metadata: Dict[str, Any], internal: bool = False) -> None:
         """Append a leftover /steer to the session's /queue overflow (behind the pending follow-up);
         a leftover "/stop" or "/new" must never reach the agent."""
         parts = text.strip().split(None, 1)
@@ -4243,7 +4263,8 @@ class GatewayTurnMixin:
                     return
         self._session_state(session_key).conversation.queued_events.append(
             MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal,
-                         wake_kind=STEER if internal else None)
+                         wake_kind=STEER if internal else None, metadata=dict(display_metadata or {}),
+                         message_id=_leftover_steer_message_id(display_metadata))
         )
         logger.info(
             "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
@@ -4311,7 +4332,8 @@ class GatewayTurnMixin:
             # behind it instead of dropping it — on the overflow tail, never the head slot (the
             # depth-cap branch re-seats pending_event in the head slot and would overwrite it; the
             # next drain promotes the overflow head). Same slash-command guard as the pending text.
-            self._queue_leftover_steer(result["pending_steer"], source, session_key, internal=_steer_internal)
+            self._queue_leftover_steer(result["pending_steer"], source, session_key, internal=_steer_internal,
+                                       display_metadata=result.get(_LEFTOVER_STEER_META) or {})
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):
@@ -4456,7 +4478,9 @@ class GatewayTurnMixin:
                 # An event-less follow-up (leftover /steer, interrupt text) has no slot entry to put
                 # back. No adapter defines ``queue_message``, so it used to vanish here; a completion
                 # steered into the capped turn after its last tool batch was lost (t_97a879af).
-                pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source)
+                _meta = _leftover_steer_meta(result, pending)
+                pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source,
+                                             metadata=_meta, message_id=_leftover_steer_message_id(_meta))
             if adapter and pending_event:
                 # The drain already promoted the overflow head into the slot; merging would REPLACE it
                 # (two internal TEXT wakes never merge), losing an accepted wake (t_f36d21e8). Put the
@@ -4522,6 +4546,8 @@ class GatewayTurnMixin:
             # Event-less interrupt/steer follow-ups continue the effective prompt
             # of the turn they are recursively following.
             next_channel_prompt = turn_ctx.channel_prompt
+            # A leftover /steer that becomes this turn keeps its platform message id on the row (t_b8fbfc54).
+            next_inbound_id = _leftover_steer_message_id(_leftover_steer_meta(result, pending))
 
         # Same composition as a fresh inbound turn: the follow-up (queued event, interrupt text, leftover
         # /steer) must persist the clean text + send time it was rendered from, or replay renders a
@@ -4600,7 +4626,8 @@ class GatewayTurnMixin:
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event),
-                    **wake_display_metadata(pending_event), **inbound_record.display_metadata(pending_event)} or None,
+                    **wake_display_metadata(pending_event), **inbound_record.display_metadata(pending_event),
+                    **(_leftover_steer_meta(result, pending) if pending_event is None else {})} or None,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -5056,11 +5083,14 @@ class GatewayTurnMixin:
                     # Provenance of the leftover steer: internal only when the leftover is built from
                     # internal steer entries of the agent's buffer. Called on EVERY turn end, leftover
                     # or not, so it retires entries a tool batch drained mid-turn (t_506536db).
-                    from gateway.run_busy import leftover_steer_is_internal
-                    _internal = leftover_steer_is_internal(
-                        turn_ctx.agent_holder[0] if turn_ctx.agent_holder else None, result.get("pending_steer"))
+                    from gateway.run_busy import leftover_steer_display_metadata, leftover_steer_is_internal
+                    _steer_agent = turn_ctx.agent_holder[0] if turn_ctx.agent_holder else None
+                    # Before the provenance check, which retires the drain snapshots (t_b8fbfc54).
+                    _steer_meta = leftover_steer_display_metadata(_steer_agent, result.get("pending_steer"))
+                    _internal = leftover_steer_is_internal(_steer_agent, result.get("pending_steer"))
                     if result.get("pending_steer"):
                         result["_pending_steer_internal"] = _internal
+                        result[_LEFTOVER_STEER_META] = _steer_meta
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )

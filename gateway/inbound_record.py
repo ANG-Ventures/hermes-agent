@@ -9,7 +9,9 @@ update itself, never from message text: ``from_id`` (the update's sender), ``cha
 composed turn text (t_239103a9). A batch that absorbed a second message is ``merged``: it is no
 longer one message. Readers (hermes-home ``scripts/shopper-codex/chat_gate.py``, Amazon chat-buy
 approvals) treat a row without the record, or with ``forwarded``/``edited``/``merged`` set, as no proof.
-Internal (self-injected) events never carry one.
+Internal (self-injected) events never carry one. A message steered into a running turn keeps its record on
+the steer row the agent writes (``steer_display_metadata``, t_b8fbfc54); a row built from several steers is
+``merged``.
 """
 
 from __future__ import annotations
@@ -71,6 +73,23 @@ def attach_transcript(event: Any, audio_paths: Any, clips: Any) -> None:
         if isinstance(tx, str) and tx.strip():
             text, source = tx, (str(done[0].get("provider")) if done[0].get("provider") else None)
     event.metadata = {**meta, KEY: {**rec, "transcript": text, "transcript_source": source}}
+
+
+def steer_display_metadata(drained_text: Any, entries: Any) -> dict:
+    """``display_metadata`` for the ONE user row a drained steer buffer becomes (t_b8fbfc54). ``entries`` are the
+    gateway's provenance entries for that buffer, ``(text, internal, record)``. The row carries the record only
+    when it is exactly one entry, that entry is the whole drained text and it has a record; a row built from
+    several messages, or from text no entry accounts for (a steer that bypassed the gateway), carries the first
+    record marked ``merged``, which approves nothing. No record on any entry: ``{}``."""
+    entries = [e for e in entries or () if isinstance(e, tuple) and len(e) >= 2]
+    recs = [e[2] for e in entries if len(e) > 2 and isinstance(e[2], dict)]
+    if not recs:
+        return {}
+    rec = dict(recs[0])
+    whole = len(entries) == 1 and str(entries[0][0]).strip() == str(drained_text or "").strip()
+    if not whole:
+        rec["merged"] = True
+    return {KEY: rec}
 
 
 def display_metadata(event: Any) -> dict:
