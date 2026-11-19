@@ -12,6 +12,9 @@ override so the test path runs on fakes:
   BV2_SCRATCH_BOARD  scratch board slug, ^bv2-smoke       (default: bv2-smoke)
   BV2_HOME_SESSION   home session stamped on the cards    (live: required)
   BV2_ORIGIN_CHAT    Discord channel id (REST, read-only) or a capture file (.jsonl/.txt)
+  BV2_HANDLED_KNOB   the gateway's boomerang-handled-line-chat.enabled knob file
+                     (default: <root>/state/boomerang-handled-line-chat.enabled; dry-run: fixtures)
+  BV2_AGENT_LOG_DIR  fleet agent log dir, <UTC day>.jsonl  (default: <root>/state/agent-logs)
   BV2_GATEWAY_LOG    gateway log                          (default: <root>/logs/gateway.log)
   BV2_GATEWAY_ENV    .env holding DISCORD_BOT_TOKEN       (default: <root>/.env)
   BV2_CONFIG         config.yaml, or a dir of stage<N>.yaml snapshots (fake)
@@ -272,6 +275,11 @@ class _LogFile:
 class ChatMessage:
     ts: float | None
     content: str
+    source: str = "chat"
+
+    @property
+    def shown(self) -> str:
+        return self.content if self.source == "chat" else f"[{self.source}] {self.content}"
 
 
 class FileChat:
@@ -336,6 +344,94 @@ class DiscordChat:
         return sorted(out, key=lambda m: m.ts or 0)
 
 
+# hermes-agent#439 (t_8ab5557d): with this knob file ABSENT (the default) the gateway writes the
+# ``boomerang handled <card> ...`` receipt to the fleet agent log, not the origin chat (a delivered
+# turn posts no line at all; the receipt row is best-effort). Present = the line posts to the chat.
+HANDLED_KNOB_FILE = "boomerang-handled-line-chat.enabled"
+HANDLED_PREFIX = "boomerang handled "
+AGENT_LOG_PRODUCER = "boomerang-wake"
+
+
+def handled_knob_path(live: bool) -> Path:
+    spec = os.environ.get("BV2_HANDLED_KNOB", "").strip()
+    if spec:
+        return Path(spec).expanduser()
+    # Dry-run fixtures keep the pre-#439 chat transcript, so the fixture knob is present.
+    return hermes_root() / "state" / HANDLED_KNOB_FILE if live else FIXTURES / f"fake_{HANDLED_KNOB_FILE}"
+
+
+def agent_log_dir(live: bool) -> Path:
+    spec = os.environ.get("BV2_AGENT_LOG_DIR", "").strip()
+    if spec:
+        return Path(spec).expanduser()
+    return hermes_root() / "state" / "agent-logs" if live else FIXTURES / "fake_agent_logs"
+
+
+class AgentLog:
+    """The gateway's ``boomerang handled`` receipt rows in the fleet agent log (agent_inbox
+    write_agent_log: ``{ts: <ISO Z>, producer: boomerang-wake, text, task_id, ...}``). Live: rows
+    since the step started, from the UTC-day files since then. Dry-run: every file, whole."""
+
+    def __init__(self, path: Path, live: bool, since: float):
+        self.path = path
+        self.live = live
+        self.since = since
+
+    def _files(self) -> list[Path]:
+        if not self.path.is_dir():
+            return []
+        files = sorted(self.path.glob("*.jsonl"))
+        if self.live:
+            first = time.strftime("%Y-%m-%d", time.gmtime(self.since)) + ".jsonl"
+            files = [f for f in files if f.name >= first]
+        return files
+
+    def messages(self) -> list[ChatMessage]:
+        out = []
+        for f in self._files():
+            for raw in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    doc = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(doc, dict) or doc.get("producer") != AGENT_LOG_PRODUCER:
+                    continue
+                text = str(doc.get("text") or doc.get("first_line") or "")
+                if not text.startswith(HANDLED_PREFIX):
+                    continue
+                ts = None
+                try:
+                    ts = _dt.datetime.fromisoformat(str(doc.get("ts")).replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    pass
+                # the row's ts has 1 s resolution: keep a row stamped in the step's first second
+                if self.live and ts is not None and ts < int(self.since):
+                    continue
+                out.append(ChatMessage(ts, text, "agent-log"))
+        return out
+
+
+class HandledReceipts:
+    """The origin chat, plus (knob absent) the agent-log handled receipts. Knob present: the chat
+    alone, so a ``boomerang handled`` line is required IN the chat. Knob absent: the receipt passes
+    from the agent log, and a chat line still counts (the gateway posts it when no log is available
+    or a turn was refused). Only ``boomerang handled`` rows are merged: warnings stay chat-only."""
+
+    def __init__(self, chat, agent_log: AgentLog, knob: Path):
+        self.chat = chat
+        self.agent_log = agent_log
+        self.knob = knob
+        self.chat_mode = knob.exists()
+        self.label = (f"{chat.label} (handled line: chat, knob {knob} present)" if self.chat_mode
+                      else f"{chat.label} + agent-log:{agent_log.path} (handled line: agent log, knob {knob} absent)")
+
+    def messages(self) -> list[ChatMessage]:
+        msgs = list(self.chat.messages())
+        if not self.chat_mode:
+            msgs.extend(self.agent_log.messages())
+        return sorted(msgs, key=lambda m: m.ts or 0)
+
+
 def make_chat(live: bool, since: float):
     spec = os.environ.get("BV2_ORIGIN_CHAT", "").strip()
     if not spec:
@@ -344,8 +440,10 @@ def make_chat(live: bool, since: float):
         spec = str(FIXTURES / "fake_origin_chat.jsonl")
     if spec.isdigit():
         env_path = Path(os.environ.get("BV2_GATEWAY_ENV") or hermes_root() / ".env")
-        return DiscordChat(spec, env_path, since)
-    return FileChat(Path(spec).expanduser())
+        chat = DiscordChat(spec, env_path, since)
+    else:
+        chat = FileChat(Path(spec).expanduser())
+    return HandledReceipts(chat, AgentLog(agent_log_dir(live), live, since), handled_knob_path(live))
 
 
 def gateway_log_path(live: bool) -> Path:
@@ -535,7 +633,7 @@ def find_chat(chat, pattern: re.Pattern, after_ts: float | None = None) -> ChatM
             continue
         for line in msg.content.splitlines() or [msg.content]:
             if pattern.search(line):
-                return ChatMessage(msg.ts, line.strip())
+                return ChatMessage(msg.ts, line.strip(), msg.source)
     return None
 
 
@@ -590,10 +688,10 @@ def step1(ctx: Ctx) -> StepReport:
             ctx.force(rep, "inject_failure", card=fail_card)
 
     hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(done_card)), win)
-    rep.check(f"origin chat: `boomerang handled {done_card} (<kind>): <summary>`", PASS if hit else FAIL,
-              hit.content if hit else f"absent after {win:.0f}s")
+    rep.check(f"handled receipt: `boomerang handled {done_card} (<kind>): <summary>`", PASS if hit else FAIL,
+              hit.shown if hit else f"absent after {win:.0f}s")
     if hit:
-        rep.raw.append(f"--- chat match\n{hit.content}")
+        rep.raw.append(f"--- handled match\n{hit.shown}")
     line = ctx.poll(lambda: find_log(log, re_notifier_line(done_card)), ctx.tick_window)
     disp = re_notifier_line(done_card).search(line).group("disp") if line else None
     rep.check(f"gateway log: `kanban notifier: boomerang-wake {done_card} disposition=auto`",
@@ -606,7 +704,7 @@ def step1(ctx: Ctx) -> StepReport:
         return find_chat(chat, re_boomerang_wake_line(ni_card))
     neg = ctx.poll(ni_auto, ctx.tick_window)  # live: waits the whole window for a line that must not come
     rep.check(f"needs_input card {ni_card}: no `boomerang handled` line", FAIL if neg else PASS,
-              neg.content if neg else f"none ({ctx.window_label()})")
+              neg.shown if neg else f"none ({ctx.window_label()})")
     ni_log = find_log(log, re_notifier_line(ni_card))
     ni_disp = re_notifier_line(ni_card).search(ni_log).group("disp") if ni_log else None
     rep.check(f"needs_input card {ni_card}: notifier disposition is not auto",
@@ -639,7 +737,7 @@ def _check_live_resurface(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, card
     early = find_chat(chat, re_boomerang_wake_line(card))
     if early:
         rep.check(f"failure card {card}: fault landed before the verdict", INCOMPLETE,
-                  f"`{early.content}` posted: the child finished before inject_failure; re-run "
+                  f"`{early.shown}` posted: the child finished before inject_failure; re-run "
                   f"(or set commands.s1_fault_hold)")
         return
     after = log_line_ts(dispatched) if (ctx.live and dispatched) else None
@@ -747,6 +845,7 @@ def step2(ctx: Ctx) -> StepReport:
     rep = StepReport(2, "kill switches take effect on the next tick (AC-8, INV-7)", ctx.mode)
     log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
     chat = make_chat(ctx.live, rep.started)
+    rep.notes.append(f"origin chat `{chat.label}`")
     rep.notes.append("the harness never edits config or the stop file: it prints each one-line "
                      "change for Apollo and waits on the ack file")
 
@@ -803,8 +902,8 @@ def step2(ctx: Ctx) -> StepReport:
                 rep.notes.append(f"fork_enabled: event forced {iso(t)}, downgrade logged {iso(ts)} "
                                  f"({ts - t:.1f}s; tick {ctx.tick:.0f}s)")
         hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.timeout)
-        rep.check(f"origin chat: `boomerang handled {card}` still posts (summary-mode child)",
-                  PASS if hit else FAIL, hit.content if hit else "absent")
+        rep.check(f"handled receipt: `boomerang handled {card}` still written (summary-mode child)",
+                  PASS if hit else FAIL, hit.shown if hit else "absent")
 
     # (b) the stop file: the next wake on a boomerang-wake card is NOT handled by a child.
     if stop("boomerang_wake=disabled"):
@@ -1414,11 +1513,11 @@ def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_pat
                       + ("" if outcome in handled_set else f" (not in the gateway's HANDLED_OUTCOMES; "
                                                           f"reason={entry.get('reason')})"))
     done = ctx.poll(lambda: find_chat(chat, re_restart_done_line(card), after_ts=after), ctx.timeout)
-    rep.check(f"{arm}: origin chat `boomerang handled {card} (<kind>): <summary>` or "
+    rep.check(f"{arm}: handled receipt `boomerang handled {card} (<kind>): <summary>` or "
               f"`[boomerang-wake] child surfaced {card}` after the restart",
-              PASS if done else FAIL, done.content if done else "absent")
+              PASS if done else FAIL, done.shown if done else "absent")
     if done:
-        rep.raw.append(f"--- chat match ({arm})\n{done.content}")
+        rep.raw.append(f"--- handled match ({arm})\n{done.shown}")
     lost = ctx.poll(lambda: find_chat(chat, re_lost_line(card)), ctx.tick_window)
     rep.check(f"{arm}: ZERO `warning boomerang-wake lost {card}` lines in the origin chat",
               FAIL if lost else PASS, lost.content if lost else f"none ({ctx.window_label()})")
@@ -1455,7 +1554,7 @@ def _s4_fallback_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path:
     # lost-warning, not a single read; a post one second after the last read must still fail the drill.
     late = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.tick_window)
     rep.check(f"{arm}: no late `boomerang handled {card}` within {ctx.window_label()} after the re-surface",
-              FAIL if late else PASS, late.content if late else "none")
+              FAIL if late else PASS, late.shown if late else "none")
 
 
 def step4(ctx: Ctx) -> StepReport:
@@ -1463,6 +1562,7 @@ def step4(ctx: Ctx) -> StepReport:
                      ctx.mode)
     log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
     chat = make_chat(ctx.live, rep.started)
+    rep.notes.append(f"origin chat `{chat.label}`")
     pid_path = Path(os.environ.get("BV2_GATEWAY_PID") or (
         hermes_root() / "gateway.pid" if ctx.live else FIXTURES / "fake_gateway.pid"))
     rep.notes.append(f"the harness never restarts anything; gateway pid file `{pid_path}` boot_id at start: "

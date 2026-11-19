@@ -37,7 +37,8 @@ run = _load()
 
 _BV2_VARS = ("BV2_WAKE_STATE", "BV2_KANBAN_CMD", "BV2_SCRATCH_BOARD", "BV2_HOME_SESSION", "BV2_ORIGIN_CHAT",
              "BV2_GATEWAY_LOG", "BV2_GATEWAY_ENV", "BV2_CONFIG", "BV2_WIRELOG_DIR", "BV2_ACK_FILE",
-             "BV2_EVIDENCE", "BV2_PLAN", "BV2_GATEWAY_PID", "BV2_STOP_FILE")
+             "BV2_EVIDENCE", "BV2_PLAN", "BV2_GATEWAY_PID", "BV2_STOP_FILE", "BV2_HANDLED_KNOB",
+             "BV2_AGENT_LOG_DIR")
 
 
 @pytest.fixture
@@ -52,6 +53,8 @@ def env(tmp_path, monkeypatch):
     tripwire.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
     tripwire.chmod(tripwire.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("BV2_KANBAN_CMD", str(tripwire))
+    # never read the host's real agent log (a live step's default is <root>/state/agent-logs)
+    monkeypatch.setenv("BV2_AGENT_LOG_DIR", str(tmp_path / "no-agent-logs"))
     return {"tmp": tmp_path, "evidence": evidence, "marker": marker}
 
 
@@ -483,8 +486,14 @@ elif verb == "complete":
     card = argv[argv.index("complete") + 1]
     with open(os.environ["BV2_GATEWAY_LOG"], "a") as fh:
         fh.write(f"{stamp} INFO gateway.kanban_watchers: kanban notifier: boomerang-wake {card} disposition=auto\n")
-    with open(os.environ["BV2_ORIGIN_CHAT"], "a") as fh:
-        fh.write(json.dumps({"ts": time.time(), "content": f"boomerang handled {card} (completed): verified"}) + "\n")
+    line = f"boomerang handled {card} (completed): verified"
+    if os.environ.get("FAKE_AGENT_LOG"):  # post-#439 gateway, knob absent: the receipt is an agent-log row
+        with open(os.environ["FAKE_AGENT_LOG"], "a") as fh:
+            fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "producer": "boomerang-wake",
+                                 "sev": "info", "first_line": line, "text": line, "task_id": card}) + "\n")
+    else:
+        with open(os.environ["BV2_ORIGIN_CHAT"], "a") as fh:
+            fh.write(json.dumps({"ts": time.time(), "content": line}) + "\n")
 elif verb == "block":
     card = argv[argv.index("block") + 1]
     with open(os.environ["BV2_GATEWAY_LOG"], "a") as fh:
@@ -508,8 +517,10 @@ def test_step1_live_against_fake_gateway_kanban(env, monkeypatch):
     plan_path.write_text(json.dumps(plan))
     for k, v in {"BV2_KANBAN_CMD": f"{sys.executable} {fake}", "FAKE_STATE": str(state),
                  "BV2_GATEWAY_LOG": str(log), "BV2_ORIGIN_CHAT": str(chat), "BV2_PLAN": str(plan_path),
-                 "BV2_HOME_SESSION": "sess-fake", "BV2_SCRATCH_BOARD": "bv2-smoke-test"}.items():
+                 "BV2_HOME_SESSION": "sess-fake", "BV2_SCRATCH_BOARD": "bv2-smoke-test",
+                 "BV2_HANDLED_KNOB": str(tmp / "knob-present"), "BV2_AGENT_LOG_DIR": str(tmp / "agent-logs")}.items():
         monkeypatch.setenv(k, v)
+    (tmp / "knob-present").write_text("")
 
     rc = run.main(["--step", "1", "--live", "--tick-seconds", "0.05", "--slack-seconds", "0.1",
                    "--timeout", "5"])
@@ -892,3 +903,129 @@ def test_step4_prespend_retries_when_the_gateway_writes_in_between(env, tmp_path
     doc = json.loads(state.read_text())
     assert set(doc["claims"]) == {"a", "b"} and doc["restart_spent"] == {"t_s4": 1}
 
+
+
+# --- t_9f0d174a: the handled receipt moved to the agent log (hermes-agent#439) --------------------
+
+def _drop_handled_chat_lines(fx: Path) -> Path:
+    chat = fx / "fake_origin_chat.jsonl"
+    kept = [ln for ln in chat.read_text().splitlines() if "boomerang handled " not in json.loads(ln)["content"]]
+    chat.write_text("".join(ln + "\n" for ln in kept))
+    return chat
+
+
+def _knob_absent(env, monkeypatch, fx: Path) -> None:
+    monkeypatch.setenv("BV2_ORIGIN_CHAT", str(fx / "fake_origin_chat.jsonl"))
+    monkeypatch.setenv("BV2_HANDLED_KNOB", str(env["tmp"] / "no-such-knob"))
+    monkeypatch.setenv("BV2_AGENT_LOG_DIR", str(fx / "fake_agent_logs"))
+
+
+def test_handled_knob_name_is_the_gateways_own():
+    sys.path.insert(0, str(REPO))
+    from gateway import kanban_boomerang_wake as bw
+
+    assert run.HANDLED_KNOB_FILE == bw.HANDLED_LINE_CHAT_FILE
+    assert run.HANDLED_PREFIX == bw.HANDLED_PREFIX
+    assert run.AGENT_LOG_PRODUCER == bw.AGENT_LOG_PRODUCER
+
+
+@pytest.mark.parametrize("step", ["1", "2", "4"])
+def test_knob_absent_agent_log_row_passes_with_no_chat_line(env, monkeypatch, step):
+    fx = _copy_fixtures(env["tmp"])
+    _drop_handled_chat_lines(fx)
+    _knob_absent(env, monkeypatch, fx)
+    assert run.main(["--step", step, "--dry-run"]) == 0, env["evidence"].read_text()
+    text = env["evidence"].read_text()
+    assert "[agent-log] boomerang handled t_5m0ce00" in text
+    assert "handled line: agent log, knob" in text
+
+
+def test_knob_absent_fails_without_the_agent_log_row(env, monkeypatch):
+    fx = _copy_fixtures(env["tmp"])
+    _drop_handled_chat_lines(fx)
+    _knob_absent(env, monkeypatch, fx)
+    log = next((fx / "fake_agent_logs").glob("*.jsonl"))
+    log.write_text("".join(ln + "\n" for ln in log.read_text().splitlines() if "t_5m0ce001" not in ln))
+    assert run.main(["--step", "1", "--dry-run"]) == 1
+    assert "handled receipt: `boomerang handled t_5m0ce001 (<kind>): <summary>` | FAIL" in env["evidence"].read_text()
+
+
+def test_knob_absent_needs_input_row_in_the_agent_log_fails(env, monkeypatch):
+    fx = _copy_fixtures(env["tmp"])
+    _knob_absent(env, monkeypatch, fx)
+    line = "boomerang handled t_5m0ce002 (needs_input): closed it"
+    with open(next((fx / "fake_agent_logs").glob("*.jsonl")), "a") as fh:
+        fh.write(json.dumps({"ts": "2026-10-19T03:02:00Z", "producer": "boomerang-wake", "text": line}) + "\n")
+    assert run.main(["--step", "1", "--dry-run"]) == 1
+    assert "needs_input card t_5m0ce002: no `boomerang handled` line | FAIL" in env["evidence"].read_text()
+
+
+def test_knob_present_requires_the_chat_line(env, monkeypatch):
+    """Knob present: the agent-log row does not count; the line must be in the origin chat."""
+    fx = _copy_fixtures(env["tmp"])
+    chat = _drop_handled_chat_lines(fx)
+    monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
+    monkeypatch.setenv("BV2_HANDLED_KNOB", str(fx / "fake_boomerang-handled-line-chat.enabled"))
+    monkeypatch.setenv("BV2_AGENT_LOG_DIR", str(fx / "fake_agent_logs"))
+    assert run.main(["--step", "1", "--dry-run"]) == 1
+    text = env["evidence"].read_text()
+    assert "handled receipt: `boomerang handled t_5m0ce001 (<kind>): <summary>` | FAIL" in text
+    assert "[agent-log]" not in text
+
+
+def test_agent_log_live_reads_only_rows_since_the_step(tmp_path):
+    d = tmp_path / "agent-logs"
+    d.mkdir()
+    since = 1795000000.0
+    day = lambda t: run.time.strftime("%Y-%m-%d", run.time.gmtime(t))  # noqa: E731
+    stamp = lambda t: run.time.strftime("%Y-%m-%dT%H:%M:%SZ", run.time.gmtime(t))  # noqa: E731
+    (d / f"{day(since - 86400)}.jsonl").write_text(json.dumps(
+        {"ts": stamp(since - 86400), "producer": "boomerang-wake", "text": "boomerang handled t_old (completed): x"}) + "\n")
+    (d / f"{day(since)}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (
+        {"ts": stamp(since - 5), "producer": "boomerang-wake", "text": "boomerang handled t_before (completed): x"},
+        {"ts": stamp(since + 5), "producer": "boomerang-wake", "text": "boomerang handled t_after (completed): x"},
+        {"ts": stamp(since + 6), "producer": "other", "text": "boomerang handled t_other (completed): x"},
+        {"ts": stamp(since + 7), "producer": "boomerang-wake", "text": "warning boomerang-wake lost t_after"})))
+    got = [m.content for m in run.AgentLog(d, True, since).messages()]
+    assert got == ["boomerang handled t_after (completed): x"]
+
+
+@pytest.mark.parametrize("knob,expect_rc", [(False, 3), (True, 1)])
+def test_step1_live_post_439_gateway_writes_the_agent_log(env, monkeypatch, knob, expect_rc):
+    """The live gateway since #439: the handled receipt is an agent-log row, no chat line. Knob absent
+    the step passes (INCOMPLETE only for the unconfigured fault hook); knob present it FAILs."""
+    tmp = env["tmp"]
+    state = tmp / "state"
+    (state / "cards").mkdir(parents=True)
+    fake = tmp / "fake_kanban.py"
+    fake.write_text(FAKE_GATEWAY_KANBAN)
+    log = tmp / "gateway.log"
+    log.write_text("")
+    chat = tmp / "chat.jsonl"
+    chat.write_text("")
+    logs = tmp / "agent-logs"
+    logs.mkdir()
+    plan = json.loads((FIXTURES / "plan.json").read_text())
+    plan["commands"]["inject_failure"] = None
+    plan_path = tmp / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    knob_path = tmp / "boomerang-handled-line-chat.enabled"
+    if knob:
+        knob_path.write_text("")
+    agent_log = logs / (run.time.strftime("%Y-%m-%d", run.time.gmtime()) + ".jsonl")
+    for k, v in {"BV2_KANBAN_CMD": f"{sys.executable} {fake}", "FAKE_STATE": str(state),
+                 "BV2_GATEWAY_LOG": str(log), "BV2_ORIGIN_CHAT": str(chat), "BV2_PLAN": str(plan_path),
+                 "BV2_HOME_SESSION": "sess-fake", "BV2_SCRATCH_BOARD": "bv2-smoke-test",
+                 "BV2_HANDLED_KNOB": str(knob_path), "BV2_AGENT_LOG_DIR": str(logs),
+                 "FAKE_AGENT_LOG": str(agent_log)}.items():
+        monkeypatch.setenv(k, v)
+    rc = run.main(["--step", "1", "--live", "--tick-seconds", "0.05", "--slack-seconds", "0.1",
+                   "--timeout", "2"])
+    text = env["evidence"].read_text()
+    assert rc == expect_rc, text
+    assert chat.read_text() == ""
+    if knob:
+        assert "handled receipt: `boomerang handled t_fa4e0000 (<kind>): <summary>` | FAIL" in text
+    else:
+        assert "[agent-log] boomerang handled t_fa4e0000 (completed): verified" in text
+        assert "| FAIL |" not in text
