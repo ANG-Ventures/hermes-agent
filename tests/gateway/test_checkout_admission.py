@@ -1632,6 +1632,13 @@ def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
         assert ca.evaluate(store)["verdict"] == UNKNOWN
         os.kill(proc.pid, signal.SIGKILL)
         proc.wait(timeout=30)
+        # The lease runs from the peer's LAST WRITE, not from the kill: a peer
+        # starved under load last wrote up to a lease before it died (t_142f9fcb:
+        # 2.69 s kill->clear on a hosted runner was a 3 s lease). Anchor the floor
+        # on that write's mtime, read on the store's own clock like the gate does.
+        peer_mtime = max(os.stat(store.consumer_path(SERVE, key)).st_mtime
+                         for key, _sig, rec in store.scan_records(SERVE)
+                         if isinstance(rec, dict) and rec.get("token") not in (None, me.token))
         killed_at = time.monotonic()
         cleared_at = None
         while time.monotonic() - killed_at < 3 * lease_s * 10:
@@ -1640,7 +1647,12 @@ def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
                 break
             time.sleep(0.05)
         assert cleared_at is not None, "flag never cleared after SIGKILL"
-        assert cleared_at - killed_at >= 3 * lease_s - 0.2  # not before the lease could expire
+        clock = store.consumers_dir / ".lease-clock.t142"
+        clock.write_text("")
+        peer_age = clock.stat().st_mtime - peer_mtime
+        clock.unlink()
+        # not before the lease could expire (0.05 s: filesystem timestamp granularity)
+        assert peer_age >= 3 * lease_s - 0.05, f"cleared {peer_age:.3f}s after the peer's last write"
         assert ca.evaluate(store)["verdict"] == QUIESCENT
     finally:
         if proc.poll() is None:
