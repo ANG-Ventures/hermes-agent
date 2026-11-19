@@ -374,6 +374,9 @@ class LoadGate:
         sample = {"host": ctx["host"], "os": _os_name(), "at": now, "ncpu": self.ncpu, "cpu_busy": self.cpu_busy,
                   "mem_available_gb": ctx["mem_available_gb"], "mem_total_gb": ctx["mem_total_gb"],
                   "procs": self.procs, "maxproc": self.proc_limit, **sample_psi()}
+        wall = time.time()
+        if ctx["limits"].fleet_cap:
+            sample.update(_local_fleet_pressure(sample["os"], wall=wall, now=now))
         leases = [_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=ts)
                   for ts, n in self._ramp for _ in range(int(n))]
         try:
@@ -382,7 +385,6 @@ class LoadGate:
             # Lease.at is wall-clock; ``now`` is the gate's clock (time.monotonic() in admit_now): re-date each lease by
             # its age, as GateTickBuilder.seed_out_of_tick does, or a settled lease reads newer than the sample and is
             # counted on top of the cpu_busy that already holds it (Prism c-79e25e334a28b343)
-            wall = time.time()
             leases += [dataclasses.replace(le, at=now - max(0.0, wall - le.at)) for le in shared_leases(ctx["host"])]
         except Exception as exc:
             why = f"utilization: shared ledger unreadable ({type(exc).__name__}: {exc}); refusing, fail closed"
@@ -747,6 +749,31 @@ def _os_name() -> str:
     return "darwin" if sys.platform == "darwin" else ("linux" if sys.platform.startswith("linux") else sys.platform)
 
 
+def _local_fleet_pressure(os_name: str, *, wall: float, now: float) -> dict:
+    """Use the same sampler fields and freshness policy as remote kanban admission."""
+    from hermes_cli import allocation_policy, kanban_headroom
+    from hermes_cli.kanban_db import kanban_home
+
+    policy = allocation_policy.load(kanban_home() / "fleet")
+    path = policy.pressure_path
+    if os_name == "darwin":
+        paths = policy.doc.get("pressure_path")
+        configured = paths.get("darwin") if isinstance(paths, dict) else None
+        path = configured if isinstance(configured, str) and configured else "/Users/Shared/placement/host-pressure.json"
+    try:
+        fields = kanban_headroom.sample_fields(None, wall, Path(path).read_text(encoding="utf-8-sig"),
+                                              stale_after_s=policy.stale_after_s, local_now=now)
+    except (OSError, ValueError, OverflowError):
+        fields = {}
+    if fields.get("sample_status") != "fresh":
+        return {"mem_total_gb": None}  # no psutil fallback for a percentage fleet RAM cap
+    total = fields["mem_total_gb"]
+    # Age leases against the sampler, not the newer live contention sample:
+    # work started since the fleet reading may not be reflected in it yet.
+    return {"at": min(now, fields["sample_at"]), "mem_total_gb": total if total is not None and total > 0 else None,
+            "fleet_cpus": fields["fleet_cpus"], "fleet_ram_gb": fields["fleet_ram_gb"]}
+
+
 def sample_psi(root: str = "/proc/pressure") -> dict:
     """PSI ``some avg10`` for cpu / memory / io as ``psi_<x>_some10`` (Linux). An unreadable file is left out, so
     admission.admit() refuses it as unmeasured rather than reading 0; darwin has no /proc/pressure and admit()
@@ -920,6 +947,7 @@ def utilization_context() -> dict:
     except Exception:
         pass
     limits = _ad.Limits(mem_reserve_gb=spec.mem_reserve_gb if spec else 0.0,
+                        fleet_cap=spec.fleet_cap if spec else (),
                         cpu_saturable=bool(spec.cpu_saturable) if spec else False,
                         # R2c closures follow this host's scorer, as placement._limits() does (Prism 8e21846c06c9)
                         r2c=spec is not None and spec.scorer == "v2",
