@@ -16113,6 +16113,8 @@ SENDBACK_SOURCES: tuple[str, ...] = (
 )
 _SENDBACK_MAX_PAYLOAD_BYTES = 16 * 1024
 _CTX_MAX_SENDBACKS = 5
+# kanban_show cuts the worker context around this section, never inside it (t_5949eafd).
+CTX_SENDBACKS_HEADER = "## Send-backs on your PR (newest last)"
 
 
 def _sendback_payload_error(payload: Any) -> Optional[str]:
@@ -16273,19 +16275,37 @@ def request_sendback(
         return False, f"task is {status!r}; a sendback needs running/ready/todo/review"
 
 
-def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+def _ctx_current_sendback(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
+    """The ONE send-back the worker must act on now, shown whole (t_5949eafd): the newest
+    ``changes_requested`` or ``sendback`` event, by event id (not wall time), that no later
+    ``review_requested`` handback answered. ``("run", run_id)`` or ``("event", event_id)``."""
+    row = conn.execute(
+        "SELECT id, kind, run_id FROM task_events WHERE task_id = ? AND kind IN ('changes_requested', ?) "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'), 0) ORDER BY id DESC LIMIT 1",
+        (task_id, SENDBACK_EVENT_KIND, task_id),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["kind"] == SENDBACK_EVENT_KIND:
+        return ("event", int(row["id"]))
+    return ("run", int(row["run_id"])) if row["run_id"] is not None else None
+
+
+def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int,
+                   current: Optional[tuple[str, int]] = None, marks: Optional[dict] = None) -> None:
     """Render the newest ``sendback`` events into the worker prompt (§2.4).
     A sendback older than the latest ``review_requested`` was already answered
     by that handback and is not replayed."""
     rows = conn.execute(
-        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
         "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
         "AND kind = 'review_requested'), 0) ORDER BY id DESC LIMIT ?",
         (task_id, SENDBACK_EVENT_KIND, task_id, _CTX_MAX_SENDBACKS),
     ).fetchall()
     if not rows:
         return
-    lines.append("## Send-backs on your PR (newest last)")
+    lines.append(CTX_SENDBACKS_HEADER)
     lines.append(
         "A producer sent a defect on your PR straight back to you. Fix it and "
         "push (a new head clears it), or reply `prism-verdict: <id> not-a-bug "
@@ -16297,11 +16317,18 @@ def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now
         where = f"{p.get('repo')}#{p.get('pr')}" if p.get("repo") else "(no PR)"
         head = str(p.get("head") or "")[:12]
         rnd = f" r{p['round']}" if p.get("round") is not None else ""
+        start = len(lines)
         lines.append(
             f"### {p.get('source')}: {p.get('reason')}{rnd} on {where}"
             + (f" @ {head}" if head else "") + f" ({_ctx_stamp(r['created_at'], now)})"
         )
-        lines.append(_ctx_cap(p.get("summary")))
+        if current == ("event", int(r["id"])):  # the one current send-back is whole (t_5949eafd)
+            lines.append(str(p.get("summary") or "").strip())
+            if marks is not None:
+                marks["sendback"] = (start, len(lines))
+        else:
+            lines.append(_ctx_cap_lines(p.get("summary"), render_operator_command(
+                get_current_board(), "show", task_id, "--json")))
         if p.get("evidence"):
             lines.append("```json")
             lines.append(_ctx_cap(json.dumps(p["evidence"], ensure_ascii=False, indent=1)))
@@ -23114,7 +23141,8 @@ def _apply_shim_model_cap(
 # ---------------------------------------------------------------------------
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(conn: sqlite3.Connection, task_id: str,
+                         spans: Optional[dict] = None) -> str:
     """Everything a worker should read about its task: header, body,
     attachments, prior attempts, done-parent handoffs, the assignee's recent
     work, comments. Lists are tail-capped and fields char-capped
@@ -23131,14 +23159,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                            (int(task.current_run_id),)).fetchone()
         run_started_at = int(row["started_at"]) if row and row["started_at"] is not None else None
     _ctx_header(lines, task, run_started_at)
+    marks: dict = {"head": (0, len(lines))}  # line ranges kanban_show never cuts (t_5949eafd)
+    current = _ctx_current_sendback(conn, task_id)
     _ctx_attachments(lines, list_attachments(conn, task_id))
-    _ctx_prior_attempts(lines, conn, task_id, now)
-    _ctx_sendbacks(lines, conn, task_id, now)
+    _ctx_prior_attempts(lines, conn, task_id, now, current, marks)
+    _ctx_sendbacks(lines, conn, task_id, now, current, marks)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     from hermes_cli import kanban_archive_read as _kar
     _ctx_comments(lines, _kar.comments_with_archive(conn, task_id), now)
-    return "\n".join(lines).rstrip() + "\n"
+    text = "\n".join(lines).rstrip() + "\n"
+    if spans is not None:  # char spans of the header+body and the current send-back
+        for key, (a, b) in marks.items():
+            start = len("\n".join(lines[:a])) + (1 if a else 0)
+            spans[key] = (start, min(len(text), len("\n".join(lines[:b]))))
+    return text
 
 
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
@@ -23149,6 +23184,21 @@ def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _ctx_cap_lines(s: Optional[str], more: str) -> str:
+    """``_ctx_cap`` for a send-back: cut at a line end within the field cap and
+    name ``more``, the command that prints the rest (t_5949eafd)."""
+    s = (s or "").strip()
+    limit = _CTX_MAX_FIELD_BYTES
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    if s[limit] != "\n":  # the cap already ends a line otherwise
+        cut = head.rfind("\n")
+        head = head[:cut] if cut > 0 else head[:max(head.rfind(" "), 1)]
+    head = head.rstrip()
+    return head + f"\n… [truncated, {len(s) - len(head)} chars omitted; whole text: `{more}`]"
 
 
 def _ctx_stamp(ts: int, now: int) -> str:
@@ -23224,7 +23274,8 @@ def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
     lines.append("")
 
 
-def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int,
+                        current: Optional[tuple[str, int]] = None, marks: Optional[dict] = None) -> None:
     """Closed runs on this task (the active run is this worker), newest
     ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
     from hermes_cli import kanban_archive_read as _kar  # R8 moves old cards' runs out (t_589fb988)
@@ -23239,11 +23290,21 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
     for offset, run in enumerate(shown):
         profile = run.profile or "(unknown)"
         outcome = run.outcome or run.status
+        start = len(lines)
         lines.append(
             f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
         )
         if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
+            if current == ("run", run.id):  # the one current send-back is whole (t_5949eafd)
+                lines.append(run.summary.strip())
+                if marks is not None:
+                    marks["sendback"] = (start, len(lines))
+            elif run.outcome == "changes_requested":
+                lines.append(_ctx_cap_lines(run.summary, render_operator_command(
+                    get_current_board(), "show", task_id, "--json",
+                    "--state-type", "outcome", "--state-name", "changes_requested")))
+            else:
+                lines.append(_ctx_cap(run.summary))
         if run.error and run.error.strip():
             lines.append(f"_error_: {_ctx_cap(run.error)}")
         meta_line = _ctx_metadata_line(run.metadata)
