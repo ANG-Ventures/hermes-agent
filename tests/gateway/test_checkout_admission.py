@@ -1297,7 +1297,8 @@ def test_unchanged_publish_tick_writes_and_fsyncs_nothing(store, monkeypatch):
     first = g.publish()
     writes, fsyncs = [], []
     real_write, real_fsync = ca._atomic_write_json, os.fsync
-    monkeypatch.setattr(ca, "_atomic_write_json", lambda p, d: (writes.append(Path(p).name), real_write(p, d))[1])
+    monkeypatch.setattr(ca, "_atomic_write_json",
+                        lambda p, d, **kw: (writes.append(Path(p).name), real_write(p, d, **kw))[1])
     monkeypatch.setattr(ca.os, "fsync", lambda fd: (fsyncs.append(fd), real_fsync(fd))[1])
     for _ in range(4):  # 8 s of 2 s ticks, nothing changed
         mono[0] += 2
@@ -1311,6 +1312,29 @@ def test_unchanged_publish_tick_writes_and_fsyncs_nothing(store, monkeypatch):
     mono[0] += 0.1  # a change (the new epoch) is written on the very next tick
     assert g.publish()["hold_epoch"] == hold.epoch and len(writes) == 1
     assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_ack_writes_never_fsync_but_the_hold_does(store, monkeypatch):
+    """t_dd40e9f2 (F5): every ack write did a file fsync + a dir fsync, each a
+    forced ext4 journal commit (~5.7k per 30 min on ACE-AI, 76% of all gateway
+    fsyncs). A liveness ack is not fsynced (lost in a crash = stale = true);
+    the operator's hold.json, which keeps the checkout closed, still is."""
+    fsyncs = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(ca.os, "fsync", lambda fd: (fsyncs.append(fd), real_fsync(fd))[1])
+    mono = [1000.0]
+    g = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, monotonic=lambda: mono[0])
+    g.publish()                  # first write
+    mono[0] += 11
+    g.publish()                  # refresh write
+    assert fsyncs == []
+    hold = store.hold("op", [SERVE], mode="freeze")
+    assert len(fsyncs) == 2      # hold.json: file + directory
+    del fsyncs[:]
+    mono[0] += 0.1
+    assert g.publish()["hold_epoch"] == hold.epoch  # a change, written
+    g.stop_lease()               # release write
+    assert fsyncs == []
 
 
 def test_lease_renewals_never_hold_back_a_fresh_publish(store):
@@ -1343,11 +1367,11 @@ class _WriteStall:
         self.parked, self.release = threading.Event(), threading.Event()
         real = ca._atomic_write_json
 
-        def write(path, payload):
+        def write(path, payload, **kw):
             if threading.current_thread().name == self.thread_name and not self.release.is_set():
                 self.parked.set()
                 assert self.release.wait(30), "stalled writer never released"
-            return real(path, payload)
+            return real(path, payload, **kw)
 
         monkeypatch.setattr(ca, "_atomic_write_json", write)
 

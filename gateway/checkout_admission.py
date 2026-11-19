@@ -93,8 +93,9 @@ LEASE_EXPIRY_FACTOR = 3
 # Write-if-changed (t_dd40e9f2): a publish whose record matches the last one
 # written (ignoring the fields below) is skipped until the last write is this
 # old, so an idle publisher writes every 10 s instead of every 2 s. Each
-# write is mkstemp + fsync + rename + dir fsync on the checkout's drive (on
-# ACE-AI ~2.7k of them per 30 min drove the OS drive's ext4 journal). Kept
+# write was mkstemp + fsync + rename + dir fsync on the checkout's drive (on
+# ACE-AI ~2.7k of them per 30 min drove the OS drive's ext4 journal; the
+# fsyncs are gone too, see write_consumer). Kept
 # well under DEFAULT_STALE_AFTER so published_at never reads stale; any change
 # (a new hold epoch, a ticket, a work count) still writes on the next tick.
 DEFAULT_REFRESH_S = 10.0
@@ -145,16 +146,21 @@ def _validate_instance(instance: str) -> str:
 
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+def _atomic_write_json(path: Path, payload: Mapping[str, Any], *, durable: bool = True) -> None:
+    """Atomic replace. ``durable=False`` skips the file and directory fsyncs:
+    each one forces an ext4 journal commit (t_dd40e9f2). Only for records whose
+    loss in a crash is the correct reading (a publisher's liveness ack)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
+            if durable:
+                fh.flush()
+                os.fsync(fh.fileno())
         os.replace(tmp, path)
-        _fsync_dir(path.parent)
+        if durable:
+            _fsync_dir(path.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
@@ -487,7 +493,9 @@ class HoldStore:
     def write_consumer(self, name: str, record: Mapping[str, Any]) -> None:
         inst = record.get("instance")
         valid = isinstance(inst, str) and bool(_INSTANCE_RE.fullmatch(inst))
-        _atomic_write_json(self.consumer_path(name, inst if valid else None), record)
+        # Not fsynced (t_dd40e9f2): an ack is a liveness record rewritten every
+        # refresh_s; one lost in a crash reads as stale, which is the truth.
+        _atomic_write_json(self.consumer_path(name, inst if valid else None), record, durable=False)
 
     def _record_paths(self, name: str) -> list:
         """``(key, path, stat)`` of every record of ``name``, newest write first."""
