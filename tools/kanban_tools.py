@@ -835,15 +835,13 @@ def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
             "summary": _cap_text(run.summary, _SHOW_REVIEW_CHARS)}
 
 
-def _cap_context(ctx: str, limit: int) -> str:
-    """Cut the worker context to ``limit`` around its send-back section: the history before
-    it gives way first, then what follows it; the section itself is cut last (t_5949eafd)."""
-    from hermes_cli.kanban_db import CTX_SENDBACKS_HEADER
-    start = ctx.find("\n" + CTX_SENDBACKS_HEADER)
-    if start < 0:
+def _cap_context(ctx: str, limit: int, span: Optional[tuple[int, int]] = None) -> str:
+    """Cut the worker context to ``limit`` around its send-back section ``span`` (char offsets from
+    build_worker_context): the history before it gives way first, then what follows it; the
+    section itself is cut last (t_5949eafd)."""
+    if not span:
         return _cap_text(ctx, limit)
-    end = ctx.find("\n## ", start + 1)
-    end = len(ctx) if end < 0 else end
+    start, end = span
     keep = _cap_text(ctx[start:end], limit)
     pre, post = ctx[:start], ctx[end:]
     room = limit - len(keep)
@@ -852,7 +850,7 @@ def _cap_context(ctx: str, limit: int) -> str:
     return _cap_text(pre, max(0, room)) + keep
 
 
-def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
+def _bounded_show(out: dict[str, Any], span: Optional[tuple[int, int]] = None) -> dict[str, Any]:
     """Shrink the history lists, oldest entries first, until the response fits the budget."""
     def size() -> int:
         return len(json.dumps(out, ensure_ascii=False, default=str))
@@ -866,7 +864,7 @@ def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
     if size() > _SHOW_BUDGET_CHARS:
         excess = size() - _SHOW_BUDGET_CHARS
         ctx = out.get("worker_context") or ""
-        out["worker_context"] = _cap_context(ctx, max(4_000, len(ctx) - excess - 200))
+        out["worker_context"] = _cap_context(ctx, max(4_000, len(ctx) - excess - 200), span)
     if not omitted:
         out.pop("omitted")
     return out
@@ -883,6 +881,7 @@ def _handle_show(args: dict, **kw) -> str:
         runs = kb.list_runs(conn, tid)
         comments = kb.list_comments(conn, tid)
         events = kb.list_events(conn, tid)
+        spans: dict = {}
         out: dict[str, Any] = {
             "latest_review": _latest_review(kb, conn, tid, runs),
             "task": {**_fields(task, _TASK_FIELDS),
@@ -910,7 +909,7 @@ def _handle_show(args: dict, **kw) -> str:
                      for r in reversed(runs[-_SHOW_MAX_RUNS:])],
             "runs_order": "newest_first",
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": _worker_context_or_error(kb, conn, tid)}
+            "worker_context": _worker_context_or_error(kb, conn, tid, spans)}
         omitted = {k: n for k, n in (("comments", len(comments) - _SHOW_MAX_COMMENTS),
                                      ("events", len(events) - _SHOW_MAX_EVENTS),
                                      ("runs", len(runs) - _SHOW_MAX_RUNS)) if n > 0}
@@ -932,15 +931,15 @@ def _handle_show(args: dict, **kw) -> str:
                                           "error": _cap_text(r_last["error"], _SHOW_FIELD_CHARS)},
                 "note": "moved to %s; full text: hermes kanban show %s" % (kar.ARCHIVE_NAME, tid),
                 **({"error": arch["error"]} if arch.get("error") else {})}
-        return json.dumps(_bounded_show(out), ensure_ascii=False, default=str)
+        return json.dumps(_bounded_show(out, spans.get("sendbacks")), ensure_ascii=False, default=str)
 
 
-def _worker_context_or_error(kb, conn, tid: str) -> str:
+def _worker_context_or_error(kb, conn, tid: str, spans: Optional[dict] = None) -> str:
     """An unreadable kanban-archive.db is named in place of the context, never rendered as less history."""
     from hermes_cli import kanban_archive_read as kar
 
     try:
-        return kb.build_worker_context(conn, tid)
+        return kb.build_worker_context(conn, tid, spans)
     except kar.ArchiveUnreadable as exc:
         return "worker context unavailable: archived history unreadable (%s)" % exc
 

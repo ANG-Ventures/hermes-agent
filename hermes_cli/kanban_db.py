@@ -23121,7 +23121,8 @@ def _apply_shim_model_cap(
 # ---------------------------------------------------------------------------
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(conn: sqlite3.Connection, task_id: str,
+                         spans: Optional[dict] = None) -> str:
     """Everything a worker should read about its task: header, body,
     attachments, prior attempts, done-parent handoffs, the assignee's recent
     work, comments. Lists are tail-capped and fields char-capped
@@ -23140,7 +23141,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_header(lines, task, run_started_at)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
+    i0 = len(lines)
     _ctx_sendbacks(lines, conn, task_id, now)
+    if spans is not None and len(lines) > i0:  # char span of the send-back section (t_5949eafd)
+        start = len("\n".join(lines[:i0])) + (1 if i0 else 0)
+        spans["sendbacks"] = (start, len("\n".join(lines)))
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     from hermes_cli import kanban_archive_read as _kar
