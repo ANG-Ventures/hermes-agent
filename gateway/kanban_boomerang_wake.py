@@ -764,8 +764,10 @@ ROW_REVIEW_HUMAN = "own_repo_review_human"
 #: Its stop file, read every tick: present = that handoff is ``none`` again (today's plain wake).
 REVIEW_HANDOFF_STOP_FILE = "boomerang-wake-review-handoff.disabled"
 #: Outcomes of a handoff child that answered its review episode (the deadman's child is then skipped).
-#: comment_why_waits: a park-return child's attended read (t_ff6f4be4); request_changes: a handoff child's send-back.
-_EPISODE_ANSWERED = frozenset({"surfaced", "request_changes", "comment_why_waits"})
+#: request_changes: a handoff child's send-back. Not comment_why_waits (t_ff6f4be4 round 2): a park-return child's
+#: receipt is claimed on the review_requested event, which hermes-home's deadman does not count, so its page
+#: still gets the deadman child whose receipt is keyed on the review_deadman event.
+_EPISODE_ANSWERED = frozenset({"surfaced", "request_changes"})
 #: t_ff6f4be4 A: a card back in review from a park (the board's ``lifecycle_entry_repair`` review_requested).
 ROW_PARK_RETURN = "review_park_return"
 PARK_RETURN_SOURCE = "lifecycle_entry_repair"

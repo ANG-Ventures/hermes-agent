@@ -2906,3 +2906,30 @@ def test_deferred_deadman_page_dispatches_when_the_stop_file_appears(env):
     stop.write_text("")
     _tick(env)
     assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+
+
+@pytest.mark.parametrize("page_first", [False, True])
+def test_park_return_why_waits_does_not_answer_the_deadman_page(env, page_first):
+    """A park-return child's comment_why_waits writes a receipt claimed on the review_requested event, which
+    hermes-home's deadman does not count (it counts only review_deadman claims). So the cycle-0 page of that
+    episode still dispatches the deadman child, whose receipt silences both tiers, as on main."""
+    tid = _card(env)
+    _sub(tid)
+    _park_return(tid)
+    _tick(env)
+    [child] = env["dispatched"]
+    assert child["row"] == "review_park_return"
+    if page_first:   # the page arrives while the park-return child still reads: it waits, then dispatches
+        _deadman_event(tid, child["event_id"])
+        env["adapter"].handled.clear()
+        _tick(env)
+        assert env["dispatched"][1:] == []
+    ah.BoomerangWakeState().update_claim(child["key"], state=ah.STATE_TERMINAL, outcome="comment_why_waits")
+    _kill(env, child)
+    if not page_first:
+        _deadman_event(tid, child["event_id"])
+    env["adapter"].handled.clear()
+    turns = _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"] and turns == []
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
