@@ -1064,7 +1064,7 @@ def test_child_handoff_renders_one_boomerang_wake_line(env):
     entry = _claimed_entry(env, tid)
     _run(env, entry, "completed", _verdict(entry, "complete", summary="verified: PR merged, tests green"))
     lines = [s for s in env["adapter"].sent if s.startswith("boomerang handled")]
-    assert lines == [f"boomerang handled {tid} (completed): verified: PR merged, tests green"]
+    assert lines == []  # t_8ab5557d: no chat line beside a delivered turn
     assert len(env["adapter"].handled) == 1   # t_aad55db4: plus one home turn (below)
 
 
@@ -1089,7 +1089,7 @@ def test_complete_verdict_on_chat_home_wakes_the_home_once_per_delegation(env):
     _run(env, entry, "completed", final)
     asyncio.run(ah.deliver_handbacks(env["runner"], ah.BoomerangWakeState()))
     assert len(env["adapter"].handled) == 1
-    assert len([s for s in env["adapter"].sent if s.startswith("boomerang handled")]) == 1
+    assert len([s for s in env["adapter"].sent if s.startswith("boomerang handled")]) == 0  # t_8ab5557d: no chat line beside a delivered turn
 
 
 def test_complete_verdict_turn_honours_the_kill_switch(env):
@@ -1293,15 +1293,14 @@ def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
     assert "ci-shard-4 red is INHERITED from main" in head
     assert "gh run view 1 --log-failed: mutate_anchor_lint" in head
     assert tail == f"Task {tid} wake"
-    assert env["adapter"].sent == [
-        f"boomerang handled {tid} (own_repo_review_red): ci-shard-4 red is INHERITED from main"]
+    assert env["adapter"].sent == []  # t_8ab5557d: no chat line beside a delivered turn
     assert ah.BoomerangWakeState().get_claim(entry["key"])["resurface_delivered"] is True
     _run(env, ah.BoomerangWakeState().get_claim(entry["key"]), "completed", final)   # replay
     assert ah.record_surface(entry, "again") is False
     with kb.connect_closing() as conn:
         ours = [c.body for c in kb.list_comments(conn, tid) if c.body.startswith("[boomerang-wake] surfaced:")]
     assert len(ours) == 1 and "ci-shard-4 red is INHERITED from main" in ours[0], ours
-    assert len(env["adapter"].handled) == 1 and len(env["adapter"].sent) == 1
+    assert len(env["adapter"].handled) == 1 and len(env["adapter"].sent) == 0
 
 
 def test_surface_with_malformed_evidence_still_resurfaces(env):
@@ -1311,12 +1310,18 @@ def test_surface_with_malformed_evidence_still_resurfaces(env):
     _run(env, entry, "completed", _verdict(entry, "surface", summary="needs operator review", evidence=True))
     [turn] = [t.text for t in env["adapter"].handled]
     assert turn.startswith(f"[boomerang-wake] child surfaced {tid}") and "needs operator review" in turn
-    assert env["adapter"].sent == [f"boomerang handled {tid} (own_repo_review_red): needs operator review"]
+    assert env["adapter"].sent == []  # t_8ab5557d: no chat line beside a delivered turn
 
 
 def test_ok_verdict_failed_line_is_retried_by_the_replay_not_nooped(env):
     """Prism d74bf844f9a4: an ok verdict whose line got no receipt leaves a pending row; the
-    replayed (terminal) handoff retries it, and only one line ever lands."""
+    replayed (terminal) handoff retries it, and only one line ever lands. The chat-line knob is on:
+    with it off a turn row has no chat line to fail (t_8ab5557d)."""
+    from hermes_constants import get_hermes_home
+
+    knob = get_hermes_home() / "state" / ah.HANDLED_LINE_CHAT_FILE
+    knob.parent.mkdir(parents=True, exist_ok=True)
+    knob.write_text("")
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid)
