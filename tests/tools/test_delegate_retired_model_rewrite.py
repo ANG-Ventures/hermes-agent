@@ -23,8 +23,8 @@ SUCCESSORS = {"_comment": "x", "successors": {"gpt-6.1-sol": "gpt-6.2-sol", "gpt
 def home(tmp_path, monkeypatch):
     root = tmp_path / "vhome"
     (root / "config").mkdir(parents=True)
-    (root / "config" / "model-retired-ids.txt").write_text(RETIRED)
-    (root / "config" / "model-successors.json").write_text(json.dumps(SUCCESSORS))
+    (root / "config" / "model-retired-ids.txt").write_text(RETIRED, encoding="utf-8")
+    (root / "config" / "model-successors.json").write_text(json.dumps(SUCCESSORS), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     return root
 
@@ -56,7 +56,7 @@ def test_missing_file_fails_open(home, missing):
 
 
 def test_unreadable_successors_fails_open(home):
-    (home / "config" / "model-successors.json").write_text("{not json")
+    (home / "config" / "model-successors.json").write_text("{not json", encoding="utf-8")
     assert retired_rewrite("gpt-6.1-sol") == ("gpt-6.1-sol", None)
 
 

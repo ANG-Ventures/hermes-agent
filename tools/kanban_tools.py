@@ -1769,7 +1769,8 @@ def _handle_create(args: dict, **kw) -> str:
                    **({"requires_not_inherited": not_inherited} if not_inherited else {}),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"model_rewritten": model_rewritten}
-                      if model_rewritten and kb.get_task(conn, new_tid).model_override == model_override else {}),
+                      if model_rewritten and kb.get_task(conn, new_tid).model_override
+                      in (model_override, model_override.partition("/")[2]) else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
 
