@@ -191,7 +191,11 @@ _CHEAPER_REMEDIES = (
     "the stuck integration, or data {\"entry_id\": ...}) reloads a single integration; domain reloads "
     "(homeassistant.reload_all, homeassistant.reload_core_config, automation.reload, script.reload, "
     "scene.reload, template.reload, group.reload) need no downtime. A Core restart takes the house "
-    "down for about 4 minutes.")
+    "down for about 4 minutes; a Core stop takes it down until someone starts Core again by hand.")
+_DOWNTIME = {
+    "restart": "Expect Home Assistant to be down for about 4 minutes.",
+    "stop": "Home Assistant stays down until Core is started again by hand (stop does not restart it).",
+}
 
 
 def _restart_guard_enabled() -> bool:
@@ -222,13 +226,15 @@ def _busy_reasons(states: list, now: datetime) -> List[str]:
         domain = eid.split(".", 1)[0]
         if domain not in ("event", "light", "switch"):
             continue
-        changed = _parse_ts(s.get("last_changed"))
+        # last_updated also moves on attribute-only changes (a brightness tweak); last_changed does not.
+        stamp = s.get("last_updated") or s.get("last_changed")
+        changed = _parse_ts(stamp)
         if changed is None or changed < cutoff:
             continue
         if domain == "event":
-            busy.append(f"{eid} fired at {s.get('last_changed')}")
+            busy.append(f"{eid} fired at {stamp}")
         elif (s.get("context") or {}).get("user_id"):
-            busy.append(f"{eid} changed by a user at {s.get('last_changed')}")
+            busy.append(f"{eid} changed by a user at {stamp}")
     return busy
 
 
@@ -283,7 +289,7 @@ def _restart_guard(domain: str, service: str, args: dict) -> Optional[str]:
     post_logs(
         f"🏠 HA Core {service} by agent session {_session_id()}: {reason}"
         f"{' (override while busy: ' + '; '.join(busy) + ')' if busy else ''}. "
-        "Expect Home Assistant to be down for about 4 minutes.")
+        f"{_DOWNTIME[service]}")
     return None
 
 
@@ -443,7 +449,7 @@ HA_CALL_SERVICE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Required for homeassistant.restart / homeassistant.stop: why a full Core "
-                    "restart (~4 min downtime) is needed instead of a reload."
+                    "restart (~4 min downtime) or stop (down until started by hand) is needed instead of a reload."
                 ),
             },
             "override": {

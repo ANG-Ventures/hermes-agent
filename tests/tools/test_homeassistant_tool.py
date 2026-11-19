@@ -456,3 +456,19 @@ class TestRestartGuard:
         assert out["result"]["success"] is True
         self.states.assert_not_awaited()
         assert self.logs == []
+
+    def test_refused_on_attribute_only_user_light_change(self):
+        # brightness tweak: state unchanged, so last_changed is old but last_updated is recent
+        self.states.return_value = IDLE_STATES + [
+            {"entity_id": "light.office", "state": "on", "last_changed": _iso(90),
+             "last_updated": _iso(2), "context": {"id": "c", "user_id": "u1", "parent_id": None}}]
+        out = self._restart(reason="r")
+        assert "light.office" in out["error"]
+        self.call.assert_not_awaited()
+
+    def test_stop_notice_does_not_promise_four_minutes(self):
+        out = json.loads(_handle_call_service({"domain": "homeassistant", "service": "stop",
+                                               "reason": "maintenance"}))
+        assert out["result"]["success"] is True
+        assert len(self.logs) == 1
+        assert "4 minutes" not in self.logs[0] and "by hand" in self.logs[0]
