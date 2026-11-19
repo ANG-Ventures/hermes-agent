@@ -1314,14 +1314,13 @@ def _moved_noise_filter_on() -> bool:
 # dispatcher's peer collision warning, a released placement door). A worker start, a completion, a send-back, an
 # assignment and a review request are NOT here: they still refuse.
 _KERNEL_NOISE_KINDS = frozenset({"terminal_worker_reaped", "dispatch_collision_peer_warning", "door_released"})
-DERIVED_APPROVE_HEAD = "pipeline derived: APPROVE"
 
 
 def _derived_approve(conn: Any, task_id: str, payload: dict, created_at: Any) -> bool:
     """t_d712444b: the ``commented`` event points at a pipeline-derived APPROVE record. The event carries no body, so
     the comment row is found by task, author, time (within 2 s of the event) and length (the event's ``len`` is the
-    body before the kernel strips it). Every such candidate must be the record (first line ``pipeline derived:
-    APPROVE``, a ``review_coverage:`` line whose ``by`` is ``pipeline/derived``); none, or any other, is not noise."""
+    body before the kernel strips it). Every such candidate must be the record (a ``review_coverage:`` line whose
+    ``verdict`` is ``APPROVE`` and ``by`` is ``pipeline/derived``); no candidate, or any other, is not noise."""
     author, n = str(payload.get("author") or "").strip(), payload.get("len")
     if not author or not isinstance(n, int) or not isinstance(created_at, (int, float)):
         return False
@@ -1331,10 +1330,7 @@ def _derived_approve(conn: Any, task_id: str, payload: dict, created_at: Any) ->
     if not bodies:
         return False
     for body in bodies:
-        lines = body.splitlines()
-        if not lines or not lines[0].startswith(DERIVED_APPROVE_HEAD):
-            return False
-        cov = [ln.split(":", 1)[1] for ln in lines[1:] if ln.startswith("review_coverage:")]
+        cov = [ln.split(":", 1)[1] for ln in body.splitlines() if ln.startswith("review_coverage:")]
         try:
             rec = json.loads(cov[0]) if cov else None
         except ValueError:

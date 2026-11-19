@@ -2967,13 +2967,16 @@ def test_delivery_marker_of_another_via_still_refuses(env):
     assert _desk_sendbacks(env, tid, entry) == 0
 
 
-@pytest.mark.parametrize("action", ["complete", "redispatch"])
-def test_derived_approve_refuses_every_other_verdict(env, action):
-    tid, entry = _human_review_claim(env)
+def test_derived_approve_refuses_every_other_verdict(env):
+    """own_repo_review_human allows only request_changes, so the other verdicts are driven on a completed-row claim."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
     with kb.connect_closing() as conn:
         kb.add_comment(conn, tid, "default", DERIVED)
-    res = ah.execute_verdict(entry, _verdict(entry, action))
-    assert not res["ok"] and res["reason"] == "state moved", res
+    for action in sorted(ah.ALLOWED["completed"] - {"surface", "request_changes"}):
+        res = ah.execute_verdict(entry, _verdict(entry, action))
+        assert not res["ok"] and res["reason"] == "state moved", (action, res)
 
 
 @pytest.mark.parametrize("body", [
@@ -2988,12 +2991,14 @@ def test_derived_approve_matches_the_record_not_the_author(env, body):
     assert _desk_sendbacks(env, tid, entry) == 0
 
 
-def test_derived_approve_next_to_an_operator_stamp_still_refuses(env):
-    """Both comments by ``default`` in the same second: the stamp's own event is a move."""
+@pytest.mark.parametrize("stamp", ["operator stamp: hold", "operator stamp: hold".ljust(len(DERIVED), ".")])
+def test_derived_approve_next_to_an_operator_stamp_still_refuses(env, stamp):
+    """Both comments by ``default`` in the same second: the stamp's own event is a move, also when its length equals
+    the record's (then every candidate row must be the record, or neither event is noise)."""
     tid, entry = _human_review_claim(env)
     with kb.connect_closing() as conn:
         kb.add_comment(conn, tid, "default", DERIVED)
-        kb.add_comment(conn, tid, "default", "operator stamp: hold")
+        kb.add_comment(conn, tid, "default", stamp)
     assert _desk_sendbacks(env, tid, entry) == 0
 
 
