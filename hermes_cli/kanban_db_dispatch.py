@@ -356,6 +356,8 @@ class DispatchResult:
     browser_joins: dict = field(default_factory=dict)
     """task id -> ``{"plans": [...], "source_host": <worker host>}`` for a ready card whose
     ``browser:ephemeral`` lease the s7 join takes at spawn (``kanban.browser_join``, t_2828292d)."""
+    browser_run_end_released: list = field(default_factory=list)
+    """run ids whose joined browser lease the run-end sweep released this tick (t_7758072d)."""
     placement_caps: dict = field(default_factory=dict)
     """task id -> what the capability layer (t_8c474c2e) saw on a ready card
     without changing its route: ``{"warn": <payload>}`` (warn mode),
@@ -6604,6 +6606,72 @@ def _browser_release_joined(conn, claimed, join: dict, env: Mapping[str, str], w
         _kb._log.warning("kanban dispatch: could not record browser lease release for %s", claimed.id, exc_info=True)
 
 
+# t_7758072d: how far back the run-end sweep looks. Past this the lease's 1800 s ttl and browserd's 15 min idle rule
+# have already removed the ephemeral; the run-id floor keeps the scan on the primary key.
+RUN_END_RELEASE_WINDOW_S = 3600
+RUN_END_RELEASE_RUN_SPAN = 5000
+
+
+def _browser_release_run(host: str, card: str, run: str, lease_id) -> dict:
+    """``dispatch_relay.py release-run`` (hermes-browsers, t_7758072d): on ``host`` release every lease (card, run)
+    holds on an ephemeral and destroy those ephemerals now. The reply carries ids and names, never a token. Tests
+    replace this seam."""
+    script = _kb.kanban_home() / "scripts" / "browsers" / "dispatch_relay.py"
+    try:
+        out = subprocess.run([sys.executable, str(script), "release-run", "--host", host, "--card", card,
+                              "--run", run, "--lease-id", str(lease_id if lease_id is not None else "")],
+                             capture_output=True, text=True, encoding="utf-8", timeout=260, stdin=subprocess.DEVNULL)
+        resp = json.loads(((out.stdout or "").strip().splitlines() or ["{}"])[-1])
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT", "detail": type(exc).__name__}
+    return resp if isinstance(resp, dict) else {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT"}
+
+
+def release_ended_run_leases(conn, now: Optional[float] = None) -> list:
+    """Release the joined browser lease of every run that has ENDED (t_7758072d).
+
+    The s7 join takes a lease per spawned run (``browser_lease_joined``) and, until now, only a failed spawn released
+    it, so every finished run held its eph + egr + gw containers for the full 1800 s ttl plus the 15 min idle rule.
+    One attempt per run: a ``browser_lease_released`` event on the run (this sweep's, or the spawn-failure release)
+    closes it, ok or not. A run killed before this sees it, or a host that does not answer, falls back to the ttl and
+    the idle rule exactly as before. Returns the run ids attempted."""
+    now = time.time() if now is None else now
+    top = conn.execute("SELECT max(id) FROM task_runs").fetchone()[0] or 0
+    rows = conn.execute(
+        "SELECT e.task_id, e.run_id, e.payload FROM task_runs r JOIN task_events e "
+        "ON e.run_id = r.id AND e.kind = 'browser_lease_joined' "
+        "WHERE r.id > ? AND r.ended_at IS NOT NULL AND r.ended_at > ? AND NOT EXISTS ("
+        "SELECT 1 FROM task_events x WHERE x.run_id = r.id AND x.kind = 'browser_lease_released') "
+        "ORDER BY e.id",
+        (top - RUN_END_RELEASE_RUN_SPAN, int(now - RUN_END_RELEASE_WINDOW_S))).fetchall()
+    done = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        host = payload.get("host")
+        if not host:
+            continue
+        try:
+            r = _browser_release_run(str(host), row["task_id"], str(row["run_id"]), payload.get("lease_id"))
+        except Exception as exc:  # never break the tick on cleanup
+            r = {"ok": False, "detail": type(exc).__name__}
+        try:
+            with _kbc.write_txn(conn):
+                _kb._append_event(conn, row["task_id"], "browser_lease_released",
+                                  {"host": host, "why": "run_ended", "ok": bool(r.get("ok")),
+                                   "refusal": r.get("refusal"), "released": r.get("released"),
+                                   "destroyed": r.get("destroyed")},
+                                  run_id=row["run_id"])
+        except Exception:
+            _kb._log.warning("kanban dispatch: could not record run-end lease release for %s", row["task_id"],
+                             exc_info=True)
+            continue
+        done.append(row["run_id"])
+    return done
+
+
 def _browser_join_refused(conn, claimed, token: str, result, failure_limit) -> None:
     """R3(c)'s one exit shape for a lease the join could not take: the claim is released, the card goes back
     to ``ready`` (the run closes ``spawn_failed`` with ``infrastructure: true``, so the breaker is never
@@ -7261,6 +7329,12 @@ def _dispatch_once_locked(
                     result.process_capped = enforce_worker_process_cap(conn)
             except Exception as exc:  # never break a dispatcher tick
                 _kb._log.warning("kanban process cap check failed: %s", exc)
+            # A finished run's joined browser lease goes now, not at its ttl + idle rule (t_7758072d).
+            try:
+                with _kts.step("reclaim_promote/browser_run_end"):
+                    result.browser_run_end_released = release_ended_run_leases(conn)
+            except Exception as exc:  # never break a dispatcher tick
+                _kb._log.warning("kanban browser run-end release failed: %s", exc)
         # PR-gate re-evaluation BEFORE recompute_ready so a card whose external
         # gate is already satisfied becomes spawnable in the SAME tick rather
         # than waiting for the next one. Bounded + cached + fail-safe: see
