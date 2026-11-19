@@ -2138,7 +2138,7 @@ from gateway.run_adapters import GatewayAdapterLifecycleMixin
 from gateway.run_topics import GatewayTopicThreadsMixin
 from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_result
 from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
-from gateway.run_busy import GatewayBusySessionMixin
+from gateway.run_busy import GatewayBusySessionMixin, _WATCH_NOTIFICATION_TYPES
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_startup import GatewayStartupMixin
 from gateway.run_watchers import GatewaySessionWatchersMixin
@@ -3267,9 +3267,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         except Exception:
             break
         evt_type = evt.get("type", "completion")
-        if evt_type in {
-            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
-            "heartbeat"}:
+        if evt_type in _WATCH_NOTIFICATION_TYPES:
             watch_events.append(evt)
         elif evt_type in {"async_delegation", "async_delegation_restarted"}:
             requeue.append(evt)
