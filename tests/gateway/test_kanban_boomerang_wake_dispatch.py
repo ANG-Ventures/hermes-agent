@@ -3052,3 +3052,203 @@ def test_review_deadman_skip_needs_an_explicit_integer_cycle_zero(env, cycle):
     env["adapter"].handled.clear()
     _tick(env)
     assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+
+
+# --- t_ff6f4be4 A: a park that runs out -> the attended-read child, not a home-session turn -------------
+
+
+def _park_return(tid, *, reviewer="human:apollo", result=None):
+    """The board's own re-entry into review: the lifecycle trigger writes the real event shape
+    (``implementer``/``reviewer``/``source: lifecycle_entry_repair``/``review_exit_id``, no run_id, no summary)."""
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked', result = ? WHERE id = ?", (result, tid))
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'review', assignee = ? WHERE id = ?", (reviewer, tid))
+    with kb.connect_closing() as conn:
+        eid, run_id, raw = conn.execute("SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+                                        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+    payload = json.loads(raw)
+    assert run_id is None and "summary" not in payload and payload["source"] == "lifecycle_entry_repair", payload
+    return eid
+
+
+@pytest.mark.parametrize("pr", [None, "merged"])
+def test_park_return_review_on_a_boomerang_card_dispatches_a_child_and_no_turn(env, pr):
+    result = None
+    if pr == "merged":
+        env["health"][(REPO, 3401)] = {"state": "merged", "merged": True, "failing": [], "head": "d" * 40}
+        result = f"PR {REPO}#3401 merged"
+    tid = _card(env)
+    _sub(tid)
+    _park_return(tid, result=result)
+    turns = _tick(env)
+    assert [(e["row"], e["mode"], e["task_id"]) for e in env["dispatched"]] == [("review_park_return", "fork", tid)]
+    assert turns == [], [t.text for t in turns]
+    goal = ah.build_goal(env["dispatched"][0])
+    assert "allowed actions: comment_why_waits, surface" in goal and "never approve" in goal.lower()
+
+
+def test_park_return_review_on_a_plain_wake_card_wakes_the_session(env):
+    tid = _card(env, auto=False)
+    _sub(tid)
+    _park_return(tid)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert _turn_kinds(turns) == ["notifier"]
+
+
+def test_park_return_off_switch_restores_the_session_wake(env):
+    stop = ah.park_return_stop_file_path()
+    assert stop.name == "boomerang-wake-park-return.disabled"
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    tid = _card(env)
+    _sub(tid)
+    _park_return(tid)
+    assert _turn_kinds(_tick(env)) == ["notifier"]
+    assert env["dispatched"] == [] and _claims() == {}
+
+
+def test_park_return_child_surface_is_not_refused_by_the_merged_pr_rule(env):
+    """A card back from a park usually carries a merged PR: the child's surface is still owed."""
+    env["health"][(REPO, 3402)] = {"state": "merged", "merged": True, "failing": [], "head": "d" * 40}
+    tid = _card(env)
+    eid = _park_return(tid, result=f"PR {REPO}#3402 merged")
+    entry = {"task_id": tid, "board": None, "event_id": eid, "row": "review_park_return",
+             "pr": f"{REPO}#3402", "assignee": "human:apollo"}
+    assert ah.stale_surface_reason(entry) is None
+
+
+# --- t_ff6f4be4 B: the deadman's cycle-0 page waits for a still-running first-read child -----------------
+
+
+def _running_handoff(env, pr):
+    _green(env, pr)
+    tid = _card(env)
+    _sub(tid)
+    _human_handback(tid, pr)
+    _tick(env)
+    [handoff] = env["dispatched"]
+    return tid, handoff
+
+
+def test_review_deadman_page_during_a_running_handoff_child_forks_nothing(env):
+    tid, handoff = _running_handoff(env, 3501)
+    _deadman_event(tid, handoff["event_id"])
+    env["adapter"].handled.clear()
+    turns = _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == [] and turns == [], [t.text for t in turns]
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    assert [c["state"] for c in deadman] == [ah.STATE_DEFERRED]
+
+
+@pytest.mark.parametrize("outcome,delivered,deadman_child", [
+    ("failed", None, True),
+    ("lost", True, True),
+    ("stale", None, True),
+    ("surfaced", True, False),    # answered while the page waited: closed, no child
+])
+def test_waiting_deadman_page_dispatches_after_the_handoff_child_ends_unanswered(env, outcome, delivered,
+                                                                                deadman_child):
+    tid, handoff = _running_handoff(env, 3502)
+    _deadman_event(tid, handoff["event_id"])
+    env["adapter"].handled.clear()
+    _tick(env)
+    assert env["dispatched"][1:] == []
+    fields = {"state": ah.STATE_TERMINAL, "outcome": outcome}
+    if delivered is not None:
+        fields["resurface_delivered"] = delivered
+    ah.BoomerangWakeState().update_claim(handoff["key"], **fields)
+    _kill(env, handoff)
+    turns = _tick(env)
+    deadman = {k: c for k, c in _claims().items() if c.get("row") == "review_deadman"}
+    if deadman_child:
+        assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"] and turns == []
+        [waited] = [c for c in deadman.values() if c.get("redispatched_as")]
+        assert (waited["state"], waited["outcome"]) == (ah.STATE_TERMINAL, "redispatched_after_wait")
+        assert waited["redispatched_as"] in deadman
+    else:
+        assert env["dispatched"][1:] == [] and turns == []
+        assert [(c["state"], c["outcome"]) for c in deadman.values()] == [(ah.STATE_TERMINAL, "episode_answered")]
+
+
+def test_review_deadman_wait_off_switch_forks_during_a_running_handoff_child(env):
+    stop = ah.deadman_wait_stop_file_path()
+    assert stop.name == "boomerang-wake-deadman-wait.disabled"
+    tid, handoff = _running_handoff(env, 3503)
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    _deadman_event(tid, handoff["event_id"])
+    env["adapter"].handled.clear()
+    _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+
+
+def test_deferred_deadman_page_dispatches_when_the_stop_file_appears(env):
+    """The stop file is read every tick: a page already waiting dispatches as on main once it is present."""
+    tid, handoff = _running_handoff(env, 3504)
+    _deadman_event(tid, handoff["event_id"])
+    _tick(env)
+    assert env["dispatched"][1:] == []
+    stop = ah.deadman_wait_stop_file_path()
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"]
+
+
+@pytest.mark.parametrize("page_first", [False, True])
+def test_park_return_why_waits_does_not_answer_the_deadman_page(env, page_first):
+    """A park-return child's comment_why_waits writes a receipt claimed on the review_requested event, which
+    hermes-home's deadman does not count (it counts only review_deadman claims). So the cycle-0 page of that
+    episode still dispatches the deadman child, whose receipt silences both tiers, as on main."""
+    tid = _card(env)
+    _sub(tid)
+    _park_return(tid)
+    _tick(env)
+    [child] = env["dispatched"]
+    assert child["row"] == "review_park_return"
+    if page_first:   # the page arrives while the park-return child still reads: it waits, then dispatches
+        _deadman_event(tid, child["event_id"])
+        env["adapter"].handled.clear()
+        _tick(env)
+        assert env["dispatched"][1:] == []
+    ah.BoomerangWakeState().update_claim(child["key"], state=ah.STATE_TERMINAL, outcome="comment_why_waits")
+    _kill(env, child)
+    if not page_first:
+        _deadman_event(tid, child["event_id"])
+    env["adapter"].handled.clear()
+    turns = _tick(env)
+    assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"] and turns == []
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
+
+
+@pytest.mark.parametrize("stop_files", [True, False])
+def test_park_return_off_switch_does_not_let_a_surfaced_park_return_answer_the_deadman_page(env, stop_files):
+    """With both stop files present the gateway is main again: a park-return child that already surfaced does not
+    answer the cycle-0 deadman page (main counts only own_repo_review_human), so the page gets its child. With
+    the files absent the surfaced park-return child answers the episode, unchanged."""
+    tid = _card(env)
+    _sub(tid)
+    _park_return(tid)
+    _tick(env)
+    [child] = env["dispatched"]
+    assert child["row"] == "review_park_return"
+    ah.BoomerangWakeState().update_claim(child["key"], state=ah.STATE_TERMINAL, outcome="surfaced",
+                                         resurface_delivered=True)
+    _kill(env, child)
+    if stop_files:
+        for stop in (ah.park_return_stop_file_path(), ah.deadman_wait_stop_file_path()):
+            stop.parent.mkdir(parents=True, exist_ok=True)
+            stop.write_text("")
+    _deadman_event(tid, child["event_id"], 0)
+    env["adapter"].handled.clear()
+    turns = _tick(env)
+    deadman = [c for c in _claims().values() if c.get("row") == "review_deadman"]
+    if stop_files:
+        assert [e["row"] for e in env["dispatched"][1:]] == ["review_deadman"] and turns == []
+        assert all(c.get("outcome") != "episode_answered" for c in deadman), deadman
+    else:
+        assert env["dispatched"][1:] == [] and turns == [], [t.text for t in turns]
+        assert [(c["state"], c["outcome"]) for c in deadman] == [(ah.STATE_TERMINAL, "episode_answered")]

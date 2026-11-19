@@ -280,3 +280,21 @@ def test_mechanical_wake_event_is_an_auto_fork_row_and_a_tag_surfaces_it():
     d = classify("mechanical_wake", {"source": "detached-run"}, PLAIN)
     assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "mechanical_wake")
     assert classify("mechanical_wake", {}, dict(PLAIN, title="[spend] card")).verdict == SURFACE
+
+
+# --- t_ff6f4be4: a card back in review from a park -> the attended-read fork ---
+
+
+@pytest.mark.parametrize("payload", [
+    {"park_return": True, "own_repo": False},
+    {"park_return": True, "own_repo": True, "pr_state": "green", "human_reviewer": True},
+])
+def test_park_return_review_is_auto_fork_whatever_its_pr(payload):
+    d = classify("review_requested", payload, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "review_park_return")
+
+
+def test_park_return_review_on_a_spend_card_surfaces():
+    card = {"title": "buy", "body": "tags: spend"}
+    assert wake_disposition("review_requested", {"park_return": True}, card) == SURFACE
+    assert wake_disposition("review_requested", {"park_return": "true"}, PLAIN) == SURFACE
