@@ -518,6 +518,8 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         return {"ok": True, "skipped": "externally-owned"}
     if resolve_store_python(root) is None:
         return {"ok": True, "skipped": "no-store-python"}
+    if _in_kanban_workspace(root):
+        return {"ok": True, "skipped": "kanban-workspace"}
     try:
         local = root / ".hermes" / "bin"
         if len(ensure_install_launchers(root, local)) != len(WINDOWS_BIN_LAUNCHERS):
@@ -536,6 +538,28 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         return {"ok": True, "written": written}
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def _in_kanban_workspace(root: Path) -> bool:
+    """A tree inside a kanban task workspace never publishes PATH commands.
+
+    The workspace is reaped when its card closes, so a ~/.local/bin launcher into it
+    exits 127 from then on (Studio ~/.local/bin/hermes-agent into t_e45c8c8d, t_fc2aac5e).
+    """
+    roots = [os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()]
+    try:
+        from hermes_cli import kanban_db
+
+        roots.extend(str(path) for path in kanban_db.workspace_root_candidates())
+    except Exception:  # noqa: BLE001 - a broken board config must not stop an update
+        pass
+    for entry in filter(None, roots):
+        try:
+            if root.is_relative_to(Path(entry).expanduser().resolve()):
+                return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return False
 
 
 def _merge_user_path(existing: str, entry: str) -> str | None:
