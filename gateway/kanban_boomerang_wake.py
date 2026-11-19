@@ -102,6 +102,7 @@ COMPLETE_TURN_STOP_FILE = "boomerang-complete-turn.disabled"
 # t_d712444b kill switch: while it exists ``_moved`` counts every newer event again (machine comments, the
 # claim's own review_deadman and delivery markers included).
 MOVED_NOISE_STOP_FILE = "boomerang-moved-noise.disabled"
+SUPERSEDED_READ = "superseded_read"   # t_d712444b: handback action of a refused write verdict that carries its read
 
 
 def state_path() -> Path:
@@ -1317,27 +1318,36 @@ _KERNEL_NOISE_KINDS = frozenset({"terminal_worker_reaped", "dispatch_collision_p
 
 
 def _derived_approve(conn: Any, task_id: str, payload: dict, created_at: Any) -> bool:
-    """t_d712444b: the ``commented`` event points at a pipeline-derived APPROVE record. The event carries no body, so
-    the comment row is found by task, author, time (within 2 s of the event) and length (the event's ``len`` is the
-    body before the kernel strips it). Every such candidate must be the record (a ``review_coverage:`` line whose
-    ``verdict`` is ``APPROVE`` and ``by`` is ``pipeline/derived``); no candidate, or any other, is not noise."""
-    author, n = str(payload.get("author") or "").strip(), payload.get("len")
-    if not author or not isinstance(n, int) or not isinstance(created_at, (int, float)):
+    """t_d712444b: the ``commented`` event points at a pipeline-derived APPROVE record. Neither the event nor the
+    comment row carries the other's id (event payload: author, len, session_ref, claimed_author, grant_id), so the
+    event is bound to a row only when that binding is unique: exactly ONE ``commented`` event by this author on the
+    card and exactly ONE comment row by this author within 2 s of it (the kernel writes both in one transaction).
+    Anything else (two comments in the window, a row with no event, an event with no row) is not bound and so is not
+    noise: fail closed. No length or body similarity decides it. The bound row must be the record (a
+    ``review_coverage:`` line whose ``verdict`` is ``APPROVE`` and ``by`` is ``pipeline/derived``)."""
+    author = str(payload.get("author") or "").strip()
+    if not author or not isinstance(created_at, (int, float)):
         return False
+    lo, hi = int(created_at) - 2, int(created_at) + 2
     rows = conn.execute("SELECT body FROM task_comments WHERE task_id = ? AND author = ? AND created_at BETWEEN ? AND ?",
-                        (task_id, author, int(created_at) - 2, int(created_at) + 2)).fetchall()
-    bodies = [str(r[0] or "") for r in rows if 0 <= n - len(str(r[0] or "")) <= 8]
-    if not bodies:
-        return False
-    for body in bodies:
-        cov = [ln.split(":", 1)[1] for ln in body.splitlines() if ln.startswith("review_coverage:")]
+                        (task_id, author, lo, hi)).fetchall()
+    events = 0
+    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented' "
+                               "AND created_at BETWEEN ? AND ?", (task_id, lo, hi)).fetchall():
         try:
-            rec = json.loads(cov[0]) if cov else None
+            p = json.loads(raw or "{}")
         except ValueError:
-            return False
-        if not isinstance(rec, dict) or rec.get("by") != "pipeline/derived" or rec.get("verdict") != "APPROVE":
-            return False
-    return True
+            return False   # an unreadable event in the window: cannot rule it out
+        if not isinstance(p, dict) or str(p.get("author") or "").strip() == author:
+            events += 1
+    if len(rows) != 1 or events != 1:
+        return False
+    cov = [ln.split(":", 1)[1] for ln in str(rows[0][0] or "").splitlines() if ln.startswith("review_coverage:")]
+    try:
+        rec = json.loads(cov[0]) if cov else None
+    except ValueError:
+        return False
+    return isinstance(rec, dict) and rec.get("by") == "pipeline/derived" and rec.get("verdict") == "APPROVE"
 
 
 def _moved_noise(row: Any, episode: Optional[int], *, action: Optional[str] = None, conn: Any = None,
@@ -2397,7 +2407,10 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
         return
     superseded = reason in _SUPERSEDE_REASONS
     stopped = reason == "stopped by /stop"
-    handback = handback_row(entry, {"summary": reason},
+    # t_d712444b round 3: a superseded WRITE verdict re-delivers the child's read (superseded_text). It keeps that
+    # identity on the pending row, so delivery never takes it for a legacy surface and drops it as stale (a merged PR).
+    read = superseded and bool(tried) and text is not None
+    handback = handback_row(entry, {"summary": reason, **({"action": SUPERSEDED_READ} if read else {})},
                             turn_text=text if text is not None else str(entry.get("wake_text") or ""))
     if fork_died and text is None:
         handback[1]["fork_died"] = True

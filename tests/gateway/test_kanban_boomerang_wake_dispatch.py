@@ -3237,3 +3237,41 @@ def test_superseded_wake_names_the_staged_read(env):
     _run(env, entry, "completed", _verdict(entry, "request_changes", findings=["x"]))
     turns = [t.text for t in env["adapter"].handled]
     assert len(turns) == 1 and f"staged read: {staged}\n" in turns[0], turns
+
+
+# --- t_d712444b round 3: bind each comment event to exactly one row; a superseded read survives a merged PR --------
+
+
+def test_derived_approve_next_to_a_whitespace_padded_operator_stamp_still_refuses(env):
+    """Outside review B: the kernel stores ``body.strip()`` but the event carries the input length, so a same-second
+    operator stamp padded with spaces to the record's length has an event that looks like the record's. Neither event
+    can be bound to exactly one row: both are moves, the verdict is refused and the read re-delivered."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+        kb.add_comment(conn, tid, "default", "operator stamp: hold".ljust(len(DERIVED), " "))
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="four findings",
+                                           findings=["own CI red the reader named"]))
+    with kb.connect_closing() as conn:
+        assert not any(e.kind == "changes_requested" for e in kb.list_events(conn, tid))
+    turns = [t.text for t in env["adapter"].handled]
+    assert len(turns) == 1 and "child verdict superseded" in turns[0], turns
+    assert "four findings" in turns[0] and "- own CI red the reader named" in turns[0]
+
+
+def test_superseded_read_is_delivered_when_the_pr_merged(env):
+    """Outside review D/G: the card completed AND its PR merged at the same head before the child's request_changes
+    returned. The write is refused; the superseded read is not dropped by the stale-surface guard at delivery."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+            assert kb.complete_task(conn, tid, summary="merged on the pipeline approval")
+    env["health"][(REPO, 3120)] = {"state": "merged", "head": "a" * 40}
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="four findings",
+                                           findings=["own CI red the reader named"]))
+    with kb.connect_closing() as conn:
+        assert not any(e.kind == "changes_requested" for e in kb.list_events(conn, tid))
+    turns = [t.text for t in env["adapter"].handled]
+    assert len(turns) == 1 and "child verdict superseded" in turns[0], turns
+    assert "four findings" in turns[0] and "- own CI red the reader named" in turns[0]
