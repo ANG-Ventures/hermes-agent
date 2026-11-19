@@ -169,7 +169,7 @@ async def test_cap_refusal_files_one_inbox_item_per_episode(tmp_path, monkeypatc
 async def test_card_wake_at_cap_evicts_a_watch_notice_instead_of_being_refused(tmp_path, monkeypatch):
     """#434 coalescing + t_469a7ef8 watch eviction together: a queue at its cap holding kanban wakes
     for distinct cards plus watch notices admits a wake for a NEW card by evicting the oldest watch
-    notice; no WakeNotAccepted and no inbox item."""
+    notice from the overflow (the head slot is never evicted); no WakeNotAccepted and no inbox item."""
     from gateway.run_busy import WATCH_NOTIFICATION_META
     home = _fake_fleet_root(tmp_path)
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
@@ -190,7 +190,7 @@ async def test_card_wake_at_cap_evicts_a_watch_notice_instead_of_being_refused(t
         queued = _queued(runner, adapter, key)
         assert len(queued) == cap
         assert [e.text for e in queued if (e.metadata or {}).get(WATCH_NOTIFICATION_META)] == [
-            f"[watch] match {i}" for i in range(1, runner._BUSY_QUEUE_MAX_WATCH)]
+            f"[watch] match {i}" for i in range(runner._BUSY_QUEUE_MAX_WATCH) if i != 1]
         assert queued[-1].text == f"[kanban] {cards[-1]} notice 0"
         assert _inbox_calls(home) == []
         assert key not in runner.__dict__.get("_wake_refusal_episodes", set())

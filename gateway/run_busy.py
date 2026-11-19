@@ -787,22 +787,15 @@ class GatewayBusySessionMixin:
         return sum(1 for item in queued if item is not None and _is_watch_notification_event(item))
 
     def _evict_oldest_watch_notification(self, session_key: str, adapter: Any) -> bool:
-        """Free one slot of a full queue by removing its oldest watch notification; False if none."""
-        pending_slot = getattr(adapter, "_pending_messages", None)
-        if pending_slot is None:
-            return False
+        """Free one slot of a full queue by removing its oldest OVERFLOW watch notification; False if
+        none. The pending head slot is never evicted: a same-sender human follow-up can be merged into
+        it (busy text debounce, photo merge), and evicting it would drop that input (Prism
+        cbbd6b0a5f80). Overflow items are never merge targets."""
         overflow = self._overflow_queue(session_key)
-        head = pending_slot.get(session_key)
-        if head is not None and _is_watch_notification_event(head):
-            if overflow:
-                pending_slot[session_key] = overflow.pop(0)
-            else:
-                pending_slot.pop(session_key, None)
-        else:
-            index = next((i for i, item in enumerate(overflow or ()) if _is_watch_notification_event(item)), None)
-            if index is None:
-                return False
-            overflow.pop(index)
+        index = next((i for i, item in enumerate(overflow or ()) if _is_watch_notification_event(item)), None)
+        if index is None:
+            return False
+        overflow.pop(index)
         logger.warning("Evicted oldest queued watch notification for session %s to admit a follow-up at cap (%d).",
                        session_key, self._BUSY_QUEUE_MAX_PENDING)
         return True

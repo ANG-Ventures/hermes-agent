@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import contextvars
 import dataclasses
+import itertools
 import json
 import logging
 import time
@@ -124,23 +125,32 @@ def _watch_route_key(evt: dict) -> str:
     return "|".join(str(evt.get(f) or "") for f in ("platform", "chat_id", "thread_id", "origin_session_id"))
 
 
+_WATCH_DRAIN_SEQ = itertools.count(1)
+
+
 def _fold_watch_matches(events: list) -> list:
     """Fold each process's ``watch_match`` events into its newest one, adding the folded ones (and
-    their own ``suppressed`` counts) to ``suppressed`` so the notice reads "N earlier matches"."""
+    their own ``suppressed`` counts) to ``suppressed`` so the notice reads "N earlier matches".
+
+    "Newest" is by ``_watch_seq``, stamped the first time a drain sees an event: a held or retried
+    event goes back to the queue tail, so queue order is not emission order, but an unstamped event
+    always arrived after every stamped one (Prism e0a50dc0c587)."""
     folded: list = []
     index: Dict[tuple, int] = {}
     for evt in events:
         if evt.get("type") != "watch_match":
             folded.append(evt)
             continue
+        evt.setdefault("_watch_seq", next(_WATCH_DRAIN_SEQ))
         key = (_watch_route_key(evt), str(evt.get("session_id") or ""))
         if key not in index:
             index[key] = len(folded)
             folded.append(evt)
             continue
-        older = folded[index[key]]
-        folded[index[key]] = {**evt, "suppressed": int(older.get("suppressed") or 0) + 1
-                              + int(evt.get("suppressed") or 0)}
+        other = folded[index[key]]
+        newer, older = (evt, other) if evt["_watch_seq"] > other["_watch_seq"] else (other, evt)
+        folded[index[key]] = {**newer, "suppressed": int(older.get("suppressed") or 0) + 1
+                              + int(newer.get("suppressed") or 0)}
     return folded
 
 

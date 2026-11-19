@@ -145,7 +145,34 @@ def test_full_queue_of_watch_notifications_still_admits_a_wake_or_user_message(m
     assert event._gateway_accepted is True
     queued = _queued(runner, adapter)
     assert len(queued) == runner._BUSY_QUEUE_MAX_PENDING and queued[-1] is event
-    assert [e.text for e in queued[:2]] == ["watch 1", "watch 2"]  # the oldest watch was evicted
+    # The oldest OVERFLOW watch was evicted; the head slot is never evicted.
+    assert [e.text for e in queued[:2]] == ["watch 0", "watch 2"]
+
+
+def test_human_input_merged_into_a_head_watch_notice_is_never_evicted(monkeypatch, tmp_path):
+    """Prism cbbd6b0a5f80: busy text debounce can merge a same-sender human follow-up into the head
+    slot's watch notice. A wake at the cap must not evict that slot and drop the human's text."""
+    runner, adapter, _ = _runner(monkeypatch, tmp_path)
+    runner._queue_or_replace_pending_event(KEY, _event("watch 0", watch=True))
+    head = adapter._pending_messages[KEY]
+    head.text += "\n\nplease also check the logs"   # what merge_pending_message_event(merge_text=True) does
+    for n in range(runner._BUSY_QUEUE_MAX_PENDING - 1):
+        runner._queue_or_replace_pending_event(KEY, _event(f"[kanban wake] t_{n}"))
+    late = _event("another user message", internal=False)
+    runner._queue_or_replace_pending_event(KEY, late)
+    assert getattr(late, "_gateway_accepted", False) is False   # refused, not admitted by evicting the head
+    assert adapter._pending_messages[KEY] is head and "please also check the logs" in head.text
+    assert len(_queued(runner, adapter)) == runner._BUSY_QUEUE_MAX_PENDING
+
+
+def test_fold_keeps_the_newest_match_when_an_older_retry_sits_behind_it():
+    """Prism e0a50dc0c587: a retried match is requeued at the tail, behind a newer match from the
+    same process. Folding must keep the newer output, not the retried older one."""
+    first = rn._fold_watch_matches([_watch(n=1)])            # drained once: MATCH 1 is stamped
+    retried = first[0]                                       # its injection failed: requeued at the tail
+    folded = rn._fold_watch_matches([_watch(n=2), retried])
+    assert len(folded) == 1
+    assert folded[0]["output"] == "MATCH 2\n" and folded[0]["suppressed"] == 1
 
 
 def test_user_message_at_cap_with_no_watch_notification_is_still_dropped(monkeypatch, tmp_path):
