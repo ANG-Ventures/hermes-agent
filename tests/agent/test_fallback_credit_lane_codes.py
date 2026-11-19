@@ -193,8 +193,8 @@ def test_upload_failed_body_renders_the_target_banner(_home, monkeypatch):
      "request upload failed on sub-vps-4 (ConnectionResetError) after 3 s of a 120 s limit; "
      "request not fully sent, not retried",
      "upload failed",
-     "our upload to sub-vps-4 did not finish in 120 s (Studio to box link; ours, not "
-     "Anthropic), not re-sent"),
+     "our upload to sub-vps-4 did not finish, failed after 3 s of 120 s (Studio to box link; "
+     "ours, not Anthropic), not re-sent"),
     ("credit_upstream_write_failed", 502,
      "request upload failed on sub-vps-4 (TimeoutError) with 0.5 MB to send; not retried",
      "upload timed out",

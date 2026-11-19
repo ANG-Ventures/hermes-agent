@@ -255,6 +255,7 @@ _CREDIT_SEAT_RE = re.compile(r"\b(?:on|for) (local|sub-vps-\d+)\b")
 _CREDIT_EXC_RE = re.compile(r"\(([A-Z]\w*(?:Error|Exception|Timeout))\)")
 _CREDIT_WHY_RE = re.compile(r"no eligible credit key \(([a-z_]+)\)")
 _CREDIT_LIMIT_RE = re.compile(r"\bof a (\d+(?:\.\d+)?) s limit\b")
+_CREDIT_ELAPSED_RE = re.compile(r"\bafter (\d+(?:\.\d+)?) s\b")
 _CREDIT_MB_RE = re.compile(r"\bwith (\d+(?:\.\d+)?) MB to send\b")
 
 
@@ -1707,6 +1708,11 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
                                     credit_lane_upload(body, text)):
                     if val:
                         row[key] = val
+                # How long the upload ran before it failed; the limit is not the
+                # elapsed time when the link reset early (Prism 7271372ea8e6).
+                m_el = _CREDIT_ELAPSED_RE.search(_credit_message(body, text))
+                if m_el:
+                    row["credit_elapsed_s"] = m_el.group(1)
         # §4.8: a direct pin's seat and hop are knowable locally (no relay
         # headers by design, #1260). Pooled rows are left as they are.
         try:
