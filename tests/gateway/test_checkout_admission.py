@@ -1216,6 +1216,96 @@ def test_lease_killed_publisher_expires_after_three_leases(store):
     assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
+def _stall_first_scan(store, mono, stall, during=None):
+    """Make the next scan_records call take ``stall`` seconds on both clocks
+    (the gate's monotonic and the store's mtime clock), once. ``during`` runs
+    inside the stall, before the records are read (a peer writing mid-scan)."""
+    real = store.scan_records
+
+    def slow(name):
+        store.scan_records = real
+        mono.t += stall
+        for key, _sig, _rec in real(name):
+            _age_record(store, name, stall, instance=key)
+        if during is not None:
+            during()
+        return real(name)
+
+    store.scan_records = slow
+
+
+def _store_clock_on_mono(store, mono, written, stall_at_first_read=0.0):
+    """record_age on the gate's injected clock: a record written at mono
+    ``written`` is ``mono.t - written`` old, so no real time enters the test.
+    ``stall_at_first_read`` seconds pass on that clock at the first age read
+    (after the gate read its clock, before the first-sight age is read)."""
+    state = {"stall": stall_at_first_read}
+
+    def age(name, instance=None):
+        mono.t += state["stall"]
+        state["stall"] = 0.0
+        return mono.t - written
+
+    store.record_age = age
+
+
+def test_lease_first_sight_anchor_survives_a_stall_in_the_scan(store):
+    """t_142f9fcb: a first-seen peer is aged from its record mtime. A stall
+    between the gate's clock read and the age read must not move the anchor
+    before the peer's write (it cleared 0.3 s early: 2.69 s against 3.0)."""
+    store.hold("op", [SERVE], mode="freeze")
+    mono = _Mono()
+    peer = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0)
+    peer.pid = os.getppid()
+    me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0, monotonic=mono)
+    peer.publish()  # the peer's last write, at mono 1000.0
+    _store_clock_on_mono(store, mono, written=1000.0)
+    _stall_first_scan(store, mono, 0.3)
+    assert me.publish().get("shared_with")
+    mono.t = 1000.0 + 3.0 - 0.05
+    assert me.publish().get("shared_with"), "cleared before the peer's lease could expire"
+    mono.t = 1000.0 + 3.0 + 0.05
+    assert "shared_with" not in me.publish()
+
+
+def test_lease_first_sight_anchor_survives_a_stall_before_the_age_read(store):
+    """t_142f9fcb (del-597d): the clock is read AFTER the first-sight age, so
+    a stall between the gate's clock read and the age read cannot backdate
+    the anchor (pins ``alive_at = self._mono() - age``)."""
+    store.hold("op", [SERVE], mode="freeze")
+    mono = _Mono()
+    peer = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0)
+    peer.pid = os.getppid()
+    me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0, monotonic=mono)
+    peer.publish()  # the peer's last write, at mono 1000.0
+    _store_clock_on_mono(store, mono, written=1000.0, stall_at_first_read=0.3)
+    assert me.publish().get("shared_with")
+    mono.t = 1000.0 + 3.0 - 0.05
+    assert me.publish().get("shared_with"), "cleared before the peer's lease could expire"
+    mono.t = 1000.0 + 3.0 + 0.05
+    assert "shared_with" not in me.publish()
+
+
+def test_lease_known_peer_write_during_a_stalled_scan_is_not_backdated(store):
+    """t_142f9fcb: a known peer that writes after the gate read its clock but
+    before the scan read its record is alive from that read, not from before."""
+    store.hold("op", [SERVE], mode="freeze")
+    mono = _Mono()
+    peer = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0)
+    peer.pid = os.getppid()
+    me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0, monotonic=mono)
+    peer.publish()
+    assert me.publish().get("shared_with")
+    seq = store.read_consumer(SERVE, peer.instance)["lease_seq"]
+    _stall_first_scan(store, mono, 0.3, during=lambda: peer._write(peer._last_record))
+    assert me.publish().get("shared_with")
+    assert store.read_consumer(SERVE, peer.instance)["lease_seq"] > seq  # the peer wrote mid-scan, at mono 1000.3
+    mono.t = 1000.3 + 3.0 - 0.05
+    assert me.publish().get("shared_with"), "cleared before the peer's lease could expire"
+    mono.t = 1000.3 + 3.0 + 0.05
+    assert "shared_with" not in me.publish()
+
+
 def test_lease_released_publisher_clears_at_once(store):
     """A clean stop writes a released record: no wait for expiry."""
     store.hold("op", [SERVE], mode="freeze")
@@ -1632,6 +1722,13 @@ def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
         assert ca.evaluate(store)["verdict"] == UNKNOWN
         os.kill(proc.pid, signal.SIGKILL)
         proc.wait(timeout=30)
+        # The lease runs from the peer's LAST WRITE, not from the kill: a peer
+        # starved under load last wrote up to a lease before it died (t_142f9fcb:
+        # 2.69 s kill->clear on a hosted runner was a 3 s lease). Anchor the floor
+        # on that write's mtime, read on the store's own clock like the gate does.
+        peer_mtime = max(os.stat(store.consumer_path(SERVE, key)).st_mtime
+                         for key, _sig, rec in store.scan_records(SERVE)
+                         if isinstance(rec, dict) and rec.get("token") not in (None, me.token))
         killed_at = time.monotonic()
         cleared_at = None
         while time.monotonic() - killed_at < 3 * lease_s * 10:
@@ -1640,7 +1737,12 @@ def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
                 break
             time.sleep(0.05)
         assert cleared_at is not None, "flag never cleared after SIGKILL"
-        assert cleared_at - killed_at >= 3 * lease_s - 0.2  # not before the lease could expire
+        clock = store.consumers_dir / ".lease-clock.t142"
+        clock.write_text("")
+        peer_age = clock.stat().st_mtime - peer_mtime
+        clock.unlink()
+        # not before the lease could expire (0.05 s: filesystem timestamp granularity)
+        assert peer_age >= 3 * lease_s - 0.05, f"cleared {peer_age:.3f}s after the peer's last write"
         assert ca.evaluate(store)["verdict"] == QUIESCENT
     finally:
         if proc.poll() is None:

@@ -830,11 +830,14 @@ class AdmissionGate:
         Records with no token predate the lease and keep the pid-identity
         check (``_same_live_process``) for one release.
         """
-        now = self._mono()
         try:
             scan = self.store.scan_records(self.consumer)
         except Exception:
             scan = []
+        # Read our clock AFTER the records (t_142f9fcb): a clock read before the
+        # scan predates a write the scan still sees, and a stall in between would
+        # anchor that peer early and clear it early by the stall.
+        now = self._mono()
         foreign_seen = None
         for key, sig, prev in scan:
             if key == self.instance or not isinstance(prev, dict):
@@ -858,7 +861,7 @@ class AdmissionGate:
                     alive_at = now if known.get("sig") != (key, sig) else known["alive_at"]
                 else:
                     age = self.store.record_age(self.consumer, key)
-                    alive_at = now if age is None else now - max(0.0, age)
+                    alive_at = now if age is None else self._mono() - max(0.0, age)  # clock after the age
                 self._peers[tok] = {
                     "pid": prev.get("pid"), "instance": prev.get("instance"),
                     "alive_at": alive_at, "expiry": _lease_expiry(prev, self.lease_s),
