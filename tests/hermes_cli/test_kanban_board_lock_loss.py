@@ -118,6 +118,39 @@ def test_quarantine_holds_the_lifecycle_lock_against_a_concurrent_tracked_open(t
             conn.close()
 
 
+def test_quarantine_copy_does_not_stall_another_databases_open_and_close(tmp_path, monkeypatch):
+    """The copy holds only ITS board out of service: an open/close of database B in this process
+    returns at once while board A's copy is in progress (t_b8456297 send-back: a process-wide lock
+    across a 537 MB copy stalled the gateway's SessionDB open)."""
+    board_a, other_b = tmp_path / "a" / "kanban.db", tmp_path / "b" / "state.db"
+    for db in (board_a, other_b):
+        db.parent.mkdir()
+        seed = sqlite3.connect(db)
+        seed.execute("CREATE TABLE t(v)")
+        seed.commit()
+        seed.close()
+    done = threading.Event()
+    state: dict = {}
+
+    def _open_close_b():
+        connect_tracked(other_b, check_same_thread=False).close()
+        done.set()
+
+    real_fingerprint = kbc._db_fingerprint
+
+    def _fingerprint_while_b(path):  # board A's copy is in progress here
+        state["thread"] = threading.Thread(target=_open_close_b, daemon=True)
+        state["thread"].start()
+        state["b_returned_during_copy"] = done.wait(5.0)
+        return real_fingerprint(path)
+
+    monkeypatch.setattr(kbc, "_db_fingerprint", _fingerprint_while_b)
+    backup = kbc._backup_corrupt_db(board_a)
+    state["thread"].join(30)
+    assert backup is not None
+    assert state["b_returned_during_copy"]
+
+
 def test_quarantine_copies_once_per_episode_until_a_clean_verdict(tmp_path):
     db = tmp_path / "kanban.db"
     db.write_bytes(b"SQLite format 3\x00" + b"\x00" * 8176)

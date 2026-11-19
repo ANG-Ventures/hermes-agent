@@ -548,10 +548,11 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     still raises loudly). Writes are confined to the DB's parent directory:
     the basename derives only from ``path.name`` + content hash.
 
-    The open-handle check and every raw read/copy run under the connection-
-    lifecycle lock (``offline_file_access``), so a tracked connection
-    (``connect_tracked``) in this process cannot open between the check and
-    the copy: it waits until the copy is done. NOT covered: a plain
+    The open-handle check and every raw read/copy run inside
+    ``database_offline`` for THIS database only, so a tracked connection
+    (``connect_tracked``) to it in this process cannot open between the check
+    and the copy: it waits until the copy is done. Opens and closes of every
+    other database (other boards, state.db) never wait on the copy. NOT covered: a plain
     ``sqlite3.connect`` (or any other opener that bypasses ``connect_tracked``)
     racing this copy in this process. The fd scan only sees handles already
     open when it runs. Other processes are never excluded, so the copy is not
@@ -568,13 +569,13 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # warn-and-proceed: losing a forensic copy beats corrupting the live DB.
     from hermes_cli.sqlite_safe_read import (
         LiveConnectionError,
-        offline_file_access,
+        database_offline,
         process_holds_open_fd,
     )
 
     sidecars = [parent / (base_name + suffix) for suffix in ("-wal", "-shm")]
     try:
-        with offline_file_access(resolved, what="quarantine"):
+        with database_offline(resolved, what="quarantine"):
             if any(process_holds_open_fd(p) for p in (resolved, *sidecars)):
                 raise LiveConnectionError(f"{resolved} has an open descriptor in this process")
             return _copy_corrupt_db(resolved, parent, base_name, sidecars)
@@ -590,7 +591,7 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
 
 def _copy_corrupt_db(resolved: Path, parent: Path, base_name: str, sidecars: list[Path]) -> Optional[Path]:
     """The raw reads and copies of :func:`_backup_corrupt_db`; the caller holds
-    the connection-lifecycle lock."""
+    this database in ``database_offline``."""
     # One copy per corruption episode. A broken board keeps taking writes on
     # already-open connections, so its hash changes between refused opens and
     # content addressing alone copied the whole file on every one (10 x 512 MB
