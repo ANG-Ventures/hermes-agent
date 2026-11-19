@@ -90,6 +90,16 @@ DEFAULT_PUBLISH_INTERVAL = 2.0
 # skew cannot fake or hide liveness.
 DEFAULT_LEASE_S = 30.0
 LEASE_EXPIRY_FACTOR = 3
+# Write-if-changed (t_dd40e9f2): a publish whose record matches the last one
+# written (ignoring the fields below) is skipped until the last write is this
+# old, so an idle publisher writes every 10 s instead of every 2 s. Each
+# write was mkstemp + fsync + rename + dir fsync on the checkout's drive (on
+# ACE-AI ~2.7k of them per 30 min drove the OS drive's ext4 journal; the
+# fsyncs are gone too, see write_consumer). Kept
+# well under DEFAULT_STALE_AFTER so published_at never reads stale; any change
+# (a new hold epoch, a ticket, a work count) still writes on the next tick.
+DEFAULT_REFRESH_S = 10.0
+_VOLATILE_FIELDS = ("published_at", "lease_seq", "lease_released")
 QUIESCENT, DRAINED, BUSY, UNKNOWN, NOT_HELD, DEFER = (
     "QUIESCENT", "DRAINED", "BUSY", "UNKNOWN", "NOT_HELD", "DEFER",
 )
@@ -136,16 +146,21 @@ def _validate_instance(instance: str) -> str:
 
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+def _atomic_write_json(path: Path, payload: Mapping[str, Any], *, durable: bool = True) -> None:
+    """Atomic replace. ``durable=False`` skips the file and directory fsyncs:
+    each one forces an ext4 journal commit (t_dd40e9f2). Only for records whose
+    loss in a crash is the correct reading (a publisher's liveness ack)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
+            if durable:
+                fh.flush()
+                os.fsync(fh.fileno())
         os.replace(tmp, path)
-        _fsync_dir(path.parent)
+        if durable:
+            _fsync_dir(path.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
@@ -478,7 +493,9 @@ class HoldStore:
     def write_consumer(self, name: str, record: Mapping[str, Any]) -> None:
         inst = record.get("instance")
         valid = isinstance(inst, str) and bool(_INSTANCE_RE.fullmatch(inst))
-        _atomic_write_json(self.consumer_path(name, inst if valid else None), record)
+        # Not fsynced (t_dd40e9f2): an ack is a liveness record rewritten every
+        # refresh_s; one lost in a crash reads as stale, which is the truth.
+        _atomic_write_json(self.consumer_path(name, inst if valid else None), record, durable=False)
 
     def _record_paths(self, name: str) -> list:
         """``(key, path, stat)`` of every record of ``name``, newest write first."""
@@ -645,7 +662,8 @@ class AdmissionGate:
                  serving: Optional[Callable[[], Mapping[str, Any]]] = None,
                  clock: Callable[[], float] = time.time,
                  lease_s: float = DEFAULT_LEASE_S,
-                 monotonic: Callable[[], float] = time.monotonic):
+                 monotonic: Callable[[], float] = time.monotonic,
+                 refresh_s: float = DEFAULT_REFRESH_S):
         self.store = store
         self.consumer = validate_consumer_name(consumer)
         self.instance = uuid.uuid4().hex
@@ -655,6 +673,12 @@ class AdmissionGate:
         self._write_lock = threading.RLock()  # mark + write, loop vs lease thread
         self._seq = 0
         self._last_record: Optional[dict] = None
+        self.refresh_s = float(refresh_s)  # 0 = write on every tick (the pre-t_dd40e9f2 behaviour)
+        self._last_write_at: Optional[float] = None  # our monotonic clock, any write (lease renewals too)
+        # Last write of a FRESH snapshot (a new published_at). Kept apart from
+        # _last_write_at: a renewal rewrites the old published_at, so counting
+        # it would let renewals skip every unchanged publish until it read stale.
+        self._last_publish_at: Optional[float] = None
         self._lease_stop = threading.Event()
         self._lease_thread: Optional[threading.Thread] = None
         # foreign lease token -> {"pid", "instance", "alive_at" (our monotonic), "expiry" (s)}
@@ -887,31 +911,62 @@ class AdmissionGate:
             with contextlib.suppress(OSError, ValueError):
                 os.unlink(self.store.consumer_path(self.consumer, key))
 
-    def _write(self, record: dict, *, release: bool = False) -> dict:
+    def _marked(self, record: dict) -> dict:
+        record = dict(record)
+        record.pop("shared_with", None)
+        record.pop("lease_released", None)
+        return self._mark_shared_record(record)
+
+    def _write(self, record: dict, *, release: bool = False, marked: bool = False) -> dict:
         """Mark + write as one step (the serving loop and the lease thread
         both write); stamps the lease on success. Writes OUR record only."""
         with self._write_lock:
-            record = dict(record)
-            record.pop("shared_with", None)
-            record.pop("lease_released", None)
-            record = self._mark_shared_record(record)
+            record = dict(record) if marked else self._marked(record)
             if release:
                 record["lease_released"] = True
             self._seq += 1
             record["lease_seq"] = self._seq  # every write is a visible change to a peer's scan
             self.store.write_consumer(self.consumer, record)
             self._last_record = record
+            self._last_write_at = self._mono()
             return record
+
+    def _written_within(self, seconds: float, last: Optional[float] = None) -> bool:
+        last = self._last_write_at if last is None else last
+        return last is not None and self._mono() - last < seconds
+
+    def _publish(self, record: dict) -> dict:
+        """Write a fresh snapshot unless it says nothing new (write-if-changed):
+        same content as the last record written, and that write younger than
+        ``refresh_s``. The peer scan (shared mark, prune) still runs every
+        tick, and a change in the shared mark is a change. Returns the record
+        now on disk."""
+        with self._write_lock:
+            record = self._marked(record)
+            last = self._last_record
+            if (last is not None and self._last_publish_at is not None
+                    and self._written_within(self.refresh_s, self._last_publish_at)
+                    and not last.get("lease_released")
+                    and all(record.get(k) == last.get(k)
+                            for k in set(record) | set(last) if k not in _VOLATILE_FIELDS)):
+                return last
+            written = self._write(record, marked=True)
+            self._last_publish_at = self._last_write_at
+            return written
 
     def renew_lease(self) -> Optional[dict]:
         """Rewrite the last record so the lease stays fresh even while the
         serving loop is stalled (its ``published_at`` still ages, so a stalled
         loop reads stale, while a peer still sees this process as alive).
-        A renewal racing a stop is dropped so it cannot undo the release."""
+        A renewal racing a stop is dropped so it cannot undo the release.
+        Skipped while a publish wrote in the last ``refresh_s`` (at most half
+        a lease): that write already renewed it."""
         with self._write_lock:
             last = self._last_record
             if last is None or self._lease_stop.is_set():
                 return None
+            if self._written_within(min(self.refresh_s, self.lease_s / 2)):
+                return last
             return self._write(last)
 
     def start_lease(self) -> threading.Thread:
@@ -951,7 +1006,7 @@ class AdmissionGate:
             logger.warning("checkout admission lease release failed", exc_info=True)
 
     def publish(self) -> dict:
-        return self._write(self.snapshot())
+        return self._publish(self.snapshot())
 
     def start_publisher_thread(self, interval: float = DEFAULT_PUBLISH_INTERVAL,
                                stop: Optional[threading.Event] = None) -> threading.Thread:
@@ -985,7 +1040,7 @@ class AdmissionGate:
             while True:
                 try:
                     record = self.snapshot()
-                    await asyncio.to_thread(self._write, record)
+                    await asyncio.to_thread(self._publish, record)
                 except asyncio.CancelledError:
                     raise
                 except Exception:

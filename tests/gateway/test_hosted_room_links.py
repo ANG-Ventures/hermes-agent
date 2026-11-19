@@ -121,3 +121,36 @@ def test_room_link_repr_never_contains_grant():
         trace_id="trace-1",
     )
     assert "top.secret.grant" not in repr(link)
+
+
+@pytest.mark.platforms("posix")
+def test_room_link_wal_sidecars_held_open_are_owner_only(tmp_path):
+    """Prism a43760be5bf9: a reader that outlives the save (the hosted-room worker's WAL
+    anchor, t_dd40e9f2) keeps -wal/-shm alive; made while the store was 0644, they kept
+    committed grants readable after the database itself became 0600."""
+    import os
+    import sqlite3
+    path = tmp_path / "state.db"
+    old_umask = os.umask(0o022)
+    try:
+        seed = sqlite3.connect(path)
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("CREATE TABLE t(x)")
+        seed.commit()
+        seed.close()
+        anchor = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        anchor.execute("SELECT 1 FROM sqlite_master").fetchall()
+        try:
+            assert stat.S_IMODE(os.stat(f"{path}-wal").st_mode) == 0o644  # the 0644 sidecar the anchor pins
+            save_room_link(path, make_stored_link(
+                room_id="room", member_id="member", target_url="https://peer.example.test",
+                target_profile="default", grant="grant", catalog=_catalog(),
+                cancellation_scope_id="cancel", trace_id="trace",
+            ))
+            assert os.path.exists(f"{path}-wal")
+            for suffix in ("", "-wal", "-shm"):
+                assert stat.S_IMODE(os.stat(f"{path}{suffix}").st_mode) == 0o600, suffix
+        finally:
+            anchor.close()
+    finally:
+        os.umask(old_umask)

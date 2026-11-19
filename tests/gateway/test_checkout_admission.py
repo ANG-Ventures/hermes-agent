@@ -1287,6 +1287,75 @@ def test_lease_thread_renews_while_serving_loop_is_stalled(store):
         g.stop_lease()
 
 
+def test_unchanged_publish_tick_writes_and_fsyncs_nothing(store, monkeypatch):
+    """t_dd40e9f2: an idle publisher re-wrote its record (mkstemp + 2 fsyncs +
+    rename) every 2 s tick, ~2.7k per 30 min on ACE-AI's OS drive. An unchanged
+    tick now writes nothing; the record is still refreshed every refresh_s (so
+    published_at never reads stale) and any change is written at once."""
+    mono = [1000.0]
+    g = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, monotonic=lambda: mono[0])
+    first = g.publish()
+    writes, fsyncs = [], []
+    real_write, real_fsync = ca._atomic_write_json, os.fsync
+    monkeypatch.setattr(ca, "_atomic_write_json",
+                        lambda p, d, **kw: (writes.append(Path(p).name), real_write(p, d, **kw))[1])
+    monkeypatch.setattr(ca.os, "fsync", lambda fd: (fsyncs.append(fd), real_fsync(fd))[1])
+    for _ in range(4):  # 8 s of 2 s ticks, nothing changed
+        mono[0] += 2
+        assert g.publish() is first
+    g.renew_lease()
+    assert (writes, fsyncs) == ([], [])
+    mono[0] += 2.5  # past refresh_s: written again, published_at advances
+    assert g.publish()["published_at"] > first["published_at"] and len(writes) == 1
+    hold = store.hold("op", [SERVE], mode="freeze")
+    del writes[:]
+    mono[0] += 0.1  # a change (the new epoch) is written on the very next tick
+    assert g.publish()["hold_epoch"] == hold.epoch and len(writes) == 1
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_ack_writes_never_fsync_but_the_hold_does(store, monkeypatch):
+    """t_dd40e9f2 (F5): every ack write did a file fsync + a dir fsync, each a
+    forced ext4 journal commit (~5.7k per 30 min on ACE-AI, 76% of all gateway
+    fsyncs). A liveness ack is not fsynced (lost in a crash = stale = true);
+    the operator's hold.json, which keeps the checkout closed, still is."""
+    fsyncs = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(ca.os, "fsync", lambda fd: (fsyncs.append(fd), real_fsync(fd))[1])
+    mono = [1000.0]
+    g = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, monotonic=lambda: mono[0])
+    g.publish()                  # first write
+    mono[0] += 11
+    g.publish()                  # refresh write
+    assert fsyncs == []
+    hold = store.hold("op", [SERVE], mode="freeze")
+    assert len(fsyncs) == 2      # hold.json: file + directory
+    del fsyncs[:]
+    mono[0] += 0.1
+    assert g.publish()["hold_epoch"] == hold.epoch  # a change, written
+    g.stop_lease()               # release write
+    assert fsyncs == []
+
+
+def test_lease_renewals_never_hold_back_a_fresh_publish(store):
+    """Prism c706b20a36bc: a renewal rewrites the old published_at. Counting it
+    as a fresh publish let renewals faster than refresh_s skip every unchanged
+    publish, so a healthy idle gate read stale after DEFAULT_STALE_AFTER."""
+    store.hold("op", [SERVE], mode="freeze")
+    wall, mono = [5000.0], [1000.0]
+    g = AdmissionGate(store, SERVE, active_work=Work(), lease_s=2, clock=lambda: wall[0],
+                      monotonic=lambda: mono[0])
+    first = g.publish()["published_at"]
+    for _ in range(11):  # 22 s, a renewal before every publish
+        wall[0] += 2
+        mono[0] += 2
+        g.renew_lease()
+        g.publish()
+    on_disk = json.loads(store.consumer_path(SERVE, g.instance).read_text())
+    assert on_disk["published_at"] > first
+    assert ca.evaluate(store, now=wall[0])["verdict"] == QUIESCENT
+
+
 class _WriteStall:
     """Park one named thread's next consumer-record write between computing the
     record and putting it on disk: the window a descheduled, SIGSTOPped or
@@ -1298,11 +1367,11 @@ class _WriteStall:
         self.parked, self.release = threading.Event(), threading.Event()
         real = ca._atomic_write_json
 
-        def write(path, payload):
+        def write(path, payload, **kw):
             if threading.current_thread().name == self.thread_name and not self.release.is_set():
                 self.parked.set()
                 assert self.release.wait(30), "stalled writer never released"
-            return real(path, payload)
+            return real(path, payload, **kw)
 
         monkeypatch.setattr(ca, "_atomic_write_json", write)
 
@@ -1315,7 +1384,8 @@ def test_interleaved_same_name_publish_never_hides_a_live_peer(store, monkeypatc
     replace B's, nothing on disk says the name is shared and evaluate reads
     QUIESCENT with both processes live."""
     store.hold("op", [SERVE], mode="freeze")
-    a = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    # refresh_s=0: the unchanged re-publish below must write (it is the write this test parks).
+    a = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, refresh_s=0)
     b = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
     a.publish()
     stall = _WriteStall(monkeypatch, "publisher-a")
@@ -1338,7 +1408,7 @@ def test_suspended_publisher_never_stalls_or_hides_a_live_peer(store, monkeypatc
     it is frozen, and after it resumes with the record it computed before
     freezing, the name never reads QUIESCENT while the peer has work."""
     store.hold("op", [SERVE], mode="freeze")
-    frozen = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    frozen = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, refresh_s=0)  # parked renew must write
     work = Work()
     healthy = AdmissionGate(store, SERVE, active_work=work, lease_s=30)
     frozen.publish()
@@ -1376,7 +1446,7 @@ def test_resumed_publisher_never_overwrites_a_busy_peer(store, monkeypatch):
     computed before the peer's writes. That write must not replace the busy
     peer's evidence: the verdict stays non-QUIESCENT while the peer has work."""
     store.hold("op", [SERVE], mode="freeze")
-    idle = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    idle = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, refresh_s=0)  # parked re-publish must write
     busy_work = Work()
     busy = AdmissionGate(store, SERVE, active_work=busy_work, lease_s=30)
     idle.publish()
