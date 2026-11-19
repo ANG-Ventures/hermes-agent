@@ -16301,7 +16301,7 @@ def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now
             f"### {p.get('source')}: {p.get('reason')}{rnd} on {where}"
             + (f" @ {head}" if head else "") + f" ({_ctx_stamp(r['created_at'], now)})"
         )
-        lines.append(_ctx_cap(p.get("summary")))
+        lines.append(str(p.get("summary") or "").strip())  # unanswered: whole (t_5949eafd)
         if p.get("evidence"):
             lines.append("```json")
             lines.append(_ctx_cap(json.dumps(p["evidence"], ensure_ascii=False, indent=1)))
@@ -23151,6 +23151,21 @@ def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
     return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
 
 
+def _ctx_cap_lines(s: Optional[str], limit: int, more: str) -> str:
+    """``_ctx_cap`` for a send-back: cut at the last line end within ``limit`` and
+    name ``more``, the command that prints the rest (t_5949eafd)."""
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    if head.rfind("\n") > 0:
+        head = head[:head.rfind("\n")]
+    head = head.rstrip()
+    return head + f"\n… [truncated, {len(s) - len(head)} chars omitted; whole text: `{more}`]"
+
+
 def _ctx_stamp(ts: int, now: int) -> str:
     """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
     disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
@@ -23233,6 +23248,8 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
     if not shown:
         return
     first_shown_idx = len(all_prior) - len(shown) + 1
+    # The newest send-back is shown whole; an older one was answered by a later handback.
+    sendbacks = [r.id for r in shown if r.outcome == "changes_requested"]
     lines.append("## Prior attempts on this task")
     if omitted_note:
         lines.append(omitted_note)
@@ -23243,7 +23260,13 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
             f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
         )
         if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
+            if sendbacks and run.id == sendbacks[-1]:
+                lines.append(run.summary.strip())
+            elif run.outcome == "changes_requested":
+                lines.append(_ctx_cap_lines(run.summary, _CTX_MAX_FIELD_BYTES,
+                                            f"hermes kanban runs {task_id} --json"))
+            else:
+                lines.append(_ctx_cap(run.summary))
         if run.error and run.error.strip():
             lines.append(f"_error_: {_ctx_cap(run.error)}")
         meta_line = _ctx_metadata_line(run.metadata)

@@ -382,3 +382,67 @@ def test_sendback_on_review_demoted_todo_restores_implementer(
         kb.recompute_ready(conn)
         t = kb.get_task(conn, tid)
         assert (t.status, t.assignee) == ("ready", "dev")
+
+
+def _long_sendback(tag: str, n_chars: int = 9_000) -> str:
+    """Numbered items, one per line, until ``n_chars``; the last line is unique."""
+    lines, i = [], 0
+    while sum(len(x) + 1 for x in lines) < n_chars:
+        i += 1
+        lines.append(f"{i}. {tag} item {i}: " + "fix the thing at this line. " * 4)
+    lines.append(f"{tag} LAST ITEM: the ninth thousand character")
+    return "\n".join(lines)
+
+
+def _review_round(conn, home, tid, reason):
+    """The worker hands back, the reviewer sends it back with ``reason``."""
+    from tests.kanban_review_helpers import covered_request_changes
+
+    claimed = kb.claim_task(conn, tid)
+    _tick(home)
+    assert kb.request_review(conn, tid, summary="PR ready", reviewer="human",
+                             expected_run_id=claimed.current_run_id)
+    _tick(home)
+    rclaim = kb.claim_review_task(conn, tid)
+    assert covered_request_changes(conn, tid, reason=reason,
+                                   expected_run_id=rclaim.current_run_id)[0]
+    _tick(home)
+
+
+def test_long_changes_requested_reaches_worker_context_whole(kanban_home: SimpleNamespace) -> None:
+    """t_5949eafd: a 9,000-character send-back is not cut at the 4 KiB field cap."""
+    reason = _long_sendback("newest")
+    assert len(reason) > 9_000 > kb._CTX_MAX_FIELD_BYTES
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="long review", assignee="dev")
+        _review_round(conn, kanban_home, tid, reason)
+        ctx = kb.build_worker_context(conn, tid)
+    assert reason in ctx
+    assert "truncated" not in ctx
+
+
+def test_long_sendback_event_reaches_worker_context_whole(kanban_home: SimpleNamespace) -> None:
+    summary = _long_sendback("producer")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="long sendback", assignee="dev")
+        assert kb.request_sendback(conn, tid, payload=_payload(summary=summary))[0]
+        ctx = kb.build_worker_context(conn, tid)
+    assert summary in ctx
+
+
+def test_older_send_back_cut_on_a_line_and_names_the_command(kanban_home: SimpleNamespace) -> None:
+    """Only the newest send-back is exempt; an older one is cut at a line end and the
+    marker names the command that prints it whole."""
+    old, new = _long_sendback("older"), _long_sendback("newest")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="two rounds", assignee="dev")
+        _review_round(conn, kanban_home, tid, old)
+        _review_round(conn, kanban_home, tid, new)
+        ctx = kb.build_worker_context(conn, tid)
+    assert new in ctx
+    assert "older LAST ITEM" not in ctx
+    marker = next(i for i, line in enumerate(ctx.splitlines())
+                  if f"whole text: `hermes kanban runs {tid} --json`" in line)
+    assert ctx.splitlines()[marker].startswith("… [truncated, ")
+    # The line ahead of the marker is a whole line of the older send-back.
+    assert ctx.splitlines()[marker - 1] in [line.rstrip() for line in old.splitlines()]
