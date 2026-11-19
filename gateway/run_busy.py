@@ -1273,6 +1273,8 @@ class GatewayBusySessionMixin:
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
                 self._queue_or_replace_pending_event(session_key, event)
                 return True
+            if _is_watch_notification_event(event):   # it lands in the empty head slot: evictable (t_270034fa)
+                event._watch_pristine = _watch_content(event)
             return False  # base adapter queues silently behind the active turn
 
         # Same authorization gate as the cold path, else unauthorized users in shared threads
