@@ -221,6 +221,43 @@ def file_length_matches_header(conn: sqlite3.Connection) -> Optional[bool]:
         return None
 
 
+def _fd_dir() -> Optional[str]:
+    for candidate in ("/proc/self/fd", "/dev/fd"):
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def process_holds_open_fd(path: Path | str) -> bool:
+    """Whether any descriptor of this process refers to *path*'s inode.
+
+    The tracked registry only knows connections opened through :func:`connect_tracked`; a plain
+    ``sqlite3.connect`` (the board anchor, notifier helpers, another SQLite library) is invisible to
+    it, yet a raw ``close()`` cancels that connection's POSIX locks all the same (t_54b8e6cc). The
+    kernel's descriptor table is the complete answer. ``False`` where there is no descriptor
+    directory to read (no POSIX advisory locks to lose there either)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    target = (st.st_dev, st.st_ino)
+    fd_dir = _fd_dir()
+    if fd_dir is None:
+        return False
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            fst = os.fstat(int(name))
+        except (OSError, ValueError):
+            continue  # the listing's own descriptor, or one closed since
+        if (fst.st_dev, fst.st_ino) == target:
+            return True
+    return False
+
+
 def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: bool = False) -> Optional[bytes]:
     """Read the first *length* bytes of *path* -- only when no connection is live. The ONLY
     sanctioned byte-level read of a database file, for first-open validation (real SQLite? zeroed?
