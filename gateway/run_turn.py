@@ -62,6 +62,15 @@ def _leftover_steer_meta(result: Any, pending: Optional[str]) -> Dict[str, Any]:
     meta = result.get(_LEFTOVER_STEER_META)
     return dict(meta) if isinstance(meta, dict) else {}
 
+
+def _leftover_steer_message_id(meta: Any) -> Optional[str]:
+    """The platform message id a leftover steer's row carries (``platform_message_id``: restart dedup and the
+    chat-buy gate's ``telegram:<id>`` lookup), from its record; ``None`` when the row merged several messages."""
+    rec = meta.get("inbound_record") if isinstance(meta, dict) else None
+    if not isinstance(rec, dict) or rec.get("merged") or rec.get("message_id") is None:
+        return None
+    return str(rec["message_id"])
+
 _tool_call_logger_lock = threading.Lock()
 
 
@@ -4254,7 +4263,8 @@ class GatewayTurnMixin:
                     return
         self._session_state(session_key).conversation.queued_events.append(
             MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal,
-                         wake_kind=STEER if internal else None, metadata=dict(display_metadata or {}))
+                         wake_kind=STEER if internal else None, metadata=dict(display_metadata or {}),
+                         message_id=_leftover_steer_message_id(display_metadata))
         )
         logger.info(
             "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
@@ -4468,8 +4478,9 @@ class GatewayTurnMixin:
                 # An event-less follow-up (leftover /steer, interrupt text) has no slot entry to put
                 # back. No adapter defines ``queue_message``, so it used to vanish here; a completion
                 # steered into the capped turn after its last tool batch was lost (t_97a879af).
+                _meta = _leftover_steer_meta(result, pending)
                 pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source,
-                                             metadata=_leftover_steer_meta(result, pending))
+                                             metadata=_meta, message_id=_leftover_steer_message_id(_meta))
             if adapter and pending_event:
                 # The drain already promoted the overflow head into the slot; merging would REPLACE it
                 # (two internal TEXT wakes never merge), losing an accepted wake (t_f36d21e8). Put the
@@ -4535,6 +4546,8 @@ class GatewayTurnMixin:
             # Event-less interrupt/steer follow-ups continue the effective prompt
             # of the turn they are recursively following.
             next_channel_prompt = turn_ctx.channel_prompt
+            # A leftover /steer that becomes this turn keeps its platform message id on the row (t_b8fbfc54).
+            next_inbound_id = _leftover_steer_message_id(_leftover_steer_meta(result, pending))
 
         # Same composition as a fresh inbound turn: the follow-up (queued event, interrupt text, leftover
         # /steer) must persist the clean text + send time it was rendered from, or replay renders a

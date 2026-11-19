@@ -140,6 +140,16 @@ async def test_a_leftover_steer_carries_the_record_into_the_next_turn():
     runner._queue_leftover_steer(leftover, ev.source, "key", display_metadata=meta)
     queued = runner._session_state("key").conversation.queued_events[-1]
     assert _gate_reads({"display_metadata": inbound_record.display_metadata(queued)}) == "place it"
+    # ...and its platform message id, which the row's platform_message_id (restart dedup, telegram:<id>) reads.
+    assert queued.message_id == str(ev.message_id)
+
+
+def test_a_merged_leftover_steer_carries_no_platform_message_id():
+    from gateway.run_turn import _leftover_steer_message_id
+    rec = {"message_id": "4242", "from_id": "571820863"}
+    assert _leftover_steer_message_id({inbound_record.KEY: rec}) == "4242"
+    assert _leftover_steer_message_id({inbound_record.KEY: {**rec, "merged": True}}) is None
+    assert _leftover_steer_message_id({}) is None
 
 
 def test_an_internal_or_unrecorded_steer_row_has_no_record():
@@ -187,6 +197,27 @@ def _calls(name):
                     yield rel, node
 
 
+def _imports_and_getattrs(name):
+    import warnings
+    for path in _sources():
+        rel = path.relative_to(REPO).as_posix()
+        if "/node_modules/" in rel:
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ImportFrom, ast.Import)) and any(
+                    a.name == name and a.asname not in (None, name) for a in node.names):
+                yield rel, node
+            elif (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "getattr" and len(node.args) > 1
+                  and isinstance(node.args[1], ast.Constant) and node.args[1].value == name):
+                yield rel, node
+
+
 @pytest.mark.parametrize("callee,keyword", sorted(_WRITERS.items()))
 def test_every_steer_row_writer_passes_the_record_source(callee, keyword):
     """A new caller must hand the record's source through (never a literal None in production): the steer
@@ -198,4 +229,7 @@ def test_every_steer_row_writer_passes_the_record_source(callee, keyword):
         if kw is None or (isinstance(kw.value, ast.Constant) and kw.value.value is None):
             bad.append(f"{rel}:{node.lineno}")
     assert found, f"no production caller of {callee} found; update _WRITERS"
+    # A call through an alias (``import ... as x``) or getattr would escape the name match above.
+    aliased = [rel for rel, node in _imports_and_getattrs(callee)]
+    assert not aliased, f"{callee} reached through an alias or getattr (the ratchet cannot see it): {aliased}"
     assert not bad, f"{callee} called without {keyword}=<record source>: {bad}"
