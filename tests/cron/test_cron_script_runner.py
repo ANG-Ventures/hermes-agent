@@ -749,7 +749,7 @@ def test_d_code_skew_drains_only_when_a_loaded_module_changed(root, monkeypatch,
     monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
     monkeypatch.setattr(script_runner, "_skew_shas", lambda: (root, "a" * 40, disk["sha"]))
     monkeypatch.setattr(script_runner, "_skew_loaded_changes",
-                        lambda: calls.append(disk["sha"]) or changes)
+                        lambda *_a: calls.append(disk["sha"]) or changes)
     monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
     r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
     r.attach_stop(threading.Event())
@@ -762,9 +762,56 @@ def test_d_code_skew_drains_only_when_a_loaded_module_changed(root, monkeypatch,
         # A later deploy that does touch a loaded module still drains.
         disk["sha"] = "c" * 40
         monkeypatch.setattr(script_runner, "_skew_loaded_changes",
-                            lambda: calls.append(disk["sha"]) or ["cron/jobs.py"])
+                            lambda *_a: calls.append(disk["sha"]) or ["cron/jobs.py"])
         r.enumerate_homes()
         assert r.draining is True and calls == ["b" * 40, "c" * 40]
+
+
+@pytest.mark.parametrize("back_to_boot", [False, True], ids=["revert_commit", "checkout_boot"])
+def test_d_code_skew_diffs_against_the_last_accepted_sha(tmp_path, root, monkeypatch,
+                                                         back_to_boot):
+    """Prism 05d607795190: boot at A, accept B (changes only the unloaded pkg/other.py), import
+    pkg/other.py from B, then a revert (new commit C, or the checkout back at A) must drain: the
+    runner runs B's code, and an A..disk diff would miss it."""
+    import types
+
+    from cron import script_runner
+
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    _git(tmp_path, "init", "-q", str(repo))
+    other = repo / "pkg" / "other.py"
+    other.write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "A")
+    a = _git(repo, "rev-parse", "HEAD")
+    other.write_text("x = 2\n", encoding="utf-8")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "B")
+    b = _git(repo, "rev-parse", "HEAD")
+    if back_to_boot:
+        c = a
+    else:
+        other.write_text("x = 1\n", encoding="utf-8")
+        _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "C revert")
+        c = _git(repo, "rev-parse", "HEAD")
+
+    disk = {"sha": b}
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: (repo, a, disk["sha"]))
+    monkeypatch.setattr(script_runner, "_detect_code_skew",
+                        lambda: None if disk["sha"] == a else ("a", "d"))
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    assert r.draining is False  # B touches no loaded module: accepted
+    mod = types.ModuleType("t2dd_other")
+    mod.__file__ = str(other)
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)  # lazily imported from B
+    r.enumerate_homes()
+    assert r.draining is False  # disk still B: nothing new
+    disk["sha"] = c
+    r.enumerate_homes()
+    assert r.draining is True
 
 
 def test_exit_reason_lines_cover_clean_drain_signal_crash_and_unrecorded(root, monkeypatch,
@@ -774,7 +821,7 @@ def test_exit_reason_lines_cover_clean_drain_signal_crash_and_unrecorded(root, m
     caplog.set_level(logging.WARNING, logger="cron.script_runner")
     # Clean skew drain: no script in flight.
     monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
-    monkeypatch.setattr(script_runner, "_skew_loaded_changes", lambda: None)
+    monkeypatch.setattr(script_runner, "_skew_loaded_changes", lambda *_a: None)
     monkeypatch.setattr(script_runner, "_inflight_count", lambda: 0)
     r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
     r.attach_stop(threading.Event())

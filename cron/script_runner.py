@@ -161,16 +161,18 @@ def _loaded_repo_files(root: Path) -> set:
     return out
 
 
-def _skew_loaded_changes() -> Optional[List[str]]:
-    """Loaded module files changed between the boot sha and the disk sha (t_2ddabbc4): ``[]`` when
-    the diff touches none of them, None when the diff cannot be read (the caller drains)."""
+def _skew_loaded_changes(base: Optional[str] = None) -> Optional[List[str]]:
+    """Loaded module files changed between ``base`` (the last accepted sha; default the boot sha)
+    and the disk sha (t_2ddabbc4): ``[]`` when the diff touches none of them, None when the diff
+    cannot be read (the caller drains)."""
     try:
         root, boot, disk = _skew_shas()
-        if not boot or not disk or boot == disk:
+        base = base or boot
+        if not base or not disk or base == disk:
             return None
         # --no-renames: a renamed loaded module must show its old path.
         p = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--no-renames",
-                            f"{boot}..{disk}"], stdin=subprocess.DEVNULL, capture_output=True,
+                            f"{base}..{disk}"], stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, encoding="utf-8", errors="replace", timeout=10,
                            check=False)
         if p.returncode != 0:
@@ -363,7 +365,9 @@ class ScriptRunner:
         self._draining_mono = float("-inf")
         self.sigterm = False
         self._skew_bounded = False
-        self._skew_kept_sha: Optional[str] = None  # a disk sha whose skew changes no loaded module
+        # The last disk sha accepted without a drain (None = the boot sha). Later skews diff
+        # against it, so a commit that reverts code imported after the accept still drains.
+        self._skew_base_sha: Optional[str] = None
         self.exit_reason: Optional[str] = None
         self._skew_withhold: set = set()
         self._bound_polled = False
@@ -526,31 +530,43 @@ class ScriptRunner:
             return time.monotonic() - started
         return out[0]
 
-    def _skew_needs_drain(self) -> bool:
-        """A code skew drains only when the boot..disk diff touches a module this process loaded,
-        or the diff cannot be read (t_2ddabbc4: 84 of 152 drains changed no loaded module). One
-        decision per disk sha, so a skew that is kept does not re-run git every cycle."""
+    def _skew_pending(self) -> bool:
+        """Disk differs from the code this process runs: the boot sha, or the last sha accepted
+        without a drain (also when the checkout returns to the boot sha)."""
+        if self._skew_base_sha is None:
+            return _detect_code_skew() is not None
         try:
             disk = _skew_shas()[2]
         except Exception:
             disk = None
-        if disk is not None and disk == self._skew_kept_sha:
-            return False
-        changed = _skew_loaded_changes()
+        if disk is None:
+            return _detect_code_skew() is not None
+        return disk != self._skew_base_sha
+
+    def _skew_needs_drain(self) -> bool:
+        """A code skew drains only when the base..disk diff touches a module this process loaded,
+        or the diff cannot be read (t_2ddabbc4: 84 of 152 drains changed no loaded module). The
+        base is the last accepted sha, so a kept skew is diffed once and a later revert of code
+        imported from it still drains."""
+        try:
+            disk = _skew_shas()[2]
+        except Exception:
+            disk = None
+        changed = _skew_loaded_changes(self._skew_base_sha)
         if changed is None:
-            logger.warning("script runner code skew: boot..disk diff unreadable; draining")
+            logger.warning("script runner code skew: base..disk diff unreadable; draining")
             return True
         if changed:
             logger.warning("script runner code skew touches %d loaded module(s): %s", len(changed),
                            ", ".join(changed[:10]) + (" ..." if len(changed) > 10 else ""))
             return True
-        self._skew_kept_sha = disk
+        self._skew_base_sha = disk
         logger.warning("script runner code skew: disk %s changes no loaded module; not draining",
                        (disk or "?")[:12])
         return False
 
     def _check_skew(self) -> None:
-        if not self.draining and _detect_code_skew() is not None and self._skew_needs_drain():
+        if not self.draining and self._skew_pending() and self._skew_needs_drain():
             self.draining = True
             self.draining_since = _now_iso()
             self._draining_mono = time.monotonic()
