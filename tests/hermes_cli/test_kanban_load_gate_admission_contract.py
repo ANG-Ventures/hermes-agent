@@ -64,6 +64,77 @@ def test_utilization_context_learns_from_the_class_usage_ledger(placement_home):
     assert need.ram_gb == 18.0
 
 
+def test_local_utilization_context_enforces_fleet_cap(placement_home):
+    path = placement_home / "config" / "fleet-hosts.json"
+    table = json.loads(path.read_text(encoding="utf-8"))
+    table["hosts"]["studio"]["fleet_cap"] = {"cpus": 8}
+    path.write_text(json.dumps(table), encoding="utf-8")
+
+    ctx = klg.utilization_context()
+    assert ctx["host"] == "studio"  # resolved through the local alias
+    sample = {"host": ctx["host"], "os": "darwin", "at": 1000.0,
+              "ncpu": 32, "cpu_busy": 0.05, "mem_available_gb": 400,
+              "mem_total_gb": 512, "fleet_cpus": 8.0}
+    at_cap = admission.admit(sample, ctx["need"], [], host=ctx["host"], limits=ctx["limits"])
+    assert not at_cap.ok
+    assert "fleet_cap:cpus" in at_cap.reason
+
+    sample["fleet_cpus"] = 0.0
+    below_cap = admission.admit(sample, ctx["need"], [], host=ctx["host"], limits=ctx["limits"])
+    assert below_cap.ok, below_cap.reason
+
+
+@pytest.mark.parametrize("os_name", ["darwin", "linux"])
+@pytest.mark.parametrize("cap,fleet,mem_total,age,allowed,reason", [
+    ({"cpus": 8}, {"cpus": 2, "ram_gb": 3}, 512, 10, 1, None),
+    ({"cpus": 8}, {"cpus": 8, "ram_gb": 3}, 512, 10, 0, "fleet_cap:cpus"),
+    ({"cpus": 8}, None, 512, 10, 0, "unmeasured:fleet_cap_cpus"),
+    ({"cpus": 8}, {"cpus": "2"}, 512, 10, 0, "unmeasured:fleet_cap_cpus"),
+    ({"cpus": 8}, {"cpus": 2}, 512, 121, 0, "unmeasured:fleet_cap_cpus"),
+    ({"ram_gb": "10%"}, {"ram_gb": 23}, 256, 10, 0, "fleet_cap:ram_gb"),
+    ({"ram_gb": "10%"}, {"ram_gb": 23}, None, 10, 0, "unmeasured:fleet_cap_ram_gb"),
+], ids=["below", "at", "absent", "malformed", "stale", "percent-ram", "missing-ram-total"])
+def test_local_gate_reads_fleet_cap_measurements(
+    placement_home, monkeypatch, os_name, cap, fleet, mem_total, age, allowed, reason,
+):
+    from types import SimpleNamespace
+    import psutil
+    from hermes_cli import kanban_db, kanban_headroom
+
+    path = placement_home / "config" / "fleet-hosts.json"
+    table = json.loads(path.read_text(encoding="utf-8"))
+    table["hosts"]["studio"]["fleet_cap"] = cap
+    path.write_text(json.dumps(table), encoding="utf-8")
+    policy = placement_home / "fleet" / "allocation-policy.json"
+    policy.parent.mkdir()
+    pressure = placement_home / "host-pressure.json"
+    policy.write_text(json.dumps({"schema": 1, "pressure_path": {os_name: str(pressure)}}), encoding="utf-8")
+    row = {"host": "studio", "at": 2000 - age, "mem_total_gb": mem_total}
+    if fleet is not None:
+        row["fleet"] = fleet
+    pressure.write_text(json.dumps(row), encoding="utf-8")
+
+    monkeypatch.setattr(klg.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(klg, "_os_name", lambda: os_name)
+    monkeypatch.setattr(kanban_db, "kanban_home", lambda: placement_home)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=400 << 30, total=512 << 30))
+    monkeypatch.setattr(klg, "sample_psi", lambda: {
+        "psi_cpu_some10": 0.0, "psi_mem_some10": 0.0, "psi_io_some10": 0.0,
+    } if os_name == "linux" else {})
+    monkeypatch.setattr(kanban_headroom, "local_kind_pause", lambda: None)
+    monkeypatch.setattr(admission, "read_slice_memory", lambda **_: None)
+    monkeypatch.setattr(klg, "unified_inputs", lambda *_: ([], admission.Priority()))
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
+
+    gate = klg.LoadGate({"max_spawn_per_tick": 1}, 32)
+    allowance, why = gate.admit(1.0, now=1000.0, running=0, cpu_busy=0.05)
+    assert allowance == allowed, why
+    if reason:
+        assert reason in why
+    else:
+        assert why is None
+
+
 def test_utilization_admit_path_runs_on_the_real_modules(placement_home, monkeypatch):
     monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0,
                                                    "psi_io_some10": 0.0})
