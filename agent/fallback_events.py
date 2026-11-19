@@ -188,7 +188,8 @@ class CreditLaneCode(NamedTuple):
     primary for 6 h (Prism 16f26d03b5d4). ``head``: the announce head label (2-3
     words). ``hop``: the leg that failed (``fallback_policy.HOPS``). ``cause``:
     the rider when the message names no seat. ``seat_cause``: the rider when
-    it does (``{seat}``, ``{exc}`` = `` (TimeoutError)`` or empty); None means
+    it does (``{seat}``, ``{exc}`` = `` (TimeoutError)`` or empty, ``{took}`` =
+    `` in 120 s`` or empty, ``{size}`` = ``1.7 MB, `` or empty); None means
     the code never carries a seat and ``cause`` is always used."""
 
     trigger_class: str
@@ -212,7 +213,15 @@ CREDIT_LANE_ERROR_CODES: Dict[str, CreditLaneCode] = {
     "credit_upstream_read_failed": CreditLaneCode(
         "conn", "seat read failed", "proxy→anthropic",
         "relay could not read Anthropic's answer (relay sent no seat), not re-sent",
-        "relay could not reach Anthropic through {seat}{exc}, not re-sent"),
+        "no answer from Anthropic through {seat}{exc}, request was sent, not re-sent"),
+    # Our upload of the request body from the Studio to the seat's box did not
+    # finish (claude-pool#470): Anthropic never had a complete request.
+    "credit_upstream_write_failed": CreditLaneCode(
+        "conn", "upload failed", "relay→bridge",
+        "our upload to the seat's box did not finish{took} ({size}Studio to box link; "
+        "ours, not Anthropic), not re-sent",
+        "our upload to {seat} did not finish{took} ({size}Studio to box link; "
+        "ours, not Anthropic), not re-sent"),
     # The credit-key ledger was reloaded/rotated while the request was in flight;
     # the relay drops the answer of the stale key.
     "credit_generation_changed": CreditLaneCode(
@@ -245,6 +254,8 @@ CREDIT_LANE_ERROR_CODES: Dict[str, CreditLaneCode] = {
 _CREDIT_SEAT_RE = re.compile(r"\b(?:on|for) (local|sub-vps-\d+)\b")
 _CREDIT_EXC_RE = re.compile(r"\(([A-Z]\w*(?:Error|Exception|Timeout))\)")
 _CREDIT_WHY_RE = re.compile(r"no eligible credit key \(([a-z_]+)\)")
+_CREDIT_LIMIT_RE = re.compile(r"\bof a (\d+(?:\.\d+)?) s limit\b")
+_CREDIT_MB_RE = re.compile(r"\bwith (\d+(?:\.\d+)?) MB to send\b")
 
 
 def _credit_error_obj(body: Any) -> Optional[Dict[str, Any]]:
@@ -289,15 +300,28 @@ def credit_lane_why(body: Any, text: Optional[str] = None) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def credit_lane_upload(body: Any, text: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """``(limit_s, mb)`` an upload-failed message names (``of a 120 s limit``,
+    ``with 1.7 MB to send``); each None when absent."""
+    msg = _credit_message(body, text)
+    lim, mb = _CREDIT_LIMIT_RE.search(msg), _CREDIT_MB_RE.search(msg)
+    return (lim.group(1) if lim else None), (mb.group(1) if mb else None)
+
+
+_CREDIT_TIMEOUT_HEADS = {"credit_upstream_read_failed": "seat timed out",
+                         "credit_upstream_write_failed": "upload timed out"}
+
+
 def credit_lane_head(code: str, exc: Optional[str] = None) -> Optional[str]:
-    """The head label of a credit-lane code: ``seat timed out`` when the read
-    failed on a timeout, else the table's own label."""
+    """The head label of a credit-lane code: ``seat timed out`` / ``upload
+    timed out`` when the read / upload failed on a timeout, else the table's
+    own label."""
     entry = CREDIT_LANE_ERROR_CODES.get(str(code or ""))
     if entry is None:
         return None
-    if code == "credit_upstream_read_failed" and exc and (
+    if code in _CREDIT_TIMEOUT_HEADS and exc and (
             exc == "TimeoutError" or exc.endswith("Timeout")):
-        return "seat timed out"
+        return _CREDIT_TIMEOUT_HEADS[code]
     return entry.head
 
 
@@ -1678,6 +1702,11 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
                              ("credit_why", credit_lane_why(body, text))):
                 if val:
                     row[key] = val
+            if ccode == "credit_upstream_write_failed":
+                for key, val in zip(("credit_limit_s", "credit_mb"),
+                                    credit_lane_upload(body, text)):
+                    if val:
+                        row[key] = val
         # §4.8: a direct pin's seat and hop are knowable locally (no relay
         # headers by design, #1260). Pooled rows are left as they are.
         try:

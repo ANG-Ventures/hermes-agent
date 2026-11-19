@@ -1460,10 +1460,14 @@ def _credit_lane_body(row: Mapping[str, Any], seat_names: bool) -> str:
     entry = CREDIT_LANE_ERROR_CODES[_credit_code(row) or ""]
     seat = row.get("seat")
     exc = f" ({row['credit_exc']})" if row.get("credit_exc") else ""
+    # Upload-failed parts (credit_upstream_write_failed): dropped when absent.
+    took = f" in {row['credit_limit_s']} s" if row.get("credit_limit_s") else ""
+    size = f"{row['credit_mb']} MB, " if row.get("credit_mb") else ""
     if entry.seat_cause and seat and seat != "unknown":
-        return entry.seat_cause.format(seat=str(seat) if seat_names else "a sub", exc=exc)
+        return entry.seat_cause.format(seat=str(seat) if seat_names else "a sub", exc=exc,
+                                       took=took, size=size)
     why = f" ({row['credit_why']})" if row.get("credit_why") else ""
-    return entry.cause.format(why=why)
+    return entry.cause.format(why=why, took=took, size=size)
 
 
 def _budget_cut_body(row: Mapping[str, Any], seat_names: bool) -> str:
