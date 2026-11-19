@@ -1537,7 +1537,9 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
     status = getattr(task, "status", None)
 
     def _send_back(reason: str) -> None:
-        ok, detail = kb.request_changes(conn, tid, reason=f"{MARKER} {reason}"[:2000], claimer=AUTHOR,
+        # Never cut (t_39a6200f): the worker reads this reason as its send-back and request_changes takes the
+        # operator's own send-backs whole; a [:2000] here dropped the end of a child's findings mid-sentence.
+        ok, detail = kb.request_changes(conn, tid, reason=f"{MARKER} {reason}", claimer=AUTHOR,
                                         operator=op, operator_kind=kb.OPERATOR_KIND_MACHINE)
         if not ok:
             raise RuntimeError(f"request_changes refused: {detail}")

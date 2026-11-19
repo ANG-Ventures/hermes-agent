@@ -1523,6 +1523,21 @@ def test_ac15b_valid_verdict_writes_once_signed_as_machine(env):
     assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
 
 
+def test_child_send_back_reaches_the_worker_whole(env):
+    """t_39a6200f: a child's send-back was cut at 2000 chars mid-sentence (t_06248233); 5,000 chars are stored whole."""
+    tid = _review_card(env)
+    entry = _claimed_entry(env, tid, row="own_repo_review_red", kind="review_requested")
+    findings = [f"item {i}: " + "x" * 480 + f" end of item {i}." for i in range(10)]
+    res = ah.execute_verdict(entry, _verdict(entry, "request_changes", findings=findings))
+    assert res["ok"], res
+    with kb.connect_closing() as conn:
+        cr = [e for e in kb.list_events(conn, tid) if e.kind == "changes_requested"]
+    sent = "; ".join(findings)
+    assert len(sent) >= 5000 and len(cr) == 1
+    stored = cr[0].payload["reason"]
+    assert stored == f"{ah.MARKER} {sent}", (len(stored), stored[-80:])
+
+
 @pytest.mark.parametrize("case", [
     "no_block", "two_blocks", "wrong_nonce", "block_only_in_wake", "land", "matrix_cell", "aba", "moved_head",
 ])
