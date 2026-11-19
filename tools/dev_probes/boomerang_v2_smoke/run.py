@@ -765,7 +765,9 @@ def step1(ctx: Ctx) -> StepReport:
             if hit:
                 return ("sup", hit)
             term = _card_claim_terminal(wpath, fail_card) if wpath is not None else None
-            return ("verdict", term) if term and term[1].get("outcome") != "superseded" else None
+            # Prism 9c73a6c38f39: only an ACCEPTED verdict (a handled outcome) explains the missing line
+            accepted = term and term[1].get("outcome") in _gateway_handled_outcomes() - {"superseded"}
+            return ("verdict", term) if accepted else None
         got = ctx.poll(sup_or_verdict, win)
         sup = got[1] if got and got[0] == "sup" else None
         label = f"gateway log: `boomerang-wake superseded {fail_card}: card moved to <status> ...`"
@@ -785,7 +787,11 @@ def step1(ctx: Ctx) -> StepReport:
         warn = ctx.poll(lambda: find_chat(chat, re_failed_line(fail_card)), ctx.tick_window)
         rep.check(f"origin chat: no `warning boomerang-wake failed {fail_card}` line (supersede)",
                   FAIL if warn else PASS, warn.content if warn else f"none ({ctx.window_label()})")
-        if inject:
+        if inject and got and got[0] == "verdict":
+            rep.check(f"failure card {fail_card}: wake re-surfaced after the fault", INCOMPLETE,
+                      f"the child's verdict was accepted (claim `{got[1][0]}` outcome={got[1][1].get('outcome')}), "
+                      f"not refused by inject_failure, so no wake was re-surfaced to check (cannot pass since #425, README)")
+        elif inject:
             _check_live_resurface(ctx, rep, log, chat, fail_card, fail_dispatch)
     return rep
 
@@ -1300,9 +1306,9 @@ def _gateway_handled_outcomes() -> frozenset:
     return HANDLED_OUTCOMES
 
 
-def _card_claim_terminal(path: Path, card: str) -> tuple[str, dict] | None:
-    """The card's newest terminal first-dispatch claim (not ``#restartN``), from the state file and its
-    ``.terminal.jsonl`` archive (the gateway moves terminal claims there), else None."""
+def _all_claims(path: Path) -> dict:
+    """key -> claim: the state file's hot claims over its ``.terminal.jsonl`` archive (the gateway
+    moves a terminal claim there once its handbacks are delivered)."""
     claims: dict = {}
     try:
         for line in path.with_name(path.stem + ".terminal.jsonl").read_text(encoding="utf-8-sig").splitlines():
@@ -1320,8 +1326,13 @@ def _card_claim_terminal(path: Path, card: str) -> tuple[str, dict] | None:
         doc = {}
     hot = doc.get("claims") if isinstance(doc, dict) else None
     claims.update(hot if isinstance(hot, dict) else {})
+    return claims
+
+
+def _card_claim_terminal(path: Path, card: str) -> tuple[str, dict] | None:
+    """The card's newest terminal first-dispatch claim (not ``#restartN``), archive included, else None."""
     found = []
-    for key, entry in claims.items():
+    for key, entry in _all_claims(path).items():
         if ("#restart" in str(key) or not isinstance(entry, dict) or entry.get("task_id") != card
                 or entry.get("state") != "terminal"):
             continue
@@ -1336,12 +1347,8 @@ def _card_claim_terminal(path: Path, card: str) -> tuple[str, dict] | None:
 def _restart_claim_terminal(path: Path, card: str, delegation: str) -> tuple[str, dict] | None:
     """The card's terminal ``<key>#restartN`` claim (the redispatched child's), else None. With
     ``delegation`` set only that child's claim counts; otherwise the newest N."""
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return None
     found = []
-    for key, entry in ((doc.get("claims") or {}).items() if isinstance(doc, dict) else ()):
+    for key, entry in _all_claims(path).items():   # Prism a27475f1327b: archive included
         m = re.search(r"#restart(\d+)$", str(key))
         if (m and isinstance(entry, dict) and entry.get("task_id") == card and entry.get("state") == "terminal"
                 and (not delegation or entry.get("delegation_id") == delegation)):

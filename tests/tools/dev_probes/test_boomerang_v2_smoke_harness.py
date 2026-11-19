@@ -1133,3 +1133,39 @@ def test_step1_fault_verdict_accepted_is_incomplete_not_fail(env, monkeypatch):
     assert "superseded t_5m0ce003: card moved to <status> ...` | INCOMPLETE" in text
     assert "outcome=surfaced" in text and "#425" in text
     assert "| FAIL |" not in text
+
+
+def test_step1_accepted_fault_verdict_skips_the_resurface_check(env, monkeypatch):
+    """Prism 9c73a6c38f39: with an accepted fault-card claim and no readable receipt, the re-surface row
+    is INCOMPLETE too (never a FAIL on a missing re-delivery); a non-handled outcome is not accepted."""
+    fx = _copy_fixtures(env["tmp"])
+    log = fx / "fake_gateway.log"
+    log.write_text("".join(ln + "\n" for ln in log.read_text().splitlines()
+                           if "superseded t_5m0ce003" not in ln and "Task t_5m0ce003" not in ln))
+    state = fx / "fake_boomerang_wake.json"
+    doc = json.loads(state.read_text())
+    doc["claims"]["bv2-smoke|t_5m0ce003|13"] = {"task_id": "t_5m0ce003", "state": "terminal", "outcome": "surfaced"}
+    state.write_text(json.dumps(doc))
+    monkeypatch.setenv("BV2_GATEWAY_LOG", str(log))
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    assert run.main(["--step", "1", "--dry-run"]) == 3
+    text = env["evidence"].read_text()
+    assert "failure card t_5m0ce003: wake re-surfaced after the fault | INCOMPLETE" in text
+    assert "| FAIL |" not in text
+    doc["claims"]["bv2-smoke|t_5m0ce003|13"]["outcome"] = "lost"
+    state.write_text(json.dumps(doc))
+    assert run.main(["--step", "1", "--dry-run"]) == 1
+    assert "superseded t_5m0ce003: card moved to <status> ...` | FAIL" in env["evidence"].read_text()
+
+
+def test_restart_claim_terminal_reads_the_archive(tmp_path):
+    """Prism a27475f1327b: a delivered #restartN claim lives only in the archive; delegation filter kept."""
+    state = tmp_path / "kanban_boomerang_wake.json"
+    state.write_text(json.dumps({"claims": {}}))
+    (tmp_path / "kanban_boomerang_wake.terminal.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (
+        {"key": "b|t_x|71#restart1", "task_id": "t_x", "state": "terminal", "outcome": "surfaced",
+         "delegation_id": "d2"},
+        {"key": "b|t_x|71", "task_id": "t_x", "state": "terminal", "outcome": "redispatched_after_restart"})))
+    key, entry = run._restart_claim_terminal(state, "t_x", "d2")
+    assert key == "b|t_x|71#restart1" and entry["outcome"] == "surfaced"
+    assert run._restart_claim_terminal(state, "t_x", "d9") is None

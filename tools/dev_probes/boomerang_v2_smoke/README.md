@@ -54,6 +54,10 @@ How the shutdown interrupt reaches a boomerang child, read from the code on main
   reply S4-HOLD-DONE" for the card's deliverable (`request_changes` on the done fixture card). The hold
   therefore never names the card: `s4_hold_turn` gets `{chat}` only, a `{card}` in it FAILs the arm
   unsent, and the lane's message says it is harness scaffolding that later turns must ignore.
+- The child must still be mid-call when the drain times out. With the lane's
+  `agent.restart_drain_timeout: 20` a forked child that decides in ~20 s finishes inside the drain
+  (three runs on 11-19, t_9f0d174a: verdict at SIGTERM+10 s, interrupt at +20 s, arm INCOMPLETE);
+  with `restart_drain_timeout: 5` in the scratch config the same arm PASSed (interrupt at +5 s).
 - Without `s4_hold_turn` in the plan the arm records INCOMPLETE up front. If the hold turn is held
   but the shutdown line is still absent, read the old boot's `drain done ... timed_out=` line and the
   `PHASE=drain_timeout_turn` lines: a timed-out drain with no shutdown line is a #283 defect (the
