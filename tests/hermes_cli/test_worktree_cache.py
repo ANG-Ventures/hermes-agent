@@ -705,7 +705,36 @@ def test_kanban_clone_on_copies_from_the_template(env, cow, monkeypatch):
     assert row["caller"] == "kanban_clone" and row["cow"] is True and row["C"] == env["c3"]
 
 
-@pytest.mark.parametrize("opts", [["--depth", "1"], ["--no-checkout"], ["--single-branch"], ["-o", "up"], ["-v"]])
+def test_kanban_clone_blob_none_filter_is_served_from_the_template(env, cow, monkeypatch):
+    """5 of 11 ci-box card checkouts fell back on ``--filter=blob:none`` (t_ef5e004a): a full
+    template copy holds every blob that filter would fetch lazily, so the cache serves it."""
+    built(env)
+    want = snapshot(plain(env, "plain", branch="feat"))
+    seen = []
+    monkeypatch.setattr(kc, "clone", lambda url, dest, o: seen.append(list(o)) or 1)
+    dest = env["base"] / "ws" / "k"
+    assert _kanban_cli(["-q", "--filter", "blob:none", "-b", "feat", URL, str(dest)], env["s"], monkeypatch) == 0
+    assert seen == []                                                   # no plain git clone
+    assert snapshot(dest) == want
+    assert _git("rev-parse", "--abbrev-ref", "HEAD", cwd=dest) == "feat"
+    assert ledger(env) == []
+    (row,) = log(env)
+    assert row["cow"] is True and row["reason"] is None and row["opts_served"] == ["--filter=blob:none"]
+
+
+def test_kanban_clone_blob_none_fallback_still_forwards_the_filter(env, cow, monkeypatch):
+    """No template for the repo: plain git gets the caller's filter, exactly as before."""
+    seen = []
+    monkeypatch.setattr(kc, "clone", lambda url, dest, o: seen.append(list(o)) or 0)
+    dest = env["base"] / "ws" / "k"
+    assert _kanban_cli(["--filter", "blob:none", URL, str(dest)], env["s"], monkeypatch) == 0
+    assert len(seen) == 1 and "--filter=blob:none" in seen[0]
+    (row,) = log(env)
+    assert row["reason"] == "no_template" and row["opts_served"] == ["--filter=blob:none"]
+
+
+@pytest.mark.parametrize("opts", [["--depth", "1"], ["--no-checkout"], ["--single-branch"], ["-o", "up"], ["-v"],
+                                  ["--filter", "tree:0"], ["--filter", "blob:none", "--depth", "1"]])
 def test_kanban_clone_options_the_cache_cannot_make_run_plain_with_a_row(env, cow, monkeypatch, opts):
     built(env)
     seen = []
