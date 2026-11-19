@@ -286,7 +286,7 @@ def test_mid_turn_compaction_keeps_the_pending_tool_round_verbatim(steers):
     pending = {m["tool_call_id"]: m["content"] for m in msgs[-2:]}
     previous = msgs[-6]
     for text in ["Also flag any node above 90% cpu.", "And list the racks they sit in."][:steers]:
-        msgs.append(steer_user_row(text))
+        msgs.append(steer_user_row(text, agent=None))
     assert previous["tool_call_id"] == "old_12"
 
     out = c.compress(list(msgs), current_tokens=estimate_messages_tokens_rough(msgs))
@@ -311,8 +311,8 @@ def test_compaction_keeps_four_images_in_a_spared_pending_round(compressor_128k)
         {"role": "user", "content": "Inspect these four images."},
         {"role": "assistant", "content": None, "tool_calls": [_image_call(call_id) for call_id in pending_ids]},
         *[_image_result(call_id) for call_id in pending_ids],
-        steer_user_row("Compare their labels."),
-        steer_user_row("Check the colors too."),
+        steer_user_row("Compare their labels.", agent=None),
+        steer_user_row("Check the colors too.", agent=None),
     ]
 
     out = compressor_128k.compress(msgs, current_tokens=estimate_messages_tokens_rough(msgs))
