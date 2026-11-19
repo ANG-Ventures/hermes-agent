@@ -1,8 +1,11 @@
 """Tests for the SSH remote execution environment backend."""
 
+import contextlib
 import json
 import os
+import shlex
 import subprocess
+import uuid
 from unittest.mock import MagicMock
 
 import pytest
@@ -129,6 +132,109 @@ class TestBuildSSHCommand:
         captured = self._capture_run_bash(monkeypatch, SSHEnvironment(host="h", user="u"))
         assert not any(a.startswith("SendEnv=") for a in captured["cmd"])
         assert captured["env"] is None
+
+    def test_run_bash_tags_remote_command_with_its_run_token(self, monkeypatch):
+        """t_44017fbc: the remote ``bash -c`` records its pid where the kill path can find it."""
+        env = SSHEnvironment(host="h", user="u")
+        proc = MagicMock()
+        captured = {}
+        monkeypatch.setattr(ssh_env, "_popen_bash", lambda cmd, stdin_data=None, **kw: captured.update(cmd=cmd) or proc)
+        assert env._run_bash("echo ok") is proc
+        token = proc._hermes_run_token
+        assert token and len(token) == 32
+        assert captured["cmd"][-3:-1] == ["bash", "-c"]
+        assert captured["cmd"][-1].startswith(shlex.quote(ssh_env._run_preamble(token))[:-1])
+        assert ssh_env._run_pidfile(token) in ssh_env._run_preamble(token)
+
+    def test_kill_process_kills_the_client_then_the_remote_group(self, monkeypatch):
+        """t_44017fbc: killing only the local ssh client left the remote tree running for 30+ h."""
+        env = SSHEnvironment(host="h", user="u")
+        order = []
+        proc = MagicMock(_hermes_run_token="ab12")
+        proc.kill.side_effect = lambda: order.append("client")
+        monkeypatch.setattr(env, "_run_ssh", lambda remote, timeout: order.append((remote, timeout)))
+        env._kill_process(proc)
+        assert order[0] == "client" and len(order) == 2
+        remote, timeout = order[1]
+        assert timeout <= 5
+        assert remote.startswith("sh -c ") and ssh_env._run_pidfile("ab12") in remote and "TERM KILL" in remote
+
+    def test_force_kill_runs_a_kill_only_remote_kill_off_thread(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        seen = []
+        monkeypatch.setattr(env, "_run_ssh", lambda remote, timeout: seen.append(remote))
+        proc = MagicMock(_hermes_run_token="ab12")
+        env._force_kill_process(proc)
+        proc.kill.assert_called_once()
+        (remote,) = seen
+        assert ssh_env._run_pidfile("ab12") in remote and "for sig in KILL;" in remote
+
+
+def _group_sleeps(pgid):
+    import psutil
+    out = []
+    for p in psutil.process_iter(["name"]):
+        try:
+            if p.info["name"] == "sleep" and os.getpgid(p.pid) == pgid:
+                out.append(p)
+        except (ProcessLookupError, psutil.Error):
+            pass
+    return out
+
+
+def _pidfile(token):
+    return os.path.expandvars(ssh_env._run_pidfile(token))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+@pytest.mark.parametrize("body", ["(sleep 600 &); sleep 601 & sleep 602; true", "sleep 601 & exec sleep 602"],
+                         ids=["background-grandchild", "top-level-exec"])
+def test_remote_group_kill_reaps_the_whole_tree(body, monkeypatch, tmp_path):
+    """t_44017fbc: run the real remote kill script against a ``bash -c`` started the way sshd starts
+    it (own session). Every sleep in its group dies, incl. a ``(cmd &)`` grandchild re-parented to
+    init and a top-level ``exec`` that replaced the tagged bash; the pidfile is removed."""
+    import stat
+    import time
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = uuid.uuid4().hex
+    tree = subprocess.Popen(["bash", "-c", ssh_env._run_preamble(token) + body], start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    want = 3 if body.startswith("(") else 2
+    try:
+        deadline = time.monotonic() + 10
+        while len(_group_sleeps(tree.pid)) < want and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(_group_sleeps(tree.pid)) == want
+        assert os.path.exists(_pidfile(token))
+        # owner-only, under the user's home: no other account can plant a pid for the kill to signal
+        assert _pidfile(token).startswith(str(tmp_path) + os.sep)
+        assert stat.S_IMODE(os.stat(os.path.dirname(_pidfile(token))).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(_pidfile(token)).st_mode) == 0o600
+        rc = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=30).returncode
+        assert rc == 0
+        tree.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while _group_sleeps(tree.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _group_sleeps(tree.pid) == []
+        assert not os.path.exists(_pidfile(token))
+    finally:
+        for p in _group_sleeps(tree.pid):
+            p.kill()
+        tree.kill()
+        tree.wait()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(_pidfile(token))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_finished_command_leaves_no_pidfile_and_kill_is_a_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = uuid.uuid4().hex
+    subprocess.run(["bash", "-c", ssh_env._run_preamble(token) + "true"], check=True, timeout=10)
+    assert not os.path.exists(_pidfile(token))
+    assert subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=10).returncode == 0
 
 
 class TestControlSocketPath:
