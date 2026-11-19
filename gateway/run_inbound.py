@@ -26,6 +26,7 @@ from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
+from gateway import inbound_record
 from gateway.run_common import _UNSET
 from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
@@ -57,6 +58,10 @@ _STT_LOG_CHAT: "ContextVar[str]" = ContextVar("_STT_LOG_CHAT", default="unknown"
 # Mutable cell shared with the shielded STT task: the handler flips ``stopped`` when /stop (or
 # /new, /reset) cancels it mid-transcription, so the task's outcome lines say "after /stop".
 _STT_STOP_CELL: "ContextVar[Optional[Dict[str, bool]]]" = ContextVar("_STT_STOP_CELL", default=None)
+# t_239103a9: per-clip STT results (``{"path", "transcript", "provider"}``) for the event being transcribed, so
+# its inbound_record carries the STT output itself, never the composed turn text. A list shared by reference with
+# the shielded STT task (its context is a copy made at creation).
+_STT_CLIPS: "ContextVar[Optional[List[Dict[str, Any]]]]" = ContextVar("_STT_CLIPS", default=None)
 
 # How long a cancelled turn waits for its in-flight voice STT before giving up on the transcript
 # and persisting the "could not be transcribed" marker instead (2026-10-19: a 281 s note was lost
@@ -1852,12 +1857,16 @@ class GatewayInboundMixin:
         *, session_id: Optional[str] = None, owner_key: Optional[str] = None,
     ) -> str:
         _stt_chat_token = _STT_LOG_CHAT.set(str(getattr(source, "chat_id", None) or "unknown"))
+        _clips: List[Dict[str, Any]] = []
+        _clips_token = _STT_CLIPS.set(_clips)
         try:
             message_text, _successful_transcripts = await self._stt_surviving_stop(
                 event, message_text, audio_paths, session_id, owner_key,
             )
         finally:
+            _STT_CLIPS.reset(_clips_token)
             _STT_LOG_CHAT.reset(_stt_chat_token)
+        inbound_record.attach_transcript(event, audio_paths, _clips)
         # Echo each successful transcript back immediately when configured so users can verify STT
         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
         # bypassed the LLM and produced two replies; enrichment leaves one neutral marker instead.
@@ -2593,6 +2602,10 @@ class GatewayInboundMixin:
             if fallback.get("success"):
                 logger.info("Configured STT failed for %s; recovered with local STT", path)
                 result = fallback
+        clips = _STT_CLIPS.get()
+        if clips is not None:
+            clips.append({"path": path, "transcript": result.get("transcript") if result.get("success") else None,
+                          "provider": result.get("provider")})
         if not result["success"]:
             logger.info("Voice transcription failed for %s: %s", path, result.get("error", "unknown error"))
             _stt_log_failed(str(result.get("error", "unknown error"))[:200], started)
@@ -2698,6 +2711,8 @@ class GatewayInboundMixin:
         _stt_chat_token = _STT_LOG_CHAT.set(
             str(getattr(getattr(event, "source", None), "chat_id", None) or "unknown")
         )
+        _clips: List[Dict[str, Any]] = []
+        _clips_token = _STT_CLIPS.set(_clips)
         try:
             if persist_session_id:
                 enriched_text, successful_transcripts = await self._stt_surviving_stop(
@@ -2706,7 +2721,9 @@ class GatewayInboundMixin:
             else:
                 enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
         finally:
+            _STT_CLIPS.reset(_clips_token)
             _STT_LOG_CHAT.reset(_stt_chat_token)
+        inbound_record.attach_transcript(event, audio_paths, _clips)
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
         return enriched_text, successful_transcripts

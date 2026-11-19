@@ -44,7 +44,7 @@ def test_a_typed_dm_message_carries_its_own_sender_and_no_forward():
     _, ev = _event()
     assert ev.metadata[inbound_record.KEY] == {
         "platform": "telegram", "from_id": "571820863", "chat_id": "571820863", "message_id": "4242",
-        "date": WHEN.timestamp(), "text": "place it", "forwarded": False, "edited": False}
+        "date": WHEN.timestamp(), "kind": "text", "text": "place it", "forwarded": False, "edited": False}
     assert inbound_record.display_metadata(ev) == {inbound_record.KEY: ev.metadata[inbound_record.KEY]}
 
 
@@ -170,3 +170,98 @@ def test_every_persisted_user_row_spreads_the_record():
                 for t in node.targets):
             sites.append(spreads_record(node.value))
     assert len(sites) >= 3 and all(sites), sites
+
+
+# -- t_239103a9: a voice note's record carries the gateway's own transcript --------------------------------------
+
+def _voice_event(caption=None, n_clips=1):
+    from gateway.platforms.event import MessageType
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***", extra={}))
+    msg = _msg(None, voice=SimpleNamespace(file_id="v1", duration=2), caption=caption)
+    ev = adapter._build_message_event(msg, MessageType.VOICE)
+    ev.media_urls = [f"/cache/audio/v{i}.ogg" for i in range(n_clips)]
+    ev.media_types = ["audio/ogg"] * n_clips
+    return ev
+
+
+def _stt(result):
+    def stt(path, *a, **k):
+        return dict(result) if isinstance(result, dict) else result(path)
+    return stt
+
+
+def test_a_voice_note_is_recorded_as_kind_voice_with_no_text():
+    rec = _rec(_voice_event())
+    assert rec["kind"] == "voice" and rec["text"] is None and "transcript" not in rec
+
+
+@pytest.mark.parametrize("attr,kind", [("audio", "audio"), ("photo", "photo"), ("document", "document")])
+def test_media_messages_name_their_kind(attr, kind):
+    from gateway.platforms.event import MessageType
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***", extra={}))
+    ev = adapter._build_message_event(_msg(None, caption="cap", **{attr: [SimpleNamespace(file_id="f")]}),
+                                      MessageType.TEXT)
+    assert _rec(ev)["kind"] == kind and _rec(ev)["text"] == "cap"
+
+
+def _runner(tmp_path):
+    from tests.gateway.test_voice_stt_cancelled_by_stop import _runner as runner
+    return runner(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_inbound_voice_stt_writes_transcript_and_source_into_the_record(tmp_path):
+    from unittest.mock import patch
+    runner, ev = _runner(tmp_path), _voice_event()
+    with patch("tools.transcription_tools.transcribe_audio",
+               _stt({"success": True, "transcript": "Place it.", "provider": "parakeet"})):
+        text = await runner._enrich_inbound_voice(ev, ev.source, "COMPOSED place it", ev.media_urls)
+    assert "Place it." in text
+    rec = inbound_record.display_metadata(ev)[inbound_record.KEY]
+    assert rec["transcript"] == "Place it." and rec["transcript_source"] == "parakeet"
+    assert rec["text"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [{"success": False, "error": "503"}, {"success": True, "transcript": "  "}])
+async def test_failed_or_empty_stt_leaves_no_transcript(tmp_path, result):
+    from unittest.mock import patch
+    runner, ev = _runner(tmp_path), _voice_event()
+    with patch("tools.transcription_tools.transcribe_audio", _stt(result)), \
+            patch("tools.transcription_tools.transcribe_audio_local_fallback", _stt({"success": False})):
+        await runner._enrich_inbound_voice(ev, ev.source, "place it", ev.media_urls)
+    assert inbound_record.display_metadata(ev)[inbound_record.KEY]["transcript"] is None
+
+
+@pytest.mark.asyncio
+async def test_two_clips_carry_no_transcript(tmp_path):
+    from unittest.mock import patch
+    runner, ev = _runner(tmp_path), _voice_event(n_clips=2)
+    with patch("tools.transcription_tools.transcribe_audio",
+               _stt({"success": True, "transcript": "place it", "provider": "local"})):
+        await runner._enrich_inbound_voice(ev, ev.source, "", ev.media_urls)
+    assert inbound_record.display_metadata(ev)[inbound_record.KEY]["transcript"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_voice_path_also_records_the_transcript(tmp_path):
+    from unittest.mock import patch
+    runner, ev = _runner(tmp_path), _voice_event()
+    runner._pending_event_audio_paths = lambda e: list(e.media_urls)
+    with patch("tools.transcription_tools.transcribe_audio",
+               _stt({"success": True, "transcript": "Place it.", "provider": "local"})):
+        await runner._transcribe_pending_audio_event_once(ev, "")
+    rec = inbound_record.display_metadata(ev)[inbound_record.KEY]
+    assert rec["transcript"] == "Place it." and rec["transcript_source"] == "local"
+
+
+def test_attach_transcript_ignores_a_typed_record_and_keeps_a_shallow_copy_intact():
+    import copy
+    _, ev = _event()
+    inbound_record.attach_transcript(ev, ["/a.ogg"], [{"path": "/a.ogg", "transcript": "place it"}])
+    assert "transcript" not in _rec(ev)
+    voice = _voice_event()
+    twin = copy.copy(voice)
+    inbound_record.attach_transcript(voice, voice.media_urls,
+                                     [{"path": voice.media_urls[0], "transcript": "yes", "provider": "x"}])
+    assert _rec(voice)["transcript"] == "yes" and "transcript" not in _rec(twin)
