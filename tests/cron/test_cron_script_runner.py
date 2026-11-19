@@ -610,6 +610,7 @@ def test_e_ac15_config_refusals_exit_78(root, tmp_path, procs, case):
     assert _hb(root) is None
     text = log.read_text(encoding="utf-8")
     assert sum("refusing to start" in line for line in text.splitlines()) == 1, text[-3000:]
+    assert "cron script runner exit: reason=config refused" in text, text[-3000:]
 
 
 # --- S2 (i): one strike re-arm ---------------------------------------------------------------------
@@ -690,6 +691,172 @@ def test_d_code_skew_drains_then_exits_0(root, monkeypatch):
     assert not script_runner.trip_marker_path().exists()
 
 
+
+# --- t_2ddabbc4: drain only when the skew touches a loaded module; every exit logs a reason ---------
+
+def _git(repo: Path, *args) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                          text=True, encoding="utf-8").stdout.strip()
+
+
+def test_skew_loaded_changes_intersects_the_diff_with_loaded_modules(tmp_path, monkeypatch):
+    """The real ``git diff`` path: a skew whose diff misses every loaded module is ``[]``, one that
+    touches (or renames away) a loaded module names it, and an unreadable diff is None."""
+    import types
+
+    from cron import script_runner
+
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    _git(tmp_path, "init", "-q", str(repo))
+    for name in ("loaded.py", "other.py", "moved.py"):
+        (repo / "pkg" / name).write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "boot")
+    boot = _git(repo, "rev-parse", "HEAD")
+    (repo / "pkg" / "other.py").write_text("x = 2\n", encoding="utf-8")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "unloaded only")
+    disk1 = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "mv", "pkg/moved.py", "pkg/renamed.py")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rename loaded")
+    disk2 = _git(repo, "rev-parse", "HEAD")
+
+    for name in ("loaded", "moved"):
+        mod = types.ModuleType(f"t2dd_{name}")
+        mod.__file__ = str(repo / "pkg" / f"{name}.py")
+        monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    shas = {"v": (repo, boot, disk1)}
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: shas["v"])
+    assert script_runner._skew_loaded_changes() == []
+    shas["v"] = (repo, boot, disk2)
+    assert script_runner._skew_loaded_changes() == ["pkg/moved.py"]
+    shas["v"] = (repo, boot, "f" * 40)  # sha not in the repo
+    assert script_runner._skew_loaded_changes() is None
+    shas["v"] = (repo, None, disk1)  # boot unresolved
+    assert script_runner._skew_loaded_changes() is None
+    shas["v"] = (tmp_path / "missing", boot, disk1)
+    assert script_runner._skew_loaded_changes() is None
+
+
+@pytest.mark.parametrize("changes,drains", [([], False), (["cron/scheduler.py"], True),
+                                            (None, True)],
+                         ids=["unchanged_modules", "changed_module", "unreadable_diff"])
+def test_d_code_skew_drains_only_when_a_loaded_module_changed(root, monkeypatch, changes, drains):
+    from cron import script_runner
+
+    calls = []
+    disk = {"sha": "b" * 40}
+    monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: (root, "a" * 40, disk["sha"]))
+    monkeypatch.setattr(script_runner, "_skew_loaded_changes",
+                        lambda *_a: calls.append(disk["sha"]) or changes)
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    r.enumerate_homes()
+    assert r.draining is drains
+    assert r.can_dispatch() is (not drains)
+    if not drains:
+        assert calls == ["b" * 40]  # one diff per disk sha, not one per cycle
+        # A later deploy that does touch a loaded module still drains.
+        disk["sha"] = "c" * 40
+        monkeypatch.setattr(script_runner, "_skew_loaded_changes",
+                            lambda *_a: calls.append(disk["sha"]) or ["cron/jobs.py"])
+        r.enumerate_homes()
+        assert r.draining is True and calls == ["b" * 40, "c" * 40]
+
+
+@pytest.mark.parametrize("back_to_boot", [False, True], ids=["revert_commit", "checkout_boot"])
+def test_d_code_skew_diffs_against_the_last_accepted_sha(tmp_path, root, monkeypatch,
+                                                         back_to_boot):
+    """Prism 05d607795190: boot at A, accept B (changes only the unloaded pkg/other.py), import
+    pkg/other.py from B, then a revert (new commit C, or the checkout back at A) must drain: the
+    runner runs B's code, and an A..disk diff would miss it."""
+    import types
+
+    from cron import script_runner
+
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    _git(tmp_path, "init", "-q", str(repo))
+    other = repo / "pkg" / "other.py"
+    other.write_text("x = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "A")
+    a = _git(repo, "rev-parse", "HEAD")
+    other.write_text("x = 2\n", encoding="utf-8")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "B")
+    b = _git(repo, "rev-parse", "HEAD")
+    if back_to_boot:
+        c = a
+    else:
+        other.write_text("x = 1\n", encoding="utf-8")
+        _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "C revert")
+        c = _git(repo, "rev-parse", "HEAD")
+
+    disk = {"sha": b}
+    monkeypatch.setattr(script_runner, "_skew_shas", lambda: (repo, a, disk["sha"]))
+    monkeypatch.setattr(script_runner, "_detect_code_skew",
+                        lambda: None if disk["sha"] == a else ("a", "d"))
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 1)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    assert r.draining is False  # B touches no loaded module: accepted
+    mod = types.ModuleType("t2dd_other")
+    mod.__file__ = str(other)
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)  # lazily imported from B
+    r.enumerate_homes()
+    assert r.draining is False  # disk still B: nothing new
+    disk["sha"] = c
+    r.enumerate_homes()
+    assert r.draining is True
+
+
+def test_exit_reason_lines_cover_clean_drain_signal_crash_and_unrecorded(root, monkeypatch,
+                                                                         caplog):
+    from cron import script_runner
+
+    caplog.set_level(logging.WARNING, logger="cron.script_runner")
+    # Clean skew drain: no script in flight.
+    monkeypatch.setattr(script_runner, "_detect_code_skew", lambda: ("aaaa", "bbbb"))
+    monkeypatch.setattr(script_runner, "_skew_loaded_changes", lambda *_a: None)
+    monkeypatch.setattr(script_runner, "_inflight_count", lambda: 0)
+    r = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r.attach_stop(threading.Event())
+    r.enumerate_homes()
+    assert r.exit_reason == "code skew drain (no script in flight)"
+    r2 = script_runner.ScriptRunner(profile_homes=lambda: [("default", root)])
+    r2.request_shutdown("signal SIGHUP")
+    r2.request_shutdown("signal SIGTERM")  # the first cause wins
+    assert r2.exit_reason == "signal SIGHUP"
+
+    # A crash in main logs its exception class, and the exit record closes this start.
+    monkeypatch.setattr(script_runner, "_setup_logging", lambda: None)
+
+    def boom(_info):
+        raise RuntimeError("ticker setup")
+
+    monkeypatch.setattr(script_runner, "_run", boom)
+    with pytest.raises(RuntimeError):
+        script_runner.main([])
+    assert "cron script runner exit: reason=crash RuntimeError: ticker setup code=exception" \
+        in caplog.text
+    record = json.loads(script_runner._exit_record_path().read_text(encoding="utf-8-sig"))
+    assert record["pid"] == os.getpid() and record["exit"]["reason"].startswith("crash")
+
+    # A previous runner that died without an exit line (SIGKILL) gets one at the next start.
+    caplog.clear()
+    script_runner._exit_record_path().write_text(
+        json.dumps({"pid": 999999, "started_at": "then", "exit": None}), encoding="utf-8")
+    script_runner.note_start()
+    assert "cron script runner exit: reason=unrecorded code=? pid 999999" in caplog.text
+    caplog.clear()
+    script_runner.note_start()  # own pid, exit None: not a previous runner
+    assert "reason=unrecorded" not in caplog.text
+
+
 @pytest.mark.slow_test(180, reason="real runner subprocess")
 def test_d_code_skew_drain_is_bounded_then_requeues(root, tmp_path, procs):
     """t_c15baa4b: a deploy (code skew) while a long script runs must not park the runner for the
@@ -720,6 +887,7 @@ def test_d_code_skew_drain_is_bounded_then_requeues(root, tmp_path, procs):
     assert rec.get(RESTART_REQUEUE_KEY), rec
     assert not (root / "cron" / "script_runner_tripped").exists()
     assert "drain bounded: re-fire available" in log.read_text(encoding="utf-8")
+    assert "exit: reason=code skew drain bounded" in log.read_text(encoding="utf-8-sig")
 
 
 @pytest.mark.slow_test(180, reason="real runner subprocess")
@@ -1898,6 +2066,9 @@ def test_c_sigterm_terminates_script_requeues_and_exits_0(root, tmp_path, procs)
     assert _group_gone(s_pid)
     rec = {r["id"]: r for r in merged_jobs(root / "cron" / "jobs.json")}[job["id"]]
     assert rec.get(RESTART_REQUEUE_KEY), rec
+    # t_2ddabbc4: the signal exit names its cause.
+    assert "cron script runner exit: reason=signal SIGTERM code=0" in log.read_text(
+        encoding="utf-8-sig")
 
 
 # --- t_302ab1e8: ledger-lock trips name the holder, self re-arm, killed jobs re-queue -----------------
