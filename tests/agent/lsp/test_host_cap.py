@@ -183,3 +183,19 @@ def test_idle_reap_keeps_the_slot_until_the_server_is_shut_down(repo):
         assert _wait_until(lambda: host_slots.held_count(6) == 0)
     finally:
         svc.shutdown()
+
+
+def test_spawn_logs_root_uri_and_config_once_per_process(repo, caplog):
+    """One INFO line per server start names its pid, rootUri and config file, so a pyright that indexes
+    the wrong tree is visible from the log (t_9cba3363)."""
+    caplog.set_level(logging.INFO, logger="hermes.lint.lsp")
+    svc = _service(max_servers_per_host=6)
+    try:
+        svc.snapshot_baseline(str(repo.path / "x.py"))
+        svc.snapshot_baseline(str(repo.path / "x.py"))
+    finally:
+        svc.shutdown()
+    spawned = [r.getMessage() for r in caplog.records if "spawned pid=" in r.getMessage()]
+    assert len(spawned) == 1, spawned
+    assert f"rootUri={repo.path.as_uri()}" in spawned[0]
+    assert spawned[0].endswith("config=none")  # the mock spec names no config file

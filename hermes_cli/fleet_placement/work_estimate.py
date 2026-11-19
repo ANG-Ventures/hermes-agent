@@ -55,6 +55,7 @@ Estimate = admission.Estimate
 P = 0.90                     # the estimate is the p90 of a class's recorded peaks (doctrine rule 3; t_d0c8e8f0)
 WINDOW = 50                  # over its last N runs on that host (doctrine rule 3: "the last ~50")
 MIN_ROWS = 10                # nearest-rank p90 must not equal one isolated maximum during cold start
+HOST_ROWS_FACTOR = 2         # a pooled sub-class's host p90 needs 2 x MIN_ROWS host rows (p90 of 20 = 3rd largest)
 FLOOR = {"cpus": 0.1, "ram_gb": 0.25, "gpu_mib": 0.0}   # never below (a measured ~0 still reserves something)
 CLASS_USAGE_REL = Path("var") / "placement" / "class-usage.jsonl"
 CLASS_USAGE_WINDOW_S = 14 * 86400.0
@@ -240,8 +241,13 @@ def _estimate(klass, host, history, seed, *, p, window, min_rows):
     for k in ((klass, base) if base != klass else (klass,)):
         rows, by_host = _class_rows(history, k)
         here = by_host.get(host, [])
+        # t_f71371a1: a pooled family's sub-class (test-gate-run:files-*) splits the family's rows 4 ways per host, so a
+        # cold host sample is routine. Its host p90 needs HOST_ROWS_FACTOR x min_rows rows: at 10 the nearest-rank p90
+        # is the 2nd largest, and two heavy runs held ace-media files-2-10 at 0.69 GB for 22 bookings (class p90
+        # 0.32). Until then the sub-class's fleet p90 (the same test files on another host) is the estimate.
+        host_min = min_rows * HOST_ROWS_FACTOR if k != base and base in POOLED_FAMILIES else min_rows
         for pick, where in ((here, host), (rows, "fleet")):
-            if len(pick) < min_rows:
+            if len(pick) < (host_min if where == host else min_rows):
                 continue
             last = pick[-window:]
             # Resolve each axis independently; a sparse host axis still gets the

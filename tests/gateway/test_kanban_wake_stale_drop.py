@@ -23,7 +23,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_notify as kbn
 from hermes_constants import get_hermes_home
 
-from tests.gateway.test_kanban_owner_wake import CHAT, HUMAN, _card, _event, _tick, env  # noqa: F401
+from tests.gateway.test_kanban_owner_wake import CHAT, HUMAN, _blocked, _card, _event, _tick, env  # noqa: F401
 
 STALE_LOG = "kanban_wake_stale_dropped"
 
@@ -111,6 +111,7 @@ def test_notifier_wake_dropped_when_card_archived_between_claim_and_send(env, ca
 def test_notifier_wake_still_sent_for_live_card(env):
     _cfgless_owner_wake_off(env)
     tid = _sub_card(env, "notify+wake")
+    _blocked(tid)  # gave_up leaves the card blocked
     _event(tid, "gave_up", {"error": "retries exhausted"})
     handled = [e for e in _tick(env) if tid in (e.text or "")]
     assert len(handled) == 1
@@ -145,6 +146,7 @@ def _wake_event(cards_live_and_stale):
 def test_dequeue_drops_wake_for_archived_card(env, caplog):
     caplog.set_level(logging.INFO)
     tid = _card(env)
+    _blocked(tid)
     ev = _wake_event([tid])
     assert fresh.filter_event(ev) is False, "live card: kept"
     _archive(tid)
@@ -157,6 +159,7 @@ def test_dequeue_narrows_multi_card_wake_to_live_cards(env):
     live, gone = _card(env), _card(env)
     ev = _wake_event([live, gone])
     _archive(gone)
+    _blocked(live)  # after the archive: its ready sweep re-readies an untyped raw block
     assert fresh.filter_event(ev) is False
     assert ev.text == f"[kanban wake] {live}"
     assert [c["task_id"] for c in ev.metadata[fresh.META_KEY]] == [live]
@@ -272,3 +275,83 @@ def test_dequeue_keeps_an_owner_notice_on_a_done_card_and_drops_it_once_gone(env
     with kb.connect_closing() as conn, kb.write_txn(conn):
         conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
     assert fresh.filter_event(ev) is True, "a gone card stays stale"
+
+
+# --- t_05badfca: a status notice whose status the card no longer holds ------------------------------------------------
+# Replay of house-voice t_305ecaca, 2026-11-18: the owner's request-changes unblocked the scheduled card into
+# review (16:24:24, the entry trigger writes a review_requested), the notifier woke the owner's busy session with
+# "handed off for review" (queued 16:24:25), the owner requested changes (16:24:28) and the implementer's run
+# claimed the card (16:24:42). The queued wake ran at 16:24:48 and told the owner a review was waiting.
+
+
+def _set_status(tid, status):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+
+
+def _review_wake(env):
+    """The 16:24:24-25 half: the card enters review and the notifier builds its wake."""
+    _cfgless_owner_wake_off(env)
+    tid = _sub_card(env, "notify+wake")
+    _set_status(tid, "review")  # tasks_review_handoff writes the review_requested, as on the board
+    with kb.connect_closing() as conn:
+        kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))]
+    assert "review_requested" in kinds
+    wakes = [e for e in _tick(env) if tid in (e.text or "")]
+    assert len(wakes) == 1 and "handed off for review" in wakes[0].text, "the card is in review: sent"
+    assert wakes[0].metadata[fresh.META_KEY][0]["kinds"] == ["review_requested"]
+    return tid, wakes[0]
+
+
+def test_replay_t_305ecaca_review_wake_dropped_after_changes_requested(env, caplog):
+    caplog.set_level(logging.INFO)
+    tid, wake = _review_wake(env)
+    assert fresh.filter_event(wake) is False, "still in review: kept"
+    _set_status(tid, "ready")
+    _event(tid, "changes_requested", {"reason": "drill 4 result", "status": "ready"})
+    with kb.connect_closing() as conn:
+        assert kb.claim_task(conn, tid) is not None, "the implementer's run claims it (16:24:42)"
+    assert fresh.filter_event(wake, now=wake.metadata[fresh.META_KEY][0]["event_ts"] + 23) is True
+    line = _stale_lines(caplog)[-1]
+    assert tid in line and "kind=review_requested" in line and "stage=dequeue" in line and "status=running" in line
+
+
+def test_review_wake_kept_while_the_reviewer_holds_the_claim(env):
+    tid, wake = _review_wake(env)
+    with kb.connect_closing() as conn:
+        assert kb.claim_review_task(conn, tid) is not None
+        assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "running"
+    assert fresh.read_status("default", tid) == "review", "a review run is still the review"
+    assert fresh.filter_event(wake) is False
+
+
+def test_notifier_drops_a_review_wake_when_changes_land_between_claim_and_send(env, caplog):
+    caplog.set_level(logging.INFO)
+    _cfgless_owner_wake_off(env)
+    tid = _sub_card(env, "notify+wake")
+    _set_status(tid, "review")
+    real = kbn.claim_unseen_events_for_sub
+
+    def claim_then_send_back(conn, **kw):
+        out = real(conn, **kw)
+        if kw.get("task_id") == tid and out[2]:
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        return out
+
+    env["monkeypatch"].setattr(kbn, "claim_unseen_events_for_sub", claim_then_send_back)
+    assert [e for e in _tick(env) if tid in (e.text or "")] == []
+    lines = _stale_lines(caplog)
+    assert lines and "stage=notifier" in lines[-1] and "kind=review_requested" in lines[-1] and "status=ready" in lines[-1]
+
+
+@pytest.mark.parametrize("status,kind,stale", [
+    ("review", "review_requested", False), ("running", "review_requested", True),
+    ("ready", "review_requested", True), ("scheduled", "review_requested", True),
+    ("blocked", "gave_up", False), ("ready", "gave_up", True),
+    ("blocked", "blocked", False), ("ready", "blocked", True),
+    ("triage", "block_loop_detected", False), ("ready", "block_loop_detected", True),
+    ("running", "completed", False), ("done", "completed", False), ("done", "gave_up", True),
+    ("ready", "crashed", False), (None, "review_requested", False), ("", "blocked", False),
+])
+def test_is_stale_notice(status, kind, stale):
+    assert fresh.is_stale_notice(status, kind) is stale

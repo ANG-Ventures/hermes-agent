@@ -546,7 +546,17 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     of the same bytes reuse one backup while changed bytes get a separate one.
     Returns the main backup path, or ``None`` if the copy failed (the caller
     still raises loudly). Writes are confined to the DB's parent directory:
-    the basename derives only from ``path.name`` + content hash."""
+    the basename derives only from ``path.name`` + content hash.
+
+    The open-handle check and every raw read/copy run inside
+    ``database_offline`` for THIS database only, so a tracked connection
+    (``connect_tracked``) to it in this process cannot open between the check
+    and the copy: it waits until the copy is done. Opens and closes of every
+    other database (other boards, state.db) never wait on the copy. NOT covered: a plain
+    ``sqlite3.connect`` (or any other opener that bypasses ``connect_tracked``)
+    racing this copy in this process. The fd scan only sees handles already
+    open when it runs. Other processes are never excluded, so the copy is not
+    a coherent SQLite snapshot."""
     # Pin the resolved parent (``resolve()`` collapses ``..`` and symlinks); we
     # only ever write inside it.
     resolved = path.resolve()
@@ -557,10 +567,19 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # must only run once the board is out of service. Another SessionDB/kanban
     # connection in this process would still be at risk — so REFUSE rather than
     # warn-and-proceed: losing a forensic copy beats corrupting the live DB.
-    from hermes_cli.sqlite_safe_read import has_live_connection, process_holds_open_fd
+    from hermes_cli.sqlite_safe_read import (
+        LiveConnectionError,
+        database_offline,
+        process_holds_open_fd,
+    )
 
     sidecars = [parent / (base_name + suffix) for suffix in ("-wal", "-shm")]
-    if has_live_connection(resolved) or any(process_holds_open_fd(p) for p in (resolved, *sidecars)):
+    try:
+        with database_offline(resolved, what="quarantine"):
+            if any(process_holds_open_fd(p) for p in (resolved, *sidecars)):
+                raise LiveConnectionError(f"{resolved} has an open descriptor in this process")
+            return _copy_corrupt_db(resolved, parent, base_name, sidecars)
+    except LiveConnectionError:
         _kb._log.error(
             "refusing to quarantine %s: a connection to it is still open in "
             "this process, and fingerprinting the file would cancel that "
@@ -568,6 +587,11 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             resolved,
         )
         return None
+
+
+def _copy_corrupt_db(resolved: Path, parent: Path, base_name: str, sidecars: list[Path]) -> Optional[Path]:
+    """The raw reads and copies of :func:`_backup_corrupt_db`; the caller holds
+    this database in ``database_offline``."""
     # One copy per corruption episode. A broken board keeps taking writes on
     # already-open connections, so its hash changes between refused opens and
     # content addressing alone copied the whole file on every one (10 x 512 MB
@@ -625,6 +649,13 @@ def _episode_backup(resolved: Path, fingerprint: Optional[dict]) -> Optional[Pat
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
     return backup if same_file and backup.is_file() else None
+
+
+def _end_corrupt_episode(resolved: Path) -> None:
+    """A verified-clean verdict (stamp, REINDEX repair, or ``repair_db`` ok)
+    ends the copy episode: the next corruption is a new incident."""
+    with contextlib.suppress(OSError):
+        _corrupt_episode_path(resolved).unlink(missing_ok=True)
 
 
 def _record_episode_backup(resolved: Path, fingerprint: Optional[dict], backup: Path) -> None:
@@ -877,6 +908,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
                 "integrity_check now clean. Pre-repair copy kept at %s.",
                 resolved, ", ".join(index_names), _backup_label(backup),
             )
+            _end_corrupt_episode(resolved)
             return
         reason = (
             f"{reason}; REINDEX auto-repair attempted but integrity_check "
@@ -947,6 +979,7 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
                 backup_path=_backup_corrupt_db(resolved),
             )
         if reason is None:
+            _end_corrupt_episode(resolved)
             return RepairResult(status="ok", db_path=resolved, messages=messages)
 
         _drop_integrity_stamp(resolved)
@@ -960,6 +993,8 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
         # to re-probe instead of trusting the stale healthy-path cache.
         with _INIT_LOCK:
             _INITIALIZED_PATHS.discard(str(resolved))
+        if repaired:
+            _end_corrupt_episode(resolved)
         return RepairResult(
             status="repaired" if repaired else "corrupt",
             db_path=resolved,

@@ -763,6 +763,7 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
             chat_type="dm",
             delivery_mode="notify+wake",
         )
+        conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))  # where the loop breaker routes it
         kb._append_event(
             conn, tid, "block_loop_detected",
             {"reason": "needs credentials", "kind": "needs_input",
