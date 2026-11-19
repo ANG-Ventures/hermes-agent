@@ -1888,7 +1888,7 @@ def handback_row(entry: dict, result: dict, *, turn_text: Optional[str] = None) 
         "event_ts": entry.get("event_ts"), "event_id": entry.get("event_id"),
         "assignee": entry.get("assignee"), "pr": entry.get("pr"),
         "claim_key": entry.get("key"), "parts": parts, "action": result.get("action"),
-        "line": f"boomerang handled {entry['task_id']} ({row}): {summary}", "turn": turn_text,
+        "line": f"{HANDLED_PREFIX}{entry['task_id']} ({row}): {summary}", "turn": turn_text,
         "attempts": 0, "created_at": _time.time()}
 
 
@@ -2034,6 +2034,8 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
     action = row.get("action")
     guarded = action == "surface" or (action is None and row.get("turn") is not None)
     delivery_parts = list(left)
+    handled = (str(row.get("line") or "").startswith(HANDLED_PREFIX)
+               and not await asyncio.to_thread(handled_line_chat_enabled))
     for part in delivery_parts:
         if guarded:
             # Recover original cursors for rows persisted before the guard was introduced.
@@ -2053,6 +2055,8 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
         try:
             if part == PART_TURN:
                 ok = await resurface(runner, entry, row.get("turn"))
+            elif handled:
+                ok = await _deliver_handled_line(runner, entry, row, turn_failed=PART_TURN in failures)
             else:
                 ok = await post_line(runner, entry, str(row.get("line") or ""))
         finally:
@@ -2123,6 +2127,54 @@ async def deliver_handbacks(runner: Any, state: BoomerangWakeState, *,
         finally:
             _DELIVERING.discard(did)
     return sent
+
+
+# t_8ab5557d: the ``boomerang handled`` line is an agent receipt (Ace's three-bin ruling, Discord
+# 1571854816139944097). Absent (default) = no chat line beside a delivered turn, and a handled-only
+# row writes it to the fleet agent log. Present = the line posts to the origin chat as before.
+HANDLED_LINE_CHAT_FILE = "boomerang-handled-line-chat.enabled"
+HANDLED_PREFIX = "boomerang handled "
+AGENT_LOG_PRODUCER = "boomerang-wake"
+
+
+def handled_line_chat_enabled() -> bool:
+    """t_8ab5557d knob: True while ``<HERMES_HOME>/state/boomerang-handled-line-chat.enabled`` exists
+    (the ``boomerang handled`` line posts to the origin chat again, as before)."""
+    from hermes_constants import get_hermes_home
+
+    return (get_hermes_home() / "state" / HANDLED_LINE_CHAT_FILE).exists()
+
+
+def write_agent_log_line(entry: dict, text: str) -> bool:
+    """One row in the fleet agent log (``<fleet root>/scripts/lib/agent_inbox.py`` write_agent_log,
+    the library the cron #alerts/#logs gates load). False when there is no library or the write fails."""
+    try:
+        from cron.fork_ext.alerts_audience_gate import _fleet_root, _load_lib
+        from hermes_constants import get_hermes_home
+
+        root = _fleet_root(Path(get_hermes_home()))
+        lib = _load_lib(root) if root is not None else None
+        if lib is None or not hasattr(lib, "write_agent_log"):
+            return False
+        lib.write_agent_log(root, AGENT_LOG_PRODUCER, "info", text, task_id=entry.get("task_id"),
+                            delegation_id=entry.get("delegation_id"))
+        return True
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: agent-log row for %s not written: %s", entry.get("task_id"), exc)
+        return False
+
+
+async def _deliver_handled_line(runner: Any, entry: dict, row: dict, *, turn_failed: bool) -> bool:
+    """The ``boomerang handled`` line (knob off). A row that delivers a turn posts no line: the turn is
+    the message, and the receipt goes to the agent log best-effort. A refused turn still posts the line
+    to the chat. A handled-only row writes the agent log; with no log it posts to the chat (never lost)."""
+    text = str(row.get("line") or "")
+    if turn_failed:
+        return await post_line(runner, entry, text)
+    logged = await asyncio.to_thread(write_agent_log_line, entry, text)
+    if row.get("turn") is not None or logged:
+        return True
+    return await post_line(runner, entry, text)
 
 
 async def post_line(runner: Any, entry: dict, text: str) -> bool:
