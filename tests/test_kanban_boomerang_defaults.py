@@ -271,7 +271,7 @@ def test_run_entry_deadman_passive_delivery(tmp_path, monkeypatch, stale):
     monkeypatch.setattr(bw, "resurface", resurface)
     sent = []
     asyncio.run(bw.run_entry(_runner([], sent), entry, state))
-    assert sent == ([] if stale else [f"boomerang handled {tid} (review_deadman): operator decision needed"])
+    assert sent == []  # t_8ab5557d: no chat line beside a delivered turn
     assert len(turns) == (0 if stale else 1)
     with kb.connect_closing() as conn:
         assert any(c.body.startswith("boomerang: review_deadman ") for c in kb.list_comments(conn, tid))

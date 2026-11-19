@@ -677,6 +677,9 @@ ALLOWED = {
     # t_efb6f435: the first read of a review handed to a human. The child stages its read and
     # surfaces, or sends back a plainly incomplete handback; it never approves or lands.
     "own_repo_review_human": frozenset({"request_changes", "surface"}),
+    # t_ff6f4be4: a card back in review from a park: the deadman child's attended read (why it waits, or
+    # surface); it never approves, completes or lands.
+    "review_park_return": frozenset({"comment_why_waits", "surface"}),
     "changes_requested": frozenset({"redispatch", "surface"}),
     "blocked_assess": frozenset({"retry", "surface"}),
     "crash_first_occurrence": frozenset({"retry", "surface"}),
@@ -765,13 +768,54 @@ ROW_REVIEW_HUMAN = "own_repo_review_human"
 #: Its stop file, read every tick: present = that handoff is ``none`` again (today's plain wake).
 REVIEW_HANDOFF_STOP_FILE = "boomerang-wake-review-handoff.disabled"
 #: Outcomes of a handoff child that answered its review episode (the deadman's child is then skipped).
+#: request_changes: a handoff child's send-back. Not comment_why_waits (t_ff6f4be4 round 2): a park-return child's
+#: receipt is claimed on the review_requested event, which hermes-home's deadman does not count, so its page
+#: still gets the deadman child whose receipt is keyed on the review_deadman event.
 _EPISODE_ANSWERED = frozenset({"surfaced", "request_changes"})
+#: t_ff6f4be4 A: a card back in review from a park (the board's ``lifecycle_entry_repair`` review_requested).
+ROW_PARK_RETURN = "review_park_return"
+PARK_RETURN_SOURCE = "lifecycle_entry_repair"
+#: Its stop file, read every tick: present = that wake surfaces to the home session again (main's behaviour).
+PARK_RETURN_STOP_FILE = "boomerang-wake-park-return.disabled"
+#: The rows whose child is the first read of a review episode (the deadman's cycle-0 page defers to it).
+_EPISODE_ROWS = frozenset({ROW_REVIEW_HUMAN, ROW_PARK_RETURN})
+#: t_ff6f4be4 B: present = a deadman cycle-0 page forks its child even while the episode's first-read child
+#: still runs (main's behaviour). Read every tick.
+DEADMAN_WAIT_STOP_FILE = "boomerang-wake-deadman-wait.disabled"
+#: A deferred deadman page (state ``deferred``, not an OPEN state) waits at most this long for the child.
+STATE_DEFERRED = "deferred"
+DEADMAN_WAIT_MAX_S = 2 * MAX_MINUTES * 60.0
 
 
 def review_handoff_stop_file_path() -> Path:
     from hermes_constants import get_hermes_home
 
     return get_hermes_home() / "state" / REVIEW_HANDOFF_STOP_FILE
+
+
+def park_return_stop_file_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / PARK_RETURN_STOP_FILE
+
+
+def deadman_wait_stop_file_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / DEADMAN_WAIT_STOP_FILE
+
+
+def park_return(payload: Optional[dict], task: Any) -> bool:
+    """t_ff6f4be4: the event is the board's own re-entry into review (``source: lifecycle_entry_repair``,
+    written when a parked or scheduled card comes back; no run, no summary) and its reviewer (the event's
+    ``reviewer``, else the card's assignee) is a human. False while the row's stop file is present."""
+    from hermes_cli import kanban_db as kb
+
+    if (payload or {}).get("source") != PARK_RETURN_SOURCE:
+        return False
+    if not kb.is_human_reviewer((payload or {}).get("reviewer") or _field(task, "assignee")):
+        return False
+    return not park_return_stop_file_path().exists()
 
 
 def human_reviewer(payload: Optional[dict], task: Any) -> bool:
@@ -796,10 +840,39 @@ def review_episode_answered(state: "BoomerangWakeState", board: Optional[str], t
     gets its child as today. A failed, lost or still-running handoff child answers nothing. The cycle
     must be an explicit integer 0 (missing, null or non-integer dispatches), and the row's stop file
     turns the skip off too, so with it present every page dispatches as on main."""
-    from hermes_cli import kanban_db as kb
-
     if review_handoff_stop_file_path().exists():
         return False
+    # t_ff6f4be4 round 3: with the park-return stop file present a park-return claim answers nothing (main).
+    park_off = park_return_stop_file_path().exists()
+    for c in _episode_claims(state, board, task_id, event_id) or ():
+        if park_off and c.get("row") == ROW_PARK_RETURN:
+            continue
+        if c.get("state") != STATE_TERMINAL:
+            continue
+        outcome = c.get("outcome")
+        if outcome in _EPISODE_ANSWERED and (outcome != "surfaced" or c.get("resurface_delivered") is True):
+            return True
+    return False
+
+
+def review_episode_running(state: "BoomerangWakeState", board: Optional[str], task_id: str,
+                           event_id: Any) -> bool:
+    """t_ff6f4be4 B: True when the review_deadman page ``event_id`` is the cycle-0 page of an episode whose
+    first-read child (own_repo_review_human / review_park_return, or its restart successor) is still open
+    and has not re-surfaced. The page then waits (``dispatch`` parks it as a ``deferred`` claim) instead of
+    forking a second child on the same head. False while the deadman-wait stop file is present."""
+    if deadman_wait_stop_file_path().exists():
+        return False
+    return any(c.get("state") in OPEN_STATES and not c.get("resurfaced")
+               for c in _episode_claims(state, board, task_id, event_id) or ())
+
+
+def _episode_claims(state: "BoomerangWakeState", board: Optional[str], task_id: str,
+                    event_id: Any) -> Optional[list]:
+    """The first-read child claims (_EPISODE_ROWS) of the episode the deadman page ``event_id`` names, or None
+    when the page is not an explicit cycle-0 page of a ``review_requested`` episode of this card."""
+    from hermes_cli import kanban_db as kb
+
     conn = _readonly(kb, board)
     try:
         page = conn.execute("SELECT payload FROM task_events WHERE id = ? AND task_id = ?",
@@ -809,25 +882,18 @@ def review_episode_answered(state: "BoomerangWakeState", board: Optional[str], t
             episode = int(payload.get("episode") or 0)
             cycle = payload.get("cycle")
         except (TypeError, ValueError, AttributeError):
-            return False
+            return None
         if episode <= 0 or type(cycle) is not int or cycle != 0:
-            return False
+            return None
         row = conn.execute("SELECT id FROM task_events WHERE id = ? AND task_id = ? "
                            "AND kind = 'review_requested'", (episode, task_id)).fetchone()
     finally:
         conn.close()
     if row is None:
-        return False
+        return None
     base = claim_key(board, task_id, row[0])
-    for key, c in state.claims().items():
-        if key != base and not key.startswith(base + "#"):
-            continue
-        if c.get("row") != ROW_REVIEW_HUMAN or c.get("state") != STATE_TERMINAL:
-            continue
-        outcome = c.get("outcome")
-        if outcome in _EPISODE_ANSWERED and (outcome != "surfaced" or c.get("resurface_delivered") is True):
-            return True
-    return False
+    return [c for key, c in state.claims().items()
+            if (key == base or key.startswith(base + "#")) and c.get("row") in _EPISODE_ROWS]
 
 
 def row_enabled(name: str) -> bool:
@@ -993,6 +1059,7 @@ def collect_candidates(kb: Any, conn: Any, board: str, task: Any, events: list, 
             payload = review_payload(kb, conn, task_id, _field(task, "result"), ev.payload, ev.run_id,
                                      pr_health, memo)
             payload["human_reviewer"] = human_reviewer(ev.payload, task)
+            payload["park_return"] = park_return(ev.payload, task)
         disp = classify_event(ev.kind, payload, task, retries)
         if disp.verdict == "auto":
             out[ev.id] = disp
@@ -1184,6 +1251,19 @@ def _review_deadman_brief(entry: dict) -> str:
     return "Do this attended read:\n" + "\n".join(s.format(**fields) for s in REVIEW_DEADMAN_STEPS) + "\n"
 
 
+#: t_ff6f4be4: a park that ran out is not a fresh handback. Its PR is often merged, or there is none.
+PARK_RETURN_NOTE = (
+    "This card came back into review on its own (a park or schedule ran out; the board wrote the "
+    "review_requested, no worker handed it back). Its PR may be merged, closed or absent: read what the "
+    "card waits on now (a readback, a `close-on:` gate, a deploy, an operator verdict), not a handback.\n"
+    "HARD RULE: you never approve, complete, enqueue or land; the operator owns the verdict.\n"
+)
+
+
+def _park_return_brief(entry: dict) -> str:
+    return _review_deadman_brief(entry) + PARK_RETURN_NOTE
+
+
 def _blocked_brief(entry: dict) -> str:
     return (
         "Assess the block, not its label: read the latest card, block reason and comments; "
@@ -1205,6 +1285,7 @@ ROW_BRIEFS = {"blocked_assess": _blocked_brief,
               "own_repo_review_all_keys_answered": _review_all_answered_brief,
               "review_deadman": _review_deadman_brief,
               ROW_REVIEW_HUMAN: _review_human_brief,
+              ROW_PARK_RETURN: _park_return_brief,
               "mechanical_wake": _mechanical_wake_brief}
 
 
@@ -1544,7 +1625,8 @@ _OWNER_COMMENT_NEWER = "owner comment newer than handback"
 #: usually to queue a watcher) did not act on it (t_707d4196, 2026-11-13). Left on the handback cursor:
 #: review_deadman (its event summarizes the handback), completed / own_repo_review_* (the event IS the handback),
 #: changes_requested (the event is the owner's own send-back; its comment is that act).
-EVENT_CURSOR_ROWS = frozenset({"mechanical_wake", "blocked_assess", "crash_first_occurrence"})
+#: t_ff6f4be4: review_park_return is its own occurrence too (a park ran out); the merged-PR rule never refuses it.
+EVENT_CURSOR_ROWS = frozenset({"mechanical_wake", "blocked_assess", "crash_first_occurrence", "review_park_return"})
 
 #: t_a6da8394: review_deadman is on its OWN event cursor too (kill switch BOOMERANG_DEADMAN_TRIGGER_CURSOR=0 puts it
 #: back on the handback cursor above). The deadman fired because the owner went quiet past the threshold or a hold
@@ -1596,6 +1678,14 @@ def _expired_hold_comment(conn: Any, task_id: str, event: Any, now: float) -> bo
     sized = [b for b in bodies if len(b) == payload.get("len")]
     bodies = sized or bodies
     return bool(bodies) and all(_hold_expired(b, now) for b in bodies)
+
+
+#: t_baebe27b: a card body with an `## Operator step` heading, or an operator line saying "after merge", owes work
+#: after its PR merges, so the merged-PR rule never refuses its surface.
+_OPERATOR_STEP_RE = re.compile(
+    r"^[ \t]*#{1,6}[ \t]*operator[ \t]+steps?\b"
+    r"|^[^\n]*\boperator\b[^\n]*\bafter[ -]merge\b|^[^\n]*\bafter[ -]merge\b[^\n]*\boperator\b",
+    re.I | re.M)
 
 
 def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[str]:
@@ -1679,6 +1769,10 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
         # Preserve the claim's PR even if a newer handback now names another one.
         if not own_event and not sendback:
             refs = list(refs) + list(_op.extract_pr_refs(entry.get("pr")))
+        # t_baebe27b: the merge is not the end when the card owes an operator step after it (t_16a0e8f3: box
+        # rollout refused 12 min as "summarized PR merged"). The card body is the dispatcher's, so it decides.
+        if _OPERATOR_STEP_RE.search(str(_field(task, "body") or "")):
+            refs = []
     finally:
         conn.close()
     health_fn = _health_fn()
@@ -1899,7 +1993,7 @@ def handback_row(entry: dict, result: dict, *, turn_text: Optional[str] = None) 
         "event_ts": entry.get("event_ts"), "event_id": entry.get("event_id"),
         "assignee": entry.get("assignee"), "pr": entry.get("pr"),
         "claim_key": entry.get("key"), "parts": parts, "action": result.get("action"),
-        "line": f"boomerang handled {entry['task_id']} ({row}): {summary}", "turn": turn_text,
+        "line": f"{HANDLED_PREFIX}{entry['task_id']} ({row}): {summary}", "turn": turn_text,
         "attempts": 0, "created_at": _time.time()}
 
 
@@ -2045,6 +2139,8 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
     action = row.get("action")
     guarded = action == "surface" or (action is None and row.get("turn") is not None)
     delivery_parts = list(left)
+    handled = (str(row.get("line") or "").startswith(HANDLED_PREFIX)
+               and not await asyncio.to_thread(handled_line_chat_enabled))
     for part in delivery_parts:
         if guarded:
             # Recover original cursors for rows persisted before the guard was introduced.
@@ -2064,6 +2160,8 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
         try:
             if part == PART_TURN:
                 ok = await resurface(runner, entry, row.get("turn"))
+            elif handled:
+                ok = await _deliver_handled_line(runner, entry, row, turn_failed=PART_TURN in failures)
             else:
                 ok = await post_line(runner, entry, str(row.get("line") or ""))
         finally:
@@ -2134,6 +2232,54 @@ async def deliver_handbacks(runner: Any, state: BoomerangWakeState, *,
         finally:
             _DELIVERING.discard(did)
     return sent
+
+
+# t_8ab5557d: the ``boomerang handled`` line is an agent receipt (Ace's three-bin ruling, Discord
+# 1571854816139944097). Absent (default) = no chat line beside a delivered turn, and a handled-only
+# row writes it to the fleet agent log. Present = the line posts to the origin chat as before.
+HANDLED_LINE_CHAT_FILE = "boomerang-handled-line-chat.enabled"
+HANDLED_PREFIX = "boomerang handled "
+AGENT_LOG_PRODUCER = "boomerang-wake"
+
+
+def handled_line_chat_enabled() -> bool:
+    """t_8ab5557d knob: True while ``<HERMES_HOME>/state/boomerang-handled-line-chat.enabled`` exists
+    (the ``boomerang handled`` line posts to the origin chat again, as before)."""
+    from hermes_constants import get_hermes_home
+
+    return (get_hermes_home() / "state" / HANDLED_LINE_CHAT_FILE).exists()
+
+
+def write_agent_log_line(entry: dict, text: str) -> bool:
+    """One row in the fleet agent log (``<fleet root>/scripts/lib/agent_inbox.py`` write_agent_log,
+    the library the cron #alerts/#logs gates load). False when there is no library or the write fails."""
+    try:
+        from cron.fork_ext.alerts_audience_gate import _fleet_root, _load_lib
+        from hermes_constants import get_hermes_home
+
+        root = _fleet_root(Path(get_hermes_home()))
+        lib = _load_lib(root) if root is not None else None
+        if lib is None or not hasattr(lib, "write_agent_log"):
+            return False
+        lib.write_agent_log(root, AGENT_LOG_PRODUCER, "info", text, task_id=entry.get("task_id"),
+                            delegation_id=entry.get("delegation_id"))
+        return True
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: agent-log row for %s not written: %s", entry.get("task_id"), exc)
+        return False
+
+
+async def _deliver_handled_line(runner: Any, entry: dict, row: dict, *, turn_failed: bool) -> bool:
+    """The ``boomerang handled`` line (knob off). A row that delivers a turn posts no line: the turn is
+    the message, and the receipt goes to the agent log best-effort. A refused turn still posts the line
+    to the chat. A handled-only row writes the agent log; with no log it posts to the chat (never lost)."""
+    text = str(row.get("line") or "")
+    if turn_failed:
+        return await post_line(runner, entry, text)
+    logged = await asyncio.to_thread(write_agent_log_line, entry, text)
+    if row.get("turn") is not None or logged:
+        return True
+    return await post_line(runner, entry, text)
 
 
 async def post_line(runner: Any, entry: dict, text: str) -> bool:
@@ -2757,6 +2903,21 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         logger.info("kanban notifier: boomerang-wake %s disposition=auto row=%s path=%s skipped: the review "
                     "handoff child answered this episode", task_id, disposition.row, path)
         return True
+    if (disposition.row == ROW_REVIEW_DEADMAN and not redispatch
+            and await asyncio.to_thread(review_episode_running, state, board, task_id, event_id)):
+        # t_ff6f4be4 B: the episode's first-read child is still reading the same head. The page waits here as
+        # a ``deferred`` claim (owned, so neither wake path turns it into a turn); reconcile re-fires it as
+        # today's deadman child once that child ends without answering, or closes it when it answered.
+        now = _time.time()
+        wait = {"key": key, "board": board, "task_id": task_id, "title": str(_field(task, "title") or "")[:160],
+                "event_id": int(event_id), "kind": kind, "event_ts": event_ts, "row": disposition.row,
+                "mode": disposition.mode or "fork", "wake_text": wake_text, "home_sid": home_sid or "",
+                "route": dict(route or {}), "path": path, "state": STATE_DEFERRED, "claimed_at": now}
+        if not await asyncio.to_thread(state.claim, key, wait):
+            return False
+        logger.info("kanban notifier: boomerang-wake %s disposition=auto row=%s path=%s deferred: the review "
+                    "first-read child of this episode is still running", task_id, disposition.row, path)
+        return True
     snap = await asyncio.to_thread(card_snapshot, board, task_id)
     entry = {
         "key": key, "board": board, "task_id": task_id, "event_id": int(event_id), "kind": kind,
@@ -3051,7 +3212,57 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
         if not await _superseded_by_terminal(runner, entry, "gateway restart", state):
             await _restart_redispatch_or_lost(runner, entry, state, now)
         handled += 1
+    handled += await _release_deferred(runner, claims, state, now)
     return handled
+
+
+async def _release_deferred(runner: Any, claims: dict, state: BoomerangWakeState, now: float) -> int:
+    """t_ff6f4be4 B: a deadman cycle-0 page ``dispatch`` parked as ``deferred`` while the episode's first-read
+    child ran. Still running (and under DEADMAN_WAIT_MAX_S, stop file absent): it keeps waiting. That child
+    answered the episode: closed as ``episode_answered`` (no child, no turn). Otherwise (failed, lost, refused
+    as stale, cancelled past its budget, gone, the wait ran out, or the stop file appeared): today's deadman
+    child is forked under ``<key>#deferred``; a failed fork re-surfaces the page as a lost wake."""
+    from gateway.kanban_wake_disposition import AUTO, Disposition
+
+    released = 0
+    for key, entry in claims.items():
+        if entry.get("state") != STATE_DEFERRED:
+            continue
+        board, tid, eid = entry.get("board"), entry["task_id"], entry["event_id"]
+        try:
+            waiting = (now - float(entry.get("claimed_at") or now) < DEADMAN_WAIT_MAX_S
+                       and await asyncio.to_thread(review_episode_running, state, board, tid, eid))
+            answered = not waiting and await asyncio.to_thread(review_episode_answered, state, board, tid, eid)
+        except Exception as exc:   # unreadable board: the page dispatches as today
+            logger.warning("kanban boomerang-wake: deferred deadman page %s unread (%s); dispatching", key, exc)
+            waiting = answered = False
+        if waiting:
+            continue
+        released += 1
+        if answered:
+            await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="episode_answered",
+                                    finished_at=_time.time())
+            logger.info("kanban boomerang-wake: %s deferred deadman page closed: the review first-read child "
+                        "answered this episode", tid)
+            continue
+        new_key = f"{key}#deferred"
+        try:
+            await dispatch(runner, board=board, key=new_key, task={"id": tid, "title": entry.get("title")},
+                           event_id=eid, kind=str(entry.get("kind") or ""), event_ts=entry.get("event_ts"),
+                           disposition=Disposition(AUTO, entry.get("mode") or "fork", 0, ROW_REVIEW_DEADMAN),
+                           wake_text=str(entry.get("wake_text") or ""), home_sid=entry.get("home_sid"),
+                           route=entry.get("route") or {}, path=f"{entry.get('path') or 'reconcile'}+deferred",
+                           state=state)
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: %s deferred deadman page dispatch failed: %s", tid, exc)
+            await _lost(runner, dict(entry, delegation_id=mint_delegation_id()),
+                        "deferred deadman page, dispatch failed", state)
+            continue
+        await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="redispatched_after_wait",
+                                redispatched_as=new_key, finished_at=_time.time())
+        logger.info("kanban boomerang-wake: %s deferred deadman page dispatched as %s (first-read child ended "
+                    "without answering)", tid, new_key)
+    return released
 
 
 # A completion verification whose verdict was DELIVERED (executor receipt) on a card that is still

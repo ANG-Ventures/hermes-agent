@@ -26,6 +26,7 @@ import logging
 from typing import Any, List, Optional, Tuple
 
 from agent.i18n import t
+from gateway import inbound_record
 from hermes_cli.queue_verbs import QueueOp, parse_queue_payload
 
 logger = logging.getLogger(__name__)
@@ -347,6 +348,8 @@ def merge_user_events(events: List[Any]) -> Any:
         head.__dict__.pop(attr, None)
     texts = [str(getattr(e, "text", "") or "").strip() for e in events]
     head.text = MERGE_SEPARATOR.join(t for t in texts if t)
+    if len(events) > 1:
+        inbound_record.mark_merged(head)   # t_118d31b1 / Prism 7fb14e749eb2: no longer one message
     for e in events[1:]:
         if getattr(e, "media_urls", None):
             head.media_urls.extend(e.media_urls)

@@ -1444,6 +1444,28 @@ BUDGET_CUT_BEFORE_HEADERS = "relay sent no headers before the cut"
 BUDGET_CUT_HEAD = "no reply within the turn budget"
 
 
+def _credit_code(row: Mapping[str, Any]) -> Optional[str]:
+    from agent.fallback_events import CREDIT_LANE_ERROR_CODES
+
+    code = str(row.get("credit_code") or "").strip().lower()
+    return code if code in CREDIT_LANE_ERROR_CODES else None
+
+
+def _credit_lane_body(row: Mapping[str, Any], seat_names: bool) -> str:
+    """``relay could not reach Anthropic through sub-vps-12 (TimeoutError),
+    not re-sent`` (t_4c447d32): the credit-lane relay's own code, the seat and
+    the exception its message named."""
+    from agent.fallback_events import CREDIT_LANE_ERROR_CODES
+
+    entry = CREDIT_LANE_ERROR_CODES[_credit_code(row) or ""]
+    seat = row.get("seat")
+    exc = f" ({row['credit_exc']})" if row.get("credit_exc") else ""
+    if entry.seat_cause and seat and seat != "unknown":
+        return entry.seat_cause.format(seat=str(seat) if seat_names else "a sub", exc=exc)
+    why = f" ({row['credit_why']})" if row.get("credit_why") else ""
+    return entry.cause.format(why=why)
+
+
 def _budget_cut_body(row: Mapping[str, Any], seat_names: bool) -> str:
     """``no first byte in 600 s on claude-alr (sub-vps-5)`` for a wall-budget cut
     (t_778185f3). The seat is the relay's ``x-pool-served-by`` when it answered
@@ -1810,6 +1832,9 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
     if _refusal_floor(row) and (_refusal_floor(row).get("served_by") or not _plain_provider(row)):
         # A pool seat answered the refusal 200 (x-pool-served-by): name it (t_5d79bfea).
         return f"{prefix}{_refusal_body(row, seat_names)}, {window}", ()
+    if _credit_code(row):
+        # The credit-lane relay stated cause and seat in its own body (t_4c447d32).
+        return f"{prefix}{_credit_lane_body(row, seat_names)}, {window}", ()
     if _plain_provider(row):
         # The banner ends after the vendor's words when there are any (Ace,
         # 2026-09-27: no relay legs, no seats, nothing after the cause).
@@ -2071,6 +2096,12 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     name the real cause instead of the status-derived ``rate limit``. When
     this returns a label, ``_quota_window_suffix`` is not applied."""
     cls = row.get("trigger_class")
+    ccode = _credit_code(row)
+    if ccode:
+        # The credit-lane relay's own code names what happened (t_4c447d32).
+        from agent.fallback_events import credit_lane_head
+
+        return credit_lane_head(ccode, row.get("credit_exc"))
     relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream", "relay_probe")
                      or bool(row.get("relay_synthetic")))
     cause = _cause_phrase(row)

@@ -128,7 +128,7 @@ def test_both_wakes_are_delivered_through_run_entry(tmp_path, monkeypatch, wake)
     monkeypatch.setattr(bw, "resurface", resurface)
     sent = []
     asyncio.run(bw.run_entry(_runner([], sent), entry, state))
-    assert sent == [f"boomerang handled {tid} (review_deadman): attended read owed on PR 11316"]
+    assert sent == []  # t_8ab5557d: no chat line beside a delivered turn
     assert len(turns) == 1
     with kb.connect_closing() as conn:
         mine = [c.body for c in kb.list_comments(conn, tid) if c.body.endswith(f"(delegation {did})")]
@@ -290,7 +290,7 @@ def test_resumed_review_wake_is_delivered_through_run_entry(tmp_path, monkeypatc
     monkeypatch.setattr(bw, "resurface", resurface)
     sent = []
     asyncio.run(bw.run_entry(_runner([], sent), entry, state))
-    assert sent == [f"boomerang handled {tid} (review_deadman): review owed"]
+    assert sent == []  # t_8ab5557d: no chat line beside a delivered turn
     assert len(turns) == 1
     with kb.connect_closing() as conn:
         mine = [c.body for c in kb.list_comments(conn, tid) if c.body.endswith(f"(delegation {did})")]
