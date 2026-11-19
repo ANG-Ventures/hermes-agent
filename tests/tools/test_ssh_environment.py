@@ -2,7 +2,10 @@
 
 import json
 import os
+import shutil
 import subprocess
+import sys
+import uuid
 from unittest.mock import MagicMock
 
 import pytest
@@ -129,6 +132,82 @@ class TestBuildSSHCommand:
         captured = self._capture_run_bash(monkeypatch, SSHEnvironment(host="h", user="u"))
         assert not any(a.startswith("SendEnv=") for a in captured["cmd"])
         assert captured["env"] is None
+
+    def test_run_bash_tags_remote_command_with_its_run_token(self, monkeypatch):
+        """t_44017fbc: the remote ``bash -c`` must be findable by the kill path."""
+        env = SSHEnvironment(host="h", user="u")
+        proc = MagicMock()
+        captured = {}
+        monkeypatch.setattr(ssh_env, "_popen_bash", lambda cmd, stdin_data=None, **kw: captured.update(cmd=cmd) or proc)
+        assert env._run_bash("echo ok") is proc
+        assert proc._hermes_run_token and len(proc._hermes_run_token) == 32
+        assert captured["cmd"][-3:-1] == ["bash", "-c"]
+        assert captured["cmd"][-1].startswith(f"': hermes-run-{proc._hermes_run_token}\n")
+
+    def test_kill_process_kills_the_remote_group_then_the_client(self, monkeypatch):
+        """t_44017fbc: killing only the local ssh client left the remote tree running for 30+ h."""
+        env = SSHEnvironment(host="h", user="u")
+        order = []
+        proc = MagicMock(_hermes_run_token="ab12")
+        proc.kill.side_effect = lambda: order.append("client")
+        monkeypatch.setattr(env, "_run_ssh", lambda remote, timeout: order.append(remote))
+        env._kill_process(proc)
+        assert order[1] == "client" and len(order) == 2
+        assert order[0].startswith("sh -c ") and "hermes-run-ab12" in order[0] and "TERM KILL" in order[0]
+
+    def test_force_kill_fires_a_kill_only_remote_kill_without_waiting(self, monkeypatch):
+        env = SSHEnvironment(host="h", user="u")
+        spawned = []
+        monkeypatch.setattr(ssh_env.subprocess, "Popen", lambda argv, **kw: spawned.append((argv, kw)))
+        monkeypatch.setattr(env, "_run_ssh", lambda *a, **k: pytest.fail("force kill must not block on ssh"))
+        proc = MagicMock(_hermes_run_token="ab12")
+        env._force_kill_process(proc)
+        (argv, kw), = spawned
+        assert kw["start_new_session"] is True
+        assert "hermes-run-ab12" in argv[-1] and "for sig in KILL;" in argv[-1]
+        proc.kill.assert_called_once()
+
+
+@pytest.mark.skipif(os.name == "nt" or not shutil.which("pgrep"), reason="POSIX remote shell + pgrep")
+def test_remote_group_kill_reaps_the_tree_and_spares_token_lookalikes():
+    """t_44017fbc: run the real remote kill script against a ``bash -c`` started the way sshd starts
+    it (own session). Every sleep dies, incl. a ``(cmd &)`` grandchild already re-parented to init;
+    a process that merely carries the token (the local ssh client, the killer) is left alone."""
+    import random
+    import time
+
+    import psutil
+
+    token, base = uuid.uuid4().hex, random.randint(40000, 49000)
+    script = f": {ssh_env._RUN_MARK}{token}\n(sleep {base} &); sleep {base + 1} & sleep {base + 2}; true"
+    tree = subprocess.Popen(["bash", "-c", script], start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    lookalike = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                                  f"ssh u@h bash -c : {ssh_env._RUN_MARK}{token}"], start_new_session=True)
+
+    def sleeps():
+        want = {str(base + i) for i in range(3)}
+        return [p for p in psutil.process_iter(["cmdline"])
+                if (p.info["cmdline"] or [])[:1] == ["sleep"] and p.info["cmdline"][-1] in want]
+    try:
+        deadline = time.monotonic() + 10
+        while len(sleeps()) < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(sleeps()) == 3
+        rc = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=30).returncode
+        assert rc == 0
+        tree.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while sleeps() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert sleeps() == []
+        assert lookalike.poll() is None
+    finally:
+        for p in sleeps():
+            p.kill()
+        for p in (tree, lookalike):
+            p.kill()
+            p.wait()
 
 
 class TestControlSocketPath:
