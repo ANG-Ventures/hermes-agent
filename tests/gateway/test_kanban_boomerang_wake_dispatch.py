@@ -399,6 +399,22 @@ def test_stale_surface_plain_handback_with_merged_pr_still_refused(env):
     assert ah.stale_surface_reason(entry) == f"summarized PR merged: {REPO}#71"
 
 
+@pytest.mark.parametrize("body,stale", [
+    ("Fix the reset.\n\n## Operator step (Apollo, after merge)\nRoll the box kit out.", None),
+    ("Fix the reset.\nOperator: after merge, run the dry runs on every box.", None),
+    ("Fix the reset.\n\n## Tests\nmerged PR is moot", f"summarized PR merged: {REPO}#71"),
+])
+def test_stale_surface_merged_pr_spared_when_card_owes_operator_step(env, body, stale):
+    """t_baebe27b (t_16a0e8f3, 2026-11-18 21:18): hermes-home#12919 merged, the card body owed a box rollout under
+    `## Operator step (Apollo, after merge)`; the child's surface was refused as "summarized PR merged" and the
+    rollout waited 12 min. RED without the operator-step check for the first two arms."""
+    tid = _card(env, body=body)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="review_requested", kind="review_requested", pr=f"{REPO}#71")
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    assert ah.stale_surface_reason(entry) == stale
+
+
 def _stale_read_comments(tid) -> list:
     with kb.connect_closing() as conn:
         return [c.body for c in kb.list_comments(conn, tid)
