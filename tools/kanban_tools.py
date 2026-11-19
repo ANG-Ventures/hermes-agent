@@ -835,22 +835,24 @@ def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
             "summary": _cap_text(run.summary, _SHOW_REVIEW_CHARS)}
 
 
-def _cap_context(ctx: str, limit: int, span: Optional[tuple[int, int]] = None) -> str:
-    """Cut the worker context to ``limit`` around its send-back section ``span`` (char offsets from
-    build_worker_context): the history before it gives way first, then what follows it; the
-    section itself is cut last (t_5949eafd)."""
-    if not span:
+def _cap_context(ctx: str, limit: int, spans: Optional[dict] = None) -> str:
+    """Cut the worker context to ``limit`` (t_5949eafd). The header+body (``spans["head"]``) and the
+    one current send-back (``spans["sendback"]``, char offsets from build_worker_context) are never
+    cut; the history between them gives way first, then what follows."""
+    spans = spans or {}
+    if "head" not in spans and "sendback" not in spans:
         return _cap_text(ctx, limit)
-    start, end = span
-    keep = _cap_text(ctx[start:end], limit)
-    pre, post = ctx[:start], ctx[end:]
-    room = limit - len(keep)
-    if room >= len(pre):
-        return pre + keep + _cap_text(post, room - len(pre))
-    return _cap_text(pre, max(0, room)) + keep
+    h_end = spans.get("head", (0, 0))[1]
+    start, end = spans.get("sendback", (len(ctx), len(ctx)))
+    head, keep = ctx[:h_end], ctx[start:end]
+    mid, post = ctx[h_end:start], ctx[end:]
+    room = max(0, limit - len(head) - len(keep))
+    mid_k = _cap_text(mid, max(room // 2, room - len(post)))
+    post_k = _cap_text(post, max(0, room - len(mid_k)))
+    return head + mid_k + keep + post_k
 
 
-def _bounded_show(out: dict[str, Any], span: Optional[tuple[int, int]] = None) -> dict[str, Any]:
+def _bounded_show(out: dict[str, Any], spans: Optional[dict] = None) -> dict[str, Any]:
     """Shrink the history lists, oldest entries first, until the response fits the budget."""
     def size() -> int:
         return len(json.dumps(out, ensure_ascii=False, default=str))
@@ -864,7 +866,7 @@ def _bounded_show(out: dict[str, Any], span: Optional[tuple[int, int]] = None) -
     if size() > _SHOW_BUDGET_CHARS:
         excess = size() - _SHOW_BUDGET_CHARS
         ctx = out.get("worker_context") or ""
-        out["worker_context"] = _cap_context(ctx, max(4_000, len(ctx) - excess - 200), span)
+        out["worker_context"] = _cap_context(ctx, max(4_000, len(ctx) - excess - 200), spans)
     if not omitted:
         out.pop("omitted")
     return out
@@ -931,7 +933,7 @@ def _handle_show(args: dict, **kw) -> str:
                                           "error": _cap_text(r_last["error"], _SHOW_FIELD_CHARS)},
                 "note": "moved to %s; full text: hermes kanban show %s" % (kar.ARCHIVE_NAME, tid),
                 **({"error": arch["error"]} if arch.get("error") else {})}
-        return json.dumps(_bounded_show(out, spans.get("sendbacks")), ensure_ascii=False, default=str)
+        return json.dumps(_bounded_show(out, spans), ensure_ascii=False, default=str)
 
 
 def _worker_context_or_error(kb, conn, tid: str, spans: Optional[dict] = None) -> str:
