@@ -788,6 +788,64 @@ def test_switch_and_templates_root_come_from_the_host_root_config(tmp_path, monk
     assert wc.settings().enabled is False                               # unreadable host config = OFF
 
 
+# --------------------------------------------------------------------------- templates root per volume (t_259301d7)
+# nas-fleet: card workspaces on /srv/fleet (ZFS dataset nas-fleet-scratch), the default templates root
+# on the container rootfs (another dataset): every real kanban_clone fell back cross_volume.
+
+
+def _two_volumes(env, monkeypatch, *, extra_root: bool):
+    """Paths under <base>/volB report a second st_dev; the host config names a root there."""
+    vol_b = env["base"] / "volB"
+    (vol_b / "ws").mkdir(parents=True)
+    real_dev = wc._dev
+
+    def fake_dev(path):
+        dev = real_dev(path)
+        if dev is not None and Path(os.path.abspath(path)).is_relative_to(vol_b):
+            return dev + 7_000_000
+        return dev
+
+    monkeypatch.setattr(wc, "_dev", fake_dev)
+    monkeypatch.delenv(wc.ENV_TEMPLATES, raising=False)
+    cfg = {"worktree_cache": {"enabled": True, "scopes": ["kanban_clone"], "repos": [SLUG]},
+           "kanban": {"workspaces_root": str(env["base"] / "ws-default")}}
+    if extra_root:
+        cfg["worktree_cache"]["templates_roots"] = [str(vol_b / "templates")]
+    monkeypatch.setattr(wc, "host_config", lambda: cfg)
+    return vol_b
+
+
+def test_create_uses_the_templates_root_on_its_destination_volume(env, cow, monkeypatch):
+    vol_b = _two_volumes(env, monkeypatch, extra_root=True)
+    import argparse
+
+    assert wc.cmd_refresh(argparse.Namespace(all=True, repo=None, force=True)) == 0   # a template in each root
+    for dest in (vol_b / "ws" / "t_card" / "demo", env["base"] / "ws" / "port"):
+        assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
+        row = log(env)[-1]
+        assert row["cow"] is True and row["reason"] is None, row
+        assert snapshot(dest) == snapshot(plain(env, f"plain-{dest.name}"))
+    assert ledger(env) == []
+    assert wc.templates_roots() == [vol_b / "templates", env["base"] / "ws-default" / ".templates"]
+    pre = wc.dest_volume(vol_b / "ws" / "t_next" / "demo")             # the operator precondition
+    assert pre["same_volume"] is True and pre["templates_root"] == str(vol_b / "templates")
+    st = wc.status(dest=str(vol_b / "ws" / "x"))
+    assert {t["root"] for t in st["templates"]} == {str(r) for r in wc.templates_roots()}
+    assert st["dest"]["same_volume"] is True
+
+
+def test_no_root_on_the_destination_volume_is_cross_volume(env, cow, monkeypatch):
+    vol_b = _two_volumes(env, monkeypatch, extra_root=False)
+    wc.refresh(SLUG)
+    dest = vol_b / "ws" / "t_card" / "demo"
+    pre = wc.dest_volume(dest)
+    assert pre["same_volume"] is False and pre["templates_root"] == str(env["base"] / "ws-default" / ".templates")
+    called = []
+    monkeypatch.setattr(wc, "_clone_entries", lambda *a: called.append(a))
+    assert wc.clone(URL, str(dest), caller="kanban_clone", s=env["s"]) == 0
+    assert called == [] and ledger(env)[-1]["reason"] == "cross_volume"
+
+
 # --------------------------------------------------------------------------- never-prune mirror (t_6de39491)
 # Prism 1484b4563429: a clone that borrows from a mirror able to prune (format 0, or no
 # extensions.preciousObjects) loses objects when the mirror is pruned. The helper repairs the
