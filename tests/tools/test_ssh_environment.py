@@ -182,15 +182,21 @@ def _group_sleeps(pgid):
     return out
 
 
+def _pidfile(token):
+    return os.path.expandvars(ssh_env._run_pidfile(token))
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
 @pytest.mark.parametrize("body", ["(sleep 600 &); sleep 601 & sleep 602; true", "sleep 601 & exec sleep 602"],
                          ids=["background-grandchild", "top-level-exec"])
-def test_remote_group_kill_reaps_the_whole_tree(body):
+def test_remote_group_kill_reaps_the_whole_tree(body, monkeypatch, tmp_path):
     """t_44017fbc: run the real remote kill script against a ``bash -c`` started the way sshd starts
     it (own session). Every sleep in its group dies, incl. a ``(cmd &)`` grandchild re-parented to
     init and a top-level ``exec`` that replaced the tagged bash; the pidfile is removed."""
+    import stat
     import time
 
+    monkeypatch.setenv("HOME", str(tmp_path))
     token = uuid.uuid4().hex
     tree = subprocess.Popen(["bash", "-c", ssh_env._run_preamble(token) + body], start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -200,7 +206,11 @@ def test_remote_group_kill_reaps_the_whole_tree(body):
         while len(_group_sleeps(tree.pid)) < want and time.monotonic() < deadline:
             time.sleep(0.05)
         assert len(_group_sleeps(tree.pid)) == want
-        assert os.path.exists(ssh_env._run_pidfile(token))
+        assert os.path.exists(_pidfile(token))
+        # owner-only, under the user's home: no other account can plant a pid for the kill to signal
+        assert _pidfile(token).startswith(str(tmp_path) + os.sep)
+        assert stat.S_IMODE(os.stat(os.path.dirname(_pidfile(token))).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(_pidfile(token)).st_mode) == 0o600
         rc = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=30).returncode
         assert rc == 0
         tree.wait(timeout=5)
@@ -208,21 +218,22 @@ def test_remote_group_kill_reaps_the_whole_tree(body):
         while _group_sleeps(tree.pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert _group_sleeps(tree.pid) == []
-        assert not os.path.exists(ssh_env._run_pidfile(token))
+        assert not os.path.exists(_pidfile(token))
     finally:
         for p in _group_sleeps(tree.pid):
             p.kill()
         tree.kill()
         tree.wait()
         with contextlib.suppress(FileNotFoundError):
-            os.unlink(ssh_env._run_pidfile(token))
+            os.unlink(_pidfile(token))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
-def test_finished_command_leaves_no_pidfile_and_kill_is_a_noop():
+def test_finished_command_leaves_no_pidfile_and_kill_is_a_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
     token = uuid.uuid4().hex
     subprocess.run(["bash", "-c", ssh_env._run_preamble(token) + "true"], check=True, timeout=10)
-    assert not os.path.exists(ssh_env._run_pidfile(token))
+    assert not os.path.exists(_pidfile(token))
     assert subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=10).returncode == 0
 
 

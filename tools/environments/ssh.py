@@ -62,8 +62,13 @@ def control_sockets(plain: Path) -> list[Path]:
 _RUN_MARK = "hermes-run-"
 
 
+_RUN_DIR = "$HOME/.hermes-run"
+
+
 def _run_pidfile(token: str) -> str:
-    return f"/tmp/.{_RUN_MARK}{token}.pid"
+    """Shell path (``$HOME`` expands remotely) of ``token``'s pidfile. Under the remote user's own
+    home in a 0700 dir, so no other account can plant a pid for the kill path to signal."""
+    return f"{_RUN_DIR}/{_RUN_MARK}{token}.pid"
 
 
 def _run_preamble(token: str) -> str:
@@ -71,7 +76,9 @@ def _run_preamble(token: str) -> str:
     sshd starts each command in its own session) where the kill path can find it. A file, not the
     argv: a top-level ``exec`` replaces the argv but keeps the pid and the group."""
     f = _run_pidfile(token)
-    return f": {_RUN_MARK}{token}\necho $$ >| {f} 2>/dev/null; trap 'rm -f {f}' EXIT\n"
+    return (f": {_RUN_MARK}{token}\n"
+            f"(umask 077; mkdir -p \"{_RUN_DIR}\" && echo $$ >| \"{f}\") 2>/dev/null; "
+            f"trap \"rm -f \\\"{f}\\\"\" EXIT\n")
 
 
 def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
@@ -81,7 +88,7 @@ def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
     sigs = "TERM KILL" if grace else "KILL"
     f = _run_pidfile(token)
     script = (
-        f"p=$(cat {f} 2>/dev/null); rm -f {f}; "
+        f"p=$(cat \"{f}\" 2>/dev/null); rm -f \"{f}\"; "
         "case \"$p\" in ''|*[!0-9]*) exit 0;; esac; "
         "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); [ -n \"$g\" ] || exit 0; "
         "[ \"$g\" = \"$p\" ] && t=\"-$g\" || t=\"$p\"; "
