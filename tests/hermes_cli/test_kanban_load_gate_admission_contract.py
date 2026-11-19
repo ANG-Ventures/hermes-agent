@@ -135,6 +135,41 @@ def test_local_gate_reads_fleet_cap_measurements(
         assert why is None
 
 
+def test_local_gate_ages_shared_lease_against_each_sample(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import allocation_policy, kanban_headroom
+
+    pressure = tmp_path / "host-pressure.json"
+    pressure.write_text(json.dumps({"at": 1890, "fleet": {"cpus": 2}}), encoding="utf-8")
+    monkeypatch.setattr(allocation_policy, "load", lambda _: SimpleNamespace(
+        pressure_path=str(pressure), doc={"pressure_path": {"darwin": str(pressure)}}, stale_after_s=120,
+    ))
+    monkeypatch.setattr(klg.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(klg, "_os_name", lambda: "darwin")
+    monkeypatch.setattr(klg, "sample_psi", lambda: {})
+    monkeypatch.setattr(kanban_headroom, "local_kind_pause", lambda: None)
+    monkeypatch.setattr(admission, "read_slice_memory", lambda **_: None)
+    monkeypatch.setattr(klg, "unified_inputs", lambda _: ([], admission.Priority(line=0.8)))
+    monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
+    # The lease started after the fleet reading but is already settled in the live reading.
+    lease = admission.Lease("studio", "ci", admission.Estimate(cpus=2), at=1900.0)
+    monkeypatch.setattr(klg, "shared_leases", lambda _: [lease])
+    ctx = {"host": "studio", "need": admission.Estimate(cpus=1), "ceiling": None,
+           "mem_available_gb": 32, "mem_total_gb": 64}
+    monkeypatch.setattr(klg, "utilization_context", lambda: ctx)
+    gate = klg.LoadGate({"max_spawn_per_tick": 1}, 32)
+
+    ctx["limits"] = admission.Limits(fleet_cap=(("cpus", 5),))
+    allowance, why = gate.admit(1.0, now=1000.0, running=0, cpu_busy=0.75)
+    assert allowance == 1, why  # exactly 2 measured + 2 held + 1 requested
+
+    ctx["limits"] = admission.Limits(fleet_cap=(("cpus", 4),))
+    allowance, why = gate.admit(1.0, now=1000.0, running=0, cpu_busy=0.75)
+    assert allowance == 0
+    assert "fleet_cap:cpus used 2.00 + young 2.00 + need 1.00" in why
+    assert gate.util["free"]["cpu"] > 0
+
+
 def test_utilization_admit_path_runs_on_the_real_modules(placement_home, monkeypatch):
     monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0,
                                                    "psi_io_some10": 0.0})

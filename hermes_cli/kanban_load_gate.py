@@ -770,7 +770,7 @@ def _local_fleet_pressure(os_name: str, *, wall: float, now: float) -> dict:
     total = fields["mem_total_gb"]
     # Age leases against the sampler, not the newer live contention sample:
     # work started since the fleet reading may not be reflected in it yet.
-    return {"at": min(now, fields["sample_at"]), "mem_total_gb": total if total is not None and total > 0 else None,
+    return {"fleet_at": min(now, fields["sample_at"]), "mem_total_gb": total if total is not None and total > 0 else None,
             "fleet_cpus": fields["fleet_cpus"], "fleet_ram_gb": fields["fleet_ram_gb"]}
 
 
