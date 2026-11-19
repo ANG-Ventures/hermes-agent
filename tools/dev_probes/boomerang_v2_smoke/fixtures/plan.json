@@ -9,6 +9,8 @@
     "  and run_entry -> _fail logs the superseded line (no chat warning, t_ce8bd439) AND re-surfaces the wake into the still-live home. null = SKIP (live).",
     "  Never rehome the card (edit --session <bogus>): that proves only the warning half ('no live home').",
     "s1_fault_hold (optional): a --body that keeps the failure card's child busy so the fault lands first.",
+    "  Since #425 the superseded row cannot pass on this fault: `_moved_noise` drops an unattributed `kanban comment`,",
+    "  and a `surface` verdict returns before the freshness check. A handled claim for the card reads INCOMPLETE (Apollo ruling).",
     "wirelog_sync: run after the step-3 canary when a remote seat served it ({sub} = the bare seat number).",
     "expect.*: the restart line is today's real boot line; the step-4 regexes are the reconciler's own INFO lines",
     "  (gateway/kanban_boomerang_wake.py: _lost, _restart_redispatch_or_lost, run_entry 'handled'). Step 4 arm 1",
@@ -27,8 +29,6 @@
                           "bv2 smoke: forced needs_input event. unblock_when: after:+1d"],
     "inject_failure": ["--board", "{board}", "comment", "{card}", "--body",
                        "bv2 smoke s1 fault: board write after the boomerang-wake claim; the verdict must be refused (state moved) and the wake re-surfaced"],
-    "s1_fault_hold": ["--board", "{board}", "edit", "{card}", "--body",
-                      "bv2 smoke s1 fault-drill fixture (board {board}). Before you decide anything about this forced completion, run `sleep 90` in the foreground with the terminal tool, then run `date -u` and quote both in your evidence. Only then decide."],
     "wirelog_sync": ["python3", "~/.hermes/scripts/wirelog-fleet.py", "sync", "--sub", "{sub}"]
   },
   "expect": {

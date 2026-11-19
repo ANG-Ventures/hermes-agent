@@ -746,6 +746,10 @@ elif verb == "block":
     card = argv[argv.index("block") + 1]
     logline(f"gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake {card} disposition=auto row=blocked_assess")
     say(f"boomerang handled {card} (blocked_assess): block is real; left blocked")
+    if os.environ.get("BV2_WAKE_STATE"):  # the gateway archives a terminal claim
+        with open(os.environ["BV2_WAKE_STATE"].replace(".json", ".terminal.jsonl"), "a") as fh:
+            fh.write(json.dumps({"key": f"bv2-smoke-test|{card}|7", "task_id": card, "state": "terminal",
+                                 "outcome": os.environ.get("FAKE_BLOCKED_OUTCOME", "surfaced")}) + "\n")
 elif verb == "comment":
     card = argv[argv.index("comment") + 1]
     logline(f"gateway.kanban_boomerang_wake: kanban boomerang-wake: boomerang-wake superseded {card}: "
@@ -767,12 +771,14 @@ def test_step1_live_fault_against_fake_gateway(env, monkeypatch):
     chat.write_text("")
     for k, v in {"BV2_KANBAN_CMD": f"{sys.executable} {fake}", "FAKE_STATE": str(state),
                  "BV2_GATEWAY_LOG": str(log), "BV2_ORIGIN_CHAT": str(chat),
-                 "BV2_HOME_SESSION": "sess-fake", "BV2_SCRATCH_BOARD": "bv2-smoke-test"}.items():
+                 "BV2_HOME_SESSION": "sess-fake", "BV2_SCRATCH_BOARD": "bv2-smoke-test",
+                 "BV2_WAKE_STATE": str(tmp / "kanban_boomerang_wake.json")}.items():
         monkeypatch.setenv(k, v)
     rc = run.main(["--step", "1", "--live", "--tick-seconds", "0.05", "--slack-seconds", "0.1",
                    "--timeout", "5"])
     text = env["evidence"].read_text()
     assert rc == 0, text
+    assert "the blocked_assess claim closed with a handled outcome | PASS" in text
     calls = [json.loads(ln) for ln in (state / "calls.jsonl").read_text().splitlines()]
     verbs = [next(a for a in c if a in {"boards", "create", "notify-subscribe", "edit", "complete",
                                         "block", "comment"}) for c in calls]
@@ -1081,3 +1087,49 @@ def test_agent_log_dir_live_default_is_the_writers_fleet_root(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_HOME", str(prof))
     assert run.agent_log_dir(True) == fleet / "state" / "agent-logs"
     assert run.handled_knob_path(True) == prof / "state" / run.HANDLED_KNOB_FILE
+
+
+def test_step1_failed_blocked_assessment_fails(env, monkeypatch):
+    """Prism 655d5a3cf9a1: a failed blocked child still logs row=blocked_assess and posts the
+    `(blocked_assess)` receipt (_fail); its claim outcome=failed must FAIL the step."""
+    fx = _copy_fixtures(env["tmp"])
+    state = fx / "fake_boomerang_wake.json"
+    state.write_text(state.read_text().replace('"outcome": "surfaced"', '"outcome": "failed"'))
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    assert run.main(["--step", "1", "--dry-run"]) == 1
+    text = env["evidence"].read_text()
+    assert "the blocked_assess claim closed with a handled outcome | FAIL" in text
+    assert "outcome=failed" in text
+
+
+def test_card_claim_terminal_reads_the_archive(tmp_path):
+    """Terminal claims move to <state>.terminal.jsonl; the newest first-dispatch claim wins."""
+    state = tmp_path / "kanban_boomerang_wake.json"
+    state.write_text(json.dumps({"claims": {"b|t_x|9#restart1": {"task_id": "t_x", "state": "terminal",
+                                                                  "outcome": "failed"}}}))
+    (tmp_path / "kanban_boomerang_wake.terminal.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (
+        {"key": "b|t_x|3", "task_id": "t_x", "state": "terminal", "outcome": "failed"},
+        {"key": "b|t_x|9", "task_id": "t_x", "state": "terminal", "outcome": "surfaced"},
+        {"key": "b|t_y|10", "task_id": "t_y", "state": "terminal", "outcome": "complete"})))
+    key, entry = run._card_claim_terminal(state, "t_x")
+    assert key == "b|t_x|9" and entry["outcome"] == "surfaced"
+    assert run._card_claim_terminal(state, "t_z") is None
+
+
+def test_step1_fault_verdict_accepted_is_incomplete_not_fail(env, monkeypatch):
+    """Apollo ruling t_9f0d174a: since #425 the plan's comment fault is board noise and a surface verdict
+    skips the freshness check, so a handled fault-card claim reads INCOMPLETE with the reason, not FAIL."""
+    fx = _copy_fixtures(env["tmp"])
+    log = fx / "fake_gateway.log"
+    log.write_text("".join(ln + "\n" for ln in log.read_text().splitlines() if "superseded t_5m0ce003" not in ln))
+    state = fx / "fake_boomerang_wake.json"
+    doc = json.loads(state.read_text())
+    doc["claims"]["bv2-smoke|t_5m0ce003|13"] = {"task_id": "t_5m0ce003", "state": "terminal", "outcome": "surfaced"}
+    state.write_text(json.dumps(doc))
+    monkeypatch.setenv("BV2_GATEWAY_LOG", str(log))
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    assert run.main(["--step", "1", "--dry-run"]) == 3
+    text = env["evidence"].read_text()
+    assert "superseded t_5m0ce003: card moved to <status> ...` | INCOMPLETE" in text
+    assert "outcome=surfaced" in text and "#425" in text
+    assert "| FAIL |" not in text

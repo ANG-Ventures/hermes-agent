@@ -736,6 +736,21 @@ def step1(ctx: Ctx) -> StepReport:
     ni_ok = bool(ni_m) and ni_m.group("disp") == "auto" and ni_m.group("row") == BLOCKED_ASSESS_ROW
     rep.check(f"gateway log: `kanban notifier: boomerang-wake {ni_card} disposition=auto row=blocked_assess`",
               PASS if ni_ok else FAIL, ni_log or "absent")
+    # Prism 655d5a3cf9a1: the row and the receipt are written for a FAILED assessment too (_fail
+    # posts `boomerang handled <card> (blocked_assess): ...` with outcome=failed). The claim's outcome decides.
+    label = f"needs_input card {ni_card}: the blocked_assess claim closed with a handled outcome"
+    path = wake_state_path(ctx.live)
+    if path is None:
+        rep.check(label, SKIP, "live needs BV2_WAKE_STATE (the scratch gateway's kanban_boomerang_wake.json)")
+    else:
+        handled_set = _gateway_handled_outcomes()
+        term = ctx.poll(lambda: _card_claim_terminal(path, ni_card), ctx.timeout)
+        outcome = term[1].get("outcome") if term else None
+        rep.check(label, PASS if outcome in handled_set else FAIL,
+                  f"claim `{term[0]}` terminal outcome={outcome}" + (
+                      "" if outcome in handled_set else f" (not in the gateway's HANDLED_OUTCOMES; "
+                                                        f"reason={term[1].get('reason')})")
+                  if term else f"no terminal claim for {ni_card} in {path} within {ctx.timeout:.0f}s")
 
     if not arm_failure:
         rep.check(f"failure card {fail_card}: `boomerang-wake superseded {fail_card}` log line", SKIP,
@@ -743,9 +758,28 @@ def step1(ctx: Ctx) -> StepReport:
     else:
         # The injected fault is a freshness refusal: a supersede (t_ce8bd439). One INFO/#logs line,
         # NO warning in the origin chat, the wake still re-surfaced.
-        sup = ctx.poll(lambda: find_log(log, re_superseded_line(fail_card)), win)
-        rep.check(f"gateway log: `boomerang-wake superseded {fail_card}: card moved to <status> ...`",
-                  PASS if sup else FAIL, sup or f"absent after {win:.0f}s")
+        wpath = wake_state_path(ctx.live)
+
+        def sup_or_verdict():
+            hit = find_log(log, re_superseded_line(fail_card))
+            if hit:
+                return ("sup", hit)
+            term = _card_claim_terminal(wpath, fail_card) if wpath is not None else None
+            return ("verdict", term) if term and term[1].get("outcome") != "superseded" else None
+        got = ctx.poll(sup_or_verdict, win)
+        sup = got[1] if got and got[0] == "sup" else None
+        label = f"gateway log: `boomerang-wake superseded {fail_card}: card moved to <status> ...`"
+        if sup:
+            rep.check(label, PASS, sup)
+        elif got:
+            # Apollo ruling t_9f0d174a-superseded-row-out-of-scope: broke with #425, not #439.
+            key, entry = got[1]
+            rep.check(label, INCOMPLETE,
+                      f"the child's verdict was not refused: claim `{key}` outcome={entry.get('outcome')}. A `surface` "
+                      f"verdict returns before the freshness check, and since #425 `_moved_noise` drops the plan's "
+                      f"unattributed `kanban comment`, so this row cannot pass on this fault (README)")
+        else:
+            rep.check(label, FAIL, f"absent after {win:.0f}s")
         if sup:
             rep.raw.append(f"--- log match\n{sup}")
         warn = ctx.poll(lambda: find_chat(chat, re_failed_line(fail_card)), ctx.tick_window)
@@ -763,9 +797,9 @@ def _check_live_resurface(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, card
     expect = ctx.plan.get("expect", {})
     early = find_chat(chat, re_boomerang_wake_line(card))
     if early:
-        rep.check(f"failure card {card}: fault landed before the verdict", INCOMPLETE,
-                  f"`{early.shown}` posted: the child finished before inject_failure; re-run "
-                  f"(or set commands.s1_fault_hold)")
+        rep.check(f"failure card {card}: wake re-surfaced after the fault", INCOMPLETE,
+                  f"`{early.shown}`: the child's verdict was accepted, not refused by inject_failure, so no wake "
+                  f"was re-surfaced to check (the superseded row says why; cannot pass since #425, README)")
         return
     after = log_line_ts(dispatched) if (ctx.live and dispatched) else None
     re_wake = re.compile(expect.get("resurface_wake_log_regex",
@@ -1264,6 +1298,39 @@ def _gateway_handled_outcomes() -> frozenset:
         sys.path.insert(0, str(REPO_ROOT))
     from gateway.kanban_boomerang_wake import HANDLED_OUTCOMES
     return HANDLED_OUTCOMES
+
+
+def _card_claim_terminal(path: Path, card: str) -> tuple[str, dict] | None:
+    """The card's newest terminal first-dispatch claim (not ``#restartN``), from the state file and its
+    ``.terminal.jsonl`` archive (the gateway moves terminal claims there), else None."""
+    claims: dict = {}
+    try:
+        for line in path.with_name(path.stem + ".terminal.jsonl").read_text(encoding="utf-8-sig").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("key"), str):
+                claims[rec["key"]] = rec
+    except OSError:
+        pass
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        doc = {}
+    hot = doc.get("claims") if isinstance(doc, dict) else None
+    claims.update(hot if isinstance(hot, dict) else {})
+    found = []
+    for key, entry in claims.items():
+        if ("#restart" in str(key) or not isinstance(entry, dict) or entry.get("task_id") != card
+                or entry.get("state") != "terminal"):
+            continue
+        tail = str(key).rsplit("|", 1)[-1]
+        found.append((int(tail) if tail.isdigit() else -1, key, entry))
+    if not found:
+        return None
+    _n, key, entry = max(found, key=lambda t: t[0])
+    return key, entry
 
 
 def _restart_claim_terminal(path: Path, card: str, delegation: str) -> tuple[str, dict] | None:
