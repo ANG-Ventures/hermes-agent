@@ -3275,3 +3275,15 @@ def test_superseded_read_is_delivered_when_the_pr_merged(env):
     turns = [t.text for t in env["adapter"].handled]
     assert len(turns) == 1 and "child verdict superseded" in turns[0], turns
     assert "four findings" in turns[0] and "- own CI red the reader named" in turns[0]
+
+
+def test_derived_approve_next_to_a_rowless_comment_event_still_refuses(env):
+    """A second ``commented`` event by the same author in the window whose row is gone (the kernel keeps the event
+    "even if a comment row is later pruned"): two events, one row, so neither event is bound to exactly one row and
+    the send-back is refused. Kills the mutant 'bind on the row count alone'."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "commented", {"author": "default", "len": len(DERIVED)})  # noqa: SLF001
+    assert _desk_sendbacks(env, tid, entry) == 0
