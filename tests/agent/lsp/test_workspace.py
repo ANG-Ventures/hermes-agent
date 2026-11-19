@@ -142,3 +142,40 @@ def test_find_git_worktree_cache_is_capped(tmp_path: Path, monkeypatch):
         d.mkdir()
         assert find_git_worktree(str(d)) is None
     assert len(ws._workspace_cache) <= 4
+
+
+@pytest.mark.platforms("posix")
+def test_home_dotfiles_repo_never_roots_pyright_over_home(tmp_path: Path, monkeypatch):
+    """$HOME itself is a git repo (the Studio's ~/.git, 2026-11-10) and a session runs with cwd=$HOME.
+    A file under ~/.hermes must root pyright at ~/.hermes, whose pyrightconfig.json carries the scoped
+    include list; a file with no project under $HOME must not root a server at $HOME at all, where no
+    scope file exists and pyright would index the whole home (V8-OOM loop, t_9cba3363)."""
+    import json
+
+    from agent.lsp.servers import find_server_for_file
+
+    home = tmp_path / "home"
+    (home / ".git").mkdir(parents=True)
+    hermes = home / ".hermes"
+    (hermes / ".git").mkdir(parents=True)
+    (hermes / "scripts").mkdir()
+    scoped = {"include": ["scripts", "tests"], "exclude": ["kanban", "**/.git"]}
+    (hermes / "pyrightconfig.json").write_text(json.dumps(scoped), encoding="utf-8")
+    in_hermes = hermes / "scripts" / "tool.py"
+    in_hermes.write_text("", encoding="utf-8")
+    loose = home / "notes" / "scratch.py"
+    loose.parent.mkdir()
+    loose.write_text("", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(home)
+
+    ws, gated = resolve_workspace_for_file(str(in_hermes))
+    assert gated is True
+    pyright = find_server_for_file(str(in_hermes))
+    assert pyright is not None and pyright.server_id == "pyright"
+    root = pyright.resolve_root(str(in_hermes), ws)
+    assert root == str(hermes)
+    config = json.loads((Path(root) / "pyrightconfig.json").read_text(encoding="utf-8"))
+    assert config["include"] == scoped["include"]
+
+    assert resolve_workspace_for_file(str(loose)) == (None, False)

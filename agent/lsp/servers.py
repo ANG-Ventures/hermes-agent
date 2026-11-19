@@ -47,6 +47,9 @@ _EXTS_BY_LANGUAGE: Dict[str, Sequence[str]] = {
 }
 LANGUAGE_BY_EXT: Dict[str, str] = {ext: lang for lang, exts in _EXTS_BY_LANGUAGE.items() for ext in exts}
 
+# V8 old-space cap (MB) for pyright-langserver; see _spawn_pyright.
+PYRIGHT_MAX_OLD_SPACE_MB = 1024
+
 _SpawnFn = Callable[[str, "ServerContext"], Optional["SpawnSpec"]]
 _RootFn = Callable[[str, str], Optional[str]]
 
@@ -60,6 +63,8 @@ class SpawnSpec:
     env: Dict[str, str] = field(default_factory=dict)
     initialization_options: Dict[str, Any] = field(default_factory=dict)
     seed_diagnostics_on_first_push: bool = False
+    # Config file the server loads at ``workspace_root`` (logged at spawn); ``None`` = none found.
+    config_path: Optional[str] = None
 
 
 @dataclass
@@ -181,7 +186,28 @@ def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     # Point pyright at the project venv; its default "python on PATH" rarely is.  Pyright executes
     # this interpreter, so a checkout's own venv is only used when the workspace is trusted.
     py = _detect_python(root if ctx.trusted else None)
-    return _make_spec(root, ctx, "pyright", [bin_path, "--stdio"], {"python": {"pythonPath": py}} if py else {})
+    spec = _make_spec(root, ctx, "pyright", [bin_path, "--stdio"], {"python": {"pythonPath": py}} if py else {})
+    # Bound the V8 heap: pyright empties its type cache near the limit, so a cap keeps it alive and under
+    # lsp-bloat-watch's 1500 MB line, where the host-sized default heap grew to V8-OOM (t_9cba3363:
+    # 64 open docs measured 1435 MB uncapped, 1031 MB under this cap).  An operator heap flag wins.
+    node_options = os.environ.get("NODE_OPTIONS", "")
+    if "NODE_OPTIONS" not in ctx.env_overrides.get("pyright", {}) and "--max-old-space-size" not in node_options:
+        spec.env["NODE_OPTIONS"] = f"{node_options} --max-old-space-size={PYRIGHT_MAX_OLD_SPACE_MB}".strip()
+    spec.config_path = _pyright_config(root)
+    return spec
+
+
+def _pyright_config(root: str) -> Optional[str]:
+    """The config file pyright loads at ``root`` (pyrightconfig.json beats pyproject.toml), else ``None``."""
+    config = os.path.join(root, "pyrightconfig.json")
+    if os.path.isfile(config):
+        return config
+    pyproject = os.path.join(root, "pyproject.toml")
+    try:
+        with open(pyproject, encoding="utf-8-sig", errors="replace") as fh:
+            return pyproject if "[tool.pyright]" in fh.read() else None
+    except OSError:
+        return None
 
 
 def _detect_python(root: Optional[str]) -> Optional[str]:

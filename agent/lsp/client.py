@@ -193,6 +193,11 @@ class LSPClient:
         return self._state
 
     @property
+    def pid(self) -> Optional[int]:
+        """The server process id, ``None`` before spawn."""
+        return self._proc.pid if self._proc is not None else None
+
+    @property
     def is_running(self) -> bool:
         return self._state == "running" and self._connection_is_open()
 

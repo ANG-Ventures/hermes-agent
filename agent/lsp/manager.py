@@ -693,6 +693,7 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             eventlog.log_spawn_failed(srv.server_id, root, e)
             return None
+        eventlog.log_spawned(srv.server_id, spec.workspace_root, client.pid, spec.config_path)
         return client
 
     def _touch(self, client: LSPClient) -> None:

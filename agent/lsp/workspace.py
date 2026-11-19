@@ -167,11 +167,14 @@ def resolve_workspace_for_file(file_path: str, *, cwd: Optional[str] = None) -> 
         # card completion); getcwd keeps raising even after the path is recreated, so
         # there is simply no cwd anchor — fall through to the file's own worktree.
         cwd_anchor = None
+    # A repo at or above $HOME (a dotfiles ~/.git) is no workspace: it would gate in every file under
+    # home and root pyright at $HOME, where no scope file exists (V8-OOM loop, t_9cba3363).
+    home = normalize_path("~")
     cwd_root = find_git_worktree(cwd_anchor) if cwd_anchor else None
-    if cwd_root is not None and is_inside_workspace(file_path, cwd_root):
+    if cwd_root is not None and is_inside_workspace(file_path, cwd_root) and not is_inside_workspace(home, cwd_root):
         return cwd_root, True
     file_root = find_git_worktree(file_path)
-    if file_root is not None:
+    if file_root is not None and not is_inside_workspace(home, file_root):
         return file_root, True
     return None, False
 
