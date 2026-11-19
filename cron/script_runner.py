@@ -161,6 +161,21 @@ def _loaded_repo_files(root: Path) -> set:
     return out
 
 
+SKEW_LOADED_ONLY_ENV = "HERMES_CRON_SKEW_LOADED_ONLY"
+SKEW_ANY_MARKER_NAME = "script_runner_skew_any"
+
+
+def _skew_any_forced() -> bool:
+    """Kill switch for the loaded-module skew filter: env ``HERMES_CRON_SKEW_LOADED_ONLY=0`` or
+    the file ``<home>/cron/script_runner_skew_any`` exists. Either restores drain on any skew."""
+    if os.environ.get(SKEW_LOADED_ONLY_ENV, "").strip() == "0":
+        return True
+    try:
+        return (trip_marker_path().parent / SKEW_ANY_MARKER_NAME).exists()
+    except Exception:
+        return True
+
+
 def _skew_loaded_changes(base: Optional[str] = None) -> Optional[List[str]]:
     """Loaded module files changed between ``base`` (the last accepted sha; default the boot sha)
     and the disk sha (t_2ddabbc4): ``[]`` when the diff touches none of them, None when the diff
@@ -547,7 +562,15 @@ class ScriptRunner:
         """A code skew drains only when the base..disk diff touches a module this process loaded,
         or the diff cannot be read (t_2ddabbc4: 84 of 152 drains changed no loaded module). The
         base is the last accepted sha, so a kept skew is diffed once and a later revert of code
-        imported from it still drains."""
+        imported from it still drains.
+
+        Kill switch (read on every skew check, no deploy needed): env
+        ``HERMES_CRON_SKEW_LOADED_ONLY=0`` or the file ``<home>/cron/script_runner_skew_any``
+        (next to the trip marker) restores drain on any skew."""
+        if _skew_any_forced():
+            logger.warning("script runner code skew: kill switch set (%s=0 or %s); draining",
+                           SKEW_LOADED_ONLY_ENV, SKEW_ANY_MARKER_NAME)
+            return True
         try:
             disk = _skew_shas()[2]
         except Exception:
