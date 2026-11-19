@@ -239,11 +239,11 @@ def retired_rewrite(model: Optional[str]) -> tuple[Optional[str], Optional[str]]
 
         cfg = get_default_hermes_root() / "config"
         retired: dict[str, str] = {}
-        for line in (cfg / "model-retired-ids.txt").read_text(encoding="utf-8").splitlines():
+        for line in (cfg / "model-retired-ids.txt").read_text(encoding="utf-8-sig").splitlines():
             parts = line.split("#", 1)[0].split()
             if parts:
                 retired[parts[0]] = next((p[8:] for p in parts[1:] if p.startswith("cutover=")), "")
-        successors = json.loads((cfg / "model-successors.json").read_text(encoding="utf-8"))["successors"]
+        successors = json.loads((cfg / "model-successors.json").read_text(encoding="utf-8-sig"))["successors"]
         prefix, bare = _split_prefixed(model.strip())
         current, hops = bare, 0
         while current in retired and isinstance(successors.get(current), str) and hops < 8:
