@@ -153,6 +153,11 @@ def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str
     # the darwin sampler's power block, for a power_policy ac_only host (Prism 24ab4994fb91): dropped here, every
     # such host read "power unmeasured" and was closed. Malformed = None (unmeasured), placement._power_fields' rule.
     out.update(placement._power_fields(doc.get("power")))
+    # t_31911eb0 fleet_cap inputs (Prism ae0dcf2b0566): the sampler's ``fleet`` block and the MEASURED mem_total_gb
+    # (a percent RAM cap refuses a total filled from the host table). Dropped here, a capped host read
+    # ``unmeasured:fleet_cap_*`` on every probe. Malformed = None, placement._fleet_fields' rule.
+    out.update(placement._fleet_fields(doc.get("fleet")))
+    out["mem_total_gb"] = _num(doc.get("mem_total_gb"))
     at = _num(doc.get("at"))
     if at is None or remote_now is None or not math.isfinite(remote_now):
         out["sample_status"] = "stale"
@@ -177,6 +182,8 @@ def sample_from_detail(d: Mapping) -> Optional[placement.Sample]:
         slo_breach=d.get("slo_breach") if isinstance(d.get("slo_breach"), bool) else None,
         power_source=d.get("power_source") if d.get("power_source") in ("ac", "battery", "ups") else None,
         sleep_disabled=d.get("sleep_disabled") if isinstance(d.get("sleep_disabled"), bool) else None,
+        fleet_cpus=_num(d.get("fleet_cpus")), fleet_ram_gb=_num(d.get("fleet_ram_gb")),
+        mem_total_gb=_num(d.get("mem_total_gb")),
         **{k: _num(d.get(k)) for k in V2_FIELDS + UTIL_FIELDS})
 
 

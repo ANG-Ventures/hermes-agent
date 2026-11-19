@@ -467,9 +467,14 @@ def _validate_sqlite_header(path: Path) -> None:
         return
     # Byte-level probe: must run BEFORE any connection to this path exists
     # (read_header_bytes_preopen refuses once one is live, because the close()
-    # would cancel this process's POSIX locks).
-    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+    # would cancel this process's POSIX locks). Its registry only sees tracked
+    # connections; a plain sqlite3.connect on the board (the board anchor, a
+    # helper) holds a descriptor it cannot see, so ask the descriptor table too
+    # (t_54b8e6cc).
+    from hermes_cli.sqlite_safe_read import process_holds_open_fd, read_header_bytes_preopen
 
+    if process_holds_open_fd(path):
+        return
     head = read_header_bytes_preopen(path, length=64)
     if head is None or head.startswith(_SQLITE_HEADER):
         return
@@ -552,9 +557,10 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # must only run once the board is out of service. Another SessionDB/kanban
     # connection in this process would still be at risk — so REFUSE rather than
     # warn-and-proceed: losing a forensic copy beats corrupting the live DB.
-    from hermes_cli.sqlite_safe_read import has_live_connection
+    from hermes_cli.sqlite_safe_read import has_live_connection, process_holds_open_fd
 
-    if has_live_connection(resolved):
+    sidecars = [parent / (base_name + suffix) for suffix in ("-wal", "-shm")]
+    if has_live_connection(resolved) or any(process_holds_open_fd(p) for p in (resolved, *sidecars)):
         _kb._log.error(
             "refusing to quarantine %s: a connection to it is still open in "
             "this process, and fingerprinting the file would cancel that "
@@ -562,6 +568,15 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             resolved,
         )
         return None
+    # One copy per corruption episode. A broken board keeps taking writes on
+    # already-open connections, so its hash changes between refused opens and
+    # content addressing alone copied the whole file on every one (10 x 512 MB
+    # in 7 min on 11-17, t_54b8e6cc). The episode ends when a clean integrity
+    # verdict is stamped or the file is replaced (new inode).
+    fingerprint = _db_fingerprint(resolved)
+    existing = _episode_backup(resolved, fingerprint)
+    if existing is not None:
+        return existing
     digest = hashlib.sha256()
     try:
         with resolved.open("rb") as handle:
@@ -581,9 +596,8 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         # A NEW backup landed — enforce the retention cap so mutating-corruption
         # loops can't accumulate quarantines forever.
         _prune_corrupt_backups(parent, base_name, keep=candidate)
-    for suffix in ("-wal", "-shm"):
-        sidecar = parent / (base_name + suffix)
-        sidecar_backup = parent / (candidate.name + suffix)
+    for sidecar in sidecars:
+        sidecar_backup = parent / (candidate.name + sidecar.name[len(base_name):])
         if (
             sidecar.parent != parent or not sidecar.exists()
             or sidecar_backup.parent != parent or sidecar_backup.exists()
@@ -591,7 +605,40 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             continue
         with contextlib.suppress(OSError):
             shutil.copy2(sidecar, sidecar_backup)
+    _record_episode_backup(resolved, fingerprint, candidate)
     return candidate
+
+
+def _corrupt_episode_path(resolved: Path) -> Path:
+    return resolved.with_name(resolved.name + ".corrupt-episode.json")
+
+
+def _episode_backup(resolved: Path, fingerprint: Optional[dict]) -> Optional[Path]:
+    """The quarantine copy already taken of this exact file (same dev/ino/birth)
+    since its last clean integrity verdict, or ``None``."""
+    if fingerprint is None:
+        return None
+    try:
+        data = json.loads(_corrupt_episode_path(resolved).read_text(encoding="utf-8-sig"))
+        same_file = all(data[key] == fingerprint[key] for key in ("dev", "ino", "birth"))
+        backup = resolved.parent / Path(str(data["backup"])).name
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    return backup if same_file and backup.is_file() else None
+
+
+def _record_episode_backup(resolved: Path, fingerprint: Optional[dict], backup: Path) -> None:
+    if fingerprint is None:
+        return
+    marker = _corrupt_episode_path(resolved)
+    tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+    record = {key: fingerprint[key] for key in ("dev", "ino", "birth")}
+    try:
+        tmp.write_text(json.dumps({**record, "backup": backup.name, "at": time.time()}), encoding="utf-8")
+        os.replace(tmp, marker)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 # Repairable integrity_check error classes — both *index-scoped*: the table
 # b-tree is intact and REINDEX rebuilds the index losslessly. The index name is
@@ -772,6 +819,7 @@ def _write_integrity_stamp(resolved: Path, fingerprint: Optional[dict], checked_
     try:
         tmp.write_text(json.dumps({**fingerprint, "checked_at": checked_at}), encoding="utf-8")
         os.replace(tmp, stamp)
+        _corrupt_episode_path(resolved).unlink(missing_ok=True)  # clean verdict ends the episode
     except OSError:
         with contextlib.suppress(OSError):
             tmp.unlink()

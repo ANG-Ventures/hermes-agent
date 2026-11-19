@@ -204,6 +204,8 @@ class _KanbanDispatcher:
                 )
                 return None
             logger.exception("kanban dispatcher: tick failed on board %s", slug)
+            from hermes_cli.kanban_db_ioerr import note_board_ioerr
+            note_board_ioerr(exc, where="dispatcher", board=slug, conn=conn)
             return None
         finally:
             if conn is not None:

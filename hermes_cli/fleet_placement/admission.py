@@ -85,6 +85,66 @@ class Limits:
     ramp_cpus: tuple = ()              # ((job_class, cpus), ...): an UNSETTLED lease of that class is charged its
                                        # measured first-settle_s CPU instead of its full estimate (live_leases ramp;
                                        # t_7566ba56). () = every lease at its full estimate (the rule before)
+    fleet_cap: tuple = ()              # ((axis, N | "P%"), ...), axis in FLEET_CAP_AXES: the host's ONE cap on fleet
+                                       # work (config/fleet-hosts.json hosts.<id>.fleet_cap, t_31911eb0). () = no cap
+
+
+# ── the fleet-work cap (t_31911eb0; Ace 2026-11-17 Discord 1572247507579314196 / 1572243651352854568) ─────────────
+# ONE allocator-level cap per host on the CPU and RAM fleet work may use, apart from contention: a quiet host whose
+# fleet work sits at its cap is refused `fleet_cap:<axis>`; a busy host under its cap is refused by contention. Counted:
+# the sample's MEASURED fleet use (host-pressure.py `fleet`, published as sample fleet_cpus / fleet_ram_gb) plus the
+# leases the sample cannot show yet (live_leases, the same set and ramp the contention axes charge) plus this job.
+# A host with a cap and no fleet measurement refuses (fail closed). No other per-host CPU/RAM cap may exist
+# (scripts/lints/fleet-cap-lint.py).
+FLEET_CAP_AXES = {"cpus": ("fleet_cpus", "ncpu"), "ram_gb": ("fleet_ram_gb", "mem_total_gb")}   # axis -> (use, total)
+
+
+def fleet_cap_errors(cap) -> List[str]:
+    """Validation of one host's ``fleet_cap`` value: {} or {cpus?, ram_gb?}, each a positive number or "P%" with
+    0 < P <= 100. -> human errors ([] = valid). Shared by placement.validate(), `fleet-work cap` and the lint."""
+    if not isinstance(cap, Mapping):
+        return [f"fleet_cap must be an object {{cpus, ram_gb}}, not {type(cap).__name__}"]
+    errs = []
+    for k, v in cap.items():
+        if k not in FLEET_CAP_AXES:
+            errs.append(f"fleet_cap.{k}: unknown axis (allowed: {', '.join(FLEET_CAP_AXES)})")
+        elif fleet_cap_spec(v) is None:
+            errs.append(f"fleet_cap.{k}: {v!r} is not a positive number or a percent \"1%\"..\"100%\"")
+    return errs
+
+
+def fleet_cap_spec(v):
+    """A cap value as (kind, number): ("abs", N) or ("pct", P); None = malformed."""
+    if _num(v) and v > 0:
+        return ("abs", float(v))
+    if isinstance(v, str) and v.endswith("%"):
+        try:
+            p = float(v[:-1])
+        except ValueError:
+            return None
+        if math.isfinite(p) and 0 < p <= 100:
+            return ("pct", p)
+    return None
+
+
+def fleet_cap_value(v, total) -> Optional[float]:
+    """The cap in CPUs / GB: an absolute as is, a percent of ``total`` (the sample's ncpu / mem_total_gb). None =
+    malformed, or a percent with no measured total (the caller refuses unmeasured)."""
+    s = fleet_cap_spec(v)
+    if s is None:
+        return None
+    if s[0] == "abs":
+        return s[1]
+    return float(total) * s[1] / 100.0 if _num(total) and total > 0 else None
+
+
+def _fleet_caps(sample: Mapping, limits: "Limits") -> dict:
+    """{axis: (cap or None, spec)} for every axis the host caps. A total the caller filled from the host table
+    (``<total>_from_spec``) is not measured: a percent cap on it resolves to None (refused unmeasured)."""
+    def total(ax):
+        key = FLEET_CAP_AXES[ax][1]
+        return None if sample.get(f"{key}_from_spec") else sample.get(key)
+    return {ax: (fleet_cap_value(v, total(ax)), v) for ax, v in limits.fleet_cap if ax in FLEET_CAP_AXES}
 
 
 # t_d7881247 / t_e0fbc8c9: PSI cpu `some` counts a task waiting on its cgroup's cpu.max (CFS quota throttling), so a
@@ -157,6 +217,9 @@ def ceilings(sample: Mapping, limits: Limits = Limits()) -> dict:
         out["ram_gb"] = float(sample["mem_total_gb"]) - limits.mem_reserve_gb
     if _num(sample.get("ncpu")) and sample["ncpu"] > 0 and not limits.cpu_saturable:
         out["cpus"] = float(sample["ncpu"]) * limits.cpu_busy_max
+    for ax, (cap, _spec) in _fleet_caps(sample, limits).items():   # a job larger than the fleet cap never fits here
+        if cap is not None:
+            out[ax] = min(out.get(ax, cap), cap)
     return out
 
 
@@ -173,7 +236,9 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
     # a measured estimate to make it fit; name both the need and this host's ceiling.
     for ax, ceiling in ceilings(sample, limits).items():
         if getattr(need, ax) > ceiling:
-            return Verdict(False, ax, f"unschedulable:resource-fit {host} need {ax}={getattr(need, ax):g} "
+            capped = _fleet_caps(sample, limits).get(ax, (None,))[0]
+            kind = "fleet_cap" if capped is not None and capped <= ceiling else "resource-fit"
+            return Verdict(False, ax, f"unschedulable:{kind} {host} need {ax}={getattr(need, ax):g} "
                            f"ceiling={ceiling:g}", {ax: ceiling - getattr(need, ax)})
     leases = list(leases)
     held = live_leases(leases, host, sample.get("at"), settle_s=settle_s, ramp=dict(limits.ramp_cpus),
@@ -226,6 +291,17 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
             missing("gpu_free_mib")
         else:
             free["gpu_mib"] = float(sample["gpu_free_mib"]) - held.gpu_mib - need.gpu_mib
+    # the fleet-work cap (t_31911eb0): measured fleet use + young leases (the same `held`) + this job <= cap
+    cap_terms: dict = {}
+    for ax, (cap, spec) in _fleet_caps(sample, limits).items():
+        key, used = f"fleet_cap_{ax}", sample.get(FLEET_CAP_AXES[ax][0])
+        if cap is None or not _num(used):
+            unmeasured.append((key, f"unmeasured:{key} (cap {spec!r} set, "
+                               + ("no fleet measurement in the sample)" if not _num(used) else "no host total)")))
+            continue
+        young, n = getattr(held, ax), getattr(need, ax)
+        free[key] = cap - float(used) - young - n
+        cap_terms[key] = (ax, float(used), young, n, cap, spec)
 
     if sample.get("slo_breach") is True:
         return Verdict(False, "slo", "saturated:slo (latency guard breached)", free)
@@ -239,6 +315,11 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
         if axis in ("cpu", "psi_cpu_some10", "psi_cpu_some60") and limits.cpu_saturable:
             continue                       # a score penalty on a saturable host (score() reads it), never a refusal
         return Verdict(False, axis, f"saturated:{axis} {free[axis]:+.2f}", free)
+    for key, (ax, used, young, n, cap, spec) in cap_terms.items():   # after contention: a busy box names contention
+        if free[key] < 0:
+            of = f" ({spec} of {sample.get(FLEET_CAP_AXES[ax][1]):g})" if isinstance(spec, str) else ""
+            return Verdict(False, key, f"fleet_cap:{ax} used {used:.2f} + young {young:.2f} + need {n:.2f} "
+                           f"> cap {cap:.2f}{of}", free)
     if unmeasured:                         # nothing measured refuses: fail closed on the first unmeasured axis
         return Verdict(False, unmeasured[0][0], unmeasured[0][1], free)
     binding = min(_fractions(free, sample, limits), key=lambda kv: kv[1])[0]
@@ -258,6 +339,9 @@ def _fractions(free: Mapping[str, float], sample: Mapping, limits: Limits):
         out.append(("procs", free["procs"]))
     if "slice_mem_gb" in free:
         out.append(("slice_mem_gb", free["slice_mem_gb"] / 100.0))
+    for ax, (cap, _spec) in _fleet_caps(sample, limits).items():
+        if f"fleet_cap_{ax}" in free and cap:
+            out.append((f"fleet_cap_{ax}", free[f"fleet_cap_{ax}"] / cap))
     return out
 
 

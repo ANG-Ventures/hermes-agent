@@ -38,7 +38,10 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh
 # GPT-6 Astra is account-gated and its Responses API accepts no disable/minimal
 # wire level; callers normalize those requests to ``low`` at the transport boundary.
 CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
-ASTRA_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-astra-900k"})
+#: One entry per Astra wire slug; the ``-900k`` picker alias is derived. gpt-6.2-astra: measured
+#: 2026-11-18 on the codex backend and api.openai.com (t_eb830c20).
+ASTRA_BASE_IDS: tuple[str, ...] = ("gpt-6-astra", "gpt-6.2-astra")
+ASTRA_MODEL_IDS: frozenset[str] = frozenset(base + alias for base in ASTRA_BASE_IDS for alias in ("", "-900k"))
 #: GPT-6 Sol/Terra/Luna (the 5.6 successors; ``-pro``/``-900k``/dated snapshots share the prefix).
 GPT6_TIER_PREFIXES: tuple[str, ...] = ("gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra")  # 6.1-terra: none + max both live 2026-11-06
 #: GPT-6.1 Sol takes Astra's ``low..max`` ladder (``none`` 400s, live 2026-09-29) without Astra's
@@ -99,9 +102,9 @@ META_AI_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
 
 
 def is_astra_model(model: Optional[str]) -> bool:
-    """``gpt-6-astra`` or its Hermes-side ``-900k`` picker alias, with or without a ``vendor/`` prefix.
-    The single home for the slug set: picker gating, effort vocabulary and the request sanitizer all
-    key off it, so a new Astra alias is one edit."""
+    """An ``ASTRA_BASE_IDS`` slug or its Hermes-side ``-900k`` picker alias, with or without a ``vendor/``
+    prefix. The single home for the slug set: picker gating, effort vocabulary and the request sanitizer
+    all key off it, so a new Astra is one edit to ``ASTRA_BASE_IDS``."""
     return (model or "").strip().lower().rsplit("/", 1)[-1] in ASTRA_MODEL_IDS
 
 

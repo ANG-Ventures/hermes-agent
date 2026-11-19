@@ -62,3 +62,36 @@ def test_probe_carries_the_power_block_to_an_ac_only_host():
         s = kh.sample_from_detail(_detail(**({} if bad is None else {"power": bad})))
         assert (s.power_source, s.sleep_disabled) == (None, None)
         assert placement.power_refusal(spec, s) == "closed:power unmeasured (power_policy ac_only)"
+
+
+def test_probe_carries_the_fleet_block_to_a_fleet_capped_host():
+    """Prism ae0dcf2b0566: sample_fields()/sample_from_detail() dropped the pressure document's ``fleet`` block and
+    its measured ``mem_total_gb``, so a host with hosts.<id>.fleet_cap read ``unmeasured:fleet_cap_*`` on every probe
+    under utilization admission, idle or not (a percent RAM cap fails closed on a total filled from the table)."""
+    from hermes_cli.fleet_placement import admission
+
+    need = admission.Estimate(cpus=1.0, ram_gb=1.0)
+    fp = placement.Footprint(ram_gb=1, threads=1)
+
+    def verdict(cap, **extra):
+        spec = placement.HostSpec(name="h", cores=8, threads=16, mem_total_gb=128, mem_reserve_gb=0, cores_reserve=0,
+                                  ceilings={"kanban": 4}, aliases=(), fleet_cap=cap)
+        doc = {"ncpu": 16, "cpu_busy": 0.0, "mem_available_gb": 64.0, "psi_cpu_some10": 0.0, "psi_cpu_some60": 0.0,
+               "psi_mem_some10": 0.0, "psi_io_some10": 0.0, "procs": 100, "maxproc": 100000, **extra}
+        s = kh.sample_from_detail(_detail(**doc))
+        return s, placement.headroom(spec, s, fp, consumer="kanban", closed_when={}, now=T0, mode="utilization",
+                                     need=need)
+
+    s, h = verdict((("cpus", 8),), fleet={"cpus": 0, "ram_gb": 0}, mem_total_gb=128.0)
+    assert (s.fleet_cpus, s.fleet_ram_gb, s.mem_total_gb) == (0.0, 0.0, 128.0)
+    assert h.eligible, h.reason
+    _, h = verdict((("ram_gb", "50%"),), fleet={"cpus": 0, "ram_gb": 0}, mem_total_gb=128.0)
+    assert h.eligible, h.reason
+    _, h = verdict((("cpus", 8),), fleet={"cpus": 7.5, "ram_gb": 0}, mem_total_gb=128.0)    # measured, at the cap
+    assert not h.eligible and "fleet_cap:cpus" in h.reason and "unmeasured" not in h.reason, h.reason
+    for bad in (None, "x", {"cpus": -1, "ram_gb": float("nan")}):                            # absent / malformed
+        s, h = verdict((("cpus", 8),), **({} if bad is None else {"fleet": bad}))
+        assert (s.fleet_cpus, s.fleet_ram_gb) == (None, None)
+        assert not h.eligible and h.reason.startswith("closed:unmeasured:fleet_cap_cpus"), h.reason
+    _, h = verdict((("ram_gb", "50%"),), fleet={"cpus": 0, "ram_gb": 0})                     # no measured total
+    assert not h.eligible and "unmeasured:fleet_cap_ram_gb" in h.reason, h.reason
