@@ -37,17 +37,25 @@ def telegram_record(message: Any) -> dict:
 
 
 def mark_merged(target: Any) -> None:
-    """``target`` absorbed another message (text or media batching): its record no longer names one message."""
+    """``target`` absorbed another message (text or media batching): its record no longer names one message.
+    Rebinds a fresh ``metadata`` dict, so a shallow copy's source event keeps its own record."""
     meta = getattr(target, "metadata", None)
     rec = meta.get(KEY) if isinstance(meta, dict) else None
     if isinstance(rec, dict):
-        meta[KEY] = {**rec, "merged": True}
+        target.metadata = {**meta, KEY: {**rec, "merged": True}}
 
 
 def display_metadata(event: Any) -> dict:
-    """``{"inbound_record": {...}}`` for a human turn whose adapter recorded one, else ``{}``."""
+    """``{"inbound_record": {...}}`` for a human turn whose adapter recorded one, else ``{}``. A record
+    whose ``message_id`` is not the event's (a batch that moved its id to a later message) reads merged."""
     if getattr(event, "internal", False):
         return {}
     meta = getattr(event, "metadata", None)
     rec = meta.get(KEY) if isinstance(meta, dict) else None
-    return {KEY: dict(rec)} if isinstance(rec, dict) else {}
+    if not isinstance(rec, dict):
+        return {}
+    rec = dict(rec)
+    event_id = getattr(event, "message_id", None)
+    if rec.get("message_id") is not None and event_id is not None and str(event_id) != rec["message_id"]:
+        rec["merged"] = True
+    return {KEY: rec}

@@ -92,6 +92,62 @@ def test_media_batching_marks_a_merged_record():
     assert pending["k"].metadata[inbound_record.KEY]["merged"] is True
 
 
+def _rec(ev):
+    return ev.metadata[inbound_record.KEY]
+
+
+@pytest.mark.parametrize("kind", ["text", "photo"])
+def test_busy_pending_merge_marks_a_merged_record(kind):
+    """Prism 7fb14e749eb2: the busy fast-path ``merge_pending_message_event`` absorbs text and photos."""
+    from gateway.platforms.base import merge_pending_message_event
+    from gateway.platforms.event import MessageType
+    adapter, first = _event(text="place it")
+    second = adapter._build_message_event(_msg("fwd", message_id=4243), MessageType.TEXT)
+    if kind == "photo":
+        for ev in (first, second):
+            ev.message_type, ev.media_urls, ev.media_types = MessageType.PHOTO, ["/tmp/x.jpg"], ["image/jpeg"]
+    pending = {}
+    merge_pending_message_event(pending, "k", first, merge_text=True)
+    assert "merged" not in _rec(pending["k"])
+    merge_pending_message_event(pending, "k", second, merge_text=True)
+    assert pending["k"] is first and _rec(first)["merged"] is True
+
+
+@pytest.mark.asyncio
+async def test_busy_text_debounce_marks_a_merged_record():
+    """Prism 7fb14e749eb2 repro: "place it" (4242) then a forward (4243) inside the debounce window."""
+    adapter, first = _event(text="place it")
+    second = adapter._build_message_event(_msg("fwd", message_id=4243, forward_origin=SimpleNamespace(type="user")),
+                                          first.message_type)
+    try:
+        await adapter._queue_text_debounce("k", first)
+        await adapter._queue_text_debounce("k", second)
+        state = adapter._text_debounce_store()["k"]
+        assert state.event.message_id == "4243"
+        assert inbound_record.display_metadata(state.event)[inbound_record.KEY]["merged"] is True
+    finally:
+        adapter._discard_text_debounce("k")
+        await asyncio.sleep(0)
+
+
+def test_a_record_naming_another_message_id_reads_as_merged():
+    """Backstop at the single reader: an event whose message_id moved off the recorded one is not that message."""
+    _, ev = _event()
+    ev.message_id = "4243"
+    assert inbound_record.display_metadata(ev)[inbound_record.KEY]["merged"] is True
+    assert "merged" not in _rec(ev)
+
+
+def test_queue_merge_of_user_items_marks_the_head_and_leaves_the_items():
+    from gateway.queue_mgmt import merge_user_events
+    adapter, first = _event(text="place it")
+    second = adapter._build_message_event(_msg("fwd", message_id=4243), first.message_type)
+    head = merge_user_events([first, second])
+    assert _rec(head)["merged"] is True
+    assert "merged" not in _rec(first) and "merged" not in _rec(second)
+    assert "merged" not in _rec(merge_user_events([first]))
+
+
 def test_every_persisted_user_row_spreads_the_record():
     """Both ``_run_agent`` calls in run_turn.py and the transient-failure transcript entry put
     ``inbound_record.display_metadata(...)`` into the user row's display_metadata."""
