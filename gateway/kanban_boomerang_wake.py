@@ -1587,6 +1587,10 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
     row = entry.get("row") or entry.get("kind")
     deadman_cursor = row == ROW_REVIEW_DEADMAN and deadman_trigger_cursor_enabled()
     own_event = row in EVENT_CURSOR_ROWS or deadman_cursor
+    # t_e86eeab2: a send-back answers the handback before it, so that handback's PR (and the claim's, read at
+    # dispatch) merging says nothing about it: a fix-forward goes into a new PR. Its merged-PR rule reads only the
+    # newest handback AFTER the send-back event (t_1b52b3e0: #12764 merged, the read of #12782 was refused).
+    sendback = row == "changes_requested" and entry.get("event_id") is not None
     now = _time.time()
     conn = _readonly(kb, entry.get("board"))
     try:
@@ -1628,17 +1632,28 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
         refs = []
         # t_59d62680: the merged-PR rule is about the HANDBACK (its review is moot once merged). An own-event row
         # carries its own occurrence: a deploy probe / watcher queued after the merge that failed is still owed.
+        if sendback:
+            # t_e86eeab2 round 2 (Apollo): a send-back's read is finished only when nothing of the card is left open:
+            # (a) the card is done/archived, or (b) the newest handback after the send-back names a PR and EVERY PR
+            # it names merged (below). A later handback naming no PR, or no later handback, refuses nothing.
+            status = str(_field(task, "status") or "")
+            if status in ("done", "archived"):
+                return f"card {status}{_DONE_REFUSAL}"
+            handback = conn.execute(
+                "SELECT payload, run_id FROM task_events WHERE task_id = ? "
+                "AND kind IN ('review_requested', 'completed') AND id > ? ORDER BY id DESC LIMIT 1",
+                (entry["task_id"], event_id)).fetchone()
         if handback and not own_event:
             payload = json.loads(handback["payload"] or "{}")
             refs = _handback_refs(kb, conn, None, payload, handback["run_id"])
         # Preserve the claim's PR even if a newer handback now names another one.
-        if not own_event:
+        if not own_event and not sendback:
             refs = list(refs) + list(_op.extract_pr_refs(entry.get("pr")))
     finally:
         conn.close()
     health_fn = _health_fn()
     if health_fn is not None:
-        seen = set()
+        seen, merged = set(), []
         for ref in refs:
             key = (ref.repo.lower(), int(ref.number))
             if key in seen:
@@ -1646,7 +1661,13 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
             seen.add(key)
             health = health_fn(ref.repo, int(ref.number)) or {}
             if health.get("state") == "merged" or health.get("merged") or health.get("merged_at"):
-                return f"summarized PR merged: {ref.repo}#{ref.number}"
+                if not sendback:
+                    return f"summarized PR merged: {ref.repo}#{ref.number}"
+                merged.append(f"{ref.repo}#{ref.number}")
+            elif sendback:
+                return None   # (b) every, not any: an open or closed-unmerged PR is work left on the card
+        if merged:
+            return f"summarized PR merged: {', '.join(merged)}"
     return None
 
 
@@ -1704,7 +1725,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     if action == "surface":
         why = _stale_refusal(live, "execute_verdict")
         if why:
-            return {"ok": False, "action": action, "reason": why, "summary": summary, "stale": True}
+            return {"ok": False, "action": action, "reason": why, "summary": summary, "stale": True, **finding}
         return {"ok": False, "action": action, "reason": "child surfaced it", "summary": summary, "surface": True,
                 **finding}
     conn = kb.connect(board=live.get("board"))
@@ -2172,6 +2193,62 @@ def record_surface(entry: dict, summary: str) -> bool:
         conn.close()
 
 
+_MERGED_REFUSAL = "summarized PR merged"
+_DONE_REFUSAL = " after send-back"   # stale_surface_reason rule (a): "card <status> after send-back"
+_STALE_READ_HEAD = f"{MARKER} stale surface refused"
+_PATH_RE = re.compile(r"[\w~./-]+\.(?:md|txt)\b")
+
+
+def _staged_read(entry: dict, texts: list) -> Optional[str]:
+    """t_e86eeab2: the file the child staged its read in. A ``.md``/``.txt`` path its verdict names (absolute, ``~``
+    or relative to the Hermes home) that exists; else the newest file naming the card in the child's scratch folder
+    (``cache/scratch/<delegation id>`` or ``del-<last 4>``, the short form the children use). None when neither."""
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    for text in texts:
+        for token in _PATH_RE.findall(str(text or "")):
+            path = Path(token).expanduser()
+            path = path if path.is_absolute() else home / path
+            if path.is_file():
+                return str(path)
+    did, tid = str(entry.get("delegation_id") or ""), str(entry.get("task_id") or "")
+    scratch = home / "cache" / "scratch"
+    found = [p for d in {did, f"del-{did[-4:]}"} if did and tid and (scratch / d).is_dir()
+             for p in (scratch / d).glob(f"*{tid}*") if p.is_file()]
+    return str(max(found, key=lambda p: (p.suffix == ".md", p.stat().st_mtime))) if found else None
+
+
+def record_stale_read(entry: dict, result: dict) -> bool:
+    """t_e86eeab2: ONE card comment when a child's ``surface`` was refused because the PR merged, or (round 3) because
+    the card was done/archived after a send-back (no chat wake): the read can still hold a finding about what merged,
+    and the refusal otherwise leaves no trace on the card. Names the staged read file and the refusal reason. Ends
+    ``(wake <key>) (delegation <id>)``: deduped on the WAKE (claim key without its ``#restartN`` suffix), since a
+    restart redispatch of the same wake mints a new delegation id; the delegation id stays as the pointer to the
+    child's folder and transcript. Any other refusal or action writes nothing."""
+    reason = str(result.get("reason") or "")
+    if result.get("action") != "surface" or not (
+            reason.startswith(_MERGED_REFUSAL) or (reason.startswith("card ") and reason.endswith(_DONE_REFUSAL))):
+        return False
+    from hermes_cli import kanban_db as kb
+
+    wake = f"(wake {str(entry['key']).split('#restart', 1)[0]}) (delegation "
+    tag = f"{wake}{entry['delegation_id']})"
+    staged = _staged_read(entry, [result.get("detail"), *(result.get("evidence") or []), result.get("summary")])
+    body = (f"{_STALE_READ_HEAD} ({reason}); the child's read was not delivered. "
+            f"Staged read: {staged or 'none found'}. Child said: {result.get('summary') or 'no summary'} {tag}")
+    conn = kb.connect(board=entry.get("board"))
+    try:
+        if any(c.author == AUTHOR and c.body.startswith(_STALE_READ_HEAD) and wake in c.body
+               for c in kb.list_comments(conn, entry["task_id"])):
+            return False
+        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+            kb.add_comment(conn, entry["task_id"], AUTHOR, body)
+        return True
+    finally:
+        conn.close()
+
+
 def _operator_home(home_sid: Any) -> bool:
     return str(home_sid or "").strip().startswith("operator:")
 
@@ -2575,6 +2652,10 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
     result = await asyncio.to_thread(execute_verdict, live, final, state=state, handback=True,
                                      wake_home=await _complete_wakes_home(runner, live))
     if result.get("stale"):
+        try:
+            await asyncio.to_thread(record_stale_read, live, result)
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: stale-read comment on %s not written: %s", live["task_id"], exc)
         await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="stale",
                                 reason=result["reason"])
         return

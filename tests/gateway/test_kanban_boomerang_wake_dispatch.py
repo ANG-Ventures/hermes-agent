@@ -363,6 +363,211 @@ def test_stale_surface_hold_line_uses_the_own_event_cursor(env, row, hold_at, st
     assert ah.stale_surface_reason(entry) == stale
 
 
+@pytest.mark.parametrize("second,stale", [
+    ("open", None),                                    # fix-forward PR B open: the read of B is delivered
+    ("merged", f"summarized PR merged: {REPO}#72"),    # B merged too: nothing left to stamp
+    (None, None),                                      # no handback after the send-back yet: A's merge is moot
+])
+def test_stale_surface_sendback_reads_the_pr_handed_back_after_it(env, second, stale):
+    """t_e86eeab2 (t_1b52b3e0, 2026-11-18): #12764 merged 09:58, the operator sent the card back 10:16 for a
+    fix-forward, the worker handed back #12782 at 10:29; the changes_requested child's surface was refused at 10:50 as
+    "summarized PR merged: #12764". RED on c47fc9de2a for the open and no-handback arms."""
+    tid = _card(env)
+    _handback(tid, 71)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1793839414 WHERE task_id = ?", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "changes_requested", json.dumps({"summary": "fix forward in a new PR"}), 1793845000))
+    entry = _claimed_entry(env, tid, row="changes_requested", kind="changes_requested", pr=f"{REPO}#71")
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    if second:
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))   # the worker took the send-back
+        _handback(tid, 72)
+        with kb.connect_closing() as conn:
+            assert [e.kind for e in kb.list_events(conn, tid)][-1] == "review_requested"
+        env["health"][(REPO, 72)] = {"state": second}
+    assert ah.stale_surface_reason(entry) == stale
+
+
+def test_stale_surface_plain_handback_with_merged_pr_still_refused(env):
+    """t_e86eeab2: the existing case, no send-back: a handback whose own PR merged is moot."""
+    tid = _card(env)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="review_requested", kind="review_requested", pr=f"{REPO}#71")
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    assert ah.stale_surface_reason(entry) == f"summarized PR merged: {REPO}#71"
+
+
+def _stale_read_comments(tid) -> list:
+    with kb.connect_closing() as conn:
+        return [c.body for c in kb.list_comments(conn, tid)
+                if c.author == ah.AUTHOR and c.body.startswith("[boomerang-wake] stale surface refused")]
+
+
+@pytest.mark.parametrize("staged", ["named", "scratch", None])
+def test_refused_surface_for_merged_pr_leaves_one_card_comment(env, staged):
+    """t_e86eeab2: a surface refused because the PR merged left no trace on the card (t_509fc279: the read of #12774
+    found a loosened guard after the merge). Now ONE comment names the staged read file and the reason; no chat
+    wake. RED on c47fc9de2a."""
+    from hermes_constants import get_hermes_home
+
+    tid = _card(env)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="completed", kind="review_requested")
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    summary = "found a loosened guard after the merge"
+    path = None
+    if staged:
+        folder = "cache/scratch/" + (f"del-{entry['delegation_id'][-4:]}" if staged == "scratch" else "mine")
+        path = get_hermes_home() / folder / f"{tid}-read.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Verdict: surface\n")
+        if staged == "named":
+            summary += f"; read staged at {folder}/{tid}-read.md"
+    _run(env, entry, "completed", _verdict(entry, "surface", summary=summary))
+    comments = _stale_read_comments(tid)
+    assert len(comments) == 1
+    assert f"(summarized PR merged: {REPO}#71)" in comments[0]
+    assert f"Staged read: {path if path else 'none found'}." in comments[0]
+    assert comments[0].endswith(f"(wake {entry['key']}) (delegation {entry['delegation_id']})")
+    assert _claims()[entry["key"]]["outcome"] == "stale"
+    assert env["adapter"].handled == [] and env["adapter"].sent == []
+    # replay of the same delegation adds nothing
+    assert ah.record_stale_read(entry, {"action": "surface", "reason": f"summarized PR merged: {REPO}#71"}) is False
+    assert len(_stale_read_comments(tid)) == 1
+
+
+def test_refused_acknowledge_or_other_reason_leaves_no_stale_read_comment(env):
+    """t_e86eeab2: only a surface refused for a merged PR is recorded; an acknowledge or another refusal is not."""
+    tid = _card(env)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="completed", kind="review_requested")
+    assert ah.record_stale_read(entry, {"action": "acknowledge", "reason": f"summarized PR merged: {REPO}#71"}) is False
+    assert ah.record_stale_read(entry, {"action": "surface", "reason": "owner comment newer than handback"}) is False
+    assert _stale_read_comments(tid) == []
+
+
+def _sendback_card(env) -> tuple:
+    """Handback A names PR 71, 71 merged, the owner sends the card back, the claim is taken on the send-back, and
+    the worker takes the card again (round 2 of t_e86eeab2)."""
+    tid = _card(env)
+    _handback(tid, 71)
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "changes_requested", json.dumps({"summary": "fix forward in a new PR"}),
+                      int(time.time()) + 1))
+    entry = _claimed_entry(env, tid, row="changes_requested", kind="changes_requested", pr=f"{REPO}#71")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
+    return tid, entry
+
+
+def _sendback_handback(tid, summary):
+    with kb.connect_closing() as conn, \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        kb.request_review(conn, tid, force=True, summary=summary)
+
+
+@pytest.mark.parametrize("arm,stale", [
+    # finding 1: the worker finished the send-back with no PR and the card is done -> rule (a)
+    ("done_no_pr", "card done after send-back"),
+    # rule (a) wins over an open PR named by the closing handback (Apollo: a done card has nothing left to stamp)
+    ("done_open_pr", "card done after send-back"),
+    # the ordinary end of a fix-forward: the PR merges, the card closes, the child answers -> rule (a)
+    ("done_merged_pr", "card done after send-back"),
+    # finding 2: one merged + one open PR in the newest handback -> every, not any: delivered
+    ("mixed", None),
+    # the same PR handed back again and merged: nothing left open -> refused
+    ("same_merged", f"summarized PR merged: {REPO}#71"),
+    # merged 71, then a handback naming only open 72 -> delivered
+    ("only_open", None),
+    # a fix-forward PR closed unmerged is not finished work -> delivered
+    ("closed_unmerged", None),
+    # a handback after the send-back naming no PR, card not done -> refuses nothing
+    ("review_no_pr", None),
+])
+def test_sendback_surface_refused_only_when_nothing_is_left_open(env, arm, stale):
+    """t_e86eeab2 round 2 (Apollo 16:08 11-18): a changes_requested read is refused as finished only when (a) the
+    card is done/archived or (b) the newest handback after the send-back names a PR and EVERY PR it names merged.
+    Through the real run entry. RED on e8f1e6d737 for done_no_pr, mixed and done_open_pr; the one-comment assert
+    (round 3) is RED on fb0b7071e1 for done_no_pr, done_open_pr and done_merged_pr."""
+    tid, entry = _sendback_card(env)
+    if arm == "done_no_pr":
+        _worker_close(tid, summary="all requested work finished, no PR")
+    elif arm == "done_open_pr":
+        env["health"][(REPO, 72)] = {"state": "open"}
+        _worker_close(tid, summary=f"fix-forward PR {REPO}#72 ready")
+    elif arm == "done_merged_pr":
+        env["health"][(REPO, 72)] = {"state": "merged"}
+        _worker_close(tid, summary=f"fix-forward PR {REPO}#72 merged")
+    elif arm == "mixed":
+        env["health"][(REPO, 72)] = {"state": "open"}
+        _sendback_handback(tid, f"PR {REPO}#71 merged; fix-forward PR {REPO}#72 ready")
+    elif arm == "same_merged":
+        _handback(tid, 71)
+    elif arm == "only_open":
+        env["health"][(REPO, 72)] = {"state": "open"}
+        _handback(tid, 72)
+    elif arm == "closed_unmerged":
+        env["health"][(REPO, 72)] = {"state": "closed"}
+        _handback(tid, 72)
+    elif arm == "review_no_pr":
+        _sendback_handback(tid, "answered the send-back in the card thread, no PR")
+    assert ah.stale_surface_reason(entry) == stale
+    _run(env, entry, "completed", _verdict(entry, "surface", summary="the fix-forward needs the owner"))
+    claim = _claims()[entry["key"]]
+    if stale:
+        assert claim["outcome"] == "stale" and claim["reason"] == stale
+        assert env["adapter"].handled == [] and env["adapter"].sent == []
+        # round 3 (Apollo 17:11): a rule (a) refusal writes the same ONE card comment as a merged-PR refusal
+        assert len(_stale_read_comments(tid)) == 1, "a refused send-back read left no trace on the card"
+    else:
+        assert claim["outcome"] != "stale"
+        assert len(env["adapter"].handled) == 1, "the send-back's read did not reach the owner"
+
+
+def test_stale_read_comment_survives_a_restart_once(env):
+    """t_e86eeab2 round 2, finding 3: the comment is committed, the process dies before the claim is made terminal;
+    the restart redispatch (``<key>#restart1``, new delegation id) gets the same refusal. Exactly one comment, and
+    both claims end terminal. RED on e8f1e6d737 (it deduped on the delegation id: two comments)."""
+
+    class Died(BaseException):
+        pass
+
+    tid = _card(env)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="completed", kind="review_requested")
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    real_update = ah.BoomerangWakeState.update_claim
+
+    def dying_update(self, key, **kw):
+        if kw.get("outcome") == "stale":
+            raise Died()
+        return real_update(self, key, **kw)
+
+    env["monkeypatch"].setattr(ah.BoomerangWakeState, "update_claim", dying_update)
+    with pytest.raises(Died):
+        _run(env, entry, "completed", _verdict(entry, "surface", summary="found a loosened guard after the merge"))
+    env["monkeypatch"].setattr(ah.BoomerangWakeState, "update_claim", real_update)
+    assert len(_stale_read_comments(tid)) == 1
+    assert _claims()[entry["key"]]["state"] != ah.STATE_TERMINAL
+    # next boot: the child is gone; reconcile redispatches the same wake under a new delegation id
+    _kill(env, entry)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    [new] = env["dispatched"][1:]
+    assert new["key"] == entry["key"] + "#restart1" and new["delegation_id"] != entry["delegation_id"]
+    _run(env, new, "completed", _verdict(new, "surface", summary="found a loosened guard after the merge"))
+    comments = _stale_read_comments(tid)
+    assert len(comments) == 1
+    assert comments[0].endswith(f"(wake {entry['key']}) (delegation {entry['delegation_id']})")
+    claims = _claims()
+    assert claims[entry["key"]]["state"] == ah.STATE_TERMINAL
+    assert claims[new["key"]]["state"] == ah.STATE_TERMINAL and claims[new["key"]]["outcome"] == "stale"
+    assert env["adapter"].handled == [] and env["adapter"].sent == []
+
+
 @pytest.mark.parametrize("assignee", ["apollo", "human:apollo"])
 def test_stale_surface_bot_comment_does_not_hide_owner_release(env, assignee):
     tid = _card(env)
