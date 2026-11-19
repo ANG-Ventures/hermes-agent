@@ -30,9 +30,10 @@ TS = dt.datetime(2026, 11, 19, 5, 28, 36, tzinfo=UTC).timestamp()   # 21:28:36 P
 # claude-pool credit_lane_relay.py / credit_lane.body_refusal at 5fed23d0d5:
 # every ``error.type`` the relay writes through ``_err(...)`` that is its own
 # (not a generic HTTP name). Pinned here so a new relay code is a red test,
-# not an "unclassified" banner.
+# not an "unclassified" banner. credit_upstream_write_failed: claude-pool#470.
 RELAY_CREDIT_CODES = {
-    "credit_upstream_read_failed": 502, "credit_generation_changed": 502,
+    "credit_upstream_read_failed": 502, "credit_upstream_write_failed": 502,
+    "credit_generation_changed": 502,
     "credit_org_mismatch": 502, "credit_lane_exhausted": 503, "credit_lane_off": 503,
     "credit_lane_cc_body": 400, "credit_lane_fable_off": 400,
 }
@@ -41,8 +42,18 @@ LIVE_BODY = {"type": "error", "error": {
     "type": "credit_upstream_read_failed",
     "message": "upstream read failed after send on sub-vps-12 (TimeoutError); not retried"}}
 EXPECTED = ("🔄 Model fallback (seat timed out): claude-elr/claude-fable-5-2 → "
-            "claude-dtlr/claude-fable-5-2 — relay could not reach Anthropic through "
-            "sub-vps-12 (TimeoutError), not re-sent, 21:28:36")
+            "claude-dtlr/claude-fable-5-2 — no answer from Anthropic through "
+            "sub-vps-12 (TimeoutError), request was sent, not re-sent, 21:28:36")
+
+# claude-pool#470: the upload from the Studio to the seat's box did not finish.
+WRITE_BODY = {"type": "error", "error": {
+    "type": "credit_upstream_write_failed",
+    "message": ("request upload failed on sub-vps-12 (TimeoutError) after 120 s of a 120 s "
+                "limit with 1.7 MB to send; request not fully sent, not retried")}}
+WRITE_EXPECTED = ("🔄 Model fallback (upload timed out): claude-elr/claude-fable-5-2 → "
+                  "claude-dtlr/claude-fable-5-2 — our upload to sub-vps-12 did not finish "
+                  "in 120 s (1.7 MB, Studio to box link; ours, not Anthropic), not re-sent, "
+                  "21:28:36")
 
 
 def _pst(monkeypatch):
@@ -128,6 +139,8 @@ def test_seat_and_exception_read_from_the_message():
     bare = {"error": {"type": "credit_upstream_read_failed",
                       "message": "credit_upstream_read_failed"}}
     assert fbe.credit_lane_seat(bare) is None and fbe.credit_lane_exc(bare) is None
+    assert fbe.credit_lane_upload(WRITE_BODY) == ("120", "1.7")
+    assert fbe.credit_lane_upload(bare) == (None, None)
 
 
 # ── the live 21:28:36 row, end to end ──────────────────────────────────────
@@ -151,11 +164,45 @@ def test_live_dead_letter_body_renders_the_target_banner(_home, monkeypatch):
         time.tzset()
 
 
+def test_upload_failed_body_renders_the_target_banner(_home, monkeypatch):
+    from agent.error_classifier import FailoverReason
+    from tests.agent.test_fallback_rider_truth import _Err
+
+    _pst(monkeypatch)
+    try:
+        _elr_failover(monkeypatch, _Err(WRITE_BODY, 502, {}), FailoverReason.server_error)
+        row = _rows(_home)[0]
+        text = row["notice_text"]
+        print(text)
+        assert text == WRITE_EXPECTED, text
+        assert "ours, not Anthropic" in text
+        assert row["hop"] == "relay→bridge"   # the relay-to-box leg, not proxy→anthropic
+        assert not (_home / "state" / "fallback-unclassified.jsonl").exists()
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
 @pytest.mark.parametrize("code,status,message,head,rider", [
     ("credit_upstream_read_failed", 502,
      "upstream read failed after send on sub-vps-3 (ConnectionResetError); not retried",
      "seat read failed",
-     "relay could not reach Anthropic through sub-vps-3 (ConnectionResetError), not re-sent"),
+     "no answer from Anthropic through sub-vps-3 (ConnectionResetError), request was sent, "
+     "not re-sent"),
+    ("credit_upstream_write_failed", 502,
+     "request upload failed on sub-vps-4 (ConnectionResetError) after 3 s of a 120 s limit; "
+     "request not fully sent, not retried",
+     "upload failed",
+     "our upload to sub-vps-4 did not finish, failed after 3 s of 120 s (Studio to box link; "
+     "ours, not Anthropic), not re-sent"),
+    ("credit_upstream_write_failed", 502,
+     "request upload failed on sub-vps-4 (TimeoutError) with 0.5 MB to send; not retried",
+     "upload timed out",
+     "our upload to sub-vps-4 did not finish (0.5 MB, Studio to box link; ours, not "
+     "Anthropic), not re-sent"),
+    ("credit_upstream_write_failed", 502, None, "upload failed",
+     "our upload to the seat's box did not finish (Studio to box link; ours, not "
+     "Anthropic), not re-sent"),
     ("credit_upstream_read_failed", 502, None, "seat read failed",
      "relay could not read Anthropic's answer (relay sent no seat), not re-sent"),
     ("credit_generation_changed", 502, None, "credit key changed",
@@ -195,8 +242,8 @@ def test_seat_names_off_hides_the_seat():
            "credit_code": "credit_upstream_read_failed", "seat": "sub-vps-12",
            "credit_exc": "TimeoutError", "hop": "relay", "http_status": 502, "ts": TS}
     text = fp.format_cause_rider(row, seat_names=False, tz=UTC)
-    assert text == ("relay could not reach Anthropic through a sub (TimeoutError), "
-                    "not re-sent, 05:28:36"), text
+    assert text == ("no answer from Anthropic through a sub (TimeoutError), "
+                    "request was sent, not re-sent, 05:28:36"), text
 
 
 def test_pool_relay_string_error_is_untouched():
