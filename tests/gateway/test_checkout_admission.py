@@ -1216,6 +1216,62 @@ def test_lease_killed_publisher_expires_after_three_leases(store):
     assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
+def _stall_first_scan(store, mono, stall, during=None):
+    """Make the next scan_records call take ``stall`` seconds on both clocks
+    (the gate's monotonic and the store's mtime clock), once. ``during`` runs
+    inside the stall, before the records are read (a peer writing mid-scan)."""
+    real = store.scan_records
+
+    def slow(name):
+        store.scan_records = real
+        mono.t += stall
+        for key, _sig, _rec in real(name):
+            _age_record(store, name, stall, instance=key)
+        if during is not None:
+            during()
+        return real(name)
+
+    store.scan_records = slow
+
+
+def test_lease_first_sight_anchor_survives_a_stall_in_the_scan(store):
+    """t_142f9fcb: a first-seen peer is aged from its record mtime. A stall
+    between the gate's clock read and the age read must not move the anchor
+    before the peer's write (it cleared 0.3 s early: 2.69 s against 3.0)."""
+    store.hold("op", [SERVE], mode="freeze")
+    mono = _Mono()
+    peer = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0)
+    peer.pid = os.getppid()
+    me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0, monotonic=mono)
+    peer.publish()  # the peer's last write, at mono 1000.0
+    _stall_first_scan(store, mono, 0.3)
+    assert me.publish().get("shared_with")
+    mono.t = 1000.0 + 3.0 - 0.05
+    assert me.publish().get("shared_with"), "cleared before the peer's lease could expire"
+    mono.t = 1000.0 + 3.0 + 0.05
+    assert "shared_with" not in me.publish()
+
+
+def test_lease_known_peer_write_during_a_stalled_scan_is_not_backdated(store):
+    """t_142f9fcb: a known peer that writes after the gate read its clock but
+    before the scan read its record is alive from that read, not from before."""
+    store.hold("op", [SERVE], mode="freeze")
+    mono = _Mono()
+    peer = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0)
+    peer.pid = os.getppid()
+    me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0, monotonic=mono)
+    peer.publish()
+    assert me.publish().get("shared_with")
+    seq = store.read_consumer(SERVE, peer.instance)["lease_seq"]
+    _stall_first_scan(store, mono, 0.3, during=lambda: peer._write(peer._last_record))
+    assert me.publish().get("shared_with")
+    assert store.read_consumer(SERVE, peer.instance)["lease_seq"] > seq  # the peer wrote mid-scan, at mono 1000.3
+    mono.t = 1000.3 + 3.0 - 0.05
+    assert me.publish().get("shared_with"), "cleared before the peer's lease could expire"
+    mono.t = 1000.3 + 3.0 + 0.05
+    assert "shared_with" not in me.publish()
+
+
 def test_lease_released_publisher_clears_at_once(store):
     """A clean stop writes a released record: no wait for expiry."""
     store.hold("op", [SERVE], mode="freeze")
