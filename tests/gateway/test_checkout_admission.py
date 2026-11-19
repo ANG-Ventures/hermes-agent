@@ -1234,6 +1234,21 @@ def _stall_first_scan(store, mono, stall, during=None):
     store.scan_records = slow
 
 
+def _store_clock_on_mono(store, mono, written, stall_at_first_read=0.0):
+    """record_age on the gate's injected clock: a record written at mono
+    ``written`` is ``mono.t - written`` old, so no real time enters the test.
+    ``stall_at_first_read`` seconds pass on that clock at the first age read
+    (after the gate read its clock, before the first-sight age is read)."""
+    state = {"stall": stall_at_first_read}
+
+    def age(name, instance=None):
+        mono.t += state["stall"]
+        state["stall"] = 0.0
+        return mono.t - written
+
+    store.record_age = age
+
+
 def test_lease_first_sight_anchor_survives_a_stall_in_the_scan(store):
     """t_142f9fcb: a first-seen peer is aged from its record mtime. A stall
     between the gate's clock read and the age read must not move the anchor
@@ -1244,7 +1259,26 @@ def test_lease_first_sight_anchor_survives_a_stall_in_the_scan(store):
     peer.pid = os.getppid()
     me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0, monotonic=mono)
     peer.publish()  # the peer's last write, at mono 1000.0
+    _store_clock_on_mono(store, mono, written=1000.0)
     _stall_first_scan(store, mono, 0.3)
+    assert me.publish().get("shared_with")
+    mono.t = 1000.0 + 3.0 - 0.05
+    assert me.publish().get("shared_with"), "cleared before the peer's lease could expire"
+    mono.t = 1000.0 + 3.0 + 0.05
+    assert "shared_with" not in me.publish()
+
+
+def test_lease_first_sight_anchor_survives_a_stall_before_the_age_read(store):
+    """t_142f9fcb (del-597d): the clock is read AFTER the first-sight age, so
+    a stall between the gate's clock read and the age read cannot backdate
+    the anchor (pins ``alive_at = self._mono() - age``)."""
+    store.hold("op", [SERVE], mode="freeze")
+    mono = _Mono()
+    peer = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0)
+    peer.pid = os.getppid()
+    me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=1.0, monotonic=mono)
+    peer.publish()  # the peer's last write, at mono 1000.0
+    _store_clock_on_mono(store, mono, written=1000.0, stall_at_first_read=0.3)
     assert me.publish().get("shared_with")
     mono.t = 1000.0 + 3.0 - 0.05
     assert me.publish().get("shared_with"), "cleared before the peer's lease could expire"
