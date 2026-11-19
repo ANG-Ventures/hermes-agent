@@ -430,7 +430,7 @@ def test_refused_surface_for_merged_pr_leaves_one_card_comment(env, staged):
     assert len(comments) == 1
     assert f"(summarized PR merged: {REPO}#71)" in comments[0]
     assert f"Staged read: {path if path else 'none found'}." in comments[0]
-    assert comments[0].endswith(f"(wake {entry['key']})")
+    assert comments[0].endswith(f"(wake {entry['key']}) (delegation {entry['delegation_id']})")
     assert _claims()[entry["key"]]["outcome"] == "stale"
     assert env["adapter"].handled == [] and env["adapter"].sent == []
     # replay of the same delegation adds nothing
@@ -475,6 +475,8 @@ def _sendback_handback(tid, summary):
     ("done_no_pr", "card done after send-back"),
     # rule (a) wins over an open PR named by the closing handback (Apollo: a done card has nothing left to stamp)
     ("done_open_pr", "card done after send-back"),
+    # the ordinary end of a fix-forward: the PR merges, the card closes, the child answers -> rule (a)
+    ("done_merged_pr", "card done after send-back"),
     # finding 2: one merged + one open PR in the newest handback -> every, not any: delivered
     ("mixed", None),
     # the same PR handed back again and merged: nothing left open -> refused
@@ -489,13 +491,17 @@ def _sendback_handback(tid, summary):
 def test_sendback_surface_refused_only_when_nothing_is_left_open(env, arm, stale):
     """t_e86eeab2 round 2 (Apollo 16:08 11-18): a changes_requested read is refused as finished only when (a) the
     card is done/archived or (b) the newest handback after the send-back names a PR and EVERY PR it names merged.
-    Through the real run entry. RED on e8f1e6d737 for done_no_pr, mixed and done_open_pr."""
+    Through the real run entry. RED on e8f1e6d737 for done_no_pr, mixed and done_open_pr; the one-comment assert
+    (round 3) is RED on fb0b7071e1 for done_no_pr, done_open_pr and done_merged_pr."""
     tid, entry = _sendback_card(env)
     if arm == "done_no_pr":
         _worker_close(tid, summary="all requested work finished, no PR")
     elif arm == "done_open_pr":
         env["health"][(REPO, 72)] = {"state": "open"}
         _worker_close(tid, summary=f"fix-forward PR {REPO}#72 ready")
+    elif arm == "done_merged_pr":
+        env["health"][(REPO, 72)] = {"state": "merged"}
+        _worker_close(tid, summary=f"fix-forward PR {REPO}#72 merged")
     elif arm == "mixed":
         env["health"][(REPO, 72)] = {"state": "open"}
         _sendback_handback(tid, f"PR {REPO}#71 merged; fix-forward PR {REPO}#72 ready")
@@ -515,6 +521,8 @@ def test_sendback_surface_refused_only_when_nothing_is_left_open(env, arm, stale
     if stale:
         assert claim["outcome"] == "stale" and claim["reason"] == stale
         assert env["adapter"].handled == [] and env["adapter"].sent == []
+        # round 3 (Apollo 17:11): a rule (a) refusal writes the same ONE card comment as a merged-PR refusal
+        assert len(_stale_read_comments(tid)) == 1, "a refused send-back read left no trace on the card"
     else:
         assert claim["outcome"] != "stale"
         assert len(env["adapter"].handled) == 1, "the send-back's read did not reach the owner"
@@ -552,7 +560,8 @@ def test_stale_read_comment_survives_a_restart_once(env):
     assert new["key"] == entry["key"] + "#restart1" and new["delegation_id"] != entry["delegation_id"]
     _run(env, new, "completed", _verdict(new, "surface", summary="found a loosened guard after the merge"))
     comments = _stale_read_comments(tid)
-    assert len(comments) == 1 and comments[0].endswith(f"(wake {entry['key']})")
+    assert len(comments) == 1
+    assert comments[0].endswith(f"(wake {entry['key']}) (delegation {entry['delegation_id']})")
     claims = _claims()
     assert claims[entry["key"]]["state"] == ah.STATE_TERMINAL
     assert claims[new["key"]]["state"] == ah.STATE_TERMINAL and claims[new["key"]]["outcome"] == "stale"

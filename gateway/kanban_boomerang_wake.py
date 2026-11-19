@@ -1558,7 +1558,7 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
             # it names merged (below). A later handback naming no PR, or no later handback, refuses nothing.
             status = str(_field(task, "status") or "")
             if status in ("done", "archived"):
-                return f"card {status} after send-back"
+                return f"card {status}{_DONE_REFUSAL}"
             handback = conn.execute(
                 "SELECT payload, run_id FROM task_events WHERE task_id = ? "
                 "AND kind IN ('review_requested', 'completed') AND id > ? ORDER BY id DESC LIMIT 1",
@@ -2084,6 +2084,7 @@ def record_surface(entry: dict, summary: str) -> bool:
 
 
 _MERGED_REFUSAL = "summarized PR merged"
+_DONE_REFUSAL = " after send-back"   # stale_surface_reason rule (a): "card <status> after send-back"
 _STALE_READ_HEAD = f"{MARKER} stale surface refused"
 _PATH_RE = re.compile(r"[\w~./-]+\.(?:md|txt)\b")
 
@@ -2109,23 +2110,26 @@ def _staged_read(entry: dict, texts: list) -> Optional[str]:
 
 
 def record_stale_read(entry: dict, result: dict) -> bool:
-    """t_e86eeab2: ONE card comment when a child's ``surface`` was refused because the PR merged (no chat wake): the
-    read can still hold a finding about what merged, and the refusal otherwise leaves no trace on the card. Names the
-    staged read file and the refusal reason. Keyed by the WAKE (claim key without its ``#restartN`` suffix), not the
-    delegation: a restart redispatch of the same wake mints a new delegation id and must not add a second comment.
-    Any other refusal or action writes nothing."""
+    """t_e86eeab2: ONE card comment when a child's ``surface`` was refused because the PR merged, or (round 3) because
+    the card was done/archived after a send-back (no chat wake): the read can still hold a finding about what merged,
+    and the refusal otherwise leaves no trace on the card. Names the staged read file and the refusal reason. Ends
+    ``(wake <key>) (delegation <id>)``: deduped on the WAKE (claim key without its ``#restartN`` suffix), since a
+    restart redispatch of the same wake mints a new delegation id; the delegation id stays as the pointer to the
+    child's folder and transcript. Any other refusal or action writes nothing."""
     reason = str(result.get("reason") or "")
-    if result.get("action") != "surface" or not reason.startswith(_MERGED_REFUSAL):
+    if result.get("action") != "surface" or not (
+            reason.startswith(_MERGED_REFUSAL) or (reason.startswith("card ") and reason.endswith(_DONE_REFUSAL))):
         return False
     from hermes_cli import kanban_db as kb
 
-    tag = f"(wake {str(entry['key']).split('#restart', 1)[0]})"
+    wake = f"(wake {str(entry['key']).split('#restart', 1)[0]}) (delegation "
+    tag = f"{wake}{entry['delegation_id']})"
     staged = _staged_read(entry, [result.get("detail"), *(result.get("evidence") or []), result.get("summary")])
     body = (f"{_STALE_READ_HEAD} ({reason}); the child's read was not delivered. "
             f"Staged read: {staged or 'none found'}. Child said: {result.get('summary') or 'no summary'} {tag}")
     conn = kb.connect(board=entry.get("board"))
     try:
-        if any(c.author == AUTHOR and c.body.startswith(_STALE_READ_HEAD) and c.body.endswith(tag)
+        if any(c.author == AUTHOR and c.body.startswith(_STALE_READ_HEAD) and wake in c.body
                for c in kb.list_comments(conn, entry["task_id"])):
             return False
         with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
