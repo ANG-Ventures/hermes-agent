@@ -660,9 +660,9 @@ def _log(row: dict) -> None:
 
 
 def plain_clone(url: str, dest: str, branch: Optional[str] = None, rev: Optional[str] = None,
-                quiet: bool = True) -> int:
+                quiet: bool = True, extra: Sequence[str] = ()) -> int:
     """Today's path: ``hermes kanban clone`` (+ ``checkout --detach <rev>``)."""
-    opts = (["--quiet"] if quiet else []) + ([f"--branch={branch}"] if branch else [])
+    opts = (["--quiet"] if quiet else []) + ([f"--branch={branch}"] if branch else []) + list(extra)
     # kanban_clone.clone borrows from the same mirror (a local source's origin names it): only when
     # that mirror is never-prune does the clone keep the alternate (Prism 1484b4563429).
     local = kanban_clone.local_source(url)
@@ -682,19 +682,25 @@ def _rm(path: Optional[Path]) -> None:
 
 
 def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional[str] = None,
-          rev: Optional[str] = None, quiet: bool = True, s: Optional[Settings] = None) -> int:
+          rev: Optional[str] = None, quiet: bool = True, s: Optional[Settings] = None,
+          served_opts: Sequence[str] = ()) -> int:
     """Clone mode (spec 5.3/5.4): an independent clone borrowing from the mirror whose
-    working files come from the template. Same exit code as the git command it replaces."""
+    working files come from the template. Same exit code as the git command it replaces.
+
+    *served_opts* are caller options a full template copy already satisfies (``--filter=blob:none``):
+    the cached path ignores them and logs them, a plain-git fallback forwards them unchanged."""
     s = s or settings()
     dest = dest or kanban_clone.default_dest(url)
     if not cache_active(caller, s):
-        return plain_clone(url, dest, branch, rev, quiet)
+        return plain_clone(url, dest, branch, rev, quiet, served_opts)
 
     t0 = time.monotonic()
     dest_p = Path(dest).absolute()
     slug = repo_slug(url)
     row = {"ts": round(time.time(), 3), "caller": caller, "repo": slug, "mode": "clone", "dest": str(dest_p),
            "cow": False, "reason": None, "T": None, "C": None, "bytes_logical": None}
+    if served_opts:
+        row["opts_served"] = list(served_opts)
     gen: Optional[Path] = None
     staging: Optional[Path] = None
 
@@ -703,13 +709,13 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
         meta = read_meta(gen) if gen else None
         nbytes = (meta or {}).get("tree_bytes")
         record_fallback(caller, reason, slug, gen, dest_p, err=err, nbytes=nbytes)
-        rc = plain_clone(url, dest, branch, rev, quiet)
+        rc = plain_clone(url, dest, branch, rev, quiet, served_opts)
         row.update(reason=reason, bytes_logical=nbytes, rc=rc, ms=round((time.monotonic() - t0) * 1000))
         _log(row)
         return rc
 
     if dest_p.exists() and (not dest_p.is_dir() or any(dest_p.iterdir())):
-        return plain_clone(url, dest, branch, rev, quiet)     # git reports the real error
+        return plain_clone(url, dest, branch, rev, quiet, served_opts)     # git reports the real error
     if slug is None or slug not in s.repos:
         return fallback("no_template")
     rdir = repo_dir(slug)
@@ -853,10 +859,14 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
 
 # --------------------------------------------------------------------------- callers (build card 3)
 
-# `hermes kanban clone` options the cache reproduces exactly: everything else (a shallow or
-# filtered clone, --no-checkout, --single-branch, --origin, ...) asks for a .git the cache does
+# `hermes kanban clone` options the cache reproduces exactly: everything else (a shallow clone, a
+# filter other than blob:none, --no-checkout, --single-branch, --origin, ...) asks for a .git the cache does
 # not make, so it runs plain git with an ``unsupported_opts`` row.
 _KANBAN_CLONE_OK = ("--quiet",)
+# Options a full template copy satisfies: a blob:none partial clone is a strict subset of the
+# full-object clone the cache registers (same refs, same history; blobs present, not lazy).
+# Served from the cache and logged as ``opts_served``; a fallback forwards them to plain git.
+_KANBAN_CLONE_SERVED = ("--filter=blob:none",)
 
 
 def kanban_clone_entry(url: str, dest: Optional[str], git_opts: Sequence[str] = (),
@@ -868,9 +878,12 @@ def kanban_clone_entry(url: str, dest: Optional[str], git_opts: Sequence[str] = 
         return kanban_clone.clone(url, dest, git_opts)
     branch: Optional[str] = None
     other = []
+    served = []
     for opt in git_opts:
         if opt.startswith("--branch="):
             branch = opt.split("=", 1)[1]
+        elif opt in _KANBAN_CLONE_SERVED:
+            served.append(opt)
         elif opt not in _KANBAN_CLONE_OK:
             other.append(opt)
     if other:
@@ -879,7 +892,8 @@ def kanban_clone_entry(url: str, dest: Optional[str], git_opts: Sequence[str] = 
         _log({"ts": round(time.time(), 3), "caller": "kanban_clone", "repo": repo_slug(url), "mode": "clone",
               "dest": str(target), "cow": False, "reason": "unsupported_opts", "opts": other})
         return kanban_clone.clone(url, dest, git_opts)
-    return clone(url, dest, caller="kanban_clone", branch=branch, quiet="--quiet" in git_opts, s=s)
+    return clone(url, dest, caller="kanban_clone", branch=branch, quiet="--quiet" in git_opts, s=s,
+                 served_opts=served)
 
 
 # --------------------------------------------------------------------------- status + CLI
