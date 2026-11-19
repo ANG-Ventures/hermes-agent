@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Iterable
@@ -61,20 +62,31 @@ def control_sockets(plain: Path) -> list[Path]:
 _RUN_MARK = "hermes-run-"
 
 
+def _run_pidfile(token: str) -> str:
+    return f"/tmp/.{_RUN_MARK}{token}.pid"
+
+
+def _run_preamble(token: str) -> str:
+    """First lines of every remote command: record the ``bash -c`` pid (= its process group, as
+    sshd starts each command in its own session) where the kill path can find it. A file, not the
+    argv: a top-level ``exec`` replaces the argv but keeps the pid and the group."""
+    f = _run_pidfile(token)
+    return f": {_RUN_MARK}{token}\necho $$ >| {f} 2>/dev/null; trap 'rm -f {f}' EXIT\n"
+
+
 def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
-    """Remote ``sh`` that signals the process group of the ``bash -c`` carrying ``token``
-    (TERM, 1 s, KILL; KILL only without ``grace``). sshd starts each command in its own
-    session, so the group holds every descendant incl. ``cmd &`` children. The pattern is
-    anchored on ``bash -c : <mark><token>``: the killer itself and the local ssh client
-    carry the token too but never match. A pid whose group is 0/1/our own is signalled alone."""
+    """Remote ``sh`` that signals the process group of the command that wrote ``token``'s pidfile
+    (TERM, 1 s, KILL; KILL only without ``grace``), so ``cmd &`` children die too. A pid that is
+    not its own group leader is signalled alone. No pidfile (the command already exited) = no-op."""
     sigs = "TERM KILL" if grace else "KILL"
+    f = _run_pidfile(token)
     script = (
-        f"pat='^bash( -l)? -c : {_RUN_MARK}{token}'; self=$(ps -o pgid= -p $$ | tr -d ' '); "
-        f"for sig in {sigs}; do found=; "
-        "for p in $(pgrep -f \"$pat\"); do g=$(ps -o pgid= -p \"$p\" | tr -d ' '); "
-        "case \"$g\" in ''|0|1|\"$self\") kill -s $sig \"$p\" 2>/dev/null;; "
-        "*) kill -s $sig -- \"-$g\" 2>/dev/null;; esac; found=1; done; "
-        "[ -n \"$found\" ] || exit 0; [ $sig = TERM ] && sleep 1; done; exit 0")
+        f"p=$(cat {f} 2>/dev/null); rm -f {f}; "
+        "case \"$p\" in ''|*[!0-9]*) exit 0;; esac; "
+        "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); [ -n \"$g\" ] || exit 0; "
+        "[ \"$g\" = \"$p\" ] && t=\"-$g\" || t=\"$p\"; "
+        f"for sig in {sigs}; do kill -s $sig -- \"$t\" 2>/dev/null || exit 0; "
+        "[ $sig = TERM ] && sleep 1; done; exit 0")
     return "sh -c " + shlex.quote(script)
 
 
@@ -353,7 +365,7 @@ class SSHEnvironment(BaseEnvironment):
         values, unset_names = resolve_passthrough_env(explicit_forward=_placed_lease_env_names(),
                                                       hermes_env_loader=_load_hermes_env_vars)
         token = uuid.uuid4().hex
-        remote = f": {_RUN_MARK}{token}\n" + prepend_unset(cmd_string, unset_names)
+        remote = _run_preamble(token) + prepend_unset(cmd_string, unset_names)
         cmd = self._build_ssh_command(send_env=values, log_to_file=True) + bash_argv(shlex.quote(remote), login)
         client_env = client_env_with(values)
         proc = _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
@@ -361,25 +373,28 @@ class SSHEnvironment(BaseEnvironment):
         return proc
 
     def _kill_process(self, proc):
-        """Kill the REMOTE command's process group, then the local ssh client. Killing only the
+        """Kill the local ssh client, then the REMOTE command's process group. Killing only the
         client leaves the remote ``bash -c`` tree running: without a pty sshd sends it no
         signal, so a silent ``grep -r`` ran on for 30+ h after its tool call timed out (t_44017fbc)."""
-        if token := getattr(proc, "_hermes_run_token", None):
-            try:
-                self._run_ssh(_remote_group_kill_command(token), timeout=15)
-            except Exception:
-                logger.debug("SSH: remote process-group kill failed", exc_info=True)
         super()._kill_process(proc)
+        if token := getattr(proc, "_hermes_run_token", None):
+            self._remote_group_kill(token, grace=True)
 
     def _force_kill_process(self, proc):
-        """Hard-exit path, must not block: fire a KILL-only remote kill in its own session (it
-        outlives our exit) and kill the client."""
-        if token := getattr(proc, "_hermes_run_token", None):
-            with contextlib.suppress(Exception):
-                subprocess.Popen(self._build_ssh_command() + [_remote_group_kill_command(token, grace=False)],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        """Hard-exit path: the client dies inline; the KILL-only remote kill runs on a daemon
+        thread given 0.25 s to start its ssh child, which then finishes it after this process exits."""
         super()._kill_process(proc)
+        if token := getattr(proc, "_hermes_run_token", None):
+            t = threading.Thread(target=self._remote_group_kill, args=(token,), kwargs={"grace": False},
+                                 daemon=True)
+            t.start()
+            t.join(0.25)
+
+    def _remote_group_kill(self, token: str, *, grace: bool) -> None:
+        try:
+            self._run_ssh(_remote_group_kill_command(token, grace=grace), timeout=5)
+        except Exception:
+            logger.debug("SSH: remote process-group kill failed", exc_info=True)
 
     def cleanup(self):
         if self._sync_manager:

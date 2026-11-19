@@ -1,10 +1,10 @@
 """Tests for the SSH remote execution environment backend."""
 
+import contextlib
 import json
 import os
-import shutil
+import shlex
 import subprocess
-import sys
 import uuid
 from unittest.mock import MagicMock
 
@@ -134,80 +134,96 @@ class TestBuildSSHCommand:
         assert captured["env"] is None
 
     def test_run_bash_tags_remote_command_with_its_run_token(self, monkeypatch):
-        """t_44017fbc: the remote ``bash -c`` must be findable by the kill path."""
+        """t_44017fbc: the remote ``bash -c`` records its pid where the kill path can find it."""
         env = SSHEnvironment(host="h", user="u")
         proc = MagicMock()
         captured = {}
         monkeypatch.setattr(ssh_env, "_popen_bash", lambda cmd, stdin_data=None, **kw: captured.update(cmd=cmd) or proc)
         assert env._run_bash("echo ok") is proc
-        assert proc._hermes_run_token and len(proc._hermes_run_token) == 32
+        token = proc._hermes_run_token
+        assert token and len(token) == 32
         assert captured["cmd"][-3:-1] == ["bash", "-c"]
-        assert captured["cmd"][-1].startswith(f"': hermes-run-{proc._hermes_run_token}\n")
+        assert captured["cmd"][-1].startswith(shlex.quote(ssh_env._run_preamble(token))[:-1])
+        assert ssh_env._run_pidfile(token) in ssh_env._run_preamble(token)
 
-    def test_kill_process_kills_the_remote_group_then_the_client(self, monkeypatch):
+    def test_kill_process_kills_the_client_then_the_remote_group(self, monkeypatch):
         """t_44017fbc: killing only the local ssh client left the remote tree running for 30+ h."""
         env = SSHEnvironment(host="h", user="u")
         order = []
         proc = MagicMock(_hermes_run_token="ab12")
         proc.kill.side_effect = lambda: order.append("client")
-        monkeypatch.setattr(env, "_run_ssh", lambda remote, timeout: order.append(remote))
+        monkeypatch.setattr(env, "_run_ssh", lambda remote, timeout: order.append((remote, timeout)))
         env._kill_process(proc)
-        assert order[1] == "client" and len(order) == 2
-        assert order[0].startswith("sh -c ") and "hermes-run-ab12" in order[0] and "TERM KILL" in order[0]
+        assert order[0] == "client" and len(order) == 2
+        remote, timeout = order[1]
+        assert timeout <= 5
+        assert remote.startswith("sh -c ") and ssh_env._run_pidfile("ab12") in remote and "TERM KILL" in remote
 
-    def test_force_kill_fires_a_kill_only_remote_kill_without_waiting(self, monkeypatch):
+    def test_force_kill_runs_a_kill_only_remote_kill_off_thread(self, monkeypatch):
         env = SSHEnvironment(host="h", user="u")
-        spawned = []
-        monkeypatch.setattr(ssh_env.subprocess, "Popen", lambda argv, **kw: spawned.append((argv, kw)))
-        monkeypatch.setattr(env, "_run_ssh", lambda *a, **k: pytest.fail("force kill must not block on ssh"))
+        seen = []
+        monkeypatch.setattr(env, "_run_ssh", lambda remote, timeout: seen.append(remote))
         proc = MagicMock(_hermes_run_token="ab12")
         env._force_kill_process(proc)
-        (argv, kw), = spawned
-        assert kw["start_new_session"] is True
-        assert "hermes-run-ab12" in argv[-1] and "for sig in KILL;" in argv[-1]
         proc.kill.assert_called_once()
+        (remote,) = seen
+        assert ssh_env._run_pidfile("ab12") in remote and "for sig in KILL;" in remote
 
 
-@pytest.mark.skipif(os.name == "nt" or not shutil.which("pgrep"), reason="POSIX remote shell + pgrep")
-def test_remote_group_kill_reaps_the_tree_and_spares_token_lookalikes():
+def _group_sleeps(pgid):
+    import psutil
+    out = []
+    for p in psutil.process_iter(["name"]):
+        try:
+            if p.info["name"] == "sleep" and os.getpgid(p.pid) == pgid:
+                out.append(p)
+        except (ProcessLookupError, psutil.Error):
+            pass
+    return out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+@pytest.mark.parametrize("body", ["(sleep 600 &); sleep 601 & sleep 602; true", "sleep 601 & exec sleep 602"],
+                         ids=["background-grandchild", "top-level-exec"])
+def test_remote_group_kill_reaps_the_whole_tree(body):
     """t_44017fbc: run the real remote kill script against a ``bash -c`` started the way sshd starts
-    it (own session). Every sleep dies, incl. a ``(cmd &)`` grandchild already re-parented to init;
-    a process that merely carries the token (the local ssh client, the killer) is left alone."""
-    import random
+    it (own session). Every sleep in its group dies, incl. a ``(cmd &)`` grandchild re-parented to
+    init and a top-level ``exec`` that replaced the tagged bash; the pidfile is removed."""
     import time
 
-    import psutil
-
-    token, base = uuid.uuid4().hex, random.randint(40000, 49000)
-    script = f": {ssh_env._RUN_MARK}{token}\n(sleep {base} &); sleep {base + 1} & sleep {base + 2}; true"
-    tree = subprocess.Popen(["bash", "-c", script], start_new_session=True,
+    token = uuid.uuid4().hex
+    tree = subprocess.Popen(["bash", "-c", ssh_env._run_preamble(token) + body], start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    lookalike = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
-                                  f"ssh u@h bash -c : {ssh_env._RUN_MARK}{token}"], start_new_session=True)
-
-    def sleeps():
-        want = {str(base + i) for i in range(3)}
-        return [p for p in psutil.process_iter(["cmdline"])
-                if (p.info["cmdline"] or [])[:1] == ["sleep"] and p.info["cmdline"][-1] in want]
+    want = 3 if body.startswith("(") else 2
     try:
         deadline = time.monotonic() + 10
-        while len(sleeps()) < 3 and time.monotonic() < deadline:
+        while len(_group_sleeps(tree.pid)) < want and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert len(sleeps()) == 3
+        assert len(_group_sleeps(tree.pid)) == want
+        assert os.path.exists(ssh_env._run_pidfile(token))
         rc = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=30).returncode
         assert rc == 0
         tree.wait(timeout=5)
         deadline = time.monotonic() + 5
-        while sleeps() and time.monotonic() < deadline:
+        while _group_sleeps(tree.pid) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert sleeps() == []
-        assert lookalike.poll() is None
+        assert _group_sleeps(tree.pid) == []
+        assert not os.path.exists(ssh_env._run_pidfile(token))
     finally:
-        for p in sleeps():
+        for p in _group_sleeps(tree.pid):
             p.kill()
-        for p in (tree, lookalike):
-            p.kill()
-            p.wait()
+        tree.kill()
+        tree.wait()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(ssh_env._run_pidfile(token))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_finished_command_leaves_no_pidfile_and_kill_is_a_noop():
+    token = uuid.uuid4().hex
+    subprocess.run(["bash", "-c", ssh_env._run_preamble(token) + "true"], check=True, timeout=10)
+    assert not os.path.exists(ssh_env._run_pidfile(token))
+    assert subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=10).returncode == 0
 
 
 class TestControlSocketPath:
