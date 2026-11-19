@@ -1,6 +1,6 @@
 2026-10-18 20:00:00,100 INFO gateway.run: Gateway running with 5 platform(s)
 2026-10-18 20:01:05,200 INFO gateway.kanban_watchers: kanban notifier: boomerang-wake t_5m0ce001 disposition=auto
-2026-10-18 20:01:05,300 INFO gateway.kanban_watchers: kanban notifier: delivered blocked event for t_5m0ce002 (surface)
+2026-10-18 20:01:05,300 INFO gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake t_5m0ce002 disposition=auto row=blocked_assess path=notifier delegation=deleg_s1b0001
 2026-10-18 20:01:06,000 INFO gateway.kanban_watchers: kanban notifier: boomerang-wake t_5m0ce003 disposition=auto
 2026-10-18 20:01:29,000 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: boomerang-wake superseded t_5m0ce003: card moved to done before the wake ran; original wake re-delivered
 2026-10-18 20:01:30,000 INFO gateway.run: inbound message: platform=discord user=fixture-user chat=1561469136796782633 msg='[kanban] Task t_5m0ce003 completed. Title: bv2 smoke s1: forced child failure' reply_to_id=None reply_to_text=''

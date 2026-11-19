@@ -13,10 +13,10 @@ tool: `tools/dev_probes/` has no `__init__.py`, so tool discovery never imports 
 
 | Step | Acceptance | What it does | Needs Apollo |
 |---|---|---|---|
-| 1 | AC-7, INV-5, INV-6 | Mints 3 cards on the scratch board (level `boomerang wake`, origin chat subscribed `notify+wake`, set by `edit --boomerang-wake`), forces `completed` / `blocked --kind needs_input` / (optional) a forced child failure through the kanban CLI, then reads the origin chat and gateway log for `boomerang handled <card> (<kind>): <summary>` (the gateway's handback line), `kanban notifier: boomerang-wake <card> disposition=auto`, no boomerang wake on the needs_input card, and (fault) a `boomerang-wake superseded <card>: card moved to <status> before the wake ran` log line with NO `warning boomerang-wake failed <card>` line in the origin chat. | no |
+| 1 | AC-7, blocked_assess, INV-6 | Mints 3 cards on the scratch board (level `boomerang wake`, origin chat subscribed `notify+wake`, set by `edit --boomerang-wake`), forces `completed` / `blocked --kind needs_input` / (optional) a forced child failure through the kanban CLI, then reads the handled receipt (see *Handled receipt* below) for `boomerang handled <card> (<kind>): <summary>` (the gateway's handback line), the gateway log for `kanban notifier: boomerang-wake <card> disposition=auto`, for the needs_input card a `boomerang handled <card> (blocked_assess): ...` receipt and `disposition=auto row=blocked_assess` and its claim (state file or `.terminal.jsonl` archive under `BV2_WAKE_STATE`) terminal with an outcome in the gateway's `HANDLED_OUTCOMES` (a failed assessment logs the same row and receipt; since #104/#309 every `blocked` event is boomerang-woken to assess the block, `gateway/kanban_wake_disposition.py` row 1; the old INV-5 "needs_input must surface" no longer holds), and (fault) a `boomerang-wake superseded <card>: card moved to <status> before the wake ran` log line with NO `warning boomerang-wake failed <card>` line in the origin chat (INCOMPLETE when the fault-card claim closed handled instead: that row cannot pass since #425, see *Before the live run*). | no |
 | 2 | AC-8, INV-7 | Kill switches. Precondition: no `<root>/state/boomerang-wake.disabled` stop file and `fork_enabled: true` (or unset). Prints the one-line change, waits for the ack, re-reads config / the stop file, forces an event, asserts `boomerang.fork_ineligible reason=fork_enabled` (fork off) and no boomerang wake within one tick (stop file present). Then asks for the restore. | **yes: 3 changes** (`fork_enabled=false`, `boomerang_wake=disabled` = touch the stop file, `restore`) |
 | 3 | AC-9, INV-8 | Sends a canary request (positive control, below), forces one fork turn (or observes one with `--no-trigger`), waits for `boomerang.fork served_by=<seat>`, then scans the relay wire capture (relay-wire-forensics JSONL, `req.headers` / `req.headerOrder`) for any `x-hermes-*` header. Zero captured records is INCOMPLETE, never PASS. | no |
-| 4 | AC-11, 5.7 | Restart drill observer, two arms, one gateway restart each. **Redispatch arm** (retry unspent, t_870c1fba): forces an event, waits for the boomerang-wake dispatch, asks for the restart, then waits for a fresh boot line after the dispatch, the old boot's INFO `kanban boomerang-wake: <card> child interrupted by gateway shutdown; claim left open` line (the drain timed out with the child mid-call, t_abf5cae7; absent = INCOMPLETE; see *Step 4: making the drain interrupt the child* below) with ZERO `warning boomerang-wake failed <card>` lines, the INFO `kanban boomerang-wake: <card> redispatched after gateway restart (retry 1/1) delegation=<new>` line within the first-tick window, the `<key>#restartN` claim of delegation `<new>` terminal in `BV2_WAKE_STATE` with an outcome in the gateway's own `HANDLED_OUTCOMES` (imported from `gateway/kanban_boomerang_wake.py`; `surfaced` counts, `failed`/`lost`/none in the window FAIL; the evidence names the outcome), `boomerang handled <card> (<kind>): <summary>` or `[boomerang-wake] child surfaced <card> (...)` after the restart, and ZERO `warning boomerang-wake lost <card>` lines. **Fallback arm** (retry pre-spent: the harness writes `restart_spent[<card>]=1` (the restart retry; `retries` is untouched) into `BV2_WAKE_STATE` once the child is `running`): `lost reason=gateway restart, retry spent resurfaced delivered=True` in the log within the first tick, `warning boomerang-wake lost <card> (reason: gateway restart, retry spent)` in the origin chat, no redispatch, no late `boomerang handled <card>` line. It never restarts anything. | **yes: 2 gateway restarts** (`restart`, once per arm) |
+| 4 | AC-11, 5.7 | Restart drill observer, two arms, one gateway restart each. **Redispatch arm** (retry unspent, t_870c1fba): forces an event, waits for the boomerang-wake dispatch, asks for the restart, then waits for a fresh boot line after the dispatch, the old boot's INFO `kanban boomerang-wake: <card> child interrupted by gateway shutdown; claim left open` line (the drain timed out with the child mid-call, t_abf5cae7; absent = INCOMPLETE; see *Step 4: making the drain interrupt the child* below) with ZERO `warning boomerang-wake failed <card>` lines, the INFO `kanban boomerang-wake: <card> redispatched after gateway restart (retry 1/1) delegation=<new>` line within the first-tick window, the `<key>#restartN` claim of delegation `<new>` terminal in `BV2_WAKE_STATE` with an outcome in the gateway's own `HANDLED_OUTCOMES` (imported from `gateway/kanban_boomerang_wake.py`; `surfaced` counts, `failed`/`lost`/none in the window FAIL; the evidence names the outcome), the handled receipt `boomerang handled <card> (<kind>): <summary>` or the chat's `[boomerang-wake] child surfaced <card> (...)` after the restart, and ZERO `warning boomerang-wake lost <card>` lines. **Fallback arm** (retry pre-spent: the harness writes `restart_spent[<card>]=1` (the restart retry; `retries` is untouched) into `BV2_WAKE_STATE` once the child is `running`): `lost reason=gateway restart, retry spent resurfaced delivered=True` in the log within the first tick, `warning boomerang-wake lost <card> (reason: gateway restart, retry spent)` in the origin chat, no redispatch, no late `boomerang handled <card>` line. It never restarts anything. | **yes: 2 gateway restarts** (`restart`, once per arm) |
 
 The harness never edits config or the stop file, never restarts the gateway, and refuses any board whose slug
 does not match `^bv2-smoke`. Its one state write is step 4's fallback arm: `restart_spent[<card>]=1` (restart retry) into
@@ -54,10 +54,37 @@ How the shutdown interrupt reaches a boomerang child, read from the code on main
   reply S4-HOLD-DONE" for the card's deliverable (`request_changes` on the done fixture card). The hold
   therefore never names the card: `s4_hold_turn` gets `{chat}` only, a `{card}` in it FAILs the arm
   unsent, and the lane's message says it is harness scaffolding that later turns must ignore.
+- The child must still be mid-call when the drain times out. With the lane's
+  `agent.restart_drain_timeout: 20` a forked child that decides in ~20 s finishes inside the drain
+  (three runs on 11-19, t_9f0d174a: verdict at SIGTERM+10 s, interrupt at +20 s, arm INCOMPLETE);
+  with `restart_drain_timeout: 5` in the scratch config the same arm PASSed (interrupt at +5 s).
 - Without `s4_hold_turn` in the plan the arm records INCOMPLETE up front. If the hold turn is held
   but the shutdown line is still absent, read the old boot's `drain done ... timed_out=` line and the
   `PHASE=drain_timeout_turn` lines: a timed-out drain with no shutdown line is a #283 defect (the
   interrupt did not reach the child, or the claim closed as failed), not a harness gap.
+
+## Handled receipt (hermes-agent#439)
+
+Since #439 (t_8ab5557d) the gateway writes `boomerang handled <card> (<kind>): <summary>` to the
+fleet agent log (`<fleet root>/state/agent-logs/<UTC day>.jsonl`, a row with `producer: boomerang-wake`),
+not to the origin chat, unless `<HERMES_HOME>/state/boomerang-handled-line-chat.enabled` exists. The
+fleet root is the nearest ancestor of `HERMES_HOME` holding `scripts/lib/agent_inbox.py` (the
+writer's own lookup; `NOTIFY_AGENT_LOG_DIR` overrides, `BV2_AGENT_LOG_DIR` overrides both); the knob
+is home-local. On the puppet lane the scratch gateway needs a fleet root to write the row at all:
+run the lane with `PUPPET_LANE_SCRATCH=<dir>` where `<dir>/scripts/lib/agent_inbox.py` exists, and point
+`BV2_AGENT_LOG_DIR` at `<dir>/state/agent-logs` (with no fleet root the gateway posts the line to the
+chat, which still counts). The harness follows the same knob (`BV2_HANDLED_KNOB`):
+
+- **Knob absent (default):** a `boomerang-wake` agent-log row since the step started passes; no
+  chat line is expected. A chat line still counts (the gateway posts it when no agent log is
+  available, or a surfaced turn was refused). The blocked_assess receipt and the negative checks
+  (step 4's late line) read both. The evidence marks an agent-log hit `[agent-log] ...`.
+- **Knob present:** the line is required in the origin chat; agent-log rows are ignored.
+
+Only `boomerang handled` rows are read from the agent log; every warning (`failed`, `lost`) is
+still a chat line. The dry-run fixtures keep the pre-#439 transcript, so the fixture knob
+(`fixtures/fake_boomerang-handled-line-chat.enabled`) is present; `fixtures/fake_agent_logs/` holds
+the same receipts as agent-log rows for the knob-absent tests.
 
 ## Ack mechanism
 
@@ -88,6 +115,8 @@ A non-zero exit is a FAIL for that ack, never a pass. Dry-run ignores it.
 | Variable | Meaning | Default |
 |---|---|---|
 | `BV2_HOME_SESSION` | home session stamped on the cards (the test channel's gateway session) | required live |
+| `BV2_HANDLED_KNOB` | the gateway's `boomerang-handled-line-chat.enabled` knob file (see *Handled receipt*) | `<HERMES_HOME>/state/boomerang-handled-line-chat.enabled` (dry-run: the fixture, present) |
+| `BV2_AGENT_LOG_DIR` | fleet agent log dir (`<UTC day>.jsonl`) read for the handled receipt when the knob is absent | `<fleet root>/state/agent-logs` (see *Handled receipt*; dry-run: `fixtures/fake_agent_logs`) |
 | `BV2_ORIGIN_CHAT` | Discord test-channel id (REST read, `DISCORD_BOT_TOKEN` from the gateway `.env`, GET only) or a capture file | required live |
 | `BV2_SCRATCH_BOARD` | scratch board slug | `bv2-smoke` |
 | `BV2_KANBAN_CMD` | kanban CLI prefix | `hermes kanban` |
@@ -149,8 +178,11 @@ Two contract gaps are parameters, not code:
   into the home session, which stays live. Step 1 then asserts that line, no chat warning, a
   `inbound message: ... msg='[kanban] Task <card>` turn in the gateway log, and no
   `no live home for <card>` line. The old fault (`edit --session <bogus>`) proved only the warning.
-  If the child finishes before the comment lands the check is INCOMPLETE; give the card a slow
-  body with `commands.s1_fault_hold`. `null` = SKIP live.
+  **Since #425 this row cannot pass on the plan's fault** (Apollo ruling
+  `t_9f0d174a-superseded-row-out-of-scope`): `_moved_noise` drops an unattributed `kanban comment`
+  (actor session NULL), so a write verdict is not refused, and a `surface` verdict returns before
+  the freshness check anyway. When the fault card's claim closes with a handled outcome the row reads
+  INCOMPLETE with that outcome, never FAIL, and the re-surface row is INCOMPLETE too. `null` = SKIP live.
 - `expect.resurface_log_regex` is a guess (5.7 names `deliver_wake` and the chat line, not a log
   line). Tune it to the line P3 emits.
 
