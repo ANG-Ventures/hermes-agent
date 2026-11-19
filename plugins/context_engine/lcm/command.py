@@ -54,6 +54,7 @@ from .assertion_store import AssertionSchemaUnavailableError, AssertionStore
 from . import rollup_builder
 from .rollup_store import RollupStore
 from .session_patterns import build_session_match_keys, matches_session_pattern
+from .sqlite_util import connect_read
 from .store import build_message_fts_spec
 from .chunking import (
     VALID_CONTENT_POLICIES,
@@ -1035,7 +1036,7 @@ def _classify_schema_stamp(db_path: Path) -> dict[str, Any]:
     so this uses a fresh read-only connection keyed on the path rather than the
     engine's own connection.
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_read(f"file:{db_path}?mode=ro", uri=True)
     try:
         return remediate_interim_schema_stamp(conn, apply=False)
     finally:
@@ -2814,7 +2815,7 @@ def _embedding_warmup_text(engine) -> str:
 def _embedding_read_connection(db_path: str | Path) -> sqlite3.Connection:
     """Open the existing database without allowing a dry run to create it."""
     uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn = connect_read(uri, uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
     return conn
 

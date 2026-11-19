@@ -800,6 +800,22 @@ def _show(root: Path, ref: str, rel: str, _seen=()):
     return text
 
 
+def _moved_from(root: Path, ref: str) -> dict:
+    """{new path: source path at ref} for files git sees as renamed or copied between ref and the work tree."""
+    p = subprocess.run(["git", "-C", str(root), "diff", "--no-ext-diff", "--find-copies", "--name-status", "-z", ref],
+                       capture_output=True, env=_git_env())
+    if p.returncode != 0:
+        raise ScanError(f"--base-ref {ref}: rename detection failed ({p.stderr.decode(errors='replace').strip()})")
+    fields, out, i = p.stdout.decode("utf-8", "surrogateescape").split("\0"), {}, 0
+    while i < len(fields) and fields[i]:
+        if fields[i][0] in "RC":
+            out[fields[i + 2]] = fields[i + 1]
+            i += 3
+        else:
+            i += 2
+    return out
+
+
 def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
     """The baseline may only go DOWN against the PR base (t_22955b73). A row added or raised is allowed only up to the
     hits that file ALREADY had in the base tree (recording code that is on main, never code this PR adds)."""
@@ -823,11 +839,14 @@ def baseline_drift(root: Path, ref: str, head_doc: dict) -> list:
     if "." not in h_scan and set(b_scan) - set(h_scan):
         bad.append(f"scan narrowed against base: {sorted(set(b_scan) - set(h_scan))}")
     b_files = base_doc.get("files", {})
+    moved = _moved_from(root, ref)
     for rel, n in sorted(head_doc.get("files", {}).items()):
         was = b_files.get(rel)
         if was is not None and n <= was:
             continue
         text = _show(root, ref, rel)
+        if text is None and rel in moved:  # a rename/copy (t_7be48220): the moved code was on main under its old name
+            text = _show(root, ref, moved[rel])
         on_base = hits_in(text, _lang_of_text(rel, text.encode("utf-8", "replace"))) if text is not None else 0
         if n <= on_base:
             continue                  # code already on main, now recorded

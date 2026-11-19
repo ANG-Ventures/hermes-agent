@@ -58,7 +58,7 @@ async def test_mid_turn_steered_message_is_not_replayed_by_backfill(_tmp_home):
     channel._messages = [msg]
     session_id = _seed_session_for_channel(adapter, store, db, channel, author)
 
-    row = steer_user_row(_steer_payload(msg.id, channel.id, "the hotspot keeps dropping"))
+    row = steer_user_row(_steer_payload(msg.id, channel.id, "the hotspot keeps dropping"), agent=None)
     db.append_message(session_id=session_id, role="user", content=row["content"],
                       display_kind=row["display_kind"])
     assert db.has_platform_message_id(session_id, str(msg.id)) is False  # the gap: no column id
@@ -99,7 +99,7 @@ async def test_unrelated_steer_and_quoted_id_do_not_mask_a_missed_message(_tmp_h
     channel._messages = [missed]
     session_id = _seed_session_for_channel(adapter, store, db, channel, author)
 
-    other = steer_user_row(_steer_payload(7060299, channel.id, "a different steer"))
+    other = steer_user_row(_steer_payload(7060299, channel.id, "a different steer"), agent=None)
     db.append_message(session_id=session_id, role="user", content=other["content"],
                       display_kind=other["display_kind"])
     db.append_message(session_id=session_id, role="user",

@@ -81,10 +81,28 @@ DEAD_LETTER_AFTER_S = 24 * 3600.0  # a part still undeliverable this long after 
 DEAD_LETTER_KEEP = 500             # newest dead-letter records kept in the state file
 CLAIM_TTL_S = 7 * 86400.0          # terminal claims older than this are pruned
 CLAIM_PRUNE_EVERY_S = 3600.0
+# t_e33a5355: every state change rewrote the whole file (11.9 MB, 6,276 of 6,281 claims terminal) into a
+# ``.boomerang-wake-*`` temp: 228 temps in 49 min, 54-80 GB/day on the Studio SSD. A terminal claim no pending
+# handback names now leaves the hot file for an append-only ``<stem>.terminal.jsonl`` (one line per claim,
+# only TERMINAL_FIELDS), so a write carries the open claims, the counters and the handback queue.
+ARCHIVE_SUFFIX = ".terminal.jsonl"
+TEMP_PREFIX = ".boomerang-wake-"
+TEMP_SWEEP_AGE_S = 600.0   # a temp this old is a dead write (killed between mkstemp and os.replace)
+#: What an archived terminal claim keeps: the dedupe/prune/migration/late-handoff reads in this module, and
+#: hermes-home scripts/lib/card_mechanical_wake.event_claims (outcome, reason, delegation_id, state).
+TERMINAL_FIELDS = frozenset({
+    "key", "task_id", "board", "event_id", "kind", "row", "state", "outcome", "reason", "action", "status",
+    "card_status", "claimed_at", "finished_at", "delegation_id", "resurfaced", "resurface_delivered",
+    "blocked_budget_exhausted", "restart_redispatch", "redispatched_as", "tried_action",
+})
 #: Kill switch for the backoff, dead-letter and claim pruning (present = pre-t_827d5940 behaviour).
 BACKOFF_STOP_FILE = "boomerang-handback-backoff.disabled"
 # t_aad55db4 kill switch: while it exists a ``complete`` verdict posts only the passive line again.
 COMPLETE_TURN_STOP_FILE = "boomerang-complete-turn.disabled"
+# t_d712444b kill switch: while it exists ``_moved`` counts every newer event again (machine comments, the
+# claim's own review_deadman and delivery markers included).
+MOVED_NOISE_STOP_FILE = "boomerang-moved-noise.disabled"
+SUPERSEDED_READ = "superseded_read"   # t_d712444b: handback action of a refused write verdict that carries its read
 
 
 def state_path() -> Path:
@@ -114,20 +132,119 @@ class BoomerangWakeState:
         self.path = Path(path) if path is not None else state_path()
         # sha256 of the bytes last read from / written to ``path`` (t_2f7fd11c: skip a no-op rewrite)
         self._disk_sha: Optional[str] = None
+        # key -> record as last read from / written to the archive (t_e33a5355)
+        self._archived: dict = {}
+
+    @property
+    def archive_path(self) -> Path:
+        return self.path.with_name(self.path.stem + ARCHIVE_SUFFIX)
 
     # --- file I/O (caller holds _LOCK) ---------------------------------------
 
     def _read(self) -> dict:
+        """The hot file with the archived terminal claims merged under ``claims`` (hot wins on a key)."""
         self._disk_sha = None
+        archived = self._read_archive()
         try:
             blob = self.path.read_bytes()
             raw = json.loads(blob.decode("utf-8-sig"))
         except (OSError, ValueError):
-            return {}
-        self._disk_sha = hashlib.sha256(blob).hexdigest()
+            raw, blob = None, None
+        if blob is not None:
+            self._disk_sha = hashlib.sha256(blob).hexdigest()
         if not isinstance(raw, dict):
+            raw = {}
+        if archived:
+            hot = raw.get("claims")
+            raw["claims"] = {**archived, **(hot if isinstance(hot, dict) else {})}
+        if not raw:
             return {}
         return self._migrate_card_text(self._migrate_blocked(self._migrate(raw)))
+
+    def _read_archive(self) -> dict:
+        """key -> archived record; later lines win, a torn line (crash mid-append) is skipped."""
+        self._archived = {}
+        try:
+            text = self.archive_path.read_text(encoding="utf-8-sig")
+        except (OSError, ValueError):
+            return {}
+        for line in text.splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("key"), str):
+                self._archived[rec["key"]] = rec
+        return {k: dict(v) for k, v in self._archived.items()}
+
+    def _partition(self, data: dict) -> tuple:
+        """``(hot_data, cold)``: ``cold`` is key -> archive record for the terminal claims no pending
+        handback names; ``hot_data`` is ``data`` with only the remaining claims (None = no claims dict)."""
+        claims = data.get("claims")
+        if not isinstance(claims, dict):
+            return data, None
+        pinned = {r.get("claim_key") for r in self._handbacks_of(data).values() if isinstance(r, dict)}
+        hot, cold = {}, {}
+        for k, v in claims.items():
+            if isinstance(v, dict) and v.get("state") == STATE_TERMINAL and k not in pinned:
+                cold[k] = {**{f: v[f] for f in TERMINAL_FIELDS if f in v}, "key": k}
+            else:
+                hot[k] = v
+        return {**data, "claims": hot}, cold
+
+    def _append_archive(self, records: list) -> None:
+        """Append ``records`` as JSON lines, fsynced. A torn tail (crash mid-append) is closed with a
+        newline first, so a new record never joins the fragment (Prism e9d482d1e7d6 / 12cc7535efb9)."""
+        if not records:
+            return
+        payload = "".join(json.dumps(r, sort_keys=True) + "\n" for r in records).encode("utf-8")
+        self.archive_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.archive_path, "a+b") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell():
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    payload = b"\n" + payload
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _atomic_write(self, path: Path, blob: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=TEMP_PREFIX, dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def sweep_temps(self, now: Optional[float] = None, min_age_s: float = TEMP_SWEEP_AGE_S) -> int:
+        """Delete ``.boomerang-wake-*`` temps older than ``min_age_s`` (a write killed between mkstemp and
+        os.replace leaves one; six of 3-9.5 MB sat on the Studio for a week). Returns the count removed."""
+        import time
+
+        now = time.time() if now is None else now
+        removed = 0
+        with _LOCK:
+            try:
+                names = list(self.path.parent.glob(TEMP_PREFIX + "*"))
+            except OSError:
+                return 0
+            for p in names:
+                try:
+                    if now - p.stat().st_mtime >= min_age_s:
+                        p.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+        return removed
 
     @staticmethod
     def _migrate_card_text(data: dict) -> dict:
@@ -215,26 +332,26 @@ class BoomerangWakeState:
         return data
 
     def _write(self, data: dict) -> None:
-        """Replace the file with ``data``; no write when the bytes equal what ``_read`` just saw."""
-        blob = json.dumps(data, sort_keys=True).encode("utf-8")
+        """Persist ``data``: terminal claims no pending handback names go to the archive, the rest to the
+        hot file. Order keeps every claim on disk at every step (a crash leaves it in both; hot wins):
+        1. new/changed archive records are appended and fsynced;
+        2. the hot file is replaced (skipped when the bytes equal what ``_read`` just saw);
+        3. only then, if a record left the archive (pruned, reopened, pinned by a handback), the archive
+           is rewritten without it (Prism f25db40874e9)."""
+        hot_data, cold = self._partition(data)
+        if cold is not None:
+            new = [r for k, r in cold.items() if self._archived.get(k) != r]
+            self._append_archive(new)
+            self._archived.update({r["key"]: r for r in new})
+        blob = json.dumps(hot_data, sort_keys=True).encode("utf-8")
         sha = hashlib.sha256(blob).hexdigest()
-        if sha == self._disk_sha:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".boomerang-wake-", dir=str(self.path.parent))
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(blob)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+        if sha != self._disk_sha:
+            self._atomic_write(self.path, blob)
             self._disk_sha = sha
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        if cold is not None and set(self._archived) - set(cold):
+            lines = "".join(json.dumps(r, sort_keys=True) + "\n" for r in cold.values())
+            self._atomic_write(self.archive_path, lines.encode("utf-8"))
+            self._archived = dict(cold)
 
     @staticmethod
     def _retries_of(data: dict) -> dict:
@@ -557,6 +674,12 @@ ALLOWED = {
     # t_6e9f48cc: the child itself posts the verdict lines, the coverage and the enqueue (all
     # outside the card's state machine); ``handled`` writes only the receipt, the card stays in review.
     "own_repo_review_all_keys_answered": frozenset({"handled", "surface"}),
+    # t_efb6f435: the first read of a review handed to a human. The child stages its read and
+    # surfaces, or sends back a plainly incomplete handback; it never approves or lands.
+    "own_repo_review_human": frozenset({"request_changes", "surface"}),
+    # t_ff6f4be4: a card back in review from a park: the deadman child's attended read (why it waits, or
+    # surface); it never approves, completes or lands.
+    "review_park_return": frozenset({"comment_why_waits", "surface"}),
     "changes_requested": frozenset({"redispatch", "surface"}),
     "blocked_assess": frozenset({"retry", "surface"}),
     "crash_first_occurrence": frozenset({"retry", "surface"}),
@@ -640,6 +763,137 @@ def enabled() -> bool:
 ROW_REVIEW_ALL_ANSWERED = "review_all_answered"
 ROW_REVIEW_DEADMAN = "review_deadman"
 ROW_MECHANICAL_WAKE = "mechanical_wake"
+#: t_efb6f435: an own-repo review handed to a human reviewer (the disposition row's name).
+ROW_REVIEW_HUMAN = "own_repo_review_human"
+#: Its stop file, read every tick: present = that handoff is ``none`` again (today's plain wake).
+REVIEW_HANDOFF_STOP_FILE = "boomerang-wake-review-handoff.disabled"
+#: Outcomes of a handoff child that answered its review episode (the deadman's child is then skipped).
+#: request_changes: a handoff child's send-back. Not comment_why_waits (t_ff6f4be4 round 2): a park-return child's
+#: receipt is claimed on the review_requested event, which hermes-home's deadman does not count, so its page
+#: still gets the deadman child whose receipt is keyed on the review_deadman event.
+_EPISODE_ANSWERED = frozenset({"surfaced", "request_changes"})
+#: t_ff6f4be4 A: a card back in review from a park (the board's ``lifecycle_entry_repair`` review_requested).
+ROW_PARK_RETURN = "review_park_return"
+PARK_RETURN_SOURCE = "lifecycle_entry_repair"
+#: Its stop file, read every tick: present = that wake surfaces to the home session again (main's behaviour).
+PARK_RETURN_STOP_FILE = "boomerang-wake-park-return.disabled"
+#: The rows whose child is the first read of a review episode (the deadman's cycle-0 page defers to it).
+_EPISODE_ROWS = frozenset({ROW_REVIEW_HUMAN, ROW_PARK_RETURN})
+#: t_ff6f4be4 B: present = a deadman cycle-0 page forks its child even while the episode's first-read child
+#: still runs (main's behaviour). Read every tick.
+DEADMAN_WAIT_STOP_FILE = "boomerang-wake-deadman-wait.disabled"
+#: A deferred deadman page (state ``deferred``, not an OPEN state) waits at most this long for the child.
+STATE_DEFERRED = "deferred"
+DEADMAN_WAIT_MAX_S = 2 * MAX_MINUTES * 60.0
+
+
+def review_handoff_stop_file_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / REVIEW_HANDOFF_STOP_FILE
+
+
+def park_return_stop_file_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / PARK_RETURN_STOP_FILE
+
+
+def deadman_wait_stop_file_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "state" / DEADMAN_WAIT_STOP_FILE
+
+
+def park_return(payload: Optional[dict], task: Any) -> bool:
+    """t_ff6f4be4: the event is the board's own re-entry into review (``source: lifecycle_entry_repair``,
+    written when a parked or scheduled card comes back; no run, no summary) and its reviewer (the event's
+    ``reviewer``, else the card's assignee) is a human. False while the row's stop file is present."""
+    from hermes_cli import kanban_db as kb
+
+    if (payload or {}).get("source") != PARK_RETURN_SOURCE:
+        return False
+    if not kb.is_human_reviewer((payload or {}).get("reviewer") or _field(task, "assignee")):
+        return False
+    return not park_return_stop_file_path().exists()
+
+
+def human_reviewer(payload: Optional[dict], task: Any) -> bool:
+    """t_efb6f435: the handback's review went to a human (``human`` / ``human:<name>``): the event's
+    ``reviewer``, else the card's assignee. False while the row's stop file is present."""
+    from hermes_cli import kanban_db as kb
+
+    reviewer = (payload or {}).get("reviewer") or _field(task, "assignee")
+    if not kb.is_human_reviewer(reviewer):
+        return False
+    return not review_handoff_stop_file_path().exists()
+
+
+def review_episode_answered(state: "BoomerangWakeState", board: Optional[str], task_id: str,
+                            event_id: Any) -> bool:
+    """True when the review_deadman page ``event_id`` is the FIRST page (cycle 0) of an episode that
+    already got its one child. The page's own key says which page it is (hermes-home
+    review_deadman_core.EventKey: ``episode`` = its review entry event id, ``cycle`` = 0 for the first
+    tier-1 page): only a cycle-0 page whose episode is a ``review_requested`` of this card, whose
+    handoff child (or that claim's restart successor) surfaced with its turn delivered or acted, is
+    answered. A later cycle, another episode (a ruling wait, a stranded card) or a page with no episode
+    gets its child as today. A failed, lost or still-running handoff child answers nothing. The cycle
+    must be an explicit integer 0 (missing, null or non-integer dispatches), and the row's stop file
+    turns the skip off too, so with it present every page dispatches as on main."""
+    if review_handoff_stop_file_path().exists():
+        return False
+    # t_ff6f4be4 round 3: with the park-return stop file present a park-return claim answers nothing (main).
+    park_off = park_return_stop_file_path().exists()
+    for c in _episode_claims(state, board, task_id, event_id) or ():
+        if park_off and c.get("row") == ROW_PARK_RETURN:
+            continue
+        if c.get("state") != STATE_TERMINAL:
+            continue
+        outcome = c.get("outcome")
+        if outcome in _EPISODE_ANSWERED and (outcome != "surfaced" or c.get("resurface_delivered") is True):
+            return True
+    return False
+
+
+def review_episode_running(state: "BoomerangWakeState", board: Optional[str], task_id: str,
+                           event_id: Any) -> bool:
+    """t_ff6f4be4 B: True when the review_deadman page ``event_id`` is the cycle-0 page of an episode whose
+    first-read child (own_repo_review_human / review_park_return, or its restart successor) is still open
+    and has not re-surfaced. The page then waits (``dispatch`` parks it as a ``deferred`` claim) instead of
+    forking a second child on the same head. False while the deadman-wait stop file is present."""
+    if deadman_wait_stop_file_path().exists():
+        return False
+    return any(c.get("state") in OPEN_STATES and not c.get("resurfaced")
+               for c in _episode_claims(state, board, task_id, event_id) or ())
+
+
+def _episode_claims(state: "BoomerangWakeState", board: Optional[str], task_id: str,
+                    event_id: Any) -> Optional[list]:
+    """The first-read child claims (_EPISODE_ROWS) of the episode the deadman page ``event_id`` names, or None
+    when the page is not an explicit cycle-0 page of a ``review_requested`` episode of this card."""
+    from hermes_cli import kanban_db as kb
+
+    conn = _readonly(kb, board)
+    try:
+        page = conn.execute("SELECT payload FROM task_events WHERE id = ? AND task_id = ?",
+                            (int(event_id), task_id)).fetchone()
+        try:
+            payload = json.loads(page[0]) if page and page[0] else {}
+            episode = int(payload.get("episode") or 0)
+            cycle = payload.get("cycle")
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if episode <= 0 or type(cycle) is not int or cycle != 0:
+            return None
+        row = conn.execute("SELECT id FROM task_events WHERE id = ? AND task_id = ? "
+                           "AND kind = 'review_requested'", (episode, task_id)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    base = claim_key(board, task_id, row[0])
+    return [c for key, c in state.claims().items()
+            if (key == base or key.startswith(base + "#")) and c.get("row") in _EPISODE_ROWS]
 
 
 def row_enabled(name: str) -> bool:
@@ -804,6 +1058,8 @@ def collect_candidates(kb: Any, conn: Any, board: str, task: Any, events: list, 
         if ev.kind == "review_requested":
             payload = review_payload(kb, conn, task_id, _field(task, "result"), ev.payload, ev.run_id,
                                      pr_health, memo)
+            payload["human_reviewer"] = human_reviewer(ev.payload, task)
+            payload["park_return"] = park_return(ev.payload, task)
         disp = classify_event(ev.kind, payload, task, retries)
         if disp.verdict == "auto":
             out[ev.id] = disp
@@ -961,6 +1217,27 @@ MECHANICAL_WAKE_STEPS = (
 )
 
 
+REVIEW_HUMAN_STEPS = (
+    "1. Read the card: `hermes kanban --board {board} show {task_id}` (the newest review run's summary and "
+    "metadata, the comment thread: any merge-hold or operator note).",
+    "2. Read the PR it names over REST, never GraphQL: `python3 {home}/scripts/gh-pr-rest.py <owner/repo> <n> "
+    "--checks` (state, head, checks, size), and its diff when the summary leaves a claim unchecked.",
+    "3. If the handback is plainly incomplete (no PR, no proof line, a claimed test or file missing from the "
+    "diff, the card's DONE list not met), return `request_changes` with one finding per gap. Otherwise return "
+    "`surface`: your summary and evidence are the staged read the operator reviews from (what changed, the "
+    "proof, PR state + head, anything that needs the operator's eye).",
+    "HARD RULE: you never approve, complete, enqueue or land; the operator owns the verdict.",
+)
+
+
+def _review_human_brief(entry: dict) -> str:
+    from hermes_constants import display_hermes_home, get_default_hermes_root
+
+    fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"],
+              "home": display_hermes_home(get_default_hermes_root())}
+    return "Do this first read:\n" + "\n".join(s.format(**fields) for s in REVIEW_HUMAN_STEPS) + "\n"
+
+
 def _mechanical_wake_brief(entry: dict) -> str:
     fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"]}
     return "Do this read:\n" + "\n".join(s.format(**fields) for s in MECHANICAL_WAKE_STEPS) + "\n"
@@ -972,6 +1249,19 @@ def _review_deadman_brief(entry: dict) -> str:
     fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"],
               "home": display_hermes_home(get_default_hermes_root())}
     return "Do this attended read:\n" + "\n".join(s.format(**fields) for s in REVIEW_DEADMAN_STEPS) + "\n"
+
+
+#: t_ff6f4be4: a park that ran out is not a fresh handback. Its PR is often merged, or there is none.
+PARK_RETURN_NOTE = (
+    "This card came back into review on its own (a park or schedule ran out; the board wrote the "
+    "review_requested, no worker handed it back). Its PR may be merged, closed or absent: read what the "
+    "card waits on now (a readback, a `close-on:` gate, a deploy, an operator verdict), not a handback.\n"
+    "HARD RULE: you never approve, complete, enqueue or land; the operator owns the verdict.\n"
+)
+
+
+def _park_return_brief(entry: dict) -> str:
+    return _review_deadman_brief(entry) + PARK_RETURN_NOTE
 
 
 def _blocked_brief(entry: dict) -> str:
@@ -994,6 +1284,8 @@ def _blocked_brief(entry: dict) -> str:
 ROW_BRIEFS = {"blocked_assess": _blocked_brief,
               "own_repo_review_all_keys_answered": _review_all_answered_brief,
               "review_deadman": _review_deadman_brief,
+              ROW_REVIEW_HUMAN: _review_human_brief,
+              ROW_PARK_RETURN: _park_return_brief,
               "mechanical_wake": _mechanical_wake_brief}
 
 
@@ -1091,16 +1383,102 @@ def board_has_receipt(board: Optional[str], task_id: str, delegation_id: str) ->
         conn.close()
 
 
-def _moved(entry: dict, kb: Any, conn: Any) -> Optional[str]:
+def _moved_noise_filter_on() -> bool:
+    from hermes_constants import get_hermes_home
+
+    try:
+        return not (get_hermes_home() / "state" / MOVED_NOISE_STOP_FILE).exists()
+    except Exception:   # unknown = today's strict rule
+        return False
+
+
+# t_d712444b round 2: session-less kernel bookkeeping that changes nothing a verdict reads (a reaped worker pid, the
+# dispatcher's peer collision warning, a released placement door). A worker start, a completion, a send-back, an
+# assignment and a review request are NOT here: they still refuse.
+_KERNEL_NOISE_KINDS = frozenset({"terminal_worker_reaped", "dispatch_collision_peer_warning", "door_released"})
+
+
+def _derived_approve(conn: Any, task_id: str, payload: dict, created_at: Any) -> bool:
+    """t_d712444b: the ``commented`` event points at a pipeline-derived APPROVE record. Neither the event nor the
+    comment row carries the other's id (event payload: author, len, session_ref, claimed_author, grant_id), so the
+    event is bound to a row only when that binding is unique: exactly ONE ``commented`` event by this author on the
+    card and exactly ONE comment row by this author within 2 s of it (the kernel writes both in one transaction).
+    Anything else (two comments in the window, a row with no event, an event with no row) is not bound and so is not
+    noise: fail closed. No length or body similarity decides it. The bound row must be the record (a
+    ``review_coverage:`` line whose ``verdict`` is ``APPROVE`` and ``by`` is ``pipeline/derived``)."""
+    author = str(payload.get("author") or "").strip()
+    if not author or not isinstance(created_at, (int, float)):
+        return False
+    lo, hi = int(created_at) - 2, int(created_at) + 2
+    rows = conn.execute("SELECT body FROM task_comments WHERE task_id = ? AND author = ? AND created_at BETWEEN ? AND ?",
+                        (task_id, author, lo, hi)).fetchall()
+    events = 0
+    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented' "
+                               "AND created_at BETWEEN ? AND ?", (task_id, lo, hi)).fetchall():
+        try:
+            p = json.loads(raw or "{}")
+        except ValueError:
+            return False   # an unreadable event in the window: cannot rule it out
+        if not isinstance(p, dict) or str(p.get("author") or "").strip() == author:
+            events += 1
+    if len(rows) != 1 or events != 1:
+        return False
+    cov = [ln.split(":", 1)[1] for ln in str(rows[0][0] or "").splitlines() if ln.startswith("review_coverage:")]
+    try:
+        rec = json.loads(cov[0]) if cov else None
+    except ValueError:
+        return False
+    return isinstance(rec, dict) and rec.get("by") == "pipeline/derived" and rec.get("verdict") == "APPROVE"
+
+
+def _moved_noise(row: Any, episode: Optional[int], *, action: Optional[str] = None, conn: Any = None,
+                 task_id: Optional[str] = None) -> bool:
+    """t_d712444b: a session-less event that changes nothing a verdict reads. A comment by kernel automation
+    (``MACHINE_AUTHORS``) or by a script with no verified identity (``unverified:*``, the authors the stale guard
+    already never reads as the owner: event-land ci-red lines, CI-red labels); the review_deadman of the claim's
+    own review episode; a boomerang delivery marker; kernel bookkeeping (:data:`_KERNEL_NOISE_KINDS`); for a
+    ``request_changes`` verdict only, a pipeline-derived APPROVE record (a reader's send-back is not refused by a
+    derived approval). Anything carrying a session (owner, worker, another child) and every other kind still counts."""
+    from hermes_cli.kanban_close_on_guard import MACHINE_AUTHORS
+
+    if row[0]:
+        return False
+    if row[1] in _KERNEL_NOISE_KINDS:
+        return True
+    if row[1] not in ("commented", "review_deadman", DELIVERED_KIND):
+        return False
+    try:
+        payload = json.loads(row[2] or "{}")
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if row[1] == "commented":
+        author = str(payload.get("author") or "").strip().lower()
+        if author in MACHINE_AUTHORS or author.startswith("unverified:"):
+            return True
+        return (action == "request_changes" and conn is not None and bool(task_id)
+                and _derived_approve(conn, task_id, payload, row[3] if len(row) > 3 else None))
+    if row[1] == "review_deadman":
+        return episode is not None and payload.get("episode") == episode
+    return payload.get("via") == VIA
+
+
+def _moved(entry: dict, kb: Any, conn: Any, action: Optional[str] = None) -> Optional[str]:
     """RC-3 freshness: an event newer than the claim's cursor (rows by this claim's own
-    child_session excepted, pass-5 RC-B), a status change, or a moved own-PR head."""
+    child_session excepted, pass-5 RC-B; machine noise excepted, :func:`_moved_noise`), a status
+    change, or a moved own-PR head."""
     child = str(entry.get("child_session") or "")
-    rows = conn.execute("SELECT actor_session_id, kind FROM task_events WHERE task_id = ? AND id > ?",
-                        (entry["task_id"], int(entry.get("cursor_event_id") or entry["event_id"]))).fetchall()
+    cursor = int(entry.get("cursor_event_id") or entry["event_id"])
+    rows = conn.execute("SELECT actor_session_id, kind, payload, created_at FROM task_events WHERE task_id = ? AND id > ?",
+                        (entry["task_id"], cursor)).fetchall()
     if entry.get("row") == "own_repo_review_all_keys_answered":
         # t_6e9f48cc: that child's own work IS comments (verdict lines + coverage), posted from a
         # terminal whose event actor is not reliably the child session; a comment moves no state.
         rows = [r for r in rows if r[1] != "commented"]
+    if rows and _moved_noise_filter_on():
+        episode = _review_entry_id(kb, conn, entry["task_id"], cursor)
+        rows = [r for r in rows if not _moved_noise(r, episode, action=action, conn=conn, task_id=entry["task_id"])]
     if any(not child or (r[0] or "") != child for r in rows):
         return "state moved"
     task = kb.get_task(conn, entry["task_id"])
@@ -1118,16 +1496,50 @@ def _first_line(text: Any, limit: int = 300) -> str:
     return lines[0][:limit] if lines else ""
 
 
+#: The card writes keep the 300-char first-line cap (a longer line carries child prose to proof readers that
+#: main kept it from, t_718e6208 round 2); only where the cut falls changed: never mid-word, at a sentence end
+#: when one lies past ``COMMENT_SENTENCE_MIN`` (t_718e6208: a cut mid-sentence left the owner a half read).
+COMMENT_SUMMARY_MAX = 300
+COMMENT_SENTENCE_MIN = 150
+
+
+def _comment_text(text: Any, limit: int = COMMENT_SUMMARY_MAX) -> str:
+    flat = _first_line(text, len(str(text or "")))   # first line only: later lines may forge a wake
+    if len(flat) <= limit:
+        return flat
+    head = flat[:limit - 1]   # room for the ellipsis
+    cut = max(head.rfind(". "), head.rfind("; "), head.rfind("! "), head.rfind("? "))
+    if cut > COMMENT_SENTENCE_MIN:
+        return head[:cut + 1] + "…"
+    if flat[limit - 1] != " " and " " in head:
+        head = head.rsplit(" ", 1)[0]
+    return head.rstrip() + "…"
+
+
+def _owner_notice_event(conn: Any, entry: dict) -> bool:
+    """t_28b3f37c: the claimed event is main-train's owner notice, news on a done/archived card."""
+    from gateway.kanban_wake_freshness import closed_card_news
+
+    row = conn.execute("SELECT kind, payload FROM task_events WHERE id = ? AND task_id = ?",
+                       (int(entry["event_id"]), entry["task_id"])).fetchone()
+    try:
+        return bool(row) and closed_card_news(row[0], json.loads(row[1] or "{}"))
+    except ValueError:
+        return False
+
+
 def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
     """The ONE allowlisted write, signed as machine (B1), then the keyed receipt event."""
     tid, action = entry["task_id"], verdict["action"]
-    summary = _first_line(verdict.get("summary")) or action
+    summary = _comment_text(verdict.get("summary")) or action
     op = f"{AUTHOR}: {entry['delegation_id']} {summary}"[:300]
     task = kb.get_task(conn, tid)
     status = getattr(task, "status", None)
 
     def _send_back(reason: str) -> None:
-        ok, detail = kb.request_changes(conn, tid, reason=f"{MARKER} {reason}"[:2000], claimer=AUTHOR,
+        # Never cut (t_39a6200f): the worker reads this reason as its send-back and request_changes takes the
+        # operator's own send-backs whole; a [:2000] here dropped the end of a child's findings mid-sentence.
+        ok, detail = kb.request_changes(conn, tid, reason=f"{MARKER} {reason}", claimer=AUTHOR,
                                         operator=op, operator_kind=kb.OPERATOR_KIND_MACHINE)
         if not ok:
             raise RuntimeError(f"request_changes refused: {detail}")
@@ -1144,7 +1556,7 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
             if status != "review":
                 raise RuntimeError(f"{action} on a {status} card")
         elif action == "acknowledge":   # t_6a70430e: receipt + one comment, no state change; any OPEN card
-            if status is None or status in ("done", "archived"):
+            if status is None or (status in ("done", "archived") and not _owner_notice_event(conn, entry)):
                 raise RuntimeError(f"{action} on a {status} card")
         elif action == "request_changes":
             if status != "review":
@@ -1215,7 +1627,8 @@ _OWNER_COMMENT_NEWER = "owner comment newer than handback"
 #: usually to queue a watcher) did not act on it (t_707d4196, 2026-11-13). Left on the handback cursor:
 #: review_deadman (its event summarizes the handback), completed / own_repo_review_* (the event IS the handback),
 #: changes_requested (the event is the owner's own send-back; its comment is that act).
-EVENT_CURSOR_ROWS = frozenset({"mechanical_wake", "blocked_assess", "crash_first_occurrence"})
+#: t_ff6f4be4: review_park_return is its own occurrence too (a park ran out); the merged-PR rule never refuses it.
+EVENT_CURSOR_ROWS = frozenset({"mechanical_wake", "blocked_assess", "crash_first_occurrence", "review_park_return"})
 
 #: t_a6da8394: review_deadman is on its OWN event cursor too (kill switch BOOMERANG_DEADMAN_TRIGGER_CURSOR=0 puts it
 #: back on the handback cursor above). The deadman fired because the owner went quiet past the threshold or a hold
@@ -1269,6 +1682,14 @@ def _expired_hold_comment(conn: Any, task_id: str, event: Any, now: float) -> bo
     return bool(bodies) and all(_hold_expired(b, now) for b in bodies)
 
 
+#: t_baebe27b: a card body with an `## Operator step` heading, or an operator line saying "after merge", owes work
+#: after its PR merges, so the merged-PR rule never refuses its surface.
+_OPERATOR_STEP_RE = re.compile(
+    r"^[ \t]*#{1,6}[ \t]*operator[ \t]+steps?\b"
+    r"|^[^\n]*\boperator\b[^\n]*\bafter[ -]merge\b|^[^\n]*\bafter[ -]merge\b[^\n]*\boperator\b",
+    re.I | re.M)
+
+
 def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
 
@@ -1288,6 +1709,10 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
     row = entry.get("row") or entry.get("kind")
     deadman_cursor = row == ROW_REVIEW_DEADMAN and deadman_trigger_cursor_enabled()
     own_event = row in EVENT_CURSOR_ROWS or deadman_cursor
+    # t_e86eeab2: a send-back answers the handback before it, so that handback's PR (and the claim's, read at
+    # dispatch) merging says nothing about it: a fix-forward goes into a new PR. Its merged-PR rule reads only the
+    # newest handback AFTER the send-back event (t_1b52b3e0: #12764 merged, the read of #12782 was refused).
+    sendback = row == "changes_requested" and entry.get("event_id") is not None
     now = _time.time()
     conn = _readonly(kb, entry.get("board"))
     try:
@@ -1329,17 +1754,32 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
         refs = []
         # t_59d62680: the merged-PR rule is about the HANDBACK (its review is moot once merged). An own-event row
         # carries its own occurrence: a deploy probe / watcher queued after the merge that failed is still owed.
+        if sendback:
+            # t_e86eeab2 round 2 (Apollo): a send-back's read is finished only when nothing of the card is left open:
+            # (a) the card is done/archived, or (b) the newest handback after the send-back names a PR and EVERY PR
+            # it names merged (below). A later handback naming no PR, or no later handback, refuses nothing.
+            status = str(_field(task, "status") or "")
+            if status in ("done", "archived"):
+                return f"card {status}{_DONE_REFUSAL}"
+            handback = conn.execute(
+                "SELECT payload, run_id FROM task_events WHERE task_id = ? "
+                "AND kind IN ('review_requested', 'completed') AND id > ? ORDER BY id DESC LIMIT 1",
+                (entry["task_id"], event_id)).fetchone()
         if handback and not own_event:
             payload = json.loads(handback["payload"] or "{}")
             refs = _handback_refs(kb, conn, None, payload, handback["run_id"])
         # Preserve the claim's PR even if a newer handback now names another one.
-        if not own_event:
+        if not own_event and not sendback:
             refs = list(refs) + list(_op.extract_pr_refs(entry.get("pr")))
+        # t_baebe27b: the merge is not the end when the card owes an operator step after it (t_16a0e8f3: box
+        # rollout refused 12 min as "summarized PR merged"). The card body is the dispatcher's, so it decides.
+        if _OPERATOR_STEP_RE.search(str(_field(task, "body") or "")):
+            refs = []
     finally:
         conn.close()
     health_fn = _health_fn()
     if health_fn is not None:
-        seen = set()
+        seen, merged = set(), []
         for ref in refs:
             key = (ref.repo.lower(), int(ref.number))
             if key in seen:
@@ -1347,7 +1787,13 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
             seen.add(key)
             health = health_fn(ref.repo, int(ref.number)) or {}
             if health.get("state") == "merged" or health.get("merged") or health.get("merged_at"):
-                return f"summarized PR merged: {ref.repo}#{ref.number}"
+                if not sendback:
+                    return f"summarized PR merged: {ref.repo}#{ref.number}"
+                merged.append(f"{ref.repo}#{ref.number}")
+            elif sendback:
+                return None   # (b) every, not any: an open or closed-unmerged PR is work left on the card
+        if merged:
+            return f"summarized PR merged: {', '.join(merged)}"
     return None
 
 
@@ -1386,7 +1832,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
         verdict = parse_verdict(live, child_final_message)
     except VerdictError as exc:
         return {"ok": False, "action": None, "reason": str(exc), "summary": ""}
-    action, summary = verdict["action"], _first_line(verdict.get("summary"))
+    action, summary = verdict["action"], _comment_text(verdict.get("summary"))
     raw_evidence = verdict.get("evidence")
     raw_evidence = raw_evidence if isinstance(raw_evidence, list) else []
     finding = {"detail": _first_line(verdict.get("summary"), 600),
@@ -1405,7 +1851,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     if action == "surface":
         why = _stale_refusal(live, "execute_verdict")
         if why:
-            return {"ok": False, "action": action, "reason": why, "summary": summary, "stale": True}
+            return {"ok": False, "action": action, "reason": why, "summary": summary, "stale": True, **finding}
         return {"ok": False, "action": action, "reason": "child surfaced it", "summary": summary, "surface": True,
                 **finding}
     conn = kb.connect(board=live.get("board"))
@@ -1415,9 +1861,11 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
                                handback=handback_row(live, {"summary": summary, "action": action})
                                if handback else None)
             return {"ok": False, "action": action, "reason": "replay", "summary": summary, "noop": True}
-        why = _moved(live, kb, conn)
+        why = _moved(live, kb, conn, action)
         if why:
-            return {"ok": False, "action": action, "reason": why, "summary": summary}
+            findings = [_first_line(f, 300) for f in verdict.get("findings") or [] if str(f).strip()][:5]
+            return {"ok": False, "action": action, "reason": why, "summary": summary, "findings": findings,
+                    **finding}
         if live.get("row") == "blocked_assess":
             from gateway.kanban_wake_disposition import card_tags, SURFACE_TAGS
 
@@ -1449,6 +1897,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     turn = (finding_text(live, {"summary": summary or action, **finding}, "child completed")
             if wake_home and action == "complete" else None)
     state.update_claim(key, state=STATE_TERMINAL, outcome=action, finished_at=_time.time(),  # RC-5 (3)
+                       tried_action=action,
                        handback=handback_row(live, {"summary": summary or action, "action": action},
                                              turn_text=turn)
                        if handback else None)
@@ -1546,7 +1995,7 @@ def handback_row(entry: dict, result: dict, *, turn_text: Optional[str] = None) 
         "event_ts": entry.get("event_ts"), "event_id": entry.get("event_id"),
         "assignee": entry.get("assignee"), "pr": entry.get("pr"),
         "claim_key": entry.get("key"), "parts": parts, "action": result.get("action"),
-        "line": f"boomerang handled {entry['task_id']} ({row}): {summary}", "turn": turn_text,
+        "line": f"{HANDLED_PREFIX}{entry['task_id']} ({row}): {summary}", "turn": turn_text,
         "attempts": 0, "created_at": _time.time()}
 
 
@@ -1555,7 +2004,7 @@ def _breadcrumb(entry: dict, result: dict) -> None:
     raises past the handback (ruling t_e98f651e-handback-first-then-everything, Prism 9def48086ed1)."""
     from hermes_cli import kanban_db as kb
 
-    summary = _first_line(result.get("summary")) or result.get("action") or "handled"
+    summary = _comment_text(result.get("summary")) or result.get("action") or "handled"
     row = entry.get("row") or entry.get("kind") or "wake"
     tag = f"(delegation {entry['delegation_id']})"
     try:
@@ -1692,6 +2141,8 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
     action = row.get("action")
     guarded = action == "surface" or (action is None and row.get("turn") is not None)
     delivery_parts = list(left)
+    handled = (str(row.get("line") or "").startswith(HANDLED_PREFIX)
+               and not await asyncio.to_thread(handled_line_chat_enabled))
     for part in delivery_parts:
         if guarded:
             # Recover original cursors for rows persisted before the guard was introduced.
@@ -1711,6 +2162,8 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
         try:
             if part == PART_TURN:
                 ok = await resurface(runner, entry, row.get("turn"))
+            elif handled:
+                ok = await _deliver_handled_line(runner, entry, row, turn_failed=PART_TURN in failures)
             else:
                 ok = await post_line(runner, entry, str(row.get("line") or ""))
         finally:
@@ -1783,6 +2236,54 @@ async def deliver_handbacks(runner: Any, state: BoomerangWakeState, *,
     return sent
 
 
+# t_8ab5557d: the ``boomerang handled`` line is an agent receipt (Ace's three-bin ruling, Discord
+# 1571854816139944097). Absent (default) = no chat line beside a delivered turn, and a handled-only
+# row writes it to the fleet agent log. Present = the line posts to the origin chat as before.
+HANDLED_LINE_CHAT_FILE = "boomerang-handled-line-chat.enabled"
+HANDLED_PREFIX = "boomerang handled "
+AGENT_LOG_PRODUCER = "boomerang-wake"
+
+
+def handled_line_chat_enabled() -> bool:
+    """t_8ab5557d knob: True while ``<HERMES_HOME>/state/boomerang-handled-line-chat.enabled`` exists
+    (the ``boomerang handled`` line posts to the origin chat again, as before)."""
+    from hermes_constants import get_hermes_home
+
+    return (get_hermes_home() / "state" / HANDLED_LINE_CHAT_FILE).exists()
+
+
+def write_agent_log_line(entry: dict, text: str) -> bool:
+    """One row in the fleet agent log (``<fleet root>/scripts/lib/agent_inbox.py`` write_agent_log,
+    the library the cron #alerts/#logs gates load). False when there is no library or the write fails."""
+    try:
+        from cron.fork_ext.alerts_audience_gate import _fleet_root, _load_lib
+        from hermes_constants import get_hermes_home
+
+        root = _fleet_root(Path(get_hermes_home()))
+        lib = _load_lib(root) if root is not None else None
+        if lib is None or not hasattr(lib, "write_agent_log"):
+            return False
+        lib.write_agent_log(root, AGENT_LOG_PRODUCER, "info", text, task_id=entry.get("task_id"),
+                            delegation_id=entry.get("delegation_id"))
+        return True
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: agent-log row for %s not written: %s", entry.get("task_id"), exc)
+        return False
+
+
+async def _deliver_handled_line(runner: Any, entry: dict, row: dict, *, turn_failed: bool) -> bool:
+    """The ``boomerang handled`` line (knob off). A row that delivers a turn posts no line: the turn is
+    the message, and the receipt goes to the agent log best-effort. A refused turn still posts the line
+    to the chat. A handled-only row writes the agent log; with no log it posts to the chat (never lost)."""
+    text = str(row.get("line") or "")
+    if turn_failed:
+        return await post_line(runner, entry, text)
+    logged = await asyncio.to_thread(write_agent_log_line, entry, text)
+    if row.get("turn") is not None or logged:
+        return True
+    return await post_line(runner, entry, text)
+
+
 async def post_line(runner: Any, entry: dict, text: str) -> bool:
     """One line to the claim's origin chat (the subscription's chat, or the home session's).
 
@@ -1818,6 +2319,33 @@ def finding_text(entry: dict, result: dict, header: str) -> str:
     return "\n".join(lines) + "\n---\n" + str(entry.get("wake_text") or "")
 
 
+def _scratch_dir(entry: dict) -> Optional[str]:
+    """The child's scratch folder (``cache/scratch/<delegation id>`` or the short ``del-<last 4>``), if it exists."""
+    from hermes_constants import get_hermes_home
+
+    did = str(entry.get("delegation_id") or "")
+    scratch = Path(get_hermes_home()) / "cache" / "scratch"
+    for name in (did, f"del-{did[-4:]}") if did else ():
+        if (scratch / name).is_dir():
+            return str(scratch / name)
+    return None
+
+
+def superseded_text(entry: dict, result: dict) -> str:
+    """t_d712444b: the re-delivered wake of a verdict refused as superseded carries what the child tried (action,
+    summary, findings, evidence) and where its read is staged, ahead of the original wake text."""
+    detail = result.get("detail") or result.get("summary") or ""
+    lines = finding_text(entry, {**result, "detail": f"{result.get('action')} not written ({result.get('reason')}): "
+                                                     f"{detail}"}, "child verdict superseded").split("\n---\n", 1)
+    extra = [f"- {f}" for f in result.get("findings") or []]
+    head = lines[0] + ("\nfindings:\n" + "\n".join(extra) if extra else "")
+    try:
+        staged = _scratch_dir(entry)
+    except Exception:
+        staged = None
+    return f"{head}\nstaged read: {staged or 'none found'}\n---\n{lines[1] if len(lines) > 1 else ''}"
+
+
 def _surfaced_summary(kb: Any, conn: Any, task_id: str, delegation_id: str) -> Optional[str]:
     """The summary of this delegation's executor ``surfaced:`` comment, None when there is none."""
     head, tag = f"{MARKER} surfaced:", f"(delegation {delegation_id})"
@@ -1838,6 +2366,62 @@ def record_surface(entry: dict, summary: str) -> bool:
         with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
             kb.add_comment(conn, entry["task_id"], AUTHOR,
                            f"{MARKER} surfaced: {summary or 'no summary'} (delegation {entry['delegation_id']})")
+        return True
+    finally:
+        conn.close()
+
+
+_MERGED_REFUSAL = "summarized PR merged"
+_DONE_REFUSAL = " after send-back"   # stale_surface_reason rule (a): "card <status> after send-back"
+_STALE_READ_HEAD = f"{MARKER} stale surface refused"
+_PATH_RE = re.compile(r"[\w~./-]+\.(?:md|txt)\b")
+
+
+def _staged_read(entry: dict, texts: list) -> Optional[str]:
+    """t_e86eeab2: the file the child staged its read in. A ``.md``/``.txt`` path its verdict names (absolute, ``~``
+    or relative to the Hermes home) that exists; else the newest file naming the card in the child's scratch folder
+    (``cache/scratch/<delegation id>`` or ``del-<last 4>``, the short form the children use). None when neither."""
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    for text in texts:
+        for token in _PATH_RE.findall(str(text or "")):
+            path = Path(token).expanduser()
+            path = path if path.is_absolute() else home / path
+            if path.is_file():
+                return str(path)
+    did, tid = str(entry.get("delegation_id") or ""), str(entry.get("task_id") or "")
+    scratch = home / "cache" / "scratch"
+    found = [p for d in {did, f"del-{did[-4:]}"} if did and tid and (scratch / d).is_dir()
+             for p in (scratch / d).glob(f"*{tid}*") if p.is_file()]
+    return str(max(found, key=lambda p: (p.suffix == ".md", p.stat().st_mtime))) if found else None
+
+
+def record_stale_read(entry: dict, result: dict) -> bool:
+    """t_e86eeab2: ONE card comment when a child's ``surface`` was refused because the PR merged, or (round 3) because
+    the card was done/archived after a send-back (no chat wake): the read can still hold a finding about what merged,
+    and the refusal otherwise leaves no trace on the card. Names the staged read file and the refusal reason. Ends
+    ``(wake <key>) (delegation <id>)``: deduped on the WAKE (claim key without its ``#restartN`` suffix), since a
+    restart redispatch of the same wake mints a new delegation id; the delegation id stays as the pointer to the
+    child's folder and transcript. Any other refusal or action writes nothing."""
+    reason = str(result.get("reason") or "")
+    if result.get("action") != "surface" or not (
+            reason.startswith(_MERGED_REFUSAL) or (reason.startswith("card ") and reason.endswith(_DONE_REFUSAL))):
+        return False
+    from hermes_cli import kanban_db as kb
+
+    wake = f"(wake {str(entry['key']).split('#restart', 1)[0]}) (delegation "
+    tag = f"{wake}{entry['delegation_id']})"
+    staged = _staged_read(entry, [result.get("detail"), *(result.get("evidence") or []), result.get("summary")])
+    body = (f"{_STALE_READ_HEAD} ({reason}); the child's read was not delivered. "
+            f"Staged read: {staged or 'none found'}. Child said: {result.get('summary') or 'no summary'} {tag}")
+    conn = kb.connect(board=entry.get("board"))
+    try:
+        if any(c.author == AUTHOR and c.body.startswith(_STALE_READ_HEAD) and wake in c.body
+               for c in kb.list_comments(conn, entry["task_id"])):
+            return False
+        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+            kb.add_comment(conn, entry["task_id"], AUTHOR, body)
         return True
     finally:
         conn.close()
@@ -1969,7 +2553,7 @@ async def _complete_wakes_home(runner: Any, entry: dict) -> bool:
 
 
 async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
-                text: Optional[str] = None, *, fork_died: bool = False) -> None:
+                text: Optional[str] = None, *, fork_died: bool = False, tried: Optional[str] = None) -> None:
     """Commit the original wake obligation before any best-effort delivery. A freshness refusal
     (the card moved under the claim) is a supersede, not a fault (t_ce8bd439): the handback keeps
     only the re-delivered wake, the origin chat gets no line, and one #logs line records it.
@@ -1991,7 +2575,10 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
         return
     superseded = reason in _SUPERSEDE_REASONS
     stopped = reason == "stopped by /stop"
-    handback = handback_row(entry, {"summary": reason},
+    # t_d712444b round 3: a superseded WRITE verdict re-delivers the child's read (superseded_text). It keeps that
+    # identity on the pending row, so delivery never takes it for a legacy surface and drops it as stale (a merged PR).
+    read = superseded and bool(tried) and text is not None
+    handback = handback_row(entry, {"summary": reason, **({"action": SUPERSEDED_READ} if read else {})},
                             turn_text=text if text is not None else str(entry.get("wake_text") or ""))
     if fork_died and text is None:
         handback[1]["fork_died"] = True
@@ -2011,7 +2598,8 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
         handback[1]["line"] = f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}"
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
                             outcome="superseded" if superseded else "stopped" if stopped else "failed",
-                            reason=reason, resurfaced=True, resurface_delivered=False, handback=handback)
+                            reason=reason, resurfaced=True, resurface_delivered=False, handback=handback,
+                            **({"tried_action": tried} if tried else {}))
     if quiet:
         line = (f"boomerang-wake superseded {entry['task_id']}: card moved to {status} before the wake ran; "
                 f"original wake re-delivered")
@@ -2245,6 +2833,10 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
     result = await asyncio.to_thread(execute_verdict, live, final, state=state, handback=True,
                                      wake_home=await _complete_wakes_home(runner, live))
     if result.get("stale"):
+        try:
+            await asyncio.to_thread(record_stale_read, live, result)
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: stale-read comment on %s not written: %s", live["task_id"], exc)
         await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="stale",
                                 reason=result["reason"])
         return
@@ -2274,8 +2866,13 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
         await asyncio.to_thread(_breadcrumb, live, result)
         await deliver_handbacks(runner, state, delegation_id=live["delegation_id"])
         return
-    text = finding_text(live, result, "child verdict refused") if result.get("refused") else None
-    await _fail(runner, live, result["reason"], state, text)
+    if result.get("refused"):
+        text = finding_text(live, result, "child verdict refused")
+    elif result.get("reason") in _SUPERSEDE_REASONS and result.get("action"):
+        text = superseded_text(live, result)   # t_d712444b: the owner gets what the child tried
+    else:
+        text = None
+    await _fail(runner, live, result["reason"], state, text, tried=result.get("action"))
 
 
 async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: int, kind: str, event_ts: Any,
@@ -2295,6 +2892,34 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
     key = key or claim_key(board, task_id, event_id)
     if await asyncio.to_thread(state.has_claim, key):
         return False
+    if (disposition.row == ROW_REVIEW_DEADMAN and not redispatch
+            and await asyncio.to_thread(review_episode_answered, state, board, task_id, event_id)):
+        # t_efb6f435: one review episode gets one child. The handoff child already surfaced its read
+        # (or acted), so this deadman page is owned here: no second child, no turn.
+        now = _time.time()
+        skip = {"key": key, "board": board, "task_id": task_id, "event_id": int(event_id), "kind": kind,
+                "row": disposition.row, "state": STATE_TERMINAL, "outcome": "episode_answered",
+                "claimed_at": now, "finished_at": now}
+        if not await asyncio.to_thread(state.claim, key, skip):
+            return False
+        logger.info("kanban notifier: boomerang-wake %s disposition=auto row=%s path=%s skipped: the review "
+                    "handoff child answered this episode", task_id, disposition.row, path)
+        return True
+    if (disposition.row == ROW_REVIEW_DEADMAN and not redispatch
+            and await asyncio.to_thread(review_episode_running, state, board, task_id, event_id)):
+        # t_ff6f4be4 B: the episode's first-read child is still reading the same head. The page waits here as
+        # a ``deferred`` claim (owned, so neither wake path turns it into a turn); reconcile re-fires it as
+        # today's deadman child once that child ends without answering, or closes it when it answered.
+        now = _time.time()
+        wait = {"key": key, "board": board, "task_id": task_id, "title": str(_field(task, "title") or "")[:160],
+                "event_id": int(event_id), "kind": kind, "event_ts": event_ts, "row": disposition.row,
+                "mode": disposition.mode or "fork", "wake_text": wake_text, "home_sid": home_sid or "",
+                "route": dict(route or {}), "path": path, "state": STATE_DEFERRED, "claimed_at": now}
+        if not await asyncio.to_thread(state.claim, key, wait):
+            return False
+        logger.info("kanban notifier: boomerang-wake %s disposition=auto row=%s path=%s deferred: the review "
+                    "first-read child of this episode is still running", task_id, disposition.row, path)
+        return True
     snap = await asyncio.to_thread(card_snapshot, board, task_id)
     entry = {
         "key": key, "board": board, "task_id": task_id, "event_id": int(event_id), "kind": kind,
@@ -2396,7 +3021,8 @@ def _owner_candidates(board: str, task_id: str, items: list) -> dict:
             payload = dict(i.get("payload") or {})
             if i.get("kind") == "review_requested":
                 # the owner-wake queues a review handback only when its fleet PR is red/dirty
-                payload.update(own_repo=True, pr_state=_disposition_pr_state(i.get("pr_state")))
+                payload.update(own_repo=True, pr_state=_disposition_pr_state(i.get("pr_state")),
+                               human_reviewer=human_reviewer(i.get("payload"), task))
                 if row_enabled(ROW_REVIEW_ALL_ANSWERED):
                     payload["prism_all_answered"] = _owner_all_answered(kb, conn, task, i, memo)
             disp = classify_event(str(i.get("kind") or ""), payload, task, retries)
@@ -2517,6 +3143,12 @@ async def _maybe_prune_claims(state: BoomerangWakeState, now: float) -> int:
     if now - _LAST_PRUNE.get(key, 0.0) < CLAIM_PRUNE_EVERY_S:
         return 0
     _LAST_PRUNE[key] = now
+    try:   # t_e33a5355: the first tick after startup, then hourly
+        swept = await asyncio.to_thread(state.sweep_temps)
+        if swept:
+            logger.info("kanban boomerang-wake: removed %d stale %s* temp file(s)", swept, TEMP_PREFIX)
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: temp sweep failed: %s", exc)
     try:
         if not await asyncio.to_thread(backoff_enabled):
             return 0
@@ -2582,7 +3214,57 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
         if not await _superseded_by_terminal(runner, entry, "gateway restart", state):
             await _restart_redispatch_or_lost(runner, entry, state, now)
         handled += 1
+    handled += await _release_deferred(runner, claims, state, now)
     return handled
+
+
+async def _release_deferred(runner: Any, claims: dict, state: BoomerangWakeState, now: float) -> int:
+    """t_ff6f4be4 B: a deadman cycle-0 page ``dispatch`` parked as ``deferred`` while the episode's first-read
+    child ran. Still running (and under DEADMAN_WAIT_MAX_S, stop file absent): it keeps waiting. That child
+    answered the episode: closed as ``episode_answered`` (no child, no turn). Otherwise (failed, lost, refused
+    as stale, cancelled past its budget, gone, the wait ran out, or the stop file appeared): today's deadman
+    child is forked under ``<key>#deferred``; a failed fork re-surfaces the page as a lost wake."""
+    from gateway.kanban_wake_disposition import AUTO, Disposition
+
+    released = 0
+    for key, entry in claims.items():
+        if entry.get("state") != STATE_DEFERRED:
+            continue
+        board, tid, eid = entry.get("board"), entry["task_id"], entry["event_id"]
+        try:
+            waiting = (now - float(entry.get("claimed_at") or now) < DEADMAN_WAIT_MAX_S
+                       and await asyncio.to_thread(review_episode_running, state, board, tid, eid))
+            answered = not waiting and await asyncio.to_thread(review_episode_answered, state, board, tid, eid)
+        except Exception as exc:   # unreadable board: the page dispatches as today
+            logger.warning("kanban boomerang-wake: deferred deadman page %s unread (%s); dispatching", key, exc)
+            waiting = answered = False
+        if waiting:
+            continue
+        released += 1
+        if answered:
+            await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="episode_answered",
+                                    finished_at=_time.time())
+            logger.info("kanban boomerang-wake: %s deferred deadman page closed: the review first-read child "
+                        "answered this episode", tid)
+            continue
+        new_key = f"{key}#deferred"
+        try:
+            await dispatch(runner, board=board, key=new_key, task={"id": tid, "title": entry.get("title")},
+                           event_id=eid, kind=str(entry.get("kind") or ""), event_ts=entry.get("event_ts"),
+                           disposition=Disposition(AUTO, entry.get("mode") or "fork", 0, ROW_REVIEW_DEADMAN),
+                           wake_text=str(entry.get("wake_text") or ""), home_sid=entry.get("home_sid"),
+                           route=entry.get("route") or {}, path=f"{entry.get('path') or 'reconcile'}+deferred",
+                           state=state)
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: %s deferred deadman page dispatch failed: %s", tid, exc)
+            await _lost(runner, dict(entry, delegation_id=mint_delegation_id()),
+                        "deferred deadman page, dispatch failed", state)
+            continue
+        await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="redispatched_after_wait",
+                                redispatched_as=new_key, finished_at=_time.time())
+        logger.info("kanban boomerang-wake: %s deferred deadman page dispatched as %s (first-read child ended "
+                    "without answering)", tid, new_key)
+    return released
 
 
 # A completion verification whose verdict was DELIVERED (executor receipt) on a card that is still

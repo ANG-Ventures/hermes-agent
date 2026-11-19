@@ -956,3 +956,96 @@ class TestRestartRewrittenToolResult:
         new_user = {"role": "user", "content": "[kanban] a genuinely new wake"}
         _rebuilt_agent_ingest(tmp_path, _turn(0) + _turn(1) + _turn(2) + _turn(2) + [new_user])
         assert _count(tmp_path, _turn(2)[2]["content"]) >= 2  # duplicate over loss
+
+
+class TestSessionEndFlushAfterCompaction:
+    """t_5ce457b8, sessions 20261111_222101_a4b76071 and 20261110_145609_5d6379ca (default gateway,
+    2026-11-16 19:18:09 and 19:21:03): compaction 657 -> 171 (178 -> 109) left the ingest cursor at
+    len(compressed); the commit then flushed the session end with the PRE-compaction list
+    (commit_memory_session -> on_session_end), which stored its rows [171:] again (486 and 69 exact
+    repeats). Those copies at the store tail broke the next ingest's anchored walk after the in-place
+    on_session_start(boundary_reason="compression") reset, so the compacted tail went in again too
+    (173 and 118, "skipped scaffold-only prefix")."""
+
+    @staticmethod
+    def _compacted(tmp_path):
+        cfg = LCMConfig(database_path=str(tmp_path / "lcm.db"), leaf_chunk_tokens=120, condensation_fanin=2,
+                        fresh_tail_count=6, context_threshold=0.05, incremental_max_depth=3)
+        eng = LCMEngine(config=cfg, hermes_home=str(tmp_path))
+        eng.on_session_start(SESSION, platform="discord")
+        history = [{"role": "system", "content": "You are Apollo."}]
+        for i in range(30):
+            history.extend(_turn(i))
+        compressed = eng.compress([dict(m) for m in history], current_tokens=10**9)
+        assert eng._last_compression_status == "compacted"
+        assert len(compressed) < len(history)
+        return eng, history, compressed
+
+    def test_session_end_with_the_precompaction_list_appends_nothing(self, tmp_path):
+        eng, history, _compressed = self._compacted(tmp_path)
+        n0 = _rows(tmp_path)
+        eng.on_session_end(SESSION, [dict(m) for m in history])
+        assert _rows(tmp_path) == n0
+
+    def test_in_place_compaction_boundary_appends_only_the_new_rows(self, tmp_path):
+        eng, history, compressed = self._compacted(tmp_path)
+        n0 = _rows(tmp_path)
+        eng.on_session_end(SESSION, [dict(m) for m in history])
+        eng.on_session_start(SESSION, platform="discord", boundary_reason="compression", old_session_id=SESSION)
+        new = _turn(30, call_prefix="toolu")
+        eng.ingest([dict(m) for m in compressed] + new)
+        assert _rows(tmp_path) == n0 + len(new)
+
+    def test_row_added_after_the_compaction_reaches_the_store(self, tmp_path):
+        # Loss direction: rows the session-end list carries past the compacted input are new.
+        eng, history, compressed = self._compacted(tmp_path)
+        n0 = _rows(tmp_path)
+        new_user = {"role": "user", "content": "[kanban] a genuinely new wake"}
+        eng.on_session_end(SESSION, [dict(m) for m in history] + [new_user])
+        assert _rows(tmp_path) == n0 + 1
+        assert _count(tmp_path, new_user["content"]) == 1
+        # The compacted context still owns the cursor: its next rows are stored.
+        new = _turn(30, call_prefix="toolu")
+        eng.ingest([dict(m) for m in compressed] + new)
+        assert all(_count(tmp_path, m["content"]) >= 1 for m in new)
+
+    def test_interior_row_changed_after_the_compaction_reaches_the_store(self, tmp_path):
+        # Prism 1523c84d53e0: same length and endpoints, a corrected tool result inside -> it is stored.
+        eng, history, _compressed = self._compacted(tmp_path)
+        changed = [dict(m) for m in history]
+        changed[-2] = dict(changed[-2], content='{"output": "card 29 was corrected after compaction"}')
+        eng.on_session_end(SESSION, changed)
+        assert _count(tmp_path, changed[-2]["content"]) == 1
+
+
+class TestRestartResumeOfHostMergedUserRows:
+    """t_eebb04bf: session 20261017_083333_13cf5395 at the 11-17 00:50:55 boot stored
+    225 resumed rows again. The store holds a prompt (13918005) and the reboot's
+    resume note (13918006) as two consecutive user rows; the rebuilt history joins
+    them into one row ("<prompt>\\n\\n<note>"), so the walk ended at that row."""
+
+    _PROMPT = "[Mon 2026-11-16 22:14:23 PST] [safe-reboot complete | SRB-867B3873] verify the post-reboot state"
+    _NOTE = ("[System note: The previous turn was interrupted by a machine reboot; the gateway is now back "
+             "online.]")
+    _NEW = {"role": "user", "content": "[kanban] a genuinely new wake"}
+
+    def _shape(self, merged_tail):
+        before = [m for i in range(10) for m in _turn(i)]
+        after = _turn(10)[1:] + _turn(11)
+        stored = ([{"role": "system", "content": "You are Apollo."}] + before
+                  + [{"role": "user", "content": self._PROMPT}, {"role": "user", "content": self._NOTE}] + after)
+        history = before + [{"role": "user", "content": self._PROMPT + "\n\n" + merged_tail}] + after + [self._NEW]
+        return stored, history
+
+    def test_host_merged_prompt_and_resume_note_appends_only_the_new_row(self, tmp_path):
+        stored, history = self._shape(self._NOTE)
+        n0 = _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _rows(tmp_path) == n0 + 1
+        assert _count(tmp_path, self._NEW["content"]) == 1
+
+    def test_host_merged_row_with_text_the_store_lacks_is_stored(self, tmp_path):
+        stored, history = self._shape("[Ace] and one more thing")
+        _stored_into(tmp_path, stored)
+        _rebuilt_agent_ingest(tmp_path, history)
+        assert _count(tmp_path, self._PROMPT + "\n\n[Ace] and one more thing") == 1

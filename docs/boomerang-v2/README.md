@@ -246,11 +246,16 @@ Scope: boomerang wake is armed for the `default` (Apollo) profile only (spec §2
 ## 5. Lines you will see in the origin chat
 
 **`boomerang handled <card> (<row>): <summary>`**
-One passive line when a child resolves or surfaces a wake, plus a card comment
-`boomerang: <row> <summary>`. This is not a deadman page or a system wake. A `surface` verdict
-also delivers the child's finding to the home session as a turn (`[boomerang-wake] child
-surfaced ...`). If the operator already commented since review began, only the card breadcrumb
-is written; chat stays silent.
+The handled receipt when a child resolves or surfaces a wake, plus a card comment
+`boomerang: <row> <summary>`. This is not a deadman page or a system wake. Since hermes-agent#439
+(t_8ab5557d) it is an agent receipt, **not a chat line**: a handled-only verdict writes it as a
+row in the fleet agent log (`state/agent-logs/<UTC day>.jsonl`, `producer: boomerang-wake`,
+`task_id: <card>`), and posts it to the origin chat only when no agent log is available. A
+`surface` verdict delivers the child's finding to the home session as a turn (`[boomerang-wake]
+child surfaced ...`) and posts no handled line (the turn is the message; the receipt row is
+best-effort); a refused turn still posts the line. The file `<HERMES_HOME>/state/boomerang-handled-line-chat.enabled`
+restores the old behaviour (the line posts to the origin chat). If the operator already commented
+since review began, only the card breadcrumb is written.
 
 Delivery is durable: the gateway writes a pending handback (`handbacks[<delegation>]` in
 `gateway/kanban_boomerang_wake.json`) before any send. A line counts as delivered only on the

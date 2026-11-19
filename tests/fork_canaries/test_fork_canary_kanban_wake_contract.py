@@ -249,6 +249,7 @@ def test_w7_needs_input_block_with_wake_sub_is_one_notifier_turn(env):
     tid = _card(env)
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))  # a block notice needs a blocked card
         kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})  # noqa: SLF001
     turns = _tick(env)
     assert _paths(turns) == ["notifier"], _msg("W7", "a needs_input block with a wake sub must wake once", turns)
@@ -380,6 +381,7 @@ def test_w14_worker_needs_input_block_still_wakes_and_kill_switch_restores(env):
     _sub(tid)
     with kb.connect_closing() as conn, kb.write_txn(conn), \
             kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))  # a block notice needs a blocked card
         kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})  # noqa: SLF001
     turns = list(_tick(env))
     assert _paths(turns) == ["notifier"], _msg("W14", "a worker's needs_input block must wake once", turns)

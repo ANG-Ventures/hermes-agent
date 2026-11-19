@@ -829,6 +829,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway import inbound_record
 from gateway.platforms.helpers import fence_state_after
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
@@ -2176,6 +2177,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         # A photo burst always absorbs; otherwise merge only when media is involved on either
         # side. Captions merge in every absorbing case.
         if both_photo or existing.media_urls or incoming_has_media:
+            inbound_record.mark_merged(existing)   # t_118d31b1 / Prism 7fb14e749eb2
             if both_photo or incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -2195,6 +2197,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
+            inbound_record.mark_merged(existing)
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
@@ -3310,6 +3313,7 @@ class BasePlatformAdapter(ABC):
         if existing is None:
             existing = self._pending_text_batches[key] = event
         else:
+            inbound_record.mark_merged(existing)   # t_118d31b1: no longer one message
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             if event.media_urls:
@@ -4927,6 +4931,7 @@ class BasePlatformAdapter(ABC):
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
             store[session_key] = state
         else:
+            inbound_record.mark_merged(state.event)
             if event.text:
                 state.event.text = _append_text(state.event.text, event.text)
             state.event.absorb_reply_expected(event)

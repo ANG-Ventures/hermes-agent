@@ -2235,6 +2235,24 @@ DEFAULT_CONFIG = {
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
     },
+    # Copy-on-write checkouts from a per-host template (hermes_cli/worktree_cache.py; spec
+    # hermes-content plans/fleet-worktree-cache). OFF: every creator runs plain git. ``scopes``
+    # turns it on per creator: dispatcher_worktree, kanban_clone, port_clone, manual,
+    # deploy_selftest, script:<name>. Read per create, so no restart is needed.
+    "worktree_cache": {
+        "enabled": False,
+        "scopes": [],
+        "repos": [
+            "ANG-Ventures/hermes-home", "ANG-Ventures/hermes-agent", "ANG-Ventures/hermes-skills",
+            "ANG-Ventures/hermes-content", "ANG-Ventures/pipecat-house-voice", "ANG-Ventures/prism-router",
+        ],
+        "max_lag_s": 900,
+        "max_diff_files": 2000,
+        # Extra templates roots, one per volume checkouts land on (absolute dirs; host root
+        # config). A create uses the root on its destination's volume, else
+        # <kanban.workspaces_root>/.templates; refresh keeps a template in every root.
+        "templates_roots": [],
+    },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
@@ -2258,6 +2276,12 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
+        # The dispatcher leader holds one idle read-only connection on every live board so other
+        # openers do not rebuild the board's -shm on disk (t_1460fa32). Env off switch:
+        # HERMES_KANBAN_BOARD_ANCHOR=0. Read when the dispatcher takes its lock. Live switches, read
+        # every pass with no restart: ~/.hermes/kanban/board-anchor.off (drop every held
+        # connection) and ~/.hermes/kanban/board-anchor-checkpoint.off (no -wal checkpoints).
+        "board_anchor": True,
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
@@ -2451,7 +2475,7 @@ DEFAULT_CONFIG = {
                       # studio_capability_only (t_9965b8d5; read per tick from the ROOT config): the Studio runs a
                       # card only for a named Studio-only capability; files / a worktree are carried or ported,
                       # else the card waits (studio_capability_only:<rule>); a pool refusal waits, never a
-                      # Studio last resort. Active only while placement-policy makes the Studio last resort
+                      # Studio last resort. Active only while allocation-policy makes the Studio last resort
                       # and the capability map reads. false = the behaviour before t_9965b8d5 (kill switch).
                       "studio_capability_only": True,
                       # prose_pins_advisory (t_c82eded0; read per tick from the ROOT config): a Studio need read

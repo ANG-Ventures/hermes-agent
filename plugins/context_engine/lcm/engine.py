@@ -142,6 +142,7 @@ from .message_content import (
 from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
+    connect_read,
 )
 from .store import MessageStore
 from .storage_security import plaintext_path_policy, retention_status
@@ -604,6 +605,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
+        # (len(input), len(compressed), digest of every input row's identity) of the
+        # last compaction, until the next ingest; see _ingest_messages_unlogged.
+        self._compaction_source: Optional[tuple] = None
         self._last_ingest_reconciliation: Dict[str, Any] = {
             "action": "none",
             "reason": "not run",
@@ -1648,7 +1652,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
         try:
             uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = connect_read(uri, uri=True)
             try:
                 row = conn.execute(
                     """
@@ -2524,6 +2528,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # only messages appended *after* this point get ingested next time.
         self._ingest_cursor = len(compressed)
         self._ingest_cursor_needs_reconcile = False
+        self._compaction_source = (
+            len(messages),
+            len(compressed),
+            self._replay_identity_digest(messages),
+        )
 
         # Per-event node accounting: nodes THIS compress built = current total minus
         # the pre-event snapshot. The lifetime total is kept in parens because it was
@@ -5907,6 +5916,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         return result
 
+    def _replay_identity_digest(self, messages: List[Dict[str, Any]]) -> str:
+        h = hashlib.sha256()
+        for msg in messages:
+            h.update(json.dumps(self._message_replay_identity(msg)).encode())
+        return h.hexdigest()
+
     def _ingest_messages_unlogged(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -5931,6 +5946,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._session_id,
             )
             return self._redact_active_replay_messages(messages)
+
+        # The cursor indexes the list the last compaction returned. A caller that
+        # still holds the list it was given (the commit's session-end flush,
+        # t_5ce457b8) would re-store rows [len(compressed):] of rows compress()
+        # already stored, so only rows past that input are new. The cursor stays
+        # on the compacted list for the next ingest.
+        source, self._compaction_source = self._compaction_source, None
+        if (
+            source is not None
+            and not self._ingest_cursor_needs_reconcile
+            and self._ingest_cursor == source[1]
+            and len(messages) >= source[0]
+            and self._replay_identity_digest(messages[: source[0]]) == source[2]
+        ):
+            self._ingest_cursor = source[0]
+            try:
+                return self._ingest_messages_unlogged(messages)
+            finally:
+                self._ingest_cursor = source[1]
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)

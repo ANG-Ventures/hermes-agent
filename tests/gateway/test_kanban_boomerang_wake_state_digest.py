@@ -99,7 +99,10 @@ def test_legacy_text_claim_is_read_and_converted_on_next_write(env, changed):  #
     _run(env, legacy, "completed", _verdict(legacy, "retry", **RETRY))
     assert (_status(tid) == "blocked") is changed
     raw = state.path.read_text()
-    assert "assessed_card_text" not in raw and '"assessed_card_digest"' in raw
+    arch = state.archive_path.read_text() if state.archive_path.exists() else ""
+    assert "assessed_card_text" not in raw + arch
+    # t_e33a5355: the claim is terminal now, so it lives in the archive without its card digest
+    assert entry["key"] not in json.loads(raw).get("claims", {}) and entry["key"] in arch
 
 
 def test_no_rewrite_over_ten_ticks_without_a_new_event(env, monkeypatch):  # noqa: F811

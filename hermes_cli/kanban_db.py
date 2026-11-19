@@ -2223,21 +2223,24 @@ def _board_db_is_empty(db_path: Path) -> bool:
     returns 3. ``mode=ro`` still refuses to create a missing file, so this
     probe cannot itself become a phantom-creator.
     """
-    try:
-        uri = f"file:{db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
-    except sqlite3.Error:
-        return False
-    try:
-        row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
-    except sqlite3.Error:
-        return False
-    finally:
+    def _read() -> bool:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
         try:
-            conn.close()
-        except sqlite3.Error:
-            pass
-    return bool(row) and row[0] == 0
+            row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        return bool(row) and row[0] == 0
+
+    # list_boards() runs this on every watcher tick in every gateway; an unchanged DB answers
+    # from memory instead of a reopen that rewrites its -shm on disk (t_2cfa2782).
+    from hermes_cli import sqlite_quiet_memo
+    try:
+        return sqlite_quiet_memo.read(db_path, "board_db_is_empty", _read)
+    except sqlite3.Error:
+        return False
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -7295,7 +7298,7 @@ def list_tasks(
 ) -> list[Task]:
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
-    query = "SELECT * FROM tasks WHERE 1=1"
+    query = " WHERE 1=1"
     params: list[Any] = []
     for col, val in (
         ("assignee", _canonical_assignee(assignee)), ("status", status), ("tenant", tenant),
@@ -7318,12 +7321,39 @@ def list_tasks(
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
             raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
-        query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
+        order_sql = VALID_SORT_ORDERS[order_by]
     else:
-        query += " ORDER BY priority DESC, created_at ASC"
+        order_sql = "priority DESC, created_at ASC"
+    if order_by == "title":
+        # Titles are long (Studio board: 3.4 MB of them): even (title, id) alone, or a
+        # 48-char prefix, outgrew the 2 MB cache and spilled etilqs files (4.1 MB per
+        # call, t_ba5a93d0). No SQL sort here; Python orders (title, id), which for
+        # UTF-8 text is SQLite's BINARY order, so results are identical.
+        # Keys first (t_188b19e8, Prism P2 e880279c7cf3): sort (title, id) only, cut to
+        # ``limit``, then read just those full rows, never every body and result.
+        keys = sorted(conn.execute(f"SELECT title, id FROM tasks{query}", params).fetchall(),
+                      key=lambda r: (r[0], r[1]))
+        ids = [r[1] for r in (keys[:int(limit)] if limit else keys)]
+        by_id: dict[str, Any] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for r in conn.execute(
+                f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk,
+            ):
+                by_id[r["id"]] = r
+        # A card deleted between the two reads is dropped, never returned half-read.
+        return [Task.from_row(by_id[i]) for i in ids if i in by_id]
+    # Sort only (keys, id), then join the full rows by primary key and order in Python.
+    # ``SELECT * ... ORDER BY`` sorted whole rows (bodies, results): 198 MB of etilqs
+    # temp files per ``kanban list`` on the Studio board (t_d24713d3). One statement,
+    # so still one read snapshot.
+    keyed = f"SELECT id, row_number() OVER (ORDER BY {order_sql}) AS rn FROM tasks{query}"
     if limit:
-        query += f" LIMIT {int(limit)}"
-    rows = conn.execute(query, params).fetchall()
+        keyed += f" ORDER BY rn LIMIT {int(limit)}"
+    rows = conn.execute(
+        f"SELECT k.rn AS _list_rn, t.* FROM ({keyed}) k JOIN tasks t ON t.id = k.id", params,
+    ).fetchall()
+    rows.sort(key=lambda r: r[0])
     return [Task.from_row(r) for r in rows]
 
 
@@ -16083,6 +16113,8 @@ SENDBACK_SOURCES: tuple[str, ...] = (
 )
 _SENDBACK_MAX_PAYLOAD_BYTES = 16 * 1024
 _CTX_MAX_SENDBACKS = 5
+# kanban_show cuts the worker context around this section, never inside it (t_5949eafd).
+CTX_SENDBACKS_HEADER = "## Send-backs on your PR (newest last)"
 
 
 def _sendback_payload_error(payload: Any) -> Optional[str]:
@@ -16243,19 +16275,37 @@ def request_sendback(
         return False, f"task is {status!r}; a sendback needs running/ready/todo/review"
 
 
-def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+def _ctx_current_sendback(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[str, int]]:
+    """The ONE send-back the worker must act on now, shown whole (t_5949eafd): the newest
+    ``changes_requested`` or ``sendback`` event, by event id (not wall time), that no later
+    ``review_requested`` handback answered. ``("run", run_id)`` or ``("event", event_id)``."""
+    row = conn.execute(
+        "SELECT id, kind, run_id FROM task_events WHERE task_id = ? AND kind IN ('changes_requested', ?) "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'), 0) ORDER BY id DESC LIMIT 1",
+        (task_id, SENDBACK_EVENT_KIND, task_id),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["kind"] == SENDBACK_EVENT_KIND:
+        return ("event", int(row["id"]))
+    return ("run", int(row["run_id"])) if row["run_id"] is not None else None
+
+
+def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int,
+                   current: Optional[tuple[str, int]] = None, marks: Optional[dict] = None) -> None:
     """Render the newest ``sendback`` events into the worker prompt (§2.4).
     A sendback older than the latest ``review_requested`` was already answered
     by that handback and is not replayed."""
     rows = conn.execute(
-        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
         "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
         "AND kind = 'review_requested'), 0) ORDER BY id DESC LIMIT ?",
         (task_id, SENDBACK_EVENT_KIND, task_id, _CTX_MAX_SENDBACKS),
     ).fetchall()
     if not rows:
         return
-    lines.append("## Send-backs on your PR (newest last)")
+    lines.append(CTX_SENDBACKS_HEADER)
     lines.append(
         "A producer sent a defect on your PR straight back to you. Fix it and "
         "push (a new head clears it), or reply `prism-verdict: <id> not-a-bug "
@@ -16267,11 +16317,18 @@ def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now
         where = f"{p.get('repo')}#{p.get('pr')}" if p.get("repo") else "(no PR)"
         head = str(p.get("head") or "")[:12]
         rnd = f" r{p['round']}" if p.get("round") is not None else ""
+        start = len(lines)
         lines.append(
             f"### {p.get('source')}: {p.get('reason')}{rnd} on {where}"
             + (f" @ {head}" if head else "") + f" ({_ctx_stamp(r['created_at'], now)})"
         )
-        lines.append(_ctx_cap(p.get("summary")))
+        if current == ("event", int(r["id"])):  # the one current send-back is whole (t_5949eafd)
+            lines.append(str(p.get("summary") or "").strip())
+            if marks is not None:
+                marks["sendback"] = (start, len(lines))
+        else:
+            lines.append(_ctx_cap_lines(p.get("summary"), render_operator_command(
+                get_current_board(), "show", task_id, "--json")))
         if p.get("evidence"):
             lines.append("```json")
             lines.append(_ctx_cap(json.dumps(p["evidence"], ensure_ascii=False, indent=1)))
@@ -21029,7 +21086,121 @@ def _cohort_death_ids(dead: list, *, now: float) -> set:
     return members if len(members) >= _COHORT_DEATH_MIN else set()
 
 
-def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive: Optional[list] = None) -> None:
+# Who sent the signal (t_c6d2e782). The Studio runs an exec flight recorder
+# (hermes-home fleet/exec-flight-recorder.py: one JSON line per exec(), hourly
+# ``YYYY-mm-dd-HH.jsonl`` files, ``ts`` in local time). A kill/pkill/killall exec
+# in the minutes before detection is the sender; its parents name the session.
+# On 2026-11-17 11:06:16 it was a worker's ``sudo -n pkill -f PAT -P N``.
+_EXEC_FLIGHT_DIRS_ENV = "HERMES_EXEC_FLIGHT_DIRS"
+_COHORT_SENDER_WINDOW_SECONDS = 240
+_COHORT_SENDER_TAIL_BYTES = 96 * 1024 * 1024
+_KILL_EXES = (b'/kill"', b'/pkill"', b'/killall"')
+
+
+def _exec_flight_dirs() -> list:
+    raw = os.environ.get(_EXEC_FLIGHT_DIRS_ENV)
+    if raw is not None:
+        return [Path(p) for p in raw.split(os.pathsep) if p]
+    return [Path("/Volumes/fleet-scratch/var/exec-flight"), Path.home() / ".hermes" / "var" / "exec-flight"]
+
+
+def _exec_flight_tail(path: Path, max_bytes: int) -> list:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read(max_bytes)
+    except OSError:
+        return []
+    lines = data.split(b"\n")
+    return lines[1:] if size > max_bytes else lines  # first line may be cut
+
+
+def _cohort_death_sender(*, pids: Iterable[int] = (), now: Optional[float] = None,
+                         window: float = _COHORT_SENDER_WINDOW_SECONDS) -> Optional[str]:
+    """Name the kill/pkill/killall exec(s) seen in the window before ``now``, else None.
+
+    ``pkill``/``killall`` (pattern kills) always count. A plain ``kill`` counts only when it
+    names a member pid or pgid from ``pids`` (or ``-1``): a targeted kill of some other pid
+    in the same minutes is another session's business, not the sender.
+
+    Reads only the tail of the current (and, across an hour boundary, previous)
+    hourly file. None also when no recorder ring exists or the killer did not exec
+    (``os.kill`` from inside a process, or the recorder itself was killed first).
+    Never raises.
+    """
+    try:
+        now = time.time() if now is None else now
+        lo = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - window))
+        hi = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now + 5))
+        hours = sorted({time.strftime("%Y-%m-%d-%H", time.localtime(t)) for t in (now - window, now)})
+        ring = next((d for d in _exec_flight_dirs() if d.is_dir()), None)
+        if ring is None:
+            return None
+        members = {abs(int(p)) for p in pids if p}
+        lines: list = []
+        for h in hours:
+            lines.extend(_exec_flight_tail(ring / f"{h}.jsonl", _COHORT_SENDER_TAIL_BYTES))
+        rows = []
+        for line in lines:
+            if not any(k in line for k in _KILL_EXES):
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            exe = os.path.basename(str(r.get("exe") or ""))
+            args = str(r.get("args") or "")
+            if exe not in ("kill", "pkill", "killall") or not (lo <= str(r.get("ts") or "") <= hi):
+                continue
+            if re.search(r"(?:^|\s)-0(?:\s|$)", args):
+                continue  # liveness probe, sends nothing
+            if exe == "kill":
+                targets = {abs(int(a)) for a in re.findall(r"(?:^|\s)(-?\d+)(?=\s|$)", args)}
+                if not (targets & members or "-1" in args.split()):
+                    continue
+            rows.append(r)
+        if not rows:
+            return None
+
+        def _parent(ppid, before: str) -> Optional[dict]:
+            needle = ('"pid":%d,' % int(ppid)).encode()
+            hit = None
+            for line in lines:
+                if needle in line:
+                    try:
+                        cand = json.loads(line)
+                    except ValueError:
+                        continue
+                    if cand.get("pid") == ppid and str(cand.get("ts") or "") <= before:
+                        hit = cand  # latest exec of that pid up to the kill
+            return hit
+
+        def _cmd(row: dict, n: int) -> str:
+            return " ".join(str(row.get("args") or "").split())[:n]
+
+        out = []
+        for r in reversed(rows[-3:]):  # newest first: the kill closest to the deaths
+            chain = [f"`{_cmd(r, 200)}` (pid {r.get('pid')}, uid {r.get('uid')}, {str(r.get('ts'))[11:]})"]
+            cur = r
+            for _ in range(3):
+                ppid = cur.get("ppid")
+                if not isinstance(ppid, int) or ppid <= 1:
+                    break
+                cur = _parent(ppid, str(cur.get("ts") or hi))
+                if cur is None:
+                    break
+                chain.append(f"`{_cmd(cur, 160)}` (pid {cur.get('pid')})")
+            out.append(" <- ".join(chain))
+        return "; ".join(out)
+    except Exception as exc:  # pragma: no cover - attribution must never break a tick
+        _log.debug("cohort-death sender lookup failed: %s", exc)
+        return None
+
+
+def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive: Optional[list] = None,
+                       sender: Optional[str] = None) -> None:
     """Page #alerts ONCE for a cohort death. Best-effort, never raises.
 
     Once per cohort by construction: the members are released in the same
@@ -21057,9 +21228,13 @@ def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive:
                 "`log show --predicate 'process == \"timed\"'`), so live workers may now "
                 "be running beside their own requeued card."
             )
+        elif sender:
+            cause = f"Signal sender (exec flight recorder): {sender}"
         else:
             cause = (
-                "Something outside the dispatcher killed them (reaper / OOM / signal sweep): "
+                "SENDER UNKNOWN: the exec flight recorder holds no kill/pkill/killall exec in the "
+                "4 min before detection (a kill from inside a process, or the recorder was killed "
+                "too). Something outside the dispatcher killed them (reaper / OOM / signal sweep): "
                 "the cohort_death events carry each member's spawn pgid and who else was in it; "
                 "find the sender with `log show --predicate 'eventMessage CONTAINS \"sent by\"'` "
                 "around the tick."
@@ -22966,7 +23141,8 @@ def _apply_shim_model_cap(
 # ---------------------------------------------------------------------------
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(conn: sqlite3.Connection, task_id: str,
+                         spans: Optional[dict] = None) -> str:
     """Everything a worker should read about its task: header, body,
     attachments, prior attempts, done-parent handoffs, the assignee's recent
     work, comments. Lists are tail-capped and fields char-capped
@@ -22983,14 +23159,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                            (int(task.current_run_id),)).fetchone()
         run_started_at = int(row["started_at"]) if row and row["started_at"] is not None else None
     _ctx_header(lines, task, run_started_at)
+    marks: dict = {"head": (0, len(lines))}  # line ranges kanban_show never cuts (t_5949eafd)
+    current = _ctx_current_sendback(conn, task_id)
     _ctx_attachments(lines, list_attachments(conn, task_id))
-    _ctx_prior_attempts(lines, conn, task_id, now)
-    _ctx_sendbacks(lines, conn, task_id, now)
+    _ctx_prior_attempts(lines, conn, task_id, now, current, marks)
+    _ctx_sendbacks(lines, conn, task_id, now, current, marks)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     from hermes_cli import kanban_archive_read as _kar
     _ctx_comments(lines, _kar.comments_with_archive(conn, task_id), now)
-    return "\n".join(lines).rstrip() + "\n"
+    text = "\n".join(lines).rstrip() + "\n"
+    if spans is not None:  # char spans of the header+body and the current send-back
+        for key, (a, b) in marks.items():
+            start = len("\n".join(lines[:a])) + (1 if a else 0)
+            spans[key] = (start, min(len(text), len("\n".join(lines[:b]))))
+    return text
 
 
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
@@ -23001,6 +23184,21 @@ def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _ctx_cap_lines(s: Optional[str], more: str) -> str:
+    """``_ctx_cap`` for a send-back: cut at a line end within the field cap and
+    name ``more``, the command that prints the rest (t_5949eafd)."""
+    s = (s or "").strip()
+    limit = _CTX_MAX_FIELD_BYTES
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    if s[limit] != "\n":  # the cap already ends a line otherwise
+        cut = head.rfind("\n")
+        head = head[:cut] if cut > 0 else head[:max(head.rfind(" "), 1)]
+    head = head.rstrip()
+    return head + f"\n… [truncated, {len(s) - len(head)} chars omitted; whole text: `{more}`]"
 
 
 def _ctx_stamp(ts: int, now: int) -> str:
@@ -23076,7 +23274,8 @@ def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
     lines.append("")
 
 
-def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int,
+                        current: Optional[tuple[str, int]] = None, marks: Optional[dict] = None) -> None:
     """Closed runs on this task (the active run is this worker), newest
     ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
     from hermes_cli import kanban_archive_read as _kar  # R8 moves old cards' runs out (t_589fb988)
@@ -23091,11 +23290,21 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
     for offset, run in enumerate(shown):
         profile = run.profile or "(unknown)"
         outcome = run.outcome or run.status
+        start = len(lines)
         lines.append(
             f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
         )
         if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
+            if current == ("run", run.id):  # the one current send-back is whole (t_5949eafd)
+                lines.append(run.summary.strip())
+                if marks is not None:
+                    marks["sendback"] = (start, len(lines))
+            elif run.outcome == "changes_requested":
+                lines.append(_ctx_cap_lines(run.summary, render_operator_command(
+                    get_current_board(), "show", task_id, "--json",
+                    "--state-type", "outcome", "--state-name", "changes_requested")))
+            else:
+                lines.append(_ctx_cap(run.summary))
         if run.error and run.error.strip():
             lines.append(f"_error_: {_ctx_cap(run.error)}")
         meta_line = _ctx_metadata_line(run.metadata)

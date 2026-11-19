@@ -69,14 +69,18 @@ def pin_unknown_host(word: str, suggestions=()) -> str:
     return f"{PIN_UNKNOWN_HOST}:{word}{tail}"
 
 # The task_event that records why a ready card was held this tick.
-PLACEMENT_WAIT_EVENT = "placement_wait"
+PLACEMENT_WAIT_EVENT = "allocation_wait"
 # The task_event on a run that was spawned on a pool host (host, reason, band).
-WORKER_PLACED_EVENT = "worker_placed"
+WORKER_PLACED_EVENT = "worker_allocated"
 # The task_event on every spawn, both routes (spec §4.1; written from Phase 2a).
-PLACEMENT_EVENT = "placement"
+PLACEMENT_EVENT = "allocation"
+# The task_event a continuation card carries naming its parent's host (kanban_continuation).
+PLACEMENT_HINT_EVENT = "allocation_hint"
+# The task_event of a held card moved off a paused/blocked host (kanban_pause_hold, kanban_placement_block).
+PLACEMENT_REROUTED_EVENT = "allocation_rerouted"
 # Rename wave 3 (t_7be48220, Fleet Work Allocation): each placement event kind gets an allocation name.
-# For one release readers accept BOTH names (historical rows are never rewritten); the writers above still
-# emit the old name until the writer step flips them. Readers query ``kind IN ({kind_marks(K)})`` with
+# For one release readers accept BOTH names (historical rows are never rewritten); the writers above emit
+# the allocation name (writer step, t_7be48220 step 3). Readers query ``kind IN ({kind_marks(K)})`` with
 # ``*kind_names(K)`` and compare with ``normalize_kind(kind) == normalize_kind(K)``.
 KIND_ALIASES = {
     "placement": "allocation",

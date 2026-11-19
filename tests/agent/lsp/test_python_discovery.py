@@ -76,3 +76,36 @@ def test_pyright_uses_the_project_interpreter_before_hermes(tmp_path, monkeypatc
             check=True, capture_output=True, text=True, timeout=10,
         )
         assert Path(child.stdout.strip()) == environment
+
+
+def test_pyright_spawn_caps_the_node_heap_and_names_its_config(tmp_path, monkeypatch):
+    """Pyright runs under a bounded V8 heap so its own cache-emptying guard fires before a host-sized heap
+    grows past lsp-bloat-watch's 1500 MB line and dies V8-OOM (t_9cba3363), and the spec names the config
+    file pyright will load so the spawn log can show it."""
+    from agent.lsp import servers
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyrightconfig.json").write_text('{"include": ["scripts"]}', encoding="utf-8")
+    monkeypatch.setenv("NODE_OPTIONS", "--enable-source-maps")
+    context = servers.ServerContext(
+        workspace_root=str(project), install_strategy="off",
+        binary_overrides={"pyright": [sys.executable]}, trusted=False,
+    )
+    spec = servers.find_server_for_file(str(project / "app.py")).build_spawn(str(project), context)
+    assert spec is not None
+    assert spec.env["NODE_OPTIONS"] == f"--enable-source-maps --max-old-space-size={servers.PYRIGHT_MAX_OLD_SPACE_MB}"
+    assert servers.PYRIGHT_MAX_OLD_SPACE_MB < 1500
+    assert spec.config_path == str(project / "pyrightconfig.json")
+
+    # No config at the root: pyright indexes the whole root, and the spawn log must say so.
+    (project / "pyrightconfig.json").unlink()
+    assert servers.find_server_for_file(str(project / "app.py")).build_spawn(str(project), context).config_path is None
+
+    # An operator's own heap flag (or an lsp.servers.pyright.env override) wins.
+    monkeypatch.setenv("NODE_OPTIONS", "--max-old-space-size=3072")
+    spec = servers.find_server_for_file(str(project / "app.py")).build_spawn(str(project), context)
+    assert spec.env["NODE_OPTIONS"] == "--max-old-space-size=3072"
+    context.env_overrides = {"pyright": {"NODE_OPTIONS": "--max-old-space-size=2048"}}
+    spec = servers.find_server_for_file(str(project / "app.py")).build_spawn(str(project), context)
+    assert spec.env["NODE_OPTIONS"] == "--max-old-space-size=2048"

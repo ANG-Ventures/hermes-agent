@@ -848,6 +848,21 @@ class TestMarkJobRun:
         mark_job_run(job["id"], success=True, delivery_error="send failed: 502")
         assert get_job(job["id"])["failure_streak"] == 0
 
+    def test_rc76_deferral_is_not_a_failure(self, tmp_cron_dir):
+        """rc 76 (house DEFERRED: host in other OS / outside window) neither grows nor resets the
+        failure streak, and reads `deferred` (t_5c58441f: windows-golden-drift-lint hit 103)."""
+        job = create_job(prompt="Win", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error="timeout")
+        err = "Script exited with code 76\nstderr:\n[host-os] deferred: ace-ai is linux, job needs windows"
+        mark_job_run(job["id"], success=False, error=err)
+        mark_job_run(job["id"], success=False, error=err)
+        got = get_job(job["id"])
+        assert got["failure_streak"] == 1
+        assert got["last_status"] == "deferred"
+        assert got["error_repeat_streak"] == 0
+        mark_job_run(job["id"], success=False, error="Script exited with code 7")
+        assert get_job(job["id"])["failure_streak"] == 2
+
     def test_failure_streak_backcompat_missing_field(self, tmp_cron_dir):
         """Jobs persisted before the field existed increment from 0."""
         job = create_job(prompt="Old", schedule="every 1h")

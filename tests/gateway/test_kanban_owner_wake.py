@@ -109,6 +109,12 @@ def _event(tid, kind, payload=None):
         kb._append_event(conn, tid, kind, payload)
 
 
+def _blocked(tid):
+    """A real block leaves the card blocked; the notifier drops a block notice once it is not (t_05badfca)."""
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+
+
 def _one_turn(env, handled):
     assert len(handled) == 1, [e.text for e in handled]
     ev = handled[0]
@@ -416,6 +422,7 @@ def test_notify_wake_sub_on_owner_chat_is_not_doubled(env):
     # t_156cc147: the sub's wake must be DELIVERED (accepted) to cover the block; a
     # rejected or downgraded one leaves the owner-wake to fire.
     _wake_sub_on_owner_chat(env, tid)
+    _blocked(tid)
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
     handled = _tick(env)
     owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
@@ -1131,6 +1138,7 @@ def _replay_957601(env, monkeypatch, *, downgrade):
     assert env["store"].lookup_by_session_id(ROTATED_SID) is None, "home sid must be rotated"
     tid = _card(env, session=ROTATED_SID, title="skill re-layout C")
     _wake_sub_on_owner_chat(env, tid)
+    _blocked(tid)
     _event(tid, "blocked", {
         "kind": "needs_input", "recurrences": 1, "source_status": "ready",
         "reason": "Wave 1 (generative-art) committed locally: branch daedalus/t_e248dbe7-wave1 @ "

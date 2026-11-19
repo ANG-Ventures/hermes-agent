@@ -386,6 +386,9 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # (test-gate exported ~/.hermes) made tests rewrite the LIVE config/fleet-hosts.json
     # (t_dbacd1f2). Tests of PLACEMENT_HOME precedence set it themselves.
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
+    # ALLOCATION_HOME is the canonical name and wins over PLACEMENT_HOME (t_fc257547,
+    # Prism 8655eeb51c54): an inherited one would override every test's own root.
+    monkeypatch.delenv("ALLOCATION_HOME", raising=False)
     # Same for the root receipt the vendored admission_demand requires (hermes-home #9789): an inherited one names
     # the LIVE fleet root. _provisioned_placement_roots below provisions each test's own root instead.
     monkeypatch.delenv("PLACEMENT_ROOT_RECEIPT", raising=False)
@@ -483,6 +486,9 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # from a checkout, often one under /Volumes/fleet-scratch. Disarm the
     # shadow-cwd boot guard; its own tests delete this.
     monkeypatch.setenv("HERMES_ALLOW_SHADOW_CWD", "1")
+    # t_969164a0: the port clone script asks the host's installed `hermes` whether the
+    # worktree cache is on; tests never start that CLI. The cache's own tests delete this.
+    monkeypatch.setenv("HERMES_WORKTREE_CACHE", "0")
 
     # 3a-GUARD (2026-07-24 WAL incident): hermeticity canary — after the
     # redirect, the resolved state.db path must live under the sandbox. If it

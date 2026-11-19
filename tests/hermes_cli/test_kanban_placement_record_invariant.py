@@ -64,8 +64,8 @@ def test_t1073ffef_run34_late_spawn_after_operator_close_still_writes_its_placem
     record = {"run_id": run_id, "route": "remote-policy", "host": "ci-box", "route_class": "portable"}
     assert kbd._set_worker_pid(conn, tid, 80596, run_id=run_id, placement=record) is False
     kinds = _kinds(conn, run_id)
-    assert "spawned" in kinds and "placement" in kinds
-    placed = _payload(conn, run_id, "placement")
+    assert "spawned" in kinds and "allocation" in kinds
+    placed = _payload(conn, run_id, "allocation")
     assert placed["host"] == "ci-box" and placed["claim_lost"] is True
     # A worker existed, so the run is not a no-worker run, whatever its close said.
     assert _cls(conn, run_id) is None
@@ -75,7 +75,7 @@ def test_spawn_without_a_caller_record_still_writes_a_placement(conn):
     tid = kb.create_task(conn, title="caller passed no record", assignee="worker")
     claimed = kb.claim_task(conn, tid)
     assert kbd._set_worker_pid(conn, tid, 4242, run_id=claimed.current_run_id) is True
-    placed = _payload(conn, claimed.current_run_id, "placement")
+    placed = _payload(conn, claimed.current_run_id, "allocation")
     assert placed is not None and placed["reason"] == "unrecorded" and placed["run_id"] == claimed.current_run_id
 
 
@@ -84,7 +84,7 @@ def test_worker_adopted_pid_writes_a_placement_when_the_dispatcher_wrote_none(co
     claimed = kb.claim_task(conn, tid)
     monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
     assert kbd.adopt_worker_pid(conn, tid, claimed.current_run_id, 5151) is True
-    placed = _payload(conn, claimed.current_run_id, "placement")
+    placed = _payload(conn, claimed.current_run_id, "allocation")
     assert placed is not None and placed["entry"] == "worker_registered"
 
 
@@ -98,8 +98,8 @@ def test_worker_registering_after_its_run_was_closed_records_placement_and_clear
     monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
     assert kbd.adopt_worker_pid(conn, tid, run_id, 9191) is False
     kinds = _kinds(conn, run_id)
-    assert "worker_registered" in kinds and kinds.count("placement") == 1
-    placed = _payload(conn, run_id, "placement")
+    assert "worker_registered" in kinds and kinds.count("allocation") == 1
+    placed = _payload(conn, run_id, "allocation")
     assert placed["entry"] == "worker_registered" and placed["claim_lost"] is True
     assert _payload(conn, run_id, "worker_registered")["claim_lost"] is True
     assert _cls(conn, run_id) is None
@@ -112,7 +112,7 @@ def test_worker_with_a_run_id_of_another_task_records_nothing(conn):
     other = kb.create_task(conn, title="b", assignee="worker")
     run_id = kb.claim_task(conn, other).current_run_id
     assert kbd.adopt_worker_pid(conn, tid, run_id, 9292) is False
-    assert "placement" not in _kinds(conn, run_id)
+    assert "allocation" not in _kinds(conn, run_id)
 
 
 def test_placement_is_never_written_twice_for_one_run(conn, monkeypatch):
@@ -121,7 +121,7 @@ def test_placement_is_never_written_twice_for_one_run(conn, monkeypatch):
     assert kbd._set_worker_pid(conn, tid, 6161, run_id=claimed.current_run_id, placement={"host": "ace-ai"}) is True
     monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
     kbd.adopt_worker_pid(conn, tid, claimed.current_run_id, 6161)
-    assert _kinds(conn, claimed.current_run_id).count("placement") == 1
+    assert _kinds(conn, claimed.current_run_id).count("allocation") == 1
 
 
 def test_operator_verdict_row_is_classed_operator(conn):
@@ -171,8 +171,8 @@ def test_a_repeated_set_worker_pid_never_writes_a_second_placement(conn):
     run_id = kb.claim_task(conn, tid).current_run_id
     assert kbd._set_worker_pid(conn, tid, 1111, run_id=run_id, placement={"host": "ace-ai", "reason": "policy"})
     assert kbd._set_worker_pid(conn, tid, 1111, run_id=run_id) is True
-    assert _kinds(conn, run_id).count("placement") == 1
-    assert _payload(conn, run_id, "placement")["host"] == "ace-ai"
+    assert _kinds(conn, run_id).count("allocation") == 1
+    assert _payload(conn, run_id, "allocation")["host"] == "ace-ai"
 
 
 def test_adopt_then_set_without_run_id_replaces_the_placeholder(conn, monkeypatch):
@@ -184,8 +184,8 @@ def test_adopt_then_set_without_run_id_replaces_the_placeholder(conn, monkeypatc
     monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
     assert kbd.adopt_worker_pid(conn, tid, run_id, 2222) is True
     assert kbd._set_worker_pid(conn, tid, 2222, placement={"host": "ace-ai", "reason": "policy"}) is True
-    assert _kinds(conn, run_id).count("placement") == 1
-    assert _payload(conn, run_id, "placement")["host"] == "ace-ai"
+    assert _kinds(conn, run_id).count("allocation") == 1
+    assert _payload(conn, run_id, "allocation")["host"] == "ace-ai"
 
 
 
@@ -197,15 +197,15 @@ def test_adopt_then_a_launch_with_no_pid_leaves_one_full_placement(conn, monkeyp
     run_id = claimed.current_run_id
     monkeypatch.setattr(kb, "_host_prefix", lambda: (claimed.claim_lock or "").split(":", 1)[0])
     assert kbd.adopt_worker_pid(conn, tid, run_id, 3333) is True
-    assert _payload(conn, run_id, "placement")["reason"] == "unrecorded"
+    assert _payload(conn, run_id, "allocation")["reason"] == "unrecorded"
     monkeypatch.setattr(kbd, "_book_local_start", lambda *a: None)
     monkeypatch.setattr("hermes_cli.kanban_continuation.record_placement", lambda *a: True)
     full = {"run_id": run_id, "host": "ace-ai", "route_class": "local", "reason": "policy", "entry": "dispatch"}
     assert kbd._launch_claimed(conn, claimed, "/scratch", board=None, spawn=lambda *a, **k: None,
                                spawn_kwargs={}, host=None, pool=None, placement_record=lambda: dict(full),
                                state=kbd._LaunchState()) == kbd._LAUNCH_OK
-    assert _kinds(conn, run_id).count("placement") == 1
-    assert _payload(conn, run_id, "placement") == full
+    assert _kinds(conn, run_id).count("allocation") == 1
+    assert _payload(conn, run_id, "allocation") == full
 
 @pytest.mark.parametrize("where", ["record", "commit"])
 def test_a_lost_claim_returns_false_even_when_its_record_cannot_be_written(conn, monkeypatch, where):

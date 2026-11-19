@@ -110,13 +110,53 @@ class _Placement:
 placement = _Placement()
 
 
+_OLD_ENV_COUNTED = set()
+
+
+def _allocation_home_env(now=None):
+    """``ALLOCATION_HOME``, else the pre-rename ``PLACEMENT_HOME`` (rename wave 3, t_fc257547): the new name wins; an
+    old-name read is counted once per process in <fleet home>/var/ci-box/deprecated-name-reads.log, the fleet home from
+    hermes_home.get_fleet_home(script_file=__file__) (a vendored copy without it: $HERMES_HOME with profiles/<p>
+    un-nested, else ~/.hermes; not counted when that dir is absent). Never the value read: that root is
+    receipt-provisioned. ``now``: injected clock. Never raises."""
+    v = os.environ.get("ALLOCATION_HOME")
+    if v:
+        return v
+    v = os.environ.get("PLACEMENT_HOME")
+    if v and "PLACEMENT_HOME" not in _OLD_ENV_COUNTED:
+        _OLD_ENV_COUNTED.add("PLACEMENT_HOME")
+        try:
+            import sys
+            import time
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
+            lib = str(Path(__file__).resolve().parents[2] / "skills-shared" / "general" / "_lib")
+            if lib not in sys.path:
+                sys.path.append(lib)
+            try:
+                from hermes_home import get_fleet_home
+                home = Path(get_fleet_home(script_file=__file__))
+            except Exception:  # noqa: BLE001 -- a vendored copy has no resolver: its steps 3-4 inline
+                home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")  # noqa: fleet-home-scope -- get_fleet_home steps 3-4; profiles/<p> un-nested below
+                if home.parent.name == "profiles":
+                    home = home.parent.parent
+            if not home.is_dir():
+                return v
+            d = home / "var" / "ci-box"
+            d.mkdir(parents=True, exist_ok=True)
+            with open(d / "deprecated-name-reads.log", "a", encoding="utf-8") as fh:
+                fh.write(f"{ts} env:PLACEMENT_HOME pid={os.getpid()}\n")
+        except Exception:  # noqa: BLE001 -- a counter must never break a reader
+            pass
+    return v
+
+
 def _fleet_root(root: Optional[Path] = None) -> Path:
     if __package__ == "fleet_admission":
         from .roots import resolve_root
         return resolve_root(root, source_file=__file__, package=__package__)
     if root is not None:
         return Path(root)
-    env = os.environ.get("PLACEMENT_HOME")
+    env = _allocation_home_env()
     if env:
         return Path(env)
     try:
@@ -499,6 +539,13 @@ def lookup_unit(workload, host, unit_id, *, timeout=TIMEOUT_S, root: Optional[Pa
     if (code != 200 or result.get("schema") != 1 or result.get("id") != unit_id
             or result.get("state") not in ("waiting", "authorized", "spent_expired", "unknown")):
         raise Unreachable("invalid unit lookup receipt")
+    rid = result.get("reservation_id")
+    if result["state"] == "authorized" and isinstance(rid, str) and rid:
+        # allocd's answer is the owner proof: an authorized unit's lease belongs to the pair, even when an
+        # authorize_start that upgraded this process's own booking lost its reply (t_b18b346e). Without this the
+        # cancel release is Refused on the stale base owner and the lease is stranded until its TTL.
+        _OWNER[_state_key(rid, root)] = identity
+        _FALLBACK_ISSUED.pop(_state_key(rid, root), None)
     return result
 
 
@@ -559,7 +606,8 @@ def publish_demand(workload: str, host: str, waiting: list, verdict: Mapping, *,
 
 def authorize_start(workload: str, host: str, unit_id: str, *, ttl_s: float = 90,
                     timeout: float = TIMEOUT_S, existing_reservation_id: Optional[str] = None,
-                    existing_consumer: Optional[str] = None, local_venue_override: bool = False, root: Optional[Path] = None) -> dict:
+                    existing_consumer: Optional[str] = None, local_venue_override: bool = False, root: Optional[Path] = None,
+                    job_class: Optional[str] = None) -> dict:
     """Consume ONE unit at the actual start boundary. No fallback; retry is idempotent.
 
     Return authorized, reservation_id, until, reused. A wait answer is {authorized: False, reason, detail} with
@@ -567,6 +615,8 @@ def authorize_start(workload: str, host: str, unit_id: str, *, ttl_s: float = 90
     with ``.reason`` set. See AUTHORIZE_REASONS for each consumer action. After a lost reply, lookup_unit() first.
     A reused true receipt never permits a second spawn: caller reconciles the original attempt.
     renew/release use consumer=f'{workload}@{host}', with existing lease lifecycle.
+    ``job_class``: the measured class the lease is estimated and recorded under (t_7e60c0e7; a class of the workload's
+    family, else allocd answers invalid); None = the workload's base class.
     """
     identity = f"{workload}@{host}"
     try:
@@ -577,6 +627,8 @@ def authorize_start(workload: str, host: str, unit_id: str, *, ttl_s: float = 90
         raise AuthorizeRefused("auth", "provisioned demand publisher token required")
     body = {"schema": 1, "workload": workload, "host": host, "id": unit_id, "ttl_s": ttl_s,
             "local_venue_override": local_venue_override}
+    if job_class is not None:
+        body["job_class"] = job_class
     headers = {}
     # Every refusal below is typed (round 2, finding 6): a bad argument is ``invalid``, a missing/empty/unreadable
     # capability credential is ``auth``; never a bare Refused a caller would have to string-match.

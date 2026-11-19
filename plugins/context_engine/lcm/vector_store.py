@@ -35,7 +35,7 @@ from .db_bootstrap import (
     verify_chunk_schema,
     verify_embedding_schema,
 )
-from .sqlite_util import _is_sqlite_locked_error, guard_connection
+from .sqlite_util import _is_sqlite_locked_error, connect_read, guard_connection
 
 logger = logging.getLogger(__name__)
 
@@ -1971,7 +1971,7 @@ class VectorStore:
 
         uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
         try:
-            conn = sqlite3.connect(
+            conn = connect_read(
                 uri,
                 uri=True,
                 timeout=max(0.001, remaining),

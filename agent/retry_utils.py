@@ -390,12 +390,18 @@ LOCAL_RELAY_RESTART_WAIT_DEFAULT_S = 20.0
 # finish, then the relay restarts (the listener gap after that is the
 # loopback-restart wait above). Every model on the relay gets the same 503,
 # so a model fallback on it is pointless; wait on the SAME model instead.
-# Default 150 s = relay drain TTL 120 s (its own worst case: it force-restarts
-# after that even with turns still in flight; FAD_RELAY_SELF_DRAIN_MAX 30 s is
-# the p90 shape) + ~5 s relaunch + health gate, rounded up. Measured
-# 2026-09-30 13:03:28-45: the live drain lasted ~17 s. Config:
-# ``fallback.relay_drain_wait_s`` (0 disables -> pre-fix overloaded policy).
-RELAY_DRAIN_WAIT_DEFAULT_S = 150.0
+# Default 300 s (t_5188f4ed). The relay's own drain TTL is 120 s (DEPLOY_DRAIN_TTL_S,
+# caller-settable 10..600), but the windows the harness saw ran longer. Measured in the
+# Studio's agent.log* (2026-11-16 11:55 .. 11-17 08:06, 6 drain windows on claude-alr):
+# 26, 46, 42, 159, 165 and 169 s from the first 503 to the last 503 + its Retry-After.
+# The 08:03:13 window's last 503 on alr was 08:05:47 and claude-dtlr still drained at
+# 08:06:05, so it ran >= ~175 s, past the old 150 s wait (which then fell over to
+# claude-dtlr, draining in the same deploy). 300 s is 1.7x the longest measured window;
+# the bound above it is the relay's 600 s TTL clamp. The other lanes of the same pool
+# drain in the same deploy, so the fallback walk skips them after the wait
+# (try_activate_fallback: both lanes relay-backed).
+# Config: ``fallback.relay_drain_wait_s`` (0 disables -> pre-fix overloaded policy).
+RELAY_DRAIN_WAIT_DEFAULT_S = 300.0
 # Poll interval when the relay sends no usable Retry-After.
 RELAY_DRAIN_DEFAULT_POLL_S = 5.0
 

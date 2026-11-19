@@ -34,7 +34,7 @@ from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli.fleet_placement import placement
-from hermes_cli import placement_policy as pp
+from hermes_cli import allocation_policy as pp
 
 POLICY = pp.PlacementPolicy()
 HOSTS = ("ci-box", "ace-ai", "ace-media")

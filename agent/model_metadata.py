@@ -463,6 +463,8 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Codex-OAuth-only and listed so "gpt-5" (400k) doesn't win.
     "gpt-6-astra": 1050000,  # also matches -pro (verified live on OpenRouter)
     "gpt-6.1-sol": 1050000,  # -pro too (OpenAI model page + OpenRouter live 2026-09-29)
+    # models.dev limit.context 1,050,000 (input 922,000 / output 128,000), read 2026-11-17.
+    "gpt-6.2-sol": 1050000, "gpt-6.2-astra": 1050000,
     "gpt-6.1-terra": 1050000,  # -pro too (models.dev limit.context 1,050,000; OpenRouter lists -pro, 2026-11-06)
     "gpt-6-sol": 1050000, "gpt-6-luna": 1050000,  # -pro too (OpenRouter live 2026-09-22)
     "gpt-5.6-luna": 1050000, "gpt-5.6-terra": 1050000, "gpt-5.6-sol": 1050000, "gpt-5.5": 1050000,
@@ -2034,6 +2036,8 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-6-astra": 272_000, "gpt-6.1-sol": 272_000, "gpt-6-sol": 272_000, "gpt-6-luna": 272_000,
     # gpt-6.1-terra: the codex-sub catalog advertises context_window=500,000 (2026-11-06, client 0.162.1).
     "gpt-6.1-terra": 500_000,
+    # GPT-6.2 (2026-11-17, client_version 0.169.0): sol advertises 500,000, astra 272,000.
+    "gpt-6.2-sol": 500_000, "gpt-6.2-astra": 272_000,
     "gpt-5.1-codex-max": 272_000, "gpt-5.1-codex-mini": 272_000, "gpt-5.3-codex": 272_000,
     "gpt-5.3-codex-spark": 128_000, "gpt-5.2-codex": 272_000, "gpt-5.4-mini": 272_000,
     "gpt-5.6-sol": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000, "gpt-daybreak-blue-latest": 272_000,
@@ -2070,12 +2074,21 @@ _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
     # client_version 0.162.1, all 3 accounts). Live request on chatgpt.com/backend-api/codex/responses:
     # 832,408 input tokens accepted, needle recalled. EXACT, like the other gpt-6 tiers.
     "gpt-6.1-terra": 872_000,
+    # GPT-6.2 Sol / Astra: catalog context_window 500,000 / 272,000, max_context_window 872,000 for both
+    # (2026-11-17, client_version 0.169.0). Request bisection on chatgpt.com/backend-api/codex/responses,
+    # identical for both ids: 918,028 input tokens accepted, 925,028 rejected (context_length_exceeded),
+    # the same ~922,000 ceiling as gpt-6.1-sol. 900K keeps the >=11K margin. EXACT entries. A live catalog
+    # that still publishes max_context_window 872,000 caps the bump there (#105443).
+    "gpt-6.2-sol": 900_000, "gpt-6.2-astra": 900_000,
 }
 _CODEX_OAUTH_STALE_ADVERTISED_CTX = 272_000  # the only advertised value the bump may override
 # Slugs whose catalog advertises a NON-272K value that is still below the verified cap. Measured
 # 2026-11-06 (client_version 0.162.1): gpt-6.1-terra and gpt-6.1-sol both advertise 500K with
 # max_context_window 872K (terra accepted an 832,408-token request). The bump may override exactly that value.
-_CODEX_OAUTH_STALE_ADVERTISED_EXACT: Dict[str, int] = {"gpt-6.1-terra": 500_000, "gpt-6.1-sol": 500_000}
+# gpt-6.2-sol also advertises 500K (2026-11-17, client_version 0.169.0); gpt-6.2-astra advertises 272K.
+_CODEX_OAUTH_STALE_ADVERTISED_EXACT: Dict[str, int] = {
+    "gpt-6.1-terra": 500_000, "gpt-6.1-sol": 500_000, "gpt-6.2-sol": 500_000,
+}
 CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"  # picker-only opt-in suffix; never sent on the wire
 # The ONLY bases eligible for ``-900k``: routable, live-verified. No family prefixing (it would synthesize
 # dead ``-pro`` variants); dated snapshots of the routable 5.6 bases are allowed. gpt-daybreak-blue-latest is a verified Sol alias.
@@ -2086,6 +2099,7 @@ _CODEX_900K_ELIGIBLE_BASES = frozenset({
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",  # measured max_context_window 872,000
     "gpt-6.1-sol",  # measured ceiling 922,000 (2026-09-30 bisection)
     "gpt-6.1-terra",  # catalog max_context_window 872,000; 832,408-token request OK (2026-11-06)
+    "gpt-6.2-sol", "gpt-6.2-astra",  # 918,028-token request OK, 925,028 rejected (2026-11-17)
 })
 _CODEX_900K_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 

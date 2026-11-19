@@ -31,12 +31,12 @@ binding free fraction after this job, PSI cpu as a penalty.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import math
 import os
 import threading
 from pathlib import Path
+from types import MappingProxyType
 from typing import Iterable, List, Mapping, Optional, Sequence
 
 SCHEMA = 1
@@ -85,6 +85,66 @@ class Limits:
     ramp_cpus: tuple = ()              # ((job_class, cpus), ...): an UNSETTLED lease of that class is charged its
                                        # measured first-settle_s CPU instead of its full estimate (live_leases ramp;
                                        # t_7566ba56). () = every lease at its full estimate (the rule before)
+    fleet_cap: tuple = ()              # ((axis, N | "P%"), ...), axis in FLEET_CAP_AXES: the host's ONE cap on fleet
+                                       # work (config/fleet-hosts.json hosts.<id>.fleet_cap, t_31911eb0). () = no cap
+
+
+# ── the fleet-work cap (t_31911eb0; Ace 2026-11-17 Discord 1572247507579314196 / 1572243651352854568) ─────────────
+# ONE allocator-level cap per host on the CPU and RAM fleet work may use, apart from contention: a quiet host whose
+# fleet work sits at its cap is refused `fleet_cap:<axis>`; a busy host under its cap is refused by contention. Counted:
+# the sample's MEASURED fleet use (host-pressure.py `fleet`, published as sample fleet_cpus / fleet_ram_gb) plus the
+# leases the sample cannot show yet (live_leases, the same set and ramp the contention axes charge) plus this job.
+# A host with a cap and no fleet measurement refuses (fail closed). No other per-host CPU/RAM cap may exist
+# (scripts/lints/fleet-cap-lint.py).
+FLEET_CAP_AXES = {"cpus": ("fleet_cpus", "ncpu"), "ram_gb": ("fleet_ram_gb", "mem_total_gb")}   # axis -> (use, total)
+
+
+def fleet_cap_errors(cap) -> List[str]:
+    """Validation of one host's ``fleet_cap`` value: {} or {cpus?, ram_gb?}, each a positive number or "P%" with
+    0 < P <= 100. -> human errors ([] = valid). Shared by placement.validate(), `fleet-work cap` and the lint."""
+    if not isinstance(cap, Mapping):
+        return [f"fleet_cap must be an object {{cpus, ram_gb}}, not {type(cap).__name__}"]
+    errs = []
+    for k, v in cap.items():
+        if k not in FLEET_CAP_AXES:
+            errs.append(f"fleet_cap.{k}: unknown axis (allowed: {', '.join(FLEET_CAP_AXES)})")
+        elif fleet_cap_spec(v) is None:
+            errs.append(f"fleet_cap.{k}: {v!r} is not a positive number or a percent \"1%\"..\"100%\"")
+    return errs
+
+
+def fleet_cap_spec(v):
+    """A cap value as (kind, number): ("abs", N) or ("pct", P); None = malformed."""
+    if _num(v) and v > 0:
+        return ("abs", float(v))
+    if isinstance(v, str) and v.endswith("%"):
+        try:
+            p = float(v[:-1])
+        except ValueError:
+            return None
+        if math.isfinite(p) and 0 < p <= 100:
+            return ("pct", p)
+    return None
+
+
+def fleet_cap_value(v, total) -> Optional[float]:
+    """The cap in CPUs / GB: an absolute as is, a percent of ``total`` (the sample's ncpu / mem_total_gb). None =
+    malformed, or a percent with no measured total (the caller refuses unmeasured)."""
+    s = fleet_cap_spec(v)
+    if s is None:
+        return None
+    if s[0] == "abs":
+        return s[1]
+    return float(total) * s[1] / 100.0 if _num(total) and total > 0 else None
+
+
+def _fleet_caps(sample: Mapping, limits: "Limits") -> dict:
+    """{axis: (cap or None, spec)} for every axis the host caps. A total the caller filled from the host table
+    (``<total>_from_spec``) is not measured: a percent cap on it resolves to None (refused unmeasured)."""
+    def total(ax):
+        key = FLEET_CAP_AXES[ax][1]
+        return None if sample.get(f"{key}_from_spec") else sample.get(key)
+    return {ax: (fleet_cap_value(v, total(ax)), v) for ax, v in limits.fleet_cap if ax in FLEET_CAP_AXES}
 
 
 # t_d7881247 / t_e0fbc8c9: PSI cpu `some` counts a task waiting on its cgroup's cpu.max (CFS quota throttling), so a
@@ -157,6 +217,9 @@ def ceilings(sample: Mapping, limits: Limits = Limits()) -> dict:
         out["ram_gb"] = float(sample["mem_total_gb"]) - limits.mem_reserve_gb
     if _num(sample.get("ncpu")) and sample["ncpu"] > 0 and not limits.cpu_saturable:
         out["cpus"] = float(sample["ncpu"]) * limits.cpu_busy_max
+    for ax, (cap, _spec) in _fleet_caps(sample, limits).items():   # a job larger than the fleet cap never fits here
+        if cap is not None:
+            out[ax] = min(out.get(ax, cap), cap)
     return out
 
 
@@ -173,11 +236,14 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
     # a measured estimate to make it fit; name both the need and this host's ceiling.
     for ax, ceiling in ceilings(sample, limits).items():
         if getattr(need, ax) > ceiling:
-            return Verdict(False, ax, f"unschedulable:resource-fit {host} need {ax}={getattr(need, ax):g} "
+            capped = _fleet_caps(sample, limits).get(ax, (None,))[0]
+            kind = "fleet_cap" if capped is not None and capped <= ceiling else "resource-fit"
+            return Verdict(False, ax, f"unschedulable:{kind} {host} need {ax}={getattr(need, ax):g} "
                            f"ceiling={ceiling:g}", {ax: ceiling - getattr(need, ax)})
     leases = list(leases)
-    held = live_leases(leases, host, sample.get("at"), settle_s=settle_s, ramp=dict(limits.ramp_cpus),
-                       now=now)
+    at = sample.get("at")
+    ramp = dict(limits.ramp_cpus)
+    held = live_leases(leases, host, at, settle_s=settle_s, ramp=ramp, now=now)
     free: dict = {}
     # an unmeasured axis is noted and the rest still computed: a MEASURED saturation names the refusal ahead of it,
     # so the band reads hot, not unknown, when memory refuses and cpu_busy is missing (t_f64c6d34, Prism d60feae165ed)
@@ -226,6 +292,24 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
             missing("gpu_free_mib")
         else:
             free["gpu_mib"] = float(sample["gpu_free_mib"]) - held.gpu_mib - need.gpu_mib
+    # Fleet use may come from a different reading than live contention. Without a separate
+    # timestamp (e.g. remote samples), use the same held leases as the contention check.
+    cap_terms: dict = {}
+    caps = _fleet_caps(sample, limits)
+    held_fleet = held
+    if caps:
+        fleet_at = sample.get("fleet_at")
+        if _num(fleet_at) and fleet_at != at:
+            held_fleet = live_leases(leases, host, fleet_at, settle_s=settle_s, ramp=ramp, now=now)
+    for ax, (cap, spec) in caps.items():
+        key, used = f"fleet_cap_{ax}", sample.get(FLEET_CAP_AXES[ax][0])
+        if cap is None or not _num(used):
+            unmeasured.append((key, f"unmeasured:{key} (cap {spec!r} set, "
+                               + ("no fleet measurement in the sample)" if not _num(used) else "no host total)")))
+            continue
+        young, n = getattr(held_fleet, ax), getattr(need, ax)
+        free[key] = cap - float(used) - young - n
+        cap_terms[key] = (ax, float(used), young, n, cap, spec)
 
     if sample.get("slo_breach") is True:
         return Verdict(False, "slo", "saturated:slo (latency guard breached)", free)
@@ -239,6 +323,11 @@ def admit(sample: Mapping, need: Estimate, leases: Iterable[Lease] = (), *, host
         if axis in ("cpu", "psi_cpu_some10", "psi_cpu_some60") and limits.cpu_saturable:
             continue                       # a score penalty on a saturable host (score() reads it), never a refusal
         return Verdict(False, axis, f"saturated:{axis} {free[axis]:+.2f}", free)
+    for key, (ax, used, young, n, cap, spec) in cap_terms.items():   # after contention: a busy box names contention
+        if free[key] < 0:
+            of = f" ({spec} of {sample.get(FLEET_CAP_AXES[ax][1]):g})" if isinstance(spec, str) else ""
+            return Verdict(False, key, f"fleet_cap:{ax} used {used:.2f} + young {young:.2f} + need {n:.2f} "
+                           f"> cap {cap:.2f}{of}", free)
     if unmeasured:                         # nothing measured refuses: fail closed on the first unmeasured axis
         return Verdict(False, unmeasured[0][0], unmeasured[0][1], free)
     binding = min(_fractions(free, sample, limits), key=lambda kv: kv[1])[0]
@@ -258,6 +347,9 @@ def _fractions(free: Mapping[str, float], sample: Mapping, limits: Limits):
         out.append(("procs", free["procs"]))
     if "slice_mem_gb" in free:
         out.append(("slice_mem_gb", free["slice_mem_gb"] / 100.0))
+    for ax, (cap, _spec) in _fleet_caps(sample, limits).items():
+        if f"fleet_cap_{ax}" in free and cap:
+            out.append((f"fleet_cap_{ax}", free[f"fleet_cap_{ax}"] / cap))
     return out
 
 
@@ -344,8 +436,11 @@ class Demand:
 def plan(workload: str, host: str, sample: Mapping, my_units: int, door: Iterable[Demand],
          registry: Priority, leases: Iterable[Lease] = (), *, need: Estimate, now: float,
          own_cpu: float = 0.0, limits: Limits = Limits(), slice_mem: Optional[SliceMem] = None,
-         asap: bool = False, settle_s: float = DEFAULT_SETTLE_S) -> Plan:
+         asap: bool = False, settle_s: float = DEFAULT_SETTLE_S, own_unit: Optional[WaitingUnit] = None) -> Plan:
     """Pure host-door decision. my_units is requested STARTS, own_cpu is current consumer CPU.
+
+    own_unit (t_2a7a47d6, an ordered door unit): this workload's place against other workloads is that unit's own
+    first arrival, even past door_hold_max_s. Only the requester's own place: other workloads' plans still drop it.
 
     No consumer-side arrival/rank logic is needed. spawn-only preserves admit_class, including
     its refusal reason. growth is the per-class opt-out. Returned stuck identities are log events.
@@ -386,6 +481,8 @@ def plan(workload: str, host: str, sample: Mapping, my_units: int, door: Iterabl
             return (0 if urgent else 1, u.at, rank, u.id, d.workload)
 
         mine = [key(d, u) for d, u in candidates if d.workload == workload]
+        if own_unit is not None:
+            mine = [key(Demand(workload, 0, need), dataclasses.replace(own_unit, at=min(own_unit.at, now)))]
         if not mine:
             urgent = asap
             mine = [(0 if urgent else 1, now, registry.rank(workload), "", workload) if mode == "fcfs"
@@ -449,19 +546,14 @@ def holdback(workload: str, demand: Iterable[Demand], priority: Priority, host: 
 def admit_class(sample: Mapping, workload: str, need: Estimate, leases: Iterable[Lease] = (), *,
                 demand: Iterable[Demand] = (), priority: Priority = Priority(), limits: Limits = Limits(),
                 host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S,
-                slice_mem: Optional[SliceMem] = None, class_line: Optional[float] = None,
-                now: Optional[float] = None) -> Verdict:
+                slice_mem: Optional[SliceMem] = None, now: Optional[float] = None) -> Verdict:
     """THE admission decision for any workload class on any host. ``limits`` supplies the host's own facts
     (mem_reserve_gb, unmeasurable axes); the CPU line is ``priority.line`` and the CPU / PSI cpu axes always refuse
-    (cpu_saturable is ignored: a class that can run past the line is how one decider starves the others).
-    ``class_line`` (t_71471192): this class's own CPU line on this host, a fraction of ALL the host's CPUs (the CI
-    lane's hosts.<h>.ci_allocator.admit_ci_cpu_pct / 100). It can only LOWER the fleet line, never raise it; None or
-    an unusable value = the fleet line alone.
+    (cpu_saturable is ignored: a class that can run past the line is how one decider starves the others). Every class
+    has the same line: the per-class CI line (t_71471192 class_line, admit_ci_cpu_pct) is deleted (t_31911eb0).
     A refusal caused only by higher-priority demand reads ``held_back:<class> ...`` with binding ``priority``."""
     host = host or str(sample.get("host") or "")
     line = priority.line
-    if _num(class_line) and 0 < class_line < line:
-        line = float(class_line)
     lim = dataclasses.replace(limits, cpu_busy_max=line, cpu_saturable=False)
     leases = list(leases)
     demand = list(demand)
@@ -478,13 +570,12 @@ def admit_class(sample: Mapping, workload: str, need: Estimate, leases: Iterable
 
 
 def preempt(workload: str, sample: Mapping, demand: Iterable[Demand], priority: Priority, leases: Iterable[Lease] = (),
-            *, limits: Limits = Limits(), host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S,
-            class_lines: Optional[Mapping[str, float]] = None) -> int:
+            *, limits: Limits = Limits(), host: Optional[str] = None, settle_s: float = DEFAULT_SETTLE_S) -> int:
     """``priority.preempt_budget_per_tick`` (t_71471192): how many of ``workload``'s units on ``host`` its scheduler
     stops REFILLING this tick, because a class that outranks it has queued units that admit_class refuses here (e.g.
     queued kanban cards on a host that CI keeps at the line). Never a kill: a running unit finishes; only the next
     refill of an exited unit is withheld, at most the budget per tick and at most the refused queue. 0 = today's
-    behaviour (the shipped value). Pure; ``class_lines`` = {class: its admit_class class_line on this host}."""
+    behaviour (the shipped value). Pure."""
     budget = priority.preempt_budget_per_tick
     if type(budget) is not int or budget <= 0:
         return 0
@@ -494,7 +585,7 @@ def preempt(workload: str, sample: Mapping, demand: Iterable[Demand], priority: 
         if d.queued <= 0 or priority.rank(d.workload) >= mine:
             continue
         v = admit_class(sample, d.workload, d.unit, leases, demand=demand, priority=priority, limits=limits,
-                        host=host, settle_s=settle_s, class_line=(class_lines or {}).get(d.workload))
+                        host=host, settle_s=settle_s)
         if not v.ok and v.binding != "priority" and not v.reason.startswith("unmeasured"):
             refused += int(d.queued)
     return min(budget, refused)
@@ -592,9 +683,9 @@ def _history_row(ln) -> Optional[dict]:
     return r if isinstance(r, dict) and r.get("schema") == SCHEMA else None
 
 
-# path -> [open binary file, bytes consumed, rows parsed so far, prefix sha256, head checkpoint, (mtime_ns, size)]
-# (read_history_cached; t_c9fd9c5e). Checkpoints = a sha256 of every consumed byte (t_48cb7ec2) and the first
-# CHECKPOINT_BYTES of them: re-read before reusing the rows, so a truncate + refill to the old size or past it, or an
+# path -> [open binary file, bytes consumed, rows parsed so far, consumed bytes, head checkpoint, (mtime_ns, size)]
+# (read_history_cached; t_c9fd9c5e). Checkpoints = every consumed byte, kept and compared exactly (t_48cb7ec2,
+# t_990ca939) and the first CHECKPOINT_BYTES of them: re-read before reusing the rows, so a truncate + refill to the old size or past it, or an
 # in-place rewrite of ANY consumed row (same inode), resets the cache instead of replaying the old generation. An append always grows the file, so the same size with a moved mtime
 # is an in-place rewrite and resets too, whatever the checkpoints say (Prism e63812f5e349).
 # The file stays OPEN while its rows are cached, so its inode cannot be recycled by an unlink + recreate (Prism e2ace455c12a).
@@ -604,20 +695,22 @@ CHECKPOINT_BYTES = 256
 
 
 def _checkpoint_ok(fh, consumed: int, want) -> bool:
-    """``want`` = a running sha256 over EVERY consumed byte (Prism 001b1324e2a1, t_48cb7ec2): a same-size in-place
-    rewrite of a MIDDLE row that keeps the head + tail bytes, followed by an append (size moved, so the mtime arm is
-    blind), still resets. ~0.5 ms/MiB to hash vs ~11 ms/MiB to parse: the incremental read keeps its point."""
+    """``want`` = EVERY consumed byte, kept (Prism 001b1324e2a1, t_48cb7ec2): a same-size in-place rewrite of a MIDDLE
+    row that keeps the head + tail bytes, followed by an append (size moved, so the mtime arm is blind), still resets.
+    t_990ca939: the re-read prefix is compared byte for byte with the kept bytes instead of re-hashed (21 MB: sha256
+    ~12 ms, compare ~3 ms; 75 MB: 44 vs ~22 ms). Exact equality is at least the guarantee the digest gave; the cost is
+    one copy of the consumed bytes in memory, beside the rows parsed from them. Parsing is ~11 ms/MiB, so the
+    incremental read keeps its point."""
     if consumed <= 0:
         return True
     fh.seek(0)
-    h, left = hashlib.sha256(), consumed
-    while left > 0:
-        b = fh.read(min(left, 1 << 20))
-        if not b:
+    off = 0
+    while off < consumed:
+        b = fh.read(min(consumed - off, 1 << 20))
+        if not b or b != want[off:off + len(b)]:
             return False
-        h.update(b)
-        left -= len(b)
-    return h.digest() == want.digest()
+        off += len(b)
+    return True
 
 
 def _head_ok(fh, want: bytes) -> bool:
@@ -637,6 +730,31 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
     inode it names cannot be reused while cached; each call compares stat(path) with fstat() of that descriptor, and
     a mismatch closes it and reads the path afresh from byte 0 (Prism e2ace455c12a). Reads always come from the held
     descriptor, so a rotation after the stat() returns the old file's rows once, never the old offset in a new file."""
+    rows = _read_cached(path, frozen=False)
+    if since is None:
+        return rows
+    out: List[dict] = []
+    for r in rows:
+        try:
+            if float(r.get("at") or 0) < since:
+                continue
+        except (ValueError, TypeError):
+            continue
+        out.append(r)
+    return out
+
+
+def read_history_frozen(path) -> tuple:
+    """Every row read_history_cached(path) returns, as a TUPLE of read-only copies (MappingProxyType over a private
+    dict), validated exactly as read_history_cached validates. t_71ff933a: placement.history_snapshot() copied every
+    row of the ledger on each call (77k rows: ~170 ms on the Studio's py3.9, twice per unified /admit, under
+    STATE.lock). Each row is now copied once, beside the cached rows; while the ledger has not grown every call
+    returns the SAME tuple object, so the identity memos downstream (placement.history_window, admit_context's class
+    filter, work_estimate._class_rows) hit across requests. A cache reset (rewrite, shrink, new inode) re-copies."""
+    return _read_cached(path, frozen=True)
+
+
+def _read_cached(path, *, frozen: bool):
     p = Path(path)
     key = str(p)
     with _HISTORY_LOCK:
@@ -653,12 +771,12 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
                 hit = None
             elif (held.st_size < hit[1] or (held.st_size == hit[5][1] and held.st_mtime_ns != hit[5][0])
                   or not _checkpoint_ok(hit[0], hit[1], hit[3]) or not _head_ok(hit[0], hit[4])):
-                hit[1:5] = [0, [], hashlib.sha256(), b""]   # shrunk or rewritten in place: start over
+                hit[1:5] = [0, [], bytearray(), b""]   # shrunk or rewritten in place: start over
         if hit is None:
             try:
-                hit = [p.open("rb"), 0, [], hashlib.sha256(), b"", (None, None)]
+                hit = [p.open("rb"), 0, [], bytearray(), b"", (None, None), None]
             except FileNotFoundError:
-                return []
+                return () if frozen else []
         fh = hit[0]
         fh.seek(hit[1])
         chunk = fh.read()
@@ -670,22 +788,21 @@ def read_history_cached(path, *, since: Optional[float] = None) -> List[dict]:
             if r is not None:
                 hit[2].append(r)
         if end:
-            hit[3].update(chunk[:end])
+            hit[3] += chunk[:end]
             if len(hit[4]) < CHECKPOINT_BYTES:
                 hit[4] = (hit[4] + chunk[:end])[:CHECKPOINT_BYTES]
         hit[1] += end
         after = os.fstat(fh.fileno())
         hit[5] = (after.st_mtime_ns, after.st_size)
         _HISTORY_CACHE[str(p)] = hit
-        rows = list(hit[2])
-    if since is None:
-        return rows
-    out: List[dict] = []
-    for r in rows:
-        try:
-            if float(r.get("at") or 0) < since:
-                continue
-        except (ValueError, TypeError):
-            continue
-        out.append(r)
-    return out
+        if not frozen:
+            return list(hit[2])
+        # hit[6] = (the rows list it copies, [copies], tuple of them): a reset replaces hit[2] with a new list
+        fz = hit[6]
+        if fz is None or fz[0] is not hit[2]:
+            fz = hit[6] = (hit[2], [], ())
+        copies = fz[1]
+        if len(copies) < len(hit[2]):
+            copies.extend(MappingProxyType(dict(r)) for r in hit[2][len(copies):])
+            fz = hit[6] = (hit[2], copies, tuple(copies))
+        return fz[2]

@@ -125,6 +125,7 @@ def test_adapter_binds_the_state_root_to_the_kanban_root(tmp_path, monkeypatch):
     from hermes_cli import kanban_db
 
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
+    monkeypatch.delenv("ALLOCATION_HOME", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     root = kanban_db.kanban_home()
     assert root != Path(fp.placement.__file__).resolve().parents[2]   # not hermes-home's checkout default

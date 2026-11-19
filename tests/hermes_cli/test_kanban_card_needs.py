@@ -266,7 +266,7 @@ def test_dec6d40f_body_waits_with_a_named_reason_instead_of_spilling(kanban_home
         status = conn.execute("SELECT status FROM tasks WHERE id=?", (docs,)).fetchone()[0]
         assert status == "ready"
         waits = [json.loads(r[0]) for r in conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait'", (docs,))]
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='allocation_wait'", (docs,))]
         assert waits and waits[-1]["reason"] == "studio_affinity:studio_needs(skills_tree,vault)"
 
 

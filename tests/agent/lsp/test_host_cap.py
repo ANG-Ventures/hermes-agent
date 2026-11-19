@@ -147,7 +147,7 @@ def test_dead_server_gives_back_its_slot_to_a_replacement(repo):
     """C5 #48 (PR #1019): a server that died keeps no host slot; at the cap the
     next edit must spawn a replacement instead of running without LSP."""
     f = str(repo.path / "x.py")
-    svc = _service(max_servers_per_host=1)
+    svc = _service(max_servers_per_host=1, crash_backoff_seconds=())  # backoff: test_crash_backoff.py
     try:
         svc.snapshot_baseline(f)
         assert len(repo.spawns) == 1 and host_slots.held_count(1) == 1
@@ -183,3 +183,19 @@ def test_idle_reap_keeps_the_slot_until_the_server_is_shut_down(repo):
         assert _wait_until(lambda: host_slots.held_count(6) == 0)
     finally:
         svc.shutdown()
+
+
+def test_spawn_logs_root_uri_and_config_once_per_process(repo, caplog):
+    """One INFO line per server start names its pid, rootUri and config file, so a pyright that indexes
+    the wrong tree is visible from the log (t_9cba3363)."""
+    caplog.set_level(logging.INFO, logger="hermes.lint.lsp")
+    svc = _service(max_servers_per_host=6)
+    try:
+        svc.snapshot_baseline(str(repo.path / "x.py"))
+        svc.snapshot_baseline(str(repo.path / "x.py"))
+    finally:
+        svc.shutdown()
+    spawned = [r.getMessage() for r in caplog.records if "spawned pid=" in r.getMessage()]
+    assert len(spawned) == 1, spawned
+    assert f"rootUri={repo.path.as_uri()}" in spawned[0]
+    assert spawned[0].endswith("config=none")  # the mock spec names no config file

@@ -3,7 +3,7 @@
   "paths": [
     "hermes_cli/fleet_placement/*.py",
     "hermes_cli/placement_ledger.py",
-    "hermes_cli/placement_policy.py",
+    "hermes_cli/allocation_policy.py",
     "hermes_cli/kanban_headroom.py",
     "hermes_cli/kanban_load_gate.py",
     "hermes_cli/kanban_placement_*.py",
@@ -23,7 +23,7 @@
     "hermes_cli/kanban_placement_view.py": 10,
     "hermes_cli/kanban_worker_pool.py": 63,
     "hermes_cli/placement_ledger.py": 3,
-    "hermes_cli/placement_policy.py": 9
+    "hermes_cli/allocation_policy.py": 9
   },
-  "_baseline_doc": "Grandfathered at t_21a7ace3. kanban_worker_pool/kanban_headroom/kanban_placement_*/kanban_load_gate: the legacy kanban-pool.json roles slot count + the SpawnPlan free-count shape, dead once kanban is utilization-only end to end; their own burn-down card. placement_ledger/placement_policy: the max_slots I-7 clamp (hermes-home placement-policy.json carries no max_slots row today)."
+  "_baseline_doc": "Grandfathered at t_21a7ace3. kanban_worker_pool/kanban_headroom/kanban_placement_*/kanban_load_gate: the legacy kanban-pool.json roles slot count + the SpawnPlan free-count shape, dead once kanban is utilization-only end to end; their own burn-down card. placement_ledger/allocation_policy: the max_slots I-7 clamp (hermes-home allocation-policy.json carries no max_slots row today)."
 }

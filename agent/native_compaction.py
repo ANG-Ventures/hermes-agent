@@ -2,8 +2,8 @@
 
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` makes the server
 summarize older context into an opaque ``compaction`` item once the input crosses N tokens.
-Deliberately narrow: gpt-5.6 on api.openai.com or the ChatGPT Codex backend, plus gpt-6-astra
-(and its ``-900k`` picker alias) on official Codex OAuth. The local compressor
+Deliberately narrow: gpt-5.6 on api.openai.com or the ChatGPT Codex backend, plus the Astra ids
+(``is_astra_model``: gpt-6-astra, gpt-6.2-astra and their ``-900k`` picker aliases) on official Codex OAuth. The local compressor
 stays armed as fallback (native threshold clamped below the local trigger); compaction items
 ride the ``codex_reasoning_items`` sidecar. No transport imports (shared gate, no cycles).
 """

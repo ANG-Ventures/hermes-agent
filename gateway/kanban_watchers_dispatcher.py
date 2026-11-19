@@ -26,6 +26,11 @@ def _kbd():
     from hermes_cli import kanban_db_dispatch
     return kanban_db_dispatch
 
+
+def _kba():
+    from hermes_cli import kanban_board_anchor
+    return kanban_board_anchor
+
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
 
@@ -194,11 +199,13 @@ class _KanbanDispatcher:
                     "SQLite database; pausing dispatch for this board until "
                     "the file changes, the gateway restarts, or the "
                     "quarantine timer expires. Move or restore the file, "
-                    "then run `hermes kanban init` if you need a fresh board.",
-                    slug, fingerprint[0],
+                    "then run `hermes kanban init` if you need a fresh board. sidecars: %s",
+                    slug, fingerprint[0], _kba().sidecar_identity(fingerprint[0]),
                 )
                 return None
             logger.exception("kanban dispatcher: tick failed on board %s", slug)
+            from hermes_cli.kanban_db_ioerr import note_board_ioerr
+            note_board_ioerr(exc, where="dispatcher", board=slug, conn=conn)
             return None
         finally:
             if conn is not None:

@@ -394,9 +394,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         # `clone` is a git operation with no board state; it must not depend
         # on (or initialize) kanban.db.
         if action == "clone":
-            from hermes_cli.kanban_clone import clone
+            # Through the worktree cache (scope kanban_clone); off = kanban_clone.clone as before.
+            from hermes_cli.worktree_cache import kanban_clone_entry
 
-            return clone(args.url, args.dest, args.git_opts)
+            return kanban_clone_entry(args.url, args.dest, args.git_opts)
         if action == "base-check":
             from hermes_cli.kanban_branch_base import run as _base_check
 
@@ -2845,8 +2846,28 @@ def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
     return 0
 
 
+def _count_deprecated_verb(verb: str, new: str) -> None:
+    """The old (pre-rename) verb was used: one deprecation line on stderr, and one
+    ``<utc iso> cli:kanban <verb> pid=<pid>`` line in <root>/var/ci-box/deprecated-name-reads.log (same
+    format as hermes-home scripts/lib/allocation_policy.count_deprecated_read). Never raises."""
+    print(f"kanban {verb}: deprecated, use `kanban {new}` (the `{verb}` alias goes after one release)",
+          file=sys.stderr)
+    try:
+        import datetime
+        d = kb.kanban_home() / "var" / "ci-box"
+        d.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(d / "deprecated-name-reads.log", "a", encoding="utf-8") as fh:
+            fh.write(f"{ts} cli:kanban {verb} pid={os.getpid()}\n")
+    except Exception:  # noqa: BLE001 -- a counter must never break the verb
+        pass
+
+
 def _cmd_placement(args: argparse.Namespace) -> int:
-    """``placement --fleet`` / ``placement <id>``: read-only (spec §4.3, Phase 3)."""
+    """``allocation --fleet`` / ``allocation <id>``: read-only (spec §4.3, Phase 3). ``placement`` is the
+    deprecated alias (rename wave 3, t_7be48220): it prints one deprecation line and is counted."""
+    if getattr(args, "kanban_action", None) == "placement":
+        _count_deprecated_verb("placement", "allocation")
     from hermes_cli import kanban_load_gate as _klg
     from hermes_cli import kanban_placement_view as kpv
     from hermes_cli.config_effective import load_user_config_effective
@@ -5310,7 +5331,8 @@ _HANDLERS = {
     "assign": _cmd_assign, "set-model": _cmd_set_model, "priority": _cmd_priority,
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
-    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "placement": _cmd_placement,
+    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "allocation": _cmd_placement,
+    "placement": _cmd_placement,  # deprecated alias of `allocation` (t_7be48220)
     "placement-holds": _cmd_placement_holds,
     "link": _cmd_link, "rehome": _cmd_rehome, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,

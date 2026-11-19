@@ -183,6 +183,25 @@ def test_filter_is_kept_when_there_is_no_mirror(fleet, monkeypatch, capsys):
     assert "mirror unavailable" in capsys.readouterr().err
 
 
+def test_public_mirror_owner_clone_borrows_from_a_mirror(fleet):
+    """t_19293188: the Studio census found agent-source (169 MB of own objects,
+    no alternates) made by `hermes kanban clone --filter=blob:none --no-checkout
+    https://github.com/ANG-Repositories/hermes-agent.git agent-source`. The
+    owner was not a fleet owner, so the helper cloned without a mirror and kept
+    the filter."""
+    _git("clone", "-q", "--bare", str(fleet / "src" / "Kyzcreig" / "demo.git"),
+         str(fleet / "src" / "ANG-Repositories" / "demo.git"))
+    rc = _run_cli(["--filter=blob:none", "--no-checkout",
+                   "https://github.com/ANG-Repositories/demo.git", "agent-source"])
+    assert rc == 0
+    dest = fleet / "agent-source"
+    mirror = fleet / "mirrors" / "ANG-Repositories" / "demo.git"
+    alternates = dest / ".git" / "objects" / "info" / "alternates"
+    assert alternates.read_text().strip() == str(mirror / "objects")
+    assert subprocess.run(["git", "config", "--get", "remote.origin.partialclonefilter"],
+                          cwd=dest, capture_output=True).returncode == 1
+
+
 def test_cli_accepts_double_dash_before_url(fleet):
     assert _run_cli(["-q", "--", "https://github.com/Kyzcreig/demo.git", "e"]) == 0
     assert (fleet / "e" / "big.txt").exists()

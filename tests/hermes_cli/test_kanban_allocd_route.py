@@ -39,7 +39,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli.fleet_placement import placement
-from hermes_cli import placement_policy as pp
+from hermes_cli import allocation_policy as pp
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "kanban_placement" / "allocd_replay.json"
 JOB_FIELDS = tuple(f.name for f in dataclasses.fields(placement.Job))
@@ -674,7 +674,7 @@ def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
             kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=4, spawn_paused=None, spawn_limit=0,
                               spillover=plan, reconcile_orphans=False)
             payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
-                                              (tid, "worker_placed")).fetchone()[0])
+                                              (tid, "worker_allocated")).fetchone()[0])
             kb.complete_task(conn, tid, summary="done")
     finally:
         loud.close()
@@ -698,7 +698,7 @@ def _dispatch_on(home, *, door_on=False):
     rid, via = kh.run_reservation(conn, tid, run_id)
     # with the door on the run's lease is the door's (run_reservation hands it no rid: _end_run leaves it alone)
     assert (rid, via) == (None, None) if door_on else (rid and via == kh.VIA_ALLOC_CLIENT)
-    placed = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_placed'",
+    placed = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_allocated'",
                                      (tid,)).fetchone()[0])
     return conn, tid, run_id, rid, placed["host"]
 

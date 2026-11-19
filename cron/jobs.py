@@ -910,6 +910,10 @@ def _ensure_cron_dir(cron_dir: Path) -> None:
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     store = _current_cron_store()
+    from hermes_cli.config_home import refuse_release_root
+    refusal = refuse_release_root(store.cron_dir.parent, "keep cron state (chmod, fire locks) in")
+    if refusal:
+        raise PermissionError(refusal)
     _ensure_cron_dir(store.cron_dir)
     _ensure_cron_dir(store.output_dir)
     _secure_dir(store.cron_dir)
@@ -5124,6 +5128,11 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
+# hermes-home's house DEFERRED rc (scripts/lib/cron_exit_contract.py DEFERRED_RC), as the script
+# runner renders it (cron/scheduler_script.py "Script exited with code N").
+_DEFERRED_EXIT_RE = re.compile(r"^Script exited with code 76\b")
+
+
 def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
     status: Optional[str], now: str,
@@ -5134,17 +5143,21 @@ def _record_run_outcome(
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
+    # rc 76 is the house DEFERRED exit (hermes-home scripts/lib/cron_exit_contract.py DEFERRED_RC:
+    # host in its other OS / outside its window). The job did not run, so it is neither a failure nor a
+    # success: last_status "deferred", failure_streak left where it was (t_5c58441f).
+    deferred = not success and status is None and bool(_DEFERRED_EXIT_RE.match(error or ""))
     # Consecutive failures carrying the IDENTICAL error string — read (before this write) by
     # the scheduler's repeated-error page gate, which pages a stuck no_agent job once instead
     # of per tick (t_04822736). Any success or changed error resets.
-    if success or not error:
+    if success or not error or deferred:
         job["error_repeat_streak"] = 0
     elif job.get("last_status") == "error" and job.get("last_error") == error:
         job["error_repeat_streak"] = int(job.get("error_repeat_streak") or 0) + 1
     else:
         job["error_repeat_streak"] = 1
-    job["last_status"] = status or (
-        "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
+    job["last_status"] = status or ("deferred" if deferred else (
+        "error" if not success else ("delivery_failed" if delivery_failed else "ok")))
     job["last_error"] = None if success else error
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
@@ -5154,7 +5167,7 @@ def _record_run_outcome(
         # A clean run closes the restart re-queue streak (fork, #1301/#1548).
         job.pop(RESTART_REQUEUE_COUNT_KEY, None)
         job["failure_streak"] = 0
-    else:
+    elif not deferred:
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
@@ -6394,6 +6407,13 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         scan.persist(
             job["id"], last_dispatch=dispatch_stamp,
             pending_slot=pending_slot_stamp(next_run, now))
+        # A new scheduled occurrence gets its own one restart re-fire (t_2b319a64): the count bounds
+        # re-fires of ONE killed run, it is not a lifetime budget. Kept across nights it let one
+        # drain-killed re-fire spend every later night's re-fire until a run happened to succeed.
+        raw = scan.find(job["id"])
+        if job.pop(RESTART_REQUEUE_COUNT_KEY, None) is not None and raw is not None:
+            raw.pop(RESTART_REQUEUE_COUNT_KEY, None)
+            scan.needs_save = True
     return True
 
 

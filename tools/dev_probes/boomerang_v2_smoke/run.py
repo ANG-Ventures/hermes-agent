@@ -12,6 +12,9 @@ override so the test path runs on fakes:
   BV2_SCRATCH_BOARD  scratch board slug, ^bv2-smoke       (default: bv2-smoke)
   BV2_HOME_SESSION   home session stamped on the cards    (live: required)
   BV2_ORIGIN_CHAT    Discord channel id (REST, read-only) or a capture file (.jsonl/.txt)
+  BV2_HANDLED_KNOB   the gateway's boomerang-handled-line-chat.enabled knob file
+                     (default: <HERMES_HOME>/state/boomerang-handled-line-chat.enabled; dry-run: fixtures)
+  BV2_AGENT_LOG_DIR  fleet agent log dir, <UTC day>.jsonl  (default: <fleet root>/state/agent-logs, the writer's lookup)
   BV2_GATEWAY_LOG    gateway log                          (default: <root>/logs/gateway.log)
   BV2_GATEWAY_ENV    .env holding DISCORD_BOT_TOKEN       (default: <root>/.env)
   BV2_CONFIG         config.yaml, or a dir of stage<N>.yaml snapshots (fake)
@@ -100,7 +103,12 @@ def re_lost_line(card: str) -> re.Pattern:
 
 
 def re_notifier_line(card: str) -> re.Pattern:
-    return re.compile(r"kanban notifier: boomerang-wake " + re.escape(card) + r" disposition=(?P<disp>[a-z_]+)")
+    return re.compile(r"kanban notifier: boomerang-wake " + re.escape(card)
+                      + r" disposition=(?P<disp>[a-z_]+)(?: row=(?P<row>[a-z_]+))?")
+
+
+# gateway/kanban_wake_disposition.py row 1: every `blocked` event is auto-handled to assess the block.
+BLOCKED_ASSESS_ROW = "blocked_assess"
 
 
 RE_FORK_INELIGIBLE = re.compile(r"boomerang\.fork_ineligible reason=(?P<reason>[A-Za-z0-9_]+)")
@@ -272,6 +280,11 @@ class _LogFile:
 class ChatMessage:
     ts: float | None
     content: str
+    source: str = "chat"
+
+    @property
+    def shown(self) -> str:
+        return self.content if self.source == "chat" else f"[{self.source}] {self.content}"
 
 
 class FileChat:
@@ -336,6 +349,113 @@ class DiscordChat:
         return sorted(out, key=lambda m: m.ts or 0)
 
 
+# hermes-agent#439 (t_8ab5557d): with this knob file ABSENT (the default) the gateway writes the
+# ``boomerang handled <card> ...`` receipt to the fleet agent log, not the origin chat (a delivered
+# turn posts no line at all; the receipt row is best-effort). Present = the line posts to the chat.
+HANDLED_KNOB_FILE = "boomerang-handled-line-chat.enabled"
+HANDLED_PREFIX = "boomerang handled "
+AGENT_LOG_PRODUCER = "boomerang-wake"
+
+
+AGENT_INBOX_LIB = Path("scripts") / "lib" / "agent_inbox.py"
+
+
+def gateway_home() -> Path:
+    """The gateway's own home (``get_hermes_home``): a profile home stays the profile home."""
+    env = os.environ.get("HERMES_HOME", "").strip()
+    return Path(env).expanduser() if env else Path.home() / ".hermes"
+
+
+def handled_knob_path(live: bool) -> Path:
+    spec = os.environ.get("BV2_HANDLED_KNOB", "").strip()
+    if spec:
+        return Path(spec).expanduser()
+    # Dry-run fixtures keep the pre-#439 chat transcript, so the fixture knob is present.
+    # Live: the gateway reads it home-local (kanban_boomerang_wake.handled_line_chat_enabled).
+    return gateway_home() / "state" / HANDLED_KNOB_FILE if live else FIXTURES / f"fake_{HANDLED_KNOB_FILE}"
+
+
+def agent_log_dir(live: bool) -> Path:
+    spec = os.environ.get("BV2_AGENT_LOG_DIR", "").strip()
+    if spec:
+        return Path(spec).expanduser()
+    if not live:
+        return FIXTURES / "fake_agent_logs"
+    # The writer's lookup (Prism 4eb4fab37d71): the nearest ancestor of the gateway home holding
+    # scripts/lib/agent_inbox.py (alerts_audience_gate._fleet_root), then its agent_log_dir.
+    home = gateway_home()
+    root = next((c for c in (home, *home.parents) if (c / AGENT_INBOX_LIB).is_file()), None)
+    if root is None:
+        return hermes_root() / "state" / "agent-logs"
+    override = os.environ.get("NOTIFY_AGENT_LOG_DIR", "").strip()
+    return Path(override) if override else root / "state" / "agent-logs"
+
+
+class AgentLog:
+    """The gateway's ``boomerang handled`` receipt rows in the fleet agent log (agent_inbox
+    write_agent_log: ``{ts: <ISO Z>, producer: boomerang-wake, text, task_id, ...}``). Live: rows
+    since the step started, from the UTC-day files since then. Dry-run: every file, whole."""
+
+    def __init__(self, path: Path, live: bool, since: float):
+        self.path = path
+        self.live = live
+        self.since = since
+
+    def _files(self) -> list[Path]:
+        if not self.path.is_dir():
+            return []
+        files = sorted(self.path.glob("*.jsonl"))
+        if self.live:
+            first = time.strftime("%Y-%m-%d", time.gmtime(self.since)) + ".jsonl"
+            files = [f for f in files if f.name >= first]
+        return files
+
+    def messages(self) -> list[ChatMessage]:
+        out = []
+        for f in self._files():
+            for raw in f.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                try:
+                    doc = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(doc, dict) or doc.get("producer") != AGENT_LOG_PRODUCER:
+                    continue
+                text = str(doc.get("text") or doc.get("first_line") or "")
+                if not text.startswith(HANDLED_PREFIX):
+                    continue
+                ts = None
+                try:
+                    ts = _dt.datetime.fromisoformat(str(doc.get("ts")).replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    pass
+                # the row's ts has 1 s resolution: keep a row stamped in the step's first second
+                if self.live and ts is not None and ts < int(self.since):
+                    continue
+                out.append(ChatMessage(ts, text, "agent-log"))
+        return out
+
+
+class HandledReceipts:
+    """The origin chat, plus (knob absent) the agent-log handled receipts. Knob present: the chat
+    alone, so a ``boomerang handled`` line is required IN the chat. Knob absent: the receipt passes
+    from the agent log, and a chat line still counts (the gateway posts it when no log is available
+    or a turn was refused). Only ``boomerang handled`` rows are merged: warnings stay chat-only."""
+
+    def __init__(self, chat, agent_log: AgentLog, knob: Path):
+        self.chat = chat
+        self.agent_log = agent_log
+        self.knob = knob
+        self.chat_mode = knob.exists()
+        self.label = (f"{chat.label} (handled line: chat, knob {knob} present)" if self.chat_mode
+                      else f"{chat.label} + agent-log:{agent_log.path} (handled line: agent log, knob {knob} absent)")
+
+    def messages(self) -> list[ChatMessage]:
+        msgs = list(self.chat.messages())
+        if not self.chat_mode:
+            msgs.extend(self.agent_log.messages())
+        return sorted(msgs, key=lambda m: m.ts or 0)
+
+
 def make_chat(live: bool, since: float):
     spec = os.environ.get("BV2_ORIGIN_CHAT", "").strip()
     if not spec:
@@ -344,8 +464,10 @@ def make_chat(live: bool, since: float):
         spec = str(FIXTURES / "fake_origin_chat.jsonl")
     if spec.isdigit():
         env_path = Path(os.environ.get("BV2_GATEWAY_ENV") or hermes_root() / ".env")
-        return DiscordChat(spec, env_path, since)
-    return FileChat(Path(spec).expanduser())
+        chat = DiscordChat(spec, env_path, since)
+    else:
+        chat = FileChat(Path(spec).expanduser())
+    return HandledReceipts(chat, AgentLog(agent_log_dir(live), live, since), handled_knob_path(live))
 
 
 def gateway_log_path(live: bool) -> Path:
@@ -535,7 +657,7 @@ def find_chat(chat, pattern: re.Pattern, after_ts: float | None = None) -> ChatM
             continue
         for line in msg.content.splitlines() or [msg.content]:
             if pattern.search(line):
-                return ChatMessage(msg.ts, line.strip())
+                return ChatMessage(msg.ts, line.strip(), msg.source)
     return None
 
 
@@ -555,14 +677,14 @@ def find_log(log: GatewayLog, pattern: re.Pattern, after_ts: float | None = None
 # --- step 1: AC-7 / INV-6 ------------------------------------------------------------------------
 
 def step1(ctx: Ctx) -> StepReport:
-    rep = StepReport(1, "boomerang-wake origin-chat lines (AC-7, INV-5, INV-6)", ctx.mode)
+    rep = StepReport(1, "boomerang-wake origin-chat lines (AC-7, blocked_assess, INV-6)", ctx.mode)
     t0 = now()
     log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
     chat = make_chat(ctx.live, t0)
     rep.notes.append(f"board `{ctx.board}`; gateway log `{log.path}`; origin chat `{chat.label}`")
 
     done_card = ctx.make_card(rep, "s1_completed", "bv2 smoke s1: completed -> boomerang-wake")
-    ni_card = ctx.make_card(rep, "s1_needs_input", "bv2 smoke s1: needs_input -> surface")
+    ni_card = ctx.make_card(rep, "s1_needs_input", "bv2 smoke s1: needs_input -> blocked_assess")
     # Dry-run evaluates the failure-line assertion against the fake chat even with no fault hook
     # configured (it exercises the matcher); live without a hook reports SKIP, never a fake PASS.
     inject = ctx.plan["commands"].get("inject_failure")
@@ -590,10 +712,10 @@ def step1(ctx: Ctx) -> StepReport:
             ctx.force(rep, "inject_failure", card=fail_card)
 
     hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(done_card)), win)
-    rep.check(f"origin chat: `boomerang handled {done_card} (<kind>): <summary>`", PASS if hit else FAIL,
-              hit.content if hit else f"absent after {win:.0f}s")
+    rep.check(f"handled receipt: `boomerang handled {done_card} (<kind>): <summary>`", PASS if hit else FAIL,
+              hit.shown if hit else f"absent after {win:.0f}s")
     if hit:
-        rep.raw.append(f"--- chat match\n{hit.content}")
+        rep.raw.append(f"--- handled match\n{hit.shown}")
     line = ctx.poll(lambda: find_log(log, re_notifier_line(done_card)), ctx.tick_window)
     disp = re_notifier_line(done_card).search(line).group("disp") if line else None
     rep.check(f"gateway log: `kanban notifier: boomerang-wake {done_card} disposition=auto`",
@@ -601,16 +723,34 @@ def step1(ctx: Ctx) -> StepReport:
     if line:
         rep.raw.append(f"--- log match\n{line}")
 
-    # needs_input is a judgment event: it must surface, never boomerang-wake (INV-5).
-    def ni_auto():
-        return find_chat(chat, re_boomerang_wake_line(ni_card))
-    neg = ctx.poll(ni_auto, ctx.tick_window)  # live: waits the whole window for a line that must not come
-    rep.check(f"needs_input card {ni_card}: no `boomerang handled` line", FAIL if neg else PASS,
-              neg.content if neg else f"none ({ctx.window_label()})")
-    ni_log = find_log(log, re_notifier_line(ni_card))
-    ni_disp = re_notifier_line(ni_card).search(ni_log).group("disp") if ni_log else None
-    rep.check(f"needs_input card {ni_card}: notifier disposition is not auto",
-              FAIL if ni_disp == "auto" else PASS, ni_log or "no boomerang-wake log line (surfaced as today)")
+    # A blocked card (needs_input included) is boomerang-woken to ASSESS the block since #104/#309
+    # (gateway/kanban_wake_disposition.py row 1 `blocked_assess`, auto, fork). The old INV-5
+    # ("needs_input must surface, never auto") no longer holds.
+    ni_hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(ni_card)), win)
+    ni_kind = re_boomerang_wake_line(ni_card).search(ni_hit.content).group("kind") if ni_hit else None
+    rep.check(f"needs_input card {ni_card}: handled receipt `boomerang handled {ni_card} (blocked_assess): ...`",
+              PASS if ni_kind == BLOCKED_ASSESS_ROW else FAIL,
+              ni_hit.shown if ni_hit else f"absent after {win:.0f}s")
+    ni_log = ctx.poll(lambda: find_log(log, re_notifier_line(ni_card)), ctx.tick_window)
+    ni_m = re_notifier_line(ni_card).search(ni_log) if ni_log else None
+    ni_ok = bool(ni_m) and ni_m.group("disp") == "auto" and ni_m.group("row") == BLOCKED_ASSESS_ROW
+    rep.check(f"gateway log: `kanban notifier: boomerang-wake {ni_card} disposition=auto row=blocked_assess`",
+              PASS if ni_ok else FAIL, ni_log or "absent")
+    # Prism 655d5a3cf9a1: the row and the receipt are written for a FAILED assessment too (_fail
+    # posts `boomerang handled <card> (blocked_assess): ...` with outcome=failed). The claim's outcome decides.
+    label = f"needs_input card {ni_card}: the blocked_assess claim closed with a handled outcome"
+    path = wake_state_path(ctx.live)
+    if path is None:
+        rep.check(label, SKIP, "live needs BV2_WAKE_STATE (the scratch gateway's kanban_boomerang_wake.json)")
+    else:
+        handled_set = _gateway_handled_outcomes()
+        term = ctx.poll(lambda: _card_claim_terminal(path, ni_card), ctx.timeout)
+        outcome = term[1].get("outcome") if term else None
+        rep.check(label, PASS if outcome in handled_set else FAIL,
+                  f"claim `{term[0]}` terminal outcome={outcome}" + (
+                      "" if outcome in handled_set else f" (not in the gateway's HANDLED_OUTCOMES; "
+                                                        f"reason={term[1].get('reason')})")
+                  if term else f"no terminal claim for {ni_card} in {path} within {ctx.timeout:.0f}s")
 
     if not arm_failure:
         rep.check(f"failure card {fail_card}: `boomerang-wake superseded {fail_card}` log line", SKIP,
@@ -618,15 +758,40 @@ def step1(ctx: Ctx) -> StepReport:
     else:
         # The injected fault is a freshness refusal: a supersede (t_ce8bd439). One INFO/#logs line,
         # NO warning in the origin chat, the wake still re-surfaced.
-        sup = ctx.poll(lambda: find_log(log, re_superseded_line(fail_card)), win)
-        rep.check(f"gateway log: `boomerang-wake superseded {fail_card}: card moved to <status> ...`",
-                  PASS if sup else FAIL, sup or f"absent after {win:.0f}s")
+        wpath = wake_state_path(ctx.live)
+
+        def sup_or_verdict():
+            hit = find_log(log, re_superseded_line(fail_card))
+            if hit:
+                return ("sup", hit)
+            term = _card_claim_terminal(wpath, fail_card) if wpath is not None else None
+            # Prism 9c73a6c38f39: only an ACCEPTED verdict (a handled outcome) explains the missing line
+            accepted = term and term[1].get("outcome") in _gateway_handled_outcomes() - {"superseded"}
+            return ("verdict", term) if accepted else None
+        got = ctx.poll(sup_or_verdict, win)
+        sup = got[1] if got and got[0] == "sup" else None
+        label = f"gateway log: `boomerang-wake superseded {fail_card}: card moved to <status> ...`"
+        if sup:
+            rep.check(label, PASS, sup)
+        elif got:
+            # Apollo ruling t_9f0d174a-superseded-row-out-of-scope: broke with #425, not #439.
+            key, entry = got[1]
+            rep.check(label, INCOMPLETE,
+                      f"the child's verdict was not refused: claim `{key}` outcome={entry.get('outcome')}. A `surface` "
+                      f"verdict returns before the freshness check, and since #425 `_moved_noise` drops the plan's "
+                      f"unattributed `kanban comment`, so this row cannot pass on this fault (README)")
+        else:
+            rep.check(label, FAIL, f"absent after {win:.0f}s")
         if sup:
             rep.raw.append(f"--- log match\n{sup}")
         warn = ctx.poll(lambda: find_chat(chat, re_failed_line(fail_card)), ctx.tick_window)
         rep.check(f"origin chat: no `warning boomerang-wake failed {fail_card}` line (supersede)",
                   FAIL if warn else PASS, warn.content if warn else f"none ({ctx.window_label()})")
-        if inject:
+        if inject and got and got[0] == "verdict":
+            rep.check(f"failure card {fail_card}: wake re-surfaced after the fault", INCOMPLETE,
+                      f"the child's verdict was accepted (claim `{got[1][0]}` outcome={got[1][1].get('outcome')}), "
+                      f"not refused by inject_failure, so no wake was re-surfaced to check (cannot pass since #425, README)")
+        elif inject:
             _check_live_resurface(ctx, rep, log, chat, fail_card, fail_dispatch)
     return rep
 
@@ -638,9 +803,9 @@ def _check_live_resurface(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, card
     expect = ctx.plan.get("expect", {})
     early = find_chat(chat, re_boomerang_wake_line(card))
     if early:
-        rep.check(f"failure card {card}: fault landed before the verdict", INCOMPLETE,
-                  f"`{early.content}` posted: the child finished before inject_failure; re-run "
-                  f"(or set commands.s1_fault_hold)")
+        rep.check(f"failure card {card}: wake re-surfaced after the fault", INCOMPLETE,
+                  f"`{early.shown}`: the child's verdict was accepted, not refused by inject_failure, so no wake "
+                  f"was re-surfaced to check (the superseded row says why; cannot pass since #425, README)")
         return
     after = log_line_ts(dispatched) if (ctx.live and dispatched) else None
     re_wake = re.compile(expect.get("resurface_wake_log_regex",
@@ -747,6 +912,7 @@ def step2(ctx: Ctx) -> StepReport:
     rep = StepReport(2, "kill switches take effect on the next tick (AC-8, INV-7)", ctx.mode)
     log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
     chat = make_chat(ctx.live, rep.started)
+    rep.notes.append(f"origin chat `{chat.label}`")
     rep.notes.append("the harness never edits config or the stop file: it prints each one-line "
                      "change for Apollo and waits on the ack file")
 
@@ -803,8 +969,8 @@ def step2(ctx: Ctx) -> StepReport:
                 rep.notes.append(f"fork_enabled: event forced {iso(t)}, downgrade logged {iso(ts)} "
                                  f"({ts - t:.1f}s; tick {ctx.tick:.0f}s)")
         hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.timeout)
-        rep.check(f"origin chat: `boomerang handled {card}` still posts (summary-mode child)",
-                  PASS if hit else FAIL, hit.content if hit else "absent")
+        rep.check(f"handled receipt: `boomerang handled {card}` still written (summary-mode child)",
+                  PASS if hit else FAIL, hit.shown if hit else "absent")
 
     # (b) the stop file: the next wake on a boomerang-wake card is NOT handled by a child.
     if stop("boomerang_wake=disabled"):
@@ -1140,15 +1306,49 @@ def _gateway_handled_outcomes() -> frozenset:
     return HANDLED_OUTCOMES
 
 
-def _restart_claim_terminal(path: Path, card: str, delegation: str) -> tuple[str, dict] | None:
-    """The card's terminal ``<key>#restartN`` claim (the redispatched child's), else None. With
-    ``delegation`` set only that child's claim counts; otherwise the newest N."""
+def _all_claims(path: Path) -> dict:
+    """key -> claim: the state file's hot claims over its ``.terminal.jsonl`` archive (the gateway
+    moves a terminal claim there once its handbacks are delivered)."""
+    claims: dict = {}
+    try:
+        for line in path.with_name(path.stem + ".terminal.jsonl").read_text(encoding="utf-8-sig").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("key"), str):
+                claims[rec["key"]] = rec
+    except OSError:
+        pass
     try:
         doc = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return None
+        doc = {}
+    hot = doc.get("claims") if isinstance(doc, dict) else None
+    claims.update(hot if isinstance(hot, dict) else {})
+    return claims
+
+
+def _card_claim_terminal(path: Path, card: str) -> tuple[str, dict] | None:
+    """The card's newest terminal first-dispatch claim (not ``#restartN``), archive included, else None."""
     found = []
-    for key, entry in ((doc.get("claims") or {}).items() if isinstance(doc, dict) else ()):
+    for key, entry in _all_claims(path).items():
+        if ("#restart" in str(key) or not isinstance(entry, dict) or entry.get("task_id") != card
+                or entry.get("state") != "terminal"):
+            continue
+        tail = str(key).rsplit("|", 1)[-1]
+        found.append((int(tail) if tail.isdigit() else -1, key, entry))
+    if not found:
+        return None
+    _n, key, entry = max(found, key=lambda t: t[0])
+    return key, entry
+
+
+def _restart_claim_terminal(path: Path, card: str, delegation: str) -> tuple[str, dict] | None:
+    """The card's terminal ``<key>#restartN`` claim (the redispatched child's), else None. With
+    ``delegation`` set only that child's claim counts; otherwise the newest N."""
+    found = []
+    for key, entry in _all_claims(path).items():   # Prism a27475f1327b: archive included
         m = re.search(r"#restart(\d+)$", str(key))
         if (m and isinstance(entry, dict) and entry.get("task_id") == card and entry.get("state") == "terminal"
                 and (not delegation or entry.get("delegation_id") == delegation)):
@@ -1414,11 +1614,11 @@ def _s4_redispatch_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_pat
                       + ("" if outcome in handled_set else f" (not in the gateway's HANDLED_OUTCOMES; "
                                                           f"reason={entry.get('reason')})"))
     done = ctx.poll(lambda: find_chat(chat, re_restart_done_line(card), after_ts=after), ctx.timeout)
-    rep.check(f"{arm}: origin chat `boomerang handled {card} (<kind>): <summary>` or "
+    rep.check(f"{arm}: handled receipt `boomerang handled {card} (<kind>): <summary>` or "
               f"`[boomerang-wake] child surfaced {card}` after the restart",
-              PASS if done else FAIL, done.content if done else "absent")
+              PASS if done else FAIL, done.shown if done else "absent")
     if done:
-        rep.raw.append(f"--- chat match ({arm})\n{done.content}")
+        rep.raw.append(f"--- handled match ({arm})\n{done.shown}")
     lost = ctx.poll(lambda: find_chat(chat, re_lost_line(card)), ctx.tick_window)
     rep.check(f"{arm}: ZERO `warning boomerang-wake lost {card}` lines in the origin chat",
               FAIL if lost else PASS, lost.content if lost else f"none ({ctx.window_label()})")
@@ -1455,7 +1655,7 @@ def _s4_fallback_arm(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, pid_path:
     # lost-warning, not a single read; a post one second after the last read must still fail the drill.
     late = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.tick_window)
     rep.check(f"{arm}: no late `boomerang handled {card}` within {ctx.window_label()} after the re-surface",
-              FAIL if late else PASS, late.content if late else "none")
+              FAIL if late else PASS, late.shown if late else "none")
 
 
 def step4(ctx: Ctx) -> StepReport:
@@ -1463,6 +1663,7 @@ def step4(ctx: Ctx) -> StepReport:
                      ctx.mode)
     log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
     chat = make_chat(ctx.live, rep.started)
+    rep.notes.append(f"origin chat `{chat.label}`")
     pid_path = Path(os.environ.get("BV2_GATEWAY_PID") or (
         hermes_root() / "gateway.pid" if ctx.live else FIXTURES / "fake_gateway.pid"))
     rep.notes.append(f"the harness never restarts anything; gateway pid file `{pid_path}` boot_id at start: "

@@ -1999,6 +1999,13 @@ class GatewayKanbanWatchersMixin:
         """Clear notifier-visible ownership before releasing the OS lock."""
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
+        anchor = getattr(self, "_kanban_board_anchor", None)
+        self._kanban_board_anchor = None
+        if anchor is not None:
+            try:
+                anchor.stop(timeout=1.0)
+            except Exception:
+                pass
         try:
             from tools.async_delegation_kanban import clear_dispatcher_heartbeat, set_dispatcher_active
             set_dispatcher_active(False)
@@ -2170,6 +2177,8 @@ class GatewayKanbanWatchersMixin:
                         _gc_retention_days = 30
 
                 def _collect():
+                    from hermes_cli.kanban_db_ioerr import note_board_ioerr
+
                     deliveries: list[dict] = []
                     # t_dcc4ed08: one memoised REST oracle per tick for the
                     # landed-close-gate check on changes_requested events.
@@ -2293,6 +2302,7 @@ class GatewayKanbanWatchersMixin:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
+                            note_board_ioerr(exc, where="notifier:connect", board=slug)
                             continue
                         try:
                             if _gc_due:
@@ -2561,6 +2571,10 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: subscription for %s on board %s failed: %s",
                                         sub.get("task_id"), slug, sub_exc,
                                     )
+                                    note_board_ioerr(sub_exc, where="notifier:collect", board=slug, conn=conn)
+                        except Exception as exc:
+                            note_board_ioerr(exc, where="notifier:collect", board=slug, conn=conn)
+                            raise
                         finally:
                             conn.close()
                     return deliveries
@@ -3305,7 +3319,7 @@ class GatewayKanbanWatchersMixin:
                                 _now_status = None
                             _ev_ts = {ev.kind: ev.created_at for ev in d["events"]}
                             for _k in sorted(_wake_kinds):
-                                if _fresh.is_stale(_now_status, _k):
+                                if _fresh.is_stale_notice(_now_status, _k):
                                     _fresh.log_dropped(sub["task_id"], _k, _ev_ts.get(_k),
                                                        "notifier", _now_status)
                                     _wake_kinds.discard(_k)
@@ -3744,14 +3758,20 @@ class GatewayKanbanWatchersMixin:
         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_notify as _kbn
-        conn = _kbc.connect(board=board)
+        from hermes_cli.kanban_db_ioerr import note_board_ioerr
+        conn = None
         try:
+            conn = _kbc.connect(board=board)
             getattr(_kbn, op)(
                 conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "", **extra,
             )
+        except Exception as exc:
+            note_board_ioerr(exc, where=f"notifier:{op}", board=board, conn=conn)
+            raise
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def _kanban_advance(self, sub: dict, cursor: int, board: Optional[str] = None) -> None:
         self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
@@ -4000,6 +4020,13 @@ class GatewayKanbanWatchersMixin:
         else:
             return
         self._kanban_dispatcher_lock_handle = _lock_handle
+        # The dispatcher leader holds an idle read-only connection on every live board, so no
+        # other opener on this host rebuilds a board's -shm on open (t_1460fa32).
+        try:
+            from hermes_cli import kanban_board_anchor as _kba
+            self._kanban_board_anchor = _kba.start_if_enabled(kanban_cfg)
+        except Exception:
+            logger.debug("kanban dispatcher: board anchor unavailable", exc_info=True)
         write_dispatcher_heartbeat = lambda _interval: None  # noqa: E731 - bound if the import fails
         try:
             from tools.async_delegation_kanban import set_dispatcher_active, write_dispatcher_heartbeat
@@ -4265,6 +4292,10 @@ class GatewayKanbanWatchersMixin:
             return (q is not None and q[0] == _board_db_fingerprint(slug)
                     and time.monotonic() - q[1] < CORRUPT_BOARD_RETRY_AFTER_SECONDS)
 
+        def _kba_sidecar_identity(db_path: str) -> str:
+            from hermes_cli import kanban_board_anchor as _kba
+            return _kba.sidecar_identity(db_path)
+
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             # The guard class lives in ``kanban_db_connect`` since upstream's
             # extraction; the facade no longer re-exports it, and a missing
@@ -4355,12 +4386,16 @@ class GatewayKanbanWatchersMixin:
                         "SQLite database; pausing dispatch for this board until "
                         "the file changes, the gateway restarts, or the "
                         "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
+                        "then run `hermes kanban init` if you need a fresh board. "
+                        "sidecars: %s",
                         slug,
                         fingerprint[0],
+                        _kba_sidecar_identity(fingerprint[0]),
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                from hermes_cli.kanban_db_ioerr import note_board_ioerr
+                note_board_ioerr(exc, where="dispatcher", board=slug, conn=conn)
                 return None
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -4370,12 +4405,16 @@ class GatewayKanbanWatchersMixin:
                         "SQLite database; pausing dispatch for this board until "
                         "the file changes, the gateway restarts, or the "
                         "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
+                        "then run `hermes kanban init` if you need a fresh board. "
+                        "sidecars: %s",
                         slug,
                         fingerprint[0],
+                        _kba_sidecar_identity(fingerprint[0]),
                     )
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                from hermes_cli.kanban_db_ioerr import note_board_ioerr
+                note_board_ioerr(exc, where="dispatcher", board=slug, conn=conn)
                 return None
             finally:
                 if conn is not None:

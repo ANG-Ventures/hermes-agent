@@ -167,7 +167,7 @@ def _spawn_run(conn, tid, host=None):
     run_id = conn.execute("SELECT COALESCE(MAX(run_id), 0) + 1 FROM task_events").fetchone()[0]
     with kb.write_txn(conn):
         if host is not None:
-            kb._append_event(conn, tid, "worker_placed", {"host": host, "pid": 1}, run_id=run_id)
+            kb._append_event(conn, tid, "worker_allocated", {"host": host, "pid": 1}, run_id=run_id)
         kb._append_event(conn, tid, "spawned", {"pid": 1}, run_id=run_id)
 
 
@@ -212,7 +212,7 @@ def test_pool_placement_names_the_unspent_override(operator, monkeypatch):
         ksa.override(conn, tid, "studio-state", "reads the live board db", actor="apollo")
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         assert spawned == [(tid, "ace-ai")], spawned
-        (raw,) = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_placed'",
+        (raw,) = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='worker_allocated'",
                               (tid,)).fetchone()
         assert json.loads(raw)["studio_override_unspent"] == "studio-override studio-state unspent (once)"
         assert ksa.live_override(conn, tid, "studio-state") is not None
@@ -429,7 +429,7 @@ def test_review_lane_hold_wakes_and_persists_its_wait(kanban_home, monkeypatch):
         tid = _review_card(conn)
         _tick(conn, spillover=_plan(free=2), spawn_limit=2)
         kinds = [k for (k,) in conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
-        wait = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' "
+        wait = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='allocation_wait' "
                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
     assert kinds.count("mechanical_wake") == 1, kinds
     assert wait is not None and json.loads(wait[0])["reason"].startswith("studio_default_deny:studio-state"), kinds
@@ -521,7 +521,7 @@ def test_a_cleared_placement_wait_ends_the_hold_episode(kanban_home):
                      (tid,))
         conn.commit()
         with kb.write_txn(conn):
-            kb._append_event(conn, tid, "placement_wait", {"cleared": True})
+            kb._append_event(conn, tid, "allocation_wait", {"cleared": True})
         assert ksa.notify_holds(conn, waits, pager_factory=lambda: pager) == [tid]
         ksa.notify_holds(conn, waits, pager_factory=lambda: pager)
     assert pager.sent == [], pager.sent  # the new episode began at the second wake, not two hours ago
@@ -534,7 +534,7 @@ def test_override_warning_uses_the_live_override_match(operator, capsys):
     with kb.connect_closing() as conn:
         tid = _card(conn)
         with kb.write_txn(conn):
-            kb._append_event(conn, tid, "placement_wait",
+            kb._append_event(conn, tid, "allocation_wait",
                              {"reason": "studio_default_deny:workspace_kind:origin_not_github (structural: x)"})
         why = {"capability": "workspace_kind:origin_not_github", "source": "structural", "evidence": "x"}
         ksa.cmd_studio_override(argparse.Namespace(task_id=tid, capability="workspace_kind",
@@ -558,7 +558,7 @@ def test_local_review_placement_records_the_resolved_capability(kanban_home, mon
         _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)
         got = {}
         for tid in (declared, plain):
-            raw = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement' "
+            raw = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='allocation' "
                                "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
             p = json.loads(raw[0])
             p = json.loads(p) if isinstance(p, str) else p

@@ -34,7 +34,7 @@ def _card(conn, body, origin="ci-box"):
 
 
 def _pause_waits(conn, tid):
-    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='placement_wait' "
+    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='allocation_wait' "
                         "AND json_extract(payload,'$.code')='pause_hold'", (tid,)).fetchone()[0]
 
 

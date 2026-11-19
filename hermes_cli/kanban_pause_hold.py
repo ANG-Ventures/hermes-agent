@@ -103,8 +103,9 @@ FWA_MAX_GRACE_S = 7200
 _warned_endless: set = set()
 #: kill switch (env): an fwa hold follows ``origin_host`` for every card, pinned or not (pre-t_72362742)
 FOLLOWS_ORIGIN_ENV = "KANBAN_PAUSE_FOLLOWS_ORIGIN"
-#: ``placement_rerouted`` reason when an unpinned card leaves its fwa-held origin host for the allocator
-REROUTE_EVENT = "placement_rerouted"
+#: ``allocation_rerouted`` (was ``placement_rerouted``) reason when an unpinned card leaves its fwa-held origin host
+#: for the allocator; ``kanban_placement_reasons.PLACEMENT_REROUTED_EVENT``
+REROUTE_EVENT = "allocation_rerouted"
 REROUTE_REASON = "origin_host_paused"
 
 

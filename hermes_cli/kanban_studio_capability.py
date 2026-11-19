@@ -84,7 +84,7 @@ def create_reasons(cmap) -> Optional[frozenset]:
     try:
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_worker_pool as _kwp
-        from hermes_cli import placement_policy as _ppol
+        from hermes_cli import allocation_policy as _ppol
         last = _ppol.load(_kb.kanban_home() / "fleet").is_last_resort(_kwp.STUDIO_HOST)
         on = active(_kb._board_home_kanban_cfg(), last)
     except Exception:

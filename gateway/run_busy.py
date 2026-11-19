@@ -48,6 +48,21 @@ def approval_input_words(input_key: str) -> Tuple[str, ...]:
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Metadata flag ``_inject_watch_notification`` sets on watch-match / heartbeat / watch-state wakes:
+# the lowest-priority internal events, deferred or evicted before a kanban wake or user message.
+WATCH_NOTIFICATION_META = "watch_notification"
+_WATCH_NOTIFICATION_TYPES = frozenset({
+    "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released", "heartbeat"})
+
+
+def _is_watch_notification_event(event: Any) -> bool:
+    return bool(getattr(event, "internal", False)) and bool(
+        (getattr(event, "metadata", None) or {}).get(WATCH_NOTIFICATION_META))
+
+
+def _watch_content(event: Any) -> tuple:
+    return (getattr(event, "text", None), tuple(getattr(event, "media_urls", None) or ()))
+
 # Agent attributes for steer provenance. ``_STEER_ENTRIES_ATTR`` holds one ``(text, internal)`` entry per
 # gateway steer accepted into the agent's CURRENT steer buffer. It lives on the agent because the buffer
 # does: a recursive follow-up reuses the cached agent while the session slot may still hold the previous
@@ -60,6 +75,9 @@ _STEER_ENTRIES_ATTR = "_gateway_steer_entries"
 _STEER_DRAINED_ATTR = "_gateway_steer_drained"
 _STEER_LOCK_ATTR = "_gateway_steer_lock"
 _STEER_ENTRIES_MAX = 64
+# The agent-side hook ``steer_user_row`` calls with the drained text (t_b8fbfc54); keep the name in step with
+# ``agent.prompt_builder.STEER_ROW_DISPLAY_METADATA_ATTR``.
+STEER_ROW_DISPLAY_METADATA_ATTR = "_steer_row_display_metadata"
 _STEER_INSTALL_LOCK = threading.Lock()
 # Set while steer_with_provenance runs its verb: the wrapped ``steer`` then records nothing itself.
 _RECORDING = threading.local()
@@ -141,11 +159,22 @@ def _provenance_lock(agent: Any) -> Optional[threading.Lock]:
         attrs["_steer_requeue_sink"] = _requeue_with_snapshot
         attrs["_steer_wipe_sink"] = _wipe_with_entries
         attrs[_STEER_LOCK_ATTR] = lock
+
+        def _row_display_metadata(text, _attrs=attrs, _lock=lock):
+            """The agent's steer row for drained *text* asks here for its ``display_metadata``
+            (``agent.prompt_builder.steer_user_row``): the inbound record of the one message it is,
+            or a merged record (t_b8fbfc54)."""
+            return _drained_display_metadata(_attrs, _lock, text)
+
+        attrs[STEER_ROW_DISPLAY_METADATA_ATTR] = _row_display_metadata
         return lock
 
 
-def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool) -> bool:
-    """``verb(text)`` (the agent's ``steer``/``redirect``) and, when accepted, record the entry."""
+def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool, event: Any) -> bool:
+    """``verb(text)`` (the agent's ``steer``/``redirect``) and, when accepted, record the entry with *event*'s
+    inbound record (``None`` for a steer with no platform message), which the steer row then carries."""
+    from gateway import inbound_record
+    record = inbound_record.display_metadata(event).get(inbound_record.KEY) if event is not None else None
     lock = _provenance_lock(agent) if agent is not None else None
     with lock if lock is not None else contextlib.nullcontext():
         fresh = _steer_buffer_empty(agent)
@@ -155,11 +184,31 @@ def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool) -
         finally:
             _RECORDING.active = False
         if accepted and lock is not None:
-            _record_steer_entry(agent, text, internal=internal, fresh=fresh)
+            _record_steer_entry(agent, text, internal=internal, fresh=fresh, record=record)
     return accepted
 
 
-def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool) -> None:
+def _drained_display_metadata(attrs: dict, lock: Any, text: Any) -> dict:
+    """``inbound_record.steer_display_metadata`` of the newest drain snapshot whose text is *text*; ``{}``
+    when none is (the text was not drained through the gateway wrapper)."""
+    from gateway import inbound_record
+    with lock:
+        for drained_text, entries in reversed(list(attrs.get(_STEER_DRAINED_ATTR) or ())):
+            if drained_text == text:
+                return inbound_record.steer_display_metadata(drained_text, entries)
+    return {}
+
+
+def leftover_steer_display_metadata(agent: Any, leftover: Optional[str]) -> dict:
+    """The record a leftover steer (``result["pending_steer"]``) carries into the next user turn. Read it
+    BEFORE :func:`leftover_steer_is_internal`, which retires the snapshots (t_b8fbfc54)."""
+    lock = getattr(agent, "__dict__", {}).get(_STEER_LOCK_ATTR) if agent is not None else None
+    if lock is None or not leftover:
+        return {}
+    return _drained_display_metadata(agent.__dict__, lock, leftover)
+
+
+def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool, record: Any = None) -> None:
     cleaned = (text or "").strip()
     if not cleaned:
         return
@@ -167,7 +216,7 @@ def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool) -
     if fresh or not isinstance(attrs.get(_STEER_ENTRIES_ATTR), list):
         attrs[_STEER_ENTRIES_ATTR] = []  # a buffer wiped without a drain (hard cancel) leaves stale entries
     ledger = attrs[_STEER_ENTRIES_ATTR]
-    ledger.append((cleaned, bool(internal)))
+    ledger.append((cleaned, bool(internal), record if isinstance(record, dict) else None))
     del ledger[:-_STEER_ENTRIES_MAX]
 
 
@@ -193,9 +242,9 @@ def leftover_steer_is_internal(agent: Any, leftover: Optional[str]) -> bool:
     if not remainder or not drained:
         return False
     text, entries = drained[-1]
-    if (text or "").strip() != remainder or not entries or not all(internal for _, internal in entries):
+    if (text or "").strip() != remainder or not entries or not all(entry[1] for entry in entries):
         return False
-    for entry_text, _ in entries:
+    for entry_text, *_ in entries:
         if entry_text not in remainder:
             return False
         remainder = remainder.replace(entry_text, "", 1)
@@ -593,14 +642,16 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str, *, internal: bool = False) -> bool:
+    def _steer_running_agent(self, running_agent: Any, text: str, *, event: Any, internal: bool = False) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it.
 
         Every accepted steer is recorded ON THE AGENT as a buffer entry with its provenance, so it
         follows the text to whichever turn drains it (see :func:`leftover_steer_is_internal`), never to
-        the context the slot held at steer time (Prism e08366573530, t_506536db)."""
-        accepted = steer_with_provenance(running_agent, running_agent.steer, text, internal=internal)
+        the context the slot held at steer time (Prism e08366573530, t_506536db). *event* is the platform
+        message being steered (its inbound record rides the entry to the steer row, t_b8fbfc54); pass
+        ``event=None`` only for a steer no platform message produced."""
+        accepted = steer_with_provenance(running_agent, running_agent.steer, text, internal=internal, event=event)
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -704,14 +755,102 @@ class GatewayBusySessionMixin:
             event._gateway_accepted = True
             return
 
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+        if self._coalesce_card_wake(session_key, event, adapter):
+            return
+
+        depth = self._queue_depth(session_key, adapter=adapter)
+        refused = self.__dict__.setdefault("_wake_refusal_episodes", set())
+        if _is_watch_notification_event(event):
+            # Watch/heartbeat notices never take the last slots: kanban wakes and user messages own
+            # them. Not accepted -> the watch drain defers and folds the event (t_469a7ef8).
+            if (depth >= self._BUSY_QUEUE_MAX_PENDING - self._BUSY_QUEUE_RESERVED_SLOTS
+                    or self._queued_watch_notification_count(session_key, adapter) >= self._BUSY_QUEUE_MAX_WATCH):
+                logger.info("Deferring watch notification for busy session %s — queue depth %d.", session_key, depth)
+                return
+        elif depth >= self._BUSY_QUEUE_MAX_PENDING and not self._evict_oldest_watch_notification(session_key, adapter):
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
+            # A refused wake raises WakeNotAccepted at its sender; file it ONCE per episode so a
+            # session that cannot take wakes shows as that, not as a failing cron (t_4a891379).
+            if getattr(event, "internal", False) and session_key not in refused:
+                refused.add(session_key)
+                from gateway.wake import record_wake_refusal
+                record_wake_refusal(session_key, depth, self._BUSY_QUEUE_MAX_PENDING, event)
             return
+        refused.discard(session_key)   # below the cap: the refusal episode (if any) is over
 
+        if _is_watch_notification_event(event):
+            event._watch_pristine = _watch_content(event)   # what the notice held when queued
         self._enqueue_fifo(session_key, event, adapter)
+
+    def _coalesce_card_wake(self, session_key: str, event: MessageEvent, adapter: Any) -> bool:
+        """A kanban/boomerang wake for a card that already has a wake waiting in this session's
+        queue REPLACES it in place: the newest text wins, with a note of how many earlier notices it
+        folded. A card never holds more than one slot (t_4a891379: ~33 wakes filled the cap of 32).
+        User messages and every other wake kind are never touched."""
+        from gateway.wake_kind import CARD_ID_KEY, KANBAN
+        meta = getattr(event, "metadata", None) or {}
+        card = meta.get(CARD_ID_KEY)
+        if not (getattr(event, "internal", False) and getattr(event, "wake_kind", None) == KANBAN and card):
+            return False
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        overflow = self._overflow_queue(session_key)
+        held = [(pending_slot, session_key)] if isinstance(pending_slot, dict) and session_key in pending_slot else []
+        held += [(overflow, i) for i in range(len(overflow or ()))]
+        for store, idx in held:
+            old = store[idx]
+            old_meta = getattr(old, "metadata", None) or {}
+            if not (getattr(old, "internal", False) and getattr(old, "wake_kind", None) == KANBAN
+                    and old_meta.get(CARD_ID_KEY) == card
+                    and getattr(old, "allow_gateway_control", True) == getattr(event, "allow_gateway_control", True)
+                    and all(old_meta.get(k) == meta.get(k) for k in self._SECURITY_METADATA_KEYS)):
+                continue
+            folded = int(old_meta.get("wake_folded") or 0) + 1
+            event.metadata = {**meta, "wake_folded": folded}
+            event.text = (f"{event.text}\n\n[{folded} earlier notice{'s' if folded != 1 else ''} for this card "
+                          "folded into this one]")
+            store[idx] = event
+            event._gateway_accepted = True
+            logger.info("Coalesced kanban wake for %s into its queued slot in session %s (%d folded)",
+                        card, session_key, folded)
+            return True
+        return False
+
+    # Of _BUSY_QUEUE_MAX_PENDING, the last RESERVED slots never hold a watch notification, and at
+    # most MAX_WATCH watch notifications are queued per session at once (t_469a7ef8).
+    _BUSY_QUEUE_RESERVED_SLOTS = 8
+    _BUSY_QUEUE_MAX_WATCH = 4
+
+    def _queued_watch_notification_count(self, session_key: str, adapter: Any) -> int:
+        head = (getattr(adapter, "_pending_messages", None) or {}).get(session_key)
+        queued = [head, *(self._overflow_queue(session_key) or ())]
+        return sum(1 for item in queued if item is not None and _is_watch_notification_event(item))
+
+    def _evict_oldest_watch_notification(self, session_key: str, adapter: Any) -> bool:
+        """Free one slot of a full queue by removing its oldest OVERFLOW watch notification, else a
+        watch notice in the pending head slot that still holds only what it was queued with; False
+        if neither. A head that absorbed a same-sender human follow-up (busy text debounce, photo
+        merge) is never evicted, since that would drop the input (Prism cbbd6b0a5f80); overflow
+        items are never merge targets."""
+        overflow = self._overflow_queue(session_key)
+        index = next((i for i, item in enumerate(overflow or ()) if _is_watch_notification_event(item)), None)
+        if index is not None:
+            overflow.pop(index)
+        else:
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            head = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+            if not (head is not None and _is_watch_notification_event(head)
+                    and getattr(head, "_watch_pristine", None) == _watch_content(head)):
+                return False
+            if overflow:
+                pending_slot[session_key] = overflow.pop(0)
+            else:
+                pending_slot.pop(session_key, None)
+        logger.warning("Evicted oldest queued watch notification for session %s to admit a follow-up at cap (%d).",
+                       session_key, self._BUSY_QUEUE_MAX_PENDING)
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -946,11 +1085,11 @@ class GatewayBusySessionMixin:
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text,
+                return self._steer_running_agent(running_agent, call_text, event=event,
                                                  internal=bool(getattr(event, "internal", False)))
             # A redirect may land in the steer buffer (tool phase), so it is a buffer entry too.
             return steer_with_provenance(running_agent, getattr(running_agent, verb), call_text,
-                                         internal=bool(getattr(event, "internal", False)))
+                                         internal=bool(getattr(event, "internal", False)), event=event)
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -1134,6 +1273,8 @@ class GatewayBusySessionMixin:
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
                 self._queue_or_replace_pending_event(session_key, event)
                 return True
+            if _is_watch_notification_event(event):   # it lands in the empty head slot: evictable (t_270034fa)
+                event._watch_pristine = _watch_content(event)
             return False  # base adapter queues silently behind the active turn
 
         # Same authorization gate as the cold path, else unauthorized users in shared threads
@@ -1451,7 +1592,8 @@ class GatewayBusySessionMixin:
         if not running_agent or not hasattr(running_agent, "steer"):
             return _queue_fallback(t("gateway.steer.queued_no_agent"))
         try:
-            accepted = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
+            accepted = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event),
+                                                 event=event)
         except Exception as exc:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)

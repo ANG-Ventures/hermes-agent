@@ -129,7 +129,7 @@ def test_studio_placement_records_the_capability_and_its_source(kanban_home, mon
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="s", assignee="alpha", body="host: studio\nrequires: studio-state")
         _res, spawned = _tick(conn, spillover=_plan(free=0), spawn_limit=2)
-        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='placement'", (tid,)).fetchone()
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='allocation'", (tid,)).fetchone()
     assert (tid, None) in spawned
     rec = json.loads(ev[0])["studio_capability"]
     assert rec["capability"] == "studio-state" and rec["source"] == "declared", rec

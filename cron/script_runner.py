@@ -70,11 +70,139 @@ def _home_label(home: Path) -> str:
     return home.name if home.parent.name == "profiles" else "default"
 
 
+EXIT_RECORD_NAME = "script_runner_exit.json"
+
+
+def _exit_record_path() -> Path:
+    return trip_marker_path().parent / EXIT_RECORD_NAME
+
+
+def note_start() -> None:
+    """Log an exit-reason line for a previous runner that left none (SIGKILL, launchd exit timeout,
+    hard crash), then record this start (t_2ddabbc4: every start in the log has a cause). Never
+    raises."""
+    try:
+        path = _exit_record_path()
+        try:
+            prev = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            prev = None
+        if isinstance(prev, dict) and prev.get("exit") is None and prev.get("pid") != os.getpid():
+            logger.warning("cron script runner exit: reason=unrecorded code=? pid %s (started %s; "
+                           "no exit line: SIGKILL, launchd exit timeout or a hard crash)",
+                           prev.get("pid"), prev.get("started_at"))
+        from utils import atomic_write_text
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, json.dumps({"pid": os.getpid(), "started_at": _now_iso(),
+                                            "exit": None}) + "\n",
+                          tmp_prefix=".script_runner_exit_", mode=0o600)
+    except Exception:
+        logger.debug("script runner: exit record start failed", exc_info=True)
+
+
+def note_exit(reason: str, code) -> None:
+    """One ``cron script runner exit: reason=<r> code=<n>`` line on every exit path, and the exit
+    record that tells the next start this one was logged. Never raises."""
+    try:
+        logger.warning("cron script runner exit: reason=%s code=%s pid %d", reason, code,
+                       os.getpid())
+        for handler in logging.getLogger().handlers:
+            with contextlib.suppress(Exception):
+                handler.flush()
+        from utils import atomic_write_text
+
+        path = _exit_record_path()
+        try:
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            record = None
+        if not isinstance(record, dict) or record.get("pid") != os.getpid():
+            record = {"pid": os.getpid(), "started_at": None}
+        record["exit"] = {"at": _now_iso(), "reason": reason, "code": code}
+        atomic_write_text(path, json.dumps(record) + "\n", tmp_prefix=".script_runner_exit_",
+                          mode=0o600)
+    except Exception:
+        logger.debug("script runner: exit record failed", exc_info=True)
+
+
 def _detect_code_skew():
     try:
         from gateway.code_skew import detect_code_skew
 
         return detect_code_skew()
+    except Exception:
+        return None
+
+
+def _skew_shas() -> tuple:
+    """``(project root, boot sha, disk sha)``; a sha is None when unresolved."""
+    from gateway import code_skew
+
+    boot = code_skew._boot_fingerprint
+    boot_sha = boot.rsplit(":", 1)[-1] if boot else None
+    if boot_sha == "unresolved":
+        boot_sha = None
+    return code_skew._PROJECT_ROOT, boot_sha, code_skew.current_code_sha()
+
+
+def _loaded_repo_files(root: Path) -> set:
+    """Repo-relative posix paths of every module file in ``sys.modules`` under ``root``."""
+    root = Path(root).resolve()
+    out = set()
+    for module in list(sys.modules.values()):
+        path = getattr(module, "__file__", None)
+        if not path:
+            continue
+        try:
+            out.add(Path(path).resolve().relative_to(root).as_posix())
+        except (ValueError, OSError):
+            continue
+    return out
+
+
+SKEW_LOADED_ONLY_ENV = "HERMES_CRON_SKEW_LOADED_ONLY"
+SKEW_ANY_MARKER_NAME = "script_runner_skew_any"
+
+
+def _skew_any_forced() -> bool:
+    """Kill switch for the loaded-module skew filter; either one restores drain on any skew.
+
+    - the file ``<home>/cron/script_runner_skew_any``: the LIVE switch, honoured by a running
+      runner on its next skew check (``touch`` to set, ``rm`` to clear);
+    - env ``HERMES_CRON_SKEW_LOADED_ONLY=0``: a LAUNCH-time switch. The runner reads its own
+      environment, so exporting it elsewhere after start does nothing until the runner restarts.
+
+    A marker that cannot be stat'ed for any reason other than absence counts as set (drain)."""
+    if os.environ.get(SKEW_LOADED_ONLY_ENV, "").strip() == "0":
+        return True
+    try:
+        (trip_marker_path().parent / SKEW_ANY_MARKER_NAME).stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+
+
+def _skew_loaded_changes(base: Optional[str] = None) -> Optional[List[str]]:
+    """Loaded module files changed between ``base`` (the last accepted sha; default the boot sha)
+    and the disk sha (t_2ddabbc4): ``[]`` when the diff touches none of them, None when the diff
+    cannot be read (the caller drains)."""
+    try:
+        root, boot, disk = _skew_shas()
+        base = base or boot
+        if not base or not disk or base == disk:
+            return None
+        # --no-renames: a renamed loaded module must show its old path.
+        p = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--no-renames",
+                            f"{base}..{disk}"], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=10,
+                           check=False)
+        if p.returncode != 0:
+            return None
+        changed = {line.strip() for line in p.stdout.splitlines() if line.strip()}
+        return sorted(changed & _loaded_repo_files(root))
     except Exception:
         return None
 
@@ -261,6 +389,10 @@ class ScriptRunner:
         self._draining_mono = float("-inf")
         self.sigterm = False
         self._skew_bounded = False
+        # The last disk sha accepted without a drain (None = the boot sha). Later skews diff
+        # against it, so a commit that reverts code imported after the accept still drains.
+        self._skew_base_sha: Optional[str] = None
+        self.exit_reason: Optional[str] = None
         self._skew_withhold: set = set()
         self._bound_polled = False
         # Land hold (t_3c08d829): None = not started; a Popen = helper running; True = settled.
@@ -422,8 +554,52 @@ class ScriptRunner:
             return time.monotonic() - started
         return out[0]
 
+    def _skew_pending(self) -> bool:
+        """Disk differs from the code this process runs: the boot sha, or the last sha accepted
+        without a drain (also when the checkout returns to the boot sha)."""
+        if self._skew_base_sha is None:
+            return _detect_code_skew() is not None
+        try:
+            disk = _skew_shas()[2]
+        except Exception:
+            disk = None
+        if disk is None:
+            return _detect_code_skew() is not None
+        return disk != self._skew_base_sha
+
+    def _skew_needs_drain(self) -> bool:
+        """A code skew drains only when the base..disk diff touches a module this process loaded,
+        or the diff cannot be read (t_2ddabbc4: 84 of 152 drains changed no loaded module). The
+        base is the last accepted sha, so a kept skew is diffed once and a later revert of code
+        imported from it still drains.
+
+        Kill switch (no deploy needed, see ``_skew_any_forced``): the file
+        ``<home>/cron/script_runner_skew_any`` (next to the trip marker) is read on every skew
+        check and works on a running runner; env ``HERMES_CRON_SKEW_LOADED_ONLY=0`` is read from
+        the runner's own environment, so it takes effect from the next runner start."""
+        if _skew_any_forced():
+            logger.warning("script runner code skew: kill switch set (%s=0 or %s); draining",
+                           SKEW_LOADED_ONLY_ENV, SKEW_ANY_MARKER_NAME)
+            return True
+        try:
+            disk = _skew_shas()[2]
+        except Exception:
+            disk = None
+        changed = _skew_loaded_changes(self._skew_base_sha)
+        if changed is None:
+            logger.warning("script runner code skew: base..disk diff unreadable; draining")
+            return True
+        if changed:
+            logger.warning("script runner code skew touches %d loaded module(s): %s", len(changed),
+                           ", ".join(changed[:10]) + (" ..." if len(changed) > 10 else ""))
+            return True
+        self._skew_base_sha = disk
+        logger.warning("script runner code skew: disk %s changes no loaded module; not draining",
+                       (disk or "?")[:12])
+        return False
+
     def _check_skew(self) -> None:
-        if not self.draining and _detect_code_skew() is not None:
+        if not self.draining and self._skew_pending() and self._skew_needs_drain():
             self.draining = True
             self.draining_since = _now_iso()
             self._draining_mono = time.monotonic()
@@ -433,6 +609,7 @@ class ScriptRunner:
             return
         if _inflight_count() == 0:
             self.exit_code = 0
+            self.exit_reason = self.exit_reason or "code skew drain (no script in flight)"
             if self._stop is not None:
                 self._stop.set()
         else:
@@ -482,7 +659,7 @@ class ScriptRunner:
                            ", ".join(sorted(j for _h, j in failed)) or "-")
             self._skew_withhold = failed
             self._skew_bounded = True
-            self.request_shutdown()
+            self.request_shutdown("code skew drain bounded (in-flight scripts terminated)")
 
     def _land_hold_settled(self) -> bool:
         """Hold the bounded kill while a home-reconcile land is writing the live tree (t_3c08d829).
@@ -757,6 +934,7 @@ class ScriptRunner:
             self._tree_kill(grace)
             self._await_inflight(min(time.monotonic() + 1.5, hard_exit_at - 0.5))
             notify.join(max(0.0, hard_exit_at - 0.3 - time.monotonic()))
+            note_exit("watchdog trip", EXIT_WATCHDOG)
             for handler in logging.getLogger().handlers:
                 with contextlib.suppress(Exception):
                     handler.flush()
@@ -1108,7 +1286,8 @@ class ScriptRunner:
 
     # --- SIGTERM shutdown (§5.4) -----------------------------------------------------------
 
-    def request_shutdown(self) -> None:
+    def request_shutdown(self, reason: str = "signal SIGTERM") -> None:
+        self.exit_reason = self.exit_reason or reason
         self.sigterm = True
         if self._stop is not None:
             self._stop.set()
@@ -1169,19 +1348,37 @@ def _setup_logging() -> None:
 
 
 def main(argv: Optional[list] = None) -> int:
-    """``hermes cron runner``. Exit 78: config refusal; 70: watchdog trip; 0: SIGTERM or skew."""
+    """``hermes cron runner``. Exit 78: config refusal; 70: watchdog trip; 0: SIGTERM or skew.
+    Every exit path logs one ``cron script runner exit: reason=...`` line (t_2ddabbc4)."""
+    _setup_logging()
+    note_start()
+    exit_info: Dict[str, Any] = {"reason": None, "code": None}
+    try:
+        code = _run(exit_info)
+        exit_info["code"] = code
+        return code
+    except BaseException as exc:
+        exit_info["reason"] = f"crash {type(exc).__name__}: {exc}"[:300]
+        exit_info["code"] = "exception"
+        raise
+    finally:
+        note_exit(exit_info["reason"] or "unknown", exit_info["code"])
+
+
+def _run(exit_info: Dict[str, Any]) -> int:
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
 
-    _setup_logging()
     _bootstrap_env()
     for key in _REFUSED_ENV:
         if key in os.environ:
             logger.error("cron script runner refusing to start: %s is set (I6: no outbox, no "
                          "shared claim identity)", key)
+            exit_info["reason"] = f"config refused ({key} set)"
             return EXIT_CONFIG
     if not isinstance(resolve_cron_scheduler(), InProcessCronScheduler):
         logger.error("cron script runner refusing to start: cron.provider is not the built-in "
                      "in-process scheduler")
+        exit_info["reason"] = "config refused (cron.provider is not in-process)"
         return EXIT_CONFIG
     with contextlib.suppress(Exception):
         from gateway.code_skew import record_boot_fingerprint
@@ -1198,7 +1395,9 @@ def main(argv: Optional[list] = None) -> int:
         script_runner_rearm.apply_gated_refires()
     stop = threading.Event()
     kwargs = runner.start_kwargs(stop)
-    signal.signal(signal.SIGTERM, lambda *_a: runner.request_shutdown())
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):  # windows-footgun: ok — POSIX-only runner (macOS LaunchAgent, spec §2)
+        signal.signal(signum, lambda num, _f: runner.request_shutdown(
+            f"signal {signal.Signals(num).name}"))
     homes = list(runner._profile_homes())
     with contextlib.suppress(Exception):
         from hermes_logging import enable_profile_log_routing
@@ -1216,10 +1415,12 @@ def main(argv: Optional[list] = None) -> int:
         while not stop.wait(0.5):
             if not thread.is_alive():
                 logger.error("cron script runner ticker thread exited; exiting 1")
+                exit_info["reason"] = "ticker thread exited"
                 runner.end_land_hold()
                 return 1
             runner.poll_skew_bound()
         runner.end_land_hold()
+        exit_info["reason"] = runner.exit_reason or "stop requested"
         if runner.sigterm:
             return runner.shutdown()
         thread.join(timeout=_SHUTDOWN_WAIT_S)

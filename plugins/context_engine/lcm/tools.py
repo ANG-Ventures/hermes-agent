@@ -80,7 +80,7 @@ from .retrieval_core import (
 from .rollup_store import RollupStore
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .session_patterns import build_session_match_keys, compile_session_pattern
-from .sqlite_util import _sqlite_savepoint
+from .sqlite_util import _sqlite_savepoint, connect_read
 from .store import build_message_fts_spec
 from .vector_store import VectorStore
 
@@ -2890,14 +2890,14 @@ def _lcm_grep_full_text_with_deadline(
             require_remaining("database path resolution")
             uri = f"{db_path.as_uri()}?mode=ro"
             require_remaining("database URI construction")
-            message_conn = sqlite3.connect(
+            message_conn = connect_read(
                 uri,
                 uri=True,
                 timeout=max(0.001, require_remaining("message connection")),
             )
             require_remaining("message connection")
             require_remaining("DAG connection")
-            dag_conn = sqlite3.connect(
+            dag_conn = connect_read(
                 uri,
                 uri=True,
                 timeout=max(0.001, require_remaining("DAG connection")),
@@ -4330,7 +4330,7 @@ def _lcm_recall_summary_source_hits(
         return 0
 
     try:
-        conn = sqlite3.connect(
+        conn = connect_read(
             uri,
             uri=True,
             timeout=max(0.001, require_remaining("database connection")),

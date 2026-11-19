@@ -50,6 +50,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
+    monkeypatch.delenv("ALLOCATION_HOME", raising=False)
     monkeypatch.delenv("KANBAN_LOCAL_LEDGER", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()

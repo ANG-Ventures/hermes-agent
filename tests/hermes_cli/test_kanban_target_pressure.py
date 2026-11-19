@@ -21,7 +21,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli import placement_ledger as pl
-from hermes_cli import placement_policy as pp
+from hermes_cli import allocation_policy as pp
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "kanban_placement"
 POLICY = pp.PlacementPolicy()  # PRD §5.3 values (fallback until schema 1 lands)

@@ -25,7 +25,7 @@ def test_flushed_steer_keeps_one_display_identity_across_compactions(tmp_path):
             skip_memory=True,
         )
     agent._ensure_db_session()
-    steer = steer_user_row("focus on the persistence failure")
+    steer = steer_user_row("focus on the persistence failure", agent=None)
 
     agent._flush_messages_to_session_db([steer], [])
 

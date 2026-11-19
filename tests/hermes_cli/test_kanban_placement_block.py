@@ -138,7 +138,7 @@ def _placed_block(conn, body, reason, host="ci-box"):
     run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
     if host:
         with kb.write_txn(conn):
-            kb._append_event(conn, tid, "worker_placed", {"host": host, "reason": "band_spilling"}, run_id=run_id)
+            kb._append_event(conn, tid, "worker_allocated", {"host": host, "reason": "band_spilling"}, run_id=run_id)
     assert kb.block_task(conn, tid, reason=reason, kind="capability")
     return tid
 

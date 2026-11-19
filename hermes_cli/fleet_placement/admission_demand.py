@@ -55,7 +55,51 @@ PRIORITY_REL = Path("fleet") / "admission-priority.json"
 PRIORITY_MODES = ("spawn-only", "fcfs", "classes")
 DEMAND_REL = Path("var") / "placement" / "demand"
 DEFAULT_MAX_AGE_S = 120.0
+# t_2a7a47d6: door units whose id starts with one of these are NOT interchangeable with their workload's other units
+# (a main-train step run in the ci door, scripts/lib/main_train_door.py): /demand/authorize starts no LATER
+# equal-urgency unit of the workload while one waits (bounded by door_hold_max_s). Every other unit stays interchangeable.
+ORDERED_UNIT_PREFIXES = ("main-train-",)
 _SAID: set = set()
+
+
+_OLD_ENV_COUNTED = set()
+
+
+def _allocation_home_env(now=None):
+    """``ALLOCATION_HOME``, else the pre-rename ``PLACEMENT_HOME`` (rename wave 3, t_fc257547): the new name wins; an
+    old-name read is counted once per process in <fleet home>/var/ci-box/deprecated-name-reads.log, the fleet home from
+    hermes_home.get_fleet_home(script_file=__file__) (a vendored copy without it: $HERMES_HOME with profiles/<p>
+    un-nested, else ~/.hermes; not counted when that dir is absent). Never the value read: that root is
+    receipt-provisioned. ``now``: injected clock. Never raises."""
+    v = os.environ.get("ALLOCATION_HOME")
+    if v:
+        return v
+    v = os.environ.get("PLACEMENT_HOME")
+    if v and "PLACEMENT_HOME" not in _OLD_ENV_COUNTED:
+        _OLD_ENV_COUNTED.add("PLACEMENT_HOME")
+        try:
+            import sys
+            import time
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
+            lib = str(Path(__file__).resolve().parents[2] / "skills-shared" / "general" / "_lib")
+            if lib not in sys.path:
+                sys.path.append(lib)
+            try:
+                from hermes_home import get_fleet_home
+                home = Path(get_fleet_home(script_file=__file__))
+            except Exception:  # noqa: BLE001 -- a vendored copy has no resolver: its steps 3-4 inline
+                home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")  # noqa: fleet-home-scope -- get_fleet_home steps 3-4; profiles/<p> un-nested below
+                if home.parent.name == "profiles":
+                    home = home.parent.parent
+            if not home.is_dir():
+                return v
+            d = home / "var" / "ci-box"
+            d.mkdir(parents=True, exist_ok=True)
+            with open(d / "deprecated-name-reads.log", "a", encoding="utf-8") as fh:
+                fh.write(f"{ts} env:PLACEMENT_HOME pid={os.getpid()}\n")
+        except Exception:  # noqa: BLE001 -- a counter must never break a reader
+            pass
+    return v
 
 
 def _root(root: Optional[Path] = None) -> Path:
@@ -64,7 +108,7 @@ def _root(root: Optional[Path] = None) -> Path:
         return resolve_root(root, source_file=__file__, package=__package__)
     if root is not None:
         return Path(root)
-    env = os.environ.get("PLACEMENT_HOME")
+    env = _allocation_home_env()
     if env:
         return Path(env)
     here = Path(__file__).resolve().parents[2]

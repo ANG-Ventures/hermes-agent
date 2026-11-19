@@ -22,6 +22,8 @@ import weakref
 from pathlib import Path
 from typing import Any, Dict
 
+from .sqlite_util import connect_read
+
 logger = logging.getLogger(__name__)
 
 
@@ -697,7 +699,7 @@ class AuxiliarySessionMixin:
             return False
         try:
             uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = connect_read(uri, uri=True)
             try:
                 row = conn.execute(
                     """
@@ -760,7 +762,7 @@ class AuxiliarySessionMixin:
         current = session_id
         try:
             uri = state_db_path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = connect_read(uri, uri=True)
             try:
                 for _ in range(32):
                     if not current or current in visited:

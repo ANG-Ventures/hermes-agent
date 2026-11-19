@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
-from .sqlite_util import StoreClosed, guard_connection
+from .sqlite_util import StoreClosed, connect_read, guard_connection
 
 
 def _synchronized(method):
@@ -471,7 +471,7 @@ class LifecycleStateStore:
                 stats["state_db_checked"] = True
                 try:
                     state_uri = path.resolve().as_uri() + "?mode=ro"
-                    state_conn = sqlite3.connect(state_uri, uri=True)
+                    state_conn = connect_read(state_uri, uri=True)
                     try:
                         state_rows = state_conn.execute("SELECT id FROM sessions WHERE id IS NOT NULL").fetchall()
                     finally:

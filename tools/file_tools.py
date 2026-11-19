@@ -32,7 +32,8 @@ from tools.file_tools_paths import (
     _resolve_path_for_task)
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
-    _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
+    _check_cross_profile_path, _check_pkill_argorder_script, _check_protected_instruction_write,
+    _check_sensitive_path,
     _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
@@ -879,7 +880,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)
-           or (None if cross_profile else _check_cross_profile_path(path, task_id)))
+           or (None if cross_profile else _check_cross_profile_path(path, task_id))
+           or _check_pkill_argorder_script(path, content))
     if not err and _is_internal_file_tool_content(content):
         err = ("Refusing to write internal read_file display text as file content. "
                "Strip read_file line-number prefixes or reconstruct the intended "

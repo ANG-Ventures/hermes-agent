@@ -221,6 +221,43 @@ def invalid_pin_reason(provider: Optional[str], model: Optional[str]) -> Optiona
     return f"model_override_invalid: {verdict.model} not on {verdict.provider}"
 
 
+def retired_rewrite(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """``(successor, note)`` when ``model`` is RETIRED on this home, else ``(model, None)``.
+
+    G7 (t_1e1450d1): long-lived sessions copied a retired id (``gpt-6.1-sol``) out of their
+    own old context into ``delegate_task``; the lane still served it, so nothing refused.
+    Retired ids are ``<root>/config/model-retired-ids.txt`` (``<id> cutover=...``) and the
+    successor is ``<root>/config/model-successors.json`` ``successors``; a chain of retired
+    ids is followed to the first live one. A ``lane/`` prefix is kept. Any missing or
+    unreadable file, or a retired id with no successor, means no rewrite (fail open).
+    """
+    if not isinstance(model, str) or not model.strip():
+        return model, None
+    try:
+        import json
+        from hermes_constants import get_default_hermes_root
+
+        cfg = get_default_hermes_root() / "config"
+        retired: dict[str, str] = {}
+        for line in (cfg / "model-retired-ids.txt").read_text(encoding="utf-8-sig").splitlines():
+            parts = line.split("#", 1)[0].split()
+            if parts:
+                retired[parts[0]] = next((p[8:] for p in parts[1:] if p.startswith("cutover=")), "")
+        successors = json.loads((cfg / "model-successors.json").read_text(encoding="utf-8-sig"))["successors"]
+        prefix, bare = _split_prefixed(model.strip())
+        current, hops = bare, 0
+        while current in retired and isinstance(successors.get(current), str) and hops < 8:
+            current, hops = successors[current].strip(), hops + 1
+        if not hops or not current or current in retired:
+            return model, None
+    except Exception:
+        return model, None
+    new = f"{prefix}/{current}" if prefix else current
+    cutover = retired.get(bare) or "?"
+    return new, (f"model rewritten: {model} -> {new} ({bare} is retired, cutover {cutover}, "
+                 f"per config/model-retired-ids.txt + model-successors.json)")
+
+
 __all__ = [
     "CATALOG_TTL_SECONDS",
     "ModelResolution",
@@ -230,4 +267,5 @@ __all__ = [
     "invalid_pin_reason",
     "require",
     "resolve",
+    "retired_rewrite",
 ]

@@ -714,6 +714,27 @@ def heartbeat_current_worker_from_env(progress_at: Optional[float] = None) -> bo
 _COMMENT_POLL_MIN_INTERVAL_SECONDS = 6.0
 _comment_poll_last_attempt: float = float("-inf")  # see _auto_heartbeat_last_attempt
 _comment_watermark: dict[str, int] = {}
+# Machine authors whose card comments are status lines or reads for the card OWNER, never an
+# instruction to the running worker: they stay on the card (kanban_show) but are not steered in
+# as "from the operator" (t_718e6208: a boomerang child's owner read became an unasked gate change
+# on t_949dac2e). Worker-addressed automation (fleetreview-route, pr-only-ci-reds, the dispatcher's
+# SOFT DEADLINE, kanban-dispatcher collision warnings) and every human/operator author still deliver.
+_MIDRUN_SKIP_AUTHORS = frozenset({
+    "boomerang-wake", "kanban", "detached-run", "obligations", "review-failsafe", "ci-dead-run",
+})
+# ``<fleet root>/state/<flag>`` present: deliver machine authors mid-run again (pre-t_718e6208).
+MIDRUN_MACHINE_NOTES_FLAG = "kanban-midrun-machine-notes.enabled"
+
+
+def _skip_midrun_author(author: str) -> bool:
+    a = str(author or "").strip().lower()
+    if a not in _MIDRUN_SKIP_AUTHORS:
+        return False
+    try:
+        from hermes_constants import get_default_hermes_root
+        return not (get_default_hermes_root() / "state" / MIDRUN_MACHINE_NOTES_FLAG).exists()
+    except Exception:
+        return True
 
 
 def inject_new_comments_from_env(agent: Any) -> bool:
@@ -745,7 +766,8 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
     # re-enter the live turn as fake operator steering).
     own = _persisted_identity()
-    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()
+             and not _skip_midrun_author(c.author)]
     if not fresh:
         return False
     lines = [
@@ -813,7 +835,24 @@ def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
             "summary": _cap_text(run.summary, _SHOW_REVIEW_CHARS)}
 
 
-def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
+def _cap_context(ctx: str, limit: int, spans: Optional[dict] = None) -> str:
+    """Cut the worker context to ``limit`` (t_5949eafd). The header+body (``spans["head"]``) and the
+    one current send-back (``spans["sendback"]``, char offsets from build_worker_context) are never
+    cut; the history between them gives way first, then what follows."""
+    spans = spans or {}
+    if "head" not in spans and "sendback" not in spans:
+        return _cap_text(ctx, limit)
+    h_end = spans.get("head", (0, 0))[1]
+    start, end = spans.get("sendback", (len(ctx), len(ctx)))
+    head, keep = ctx[:h_end], ctx[start:end]
+    mid, post = ctx[h_end:start], ctx[end:]
+    room = max(0, limit - len(head) - len(keep))
+    mid_k = _cap_text(mid, max(room // 2, room - len(post)))
+    post_k = _cap_text(post, max(0, room - len(mid_k)))
+    return head + mid_k + keep + post_k
+
+
+def _bounded_show(out: dict[str, Any], spans: Optional[dict] = None) -> dict[str, Any]:
     """Shrink the history lists, oldest entries first, until the response fits the budget."""
     def size() -> int:
         return len(json.dumps(out, ensure_ascii=False, default=str))
@@ -827,7 +866,7 @@ def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
     if size() > _SHOW_BUDGET_CHARS:
         excess = size() - _SHOW_BUDGET_CHARS
         ctx = out.get("worker_context") or ""
-        out["worker_context"] = _cap_text(ctx, max(4_000, len(ctx) - excess - 200))
+        out["worker_context"] = _cap_context(ctx, max(4_000, len(ctx) - excess - 200), spans)
     if not omitted:
         out.pop("omitted")
     return out
@@ -844,6 +883,7 @@ def _handle_show(args: dict, **kw) -> str:
         runs = kb.list_runs(conn, tid)
         comments = kb.list_comments(conn, tid)
         events = kb.list_events(conn, tid)
+        spans: dict = {}
         out: dict[str, Any] = {
             "latest_review": _latest_review(kb, conn, tid, runs),
             "task": {**_fields(task, _TASK_FIELDS),
@@ -871,7 +911,7 @@ def _handle_show(args: dict, **kw) -> str:
                      for r in reversed(runs[-_SHOW_MAX_RUNS:])],
             "runs_order": "newest_first",
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": _worker_context_or_error(kb, conn, tid)}
+            "worker_context": _worker_context_or_error(kb, conn, tid, spans)}
         omitted = {k: n for k, n in (("comments", len(comments) - _SHOW_MAX_COMMENTS),
                                      ("events", len(events) - _SHOW_MAX_EVENTS),
                                      ("runs", len(runs) - _SHOW_MAX_RUNS)) if n > 0}
@@ -893,15 +933,15 @@ def _handle_show(args: dict, **kw) -> str:
                                           "error": _cap_text(r_last["error"], _SHOW_FIELD_CHARS)},
                 "note": "moved to %s; full text: hermes kanban show %s" % (kar.ARCHIVE_NAME, tid),
                 **({"error": arch["error"]} if arch.get("error") else {})}
-        return json.dumps(_bounded_show(out), ensure_ascii=False, default=str)
+        return json.dumps(_bounded_show(out, spans), ensure_ascii=False, default=str)
 
 
-def _worker_context_or_error(kb, conn, tid: str) -> str:
+def _worker_context_or_error(kb, conn, tid: str, spans: Optional[dict] = None) -> str:
     """An unreadable kanban-archive.db is named in place of the context, never rendered as less history."""
     from hermes_cli import kanban_archive_read as kar
 
     try:
-        return kb.build_worker_context(conn, tid)
+        return kb.build_worker_context(conn, tid, spans)
     except kar.ArchiveUnreadable as exc:
         return "worker context unavailable: archived history unreadable (%s)" % exc
 
@@ -1620,6 +1660,10 @@ def _handle_create(args: dict, **kw) -> str:
     until_raw = args.get("until")
     force_model = args.get("force_model")
     _check(force_model is None or isinstance(force_model, str), "force_model must be a reason string")
+    model_rewritten = None  # G7 (t_1e1450d1): a RETIRED id becomes its successor unless forced
+    if model_override and not (force_model or "").strip():
+        from hermes_cli.model_registry import retired_rewrite
+        model_override, model_rewritten = retired_rewrite(model_override)
     allow_flagship = args.get("allow_flagship")
     _check(allow_flagship is None or isinstance(allow_flagship, str),
            "allow_flagship must be a reason string")
@@ -1742,6 +1786,9 @@ def _handle_create(args: dict, **kw) -> str:
                    **({"placement": placement} if placement else {}),
                    **({"requires_not_inherited": not_inherited} if not_inherited else {}),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
+                   **({"model_rewritten": model_rewritten}
+                      if model_rewritten and kb.get_task(conn, new_tid).model_override
+                      in (model_override, model_override.partition("/")[2]) else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
 

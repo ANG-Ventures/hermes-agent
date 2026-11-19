@@ -149,7 +149,26 @@ def _base_baseline(root: Path, ref: str, rel: str):
     r = _git(root, "show", f"{ref}:{rel}")
     if r.returncode != 0:
         raise ValueError(f"git show {ref}:{rel} failed: {r.stderr.decode('utf-8', 'replace').strip()}")
-    return load_config(json.loads(r.stdout))[2]
+    base = dict(load_config(json.loads(r.stdout))[2])
+    for new, old in _renamed_from(root, ref).items():   # a git mv keeps its row (rename wave 3, t_fc257547)
+        if new not in base and old in base:
+            base[new] = base[old]
+    return base
+
+
+def _renamed_from(root: Path, ref: str) -> dict:
+    """{new path: path at ref} for the files git sees as renamed or copied between ref and the work tree."""
+    r = _git(root, "diff", "--no-ext-diff", "--find-renames", "--find-copies", "--name-status", "-z", ref)
+    if r.returncode != 0:
+        raise ValueError(f"--base-ref {ref!r}: rename detection failed ({r.stderr.decode('utf-8', 'replace').strip()})")
+    fields, out, i = r.stdout.decode("utf-8", "surrogateescape").split("\0"), {}, 0
+    while i < len(fields) and fields[i]:
+        if fields[i][0] in "RC":
+            out[fields[i + 2]] = fields[i + 1]
+            i += 3
+        else:
+            i += 2
+    return out
 
 
 def run(root: Path, config_rel: str, base_ref=None, out=print) -> int:
@@ -207,6 +226,17 @@ def selftest() -> int:
         cfg["baseline"]["alloc/a.py"] = 5
         (root / CONFIG_REL).write_text(json.dumps(cfg), encoding="utf-8")
         rc.append(run(root, CONFIG_REL, base_ref="HEAD", out=quiet)); cases.append(("raising the baseline is red", 1))
+        cfg["baseline"] = {"alloc/z.py": 1}
+        (root / CONFIG_REL).write_text(json.dumps(cfg), encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "mv", "alloc/a.py", "alloc/z.py"], check=True, env=_scrub_git_env())
+        rc.append(run(root, CONFIG_REL, base_ref="HEAD", out=quiet)); cases.append(("a git mv keeps its row", 0))
+        cfg["baseline"] = {"alloc/z.py": 2}
+        (root / CONFIG_REL).write_text(json.dumps(cfg), encoding="utf-8")
+        rc.append(run(root, CONFIG_REL, base_ref="HEAD", out=quiet))
+        cases.append(("raising a moved row is red", 1))
+        subprocess.run(["git", "-C", str(root), "mv", "alloc/z.py", "alloc/a.py"], check=True, env=_scrub_git_env())
+        cfg["baseline"] = {"alloc/a.py": 5}
+        (root / CONFIG_REL).write_text(json.dumps(cfg), encoding="utf-8")
         rc.append(run(root, CONFIG_REL, base_ref="no-such-ref", out=quiet))
         cases.append(("an unresolvable base ref is rc 2, not bootstrap", 2))
         empty_tree = subprocess.run(["git", "-C", str(root), "hash-object", "-t", "tree", "-w", "--stdin"],

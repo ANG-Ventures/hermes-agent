@@ -97,7 +97,9 @@ def test_long_quota_never_retries_primary(status, fallback):
 def test_native_next_lane_and_same_model(provider, cls):
     agent = make_agent([], provider=provider)
     chain = ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr", "cpa"]
-    next_lane = chain[chain.index(provider) + 1]
+    # quota_model = no seat of the pool can serve the model; every other relay face
+    # shares those seats, so the walk skips to the first lane off the pool (t_5188f4ed).
+    next_lane = "cpa" if cls == "quota_model" else chain[chain.index(provider) + 1]
     agent._fallback_chain = agent._fallback_chain[chain.index(provider):]
     chosen_model = agent.model
     sleeps = []
@@ -245,7 +247,7 @@ def test_long_quota_stays_exhausted_when_capacity_policy_widens_ceiling():
     sleeps = []
     result, _, call, attempts = run(agent, quota_error(cls="quota_model"), sleeps)
     assert result["completed"] is True
-    assert [p for p, _ in attempts] == ["claude-alr", "claude-dtlr"]
+    assert [p for p, _ in attempts] == ["claude-alr", "cpa"]  # same-pool faces skipped (t_5188f4ed)
     assert call.call_count == 2
     assert sum(sleeps) == 0
 
@@ -298,7 +300,7 @@ def test_undated_quota_model_falls_back_without_capacity_wait(status):
     assert sum(sleeps) == 0, f"slept {sleeps} on a model capped on every seat"
     assert result["completed"] is True
     assert activate.called
-    assert [p for p, _ in attempts] == ["claude-dtlr", "claude-btpr"]
+    assert [p for p, _ in attempts] == ["claude-dtlr", "cpa"]  # same-pool faces skipped (t_5188f4ed)
     pool.mark_exhausted_and_rotate.assert_not_called()
     # Recorded as the quota it is: the existing Fable banner, not "relay busy".
     assert any("Model fallback (Fable weekly limit)" in text for _, text in statuses), statuses

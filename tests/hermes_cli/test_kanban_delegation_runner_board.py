@@ -256,11 +256,11 @@ def test_k3_spawn_now_writes_the_same_events_as_a_tick(home, all_assignees_spawn
         ticked = kb.create_task(conn, title="tick", assignee="worker")
         res = kbd.dispatch_once(conn, spawn_fn=spawn, board=OTHER)
         assert ticked in [s[0] for s in res.spawned]
-        tick_keys = (_payload_keys(conn, ticked, "spawned"), _payload_keys(conn, ticked, "placement"))
+        tick_keys = (_payload_keys(conn, ticked, "spawned"), _payload_keys(conn, ticked, "allocation"))
     with _conn(BOARD) as conn:
         unit = kb.create_task(conn, title="unit", assignee="worker")
         assert kbd.spawn_now(conn, unit, board=BOARD, spawn_fn=spawn) == os.getpid()
-        now_keys = (_payload_keys(conn, unit, "spawned"), _payload_keys(conn, unit, "placement"))
+        now_keys = (_payload_keys(conn, unit, "spawned"), _payload_keys(conn, unit, "allocation"))
         assert kb.get_task(conn, unit).status == "running"
     assert now_keys == tick_keys
 

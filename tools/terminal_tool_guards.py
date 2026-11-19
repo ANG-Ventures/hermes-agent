@@ -427,3 +427,19 @@ def home_deletion_block(
         return None
     logger.warning("Blocked protected-home delete: %s (command: %s)", hit, _safe_command_preview(command))
     return _blocked_json(refusal_message(hit), "blocked", blocked_by=BLOCK_MARKER)
+
+
+def pkill_argorder_block(*, command: str) -> Optional[str]:
+    """Refuse ``pkill``/``pgrep`` with an option after the pattern (``tools.pkill_argorder_guard``).
+
+    Text-only, so it applies on every backend, including a command shipped to
+    another host inside ``ssh host "..."``. Returns the JSON error string when
+    blocked, else None.
+    """
+    from tools.pkill_argorder_guard import BLOCK_MARKER, find_misordered_pkill, refusal_message
+
+    hit = find_misordered_pkill(command)
+    if not hit:
+        return None
+    logger.warning("Blocked misordered pkill/pgrep: %s (command: %s)", hit, _safe_command_preview(command))
+    return _blocked_json(refusal_message(hit), "blocked", blocked_by=BLOCK_MARKER)

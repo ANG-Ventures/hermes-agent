@@ -325,7 +325,7 @@ def _studio_registered(fleet: Path, policy_hosts=None):
                       for h in ("mac-studio", "ace-ai", "ace-media")}}
     _write_pool(fleet, roles=roles, sidecar=side)
     if policy_hosts is not None:
-        (fleet / "placement-policy.json").write_text(
+        (fleet / "allocation-policy.json").write_text(
             json.dumps({"schema": 1, "hosts": policy_hosts}), encoding="utf-8")
 
 
@@ -476,7 +476,7 @@ def test_plan_unreachable_reason_names_probe_error(monkeypatch, tmp_path):
     def probe(host):
         return kwp.probe_host(host, runner=lambda a, **k: _Proc(255, ""), memory=mem)
 
-    from hermes_cli import placement_policy as pp
+    from hermes_cli import allocation_policy as pp
     signal = kwp.TargetSignal(policy=pp.PlacementPolicy(), ledger_dir=tmp_path, clock=lambda: 1.0)
     p = kwp.plan([h], {}, probe=probe, signal=signal)
     why = p.detail["ace-ai"]["pressure"]
@@ -840,7 +840,7 @@ def _lineage(monkeypatch, mode):
 
 def _placement_waits(conn, tid):
     return [json.loads(r[0]) for r in conn.execute(
-        "SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' ORDER BY id",
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='allocation_wait' ORDER BY id",
         (tid,))]
 
 
@@ -862,7 +862,7 @@ def test_placement_wait_event_written_once_then_deduplicated(kanban_home, lineag
         assert ev["reason"] == f"not_portable:linked(blocks->{parent})"
         assert ev["route"] == "wait" and ev["host"] is None and isinstance(ev["since"], int)
         conn.execute("UPDATE task_events SET created_at = created_at - 901 "
-                     "WHERE task_id=? AND kind='placement_wait'", (child,))
+                     "WHERE task_id=? AND kind='allocation_wait'", (child,))
         conn.commit()
         _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
         evs = _placement_waits(conn, child)
@@ -883,7 +883,7 @@ def test_placement_wait_new_episode_after_run_is_not_deduplicated(kanban_home, l
         # Backdate the first episode by 300 s (still inside the 900 s window).
         conn.execute("UPDATE task_events SET created_at = created_at - 300, payload = "
                      "json_set(payload, '$.since', json_extract(payload, '$.since') - 300) "
-                     "WHERE task_id=? AND kind='placement_wait'", (child,))
+                     "WHERE task_id=? AND kind='allocation_wait'", (child,))
         with kb.write_txn(conn):
             kb._append_event(conn, child, "claimed", {"run_id": 1})
             kb._append_event(conn, child, "requeued", {"reason": "test"})
@@ -1624,7 +1624,7 @@ def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monk
         status = conn.execute("SELECT status FROM tasks WHERE id=?", (browser,)).fetchone()[0]
         assert status == "ready"
         aff = _events(conn, browser, "placement_affinity")
-        waits = _events(conn, browser, "placement_wait")
+        waits = _events(conn, browser, "allocation_wait")
         assert aff == [{"host": "mac-studio", "rule": "studio_manifest",
                         "matched_by": "skill:browser-access (manifest:host_affinity)"}]
         assert waits == [{"host": "mac-studio", "reason": "studio_affinity:studio_manifest",
@@ -1633,20 +1633,20 @@ def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monk
         _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
               spawn_paused="spilling")
         assert len(_events(conn, browser, "placement_affinity")) == 1
-        assert len(_events(conn, browser, "placement_wait")) == 1
+        assert len(_events(conn, browser, "allocation_wait")) == 1
         # Spawned in between (a claim), then waiting again for the same reason:
         # that is a NEW wait and is recorded.
         kb._append_event(conn, browser, "claimed", {"lock": "test"})
         conn.commit()
         _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
               spawn_paused="spilling")
-        assert len(_events(conn, browser, "placement_wait")) == 2
+        assert len(_events(conn, browser, "allocation_wait")) == 2
         # A (re)assignment ends the episode too (shared end-kind set, Prism
         # 75f6107b): the same wait is re-written, so the view still lists it.
         assert kb.assign_task(conn, browser, "alpha")
         _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
               spawn_paused="spilling")
-        assert len(_events(conn, browser, "placement_wait")) == 3
+        assert len(_events(conn, browser, "allocation_wait")) == 3
         from hermes_cli import kanban_placement_view as kpv
         assert browser in [h["task_id"] for h in kpv._held(conn)]
 
@@ -1675,7 +1675,7 @@ def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_h
         (cdp,) = _make(conn, 1, body="signed-in browser work")
         spill = lambda: _plan(free=2, band="spilling")  # noqa: E731
         _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
-        assert [e["reason"] for e in _events(conn, cdp, "placement_wait")] == [
+        assert [e["reason"] for e in _events(conn, cdp, "allocation_wait")] == [
             "studio_affinity:studio_body"]
         # Room on the Studio, but the assignee is at its per-profile cap: the
         # card is evaluated with NO wait reason and still not claimed.
@@ -1688,18 +1688,18 @@ def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_h
         # Momus R-A (t_7133e03d): the per-profile hold is a named wait now,
         # so the episode turns over on the reason change instead of a clear.
         assert spawned == [] and res.placement_waits[cdp] == "per_profile_cap (alpha 1/1)"
-        waits = _events(conn, cdp, "placement_wait")
+        waits = _events(conn, cdp, "allocation_wait")
         assert waits[-1]["reason"] == "per_profile_cap (alpha 1/1)"
         conn.execute("UPDATE tasks SET status='done', claim_lock=NULL WHERE id=?", (busy,))
         conn.commit()
         _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
-        waits = _events(conn, cdp, "placement_wait")
+        waits = _events(conn, cdp, "allocation_wait")
         assert [w.get("reason", "cleared") for w in waits] == [
             "studio_affinity:studio_body", "per_profile_cap (alpha 1/1)",
             "studio_affinity:studio_body"]
         # Repeating the same wait writes nothing new.
         _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
-        assert len(_events(conn, cdp, "placement_wait")) == 3
+        assert len(_events(conn, cdp, "allocation_wait")) == 3
 
 
 def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home):
@@ -1729,7 +1729,7 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
         assert _events(conn, card, "placement_affinity")[-1] == {"cleared": True}
         # The binding's wait ends with it (Prism 0f21fb8c); the card's own
         # pool wait is then a new placement_wait (main's per-card writer).
-        assert [w.get("reason", "cleared") for w in _events(conn, card, "placement_wait")] == [
+        assert [w.get("reason", "cleared") for w in _events(conn, card, "allocation_wait")] == [
             "studio_affinity:studio_bound_skill", "cleared", "pool_full"]
         # Idempotent: an unbound card with a cleared history writes nothing.
         plan3 = spill()
@@ -1746,7 +1746,7 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
         assert [a.get("rule", "cleared") for a in aff] == [
             "studio_bound_skill", "cleared", "studio_bound_skill"]
         # ...and the same wait after the re-bind is a new episode, not a duplicate.
-        assert [w.get("reason", "cleared") for w in _events(conn, card, "placement_wait")] == [
+        assert [w.get("reason", "cleared") for w in _events(conn, card, "allocation_wait")] == [
             "studio_affinity:studio_bound_skill", "cleared", "pool_full",
             "studio_affinity:studio_bound_skill"]
         # A card that was never bound never gets a cleared event.
@@ -2012,7 +2012,7 @@ def test_drained_pin_wait_posts_one_logs_line_after_15_min(kanban_home, monkeypa
         assert sent == []  # a fresh wait is not news
         conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
                      "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
-                     "AND kind='placement_wait'", (tid,))
+                     "AND kind='allocation_wait'", (tid,))
         conn.commit()
         _tick(conn, spillover=_drained_plan(), spawn_limit=4)
         _tick(conn, spillover=_drained_plan(), spawn_limit=4)
@@ -2047,7 +2047,7 @@ def test_drained_pin_latch_survives_a_tick_the_card_is_missing_from(kanban_home,
         _tick(conn, spillover=_drained_plan(), spawn_limit=4)
         conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
                      "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
-                     "AND kind='placement_wait'", (tid,))
+                     "AND kind='allocation_wait'", (tid,))
         conn.commit()
         now = int(time.time())
         assert len(kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now)) == 1
@@ -2069,7 +2069,7 @@ def test_drained_pin_corrupt_marker_posts_nothing_and_is_rewritten(kanban_home, 
         _tick(conn, spillover=_drained_plan(), spawn_limit=4)
         conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
                      "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
-                     "AND kind='placement_wait'", (tid,))
+                     "AND kind='allocation_wait'", (tid,))
         conn.commit()
         marker = kb.board_state_dir(None) / kdp._MARKER
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -2151,7 +2151,7 @@ def test_typo_pin_is_refused_with_one_comment_per_park(fleet_aliases):
         assert reason.startswith("pin_unknown_host:mac-studio-m3 (did you mean: ")
         assert "mac-studio-m3u->studio" in reason
         ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = "
-                          "'placement_wait' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                          "'allocation_wait' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
         assert json.loads(ev[0])["reason"] == reason
         for _ in range(2):
             _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)

@@ -42,6 +42,7 @@ import dataclasses
 import json
 import math
 import sys
+import threading
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, Sequence
 
@@ -54,6 +55,7 @@ Estimate = admission.Estimate
 P = 0.90                     # the estimate is the p90 of a class's recorded peaks (doctrine rule 3; t_d0c8e8f0)
 WINDOW = 50                  # over its last N runs on that host (doctrine rule 3: "the last ~50")
 MIN_ROWS = 10                # nearest-rank p90 must not equal one isolated maximum during cold start
+HOST_ROWS_FACTOR = 2         # a pooled sub-class's host p90 needs 2 x MIN_ROWS host rows (p90 of 20 = 3rd largest)
 FLOOR = {"cpus": 0.1, "ram_gb": 0.25, "gpu_mib": 0.0}   # never below (a measured ~0 still reserves something)
 CLASS_USAGE_REL = Path("var") / "placement" / "class-usage.jsonl"
 CLASS_USAGE_WINDOW_S = 14 * 86400.0
@@ -65,6 +67,10 @@ CLASS_USAGE_WINDOW_S = 14 * 86400.0
 CONSUMER_CLASS = {"kanban": "kanban-worker-llm-wait", "athena": "kanban-worker-llm-wait", "test-gate": "test-gate-run",
                   "prism": "prism-review", "ci": "ci-suite-shard"}
 PROFILE_CONSUMERS = ("kanban", "athena")   # a Job.profile names a sub-class here (footprints.kanban.profiles)
+# t_7e60c0e7: a family whose BASE estimate reads its sub-classes' rows too. test-gate books test_gate_class(<files>);
+# until a sub-class has MIN_ROWS of its own it falls back to the base, and the base must stay the shared p90 it was
+# before the split (every test-gate run, light and heavy), never a number built only from the runs left unclassed.
+POOLED_FAMILIES = frozenset({CONSUMER_CLASS["test-gate"]})
 
 
 # ── class names ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -169,18 +175,79 @@ def estimate(klass: str, host: str, history: Iterable[Mapping], seed: Optional[E
     return _estimate(klass, host, history, seed, p=p, window=window, min_rows=min_rows)[0]
 
 
+def _in_class(row_class, k: str) -> bool:
+    """A ledger row counts toward ``k``: its own class, or (POOLED_FAMILIES base) any ``k:<sub>`` of the family."""
+    return row_class == k or (k in POOLED_FAMILIES and isinstance(row_class, str) and row_class.startswith(k + ":"))
+
+
+def class_history(history: Iterable[Mapping], klass: str) -> list:
+    """The rows of ``history`` that estimate(klass, ...) can read: its class or its base class (_in_class), in order.
+    estimate() over this subset equals estimate() over ``history`` (t_990ca939: admit_context keeps only these)."""
+    base = klass.split(":", 1)[0]
+    return [r for r in history if _in_class(r.get("class"), klass) or (base != klass and _in_class(r.get("class"), base))]
+
+
+def _build_class_rows(history, k):
+    """(rows of class k sorted by ``at``, {host: those rows in the same order}): what _estimate reads for k."""
+    rows = sorted((r for r in history if _in_class(r.get("class"), k)), key=lambda r: float(r.get("at") or 0.0))
+    by_host: dict = {}
+    for r in rows:
+        try:
+            by_host.setdefault(r.get("host"), []).append(r)
+        except TypeError:   # an unhashable host (a malformed row) never equals a host id, as the old == scan read it
+            pass
+    return rows, by_host
+
+
+# The ONE per-snapshot memo (t_990ca939, t_71ff933a, t_f418e647): values derived from a history TUPLE, keyed on the
+# tuple's identity and held by a strong reference so the id cannot be reused while memoized. A tuple cannot change; a
+# new snapshot is a new object and misses. Any other iterable (a list a caller may mutate) is never memoized.
+# Process-wide, not per thread (allocd serves every request on a new thread). Its users: placement.history_window
+# (the snapshot's `at` index and its newest window), placement.admit_context (the class filter of a window) and
+# _class_rows below (a class's sorted rows, once per class instead of once per table host inside choose()). A few
+# snapshots, so the snapshot, its window and its class tuples of one generation do not evict each other.
+_SNAP_MEMO: dict = {}          # id(history) -> (history, {key: value})
+_SNAP_MEMO_MAX = 16
+_SNAP_LOCK = threading.Lock()
+
+
+def snap_memo(history: tuple, key, build, keep=None):
+    """The value memoized under ``key`` for the snapshot tuple ``history``, built by ``build()`` on a miss. ``keep``:
+    a cached value it rejects is rebuilt and REPLACES it (one entry per key, e.g. only the newest window)."""
+    with _SNAP_LOCK:
+        ent = _SNAP_MEMO.get(id(history))
+        if ent is None or ent[0] is not history:
+            while len(_SNAP_MEMO) >= _SNAP_MEMO_MAX:
+                _SNAP_MEMO.pop(next(iter(_SNAP_MEMO)))
+            ent = _SNAP_MEMO[id(history)] = (history, {})
+        if key not in ent[1] or (keep is not None and not keep(ent[1][key])):
+            ent[1][key] = build()
+        return ent[1][key]
+
+
+def _class_rows(history, k):
+    if not isinstance(history, tuple):
+        return _build_class_rows(history, k)
+    return snap_memo(history, ("rows", k), lambda: _build_class_rows(history, k))
+
+
 def _estimate(klass, host, history, seed, *, p, window, min_rows):
     """estimate() plus the axes it booked from the seed (no measurement in the window it read)."""
-    history = list(history)
+    history = history if isinstance(history, tuple) else list(history)
     seed = seed or Estimate()
     base = klass.split(":", 1)[0]
     v = dict.fromkeys((*AXES, "cpu_s", "wall_s"))
     source = "seed"
     for k in ((klass, base) if base != klass else (klass,)):
-        rows = sorted((r for r in history if r.get("class") == k), key=lambda r: float(r.get("at") or 0.0))
-        here = [r for r in rows if r.get("host") == host]
+        rows, by_host = _class_rows(history, k)
+        here = by_host.get(host, [])
+        # t_f71371a1: a pooled family's sub-class (test-gate-run:files-*) splits the family's rows 4 ways per host, so a
+        # cold host sample is routine. Its host p90 needs HOST_ROWS_FACTOR x min_rows rows: at 10 the nearest-rank p90
+        # is the 2nd largest, and two heavy runs held ace-media files-2-10 at 0.69 GB for 22 bookings (class p90
+        # 0.32). Until then the sub-class's fleet p90 (the same test files on another host) is the estimate.
+        host_min = min_rows * HOST_ROWS_FACTOR if k != base and base in POOLED_FAMILIES else min_rows
         for pick, where in ((here, host), (rows, "fleet")):
-            if len(pick) < min_rows:
+            if len(pick) < (host_min if where == host else min_rows):
                 continue
             last = pick[-window:]
             # Resolve each axis independently; a sparse host axis still gets the

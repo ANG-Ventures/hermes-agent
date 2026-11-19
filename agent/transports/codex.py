@@ -11,7 +11,7 @@ import re
 from typing import Any, Callable, Optional
 
 from agent.reasoning_effort import (
-    CODEX_ASTRA_EFFORTS, CODEX_LEGACY_EFFORTS,
+    CODEX_ASTRA_EFFORTS, CODEX_LEGACY_EFFORTS, NO_DISABLE_TIER_PREFIXES,
     XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort, is_astra_model,
     # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort):
     # per-model — "max" availability varies; "minimal"/"ultra" clamp to a listed level.
@@ -387,7 +387,10 @@ def _codex_efforts_for_route(model: Any, base_url: Any, *, is_codex_backend: boo
 
         if openai_model_rejects_reasoning(str(model or "")):
             return ()
-    if is_astra_model(model) and not (
+    # An id in NO_DISABLE_TIER_PREFIXES (gpt-6.2-astra) keeps its own ladder on a relay: the legacy set
+    # carries ``none``, which both origins 400 for it (measured 2026-11-18, t_eb830c20).
+    bare = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    if is_astra_model(model) and not bare.startswith(NO_DISABLE_TIER_PREFIXES) and not (
         is_codex_backend or _is_official_openai_responses_route(model, base_url)
     ):
         return CODEX_LEGACY_EFFORTS

@@ -1516,6 +1516,7 @@ class AIAgent(
             model=function_args.get("model"),
             provider=function_args.get("provider"),
             allow_flagship_reason=function_args.get("allow_flagship_reason"),
+            force_model=function_args.get("force_model"),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
             sign_grant=function_args.get("sign_grant"),

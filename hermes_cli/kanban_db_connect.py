@@ -57,6 +57,13 @@ _INIT_LOCK_POLL_SECONDS = 0.05
 _INTEGRITY_STAMP_TTL_ENV = "HERMES_KANBAN_INTEGRITY_STAMP_TTL_SECONDS"
 _INTEGRITY_STAMP_TTL_SECONDS = 900
 
+# A corrupt verdict is acted on (quarantine copy, REINDEX, KanbanDbCorruptError)
+# only when a second integrity read on a fresh connection, after this pause,
+# agrees. One transient read error (SQLITE_IOERR_SHORT_READ zero-fills the page,
+# so integrity_check reports it as a damaged page instead of raising) must not
+# start the raw copy of db + -wal + -shm (t_3200d600).
+_CORRUPT_CONFIRM_DELAY_SECONDS = 0.25
+
 
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections. Kanban is the
@@ -467,9 +474,14 @@ def _validate_sqlite_header(path: Path) -> None:
         return
     # Byte-level probe: must run BEFORE any connection to this path exists
     # (read_header_bytes_preopen refuses once one is live, because the close()
-    # would cancel this process's POSIX locks).
-    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+    # would cancel this process's POSIX locks). Its registry only sees tracked
+    # connections; a plain sqlite3.connect on the board (the board anchor, a
+    # helper) holds a descriptor it cannot see, so ask the descriptor table too
+    # (t_54b8e6cc).
+    from hermes_cli.sqlite_safe_read import process_holds_open_fd, read_header_bytes_preopen
 
+    if process_holds_open_fd(path):
+        return
     head = read_header_bytes_preopen(path, length=64)
     if head is None or head.startswith(_SQLITE_HEADER):
         return
@@ -541,7 +553,17 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     of the same bytes reuse one backup while changed bytes get a separate one.
     Returns the main backup path, or ``None`` if the copy failed (the caller
     still raises loudly). Writes are confined to the DB's parent directory:
-    the basename derives only from ``path.name`` + content hash."""
+    the basename derives only from ``path.name`` + content hash.
+
+    The open-handle check and every raw read/copy run inside
+    ``database_offline`` for THIS database only, so a tracked connection
+    (``connect_tracked``) to it in this process cannot open between the check
+    and the copy: it waits until the copy is done. Opens and closes of every
+    other database (other boards, state.db) never wait on the copy. NOT covered: a plain
+    ``sqlite3.connect`` (or any other opener that bypasses ``connect_tracked``)
+    racing this copy in this process. The fd scan only sees handles already
+    open when it runs. Other processes are never excluded, so the copy is not
+    a coherent SQLite snapshot."""
     # Pin the resolved parent (``resolve()`` collapses ``..`` and symlinks); we
     # only ever write inside it.
     resolved = path.resolve()
@@ -552,9 +574,19 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     # must only run once the board is out of service. Another SessionDB/kanban
     # connection in this process would still be at risk — so REFUSE rather than
     # warn-and-proceed: losing a forensic copy beats corrupting the live DB.
-    from hermes_cli.sqlite_safe_read import has_live_connection
+    from hermes_cli.sqlite_safe_read import (
+        LiveConnectionError,
+        database_offline,
+        process_holds_open_fd,
+    )
 
-    if has_live_connection(resolved):
+    sidecars = [parent / (base_name + suffix) for suffix in ("-wal", "-shm")]
+    try:
+        with database_offline(resolved, what="quarantine"):
+            if any(process_holds_open_fd(p) for p in (resolved, *sidecars)):
+                raise LiveConnectionError(f"{resolved} has an open descriptor in this process")
+            return _copy_corrupt_db(resolved, parent, base_name, sidecars)
+    except LiveConnectionError:
         _kb._log.error(
             "refusing to quarantine %s: a connection to it is still open in "
             "this process, and fingerprinting the file would cancel that "
@@ -562,6 +594,20 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             resolved,
         )
         return None
+
+
+def _copy_corrupt_db(resolved: Path, parent: Path, base_name: str, sidecars: list[Path]) -> Optional[Path]:
+    """The raw reads and copies of :func:`_backup_corrupt_db`; the caller holds
+    this database in ``database_offline``."""
+    # One copy per corruption episode. A broken board keeps taking writes on
+    # already-open connections, so its hash changes between refused opens and
+    # content addressing alone copied the whole file on every one (10 x 512 MB
+    # in 7 min on 11-17, t_54b8e6cc). The episode ends when a clean integrity
+    # verdict is stamped or the file is replaced (new inode).
+    fingerprint = _db_fingerprint(resolved)
+    existing = _episode_backup(resolved, fingerprint)
+    if existing is not None:
+        return existing
     digest = hashlib.sha256()
     try:
         with resolved.open("rb") as handle:
@@ -581,9 +627,8 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         # A NEW backup landed — enforce the retention cap so mutating-corruption
         # loops can't accumulate quarantines forever.
         _prune_corrupt_backups(parent, base_name, keep=candidate)
-    for suffix in ("-wal", "-shm"):
-        sidecar = parent / (base_name + suffix)
-        sidecar_backup = parent / (candidate.name + suffix)
+    for sidecar in sidecars:
+        sidecar_backup = parent / (candidate.name + sidecar.name[len(base_name):])
         if (
             sidecar.parent != parent or not sidecar.exists()
             or sidecar_backup.parent != parent or sidecar_backup.exists()
@@ -591,7 +636,47 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             continue
         with contextlib.suppress(OSError):
             shutil.copy2(sidecar, sidecar_backup)
+    _record_episode_backup(resolved, fingerprint, candidate)
     return candidate
+
+
+def _corrupt_episode_path(resolved: Path) -> Path:
+    return resolved.with_name(resolved.name + ".corrupt-episode.json")
+
+
+def _episode_backup(resolved: Path, fingerprint: Optional[dict]) -> Optional[Path]:
+    """The quarantine copy already taken of this exact file (same dev/ino/birth)
+    since its last clean integrity verdict, or ``None``."""
+    if fingerprint is None:
+        return None
+    try:
+        data = json.loads(_corrupt_episode_path(resolved).read_text(encoding="utf-8-sig"))
+        same_file = all(data[key] == fingerprint[key] for key in ("dev", "ino", "birth"))
+        backup = resolved.parent / Path(str(data["backup"])).name
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    return backup if same_file and backup.is_file() else None
+
+
+def _end_corrupt_episode(resolved: Path) -> None:
+    """A verified-clean verdict (stamp, REINDEX repair, or ``repair_db`` ok)
+    ends the copy episode: the next corruption is a new incident."""
+    with contextlib.suppress(OSError):
+        _corrupt_episode_path(resolved).unlink(missing_ok=True)
+
+
+def _record_episode_backup(resolved: Path, fingerprint: Optional[dict], backup: Path) -> None:
+    if fingerprint is None:
+        return
+    marker = _corrupt_episode_path(resolved)
+    tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+    record = {key: fingerprint[key] for key in ("dev", "ino", "birth")}
+    try:
+        tmp.write_text(json.dumps({**record, "backup": backup.name, "at": time.time()}), encoding="utf-8")
+        os.replace(tmp, marker)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 # Repairable integrity_check error classes — both *index-scoped*: the table
 # b-tree is intact and REINDEX rebuilds the index losslessly. The index name is
@@ -695,6 +780,25 @@ def _probe_for_corruption(resolved: Path) -> tuple[Optional[list[str]], Optional
     return messages, f"integrity_check returned {messages[0] if messages else '<no row>'!r}"
 
 
+def _confirm_corruption(
+    resolved: Path, messages: Optional[list[str]], reason: str,
+) -> tuple[Optional[list[str]], Optional[str]]:
+    """Re-probe a corrupt verdict on a fresh connection before anything acts on
+    it. Returns the confirming probe's ``(messages, reason)``: ``reason`` is
+    ``None`` when the second read is clean (the first was transient).
+    ``OperationalError`` on the re-probe propagates raw, as in the first probe."""
+    time.sleep(_CORRUPT_CONFIRM_DELAY_SECONDS)
+    confirm_messages, confirm_reason = _probe_for_corruption(resolved)
+    if confirm_reason is None:
+        _kb._log.warning(
+            "kanban DB %s: first integrity read said %s, a fresh connection "
+            "%.2fs later reads clean; treating it as a transient read error "
+            "(no quarantine copy).",
+            resolved, reason, _CORRUPT_CONFIRM_DELAY_SECONDS,
+        )
+    return confirm_messages, confirm_reason
+
+
 def _integrity_stamp_path(resolved: Path) -> Path:
     return resolved.with_name(resolved.name + ".integrity-ok")
 
@@ -772,6 +876,7 @@ def _write_integrity_stamp(resolved: Path, fingerprint: Optional[dict], checked_
     try:
         tmp.write_text(json.dumps({**fingerprint, "checked_at": checked_at}), encoding="utf-8")
         os.replace(tmp, stamp)
+        _corrupt_episode_path(resolved).unlink(missing_ok=True)  # clean verdict ends the episode
     except OSError:
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -808,6 +913,8 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     checked_at = time.time()
     messages, reason = _probe_for_corruption(resolved)
+    if reason is not None:
+        messages, reason = _confirm_corruption(resolved, messages, reason)
     if reason is None:
         _write_integrity_stamp(resolved, fingerprint, checked_at)
         return
@@ -829,6 +936,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
                 "integrity_check now clean. Pre-repair copy kept at %s.",
                 resolved, ", ".join(index_names), _backup_label(backup),
             )
+            _end_corrupt_episode(resolved)
             return
         reason = (
             f"{reason}; REINDEX auto-repair attempted but integrity_check "
@@ -891,6 +999,8 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
 
     with _cross_process_init_lock(resolved):
         messages, reason = _probe_for_corruption(resolved)
+        if reason is not None:
+            messages, reason = _confirm_corruption(resolved, messages, reason)
         if messages is None:
             # Same quarantine the connect-time guard takes when sqlite
             # refuses to open the file at all.
@@ -899,6 +1009,7 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
                 backup_path=_backup_corrupt_db(resolved),
             )
         if reason is None:
+            _end_corrupt_episode(resolved)
             return RepairResult(status="ok", db_path=resolved, messages=messages)
 
         _drop_integrity_stamp(resolved)
@@ -912,6 +1023,8 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
         # to re-probe instead of trusting the stale healthy-path cache.
         with _INIT_LOCK:
             _INITIALIZED_PATHS.discard(str(resolved))
+        if repaired:
+            _end_corrupt_episode(resolved)
         return RepairResult(
             status="repaired" if repaired else "corrupt",
             db_path=resolved,

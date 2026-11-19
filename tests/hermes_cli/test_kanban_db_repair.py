@@ -4,6 +4,7 @@ and the ``hermes kanban repair`` CLI verb."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -123,6 +124,34 @@ def test_connect_auto_repairs_index_only_corruption(tmp_path):
     assert any(m.startswith("wrong # of entries in index") for m in pre)
 
 
+@pytest.mark.parametrize("repair", ["repair_db", "connect"])
+def test_each_repaired_corruption_gets_its_own_pre_repair_copy(tmp_path, monkeypatch, repair):
+    """A clean repair ends the copy episode: the next corruption of the same file is a new
+    incident and gets its own pre-repair copy, not the previous incident's (t_b8456297)."""
+    db_path = tmp_path / "kanban.db"
+    _build_board_db(db_path)
+    copies: list = []
+    real_backup = kbc._backup_corrupt_db
+    monkeypatch.setattr(kbc, "_backup_corrupt_db", lambda p: copies.append(real_backup(p)) or copies[-1])
+
+    for episode in range(2):
+        _corrupt_index(db_path, "idx_tasks_status")
+        if repair == "repair_db":
+            assert kbc.repair_db(db_path=db_path).status == "repaired"
+        else:
+            kbc.connect(db_path=db_path).close()
+        assert _integrity_messages(db_path) == ["ok"]
+        # The board takes writes between incidents. A plain connection: connect() would stamp a
+        # clean verdict, which ends the episode on its own and hides the repair paths.
+        raw = sqlite3.connect(db_path, isolation_level=None)
+        raw.execute("UPDATE tasks SET title = title || ?", (f"-after-{episode}",))
+        raw.close()
+
+    assert len(copies) == 2 and None not in copies
+    assert copies[0] != copies[1]
+    assert all(copy.is_file() for copy in copies)
+
+
 
 
 
@@ -147,10 +176,14 @@ def test_corrupt_backup_retention_cap_prunes_oldest(tmp_path, monkeypatch):
 
     minted: list[Path] = []
     for i in range(8):
-        # Mutate the corrupt bytes → new sha → new backup each round.
-        with db_path.open("r+b") as fh:
-            fh.seek(200)
-            fh.write(bytes([i]) * 16)
+        # A replaced corrupt file (new inode, new bytes) is a new episode → new
+        # backup each round. In-place changes to one file share one backup
+        # (t_54b8e6cc).
+        mutated = bytearray(db_path.read_bytes())
+        mutated[200:216] = bytes([i]) * 16
+        staged = tmp_path / "staged.db"
+        staged.write_bytes(bytes(mutated))
+        os.replace(staged, db_path)
         kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
         with pytest.raises(kbc.KanbanDbCorruptError) as excinfo:
             kbc.connect(db_path=db_path)

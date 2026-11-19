@@ -22,7 +22,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_headroom as kh
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli.fleet_placement import placement
-from hermes_cli import placement_policy as pp
+from hermes_cli import allocation_policy as pp
 
 POLICY = pp.PlacementPolicy()
 T0 = 1_791_850_000.0
@@ -84,6 +84,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
+    monkeypatch.delenv("ALLOCATION_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     monkeypatch.setattr(kbd, "_default_spawn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("real spawn")))
@@ -208,7 +209,7 @@ def test_dispatch_reserves_each_spawn_and_run_end_releases_it(home):
     assert sorted(r["job_id"] for r in rows) == sorted(ids) and {r["host"] for r in rows} == {"ci-box"}
     assert placement.live_reservations(ledger)["ci-box"].ram_gb == 9
     with kb.connect_closing() as conn:
-        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_placed'",
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_allocated'",
                           (ids[0],)).fetchone()
         payload = json.loads(ev[0])
         assert payload[kh.RESERVATION_KEY] in {r["id"] for r in rows} and payload["rule"] == "default_first"

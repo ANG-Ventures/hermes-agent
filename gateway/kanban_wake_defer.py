@@ -370,9 +370,8 @@ def owner_acted(conn: sqlite3.Connection, row: dict,
 
 def evaluate(conn: sqlite3.Connection, row: dict) -> Optional[str]:
     """Sync (worker thread): the drop reason for ``row``, or None when it still waits."""
-    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (row["task_id"],)).fetchone()
-    now_status = str(status[0] or "") if status else _fresh.GONE
-    if all(_fresh.is_stale(now_status, k) for k in row.get("kinds") or ()):
+    now_status = _fresh.current_status(conn, row["task_id"])
+    if all(_fresh.is_stale_notice(now_status, k) for k in row.get("kinds") or ()):
         return f"card is {now_status}"
     return owner_acted(conn, row)
 
