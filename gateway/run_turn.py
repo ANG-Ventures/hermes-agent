@@ -30,6 +30,7 @@ from gateway.response_filters import (
     wake_chrome_muted, wake_progress_header,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
+from gateway import inbound_record
 from gateway.wake_kind import STEER, wake_display_metadata
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
@@ -2079,7 +2080,8 @@ class GatewayTurnMixin:
         if prepared.persist_user_display_kind:
             _user_entry["display_kind"] = prepared.persist_user_display_kind
         if prepared.persistence_owner:
-            _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
+            _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner,
+                                               **inbound_record.display_metadata(event)}
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
@@ -2641,7 +2643,7 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event),
-                    **wake_display_metadata(event)},
+                    **wake_display_metadata(event), **inbound_record.display_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
@@ -4598,7 +4600,7 @@ class GatewayTurnMixin:
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event),
-                    **wake_display_metadata(pending_event)} or None,
+                    **wake_display_metadata(pending_event), **inbound_record.display_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(

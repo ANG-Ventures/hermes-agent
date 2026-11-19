@@ -205,6 +205,7 @@ _MEDIA_KIND_KEYS = {
     "voice message": "platform.telegram.media.kind_voice", "audio file": "platform.telegram.media.kind_audio",
     "video file": "platform.telegram.media.kind_video"}
 
+from gateway import inbound_record
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
@@ -6878,6 +6879,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if existing is None:
             pending[key] = event
             return
+        inbound_record.mark_merged(existing)
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
         if event.text:
@@ -7369,6 +7371,8 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_to_author_id, reply_to_is_own_message=reply_to_is_own,
             auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
+            # t_118d31b1: who sent THIS message, from the update itself (persisted on the user row)
+            metadata={inbound_record.KEY: inbound_record.telegram_record(message)},
             timestamp=message.date)
 
     # -- Message reactions (processing lifecycle) --
