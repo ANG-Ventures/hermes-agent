@@ -27,6 +27,8 @@
                           "bv2 smoke: forced needs_input event. unblock_when: after:+1d"],
     "inject_failure": ["--board", "{board}", "comment", "{card}", "--body",
                        "bv2 smoke s1 fault: board write after the boomerang-wake claim; the verdict must be refused (state moved) and the wake re-surfaced"],
+    "s1_fault_hold": ["--board", "{board}", "edit", "{card}", "--body",
+                      "bv2 smoke s1 fault-drill fixture (board {board}). Before you decide anything about this forced completion, run `sleep 90` in the foreground with the terminal tool, then run `date -u` and quote both in your evidence. Only then decide."],
     "wirelog_sync": ["python3", "~/.hermes/scripts/wirelog-fleet.py", "sync", "--sub", "{sub}"]
   },
   "expect": {

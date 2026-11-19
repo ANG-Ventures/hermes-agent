@@ -93,13 +93,28 @@ def _copy_fixtures(tmp_path: Path) -> Path:
     return dst
 
 
-def test_step1_fails_when_needs_input_is_boomerang_woken(env, monkeypatch):
+def test_step1_fails_when_the_blocked_card_is_not_assessed(env, monkeypatch):
+    """#104/#309: a needs_input block is boomerang-woken as row blocked_assess. No receipt = FAIL."""
     fx = _copy_fixtures(env["tmp"])
-    with open(fx / "fake_origin_chat.jsonl", "a") as fh:
-        fh.write(json.dumps({"ts": 1792378999.0, "content": "boomerang handled t_5m0ce002 (needs_input): closed it"}) + "\n")
-    monkeypatch.setenv("BV2_ORIGIN_CHAT", str(fx / "fake_origin_chat.jsonl"))
+    chat = fx / "fake_origin_chat.jsonl"
+    chat.write_text("".join(ln + "\n" for ln in chat.read_text().splitlines() if "(blocked_assess)" not in ln))
+    monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
     assert run.main(["--step", "1", "--dry-run"]) == 1
-    assert "needs_input card t_5m0ce002: no `boomerang handled` line | FAIL" in env["evidence"].read_text()
+    assert ("needs_input card t_5m0ce002: handled receipt `boomerang handled t_5m0ce002 (blocked_assess): ...` | FAIL"
+            in env["evidence"].read_text())
+
+
+@pytest.mark.parametrize("old", ["disposition=auto row=blocked_assess", "row=blocked_assess"])
+def test_step1_fails_when_the_blocked_card_surfaces(env, monkeypatch, old):
+    """The pre-#309 behaviour (the block surfaced, not auto / another row) is a FAIL now."""
+    fx = _copy_fixtures(env["tmp"])
+    log = fx / "fake_gateway.log"
+    new = "disposition=surface" if old.startswith("disposition") else "row=card_tag_surface"
+    log.write_text(log.read_text().replace(old, new))
+    monkeypatch.setenv("BV2_GATEWAY_LOG", str(log))
+    assert run.main(["--step", "1", "--dry-run"]) == 1
+    assert ("gateway log: `kanban notifier: boomerang-wake t_5m0ce002 disposition=auto row=blocked_assess` | FAIL"
+            in env["evidence"].read_text())
 
 
 def test_step1_fails_without_the_boomerang_wake_line(env, monkeypatch):
@@ -494,10 +509,19 @@ elif verb == "complete":
     else:
         with open(os.environ["BV2_ORIGIN_CHAT"], "a") as fh:
             fh.write(json.dumps({"ts": time.time(), "content": line}) + "\n")
-elif verb == "block":
+elif verb == "block":  # #104/#309: every blocked event is auto-handled as row blocked_assess
     card = argv[argv.index("block") + 1]
     with open(os.environ["BV2_GATEWAY_LOG"], "a") as fh:
-        fh.write(f"{stamp} INFO gateway.kanban_watchers: kanban notifier: delivered blocked for {card}\n")
+        fh.write(f"{stamp} INFO gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake {card} "
+                 f"disposition=auto row=blocked_assess path=notifier delegation=d_{card}\n")
+    line = f"boomerang handled {card} (blocked_assess): block is real; left blocked"
+    if os.environ.get("FAKE_AGENT_LOG"):
+        with open(os.environ["FAKE_AGENT_LOG"], "a") as fh:
+            fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "producer": "boomerang-wake",
+                                 "sev": "info", "first_line": line, "text": line, "task_id": card}) + "\n")
+    else:
+        with open(os.environ["BV2_ORIGIN_CHAT"], "a") as fh:
+            fh.write(json.dumps({"ts": time.time(), "content": line}) + "\n")
 """
 
 
@@ -718,6 +742,10 @@ elif verb == "complete":
     logline(f"gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake {card} disposition=auto")
     if "forced child failure" not in title:
         say(f"boomerang handled {card} (completed): verified")
+elif verb == "block":
+    card = argv[argv.index("block") + 1]
+    logline(f"gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake {card} disposition=auto row=blocked_assess")
+    say(f"boomerang handled {card} (blocked_assess): block is real; left blocked")
 elif verb == "comment":
     card = argv[argv.index("comment") + 1]
     logline(f"gateway.kanban_boomerang_wake: kanban boomerang-wake: boomerang-wake superseded {card}: "
@@ -950,14 +978,18 @@ def test_knob_absent_fails_without_the_agent_log_row(env, monkeypatch):
     assert "handled receipt: `boomerang handled t_5m0ce001 (<kind>): <summary>` | FAIL" in env["evidence"].read_text()
 
 
-def test_knob_absent_needs_input_row_in_the_agent_log_fails(env, monkeypatch):
+def test_knob_absent_blocked_card_needs_a_blocked_assess_row(env, monkeypatch):
+    """Knob absent: the blocked card's receipt is read from the agent log too, and its kind must be
+    blocked_assess (the placement-collector row with the same text is another producer's)."""
     fx = _copy_fixtures(env["tmp"])
+    _drop_handled_chat_lines(fx)
     _knob_absent(env, monkeypatch, fx)
-    line = "boomerang handled t_5m0ce002 (needs_input): closed it"
-    with open(next((fx / "fake_agent_logs").glob("*.jsonl")), "a") as fh:
-        fh.write(json.dumps({"ts": "2026-10-19T03:02:00Z", "producer": "boomerang-wake", "text": line}) + "\n")
+    log = next((fx / "fake_agent_logs").glob("*.jsonl"))
+    log.write_text(log.read_text().replace("t_5m0ce002 (blocked_assess)", "t_5m0ce002 (needs_input)"))
     assert run.main(["--step", "1", "--dry-run"]) == 1
-    assert "needs_input card t_5m0ce002: no `boomerang handled` line | FAIL" in env["evidence"].read_text()
+    text = env["evidence"].read_text()
+    assert "handled receipt `boomerang handled t_5m0ce002 (blocked_assess): ...` | FAIL" in text
+    assert "[agent-log] boomerang handled t_5m0ce002 (needs_input)" in text
 
 
 def test_knob_present_requires_the_chat_line(env, monkeypatch):
@@ -1029,3 +1061,23 @@ def test_step1_live_post_439_gateway_writes_the_agent_log(env, monkeypatch, knob
     else:
         assert "[agent-log] boomerang handled t_fa4e0000 (completed): verified" in text
         assert "| FAIL |" not in text
+
+
+def test_agent_log_dir_live_default_is_the_writers_fleet_root(tmp_path, monkeypatch):
+    """Prism 4eb4fab37d71: the gateway writes under the nearest ancestor of its home holding
+    scripts/lib/agent_inbox.py; the knob stays home-local (handled_line_chat_enabled)."""
+    for var in ("BV2_AGENT_LOG_DIR", "BV2_HANDLED_KNOB", "NOTIFY_AGENT_LOG_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    fleet = tmp_path / "fleet"
+    (fleet / "scripts" / "lib").mkdir(parents=True)
+    (fleet / "scripts" / "lib" / "agent_inbox.py").write_text("")
+    home = fleet / "lanes" / "scratch"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert run.agent_log_dir(True) == fleet / "state" / "agent-logs"
+    assert run.handled_knob_path(True) == home / "state" / run.HANDLED_KNOB_FILE
+    prof = fleet / "profiles" / "p1"
+    prof.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(prof))
+    assert run.agent_log_dir(True) == fleet / "state" / "agent-logs"
+    assert run.handled_knob_path(True) == prof / "state" / run.HANDLED_KNOB_FILE

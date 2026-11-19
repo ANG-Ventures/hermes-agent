@@ -13,8 +13,8 @@ override so the test path runs on fakes:
   BV2_HOME_SESSION   home session stamped on the cards    (live: required)
   BV2_ORIGIN_CHAT    Discord channel id (REST, read-only) or a capture file (.jsonl/.txt)
   BV2_HANDLED_KNOB   the gateway's boomerang-handled-line-chat.enabled knob file
-                     (default: <root>/state/boomerang-handled-line-chat.enabled; dry-run: fixtures)
-  BV2_AGENT_LOG_DIR  fleet agent log dir, <UTC day>.jsonl  (default: <root>/state/agent-logs)
+                     (default: <HERMES_HOME>/state/boomerang-handled-line-chat.enabled; dry-run: fixtures)
+  BV2_AGENT_LOG_DIR  fleet agent log dir, <UTC day>.jsonl  (default: <fleet root>/state/agent-logs, the writer's lookup)
   BV2_GATEWAY_LOG    gateway log                          (default: <root>/logs/gateway.log)
   BV2_GATEWAY_ENV    .env holding DISCORD_BOT_TOKEN       (default: <root>/.env)
   BV2_CONFIG         config.yaml, or a dir of stage<N>.yaml snapshots (fake)
@@ -103,7 +103,12 @@ def re_lost_line(card: str) -> re.Pattern:
 
 
 def re_notifier_line(card: str) -> re.Pattern:
-    return re.compile(r"kanban notifier: boomerang-wake " + re.escape(card) + r" disposition=(?P<disp>[a-z_]+)")
+    return re.compile(r"kanban notifier: boomerang-wake " + re.escape(card)
+                      + r" disposition=(?P<disp>[a-z_]+)(?: row=(?P<row>[a-z_]+))?")
+
+
+# gateway/kanban_wake_disposition.py row 1: every `blocked` event is auto-handled to assess the block.
+BLOCKED_ASSESS_ROW = "blocked_assess"
 
 
 RE_FORK_INELIGIBLE = re.compile(r"boomerang\.fork_ineligible reason=(?P<reason>[A-Za-z0-9_]+)")
@@ -352,19 +357,38 @@ HANDLED_PREFIX = "boomerang handled "
 AGENT_LOG_PRODUCER = "boomerang-wake"
 
 
+AGENT_INBOX_LIB = Path("scripts") / "lib" / "agent_inbox.py"
+
+
+def gateway_home() -> Path:
+    """The gateway's own home (``get_hermes_home``): a profile home stays the profile home."""
+    env = os.environ.get("HERMES_HOME", "").strip()
+    return Path(env).expanduser() if env else Path.home() / ".hermes"
+
+
 def handled_knob_path(live: bool) -> Path:
     spec = os.environ.get("BV2_HANDLED_KNOB", "").strip()
     if spec:
         return Path(spec).expanduser()
     # Dry-run fixtures keep the pre-#439 chat transcript, so the fixture knob is present.
-    return hermes_root() / "state" / HANDLED_KNOB_FILE if live else FIXTURES / f"fake_{HANDLED_KNOB_FILE}"
+    # Live: the gateway reads it home-local (kanban_boomerang_wake.handled_line_chat_enabled).
+    return gateway_home() / "state" / HANDLED_KNOB_FILE if live else FIXTURES / f"fake_{HANDLED_KNOB_FILE}"
 
 
 def agent_log_dir(live: bool) -> Path:
     spec = os.environ.get("BV2_AGENT_LOG_DIR", "").strip()
     if spec:
         return Path(spec).expanduser()
-    return hermes_root() / "state" / "agent-logs" if live else FIXTURES / "fake_agent_logs"
+    if not live:
+        return FIXTURES / "fake_agent_logs"
+    # The writer's lookup (Prism 4eb4fab37d71): the nearest ancestor of the gateway home holding
+    # scripts/lib/agent_inbox.py (alerts_audience_gate._fleet_root), then its agent_log_dir.
+    home = gateway_home()
+    root = next((c for c in (home, *home.parents) if (c / AGENT_INBOX_LIB).is_file()), None)
+    if root is None:
+        return hermes_root() / "state" / "agent-logs"
+    override = os.environ.get("NOTIFY_AGENT_LOG_DIR", "").strip()
+    return Path(override) if override else root / "state" / "agent-logs"
 
 
 class AgentLog:
@@ -389,7 +413,7 @@ class AgentLog:
     def messages(self) -> list[ChatMessage]:
         out = []
         for f in self._files():
-            for raw in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            for raw in f.read_text(encoding="utf-8-sig", errors="replace").splitlines():
                 try:
                     doc = json.loads(raw)
                 except ValueError:
@@ -653,14 +677,14 @@ def find_log(log: GatewayLog, pattern: re.Pattern, after_ts: float | None = None
 # --- step 1: AC-7 / INV-6 ------------------------------------------------------------------------
 
 def step1(ctx: Ctx) -> StepReport:
-    rep = StepReport(1, "boomerang-wake origin-chat lines (AC-7, INV-5, INV-6)", ctx.mode)
+    rep = StepReport(1, "boomerang-wake origin-chat lines (AC-7, blocked_assess, INV-6)", ctx.mode)
     t0 = now()
     log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
     chat = make_chat(ctx.live, t0)
     rep.notes.append(f"board `{ctx.board}`; gateway log `{log.path}`; origin chat `{chat.label}`")
 
     done_card = ctx.make_card(rep, "s1_completed", "bv2 smoke s1: completed -> boomerang-wake")
-    ni_card = ctx.make_card(rep, "s1_needs_input", "bv2 smoke s1: needs_input -> surface")
+    ni_card = ctx.make_card(rep, "s1_needs_input", "bv2 smoke s1: needs_input -> blocked_assess")
     # Dry-run evaluates the failure-line assertion against the fake chat even with no fault hook
     # configured (it exercises the matcher); live without a hook reports SKIP, never a fake PASS.
     inject = ctx.plan["commands"].get("inject_failure")
@@ -699,16 +723,19 @@ def step1(ctx: Ctx) -> StepReport:
     if line:
         rep.raw.append(f"--- log match\n{line}")
 
-    # needs_input is a judgment event: it must surface, never boomerang-wake (INV-5).
-    def ni_auto():
-        return find_chat(chat, re_boomerang_wake_line(ni_card))
-    neg = ctx.poll(ni_auto, ctx.tick_window)  # live: waits the whole window for a line that must not come
-    rep.check(f"needs_input card {ni_card}: no `boomerang handled` line", FAIL if neg else PASS,
-              neg.shown if neg else f"none ({ctx.window_label()})")
-    ni_log = find_log(log, re_notifier_line(ni_card))
-    ni_disp = re_notifier_line(ni_card).search(ni_log).group("disp") if ni_log else None
-    rep.check(f"needs_input card {ni_card}: notifier disposition is not auto",
-              FAIL if ni_disp == "auto" else PASS, ni_log or "no boomerang-wake log line (surfaced as today)")
+    # A blocked card (needs_input included) is boomerang-woken to ASSESS the block since #104/#309
+    # (gateway/kanban_wake_disposition.py row 1 `blocked_assess`, auto, fork). The old INV-5
+    # ("needs_input must surface, never auto") no longer holds.
+    ni_hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(ni_card)), win)
+    ni_kind = re_boomerang_wake_line(ni_card).search(ni_hit.content).group("kind") if ni_hit else None
+    rep.check(f"needs_input card {ni_card}: handled receipt `boomerang handled {ni_card} (blocked_assess): ...`",
+              PASS if ni_kind == BLOCKED_ASSESS_ROW else FAIL,
+              ni_hit.shown if ni_hit else f"absent after {win:.0f}s")
+    ni_log = ctx.poll(lambda: find_log(log, re_notifier_line(ni_card)), ctx.tick_window)
+    ni_m = re_notifier_line(ni_card).search(ni_log) if ni_log else None
+    ni_ok = bool(ni_m) and ni_m.group("disp") == "auto" and ni_m.group("row") == BLOCKED_ASSESS_ROW
+    rep.check(f"gateway log: `kanban notifier: boomerang-wake {ni_card} disposition=auto row=blocked_assess`",
+              PASS if ni_ok else FAIL, ni_log or "absent")
 
     if not arm_failure:
         rep.check(f"failure card {fail_card}: `boomerang-wake superseded {fail_card}` log line", SKIP,
