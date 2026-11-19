@@ -1590,6 +1590,14 @@ def _expired_hold_comment(conn: Any, task_id: str, event: Any, now: float) -> bo
     return bool(bodies) and all(_hold_expired(b, now) for b in bodies)
 
 
+#: t_baebe27b: a card body with an `## Operator step` heading, or an operator line saying "after merge", owes work
+#: after its PR merges, so the merged-PR rule never refuses its surface.
+_OPERATOR_STEP_RE = re.compile(
+    r"^[ \t]*#{1,6}[ \t]*operator[ \t]+steps?\b"
+    r"|^[^\n]*\boperator\b[^\n]*\bafter[ -]merge\b|^[^\n]*\bafter[ -]merge\b[^\n]*\boperator\b",
+    re.I | re.M)
+
+
 def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
 
@@ -1671,6 +1679,10 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False) -> Optional[st
         # Preserve the claim's PR even if a newer handback now names another one.
         if not own_event and not sendback:
             refs = list(refs) + list(_op.extract_pr_refs(entry.get("pr")))
+        # t_baebe27b: the merge is not the end when the card owes an operator step after it (t_16a0e8f3: box
+        # rollout refused 12 min as "summarized PR merged"). The card body is the dispatcher's, so it decides.
+        if _OPERATOR_STEP_RE.search(str(_field(task, "body") or "")):
+            refs = []
     finally:
         conn.close()
     health_fn = _health_fn()
