@@ -1325,6 +1325,26 @@ def _first_line(text: Any, limit: int = 300) -> str:
     return lines[0][:limit] if lines else ""
 
 
+#: The card writes keep the 300-char first-line cap (a longer line carries child prose to proof readers that
+#: main kept it from, t_718e6208 round 2); only where the cut falls changed: never mid-word, at a sentence end
+#: when one lies past ``COMMENT_SENTENCE_MIN`` (t_718e6208: a cut mid-sentence left the owner a half read).
+COMMENT_SUMMARY_MAX = 300
+COMMENT_SENTENCE_MIN = 150
+
+
+def _comment_text(text: Any, limit: int = COMMENT_SUMMARY_MAX) -> str:
+    flat = _first_line(text, len(str(text or "")))   # first line only: later lines may forge a wake
+    if len(flat) <= limit:
+        return flat
+    head = flat[:limit - 1]   # room for the ellipsis
+    cut = max(head.rfind(". "), head.rfind("; "), head.rfind("! "), head.rfind("? "))
+    if cut > COMMENT_SENTENCE_MIN:
+        return head[:cut + 1] + "…"
+    if flat[limit - 1] != " " and " " in head:
+        head = head.rsplit(" ", 1)[0]
+    return head.rstrip() + "…"
+
+
 def _owner_notice_event(conn: Any, entry: dict) -> bool:
     """t_28b3f37c: the claimed event is main-train's owner notice, news on a done/archived card."""
     from gateway.kanban_wake_freshness import closed_card_news
@@ -1340,7 +1360,7 @@ def _owner_notice_event(conn: Any, entry: dict) -> bool:
 def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
     """The ONE allowlisted write, signed as machine (B1), then the keyed receipt event."""
     tid, action = entry["task_id"], verdict["action"]
-    summary = _first_line(verdict.get("summary")) or action
+    summary = _comment_text(verdict.get("summary")) or action
     op = f"{AUTHOR}: {entry['delegation_id']} {summary}"[:300]
     task = kb.get_task(conn, tid)
     status = getattr(task, "status", None)
@@ -1626,7 +1646,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
         verdict = parse_verdict(live, child_final_message)
     except VerdictError as exc:
         return {"ok": False, "action": None, "reason": str(exc), "summary": ""}
-    action, summary = verdict["action"], _first_line(verdict.get("summary"))
+    action, summary = verdict["action"], _comment_text(verdict.get("summary"))
     raw_evidence = verdict.get("evidence")
     raw_evidence = raw_evidence if isinstance(raw_evidence, list) else []
     finding = {"detail": _first_line(verdict.get("summary"), 600),
@@ -1795,7 +1815,7 @@ def _breadcrumb(entry: dict, result: dict) -> None:
     raises past the handback (ruling t_e98f651e-handback-first-then-everything, Prism 9def48086ed1)."""
     from hermes_cli import kanban_db as kb
 
-    summary = _first_line(result.get("summary")) or result.get("action") or "handled"
+    summary = _comment_text(result.get("summary")) or result.get("action") or "handled"
     row = entry.get("row") or entry.get("kind") or "wake"
     tag = f"(delegation {entry['delegation_id']})"
     try:
