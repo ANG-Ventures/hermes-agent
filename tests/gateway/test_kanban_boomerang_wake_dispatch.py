@@ -1266,9 +1266,12 @@ def test_card_moved_before_the_verdict_is_a_quiet_supersede(env):
     assert env["adapter"].sent == [], env["adapter"].sent
     assert logs == [f"boomerang-wake superseded {tid}: card moved to ready before the wake ran; "
                     f"original wake re-delivered"], logs
-    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    turns = [t.text for t in env["adapter"].handled]   # t_d712444b: the child's read rides ahead of the wake
+    assert len(turns) == 1 and turns[0].endswith(f"\n---\nTask {tid} wake"), turns
+    assert turns[0].startswith(f"[boomerang-wake] child verdict superseded {tid} ") and "verified" in turns[0]
     claim = ah.BoomerangWakeState().get_claim(entry["key"])
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded"
+    assert claim["tried_action"] == "complete"
     assert claim["reason"] == "state moved" and claim["resurface_delivered"] is True
 
 
@@ -3273,3 +3276,319 @@ def test_park_return_off_switch_does_not_let_a_surfaced_park_return_answer_the_d
     else:
         assert env["dispatched"][1:] == [] and turns == [], [t.text for t in turns]
         assert [(c["state"], c["outcome"]) for c in deadman] == [(ah.STATE_TERMINAL, "episode_answered")]
+
+
+# --- t_d712444b: machine noise during the child's read does not supersede its verdict ----------
+
+
+def _machine_noise(tid, entry) -> None:
+    """What landed on t_8f6266f4 during a 21-minute read: three event-land ci-red lines and one CI-red label by a
+    session-less script (``unverified:default``), the review episode's own deadman, another delegation's marker."""
+    with kb.connect_closing() as conn:
+        for _ in range(3):
+            kb.add_comment(conn, tid, "unverified:default",
+                           f"[event-land] ci-red at {REPO}#3120 head aaaaaaaaaaaa NOT sent back (card stays in review)")
+        kb.add_comment(conn, tid, "unverified:default", f"{REPO}#3120 CI reds at aaaaaaaa: OWN 2 (lint)")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "review_deadman", {  # noqa: SLF001
+                "by": "kanban-review-deadman", "cycle": 0, "episode": entry["event_id"], "threshold_min": 15})
+            kb._append_event(conn, tid, ah.DELIVERED_KIND, {  # noqa: SLF001
+                "delegation_id": "del-other", "part": "turn", "via": ah.VIA})
+
+
+def _human_review_claim(env):
+    tid = _review_card(env)
+    entry = _claimed_entry(env, tid, row="own_repo_review_human", kind="review_requested")
+    return tid, entry
+
+
+def test_machine_noise_during_the_read_does_not_supersede_the_send_back(env):
+    tid, entry = _human_review_claim(env)
+    _machine_noise(tid, entry)
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="5 findings",
+                                           findings=["own CI red: lint", "Prism P1 reproduced"]))
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "review"
+        assert sum(e.kind == "changes_requested" for e in kb.list_events(conn, tid)) == 1
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["outcome"] == "request_changes" and claim["tried_action"] == "request_changes"
+
+
+def test_moved_noise_stop_file_restores_the_strict_rule(env):
+    from hermes_constants import get_hermes_home
+
+    tid, entry = _human_review_claim(env)
+    _machine_noise(tid, entry)
+    stop = get_hermes_home() / "state" / ah.MOVED_NOISE_STOP_FILE
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.write_text("")
+    res = ah.execute_verdict(entry, _verdict(entry, "request_changes", findings=["x"]))
+    assert not res["ok"] and res["reason"] == "state moved"
+
+
+def _another_deadman_episode(env, tid, entry):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "review_deadman", {"by": "kanban-review-deadman", "episode": 1})  # noqa: SLF001
+
+
+@pytest.mark.parametrize("how", ["owner_comment", "status_change", "moved_head", "worker_event", "other_deadman"])
+def test_real_moves_still_supersede_and_the_wake_carries_the_child_read(env, how):
+    tid, entry = _human_review_claim(env)
+    _machine_noise(tid, entry)
+    if how == "owner_comment":
+        with kb.connect_closing() as conn, \
+                kb.mutation_actor(session_ids=[env["group"].session_id], profile="default", surface="gateway"):
+            kb.add_comment(conn, tid, "default", "holding this one, I read it myself")
+    elif how == "status_change":
+        with kb.connect_closing() as conn, \
+                kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):   # session-less send-back
+            ok, detail = kb.request_changes(conn, tid, reason="CI red", claimer="ci-sendback",
+                                            operator="ci-sendback: CI red", operator_kind=kb.OPERATOR_KIND_MACHINE)
+            assert ok, detail
+    elif how == "moved_head":
+        _red(env, 3120, head="b" * 40)
+    elif how == "worker_event":
+        with kb.connect_closing() as conn, \
+                kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+            kb.add_comment(conn, tid, "unverified:default", "[event-land] posted from a worker session")
+    else:
+        _another_deadman_episode(env, tid, entry)
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="five findings on #3120",
+                                           findings=["own CI red: lint", "Prism P1 reproduced"]))
+    with kb.connect_closing() as conn:
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert ah.RECEIPT_KIND not in kinds, f"{how}: verdict written"
+    assert kinds.count("changes_requested") == (how == "status_change"), f"{how}: send-back written"
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["outcome"] == "superseded" and claim["tried_action"] == "request_changes"
+    turns = [t.text for t in env["adapter"].handled]
+    assert len(turns) == 1, turns
+    assert "child verdict superseded" in turns[0] and "five findings on #3120" in turns[0]
+    assert "- Prism P1 reproduced" in turns[0] and "staged read: " in turns[0]
+    assert turns[0].endswith(f"Task {tid} wake")
+
+
+# --- t_d712444b round 2: kernel bookkeeping, derived approvals, mutants of the noise rule -----------------------
+
+
+def _desk_own_deadman(tid, entry):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "review_deadman", {  # noqa: SLF001
+            "by": "kanban-review-deadman", "cycle": 0, "episode": entry["event_id"], "threshold_min": 15})
+
+
+def _desk_sendbacks(env, tid, entry, action="request_changes"):
+    _run(env, entry, "completed", _verdict(entry, action, summary="findings", findings=["own CI red"]))
+    with kb.connect_closing() as conn:
+        return sum(e.kind == "changes_requested" for e in kb.list_events(conn, tid))
+
+
+def test_desk_f135_terminal_worker_reaped(env):
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "terminal_worker_reaped", {  # noqa: SLF001
+            "pid": 17622, "prev_pid": 17622, "host_local": True, "termination_attempted": True,
+            "terminated": True, "sigkill": False})
+    _desk_own_deadman(tid, entry)
+    assert _desk_sendbacks(env, tid, entry) == 1
+
+
+def test_desk_2ef1_collision_peer_warning(env):
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "kanban-dispatcher", "DISPATCH COLLISION WARNING: newly dispatching card t_x overlaps")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "dispatch_collision_peer_warning", {  # noqa: SLF001
+                "task_id": "t_69e2adef", "paths": [".github/ci/suites.json"]})
+    _desk_own_deadman(tid, entry)
+    assert _desk_sendbacks(env, tid, entry) == 1
+
+
+DERIVED = ('pipeline derived: APPROVE @ aaaaaaa\nreview_coverage: {"verdict": "APPROVE", "head_sha": "' + "a" * 40
+           + '", "pr": "ANG-Ventures/hermes-agent#3120", "reviewer": "pipeline", "by": "pipeline/derived"}')
+
+
+def test_desk_2b07_derived_approve_comment(env):
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+    assert _desk_sendbacks(env, tid, entry) == 1
+
+
+def test_desk_door_released(env):
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "door_released", {  # noqa: SLF001
+            "reservation_id": "e5214b0c8e2a", "consumer": "kanban@ci-box", "host": "ci-box",
+            "unit_id": "kb-x-t_x-0", "at_source": "authorization_receipt_received"})
+    assert _desk_sendbacks(env, tid, entry) == 1
+
+
+@pytest.mark.parametrize("author", ["default", "detached-run", "obligations"])
+def test_desk_control_sessionless_nonmachine_comment_still_refuses(env, author):
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, author, "holding this one, I read it myself")
+    assert _desk_sendbacks(env, tid, entry) == 0
+
+
+def test_desk_control_kanban_dispatcher_comment_alone_is_noise(env):
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "kanban-dispatcher", "DISPATCH COLLISION WARNING: x")
+        kb.add_comment(conn, tid, "kanban", "survivor PR open")
+    assert _desk_sendbacks(env, tid, entry) == 1
+
+
+_KERNEL_NOISE = {
+    "terminal_worker_reaped": {"pid": 17622, "prev_pid": 17622, "host_local": True, "terminated": True},
+    "dispatch_collision_peer_warning": {"task_id": "t_69e2adef", "paths": [".github/ci/suites.json"]},
+    "door_released": {"reservation_id": "e5214b0c8e2a", "consumer": "kanban@ci-box", "host": "ci-box"},
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_KERNEL_NOISE))
+@pytest.mark.parametrize("session", [False, True])
+def test_kernel_noise_kind_is_noise_only_without_a_session(env, kind, session):
+    """One row per kernel kind the rule drops; the same kind written under a worker session still refuses."""
+    tid, entry = _human_review_claim(env)
+    actor = [WORKER_SID] if session else []
+    with kb.connect_closing() as conn, kb.mutation_actor(session_ids=actor, profile="default", surface="gateway"), \
+            kb.write_txn(conn):
+        kb._append_event(conn, tid, kind, _KERNEL_NOISE[kind])  # noqa: SLF001
+    assert _desk_sendbacks(env, tid, entry) == (0 if session else 1)
+
+
+@pytest.mark.parametrize("kind", ["claimed", "spawned", "completed", "sendback", "assigned", "review_requested"])
+def test_sessionless_state_events_still_refuse(env, kind):
+    """A worker start, a completion, a send-back, an assignment and a review request are moves, session or not."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, kind, {"by": "kernel"})  # noqa: SLF001
+    assert _desk_sendbacks(env, tid, entry) == 0
+
+
+def test_delivery_marker_of_another_via_still_refuses(env):
+    """Kills the mutant 'the delivery-marker branch returns True for any via'."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, ah.DELIVERED_KIND, {  # noqa: SLF001
+            "delegation_id": "del-other", "part": "turn", "via": "not-boomerang"})
+    assert _desk_sendbacks(env, tid, entry) == 0
+
+
+def test_derived_approve_refuses_every_other_verdict(env):
+    """own_repo_review_human allows only request_changes, so the other verdicts are driven on a completed-row claim."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+    for action in sorted(ah.ALLOWED["completed"] - {"surface", "request_changes"}):
+        res = ah.execute_verdict(entry, _verdict(entry, action))
+        assert not res["ok"] and res["reason"] == "state moved", (action, res)
+
+
+@pytest.mark.parametrize("body", [
+    "pipeline derived: APPROVE @ aaaaaaa",                                       # no record line
+    DERIVED.replace("pipeline/derived", "apollo"),                               # an operator's stamp
+    DERIVED.replace('"verdict": "APPROVE"', '"verdict": "REQUEST_CHANGES"'),    # not an approval
+])
+def test_derived_approve_matches_the_record_not_the_author(env, body):
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", body)
+    assert _desk_sendbacks(env, tid, entry) == 0
+
+
+@pytest.mark.parametrize("stamp", ["operator stamp: hold", "operator stamp: hold".ljust(len(DERIVED), ".")])
+def test_derived_approve_next_to_an_operator_stamp_still_refuses(env, stamp):
+    """Both comments by ``default`` in the same second: the stamp's own event is a move, also when its length equals
+    the record's (then every candidate row must be the record, or neither event is noise)."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+        kb.add_comment(conn, tid, "default", stamp)
+    assert _desk_sendbacks(env, tid, entry) == 0
+
+
+def test_pr_merged_after_a_derived_approve_carries_the_findings_in_the_wake(env):
+    """The PR merges (card done) between the derived approval and the verdict: the status change refuses the send-back
+    and the re-delivered wake carries the reader's findings."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+            assert kb.complete_task(conn, tid, summary="merged on the pipeline approval")
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="four findings",
+                                           findings=["own CI red the reader named"]))
+    with kb.connect_closing() as conn:
+        assert not any(e.kind == "changes_requested" for e in kb.list_events(conn, tid))
+    turns = [t.text for t in env["adapter"].handled]
+    assert len(turns) == 1 and "child verdict superseded" in turns[0], turns
+    assert "- own CI red the reader named" in turns[0]
+
+
+def test_superseded_wake_names_the_staged_read(env):
+    """Kills the mutant 'staged = None in superseded_text'."""
+    from hermes_constants import get_hermes_home
+
+    tid, entry = _human_review_claim(env)
+    staged = get_hermes_home() / "cache" / "scratch" / entry["delegation_id"]
+    staged.mkdir(parents=True)
+    with kb.connect_closing() as conn, \
+            kb.mutation_actor(session_ids=[env["group"].session_id], profile="default", surface="gateway"):
+        kb.add_comment(conn, tid, "default", "holding this one, I read it myself")
+    _run(env, entry, "completed", _verdict(entry, "request_changes", findings=["x"]))
+    turns = [t.text for t in env["adapter"].handled]
+    assert len(turns) == 1 and f"staged read: {staged}\n" in turns[0], turns
+
+
+# --- t_d712444b round 3: bind each comment event to exactly one row; a superseded read survives a merged PR --------
+
+
+def test_derived_approve_next_to_a_whitespace_padded_operator_stamp_still_refuses(env):
+    """Outside review B: the kernel stores ``body.strip()`` but the event carries the input length, so a same-second
+    operator stamp padded with spaces to the record's length has an event that looks like the record's. Neither event
+    can be bound to exactly one row: both are moves, the verdict is refused and the read re-delivered."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+        kb.add_comment(conn, tid, "default", "operator stamp: hold".ljust(len(DERIVED), " "))
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="four findings",
+                                           findings=["own CI red the reader named"]))
+    with kb.connect_closing() as conn:
+        assert not any(e.kind == "changes_requested" for e in kb.list_events(conn, tid))
+    turns = [t.text for t in env["adapter"].handled]
+    assert len(turns) == 1 and "child verdict superseded" in turns[0], turns
+    assert "four findings" in turns[0] and "- own CI red the reader named" in turns[0]
+
+
+def test_superseded_read_is_delivered_when_the_pr_merged(env):
+    """Outside review D/G: the card completed AND its PR merged at the same head before the child's request_changes
+    returned. The write is refused; the superseded read is not dropped by the stale-surface guard at delivery."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+            assert kb.complete_task(conn, tid, summary="merged on the pipeline approval")
+    env["health"][(REPO, 3120)] = {"state": "merged", "head": "a" * 40}
+    _run(env, entry, "completed", _verdict(entry, "request_changes", summary="four findings",
+                                           findings=["own CI red the reader named"]))
+    with kb.connect_closing() as conn:
+        assert not any(e.kind == "changes_requested" for e in kb.list_events(conn, tid))
+    turns = [t.text for t in env["adapter"].handled]
+    assert len(turns) == 1 and "child verdict superseded" in turns[0], turns
+    assert "four findings" in turns[0] and "- own CI red the reader named" in turns[0]
+
+
+def test_derived_approve_next_to_a_rowless_comment_event_still_refuses(env):
+    """A second ``commented`` event by the same author in the window whose row is gone (the kernel keeps the event
+    "even if a comment row is later pruned"): two events, one row, so neither event is bound to exactly one row and
+    the send-back is refused. Kills the mutant 'bind on the row count alone'."""
+    tid, entry = _human_review_claim(env)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", DERIVED)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "commented", {"author": "default", "len": len(DERIVED)})  # noqa: SLF001
+    assert _desk_sendbacks(env, tid, entry) == 0
