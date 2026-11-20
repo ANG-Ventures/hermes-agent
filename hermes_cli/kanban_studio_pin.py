@@ -10,6 +10,7 @@ from hermes_cli import kanban_worker_pool as pool
 _FIRST_LINE = re.compile(r"^[ \t]*host:[ \t]*(?:studio|mac-studio[\w-]*)[ \t]*$", re.IGNORECASE)
 _STUDIO_NEEDS = frozenset({"studio_relay", "studio_launchd", "vault", "skills_tree", "studio_tree"})
 NOTICE_PREFIX = "[placement] bare host: studio dropped: add requires: "
+CP_PROSE_PREFIX = "[placement] control-plane-read not pinned: "
 _log = logging.getLogger(__name__)
 _REQUIRES_LINE = re.compile(r"^([ \t]*requires:[ \t]*)(.*?)([ \t]*\r?)$", re.IGNORECASE | re.MULTILINE)
 # hermes-home studio-requires-reason (create_refusal): a Studio-only word needs >= 3 words after the note cut.
@@ -38,6 +39,10 @@ def add_requires_word(body, word, note):
 
 def prepare_body(body, notices=None):
     """Validate against the dispatcher's vocabulary; unknown maps retain the existing safe-local behavior."""
+    if notices is not None and body:
+        prose = pool.control_plane_prose(body)
+        if prose:
+            notices.append(ControlPlaneProse(prose))
     # Saved bodies carry provenance before the caller's placement directives.
     content = pool.without_header_lines(body).lstrip("\r\n")
     if not content or not _FIRST_LINE.fullmatch(content.splitlines()[0]):
@@ -74,9 +79,30 @@ def prepare_body(body, notices=None):
     )
 
 
+class ControlPlaneProse(tuple):
+    """A create/edit notice: the body names live control-plane files without ``requires: control-plane-read``."""
+
+
+def control_plane_prose_text(paths) -> str:
+    """The notice (t_b720fdea): names the file and both fixes."""
+    return (CP_PROSE_PREFIX + "the body names " + ", ".join(f"`{p}`" for p in paths)
+            + " but declares no control-plane capability, so it runs on a pool host, which reads Studio files over "
+              "`ssh studio` (sqlite3 -readonly, cat, tail). If the work must open that file ON the Studio, add the "
+              "line `requires: control-plane-read`; otherwise nothing to do (writing \"the board database\" "
+              "instead of the path also silences this notice).")
+
+
 def report_notices(conn, card_id, notices):
     """Report only after a successful write, sharing dispatch's durable dedup key."""
     for reasons in notices:
+        if isinstance(reasons, ControlPlaneProse):
+            text = control_plane_prose_text(reasons)
+            try:
+                _note_once(conn, card_id, CP_PROSE_PREFIX, text)
+            except Exception as exc:  # the card is already saved; the stderr line still tells the writer
+                _log.warning("control-plane notice for %s not written: %s", card_id, exc)
+            print("Warning: " + text, file=sys.stderr)
+            continue
         try:
             note_drop(conn, card_id, reasons)
         except Exception as exc:  # the card is already saved; the dispatcher posts the notice later
@@ -88,14 +114,18 @@ def report_notices(conn, card_id, notices):
 
 def note_drop(conn, card_id, reasons):
     """Persist one notice per card, not one per dispatcher process or retry."""
+    _note_once(conn, card_id, NOTICE_PREFIX, NOTICE_PREFIX + ", ".join(sorted(reasons or ())))
+
+
+def _note_once(conn, card_id, prefix, text):
+    """One dispatcher comment per card per ``prefix``."""
     from hermes_cli import kanban_db as kb
     exists = ("SELECT 1 FROM task_comments WHERE task_id=? AND substr(body,1,?)=? LIMIT 1",
-              (card_id, len(NOTICE_PREFIX), NOTICE_PREFIX))
+              (card_id, len(prefix), prefix))
     # Dispatch re-routes dropped pins every tick: an existing notice must not cost the board's write lock.
     if conn.execute(*exists).fetchone():
         return
     with kb.write_txn(conn):
         if conn.execute(*exists).fetchone():
             return
-        kb.add_comment(conn, card_id, "dispatcher",
-                       NOTICE_PREFIX + ", ".join(sorted(reasons or ())))
+        kb.add_comment(conn, card_id, "dispatcher", text)

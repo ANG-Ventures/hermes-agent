@@ -934,10 +934,13 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
     known ssh host, a ``host:<pin>`` line is never a target. ``<host>`` is the
     canonical pin of the alias when ``canon`` names one (``ci`` -> ``ci-box``).
 
-    ``control-plane-read``: a LIVE path-shaped mention of kanban.db, gateway.log,
-    load_gate.json or kanban-pool.json (:func:`_live_control_plane_path`), or an
-    explicit ``requires: control-plane-read`` line. A bare word never binds, nor
-    does a repo-relative path (``fleet/kanban-pool.json``).
+    ``control-plane-read``: an explicit ``requires: control-plane-read`` line only
+    (t_b720fdea). A LIVE path-shaped mention of kanban.db, gateway.log,
+    load_gate.json or kanban-pool.json no longer binds: every pool host reads those
+    files over the ``ssh studio`` door (studio-state, t_b0290889), and 5 of the 6
+    control-plane-read Studio overrides in the 30 days to 2026-11-19 were bodies
+    that only named the file. :func:`control_plane_prose` reports such a mention at
+    create time instead.
     """
     from hermes_cli import kanban_host_capabilities as _khc
     alias_set = {a.lower() for a in (aliases or ()) if a}
@@ -945,7 +948,6 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
     known = None if ssh_hosts is None else {h.lower() for h in ssh_hosts}
     canon = {k.lower(): v for k, v in (canon or {}).items()}
     served_set = {s.lower() for s in (served or ()) if s}
-    cp_read = False
     for line in (body or "").splitlines():
         m = HOST_PIN_RE.match(line)
         if m and m.group(1).lower() in pins:
@@ -968,12 +970,24 @@ def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
                 if w in served_set:
                     continue
                 return _reasons.ssh_root(canon.get(w, w))
-        if not cp_read and any(_live_control_plane_path(m.group(1))
-                               for m in _CONTROL_PLANE_PATH_RE.finditer(line)):
-            cp_read = True
-    if cp_read or _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
+    if _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
         return _reasons.ACCESS_CONTROL_PLANE_READ
     return None
+
+
+def control_plane_prose(body: Optional[str]) -> Tuple[str, ...]:
+    """The live control-plane paths a body names (``~/.hermes/kanban.db``, ``logs/gateway.log`` ...) while it
+    declares no ``requires: control-plane-read``: what used to pin the card to the Studio and no longer does
+    (t_b720fdea). Empty when the body declares the word or names no live path."""
+    from hermes_cli import kanban_host_capabilities as _khc
+    if _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
+        return ()
+    found = []
+    for line in (body or "").splitlines():
+        for m in _CONTROL_PLANE_PATH_RE.finditer(line):
+            if _live_control_plane_path(m.group(1)):
+                found.append(m.group(1) + "/" + m.group(2))
+    return tuple(dict.fromkeys(found))
 
 
 def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str],

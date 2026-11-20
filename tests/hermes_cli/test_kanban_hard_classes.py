@@ -127,9 +127,9 @@ def test_kanban_db_body_routes_local_with_a_healthy_pool(home):
     with kb.connect_closing() as conn:
         tid = _card(conn, "Count blocked runs: sqlite3 -readonly ~/.hermes/kanban.db 'select ...'")
         (route, aff, _out) = _route(conn, tid)
-        # A kanban.db PATH is access-bound (traceability spec §2.6, t_e99ef75c):
-        # the more specific name wins over the studio-state soft rule.
-        assert route == ("local", "access_bound:control-plane-read")
+        # A kanban.db PATH alone no longer binds access_bound:control-plane-read (t_b720fdea): the
+        # studio-state rule judges it, and this fixture map gives no pool host studio-state.
+        assert route == ("local", "studio_affinity:requires:studio-state")
         res, spawned = _tick(conn)
         assert spawned == [(tid, "studio")]
         assert not res.placed
@@ -137,7 +137,7 @@ def test_kanban_db_body_routes_local_with_a_healthy_pool(home):
 
 def test_studio_state_soft_true_spills(home):
     """Kill switch / negative: a studio-state body under `soft: true` routes portable.
-    (turns.db: studio-state, not access-bound; a kanban.db path stays access-bound.)"""
+    (turns.db: studio-state, not access-bound; since t_b720fdea a kanban.db path is not access-bound either.)"""
     _map(home, lambda d: d["capabilities"]["studio-state"].update(soft=True))
     with kb.connect_closing() as conn:
         tid = _card(conn, "Count turns: sqlite3 -readonly ~/.hermes/turns.db 'select ...'")
