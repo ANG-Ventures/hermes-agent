@@ -2715,7 +2715,22 @@ def _run_child_delegate(parent: Any, goal: str, mode: str) -> tuple:
         # ``summary`` of an interrupted child is its partial output (t_abf5cae7: a reason read
         # "child interrupted: **Delegation ID ...**"); the cause is the message or the placeholder.
         return "interrupted", str(res.get("interrupt_message") or res.get("error") or "no interrupt reason recorded")
+    if res.get("status") == "failed" and res.get("failure_reason") == "content_policy_blocked":
+        # t_c4e82186: the provider's safety filter refused the child; a refusal stays a refusal
+        # (no reword, no other model), but the owner line must say what was lost.
+        return "refused", str(res.get("summary") or res.get("error") or "")
     return str(res.get("status") or "failed"), str(res.get("summary") or res.get("error") or "")
+
+
+def _refused_reason(entry: dict, status: str) -> str:
+    """The owner line for a child the provider's safety filter refused: what was lost, the card's
+    unchanged state (the deadman still covers it) and the command to read it by hand."""
+    from hermes_cli.kanban_db import render_operator_command
+
+    tid = str(entry.get("task_id") or "?")
+    cmd = render_operator_command(str(entry.get("board") or "default"), "show", tid)
+    return (f"child refused by the model provider's safety filter; the {entry.get('row') or 'wake'} on {tid} "
+            f"was not read and the card stays {status}. Read it yourself: {cmd}")
 
 
 def _gateway_stopping(runner: Any) -> bool:
@@ -2818,7 +2833,10 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
                     "the next boot delegation=%s", live["task_id"], live.get("delegation_id"))
         return
     if status != "completed":
-        reason = "stopped by /stop" if status == "stopped" else f"child {status}: {_first_line(final, 200)}"
+        if status == "refused":
+            reason = _refused_reason(live, await asyncio.to_thread(_card_status, live))
+        else:
+            reason = "stopped by /stop" if status == "stopped" else f"child {status}: {_first_line(final, 200)}"
         await _fail(runner, live, reason, state, fork_died=status != "stopped")
         return
     if await asyncio.to_thread(deadman_owner_acted, live):

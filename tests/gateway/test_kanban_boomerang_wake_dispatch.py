@@ -1193,6 +1193,33 @@ def test_child_stop_attribution_preserves_wake(env, stop):
     assert claim["resurface_delivered"] is True
 
 
+def test_safeguard_refused_child_tells_owner_what_was_lost_and_keeps_card_state(env):
+    """t_c4e82186: a child the provider's safety filter refused gets an owner line naming the card,
+    what was not read and the command to read it; the card's state is untouched (deadman covers it)."""
+    from tools import delegate_tool
+
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    with kb.connect_closing() as conn:
+        before = kb.get_task(conn, tid).status
+    result = {"status": "failed", "failure_reason": "content_policy_blocked",
+              "summary": "⚠️  The model provider's safety filter blocked this request (not a Hermes/gateway failure).",
+              "error": "HTTP 400: [safeguard_refusal: ...]"}
+    env["monkeypatch"].setattr(delegate_tool, "delegate_task", lambda **_kw: json.dumps({"results": [result]}))
+    status, final = ah._run_child_delegate(object(), "goal", "fork")
+    assert status == "refused"
+    _run(env, entry, status, final)
+    [line] = env["adapter"].sent
+    assert line.startswith(f"⚠️ boomerang-wake failed {tid}: child refused by the model provider's safety filter")
+    assert f"on {tid} was not read and the card stays {before}." in line
+    assert f"Read it yourself: hermes kanban --board default show {tid}" in line
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == before
+    assert [event.text for event in env["adapter"].handled] == [entry["wake_text"]]
+    assert ah.BoomerangWakeState().get_claim(entry["key"])["outcome"] == "failed"
+
+
 @pytest.mark.parametrize("how", ["draining", "shutdown_event"])
 def test_shutdown_interrupted_child_leaves_claim_open_then_redispatches_on_next_boot(env, caplog, how):
     """t_abf5cae7: a drain-timeout interrupt is the restart's, not a child fault. No warning line,
