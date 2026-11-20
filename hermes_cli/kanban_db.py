@@ -6544,6 +6544,15 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
+    if workspace_of is None and not continues and not project_id:
+        # A worktree on a checkout whose origin is an upstream we do not own can never rerun off the Studio:
+        # mint scratch + `Repo:` + `Branch:` lines instead (t_efd1497a).
+        from hermes_cli import kanban_mint_scratch as _kms
+        _scratch = _kms.rewrite(workspace_kind, workspace_path, branch_name, body)
+        if _scratch is not None:
+            body, _notice = _scratch
+            workspace_kind, workspace_path, branch_name = "scratch", None, None
+            print(_notice, file=sys.stderr)
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 

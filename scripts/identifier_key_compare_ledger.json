@@ -567,6 +567,16 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
    "where": "hermes_cli/kanban_worktree_port.py:81 read_mirrors"
   },
+  "hermes_cli/kanban_mint_scratch.py::rewrite::fold::slug::if any(n != slug.lower() for n in named):": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so a body Repo: line naming the push repo in another case names the same repo the scratch clone uses; byte-exact would keep worktrees for the same repo. Same fold as _push_repo_remotes.",
+   "where": "hermes_cli/kanban_mint_scratch.py:124 rewrite"
+  },
+  "hermes_cli/kanban_mint_scratch.py::_push_repo_remotes::fold::slug::if m and m.group(1).lower() == slug.lower():": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so a remote whose fetch URL differs from the push repo only in case is the same repo; same fold as kanban_worktree_port port_for/mint_rewrite.",
+   "where": "hermes_cli/kanban_mint_scratch.py:64 _push_repo_remotes"
+  },
   "hermes_cli/kanban_db.py::complete_task::fold::repo::own_keys = {(r.repo.lower(), r.number) for r in _open_pr.split_fleet(_open_pr.extract_pr_refs(": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
