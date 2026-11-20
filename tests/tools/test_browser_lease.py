@@ -192,10 +192,10 @@ def _fake_browserctl(tmp_path, port):
         print("port={port}", flush=True)
         while True:
             time.sleep(0.1)
-        """))
+        """), encoding="utf-8")
     ctl.chmod(0o755)
     fwd = tmp_path / "fwd"
-    fwd.write_text("")
+    fwd.write_text("", encoding="utf-8")
     return ctl, fwd, released
 
 
@@ -214,7 +214,7 @@ def test_watcher_releases_when_the_tool_closes_its_stdin(tmp_path):
     assert p.stdout.readline().strip() == b"port=4711"
     p.stdin.close()
     assert _wait(released)
-    assert released.read_text() == f"with id-github-kyzcreig --class read --card t_lease001 -- {fwd} --serve"
+    assert released.read_text(encoding="utf-8-sig") == f"with id-github-kyzcreig --class read --card t_lease001 -- {fwd} --serve"
     assert p.wait(15) == 143
 
 
@@ -229,7 +229,7 @@ def test_watcher_releases_when_the_worker_is_killed(tmp_path):
     """)
     w = subprocess.Popen([sys.executable, "-c", worker], stdout=subprocess.PIPE, start_new_session=True)
     assert w.stdout.readline().strip() == b"port=4712"
-    os.kill(w.pid, signal.SIGKILL)
+    os.kill(w.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     w.wait(10)
     assert _wait(released)
 
