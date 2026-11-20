@@ -255,6 +255,17 @@ def test_lane_qualified_target_matches_bare_id_on_that_lane(slots):
     assert slot_canonicalise("gpt-6.2-sol") == ("gpt-6.2-sol", None)
 
 
+def test_lane_qualified_pick_keeps_its_lane_on_the_slot(slots):
+    """An explicit ``cpa/`` pick of a lane-qualified target stores ``cpa/sol``, not ``sol``, so a
+    later rollout to an unqualified target keeps the caller's lane (Prism 7c7a0c08ca9d, round 3).
+    A vendor prefix that is not the lane still stores the bare slot."""
+    _write(slots, "model-slots.json", {"slots": {"sol": "cpa/gpt-6.2-sol", "gemini-pro": "google/gemini-4-argon"}})
+    assert slot_canonicalise("cpa/gpt-6.2-sol", "cpa") == (
+        "cpa/sol", "stored as slot cpa/sol, currently id cpa/gpt-6.2-sol")
+    assert model_registry.slot_resolve("cpa/sol")[0] == "cpa/gpt-6.2-sol"
+    assert slot_canonicalise("google/gemini-4-argon", "openrouter")[0] == "gemini-pro"
+
+
 def test_batch_set_model_keeps_stdout_one_record_per_card(board, capsys):
     """Batch ``set-model`` prints one record per card on stdout; the slot line goes to stderr
     (Prism 76ade10dd010). A single named card keeps the line on stdout."""

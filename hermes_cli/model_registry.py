@@ -376,7 +376,11 @@ def slot_canonicalise(
     names = sorted(name for name, target in view.items() if target in (bare, spec, laned))
     if len(names) != 1:
         return model, None
-    slot = names[0] if view[names[0]] in (spec, laned) or not prefix else f"{prefix}/{names[0]}"
+    # An explicit lane prefix stays on the slot (``cpa/gpt-6.2-sol`` on cpa -> ``cpa/sol``), so a
+    # later rollout to an unqualified target keeps the caller's lane (Prism 7c7a0c08ca9d).
+    on_lane = bool(prefix) and isinstance(provider, str) and prefix.lower() == provider.strip().lower()
+    keep = prefix and (on_lane or view[names[0]] not in (spec, laned))
+    slot = f"{prefix}/{names[0]}" if keep else names[0]
     if slot_resolve(slot)[0] not in (spec, laned):
         return model, None
     try:
