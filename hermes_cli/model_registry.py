@@ -267,25 +267,42 @@ _slot_view_memo: dict[str, tuple[int, int, dict[str, str]]] = {}
 _slot_view_lock = threading.Lock()
 
 
+def _drop_slot_view(key: str) -> None:
+    """A missing file evicts its cached view, so a torn re-create cannot fall back to it."""
+    with _slot_view_lock:
+        _slot_view_memo.pop(key, None)
+
+
 def slot_view() -> dict[str, str]:
     """``{slot: id}`` from ``<root>/config/model-slots.json`` (rendered by ``model-registry.py``).
 
     Accepts ``{"slots": {...}, ...}`` or a flat ``{slot: id, ...}`` (keys starting with ``_``
     and ``rendered_from`` are metadata). mtime-cached, so a re-render is seen on the next call
-    with no restart. Missing or unreadable file means ``{}`` (fail open: names pass through).
+    with no restart. A missing file means ``{}`` (fail open: names pass through); a file that
+    cannot be read or parsed (a checkout rewriting it mid-read) keeps the last good parse.
     """
+    hit = None
     try:
         import json
         from hermes_constants import get_default_hermes_root
 
         path = get_default_hermes_root() / "config" / "model-slots.json"
-        st = path.stat()
         key = str(path)
         with _slot_view_lock:
             hit = _slot_view_memo.get(key)
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            _drop_slot_view(key)
+            return {}
         if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
             return hit[2]
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:  # deleted between stat and read: missing, not torn
+            _drop_slot_view(key)
+            return {}
+        data = json.loads(text)
         table = data.get("slots") if isinstance(data.get("slots"), dict) else data
         view = {
             str(k).strip(): v.strip()
@@ -297,7 +314,7 @@ def slot_view() -> dict[str, str]:
             _slot_view_memo[key] = (st.st_mtime_ns, st.st_size, view)
         return view
     except Exception:
-        return {}
+        return hit[2] if hit is not None else {}
 
 
 def slot_resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -314,7 +331,10 @@ def slot_resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     target = slot_view().get(bare)
     if not target or target == bare:
         return model, None
-    return (f"{prefix}/{target}" if prefix else target), spec
+    # ``google/gemini`` with target ``google/gemini-2.5-pro``: the target already carries it.
+    if prefix and not target.startswith(f"{prefix}/"):
+        target = f"{prefix}/{target}"
+    return target, spec
 
 
 __all__ = [

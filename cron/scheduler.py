@@ -2357,8 +2357,11 @@ def _fallback_was_declared(job: dict, new_provider, new_model) -> bool:
     # step to a sibling model and back: P/X -> P/M) never left its declared
     # primary, so it is not an undeclared switch (t_1fbc5271). Both halves must
     # match: a job with no pinned provider cannot vouch for the provider.
+    # A slot (``opus``) in the job matches the id the run ended on (the agent sends the id).
+    from hermes_cli.model_registry import slot_resolve
+
     own_provider = str(job.get("provider") or "").strip()
-    own_model = _coerce_job_model(job.get("model"))
+    own_model = slot_resolve(_coerce_job_model(job.get("model")))[0]
     if (own_provider and own_model and new_provider
             and own_provider == str(new_provider).strip() and own_model == new_model):
         return True
@@ -2369,7 +2372,7 @@ def _fallback_was_declared(job: dict, new_provider, new_model) -> bool:
         if not isinstance(entry, dict):
             continue
         ep = entry.get("provider")
-        em = entry.get("model")
+        em = slot_resolve(entry.get("model"))[0]
         # Match on model (with optional provider) — provider labels can vary
         # (pool face vs sub) but the model slug is the stable identity.
         if em and em == new_model and (not ep or not new_provider or ep == new_provider):

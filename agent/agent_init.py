@@ -518,7 +518,9 @@ def _finalize_routing(agent, api_mode, credential_pool):
             _AGGREGATOR_PROVIDERS, normalize_model_for_provider
         )
 
-        if agent.provider not in _AGGREGATOR_PROVIDERS:
+        # A slot's id is normalized on every lane, aggregators included: the view holds bare ids
+        # (kimi-k3.1-pro) and openrouter needs the vendor prefix /model validated.
+        if agent.provider not in _AGGREGATOR_PROVIDERS or getattr(agent, "_model_slot", None):
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
 
     # Nous model policy follows the ROUTE (the welcome host serves one model); a credential-pool
