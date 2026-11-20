@@ -3148,6 +3148,50 @@ def test_park_return_off_switch_restores_the_session_wake(env):
     assert env["dispatched"] == [] and _claims() == {}
 
 
+def _scheduled_from_review(env) -> str:
+    """t_63ebf58b: a review card parked with ``kanban schedule`` (resumes in review), subscribed after the park."""
+    tid = _card(env)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'review', assignee = 'human:apollo' WHERE id = ?", (tid,))
+    with kb.connect_closing() as conn:
+        assert kb.schedule_task(conn, tid, reason="wait for the readback", wake_at=int(time.time()) + 3600)
+        assert kb.get_task(conn, tid).status == "scheduled"
+    _sub(tid)
+    return tid
+
+
+def _repair_review_events(tid) -> int:
+    with kb.connect_closing() as conn:
+        return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+                            "AND json_extract(payload, '$.source') = 'lifecycle_entry_repair' AND id > "
+                            "(SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'scheduled')",
+                            (tid, tid)).fetchone()[0]
+
+
+def test_scheduled_park_that_runs_out_still_dispatches_the_park_return_child(env):
+    """The timer expires and nobody closed the card: the home session is woken exactly as before."""
+    tid = _scheduled_from_review(env)
+    with kb.connect_closing() as conn:
+        assert kb.wake_due_scheduled(conn, now=int(time.time()) + 3600) == [tid]
+        assert kb.get_task(conn, tid).status == "review"
+    assert _repair_review_events(tid) == 1
+    assert _tick(env) == []
+    assert [(e["row"], e["task_id"]) for e in env["dispatched"]] == [("review_park_return", tid)]
+
+
+def test_operator_completes_a_scheduled_card_in_one_step_with_no_park_return_wake(env):
+    """t_63ebf58b: complete takes the scheduled card directly; no review state, no repair event, no child."""
+    tid = _scheduled_from_review(env)
+    with kb.connect_closing() as conn:
+        assert kb.complete_task(conn, tid, summary="readback met; closing")
+        task = kb.get_task(conn, tid)
+        assert task.status == "done" and task.next_eligible_at is None
+        assert kb.wake_due_scheduled(conn, now=int(time.time()) + 7200) == []
+    assert _repair_review_events(tid) == 0
+    _tick(env)
+    assert "review_park_return" not in [e["row"] for e in env["dispatched"]]
+
+
 def test_park_return_child_surface_is_not_refused_by_the_merged_pr_rule(env):
     """A card back from a park usually carries a merged PR: the child's surface is still owed."""
     env["health"][(REPO, 3402)] = {"state": "merged", "merged": True, "failing": [], "head": "d" * 40}

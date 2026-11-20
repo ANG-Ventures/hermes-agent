@@ -234,6 +234,32 @@ def test_manual_unblock_clears_wake_stamp(kanban_home: Path) -> None:
         assert task.status == "ready" and task.next_eligible_at is None
 
 
+def test_operator_complete_closes_a_scheduled_card_in_one_step(kanban_home: Path) -> None:
+    """t_63ebf58b: no unblock first, so no review state and no lifecycle-repair review_requested."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="parked review", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        assert kb.schedule_task(conn, tid, reason="readback", wake_at=int(time.time()) + HOUR)
+        before = len(_kinds(conn, tid))
+        # Parked from review: closes as the review approval, evidence optional (as from review).
+        assert kb.complete_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task.status == "done" and task.next_eligible_at is None
+        assert _kinds(conn, tid)[before:].count("review_requested") == 0
+        assert "unblocked" not in _kinds(conn, tid)[before:]
+
+        ready = _scheduled(conn, title="parked ready")
+        with pytest.raises(kb.EmptyCompletionError):
+            kb.complete_task(conn, ready)
+        assert kb.get_task(conn, ready).status == "scheduled"
+        # A worker run never owns a scheduled card: the run-bound close stays refused.
+        assert not kb.complete_task(conn, ready, summary="x", expected_run_id=1)
+        assert "running/ready/blocked/review" in kb.explain_complete_refusal(conn, ready, expected_run_id=1)
+        assert kb.complete_task(conn, ready, summary="event never came; closing")
+        assert kb.get_task(conn, ready).status == "done"
+
+
 def test_promote_refusal_names_the_scheduled_exit(kanban_home: Path) -> None:
     # ``force=`` was retired with upstream #106195 (a forced promotion only
     # reported a success the first claim reverted); the scheduled-exit hint
