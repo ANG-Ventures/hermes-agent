@@ -98,3 +98,36 @@ def test_malformed_pricing_is_no_row(home, pricing):
 def test_malformed_context_is_no_row(home, ctx):
     _meta(home, {FRESH: {"context": ctx}})
     assert registry_context_length(FRESH) is None
+
+
+# Prism dbbdd3313f7f: a registry row is one per id (the API window). A lane that enforces its own,
+# smaller window keeps it; the row only fills in when that lane's lookup has nothing.
+BIG_ROW = {"context": 1_100_000}
+
+
+def test_codex_oauth_lane_window_beats_registry_row(home):
+    want = get_model_context_length(KNOWN, provider="openai-codex")
+    assert want != 1_100_000
+    _meta(home, {KNOWN: BIG_ROW})
+    assert get_model_context_length(KNOWN, provider="openai-codex") == want
+
+
+def test_codex_subscription_proxy_lane_window_beats_registry_row(home, monkeypatch):
+    import agent.model_metadata as mm
+    monkeypatch.setattr(mm, "provider_serves_codex_subscription", lambda p: p == "cpa")
+    want = get_model_context_length(KNOWN, provider="cpa")
+    assert want != 1_100_000
+    _meta(home, {KNOWN: BIG_ROW})
+    assert get_model_context_length(KNOWN, provider="cpa") == want
+
+
+def test_copilot_lane_window_beats_registry_row(home, monkeypatch):
+    import hermes_cli.models as models
+    monkeypatch.setattr(models, "get_copilot_model_context", lambda model, api_key=None: 128_000)
+    _meta(home, {KNOWN: BIG_ROW})
+    assert get_model_context_length(KNOWN, provider="copilot") == 128_000
+
+
+def test_lane_window_provider_uses_registry_row_when_lane_has_none(home):
+    _meta(home, {FRESH: FRESH_ROW})
+    assert get_model_context_length(FRESH, provider="openai-codex") == 777_777
