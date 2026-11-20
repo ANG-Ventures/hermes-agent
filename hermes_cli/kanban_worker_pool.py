@@ -1471,10 +1471,16 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
     aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
                                    *(h.lower() for h in pool_hosts)]))
-    # Only a declared ``reach:`` line names a target (t_efd1497a); ssh-shaped prose is reported, never bound.
-    bound = any(s.rsplit("/", 1)[-1] in HOST_BOUND_SKILLS for s in (skills or ()))
+    # A declared ``reach:`` line binds (t_efd1497a); ssh-shaped prose alone is reported, never bound. A card a
+    # HOST_BOUND skill already binds still reads its ssh-shaped targets: without them an alias nobody reaches
+    # would drop out of the fallback and the card would spill to a host with no route (Prism ac47bd4b21d9).
+    skill_bound = any(s.rsplit("/", 1)[-1] in HOST_BOUND_SKILLS for s in (skills or ()))
     named = declared_reach(body, aliases)
-    bound = bound or bool(named)
+    if skill_bound:
+        _b, prose = host_bound_targets(body, (), aliases, pin_hosts=pool_hosts,
+                                       ssh_hosts=getattr(pool, "ssh_hosts", None))
+        named = tuple(dict.fromkeys([*named, *prose]))
+    bound = skill_bound or bool(named)
     wanted = tuple(dict.fromkeys(h.lower() for h in (targets or {}).values() if h))
     if not bound and not wanted:
         return None

@@ -526,3 +526,15 @@ def test_declared_reach_reads_the_line_only():
     assert kwp.declared_reach("  REACH: `ace-ai`", vocab) == ("ace-ai",)
     assert kwp.declared_reach("we reach: dell-rugged later", vocab) == ()     # not line-anchored
     assert kwp.declared_reach("reach: nowhere", vocab) == ()                  # not in the vocabulary
+
+
+def test_skill_bound_card_keeps_its_ssh_named_target(tmp_path):
+    """Prism ac47bd4b21d9: ssh-machines + `ssh mac-studio-m3u uptime` must still need mac-studio-m3u (nobody
+    reaches it: held), not fall back to the aliases some host reaches and spill."""
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"ci-box": _row(ace_ai=0), "ace-media": _row(ace_ai=0, unifi=0)})
+    pool = _pool(fleet)
+    body = "ssh mac-studio-m3u uptime"
+    assert kwp.reach_allowed_hosts(body=body, skills=("ssh-machines",), pool=pool) == ()
+    assert _portable(pool, body=body, skills=("ssh-machines",)) == (False, "host_reach", None)
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) is None     # prose alone: not bound

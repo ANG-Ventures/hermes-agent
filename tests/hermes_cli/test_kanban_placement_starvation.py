@@ -87,7 +87,8 @@ def test_unreached_alias_is_excluded_only_from_the_fallback(tmp_path):
 
 # -- (b) a card whose only target nobody reaches still waits -------------------
 
-@pytest.mark.parametrize("body", ["reach: haos\nssh haos 'ha core info'", "reach: unifi\nssh unifi 'info'"])
+# A HOST_BOUND skill still reads its ssh-shaped target (Prism ac47bd4b21d9): no reach: line needed.
+@pytest.mark.parametrize("body", ["ssh haos 'ha core info'", "ssh unifi 'info'", "reach: haos\nssh haos 'ha core info'"])
 def test_card_naming_only_an_unreachable_alias_still_waits(tmp_path, body):
     pool = _pool(tmp_path / "fleet")
     pool = kwp.PoolConfig(**{**pool.__dict__, "ssh_hosts": frozenset({"haos", "unifi"})})
