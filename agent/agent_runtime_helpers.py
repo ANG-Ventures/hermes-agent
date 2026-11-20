@@ -1584,6 +1584,8 @@ def restore_primary_runtime(agent, *, _policy_decision=None, _failed_class=None)
             agent.reasoning_config = dict(saved_reasoning) if isinstance(saved_reasoning, dict) else saved_reasoning
         agent._fallback_activated = False
         agent._fallback_index = 0
+        if "model_slot" in rt:  # init snapshot: the restored route's slot (a startup rung's)
+            agent._model_slot = rt["model_slot"]
         # Clear the fallback-announce dedupe so a LATER fallback episode (after this primary
         # recovery) re-announces instead of being suppressed as a repeat of the prior transition
         # (once per episode, not once ever).

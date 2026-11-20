@@ -465,6 +465,33 @@ def _recover_provider_from_model(model: str, provider: str) -> tuple[str, str]:
     return provider, model
 
 
+def _resolve_turn_slot(model: str, provider: str, asked: Any) -> tuple[str, str]:
+    """``(model, model_slot)`` for the turn row (t_5c87d313).
+
+    ``asked`` is the slot the agent was configured with (``agent._model_slot``), and ``model`` is
+    normally already its resolved id. A slot name that reaches the recorder as ``model`` is resolved
+    here, at turn time, so the row holds the id the turn ran on and a later reprice cannot price it
+    at whatever the slot points to by then. A slot the view cannot resolve stays in ``model`` (the
+    turn books unpriced under the slot name). ``model_slot`` is ``''`` for a literal id.
+    """
+    slot = asked.strip() if isinstance(asked, str) else ""
+    if str(provider or "").strip().lower() == "moa":
+        return model, slot
+    try:
+        from hermes_cli.model_registry import slot_resolve
+
+        resolved, named = slot_resolve(model)
+    except Exception:
+        return model, slot
+    if not named or not resolved:
+        return model, slot
+    resolved = str(resolved)
+    lane = str(provider or "").strip().lower()
+    if lane and resolved.lower().startswith(lane + "/"):
+        resolved = resolved.split("/", 1)[1]  # ``cpa/sol`` on provider cpa: the lane is the provider
+    return resolved, slot or named
+
+
 
 def _profile_name() -> str:
     try:
@@ -665,6 +692,7 @@ def _build_record(
     if is_subagent and not bool(cfg.get("record_subagents", True)):
         return None
 
+    model, model_slot = _resolve_turn_slot(model, provider, kwargs.get("model_slot"))
     # Repair a leaked composite ``<provider>/<model>`` model id that arrived with
     # an empty provider column (Ace's 2026-07-05 phantom "Spend by model" row).
     # Done here at the recording boundary so it's telemetry-only and can never
@@ -785,6 +813,7 @@ def _build_record(
         final_text=str(final_response or "") if store_text else "",
         tool_calls=tool_calls if store_text else [],
         cli_invocation_id=kwargs.get("cli_invocation_id"),
+        model_slot=model_slot,
         # A caller writing on another process's behalf (orphan repair) passes
         # the key explicitly so this process's placement is never stamped.
         placement_host=(
@@ -838,6 +867,7 @@ def _abandoned_record(args: dict[str, Any], cfg: dict[str, Any]) -> TurnRecord |
             "chat_name": args.get("chat_name"),
             "turn_exit_reason": args.get("reason"),
             "reasoning_effort": args.get("reasoning_effort"),
+            "model_slot": args.get("model_slot"),
             "provisional": True,
         },
     )

@@ -960,6 +960,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             _refused_entries.append((_fb_provider, "no usable credentials"))
             continue
         agent._fallback_activated = True
+        from hermes_cli.model_registry import slot_resolve
+        agent._fallback_model_slot = slot_resolve(_fb["model"])[1] or ""  # turn row's model_slot
         if _fb_provider.strip().lower() == "moa":
             # The chokepoint handed back the preset's aggregator client, which only proves the
             # preset resolves and its aggregator has credentials. A MoA entry means the preset
@@ -2484,6 +2486,10 @@ def _snapshot_primary_runtime(agent):
         "compressor_provider": getattr(_cc, "provider", agent.provider),
         "compressor_context_length": _cc.context_length,
         "compressor_threshold_tokens": _cc.threshold_tokens,
+        # The slot of the route captured here: after a startup fallback that is the rung's, which
+        # the first turn's restore re-applies (turn row model_slot, t_5c87d313).
+        "model_slot": (getattr(agent, "_fallback_model_slot", None) if agent._fallback_activated
+                       else getattr(agent, "_model_slot", None)) or None,
     }
     if agent.api_mode == "anthropic_messages":
         agent._primary_runtime.update({

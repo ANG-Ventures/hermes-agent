@@ -61,4 +61,18 @@ def refresh_slot_for_turn(agent: Any) -> bool:
     return True
 
 
-__all__ = ["apply_slot_at_init", "refresh_slot_for_turn"]
+def served_slot(agent: Any) -> str:
+    """Slot of the seat that is serving now, for the turn row (``model_slot``; t_5c87d313).
+
+    On a fallback rung it is the rung's slot (``''`` for a literal rung, or when the rung's slot
+    was never recorded), never the primary's: ``agent._model_slot`` stays the primary's so the next
+    restored turn re-resolves it.
+    """
+    if getattr(agent, "_fallback_activated", False):
+        slot = getattr(agent, "_fallback_model_slot", None)
+    else:
+        slot = getattr(agent, "_model_slot", None)
+    return slot if isinstance(slot, str) else ""
+
+
+__all__ = ["apply_slot_at_init", "refresh_slot_for_turn", "served_slot"]
