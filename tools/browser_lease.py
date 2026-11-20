@@ -49,7 +49,7 @@ DEAD_URL = "http://127.0.0.1:0"
 # forwarder inherits the lease env and stdout; its exit is announced on the same stdout at once.
 FORWARDER_SHIM = r'''
 import subprocess, sys
-p = subprocess.Popen(sys.argv[1:])
+p = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL)  # the token rides env; nothing reads stdin
 rc = p.wait()
 print("%(exit_line)s rc=%%d" %% rc, flush=True)
 sys.exit(rc if rc >= 0 else 1)
@@ -204,7 +204,7 @@ def _read_port(proc: subprocess.Popen, tail: List[str], timeout: float,
             if "lease_id" not in grant:
                 grant.update(_grant_fields(line))
             if line.startswith(RELEASE_LINE):
-                grant["released"] = line[len(RELEASE_LINE):].split()[0]
+                grant["released"] = (line[len(RELEASE_LINE):].split() or [""])[0]
             if line.startswith(EXIT_LINE):
                 gone.set()
                 ready.set()
