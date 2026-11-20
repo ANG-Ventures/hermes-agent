@@ -2325,7 +2325,8 @@ class SpilloverPlan:
     def take(self, assignee: Optional[str], pin: Optional[str] = None,
              only: Optional[Collection[str]] = None,
              board: Optional[str] = None, job: Any = None,
-             job_id: Optional[str] = None, skip_admission: bool = False) -> Optional[PoolHost]:
+             job_id: Optional[str] = None, skip_admission: bool = False,
+             prefer: Optional[Collection[str]] = None) -> Optional[PoolHost]:
         """Reserve one slot: on ``pin`` only, else (signal + placement table)
         ``placement.choose()`` over the hosts that serve ``assignee`` with
         ``job`` overrides (t_d6ce856e); without a table the band pick. ``only``
@@ -2333,7 +2334,18 @@ class SpilloverPlan:
         hosts; an empty ``only`` takes nothing (``host_reach``). ``board`` drops
         every host that cannot host that board (:meth:`board_refusal`) before
         the pick: the card spills to another host or waits ``board_unhostable``.
+        ``prefer`` (unpinned only; the prose reach preference, t_efd1497a /
+        Prism 77c519869eff) is tried first, within ``only``; when those hosts
+        cannot take the card the pick falls back to all of ``only``.
         None sets ``refusal``."""
+        if prefer is not None and pin is None:
+            want = {n.lower() for n in prefer}
+            pref = [n for n in (self.hosts if only is None else only) if n.lower() in want]
+            if pref:
+                host = self.take(assignee, only=pref, board=board, job=job, job_id=job_id,
+                                 skip_admission=skip_admission)
+                if host is not None:
+                    return host
         self.refusal = None
         self.last_decision = None
         self.last_reservation = None

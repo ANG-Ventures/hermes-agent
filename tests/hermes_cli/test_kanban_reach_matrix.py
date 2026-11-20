@@ -789,3 +789,64 @@ def test_reaching_hosts_self_rule_is_canonical_and_case_folded():
     # Prism 1fb15e606226: a mixed-case target folds like the host id it names.
     assert kwp.reaching_hosts({"CI-Box": {"CI-Box": 255}}, ("CI-Box",), (), config_logins=cfg) == ("CI-Box",)
     assert kwp.reaching_hosts({"ci-box": {}}, ("ci-box",), (), logins={"CI-BOX": {"ace"}}, config_logins=cfg) == ()
+
+
+# -- Prism 77c519869eff (deferred to t_8c580b20): the prose preference is soft in take() too ---------------------
+
+def _soft_plan(kanban_home, profiles_mbp=("alpha",)):
+    fleet = kanban_home / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwp.REACH_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "ci-box": {"at": NOW, "reach": {"nas-fleet": 255}}, "mbp-2026": {"at": NOW, "reach": {"nas-fleet": 0}}}}))
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    cfg = kwp.PoolConfig(hosts=("ci-box", "mbp-2026"), profiles=("alpha",), reach=reach,
+                         reach_aliases=aliases, reach_status=status)
+    mbp = kwp.PoolHost(name="mbp-2026", ssh_host="mbp-2026", ssh_user=kwp.SSH_USER, slots=4, capacity_pct=0.8,
+                       absence="required", profiles=profiles_mbp, state="active", enabled=True, priority=1)
+    plan = kwp.plan([_fleet_host("ci-box", 0), mbp], {}, probe=lambda h: (1.0, 16), config=cfg)
+    plan.band, plan.spill_reason = "paused", "load"
+    return plan
+
+
+def test_prose_preference_lands_on_the_preferred_host_when_it_can(kanban_home):
+    plan = _soft_plan(kanban_home)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="drop", assignee="alpha", body="scp out nas-fleet:/srv/drop/")
+        res, spawned = _tick(conn, plan)
+    assert spawned == [(tid, "mbp-2026")]
+
+
+def test_prose_preference_falls_back_when_the_preferred_host_cannot_take(kanban_home):
+    """mbp-2026 alone reaches nas-fleet but does not serve alpha: take(only=pref) said pool_full and the card
+    waited. A preference falls back to the other eligible hosts.
+    Mutation: pass only=_prefer to take() with no fallback -> placement_waits pool_full (RED)."""
+    plan = _soft_plan(kanban_home, profiles_mbp=("beta",))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="drop", assignee="alpha", body="scp out nas-fleet:/srv/drop/")
+        res, spawned = _tick(conn, plan)
+    assert spawned == [(tid, "ci-box")], res.placement_waits
+
+
+def test_take_prefer_is_tried_first_then_only(kanban_home):
+    plan = _soft_plan(kanban_home, profiles_mbp=("beta",))
+    assert plan.take("alpha", prefer=("mbp-2026",)).name == "ci-box"
+    plan = _soft_plan(kanban_home)
+    assert plan.take("alpha", prefer=("mbp-2026",)).name == "mbp-2026"
+    # prefer never widens a hard set
+    plan = _soft_plan(kanban_home)
+    assert plan.take("alpha", only=("ci-box",), prefer=("mbp-2026",)).name == "ci-box"
+
+
+def test_admit_outside_the_prose_preference_is_not_host_reach(kanban_home):
+    """`kanban admit --host ci-box` on a card whose prose prefers mbp-2026: the preference is not eligibility."""
+    plan = _soft_plan(kanban_home)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="drop", assignee="alpha", body="scp out nas-fleet:/srv/drop/")
+        spawned = []
+
+        def spawn(task, workspace, *, board=None, placement=None):
+            spawned.append((task.id, placement.name if placement else None))
+            return 4242
+
+        res = kbd.admit_once(conn, tid, "ci-box", spawn_fn=spawn, spillover=plan, max_spawn=64)
+    assert spawned == [(tid, "ci-box")], res.placement_waits

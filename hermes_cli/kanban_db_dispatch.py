@@ -5563,8 +5563,19 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
             _narrowed = tuple(h for h in _pref) if _only is None else tuple(
                 h for h in _only if h.lower() in _want)
             if _narrowed:
-                _only = _narrowed
+                _only = _ProsePreferred(_narrowed, _only)
     return _only, _job
+
+
+class _ProsePreferred(tuple):
+    """The prose-preferred hosts (t_efd1497a) that remember the hard set they narrowed: ``fallback`` (None =
+    any pool host). take() tries the preferred hosts first and falls back; ``kanban admit --host`` judges
+    eligibility on ``fallback`` (Prism 77c519869eff)."""
+
+    def __new__(cls, hosts, fallback):
+        self = super().__new__(cls, hosts)
+        self.fallback = None if fallback is None else tuple(fallback)
+        return self
 
 
 def _reroute_off_held_origin(conn, row, host: str, pause_cache: Optional[dict], *, dry_run: bool = False):
@@ -8667,6 +8678,11 @@ def _dispatch_once_locked(
             if route == "portable":
                 _only, _job = _portable_only(conn, row, row_assignee, spillover, _caps, _cap_only,
                                              _worktree_ports.get(row["id"]))
+            # A prose preference is soft (Prism 77c519869eff): ``_prefer`` is tried first, ``_only`` is the hard set.
+            _prefer = None
+            if isinstance(_only, _ProsePreferred):
+                _only, _prefer = _only.fallback, tuple(_only)
+            _pref_kw = {"prefer": _prefer} if _prefer else {}
             # FWA destination fence (Prism 71b4b90b5c73): a live fwa hold on lane kanban closes a host to NEW work
             # whatever the card's origin. A pin to it waits; a portable pick skips it.
             _held_dest = _kph.held_destinations(list(spillover.hosts), _pause_cache)
@@ -8698,9 +8714,9 @@ def _dispatch_once_locked(
                                              skip_admission=True, **_take_kw)
             elif _only is None:
                 placed_host = spillover.take(row_assignee, pin=route_arg if route in ("pin", "origin") else None,
-                                             board=_board_slug, **_take_kw)
+                                             board=_board_slug, **_pref_kw, **_take_kw)
             else:
-                placed_host = spillover.take(row_assignee, only=_only, board=_board_slug, **_take_kw)
+                placed_host = spillover.take(row_assignee, only=_only, board=_board_slug, **_pref_kw, **_take_kw)
             _decision = getattr(spillover, "last_decision", None)
             _rid = getattr(spillover, "last_reservation", None)
             if placed_host is None:
