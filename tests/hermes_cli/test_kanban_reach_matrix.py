@@ -754,6 +754,23 @@ def test_self_reach_follows_the_alias_ssh_config_login(tmp_path):
                               config_logins={"CI-Box": {"CI.ACE": W}}) == ("ci-box",)
 
 
+def test_self_reach_uses_each_hosts_own_worker_login(tmp_path):
+    """Option A (t_5e87455b): a host cut over to its owner account (hosts.ci-box.ssh_user = ace) self-reaches
+    as ace, not as kanbanw; a host still on the default keeps kanbanw.
+    Mutation: compare against the module SSH_USER instead of PoolHost.ssh_user -> () for ace@ (RED)."""
+    pool = _live_shape(tmp_path / "fleet")
+    hosts = tuple(kwp.PoolHost(name=h, ssh_host=h, ssh_user=("ace" if h == "ci-box" else W), slots=None,
+                               capacity_pct=1.0, absence="optional", profiles=("alpha",), state="active",
+                               enabled=True, priority=i) for i, h in enumerate(pool.hosts))
+    cut = kwp.PoolConfig(**{**pool.__dict__, "pool_hosts": hosts})
+    assert kwp.reach_allowed_hosts(body="reach: ci.ace\nssh ace@ci.ace df", skills=(), pool=cut) == ("ci-box",)
+    assert kwp.reach_allowed_hosts(body="reach: ci.ace\nssh kanbanw@ci.ace df", skills=(), pool=cut) == ()
+    assert "ci-box" in (kwp.prose_reach_preference(body="ssh ace@ci.ace df", skills=(), pool=cut) or ())
+    # ace-ai stays on kanbanw: unchanged.
+    assert kwp.reach_allowed_hosts(body="reach: ace-ai\nssh kanbanw@ace-ai df", skills=(),
+                                   pool=cut) == ("ci-box", "ace-ai", "ace-media")
+
+
 def test_prose_preference_applies_the_self_and_login_rules(tmp_path):
     """Row-17 reader (Apollo 2026-11-20): prose_reach_preference passed only 3 arguments to
     reaching_hosts, so prose `ssh ci.ace` had no self-reach (canon) and no login rule.

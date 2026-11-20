@@ -9,7 +9,10 @@ Hosts come from two files under the fleet root (``<kanban_home>/fleet``):
 * ``kanban-pool.json``: the kanban sidecar (``priority``, ``capacity_pct``,
   ``studio_only`` (deny-list: every other profile is a pool profile) or the
   legacy ``profiles`` allow-list, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
-  capacity_pct?, profiles?}``, ``ssh_user`` locked to ``kanbanw``). Written
+  capacity_pct?, profiles?, ssh_user?, ssh_identity?}``, ``ssh_user``: the worker login, a default that a
+  host row may override, never ``root``; t_5e87455b, Option A; ``ssh_identity``: the worker
+  key's private-key path, same default/override, required for any login other than kanbanw).
+  Written
   only by hermes-home ``scripts/fleet-host``.
 
 Drift (PRD §5.1 table): a structural error refuses the whole pool; a per-host
@@ -57,7 +60,16 @@ from hermes_cli import allocation_policy as _policy
 logger = logging.getLogger(__name__)
 
 ROLE = "kanban-worker"
+# The legacy worker login; the sidecar's ``ssh_user`` (and ``hosts.<id>.ssh_user``) decides
+# per host since Option A (Ace 2026-11-20, t_5e87455b: workers run as each host's owner).
 SSH_USER = "kanbanw"
+# A plain POSIX login (it lands in an ssh argv as ``user@host``), and never root.
+_SSH_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+# The worker key (an absolute path; it lands in an ssh argv as ``-i <path>``). A login other than
+# kanbanw is the host OWNER's account, where the Studio's default key is the owner's own
+# unrestricted key: only a dedicated key, pinned with IdentitiesOnly, reaches the forced-command
+# worker wrapper (Apollo ruling 2026-11-20 03:55, t_911ce504).
+_SSH_IDENTITY_RE = re.compile(r"/[A-Za-z0-9._/~+@-]+")
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
 # Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
@@ -101,9 +113,9 @@ _ROLES_ROW = frozenset({"roles", "state"})
 # Optional audit field {by, card, reason, at} the fleet-host CLI stamps on a row (who/why/when of the last state
 # change); validated by the router's registry, never read for placement here.
 _ROLES_ROW_OPTIONAL = frozenset({"last_change"})
-_SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
+_SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "ssh_identity", "capacity_pct", "priority",
                           "profiles", "studio_only", "studio_bound_skills", "hosts"})
-_SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles"})
+_SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles", "ssh_user", "ssh_identity"})
 _ABSENCE = ("required", "optional")
 _STATES = ("active", "draining")
 
@@ -223,6 +235,7 @@ class PoolHost:
     enabled: bool
     priority: int
     ssh_port: int = 22
+    ssh_identity: Optional[str] = None   # the worker key; None = ssh's own defaults (kanbanw)
 
     @property
     def target(self) -> str:
@@ -317,6 +330,15 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
     return out
 
 
+def _ssh_identity_ok(path) -> bool:
+    return isinstance(path, str) and bool(_SSH_IDENTITY_RE.fullmatch(path)) and ".." not in path.split("/")
+
+
+def _ssh_user_ok(user) -> bool:
+    return (isinstance(user, str) and bool(_SSH_USER_RE.fullmatch(user))
+            and user != "root")
+
+
 def validate_sidecar(doc) -> List[str]:
     """Structural errors of ``kanban-pool.json`` (any error refuses it whole)."""
     if not isinstance(doc, dict):
@@ -326,8 +348,10 @@ def validate_sidecar(doc) -> List[str]:
         errs.append(f"unknown top-level keys {sorted(set(doc) - _SIDECAR_TOP)}")
     if isinstance(doc.get("schema"), bool) or doc.get("schema") != 1:
         errs.append(f"schema must be 1, not {doc.get('schema')!r}")
-    if doc.get("ssh_user") != SSH_USER:
-        errs.append(f"ssh_user must be {SSH_USER!r} (locked), not {doc.get('ssh_user')!r}")
+    if not _ssh_user_ok(doc.get("ssh_user")):
+        errs.append(f"ssh_user must be a plain login other than root, not {doc.get('ssh_user')!r}")
+    if "ssh_identity" in doc and not _ssh_identity_ok(doc["ssh_identity"]):
+        errs.append(f"ssh_identity must be an absolute key path, not {doc['ssh_identity']!r}")
     if "capacity_pct" in doc and not _pct(doc["capacity_pct"]):
         errs.append(f"capacity_pct must be in (0, 1], not {doc['capacity_pct']!r}")
     for key in ("profiles", "studio_only", "studio_bound_skills"):
@@ -345,10 +369,16 @@ def validate_sidecar(doc) -> List[str]:
         if not isinstance(hid, str) or not _PLAIN_RE.fullmatch(hid) or not isinstance(row, dict):
             errs.append(f"hosts.{hid!r} is not a plain id with an object row")
             continue
-        if "ssh_user" in row:
-            errs.append(f"hosts.{hid}.ssh_user: per-host override refused (locked {SSH_USER})")
-        if set(row) - _SIDECAR_ROW - {"ssh_user"}:
-            errs.append(f"hosts.{hid}: unknown keys {sorted(set(row) - _SIDECAR_ROW - {'ssh_user'})}")
+        if "ssh_user" in row and not _ssh_user_ok(row["ssh_user"]):
+            errs.append(f"hosts.{hid}.ssh_user must be a plain login other than root, not {row['ssh_user']!r}")
+        if "ssh_identity" in row and not _ssh_identity_ok(row["ssh_identity"]):
+            errs.append(f"hosts.{hid}.ssh_identity must be an absolute key path, not {row['ssh_identity']!r}")
+        user = row.get("ssh_user", doc.get("ssh_user"))
+        if user != SSH_USER and not row.get("ssh_identity", doc.get("ssh_identity")):
+            errs.append(f"hosts.{hid}: login {user!r} needs ssh_identity (a dedicated worker key: the "
+                        "owner's default key would skip the worker wrapper)")
+        if set(row) - _SIDECAR_ROW:
+            errs.append(f"hosts.{hid}: unknown keys {sorted(set(row) - _SIDECAR_ROW)}")
         if not isinstance(row.get("enabled"), bool):
             errs.append(f"hosts.{hid}.enabled must be true|false")
         if row.get("absence") not in _ABSENCE:
@@ -457,7 +487,9 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             continue
         role_slots, state = roles[hid]
         hosts.append(PoolHost(
-            name=hid, ssh_host=hid, ssh_user=SSH_USER, slots=role_slots[ROLE],
+            name=hid, ssh_host=hid, ssh_user=row.get("ssh_user", sidecar["ssh_user"]),
+            ssh_identity=row.get("ssh_identity", sidecar.get("ssh_identity")),
+            slots=role_slots[ROLE],
             capacity_pct=float(row.get("capacity_pct", gcap)), absence=row["absence"],
             profiles=tuple(p for p in row.get("profiles", gprofiles) if p.lower() not in deny),
             state=state, enabled=True,
@@ -474,6 +506,23 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     # Not a pool-drift warning: a missing matrix is the normal pre-cron state
     # and the classifier is fail-closed without it (reach_status carries it).
     reach, aliases, reach_status = read_reach(fleet_dir)
+    caps, reach_logins = read_caps(fleet_dir), read_reach_logins(fleet_dir)
+    # A row probed under another login (the kanbanw row of a host just cut over
+    # to its owner, t_5e87455b) proves nothing for the new login: drop its
+    # reach, caps and logins until the matrix cron re-probes it (fail closed).
+    # A row with no ``user`` (schema 1) is the kanbanw-era cron's: it counts
+    # only for the legacy kanbanw login (Prism e315557dce42).
+    probed = read_reach_users(fleet_dir)
+    for h in hosts:
+        key = h.name.lower()
+        was = probed.get(key, SSH_USER)
+        if was != h.ssh_user and any(key in t for t in (reach, caps, reach_logins)):
+            warnings.append(f"kanban pool: reach row for {h.name} was probed as {was}, "
+                            f"worker login is {h.ssh_user} (row ignored until re-probed)")
+            for table in (reach, caps, reach_logins):
+                table.pop(h.name.lower(), None)
+    if reach_status == "ok" and not reach:
+        reach_status = "stale"
     # ``hosts`` is every host the pool files KNOW, placement-eligible or not:
     # a pin on a dropped host (role but no row, row not in priority) must
     # still resolve as a pin and wait at take(), never fall back (Prism 4271004b).
@@ -485,8 +534,8 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         reach=reach, reach_aliases=aliases, reach_status=reach_status,
         ssh_hosts=known_ssh_hosts(fleet_dir),
         pin_aliases=pin_aliases(fleet_dir),
-        caps=read_caps(fleet_dir),
-        reach_logins=read_reach_logins(fleet_dir),
+        caps=caps,
+        reach_logins=reach_logins,
     )
 
 
@@ -635,6 +684,18 @@ def read_reach_logins(fleet_dir: Path) -> Dict[str, Dict[str, str]]:
             out[hid.lower()] = {a.lower(): u for a, u in table.items()
                                 if isinstance(a, str) and a and isinstance(u, str) and u}
     return out
+
+
+def read_reach_users(fleet_dir: Path) -> Dict[str, str]:
+    """``{host: login the matrix row was probed as}`` (each row's ``user``).
+    Rows without one are left out."""
+    try:
+        doc = _read_json(Path(fleet_dir) / REACH_FILE)
+    except (OSError, ValueError):
+        return {}
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    return {hid.lower(): row["user"] for hid, row in (hosts.items() if isinstance(hosts, dict) else ())
+            if isinstance(hid, str) and isinstance(row, dict) and isinstance(row.get("user"), str)}
 
 
 _HOST_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
@@ -1092,6 +1153,7 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
                    aliases: Iterable[str], canon: Optional[Mapping[str, str]] = None,
                    logins: Optional[Mapping[str, Collection[str]]] = None,
                    self_user: str = SSH_USER,
+                   host_users: Optional[Mapping[str, str]] = None,
                    config_logins: Optional[Mapping[str, Mapping[str, str]]] = None,
                    body_aliases: Iterable[str] = ()) -> Tuple[str, ...]:
     """Worker hosts whose fresh row shows ``rc == 0`` for EVERY target (or,
@@ -1109,7 +1171,8 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
     names for the target (``logins``, :func:`ssh_target_logins`: ``user@``,
     ``-l``, ``-o User=``), else the user the alias resolves to in that host's
     ssh config (``config_logins[host][alias]``, :func:`read_reach_logins`).
-    Every one must be ``self_user``. ``ssh ace@ci.ace`` is user ace, and a bare
+    Every one must be that host's worker login: ``host_users[host]``
+    (:func:`worker_logins`, the sidecar's per-host ``ssh_user``), else ``self_user``. ``ssh ace@ci.ace`` is user ace, and a bare
     ``ssh ci.ace`` whose config sets ``User fleetw`` is fleetw: a worker placed
     on ci-box is kanbanw, so neither self-reaches; a peer whose fresh row
     proves the alias takes the card. No recorded config login: no self-reach.
@@ -1128,8 +1191,10 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
 
     mentioned = {a.lower() for a in (*want, *body_aliases, *named)}
 
+    users = {k.lower(): v for k, v in (host_users or {}).items()}
+
     def as_worker(host: str, t: str) -> bool:
-        return (named.get(t) or {config.get(host, {}).get(t)}) == {self_user}
+        return (named.get(t) or {config.get(host, {}).get(t)}) == {users.get(host, self_user)}
 
     def reached(host: str, row: Mapping[str, int], a: str) -> bool:
         if row.get(a) == 0:
@@ -1142,6 +1207,11 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
                    for b in mentioned if b == host or canon.get(b) == host)
 
     return tuple(h for h, row in reach.items() if all(reached(h.lower(), row, a) for a in want))
+
+
+def worker_logins(pool) -> Dict[str, str]:
+    """``{host id: worker ssh login}`` of the pool's enabled hosts (t_5e87455b)."""
+    return {h.name.lower(): h.ssh_user for h in (getattr(pool, "pool_hosts", ()) or ())}
 
 
 def load_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> Tuple[List[PoolHost], List[str]]:
@@ -1611,7 +1681,7 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     _b, prose = host_bound_targets(REACH_LINE_RE.sub("", body or ""), (), aliases, pin_hosts=pool_hosts,
                                    ssh_hosts=getattr(pool, "ssh_hosts", None))
     return reaching_hosts(reach, named, aliases, getattr(pool, "pin_aliases", None),
-                          logins=ssh_target_logins(body),
+                          logins=ssh_target_logins(body), host_users=worker_logins(pool),
                           config_logins=getattr(pool, "reach_logins", None), body_aliases=prose)
 
 
@@ -1637,6 +1707,7 @@ def prose_reach_preference(*, body: Optional[str], skills: Iterable[str], pool,
     # Same self-reach and login rules as a declared target (t_8c580b20).
     out = tuple(h for h in reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases,
                                           getattr(pool, "pin_aliases", None), logins=ssh_target_logins(body),
+                                          host_users=worker_logins(pool),
                                           config_logins=getattr(pool, "reach_logins", None))
                 if h.lower() in enabled)
     return out or None
@@ -1732,7 +1803,14 @@ def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
     if host.ssh_port != 22:
         argv += ["-p", str(host.ssh_port)]
-    return argv + [host.target, remote_cmd]
+    return argv + identity_args(getattr(host, "ssh_identity", None)) + [host.target, remote_cmd]
+
+
+def identity_args(path: Optional[str]) -> List[str]:
+    """``-i <key> -o IdentitiesOnly=yes`` for a pinned worker key, else nothing: without
+    IdentitiesOnly ssh still offers the agent's and the default keys, and the owner's own key
+    would log in past the worker wrapper."""
+    return ["-i", path, "-o", "IdentitiesOnly=yes"] if path else []
 
 
 @dataclass(frozen=True)
@@ -1756,6 +1834,7 @@ class HostSample:
 # task on the host, while ``nproc`` honours the probing user's cgroup quota
 # (kanbanw's user-1001.slice CPUQuota=800% made it print 8 on 24/32 cores,
 # t_2dc3be98), which shrank the v0.1 refuse line to 0.8 x 8 = 6.4 load1.
+# getconf reads the host, not the login, so it holds for any worker ssh_user.
 _NCPU_CMD = "getconf _NPROCESSORS_ONLN"
 
 
@@ -1765,7 +1844,7 @@ BOARDS_MARKER = "@@hermes-hostable-boards"
 
 def _boards_cmd(workspaces_root: str) -> str:
     """The board dirs under ``workspaces_root`` that exist AND that the probing
-    uid (the worker's ``kanbanw``) can create a workspace in."""
+    uid (the host's worker login, ``PoolHost.ssh_user``) can create a workspace in."""
     import shlex
     root = shlex.quote(str(workspaces_root).rstrip("/") or "/")
     return (f"echo {BOARDS_MARKER}; for d in {root}/*/; do "

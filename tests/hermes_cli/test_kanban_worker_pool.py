@@ -262,9 +262,135 @@ def test_reader_drops_one_host_on_disagreement_and_refuses_structure(tmp_path):
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
     assert [h.name for h in hosts] == ["ace-ai", "ace-media"]
     assert any("ace-x" in w for w in warnings)
-    side["ssh_user"] = "ace"
+    side["ssh_user"] = "root"
     _write_pool(tmp_path, sidecar=side)
     assert kwp.load_pool(tmp_path, kanban_cfg={})[0] == []
+
+
+def test_reader_takes_a_per_host_ssh_user_and_falls_back_to_the_top_level(tmp_path):
+    """Option A (Ace 2026-11-20, t_5e87455b): a pool host's worker may run as the host's owner
+    account. ``hosts.<id>.ssh_user`` overrides the top-level ``ssh_user`` for that host only, so
+    the cutover flips host by host; every ssh the dispatcher makes to the host uses it."""
+    from hermes_cli import kanban_worker_hosts as kwh
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
+    assert warnings == []
+    by = {h.name: h for h in hosts}
+    assert by["ace-ai"].ssh_user == "ace" and by["ace-ai"].target == "ace@ace-ai"
+    assert by["ace-media"].ssh_user == "kanbanw"
+    assert kwp._ssh_argv(by["ace-ai"], "true")[-2] == "ace@ace-ai"
+    assert kwh.placement_env(by["ace-ai"], "/w")["TERMINAL_SSH_USER"] == "ace"
+    # the top level is a default, no longer locked to kanbanw
+    side["ssh_user"] = "alexgierczyk"
+    side["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h.ssh_user for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    assert by == {"ace-ai": "ace", "ace-media": "alexgierczyk"}
+
+
+def test_reader_ignores_a_reach_row_probed_under_another_login(tmp_path):
+    """Prism dcd859b63482: the matrix cron re-probes once a day (rows stay fresh 36 h). After a
+    host flips to its owner login, its kanbanw row proves nothing for the new login: its reach,
+    caps and logins are dropped until a row probed as the new login arrives."""
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    row = {"at": time.time(), "reach": {"studio": 0}, "caps": {"studio-state": True},
+           "logins": {"studio": "kanbanw"}, "user": "kanbanw"}
+    doc = {"schema": 1, "hosts": {"ace-ai": dict(row), "ace-media": dict(row)}}
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(cfg.reach) == {"ace-media"} and cfg.reach_status == "ok"
+    assert set(cfg.caps) == {"ace-media"} and set(cfg.reach_logins) == {"ace-media"}
+    assert any("ace-ai was probed as kanbanw" in w for w in cfg.warnings)
+    # the re-probe as the new login is read again
+    doc["hosts"]["ace-ai"]["user"] = "ace"
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(cfg.reach) == {"ace-ai", "ace-media"} and not any("probed as" in w for w in cfg.warnings)
+
+
+def test_unlabeled_reach_row_counts_only_for_the_legacy_kanbanw_login(tmp_path):
+    """Prism e315557dce42: a schema-1 row with no ``user`` was written by the kanbanw-era cron.
+    It still proves reach for a kanbanw host, but not for a host cut over to its owner login."""
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    row = {"at": time.time(), "reach": {"ci-box": 0}}
+    doc = {"schema": 1, "hosts": {"ace-ai": dict(row), "ace-media": dict(row)}}
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    pool = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(pool.reach) == {"ace-media"}
+    allowed = kwp.reach_allowed_hosts(body="reach: ci-box", skills=(), pool=pool)
+    assert "ace-ai" not in allowed and "ace-media" in allowed
+    assert any("ace-ai was probed as kanbanw" in w for w in pool.warnings)
+
+
+def test_owner_login_pins_the_worker_key_on_every_ssh_path(tmp_path):
+    """Apollo ruling 2026-11-20 03:55 (t_911ce504): on an owner login the worker env comes from a
+    forced command bound to a dedicated worker key. The Studio's default key is the owner's own,
+    unrestricted, so every dispatcher ssh to that host names the key with IdentitiesOnly=yes:
+    the probe/carry argv, the worker's terminal backend (TERMINAL_SSH_KEY) and the custody probe.
+    A non-kanbanw login with no key refuses the sidecar."""
+    from hermes_cli import kanban_worker_hosts as kwh
+    from tools.environments.ssh import SSHEnvironment
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    _write_pool(tmp_path, sidecar=side)
+    assert any("ace-ai: login 'ace' needs ssh_identity" in e for e in kwp.validate_sidecar(side))
+    assert kwp.read_pool(tmp_path).refused == "sidecar"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/Users/x/.ssh/kanban_worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    argv = kwp._ssh_argv(by["ace-ai"], "true")
+    assert argv[argv.index("-i") + 1] == "/Users/x/.ssh/kanban_worker" and "IdentitiesOnly=yes" in argv
+    assert argv.index("IdentitiesOnly=yes") < argv.index("ace@ace-ai")
+    env = kwh.placement_env(by["ace-ai"], "/w")
+    assert env["TERMINAL_SSH_KEY"] == "/Users/x/.ssh/kanban_worker"
+    ssh = SSHEnvironment.__new__(SSHEnvironment)
+    ssh.port, ssh.key_path = 22, env["TERMINAL_SSH_KEY"]
+    assert ssh._target_flags("-p") == ["-i", "/Users/x/.ssh/kanban_worker", "-o", "IdentitiesOnly=yes"]
+    seen = []
+    kwh.remote_workspace_has_content(json.dumps({"env": env}),
+                                     runner=lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})())
+    assert seen and seen[0][seen[0].index("-i") + 1] == "/Users/x/.ssh/kanban_worker" and "IdentitiesOnly=yes" in seen[0]
+    # kanbanw with no key keeps today's argv (ssh's own defaults)
+    assert "-i" not in kwp._ssh_argv(by["ace-media"], "true") and "TERMINAL_SSH_KEY" not in \
+        kwh.placement_env(by["ace-media"], "/w")
+    # a top-level key is the default for every host; a per-host key beats it
+    side["ssh_identity"] = "/k/default"
+    _write_pool(tmp_path, sidecar=side)
+    keys = {h.name: h.ssh_identity for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    assert keys == {"ace-ai": "/Users/x/.ssh/kanban_worker", "ace-media": "/k/default"}
+    # a relative, spaced or dot-dot path refuses
+    for bad in ("k/rel", "/a b", "/a/../b", 5):
+        side["hosts"]["ace-ai"]["ssh_identity"] = bad
+        assert any("ssh_identity" in e for e in kwp.validate_sidecar(side)), bad
+
+
+@pytest.mark.parametrize("where,value", [
+    ("top", None), ("top", ""), ("top", "root"), ("top", "a b"), ("top", 5), ("top", "-oProxyCommand=x"),
+    ("row", ""), ("row", "root"), ("row", "ace@ci-box"), ("row", None),
+])
+def test_reader_refuses_a_bad_ssh_user(tmp_path, where, value):
+    """A worker never logs in as root, and the name must be a plain login (it lands in an ssh
+    argv): anything else refuses the sidecar, as every structural error does."""
+    side = _write_pool(tmp_path)
+    if where == "top":
+        if value is None:
+            side.pop("ssh_user")
+        else:
+            side["ssh_user"] = value
+    else:
+        side["hosts"]["ace-ai"]["ssh_user"] = value
+    _write_pool(tmp_path, sidecar=side)
+    assert any("ssh_user" in e for e in kwp.validate_sidecar(side))
+    assert kwp.read_pool(tmp_path).refused == "sidecar"
 
 
 def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_row_keys(tmp_path):
