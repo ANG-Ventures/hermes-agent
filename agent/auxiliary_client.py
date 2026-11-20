@@ -6244,6 +6244,9 @@ def resolve_provider_client(
         # pre-filling it sends the image to a model that cannot accept one and the Portal 404s. Leave
         # ``model`` unset and let the Portal slot through; only an explicit caller model may override it.
         model = _get_aux_model_for_provider(provider) or _read_main_model_for_aux() or model
+    # Every aux / fallback / MoA client is built here: a slot name never reaches a branch or the wire.
+    from hermes_cli.model_registry import slot_resolve
+    model = slot_resolve(model)[0]
     req = _ResolveRequest(
         provider, original_provider, model, async_mode, raw_codex,
         explicit_base_url, explicit_api_key, api_mode, main_runtime, is_vision, task,
@@ -6901,6 +6904,9 @@ def _resolve_task_provider_model(
             resolved_model = cfg_model
             cfg_base_url = None
             cfg_api_key = None
+    # A slot name (``sol``) in auxiliary.<task>.model or the explicit kwarg becomes its current id.
+    from hermes_cli.model_registry import slot_resolve
+    resolved_model = slot_resolve(resolved_model)[0]
     # One shared alias table with resolve_runtime_provider(): ``provider: openai`` routes the same
     # way here (compression/vision/title) and on the runtime path (background review, curator, MoA).
     from hermes_cli.runtime_provider_custom import expand_direct_api_alias

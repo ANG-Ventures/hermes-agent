@@ -199,8 +199,10 @@ def require(
     force_reason: Optional[str] = None,
     flag: str = "--force-model",
 ) -> ModelResolution:
-    """:func:`resolve`, raising :class:`UnknownModel` on a refused id."""
-    verdict = resolve(provider, model, force_reason=force_reason)
+    """:func:`resolve`, raising :class:`UnknownModel` on a refused id.
+
+    A slot (``sol``) is checked as the id it resolves to; writers still store the slot."""
+    verdict = resolve(provider, slot_resolve(model)[0], force_reason=force_reason)
     if not verdict.ok:
         raise UnknownModel(verdict.provider or "", verdict.model or "", verdict.valid_ids, flag=flag)
     return verdict
@@ -212,6 +214,8 @@ def invalid_pin_reason(provider: Optional[str], model: Optional[str]) -> Optiona
     The dispatcher's pre-spawn form: a row written by hand or before the writers
     validated is caught here, every tick, without ever raising.
     """
+    # A slot pin (``sol``) is valid when the id it resolves to is; the row keeps the slot.
+    model = slot_resolve(model)[0]
     try:
         verdict = resolve(provider, model, resolve_aliases=False)
     except Exception:

@@ -3735,7 +3735,7 @@ class GatewaySlashCommandsMixin(
                 "capabilities": dict(result.runtime_capabilities or {}),
             }
             # No durable work before confirmation. The owned turn saves after delivery.
-            from hermes_cli.model_switch import format_model_for_display
+            from hermes_cli.model_switch import format_switch_target
             self._apply_session_model_override_in_memory(session_key, _new_override)
             if one_turn:
                 # A repeated --once before the turn runs must keep the EARLIEST snapshot: the
@@ -3789,7 +3789,7 @@ class GatewaySlashCommandsMixin(
             # Build confirmation message with full metadata
             _mct.phase("confirm")
             provider_label = result.provider_label or result.target_provider
-            lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
+            lines = [t("gateway.model.switched", model=format_switch_target(result.new_model))]
             lines.append(t("gateway.model.provider_label", provider=_with_resolved_route(provider_label, result)))
             _fast_row = self._fast_unavailable_model_switch_row(result)
             if _fast_row:

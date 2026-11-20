@@ -2755,6 +2755,9 @@ def get_model_context_length(
         ctx = _resolve_moa_context_length(model, custom_providers)
         if ctx is not None:
             return ctx
+    # A slot name (``sol``) has the window of the id it resolves to, not the unknown-model fallback.
+    from hermes_cli.model_registry import slot_resolve
+    model = slot_resolve(model)[0]
     ctx = _config_override_context_length(model, base_url, provider, custom_providers)
     if ctx is not None:
         return ctx

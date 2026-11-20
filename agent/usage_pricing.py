@@ -2581,6 +2581,14 @@ def resolve_billing_route(
     provider_name = (provider or "").strip().lower()
     base = (base_url or "").strip().lower()
     model = (model_name or "").strip()
+    # A slot name (``sol``, ``cpa/sol``) is priced as the id it resolves to; a recorded slot turn
+    # heals on the next reprice. Literal ids and a missing view pass through.
+    from hermes_cli.model_registry import slot_resolve
+    _resolved, _slot = slot_resolve(model)
+    if _slot:
+        model = str(_resolved)
+        if "/" in model and model.split("/", 1)[0].lower() == provider_name:
+            model = model.split("/", 1)[1]  # ``cpa/sol`` on provider cpa: the lane is the provider
     if not provider_name and "/" in model:
         inferred_provider, bare_model = model.split("/", 1)
         if inferred_provider in {"anthropic", "openai", "google"}:

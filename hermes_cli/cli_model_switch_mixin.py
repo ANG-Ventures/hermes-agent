@@ -124,8 +124,8 @@ def _print_switch_summary(cli, result, old_model, *, one_turn: bool, strict_cont
     context-resolution errors propagate; the picker path swallows them.
     """
     from cli import _cprint
-    from hermes_cli.model_switch import format_model_for_display, resolve_display_context_length
-    _display_new = format_model_for_display(result.new_model)
+    from hermes_cli.model_switch import format_switch_target, resolve_display_context_length
+    _display_new = format_switch_target(result.new_model)
     _cprint(f"  {t('cli.model.switched', model=_display_new)}")
     _cprint(f"    {t('gateway.model.provider_label', provider=result.provider_label or result.target_provider)}")
     if result.target_provider == "moa":

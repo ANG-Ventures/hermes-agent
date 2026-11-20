@@ -453,10 +453,10 @@ class GatewayModelCommandsMixin:
     ) -> str:
         """Confirmation text with full metadata (display form shortens opaque Palantir IDs)."""
         from gateway.run import _load_gateway_config
-        from hermes_cli.model_switch import format_model_for_display, resolve_display_context_length_async
+        from hermes_cli.model_switch import format_switch_target, resolve_display_context_length_async
 
         lines = [
-            t("gateway.model.switched", model=format_model_for_display(result.new_model)),
+            t("gateway.model.switched", model=format_switch_target(result.new_model)),
             t("gateway.model.provider_label", provider=result.provider_label or result.target_provider),
         ]
         # Provider-aware chain: Codex OAuth, Copilot and Nous caps win over the raw models.dev entry.

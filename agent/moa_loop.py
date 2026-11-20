@@ -305,7 +305,8 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     on error — never cached, or a transient error would pin bare kwargs for a TTL.
     """
     provider = str(slot.get("provider") or "").strip()
-    model = str(slot.get("model") or "").strip()
+    from hermes_cli.model_registry import slot_resolve  # a preset member named ``opus`` -> its id
+    model = str(slot_resolve(str(slot.get("model") or "").strip())[0] or "")
     # hermes_home_key() in the key: the resolved api_key/base_url are per-profile, and under a
     # multiplex gateway two profiles can share (provider, model) with different accounts.
     from hermes_constants import hermes_home_key

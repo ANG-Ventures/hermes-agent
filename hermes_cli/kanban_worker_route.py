@@ -249,8 +249,10 @@ def _norm(value) -> str:
 def _model_key(value) -> str:
     """A model id compared as a KEY: byte-exact after trimming whitespace (t_75fdedd4). Provider
     ids are canonical lower-case aliases (``_norm``); model ids are not: ``custommodel`` is not
-    ``CustomModel`` (Prism 20f583066d18, #1921), so a pin on one must not admit the other."""
-    return str(value or "").strip()
+    ``CustomModel`` (Prism 20f583066d18, #1921), so a pin on one must not admit the other.
+    A slot pin (``sol``) keys as the id it resolves to, the id the worker serves."""
+    from hermes_cli.model_registry import slot_resolve
+    return str(slot_resolve(str(value or "").strip())[0] or "")
 
 
 def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:

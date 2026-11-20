@@ -349,6 +349,8 @@ def _require_pinned_command(command: Optional[str], message: str) -> None:
 
 def _credential_bundle(model, provider, base_url, api_key, api_mode, request_overrides, **extra) -> dict:
     """The child credential dict every branch of ``_resolve_delegation_credentials`` returns."""
+    from hermes_cli.model_registry import slot_resolve  # delegation.model: sol -> its id
+    model = slot_resolve(model)[0]
     return {
         "model": model, "provider": provider, "base_url": base_url, "api_key": api_key, "api_mode": api_mode,
         "request_overrides": request_overrides, **extra,

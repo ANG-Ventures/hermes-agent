@@ -23056,7 +23056,8 @@ def _shim_model_rank(model: Optional[str]) -> Optional[int]:
     rank the same as the bare model. Unknown families never rank, so a cap
     never fires on a model the dispatcher cannot place (fail-open to today).
     """
-    name = str(model or "").rsplit("/", 1)[-1].lower()
+    from hermes_cli.model_registry import slot_resolve  # a slot card (``opus``) ranks as its id
+    name = str(slot_resolve(str(model or ""))[0] or "").rsplit("/", 1)[-1].lower()
     # Only recognized Claude model-id shapes rank (``claude-<family>-<digit>``
     # e.g. claude-opus-5, claude-sonnet-4-5, claude-haiku-4-5-20251001).
     # A custom alias (``acme/opus-v1``, ``claude-custom-opus-v1``) never ranks,

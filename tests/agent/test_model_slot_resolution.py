@@ -101,9 +101,9 @@ def test_slot_seat_gets_the_ids_context_and_price(home):
     assert seat.model == SOL_ID
     assert seat._model_slot == "sol"
     assert literal._model_slot is None
-    # The bug class: the slot name alone falls to the unknown-model fallback.
+    # P2b (t_2f4dc291): the metadata lookup itself resolves the slot now, for every seat.
     want_ctx = get_model_context_length(SOL_ID, provider="cpa")
-    assert get_model_context_length("sol", provider="cpa") != want_ctx
+    assert get_model_context_length("sol", provider="cpa") == want_ctx
     assert seat.context_compressor.context_length == literal.context_compressor.context_length == want_ctx
     assert get_pricing_entry(seat.model, provider="cpa") is not None
     assert get_pricing_entry(seat.model, provider="cpa") == get_pricing_entry(SOL_ID, provider="cpa")
