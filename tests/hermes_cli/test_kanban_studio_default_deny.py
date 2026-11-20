@@ -619,6 +619,20 @@ def test_the_split_identity_name_also_declares_its_need():
     assert ksa.need_refusal("browser-public", None) is None
 
 
+def test_a_legacy_named_override_holds_for_the_derived_identity_name(operator):
+    # Prism b4a322a16d7c: the split map derives requires:browser-identity; a live override named browser-session
+    # (and an allow list naming either) still releases it, and the reverse.
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: browser-session")
+        ksa.override(conn, tid, "browser-session", "reads the signed-in order page", need="signed-in-identity")
+        assert ksa.live_override(conn, tid, "browser-identity") is not None
+        assert ksa.live_override(conn, tid, "browser-session") is not None
+        assert ksa.live_override(conn, tid, "browser-public") is None
+    assert ksa.allowed("browser-identity", frozenset({"browser-session"}))
+    assert ksa.allowed("browser-session", frozenset({"browser-identity"}))
+    assert not ksa.allowed("browser-public", frozenset({"browser-session"}))
+
+
 def test_need_is_only_checked_for_browser_session(operator):
     with kb.connect_closing() as conn:
         tid = _card(conn)

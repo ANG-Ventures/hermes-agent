@@ -219,11 +219,10 @@ class CapabilityTick:
             return WARN   # F11: a malformed map degrades every capability to warn
         if cap.startswith(UNKNOWN_PREFIX):
             return ENFORCE  # F4: an unknown word keeps the card local
-        names = self.cmap.names(cap)   # an alias and its target share one mode (t_f935cb6f)
-        for n in sorted(names):
-            if n in self.cmap.soft:
-                return WARN if self.cmap.soft[n] else ENFORCE   # the map's kill switch, per class
-        return ENFORCE if names & set(self.enforce) else WARN
+        soft = group_soft(self.cmap, cap)   # an alias and its target share one mode (t_f935cb6f)
+        if soft is not None:
+            return WARN if soft else ENFORCE   # the map's kill switch, per class
+        return ENFORCE if self.cmap.names(cap) & set(self.enforce) else WARN
 
     @property
     def error(self) -> Optional[str]:
@@ -342,6 +341,15 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
     if not isinstance(tier, dict) or any(c not in known or v != IDENTITY_ONLY for c, v in tier.items()):
         raise ValueError(f"hosts.{STUDIO_ROW}.studio_tier must map known capabilities to {IDENTITY_ONLY!r}")
     return tuple(names), tuple(sniff), out, soft, frozenset(tier)
+
+
+def group_soft(cmap: "CapabilityMap", cap: str) -> Optional[bool]:
+    """The map's ``soft`` for ``cap``'s alias group (target and aliases share one mode, t_f935cb6f), the
+    first set one in name order; None when no name of the group sets it."""
+    for n in sorted(cmap.names(cap)):
+        if n in cmap.soft:
+            return cmap.soft[n]
+    return None
 
 
 def parse_aliases(caps: Mapping[str, Any]) -> Dict[str, str]:
@@ -816,9 +824,9 @@ def spawn_env(fleet_dir: Path, kanban_cfg: Any) -> str:
     mode = effective_mode(mode, cmap)
     if mode == ENFORCE and cmap.soft:
         # The map's per-class hardness wins, exactly as CapabilityTick.mode_of
-        # decides placement (Prism b8ddb038892b on #1902).
+        # decides placement (Prism b8ddb038892b on #1902), judged per alias group (Prism 5f58fcfad85b).
         enforce = tuple(c for c in dict.fromkeys([*enforce, *(k for k, v in cmap.soft.items() if not v)])
-                        if not cmap.soft.get(c, False))
+                        if not group_soft(cmap, c))
     if mode == ENFORCE and cmap.aliases:
         # The worker's gates ask by either word (t_f935cb6f): every name of an enforced capability is enforced.
         enforce = tuple(dict.fromkeys(n for c in enforce for n in (c, *sorted(cmap.names(c) - {c}))))

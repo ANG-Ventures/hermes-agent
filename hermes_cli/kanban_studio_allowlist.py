@@ -99,8 +99,15 @@ def head(part: str) -> str:
     return re.split(r"[:(]", part, maxsplit=1)[0].strip()
 
 
+def _identity_names(part: str) -> frozenset:
+    """Both spellings of the identity capability when ``part`` is one (t_f935cb6f, Prism b4a322a16d7c): the map now
+    derives ``browser-identity`` where older allow lists and live overrides say ``browser-session``."""
+    from hermes_cli.kanban_host_capabilities import BROWSER_IDENTITY_CAPS
+    return BROWSER_IDENTITY_CAPS if head(part) in BROWSER_IDENTITY_CAPS else frozenset({part})
+
+
 def _covered(part: str, words) -> bool:
-    return part in words or head(part) in words
+    return part in words or head(part) in words or bool(_identity_names(part) & set(words))
 
 
 def allowed(capability: Optional[str], allow) -> bool:
@@ -123,6 +130,7 @@ def live_override(conn, task_id: str, capability: Optional[str], *, now: Optiona
     ``once``: no Studio start after it (:func:`_spent_on_studio`). ``until``: ``now`` before it."""
     want = set(parts(capability))
     want |= {head(p) for p in want}
+    want |= {n for p in list(want) for n in _identity_names(p)}
     if not want:
         return None
     for p in _live_overrides(conn, task_id, now):

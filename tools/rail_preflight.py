@@ -200,7 +200,10 @@ def browser_capability_error(*, identity: bool = False) -> Optional[str]:
         return None
     from tools.browser_tool_cdp import _get_cdp_override_raw
     from hermes_cli.kanban_placement_failfast import capability_gate
-    absent = capability_gate("browser-session" if identity or _get_cdp_override_raw() else "browser-public")
+    from tools.browser_tool_cloud import _use_real_profile
+    # browser.use_real_profile opens a copy of the user's signed-in profile: identity work too (Prism a270aad9f004).
+    absent = capability_gate("browser-session" if identity or _get_cdp_override_raw() or _use_real_profile()
+                             else "browser-public")
     if absent is not None:
         record_absent(absent)
     return absent

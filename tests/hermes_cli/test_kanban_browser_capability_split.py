@@ -108,6 +108,20 @@ def test_alias_and_target_share_one_mode_and_the_worker_env_enforces_both(board)
     assert env["browser-identity"] == env["browser-session"] == env["browser-public"] == khc.ENFORCE
 
 
+@pytest.mark.parametrize("soft_on", ["browser-identity", "browser-session"])
+def test_a_soft_target_or_alias_makes_the_whole_group_warn_for_placement_and_worker(board, soft_on):
+    # Prism 5f58fcfad85b: the kill switch on either name must not leave the other enforced in the worker env.
+    doc = _split_doc()
+    doc["capabilities"][soft_on]["soft"] = True
+    (board / khc.MAP_FILE).write_text(json.dumps(doc), encoding="utf-8")
+    ctx = khc.tick(board, ENFORCE, POOL)
+    assert ctx.mode_of("browser-identity") == ctx.mode_of("browser-session") == khc.WARN
+    env = json.loads(khc.spawn_env(board, ENFORCE))
+    assert env.get("browser-identity", env.get("*")) != khc.ENFORCE
+    assert env.get("browser-session", env.get("*")) != khc.ENFORCE
+    assert env["browser-public"] == khc.ENFORCE
+
+
 @pytest.mark.parametrize("alias_of", ["nope", "browser-session", 7])
 def test_an_alias_to_nothing_itself_or_an_alias_is_a_malformed_map(board, alias_of):
     doc = _split_doc()
@@ -165,6 +179,17 @@ def test_a_cdp_override_is_still_the_identity_rail(board, monkeypatch):
     monkeypatch.setenv("BROWSER_CDP_URL", "wss://cdp.browsers.ace/id-github-kyzcreig")
     line = rp.browser_capability_error()
     assert line.startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ace-ai")
+
+
+def test_a_real_profile_browser_is_identity_work(board, monkeypatch):
+    # Prism a270aad9f004: browser.use_real_profile opens a copy of the user's signed-in profile, no CDP override.
+    from tools import browser_tool_cloud as btc
+    from tools import rail_preflight as rp
+    tid = _card()
+    _placed(monkeypatch, board, tid, 1, "ace-ai")                    # serves browser-public, not the identity
+    assert rp.browser_capability_error() is None
+    monkeypatch.setattr(btc, "_use_real_profile", lambda: True)
+    assert rp.browser_capability_error().startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ace-ai")
 
 
 def test_a_vault_credential_is_identity_work_even_in_the_agents_own_browser(board, monkeypatch):
