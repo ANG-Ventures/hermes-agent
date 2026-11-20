@@ -1137,13 +1137,15 @@ class TurnRunner:
             _warn_route_drop("muted")
             return dropped
         if is_route_change:
-            from gateway.response_filters import route_notice_muted
+            from gateway.response_filters import route_notice_muted, write_route_notice_agent_log
             if route_notice_muted(ctx.source, ctx.user_config):
-                # Not a drop: a page channel does not take route telemetry (t_733b4104). INFO, and
-                # never queued for redelivery.
+                # Not a drop: a page channel does not take route telemetry (t_733b4104), and the
+                # #logs banner is agent-only (t_79c10430). INFO, one agent-log row, never queued
+                # for redelivery.
+                redacted = _redact_gateway_user_facing_secrets(str(message or ""))
                 logger.info("route-change status not posted to page channel %s: %s",
-                            ctx._status_chat_id,
-                            _redact_gateway_user_facing_secrets(str(message or ""))[:160])
+                            ctx._status_chat_id, redacted[:160])
+                write_route_notice_agent_log(ctx.source, redacted)
                 return False
         else:
             from gateway.response_filters import is_compaction_announce, lifecycle_notice_muted

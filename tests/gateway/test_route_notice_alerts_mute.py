@@ -20,6 +20,7 @@ from gateway.run import TurnRunner
 from gateway.turn_context import TurnContext
 
 ALERTS = "1480528231286181948"
+LOGS = "1480525090331561984"
 OTHER = "1536471262346477598"
 ROUTE_MESSAGE = (
     "🔄 Model fallback (relay busy): claude-dtlr/claude-fable-5-1 → claude-btpr/claude-fable-5-1"
@@ -30,6 +31,7 @@ ROUTE_MESSAGE = (
 @pytest.fixture(autouse=True)
 def _env(tmp_path, monkeypatch):
     monkeypatch.delenv("DISCORD_ALERTS_CHANNEL", raising=False)
+    monkeypatch.delenv("DISCORD_LOGS_CHANNEL", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
 
@@ -42,6 +44,14 @@ def _src(chat_id=ALERTS, platform=Platform.DISCORD):
 def test_alerts_channel_is_muted_by_default():
     assert route_notice_muted(_src(), {}) is True
     assert route_notice_muted(_src(), None) is True
+
+
+def test_logs_channel_is_muted_by_default(monkeypatch):
+    # t_79c10430: the fallback banner is agent-only by the #logs rule (Discord 1571854816139944097).
+    assert route_notice_muted(_src(LOGS), {}) is True
+    monkeypatch.setenv("DISCORD_LOGS_CHANNEL", "4444")
+    assert route_notice_muted(_src("4444"), {}) is True
+    assert route_notice_muted(_src(LOGS), {}) is False
 
 
 def test_other_chat_is_not_muted():
@@ -114,6 +124,50 @@ def test_route_notice_in_alerts_is_not_posted_or_queued(caplog):
     assert result is False
     assert rno.default_outbox().pending(rno.chat_key(Platform.DISCORD, ALERTS, None)) == []
     assert not [r for r in caplog.records if "route-change status dropped" in r.getMessage()]
+
+
+_STUB_LIB = '''
+import json
+from pathlib import Path
+
+
+def write_agent_log(root, producer, sev, message, now=None, **extra):
+    d = Path(root) / "state" / "agent-logs"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "day.jsonl"
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"producer": producer, "sev": sev, "text": message, **extra}) + "\\n")
+    return p
+'''
+
+
+def _agent_log_rows(home):
+    import json
+    p = home / "state" / "agent-logs" / "day.jsonl"
+    return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
+
+
+def test_route_notice_in_logs_writes_agent_log_and_posts_nothing(tmp_path):
+    # t_79c10430: done when a fallback event writes an agent-log row and posts nothing to #logs.
+    lib = tmp_path / "scripts" / "lib" / "agent_inbox.py"
+    lib.parent.mkdir(parents=True)
+    lib.write_text(_STUB_LIB, encoding="utf-8")
+    adapter, result = _drive(LOGS)
+    assert adapter.delivered == []
+    assert result is False
+    assert rno.default_outbox().pending(rno.chat_key(Platform.DISCORD, LOGS, None)) == []
+    rows = _agent_log_rows(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["producer"] == "gateway-route-notice"
+    assert rows[0]["chat_id"] == LOGS
+    assert rows[0]["text"].startswith("🔄 Model fallback (relay busy)")
+
+
+def test_muted_route_notice_without_fleet_library_still_posts_nothing(tmp_path):
+    adapter, result = _drive(LOGS)
+    assert adapter.delivered == []
+    assert result is False
+    assert _agent_log_rows(tmp_path) == []
 
 
 def test_route_notice_in_other_chat_is_posted():
