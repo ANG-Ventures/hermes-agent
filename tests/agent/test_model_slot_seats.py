@@ -632,3 +632,72 @@ def test_assignee_slot_lane_reads_the_profile(aliased, monkeypatch):
     monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda name: str(prof))
     assert model_policy.assignee_slot_lane("w", "kimi") == "claude-alr"
     assert model_policy.assignee_slot_lane("w", "opus") is None  # its alias names the lane
+
+
+# ── P2c fix 2 (t_b1317173): Prism at 966dc6cc ──────────────────────────────────
+
+def test_cron_honours_a_same_name_alias_lane_before_the_profile_lane(aliased):
+    # c-54cea5920fc27554: model.provider claude-alr, sol -> an OpenAI id, alias sol on cpa.
+    import yaml
+    from cron.jobs import _require_known_job_route
+
+    cfg = yaml.safe_load((aliased / "config.yaml").read_text())
+    cfg["model"]["provider"] = "claude-alr"
+    (aliased / "config.yaml").write_text(yaml.safe_dump(cfg))
+    _require_known_job_route("sol", None)  # admitted: the alias names cpa
+
+
+def _providerless_kimi():
+    from hermes_cli.model_switch import DirectAlias
+
+    return {"kimi": DirectAlias(model="kimi-k3.1-pro", provider="", base_url="")}
+
+
+def test_resolve_alias_providerless_alias_keeps_the_session_lane(aliased):
+    # c-31305575cb747465: an alias with no provider is not a lane override.
+    from hermes_cli.model_switch import resolve_alias
+
+    with patch("hermes_cli.model_switch.DIRECT_ALIASES", _providerless_kimi()), \
+         patch("hermes_cli.model_switch._ensure_direct_aliases", lambda: None):
+        assert resolve_alias("kimi", "claude-alr") == ("claude-alr", "kimi-k3.1-pro", "kimi")
+
+
+def test_model_command_providerless_alias_still_refuses_a_foreign_lane(aliased):
+    with patch("hermes_cli.model_switch.DIRECT_ALIASES", _providerless_kimi()), \
+         patch("hermes_cli.model_switch._ensure_direct_aliases", lambda: None):
+        res = _switch("kimi", current="claude-alr")
+    assert not res.success
+    assert res.error_message.startswith("slot kimi (kimi-k3.1-pro) is not served on claude-alr")
+
+
+def test_custom_endpoint_lane_name_does_not_stand_in_for_its_capabilities(aliased):
+    # c-cdb14377ca7eeff7: custom:openai-codex serving Kimi is not OpenAI-only.
+    from hermes_cli import model_registry as mr
+
+    with patch.object(mr, "catalog_for", return_value=()):
+        assert mr._lane_vendors("custom:openai-codex") is None
+        assert mr.slot_lane_refusal("kimi", "custom:openai-codex") is None
+    with patch.object(mr, "catalog_for", return_value=("kimi-k3.1-pro",)):
+        assert mr._lane_vendors("custom:openai-codex") == frozenset({"moonshotai"})
+    assert mr._lane_vendors("openai-codex") == frozenset({"openai"})
+
+
+def test_view_deleted_between_stat_and_read_is_missing(home):
+    # c-1425a6658d25b243: FileNotFoundError from read_text is a missing file, not a torn one.
+    from pathlib import Path
+
+    from hermes_cli.model_registry import slot_resolve
+
+    assert slot_resolve("sol") == (SOL_ID, "sol")
+    path = home / "config" / "model-slots.json"
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 3_000_000_000))
+    real = Path.read_text
+
+    def _gone(self, *a, **k):
+        if self == path:
+            raise FileNotFoundError(str(path))
+        return real(self, *a, **k)
+
+    with patch.object(Path, "read_text", _gone):
+        assert slot_resolve("sol") == ("sol", None)

@@ -4436,7 +4436,9 @@ def _require_known_job_route(
     from hermes_cli.model_registry import require, require_slot_lane
 
     if model:
-        if not provider:  # a bare slot with no alias lane runs on the profile's lane
+        from hermes_cli.model_switch import alias_lane
+
+        if not provider and not alias_lane(model):  # no lane named: it runs on the profile's lane
             require_slot_lane(model, _profile_lane())
         require(provider, model, force_reason=force_model_reason, flag="--force-model")
     entries = [fallback] if isinstance(fallback, dict) else (fallback if isinstance(fallback, list) else [])

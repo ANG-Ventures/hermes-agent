@@ -290,7 +290,11 @@ def slot_view() -> dict[str, str]:
             return {}
         if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
             return hit[2]
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:  # deleted between stat and read: missing, not torn
+            return {}
+        data = json.loads(text)
         table = data.get("slots") if isinstance(data.get("slots"), dict) else data
         view = {
             str(k).strip(): v.strip()
@@ -322,6 +326,12 @@ def slot_resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     return (f"{prefix}/{target}" if prefix else target), spec
 
 
+def _vendor_of(model_id: object) -> Optional[str]:
+    from agent.usage_pricing import _infer_vendor_from_model
+
+    return _infer_vendor_from_model(str(model_id).split("/")[-1]) or None
+
+
 def _lane_vendors(provider: Optional[str]) -> Optional[frozenset[str]]:
     """The vendors (``_infer_vendor_from_model`` keys) ``provider`` serves; ``None`` = unknown.
 
@@ -330,11 +340,13 @@ def _lane_vendors(provider: Optional[str]) -> Optional[frozenset[str]]:
     aggregator, a custom endpoint with no list, or an unknown lane is ``None``: nothing to refuse on.
     """
     p = (provider or "").strip().lower()
-    if p.startswith("custom:"):
-        p = p.split(":", 1)[1].strip()
     if not p:
         return None
     try:
+        if p.startswith("custom:"):
+            # A custom endpoint's name says nothing about what it serves: its own catalog, else unknown.
+            vendors = frozenset(v for v in (_vendor_of(i) for i in catalog_for(p)) if v)
+            return vendors or None
         from agent import usage_pricing as up
         from agent.relay_lanes import is_relay_backed
 
@@ -353,7 +365,7 @@ def _lane_vendors(provider: Optional[str]) -> Optional[frozenset[str]]:
         if normalize_provider(p) in _AGGREGATOR_PROVIDERS:
             return None
         ids = tuple(_PROVIDER_MODELS.get(normalize_provider(p), ())) or catalog_for(p)
-        vendors = frozenset(v for v in (up._infer_vendor_from_model(str(i).split("/")[-1]) for i in ids) if v)
+        vendors = frozenset(v for v in (_vendor_of(i) for i in ids) if v)
         return vendors or None
     except Exception:
         return None

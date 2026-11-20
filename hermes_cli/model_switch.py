@@ -680,6 +680,16 @@ def resolve_startup_model_arg(
     return None, raw_model
 
 
+def alias_lane(name: Any) -> str:
+    """The lane a same-name ``model.aliases`` entry names for ``name``, else ``""``.
+
+    Only an alias that names a provider overrides the inherited lane; a providerless one does not.
+    """
+    _ensure_direct_aliases()
+    hit = DIRECT_ALIASES.get(str(name or "").strip().lower())
+    return str(hit.provider or "").strip() if hit is not None else ""
+
+
 def _slot_target(name: str) -> str:
     """The id a bare slot name (``sol``) points at in the slot view, else ``""``."""
     from hermes_cli.model_registry import slot_resolve
@@ -1090,7 +1100,7 @@ def resolve_alias(raw_input: str, current_provider: str, user_providers: Optiona
     # slot's id, on the alias's lane when there is one (switch_model stores the slot itself).
     slot_id = _slot_target(key)
     if slot_id:
-        return (direct.provider if direct is not None else current_provider), slot_id, key
+        return (alias_lane(key) or current_provider), slot_id, key
     if direct is not None:
         return (direct.provider, direct.model, key)
 
@@ -2180,10 +2190,9 @@ def switch_model(
 
     typed = st.new_model
     if not st.explicit_provider:
-        # A bare slot with no same-name alias inherits the session's lane: refused when that lane
-        # does not serve the slot's vendor (lanes differ in billing; never pick one silently).
-        _ensure_direct_aliases()
-        if typed.strip().lower() not in DIRECT_ALIASES:
+        # A bare slot with no same-name alias lane inherits the session's lane: refused when that
+        # lane does not serve the slot's vendor (lanes differ in billing; never pick one silently).
+        if not alias_lane(typed):
             from hermes_cli.model_registry import slot_lane_refusal
             refusal = slot_lane_refusal(typed, current_provider)
             if refusal:
