@@ -15,6 +15,7 @@ Hermetic: a temp board, the Phase 1 fixture map rewritten to the split shape, no
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -152,6 +153,74 @@ def test_browser_remote_grants_the_identity_under_both_names(board):
     for body in ("requires: browser-session\n", "requires: browser-identity\n"):
         v = khc.evaluate(body, (), ctx)
         assert v.hard_rule is None and v.only == ("ace-ai",), body
+
+
+# -- every gate reads the host's EFFECTIVE capabilities (Prism 17187502307d, t_6e8eac1c) ----
+# Dispatch, the boot check, the attached-skill check (Layer 0b) and the mid-run checks all read
+# khc.mapped_caps: static rows plus the browser_remote grant, minus a failed leg's veto.
+
+def _remote(board, record, *, static_identity=False):
+    doc = _split_doc()
+    if record is not None:
+        doc["hosts"]["ace-ai"]["browser_remote"] = record
+    if static_identity:
+        doc["hosts"]["ace-ai"]["capabilities"] = [*doc["hosts"]["ace-ai"]["capabilities"], "browser-identity"]
+    (board / khc.MAP_FILE).write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _gates(board, monkeypatch, body="requires: browser-identity\n", skills=("deal-alerts",)):
+    """What each gate says for an identity card placed on ace-ai: (only, boot, layer0b, skill_view, browser_*)."""
+    ctx = khc.tick(board, ENFORCE, POOL)
+    only = khc.evaluate(body, skills, ctx).only
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body=body, skills=list(skills))
+    _placed(monkeypatch, board, tid, 1, "ace-ai")
+    boot = pff.boot_check(tid, dict(os.environ), fleet_dir=board)
+    return (only, boot, pff.attached_skill_gap(list(skills), "ace-ai", ctx),
+            pff.skill_gate("deal-alerts"), pff.capability_gate("browser-session"))
+
+
+def test_a_host_granted_only_by_browser_remote_passes_every_gate(board, monkeypatch):
+    # Prism's repro: ace-ai.browser_remote = front_door + ssh true, no static identity row.
+    _remote(board, {"front_door": True, "ssh": True})
+    only, boot, gap, view, call = _gates(board, monkeypatch)
+    assert only == ("ace-ai",)
+    assert (boot, gap, view, call) == (None, None, None, None)
+
+
+def test_a_failed_browser_remote_leg_vetoes_a_static_grant_at_every_gate(board, monkeypatch):
+    _remote(board, {"front_door": True, "ssh": False}, static_identity=True)
+    only, boot, gap, view, call = _gates(board, monkeypatch)
+    assert "ace-ai" not in only
+    assert gap == "browser-session"                       # the dispatcher waits the card off ace-ai
+    line = pff.absent_line("browser-identity", "ace-ai")
+    assert boot == line                                   # one message at boot ...
+    assert view.startswith("BROWSER_RAIL_ABSENT cap=browser-") and call.startswith("BROWSER_RAIL_ABSENT cap=browser-")
+
+
+@pytest.mark.parametrize("static_identity", [True, False])
+def test_a_host_with_no_browser_remote_row_reads_its_static_row_as_before(board, monkeypatch, static_identity):
+    _remote(board, None, static_identity=static_identity)
+    only, boot, gap, view, call = _gates(board, monkeypatch)
+    if static_identity:
+        assert "ace-ai" in only and (boot, gap, view, call) == (None, None, None, None)
+    else:
+        assert only == () and gap == "browser-session"
+        assert boot == pff.absent_line("browser-identity", "ace-ai")
+        assert view.startswith("BROWSER_RAIL_ABSENT") and call.startswith("BROWSER_RAIL_ABSENT")
+
+
+def test_no_gate_reads_the_static_host_rows_directly():
+    # One rule: outside khc.mapped_caps nothing reads cmap.hosts (a second copy is how Layer 0b drifted).
+    root = Path(__file__).resolve().parents[2]
+    hits = [f"{p.relative_to(root)}:{n}" for d in ("hermes_cli", "tools", "agent", "gateway")
+            for p in sorted((root / d).rglob("*.py")) if p.name != "kanban_host_capabilities.py"
+            for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1)
+            if "cmap.hosts" in line]
+    assert hits == []
+    src = (root / "hermes_cli" / "kanban_host_capabilities.py").read_text(encoding="utf-8").splitlines()
+    readers = [n for n, line in enumerate(src, 1) if "cmap.hosts" in line and not line.lstrip().startswith(("#", '"'))]
+    assert len(readers) == 1, readers                     # the read inside mapped_caps
 
 
 # -- Layer 1b + the exit: a public page never reads as Ace's browser ------------------------

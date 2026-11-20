@@ -648,7 +648,8 @@ def _host_caps(ctx: CapabilityTick, host: str) -> frozenset:
 
 def mapped_caps(cmap: CapabilityMap, host: str) -> frozenset:
     """``host``'s capabilities under ``cmap``, with the ``browser_remote`` grant/veto applied: the one
-    reading placement and the worker's own mid-run gates share (t_ce9bd5a3)."""
+    reading placement, worker boot, the attached-skill check (Layer 0b) and the mid-run gates share
+    (t_ce9bd5a3, t_6e8eac1c). No gate reads the static host rows directly."""
     caps = cmap.hosts.get(host, frozenset())
     record = cmap.browser_remote.get(host)
     if cmap.browser_remote:
