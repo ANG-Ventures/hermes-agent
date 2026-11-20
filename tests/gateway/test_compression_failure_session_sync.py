@@ -286,3 +286,27 @@ class _ProviderSwitchAgent(_CompressionThenFailureAgent):
         }
 
 
+
+
+class _SafeguardRefusalAgent(_CompressionThenFailureAgent):
+    def run_conversation(self, user_message, conversation_history=None, task_id=None, **_kwargs):
+        return {
+            "final_response": "", "failed": True, "completed": False,
+            "error": "content_policy_blocked: HTTP 400: [safeguard_refusal: refused model=x category=y]",
+            "failure_reason": "content_policy_blocked", "error_code": "safeguard_refusal",
+            "messages": [*(conversation_history or []), {"role": "user", "content": user_message}],
+            "api_calls": 1,
+        }
+
+
+def test_safeguard_refusal_error_code_reaches_gateway_result(monkeypatch):
+    """_run_agent must forward error_code, or the transcript-skip log in run_turn.py can never
+    name a safeguard refusal and falls back to "context-overflow failure" (t_438a9c74)."""
+    _install_compression_failure_agent(monkeypatch, _SafeguardRefusalAgent)
+    runner = _runner(_SessionStore())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="user-1")
+
+    result = _run_compression_failure_turn(runner, source)
+
+    assert result["failed"] is True
+    assert result["error_code"] == "safeguard_refusal"

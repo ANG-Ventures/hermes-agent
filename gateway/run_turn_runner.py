@@ -2582,6 +2582,8 @@ class TurnRunner:
             "turn_exit_reason": result.get("turn_exit_reason"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
+            # e.g. "safeguard_refusal": the transcript-skip log names the real class (t_438a9c74).
+            "error_code": result.get("error_code"),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],
