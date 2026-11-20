@@ -72,13 +72,27 @@ def _run_pidfile(token: str) -> str:
 
 
 def _run_preamble(token: str) -> str:
-    """First lines of every remote command: record the ``bash -c`` pid (= its process group, as
-    sshd starts each command in its own session) where the kill path can find it. A file, not the
-    argv: a top-level ``exec`` replaces the argv but keeps the pid and the group."""
+    """First lines of every remote command: sweep dead pidfiles, then record the ``bash -c`` pid
+    (= its process group, as sshd starts each command in its own session) where the kill path can
+    find it. A file, not the argv: a top-level ``exec`` replaces the argv but keeps the pid and the
+    group. The EXIT trap is best effort (a command that replaces it, ``exec``s or is SIGKILLed
+    leaves its file), so the next command on the host removes such leftovers (t_70090b16)."""
     f = _run_pidfile(token)
     return (f": {_RUN_MARK}{token}\n"
+            f"{_stale_pidfile_sweep()}\n"
             f"(umask 077; mkdir -p \"{_RUN_DIR}\" && echo $$ >| \"{f}\") 2>/dev/null; "
             f"trap \"rm -f \\\"{f}\\\"\" EXIT\n")
+
+
+def _stale_pidfile_sweep() -> str:
+    """Shell that removes this writer's pidfiles (``hermes-run-<32 hex>.pid`` only) whose pid is
+    gone. Builtins only (no fork unless a file is removed); an empty or non-numeric file (pid not
+    written yet) is kept; its loop variables are unset so the command never sees them."""
+    name = _RUN_MARK + "[0-9a-f]" * 32 + ".pid"
+    return (f"for _vr_f in \"{_RUN_DIR}\"/{name}; do "
+            "[ -f \"$_vr_f\" ] || continue; _vr_p=; read -r _vr_p < \"$_vr_f\" 2>/dev/null; "
+            "case \"$_vr_p\" in ''|*[!0-9]*) continue;; esac; "
+            "kill -0 \"$_vr_p\" 2>/dev/null || rm -f -- \"$_vr_f\"; done 2>/dev/null; unset _vr_f _vr_p")
 
 
 def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
