@@ -56,9 +56,11 @@ GRANT = {"lease_id": 12473, "identity": "id-github-kyzcreig", "class": "read", "
          "heartbeat_every_s": 60}
 
 
-def _fake_client(monkeypatch, port: int, *, then_exit: bool = False, refuse: str = ""):
+def _fake_client(monkeypatch, port: int, *, then_exit: bool = False, refuse: str = "", release_after: float = 0.0,
+                 release_answer: str = "12473"):
     """``_spawn`` replaced by a child that behaves like the watcher: prints browserctl's grant line and ``port=N``
-    (or a refusal); on stdin EOF prints browserctl's release line, as `with` does when the watcher ends it."""
+    (or a refusal); on stdin EOF prints browserctl's release line (``release_answer``, ``release_after`` s later),
+    as `with` does when the watcher ends it."""
     spawned = []
     body = f"print({refuse!r}, flush=True); raise SystemExit(3)" if refuse else textwrap.dedent(f"""
         import sys, time
@@ -68,7 +70,8 @@ def _fake_client(monkeypatch, port: int, *, then_exit: bool = False, refuse: str
         if {then_exit!r}:
             raise SystemExit(0)
         sys.stdin.read()
-        print("browserctl with: released=12473 heartbeats ok=0 fail=0", flush=True)
+        time.sleep({release_after!r})
+        print("browserctl with: released={release_answer} heartbeats ok=0 fail=0", flush=True)
     """)
 
     def spawn(identity, klass, card):
@@ -197,6 +200,26 @@ def test_navigate_returns_the_lease_id_and_release_ends_only_this_runs_lease(mon
     assert rp.browser_rail_error(f"http://127.0.0.1:{port}").startswith("BROWSER_LEASE_UNAVAILABLE")
     again = json.loads(registry.dispatch("browser_lease_release", {}, task_id="t"))
     assert (again["success"], again["released"]) == (True, False)
+
+
+@pytest.mark.parametrize("answer,after,want", [
+    ("12473", 1.5, {"released": True, "release_answer": "12473", "success": True}),
+    ("BROWSER_LEASE_UNKNOWN", 1.5, {"released": False, "release_answer": "BROWSER_LEASE_UNKNOWN", "success": False}),
+    ("12473", 60.0, {"released": None, "release_answer": "not read", "success": True,
+                    "detail": "release sent, answer not read: check egress-status --lease 12473"}),
+])
+def test_a_slow_release_answer_is_reported_as_it_is(monkeypatch, answer, after, want):
+    """t_239fe5ae: a release answer that comes slowly is still read (released, or refused); one that has not come
+    within RELEASE_WAIT_S is 'release sent, answer not read', never released: false."""
+    monkeypatch.setattr(bl, "RELEASE_WAIT_S", 3.0)
+    _fake_client(monkeypatch, _free_port(), release_after=after, release_answer=answer)
+    lease, err = bl.open_lease("id-github-kyzcreig", "read", card="t_lease001", timeout=10)
+    assert err is None
+    t = time.monotonic()
+    rel = bl.release_lease()
+    assert rel == dict({"lease_id": 12473, "identity": "id-github-kyzcreig", "class": "read"}, **want)
+    assert time.monotonic() - t < 3.0 + 5.5, "bounded by RELEASE_WAIT_S and the drain wait"
+    assert lease.proc.poll() is not None, "the lease client is ended either way"
 
 
 def test_the_release_tool_is_for_kanban_workers_only(monkeypatch):

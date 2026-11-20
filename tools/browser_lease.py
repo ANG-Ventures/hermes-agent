@@ -225,7 +225,14 @@ def _read_port(proc: subprocess.Popen, tail: List[str], timeout: float,
     return got.get("port")
 
 
-def _end(lease: Lease) -> None:
+# t_239fe5ae: how long release_lease waits for browserctl's release line after the watcher's stdin EOF. Measured on
+# ace-media, 10 read leases each after one navigate: 10.3-10.6 s nine times and 19.6 s once (browserctl SIGKILLs a
+# forwarder still holding a CDP connection after 10 s, then the release call). The watcher SIGKILLs browserctl 30 s
+# after its SIGTERM, so no answer can arrive after about 30 s: wait past that.
+RELEASE_WAIT_S = 35.0
+
+
+def _end(lease: Lease, timeout: float = 40.0) -> None:
     proc = lease.proc
     try:
         if proc.stdin:
@@ -233,7 +240,7 @@ def _end(lease: Lease) -> None:
     except OSError:
         pass
     try:
-        proc.wait(timeout=40)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
 
@@ -313,14 +320,18 @@ def release_lease() -> dict:
         lease, _active = _active, None
     if lease is None:
         return {"success": True, "released": False, "detail": "this run holds no browser lease"}
-    _end(lease)
+    _end(lease, RELEASE_WAIT_S)
     lease.closed.wait(5)
     g = lease.grant
     ans = g.get("released") or ""
+    out = {"lease_id": g.get("lease_id"), "identity": lease.identity, "class": lease.klass}
+    if not ans:
+        # t_239fe5ae: the release was sent (the watcher has its EOF) but its answer was not read: not a refusal
+        return dict(out, released=None, release_answer="not read", success=True,
+                    detail=f"release sent, answer not read: check egress-status --lease {g.get('lease_id')}")
     # browserctl prints ``released=<lease id>`` (browserd's release answer) or ``released=<refusal token>``
     ok = ans.isdigit() and (g.get("lease_id") is None or ans == str(g.get("lease_id")))
-    out = {"lease_id": g.get("lease_id"), "identity": lease.identity, "class": lease.klass,
-           "released": ok, "release_answer": ans or "no release line read"}
+    out.update(released=ok, release_answer=ans)
     out["success"] = out["released"]
     return out
 
