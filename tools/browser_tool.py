@@ -494,7 +494,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_lease_release",
-        "description": "Kanban workers only: release the browser identity lease this run took with browser_navigate(lease_identity=...). Releases this run's own lease and nothing else; the lease is also released when the run exits. Returns the lease id and the release answer; released is null when the release was sent but its answer was not read (check egress-status --lease <id>, do not retry). Browser calls after it fail closed until browser_navigate leases again.",
+        "description": "Kanban workers only: release the browser identity lease this run took with browser_navigate(lease_identity=...). Releases this run's own lease and nothing else; the lease is also released when the run exits. Returns the lease id and the release answer; released is null when the release was sent but its answer was not read (success true), or when the lease client had already exited so no release was sent (success false); either way check egress-status --lease <id>, do not retry. Browser calls after it fail closed until browser_navigate leases again.",
         "parameters": {"type": "object", "properties": {}, "required": []}
     },
     {

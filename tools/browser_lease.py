@@ -320,11 +320,16 @@ def release_lease() -> dict:
         lease, _active = _active, None
     if lease is None:
         return {"success": True, "released": False, "detail": "this run holds no browser lease"}
+    already_exited = lease.proc.poll() is not None   # Prism ba98afcb8f7a: then closing stdin sends no release
     _end(lease, RELEASE_WAIT_S)
     lease.closed.wait(5)
     g = lease.grant
     ans = g.get("released") or ""
     out = {"lease_id": g.get("lease_id"), "identity": lease.identity, "class": lease.klass}
+    if not ans and already_exited:
+        return dict(out, released=None, release_answer="none", success=False,
+                    detail=f"lease client had already exited; no release sent: check egress-status --lease "
+                           f"{g.get('lease_id')}")
     if not ans:
         # t_239fe5ae: the release was sent (the watcher has its EOF) but its answer was not read: not a refusal
         return dict(out, released=None, release_answer="not read", success=True,

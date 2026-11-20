@@ -219,7 +219,22 @@ def test_a_slow_release_answer_is_reported_as_it_is(monkeypatch, answer, after, 
     rel = bl.release_lease()
     assert rel == dict({"lease_id": 12473, "identity": "id-github-kyzcreig", "class": "read"}, **want)
     assert time.monotonic() - t < 3.0 + 5.5, "bounded by RELEASE_WAIT_S and the drain wait"
-    assert lease.proc.poll() is not None, "the lease client is ended either way"
+    # _end SIGKILLs a child that outlived the wait without reaping it, so poll() can still read None here: reap it
+    assert lease.proc.wait(5) is not None, "the lease client is ended either way"
+
+
+def test_a_lease_client_that_already_exited_is_not_reported_as_release_sent(monkeypatch):
+    """Prism ba98afcb8f7a: the watcher died (here SIGKILLed) before release_lease ran, so closing its stdin sends no
+    release: say so, with success false, never 'release sent'."""
+    _fake_client(monkeypatch, _free_port())
+    lease, err = bl.open_lease("id-github-kyzcreig", "read", card="t_lease001", timeout=10)
+    assert err is None
+    lease.proc.kill()
+    lease.proc.wait(10)
+    rel = bl.release_lease()
+    assert rel == {"lease_id": 12473, "identity": "id-github-kyzcreig", "class": "read", "released": None,
+                   "release_answer": "none", "success": False,
+                   "detail": "lease client had already exited; no release sent: check egress-status --lease 12473"}
 
 
 def test_the_release_tool_is_for_kanban_workers_only(monkeypatch):
@@ -276,10 +291,12 @@ def _fake_browserctl(tmp_path, port):
 
 
 def _wait(path, s=15.0):
+    """Wait for the file's CONTENT, not only its existence: the fake's ``open(.., "w")`` creates it empty before the
+    write lands, and a read in that gap saw "" (hermes-agent#493 CI at dc1fcdec)."""
     end = time.monotonic() + s
-    while time.monotonic() < end and not path.exists():
+    while time.monotonic() < end and not (path.exists() and path.stat().st_size > 0):
         time.sleep(0.05)
-    return path.exists()
+    return path.exists() and path.stat().st_size > 0
 
 
 def test_watcher_releases_when_the_tool_closes_its_stdin(tmp_path):
