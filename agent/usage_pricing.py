@@ -3179,10 +3179,13 @@ def _resolve_pricing_entry(
         return None
     if route.billing_mode == "subscription_included":
         return _INCLUDED_ENTRY
+    # The registry row (config/model-meta.json) replaces the built-in snapshot tables only. On a
+    # metered relay route the relay's configured tariff wins over it, and the row prices the id
+    # when that lookup has nothing (Prism df9e5fd55d0d, Apollo 2026-11-20).
     registry_entry = _registry_pricing_entry(route)
-    if registry_entry is not None:
-        return registry_entry
     if route.provider == "openrouter":
+        if registry_entry is not None:
+            return _external_pricing_entry(route) or registry_entry
         # Notional relays (openai-codex, provider: openrouter routes) and any
         # model absent from the curated snapshot price from the configured
         # external catalog — models.dev by default, OpenRouter as fallback
@@ -3210,6 +3213,8 @@ def _resolve_pricing_entry(
             return snapshot
         return _external_pricing_entry(route)
 
+    if registry_entry is not None:
+        return registry_entry
     bundled_entry = _lookup_official_docs_pricing(route)
     if bundled_entry:
         return bundled_entry

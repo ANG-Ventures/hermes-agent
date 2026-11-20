@@ -172,6 +172,41 @@ def test_cron_force_model_keeps_literal(cron_store):
     assert _stored(jobs, job["id"])["model"] == SONNET
 
 
+# Prism 07e86974b011 (Apollo 2026-11-20): the A-lane default fallback ran on the stored slot and
+# checked each rung's lane list (which holds literal ids) with ``sonnet``, so every rung was
+# dropped and the job lost its failover. A rung is checked with the slot's current id and stores
+# the job's model, so it follows the job's slot.
+def _rungs_list_literal_ids(jobs, monkeypatch):
+    real = model_registry.resolve
+    served = {lane: (SONNET,) for lane in jobs._A_LANE_DEFAULT_FALLBACK_PROVIDERS}
+
+    def resolve(lane, model, *a, **kw):
+        if lane in served:
+            return SimpleNamespace(ok=model in served[lane], reason="ok" if model in served[lane] else "unknown")
+        return real(lane, model, *a, **kw)
+    monkeypatch.setattr(model_registry, "resolve", resolve)
+
+
+@pytest.mark.parametrize("model", [SONNET, "sonnet"])
+def test_a_lane_job_on_a_slot_keeps_its_fallback_chain(cron_store, monkeypatch, model):
+    jobs = cron_store
+    _rungs_list_literal_ids(jobs, monkeypatch)
+    job = jobs.create_job(prompt="p", schedule="every 1h", model=model, provider="claude-alr")
+    stored = _stored(jobs, job["id"])
+    assert stored["model"] == "sonnet"
+    assert stored.get("fallback") == [
+        {"provider": lane, "model": "sonnet"} for lane in jobs._A_LANE_DEFAULT_FALLBACK_PROVIDERS]
+    assert stored.get("allow_cross_provider_fallback") is True
+
+
+def test_a_lane_rung_on_a_lane_that_lacks_the_slot_id_is_dropped(cron_store, slots, monkeypatch):
+    jobs = cron_store
+    _rungs_list_literal_ids(jobs, monkeypatch)
+    _write(slots, "model-slots.json", {"slots": {"sonnet": "claude-sonnet-9"}})
+    job = jobs.create_job(prompt="p", schedule="every 1h", model="sonnet", provider="claude-alr")
+    assert _stored(jobs, job["id"]).get("fallback") is None
+
+
 def test_cron_tool_confirmation_line(cron_store):
     from tools import cronjob_tools as ct
     job = {"model": "sonnet"}

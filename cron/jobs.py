@@ -4170,12 +4170,15 @@ def _apply_a_lane_default_fallback(job: Dict[str, Any]) -> None:
     if (job_lane(job) == "script" or not model or not _A_LANE_RE.fullmatch(provider)
             or job.get("fallback") or "allow_cross_provider_fallback" in job):
         return
-    from hermes_cli.model_registry import resolve
+    from hermes_cli.model_registry import resolve, slot_resolve
 
+    # A rung follows its job's model (a slot stays a slot), but the lane's list holds literal
+    # ids, so each rung is checked with the slot's current id (Prism 07e86974b011).
+    check = slot_resolve(model)[0] or model
     chain = []
     for lane in _A_LANE_DEFAULT_FALLBACK_PROVIDERS:
         try:
-            ok = resolve(lane, model, resolve_aliases=False).ok
+            ok = resolve(lane, check, resolve_aliases=False).ok
         except Exception:
             ok = True
         if ok:

@@ -17,11 +17,13 @@ verdict says so, and the dispatcher re-checks on every tick.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Optional
 
 #: In-process memo of a lane's catalog; the disk cache under it has the same TTL.
@@ -453,11 +455,13 @@ def registry_pricing(model: Optional[str]) -> Optional[dict[str, str]]:
             continue
         if isinstance(value, bool) or not isinstance(value, (int, float, str)):
             return None
+        # Decimal, not float: a huge JSON integer must not raise OverflowError, and a
+        # non-finite rate (Infinity, NaN, or past float range) is no row (Prism c-61c5c01d036c6b97).
         try:
-            number = float(value)
-        except ValueError:
+            number = Decimal(str(value).strip())
+        except (InvalidOperation, ValueError):
             return None
-        if not number >= 0:
+        if not number.is_finite() or number < 0 or not math.isfinite(float(number)):
             return None
         out[key] = str(value)
     return out if "input" in out and "output" in out else None

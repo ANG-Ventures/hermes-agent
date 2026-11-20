@@ -61,10 +61,37 @@ def test_slot_name_reads_its_ids_row(home):
 
 
 def test_registry_row_wins_over_builtin_table(home):
-    _meta(home, {KNOWN: {"context": 123_456, "pricing": {"input": 9, "output": 99}}})
+    _meta(home, {KNOWN: {"context": 123_456}, "claude-sonnet-5-5": {"pricing": {"input": 9, "output": 99}}})
     assert get_model_context_length(KNOWN, provider="cpa") == 123_456
-    assert get_pricing_entry(KNOWN, provider="cpa").output_cost_per_million == Decimal("99")
     assert get_model_context_length(f"cpa/{KNOWN}", provider="cpa") == 123_456
+    # a direct route: the registry row replaces the built-in snapshot price
+    assert get_pricing_entry("claude-sonnet-5-5", provider="anthropic").output_cost_per_million == Decimal("99")
+
+
+# Prism df9e5fd55d0d (Apollo 2026-11-20): on a metered relay route (provider openrouter: cpa,
+# openai-codex, openrouter) the relay's configured tariff wins over the registry row; the row
+# stands in for the built-in snapshot and prices the id when the relay lookup has nothing.
+def _relay_tariff(monkeypatch, entry):
+    import agent.usage_pricing as up
+    monkeypatch.setattr(up, "_external_pricing_entry", lambda route: entry)
+
+
+def test_relay_tariff_wins_over_registry_row(home, monkeypatch):
+    from agent.usage_pricing import PricingEntry
+    _relay_tariff(monkeypatch, PricingEntry(
+        input_cost_per_million=Decimal("5"), output_cost_per_million=Decimal("15"),
+        source="provider_models_api", pricing_version="openrouter-models-api"))
+    _meta(home, {FRESH: {"pricing": {"input": 3, "output": "12.50"}}})
+    entry = get_pricing_entry(FRESH, provider="openrouter")
+    assert (entry.input_cost_per_million, entry.output_cost_per_million) == (Decimal("5"), Decimal("15"))
+
+
+def test_relay_without_tariff_uses_registry_row(home, monkeypatch):
+    _relay_tariff(monkeypatch, None)
+    _meta(home, {FRESH: {"pricing": {"input": 3, "output": "12.50"}}})
+    entry = get_pricing_entry(FRESH, provider="openrouter")
+    assert entry.pricing_version == "model-registry"
+    assert (entry.input_cost_per_million, entry.output_cost_per_million) == (Decimal("3"), Decimal("12.50"))
 
 
 @pytest.mark.parametrize("view", ["missing", "no_row", "bad_rows"])
@@ -91,6 +118,19 @@ def test_explicit_config_context_still_wins(home):
 ])
 def test_malformed_pricing_is_no_row(home, pricing):
     _meta(home, {FRESH: {"pricing": pricing}})
+    assert registry_pricing(FRESH) is None
+
+
+@pytest.mark.parametrize("raw", [
+    '{"input": Infinity, "output": 2}', '{"input": NaN, "output": 2}',
+    '{"input": 1, "output": 1' + "0" * 400 + '}',  # a JSON integer float() cannot hold (OverflowError)
+])
+def test_non_finite_pricing_is_no_row_and_never_raises(home, raw):
+    """Prism c-61c5c01d036c6b97: a pricing lookup must never raise or return 'inf'."""
+    path = home / "config" / "model-meta.json"
+    path.write_text('{"models": {"%s": {"pricing": %s}}}' % (FRESH, raw), encoding="utf-8")
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
     assert registry_pricing(FRESH) is None
 
 
