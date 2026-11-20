@@ -262,9 +262,51 @@ def test_reader_drops_one_host_on_disagreement_and_refuses_structure(tmp_path):
     hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
     assert [h.name for h in hosts] == ["ace-ai", "ace-media"]
     assert any("ace-x" in w for w in warnings)
-    side["ssh_user"] = "ace"
+    side["ssh_user"] = "root"
     _write_pool(tmp_path, sidecar=side)
     assert kwp.load_pool(tmp_path, kanban_cfg={})[0] == []
+
+
+def test_reader_takes_a_per_host_ssh_user_and_falls_back_to_the_top_level(tmp_path):
+    """Option A (Ace 2026-11-20, t_5e87455b): a pool host's worker may run as the host's owner
+    account. ``hosts.<id>.ssh_user`` overrides the top-level ``ssh_user`` for that host only, so
+    the cutover flips host by host; every ssh the dispatcher makes to the host uses it."""
+    from hermes_cli import kanban_worker_hosts as kwh
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    _write_pool(tmp_path, sidecar=side)
+    hosts, warnings = kwp.load_pool(tmp_path, kanban_cfg={})
+    assert warnings == []
+    by = {h.name: h for h in hosts}
+    assert by["ace-ai"].ssh_user == "ace" and by["ace-ai"].target == "ace@ace-ai"
+    assert by["ace-media"].ssh_user == "kanbanw"
+    assert kwp._ssh_argv(by["ace-ai"], "true")[-2] == "ace@ace-ai"
+    assert kwh.placement_env(by["ace-ai"], "/w")["TERMINAL_SSH_USER"] == "ace"
+    # the top level is a default, no longer locked to kanbanw
+    side["ssh_user"] = "alexgierczyk"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h.ssh_user for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    assert by == {"ace-ai": "ace", "ace-media": "alexgierczyk"}
+
+
+@pytest.mark.parametrize("where,value", [
+    ("top", None), ("top", ""), ("top", "root"), ("top", "a b"), ("top", 5), ("top", "-oProxyCommand=x"),
+    ("row", ""), ("row", "root"), ("row", "ace@ci-box"), ("row", None),
+])
+def test_reader_refuses_a_bad_ssh_user(tmp_path, where, value):
+    """A worker never logs in as root, and the name must be a plain login (it lands in an ssh
+    argv): anything else refuses the sidecar, as every structural error does."""
+    side = _write_pool(tmp_path)
+    if where == "top":
+        if value is None:
+            side.pop("ssh_user")
+        else:
+            side["ssh_user"] = value
+    else:
+        side["hosts"]["ace-ai"]["ssh_user"] = value
+    _write_pool(tmp_path, sidecar=side)
+    assert any("ssh_user" in e for e in kwp.validate_sidecar(side))
+    assert kwp.read_pool(tmp_path).refused == "sidecar"
 
 
 def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_row_keys(tmp_path):

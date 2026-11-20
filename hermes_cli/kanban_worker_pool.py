@@ -9,7 +9,8 @@ Hosts come from two files under the fleet root (``<kanban_home>/fleet``):
 * ``kanban-pool.json``: the kanban sidecar (``priority``, ``capacity_pct``,
   ``studio_only`` (deny-list: every other profile is a pool profile) or the
   legacy ``profiles`` allow-list, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
-  capacity_pct?, profiles?}``, ``ssh_user`` locked to ``kanbanw``). Written
+  capacity_pct?, profiles?, ssh_user?}``, ``ssh_user``: the worker login, a default that a
+  host row may override, never ``root``; t_5e87455b, Option A). Written
   only by hermes-home ``scripts/fleet-host``.
 
 Drift (PRD §5.1 table): a structural error refuses the whole pool; a per-host
@@ -57,7 +58,12 @@ from hermes_cli import allocation_policy as _policy
 logger = logging.getLogger(__name__)
 
 ROLE = "kanban-worker"
+# The legacy worker login; the sidecar's ``ssh_user`` (and ``hosts.<id>.ssh_user``) decides
+# per host since Option A (Ace 2026-11-20, t_5e87455b: workers run as each host's owner).
 SSH_USER = "kanbanw"
+# A plain POSIX login (it lands in an ssh argv as ``user@host``), and never root.
+_SSH_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+_FORBIDDEN_SSH_USERS = frozenset({"root"})
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
 # Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
@@ -103,7 +109,7 @@ _ROLES_ROW = frozenset({"roles", "state"})
 _ROLES_ROW_OPTIONAL = frozenset({"last_change"})
 _SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
                           "profiles", "studio_only", "studio_bound_skills", "hosts"})
-_SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles"})
+_SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles", "ssh_user"})
 _ABSENCE = ("required", "optional")
 _STATES = ("active", "draining")
 
@@ -317,6 +323,11 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
     return out
 
 
+def _ssh_user_ok(user) -> bool:
+    return (isinstance(user, str) and bool(_SSH_USER_RE.fullmatch(user))
+            and user not in _FORBIDDEN_SSH_USERS)
+
+
 def validate_sidecar(doc) -> List[str]:
     """Structural errors of ``kanban-pool.json`` (any error refuses it whole)."""
     if not isinstance(doc, dict):
@@ -326,8 +337,8 @@ def validate_sidecar(doc) -> List[str]:
         errs.append(f"unknown top-level keys {sorted(set(doc) - _SIDECAR_TOP)}")
     if isinstance(doc.get("schema"), bool) or doc.get("schema") != 1:
         errs.append(f"schema must be 1, not {doc.get('schema')!r}")
-    if doc.get("ssh_user") != SSH_USER:
-        errs.append(f"ssh_user must be {SSH_USER!r} (locked), not {doc.get('ssh_user')!r}")
+    if not _ssh_user_ok(doc.get("ssh_user")):
+        errs.append(f"ssh_user must be a plain login other than root, not {doc.get('ssh_user')!r}")
     if "capacity_pct" in doc and not _pct(doc["capacity_pct"]):
         errs.append(f"capacity_pct must be in (0, 1], not {doc['capacity_pct']!r}")
     for key in ("profiles", "studio_only", "studio_bound_skills"):
@@ -345,10 +356,10 @@ def validate_sidecar(doc) -> List[str]:
         if not isinstance(hid, str) or not _PLAIN_RE.fullmatch(hid) or not isinstance(row, dict):
             errs.append(f"hosts.{hid!r} is not a plain id with an object row")
             continue
-        if "ssh_user" in row:
-            errs.append(f"hosts.{hid}.ssh_user: per-host override refused (locked {SSH_USER})")
-        if set(row) - _SIDECAR_ROW - {"ssh_user"}:
-            errs.append(f"hosts.{hid}: unknown keys {sorted(set(row) - _SIDECAR_ROW - {'ssh_user'})}")
+        if "ssh_user" in row and not _ssh_user_ok(row["ssh_user"]):
+            errs.append(f"hosts.{hid}.ssh_user must be a plain login other than root, not {row['ssh_user']!r}")
+        if set(row) - _SIDECAR_ROW:
+            errs.append(f"hosts.{hid}: unknown keys {sorted(set(row) - _SIDECAR_ROW)}")
         if not isinstance(row.get("enabled"), bool):
             errs.append(f"hosts.{hid}.enabled must be true|false")
         if row.get("absence") not in _ABSENCE:
@@ -457,7 +468,8 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
             continue
         role_slots, state = roles[hid]
         hosts.append(PoolHost(
-            name=hid, ssh_host=hid, ssh_user=SSH_USER, slots=role_slots[ROLE],
+            name=hid, ssh_host=hid, ssh_user=row.get("ssh_user", sidecar["ssh_user"]),
+            slots=role_slots[ROLE],
             capacity_pct=float(row.get("capacity_pct", gcap)), absence=row["absence"],
             profiles=tuple(p for p in row.get("profiles", gprofiles) if p.lower() not in deny),
             state=state, enabled=True,
@@ -1756,6 +1768,7 @@ class HostSample:
 # task on the host, while ``nproc`` honours the probing user's cgroup quota
 # (kanbanw's user-1001.slice CPUQuota=800% made it print 8 on 24/32 cores,
 # t_2dc3be98), which shrank the v0.1 refuse line to 0.8 x 8 = 6.4 load1.
+# getconf reads the host, not the login, so it holds for any worker ssh_user.
 _NCPU_CMD = "getconf _NPROCESSORS_ONLN"
 
 
@@ -1765,7 +1778,7 @@ BOARDS_MARKER = "@@hermes-hostable-boards"
 
 def _boards_cmd(workspaces_root: str) -> str:
     """The board dirs under ``workspaces_root`` that exist AND that the probing
-    uid (the worker's ``kanbanw``) can create a workspace in."""
+    uid (the host's worker login, ``PoolHost.ssh_user``) can create a workspace in."""
     import shlex
     root = shlex.quote(str(workspaces_root).rstrip("/") or "/")
     return (f"echo {BOARDS_MARKER}; for d in {root}/*/; do "
