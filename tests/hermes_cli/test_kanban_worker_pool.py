@@ -1829,8 +1829,10 @@ def test_manifest_targets_reads_host_affinity_naming_a_fleet_host(tmp_path, monk
 
 
 def test_manifest_target_refused_on_non_reaching_pool_host_allowed_once_reached():
+    # The target's own row is absent in these fixtures: a fresh ace-ai row reaches
+    # ace-ai by definition (t_8c580b20, test_kanban_reach_matrix).
     targets = {"vllm-gpu": "ace-ai"}
-    no_route = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255}})
+    no_route = _reach_cfg({"ace-media": {"ace-ai": 255}})
     # (1) every pool host is rc 255 to ace-ai: not portable, stays on the Studio.
     assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=no_route,
                                    targets=targets) == ()
@@ -1838,12 +1840,12 @@ def test_manifest_target_refused_on_non_reaching_pool_host_allowed_once_reached(
         False, "host_reach", None)
     # The live matrix also carries the Studio's own row (rc 0 to ace-ai): the
     # allowed set is then the Studio only, which take() never matches.
-    with_studio = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255},
+    with_studio = _reach_cfg({"ace-media": {"ace-ai": 255},
                               "mac-studio-m3u": {"ace-ai": 0}})
     assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=with_studio,
                                    targets=targets) == ("mac-studio-m3u",)
     # (2) a fixture row gives ace-media rc 0: portable, and take() is held to it.
-    routed = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 0}})
+    routed = _reach_cfg({"ace-media": {"ace-ai": 0}})
     assert _portable(skills=("vllm-gpu",), pool=routed, targets=targets) == (True, None, "policy")
     assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=routed,
                                    targets=targets) == ("ace-media",)
@@ -1874,7 +1876,7 @@ def test_gpu_card_never_spills_to_a_pool_host_without_a_route(kanban_home, monke
         p.band, p.spill_reason = "spilling", "load"
         return p
 
-    no_route = {"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255},
+    no_route = {"ace-media": {"ace-ai": 255},
                 "mac-studio-m3u": {"ace-ai": 0}}       # the live matrix shape
     with kb.connect_closing() as conn:
         (gpu,) = _make(conn, 1, priority=9, skills=["vllm-gpu"])
@@ -1889,7 +1891,7 @@ def test_gpu_card_never_spills_to_a_pool_host_without_a_route(kanban_home, monke
         assert (gpu, None) in spawned                      # local: the Studio reaches ace-ai
     with kb.connect_closing() as conn:
         (gpu2,) = _make(conn, 1, priority=9, skills=["vllm-gpu"])
-        routed = {"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 0}}
+        routed = {"ace-media": {"ace-ai": 0}}
         res, spawned = _tick(conn, spillover=plan_for(routed), spawn_limit=0,
                              spawn_paused="spilling")
         assert (gpu2, "ace-media") in spawned
@@ -1902,14 +1904,12 @@ def test_unnamed_host_bound_card_still_requires_its_manifest_target():
     targets = {"vllm-gpu": "ace-ai"}
     skills = ("ssh-machines", "vllm-gpu")
     aliases_ok = {"ace-media": 0, "mac-studio-m3u": 0}
-    no_route = _reach_cfg({"ace-ai": {**aliases_ok, "ace-ai": 255},
-                           "ace-media": {**aliases_ok, "ace-ai": 255}})
+    no_route = _reach_cfg({"ace-media": {**aliases_ok, "ace-ai": 255}})
     assert kwp.reach_allowed_hosts(body="fix it", skills=skills, pool=no_route,
                                    targets=targets) == ()
     assert _portable(body="fix it", skills=skills, pool=no_route, targets=targets) == (
         False, "host_reach", None)
-    routed = _reach_cfg({"ace-ai": {**aliases_ok, "ace-ai": 255},
-                         "ace-media": {**aliases_ok, "ace-ai": 0}})
+    routed = _reach_cfg({"ace-media": {**aliases_ok, "ace-ai": 0}})
     assert kwp.reach_allowed_hosts(body="fix it", skills=skills, pool=routed,
                                    targets=targets) == ("ace-media",)
     # An unprobed target (no column anywhere) fails closed in the fallback too.

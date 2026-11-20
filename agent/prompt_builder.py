@@ -1162,6 +1162,33 @@ def _embedder_environment_hint() -> str:
         (_config_readonly("agent.environment_hint").get("agent", {}) or {}).get("environment_hint", "")).strip()
 
 
+def kanban_placement_hint(environ: "Optional[Dict[str, str]]" = None) -> str:
+    """The line a kanban worker placed on a pool host reads (t_8c580b20): its
+    terminal runs ON that host, which has no ssh route to itself, so a card step
+    ``ssh <host> '<cmd>'`` is run directly. Read from the dispatcher's placement
+    env (``KANBAN_WORKER_PLACEMENT``, kanban_worker_hosts.apply_placement); ``""``
+    for an unplaced or malformed placement."""
+    env = os.environ if environ is None else environ
+    try:
+        data = json.loads(env.get("KANBAN_WORKER_PLACEMENT") or "")
+        host, values = str(data.get("host") or ""), data.get("env") or {}
+        user = str(values.get("TERMINAL_SSH_USER") or "")
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    if not host or values.get("TERMINAL_ENV") != "ssh":
+        return ""
+    who = f" as `{user}`" if user else ""
+    return (f"Kanban placement: you are on pool host `{host}`. Your terminal runs ON {host}{who}, so run "
+            f"{host}'s commands directly in it. Do not `ssh {host}` (or any other name of it) from there: a "
+            f"host has no ssh route to itself (rc 255). A card step written as `ssh {host} '<cmd>'` means: "
+            f"run `<cmd>` here, but as {user or 'the worker account'}, NOT as the account that alias logs into "
+            f"from a peer (an ssh config `User`, often fleetw or ace): `~`, `$HOME` and that account's files "
+            f"differ, so use absolute paths. A step that needs another "
+            f"account's home, files or permissions (`ssh <user>@{host}`, `-l <user>`, `-o User=<user>`, or a "
+            f"`~` path of the alias's account) cannot run here; block it with kind=capability naming that "
+            f"login.")
+
+
 def build_environment_hints() -> str:
     """Execution-environment block: local backends get host OS/home/cwd; remote/sandbox
     backends get ONLY the backend's own state (the agent's tools cannot touch the host).
@@ -1169,6 +1196,7 @@ def build_environment_hints() -> str:
     backend = (_tenv_read("TERMINAL_ENV") or "local").strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
     hints = [_remote_backend_hint(backend)] if is_remote_backend else _local_host_hints()
+    hints.append(kanban_placement_hint())
     # A host-placed Bot Screen is only reachable from a local backend (a sandboxed terminal cannot
     # open windows on the gateway host), and a sandbox-placed one is the sandbox probe's business.
     if not is_remote_backend:

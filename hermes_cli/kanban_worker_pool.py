@@ -260,6 +260,9 @@ class PoolConfig:
     # ``{host: needs it covers}`` from fresh reach-matrix rows (t_aea826a9).
     # A host with no row or no ``caps`` covers nothing: fail closed.
     caps: Mapping[str, frozenset] = field(default_factory=dict)
+    # ``{host: {alias: user}}``: the login ``ssh -G <alias>`` resolves to for
+    # the worker user on that host (:func:`read_reach_logins`, t_8c580b20).
+    reach_logins: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
 
 # -- registry ---------------------------------------------------------------
@@ -483,6 +486,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         ssh_hosts=known_ssh_hosts(fleet_dir),
         pin_aliases=pin_aliases(fleet_dir),
         caps=read_caps(fleet_dir),
+        reach_logins=read_reach_logins(fleet_dir),
     )
 
 
@@ -614,6 +618,25 @@ def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
     return reach, vocab, "ok"
 
 
+def read_reach_logins(fleet_dir: Path) -> Dict[str, Dict[str, str]]:
+    """``{host: {alias: user}}`` from each matrix row's ``logins`` (the ``user``
+    line of ``ssh -G <alias>`` as the worker on that host; with no ``User`` set
+    that is the worker account itself). Absent or malformed: ``{}``, and
+    :func:`reaching_hosts` then grants no self-reach (fail closed, t_8c580b20)."""
+    try:
+        doc = _read_json(Path(fleet_dir) / REACH_FILE)
+    except (OSError, ValueError):
+        return {}
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    out: Dict[str, Dict[str, str]] = {}
+    for hid, row in (hosts or {}).items() if isinstance(hosts, dict) else ():
+        table = row.get("logins") if isinstance(hid, str) and isinstance(row, dict) else None
+        if isinstance(table, dict):
+            out[hid.lower()] = {a.lower(): u for a, u in table.items()
+                                if isinstance(a, str) and a and isinstance(u, str) and u}
+    return out
+
+
 _HOST_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 # The ssh-shaped ways a body drives a host (t_696a9a06, t_f1b135a8). A bare
 # word is prose: "ci-box burst 2/6" or "the ci-box build sheet" drive nothing,
@@ -655,16 +678,24 @@ def _strip_token(tok: str) -> str:
 
 def _ssh_target(rest: str, verb: str = "ssh") -> Optional[str]:
     """``[user@]host`` of the first non-option operand of ssh/sftp/mosh."""
+    return _ssh_target_login(rest, verb)[0]
+
+
+def _ssh_target_login(rest: str, verb: str = "ssh") -> Tuple[Optional[str], Optional[str]]:
+    """``(host, login)`` of the first non-option operand of ssh/sftp/mosh. The
+    login is the ``user@`` prefix, else an ``-l user`` before the operand, else
+    None (t_8c580b20: self-reach must know whose account the line logs in as)."""
     short_args, long_args = _VERB_ARG_OPTS[verb]
     toks = rest.split()
     i = 0
+    login: Optional[str] = None
     while i < len(toks):
         tok = _strip_token(toks[i])
         i += 1
         if not tok:
             continue
         if tok in _CMD_BREAK:
-            return None
+            return None, None
         if tok == "--":
             continue
         if tok.startswith("--"):
@@ -675,16 +706,51 @@ def _ssh_target(rest: str, verb: str = "ssh") -> Optional[str]:
             flags = tok[1:]
             for j, ch in enumerate(flags):
                 if ch in short_args:
+                    val = flags[j + 1:]
                     if j == len(flags) - 1:
+                        val = _strip_token(toks[i]) if i < len(toks) else ""
                         i += 1     # value is the next token
+                    if ch == "l" and val:
+                        login = val
+                    elif ch == "o":    # -o User=ace / -oUser=ace / -o "User ace" (Prism 5ffa30ab3a7a)
+                        key, eq, opt = val.partition("=")
+                        if key.lower() == "user" and not eq and i < len(toks):
+                            opt = _strip_token(toks[i])
+                            i += 1
+                        if key.lower() == "user" and opt:
+                            login = opt
                     break          # else the value is attached (-p22, -oX=y)
             continue
         if tok.lower().startswith("ssh://"):
             tok = tok[6:]
-        tok = tok.rsplit("@", 1)[-1]
-        m = re.match(_HOST_TOKEN, tok)
-        return m.group(0) if m else None
-    return None
+        user, at, host = tok.rpartition("@")
+        m = re.match(_HOST_TOKEN, host)
+        return (m.group(0) if m else None), ((user if at and user else login) if m else None)
+    return None, None
+
+
+_USER_AT_HOST_RE = re.compile(rf"(?<![\w.@-])([A-Za-z_][\w.-]*)@({_HOST_TOKEN})")
+
+
+def ssh_target_logins(body: Optional[str]) -> Dict[str, frozenset]:
+    """``{target: logins}``: every login a body names for an ssh target, keyed by
+    the lower-cased target (``ssh ace@ci.ace`` -> ``{"ci.ace": {"ace"}}``). Read
+    from ``user@host`` anywhere (ssh, scp, rsync, ``-H``) and from ``-l user`` on
+    ssh/sftp. Over-reading only narrows self-reach, never widens it."""
+    out: Dict[str, set] = {}
+    for line in (body or "").splitlines():
+        for m in _USER_AT_HOST_RE.finditer(line):
+            out.setdefault(m.group(2).lower().rstrip("._-"), set()).add(m.group(1))
+        verbs = list(_SSH_VERB_RE.finditer(line))
+        for k, v in enumerate(verbs):
+            verb = v.group(1).lower()
+            if verb not in ("ssh", "sftp"):
+                continue
+            rest = line[v.end():verbs[k + 1].start() if k + 1 < len(verbs) else len(line)]
+            host, login = _ssh_target_login(rest, verb)
+            if host and login:
+                out.setdefault(host.lower().rstrip("._-"), set()).add(login)
+    return {h: frozenset(ls) for h, ls in out.items()}
 
 
 def _remote_operands(rest: str) -> List[str]:
@@ -1023,15 +1089,48 @@ def control_plane_prose(body: Optional[str]) -> Tuple[str, ...]:
 
 
 def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str],
-                   aliases: Iterable[str]) -> Tuple[str, ...]:
+                   aliases: Iterable[str], canon: Optional[Mapping[str, str]] = None,
+                   logins: Optional[Mapping[str, Collection[str]]] = None,
+                   self_user: str = SSH_USER,
+                   config_logins: Optional[Mapping[str, Mapping[str, str]]] = None) -> Tuple[str, ...]:
     """Worker hosts whose fresh row shows ``rc == 0`` for EVERY target (or,
     with no named target, for every alias the matrix knows). Empty when the
     matrix is empty: fail closed.
+
+    A host reaches ITSELF (t_8c580b20): a target that is the row's own host id,
+    or an alias ``canon`` (``{alias: canonical pin}``, :func:`pin_aliases`)
+    resolves to it, counts as reached. The writer records rc 255 there (a host
+    has no ssh alias to itself), which kept a card reading ci-box state off
+    ci-box (t_b58d9b08). Only a fresh row counts, as for every other target.
+
+    The self rule holds only for the worker's own account, judged on the
+    EFFECTIVE login (operator ruling, Apollo 2026-11-20): the logins the body
+    names for the target (``logins``, :func:`ssh_target_logins`: ``user@``,
+    ``-l``, ``-o User=``), else the user the alias resolves to in that host's
+    ssh config (``config_logins[host][alias]``, :func:`read_reach_logins`).
+    Every one must be ``self_user``. ``ssh ace@ci.ace`` is user ace, and a bare
+    ``ssh ci.ace`` whose config sets ``User fleetw`` is fleetw: a worker placed
+    on ci-box is kanbanw, so neither self-reaches; a peer whose fresh row
+    proves the alias takes the card. No recorded config login: no self-reach.
     """
     want = tuple(targets) or tuple(aliases)
     if not want:
         return ()
-    return tuple(h for h, row in reach.items() if all(row.get(a) == 0 for a in want))
+    canon = {k.lower(): v.lower() for k, v in (canon or {}).items() if isinstance(v, str)}
+    named = {k.lower(): set(v) for k, v in (logins or {}).items()}
+    config = {k.lower(): {a.lower(): u for a, u in v.items() if isinstance(a, str)}
+              for k, v in (config_logins or {}).items() if isinstance(v, Mapping)}
+
+    def reached(host: str, row: Mapping[str, int], a: str) -> bool:
+        if row.get(a) == 0:
+            return True
+        t = a.lower()
+        if not (t == host or canon.get(t) == host):
+            return False
+        effective = named.get(t) or {config.get(host, {}).get(t)}
+        return effective == {self_user}
+
+    return tuple(h for h, row in reach.items() if all(reached(h.lower(), row, a) for a in want))
 
 
 def load_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> Tuple[List[PoolHost], List[str]]:
@@ -1498,7 +1597,9 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     # Manifest targets always join (an unprobed one still fails closed,
     # Prism bf503f94e81a).
     named = tuple(dict.fromkeys([*base, *wanted]))
-    return reaching_hosts(reach, named, aliases)
+    return reaching_hosts(reach, named, aliases, getattr(pool, "pin_aliases", None),
+                          logins=ssh_target_logins(body),
+                          config_logins=getattr(pool, "reach_logins", None))
 
 
 def prose_reach_preference(*, body: Optional[str], skills: Iterable[str], pool,
@@ -1520,7 +1621,10 @@ def prose_reach_preference(*, body: Optional[str], skills: Iterable[str], pool,
     live = getattr(pool, "pool_hosts", ()) or ()
     enabled = ({h.name.lower() for h in live} if live
                else {h.lower() for h in pool_hosts} - {d.lower() for d in (getattr(pool, "disabled", ()) or ())})
-    out = tuple(h for h in reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases)
+    # Same self-reach and login rules as a declared target (t_8c580b20).
+    out = tuple(h for h in reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases,
+                                          getattr(pool, "pin_aliases", None), logins=ssh_target_logins(body),
+                                          config_logins=getattr(pool, "reach_logins", None))
                 if h.lower() in enabled)
     return out or None
 
