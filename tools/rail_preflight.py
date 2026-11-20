@@ -43,7 +43,6 @@ _PROBE_OK_TTL_S = 30.0
 _lock = threading.Lock()
 _emitted: Dict[str, str] = {}  # owning task id -> first unconsumed rail message
 _probe_ok: Dict[str, float] = {}
-_lease_ok: Dict[str, Tuple[float, str]] = {}
 _in_cleanup: ContextVar[bool] = ContextVar("rail_preflight_in_cleanup", default=False)
 
 
@@ -168,53 +167,51 @@ def record_absent(message: str) -> Optional[str]:
     return message
 
 
-LEASE_BROWSER_PREFIX = "lease/"   # lease-cdp-forward.py's /json/version "Browser": "lease/<identity>"
-
-
-def _version_on_browser_host(version_url: str) -> Optional[dict]:
-    """``/json/version`` read on the host agent-browser runs on: inside the terminal backend when the
-    browser is placed there (a pool host's loopback is not this process's), else from this process."""
+def _probe_on_browser_host(port: int) -> dict:
+    """``tools/lease_forwarder_probe.py`` run on the host agent-browser runs on: inside the terminal
+    backend when the browser is placed there (a pool host's loopback is not this process's), else here."""
+    from tools import lease_forwarder_probe as probe
     from tools.bot_desktop import placement
-    if placement.resolve().where == placement.TERMINAL:
-        from tools.environments import streams
-        env = placement.terminal_environment(create=True)
-        if env is None:
-            return None
-        proc = streams.run_in(env, ["curl", "-sS", "--noproxy", "*", "--max-time", str(int(_PROBE_TIMEOUT_S)),
-                                    version_url], timeout=_PROBE_TIMEOUT_S + 10)
-        body = proc.stdout if proc.returncode == 0 else b""
-    else:
-        import requests
-        from agent.proxy_bypass import loopback_request_kwargs
-        resp = requests.get(version_url, timeout=_PROBE_TIMEOUT_S, **loopback_request_kwargs(version_url))
-        body = resp.content if resp.status_code == 200 else b""
-    data = json.loads(body or b"null")
-    return data if isinstance(data, dict) else None
+    if placement.resolve().where != placement.TERMINAL:
+        return json.loads(_probe_main(probe, port))
+    from tools.environments import streams
+    env = placement.terminal_environment(create=True)
+    if env is None:
+        return {"ok": False, "why": "no terminal backend"}
+    with open(probe.__file__, encoding="utf-8") as f:
+        source = f.read()
+    proc = streams.run_in(env, ["/usr/bin/python3", "-I", "-c", source, str(port)], timeout=30)
+    lines = (proc.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+    return json.loads(lines[-1]) if lines else {"ok": False, "why": "probe printed nothing"}
+
+
+def _probe_main(probe, port: int) -> str:
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        probe.main([str(port)])
+    return buf.getvalue().strip().splitlines()[-1]
 
 
 def lease_forwarder(cdp_url: str) -> Optional[str]:
-    """The identity name when ``cdp_url`` is a ``lease-cdp-forward.py`` endpoint (its ``/json/version``
-    ``Browser`` reads ``lease/<identity>``; the lease token never leaves the forwarder), else None. Any other
-    browser answering the port (a pool host's own Brave on :9222) is not a lease. A hit is cached 30 s."""
-    kind, target = _probe_target(cdp_url)
-    if kind != "http":
+    """The identity name when ``cdp_url`` is a LIVE browser lease forwarder on the browser's host, else
+    None. A ``/json/version`` string is not trusted: ``lease_forwarder_probe`` binds the port to the
+    root-installed forwarder under ``browserctl with <identity> --class read|act`` and to a gateway call
+    that succeeds now (Prism e44cea4791ec). Nothing is cached, so a released or expired lease, or another
+    process on the same port, is refused on the very next call (Prism 40878f845b06). The token is never
+    read."""
+    from agent.proxy_bypass import is_loopback_host, split_host_port
+    host, port = split_host_port((cdp_url or "").strip())
+    if not port or not is_loopback_host(host):
         return None
-    key = f"lease:{target}"
-    now = time.monotonic()
-    with _lock:
-        hit = _lease_ok.get(key)
-        if hit and now - hit[0] < _PROBE_OK_TTL_S:
-            return hit[1]
     try:
-        browser = str((_version_on_browser_host(str(target)) or {}).get("Browser") or "")
+        res = _probe_on_browser_host(int(port))
     except Exception:
         return None
-    name = browser[len(LEASE_BROWSER_PREFIX):] if browser.startswith(LEASE_BROWSER_PREFIX) else ""
-    if not name:
+    if not isinstance(res, dict) or res.get("ok") is not True:
         return None
-    with _lock:
-        _lease_ok[key] = (now, name)
-    return name
+    return str(res.get("identity") or "") or None
 
 
 def placed_loopback(cdp_url: str) -> bool:

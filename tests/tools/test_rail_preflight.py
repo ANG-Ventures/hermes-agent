@@ -23,7 +23,6 @@ from hermes_cli import kanban_worker_hosts as kwh
 def _clean(monkeypatch):
     rp._emitted.clear()
     rp._probe_ok.clear()
-    getattr(rp, "_lease_ok", {}).clear()
     monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
     monkeypatch.delenv(kwh.PLACEMENT_ENV, raising=False)
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
@@ -82,20 +81,19 @@ def _navigate(monkeypatch, cdp_url):
     return json.loads(registry.dispatch("browser_navigate", {"url": "https://example.com"}, task_id="rail"))
 
 
-def _browser_host_version(monkeypatch, answer):
-    """``/json/version`` as read on the browser's host; records each probed URL."""
+def _browser_host_probe(monkeypatch, answer):
+    """``lease_forwarder_probe`` as run on the browser's host; records each probed port."""
     seen = []
 
-    def fake(url):
-        seen.append(url)
-        return answer
-    monkeypatch.setattr(rp, "_version_on_browser_host", fake)
+    def fake(port):
+        seen.append(port)
+        return answer() if callable(answer) else answer
+    monkeypatch.setattr(rp, "_probe_on_browser_host", fake)
     return seen
 
 
-BRAVE_VERSION = {"Browser": "Chrome/131.0.0.0", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/x"}
-LEASE_VERSION = {"Browser": "lease/id-github-kyzcreig", "Protocol-Version": "1.3",
-                 "webSocketDebuggerUrl": "ws://127.0.0.1:52656/devtools/browser/lease"}  # live forwarder, 11-19
+NOT_A_LEASE = {"ok": False, "why": "/usr/bin/brave is not the installed lease-cdp-forward.py"}
+LIVE_LEASE = {"ok": True, "identity": "id-github-kyzcreig", "class": "read", "pid": 4242}
 
 
 def test_placed_worker_with_live_loopback_cdp_gets_exact_message(monkeypatch):
@@ -103,34 +101,37 @@ def test_placed_worker_with_live_loopback_cdp_gets_exact_message(monkeypatch):
     _worker(monkeypatch)
     _placed(monkeypatch, "ace-ai")
     calls = _cdp_requests(monkeypatch, answers=True)
-    seen = _browser_host_version(monkeypatch, BRAVE_VERSION)
+    seen = _browser_host_probe(monkeypatch, NOT_A_LEASE)
     out = _navigate(monkeypatch, "http://127.0.0.1:9222")
     assert out.get("success") is False
     assert out["error"] == EXPECTED_BROWSER.format(host="ace-ai")
     assert calls == [], "a placed worker never probes this process's loopback"
-    assert seen == ["http://127.0.0.1:9222/json/version"], "only the lease marker is read, on the browser's host"
+    assert seen == [9222], "only the lease probe runs, on the browser's host"
 
 
-def test_placed_worker_may_drive_a_lease_forwarder(monkeypatch):
-    # t_ce9bd5a3: the forwarder's /json/version names the lease, so a placed worker's own browser
-    # tools may drive it; nothing is recorded for parking.
+def test_placed_worker_may_drive_a_live_lease_and_every_call_rechecks(monkeypatch):
+    # t_ce9bd5a3: a live lease forwarder may be driven by a placed worker's own browser tools. Prism
+    # 40878f845b06: no grant is cached, so the call after the lease ends (or another process takes the
+    # port) is refused.
     _worker(monkeypatch)
     _placed(monkeypatch, "ace-ai")
-    seen = _browser_host_version(monkeypatch, LEASE_VERSION)
+    state = {"answer": LIVE_LEASE}
+    seen = _browser_host_probe(monkeypatch, lambda: state["answer"])
     assert rp.browser_rail_error("http://127.0.0.1:52656") is None
-    assert rp.browser_rail_error("http://127.0.0.1:52656") is None
-    assert seen == ["http://127.0.0.1:52656/json/version"], "a hit is cached"
+    assert rp.browser_rail_error("ws://127.0.0.1:52656/devtools/browser/lease") is None
+    assert seen == [52656, 52656], "every call re-runs the probe"
     assert rp.take_rail_absent() is None
-    for bad in ({"Browser": "lease/"}, {"Browser": "Chrome/1 lease/x"}, None):
-        rp._lease_ok.clear()
-        _browser_host_version(monkeypatch, bad)
-        assert rp.browser_rail_error("http://127.0.0.1:52656") == EXPECTED_BROWSER.format(host="ace-ai"), bad
+    for gone in ({"ok": False, "why": "lease id-github-kyzcreig is not live at the gateway (/json/list 500)"},
+                 {"ok": False, "why": "0 listeners on port 52656"}, {"ok": "yes", "identity": "x"}, None):
+        state["answer"] = gone
+        assert rp.browser_rail_error("http://127.0.0.1:52656") == EXPECTED_BROWSER.format(host="ace-ai"), gone
 
 
-def test_lease_marker_is_read_inside_the_terminal_backend(monkeypatch):
+def test_lease_probe_runs_inside_the_terminal_backend(monkeypatch):
     # The forwarder listens on the POOL host's loopback: the probe runs where agent-browser runs
-    # (the terminal backend), never from this process.
+    # (the terminal backend), never from this process, as an isolated stdlib-only interpreter.
     import subprocess
+    from tools import lease_forwarder_probe as probe
     from tools.bot_desktop import placement
     from tools.environments import streams
     calls = _cdp_requests(monkeypatch, answers=True)
@@ -141,11 +142,14 @@ def test_lease_marker_is_read_inside_the_terminal_backend(monkeypatch):
 
     def run_in(e, argv, **kw):
         ran.append((e, argv))
-        return subprocess.CompletedProcess(argv, 0, json.dumps(LEASE_VERSION).encode(), b"")
+        return subprocess.CompletedProcess(argv, 0, (json.dumps(LIVE_LEASE) + "\n").encode(), b"")
     monkeypatch.setattr(streams, "run_in", run_in)
     assert rp.lease_forwarder("http://127.0.0.1:52656") == "id-github-kyzcreig"
-    assert ran and ran[0][0] is env and ran[0][1][0] == "curl" and ran[0][1][-1] == "http://127.0.0.1:52656/json/version"
+    with open(probe.__file__, encoding="utf-8") as f:
+        source = f.read()
+    assert ran == [(env, ["/usr/bin/python3", "-I", "-c", source, "52656"])]
     assert calls == []
+    assert rp.lease_forwarder("http://10.0.0.5:52656") is None and len(ran) == 1, "only loopback is a forwarder"
 
 
 def test_placed_loopback_override_is_not_discovered_or_supervised_here(monkeypatch):
@@ -179,12 +183,12 @@ def test_navigate_lease_cdp_port_connects_only_a_lease(monkeypatch):
     def nav(port):
         return json.loads(registry.dispatch("browser_navigate", {"url": "https://github.com", "lease_cdp_port": port},
                                             task_id="rail"))
-    _browser_host_version(monkeypatch, BRAVE_VERSION)
+    _browser_host_probe(monkeypatch, NOT_A_LEASE)
     out = nav(9222)
     assert out["success"] is False and "is not a browser lease forwarder" in out["error"]
     assert __import__("os").environ["BROWSER_CDP_URL"] == ""
     assert "TCP port" in nav("x")["error"]
-    _browser_host_version(monkeypatch, LEASE_VERSION)
+    _browser_host_probe(monkeypatch, LIVE_LEASE)
     assert nav(52656) == {"success": True, "url": "https://github.com"}
     assert __import__("os").environ["BROWSER_CDP_URL"] == "http://127.0.0.1:52656"
     assert rp.take_rail_absent() is None
