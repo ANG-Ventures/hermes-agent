@@ -95,10 +95,14 @@ def _stale_pidfile_sweep() -> str:
             "kill -0 \"$_vr_p\" 2>/dev/null || rm -f -- \"$_vr_f\"; done 2>/dev/null; unset _vr_f _vr_p")
 
 
+_KILLED_MARK = "hermes-run-killed"
+
+
 def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
     """Remote ``sh`` that signals the process group of the command that wrote ``token``'s pidfile
     (TERM, 1 s, KILL; KILL only without ``grace``), so ``cmd &`` children die too. A pid that is
-    not its own group leader is signalled alone. No pidfile (the command already exited) = no-op."""
+    not its own group leader is signalled alone. No pidfile (the command already exited) = no-op.
+    Prints ``_KILLED_MARK`` once a signal reached a live process."""
     sigs = "TERM KILL" if grace else "KILL"
     f = _run_pidfile(token)
     script = (
@@ -106,7 +110,7 @@ def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
         "case \"$p\" in ''|*[!0-9]*) exit 0;; esac; "
         "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); [ -n \"$g\" ] || exit 0; "
         "[ \"$g\" = \"$p\" ] && t=\"-$g\" || t=\"$p\"; "
-        f"for sig in {sigs}; do kill -s $sig -- \"$t\" 2>/dev/null || exit 0; "
+        f"for sig in {sigs}; do kill -s $sig -- \"$t\" 2>/dev/null || exit 0; echo {_KILLED_MARK}; "
         "[ $sig = TERM ] && sleep 1; done; exit 0")
     return "sh -c " + shlex.quote(script)
 
@@ -411,11 +415,43 @@ class SSHEnvironment(BaseEnvironment):
             t.start()
             t.join(0.25)
 
-    def _remote_group_kill(self, token: str, *, grace: bool) -> None:
+    def _remote_group_kill(self, token: str, *, grace: bool) -> bool | None:
+        """True: a live remote command was signalled; False: none was running; None: unknown."""
         try:
-            self._run_ssh(_remote_group_kill_command(token, grace=grace), timeout=5)
+            result = self._run_ssh(_remote_group_kill_command(token, grace=grace), timeout=5)
         except Exception:
             logger.debug("SSH: remote process-group kill failed", exc_info=True)
+            return None
+        if getattr(result, "returncode", 0) != 0:
+            return None
+        return _KILLED_MARK in (getattr(result, "stdout", "") or "")
+
+    def _wait_for_process(self, proc, timeout: int = 120, **kwargs) -> dict:
+        """An ssh client that exits 255 without the command's cwd marker may have lost its
+        connection (master ended, host gone) while the remote command still runs; sshd sends a
+        tty-less command no signal, so it would run on unowned (t_db3261ec). Kill its group and say
+        so. With nothing left running the result says it was the command's own 255 or a dropped link."""
+        result = super()._wait_for_process(proc, timeout, **kwargs)
+        token = getattr(proc, "_hermes_run_token", None)
+        output = result.get("output") or ""
+        if (result.get("returncode") != 255 or not token or self._cwd_marker in output
+                or result.get("hermes_interrupted") or result.get("hermes_timed_out")):
+            return result
+        killed = self._remote_group_kill(token, grace=True)
+        if killed is False:
+            # No completion marker and nothing left running: the command ran ``exit 255`` itself, or
+            # the link dropped and the command then died (a chatty one gets SIGPIPE). Name both.
+            note = ("[exit 255 without the completion marker: the command exited 255 itself or the ssh "
+                    f"connection to {self.user}@{self.host} closed; no remote process is left]")
+            result["output"] = f"{output.rstrip(chr(10))}\n{note}" if output.strip() else note
+            return result
+        fate = ("the remote command was still running and has been killed" if killed
+                else "the remote command's state could not be checked")
+        note = f"[ssh connection to {self.user}@{self.host} closed before the command finished (exit 255); {fate}]"
+        logger.warning("SSH: %s", note)
+        result["output"] = f"{output.rstrip(chr(10))}\n{note}" if output.strip() else note
+        result["hermes_connection_lost"] = True
+        return result
 
     def cleanup(self):
         if self._sync_manager:
