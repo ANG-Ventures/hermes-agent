@@ -2577,7 +2577,7 @@ def cached_provider_model_ids(
         if tier is not None:
             if tier == "stale":
                 _spawn_swr_refresh(normalized)
-            return _chat_catalog_rows(list(entry["models"]))
+            return _chat_catalog_rows(_cached_rows(entry))
 
     if non_blocking and not force_refresh:
         # Read path: never touch the network in the caller's thread. A same-credentials row past the
@@ -2597,7 +2597,7 @@ def cached_provider_model_ids(
             # The live fetch degraded to the curated list; the account's real catalog is on disk.
             return _chat_catalog_rows([model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)])
         _store_cache_entry(normalized, fresh, cache)
-        return _chat_catalog_rows(list(live))
+        return _chat_catalog_rows(type(live)(live))
 
     if is_ollama:
         if _ollama_native_probe_reachable():
@@ -2614,8 +2614,15 @@ def cached_provider_model_ids(
     # models, which only a successful discovery may advertise (the entry itself is untouched, so the
     # next successful fetch restores them).
     if _cache_entry_valid(entry, fp):
-        return _chat_catalog_rows([model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)])
+        return _chat_catalog_rows(type(_cached_rows(entry))(
+            model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)))
     return []
+
+
+def _cached_rows(entry: dict) -> list[str]:
+    """A disk row's models, still marked :class:`CuratedFallbackModels` when the row is a fallback
+    placeholder, so a caller that must not trust a placeholder (the model registry) can tell."""
+    return (CuratedFallbackModels if entry.get("fallback") else list)(entry["models"])
 
 
 def clear_provider_models_cache(provider: Optional[str] = None) -> None:
