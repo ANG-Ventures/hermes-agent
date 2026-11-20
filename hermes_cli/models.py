@@ -2529,14 +2529,18 @@ def _store_cache_entry(cache_key: str, entry: dict, cache: Optional[dict] = None
 
 def update_provider_cache_entry(provider: str, models: list[str]) -> None:
     """Thread-safe single-entry update for parallel prefetch workers: load-modify-save under a lock
-    so concurrent fetches don't clobber each other's rows. Best-effort, silent on any error."""
+    so concurrent fetches don't clobber each other's rows. Best-effort, silent on any error.
+    A :class:`CuratedFallbackModels` result keeps its ``fallback`` flag and never replaces a live row."""
     try:
         normalized = normalize_provider(provider) or (provider or "")
         if not normalized or not models:
             return
         fp = _credential_fingerprint(normalized)
         with _cache_write_lock:
-            _store_cache_entry(normalized, _cache_entry(fp, models))
+            cache = _load_provider_models_cache()
+            entry = _live_result_entry(fp, models, cache.get(normalized))
+            if entry is not None:
+                _store_cache_entry(normalized, entry, cache)
     except Exception:
         pass
 

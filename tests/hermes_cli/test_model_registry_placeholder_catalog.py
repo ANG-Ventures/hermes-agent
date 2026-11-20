@@ -91,3 +91,26 @@ def test_cached_provider_model_ids_keeps_the_placeholder_marker(cpa_lane, monkey
     cpa_lane["cpa"] = {"fp": "fp", "at": time.time() - 5, "models": list(LIVE)}
     out = models.cached_provider_model_ids("cpa")
     assert out == LIVE and not isinstance(out, models.CuratedFallbackModels)
+
+
+def test_parallel_picker_warmup_keeps_the_placeholder_marker(cpa_lane, monkeypatch):
+    """Prism 8e3d509f0460: the picker warmup re-saves every non-empty result through the locked
+    writer. That writer must keep the ``fallback`` flag, or the next pin check reads the snapshot as
+    the lane's list again and refuses the slot."""
+    from hermes_cli.model_switch_providers import _prefetch_provider_models_parallel
+
+    monkeypatch.setattr(models, "provider_model_ids", lambda *a, **k: models.CuratedFallbackModels(SNAPSHOT))
+
+    _prefetch_provider_models_parallel(["cpa"])
+
+    assert cpa_lane["cpa"]["models"] == SNAPSHOT and cpa_lane["cpa"]["fallback"] is True
+    assert model_registry.require("cpa", "gpt-6.2-sol").reason == "unverifiable"
+
+
+def test_locked_writer_never_replaces_a_live_row_with_a_placeholder(cpa_lane):
+    cpa_lane["cpa"] = {"fp": "fp", "at": time.time() - 5, "models": list(LIVE)}
+    models.update_provider_cache_entry("cpa", models.CuratedFallbackModels(SNAPSHOT))
+    assert cpa_lane["cpa"]["models"] == LIVE and not cpa_lane["cpa"].get("fallback")
+
+    models.update_provider_cache_entry("cpa", list(LIVE[:2]))
+    assert cpa_lane["cpa"]["models"] == LIVE[:2] and not cpa_lane["cpa"].get("fallback")
