@@ -436,7 +436,11 @@ def _fix_card(conn, capability: str) -> Optional[str]:
 # browser-session override cards (11-14..11-20) said in their own --why that they needed the operator SSH lane, the
 # Gmail read lane, LAN reach or Studio files, and no browser; a portal skill's declaration had raised the hold.
 BROWSER_CAP = "browser-session"
-_NO_BROWSER = re.compile(r"\b(?:no|without(?: a)?|not a)\s+browser\b[^;,.]*", re.I)
+# The span ends at punctuation or at a contrast word, so "no browser for X but CDP for Y" keeps its CDP clause.
+_NO_BROWSER = re.compile(r"\b(?:no|without(?: a)?|not a)\s+browser\b"
+                         r"(?:(?!\b(?:but|however|though|although|except|yet|while)\b)[^;,.])*", re.I)
+# A capability's own name ("the browser-session hold") is not a browser need.
+_CAP_NAMES = re.compile(r"(?<![\w-])browser-(?:session|ephemeral)(?![\w-])", re.I)
 _BROWSER_NEED = re.compile(
     r"(?<![\w-])id-[a-z0-9][\w-]*|\b(?:read|act|buy|human|browser|identity|cdp)\s+leases?\b|\bsigned[- ]in\b"
     r"|\blogged[- ]in\b|\bcdp\b|:922[2-4]\b|\bbrowserd?\b|\bidentity\s+(?:containers?|units?|profiles?)\b"
@@ -463,8 +467,9 @@ def misnamed_need(capability: str, why: str) -> Optional[str]:
     let through: only a ``why`` that names something else, or says "no browser", is refused."""
     if (capability or "").strip().lower() != BROWSER_CAP:
         return None
-    text = _NO_BROWSER.sub(" ", why or "")
-    said_no = text != (why or "")
+    named_caps = _CAP_NAMES.sub(" ", why or "")
+    text = _NO_BROWSER.sub(" ", named_caps)
+    said_no = text != named_caps
     if _BROWSER_NEED.search(text):
         return None
     hits: dict = {}

@@ -637,3 +637,15 @@ def test_browser_override_naming_an_identity_need_is_recorded(operator, why):
 def test_need_check_only_reads_browser_session_overrides():
     assert ksa.misnamed_need("studio-state", "SSH lane to the portal host and read-only Gmail") is None
     assert ksa.misnamed_need("browser-session", "operator asked for this one now") is None  # names nothing: let through
+
+
+def test_the_capability_name_itself_is_not_a_browser_need():
+    # Prism ffca430ba996: "browser" inside "browser-session" must not count as a browser need.
+    refusal = ksa.misnamed_need("browser-session", "Needs SSH only; the attached skill raised the browser-session hold")
+    assert refusal and "--capability fleet-ssh" in refusal
+
+
+def test_a_contrast_clause_after_no_browser_keeps_its_browser_need():
+    # Prism dd6b4b842475: the "no browser" span ends at "but", so the CDP clause after it still counts.
+    assert ksa.misnamed_need("browser-session", "No browser needed for SSH but CDP is required for checkout") is None
+    assert ksa.misnamed_need("browser-session", "no browser needed for the SSH lane") is not None
