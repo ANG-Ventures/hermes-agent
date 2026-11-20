@@ -370,11 +370,14 @@ def slot_canonicalise(
     view = slot_view()
     if not view or bare in view:
         return model, None
-    names = sorted(name for name, target in view.items() if target in (bare, spec))
+    # A bare id passed with its lane separately matches a lane-qualified target
+    # (``sol: cpa/gpt-6.2-sol`` with provider ``cpa``; Prism 7c7a0c08ca9d).
+    laned = f"{provider.strip()}/{spec}" if isinstance(provider, str) and provider.strip() and not prefix else None
+    names = sorted(name for name, target in view.items() if target in (bare, spec, laned))
     if len(names) != 1:
         return model, None
-    slot = names[0] if view[names[0]] == spec or not prefix else f"{prefix}/{names[0]}"
-    if slot_resolve(slot)[0] != spec:
+    slot = names[0] if view[names[0]] in (spec, laned) or not prefix else f"{prefix}/{names[0]}"
+    if slot_resolve(slot)[0] not in (spec, laned):
         return model, None
     try:
         verdict = resolve(provider, spec, resolve_aliases=False)

@@ -241,3 +241,38 @@ def test_kanban_tool_create_says_so_and_retired_keeps_successor(slots, monkeypat
         assert kb.get_task(conn, r["task_id"]).model_override == SONNET
     finally:
         conn.close()
+
+
+# ── Prism round 1 on #487 ────────────────────────────────────────────────────
+
+def test_lane_qualified_target_matches_bare_id_on_that_lane(slots):
+    """A slot whose target carries its lane (``sol: cpa/gpt-6.2-sol``) matches the bare id a
+    writer passes with ``provider=cpa`` (Prism 7c7a0c08ca9d). Another lane keeps the literal."""
+    _write(slots, "model-slots.json", {"slots": {"sol": "cpa/gpt-6.2-sol"}})
+    assert slot_canonicalise("gpt-6.2-sol", "cpa") == (
+        "sol", "stored as slot sol, currently id gpt-6.2-sol")
+    assert slot_canonicalise("gpt-6.2-sol", "openai-codex") == ("gpt-6.2-sol", None)
+    assert slot_canonicalise("gpt-6.2-sol") == ("gpt-6.2-sol", None)
+
+
+def test_batch_set_model_keeps_stdout_one_record_per_card(board, capsys):
+    """Batch ``set-model`` prints one record per card on stdout; the slot line goes to stderr
+    (Prism 76ade10dd010). A single named card keeps the line on stdout."""
+    import argparse
+
+    from hermes_cli import kanban as kc
+
+    kb, conn = board
+    a = kb.create_task(conn, title="a", assignee="peer")
+    b = kb.create_task(conn, title="b", assignee="peer")
+    parser = argparse.ArgumentParser()
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    capsys.readouterr()
+    assert kc.kanban_command(parser.parse_args(["kanban", "set-model", a, b, SONNET])) == 0
+    out, err = capsys.readouterr()
+    lines = [line for line in out.splitlines() if line.strip()]
+    assert len(lines) == 2 and all(line.startswith("t_") for line in lines), out
+    assert NOTE in err
+    assert kc.kanban_command(parser.parse_args(["kanban", "set-model", a, SONNET])) == 0
+    out, _ = capsys.readouterr()
+    assert NOTE in out

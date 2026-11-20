@@ -2352,12 +2352,14 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     # that is an established user-facing contract and the per-card flow reads
     # better as prose. The machine-readable `t_x: route=... applies=...` line
     # is what a BATCH needs, where one line per card is the whole point.
+    single = len(applied) == 1 and bool(task_ids)
     if applied and touch_model and model and not (getattr(args, "force_model", None) or "").strip():
         # The board stored the slot for a slot's current id (t_efde9d1a): say so once.
+        # A batch keeps stdout one record per card, so the line goes to stderr there.
         from hermes_cli.model_registry import slot_canonicalise, slot_store_note
         if (_canon := slot_store_note(model, slot_canonicalise(model, provider)[0])):
-            print(f"Model {_canon} (--force-model <reason> keeps the literal id)")
-    single = len(applied) == 1 and bool(task_ids)
+            print(f"Model {_canon} (--force-model <reason> keeps the literal id)",
+                  file=sys.stdout if single else sys.stderr)
     for task_id, redispatched in applied:
         # `--reclaim` asked for a redispatch. If it did not happen, saying
         # `applies=next-dispatch` alone is technically true but reads as
