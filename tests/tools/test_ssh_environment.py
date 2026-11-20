@@ -590,6 +590,19 @@ class TestIdleReaperSparesARunningCommand:
         env.cleanup.assert_not_called()
         assert tt._active_environments.get("t_reap") is env
 
+    def test_idle_env_sharing_a_busy_envs_master_is_not_reaped(self, stale_env, monkeypatch):
+        """Prism b928ca3e4fd8: cleanup() ends the ControlMaster, which every env on the same target and
+        control scope shares (a delegate_task child in the same worker): reaping the idle one would drop
+        the busy one's call."""
+        from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
+        env, base = stale_env
+        env.control_socket = "/tmp/hermes-ssh/abc.sock"
+        busy = MagicMock(control_socket="/tmp/hermes-ssh/abc.sock")
+        proc = MagicMock()
+        monkeypatch.setitem(base._live_foreground, id(proc), (busy, proc))
+        _cleanup_inactive_envs(300)
+        env.cleanup.assert_not_called()
+
     def test_idle_env_without_a_command_is_still_reaped(self, stale_env):
         from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
         import tools.terminal_tool as tt
