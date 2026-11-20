@@ -235,7 +235,7 @@ def test_override_for_another_capability_does_not_release(operator):
     _cfg(operator, True, [])
     with kb.connect_closing() as conn:
         tid = _card(conn)
-        ksa.override(conn, tid, "browser-session", "needs the signed-in browser")
+        ksa.override(conn, tid, "browser-session", "needs the signed-in browser", need="signed-in-identity")
         assert _route(conn, tid)[0] == "wait"
 
 
@@ -263,6 +263,7 @@ def test_cli_prints_one_line_and_refuses_with_rc1(operator, capsys):
 def test_verb_is_registered_and_denied_to_subagents():
     import argparse
     from hermes_cli import kanban as kcli
+    import argparse
     from hermes_cli import kanban_parser as kp
     assert "studio-override" in kcli._DELEGATED_CHILD_DENIED_ACTIONS
     top = argparse.ArgumentParser()
@@ -543,7 +544,8 @@ def test_override_warning_uses_the_live_override_match(operator, capsys):
     err = capsys.readouterr().err
     assert released and "WARNING" not in err, err
     ksa.cmd_studio_override(argparse.Namespace(task_id=tid, capability="browser-session",
-                                               why="the signed in browser", until=None, board=None))
+                                               why="the signed in browser", until=None, board=None,
+                                               need="signed-in-identity"))
     assert "does not release it" in capsys.readouterr().err
 
 
@@ -565,3 +567,69 @@ def test_local_review_placement_records_the_resolved_capability(kanban_home, mon
             got[tid] = (p.get("entry"), (p.get("studio_capability") or {}).get("capability"))
     assert {declared, plain} <= {t for t, _h in spawned}, spawned
     assert got == {declared: ("review", "studio-state"), plain: ("review", "review_lane")}, got
+
+
+# -- 6. a browser-session override declares its need (t_9d6a5d75) ------------------------------------------------
+# Operator ruling 11-19: the --why text is not parsed; --need is a fixed set and only signed-in-identity (and other,
+# recorded) goes through.
+REFUSED_NEEDS = [("public-page", "browser-ephemeral"), ("lan-reach", "host_reach"), ("ssh", "fleet-ssh"),
+                 ("gmail", "studio-state")]
+
+
+def _overrides(conn, tid):
+    return conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+                        (tid, ksa.OVERRIDE_EVENT)).fetchone()[0]
+
+
+@pytest.mark.parametrize("need,instead", REFUSED_NEEDS)
+def test_browser_override_with_a_non_identity_need_is_refused_naming_the_capability(operator, need, instead):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: browser-session")
+        with pytest.raises(ksa.OverrideRefused) as exc:
+            ksa.override(conn, tid, "browser-session", "needs a signed-in browser for checkout", need=need)
+        assert _overrides(conn, tid) == 0
+    assert f"--capability {instead} instead" in str(exc.value), str(exc.value)
+
+
+@pytest.mark.parametrize("need", [None, "", "browser", "Signed In"])
+def test_browser_override_without_a_valid_need_is_refused(operator, need):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: browser-session")
+        with pytest.raises(ksa.OverrideRefused) as exc:
+            ksa.override(conn, tid, "browser-session", "the signed-in Amazon identity", need=need)
+        assert _overrides(conn, tid) == 0
+    assert "needs --need, one of: signed-in-identity" in str(exc.value)
+
+
+@pytest.mark.parametrize("need", ["signed-in-identity", "other"])
+def test_browser_override_with_identity_or_other_is_recorded_with_its_need(operator, need):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: browser-session")
+        p = ksa.override(conn, tid, "browser-session", "no browser needed, only SSH and Gmail", need=need)
+        assert _overrides(conn, tid) == 1
+    assert p["need"] == need
+    line = json.loads(ksa.ledger_path().read_text().splitlines()[-1])
+    assert line["need"] == need  # `other` is counted from the ledger
+
+
+def test_need_is_only_checked_for_browser_session(operator):
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        assert ksa.override(conn, tid, "studio-state", "reads the live board db")["capability"] == "studio-state"
+    assert ksa.need_refusal("studio-state", None) is None
+
+
+def test_parser_need_choices_match_the_need_table():
+    import argparse
+    from hermes_cli import kanban_parser as kp
+    top = argparse.ArgumentParser()
+    kp.build_parser(top.add_subparsers(dest="cmd"))
+    args = top.parse_args(["kanban", "studio-override", "t_x", "--capability", "browser-session", "--why", "a b c",
+                           "--need", "lan-reach"])
+    assert args.need == "lan-reach"
+    with pytest.raises(SystemExit):
+        top.parse_args(["kanban", "studio-override", "t_x", "--capability", "browser-session", "--why", "a b c",
+                        "--need", "browser"])
+    sub = next(a for a in top._actions if isinstance(a, argparse._SubParsersAction)).choices["kanban"]
+    so = next(a for a in sub._actions if isinstance(a, argparse._SubParsersAction)).choices["studio-override"]
+    assert tuple(next(a for a in so._actions if a.dest == "need").choices) == tuple(ksa.NEEDS)
