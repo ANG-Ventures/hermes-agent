@@ -128,9 +128,30 @@ def test_branch_with_local_only_commits_keeps_the_worktree(kanban_home, studio_a
         tid = kb.create_task(conn, title="rework", assignee="alpha", body="x",
                              workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="feature")
         assert _row(conn, tid)[:3] == ("worktree", str(studio_agent), "feature")
-    # once a remote-tracking ref holds the tip (it was pushed), the card mints scratch
-    _git("update-ref", "refs/remotes/origin/feature", "feature", cwd=studio_agent)
+    # once the push repo's tracking ref holds the tip (it was pushed to the fork), the card mints scratch
+    _git("remote", "add", "fork", FORK, cwd=studio_agent)
+    _git("update-ref", "refs/remotes/fork/feature", "feature", cwd=studio_agent)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="rework", assignee="alpha", body="x",
                              workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="feature")
         assert _row(conn, tid)[:3] == ("scratch", None, None)
+
+
+CONTRIBUTOR = "https://github.com/Kyzcreig/hermes-agent.git"
+
+
+def test_tip_held_only_by_another_remote_keeps_the_worktree(kanban_home, studio_agent):
+    """Prism 06ea8a9299c1 (Wrong Remote): a tip only the upstream or a contributor fork holds is not on the fork
+    the scratch clone uses, so the card keeps its worktree."""
+    _commit(studio_agent, "base")
+    _git("checkout", "-q", "-b", "feature", cwd=studio_agent)
+    _commit(studio_agent, "theirs")
+    _git("remote", "add", "contributor", CONTRIBUTOR, cwd=studio_agent)
+    _git("update-ref", "refs/remotes/contributor/feature", "feature", cwd=studio_agent)
+    _git("update-ref", "refs/remotes/origin/feature", "feature", cwd=studio_agent)
+    _git("remote", "add", "fork", FORK, cwd=studio_agent)
+    assert kms.rewrite("worktree", str(studio_agent), "feature", "x") is None
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework", assignee="alpha", body="x",
+                             workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="feature")
+        assert _row(conn, tid)[:3] == ("worktree", str(studio_agent), "feature")
