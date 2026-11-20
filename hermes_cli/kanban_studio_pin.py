@@ -12,8 +12,8 @@ _STUDIO_NEEDS = frozenset({"studio_relay", "studio_launchd", "vault", "skills_tr
 NOTICE_PREFIX = "[placement] bare host: studio dropped: add requires: "
 CP_PROSE_PREFIX = "[placement] control-plane-read not pinned: "
 HR_PROSE_PREFIX = "[placement] host_reach not pinned: "
-# Cheap gate before the pool read: every ssh shape host_bound_targets reads has one of these.
-_SSH_SHAPE_HINT = re.compile(r"ssh|scp|rsync|sftp|mosh|-H\b|\w:/", re.IGNORECASE)
+# Cheap gate before the pool read: every ssh shape host_bound_targets reads has one of these (or _SCP_RE).
+_SSH_SHAPE_HINT = re.compile(r"ssh|scp|rsync|sftp|mosh|-H", re.IGNORECASE)
 _log = logging.getLogger(__name__)
 _REQUIRES_LINE = re.compile(r"^([ \t]*requires:[ \t]*)(.*?)([ \t]*\r?)$", re.IGNORECASE | re.MULTILINE)
 # hermes-home studio-requires-reason (create_refusal): a Studio-only word needs >= 3 words after the note cut.
@@ -95,7 +95,8 @@ class HostReachProse(tuple):
 
 def host_reach_prose(body):
     """Aliases the body addresses in an ssh shape with no ``reach:`` line (t_efd1497a); () on any read fault."""
-    if not body or not _SSH_SHAPE_HINT.search(body):
+    # ``alias:~/path`` / ``alias:path`` is read by the same regex host_bound_targets uses (Prism 703b3483074b).
+    if not body or not (_SSH_SHAPE_HINT.search(body) or pool._SCP_RE.search(body)):
         return ()
     try:
         from hermes_cli.kanban_create_placement import _pool_config

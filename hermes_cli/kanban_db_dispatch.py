@@ -5553,6 +5553,17 @@ def _portable_only(conn, row, assignee, plan, caps, cap_only, wt_port) -> tuple:
         # A worktree card lands only where its repo's mirror is.
         _only = wt_port[2] if _only is None else tuple(
             h for h in _only if h.lower() in wt_port[2])
+    # ssh-shaped prose prefers the hosts that reach its aliases (t_efd1497a); soft: dropped when it would leave
+    # no host, and never applied to a card with a ``host:`` line (the pin decides).
+    if _kwp_take.card_pin(row["body"]) is None:
+        _pref = _kwp_take.prose_reach_preference(
+            body=row["body"], skills=_skills, pool=plan.config, targets=_targets)
+        if _pref:
+            _want = {h.lower() for h in _pref}
+            _narrowed = tuple(h for h in _pref) if _only is None else tuple(
+                h for h in _only if h.lower() in _want)
+            if _narrowed:
+                _only = _narrowed
     return _only, _job
 
 

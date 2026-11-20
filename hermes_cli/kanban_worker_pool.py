@@ -1477,7 +1477,8 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     skill_bound = any(s.rsplit("/", 1)[-1] in HOST_BOUND_SKILLS for s in (skills or ()))
     named = declared_reach(body, aliases)
     if skill_bound:
-        _b, prose = host_bound_targets(body, (), aliases, pin_hosts=pool_hosts,
+        # The ``reach:`` line (and its note) is a declaration, not ssh prose (Prism ac47bd4b21d9).
+        _b, prose = host_bound_targets(REACH_LINE_RE.sub("", body or ""), (), aliases, pin_hosts=pool_hosts,
                                        ssh_hosts=getattr(pool, "ssh_hosts", None))
         named = tuple(dict.fromkeys([*named, *prose]))
     bound = skill_bound or bool(named)
@@ -1498,6 +1499,30 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     # Prism bf503f94e81a).
     named = tuple(dict.fromkeys([*base, *wanted]))
     return reaching_hosts(reach, named, aliases)
+
+
+def prose_reach_preference(*, body: Optional[str], skills: Iterable[str], pool,
+                           targets: Optional[Mapping[str, str]] = None) -> Optional[Tuple[str, ...]]:
+    """Soft narrowing for a card whose ssh-shaped PROSE names fleet aliases (Apollo 2026-11-20, t_efd1497a): the
+    enabled pool hosts whose fresh row reaches every such alias, or None (place anywhere). Never a hold: None when
+    no enabled host reaches them, and None whenever :func:`reach_allowed_hosts` already binds the card (a
+    ``reach:`` line, a HOST_BOUND skill or a manifest target decide then). Only ``_portable_only`` reads it, so
+    prose can never make :func:`portable` return HOST_REACH."""
+    if reach_allowed_hosts(body=body, skills=skills, pool=pool, targets=targets) is not None:
+        return None
+    pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
+    aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
+                                   *(h.lower() for h in pool_hosts)]))
+    _b, named = host_bound_targets(body, (), aliases, pin_hosts=pool_hosts,
+                                   ssh_hosts=getattr(pool, "ssh_hosts", None))
+    if not named:
+        return None
+    live = getattr(pool, "pool_hosts", ()) or ()
+    enabled = ({h.name.lower() for h in live} if live
+               else {h.lower() for h in pool_hosts} - {d.lower() for d in (getattr(pool, "disabled", ()) or ())})
+    out = tuple(h for h in reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases)
+                if h.lower() in enabled)
+    return out or None
 
 
 def body_host_targets(body: Optional[str], pool) -> Tuple[str, ...]:

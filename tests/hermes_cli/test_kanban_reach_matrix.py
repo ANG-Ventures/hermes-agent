@@ -538,3 +538,83 @@ def test_skill_bound_card_keeps_its_ssh_named_target(tmp_path):
     assert kwp.reach_allowed_hosts(body=body, skills=("ssh-machines",), pool=pool) == ()
     assert _portable(pool, body=body, skills=("ssh-machines",)) == (False, "host_reach", None)
     assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) is None     # prose alone: not bound
+
+
+# -- t_efd1497a round 2 (Apollo 2026-11-20): prose is a SOFT narrowing, never a hold -------------------------
+def _soft_pool(tmp_path, rows, hosts):
+    fleet = tmp_path / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwp.REACH_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        h: {"at": NOW, "reach": r} for h, r in rows.items()}}))
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    return kwp.PoolConfig(hosts=hosts, profiles=("alpha",), reach=reach, reach_aliases=aliases,
+                          reach_status=status)
+
+
+class _Plan:
+    def __init__(self, config):
+        self.config = config
+        self.prose_advisory = False
+
+
+def _only(pool, body, skills=()):
+    row = {"body": body, "skills": json.dumps(list(skills))}
+    return kbd._portable_only(None, row, "alpha", _Plan(pool), None, None, None)[0]
+
+
+SOFT_HOSTS = ("ci-box", "ace-ai", "ace-media", "mbp-2026")
+NAS_ROWS = {"ci-box": {"nas-fleet": 255}, "ace-ai": {"nas-fleet": 255}, "ace-media": {"nas-fleet": 255},
+            "mbp-2026": {"nas-fleet": 0}}
+
+
+def test_prose_alias_narrows_to_the_hosts_that_reach_it(tmp_path):
+    """t_a0d8ac3e / t_592555dd shape: only mbp-2026 reaches nas-fleet. The card lands only there, and prose
+    never makes portable() hold it."""
+    pool = _soft_pool(tmp_path, NAS_ROWS, SOFT_HOSTS)
+    body = "scp out nas-fleet:/srv/drop/"
+    assert _only(pool, body) == ("mbp-2026",)
+    assert _portable(pool, body=body)[1] != "host_reach"
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) is None
+    # a host: line decides placement on its own; the preference does not apply
+    assert _only(pool, "host: ci-box\n" + body) is None
+
+
+def test_prose_alias_no_host_reaches_places_anywhere(tmp_path):
+    pool = _soft_pool(tmp_path, {"ci-box": {"dell-rugged": 255}, "ace-ai": {"dell-rugged": 255}},
+                      ("ci-box", "ace-ai"))
+    body = "ssh dell-rugged true"
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) is None
+    assert kwp.prose_reach_preference(body=body, skills=(), pool=pool) is None
+    assert _only(pool, body) is None
+    assert _portable(pool, body=body)[0] is True
+
+
+def test_prose_preference_never_empties_a_narrower_set(tmp_path, monkeypatch):
+    """Soft: if another rule already narrowed to hosts that do not reach the alias, the preference is dropped."""
+    pool = _soft_pool(tmp_path, NAS_ROWS, SOFT_HOSTS)
+    monkeypatch.setattr(kwp, "needs_allowed_hosts", lambda *a, **k: ("ci-box",))
+    assert _only(pool, "scp out nas-fleet:/srv/drop/") == ("ci-box",)
+
+
+def test_skill_path_ignores_the_reach_line_note(tmp_path):
+    """Prism ac47bd4b21d9 repro: the reach: line's own note is not ssh prose."""
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"ci-box": _row(ace_ai=0), "ace-media": _row(ace_ai=0, unifi=0)})
+    pool = _pool(fleet)
+    body = "reach: ace-ai -- example: ssh mac-studio-m3u uptime"
+    assert kwp.reach_allowed_hosts(body=body, skills=("ssh-machines",), pool=pool) == ("ci-box", "ace-media")
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ("ci-box", "ace-media")
+
+
+@pytest.mark.parametrize("body", ["Use ace-media:~/drop/ as the destination.", "pdsh -Hace-media uptime"])
+def test_notice_fires_for_every_shape_the_reader_binds(kanban_home, monkeypatch, body):
+    """Prism 703b3483074b: the prefilter must not skip `alias:~/path` or an attached `-Halias`."""
+    from hermes_cli import kanban_create_placement as kcp
+    from hermes_cli import kanban_studio_pin as ksp
+    fleet = kanban_home / "fleet"
+    _matrix(fleet, {"ci-box": _row(ace_media=0)})
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    cfg = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), reach=reach, reach_aliases=aliases,
+                         reach_status=status)
+    monkeypatch.setattr(kcp, "_pool_config", lambda: cfg)
+    assert ksp.host_reach_prose(body) == ("ace-media",)
