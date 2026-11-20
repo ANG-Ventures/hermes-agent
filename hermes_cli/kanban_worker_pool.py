@@ -9,8 +9,10 @@ Hosts come from two files under the fleet root (``<kanban_home>/fleet``):
 * ``kanban-pool.json``: the kanban sidecar (``priority``, ``capacity_pct``,
   ``studio_only`` (deny-list: every other profile is a pool profile) or the
   legacy ``profiles`` allow-list, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
-  capacity_pct?, profiles?, ssh_user?}``, ``ssh_user``: the worker login, a default that a
-  host row may override, never ``root``; t_5e87455b, Option A). Written
+  capacity_pct?, profiles?, ssh_user?, ssh_identity?}``, ``ssh_user``: the worker login, a default that a
+  host row may override, never ``root``; t_5e87455b, Option A; ``ssh_identity``: the worker
+  key's private-key path, same default/override, required for any login other than kanbanw).
+  Written
   only by hermes-home ``scripts/fleet-host``.
 
 Drift (PRD §5.1 table): a structural error refuses the whole pool; a per-host
@@ -63,6 +65,11 @@ ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
 # A plain POSIX login (it lands in an ssh argv as ``user@host``), and never root.
 _SSH_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+# The worker key (an absolute path; it lands in an ssh argv as ``-i <path>``). A login other than
+# kanbanw is the host OWNER's account, where the Studio's default key is the owner's own
+# unrestricted key: only a dedicated key, pinned with IdentitiesOnly, reaches the forced-command
+# worker wrapper (Apollo ruling 2026-11-20 03:55, t_911ce504).
+_SSH_IDENTITY_RE = re.compile(r"/[A-Za-z0-9._/~+@-]+")
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
 # Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
@@ -106,9 +113,9 @@ _ROLES_ROW = frozenset({"roles", "state"})
 # Optional audit field {by, card, reason, at} the fleet-host CLI stamps on a row (who/why/when of the last state
 # change); validated by the router's registry, never read for placement here.
 _ROLES_ROW_OPTIONAL = frozenset({"last_change"})
-_SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
+_SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "ssh_identity", "capacity_pct", "priority",
                           "profiles", "studio_only", "studio_bound_skills", "hosts"})
-_SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles", "ssh_user"})
+_SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles", "ssh_user", "ssh_identity"})
 _ABSENCE = ("required", "optional")
 _STATES = ("active", "draining")
 
@@ -228,6 +235,7 @@ class PoolHost:
     enabled: bool
     priority: int
     ssh_port: int = 22
+    ssh_identity: Optional[str] = None   # the worker key; None = ssh's own defaults (kanbanw)
 
     @property
     def target(self) -> str:
@@ -322,6 +330,10 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
     return out
 
 
+def _ssh_identity_ok(path) -> bool:
+    return isinstance(path, str) and bool(_SSH_IDENTITY_RE.fullmatch(path)) and ".." not in path.split("/")
+
+
 def _ssh_user_ok(user) -> bool:
     return (isinstance(user, str) and bool(_SSH_USER_RE.fullmatch(user))
             and user != "root")
@@ -338,6 +350,8 @@ def validate_sidecar(doc) -> List[str]:
         errs.append(f"schema must be 1, not {doc.get('schema')!r}")
     if not _ssh_user_ok(doc.get("ssh_user")):
         errs.append(f"ssh_user must be a plain login other than root, not {doc.get('ssh_user')!r}")
+    if "ssh_identity" in doc and not _ssh_identity_ok(doc["ssh_identity"]):
+        errs.append(f"ssh_identity must be an absolute key path, not {doc['ssh_identity']!r}")
     if "capacity_pct" in doc and not _pct(doc["capacity_pct"]):
         errs.append(f"capacity_pct must be in (0, 1], not {doc['capacity_pct']!r}")
     for key in ("profiles", "studio_only", "studio_bound_skills"):
@@ -357,6 +371,12 @@ def validate_sidecar(doc) -> List[str]:
             continue
         if "ssh_user" in row and not _ssh_user_ok(row["ssh_user"]):
             errs.append(f"hosts.{hid}.ssh_user must be a plain login other than root, not {row['ssh_user']!r}")
+        if "ssh_identity" in row and not _ssh_identity_ok(row["ssh_identity"]):
+            errs.append(f"hosts.{hid}.ssh_identity must be an absolute key path, not {row['ssh_identity']!r}")
+        user = row.get("ssh_user", doc.get("ssh_user"))
+        if user != SSH_USER and not row.get("ssh_identity", doc.get("ssh_identity")):
+            errs.append(f"hosts.{hid}: login {user!r} needs ssh_identity (a dedicated worker key: the "
+                        "owner's default key would skip the worker wrapper)")
         if set(row) - _SIDECAR_ROW:
             errs.append(f"hosts.{hid}: unknown keys {sorted(set(row) - _SIDECAR_ROW)}")
         if not isinstance(row.get("enabled"), bool):
@@ -468,6 +488,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         role_slots, state = roles[hid]
         hosts.append(PoolHost(
             name=hid, ssh_host=hid, ssh_user=row.get("ssh_user", sidecar["ssh_user"]),
+            ssh_identity=row.get("ssh_identity", sidecar.get("ssh_identity")),
             slots=role_slots[ROLE],
             capacity_pct=float(row.get("capacity_pct", gcap)), absence=row["absence"],
             profiles=tuple(p for p in row.get("profiles", gprofiles) if p.lower() not in deny),
@@ -1779,7 +1800,14 @@ def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
     if host.ssh_port != 22:
         argv += ["-p", str(host.ssh_port)]
-    return argv + [host.target, remote_cmd]
+    return argv + identity_args(getattr(host, "ssh_identity", None)) + [host.target, remote_cmd]
+
+
+def identity_args(path: Optional[str]) -> List[str]:
+    """``-i <key> -o IdentitiesOnly=yes`` for a pinned worker key, else nothing: without
+    IdentitiesOnly ssh still offers the agent's and the default keys, and the owner's own key
+    would log in past the worker wrapper."""
+    return ["-i", path, "-o", "IdentitiesOnly=yes"] if path else []
 
 
 @dataclass(frozen=True)

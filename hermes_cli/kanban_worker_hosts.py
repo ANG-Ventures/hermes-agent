@@ -24,7 +24,7 @@ import shlex
 import subprocess
 from typing import Callable, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
-from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
+from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv, identity_args  # noqa: F401
 from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
 
 PLACEMENT_ENV = "KANBAN_WORKER_PLACEMENT"
@@ -52,6 +52,10 @@ def placement_env(host: PoolHost, workspace: str, *, run_id: Optional[int] = Non
         # profile from a tree another profile wrote.
         "TERMINAL_SSH_SYNC_FILES": "false",
     }
+    # The pinned worker key (``ssh.py`` adds IdentitiesOnly with it): on an owner login only
+    # this key reaches the forced-command worker wrapper.
+    if getattr(host, "ssh_identity", None):
+        values["TERMINAL_SSH_KEY"] = host.ssh_identity
     # N workers placed on one host in one tick shared one ControlMaster socket
     # and raced to create it; the loser printed "ControlSocket ... already
     # exists" into its tool output (t_3d487402). One socket per run.
@@ -1717,6 +1721,7 @@ def remote_workspace_has_content(placement_raw: Optional[str],
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
         if str(env.get("TERMINAL_SSH_PORT") or "22") != "22":
             argv += ["-p", str(env["TERMINAL_SSH_PORT"])]
+        argv += identity_args(env.get("TERMINAL_SSH_KEY"))
         target = f"{env['TERMINAL_SSH_USER']}@{ssh_host}" if env.get("TERMINAL_SSH_USER") else ssh_host
         # rc 0 = empty or proven absent, rc 3 = has entries; anything else (ssh 255, perms, I/O)
         # fails closed. ``[ -e ]`` is false for ENOENT, for a dangling link AND for a path under

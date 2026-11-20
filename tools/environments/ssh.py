@@ -190,7 +190,9 @@ class SSHEnvironment(BaseEnvironment):
     def _target_flags(self, port_flag: str) -> list:
         """Port/key flags shared by ssh (``-p``) and scp (``-P``)."""
         flags = [port_flag, str(self.port)] if self.port != 22 else []
-        return flags + (["-i", self.key_path] if self.key_path else [])
+        # IdentitiesOnly: with a key named, offer only it, never the agent's or the default keys
+        # (a pool owner login accepts the owner's own key too, past the worker wrapper).
+        return flags + (["-i", self.key_path, "-o", "IdentitiesOnly=yes"] if self.key_path else [])
 
     def _build_ssh_command(self, extra_args: list | None = None, send_env: Iterable[str] = (),
                            log_to_file: bool = False) -> list:
