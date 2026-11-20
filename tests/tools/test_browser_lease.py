@@ -50,16 +50,25 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+# browserctl's stderr grant line (merged into the watcher's stdout), with the secret-bearing values it really carries
+GRANT = {"lease_id": 12473, "identity": "id-github-kyzcreig", "class": "read", "expires_at": 1795213000.5,
+         "cdp_url": "wss://cdp.browsers.ace/SECRETCDP", "viewer_url": "https://studio/view?ticket=SECRETVIEW",
+         "heartbeat_every_s": 60}
+
+
 def _fake_client(monkeypatch, port: int, *, then_exit: bool = False, refuse: str = ""):
-    """``_spawn`` replaced by a child that behaves like the watcher: prints ``port=N`` (or a refusal)."""
+    """``_spawn`` replaced by a child that behaves like the watcher: prints browserctl's grant line and ``port=N``
+    (or a refusal); on stdin EOF prints browserctl's release line, as `with` does when the watcher ends it."""
     spawned = []
     body = f"print({refuse!r}, flush=True); raise SystemExit(3)" if refuse else textwrap.dedent(f"""
         import sys, time
+        print({json.dumps(GRANT, sort_keys=True)!r}, flush=True)
         print("lease-cdp-forward: gateway ok", flush=True)
         print("port={port}", flush=True)
         if {then_exit!r}:
             raise SystemExit(0)
         sys.stdin.read()
+        print("browserctl with: released=12473 heartbeats ok=0 fail=0", flush=True)
     """)
 
     def spawn(identity, klass, card):
@@ -151,11 +160,49 @@ def test_navigate_takes_an_identity_never_a_port(monkeypatch):
     monkeypatch.setenv("BROWSER_CDP_URL", f"http://127.0.0.1:{port}")
     assert nav(lease_cdp_port=port)["error"] == EXPECTED.format(host="ace-ai")
     _fake_client(monkeypatch, port)
-    assert nav(lease_identity="id-github-kyzcreig") == {"success": True, "url": "https://github.com"}
+    lease = {"lease_id": 12473, "identity": "id-github-kyzcreig", "class": "read", "expires_at": 1795213000.5,
+             "release": "browser_lease_release"}
+    assert nav(lease_identity="id-github-kyzcreig") == {"success": True, "url": "https://github.com", "lease": lease}
     assert cleaned == [1]
     assert nav() == {"success": True, "url": "https://github.com"}, "later calls stay on the lease"
-    assert nav(lease_identity="id-github-kyzcreig") == {"success": True, "url": "https://github.com"}
+    assert nav(lease_identity="id-github-kyzcreig") == {"success": True, "url": "https://github.com", "lease": lease}
     assert cleaned == [1], "the same live lease is reused, not re-acquired"
+
+
+def test_navigate_returns_the_lease_id_and_release_ends_only_this_runs_lease(monkeypatch):
+    """t_62be0ba9: the leasing navigate names its lease (id, identity, class, expiry) and no grant URL; the release
+    tool ends that lease (browserctl's release answer comes back), later calls fail closed, and a second release
+    finds nothing to release."""
+    import model_tools  # noqa: F401
+    from tools import browser_tool as bt
+    from tools.registry import registry
+    monkeypatch.setattr("tools.rail_preflight.browser_capability_error", lambda **_k: None)
+    monkeypatch.setattr(bt, "browser_navigate", lambda url, task_id=None: json.dumps({"success": True, "url": url}))
+    monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: None)
+    port = _free_port()
+    _fake_client(monkeypatch, port)
+    raw = registry.dispatch("browser_navigate", {"url": "https://github.com", "lease_identity": "id-github-kyzcreig"},
+                            task_id="t")
+    out = json.loads(raw)
+    assert out["lease"]["lease_id"] == 12473, "the lease id is in the navigate result"
+    assert (out["lease"]["identity"], out["lease"]["class"], out["lease"]["expires_at"]) == (
+        "id-github-kyzcreig", "read", 1795213000.5)
+    assert "SECRET" not in raw and "cdp_url" not in raw and "viewer_url" not in raw
+    lease = bl._active
+    assert bt.check_browser_lease_release_requirements(), "a kanban worker sees the release tool"
+    rel = json.loads(registry.dispatch("browser_lease_release", {}, task_id="t"))
+    assert rel == {"success": True, "released": True, "lease_id": 12473, "identity": "id-github-kyzcreig",
+                   "class": "read", "release_answer": "12473"}
+    assert lease.proc.poll() is not None, "the lease client has exited"
+    assert rp.browser_rail_error(f"http://127.0.0.1:{port}").startswith("BROWSER_LEASE_UNAVAILABLE")
+    again = json.loads(registry.dispatch("browser_lease_release", {}, task_id="t"))
+    assert (again["success"], again["released"]) == (True, False)
+
+
+def test_the_release_tool_is_for_kanban_workers_only(monkeypatch):
+    from tools import browser_tool as bt
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    assert not bt.check_browser_lease_release_requirements()
 
 
 def test_lease_is_for_kanban_workers_only(monkeypatch):
@@ -295,7 +342,7 @@ def test_a_dead_lease_never_falls_back_to_the_configured_browser(monkeypatch, wh
         _fake_client(monkeypatch, _free_port())
         nav = json.loads(registry.dispatch("browser_navigate", {"url": "https://github.com",
                                                                 "lease_identity": "id-github-kyzcreig"}, task_id="t"))
-        assert nav == {"success": True}
+        assert nav["success"] is True and nav["lease"]["lease_id"] == 12473
         lease = bl._active
         os.kill(lease.proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         lease.proc.wait(10)

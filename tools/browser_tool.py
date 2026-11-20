@@ -493,6 +493,11 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_lease_release",
+        "description": "Kanban workers only: release the browser identity lease this run took with browser_navigate(lease_identity=...). Releases this run's own lease and nothing else; the lease is also released when the run exits. Returns the lease id and the release answer. Browser calls after it fail closed until browser_navigate leases again.",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
         "name": "browser_snapshot",
         "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
         "parameters": {
@@ -1357,8 +1362,37 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
         params["task_id"] = kw.get("task_id")
         for k in extra_kw:
             params[k] = kw.get(k)
-        return globals()[fn_name](**params)
+        out = globals()[fn_name](**params)
+        if args.get("lease_identity"):
+            out = _with_lease_info(out)
+        return out
     return call
+
+
+def _with_lease_info(out: str) -> str:
+    """t_62be0ba9: a navigate that leased an identity says which lease it holds (id, identity, class, expiry)."""
+    from tools import browser_lease
+    info = browser_lease.lease_info()
+    try:
+        res = json.loads(out)
+    except (TypeError, ValueError):
+        return out
+    if info is None or not isinstance(res, dict):
+        return out
+    res["lease"] = info
+    return _dumps(res)
+
+
+def browser_lease_release(task_id: Optional[str] = None) -> str:
+    """t_62be0ba9: release the lease this run's browser_navigate(lease_identity=...) took, and only that one."""
+    from tools import browser_lease
+    return _dumps(browser_lease.release_lease())
+
+
+def check_browser_lease_release_requirements() -> bool:
+    """Only a dispatcher-owned kanban worker can hold a lease (``_connect_lease``)."""
+    from tools.rail_preflight import _owned_task
+    return bool(_owned_task())
 
 
 # (tool name, emoji, availability gate, schema-arg defaults[, extra kw names]); the tool
@@ -1394,6 +1428,10 @@ def _routed_handler(name: str, fallback):
         ), _cloud.browser_backend_name)
     return handler
 
+
+registry.register(name="browser_lease_release", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_lease_release"],
+                  handler=lambda args, **kw: browser_lease_release(task_id=kw.get("task_id")),
+                  check_fn=check_browser_lease_release_requirements, emoji="🔓")
 
 for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
     if _check_fn is None:  # also binds the legacy check_browser_<x>_requirements globals (tests + callers)
