@@ -354,7 +354,7 @@ def test_owner_login_pins_the_worker_key_on_every_ssh_path(tmp_path):
     assert env["TERMINAL_SSH_KEY"] == "/Users/x/.ssh/kanban_worker"
     ssh = SSHEnvironment.__new__(SSHEnvironment)
     ssh.port, ssh.key_path = 22, env["TERMINAL_SSH_KEY"]
-    assert ssh._target_flags("-p") == ["-i", "/Users/x/.ssh/kanban_worker", "-o", "IdentitiesOnly=yes"]
+    assert ssh._target_flags("-p")[:4] == ["-i", "/Users/x/.ssh/kanban_worker", "-o", "IdentitiesOnly=yes"]
     seen = []
     kwh.remote_workspace_has_content(json.dumps({"env": env}),
                                      runner=lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})())
@@ -371,6 +371,141 @@ def test_owner_login_pins_the_worker_key_on_every_ssh_path(tmp_path):
     for bad in ("k/rel", "/a b", "/a/../b", 5):
         side["hosts"]["ace-ai"]["ssh_identity"] = bad
         assert any("ssh_identity" in e for e in kwp.validate_sidecar(side)), bad
+
+
+def test_pinned_worker_key_never_shares_a_control_master(tmp_path, monkeypatch):
+    """t_3911e84c: an ssh that reuses an open ControlMaster never authenticates, so on an owner
+    login (ace@host, the operator's own user@host) the pinned worker key decided nothing: the call
+    rode the operator's ~/.ssh/cm master and skipped the forced-command wrapper. A keyed argv opts
+    out of every mux; a keyed and an unkeyed SSHEnvironment never share a socket. kanbanw hosts
+    with no key keep today's argv byte for byte."""
+    import tempfile
+    from hermes_cli import kanban_worker_hosts as kwh
+    from tools.environments.ssh import control_socket_path
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/Users/x/.ssh/kanban_worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    argv = kwp._ssh_argv(by["ace-ai"], "true")
+    assert "ControlMaster=no" in argv and "ControlPath=none" in argv
+    assert argv.index("ControlPath=none") < argv.index("ace@ace-ai")
+    seen = []
+    kwh.remote_workspace_has_content(json.dumps({"env": kwh.placement_env(by["ace-ai"], "/w")}),
+                                     runner=lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})())
+    assert "ControlMaster=no" in seen[0] and "ControlPath=none" in seen[0]
+    assert kwp._ssh_argv(by["ace-media"], "true") == [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "kanbanw@ace-media", "true"]
+    # a keyed probe that fell back to direct never `-O exit`s the shared ~/.ssh/cm master: that
+    # master is the operator's own session for the same user@host
+    exits = []
+    monkeypatch.setattr(kwp.subprocess, "run", lambda a, **kw: exits.append(a))
+    kwp._drop_stale_master(by["ace-ai"])
+    assert exits == []
+    kwp._drop_stale_master(by["ace-media"])
+    assert exits and exits[0][:3] == ["ssh", "-O", "exit"]
+    # an unreadable key turns auth off: ssh would warn and log in with the ssh_config IdentityFile,
+    # the owner's own key (Prism e74bdeef952b; measured on the Studio)
+    from tools.environments.ssh import SSHEnvironment
+    off = ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no"]
+    key = tmp_path / "kanban_worker"
+    key.write_text("k")
+    ssh = SSHEnvironment.__new__(SSHEnvironment)
+    ssh.port = 22
+    for path, refused in (("/Users/x/.ssh/kanban_worker", True), (str(key), False)):
+        args = kwp.identity_args(path)
+        assert args[:2] == ["-i", path] and (args[-6:] == off) is refused, args
+        ssh.key_path = path
+        assert (ssh._target_flags("-p")[-6:] == off) is refused
+    assert kwp.identity_args(None) == [] and kwp.identity_args("") == []
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    plain = control_socket_path("ace", "ace-ai", 22)
+    keyed = control_socket_path("ace", "ace-ai", 22, key_path="/Users/x/.ssh/kanban_worker")
+    assert plain != keyed
+    assert control_socket_path("ace", "ace-ai", 22, key_path="") == plain
+    # a kanban run's scoped socket keeps its name: the footprint release finds it by user@host:port+run
+    assert control_socket_path("ace", "ace-ai", 22, "run7", key_path="/k") == \
+        control_socket_path("ace", "ace-ai", 22, "run7")
+
+
+def test_pinned_worker_key_fails_closed_on_both_ends(tmp_path, monkeypatch):
+    """t_3911e84c send-back. a04c57100fc5: a "~/..." key reads as unreadable to os.access, which turned
+    auth off for a readable key. fb4485599af6: ssh still lists the ssh_config IdentityFile (the owner's
+    key) after the worker key, and an agent key too, so a server that refuses the worker key logs the
+    owner in. Client: IdentityAgent=none. Remote: every keyed command runs behind a guard that exits 97
+    unless the forced command set FLEET_WORKER_SESSION=1, and a probe that gets 97 is unusable, never a
+    reused sample. kanbanw hosts keep today's argv and remote command byte for byte."""
+    import os
+    import subprocess as sp
+    from hermes_cli import kanban_worker_hosts as kwh
+    from tools.environments import ssh as ssh_mod
+    from tools.environments.ssh import SSHEnvironment
+    assert ssh_mod.WORKER_SESSION_GUARD == kwp.WORKER_SESSION_GUARD
+    # the guard itself, in a real shell
+    for shell in ("sh", "bash"):
+        cmd = [shell, "-c", kwp.WORKER_SESSION_GUARD + "echo ran"]
+        env = {k: v for k, v in os.environ.items() if k != "FLEET_WORKER_SESSION"}
+        no = sp.run(cmd, capture_output=True, text=True, env=env)
+        assert (no.returncode, no.stdout, no.stderr.strip()) == (97, "", "not a fleet worker session")
+        yes = sp.run(cmd, capture_output=True, text=True, env={**env, "FLEET_WORKER_SESSION": "1"})
+        assert (yes.returncode, yes.stdout) == (0, "ran\n")
+    # tilde key: expanded once, readable, auth stays on
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "x").write_text("k")
+    args = kwp.identity_args("~/.ssh/x")
+    assert args[:2] == ["-i", str(tmp_path / ".ssh" / "x")] and "PubkeyAuthentication=no" not in args
+    ssh = SSHEnvironment.__new__(SSHEnvironment)
+    ssh.port, ssh.key_path = 22, "~/.ssh/x"
+    flags = ssh._target_flags("-p")
+    assert flags[:2] == ["-i", str(tmp_path / ".ssh" / "x")] and "PubkeyAuthentication=no" not in flags
+    # no agent key is ever offered, on both argvs
+    assert "IdentityAgent=none" in args and "IdentityAgent=none" in flags
+    # the guard rides every keyed remote command: _ssh_argv, the custody probe, the terminal backend
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/Users/x/.ssh/kanban_worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    argv = kwp._ssh_argv(by["ace-ai"], "true")
+    assert "IdentityAgent=none" in argv and argv[-1] == kwp.WORKER_SESSION_GUARD + "true"
+    seen = []
+    fake = lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})()
+    kwh.remote_workspace_has_content(json.dumps({"env": kwh.placement_env(by["ace-ai"], "/w")}), runner=fake)
+    kwh.remote_workspace_has_content(json.dumps({"env": kwh.placement_env(by["ace-media"], "/w")}), runner=fake)
+    assert seen[0][-1].startswith(kwp.WORKER_SESSION_GUARD)
+    assert seen[1][-1] == seen[0][-1][len(kwp.WORKER_SESSION_GUARD):]  # kanbanw: today's script
+    sent = []
+    monkeypatch.setattr(ssh_mod, "run_capture", lambda cmd, **kw: sent.append(cmd))
+    monkeypatch.setattr(ssh_mod, "_popen_bash", lambda cmd, *a, **kw: sent.append(cmd) or type("P", (), {})())
+    for key in ("/k", ""):
+        env = SSHEnvironment.__new__(SSHEnvironment)
+        env.host, env.user, env.port, env.key_path, env.log_file = "h", "ace", 22, key, ""
+        env.control_socket = tmp_path / "s.sock"
+        env._run_ssh("echo hi", timeout=1)
+        env._run_bash("echo hi")
+    keyed_ssh, keyed_bash, plain_ssh, plain_bash = sent
+    assert keyed_ssh[-1] == kwp.WORKER_SESSION_GUARD + "echo hi" and plain_ssh[-1] == "echo hi"
+    assert kwp.WORKER_SESSION_GUARD in keyed_bash[-1] and kwp.WORKER_SESSION_GUARD not in plain_bash[-1]
+    # kanbanw: today's argv and remote command
+    assert kwp._ssh_argv(by["ace-media"], "true") == [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "kanbanw@ace-media", "true"]
+    # a probe answered by the guard (rc 97) is unusable with that reason, even with a fresh last sample
+    mem = kwp.ProbeMemory()
+    calls = []
+
+    def ssh_run(rc):
+        def run(a, **kw):
+            calls.append(a)
+            return type("P", (), {"returncode": rc, "stdout": "0.5\n8\n" if rc == 0 else "",
+                                  "stderr": "" if rc == 0 else "not a fleet worker session\n"})()
+        return run
+    assert kwp.probe_host(by["ace-ai"], ssh_run(0), memory=mem) == (0.5, 8)
+    calls.clear()
+    assert kwp.probe_host(by["ace-ai"], ssh_run(97), memory=mem) is None
+    assert len(calls) == 1  # no direct retry: a second connection meets the same guard
+    note = kwp.probe_note(by["ace-ai"], mem)
+    assert "not a fleet worker session" in note and "reusing" not in note
 
 
 @pytest.mark.parametrize("where,value", [

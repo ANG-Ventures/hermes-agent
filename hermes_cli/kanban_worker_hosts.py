@@ -24,7 +24,7 @@ import shlex
 import subprocess
 from typing import Callable, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
-from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv, identity_args  # noqa: F401
+from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv, identity_args, worker_guarded  # noqa: F401
 from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
 
 PLACEMENT_ENV = "KANBAN_WORKER_PLACEMENT"
@@ -1737,7 +1737,8 @@ def remote_workspace_has_content(placement_raw: Optional[str],
                   'o=$(find "$w" -mindepth 1 -maxdepth 1 -print -quit) || exit 4; '
                   '[ -z "$o" ] && exit 0; exit 3; fi; '
                   '[ -d "$p" ] && [ -x "$p" ] && [ -r "$p" ] || exit 5; exit 0')
-        proc = runner(argv + [target, script],
+        # a keyed probe runs behind the worker-session guard: rc 97 is not 0, so it reads as content
+        proc = runner(argv + [target, worker_guarded(env.get("TERMINAL_SSH_KEY"), script)],
                       capture_output=True, text=True, encoding="utf-8", timeout=_PROBE_TIMEOUT_SECONDS,
                       stdin=subprocess.DEVNULL)
         return getattr(proc, "returncode", 1) != 0

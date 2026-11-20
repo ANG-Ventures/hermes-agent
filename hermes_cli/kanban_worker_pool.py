@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import subprocess
 import time
@@ -1803,14 +1804,46 @@ def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
     if host.ssh_port != 22:
         argv += ["-p", str(host.ssh_port)]
-    return argv + identity_args(getattr(host, "ssh_identity", None)) + [host.target, remote_cmd]
+    ident = getattr(host, "ssh_identity", None)
+    return argv + identity_args(ident) + [host.target, worker_guarded(ident, remote_cmd)]
+
+
+# The remote half of the pinned-key fence (t_3911e84c fb4485599af6): ssh still lists the ssh_config
+# IdentityFile (the owner's key) after the worker key, so a server that refuses the worker key logs the
+# owner in. Only the forced command fleet-worker-shell exports FLEET_WORKER_SESSION=1, so every command
+# sent with a worker key exits WORKER_GUARD_RC on any other session.
+WORKER_GUARD_RC = 97
+WORKER_SESSION_GUARD = ('[ "${FLEET_WORKER_SESSION:-}" = 1 ] || '
+                        '{ echo "not a fleet worker session" >&2; exit 97; }; ')
+
+
+def worker_guarded(path: Optional[str], remote_cmd: str) -> str:
+    """``remote_cmd`` behind :data:`WORKER_SESSION_GUARD` for a pinned worker key, else unchanged."""
+    return WORKER_SESSION_GUARD + remote_cmd if path else remote_cmd
 
 
 def identity_args(path: Optional[str]) -> List[str]:
     """``-i <key> -o IdentitiesOnly=yes`` for a pinned worker key, else nothing: without
     IdentitiesOnly ssh still offers the agent's and the default keys, and the owner's own key
-    would log in past the worker wrapper."""
-    return ["-i", path, "-o", "IdentitiesOnly=yes"] if path else []
+    would log in past the worker wrapper. A keyed connection also opts out of any ControlMaster
+    (t_3911e84c): one that reuses a master never authenticates, so on an owner login it would ride
+    the operator's own ~/.ssh/cm master past the wrapper, or open the master the operator's own
+    ssh then rides as a worker. A direct handshake measured 0.13 s Studio -> ace-ai.
+    An unreadable key turns every auth method off: ssh would warn and log in with the
+    IdentityFile the user's ssh_config names for the host, i.e. the owner's own key
+    (measured Studio -> ace@192.168.1.216: FLEET_WORKER_SESSION unset, rc 0)."""
+    if not path:
+        return []
+    path = os.path.expanduser(path)  # os.access() reads a literal "~/..." as missing (a04c57100fc5)
+    # IdentityAgent=none: no agent key (the owner's, if loaded) is ever offered (fb4485599af6)
+    argv = ["-i", path, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+            "-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    return argv if os.access(path, os.R_OK) else argv + NO_AUTH_ARGS
+
+
+# every client auth method off: the fail-closed tail for a pinned key that is not readable
+NO_AUTH_ARGS = ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no"]
 
 
 @dataclass(frozen=True)
@@ -2098,7 +2131,11 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     kw = dict(pressure_path=pressure_path, workspaces_root=workspaces_root,
               workspace_paths=workspace_paths)
     got, err = _probe_once(h, runner, **kw)
-    if got is None:
+    refused = err.startswith(f"ssh rc={WORKER_GUARD_RC}") and bool(getattr(h, "ssh_identity", None))
+    if refused:
+        # the guard answered: the session is not a worker one; never healthy, never a reused sample
+        err = f"not a fleet worker session (ssh rc={WORKER_GUARD_RC})"
+    elif got is None:
         direct, derr = _probe_once(h, runner, direct=True, **kw)
         if direct is not None:
             got, err = direct, ""
@@ -2116,7 +2153,7 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
         return got
     rec.fails += 1
     rec.last_error = err
-    rec.reused = (rec.last_sample is not None and rec.last_ok_at is not None
+    rec.reused = (not refused and rec.last_sample is not None and rec.last_ok_at is not None
                   and rec.fails <= PROBE_GRACE_FAILS
                   and rec.last_tried_at - rec.last_ok_at <= PROBE_GRACE_SECONDS)
     logger.warning("kanban pool: %s", probe_note(h, memory))
@@ -2132,7 +2169,10 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
 def _drop_stale_master(h: PoolHost) -> None:
     """The muxed probe failed and a direct one answered: the ControlMaster is
     stale (ace-media 2026-11-06). Ask it to exit so the next tick re-masters;
-    best effort, bounded."""
+    best effort, bounded. A keyed host never used a master, and the one at its
+    user@host is the operator's own session (t_3911e84c): leave it alone."""
+    if h.ssh_identity:
+        return
     argv = ["ssh", "-O", "exit"] + (["-p", str(h.ssh_port)] if h.ssh_port != 22 else []) + [h.target]
     try:
         subprocess.run(argv, capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
