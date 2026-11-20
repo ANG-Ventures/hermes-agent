@@ -272,20 +272,29 @@ def slot_view() -> dict[str, str]:
 
     Accepts ``{"slots": {...}, ...}`` or a flat ``{slot: id, ...}`` (keys starting with ``_``
     and ``rendered_from`` are metadata). mtime-cached, so a re-render is seen on the next call
-    with no restart. Missing or unreadable file means ``{}`` (fail open: names pass through).
+    with no restart. A missing file means ``{}`` (fail open: names pass through); a file that
+    cannot be read or parsed (a checkout rewriting it mid-read) keeps the last good parse.
     """
+    hit = None
     try:
         import json
         from hermes_constants import get_default_hermes_root
 
         path = get_default_hermes_root() / "config" / "model-slots.json"
-        st = path.stat()
         key = str(path)
         with _slot_view_lock:
             hit = _slot_view_memo.get(key)
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            return {}
         if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
             return hit[2]
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:  # deleted between stat and read: missing, not torn
+            return {}
+        data = json.loads(text)
         table = data.get("slots") if isinstance(data.get("slots"), dict) else data
         view = {
             str(k).strip(): v.strip()
@@ -297,7 +306,7 @@ def slot_view() -> dict[str, str]:
             _slot_view_memo[key] = (st.st_mtime_ns, st.st_size, view)
         return view
     except Exception:
-        return {}
+        return hit[2] if hit is not None else {}
 
 
 def slot_resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
