@@ -11928,8 +11928,13 @@ def complete_task(
     external: Optional[str] = None,
     watcher: Optional[str] = None,
     abandon_routed_pr: Optional[str] = None,
+    scheduled_ok: bool = False,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``scheduled_ok`` (t_63ebf58b) lets an explicit operator close (no ``expected_run_id``)
+    take a ``scheduled`` card in one step. Only the complete verbs pass it; internal callers
+    such as the review-policy fallback in :func:`request_review` never end a park.
 
     ``abandon_routed_pr`` (t_829fce95) is the audited override for
     :func:`_enforce_routed_pr_survivor`: a survivor claim naming a different PR
@@ -12082,10 +12087,17 @@ def complete_task(
     # An external close also takes a ``triage`` card: the external-wait card
     # parked there by a block loop is exactly what the verb exists to end.
     closable = ('running', 'ready', 'blocked', 'review') + (('triage',) if external else ())
+    # An operator closes a ``scheduled`` card in one step (t_63ebf58b): no unblock first, so no
+    # lifecycle-repair review_requested and no park-return wake for a card that is done seconds later.
+    if scheduled_ok and expected_run_id is None:
+        closable += ('scheduled',)
     if candidate is None or (candidate.status not in closable and not _operator_todo(candidate)):
         return False
     if expected_run_id is not None and candidate.current_run_id != expected_run_id:
         return False
+    # A card parked from review closes as the review approval the unblock+complete pair recorded.
+    parked_review = (candidate.status == "scheduled"
+                     and _resume_status_from_events(conn, task_id) == "review")
     # A reviewer approval (the active run was claimed from ``review``) that
     # names the reviewed PR head writes the APPROVE review_coverage record
     # card-sourced land requests read as the review of record (t_7fee0f83).
@@ -12170,7 +12182,7 @@ def complete_task(
         negative_trigger = _neg.match(_neg.handoff_texts(summary, result), metadata)
     from hermes_cli import kanban_open_pr as _open_pr
     _pr_query = None
-    if candidate.status != 'review' and not approve_head_sha:
+    if candidate.status != 'review' and not parked_review and not approve_head_sha:
         # Foreign-owner PRs (upstream / third-party repos) are mentions, not a
         # gate: the fleet cannot merge them (t_06dccfe3). Record, never route.
         foreign = _open_pr.foreign_pr_refs(
@@ -12576,7 +12588,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    if candidate.status == "review" or review_claimed:
+    if candidate.status == "review" or parked_review or review_claimed:
         metadata = _carry_routed_artifacts(conn, task_id, metadata)
     if superseded_by:
         metadata = dict(metadata or {}, superseded_by=superseded_by)
@@ -12587,7 +12599,7 @@ def complete_task(
         metadata = dict(metadata or {}, external={"url": external, "watcher": watcher})
         if not (summary or "").strip() and not (result or "").strip():
             summary = f"External: {external} (watcher {watcher} reopens on upstream close)."
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    _gate_empty_completion(conn, task_id, result=result, summary=summary, review_approval=parked_review)
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata, superseded=content_survivors)
     if acceptance is False:
@@ -12605,6 +12617,8 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        if parked_review and prior_status == "scheduled":
+            prior_status = "review"
         if expected_run_id is None and not force and trow and _claim_is_live(trow):
             raise LiveClaimError(task_id)
         if expected_run_id is None:
@@ -12618,13 +12632,16 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       next_eligible_at = CASE WHEN status = 'scheduled'
+                                          THEN NULL ELSE next_eligible_at END
                  WHERE id = ?
                    AND (status IN ('running', 'ready', 'blocked', 'review')
+                        OR (? AND status = 'scheduled')
                         OR (? AND status = 'triage')
                         OR (status = 'todo' AND (assignee = 'human' OR substr(assignee, 1, 6) = 'human:')))
                 """,
-                (result, now, task_id, bool(external)),
+                (result, now, task_id, bool(scheduled_ok), bool(external)),
             )
         else:
             cur = conn.execute(
@@ -12821,11 +12838,13 @@ def _gate_empty_completion(
     *,
     result: Optional[str],
     summary: Optional[str],
+    review_approval: bool = False,
 ) -> None:
     """Refuse a completion that would leave the card with no evidence.
 
     Review approvals are exempt: a human vouches for the card and
-    ``_REVIEW_APPROVED_NOTE`` is the documented record.
+    ``_REVIEW_APPROVED_NOTE`` is the documented record. ``review_approval``
+    marks a scheduled card parked from review as one (t_63ebf58b).
     """
     row = conn.execute(
         "SELECT status, result FROM tasks WHERE id = ?",
@@ -12833,7 +12852,7 @@ def _gate_empty_completion(
     ).fetchone()
     if row is None:
         return
-    if row["status"] == "review":
+    if row["status"] == "review" or review_approval:
         return
     stored = row["result"]
     if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
@@ -23956,9 +23975,10 @@ def explain_complete_refusal(
         )
         state = "already done" if task.status == "done" else "archived (was done)" if task.completed_at else "archived"
         return f"{state} by {who} at {when}{outcome}"
-    if task.status not in ("running", "ready", "blocked", "review") and not _operator_todo(task):
+    closable = ("running", "ready", "blocked", "review") + (("scheduled",) if expected_run_id is None else ())
+    if task.status not in closable and not _operator_todo(task):
         return (f"status is {task.status!r}; complete needs running/ready/blocked/review "
-                f"(or todo on a human-assigned operator card)")
+                f"(scheduled from an operator, or todo on a human-assigned operator card)")
     if expected_run_id is not None and task.current_run_id != expected_run_id:
         return (
             f"run {expected_run_id} is no longer the current run "
