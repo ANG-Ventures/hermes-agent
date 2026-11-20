@@ -666,16 +666,25 @@ def resolve_startup_model_arg(
             # the right-hand side may itself be a direct alias (``xai:grok``)
             _ensure_direct_aliases()
             da = DIRECT_ALIASES.get(model.strip().lower())
-            if da is not None and da.provider == provider:
+            if da is not None and da.provider == provider and not _slot_target(model.strip()):
                 model = da.model
             return provider, model
         _ensure_direct_aliases()
         da = DIRECT_ALIASES.get(raw.lower())
         if da is not None:
-            return (da.provider or None), da.model
+            # A slot name wins over an identical alias: the slot is kept (it follows a flip) on
+            # the alias's lane; only the lane comes from the alias.
+            return (da.provider or None), (raw if _slot_target(raw) else da.model)
     except Exception:  # pragma: no cover - resolution must never block startup
         logger.debug("startup -m alias resolution failed for %r", raw, exc_info=True)
     return None, raw_model
+
+
+def _slot_target(name: str) -> str:
+    """The id a bare slot name (``sol``) points at in the slot view, else ``""``."""
+    from hermes_cli.model_registry import slot_resolve
+    resolved, slot = slot_resolve(name)
+    return resolved if slot else ""
 
 
 def resolve_model_pair_for_storage(
@@ -1077,6 +1086,11 @@ def resolve_alias(raw_input: str, current_provider: str, user_providers: Optiona
 
     _ensure_direct_aliases()
     direct = DIRECT_ALIASES.get(key)
+    # A slot name wins over an identical alias and over the MODEL_ALIASES family catalog: the
+    # slot's id, on the alias's lane when there is one (switch_model stores the slot itself).
+    slot_id = _slot_target(key)
+    if slot_id:
+        return (direct.provider if direct is not None else current_provider), slot_id, key
     if direct is not None:
         return (direct.provider, direct.model, key)
 
@@ -2164,12 +2178,19 @@ def switch_model(
             ):
                 st.unknown_slash_prefix = _head
 
+    typed = st.new_model
     route = _route_explicit_provider if st.explicit_provider else _route_from_model_input
     for step in (route, _resolve_switch_credentials, _validate_switch, _refuse_unknown_slash_prefix):
         fail = step(st)
         if fail is not None:
             return fail
-    return _build_switch_result(st)
+    result = _build_switch_result(st)
+    # Routed, validated and probed on the slot's id; the selection stores the slot so it follows
+    # a flip (the agent resolves it per turn), and format_switch_target shows ``slot -> id``.
+    slot_id = _slot_target(typed)
+    if slot_id and result.new_model in (slot_id, normalize_model_for_provider(slot_id, result.target_provider)):
+        result.new_model = typed
+    return result
 
 
 def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg: Any) -> dict[str, Any]:

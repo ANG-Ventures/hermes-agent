@@ -360,3 +360,172 @@ def test_model_switch_confirmation_without_view(no_view):
     from hermes_cli.model_switch import format_switch_target
 
     assert format_switch_target("sol") == "sol"
+
+
+# ── P2c (t_81e582e0): a slot name wins over an identical alias ─────────────────
+# The Studio's model.aliases carry slot-named keys (sol, opus, ...). Resolved at write time they
+# stored the literal id, so a pinned card/cron/`/model sol` never followed a slot flip.
+
+_STALE_SOL = "gpt-6.1-sol"
+_LANES = {
+    "cpa": {"base_url": "http://127.0.0.1:8317/v1", "api_key": "fake-test-token"},
+    "claude-alr": {"base_url": "http://127.0.0.1:8318/v1", "api_key": "fake-test-token"},
+}
+
+
+@pytest.fixture
+def aliased(home):
+    """Slot-named aliases (one stale on purpose), a non-slot alias, and a slot with no alias."""
+    import yaml
+
+    _write_view(home, {"sol": SOL_ID, "opus": OPUS_ID, "kimi": "kimi-k3.1-pro", "grok": "grok-4.7"})
+    (home / "config.yaml").write_text(yaml.safe_dump({
+        "model": {
+            "default": "sol", "provider": "cpa",
+            "aliases": {"sol": f"cpa/{_STALE_SOL}", "opus": f"claude-alr/{OPUS_ID}",
+                        "grok": "xai-oauth/grok-4.6",
+                        "k31": "cpa/kimi-k3.1-pro", "sol-e": f"cpa/{SOL_ID}"},
+        },
+        "providers": _LANES,
+    }), encoding="utf-8")
+    return home
+
+
+def test_storage_keeps_a_slot_named_alias_as_the_slot_on_the_aliases_lane(aliased):
+    from hermes_cli.model_switch import resolve_model_pair_for_storage as store
+
+    assert store("sol") == ("sol", "cpa")
+    assert store("opus") == ("opus", "claude-alr")
+    # inline lane + slot-named alias on that lane: the slot is kept, not the alias's id
+    assert store("xai-oauth/grok") == ("grok", "xai-oauth")
+    assert store("xai-oauth:grok") == ("grok", "xai-oauth")
+    # a lane prefix the parser does not know stays on the string (slot_resolve keeps it)
+    assert store("cpa/sol") == ("cpa/sol", None)
+    # explicit provider still wins over the alias lane
+    assert store("sol", "claude-alr") == ("sol", "claude-alr")
+
+
+def test_storage_leaves_non_slot_aliases_and_literals_alone(aliased):
+    from hermes_cli.model_switch import resolve_model_pair_for_storage as store
+
+    assert store("k31") == ("kimi-k3.1-pro", "cpa")
+    assert store("sol-e") == (SOL_ID, "cpa")
+    assert store(SOL_ID) == (SOL_ID, None)
+
+
+def test_storage_without_view_is_unchanged(aliased):
+    from hermes_cli.model_switch import resolve_model_pair_for_storage as store
+
+    (aliased / "config" / "model-slots.json").unlink()
+    assert store("sol") == (_STALE_SOL, "cpa")
+    assert store("opus") == (OPUS_ID, "claude-alr")
+    assert store("xai-oauth/grok") == ("grok-4.6", "xai-oauth")
+
+
+def _switch(raw, current="cpa"):
+    from hermes_cli.model_switch import switch_model
+
+    return switch_model(raw, current, "claude-haiku-5-5", current_base_url=_LANES[current]["base_url"],
+                        current_api_key="fake-test-token", user_providers=_LANES, probe_catalog=False)
+
+
+def test_model_command_stores_the_slot_and_keeps_the_alias_lane(aliased):
+    from hermes_cli.model_switch import format_switch_target
+
+    res = _switch("sol")
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == ("sol", "cpa")
+    assert format_switch_target(res.new_model) == f"sol -> {SOL_ID}"
+
+    res = _switch("opus")  # alias lane claude-alr, typed from cpa
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == ("opus", "claude-alr")
+
+    res = _switch("cpa/sol", current="claude-alr")  # lane-pinned stays on its lane
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == ("sol", "cpa")
+
+
+def test_model_command_slot_wins_over_the_builtin_family_catalog(aliased):
+    # `kimi` is a MODEL_ALIASES family and has no user alias: the slot decides, no catalog search.
+    with patch("hermes_cli.model_switch.list_provider_models",
+               side_effect=AssertionError("catalog consulted for a slot")):
+        res = _switch("kimi")
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == ("kimi", "cpa")
+
+
+def test_model_command_non_slot_alias_and_literal_unchanged(aliased):
+    res = _switch("k31")
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == ("kimi-k3.1-pro", "cpa")
+    res = _switch(SOL_ID)
+    assert res.success, res.error_message
+    assert res.new_model == SOL_ID
+
+
+def test_model_command_without_view_is_unchanged(aliased):
+    (aliased / "config" / "model-slots.json").unlink()
+    res = _switch("sol")
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == (_STALE_SOL, "cpa")
+
+
+# ── P2c: aux seams that read config model.default directly ────────────────────
+
+def test_custom_endpoint_aux_sends_the_slots_id(home):
+    from agent import auxiliary_client as aux
+
+    with patch.object(aux, "_resolve_custom_runtime",
+                      return_value=("http://127.0.0.1:9999/v1", "fake-test-token", None)), \
+         patch.object(aux, "_read_main_model_for_aux", return_value="sol"), \
+         patch.object(aux, "_create_openai_client", return_value=MagicMock()):
+        _client, model = aux._try_custom_endpoint()
+    assert model == SOL_ID
+
+
+def test_custom_endpoint_aux_literal_and_no_view_unchanged(no_view):
+    from agent import auxiliary_client as aux
+
+    with patch.object(aux, "_resolve_custom_runtime",
+                      return_value=("http://127.0.0.1:9999/v1", "fake-test-token", None)), \
+         patch.object(aux, "_create_openai_client", return_value=MagicMock()):
+        with patch.object(aux, "_read_main_model_for_aux", return_value="sol"):
+            assert aux._try_custom_endpoint()[1] == "sol"
+        with patch.object(aux, "_read_main_model_for_aux", return_value=SOL_ID):
+            assert aux._try_custom_endpoint()[1] == SOL_ID
+
+
+def test_vision_auto_route_checks_the_slots_id(home):
+    from agent import auxiliary_client as aux
+
+    seen = []
+
+    def _main_client(provider, model, *a, **k):
+        seen.append(model)
+        return None, None
+
+    with patch.object(aux, "_read_main_model", return_value="sol"), \
+         patch.object(aux, "_vision_main_provider_client", side_effect=_main_client), \
+         patch.object(aux, "_resolve_strict_vision_backend", return_value=(None, None)):
+        aux._vision_auto_route({"provider": "cpa"}, None, None, False)
+    assert seen == [SOL_ID]
+
+
+# ── P2c: a torn view keeps the last good parse ─────────────────────────────────
+
+def test_torn_view_keeps_the_last_good_parse(home):
+    from hermes_cli.model_registry import slot_resolve
+
+    assert slot_resolve("sol") == (SOL_ID, "sol")
+    path = home / "config" / "model-slots.json"
+    path.write_text('{"slots": {"sol": "gpt-6', encoding="utf-8")  # mid-rewrite
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+    assert slot_resolve("sol") == (SOL_ID, "sol")
+    # a later good render is picked up
+    _write_view(home, {"sol": "gpt-6.3-sol"})
+    assert slot_resolve("sol") == ("gpt-6.3-sol", "sol")
+    # a missing file is still pass-through
+    path.unlink()
+    assert slot_resolve("sol") == ("sol", None)

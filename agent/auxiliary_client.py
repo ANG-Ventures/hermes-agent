@@ -3278,7 +3278,8 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
         return None, None
     if custom_base.lower().startswith(_CODEX_AUX_BASE_URL.lower()):
         return None, None
-    model = _read_main_model_for_aux() or "gpt-4o-mini"
+    from hermes_cli.model_registry import slot_resolve
+    model = slot_resolve(_read_main_model_for_aux() or "gpt-4o-mini")[0]
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
@@ -6426,6 +6427,9 @@ def _vision_auto_route(
         if _agg_provider and _agg_model:
             main_provider, main_model = _agg_provider, _agg_model
             runtime = dict(runtime, base_url="", api_key="", api_mode="")
+    # The capability check below must see the id, not a config slot name (``sol``).
+    from hermes_cli.model_registry import slot_resolve
+    main_model = slot_resolve(main_model)[0]
     if main_provider and main_provider not in {"auto", "", "moa"}:
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
         if client is not None:
