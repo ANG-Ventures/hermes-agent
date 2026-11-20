@@ -201,8 +201,15 @@ class SSHEnvironment(BaseEnvironment):
         """Port/key flags shared by ssh (``-p``) and scp (``-P``)."""
         flags = [port_flag, str(self.port)] if self.port != 22 else []
         # IdentitiesOnly: with a key named, offer only it, never the agent's or the default keys
-        # (a pool owner login accepts the owner's own key too, past the worker wrapper).
-        return flags + (["-i", self.key_path, "-o", "IdentitiesOnly=yes"] if self.key_path else [])
+        # (a pool owner login accepts the owner's own key too, past the worker wrapper). An unreadable
+        # key turns auth off: ssh would fall back to the ssh_config IdentityFile, the owner's key (t_3911e84c).
+        if not self.key_path:
+            return flags
+        flags += ["-i", self.key_path, "-o", "IdentitiesOnly=yes"]
+        if not os.access(self.key_path, os.R_OK):
+            flags += ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no",
+                      "-o", "KbdInteractiveAuthentication=no"]
+        return flags
 
     def _build_ssh_command(self, extra_args: list | None = None, send_env: Iterable[str] = (),
                            log_to_file: bool = False) -> list:

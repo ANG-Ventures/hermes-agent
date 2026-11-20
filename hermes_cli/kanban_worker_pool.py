@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import subprocess
 import time
@@ -1812,9 +1813,19 @@ def identity_args(path: Optional[str]) -> List[str]:
     would log in past the worker wrapper. A keyed connection also opts out of any ControlMaster
     (t_3911e84c): one that reuses a master never authenticates, so on an owner login it would ride
     the operator's own ~/.ssh/cm master past the wrapper, or open the master the operator's own
-    ssh then rides as a worker. A direct handshake measured 0.13 s Studio -> ace-ai."""
-    return ["-i", path, "-o", "IdentitiesOnly=yes",
-            "-o", "ControlMaster=no", "-o", "ControlPath=none"] if path else []
+    ssh then rides as a worker. A direct handshake measured 0.13 s Studio -> ace-ai.
+    An unreadable key turns every auth method off: ssh would warn and log in with the
+    IdentityFile the user's ssh_config names for the host, i.e. the owner's own key
+    (measured Studio -> ace@192.168.1.216: FLEET_WORKER_SESSION unset, rc 0)."""
+    if not path:
+        return []
+    argv = ["-i", path, "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    return argv if os.access(path, os.R_OK) else argv + NO_AUTH_ARGS
+
+
+# every client auth method off: the fail-closed tail for a pinned key that is not readable
+NO_AUTH_ARGS = ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no"]
 
 
 @dataclass(frozen=True)
@@ -2138,7 +2149,7 @@ def _drop_stale_master(h: PoolHost) -> None:
     stale (ace-media 2026-11-06). Ask it to exit so the next tick re-masters;
     best effort, bounded. A keyed host never used a master, and the one at its
     user@host is the operator's own session (t_3911e84c): leave it alone."""
-    if getattr(h, "ssh_identity", None):
+    if h.ssh_identity:
         return
     argv = ["ssh", "-O", "exit"] + (["-p", str(h.ssh_port)] if h.ssh_port != 22 else []) + [h.target]
     try:

@@ -354,7 +354,7 @@ def test_owner_login_pins_the_worker_key_on_every_ssh_path(tmp_path):
     assert env["TERMINAL_SSH_KEY"] == "/Users/x/.ssh/kanban_worker"
     ssh = SSHEnvironment.__new__(SSHEnvironment)
     ssh.port, ssh.key_path = 22, env["TERMINAL_SSH_KEY"]
-    assert ssh._target_flags("-p") == ["-i", "/Users/x/.ssh/kanban_worker", "-o", "IdentitiesOnly=yes"]
+    assert ssh._target_flags("-p")[:4] == ["-i", "/Users/x/.ssh/kanban_worker", "-o", "IdentitiesOnly=yes"]
     seen = []
     kwh.remote_workspace_has_content(json.dumps({"env": env}),
                                      runner=lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})())
@@ -404,6 +404,20 @@ def test_pinned_worker_key_never_shares_a_control_master(tmp_path, monkeypatch):
     assert exits == []
     kwp._drop_stale_master(by["ace-media"])
     assert exits and exits[0][:3] == ["ssh", "-O", "exit"]
+    # an unreadable key turns auth off: ssh would warn and log in with the ssh_config IdentityFile,
+    # the owner's own key (Prism e74bdeef952b; measured on the Studio)
+    from tools.environments.ssh import SSHEnvironment
+    off = ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no"]
+    key = tmp_path / "kanban_worker"
+    key.write_text("k")
+    ssh = SSHEnvironment.__new__(SSHEnvironment)
+    ssh.port = 22
+    for path, refused in (("/Users/x/.ssh/kanban_worker", True), (str(key), False)):
+        args = kwp.identity_args(path)
+        assert args[:2] == ["-i", path] and (args[-6:] == off) is refused, args
+        ssh.key_path = path
+        assert (ssh._target_flags("-p")[-6:] == off) is refused
+    assert kwp.identity_args(None) == [] and kwp.identity_args("") == []
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     plain = control_socket_path("ace", "ace-ai", 22)
     keyed = control_socket_path("ace", "ace-ai", 22, key_path="/Users/x/.ssh/kanban_worker")
