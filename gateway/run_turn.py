@@ -4215,7 +4215,9 @@ class GatewayTurnMixin:
         _result_for_fb = turn_ctx.result_holder[0]
         if _agent is None or not hasattr(_agent, 'model') or (_result_for_fb and _result_for_fb.get("failed")):
             return
-        _cfg_model = _resolve_gateway_model()
+        # A slot default (``sol``) is compared as the id it resolves to, or every turn evicts.
+        from hermes_cli.model_registry import slot_resolve
+        _cfg_model = slot_resolve(_resolve_gateway_model())[0]
         # Normalize as AIAgent.__init__ does (vendor prefix stripped on native providers), else the
         # cached agent is evicted every turn, destroying prompt caching.
         with suppress(Exception):

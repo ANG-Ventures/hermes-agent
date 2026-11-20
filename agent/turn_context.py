@@ -1249,6 +1249,9 @@ def build_turn_context(
         persist_user_timestamp, persist_user_platform_id,
     )
     agent._restore_primary_runtime()
+    # A slot-configured seat follows a re-rendered model-slots.json from this turn on.
+    from agent.model_slots import refresh_slot_for_turn
+    refresh_slot_for_turn(agent)
     _publish_runtime_main(agent)
     _publish_cron_auto_model(agent)
     _refresh_mcp_tools_between_turns(agent)

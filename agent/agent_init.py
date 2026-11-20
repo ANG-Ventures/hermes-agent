@@ -1875,6 +1875,9 @@ def _scope_context_length_to_default_runtime(
         from hermes_cli.config import split_model_config_default
         _default, _ = split_model_config_default(_default)
     _configured_default_model = str(_default or "").strip()
+    # A slot default (``sol``) describes whatever id the slot resolves to now.
+    from hermes_cli.model_registry import slot_resolve
+    _configured_default_model = str(slot_resolve(_configured_default_model)[0] or "")
     _configured_default_runtime_model = _configured_default_model
     _active_runtime_model = agent.model
     if _configured_default_model:
@@ -2614,6 +2617,9 @@ def init_agent(
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
     agent.session_cwd = cwd or None
+    # A slot name (``sol``) becomes its current id before anything reads agent.model.
+    from agent.model_slots import apply_slot_at_init
+    apply_slot_at_init(agent)
     # Shared iteration budget: parent creates, children inherit.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     # CLI replaces this with _cprint so raw ANSI status lines go through prompt_toolkit's

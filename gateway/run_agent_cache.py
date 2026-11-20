@@ -342,8 +342,10 @@ class GatewayAgentCacheMixin:
         override names that model, or the Nous gateway moved the session off the ``nous/welcome``
         alias that *config_model* still carries (``anon_auth.apply_model_switch``)."""
         override = self._session_model_override(session_key)
-        if override is not None and override.get("model") == agent.model:
-            return True
+        if override is not None:
+            from hermes_cli.model_registry import slot_resolve  # /model sol stores the slot
+            if slot_resolve(override.get("model"))[0] == agent.model:
+                return True
         # Exactly the recorded move (alias -> backing): a later fallback onto some other model is
         # ordinary drift and still evicts.
         return getattr(agent, "_nous_model_switch", None) == (config_model, agent.model)

@@ -258,8 +258,65 @@ def retired_rewrite(model: Optional[str]) -> tuple[Optional[str], Optional[str]]
                  f"per config/model-retired-ids.txt + model-successors.json)")
 
 
+#: ``path -> (mtime_ns, size, {slot: id})``; one entry per home, re-read when the file changes.
+_slot_view_memo: dict[str, tuple[int, int, dict[str, str]]] = {}
+_slot_view_lock = threading.Lock()
+
+
+def slot_view() -> dict[str, str]:
+    """``{slot: id}`` from ``<root>/config/model-slots.json`` (rendered by ``model-registry.py``).
+
+    Accepts ``{"slots": {...}, ...}`` or a flat ``{slot: id, ...}`` (keys starting with ``_``
+    and ``rendered_from`` are metadata). mtime-cached, so a re-render is seen on the next call
+    with no restart. Missing or unreadable file means ``{}`` (fail open: names pass through).
+    """
+    try:
+        import json
+        from hermes_constants import get_default_hermes_root
+
+        path = get_default_hermes_root() / "config" / "model-slots.json"
+        st = path.stat()
+        key = str(path)
+        with _slot_view_lock:
+            hit = _slot_view_memo.get(key)
+        if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            return hit[2]
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        table = data.get("slots") if isinstance(data.get("slots"), dict) else data
+        view = {
+            str(k).strip(): v.strip()
+            for k, v in table.items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip()
+            and not k.startswith("_") and k != "rendered_from"
+        }
+        with _slot_view_lock:
+            _slot_view_memo[key] = (st.st_mtime_ns, st.st_size, view)
+        return view
+    except Exception:
+        return {}
+
+
+def slot_resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """``(id, slot)`` when ``model`` names a slot in :func:`slot_view`, else ``(model, None)``.
+
+    A ``lane/`` prefix is kept on both (``cpa/sol`` -> ``cpa/gpt-6.2-sol``, slot ``cpa/sol``), so
+    re-resolving the slot later lands on the same lane. Literal ids, unknown names and a missing
+    view pass through unchanged.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return model, None
+    spec = model.strip()
+    prefix, bare = _split_prefixed(spec)
+    target = slot_view().get(bare)
+    if not target or target == bare:
+        return model, None
+    return (f"{prefix}/{target}" if prefix else target), spec
+
+
 __all__ = [
     "CATALOG_TTL_SECONDS",
+    "slot_resolve",
+    "slot_view",
     "ModelResolution",
     "UnknownModel",
     "catalog_for",
