@@ -820,6 +820,38 @@ def known_ssh_hosts(fleet_dir: Path, *, ssh_config: Optional[Path] = None) -> Op
     return cfg | frozenset(reached)
 
 
+# A declared reach target (t_efd1497a): ``reach: dell-rugged`` / ``reach: ci-box, nas-fleet``. Only this line (or a
+# HOST_BOUND_SKILLS skill / a manifest target) binds host_reach in :func:`reach_allowed_hosts`. An ssh example in prose
+# (what :func:`host_bound_targets` reads) is reported by :func:`host_reach_prose` and does not pin (Apollo 2026-11-19:
+# t_a0f9580e, a design-only card, was held on host_reach for quoting ``ssh root@dell-rugged true``).
+REACH_LINE_RE = re.compile(r"^[ \t]*reach:[ \t]*(.*?)[ \t]*\r?$", re.IGNORECASE | re.MULTILINE)
+_REACH_NOTE_RE = re.compile(r"\s(?:\u2014|\u2013|--|#)|[(#]")
+
+
+def declared_reach(body: Optional[str], aliases: Iterable[str]) -> Tuple[str, ...]:
+    """Aliases named on line-anchored ``reach:`` lines, in order; a word the vocabulary lacks is dropped (a trailing
+    note after `` -- ``, ``#`` or ``(`` is not a word)."""
+    alias_set = {a.lower() for a in (aliases or ()) if a}
+    out: List[str] = []
+    for m in REACH_LINE_RE.finditer(body or ""):
+        value = _REACH_NOTE_RE.split(m.group(1), maxsplit=1)[0]
+        for w in re.split(r"[,\s]+", value.strip().strip("`")):
+            w = w.strip("`'\".;").lower().rstrip("._-")
+            if w in alias_set and w not in out:
+                out.append(w)
+    return tuple(out)
+
+
+def host_reach_prose(body: Optional[str], aliases: Iterable[str], *, pin_hosts: Iterable[str] = (),
+                     ssh_hosts: Optional[Collection[str]] = None) -> Tuple[str, ...]:
+    """Aliases the body addresses in an ssh shape that no ``reach:`` line declares: what used to bind host_reach
+    and no longer does (t_efd1497a). Empty when every such alias is declared."""
+    alias_set = tuple(a.lower() for a in (aliases or ()) if a)
+    declared = set(declared_reach(body, alias_set))
+    _bound, named = host_bound_targets(body, (), alias_set, pin_hosts=pin_hosts, ssh_hosts=ssh_hosts)
+    return tuple(a for a in named if a not in declared)
+
+
 def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iterable[str],
                        *, pin_hosts: Iterable[str] = (),
                        ssh_hosts: Optional[Collection[str]] = None,
@@ -1439,8 +1471,10 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
     aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
                                    *(h.lower() for h in pool_hosts)]))
-    bound, named = host_bound_targets(body, skills, aliases, pin_hosts=pool_hosts,
-                                      ssh_hosts=getattr(pool, "ssh_hosts", None))
+    # Only a declared ``reach:`` line names a target (t_efd1497a); ssh-shaped prose is reported, never bound.
+    bound = any(s.rsplit("/", 1)[-1] in HOST_BOUND_SKILLS for s in (skills or ()))
+    named = declared_reach(body, aliases)
+    bound = bound or bool(named)
     wanted = tuple(dict.fromkeys(h.lower() for h in (targets or {}).values() if h))
     if not bound and not wanted:
         return None

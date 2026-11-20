@@ -170,7 +170,7 @@ def test_fleet_ssh_soft_true_leaves_only_the_matrix(home):
     _map(home, lambda d: d["capabilities"]["fleet-ssh"].update(soft=True))
     with kb.connect_closing() as conn:
         # No sudo: fleet-ssh + matrix only (a sudo body is access-bound, §2.6).
-        tid = _card(conn, "Step 1: ssh ci 'lspci -vv -s 80:01.1'")
+        tid = _card(conn, "reach: ci\nStep 1: ssh ci 'lspci -vv -s 80:01.1'")
         (route, _aff, out) = _route(conn, tid)
         assert route == ("local", None) and tid not in out.get("reasons", {})
 

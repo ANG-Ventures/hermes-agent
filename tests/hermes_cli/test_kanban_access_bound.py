@@ -200,7 +200,7 @@ def test_access_bound_is_decided_before_host_reach_on_a_stale_matrix():
     must not depend on matrix freshness."""
     stale = _cfg(reach={}, status="stale")
     assert _portable(SETPCI, stale) == (False, "access_bound:ssh-root:ci-box", None)
-    assert _portable("ssh ci-box uptime\n", stale) == (False, "host_reach", None)
+    assert _portable("reach: ci-box\nssh ci-box uptime\n", stale) == (False, "host_reach", None)
 
 
 def test_access_bound_beats_the_pool_pin_in_portable():
