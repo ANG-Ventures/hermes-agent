@@ -2024,7 +2024,15 @@ class GatewayTurnMixin:
         agent_failed_early = bool(agent_result.get("failed"))
         hidden_reasoning_incomplete = _is_gateway_hidden_reasoning_incomplete_turn(agent_result)
         is_context_overflow_failure = is_context_overflow_failure_result(agent_result, len(history))
-        if is_context_overflow_failure:
+        if is_context_overflow_failure and agent_result.get("error_code") == "safeguard_refusal":
+            # A bridge safeguard refusal is an HTTP 400, so on a long session the overflow verdict
+            # (400 + history > 50) also takes the skip; name the real class in the log (t_438a9c74).
+            logger.info(
+                "Skipping transcript persistence for safeguard-refusal failure in session %s "
+                "(provider safety filter refused the request; HTTP 400 on a %d-message session "
+                "also matches the context-overflow verdict).", session_entry.session_id, len(history),
+            )
+        elif is_context_overflow_failure:
             logger.info(
                 "Skipping transcript persistence for context-overflow "
                 "failure in session %s to prevent session growth loop.", session_entry.session_id,
