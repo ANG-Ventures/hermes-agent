@@ -31,8 +31,8 @@ FORWARDERS = (("/usr/local/bin/browser-lease-forward",),
 CLASSES = ("read", "act")
 PORT_WAIT_S = 120.0
 
-# Runs on the browser host as ``/usr/bin/python3 -I -c WATCH <identity> <class> <card>``.
-WATCH = r'''
+# Runs on the browser host as ``/usr/bin/python3 -I -c <watch_source()> <identity> <class> <card>``.
+_WATCH = r'''
 import os, signal, subprocess, sys, threading
 BROWSERCTL = %(browserctl)r
 FORWARDERS = %(forwarders)r
@@ -80,7 +80,11 @@ for line in iter(p.stdout.readline, b""):
         stop()
         break
 sys.exit(p.wait())
-''' % {"browserctl": BROWSERCTL, "forwarders": FORWARDERS}
+'''
+
+
+def watch_source(browserctl: str = BROWSERCTL, forwarders=FORWARDERS) -> str:
+    return _WATCH % {"browserctl": browserctl, "forwarders": tuple(tuple(f) for f in forwarders)}
 
 
 @dataclass
@@ -105,7 +109,7 @@ _active: Optional[Lease] = None
 
 def _spawn(identity: str, klass: str, card: str) -> subprocess.Popen:
     """The watcher as this tool's child, on the host agent-browser runs on."""
-    argv = ["/usr/bin/python3", "-I", "-c", WATCH, identity, klass, card]
+    argv = ["/usr/bin/python3", "-I", "-c", watch_source(), identity, klass, card]
     from tools.bot_desktop import placement
     if placement.resolve().where == placement.TERMINAL:
         from tools.environments import streams
