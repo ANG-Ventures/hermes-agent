@@ -205,6 +205,8 @@ class DirectAlias(NamedTuple):
     base_url: str
     api_key: str = ""
     key_env: str = ""
+    # False when ``provider`` was filled from ``model.provider`` (no lane named in the alias).
+    lane_named: bool = True
 
 
 # Built-in direct aliases (extended via config.yaml model_aliases:)
@@ -288,12 +290,14 @@ def _load_direct_aliases(cfg: Optional[dict] = None) -> tuple[dict[str, DirectAl
                             model=model, provider=_clean(value.get("provider")) or current_provider or "custom",
                             base_url=_clean(value.get("base_url", "")),
                             api_key=_clean(value.get("api_key", "")),
-                            key_env=_clean(value.get("key_env", "")))
+                            key_env=_clean(value.get("key_env", "")),
+                            lane_named=bool(_clean(value.get("provider"))))
                 elif isinstance(value, str) and value.strip():
                     val = value.strip()
                     provider, model = val.split("/", 1) if "/" in val else (current_provider, val)
                     merged[key] = DirectAlias(
-                        model=model.strip(), provider=provider.strip() or current_provider, base_url="")
+                        model=model.strip(), provider=provider.strip() or current_provider, base_url="",
+                        lane_named=bool("/" in val and provider.strip()))
     except Exception:
         # Config read failed — signal degraded so the caller keeps last-known-good user
         # aliases instead of pruning to builtins.
@@ -674,7 +678,9 @@ def resolve_startup_model_arg(
         if da is not None:
             # A slot name wins over an identical alias: the slot is kept (it follows a flip) on
             # the alias's lane; only the lane comes from the alias.
-            return (da.provider or None), (raw if _slot_target(raw) else da.model)
+            if _slot_target(raw):
+                return (alias_lane(raw) or None), raw
+            return (da.provider or None), da.model
     except Exception:  # pragma: no cover - resolution must never block startup
         logger.debug("startup -m alias resolution failed for %r", raw, exc_info=True)
     return None, raw_model
@@ -683,11 +689,14 @@ def resolve_startup_model_arg(
 def alias_lane(name: Any) -> str:
     """The lane a same-name ``model.aliases`` entry names for ``name``, else ``""``.
 
-    Only an alias that names a provider overrides the inherited lane; a providerless one does not.
+    Only an alias that names a provider overrides the inherited lane; a providerless one (or one
+    the loader filled from ``model.provider``) does not.
     """
     _ensure_direct_aliases()
     hit = DIRECT_ALIASES.get(str(name or "").strip().lower())
-    return str(hit.provider or "").strip() if hit is not None else ""
+    if hit is None or not hit.lane_named:
+        return ""
+    return str(hit.provider or "").strip()
 
 
 def _slot_target(name: str) -> str:

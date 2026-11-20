@@ -641,10 +641,14 @@ def test_cron_honours_a_same_name_alias_lane_before_the_profile_lane(aliased):
     import yaml
     from cron.jobs import _require_known_job_route
 
+    from cron.jobs import _resolve_stored_model_pair
+
     cfg = yaml.safe_load((aliased / "config.yaml").read_text())
     cfg["model"]["provider"] = "claude-alr"
     (aliased / "config.yaml").write_text(yaml.safe_dump(cfg))
-    _require_known_job_route("sol", None)  # admitted: the alias names cpa
+    # create_job resolves first: the alias names cpa, so the stored route is (sol, cpa)
+    assert _resolve_stored_model_pair("sol", None) == ("sol", "cpa")
+    _require_known_job_route(*_resolve_stored_model_pair("sol", None))
 
 
 def _providerless_kimi():
@@ -701,3 +705,67 @@ def test_view_deleted_between_stat_and_read_is_missing(home):
 
     with patch.object(Path, "read_text", _gone):
         assert slot_resolve("sol") == ("sol", None)
+
+
+# ── P2c fix 3 (t_81e582e0): Prism at 9e54351a ──────────────────────────────────
+
+def _set_cfg(home, **model_and_cron):
+    import yaml
+
+    cfg = yaml.safe_load((home / "config.yaml").read_text())
+    for key, value in model_and_cron.items():
+        section, _, field = key.partition("__")
+        cfg.setdefault(section, {})
+        if isinstance(value, dict):
+            cfg[section].setdefault(field, {}).update(value)
+        else:
+            cfg[section][field] = value
+    (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+
+
+def test_bare_string_alias_without_lane_is_not_a_lane_override(aliased):
+    # e0791a197d87: `kimi: kimi-k3.1-pro` (no lane prefix) is filled with model.provider by the
+    # loader; it must not stand in for a lane the user named.
+    from hermes_cli import model_switch
+
+    _set_cfg(aliased, model__aliases={"kimi": "kimi-k3.1-pro"})
+    model_switch.DIRECT_ALIASES.clear()
+    assert model_switch.alias_lane("kimi") == ""
+    assert model_switch.alias_lane("sol") == "cpa"
+    assert model_switch.resolve_model_pair_for_storage("kimi") == ("kimi", None)
+    # a non-slot alias keeps today's route (filled lane)
+    _set_cfg(aliased, model__aliases={"k3": "kimi-k3.1-pro"})
+    model_switch.DIRECT_ALIASES.clear()
+    assert model_switch.resolve_model_pair_for_storage("k3") == ("kimi-k3.1-pro", "cpa")
+
+
+def test_model_command_bare_string_alias_still_refuses_a_foreign_lane(aliased):
+    from hermes_cli import model_switch
+
+    _set_cfg(aliased, model__aliases={"kimi": "kimi-k3.1-pro"})
+    model_switch.DIRECT_ALIASES.clear()
+    res = _switch("kimi", current="claude-alr")
+    assert not res.success
+    assert res.error_message.startswith("slot kimi (kimi-k3.1-pro) is not served on claude-alr")
+
+
+def test_cron_checks_the_stored_route_not_the_alias(aliased):
+    # d5b7e9fab5dc: (sol, "") runs on the profile lane at fire time; an alias does not exempt it.
+    from cron.jobs import _require_known_job_route
+    from hermes_cli.model_registry import SlotLaneRefused
+
+    _set_cfg(aliased, model__provider="claude-alr")
+    with pytest.raises(SlotLaneRefused, match="slot sol .* not served on claude-alr"):
+        _require_known_job_route("sol", "")
+
+
+def test_cron_lane_is_cron_model_provider_first(aliased):
+    # bd86eeec51f7: the scheduler runs an unpinned job on cron.model_provider before model.provider.
+    from cron.jobs import _require_known_job_route
+    from hermes_cli.model_registry import SlotLaneRefused
+
+    _set_cfg(aliased, model__provider="claude-alr", cron__model_provider="cpa")
+    _require_known_job_route("kimi", None)
+    _set_cfg(aliased, model__provider="cpa", cron__model_provider="claude-alr")
+    with pytest.raises(SlotLaneRefused, match="slot kimi .* not served on claude-alr"):
+        _require_known_job_route("kimi", None)

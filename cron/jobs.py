@@ -4411,14 +4411,16 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 
 def _profile_lane() -> Optional[str]:
-    """``model.provider`` of this home: the lane a job with no provider runs on."""
+    """The lane a job with no provider runs on: ``cron.model_provider``, else ``model.provider``
+    (the scheduler's precedence, ``_resolve_job_runtime``)."""
     try:
         from hermes_cli.config import load_config
 
-        section = load_config().get("model")
-        if not isinstance(section, dict):
-            return None
-        return str(section.get("provider") or "").strip() or None
+        cfg = load_config()
+        cron, model = cfg.get("cron"), cfg.get("model")
+        lane = (str(cron.get("model_provider") or "").strip() if isinstance(cron, dict) else "") or (
+            str(model.get("provider") or "").strip() if isinstance(model, dict) else "")
+        return lane or None
     except Exception:
         return None
 
@@ -4436,9 +4438,9 @@ def _require_known_job_route(
     from hermes_cli.model_registry import require, require_slot_lane
 
     if model:
-        from hermes_cli.model_switch import alias_lane
-
-        if not provider and not alias_lane(model):  # no lane named: it runs on the profile's lane
+        # Checked on the STORED route: aliases were resolved at write time and the scheduler does
+        # not apply them at fire time, so a record with no provider runs on the cron lane.
+        if not provider:
             require_slot_lane(model, _profile_lane())
         require(provider, model, force_reason=force_model_reason, flag="--force-model")
     entries = [fallback] if isinstance(fallback, dict) else (fallback if isinstance(fallback, list) else [])
