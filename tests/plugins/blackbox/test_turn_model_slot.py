@@ -327,3 +327,82 @@ def test_fallback_turn_records_the_rungs_slot_never_the_primarys(bb, monkeypatch
     assert row["cost_usd"] == pytest.approx(_rung_price(want_model, rung["provider"]))
     # The primary's slot is unchanged: the next restored turn re-resolves sol.
     assert agent._model_slot == "sol"
+
+
+# ── Prism round 2 on #483 ─────────────────────────────────────────────────────
+
+def _reprice_all():
+    from plugins.blackbox import store
+    from plugins.blackbox.cost import compute_turn_cost
+
+    def fn(m, p, t):
+        return compute_turn_cost(m, p, None, [dict(
+            input_tokens=t["input_tokens"], output_tokens=t["output_tokens"],
+            cache_read_tokens=t["cache_read_tokens"], cache_write_tokens=t["cache_write_tokens"])])
+
+    return store.reprice_unpriced(fn, apply=True)
+
+
+def test_new_unresolved_slot_row_stays_unpriced_on_a_later_reprice(bb):
+    # Prism 80c955779244: a turn recorded while the view could not resolve ``sol`` holds the slot
+    # name in ``model``. Once the view is back, a reprice must not price it as today's target: the
+    # turn's id was never observed. A pre-column row (model_slot NULL) keeps the legacy heal.
+    from plugins.blackbox import store
+
+    (bb._root / "config" / "model-slots.json").unlink()
+    for turn_id, model in (("turn_unres_bare", "sol"), ("turn_unres_lane", "cpa/sol")):
+        row = _end(bb, turn_id, model, model_slot="sol")
+        assert (row["model"], row["model_slot"], row["cost_usd"]) == (model, "sol", None)
+    legacy = _end(bb, "turn_legacy", "sol")
+    con = sqlite3.connect(str(store._db_path()))
+    con.execute("UPDATE turns SET model_slot=NULL WHERE turn_id='turn_legacy'")
+    con.commit()
+    con.close()
+
+    _write_view(bb._root, {"sol": FLIP_ID})
+    _reprice_all()
+    assert store.get_turn("turn_unres_bare")["cost_usd"] is None
+    assert store.get_turn("turn_unres_lane")["cost_usd"] is None
+    assert legacy["cost_usd"] is None
+    assert store.get_turn("turn_legacy")["cost_usd"] == pytest.approx(_priced(FLIP_ID))
+
+
+def test_first_turn_after_a_startup_fallback_keeps_the_rungs_slot(bb, monkeypatch):
+    # Prism be9aa8be8d26: the primary has no credentials at init, so the agent starts on a
+    # slot-named rung. The init snapshot holds the rung's route; the first turn restores it and
+    # clears _fallback_activated. The row must still name the rung's slot, not the primary's ('').
+    from unittest.mock import MagicMock, patch
+
+    from agent import fallback_policy as fp
+    from agent.model_slots import served_slot
+    from run_agent import AIAgent
+
+    _write_view(bb._root, {"sol": SOL_ID})
+    client = MagicMock()
+    client.base_url = "http://127.0.0.1:8317/v1"
+    client.api_key = "fb-key"
+
+    def _resolve(provider, model=None, **kw):
+        return (client, model) if provider == "custom" else (None, None)
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve),
+        patch("hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: None),
+    ):
+        agent = AIAgent(model="qwen3.6-plus", provider="alibaba-coding-plan",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        fallback_model=[{"provider": "custom", "model": "sol",
+                                         "base_url": "http://127.0.0.1:8317/v1"}])
+    agent.client = MagicMock()
+    assert agent._fallback_activated and agent.provider == "custom"
+    assert served_slot(agent) == "sol"
+
+    monkeypatch.setattr("agent.fallback_wiring.restore_allowed",
+                        lambda *a, **k: fp.Decision(True, None, "test"))
+    monkeypatch.setattr("agent.agent_runtime_helpers._rebuild_primary_client", lambda *a, **k: None)
+    agent._restore_primary_runtime()
+    assert agent._fallback_activated is False and agent.provider == "custom"
+    assert served_slot(agent) == "sol"

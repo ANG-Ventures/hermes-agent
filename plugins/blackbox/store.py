@@ -1833,6 +1833,14 @@ _PURE_BILLING_MODES = frozenset({"official_docs_snapshot", "subscription_include
 _ZERO_PERCLASS = {"uncached": 0.0, "cache_read": 0.0, "cache_write": 0.0, "output": 0.0}
 
 
+def _unresolved_slot_row(model: Any, model_slot: Any) -> bool:
+    """True when a row with a recorded slot still carries the slot name as its model."""
+    slot = str(model_slot or "").strip().lower()
+    if not slot:
+        return False
+    return str(model or "").strip().lower().rsplit("/", 1)[-1] == slot.rsplit("/", 1)[-1]
+
+
 def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = None) -> dict:
     """Re-price turns whose cost_usd is NULL. Returns the pinned status schema
     ``{scanned, repriced, zeroed, still_unknown}`` (RC-F).
@@ -1853,7 +1861,7 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
     try:
         conn.execute("PRAGMA busy_timeout=5000")  # INV-8: wait, don't error, on a live writer
         sel = (
-            "SELECT turn_id, model, provider, "
+            "SELECT turn_id, model, provider, model_slot, "
             "COALESCE(input_tokens,0) AS i, COALESCE(output_tokens,0) AS o, "
             "COALESCE(cache_read,0) AS cr, COALESCE(cache_write,0) AS cw, "
             "COALESCE(output_tokens_unknown,0) AS ou, "
@@ -1873,8 +1881,16 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
         # (turn_id, cost, status, perclass, is_zero)
         candidates: list[tuple[str, float, str, dict, bool]] = []
         for r in rows:
-            route = resolve_billing_route(r["model"], provider=r["provider"])
             usage_unknown = any(bool(r[key]) for key in ("ou", "iu", "cru", "cwu", "uu"))
+            if _unresolved_slot_row(r["model"], r["model_slot"]):
+                # A row written with the model_slot column holds the id the turn ran on; when it
+                # still holds the slot name, the view could not resolve it at turn time and no id
+                # was observed. Pricing it from today's view would book a model the turn never ran
+                # on (t_5c87d313). Pre-column rows (model_slot NULL) keep the legacy heal below.
+                if not usage_unknown and r["i"] + r["o"] + r["cr"] + r["cw"] == 0:
+                    candidates.append((r["turn_id"], 0.0, "priced_zero", dict(_ZERO_PERCLASS), True))
+                continue
+            route = resolve_billing_route(r["model"], provider=r["provider"])
             if usage_unknown:
                 # Missing counts cannot be repriced from their integer-zero
                 # placeholders. The one exception is a route whose marginal
