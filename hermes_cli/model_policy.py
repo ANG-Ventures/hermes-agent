@@ -361,6 +361,39 @@ def assignee_pinned_model(assignee: Optional[str], model: Optional[str]) -> Opti
         return f"{UNRESOLVED_ROUTE_PREFIX} {type(exc).__name__} reading {name} config>"
 
 
+def assignee_slot_lane(assignee: Optional[str], slot: Optional[str]) -> Optional[str]:
+    """The lane a worker on ``assignee`` INHERITS for a bare pin ``slot`` (its ``model.provider``).
+
+    ``None`` when the pin does not inherit one: the worker's own ``model.aliases`` entry of that
+    name supplies a lane (honoured as given), or the profile/config cannot be read (fail open;
+    the registry and the dispatcher still check the id).
+    """
+    pin = str(slot or "").strip()
+    name = str(assignee or "").strip()
+    if not pin or not name or name == "human" or name.startswith("human:"):
+        return None
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        home = resolve_profile_env(name)
+        from pathlib import Path
+
+        from hermes_cli.kanban_db_dispatch import _worker_profile_scope
+        from hermes_cli.model_switch import _load_direct_aliases
+
+        with _worker_profile_scope(home, bind_home=False):
+            cfg = _profile_effective_config(Path(home) / "config.yaml")
+        hit = _load_direct_aliases(cfg)[0].get(pin.lower())
+        if hit is not None and str(hit.provider or "").strip():
+            return None
+        section = cfg.get("model")
+        if not isinstance(section, dict):
+            return None
+        return str(section.get("provider") or "").strip() or None
+    except Exception:
+        return None
+
+
 def _runs_as_worker(assignee: Optional[str]) -> bool:
     """The dispatcher's own test (``kanban_db.is_worker_assignee``)."""
     from hermes_cli.kanban_db import is_worker_assignee

@@ -4410,6 +4410,19 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+def _profile_lane() -> Optional[str]:
+    """``model.provider`` of this home: the lane a job with no provider runs on."""
+    try:
+        from hermes_cli.config import load_config
+
+        section = load_config().get("model")
+        if not isinstance(section, dict):
+            return None
+        return str(section.get("provider") or "").strip() or None
+    except Exception:
+        return None
+
+
 def _require_known_job_route(
     model: Any, provider: Any, fallback: Any = None, *, force_model_reason: Optional[str] = None,
 ) -> None:
@@ -4420,9 +4433,11 @@ def _require_known_job_route(
     chain is a route the job may fire on, so each is checked exactly like the primary.
     A lane whose list cannot be read is admitted (unverifiable), never guessed at.
     """
-    from hermes_cli.model_registry import require
+    from hermes_cli.model_registry import require, require_slot_lane
 
     if model:
+        if not provider:  # a bare slot with no alias lane runs on the profile's lane
+            require_slot_lane(model, _profile_lane())
         require(provider, model, force_reason=force_model_reason, flag="--force-model")
     entries = [fallback] if isinstance(fallback, dict) else (fallback if isinstance(fallback, list) else [])
     for entry in entries:

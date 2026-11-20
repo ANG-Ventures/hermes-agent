@@ -4098,7 +4098,11 @@ def _delegate_task_impl(
 
         model, provider = resolve_model_pair_for_storage(model, provider)
         # A slot (``sol``) is checked by policy and the registry, and run, as its current id.
-        from hermes_cli.model_registry import slot_resolve
+        from hermes_cli.model_registry import slot_lane_refusal, slot_resolve
+        if not provider:  # no lane prefix, no alias lane: the child inherits the parent's lane
+            refusal = slot_lane_refusal(model, getattr(parent_agent, "provider", None))
+            if refusal:
+                return tool_error(refusal)
         model = slot_resolve(model)[0]
         try:
             reason = validate_worker_model(model, allow_flagship_reason=allow_flagship_reason)

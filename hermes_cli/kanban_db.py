@@ -3959,6 +3959,22 @@ def _require_known_model(
     return require(provider, model, force_reason=force_model_reason, flag="--force-model")
 
 
+def _require_card_slot_lane(model: Optional[str], provider: Optional[str], assignee: Optional[str]) -> None:
+    """A bare slot pin with no lane runs on the assignee's lane: refuse it when that lane does
+    not serve the slot's vendor (``SlotLaneRefused``, a ``ValueError``)."""
+    if not model or provider:
+        return
+    from hermes_cli.model_policy import assignee_slot_lane
+    from hermes_cli.model_registry import require_slot_lane
+
+    require_slot_lane(model, assignee_slot_lane(assignee, model))
+
+
+def _task_assignee(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return row[0] if row else None
+
+
 def _model_registry_valid_ids(provider: Optional[str]) -> tuple[str, ...]:
     """The lane's model list for a refusal message; empty when unreadable."""
     try:
@@ -6489,6 +6505,7 @@ def create_task(
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
+    _require_card_slot_lane(model_override, provider_override, assignee)
     # A delegations-board card contains an already-admitted delegate_task call, not a new work item.
     # Its goal-derived title may quote a ruling without minting a ruling-bearing task.
     container_card = _kdb.conn_is_delegations(conn)
@@ -7921,6 +7938,7 @@ def set_model_override(
         pin_sub_fallback=pin_sub_fallback,
         force_model_reason=force_model_reason,
     )
+    _require_card_slot_lane(model, provider, _task_assignee(conn, task_id))
     # add_comment's refusals on every comment the locked writer inserts, judged
     # before authorize_flagship journals (Prism b7477c45a580; batch: d0b2bf482d38).
     for author, body in _model_override_comments(
@@ -18225,6 +18243,7 @@ def set_task_model(
     _verdict = _require_known_model(
         resolved_model, resolved_provider, force_model_reason=force_model_reason,
     )
+    _require_card_slot_lane(resolved_model, resolved_provider, _task_assignee(conn, task_id))
     if not resolved_model:
         resolved_provider = None
     with write_txn(conn):

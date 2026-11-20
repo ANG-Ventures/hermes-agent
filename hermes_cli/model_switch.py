@@ -2179,6 +2179,15 @@ def switch_model(
                 st.unknown_slash_prefix = _head
 
     typed = st.new_model
+    if not st.explicit_provider:
+        # A bare slot with no same-name alias inherits the session's lane: refused when that lane
+        # does not serve the slot's vendor (lanes differ in billing; never pick one silently).
+        _ensure_direct_aliases()
+        if typed.strip().lower() not in DIRECT_ALIASES:
+            from hermes_cli.model_registry import slot_lane_refusal
+            refusal = slot_lane_refusal(typed, current_provider)
+            if refusal:
+                return st.fail(refusal)
     route = _route_explicit_provider if st.explicit_provider else _route_from_model_input
     for step in (route, _resolve_switch_credentials, _validate_switch, _refuse_unknown_slash_prefix):
         fail = step(st)

@@ -322,6 +322,102 @@ def slot_resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     return (f"{prefix}/{target}" if prefix else target), spec
 
 
+def _lane_vendors(provider: Optional[str]) -> Optional[frozenset[str]]:
+    """The vendors (``_infer_vendor_from_model`` keys) ``provider`` serves; ``None`` = unknown.
+
+    Built from the lane metadata pricing already keys on (Claude relay lanes, the multi-vendor
+    ``cpa`` proxy, single-vendor OAuth lanes), then the lane's static or live catalog. An
+    aggregator, a custom endpoint with no list, or an unknown lane is ``None``: nothing to refuse on.
+    """
+    p = (provider or "").strip().lower()
+    if p.startswith("custom:"):
+        p = p.split(":", 1)[1].strip()
+    if not p:
+        return None
+    try:
+        from agent import usage_pricing as up
+        from agent.relay_lanes import is_relay_backed
+
+        if p == "anthropic" or up.is_notional_anthropic_provider(p) or is_relay_backed(p):
+            return frozenset({"anthropic"})
+        if up.proxy_lane(p):
+            return frozenset(up._PROXY_VENDOR_PRICING_LANE)
+        if p == "xai" or up.is_notional_xai_provider(p):
+            return frozenset({"xai"})
+        if p in up.NOTIONAL_MOONSHOT_PROVIDERS:
+            return frozenset({"moonshotai"})
+        if p == "openai-codex":
+            return frozenset({"openai"})
+        from hermes_cli.models import _AGGREGATOR_PROVIDERS, _PROVIDER_MODELS, normalize_provider
+
+        if normalize_provider(p) in _AGGREGATOR_PROVIDERS:
+            return None
+        ids = tuple(_PROVIDER_MODELS.get(normalize_provider(p), ())) or catalog_for(p)
+        vendors = frozenset(v for v in (up._infer_vendor_from_model(str(i).split("/")[-1]) for i in ids) if v)
+        return vendors or None
+    except Exception:
+        return None
+
+
+def _configured_lanes() -> list[str]:
+    """Lane names this home is configured with: ``providers:``, ``model.provider``, alias lanes."""
+    lanes: list[str] = []
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        if isinstance(cfg.get("providers"), dict):
+            lanes.extend(str(k) for k in cfg["providers"])
+        lanes.append(str(model_cfg.get("provider") or ""))
+        from hermes_cli.model_switch import DIRECT_ALIASES, _ensure_direct_aliases
+
+        _ensure_direct_aliases()
+        lanes.extend(str(a.provider or "") for a in DIRECT_ALIASES.values())
+    except Exception:
+        pass
+    seen: list[str] = []
+    for lane in (x.strip().lower() for x in lanes):
+        if lane and lane not in seen:
+            seen.append(lane)
+    return seen
+
+
+def slot_lane_refusal(model: Optional[str], lane: Optional[str]) -> Optional[str]:
+    """One refusal line when the bare slot ``model`` would run on ``lane`` and that lane does not
+    serve the vendor of the slot's current id; ``None`` otherwise.
+
+    Callers use it only for the lane a slot would INHERIT (the session's, the profile's, the
+    parent's): an explicit ``lane/slot`` or a ``model.aliases`` lane is honoured as given. Lanes
+    differ in billing, so a non-serving lane is refused, never swapped for another one.
+    Unknown vendor, unknown lane, or a name that is not a bare slot: ``None`` (admit).
+    """
+    resolved, slot = slot_resolve(model)
+    if not slot or "/" in slot or not lane:
+        return None
+    from agent.usage_pricing import _infer_vendor_from_model
+
+    vendor = _infer_vendor_from_model(str(resolved))
+    served = _lane_vendors(lane)
+    if not vendor or served is None or vendor in served:
+        return None
+    serving = [x for x in _configured_lanes() if (_lane_vendors(x) or frozenset()) >= {vendor}]
+    hint = (f"lanes that serve it: {', '.join(serving)} (e.g. {serving[0]}/{slot})" if serving
+            else f"no configured lane serves {vendor}; name one as <lane>/{slot}")
+    return f"slot {slot} ({resolved}) is not served on {lane.strip().lower()}; {hint}"
+
+
+class SlotLaneRefused(ValueError):
+    """A bare slot would run on an inherited lane that does not serve its vendor."""
+
+
+def require_slot_lane(model: Optional[str], lane: Optional[str]) -> None:
+    """:func:`slot_lane_refusal`, raising :class:`SlotLaneRefused`."""
+    line = slot_lane_refusal(model, lane)
+    if line:
+        raise SlotLaneRefused(line)
+
+
 __all__ = [
     "CATALOG_TTL_SECONDS",
     "slot_resolve",

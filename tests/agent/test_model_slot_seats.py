@@ -529,3 +529,106 @@ def test_torn_view_keeps_the_last_good_parse(home):
     # a missing file is still pass-through
     path.unlink()
     assert slot_resolve("sol") == ("sol", None)
+
+
+# ── P2c fix (t_95737e7d): a slot is refused on an inherited lane that does not serve its vendor ──
+# Measured at 754a8045: `/model kimi` from a claude-alr session stored claude-alr/kimi (404 next turn).
+# A lane prefix or a same-name alias names the lane; otherwise the inherited lane must serve it.
+
+def test_model_command_refuses_a_slot_on_a_lane_that_does_not_serve_it(aliased):
+    res = _switch("kimi", current="claude-alr")
+    assert not res.success
+    assert res.error_message == (
+        "slot kimi (kimi-k3.1-pro) is not served on claude-alr; lanes that serve it: cpa (e.g. cpa/kimi)"
+    )
+
+
+def test_model_command_lane_prefixed_slot_is_honoured(aliased):
+    res = _switch("cpa/kimi", current="claude-alr")
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == ("kimi", "cpa")
+
+
+def test_model_command_slot_on_a_serving_lane_is_accepted(aliased):
+    lanes = dict(_LANES, **{"openai-codex": {"base_url": "http://127.0.0.1:8319/v1", "api_key": "fake-test-token"}})
+    from hermes_cli.model_switch import switch_model
+
+    with patch("hermes_cli.model_switch.DIRECT_ALIASES", {}), \
+         patch("hermes_cli.model_switch._ensure_direct_aliases", lambda: None):
+        res = switch_model("sol", "openai-codex", "gpt-6.1-terra", current_base_url="http://127.0.0.1:8319/v1",
+                           current_api_key="fake-test-token", user_providers=lanes, probe_catalog=False)
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == ("sol", "openai-codex")
+
+
+def test_model_command_aliased_slot_keeps_its_alias_lane_from_a_foreign_lane(aliased):
+    res = _switch("opus", current="cpa")  # cpa does not serve anthropic; the alias names claude-alr
+    assert res.success, res.error_message
+    assert (res.new_model, res.target_provider) == ("opus", "claude-alr")
+
+
+def test_slot_lane_refusal_unit(aliased):
+    from hermes_cli.model_registry import slot_lane_refusal
+
+    assert slot_lane_refusal("kimi", "claude-alr").startswith("slot kimi (kimi-k3.1-pro) is not served on claude-alr")
+    assert slot_lane_refusal("kimi", "cpa") is None
+    assert slot_lane_refusal("sol", "openai-codex") is None
+    assert slot_lane_refusal("opus", "claude-apx-7") is None
+    assert slot_lane_refusal("cpa/kimi", "claude-alr") is None  # lane-prefixed: not inherited
+    assert slot_lane_refusal("kimi-k3.1-pro", "claude-alr") is None  # literal id: the registry's job
+    assert slot_lane_refusal("kimi", "openrouter") is None  # aggregator serves every vendor
+    assert slot_lane_refusal("kimi", "some-unknown-lane") is None  # unknown lane: fail open
+
+
+def test_slot_lane_refusal_without_view(no_view):
+    from hermes_cli.model_registry import slot_lane_refusal
+
+    assert slot_lane_refusal("kimi", "claude-alr") is None
+
+
+def test_delegate_refuses_a_slot_on_the_parents_foreign_lane(aliased):
+    from tools.delegate_tool import delegate_task
+
+    parent = MagicMock(provider="claude-alr")
+    out = json.loads(delegate_task(goal="x", model="kimi", parent_agent=parent))
+    assert "slot kimi (kimi-k3.1-pro) is not served on claude-alr" in out["error"]
+
+
+def test_cron_refuses_a_slot_on_the_profiles_foreign_lane(aliased):
+    import yaml
+    from cron.jobs import _require_known_job_route
+    from hermes_cli.model_registry import SlotLaneRefused
+
+    cfg = yaml.safe_load((aliased / "config.yaml").read_text())
+    cfg["model"]["provider"] = "claude-alr"
+    (aliased / "config.yaml").write_text(yaml.safe_dump(cfg))
+    with pytest.raises(SlotLaneRefused, match="slot kimi .* not served on claude-alr"):
+        _require_known_job_route("kimi", None)
+    _require_known_job_route("kimi", "cpa")  # lane named: honoured
+    _require_known_job_route("opus", "claude-alr")
+
+
+def test_kanban_pin_refuses_a_slot_on_the_assignees_foreign_lane(aliased, monkeypatch):
+    from hermes_cli import kanban_db
+    from hermes_cli.model_registry import SlotLaneRefused
+
+    monkeypatch.setattr("hermes_cli.model_policy.assignee_slot_lane",
+                        lambda assignee, slot: {"alr-worker": "claude-alr", "cpa-worker": "cpa"}.get(assignee))
+    with pytest.raises(SlotLaneRefused, match="slot kimi .* not served on claude-alr"):
+        kanban_db._require_card_slot_lane("kimi", None, "alr-worker")
+    kanban_db._require_card_slot_lane("kimi", None, "cpa-worker")
+    kanban_db._require_card_slot_lane("kimi", "cpa", "alr-worker")  # provider named: honoured
+
+
+def test_assignee_slot_lane_reads_the_profile(aliased, monkeypatch):
+    import yaml
+    from hermes_cli import model_policy
+
+    prof = aliased / "profiles" / "w"
+    prof.mkdir(parents=True)
+    (prof / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"default": "opus", "provider": "claude-alr", "aliases": {"opus": f"claude-alr/{OPUS_ID}"}},
+    }))
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda name: str(prof))
+    assert model_policy.assignee_slot_lane("w", "kimi") == "claude-alr"
+    assert model_policy.assignee_slot_lane("w", "opus") is None  # its alias names the lane
