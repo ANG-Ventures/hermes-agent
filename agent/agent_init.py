@@ -1875,6 +1875,9 @@ def _scope_context_length_to_default_runtime(
         from hermes_cli.config import split_model_config_default
         _default, _ = split_model_config_default(_default)
     _configured_default_model = str(_default or "").strip()
+    # A slot default (``sol``) describes whatever id the slot resolves to now.
+    from hermes_cli.model_registry import slot_resolve
+    _configured_default_model = str(slot_resolve(_configured_default_model)[0] or "")
     _configured_default_runtime_model = _configured_default_model
     _active_runtime_model = agent.model
     if _configured_default_model:

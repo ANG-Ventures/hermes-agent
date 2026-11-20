@@ -11,35 +11,20 @@ re-rendered view moves the next turn to the new id with no restart and no pin mi
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
+
+from hermes_cli.model_registry import _split_prefixed, slot_resolve
 
 logger = logging.getLogger(__name__)
 
 
-def resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """``(id, slot)``; ``(model, None)`` for a literal id, an unknown name or no view."""
-    try:
-        from hermes_cli.model_registry import slot_resolve
-
-        return slot_resolve(model)
-    except Exception:
-        return model, None
-
-
 def apply_slot_at_init(agent: Any) -> None:
     """Resolve ``agent.model`` once, before routing/context/compressor setup reads it."""
-    resolved, slot = resolve(getattr(agent, "model", None))
+    resolved, slot = slot_resolve(getattr(agent, "model", None))
     agent._model_slot = slot
     if slot:
         logger.info("model slot %s -> %s", slot, resolved)
         agent.model = resolved
-
-
-def model_label(agent: Any) -> str:
-    """``sol -> gpt-6.2-sol`` for a slot-configured agent, else the model id."""
-    model = str(getattr(agent, "model", "") or "")
-    slot = getattr(agent, "_model_slot", None)
-    return f"{slot} -> {model}" if slot and model and slot != model else model
 
 
 def refresh_slot_for_turn(agent: Any) -> bool:
@@ -53,8 +38,9 @@ def refresh_slot_for_turn(agent: Any) -> bool:
     slot = getattr(agent, "_model_slot", None)
     if not slot or getattr(agent, "_fallback_activated", False):
         return False
-    new_id, new_slot = resolve(slot)
-    if not new_slot or not new_id or new_id == agent.model:
+    new_id, new_slot = slot_resolve(slot)
+    # Bare-id compare: init may have normalized the lane prefix off agent.model.
+    if not new_slot or not new_id or _split_prefixed(new_id)[1] == _split_prefixed(agent.model or "")[1]:
         return False
     old_id = agent.model
     try:
@@ -75,4 +61,4 @@ def refresh_slot_for_turn(agent: Any) -> bool:
     return True
 
 
-__all__ = ["apply_slot_at_init", "model_label", "refresh_slot_for_turn", "resolve"]
+__all__ = ["apply_slot_at_init", "refresh_slot_for_turn"]

@@ -237,7 +237,7 @@ class CLIStatusBarMixin:
         # A slot-configured seat shows what the slot points at: ``sol -> gpt-6.2-sol``. Not on a
         # fallback, where agent.model is the fallback's id and not the slot's.
         _slot = getattr(agent, "_model_slot", None)
-        if isinstance(_slot, str) and _slot and not getattr(agent, "_fallback_activated", False):
+        if _slot and not getattr(agent, "_fallback_activated", False):
             model_short = f"{_slot} -> {model_short}"
 
         prompt_start = getattr(self, "_prompt_start_time", None)

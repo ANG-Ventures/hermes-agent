@@ -299,16 +299,18 @@ def slot_view() -> dict[str, str]:
 def slot_resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """``(id, slot)`` when ``model`` names a slot in :func:`slot_view`, else ``(model, None)``.
 
-    A ``lane/`` prefix is kept (``cpa/sol`` -> ``cpa/gpt-6.2-sol``, slot ``sol``). Literal
-    ids, unknown names and a missing view pass through unchanged.
+    A ``lane/`` prefix is kept on both (``cpa/sol`` -> ``cpa/gpt-6.2-sol``, slot ``cpa/sol``), so
+    re-resolving the slot later lands on the same lane. Literal ids, unknown names and a missing
+    view pass through unchanged.
     """
     if not isinstance(model, str) or not model.strip():
         return model, None
-    prefix, bare = _split_prefixed(model.strip())
+    spec = model.strip()
+    prefix, bare = _split_prefixed(spec)
     target = slot_view().get(bare)
     if not target or target == bare:
         return model, None
-    return (f"{prefix}/{target}" if prefix else target), bare
+    return (f"{prefix}/{target}" if prefix else target), spec
 
 
 __all__ = [

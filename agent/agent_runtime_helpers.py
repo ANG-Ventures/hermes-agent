@@ -2679,7 +2679,7 @@ def switch_model(
     TUI, one-turn restore) omit it and get the #467 keep-current-unless-per-model behaviour."""
     # A slot name (``sol``) switches to the slot's current id; the slot is kept on the agent
     # so the next turns follow a re-rendered view (agent/model_slots.py).
-    from agent.model_slots import resolve as _resolve_slot
+    from hermes_cli.model_registry import slot_resolve as _resolve_slot
     new_model, _new_slot = _resolve_slot(new_model)
     old_model = agent.model
     old_provider = agent.provider

@@ -43,7 +43,7 @@ def test_slot_resolves_to_id(home):
 
 
 def test_lane_prefix_kept(home):
-    assert slot_resolve("cpa/sol") == (f"cpa/{SOL_ID}", "sol")
+    assert slot_resolve("cpa/sol") == (f"cpa/{SOL_ID}", "cpa/sol")
 
 
 def test_flat_view_shape_accepted(home):
@@ -117,7 +117,7 @@ def test_wire_carries_the_resolved_id(home):
 
 def test_flip_moves_the_next_turn_without_reload(home):
     seat = _make_agent("sol")
-    from agent.model_slots import model_label, refresh_slot_for_turn
+    from agent.model_slots import refresh_slot_for_turn
 
     assert refresh_slot_for_turn(seat) is False  # unchanged view: no switch
     _write_view(home, {"sol": NEXT_SOL_ID})
@@ -126,7 +126,6 @@ def test_flip_moves_the_next_turn_without_reload(home):
     assert seat._model_slot == "sol"
     assert seat._primary_runtime["model"] == NEXT_SOL_ID
     assert seat._build_api_kwargs([{"role": "user", "content": "hi"}])["model"] == NEXT_SOL_ID
-    assert model_label(seat) == f"sol -> {NEXT_SOL_ID}"
 
 
 def test_flip_waits_while_on_fallback(home):
@@ -157,12 +156,11 @@ def test_missing_view_agent_passes_through(home):
 
 def test_literal_seat_untouched_by_refresh(home):
     agent = _make_agent(SOL_ID)
-    from agent.model_slots import model_label, refresh_slot_for_turn
+    from agent.model_slots import refresh_slot_for_turn
 
     _write_view(home, {"sol": NEXT_SOL_ID})
     assert refresh_slot_for_turn(agent) is False
     assert agent.model == SOL_ID
-    assert model_label(agent) == SOL_ID
 
 
 def test_switch_model_to_slot_keeps_slot(home):
@@ -210,3 +208,69 @@ def test_status_line_literal_and_fallback_show_the_id_only():
     assert _status_snapshot(_status_agent())["model_short"] == SOL_ID
     snap = _status_snapshot(_status_agent(model="claude-opus-5-5", _model_slot="sol", _fallback_activated=True))
     assert snap["model_short"] == "claude-opus-5-5"
+
+
+# ── Prism round 1 (#466): prefix, gateway eviction, configured context ceiling ──
+
+def test_prefixed_slot_seat_keeps_its_lane_across_turns(home):
+    """``cpa/sol``: the slot kept on the agent carries the lane, so the turn-start refresh neither
+    re-switches on an unchanged view nor drops the prefix on a flip."""
+    from agent.model_slots import refresh_slot_for_turn
+    from hermes_cli.model_registry import _split_prefixed
+
+    seat = _make_agent("cpa/sol")
+    assert seat._model_slot == "cpa/sol"
+    assert _split_prefixed(seat.model)[1] == SOL_ID
+    assert refresh_slot_for_turn(seat) is False  # unchanged view: no switch every turn
+    _write_view(home, {"sol": NEXT_SOL_ID})
+    assert refresh_slot_for_turn(seat) is True
+    assert _split_prefixed(seat.model)[1] == NEXT_SOL_ID
+    assert seat._model_slot == "cpa/sol"
+
+
+def _evict_probe(cfg_model, agent, override=None):
+    from types import SimpleNamespace
+    from gateway.run_turn import GatewayTurnMixin
+
+    evicted = []
+    runner = SimpleNamespace(
+        _evict_cached_agent=evicted.append,
+        _session_model_override=lambda _k: override,
+    )
+    from gateway.run_agent_cache import GatewayAgentCacheMixin as _Cache
+    runner._is_intentional_model_switch = lambda k, a, c: _Cache._is_intentional_model_switch(runner, k, a, c)
+    turn_ctx = SimpleNamespace(session_key="s1", agent_holder=[agent], result_holder=[{"failed": False}])
+    with patch("gateway.run._resolve_gateway_model", return_value=cfg_model):
+        GatewayTurnMixin._run_agent_evict_on_fallback(runner, turn_ctx)
+    return evicted
+
+
+def test_gateway_keeps_a_slot_seats_cached_agent(home):
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(model=SOL_ID, provider="cpa", _model_slot="sol")
+    assert _evict_probe("sol", agent) == []
+    # /model sol stores the slot as the session override: still intentional.
+    assert _evict_probe("claude-opus-5-5", agent, override={"model": "sol"}) == []
+    # Real drift still evicts.
+    drift = SimpleNamespace(model="claude-opus-5-5", provider="cpa", _model_slot=None)
+    assert _evict_probe("sol", drift) == ["s1"]
+
+
+def test_configured_context_ceiling_kept_for_a_slot_default(home):
+    cfg = {"model": {"default": "sol", "provider": "cpa", "context_length": 400_000}}
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        seat = AIAgent(
+            model="sol", provider="cpa", api_key="fake-test-token",
+            base_url="http://127.0.0.1:8317/v1", quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+        )
+    assert seat.model == SOL_ID
+    assert seat._config_context_length == 400_000
+    assert seat.context_compressor.context_length == 400_000
