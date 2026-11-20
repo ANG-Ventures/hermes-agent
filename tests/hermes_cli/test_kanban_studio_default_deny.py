@@ -572,7 +572,7 @@ def test_local_review_placement_records_the_resolved_capability(kanban_home, mon
 # -- 6. a browser-session override declares its need (t_9d6a5d75) ------------------------------------------------
 # Operator ruling 11-19: the --why text is not parsed; --need is a fixed set and only signed-in-identity (and other,
 # recorded) goes through.
-REFUSED_NEEDS = [("public-page", "browser-ephemeral"), ("lan-reach", "host_reach"), ("ssh", "fleet-ssh"),
+REFUSED_NEEDS = [("public-page", "browser-public"), ("lan-reach", "lan-reach"), ("ssh", "fleet-ssh"),
                  ("gmail", "studio-state")]
 
 
@@ -610,6 +610,27 @@ def test_browser_override_with_identity_or_other_is_recorded_with_its_need(opera
     assert p["need"] == need
     line = json.loads(ksa.ledger_path().read_text().splitlines()[-1])
     assert line["need"] == need  # `other` is counted from the ledger
+
+
+def test_the_split_identity_name_also_declares_its_need():
+    # t_f935cb6f: browser-identity is browser-session's target; overriding it by the new name is the same hold.
+    assert "needs --need" in ksa.need_refusal("browser-identity", None)
+    assert ksa.need_refusal("browser-identity", "signed-in-identity") is None
+    assert ksa.need_refusal("browser-public", None) is None
+
+
+def test_a_legacy_named_override_holds_for_the_derived_identity_name(operator):
+    # Prism b4a322a16d7c: the split map derives requires:browser-identity; a live override named browser-session
+    # (and an allow list naming either) still releases it, and the reverse.
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: browser-session")
+        ksa.override(conn, tid, "browser-session", "reads the signed-in order page", need="signed-in-identity")
+        assert ksa.live_override(conn, tid, "browser-identity") is not None
+        assert ksa.live_override(conn, tid, "browser-session") is not None
+        assert ksa.live_override(conn, tid, "browser-public") is None
+    assert ksa.allowed("browser-identity", frozenset({"browser-session"}))
+    assert ksa.allowed("browser-session", frozenset({"browser-identity"}))
+    assert not ksa.allowed("browser-public", frozenset({"browser-session"}))
 
 
 def test_need_is_only_checked_for_browser_session(operator):

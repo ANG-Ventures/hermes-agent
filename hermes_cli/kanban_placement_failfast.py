@@ -59,8 +59,13 @@ ROUTE_HASH_KEY = "route_hash"
 REQUIRES_KEY = "requires"
 
 # #1876's spelling for the two rail tokens (spec s3, one token family).
-_TOKEN_OF_CAP = {"browser-session": "BROWSER_RAIL_ABSENT", "screen": "SCREEN_RAIL_ABSENT"}
-_CAP_OF_TOKEN = {v: k for k, v in _TOKEN_OF_CAP.items()}
+# t_f935cb6f: only a signed-in identity is the browser RAIL. ``browser-identity`` and its one-release alias
+# ``browser-session`` share the token; ``browser-public`` (the agent's own Chromium) and ``lan-reach`` are plain
+# capabilities (BROWSER_PUBLIC_ABSENT, LAN_REACH_ABSENT), so a public page never reads as Ace's browser.
+_TOKEN_OF_CAP = {"browser-identity": "BROWSER_RAIL_ABSENT", "browser-session": "BROWSER_RAIL_ABSENT",
+                 "screen": "SCREEN_RAIL_ABSENT"}
+# A capless #1876 rail line re-routes as ``browser-session``: the word every map (old or split) defines.
+_CAP_OF_TOKEN = {"BROWSER_RAIL_ABSENT": "browser-session", "SCREEN_RAIL_ABSENT": "screen"}
 _FIELD_RE = re.compile(r"\b(cap|host)=([A-Za-z0-9._-]+)")
 
 

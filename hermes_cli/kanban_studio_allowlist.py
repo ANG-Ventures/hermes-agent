@@ -99,8 +99,15 @@ def head(part: str) -> str:
     return re.split(r"[:(]", part, maxsplit=1)[0].strip()
 
 
+def _identity_names(part: str) -> frozenset:
+    """Both spellings of the identity capability when ``part`` is one (t_f935cb6f, Prism b4a322a16d7c): the map now
+    derives ``browser-identity`` where older allow lists and live overrides say ``browser-session``."""
+    from hermes_cli.kanban_host_capabilities import BROWSER_IDENTITY_CAPS
+    return BROWSER_IDENTITY_CAPS if head(part) in BROWSER_IDENTITY_CAPS else frozenset({part})
+
+
 def _covered(part: str, words) -> bool:
-    return part in words or head(part) in words
+    return part in words or head(part) in words or bool(_identity_names(part) & set(words))
 
 
 def allowed(capability: Optional[str], allow) -> bool:
@@ -123,6 +130,7 @@ def live_override(conn, task_id: str, capability: Optional[str], *, now: Optiona
     ``once``: no Studio start after it (:func:`_spent_on_studio`). ``until``: ``now`` before it."""
     want = set(parts(capability))
     want |= {head(p) for p in want}
+    want |= {n for p in list(want) for n in _identity_names(p)}
     if not want:
         return None
     for p in _live_overrides(conn, task_id, now):
@@ -437,10 +445,13 @@ def _fix_card(conn, capability: str) -> Optional[str]:
 # this fixed set. 13 of the 34 browser-session override cards (11-14..11-20) needed an SSH lane, the Gmail lane, LAN
 # reach or a public page, not a signed-in identity. need -> (what it is, the capability to use instead or None).
 BROWSER_CAP = "browser-session"
+# t_f935cb6f split browser-session: browser-identity is its target (browser-session its alias for one release), a
+# public page is browser-public and a .ace LAN web UI is lan-reach. An override of either identity name declares a need.
+BROWSER_CAPS = frozenset({BROWSER_CAP, "browser-identity"})
 NEEDS = {
     "signed-in-identity": ("a signed-in browser identity", None),
-    "public-page": ("a public web page", "browser-ephemeral"),
-    "lan-reach": ("LAN reach to a host (slicer, dashboard, .ace API)", "host_reach"),
+    "public-page": ("a public web page", "browser-public"),
+    "lan-reach": ("LAN reach to a host (slicer, dashboard, .ace API)", "lan-reach"),
     "ssh": ("an SSH lane (operator lane, portal host)", "fleet-ssh"),
     "gmail": ("the Gmail read lane (a Studio job; a pool host reaches it over `ssh studio`)", "studio-state"),
     "other": ("a need not in this list (say it in --why)", None),
@@ -449,7 +460,7 @@ NEEDS = {
 
 def need_refusal(capability: str, need: Optional[str]) -> Optional[str]:
     """The refusal line for a ``browser-session`` override's ``need``, or None when it may go through."""
-    if (capability or "").strip().lower() != BROWSER_CAP:
+    if (capability or "").strip().lower() not in BROWSER_CAPS:
         return None
     n = (need or "").strip().lower()
     if n not in NEEDS:
