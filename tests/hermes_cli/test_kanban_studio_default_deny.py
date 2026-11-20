@@ -565,3 +565,75 @@ def test_local_review_placement_records_the_resolved_capability(kanban_home, mon
             got[tid] = (p.get("entry"), (p.get("studio_capability") or {}).get("capability"))
     assert {declared, plain} <= {t for t, _h in spawned}, spawned
     assert got == {declared: ("review", "studio-state"), plain: ("review", "review_lane")}, got
+
+
+# -- 6. a browser-session override names a browser need (t_9d6a5d75) --------------------------------------------
+# The --why texts of the 14 browser-session overrides (13 cards) on the live board, 11-14..11-20, that needed no browser
+# (census in hermes-content docs/research/browser-rail-off-studio.md 4.1), with the capability the refusal must name.
+NO_BROWSER_WHYS = [
+    ("SSH lane to the portal host for store copies and logs; hold raised by the attached portal skill", {"fleet-ssh"}),
+    ("needs the Studio operator SSH lane and Gmail read lane; hold is raised by the attached portal skill",
+     {"fleet-ssh", "studio-state"}),
+    ("needs the Studio operator SSH lane to the portal host and the Studio read-only Gmail lane; hold is raised by its "
+     "attached portal skill", {"fleet-ssh", "studio-state"}),
+    ("needs the Studio's operator SSH lane to read a copy of the purchase store on the portal host; the hold is raised "
+     "by its attached portal skill", {"fleet-ssh"}),
+    ("evidence screenshots and the Print Doctor script and state live on the Studio; no browser needed",
+     {"studio-state"}),
+    ("Studio-only runner: public web search plus local vision lane; hold raised by the attached portal skill",
+     {"browser-ephemeral"}),
+    ("reads sync logs on the portal host and the Gmail read lane from the Studio; hold raised by the attached portal "
+     "skill", {"fleet-ssh", "studio-state"}),
+    ("the worker needs to reach 3dprinter.ace (slicer and queue API), which the pool host could not; the Studio can",
+     {"host_reach"}),
+    ("slicer and queue API reachable from the Studio only", {"host_reach"}),
+    ("SSH lane to the portal host and read-only Gmail; hold raised by the attached portal skill",
+     {"fleet-ssh", "studio-state"}),
+    ("the worker must reach 3dprinter.ace for the slicer and queue API; pool hosts could not last time",
+     {"host_reach"}),
+    ("needs 3dprinter.ace slicer and queue API; ace-ai could not reach it", {"host_reach"}),
+    ("reads Studio lease ledgers and the portal host journal over the operator SSH lane; hold raised by the attached "
+     "portal skill", {"fleet-ssh", "studio-state"}),
+    ("read-only investigation that must reach the printer dashboard and the NAS printer stack logs from the Studio; "
+     "no pool host has that reach", {"host_reach"}),
+]
+# Signed-in identity overrides from the same census: each still goes through.
+BROWSER_WHYS = [
+    "Instacart read lease and SSH lane on the Studio; hold raised by the attached portal skill",
+    "needs the Studio SSH lane and one Amazon read lease; hold raised by the attached portal skill",
+    "Studio-only: Gmail lane, Etsy and Amazon read leases, web search and vision lane; hold raised by the attached "
+    "portal skill",
+    "needs the Studio :9224 Amazon browser and iMessage; Ace ruling Discord msg 1572790018324439177",
+    "read lease on id-amazon-alex for order detail pages, read-only; outside the 05:00-06:30 sync window",
+    "apollo: Amazon acceptance failed on the live path; the fix needs the Studio identity container and browserd ledger",
+    "files Ace's approved eBay case from his logged-in buyer account in the Studio CDP browser",
+    "signed-in shopping identity containers and their leases exist only on the Studio; the card scrapes through them",
+    "the agy login and the signed-in browser exist only on the Studio",
+]
+
+ALL_CAPS = ("fleet-ssh", "studio-state", "host_reach", "browser-ephemeral")
+
+
+@pytest.mark.parametrize("why,caps", NO_BROWSER_WHYS)
+def test_browser_override_whose_why_names_no_browser_is_refused_naming_the_need(operator, why, caps):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: browser-session")
+        with pytest.raises(ksa.OverrideRefused) as exc:
+            ksa.override(conn, tid, "browser-session", why)
+        n = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+                         (tid, ksa.OVERRIDE_EVENT)).fetchone()[0]
+    named = {c for c in ALL_CAPS if f"--capability {c}" in str(exc.value)}
+    assert named == caps, str(exc.value)
+    assert n == 0
+
+
+@pytest.mark.parametrize("why", BROWSER_WHYS)
+def test_browser_override_naming_an_identity_need_is_recorded(operator, why):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: browser-session")
+        assert ksa.override(conn, tid, "browser-session", why)["capability"] == "browser-session"
+
+
+def test_need_check_only_reads_browser_session_overrides():
+    assert ksa.misnamed_need("studio-state", "SSH lane to the portal host and read-only Gmail") is None
+    assert ksa.misnamed_need("browser-session", "operator asked for this one now") is None  # names nothing: let through

@@ -25,7 +25,9 @@ operator token only, ``--capability`` required. One ``studio_override`` board ev
 default) is used up by the card's next run that starts ON the Studio; a run on a pool host leaves it unspent and
 its ``worker_placed`` event says so (``studio_override_unspent``, t_a94fafef). ``--until`` holds until that time. The override covers a held
 capability only when it names one of its parts. Every override also writes one line to the capability-gap ledger
-``<root>/state/studio-capability-gap/overrides.jsonl`` (t_b3884ae0's state dir).
+``<root>/state/studio-capability-gap/overrides.jsonl`` (t_b3884ae0's state dir). A ``browser-session`` override whose
+``--why`` names only an SSH lane, the Gmail lane, Studio files, LAN reach or a public page is refused with the
+capability that serves that need (:func:`misnamed_need`, t_9d6a5d75).
 
 Holding: the first tick that holds a card in an episode writes ONE ``mechanical_wake`` event (source
 ``studio-default-deny``). The gateway owner-wake turns that into a silent turn in the card's home session, not a chat
@@ -430,6 +432,55 @@ def _fix_card(conn, capability: str) -> Optional[str]:
     return row[0] if row else None
 
 
+# t_9d6a5d75 (design t_e7f581f6 card 4): a ``browser-session`` override must name a browser need. 13 of the 34
+# browser-session override cards (11-14..11-20) said in their own --why that they needed the operator SSH lane, the
+# Gmail read lane, LAN reach or Studio files, and no browser; a portal skill's declaration had raised the hold.
+BROWSER_CAP = "browser-session"
+_NO_BROWSER = re.compile(r"\b(?:no|without(?: a)?|not a)\s+browser\b[^;,.]*", re.I)
+_BROWSER_NEED = re.compile(
+    r"(?<![\w-])id-[a-z0-9][\w-]*|\b(?:read|act|buy|human|browser|identity|cdp)\s+leases?\b|\bsigned[- ]in\b"
+    r"|\blogged[- ]in\b|\bcdp\b|:922[2-4]\b|\bbrowserd?\b|\bidentity\s+(?:containers?|units?|profiles?)\b"
+    r"|\bcookies?\b|\bcart\b|\bcheckout\b", re.I)
+# (capability that serves it, what the --why named, pattern). Order is the order the refusal lists them.
+_NON_BROWSER_NEEDS = (
+    ("fleet-ssh", "an SSH lane", re.compile(r"\bssh\b|\bportal host\b|\boperator lane\b", re.I)),
+    ("studio-state", "the Gmail read lane (it runs on the Studio; a pool host reaches it over `ssh studio`)",
+     re.compile(r"\bgmail\b", re.I)),
+    ("studio-state", "Studio files", re.compile(
+        r"\bstudio(?:'s)?\s+(?:[\w-]+\s+){0,2}(?:ledgers?|files?|logs?|state|db|journal)\b"
+        r"|\b(?:scripts?|state|files?|logs?|ledgers?)\b[^;]{0,40}?\b(?:live|lives|exist|exists)\s+(?:only\s+)?on\s+the\s+studio",
+        re.I)),
+    ("host_reach", "LAN reach to a host", re.compile(
+        r"(?<![\w.-])[a-z0-9][\w-]*\.ace\b|\blan\b|\bdashboard\b|\bslicer\b|\bqueue api\b|\breach(?:able)?\b", re.I)),
+    ("browser-ephemeral", "a public web page (no signed-in identity)", re.compile(
+        r"\bpublic\s+(?:web|pages?|sites?)\b|\bweb\s+search\b", re.I)),
+)
+
+
+def misnamed_need(capability: str, why: str) -> Optional[str]:
+    """For a ``browser-session`` override whose ``why`` names no browser need, the refusal text naming the
+    capability (or capabilities) that serve what the ``why`` does name; else None. A ``why`` that names neither is
+    let through: only a ``why`` that names something else, or says "no browser", is refused."""
+    if (capability or "").strip().lower() != BROWSER_CAP:
+        return None
+    text = _NO_BROWSER.sub(" ", why or "")
+    said_no = text != (why or "")
+    if _BROWSER_NEED.search(text):
+        return None
+    hits: dict = {}
+    for cap, what, rx in _NON_BROWSER_NEEDS:
+        if rx.search(text):
+            hits.setdefault(cap, []).append(what)
+    if not hits and not said_no:
+        return None
+    named = "; ".join(f"{' and '.join(w)} -> --capability {c}" for c, w in hits.items()) or "no browser"
+    return (f"--capability {BROWSER_CAP} is for a signed-in browser identity, but --why names no browser need "
+            f"({named}). Override with the capability that serves the need"
+            + (f" ({', '.join(hits)})" if hits else "")
+            + ", and drop the browser-session hold at its source (the card's requires: line or the attached skill); "
+            "if the card does need a signed-in identity, say which (id-<name>, read/act lease) in --why")
+
+
 def override(conn, task_id: str, capability: str, why: str, *, once: bool = True, until: Optional[str] = None,
              actor: Optional[str] = None, now: Optional[float] = None, root: Optional[Path] = None) -> dict:
     """Record one override. Raises :class:`OverrideRefused` with the line to print."""
@@ -443,6 +494,9 @@ def override(conn, task_id: str, capability: str, why: str, *, once: bool = True
         raise OverrideRefused("--capability is required: name ONE capability (the one the wait reason names)")
     if len((why or "").split()) < 3:
         raise OverrideRefused("--why is required: at least 3 words saying why this card needs the Studio")
+    misnamed = misnamed_need(cap, why)
+    if misnamed:
+        raise OverrideRefused(misnamed)
     row = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         raise OverrideRefused(f"unknown card {task_id}")
