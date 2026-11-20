@@ -1039,6 +1039,8 @@ def cron_create(args):
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     _print_job_details(result.get("job", {}))
+    if result.get("model_canonicalised"):  # t_efde9d1a
+        print(f"  Model {result['model_canonicalised']}")
     if not result.get("job", {}).get("enabled", True):
         print("  Created PAUSED — resume to schedule, or explicitly run now.")
     else:
@@ -1085,6 +1087,8 @@ def cron_edit(args):
     print(f"  Skills: {', '.join(updated['skills'])}" if updated.get("skills") else
           "  Skills: none")
     _print_job_details(updated)
+    if result.get("model_canonicalised"):  # t_efde9d1a
+        print(f"  Model {result['model_canonicalised']}")
     if getattr(args, "reasoning_effort", None) is not None:
         from cron.jobs import get_job
 

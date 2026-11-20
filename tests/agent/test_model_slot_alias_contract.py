@@ -11,7 +11,8 @@ This file pins the contract the sweep relies on, at every writer and seat:
 (c) a kanban pin / cron job ``sol`` is stored as the slot on the alias lane, dispatched as the id;
 (d) ``delegate_task(model='sol')`` runs the id on the alias lane;
 (e) write-time catalog validation sees the resolved id, never the string ``sol``;
-(f) literal aliases (``sol: cpa/gpt-6.2-sol``) behave as on main.
+(f) literal aliases (``sol: cpa/gpt-6.2-sol``) behave as on main, except that a writer stores the
+    slot's current id as the slot (P6, t_efde9d1a).
 Plus the seams carried from hermes-agent#469: the two aux seams that read config model.default
 directly, and ``slot_view`` keeping the last good parse on a torn file.
 """
@@ -296,9 +297,12 @@ def test_f_literal_alias_behaves_as_on_main(literal, monkeypatch):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="lit", assignee="worker", model_override="sol")
         task = kb.get_task(conn, tid)
-    assert (task.model_override, task.provider_override) == (SOL_ID, "cpa")
+    # P6 (t_efde9d1a): the alias resolves to the slot's CURRENT id, which a writer now stores as
+    # the slot on the alias lane; the run still sends the id.
+    assert (task.model_override, task.provider_override) == ("sol", "cpa")
     job = cj.create_job(prompt="ping", schedule="in 1 hour", model="sol")
-    assert (job["model"], job["provider"]) == (SOL_ID, "cpa")
+    assert (job["model"], job["provider"]) == ("sol", "cpa")
+    assert _turn("sol", "cpa") == ("cpa", SOL_ID)
 
 
 def test_bare_slot_with_no_alias_stays_on_the_current_lane(vhome):

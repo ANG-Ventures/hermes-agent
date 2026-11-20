@@ -1616,6 +1616,13 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
+def _slot_note(requested, stored) -> Optional[str]:
+    """``stored as slot X, currently id Y`` when the board kept the slot for the id asked for."""
+    from hermes_cli.model_registry import slot_store_note
+
+    return slot_store_note(requested, stored)
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -1732,7 +1739,7 @@ def _handle_create(args: dict, **kw) -> str:
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
-            force_model_reason=force_model,
+            force_model_reason=force_model, keep_literal_model=bool(model_rewritten),
             flagship_override_reason=allow_flagship,
             flagship_override_author=_persisted_identity(),
             reasoning_effort=reasoning_effort,
@@ -1789,6 +1796,8 @@ def _handle_create(args: dict, **kw) -> str:
                    **({"model_rewritten": model_rewritten}
                       if model_rewritten and kb.get_task(conn, new_tid).model_override
                       in (model_override, model_override.partition("/")[2]) else {}),
+                   **({"model_canonicalised": _canon} if (_canon := _slot_note(
+                       model_override, kb.get_task(conn, new_tid).model_override)) else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
 

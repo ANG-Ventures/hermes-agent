@@ -2738,6 +2738,12 @@ def _resolve_provider_aware_context_length(model: str, base_url: str, api_key: s
     return None
 
 
+# Providers whose step-5 lookup returns the window the lane enforces, which can be smaller than the
+# id's API window (Codex OAuth 922K vs 1.05M; Copilot account caps). A per-id registry row must not
+# override it.
+_LANE_WINDOW_PROVIDERS = frozenset({"openai-codex", "copilot", "copilot-acp", "github-copilot"})
+
+
 def get_model_context_length(
     model: str, base_url: str = "", api_key: str = "", config_context_length: int | None = None,
     provider: str = "", custom_providers: list | None = None,
@@ -2811,6 +2817,16 @@ def get_model_context_length(
     # (HERMES_CODEX_BASE_URL, model.base_url, custom api_mode: codex_responses) the URL looks
     # generic while the window is still the Codex OAuth one (#116191).
     codex_route = _is_codex_route(provider, base_url, custom_providers)
+    # Slot aliases P7 (t_efde9d1a): the registry row's window (config/model-meta.json) wins over the
+    # caches, probes and built-in tables below. It is one row per id (the API window), so it runs
+    # AFTER the lane windows above (Codex-subscription proxy, endpoint-scoped, profile bound), and a
+    # lane that enforces its own window in step 5 (Codex OAuth, Copilot) reads it only when that
+    # lane lookup misses, just before the hardcoded table (Prism dbbdd3313f7f).
+    from hermes_cli.model_registry import registry_context_length
+    lane_window = codex_route or (provider or "").strip().lower() in _LANE_WINDOW_PROVIDERS
+    ctx = None if lane_window else registry_context_length(model)
+    if ctx is not None:
+        return ctx
     # 1. Persistent cache (LM Studio / Codex routes excluded — see _skip_persistent_context_cache).
     cached = get_cached_context_length(model, base_url) if base_url and not is_bedrock_context and not codex_route and not _skip_persistent_context_cache(base_url, provider) else None
     validated = _validate_cached_context_length(model, base_url, cached, api_key=api_key, provider=provider) if cached is not None else None
@@ -2891,6 +2907,9 @@ def get_model_context_length(
             if base_url and not _skip_persistent_context_cache(base_url, provider):
                 save_context_length(model, base_url, agg_ctx)
             return agg_ctx
+    ctx = registry_context_length(model) if lane_window else None
+    if ctx is not None:
+        return ctx
     # 8. Hardcoded defaults: `key in model` only — the reverse would let "claude-sonnet-4" match "claude-sonnet-4-6" and return 1M.
     hit = _longest_key_match(DEFAULT_CONTEXT_LENGTHS, model.lower())
     if hit:

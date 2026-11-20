@@ -4170,12 +4170,15 @@ def _apply_a_lane_default_fallback(job: Dict[str, Any]) -> None:
     if (job_lane(job) == "script" or not model or not _A_LANE_RE.fullmatch(provider)
             or job.get("fallback") or "allow_cross_provider_fallback" in job):
         return
-    from hermes_cli.model_registry import resolve
+    from hermes_cli.model_registry import resolve, slot_resolve
 
+    # A rung follows its job's model (a slot stays a slot), but the lane's list holds literal
+    # ids, so each rung is checked with the slot's current id (Prism 07e86974b011).
+    check = slot_resolve(model)[0] or model
     chain = []
     for lane in _A_LANE_DEFAULT_FALLBACK_PROVIDERS:
         try:
-            ok = resolve(lane, model, resolve_aliases=False).ok
+            ok = resolve(lane, check, resolve_aliases=False).ok
         except Exception:
             ok = True
         if ok:
@@ -4265,6 +4268,8 @@ def create_job(
         f["model"], allow_flagship_reason=allow_flagship_reason
     )
     _require_known_job_route(f["model"], f["provider"], force_model_reason=force_model_reason)
+    if not str(force_model_reason or "").strip():  # --force-model keeps the literal
+        f["model"] = _slot_for_current_id(f["model"], f["provider"])
     _revalidate_resolved_provider(provider, f["provider"], f["base_url"])
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
@@ -4408,6 +4413,20 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
     return jobs
+
+
+def _slot_for_current_id(model: Any, provider: Any) -> Any:
+    """Slot aliases P6 (t_efde9d1a): a job model that is exactly a slot's CURRENT id on a lane
+    that serves it is stored as the slot (``gpt-6.2-sol`` -> ``sol``), so a rollout moves the job
+    with no sweep. The tool and CLI confirmation say so (``model_canonicalised``)."""
+    if not isinstance(model, str) or not model:
+        return model
+    from hermes_cli.model_registry import slot_canonicalise
+
+    stored, note = slot_canonicalise(model, provider if isinstance(provider, str) else None)
+    if note:
+        logger.info("cron: model %s", note)
+    return stored
 
 
 def _require_known_job_route(
@@ -4682,6 +4701,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 force_model_reason=_force,
             )
             updated.pop("force_model_reason", None)
+            if "model" in updates and not str(_force or "").strip():  # --force-model keeps the literal
+                updated["model"] = _slot_for_current_id(updated.get("model"), updated.get("provider"))
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
