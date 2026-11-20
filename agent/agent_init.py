@@ -2614,6 +2614,9 @@ def init_agent(
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
     agent.session_cwd = cwd or None
+    # A slot name (``sol``) becomes its current id before anything reads agent.model.
+    from agent.model_slots import apply_slot_at_init
+    apply_slot_at_init(agent)
     # Shared iteration budget: parent creates, children inherit.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     # CLI replaces this with _cprint so raw ANSI status lines go through prompt_toolkit's

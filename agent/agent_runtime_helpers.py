@@ -2677,6 +2677,10 @@ def switch_model(
     ``session_reasoning_config`` lets a caller that owns session state (the gateway) hand in the
     effort the session actually runs at for the NEW model. Callers without session state (CLI,
     TUI, one-turn restore) omit it and get the #467 keep-current-unless-per-model behaviour."""
+    # A slot name (``sol``) switches to the slot's current id; the slot is kept on the agent
+    # so the next turns follow a re-rendered view (agent/model_slots.py).
+    from agent.model_slots import resolve as _resolve_slot
+    new_model, _new_slot = _resolve_slot(new_model)
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
@@ -2766,6 +2770,7 @@ def switch_model(
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
+    agent._model_slot = _new_slot
     _finish_switch(agent, new_provider, old_norm, new_norm, persist_fallback=persist_fallback)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
