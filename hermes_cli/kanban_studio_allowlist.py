@@ -25,9 +25,10 @@ operator token only, ``--capability`` required. One ``studio_override`` board ev
 default) is used up by the card's next run that starts ON the Studio; a run on a pool host leaves it unspent and
 its ``worker_placed`` event says so (``studio_override_unspent``, t_a94fafef). ``--until`` holds until that time. The override covers a held
 capability only when it names one of its parts. Every override also writes one line to the capability-gap ledger
-``<root>/state/studio-capability-gap/overrides.jsonl`` (t_b3884ae0's state dir). A ``browser-session`` override whose
-``--why`` names only an SSH lane, the Gmail lane, Studio files, LAN reach or a public page is refused with the
-capability that serves that need (:func:`misnamed_need`, t_9d6a5d75).
+``<root>/state/studio-capability-gap/overrides.jsonl`` (t_b3884ae0's state dir). A ``browser-session`` override
+needs ``--need`` from a fixed set (:data:`NEEDS`, t_9d6a5d75): only ``signed-in-identity`` is accepted, ``other`` is
+accepted and recorded, every other need is refused with the capability that serves it. The ``--why`` text is never
+parsed for the need.
 
 Holding: the first tick that holds a card in an episode writes ONE ``mechanical_wake`` event (source
 ``studio-default-deny``). The gateway owner-wake turns that into a silent turn in the card's home session, not a chat
@@ -432,62 +433,38 @@ def _fix_card(conn, capability: str) -> Optional[str]:
     return row[0] if row else None
 
 
-# t_9d6a5d75 (design t_e7f581f6 card 4): a ``browser-session`` override must name a browser need. 13 of the 34
-# browser-session override cards (11-14..11-20) said in their own --why that they needed the operator SSH lane, the
-# Gmail read lane, LAN reach or Studio files, and no browser; a portal skill's declaration had raised the hold.
+# t_9d6a5d75 (design t_e7f581f6 card 4; operator ruling 11-19): a ``browser-session`` override declares its need from
+# this fixed set. 13 of the 34 browser-session override cards (11-14..11-20) needed an SSH lane, the Gmail lane, LAN
+# reach or a public page, not a signed-in identity. need -> (what it is, the capability to use instead or None).
 BROWSER_CAP = "browser-session"
-# The span ends at punctuation or at a contrast word, so "no browser for X but CDP for Y" keeps its CDP clause.
-_NO_BROWSER = re.compile(r"\b(?:no|without(?: a)?|not a)\s+browser\b"
-                         r"(?:(?!\b(?:but|however|though|although|except|yet|while)\b)[^;,.])*", re.I)
-# A capability's own name ("the browser-session hold") is not a browser need.
-_CAP_NAMES = re.compile(r"(?<![\w-])browser-(?:session|ephemeral)(?![\w-])", re.I)
-_BROWSER_NEED = re.compile(
-    r"(?<![\w-])id-[a-z0-9][\w-]*|\b(?:read|act|buy|human|browser|identity|cdp)\s+leases?\b|\bsigned[- ]in\b"
-    r"|\blogged[- ]in\b|\bcdp\b|:922[2-4]\b|\bbrowserd?\b|\bidentity\s+(?:containers?|units?|profiles?)\b"
-    r"|\bcookies?\b|\bcart\b|\bcheckout\b", re.I)
-# (capability that serves it, what the --why named, pattern). Order is the order the refusal lists them.
-_NON_BROWSER_NEEDS = (
-    ("fleet-ssh", "an SSH lane", re.compile(r"\bssh\b|\bportal host\b|\boperator lane\b", re.I)),
-    ("studio-state", "the Gmail read lane (it runs on the Studio; a pool host reaches it over `ssh studio`)",
-     re.compile(r"\bgmail\b", re.I)),
-    ("studio-state", "Studio files", re.compile(
-        r"\bstudio(?:'s)?\s+(?:[\w-]+\s+){0,2}(?:ledgers?|files?|logs?|state|db|journal)\b"
-        r"|\b(?:scripts?|state|files?|logs?|ledgers?)\b[^;]{0,40}?\b(?:live|lives|exist|exists)\s+(?:only\s+)?on\s+the\s+studio",
-        re.I)),
-    ("host_reach", "LAN reach to a host", re.compile(
-        r"(?<![\w.-])[a-z0-9][\w-]*\.ace\b|\blan\b|\bdashboard\b|\bslicer\b|\bqueue api\b|\breach(?:able)?\b", re.I)),
-    ("browser-ephemeral", "a public web page (no signed-in identity)", re.compile(
-        r"\bpublic\s+(?:web|pages?|sites?)\b|\bweb\s+search\b", re.I)),
-)
+NEEDS = {
+    "signed-in-identity": ("a signed-in browser identity", None),
+    "public-page": ("a public web page", "browser-ephemeral"),
+    "lan-reach": ("LAN reach to a host (slicer, dashboard, .ace API)", "host_reach"),
+    "ssh": ("an SSH lane (operator lane, portal host)", "fleet-ssh"),
+    "gmail": ("the Gmail read lane (a Studio job; a pool host reaches it over `ssh studio`)", "studio-state"),
+    "other": ("a need not in this list (say it in --why)", None),
+}
 
 
-def misnamed_need(capability: str, why: str) -> Optional[str]:
-    """For a ``browser-session`` override whose ``why`` names no browser need, the refusal text naming the
-    capability (or capabilities) that serve what the ``why`` does name; else None. A ``why`` that names neither is
-    let through: only a ``why`` that names something else, or says "no browser", is refused."""
+def need_refusal(capability: str, need: Optional[str]) -> Optional[str]:
+    """The refusal line for a ``browser-session`` override's ``need``, or None when it may go through."""
     if (capability or "").strip().lower() != BROWSER_CAP:
         return None
-    named_caps = _CAP_NAMES.sub(" ", why or "")
-    text = _NO_BROWSER.sub(" ", named_caps)
-    said_no = text != named_caps
-    if _BROWSER_NEED.search(text):
+    n = (need or "").strip().lower()
+    if n not in NEEDS:
+        return (f"--capability {BROWSER_CAP} needs --need, one of: {', '.join(NEEDS)}"
+                + (f" (got {need!r})" if n else ""))
+    what, instead = NEEDS[n]
+    if instead is None:
         return None
-    hits: dict = {}
-    for cap, what, rx in _NON_BROWSER_NEEDS:
-        if rx.search(text):
-            hits.setdefault(cap, []).append(what)
-    if not hits and not said_no:
-        return None
-    named = "; ".join(f"{' and '.join(w)} -> --capability {c}" for c, w in hits.items()) or "no browser"
-    return (f"--capability {BROWSER_CAP} is for a signed-in browser identity, but --why names no browser need "
-            f"({named}). Override with the capability that serves the need"
-            + (f" ({', '.join(hits)})" if hits else "")
-            + ", and drop the browser-session hold at its source (the card's requires: line or the attached skill); "
-            "if the card does need a signed-in identity, say which (id-<name>, read/act lease) in --why")
+    return (f"--need {n} is {what}, not a signed-in browser identity: override with --capability {instead} instead, "
+            f"and drop the {BROWSER_CAP} hold at its source (the card's requires: line or the attached skill)")
 
 
 def override(conn, task_id: str, capability: str, why: str, *, once: bool = True, until: Optional[str] = None,
-             actor: Optional[str] = None, now: Optional[float] = None, root: Optional[Path] = None) -> dict:
+             actor: Optional[str] = None, now: Optional[float] = None, root: Optional[Path] = None,
+             need: Optional[str] = None) -> dict:
     """Record one override. Raises :class:`OverrideRefused` with the line to print."""
     from hermes_cli import kanban_db as _kb
     now = time.time() if now is None else now
@@ -499,15 +476,16 @@ def override(conn, task_id: str, capability: str, why: str, *, once: bool = True
         raise OverrideRefused("--capability is required: name ONE capability (the one the wait reason names)")
     if len((why or "").split()) < 3:
         raise OverrideRefused("--why is required: at least 3 words saying why this card needs the Studio")
-    misnamed = misnamed_need(cap, why)
-    if misnamed:
-        raise OverrideRefused(misnamed)
+    refused = need_refusal(cap, need)
+    if refused:
+        raise OverrideRefused(refused)
     row = conn.execute("SELECT id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         raise OverrideRefused(f"unknown card {task_id}")
     until_ts = _parse_until(until, now) if until else None
     payload = {"capability": cap, "why": why.strip(), "by": actor or "operator", "at": int(now),
-               "once": until_ts is None, "until": until_ts, "fix_card": _fix_card(conn, cap)}
+               "once": until_ts is None, "until": until_ts, "fix_card": _fix_card(conn, cap),
+               **({"need": need.strip().lower()} if need else {})}
     with _kb.write_txn(conn):
         _kb._append_event(conn, task_id, OVERRIDE_EVENT, payload)
     line = {"kind": "override", "task_id": task_id, **payload}
@@ -546,12 +524,13 @@ def cmd_studio_override(args) -> int:
     try:
         with _kb.connect_closing(board=getattr(args, "board", None)) as conn:
             p = override(conn, args.task_id, args.capability, args.why, until=getattr(args, "until", None),
-                         actor=actor)
+                         actor=actor, need=getattr(args, "need", None))
     except OverrideRefused as exc:
         print(f"kanban studio-override: REFUSED {exc}", file=sys.stderr)
         return 1
     scope = "once (next run only)" if p["once"] else f"until {p['until']}"
-    print(f"kanban studio-override: {args.task_id} may start on the Studio for {p['capability']} {scope}; "
+    need = f" (need {p['need']})" if p.get("need") else ""
+    print(f"kanban studio-override: {args.task_id} may start on the Studio for {p['capability']}{need} {scope}; "
           f"fix card: {p['fix_card'] or 'none'}; event={OVERRIDE_EVENT}; ledger={p.get('ledger') or 'NOT WRITTEN'}")
     held = parts(p.get("held_capability"))
     if held and p["capability"] not in set(held) | {head(x) for x in held}:  # live_override's match

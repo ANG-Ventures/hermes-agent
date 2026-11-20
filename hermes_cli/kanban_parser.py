@@ -1011,6 +1011,9 @@ _SPECS = [
         _arg("--capability", required=True,
              help="The ONE Studio-only capability the hold names (from its studio_default_deny:<cap> wait reason)"),
         _arg("--why", required=True, help="Why this card truly needs the Mac Studio (at least 3 words)"),
+        _arg("--need", choices=("signed-in-identity", "public-page", "lan-reach", "ssh", "gmail", "other"),
+             help="Required with --capability browser-session: what the card needs. Only signed-in-identity (and "
+                  "other, recorded) is accepted; the rest are refused with the capability to use instead"),
         _group(
             _arg("--once", action="store_true", help="One run only (default): the next spawn uses it up"),
             _arg("--until", metavar="TIME", help="Hold until TIME (ISO-8601, epoch, or +N[smhd])"),
