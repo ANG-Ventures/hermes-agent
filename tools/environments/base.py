@@ -88,6 +88,12 @@ def _leave_foreground_spawn(env: "BaseEnvironment", spawned) -> bool:
         return _exit_fenced
 
 
+def envs_with_live_foreground() -> set[int]:
+    """``id()`` of every environment with a foreground command in flight in this process."""
+    with _live_foreground_cond:
+        return {id(env) for env, _ in _live_foreground.values()}
+
+
 def _quiet_kill(kill: Callable, proc) -> None:
     try:
         kill(proc)

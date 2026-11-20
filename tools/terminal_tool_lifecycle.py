@@ -156,10 +156,18 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
                 _last_activity[task_id] = current_time
     except ImportError:
         pass
+    # So does one with a foreground command in flight: idle is timed from the call's START, and
+    # tearing an ssh env down mid-call ends its master, so the call returned 255 with no output at
+    # 300-360 s and the remote command ran on unowned (t_db3261ec).
+    from tools.environments.base import envs_with_live_foreground
+    busy = envs_with_live_foreground()
 
     # Phase 1: unregister stale entries atomically under the lock; phase 2:
     # stop them outside it (see _unregister_env for why).
     with _env_lock:
+        for task_id in list(_last_activity.keys()):
+            if id(_active_environments.get(task_id)) in busy:
+                _last_activity[task_id] = current_time
         stale = [t for t, last in list(_last_activity.items()) if current_time - last > lifetime_seconds]
         envs_to_stop = [(t, _active_environments.pop(t, None)) for t in stale]
         for t in stale:

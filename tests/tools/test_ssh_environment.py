@@ -559,3 +559,119 @@ class TestPersistentSSH:
         assert len(lines) == 1000
         assert lines[0] == "1"
         assert lines[-1] == "1000"
+
+
+class TestIdleReaperSparesARunningCommand:
+    """t_db3261ec: the idle reaper (TERMINAL_LIFETIME_SECONDS=300, checked every 60 s) timed an env
+    from its LAST CALL START, so a foreground command still running at 300-360 s had its env torn
+    down under it: SSHEnvironment.cleanup() sends ``ssh -O exit`` to the master, the call returns
+    255 with no output and the remote command runs on unowned. 209 of 209 such drops in the logged
+    24 h sat within 3 s of 'Cleaned up inactive environment'."""
+
+    @pytest.fixture
+    def stale_env(self, monkeypatch):
+        import time
+        import tools.terminal_tool as tt
+        from tools.environments import base
+        env = MagicMock()
+        monkeypatch.setitem(tt._active_environments, "t_reap", env)
+        monkeypatch.setitem(tt._last_activity, "t_reap", time.time() - 340)
+        yield env, base
+        tt._active_environments.pop("t_reap", None)
+        tt._last_activity.pop("t_reap", None)
+
+    def test_env_with_a_live_foreground_command_is_not_reaped(self, stale_env, monkeypatch):
+        from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
+        import tools.terminal_tool as tt
+        env, base = stale_env
+        proc = MagicMock()
+        monkeypatch.setitem(base._live_foreground, id(proc), (env, proc))
+        _cleanup_inactive_envs(300)
+        env.cleanup.assert_not_called()
+        assert tt._active_environments.get("t_reap") is env
+
+    def test_idle_env_without_a_command_is_still_reaped(self, stale_env):
+        from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
+        import tools.terminal_tool as tt
+        env, _ = stale_env
+        _cleanup_inactive_envs(300)
+        env.cleanup.assert_called_once()
+        assert "t_reap" not in tt._active_environments
+
+
+class TestLostConnectionIsNamedAndTheRemoteCommandDecided:
+    """t_db3261ec: an ssh client that exits 255 while its remote command still runs (master gone)
+    must not hand back a bare empty 255 and leave the command running: the remote group is killed
+    and the result says so. A command that itself exited 255 is left alone."""
+
+    @pytest.fixture
+    def env(self, monkeypatch):
+        monkeypatch.setattr("tools.environments.ssh.subprocess.run",
+                            lambda *a, **k: subprocess.CompletedProcess([], 0))
+        monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",
+                            lambda *a, **k: MagicMock(stdout=iter([]), stderr=iter([]), stdin=MagicMock()))
+        return SSHEnvironment(host="h", user="u", sync_files=False)
+
+    def _wait(self, env, monkeypatch, output, rc, remote_stdout):
+        from tools.environments.base import BaseEnvironment
+        monkeypatch.setattr(BaseEnvironment, "_wait_for_process",
+                            lambda self, proc, timeout=120, **kw: {"output": output, "returncode": rc})
+        calls = []
+
+        def fake_run_ssh(remote, timeout):
+            calls.append(remote)
+            if isinstance(remote_stdout, Exception):
+                raise remote_stdout
+            return subprocess.CompletedProcess([], 0, stdout=remote_stdout, stderr="")
+        monkeypatch.setattr(env, "_run_ssh", fake_run_ssh)
+        return env._wait_for_process(MagicMock(_hermes_run_token="ab12"), timeout=600), calls
+
+    def test_dropped_connection_kills_the_remote_command_and_names_it(self, env, monkeypatch):
+        r, calls = self._wait(env, monkeypatch, "02:37:04\n", 255, ssh_env._KILLED_MARK + "\n")
+        assert len(calls) == 1 and ssh_env._run_pidfile("ab12") in calls[0]
+        assert r["returncode"] == 255 and r["hermes_connection_lost"] is True
+        assert r["output"].startswith("02:37:04\n")
+        assert "ssh connection to u@h closed" in r["output"] and "has been killed" in r["output"]
+
+    def test_unreachable_host_still_names_the_failure(self, env, monkeypatch):
+        r, _ = self._wait(env, monkeypatch, "", 255, subprocess.TimeoutExpired("ssh", 5))
+        assert r["hermes_connection_lost"] is True
+        assert r["output"].startswith("[ssh connection to u@h closed") and "could not be checked" in r["output"]
+
+    def test_command_that_exited_255_itself_is_left_alone(self, env, monkeypatch):
+        r, calls = self._wait(env, monkeypatch, "Permission denied (publickey).\n", 255, "")
+        assert len(calls) == 1
+        assert r == {"output": "Permission denied (publickey).\n", "returncode": 255}
+
+    def test_completed_command_with_cwd_marker_costs_no_probe(self, env, monkeypatch):
+        out = f"x\n{env._cwd_marker}/tmp{env._cwd_marker}git: seq=1\n"
+        r, calls = self._wait(env, monkeypatch, out, 255, ssh_env._KILLED_MARK)
+        assert calls == [] and "hermes_connection_lost" not in r
+
+    def test_other_exit_codes_cost_no_probe(self, env, monkeypatch):
+        r, calls = self._wait(env, monkeypatch, "", 1, ssh_env._KILLED_MARK)
+        assert calls == [] and r == {"output": "", "returncode": 1}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_remote_group_kill_reports_whether_it_killed_a_live_command(monkeypatch, tmp_path):
+    """The kill script prints the marker only when it signalled a live group, so the lost-connection
+    path can tell 'still running, now killed' from 'already finished'."""
+    import time
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = uuid.uuid4().hex
+    tree = subprocess.Popen(["bash", "-c", ssh_env._run_preamble(token) + "sleep 603; true"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not os.path.exists(_pidfile(token)) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        out = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], capture_output=True,
+                             text=True, timeout=30).stdout
+        assert ssh_env._KILLED_MARK in out
+        tree.wait(timeout=5)
+        out = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], capture_output=True,
+                             text=True, timeout=30).stdout
+        assert ssh_env._KILLED_MARK not in out
+    finally:
+        tree.kill()
+        tree.wait()
