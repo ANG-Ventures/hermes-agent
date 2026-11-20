@@ -43,10 +43,16 @@ def _placed_lease_env_names() -> tuple[str, ...]:
     return tuple(n for n in LEASE_ENV_NAMES if os.environ.get(n))
 
 
-def control_socket_path(user: str, host: str, port: int, control_scope: str = "", *, probe: str = "") -> Path:
+def control_socket_path(user: str, host: str, port: int, control_scope: str = "", *, probe: str = "",
+                        key_path: str = "") -> Path:
     """The plain ControlMaster socket for ``user@host:port`` (+ a kanban run's ``control_scope``). The kanban
-    release reads a finished run's footprint over this same master (t_26acfaa2), so both name it here."""
+    release reads a finished run's footprint over this same master (t_26acfaa2), so both name it here.
+    ``key_path`` keys an unscoped socket (t_3911e84c): a master never re-authenticates, so a keyed and an
+    unkeyed environment for one user@host:port (a pool-placed delegate child on an owner login) must not
+    share one. A scoped socket belongs to one kanban run, whose key is fixed, and keeps its name."""
     socket_key = f"{user}@{host}:{port}" + (f":{control_scope}" if control_scope else "")
+    if key_path and not control_scope:
+        socket_key = f"{socket_key}:key:{key_path}"
     if probe:
         socket_key = f"{socket_key}:probe:{probe}"
     return Path(tempfile.gettempdir()) / "hermes-ssh" / f"{hashlib.sha256(socket_key.encode()).hexdigest()[:16]}.sock"
@@ -157,7 +163,7 @@ class SSHEnvironment(BaseEnvironment):
         # ``control_scope`` (a kanban run) gives concurrent processes to one target their own
         # master instead of racing to create the shared one.
         self.control_socket = control_socket_path(
-            user, host, port, control_scope, probe=self._session_id if probe_only else "")
+            user, host, port, control_scope, probe=self._session_id if probe_only else "", key_path=key_path)
         _ensure_ssh_available()
         self._establish_connection()
         if probe_only:

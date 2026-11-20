@@ -373,6 +373,47 @@ def test_owner_login_pins_the_worker_key_on_every_ssh_path(tmp_path):
         assert any("ssh_identity" in e for e in kwp.validate_sidecar(side)), bad
 
 
+def test_pinned_worker_key_never_shares_a_control_master(tmp_path, monkeypatch):
+    """t_3911e84c: an ssh that reuses an open ControlMaster never authenticates, so on an owner
+    login (ace@host, the operator's own user@host) the pinned worker key decided nothing: the call
+    rode the operator's ~/.ssh/cm master and skipped the forced-command wrapper. A keyed argv opts
+    out of every mux; a keyed and an unkeyed SSHEnvironment never share a socket. kanbanw hosts
+    with no key keep today's argv byte for byte."""
+    import tempfile
+    from hermes_cli import kanban_worker_hosts as kwh
+    from tools.environments.ssh import control_socket_path
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/Users/x/.ssh/kanban_worker"
+    _write_pool(tmp_path, sidecar=side)
+    by = {h.name: h for h in kwp.load_pool(tmp_path, kanban_cfg={})[0]}
+    argv = kwp._ssh_argv(by["ace-ai"], "true")
+    assert "ControlMaster=no" in argv and "ControlPath=none" in argv
+    assert argv.index("ControlPath=none") < argv.index("ace@ace-ai")
+    seen = []
+    kwh.remote_workspace_has_content(json.dumps({"env": kwh.placement_env(by["ace-ai"], "/w")}),
+                                     runner=lambda a, **kw: seen.append(a) or type("P", (), {"returncode": 0})())
+    assert "ControlMaster=no" in seen[0] and "ControlPath=none" in seen[0]
+    assert kwp._ssh_argv(by["ace-media"], "true") == [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4", "kanbanw@ace-media", "true"]
+    # a keyed probe that fell back to direct never `-O exit`s the shared ~/.ssh/cm master: that
+    # master is the operator's own session for the same user@host
+    exits = []
+    monkeypatch.setattr(kwp.subprocess, "run", lambda a, **kw: exits.append(a))
+    kwp._drop_stale_master(by["ace-ai"])
+    assert exits == []
+    kwp._drop_stale_master(by["ace-media"])
+    assert exits and exits[0][:3] == ["ssh", "-O", "exit"]
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    plain = control_socket_path("ace", "ace-ai", 22)
+    keyed = control_socket_path("ace", "ace-ai", 22, key_path="/Users/x/.ssh/kanban_worker")
+    assert plain != keyed
+    assert control_socket_path("ace", "ace-ai", 22, key_path="") == plain
+    # a kanban run's scoped socket keeps its name: the footprint release finds it by user@host:port+run
+    assert control_socket_path("ace", "ace-ai", 22, "run7", key_path="/k") == \
+        control_socket_path("ace", "ace-ai", 22, "run7")
+
+
 @pytest.mark.parametrize("where,value", [
     ("top", None), ("top", ""), ("top", "root"), ("top", "a b"), ("top", 5), ("top", "-oProxyCommand=x"),
     ("row", ""), ("row", "root"), ("row", "ace@ci-box"), ("row", None),

@@ -1809,8 +1809,12 @@ def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
 def identity_args(path: Optional[str]) -> List[str]:
     """``-i <key> -o IdentitiesOnly=yes`` for a pinned worker key, else nothing: without
     IdentitiesOnly ssh still offers the agent's and the default keys, and the owner's own key
-    would log in past the worker wrapper."""
-    return ["-i", path, "-o", "IdentitiesOnly=yes"] if path else []
+    would log in past the worker wrapper. A keyed connection also opts out of any ControlMaster
+    (t_3911e84c): one that reuses a master never authenticates, so on an owner login it would ride
+    the operator's own ~/.ssh/cm master past the wrapper, or open the master the operator's own
+    ssh then rides as a worker. A direct handshake measured 0.13 s Studio -> ace-ai."""
+    return ["-i", path, "-o", "IdentitiesOnly=yes",
+            "-o", "ControlMaster=no", "-o", "ControlPath=none"] if path else []
 
 
 @dataclass(frozen=True)
@@ -2132,7 +2136,10 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
 def _drop_stale_master(h: PoolHost) -> None:
     """The muxed probe failed and a direct one answered: the ControlMaster is
     stale (ace-media 2026-11-06). Ask it to exit so the next tick re-masters;
-    best effort, bounded."""
+    best effort, bounded. A keyed host never used a master, and the one at its
+    user@host is the operator's own session (t_3911e84c): leave it alone."""
+    if getattr(h, "ssh_identity", None):
+        return
     argv = ["ssh", "-O", "exit"] + (["-p", str(h.ssh_port)] if h.ssh_port != 22 else []) + [h.target]
     try:
         subprocess.run(argv, capture_output=True, timeout=3, stdin=subprocess.DEVNULL)
