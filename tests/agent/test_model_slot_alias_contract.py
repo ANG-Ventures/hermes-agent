@@ -140,6 +140,26 @@ def test_a_e_model_command_validates_the_resolved_id(aliased):
     assert seen == [SOL_ID]
 
 
+def test_a_e_slot_is_not_normalized_before_it_resolves(vhome, monkeypatch):
+    # Prism 83fa1f7f219b: openrouter's normalizer turned slot ``gemini`` into ``google/gemini``,
+    # and slot_resolve kept that prefix -> probe ``google/google/gemini-2.5-pro``.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-test-token")
+    _write_view(vhome, {"gemini": "google/gemini-2.5-pro"})
+    (vhome / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"default": "opus", "provider": "claude-alr",
+                  "aliases": {"gemini": "openrouter/gemini"}},
+        "providers": _LANES,
+    }), encoding="utf-8")
+    _reset_aliases()
+    validate, seen = _catalog_only("google/gemini-2.5-pro")
+    with patch("hermes_cli.models._validate_requested_model_seam", return_value=validate):
+        res = _switch("gemini", probe=True)
+    assert res.success, res.error_message
+    assert (res.target_provider, res.new_model) == ("openrouter", "gemini")
+    assert seen == ["google/gemini-2.5-pro"]
+    assert _turn(res.new_model, res.target_provider) == ("openrouter", "google/gemini-2.5-pro")
+
+
 # ── (b) hermes -m sol at CLI startup ───────────────────────────────────────────
 
 def _startup(raw):

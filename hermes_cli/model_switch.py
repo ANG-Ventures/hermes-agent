@@ -1939,10 +1939,17 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
     from hermes_cli.models_local import _get_ollama_request_headers
     from hermes_cli import models as _models_facade  # validate_requested_model is a patch seam there
     st.new_model = _resolve_named_custom_model_id(st.new_model, st.target_provider, st.custom_providers)
-    st.new_model = normalize_model_for_provider(st.new_model, st.target_provider)
+    # A slot (``sol``, e.g. from ``sol: cpa/sol``) is stored as the slot, unnormalized (the
+    # normalizer would prefix it, ``gemini`` -> ``google/gemini``), and probed as its current id.
+    from hermes_cli.model_registry import slot_resolve
+    slot_id, slot = slot_resolve(st.new_model)
+    if slot:
+        probe_id = normalize_model_for_provider(slot_id, st.target_provider)
+    else:
+        st.new_model = probe_id = normalize_model_for_provider(st.new_model, st.target_provider)
 
     from hermes_cli.chat_catalog import is_known_non_chat_model
-    if is_known_non_chat_model(st.new_model):
+    if is_known_non_chat_model(probe_id):
         return st.fail(
             f"`{st.new_model}` is a generation model and cannot be used for chat. "
             "Pick a chat model, or use image generation for image models.",
@@ -1968,14 +1975,12 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
         # validation branch (#120020; mirrors ``_lap_lmstudio_row``'s endpoint test).
         if pdef is not None and pdef.source == "user-config" and (pdef.base_url or ""):
             validate_as = f"custom:{validate_as}"
-    # A slot (``sol``, e.g. from ``sol: cpa/sol``) is stored as the slot but probed as its current id.
-    from hermes_cli.model_registry import slot_resolve
     try:
         if not st.probe_catalog:
             # Re-resolution of an already-accepted route: no live probe.
             raise _SkipCatalogProbe
         validation = _models_facade._validate_requested_model_seam()(
-            slot_resolve(st.new_model)[0], validate_as, api_key=st.api_key, base_url=st.base_url,
+            probe_id, validate_as, api_key=st.api_key, base_url=st.base_url,
             api_mode=st.api_mode or None, headers=headers)
     except _SkipCatalogProbe:
         validation = {"accepted": True, "persist": True, "recognized": False, "message": None}
