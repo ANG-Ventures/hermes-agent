@@ -102,8 +102,21 @@ def test_unnamed_card_on_an_empty_or_unreached_matrix_still_waits(tmp_path):
     dark = _pool(tmp_path / "b", rows={h: {a: 255 for a in _LINUX} for h in POOL})
     assert _portable(dark, "fix it", ("ssh-machines",)) == (False, "host_reach", None)
     # A named pool host nobody reaches waits too, never widens to the fallback.
-    lone = _pool(tmp_path / "c", rows={h: {**_LINUX, "ace-ai": 255} for h in POOL})
+    # Under the self rule (t_8c580b20) the target must not be a candidate itself:
+    # ace-ai is down, so it has no fresh row (absent, or stale past 36 h), and no
+    # peer reaches it.
+    peers = {h: {**_LINUX, "ace-ai": 255} for h in POOL if h != "ace-ai"}
+    lone = _pool(tmp_path / "c", rows=peers)
     assert _portable(lone, B904, ("media-homelab-servarr",)) == (False, "host_reach", None)
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / kwp.REACH_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        **{h: {"at": NOW, "reach": r} for h, r in peers.items()},
+        "ace-ai": {"at": NOW - 40 * 3600, "reach": {**_LINUX, "ace-ai": 255}}}}))
+    reach, aliases, status = kwp.read_reach(tmp_path / "d", now=NOW)
+    assert "ace-ai" not in reach
+    stale = kwp.PoolConfig(hosts=POOL, profiles=("alpha",), reach=reach, reach_aliases=aliases,
+                           reach_status=status)
+    assert _portable(stale, B904, ("media-homelab-servarr",)) == (False, "host_reach", None)
 
 
 # -- t_cb47a348: the origin line is never a need --------------------------------
