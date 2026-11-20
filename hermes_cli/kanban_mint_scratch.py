@@ -10,7 +10,10 @@ choke point: such a card is minted ``scratch`` with ``Repo: <owner/repo>`` (the 
 branch carried by name in a ``Branch:`` line, never by a Studio path.
 
 Only that case: a worktree whose origin IS ours ports today and is left alone, and so is a path that is not a
-git checkout or whose push URL is not a fleet-owned GitHub repo (nothing to name). Never raises.
+git checkout or whose push URL is not a fleet-owned GitHub repo (nothing to name). Also left alone (Prism round 1):
+a body whose ``Branch:`` line names another branch than the one asked for (the target is ambiguous), and a branch
+that exists in the checkout with commits no remote-tracking ref holds (a clone of the fork could not check them
+out). Never raises.
 """
 from __future__ import annotations
 
@@ -20,7 +23,7 @@ import subprocess
 from typing import Callable, Optional, Tuple
 
 _REPO_LINE_RE = re.compile(r"^[ \t]*repo:[ \t]*\S", re.IGNORECASE | re.MULTILINE)
-_BRANCH_LINE_RE = re.compile(r"^[ \t]*branch:[ \t]*\S", re.IGNORECASE | re.MULTILINE)
+_BRANCH_LINE_RE = re.compile(r"^[ \t]*branch:[ \t]*`?([^\s`]+)", re.IGNORECASE | re.MULTILINE)
 NOTICE_PREFIX = "kanban: minted scratch, not worktree: "
 
 
@@ -51,6 +54,18 @@ def foreign_origin_slug(workspace_path: Optional[str], runner: Callable = subpro
     return m.group(1)
 
 
+def has_local_only_commits(workspace_path: str, branch_name: str, runner: Callable = subprocess.run) -> bool:
+    """True when ``branch_name`` is a local branch in the checkout whose tip no remote-tracking ref contains: a
+    worker cloning the fork could not check that state out. A failed probe of an existing branch counts as True."""
+    tip = _git(workspace_path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch_name}^{{commit}}",
+               runner=runner)
+    if not tip:
+        return False  # no such local branch: the worker creates it from the fork's default branch
+    held = _git(workspace_path, "for-each-ref", "--count=1", "--contains", tip, "--format=%(refname)",
+                "refs/remotes", runner=runner)
+    return not held
+
+
 def rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], branch_name: Optional[str],
             body: Optional[str], runner: Callable = subprocess.run) -> Optional[Tuple[str, str]]:
     """``(new body, notice)`` when the card must mint scratch instead, else None (mint as asked)."""
@@ -63,10 +78,18 @@ def rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], branch
     if not slug:
         return None
     text = body or ""
+    stated = _BRANCH_LINE_RE.search(text)
+    if branch_name and stated and stated.group(1) != branch_name:
+        return None  # the body names another branch: converting would drop the requested one
+    try:
+        if branch_name and has_local_only_commits(str(workspace_path), branch_name, runner):
+            return None  # the branch holds commits only this checkout has: keep the worktree
+    except Exception:  # noqa: BLE001 - a probe fault mints the card as asked
+        return None
     add = []
     if not _REPO_LINE_RE.search(text):
         add.append(f"Repo: {slug}")
-    if branch_name and not _BRANCH_LINE_RE.search(text):
+    if branch_name and not stated:
         add.append(f"Branch: {branch_name}")
     if add:
         text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + "\n".join(add) + "\n"

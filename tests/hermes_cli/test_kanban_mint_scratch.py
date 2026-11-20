@@ -91,3 +91,46 @@ def test_probe_fault_mints_as_asked(studio_agent):
     def boom(*a, **k):
         raise OSError("git missing")
     assert kms.rewrite("worktree", str(studio_agent), None, "x", runner=boom) is None
+
+
+def test_conflicting_branch_line_keeps_the_worktree(kanban_home, studio_agent):
+    """Prism 06ea8a9299c1: a body naming another branch must not silently replace the requested one."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework", assignee="alpha", body="Branch: repair/old\nFix the issue",
+                             workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="repair/new")
+        kind, path, branch, body = _row(conn, tid)
+    assert (kind, path, branch) == ("worktree", str(studio_agent), "repair/new")
+    assert "repair/new" not in body
+
+
+def test_matching_branch_line_is_kept_not_doubled(kanban_home, studio_agent):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework", assignee="alpha", body="Branch: `repair/new`\nFix it",
+                             workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="repair/new")
+        kind, _path, branch, body = _row(conn, tid)
+    assert (kind, branch) == ("scratch", None)
+    assert body.lower().count("branch:") == 1
+
+
+def _commit(repo, name):
+    (repo / name).write_text(name)
+    _git("add", name, cwd=repo)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", name, cwd=repo)
+
+
+def test_branch_with_local_only_commits_keeps_the_worktree(kanban_home, studio_agent):
+    """Prism 00766c74ea02: an unpushed commit on the requested branch is not reachable from a fork clone."""
+    _commit(studio_agent, "base")
+    _git("update-ref", "refs/remotes/origin/main", "HEAD", cwd=studio_agent)
+    _git("checkout", "-q", "-b", "feature", cwd=studio_agent)
+    _commit(studio_agent, "unpushed")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework", assignee="alpha", body="x",
+                             workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="feature")
+        assert _row(conn, tid)[:3] == ("worktree", str(studio_agent), "feature")
+    # once a remote-tracking ref holds the tip (it was pushed), the card mints scratch
+    _git("update-ref", "refs/remotes/origin/feature", "feature", cwd=studio_agent)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework", assignee="alpha", body="x",
+                             workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="feature")
+        assert _row(conn, tid)[:3] == ("scratch", None, None)
