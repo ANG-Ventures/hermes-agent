@@ -3588,6 +3588,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     external=external,
                     watcher=watcher,
                     abandon_routed_pr=abandon_routed_pr,
+                    scheduled_ok=True,
                 )
             except kb.LiveClaimError:
                 failed.append(tid)

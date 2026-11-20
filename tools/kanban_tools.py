@@ -1072,7 +1072,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 conn, tid, result=result, summary=summary, metadata=metadata,
                 created_cards=created_cards, expected_run_id=_worker_run_id(tid),
                 survivor_pr=survivor_pr, survivor_ref=survivor_ref,
-                superseded_by=superseded_by, draft_ok=draft_ok)
+                superseded_by=superseded_by, draft_ok=draft_ok, scheduled_ok=True)
         except kb.EmptyDraftOverrideError as draft_err:
             return tool_error(f"kanban_complete blocked: {draft_err}.")
         except kb.EmptySupersedeError as supersede_err:

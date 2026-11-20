@@ -3183,7 +3183,7 @@ def test_operator_completes_a_scheduled_card_in_one_step_with_no_park_return_wak
     """t_63ebf58b: complete takes the scheduled card directly; no review state, no repair event, no child."""
     tid = _scheduled_from_review(env)
     with kb.connect_closing() as conn:
-        assert kb.complete_task(conn, tid, summary="readback met; closing")
+        assert kb.complete_task(conn, tid, summary="readback met; closing", scheduled_ok=True)
         task = kb.get_task(conn, tid)
         assert task.status == "done" and task.next_eligible_at is None
         assert kb.wake_due_scheduled(conn, now=int(time.time()) + 7200) == []

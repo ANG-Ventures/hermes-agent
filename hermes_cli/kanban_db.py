@@ -11928,8 +11928,13 @@ def complete_task(
     external: Optional[str] = None,
     watcher: Optional[str] = None,
     abandon_routed_pr: Optional[str] = None,
+    scheduled_ok: bool = False,
 ) -> bool:
-    """Transition ``running|ready|blocked|review -> done`` (operator: also ``scheduled``) and record ``result``.
+    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``scheduled_ok`` (t_63ebf58b) lets an explicit operator close (no ``expected_run_id``)
+    take a ``scheduled`` card in one step. Only the complete verbs pass it; internal callers
+    such as the review-policy fallback in :func:`request_review` never end a park.
 
     ``abandon_routed_pr`` (t_829fce95) is the audited override for
     :func:`_enforce_routed_pr_survivor`: a survivor claim naming a different PR
@@ -12084,7 +12089,7 @@ def complete_task(
     closable = ('running', 'ready', 'blocked', 'review') + (('triage',) if external else ())
     # An operator closes a ``scheduled`` card in one step (t_63ebf58b): no unblock first, so no
     # lifecycle-repair review_requested and no park-return wake for a card that is done seconds later.
-    if expected_run_id is None:
+    if scheduled_ok and expected_run_id is None:
         closable += ('scheduled',)
     if candidate is None or (candidate.status not in closable and not _operator_todo(candidate)):
         return False
@@ -12631,11 +12636,12 @@ def complete_task(
                        next_eligible_at = CASE WHEN status = 'scheduled'
                                           THEN NULL ELSE next_eligible_at END
                  WHERE id = ?
-                   AND (status IN ('running', 'ready', 'blocked', 'review', 'scheduled')
+                   AND (status IN ('running', 'ready', 'blocked', 'review')
+                        OR (? AND status = 'scheduled')
                         OR (? AND status = 'triage')
                         OR (status = 'todo' AND (assignee = 'human' OR substr(assignee, 1, 6) = 'human:')))
                 """,
-                (result, now, task_id, bool(external)),
+                (result, now, task_id, bool(scheduled_ok), bool(external)),
             )
         else:
             cur = conn.execute(
