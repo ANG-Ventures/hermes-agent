@@ -430,7 +430,7 @@ class SSHEnvironment(BaseEnvironment):
         """An ssh client that exits 255 without the command's cwd marker may have lost its
         connection (master ended, host gone) while the remote command still runs; sshd sends a
         tty-less command no signal, so it would run on unowned (t_db3261ec). Kill its group and say
-        so; a command that exited 255 by itself has already removed its pidfile and is left alone."""
+        so. With nothing left running the result says it was the command's own 255 or a dropped link."""
         result = super()._wait_for_process(proc, timeout, **kwargs)
         token = getattr(proc, "_hermes_run_token", None)
         output = result.get("output") or ""
@@ -439,6 +439,11 @@ class SSHEnvironment(BaseEnvironment):
             return result
         killed = self._remote_group_kill(token, grace=True)
         if killed is False:
+            # No completion marker and nothing left running: the command ran ``exit 255`` itself, or
+            # the link dropped and the command then died (a chatty one gets SIGPIPE). Name both.
+            note = ("[exit 255 without the completion marker: the command exited 255 itself or the ssh "
+                    f"connection to {self.user}@{self.host} closed; no remote process is left]")
+            result["output"] = f"{output.rstrip(chr(10))}\n{note}" if output.strip() else note
             return result
         fate = ("the remote command was still running and has been killed" if killed
                 else "the remote command's state could not be checked")

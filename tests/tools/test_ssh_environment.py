@@ -651,10 +651,13 @@ class TestLostConnectionIsNamedAndTheRemoteCommandDecided:
         assert r["hermes_connection_lost"] is True
         assert r["output"].startswith("[ssh connection to u@h closed") and "could not be checked" in r["output"]
 
-    def test_command_that_exited_255_itself_is_left_alone(self, env, monkeypatch):
-        r, calls = self._wait(env, monkeypatch, "Permission denied (publickey).\n", 255, "")
-        assert len(calls) == 1
-        assert r == {"output": "Permission denied (publickey).\n", "returncode": 255}
+    def test_no_marker_and_nothing_running_is_named_without_claiming_a_lost_link(self, env, monkeypatch):
+        """Prism dbd92286d045: a chatty command SIGPIPEd by the drop leaves no pidfile, just like a command
+        that ran ``exit 255``; neither prints the completion marker. Say which two it can be, never bare."""
+        r, calls = self._wait(env, monkeypatch, "tick 31\n", 255, "")
+        assert len(calls) == 1 and r["returncode"] == 255 and "hermes_connection_lost" not in r
+        assert r["output"].startswith("tick 31\n[exit 255 without the completion marker")
+        assert "no remote process is left" in r["output"]
 
     def test_completed_command_with_cwd_marker_costs_no_probe(self, env, monkeypatch):
         out = f"x\n{env._cwd_marker}/tmp{env._cwd_marker}git: seq=1\n"
