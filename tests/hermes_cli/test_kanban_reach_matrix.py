@@ -696,6 +696,37 @@ def test_self_reach_only_as_the_worker_account(tmp_path, body):
     assert kwp.reach_allowed_hosts(body=body, skills=(), pool=routed) == ("ace-ai",)
 
 
+@pytest.mark.parametrize("sibling", [
+    "ssh ace@ci.ace cat /etc/hostname",
+    "ssh -l ace ci.ace cat /etc/hostname",
+    "ssh -o User=ace ci.ace cat /etc/hostname",
+    "scp ace@ci.ace:/var/log/syslog .",
+    "ssh ci.ace cat /etc/hostname",      # ci.ace's ssh config User is fleetw on ci-box
+])
+def test_a_foreign_login_on_a_sibling_alias_blocks_self_reach(tmp_path, sibling):
+    """Round-4 reader repro (Apollo 2026-11-20 02:3x): `reach: ci-box` logs in as the worker (alias A), but the
+    body also runs a step on ci.ace (alias B of the same host) as another account. Self-reach for a host holds
+    only if EVERY alias of it the body names resolves to the worker; one foreign login on any alias and the
+    host needs a real rc 0 like any peer.
+    Mutation: judge only the declared targets' logins in reaching_hosts -> ci-box admitted (RED)."""
+    logins = {**SELF_LOGINS, "ci-box": {"ci-box": W, "ci.ace": "fleetw"}}
+    pool = _live_shape(tmp_path / "fleet", logins=logins)
+    body = "reach: ci-box\nssh ci-box df\n" + sibling
+    assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ("ace-ai", "ace-media")
+    assert _portable(pool, body="host: ci-box\n" + body) == (False, "host_reach", None)
+    # With every alias of ci-box resolving to the worker, ci-box self-reaches again.
+    assert kwp.reach_allowed_hosts(body="reach: ci-box\nssh ci-box df\nssh kanbanw@ci.ace df", skills=(),
+                                   pool=pool) == ("ci-box", "ace-ai", "ace-media")
+    # A real probe still counts: ci-box's own row proving ci.ace (rc 0) admits it as written.
+    rows = dict(pool.reach)
+    rows["ci-box"] = {**rows["ci-box"], "ci.ace": 0}
+    routed = kwp.PoolConfig(**{**pool.__dict__, "reach": rows})
+    assert "ci-box" in kwp.reach_allowed_hosts(body=body, skills=(), pool=routed)
+    # The same rule through the soft prose preference (no reach: line).
+    prose = "ssh ci-box df\n" + sibling
+    assert "ci-box" not in (kwp.prose_reach_preference(body=prose, skills=(), pool=pool) or ())
+
+
 def test_self_reach_follows_the_alias_ssh_config_login(tmp_path):
     """Operator ruling (Apollo 2026-11-20 01:3x): a bare `ssh ci.ace` whose ssh config
     on ci-box sets User fleetw is fleetw, not the worker: ci-box does not self-reach
