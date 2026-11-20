@@ -312,11 +312,11 @@ class GatewayModelCommandsMixin:
     # ----------------------------------------------------------------- /model
 
     async def _perform_model_switch(
-        self, ctx: _ModelSwitchContext, raw_input: str, explicit_provider, source
+        self, ctx: _ModelSwitchContext, raw_input: str, explicit_provider, source, *, exact: bool = False
     ):
         """Resolve a /model switch off-loop. Returns ``(result, None)`` or ``(None, error_text)``."""
         from gateway.run import _load_gateway_config
-        from hermes_cli.model_switch import switch_model
+        from hermes_cli.model_switch import canonicalise_switch_result, switch_model
 
         skew_error = _model_switch_skew_guard()
         if skew_error:
@@ -331,6 +331,9 @@ class GatewayModelCommandsMixin:
         )
         if not result.success:
             return None, t("gateway.model.error_prefix", error=result.error_message)
+        # A pick of a slot's current id is stored as the slot (t_efde9d1a); off-loop: it may read
+        # the lane's model list.
+        await asyncio.to_thread(canonicalise_switch_result, result, exact=exact)
         try:
             from hermes_cli.context_switch_guard import enrich_model_switch_warnings_for_gateway
             # Off-loop: merge_preflight_compression_warning() runs the sync provider probe ladder.
@@ -940,7 +943,8 @@ class GatewayModelCommandsMixin:
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         if not request.target and not request.explicit_provider:
             return await self._model_listing_reply(event, ctx, profile_home)
-        result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
+        result, error = await self._perform_model_switch(
+            ctx, request.target, request.explicit_provider, source, exact=request.exact)
         if error is not None:
             return error
         guard_fired, guard_reply = await self._model_selection_guard_reply(event, ctx, result)

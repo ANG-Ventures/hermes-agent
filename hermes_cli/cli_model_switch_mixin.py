@@ -911,6 +911,8 @@ class CLIModelSwitchMixin:
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
+        from hermes_cli.model_switch import canonicalise_switch_result
+        canonicalise_switch_result(result, exact=request.exact)  # slot's current id -> slot (t_efde9d1a)
         _merge_preflight_warning(self, result, custom_provs)
         extra = (request.reasoning_effort,) if request.reasoning_effort else ()
         _run_confirm_and_apply(

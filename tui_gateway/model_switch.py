@@ -321,6 +321,10 @@ def _apply_model_switch(
         custom_providers=custom_provs)
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
+    if count_switch:  # a user's pick of a slot's current id is stored as the slot (t_efde9d1a)
+        from hermes_cli.model_switch import canonicalise_switch_result, parse_model_switch_args
+        flags = parse_model_switch_args(raw_input) if parsed_flags is None else parsed_flags
+        canonicalise_switch_result(result, exact=bool(getattr(flags, "exact", False)))
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
     if agent:
         _merge_preflight_warning(result, agent, session, cfg, custom_provs)

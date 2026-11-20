@@ -3959,6 +3959,18 @@ def _require_known_model(
     return require(provider, model, force_reason=force_model_reason, flag="--force-model")
 
 
+def _store_slot(model: Optional[str], provider: Optional[str], force_model_reason: Optional[str]) -> Optional[str]:
+    """Slot aliases P6 (t_efde9d1a): a card pin that is exactly a slot's CURRENT id on a lane
+    that serves it is stored as the slot (``gpt-6.2-sol`` -> ``sol``), so a rollout moves the pin
+    with no sweep. ``--force-model`` keeps the literal. Callers print
+    :func:`hermes_cli.model_registry.slot_store_note` as the confirmation line."""
+    if not model or (force_model_reason or "").strip():
+        return model
+    from hermes_cli.model_registry import slot_canonicalise
+
+    return slot_canonicalise(model, provider)[0]
+
+
 def _model_registry_valid_ids(provider: Optional[str]) -> tuple[str, ...]:
     """The lane's model list for a refusal message; empty when unreadable."""
     try:
@@ -6336,6 +6348,7 @@ def create_task(
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     force_model_reason: Optional[str] = None,
+    keep_literal_model: bool = False,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -6489,6 +6502,8 @@ def create_task(
     _model_verdict = _require_known_model(
         model_override, provider_override, force_model_reason=force_model_reason,
     )
+    if not keep_literal_model:
+        model_override = _store_slot(model_override, provider_override, force_model_reason)
     # A delegations-board card contains an already-admitted delegate_task call, not a new work item.
     # Its goal-derived title may quote a ruling without minting a ruling-bearing task.
     container_card = _kdb.conn_is_delegations(conn)
@@ -8059,7 +8074,7 @@ def _validate_model_override_args(
         if not body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
             raise ValueError(flagship_model_error(str(model)))
     _require_known_model(model, provider, force_model_reason=force_model_reason)
-    return model, provider
+    return _store_slot(model, provider, force_model_reason), provider
 
 
 def _flagship_reason_to_audit(
@@ -18234,6 +18249,7 @@ def set_task_model(
     _verdict = _require_known_model(
         resolved_model, resolved_provider, force_model_reason=force_model_reason,
     )
+    resolved_model = _store_slot(resolved_model, resolved_provider, force_model_reason)
     if not resolved_model:
         resolved_provider = None
     with write_txn(conn):

@@ -2761,6 +2761,12 @@ def get_model_context_length(
     ctx = _config_override_context_length(model, base_url, provider, custom_providers)
     if ctx is not None:
         return ctx
+    # Slot aliases P7 (t_efde9d1a): the registry row's window (config/model-meta.json) wins over
+    # every built-in table and probe below; no row (or no view) falls through to them.
+    from hermes_cli.model_registry import registry_context_length
+    ctx = registry_context_length(model)
+    if ctx is not None:
+        return ctx
     # Malformed URLs (unmatched IPv6 bracket) make urllib.parse raise; treat them as unknown so
     # the inference layer reports the configuration error itself.
     if base_url:

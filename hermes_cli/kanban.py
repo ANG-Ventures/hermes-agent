@@ -1151,6 +1151,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                          wake_route=route))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        from hermes_cli.model_registry import slot_store_note
+        if (_canon := slot_store_note(getattr(args, "model_override", None), task.model_override)):
+            print(f"Model {_canon} (--force-model <reason> keeps the literal id)")
         if auto_added:
             print(
                 f"Added skill {kb.MILESTONE_QA_SKILL} ([milestone] QA cards run "
@@ -2349,6 +2352,11 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     # that is an established user-facing contract and the per-card flow reads
     # better as prose. The machine-readable `t_x: route=... applies=...` line
     # is what a BATCH needs, where one line per card is the whole point.
+    if applied and touch_model and model and not (getattr(args, "force_model", None) or "").strip():
+        # The board stored the slot for a slot's current id (t_efde9d1a): say so once.
+        from hermes_cli.model_registry import slot_canonicalise, slot_store_note
+        if (_canon := slot_store_note(model, slot_canonicalise(model, provider)[0])):
+            print(f"Model {_canon} (--force-model <reason> keeps the literal id)")
     single = len(applied) == 1 and bool(task_ids)
     for task_id, redispatched in applied:
         # `--reclaim` asked for a redispatch. If it did not happen, saying
@@ -3807,6 +3815,10 @@ def _cmd_edit(args: argparse.Namespace) -> int:
                 print(f"Cleared model override on {args.task_id}")
             else:
                 print(f"Set model override on {args.task_id}: {new_model}")
+                from hermes_cli.model_registry import slot_store_note
+                _stored = kb.get_task(conn, args.task_id)
+                if (_canon := slot_store_note(new_model, _stored.model_override if _stored else None)):
+                    print(f"Model {_canon} (--force-model <reason> keeps the literal id)")
         if do_result or do_fields:
             ok = kb.edit_task(
                 conn, args.task_id, title=title, body=body,

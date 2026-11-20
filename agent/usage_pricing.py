@@ -3141,6 +3141,24 @@ def _effective_pricing_entry(
     return entry
 
 
+def _registry_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+    """Slot aliases P7 (t_efde9d1a): the registry row's price (config/model-meta.json), read
+    before the built-in snapshot tables; None (no view, no row, no input+output) falls back."""
+    from hermes_cli.model_registry import registry_pricing
+
+    rates = registry_pricing(route.model)
+    if rates is None:
+        return None
+    return PricingEntry(
+        input_cost_per_million=Decimal(rates["input"]),
+        output_cost_per_million=Decimal(rates["output"]),
+        cache_read_cost_per_million=Decimal(rates["cache_read"]) if "cache_read" in rates else None,
+        cache_write_cost_per_million=Decimal(rates["cache_write"]) if "cache_write" in rates else None,
+        source="official_docs_snapshot",
+        pricing_version="model-registry",
+    )
+
+
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -3161,6 +3179,9 @@ def _resolve_pricing_entry(
         return None
     if route.billing_mode == "subscription_included":
         return _INCLUDED_ENTRY
+    registry_entry = _registry_pricing_entry(route)
+    if registry_entry is not None:
+        return registry_entry
     if route.provider == "openrouter":
         # Notional relays (openai-codex, provider: openrouter routes) and any
         # model absent from the curated snapshot price from the configured
