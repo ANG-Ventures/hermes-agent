@@ -11,6 +11,9 @@ _FIRST_LINE = re.compile(r"^[ \t]*host:[ \t]*(?:studio|mac-studio[\w-]*)[ \t]*$"
 _STUDIO_NEEDS = frozenset({"studio_relay", "studio_launchd", "vault", "skills_tree", "studio_tree"})
 NOTICE_PREFIX = "[placement] bare host: studio dropped: add requires: "
 CP_PROSE_PREFIX = "[placement] control-plane-read not pinned: "
+HR_PROSE_PREFIX = "[placement] host_reach not pinned: "
+# Cheap gate before the pool read: every ssh shape host_bound_targets reads has one of these (or _SCP_RE).
+_SSH_SHAPE_HINT = re.compile(r"ssh|scp|rsync|sftp|mosh|-H", re.IGNORECASE)
 _log = logging.getLogger(__name__)
 _REQUIRES_LINE = re.compile(r"^([ \t]*requires:[ \t]*)(.*?)([ \t]*\r?)$", re.IGNORECASE | re.MULTILINE)
 # hermes-home studio-requires-reason (create_refusal): a Studio-only word needs >= 3 words after the note cut.
@@ -43,6 +46,9 @@ def prepare_body(body, notices=None):
         prose = pool.control_plane_prose(body)
         if prose:
             notices.append(ControlPlaneProse(prose))
+        hosts = host_reach_prose(body)
+        if hosts:
+            notices.append(HostReachProse(hosts))
     # Saved bodies carry provenance before the caller's placement directives.
     content = pool.without_header_lines(body).lstrip("\r\n")
     if not content or not _FIRST_LINE.fullmatch(content.splitlines()[0]):
@@ -83,6 +89,34 @@ class ControlPlaneProse(tuple):
     """A create/edit notice: the body names live control-plane files without ``requires: control-plane-read``."""
 
 
+class HostReachProse(tuple):
+    """A create/edit notice: the body addresses fleet aliases in an ssh shape without a ``reach:`` line."""
+
+
+def host_reach_prose(body):
+    """Aliases the body addresses in an ssh shape with no ``reach:`` line (t_efd1497a); () on any read fault."""
+    # ``alias:~/path`` / ``alias:path`` is read by the same regex host_bound_targets uses (Prism 703b3483074b).
+    if not body or not (_SSH_SHAPE_HINT.search(body) or pool._SCP_RE.search(body)):
+        return ()
+    try:
+        from hermes_cli.kanban_create_placement import _pool_config
+        cfg = _pool_config()
+        hosts = tuple(getattr(cfg, "hosts", ()) or ())
+        aliases = (*(getattr(cfg, "reach_aliases", ()) or ()), *(h.lower() for h in hosts))
+        return pool.host_reach_prose(body, aliases, pin_hosts=hosts, ssh_hosts=getattr(cfg, "ssh_hosts", None))
+    except Exception:  # noqa: BLE001 - a notice must never fail a create
+        _log.debug("host_reach prose read failed", exc_info=True)
+        return ()
+
+
+def host_reach_prose_text(aliases) -> str:
+    """The notice (t_efd1497a): names the alias and the fix."""
+    names = ", ".join(f"`{a}`" for a in aliases)
+    return (HR_PROSE_PREFIX + "the body addresses " + names + " in an ssh shape but has no `reach:` line, so it "
+            "does not hold the card for a host that can ssh there. If the work must ssh to it, add the line `reach: "
+            + ", ".join(aliases) + "`; otherwise nothing to do (an example or an instruction for a human stays prose).")
+
+
 def control_plane_prose_text(paths) -> str:
     """The notice (t_b720fdea): names the file and both fixes."""
     return (CP_PROSE_PREFIX + "the body names " + ", ".join(f"`{p}`" for p in paths)
@@ -95,6 +129,14 @@ def control_plane_prose_text(paths) -> str:
 def report_notices(conn, card_id, notices):
     """Report only after a successful write, sharing dispatch's durable dedup key."""
     for reasons in notices:
+        if isinstance(reasons, HostReachProse):
+            text = host_reach_prose_text(reasons)
+            try:
+                _note_once(conn, card_id, HR_PROSE_PREFIX, text)
+            except Exception as exc:  # the card is already saved; the stderr line still tells the writer
+                _log.warning("host_reach notice for %s not written: %s", card_id, exc)
+            print("Warning: " + text, file=sys.stderr)
+            continue
         if isinstance(reasons, ControlPlaneProse):
             text = control_plane_prose_text(reasons)
             try:

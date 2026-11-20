@@ -59,7 +59,7 @@ def _host(name, prio=0, slots=4, profiles=("alpha",)):
 ALIASES = ("ace-ai", "ace-media", "ci-box")
 REACH = {"ace-ai": {"ace-media": 255, "ace-ai": 0, "ci-box": 0},
          "ci-box": {"ace-media": 0, "ace-ai": 0, "ci-box": 0}}
-REACH_BOUND_TO_B = "Sync the build: rsync -a ./out ace-media:/srv/drop/ and verify."
+REACH_BOUND_TO_B = "reach: ace-media\nSync the build: rsync -a ./out ace-media:/srv/drop/ and verify."
 PORTABLE = "Refactor the parser and add tests."
 
 
