@@ -110,3 +110,69 @@ def test_cache_key_is_per_config_path(tmp_path, monkeypatch):
     # And switching back still works — both entries coexist in the cache.
     monkeypatch.setenv("HERMES_HOME", str(home_a))
     assert get_external_skills_dirs() == [ext_a.resolve()]
+
+
+def _write_dirs(config: Path, *dirs: Path) -> None:
+    config.write_text(
+        "skills:\n  external_dirs:\n" + "".join(f"    - {d}\n" for d in dirs),
+        encoding="utf-8",
+    )
+
+
+def test_listed_dir_that_appears_later_is_returned(hermes_home_with_config):
+    """A listed folder created after the first resolve shows up without a config edit."""
+    _home, external, config = hermes_home_with_config
+    late = external.parent / "late_skills"
+    _write_dirs(config, external, late)
+    _external_dirs_cache_clear()
+
+    assert get_external_skills_dirs() == [external.resolve()]
+    config_sig = config.stat()
+
+    late.mkdir()
+    assert config.stat().st_mtime_ns == config_sig.st_mtime_ns  # config untouched
+    assert get_external_skills_dirs() == [external.resolve(), late.resolve()]
+
+
+def test_listed_dir_that_is_removed_is_dropped(hermes_home_with_config):
+    """A listed folder removed after the first resolve drops out without a config edit."""
+    _home, external, config = hermes_home_with_config
+    second = external.parent / "second_skills"
+    second.mkdir()
+    _write_dirs(config, external, second)
+    _external_dirs_cache_clear()
+
+    assert get_external_skills_dirs() == [external.resolve(), second.resolve()]
+
+    second.rmdir()
+    assert get_external_skills_dirs() == [external.resolve()]
+
+
+def test_hot_path_does_not_reread_or_reparse_config(hermes_home_with_config):
+    """N calls with nothing changed read and parse config.yaml once, including when a
+    listed entry is missing (the case that must still notice the folder appearing)."""
+    _home, external, config = hermes_home_with_config
+    _write_dirs(config, external, external.parent / "missing_skills")
+    _external_dirs_cache_clear()
+
+    parses = []
+    reads = []
+    real_yaml_load = skill_utils.yaml_load
+    real_read_text = Path.read_text
+
+    def counting_yaml_load(content):
+        parses.append(1)
+        return real_yaml_load(content)
+
+    def counting_read_text(self, *a, **kw):
+        if self == config:
+            reads.append(1)
+        return real_read_text(self, *a, **kw)
+
+    with patch.object(skill_utils, "yaml_load", counting_yaml_load), \
+            patch.object(Path, "read_text", counting_read_text):
+        results = [get_external_skills_dirs() for _ in range(200)]
+
+    assert all(r == [external.resolve()] for r in results)
+    assert len(parses) == 1
+    assert len(reads) == 1
