@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import subprocess
 import threading
 import time
@@ -150,6 +151,15 @@ def _spawn(identity: str, klass: str, card: str) -> subprocess.Popen:
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True)
 
 
+_URL_VALUE = re.compile(r'("[A-Za-z0-9_]*url"\s*:\s*)"[^"]*"?', re.IGNORECASE)
+
+
+def _redact(line: str) -> str:
+    """browserctl's stderr grant JSON rides the same stream; its ``*_url`` values (``viewer_url`` carries
+    a view ticket) never reach the tail an error line is built from."""
+    return _URL_VALUE.sub(r'\1"<redacted>"', line)
+
+
 def _read_port(proc: subprocess.Popen, tail: List[str], timeout: float,
                gone: Optional[threading.Event] = None) -> Optional[int]:
     """Drain the child's stdout for its whole life (keeps tail lines); return the first ``port=N``.
@@ -163,7 +173,7 @@ def _read_port(proc: subprocess.Popen, tail: List[str], timeout: float,
             line = raw.decode("utf-8", "replace").strip()
             if not line:
                 continue
-            tail.append(line[:300])
+            tail.append(_redact(line)[:300])
             del tail[:-8]
             if line.startswith(EXIT_LINE):
                 gone.set()

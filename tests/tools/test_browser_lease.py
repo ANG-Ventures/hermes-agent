@@ -139,7 +139,7 @@ def test_navigate_takes_an_identity_never_a_port(monkeypatch):
     props = schema["parameters"]["properties"]
     assert "lease_identity" in props and "lease_cdp_port" not in props
     assert props["lease_class"]["enum"] == ["read", "act"]
-    monkeypatch.setattr("tools.rail_preflight.browser_capability_error", lambda: None)
+    monkeypatch.setattr("tools.rail_preflight.browser_capability_error", lambda **_k: None)
     monkeypatch.setattr(bt, "browser_navigate", lambda url, task_id=None: json.dumps({"success": True, "url": url}))
     cleaned = []
     monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: cleaned.append(1))
@@ -284,7 +284,7 @@ def test_a_dead_lease_never_falls_back_to_the_configured_browser(monkeypatch, wh
         configured = f"http://127.0.0.1:{srv.server_address[1]}"
     try:
         monkeypatch.setenv("BROWSER_CDP_URL", configured)
-        monkeypatch.setattr("tools.rail_preflight.browser_capability_error", lambda: None)
+        monkeypatch.setattr("tools.rail_preflight.browser_capability_error", lambda **_k: None)
         monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: None)
         ran = []
         monkeypatch.setattr(bt, "browser_snapshot", lambda **kw: ran.append(kw) or json.dumps({"success": True}))
@@ -368,3 +368,63 @@ def test_the_shim_announces_the_forwarder_exit_through_the_real_watcher(tmp_path
     assert lease.proc.poll() is None, "watcher and browserctl still alive"
     assert rp.browser_rail_error(lease.url).startswith("BROWSER_LEASE_UNAVAILABLE")
     assert any(t.startswith(bl.EXIT_LINE) for t in lease.tail)
+
+
+def _gate_records(monkeypatch, refuse: bool = False):
+    """capability_gate recording the capability each browser call asks for (#477 split)."""
+    asked = []
+
+    def gate(cap):
+        asked.append(cap)
+        return f"BROWSER_RAIL_ABSENT cap={cap}" if refuse else None
+    monkeypatch.setattr("hermes_cli.kanban_placement_failfast.capability_gate", gate)
+    return asked
+
+
+def test_a_leasing_call_is_gated_on_the_identity_capability(monkeypatch):
+    """Review item 2: with no override yet, the call that acquires the lease is identity work: it asks
+    for browser-session, not browser-public, and a refusal spawns no lease client."""
+    from tools import browser_tool as bt
+    asked = _gate_records(monkeypatch, refuse=True)
+    spawned = _fake_client(monkeypatch, _free_port())
+    call = bt._fallback_call("browser_navigate", {"url": ""})
+    out = json.loads(call({"url": "https://github.com", "lease_identity": "id-github-kyzcreig"}, {"task_id": "t"}))
+    assert asked == ["browser-session"]
+    assert out["error"] == "BROWSER_RAIL_ABSENT cap=browser-session"
+    assert spawned == [], "no lease client when the gate refuses"
+
+
+def test_a_lease_never_goes_to_camofox(monkeypatch):
+    """Review item 1: with Camofox selected as the backend, a leased call stays on the lease."""
+    from tools import browser_camofox, browser_tool as bt
+    _gate_records(monkeypatch)
+    _fake_client(monkeypatch, _free_port())
+    monkeypatch.setattr("tools.tool_backend_helpers.read_selection", lambda kind: "camofox")
+    monkeypatch.setattr(browser_camofox, "_config_cdp_url", lambda: "")
+    assert browser_camofox.is_camofox_mode(), "precondition: Camofox is the selected backend"
+    camo = []
+    monkeypatch.setattr(bt, "_camofox", lambda *a: camo.append(a) or json.dumps({"success": True, "camofox": True}))
+    monkeypatch.setattr(bt._session, "_run_browser_command",
+                        lambda key, cmd, args=None, **kw: {"success": True, "data": {"title": "t", "url": "u"}})
+    monkeypatch.setattr(bt._session, "_get_session_info", lambda key: {})
+    monkeypatch.setattr(bt, "_maybe_start_recording", lambda key: None)
+    monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: None)
+    call = bt._fallback_call("browser_navigate", {"url": ""})
+    call({"url": "https://github.com", "lease_identity": "id-github-kyzcreig"}, {"task_id": "t"})
+    assert camo == []
+    assert not browser_camofox.is_camofox_mode()
+    bl.clear_lease()
+    assert browser_camofox.is_camofox_mode(), "an explicit clear gives Camofox back"
+
+
+def test_the_grant_json_urls_never_reach_the_model(monkeypatch):
+    """Review item 3: browserctl's stderr grant JSON (viewer_url carries a view ticket) is merged into the
+    watcher's stdout; no *_url value is kept in the tail that goes into an error line."""
+    grant = json.dumps({"lease_id": 1, "class": "read", "viewer_url": "https://studio/view?ticket=SECRET1",
+                        "cdp_url": "ws://x/SECRET2"})
+    _fake_client(monkeypatch, 0, refuse=grant)
+    lease, err = bl.open_lease("id-github-kyzcreig", "read", timeout=10)
+    assert lease is None
+    assert "SECRET" not in err and "lease_id" in err
+    time.sleep(0.1)
+    assert "SECRET" not in (bl.unavailable_error() or "")

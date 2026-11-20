@@ -1347,7 +1347,8 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
         # t_db491366: refuse before any session/CDP discovery when the operator's browser
         # cannot exist here (placed kanban worker, or a dead loopback endpoint).
         from tools.rail_preflight import browser_capability_error, browser_rail_error
-        rail = (browser_capability_error()
+        # acquiring a lease is identity work even before any override exists (#477 split)
+        rail = (browser_capability_error(identity=bool(args.get("lease_identity")))
                 or (args.get("lease_identity") and _connect_lease(args["lease_identity"], args.get("lease_class")))
                 or browser_rail_error(_cdp._get_cdp_override_raw()))
         if rail:
