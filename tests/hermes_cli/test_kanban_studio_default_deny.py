@@ -572,7 +572,7 @@ def test_local_review_placement_records_the_resolved_capability(kanban_home, mon
 # -- 6. a browser-session override declares its need (t_9d6a5d75) ------------------------------------------------
 # Operator ruling 11-19: the --why text is not parsed; --need is a fixed set and only signed-in-identity (and other,
 # recorded) goes through.
-REFUSED_NEEDS = [("public-page", "browser-ephemeral"), ("lan-reach", "host_reach"), ("ssh", "fleet-ssh"),
+REFUSED_NEEDS = [("public-page", "browser-public"), ("lan-reach", "lan-reach"), ("ssh", "fleet-ssh"),
                  ("gmail", "studio-state")]
 
 
@@ -610,6 +610,13 @@ def test_browser_override_with_identity_or_other_is_recorded_with_its_need(opera
     assert p["need"] == need
     line = json.loads(ksa.ledger_path().read_text().splitlines()[-1])
     assert line["need"] == need  # `other` is counted from the ledger
+
+
+def test_the_split_identity_name_also_declares_its_need():
+    # t_f935cb6f: browser-identity is browser-session's target; overriding it by the new name is the same hold.
+    assert "needs --need" in ksa.need_refusal("browser-identity", None)
+    assert ksa.need_refusal("browser-identity", "signed-in-identity") is None
+    assert ksa.need_refusal("browser-public", None) is None
 
 
 def test_need_is_only_checked_for_browser_session(operator):

@@ -143,7 +143,9 @@ def _emit(task: str, message: str) -> str:
     from hermes_cli import kanban_worker_hosts as kwh
     placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
     modes = pff.caps_modes() if kwh.is_pool_host(placed) else {}
-    cap = _RAIL_CAP.get(message.split("_", 1)[0])
+    parsed = pff.parse_absent(message)   # a ``cap=`` line names its own capability (t_f935cb6f)
+    cap = (parsed[1] if parsed and "cap=" in message.split("\n", 1)[0] else None) \
+        or _RAIL_CAP.get(message.split("_", 1)[0])
     if modes and cap and not pff.enforced(cap, modes):
         pff.note_gate_warn(cap, message, modes)
         return message
@@ -182,15 +184,23 @@ def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str
     return None
 
 
-def browser_capability_error() -> Optional[str]:
+def browser_capability_error(*, identity: bool = False) -> Optional[str]:
     """Layer 1b (D1b-undeclared, t_f813a42f): a browser_* call from a placed worker whose host
-    lacks an ENFORCED ``browser-session`` gets the placement ABSENT line at once, recorded like
-    the mid-run skill_view gate, whether or not the card declared the need. Without it the call
-    passes every declared-need gate and fails slowly inside CDP on the pool host."""
+    lacks the ENFORCED capability the call needs gets the placement ABSENT line at once, recorded
+    like the mid-run skill_view gate, whether or not the card declared the need. Without it the
+    call passes every declared-need gate and fails slowly inside CDP on the pool host.
+
+    Which capability (t_f935cb6f): a configured CDP override is a signed-in browser, so the call
+    needs ``browser-session`` (the identity; every map defines that word). Without one the call
+    drives the agent's own Chromium on a public page and needs only ``browser-public``, so a pool
+    host with agent-browser serves it and the card is never sent to the Studio for it.
+    ``identity``: the call puts a credential into the page (browser_vault_*), which is identity
+    work in any browser: a pool host's own Chromium never gets one."""
     if not _owned_task():   # background-review fork / delegate child / interactive: never gated
         return None
+    from tools.browser_tool_cdp import _get_cdp_override_raw
     from hermes_cli.kanban_placement_failfast import capability_gate
-    absent = capability_gate("browser-session")
+    absent = capability_gate("browser-session" if identity or _get_cdp_override_raw() else "browser-public")
     if absent is not None:
         record_absent(absent)
     return absent
@@ -198,14 +208,16 @@ def browser_capability_error() -> Optional[str]:
 
 def placed_browser_rail_error() -> Optional[str]:
     """The agent's own browser could not be placed on this worker's pool host (no desktop stack
-    in its sandbox): report it as the browser rail, since the only browser left is the Studio's.
+    in its sandbox): report it as a missing ``browser-public`` (t_f935cb6f), never as Ace's
+    browser rail, so the re-route goes to a pool host whose agent-browser works, not the Studio.
     None for anything but a placed, dispatcher-owned worker. Never recorded for parking from a
     background cleanup ``close`` (``background_cleanup``)."""
     task = _owned_task()
     placed = _placed_host() if task else None
     if not placed:
         return None
-    message = rail_absent_message("browser", placed)
+    from hermes_cli.kanban_placement_failfast import absent_line
+    message = absent_line("browser-public", placed)
     return message if _in_cleanup.get() else _emit(task, message)
 
 

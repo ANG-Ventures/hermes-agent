@@ -948,6 +948,9 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     ``_run_browser_command``; they must honour the Bot Desktop lease like every other page access,
     or a human typing a credential on the taken-over screen could be read or written to."""
+    from tools.rail_preflight import browser_capability_error
+    if rail := browser_capability_error(identity=True):   # a credential is identity work (t_f935cb6f)
+        return json.dumps({"success": False, "error": rail})
     from tools.browser_tool import _active_sessions, _last_session_key
     from tools.browser_tool_session import run_fenced
 

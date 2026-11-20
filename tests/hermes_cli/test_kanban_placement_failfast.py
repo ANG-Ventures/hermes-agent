@@ -247,6 +247,9 @@ def test_midrun_skill_view_returns_the_token_and_records_it(board, monkeypatch, 
 def test_undeclared_browser_navigate_on_ci_box_returns_the_token_and_records_it(board, monkeypatch):
     # Layer 1b, D1b-undeclared (t_f813a42f): no requires: line and no skill on the card, so
     # boot, dispatch and skill_view all pass; the browser tool itself must refuse up front.
+    # A CDP override is a signed-in browser (t_f935cb6f): the call asks browser-session, the rail.
+    # Without one it asks browser-public (test_kanban_browser_capability_split.py).
+    monkeypatch.setenv("BROWSER_CDP_URL", "wss://cdp.browsers.ace/id-github-kyzcreig")
     from tools import rail_preflight as rp
     from tools.registry import registry
     import model_tools  # noqa: F401

@@ -58,6 +58,11 @@ DEFAULT_MODE = WARN
 # from every SKILL.md and compares it against ``source_hash``.
 INDEX_GENERATOR = "fleet-host capabilities --sync"
 DEFAULT_ENFORCE = ("browser-session", "screen")
+# t_f935cb6f: ``browser-session`` split into ``browser-identity`` (a signed-in identity, by lease),
+# ``browser-public`` (the agent's own Chromium) and ``lan-reach``. The old word stays an alias of
+# ``browser-identity`` for one release (``capabilities.browser-session.alias_of`` in the map). Both
+# names of the identity capability: what ``browser_remote`` grants or vetoes on a pool host.
+BROWSER_IDENTITY_CAPS = frozenset({"browser-identity", "browser-session"})
 # kanban.placement.body_requires_mode (t_640a4ea0): ``advisory`` (default) = a
 # body-sniffed pin that no host may serve never holds the card; ``enforce`` =
 # the pre-t_640a4ea0 hold. An explicit ``requires:`` line is always enforced.
@@ -147,10 +152,22 @@ class CapabilityMap:
     # t_79c2259b): alias (lower) -> capability. An access-bound card on a mapped alias is judged as a
     # HARD requirement of that capability, not pinned to the Studio.
     ssh_root: Mapping[str, str] = field(default_factory=dict)
+    # ``capabilities.<old>.alias_of: <new>`` (t_f935cb6f): a renamed capability's old word, read as
+    # the new one in every declaration and index row. A host row naming either serves both.
+    aliases: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
         return self.error is None
+
+    def canonical(self, cap: str) -> str:
+        """The capability ``cap`` names: its ``alias_of`` target, else itself."""
+        return self.aliases.get(cap, cap)
+
+    def names(self, cap: str) -> frozenset:
+        """Every word for the capability ``cap`` names (the target and its aliases)."""
+        target = self.canonical(cap)
+        return frozenset({cap, target, *(a for a, t in self.aliases.items() if t == target)})
 
 
 @dataclass(frozen=True)
@@ -202,9 +219,11 @@ class CapabilityTick:
             return WARN   # F11: a malformed map degrades every capability to warn
         if cap.startswith(UNKNOWN_PREFIX):
             return ENFORCE  # F4: an unknown word keeps the card local
-        if cap in self.cmap.soft:
-            return WARN if self.cmap.soft[cap] else ENFORCE   # the map's kill switch, per class
-        return ENFORCE if cap in self.enforce else WARN
+        names = self.cmap.names(cap)   # an alias and its target share one mode (t_f935cb6f)
+        for n in sorted(names):
+            if n in self.cmap.soft:
+                return WARN if self.cmap.soft[n] else ENFORCE   # the map's kill switch, per class
+        return ENFORCE if names & set(self.enforce) else WARN
 
     @property
     def error(self) -> Optional[str]:
@@ -305,6 +324,7 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
                 raise ValueError(f"capabilities.{cap}.sniff {t!r}: {exc}") from None
         names.append(cap)
     known = set(names)
+    aliases = parse_aliases(caps)
     out: Dict[str, frozenset] = {}
     for hid, row in hosts.items():
         if not isinstance(hid, str) or not isinstance(row, dict) or not isinstance(row.get("capabilities"), list):
@@ -312,12 +332,30 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
         bad = [c for c in row["capabilities"] if c not in known]
         if bad:
             raise ValueError(f"hosts.{hid} names unknown capabilities {bad}")
-        out[hid.lower()] = frozenset(row["capabilities"])
+        have = set(row["capabilities"])
+        for alias, target in aliases.items():   # either word serves both (t_f935cb6f)
+            if alias in have or target in have:
+                have |= {alias, target}
+        out[hid.lower()] = frozenset(have)
     soft = {c: r["soft"] for c, r in caps.items() if "soft" in r}
     tier = (hosts.get(STUDIO_ROW) or {}).get("studio_tier", {})
     if not isinstance(tier, dict) or any(c not in known or v != IDENTITY_ONLY for c, v in tier.items()):
         raise ValueError(f"hosts.{STUDIO_ROW}.studio_tier must map known capabilities to {IDENTITY_ONLY!r}")
     return tuple(names), tuple(sniff), out, soft, frozenset(tier)
+
+
+def parse_aliases(caps: Mapping[str, Any]) -> Dict[str, str]:
+    """``{alias: target}`` from ``capabilities.<alias>.alias_of`` (t_f935cb6f). The target must be
+    a capability of the map that is not itself an alias; anything else is a malformed map."""
+    out: Dict[str, str] = {}
+    for cap, row in caps.items():
+        if isinstance(row, dict) and "alias_of" in row:
+            target = row["alias_of"]
+            if not isinstance(target, str) or target == cap or not isinstance(caps.get(target), dict) \
+                    or "alias_of" in caps[target]:
+                raise ValueError(f"capabilities.{cap}.alias_of must name another, non-alias capability")
+            out[cap] = target
+    return out
 
 
 def index_hash(skills: Mapping[str, Iterable[str]]) -> str:
@@ -414,6 +452,7 @@ def map_from_bytes(map_bytes: Optional[bytes], index_bytes: Optional[bytes], *,
                          ssh_root={a.lower(): cap for cap, row in (doc["capabilities"].items()
                                                                    if error is None else ())
                                    for a in row.get("ssh_root", ())},
+                         aliases=parse_aliases(doc["capabilities"]) if error is None else {},
                          index_unverified=unverified if index_error is None else None)
 
 
@@ -540,7 +579,8 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
         known = {c for caps in cmap.index.values() for c in caps}
 
     def cap_of(word: str) -> str:
-        return word if word in known else UNKNOWN_PREFIX + word
+        # An alias reads as its target (t_f935cb6f): `requires: browser-session` is browser-identity.
+        return cmap.canonical(word) if word in known else UNKNOWN_PREFIX + word
 
     reqs: List[Requirement] = []
     words = declared_words(body)
@@ -601,8 +641,8 @@ def _host_caps(ctx: CapabilityTick, host: str) -> frozenset:
         # Once remote probing is enabled, an unobserved host is not a grant.
         # Failed legs also veto stale/static browser advertisements.
         if browser_remote_refusal(record) is None:
-            return caps | {"browser-session"}
-        return caps - {"browser-session"}
+            return caps | BROWSER_IDENTITY_CAPS
+        return caps - BROWSER_IDENTITY_CAPS
     return caps
 
 
@@ -647,7 +687,7 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
     live = [r for r in reqs if ctx.mode_of(r.cap) != OFF and (
         not _satisfied(r.cap, ctx, pin_host)
         or (pin_host is None and (r.cap in ctx.cmap.identity_only
-                                 or (r.cap == "browser-session" and ctx.cmap.browser_remote))))]
+                                 or (r.cap in BROWSER_IDENTITY_CAPS and ctx.cmap.browser_remote))))]
     enforced = [r for r in live if ctx.mode_of(r.cap) == ENFORCE]
     ignored: Tuple[Requirement, ...] = ()
     if ctx.body_mode == ADVISORY and pin_host is None:
@@ -698,7 +738,7 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         body_ignored=ignored,
         wait=(browser_remote_refusal(ctx.cmap.browser_remote.get(pin_host.lower()))
               if pin_host and ctx.cmap.browser_remote
-              and any(r.cap == "browser-session" for r in binding) else None),
+              and any(r.cap in BROWSER_IDENTITY_CAPS for r in binding) else None),
     )
 
 
@@ -779,6 +819,9 @@ def spawn_env(fleet_dir: Path, kanban_cfg: Any) -> str:
         # decides placement (Prism b8ddb038892b on #1902).
         enforce = tuple(c for c in dict.fromkeys([*enforce, *(k for k, v in cmap.soft.items() if not v)])
                         if not cmap.soft.get(c, False))
+    if mode == ENFORCE and cmap.aliases:
+        # The worker's gates ask by either word (t_f935cb6f): every name of an enforced capability is enforced.
+        enforce = tuple(dict.fromkeys(n for c in enforce for n in (c, *sorted(cmap.names(c) - {c}))))
     return env_value(mode, enforce)
 
 
