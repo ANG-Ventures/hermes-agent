@@ -478,6 +478,10 @@ BROWSER_TOOL_SCHEMAS = [
                 "url": {
                     "type": "string",
                     "description": "The URL to navigate to (e.g., 'https://example.com')"
+                },
+                "lease_cdp_port": {
+                    "type": "integer",
+                    "description": "Kanban workers only: the port printed by `lease-cdp-forward.py --serve` run under `browserctl with <identity>` in your terminal. Points the browser tools at that leased browser for the rest of the run; any other port is refused."
                 }
             },
             "required": ["url"]
@@ -1312,6 +1316,30 @@ def check_browser_routed_requirements(action: str = "browser_snapshot") -> bool:
     return _install.check_browser_requirements() or extension_controller_available(action)
 
 
+def _connect_lease(port: Any) -> Optional[str]:
+    """``browser_navigate(lease_cdp_port=N)``: point this worker's browser tools at a lease forwarder on
+    127.0.0.1:N (the host its browser runs on). Narrower than ``/browser connect``: only a dispatcher-owned
+    worker, and only an endpoint whose /json/version names a lease (t_ce9bd5a3). Error text, or None."""
+    from tools.rail_preflight import _owned_task, lease_forwarder
+    if not _owned_task():
+        return "lease_cdp_port is for kanban workers; an interactive session uses /browser connect"
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 0
+    if not 0 < port < 65536:
+        return "lease_cdp_port must be a TCP port number"
+    url = f"http://127.0.0.1:{port}"
+    if not lease_forwarder(url):
+        return (f"127.0.0.1:{port} is not a browser lease forwarder. In the terminal run `browserctl with <identity> "
+                "--class read --card <card> -- lease-cdp-forward.py --serve` in the background and pass the port it prints.")
+    if os.environ.get("BROWSER_CDP_URL", "").strip() != url:
+        from tools.browser_tool_lifecycle import cleanup_all_browsers
+        cleanup_all_browsers()  # the next command opens a session on the lease, as /browser connect does
+        os.environ["BROWSER_CDP_URL"] = url
+    return None
+
+
 def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple = ()):
     """Adapter from the registry's ``(args, kw)`` to ``<fn_name>(**schema_args, task_id=...)``;
     the function is looked up in module globals at call time so monkeypatching works."""
@@ -1319,7 +1347,9 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
         # t_db491366: refuse before any session/CDP discovery when the operator's browser
         # cannot exist here (placed kanban worker, or a dead loopback endpoint).
         from tools.rail_preflight import browser_capability_error, browser_rail_error
-        rail = browser_capability_error() or browser_rail_error(_cdp._get_cdp_override_raw())
+        rail = (browser_capability_error()
+                or (args.get("lease_cdp_port") is not None and _connect_lease(args["lease_cdp_port"]))
+                or browser_rail_error(_cdp._get_cdp_override_raw()))
         if rail:
             return _dumps(_err(rail))
         params = {a: args.get(a, d) for a, d in arg_defaults.items()}

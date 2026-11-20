@@ -11,7 +11,8 @@ minutes in (t_db491366).
 Scope: only the dispatcher-owned worker (``owned_kanban_task``); interactive sessions, in-process
 cron and delegate children never see these errors. A configured LOOPBACK CDP override is the
 operator's browser: the browser_* tools (whose agent-browser runs on the pool host under
-placement) are refused up front off the dispatcher host, while ``browser_cdp`` (which connects from
+placement) are refused up front off the dispatcher host unless the endpoint is a Studio identity lease
+forwarded onto the pool host (``lease_forwarder``, t_ce9bd5a3), while ``browser_cdp`` (which connects from
 the dispatcher process itself) only gets the liveness probe. The agent's own Chromium and the
 computer_use desktop are not operator rails: a placed worker keeps both wherever the pool host can
 host them, and only when that placement fails is the failure reported as this rail
@@ -26,6 +27,7 @@ turn loop, and only it, parks the card ``needs_input`` with the message verbatim
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
@@ -41,6 +43,7 @@ _PROBE_OK_TTL_S = 30.0
 _lock = threading.Lock()
 _emitted: Dict[str, str] = {}  # owning task id -> first unconsumed rail message
 _probe_ok: Dict[str, float] = {}
+_lease_ok: Dict[str, Tuple[float, str]] = {}
 _in_cleanup: ContextVar[bool] = ContextVar("rail_preflight_in_cleanup", default=False)
 
 
@@ -165,6 +168,64 @@ def record_absent(message: str) -> Optional[str]:
     return message
 
 
+LEASE_BROWSER_PREFIX = "lease/"   # lease-cdp-forward.py's /json/version "Browser": "lease/<identity>"
+
+
+def _version_on_browser_host(version_url: str) -> Optional[dict]:
+    """``/json/version`` read on the host agent-browser runs on: inside the terminal backend when the
+    browser is placed there (a pool host's loopback is not this process's), else from this process."""
+    from tools.bot_desktop import placement
+    if placement.resolve().where == placement.TERMINAL:
+        from tools.environments import streams
+        env = placement.terminal_environment(create=True)
+        if env is None:
+            return None
+        proc = streams.run_in(env, ["curl", "-sS", "--noproxy", "*", "--max-time", str(int(_PROBE_TIMEOUT_S)),
+                                    version_url], timeout=_PROBE_TIMEOUT_S + 10)
+        body = proc.stdout if proc.returncode == 0 else b""
+    else:
+        import requests
+        from agent.proxy_bypass import loopback_request_kwargs
+        resp = requests.get(version_url, timeout=_PROBE_TIMEOUT_S, **loopback_request_kwargs(version_url))
+        body = resp.content if resp.status_code == 200 else b""
+    data = json.loads(body or b"null")
+    return data if isinstance(data, dict) else None
+
+
+def lease_forwarder(cdp_url: str) -> Optional[str]:
+    """The identity name when ``cdp_url`` is a ``lease-cdp-forward.py`` endpoint (its ``/json/version``
+    ``Browser`` reads ``lease/<identity>``; the lease token never leaves the forwarder), else None. Any other
+    browser answering the port (a pool host's own Brave on :9222) is not a lease. A hit is cached 30 s."""
+    kind, target = _probe_target(cdp_url)
+    if kind != "http":
+        return None
+    key = f"lease:{target}"
+    now = time.monotonic()
+    with _lock:
+        hit = _lease_ok.get(key)
+        if hit and now - hit[0] < _PROBE_OK_TTL_S:
+            return hit[1]
+    try:
+        browser = str((_version_on_browser_host(str(target)) or {}).get("Browser") or "")
+    except Exception:
+        return None
+    name = browser[len(LEASE_BROWSER_PREFIX):] if browser.startswith(LEASE_BROWSER_PREFIX) else ""
+    if not name:
+        return None
+    with _lock:
+        _lease_ok[key] = (now, name)
+    return name
+
+
+def placed_loopback(cdp_url: str) -> bool:
+    """A dispatcher-owned worker on a pool host with a loopback CDP override: the endpoint lives on the
+    pool host, so this process must not discover or attach to it (its own loopback is another machine's)."""
+    if not cdp_url or not _owned_task() or not _placed_host():
+        return False
+    from agent.proxy_bypass import is_loopback_host, split_host_port
+    return is_loopback_host(split_host_port(cdp_url.strip())[0])
+
+
 def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str]:
     """``BROWSER_RAIL_ABSENT`` for a configured loopback CDP override (the operator's browser),
     or None to proceed. ``cdp_url`` is the configured, unresolved override. ``host_side``: the
@@ -178,6 +239,8 @@ def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str
         return None  # a remote CDP endpoint is reachable from any host
     placed = None if host_side else _placed_host()
     if placed:
+        if lease_forwarder(cdp_url):
+            return None  # a Studio identity lease forwarded onto this pool host (t_ce9bd5a3)
         return _emit(task, rail_absent_message("browser", placed))
     if not _endpoint_answers(cdp_url):
         return _emit(task, rail_absent_message("browser", socket.gethostname()))

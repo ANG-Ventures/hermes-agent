@@ -643,9 +643,15 @@ def browser_remote_refusal(record: Any) -> Optional[str]:
 
 
 def _host_caps(ctx: CapabilityTick, host: str) -> frozenset:
-    caps = ctx.cmap.hosts.get(host, frozenset())
-    record = ctx.cmap.browser_remote.get(host)
-    if ctx.cmap.browser_remote:
+    return mapped_caps(ctx.cmap, host)
+
+
+def mapped_caps(cmap: CapabilityMap, host: str) -> frozenset:
+    """``host``'s capabilities under ``cmap``, with the ``browser_remote`` grant/veto applied: the one
+    reading placement and the worker's own mid-run gates share (t_ce9bd5a3)."""
+    caps = cmap.hosts.get(host, frozenset())
+    record = cmap.browser_remote.get(host)
+    if cmap.browser_remote:
         # Once remote probing is enabled, an unobserved host is not a grant.
         # Failed legs also veto stale/static browser advertisements.
         if browser_remote_refusal(record) is None:

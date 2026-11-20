@@ -23,6 +23,7 @@ from hermes_cli import kanban_worker_hosts as kwh
 def _clean(monkeypatch):
     rp._emitted.clear()
     rp._probe_ok.clear()
+    getattr(rp, "_lease_ok", {}).clear()
     monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
     monkeypatch.delenv(kwh.PLACEMENT_ENV, raising=False)
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
@@ -81,15 +82,114 @@ def _navigate(monkeypatch, cdp_url):
     return json.loads(registry.dispatch("browser_navigate", {"url": "https://example.com"}, task_id="rail"))
 
 
+def _browser_host_version(monkeypatch, answer):
+    """``/json/version`` as read on the browser's host; records each probed URL."""
+    seen = []
+
+    def fake(url):
+        seen.append(url)
+        return answer
+    monkeypatch.setattr(rp, "_version_on_browser_host", fake)
+    return seen
+
+
+BRAVE_VERSION = {"Browser": "Chrome/131.0.0.0", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/x"}
+LEASE_VERSION = {"Browser": "lease/id-github-kyzcreig", "Protocol-Version": "1.3",
+                 "webSocketDebuggerUrl": "ws://127.0.0.1:52656/devtools/browser/lease"}  # live forwarder, 11-19
+
+
 def test_placed_worker_with_live_loopback_cdp_gets_exact_message(monkeypatch):
     # The ace-ai case: a different Brave answers 127.0.0.1:9222, so liveness passes — placement must still refuse.
     _worker(monkeypatch)
     _placed(monkeypatch, "ace-ai")
     calls = _cdp_requests(monkeypatch, answers=True)
+    seen = _browser_host_version(monkeypatch, BRAVE_VERSION)
     out = _navigate(monkeypatch, "http://127.0.0.1:9222")
     assert out.get("success") is False
     assert out["error"] == EXPECTED_BROWSER.format(host="ace-ai")
-    assert calls == [], "a placed worker is refused before any CDP probe"
+    assert calls == [], "a placed worker never probes this process's loopback"
+    assert seen == ["http://127.0.0.1:9222/json/version"], "only the lease marker is read, on the browser's host"
+
+
+def test_placed_worker_may_drive_a_lease_forwarder(monkeypatch):
+    # t_ce9bd5a3: the forwarder's /json/version names the lease, so a placed worker's own browser
+    # tools may drive it; nothing is recorded for parking.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    seen = _browser_host_version(monkeypatch, LEASE_VERSION)
+    assert rp.browser_rail_error("http://127.0.0.1:52656") is None
+    assert rp.browser_rail_error("http://127.0.0.1:52656") is None
+    assert seen == ["http://127.0.0.1:52656/json/version"], "a hit is cached"
+    assert rp.take_rail_absent() is None
+    for bad in ({"Browser": "lease/"}, {"Browser": "Chrome/1 lease/x"}, None):
+        rp._lease_ok.clear()
+        _browser_host_version(monkeypatch, bad)
+        assert rp.browser_rail_error("http://127.0.0.1:52656") == EXPECTED_BROWSER.format(host="ace-ai"), bad
+
+
+def test_lease_marker_is_read_inside_the_terminal_backend(monkeypatch):
+    # The forwarder listens on the POOL host's loopback: the probe runs where agent-browser runs
+    # (the terminal backend), never from this process.
+    import subprocess
+    from tools.bot_desktop import placement
+    from tools.environments import streams
+    calls = _cdp_requests(monkeypatch, answers=True)
+    monkeypatch.setattr(placement, "resolve", lambda: placement.Placement(placement.TERMINAL, "ssh"))
+    env = object()
+    monkeypatch.setattr(placement, "terminal_environment", lambda create=True: env)
+    ran = []
+
+    def run_in(e, argv, **kw):
+        ran.append((e, argv))
+        return subprocess.CompletedProcess(argv, 0, json.dumps(LEASE_VERSION).encode(), b"")
+    monkeypatch.setattr(streams, "run_in", run_in)
+    assert rp.lease_forwarder("http://127.0.0.1:52656") == "id-github-kyzcreig"
+    assert ran and ran[0][0] is env and ran[0][1][0] == "curl" and ran[0][1][-1] == "http://127.0.0.1:52656/json/version"
+    assert calls == []
+
+
+def test_placed_loopback_override_is_not_discovered_or_supervised_here(monkeypatch):
+    # Discovery / the CDP supervisor from this process would dial ITS loopback, another machine's.
+    from tools import browser_tool_cdp as cdp
+    from tools import browser_supervisor
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    calls = _cdp_requests(monkeypatch, answers=True)
+    started = []
+    monkeypatch.setattr(browser_supervisor.SUPERVISOR_REGISTRY, "get_or_start", lambda **kw: started.append(kw))
+    monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:52656")
+    assert cdp._get_cdp_override() == "http://127.0.0.1:52656"
+    cdp._ensure_cdp_supervisor("rail")
+    assert calls == [] and started == []
+    assert rp.placed_loopback("ws://10.0.0.5:9222") is False
+    monkeypatch.delenv(kwh.PLACEMENT_ENV)
+    assert rp.placed_loopback("http://127.0.0.1:52656") is False
+
+
+def test_navigate_lease_cdp_port_connects_only_a_lease(monkeypatch):
+    from tools import browser_tool as bt
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    import model_tools  # noqa: F401
+    from tools.registry import registry
+    monkeypatch.setattr(bt, "browser_navigate", lambda url, task_id=None: json.dumps({"success": True, "url": url}))
+    monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: None)
+    monkeypatch.setenv("BROWSER_CDP_URL", "")  # restored at teardown: the connect sets it process-wide
+
+    def nav(port):
+        return json.loads(registry.dispatch("browser_navigate", {"url": "https://github.com", "lease_cdp_port": port},
+                                            task_id="rail"))
+    _browser_host_version(monkeypatch, BRAVE_VERSION)
+    out = nav(9222)
+    assert out["success"] is False and "is not a browser lease forwarder" in out["error"]
+    assert __import__("os").environ["BROWSER_CDP_URL"] == ""
+    assert "TCP port" in nav("x")["error"]
+    _browser_host_version(monkeypatch, LEASE_VERSION)
+    assert nav(52656) == {"success": True, "url": "https://github.com"}
+    assert __import__("os").environ["BROWSER_CDP_URL"] == "http://127.0.0.1:52656"
+    assert rp.take_rail_absent() is None
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    assert "interactive session uses /browser connect" in nav(52656)["error"]
 
 
 def test_unplaced_worker_unreachable_endpoint_gets_exact_message(monkeypatch):

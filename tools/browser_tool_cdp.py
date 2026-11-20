@@ -24,6 +24,11 @@ def cdp_version_url(raw: str) -> Optional[str]:
     return discovery_url if discovery_url.lower().endswith("/json/version") else discovery_url.rstrip("/") + "/json/version"
 
 
+def _placed_loopback(cdp_url: str) -> bool:
+    from tools.rail_preflight import placed_loopback
+    return placed_loopback(cdp_url)
+
+
 def _resolve_cdp_override(cdp_url: str) -> str:
     """Normalize a user-supplied CDP endpoint into a concrete websocket URL.
 
@@ -35,7 +40,9 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     if not raw:
         return ""
     version_url = cdp_version_url(raw)
-    if version_url is None:
+    if version_url is None or _placed_loopback(raw):
+        # placed loopback: agent-browser on the pool host discovers it there; this process's
+        # loopback is another machine (t_ce9bd5a3)
         return raw
 
     san = _bt._sanitize_url_for_logs
@@ -124,6 +131,8 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
             cdp_url = _resolve_cdp_override(maybe)
     if not cdp_url:
         return
+    if _placed_loopback(cdp_url):
+        return  # the endpoint is on the worker's pool host; a supervisor here would dial our own loopback
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
         policy, timeout_s = _get_dialog_policy_config()
