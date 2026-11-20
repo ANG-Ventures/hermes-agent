@@ -98,13 +98,14 @@ def _fetch_catalog(provider: str, *, force_refresh: bool = False) -> tuple[str, 
     if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("HERMES_MODEL_REGISTRY_LIVE"):
         return ()
     try:
-        from hermes_cli.models import cached_provider_model_ids
+        from hermes_cli.models import CuratedFallbackModels, cached_provider_model_ids
 
-        return tuple(
-            str(m) for m in cached_provider_model_ids(
-                provider, force_refresh=force_refresh, ttl_seconds=CATALOG_TTL_SECONDS,
-            ) if m
-        )
+        ids = cached_provider_model_ids(provider, force_refresh=force_refresh, ttl_seconds=CATALOG_TTL_SECONDS)
+        # A curated placeholder (the live probe failed; the plugin's offline snapshot) is not the
+        # lane's list: refusing against it refused every id the snapshot omits (t_cf4c6032).
+        if isinstance(ids, CuratedFallbackModels):
+            return ()
+        return tuple(str(m) for m in ids if m)
     except Exception:
         return ()
 
