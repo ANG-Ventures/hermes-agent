@@ -1968,12 +1968,14 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
         # validation branch (#120020; mirrors ``_lap_lmstudio_row``'s endpoint test).
         if pdef is not None and pdef.source == "user-config" and (pdef.base_url or ""):
             validate_as = f"custom:{validate_as}"
+    # A slot (``sol``, e.g. from ``sol: cpa/sol``) is stored as the slot but probed as its current id.
+    from hermes_cli.model_registry import slot_resolve
     try:
         if not st.probe_catalog:
             # Re-resolution of an already-accepted route: no live probe.
             raise _SkipCatalogProbe
         validation = _models_facade._validate_requested_model_seam()(
-            st.new_model, validate_as, api_key=st.api_key, base_url=st.base_url,
+            slot_resolve(st.new_model)[0], validate_as, api_key=st.api_key, base_url=st.base_url,
             api_mode=st.api_mode or None, headers=headers)
     except _SkipCatalogProbe:
         validation = {"accepted": True, "persist": True, "recognized": False, "message": None}
