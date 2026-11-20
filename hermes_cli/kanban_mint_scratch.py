@@ -13,7 +13,8 @@ Only that case: a worktree whose origin IS ours ports today and is left alone, a
 git checkout or whose push URL is not a fleet-owned GitHub repo (nothing to name). Also left alone (Prism round 1):
 a body whose ``Branch:`` line names another branch than the one asked for (the target is ambiguous), and a branch
 that exists in the checkout with commits the push repo does not hold (a clone of the fork could not check them
-out; only the tracking refs of a remote fetching that repo count). Never raises.
+out; only the tracking ref of the requested branch on a remote fetching that repo counts), and a body whose
+``Repo:`` line names another repo than the push fork (the worker would clone that one). Never raises.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ import subprocess
 from typing import Callable, Optional, Tuple
 
 _REPO_LINE_RE = re.compile(r"^[ \t]*repo:[ \t]*\S", re.IGNORECASE | re.MULTILINE)
+_REPO_VALUE_RE = re.compile(r"^[ \t]*repo:[ \t]*(\S+)", re.IGNORECASE | re.MULTILINE)
 _BRANCH_LINE_RE = re.compile(r"^[ \t]*branch:[ \t]*`?([^\s`]+)", re.IGNORECASE | re.MULTILINE)
 NOTICE_PREFIX = "kanban: minted scratch, not worktree: "
 
@@ -80,10 +82,27 @@ def has_local_only_commits(workspace_path: str, branch_name: str, runner: Callab
     if not slug:
         return True
     for name in _push_repo_remotes(workspace_path, slug, runner):
-        if _git(workspace_path, "for-each-ref", "--count=1", "--contains", tip, "--format=%(refname)",
-                f"refs/remotes/{name}/", runner=runner):
+        # Only the tracking ref OF THE REQUESTED BRANCH counts: the worker checks that branch out by name, so a
+        # tip held by fork/main while fork/<branch> is older would run the old code (Prism 82d48e508766).
+        ref = f"refs/remotes/{name}/{branch_name}"
+        held = _git(workspace_path, "for-each-ref", "--contains", tip, "--format=%(refname)", ref, runner=runner)
+        if ref in held.splitlines():
             return False
     return True
+
+
+def _repo_line_slugs(text: str) -> list:
+    """``owner/repo`` named by each ``Repo:`` line (lower-cased); a value that is not one yields ``""``."""
+    from hermes_cli import kanban_worktree_port as kwp
+    out = []
+    for m in _REPO_VALUE_RE.finditer(text):
+        val = m.group(1).strip("`'\"<>()[],;")
+        hit = kwp._SLUG_RE.match(val)
+        if hit:
+            val = hit.group(1)
+        val = val[:-4] if val.lower().endswith(".git") else val
+        out.append(val.lower() if re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", val) else "")
+    return out
 
 
 def rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], branch_name: Optional[str],
@@ -101,6 +120,9 @@ def rewrite(workspace_kind: Optional[str], workspace_path: Optional[str], branch
     stated = _BRANCH_LINE_RE.search(text)
     if branch_name and stated and stated.group(1) != branch_name:
         return None  # the body names another branch: converting would drop the requested one
+    named = _repo_line_slugs(text)
+    if any(n != slug.lower() for n in named):
+        return None  # the body's Repo: decides what the worker clones and it is not the push fork (Prism 28ff59f8c7f2)
     try:
         if branch_name and has_local_only_commits(str(workspace_path), branch_name, runner, slug):
             return None  # the branch holds commits only this checkout has: keep the worktree

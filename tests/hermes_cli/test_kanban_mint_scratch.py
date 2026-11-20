@@ -155,3 +155,58 @@ def test_tip_held_only_by_another_remote_keeps_the_worktree(kanban_home, studio_
         tid = kb.create_task(conn, title="rework", assignee="alpha", body="x",
                              workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="feature")
         assert _row(conn, tid)[:3] == ("worktree", str(studio_agent), "feature")
+
+
+def test_tip_on_fork_main_but_fork_branch_older_keeps_the_worktree(kanban_home, studio_agent):
+    """Prism 82d48e508766: the worker checks the branch out BY NAME, so fork/main holding the tip is not enough when
+    fork/<branch> is older (local feature at B, fork/main at B, fork/feature at A: kept)."""
+    _commit(studio_agent, "base")
+    _git("checkout", "-q", "-b", "feature", cwd=studio_agent)
+    _commit(studio_agent, "A")
+    _git("remote", "add", "fork", FORK, cwd=studio_agent)
+    _git("update-ref", "refs/remotes/fork/feature", "feature", cwd=studio_agent)
+    _commit(studio_agent, "B")
+    _git("update-ref", "refs/remotes/fork/main", "feature", cwd=studio_agent)
+    assert kms.rewrite("worktree", str(studio_agent), "feature", "x") is None
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework", assignee="alpha", body="x",
+                             workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="feature")
+        assert _row(conn, tid)[:3] == ("worktree", str(studio_agent), "feature")
+    # fork/feature catching up to B converts
+    _git("update-ref", "refs/remotes/fork/feature", "feature", cwd=studio_agent)
+    assert kms.rewrite("worktree", str(studio_agent), "feature", "x") is not None
+
+
+def test_branch_prefix_ref_does_not_count(studio_agent):
+    """fork/feature/sub holding the tip is not fork/feature."""
+    _commit(studio_agent, "base")
+    _git("checkout", "-q", "-b", "feature", cwd=studio_agent)
+    _commit(studio_agent, "A")
+    _git("remote", "add", "fork", FORK, cwd=studio_agent)
+    _git("update-ref", "refs/remotes/fork/feature/sub", "feature", cwd=studio_agent)
+    assert kms.has_local_only_commits(str(studio_agent), "feature", slug="ANG-Ventures/hermes-agent") is True
+
+
+def test_body_repo_line_naming_another_repo_keeps_the_worktree(kanban_home, studio_agent):
+    """Prism 28ff59f8c7f2: Repo: decides the clone; naming the upstream while the branch is only on the fork: kept."""
+    _commit(studio_agent, "base")
+    _git("checkout", "-q", "-b", "feature", cwd=studio_agent)
+    _commit(studio_agent, "A")
+    _git("remote", "add", "fork", FORK, cwd=studio_agent)
+    _git("update-ref", "refs/remotes/fork/feature", "feature", cwd=studio_agent)
+    body = "Repo: NousResearch/hermes-agent\nfix it"
+    assert kms.rewrite("worktree", str(studio_agent), "feature", body) is None
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework", assignee="alpha", body=body,
+                             workspace_kind="worktree", workspace_path=str(studio_agent), branch_name="feature")
+        kind, path, branch, got = _row(conn, tid)
+    assert (kind, path, branch) == ("worktree", str(studio_agent), "feature")
+    assert got.endswith(body) and "Branch:" not in got
+    # the same body naming the push fork (any case, URL or backticked form) converts
+    for same in ("Repo: ang-ventures/hermes-agent", "Repo: `ANG-Ventures/hermes-agent`",
+                 "repo: https://github.com/ANG-Ventures/hermes-agent.git"):
+        assert kms.rewrite("worktree", str(studio_agent), "feature", same + "\nfix it") is not None, same
+
+
+def test_unparseable_repo_line_keeps_the_worktree(studio_agent):
+    assert kms.rewrite("worktree", str(studio_agent), None, "Repo: the agent repo\nx") is None
