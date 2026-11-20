@@ -314,6 +314,23 @@ def test_reader_ignores_a_reach_row_probed_under_another_login(tmp_path):
     assert set(cfg.reach) == {"ace-ai", "ace-media"} and not any("probed as" in w for w in cfg.warnings)
 
 
+def test_unlabeled_reach_row_counts_only_for_the_legacy_kanbanw_login(tmp_path):
+    """Prism e315557dce42: a schema-1 row with no ``user`` was written by the kanbanw-era cron.
+    It still proves reach for a kanbanw host, but not for a host cut over to its owner login."""
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    side["hosts"]["ace-ai"]["ssh_identity"] = "/k/worker"
+    _write_pool(tmp_path, sidecar=side)
+    row = {"at": time.time(), "reach": {"ci-box": 0}}
+    doc = {"schema": 1, "hosts": {"ace-ai": dict(row), "ace-media": dict(row)}}
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    pool = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(pool.reach) == {"ace-media"}
+    allowed = kwp.reach_allowed_hosts(body="reach: ci-box", skills=(), pool=pool)
+    assert "ace-ai" not in allowed and "ace-media" in allowed
+    assert any("ace-ai was probed as kanbanw" in w for w in pool.warnings)
+
+
 def test_owner_login_pins_the_worker_key_on_every_ssh_path(tmp_path):
     """Apollo ruling 2026-11-20 03:55 (t_911ce504): on an owner login the worker env comes from a
     forced command bound to a dedicated worker key. The Studio's default key is the owner's own,

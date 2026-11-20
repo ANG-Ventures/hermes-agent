@@ -510,10 +510,13 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     # A row probed under another login (the kanbanw row of a host just cut over
     # to its owner, t_5e87455b) proves nothing for the new login: drop its
     # reach, caps and logins until the matrix cron re-probes it (fail closed).
+    # A row with no ``user`` (schema 1) is the kanbanw-era cron's: it counts
+    # only for the legacy kanbanw login (Prism e315557dce42).
     probed = read_reach_users(fleet_dir)
     for h in hosts:
-        was = probed.get(h.name.lower())
-        if was is not None and was != h.ssh_user:
+        key = h.name.lower()
+        was = probed.get(key, SSH_USER)
+        if was != h.ssh_user and any(key in t for t in (reach, caps, reach_logins)):
             warnings.append(f"kanban pool: reach row for {h.name} was probed as {was}, "
                             f"worker login is {h.ssh_user} (row ignored until re-probed)")
             for table in (reach, caps, reach_logins):
