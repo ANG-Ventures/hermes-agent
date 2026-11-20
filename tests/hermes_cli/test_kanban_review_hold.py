@@ -132,6 +132,9 @@ def test_holder_hands_to_operator_with_open_pr_and_keeps_implementer(kanban_home
         assert (row["status"], row["assignee"]) == ("review", "human:apollo")
         rr = [p for k, p in _stream(conn, tid) if k == "review_requested"][-1]
         assert (rr["reviewer"], rr["implementer"], rr["handed_from"]) == ("human:apollo", "worker", HOLD)
+        # t_9000e509: assign_task reads no checks, so the summary claims nothing about CI (it was "checks settled"
+        # while the head's CI was still running)
+        assert rr["summary"] == "review hold: handed to human:apollo for an operator record"
         # a later send-back still restores the worker
         ok, _detail = kb.request_sendback(conn, tid, payload={"source": "prism", "reason": "prism:P1:x",
                                                                 "summary": "P1 x"})
