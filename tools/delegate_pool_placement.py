@@ -181,8 +181,8 @@ def acquire(child_task_id: str, placement) -> Tuple[Optional[PoolLease], Optiona
     logger.info("delegate pool placement: child %s placed on %s (%s), reservation %s",
                 child_task_id, host.name, host.target, rid)
     note = (f"{NOTE_PREFIX} Your terminal, file and execute_code tools run on fleet pool host {host.name} as "
-            f"{host.target}, in {workspace}. It has its own credentials and none of the operator's home or "
-            f"live state: fetch what you need there (git, gh), and push anything you must keep.")
+            f"{host.target}, in {workspace}. None of the gateway host's files or live state are there: fetch "
+            f"what you need there (git, gh), and push anything you must keep.")
     return lease, note
 
 

@@ -63,7 +63,6 @@ ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
 # A plain POSIX login (it lands in an ssh argv as ``user@host``), and never root.
 _SSH_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
-_FORBIDDEN_SSH_USERS = frozenset({"root"})
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
 # Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
@@ -325,7 +324,7 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
 
 def _ssh_user_ok(user) -> bool:
     return (isinstance(user, str) and bool(_SSH_USER_RE.fullmatch(user))
-            and user not in _FORBIDDEN_SSH_USERS)
+            and user != "root")
 
 
 def validate_sidecar(doc) -> List[str]:
@@ -1104,6 +1103,7 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
                    aliases: Iterable[str], canon: Optional[Mapping[str, str]] = None,
                    logins: Optional[Mapping[str, Collection[str]]] = None,
                    self_user: str = SSH_USER,
+                   host_users: Optional[Mapping[str, str]] = None,
                    config_logins: Optional[Mapping[str, Mapping[str, str]]] = None,
                    body_aliases: Iterable[str] = ()) -> Tuple[str, ...]:
     """Worker hosts whose fresh row shows ``rc == 0`` for EVERY target (or,
@@ -1121,7 +1121,8 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
     names for the target (``logins``, :func:`ssh_target_logins`: ``user@``,
     ``-l``, ``-o User=``), else the user the alias resolves to in that host's
     ssh config (``config_logins[host][alias]``, :func:`read_reach_logins`).
-    Every one must be ``self_user``. ``ssh ace@ci.ace`` is user ace, and a bare
+    Every one must be that host's worker login: ``host_users[host]``
+    (:func:`worker_logins`, the sidecar's per-host ``ssh_user``), else ``self_user``. ``ssh ace@ci.ace`` is user ace, and a bare
     ``ssh ci.ace`` whose config sets ``User fleetw`` is fleetw: a worker placed
     on ci-box is kanbanw, so neither self-reaches; a peer whose fresh row
     proves the alias takes the card. No recorded config login: no self-reach.
@@ -1140,8 +1141,10 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
 
     mentioned = {a.lower() for a in (*want, *body_aliases, *named)}
 
+    users = {k.lower(): v for k, v in (host_users or {}).items()}
+
     def as_worker(host: str, t: str) -> bool:
-        return (named.get(t) or {config.get(host, {}).get(t)}) == {self_user}
+        return (named.get(t) or {config.get(host, {}).get(t)}) == {users.get(host, self_user)}
 
     def reached(host: str, row: Mapping[str, int], a: str) -> bool:
         if row.get(a) == 0:
@@ -1154,6 +1157,11 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
                    for b in mentioned if b == host or canon.get(b) == host)
 
     return tuple(h for h, row in reach.items() if all(reached(h.lower(), row, a) for a in want))
+
+
+def worker_logins(pool) -> Dict[str, str]:
+    """``{host id: worker ssh login}`` of the pool's enabled hosts (t_5e87455b)."""
+    return {h.name.lower(): h.ssh_user for h in (getattr(pool, "pool_hosts", ()) or ())}
 
 
 def load_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> Tuple[List[PoolHost], List[str]]:
@@ -1623,7 +1631,7 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     _b, prose = host_bound_targets(REACH_LINE_RE.sub("", body or ""), (), aliases, pin_hosts=pool_hosts,
                                    ssh_hosts=getattr(pool, "ssh_hosts", None))
     return reaching_hosts(reach, named, aliases, getattr(pool, "pin_aliases", None),
-                          logins=ssh_target_logins(body),
+                          logins=ssh_target_logins(body), host_users=worker_logins(pool),
                           config_logins=getattr(pool, "reach_logins", None), body_aliases=prose)
 
 
@@ -1649,6 +1657,7 @@ def prose_reach_preference(*, body: Optional[str], skills: Iterable[str], pool,
     # Same self-reach and login rules as a declared target (t_8c580b20).
     out = tuple(h for h in reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases,
                                           getattr(pool, "pin_aliases", None), logins=ssh_target_logins(body),
+                                          host_users=worker_logins(pool),
                                           config_logins=getattr(pool, "reach_logins", None))
                 if h.lower() in enabled)
     return out or None
