@@ -1092,7 +1092,8 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
                    aliases: Iterable[str], canon: Optional[Mapping[str, str]] = None,
                    logins: Optional[Mapping[str, Collection[str]]] = None,
                    self_user: str = SSH_USER,
-                   config_logins: Optional[Mapping[str, Mapping[str, str]]] = None) -> Tuple[str, ...]:
+                   config_logins: Optional[Mapping[str, Mapping[str, str]]] = None,
+                   body_aliases: Iterable[str] = ()) -> Tuple[str, ...]:
     """Worker hosts whose fresh row shows ``rc == 0`` for EVERY target (or,
     with no named target, for every alias the matrix knows). Empty when the
     matrix is empty: fail closed.
@@ -1112,6 +1113,10 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
     ``ssh ci.ace`` whose config sets ``User fleetw`` is fleetw: a worker placed
     on ci-box is kanbanw, so neither self-reaches; a peer whose fresh row
     proves the alias takes the card. No recorded config login: no self-reach.
+    The rule covers EVERY alias of that host the body names, not only the
+    targets (``body_aliases`` plus the ``logins`` keys): ``reach: ci-box`` as
+    kanbanw next to ``ssh ace@ci.ace ...`` is a step as ace on ci-box, so
+    ci-box needs a real rc 0 (round-4 reader repro, Apollo 2026-11-20).
     """
     want = tuple(targets) or tuple(aliases)
     if not want:
@@ -1121,14 +1126,20 @@ def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str
     config = {k.lower(): {a.lower(): u for a, u in v.items() if isinstance(a, str)}
               for k, v in (config_logins or {}).items() if isinstance(v, Mapping)}
 
+    mentioned = {a.lower() for a in (*want, *body_aliases, *named)}
+
+    def as_worker(host: str, t: str) -> bool:
+        return (named.get(t) or {config.get(host, {}).get(t)}) == {self_user}
+
     def reached(host: str, row: Mapping[str, int], a: str) -> bool:
         if row.get(a) == 0:
             return True
         t = a.lower()
         if not (t == host or canon.get(t) == host):
             return False
-        effective = named.get(t) or {config.get(host, {}).get(t)}
-        return effective == {self_user}
+        # Every alias of this host the body names logs in as the worker, or this row probes it (rc 0).
+        return all(row.get(b) == 0 or as_worker(host, b)
+                   for b in mentioned if b == host or canon.get(b) == host)
 
     return tuple(h for h, row in reach.items() if all(reached(h.lower(), row, a) for a in want))
 
@@ -1597,9 +1608,11 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     # Manifest targets always join (an unprobed one still fails closed,
     # Prism bf503f94e81a).
     named = tuple(dict.fromkeys([*base, *wanted]))
+    _b, prose = host_bound_targets(REACH_LINE_RE.sub("", body or ""), (), aliases, pin_hosts=pool_hosts,
+                                   ssh_hosts=getattr(pool, "ssh_hosts", None))
     return reaching_hosts(reach, named, aliases, getattr(pool, "pin_aliases", None),
                           logins=ssh_target_logins(body),
-                          config_logins=getattr(pool, "reach_logins", None))
+                          config_logins=getattr(pool, "reach_logins", None), body_aliases=prose)
 
 
 def prose_reach_preference(*, body: Optional[str], skills: Iterable[str], pool,

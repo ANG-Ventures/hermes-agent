@@ -134,6 +134,12 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
             only, _ = _portable_only(conn, card, assignee, plan, caps,
                                      own_only.get(card["id"]),
                                      (worktree_ports or {}).get(card["id"]))
+        # A prose preference is soft (Prism 77c519869eff, as the dispatcher reads it): the preferred hosts are
+        # tried first, the hard set (``fallback``, None = any pool host) decides eligibility.
+        prefer = ()
+        from hermes_cli.kanban_db_dispatch import _ProsePreferred
+        if isinstance(only, _ProsePreferred):
+            only, prefer = only.fallback, tuple(only)
         allowed = None if only is None else {n.lower() for n in only}
         local_free = local_budget is None or local_used < local_budget
         remote = (route == "portable" and plan is not None
@@ -147,7 +153,9 @@ def waiting_by_host(cards, plan, *, routes, local_host: str, board=None, default
             continue
         if plan is None:
             continue
-        for name, host in plan.hosts.items():
+        want = {n.lower() for n in prefer}
+        ordered = sorted(plan.hosts.items(), key=lambda kv: kv[0].lower() not in want)
+        for name, host in ordered:
             if route in ("pin", "origin") and name != arg:
                 continue
             if allowed is not None and name.lower() not in allowed:
