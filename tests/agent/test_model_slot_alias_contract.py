@@ -492,6 +492,36 @@ def test_aggregator_slot_sends_the_id_it_validated(vhome, monkeypatch, alias):
     assert _wire(_real_agent(res.new_model, res.target_provider, _OR_URL)) == wire_id + "-next"
 
 
+# The reader's probe (Apollo send-back on 44ac374f), as a test: the real view's prefix-less ids,
+# one openrouter alias per spelling the sweep writes. probed == sent == the vendor-prefixed id,
+# stored == the bare slot.
+_REAL_VIEW = {"kimi": "kimi-k3.1-pro", "gemini-pro": "gemini-4-argon", "opus": OPUS_ID}
+_OR_PROBE = {
+    "k3-or": ("openrouter/kimi", "kimi", "moonshotai/kimi-k3.1-pro"),
+    "gp-or": ({"provider": "openrouter", "model": "gemini-pro"}, "gemini-pro", "google/gemini-4-argon"),
+}
+
+
+@pytest.mark.parametrize("alias", sorted(_OR_PROBE))
+def test_openrouter_alias_probes_sends_and_stores_per_the_contract(vhome, monkeypatch, alias):
+    _value, slot, wire_id = _OR_PROBE[alias]
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-test-token")
+    _write_view(vhome, _REAL_VIEW)
+    (vhome / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"default": "opus", "provider": "claude-alr",
+                  "aliases": {name: v for name, (v, _s, _w) in _OR_PROBE.items()}},
+        "providers": _LANES,
+    }), encoding="utf-8")
+    _reset_aliases()
+    validate, seen = _catalog_only(wire_id)
+    with patch("hermes_cli.models._validate_requested_model_seam", return_value=validate):
+        res = _switch(alias, probe=True)
+    assert res.success, res.error_message
+    assert (res.target_provider, res.new_model) == ("openrouter", slot)
+    assert seen == [wire_id]
+    assert _wire(_real_agent(res.new_model, res.target_provider, _OR_URL)) == wire_id
+
+
 def test_slot_resolve_does_not_double_a_vendor_prefix_the_target_carries(vhome):
     from hermes_cli.model_registry import slot_resolve
 
