@@ -1060,6 +1060,7 @@ def emit_session_end(
                     turn_id=turn_id,
                     reason=turn_exit_reason,
                     model=agent.model,
+                    model_slot=getattr(agent, "_model_slot", None) or "",
                     platform=getattr(agent, "platform", None) or "",
                     provider=getattr(agent, "provider", None) or "",
                     chat_id=getattr(agent, "_chat_id", None) or "",
@@ -1095,6 +1096,8 @@ def emit_session_end(
                 turn_exit_reason=turn_exit_reason,
                 terminal_error=_terminal_error,
                 model=agent.model,
+                # The slot the seat asked for ('' for a literal id); model is its resolved id.
+                model_slot=getattr(agent, "_model_slot", None) or "",
                 platform=getattr(agent, "platform", None) or "",
                 provider=getattr(agent, "provider", None) or "",
                 chat_id=getattr(agent, "_chat_id", None) or "",

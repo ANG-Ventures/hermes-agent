@@ -1,0 +1,240 @@
+"""Slot aliases P2 follow-up (t_5c87d313): every turn row records the slot asked for and the id it ran on.
+
+A seat may name a model slot (``sol``); the runtime resolves it to the current id each turn. The turn
+row now carries both: ``model`` is the resolved id (what the turn is priced by, at insert and on every
+later reprice) and ``model_slot`` is the slot asked for (``''`` for a literal id, NULL on rows written
+before the column existed). A slot the view cannot resolve is still recorded under the slot name and
+books unpriced, as before.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import time
+from types import SimpleNamespace
+
+import pytest
+
+SOL_ID = "gpt-6.2-sol"      # cpa: $2 / $10 per M
+FLIP_ID = "gpt-5.5"         # cpa: $5 / $30 per M
+USAGE_CALL = dict(input_tokens=10_000, output_tokens=2_000, cache_read_tokens=0, cache_write_tokens=0)
+
+
+def _write_view(root, slots):
+    path = root / "config" / "model-slots.json"
+    path.write_text(json.dumps({"rendered_from": "abc123", "slots": dict(slots)}), encoding="utf-8")
+    st = path.stat()
+    # slot_view caches on mtime: move it forward so a flip inside one second is seen.
+    bump = getattr(_write_view, "_bump", 0) + 1
+    _write_view._bump = bump
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + bump * 1_000_000_000))
+
+
+@pytest.fixture
+def bb(tmp_path, monkeypatch):
+    root = tmp_path / "vhome"
+    (root / "config").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    _write_view(root, {"sol": SOL_ID})
+    import plugins.blackbox as bb
+
+    bb._sessions.clear()
+    monkeypatch.setattr(bb, "_config", lambda: {
+        "enabled": True, "cost_alert_threshold_usd": 999.0, "alerts_enabled": False,
+        "store_text": False, "record_subagents": True,
+    })
+    monkeypatch.setattr(bb, "_observe_pricing_sentinel", lambda *a, **k: None)
+    bb._root = root
+    return bb
+
+
+def _end(bb, turn_id, model, **extra):
+    usage = {"api_calls": 1, "input_tokens": USAGE_CALL["input_tokens"],
+             "output_tokens": USAGE_CALL["output_tokens"], "cache_read_tokens": 0,
+             "cache_write_tokens": 0, "latency_s": 1.0, "calls": [dict(USAGE_CALL)]}
+    bb._on_session_end(
+        session_id="s1", completed=True, interrupted=False, model=model, platform="discord",
+        provider="cpa", user_message="hi", final_response="ok", turn_usage=usage,
+        turn_id=turn_id, chat_id="42", chat_name="c", **extra,
+    )
+    from plugins.blackbox import store
+
+    return store.get_turn(turn_id)
+
+
+def _priced(model_id):
+    from plugins.blackbox.cost import compute_turn_cost
+
+    cost, status, _ = compute_turn_cost(model_id, "cpa", None, [dict(USAGE_CALL)])
+    assert status == "estimated" and cost and cost > 0, (model_id, status, cost)
+    return cost
+
+
+def test_slot_turn_is_priced_by_its_resolved_id_and_records_the_slot(bb):
+    # The live finalizer shape: agent.model is already the id, agent._model_slot the slot.
+    row = _end(bb, "turn_slot", SOL_ID, model_slot="sol")
+    assert row["model"] == SOL_ID
+    assert row["model_slot"] == "sol"
+    assert row["cost_status"] == "estimated"
+    assert row["cost_usd"] == pytest.approx(_priced(SOL_ID))
+
+
+def test_slot_name_reaching_the_recorder_is_resolved_at_record_time(bb):
+    # A writer that hands the slot itself (an older caller, a lane-prefixed seat) must not leave
+    # the slot in the model column: a later reprice would price it at whatever the slot is THEN.
+    for turn_id, model in (("turn_bare", "sol"), ("turn_lane", "cpa/sol")):
+        row = _end(bb, turn_id, model)
+        assert row["model"] == SOL_ID, turn_id
+        assert row["model_slot"] == model, turn_id
+        assert row["cost_usd"] == pytest.approx(_priced(SOL_ID)), turn_id
+
+
+def test_literal_turn_is_unchanged_and_records_an_empty_slot(bb):
+    row = _end(bb, "turn_literal", SOL_ID, model_slot="")
+    assert row["model"] == SOL_ID
+    assert row["model_slot"] == ""
+    assert row["cost_usd"] == pytest.approx(_priced(SOL_ID))
+    # No model_slot kwarg at all (a host that predates it) with a literal id: same row.
+    row = _end(bb, "turn_literal_nokw", SOL_ID)
+    assert row["model"] == SOL_ID and row["model_slot"] == ""
+
+
+def test_flip_between_two_turns_prices_each_by_its_own_id_now_and_on_reprice(bb):
+    from plugins.blackbox import store
+    from plugins.blackbox.cost import compute_turn_cost
+
+    a = _end(bb, "turn_a", "sol")
+    _write_view(bb._root, {"sol": FLIP_ID})
+    b = _end(bb, "turn_b", "sol")
+    assert (a["model"], a["model_slot"]) == (SOL_ID, "sol")
+    assert (b["model"], b["model_slot"]) == (FLIP_ID, "sol")
+    assert a["cost_usd"] == pytest.approx(_priced(SOL_ID))
+    assert b["cost_usd"] == pytest.approx(_priced(FLIP_ID))
+    assert a["cost_usd"] != pytest.approx(b["cost_usd"])
+
+    # The reprice sweep reads the model column: after the flip, turn_a must still be priced as
+    # gpt-6.2-sol, not as whatever ``sol`` points at today.
+    con = sqlite3.connect(str(store._db_path()))
+    con.execute("UPDATE turns SET cost_usd=NULL, cost_status=NULL, cost_uncached_usd=NULL, "
+                "cost_cache_read_usd=NULL, cost_cache_write_usd=NULL, cost_output_usd=NULL")
+    con.commit()
+    con.close()
+
+    def fn(m, p, t):  # tokens-reprice-sweep driver shape
+        return compute_turn_cost(m, p, None, [dict(
+            input_tokens=t["input_tokens"], output_tokens=t["output_tokens"],
+            cache_read_tokens=t["cache_read_tokens"], cache_write_tokens=t["cache_write_tokens"])])
+
+    store.reprice_unpriced(fn, apply=True)
+    assert store.get_turn("turn_a")["cost_usd"] == pytest.approx(_priced(SOL_ID))
+    assert store.get_turn("turn_b")["cost_usd"] == pytest.approx(_priced(FLIP_ID))
+
+
+def test_slot_that_resolves_to_nothing_books_unpriced_under_the_slot(bb):
+    (bb._root / "config" / "model-slots.json").unlink()
+    row = _end(bb, "turn_unresolved", "sol", model_slot="sol")
+    assert row["model"] == "sol"
+    assert row["model_slot"] == "sol"
+    assert row["cost_status"] == "unknown"
+    assert row["cost_usd"] is None
+
+
+def test_abandoned_turn_records_the_slot(bb):
+    from plugins.blackbox import store
+
+    bb._on_turn_abandoned(turn_id="turn_ab", session_id="s1", model=SOL_ID, provider="cpa",
+                          platform="discord", chat_id="42", model_slot="sol", reason="shutdown")
+    row = store.get_turn("turn_ab")
+    assert row["model"] == SOL_ID and row["model_slot"] == "sol"
+
+
+def _hook_kwargs(monkeypatch, agent, provisional=False):
+    import hermes_cli.lifecycle as lifecycle
+    from agent import turn_finalizer as tf
+
+    seen = {}
+
+    def _fake_invoke_hook(name, **kwargs):
+        seen[name] = kwargs
+        return []
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", _fake_invoke_hook)
+    call = {"input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "reasoning_tokens": 0, "total_tokens": 2, "latency_s": 0.1}
+    tf.emit_session_end(
+        agent, turn_id="t1", effective_task_id=None, completed=True, failed=False,
+        interrupted=False, turn_exit_reason=None, original_user_message="hi",
+        final_response="ok", turn_calls=[call], provisional=provisional,
+    )
+    return seen
+
+
+def _agent(**over):
+    base = dict(session_id="s", model=SOL_ID, platform="discord", provider="cpa",
+                reasoning_config=None, _blackbox_compaction={}, context_compressor=None)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_finalizer_hands_the_slot_to_the_hook(monkeypatch):
+    seen = _hook_kwargs(monkeypatch, _agent(_model_slot="sol"))
+    assert seen["on_session_end"]["model"] == SOL_ID
+    assert seen["on_session_end"]["model_slot"] == "sol"
+    seen = _hook_kwargs(monkeypatch, _agent())
+    assert seen["on_session_end"]["model_slot"] == ""
+    seen = _hook_kwargs(monkeypatch, _agent(_model_slot="sol", _current_turn_id="t1"), provisional=True)
+    assert seen["on_turn_abandoned"]["model_slot"] == "sol"
+
+
+def test_old_rows_keep_a_null_slot_after_migration(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from plugins.blackbox import store
+
+    db = tmp_path / "blackbox" / "turns.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE turns (turn_id TEXT PRIMARY KEY, ts_start REAL, ts_end REAL, provider TEXT, "
+        "model TEXT, platform TEXT, chat_id TEXT, input_tokens INT, output_tokens INT, "
+        "cost_usd REAL, cost_status TEXT)")
+    now = time.time()
+    conn.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                 ("turn_old", now - 5, now, "cpa", "sol", "discord", "7", 10, 5, None, "unknown"))
+    conn.commit()
+    conn.close()
+
+    c = store._connect()
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(turns)").fetchall()}
+        old = c.execute("SELECT model, model_slot FROM turns WHERE turn_id='turn_old'").fetchone()
+    finally:
+        c.close()
+    assert "model_slot" in cols
+    assert tuple(old) == ("sol", None)
+    store._connect().close()  # idempotent re-open
+
+
+def test_signaled_worker_turn_records_the_slot(bb, monkeypatch):
+    # A SIGTERM'd kanban worker (a slot-seated daedalus card) writes its row via cli_shutdown.
+    import cli as cli_mod
+    from hermes_cli import lifecycle
+    from plugins.blackbox import store
+
+    monkeypatch.setattr(cli_mod, "_handed_off_session_ids", set())
+    monkeypatch.setattr(cli_mod, "_flush_one_shot_session_store", lambda _cli: None)
+
+    def invoke_hook(name, **kwargs):
+        if name == "on_session_end":
+            bb._on_session_end(**kwargs)
+        return []
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", invoke_hook)
+    agent = SimpleNamespace(
+        session_id="sig", _current_turn_id="sig:t1", _current_task_id="", _current_api_request_id="",
+        model=SOL_ID, provider="cpa", platform="cli", _model_slot="sol",
+        interrupt=lambda *_a, **_k: None,
+    )
+    cli_mod._finalize_signaled_kanban_worker(SimpleNamespace(agent=agent, session_id="sig"), 15)
+    row = store.get_turn("sig:t1")
+    assert (row["model"], row["model_slot"], row["terminal_error"]) == (SOL_ID, "sol", "signal_15")

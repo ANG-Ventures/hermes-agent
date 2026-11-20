@@ -181,7 +181,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             attribution TEXT,
             terminal_error TEXT,
             reasoning_effort TEXT,
-            placement_host TEXT
+            placement_host TEXT,
+            model_slot TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -555,8 +556,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # `placement_host` (t_c9fc6c9f): the box that ran a kanban worker's tools
     # (pool host name, or `studio-local`); NULL for non-worker turns and for
     # rows written before the column existed.
+    # `model_slot` (t_5c87d313): the slot the turn asked for (`sol`), `''` for a
+    # literal id; `model` holds the id it resolved to. NULL on older rows.
     for _col in ("served_subs_json", "attribution", "terminal_error", "reasoning_effort",
-                 "placement_host"):
+                 "placement_host", "model_slot"):
         if _col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
@@ -926,6 +929,7 @@ _INSERT_TURN_COLUMNS = (
     "lane_family", "vendor", "served_provider",
     "reasoning_effort",
     "placement_host",
+    "model_slot",
 )
 
 _INSERT_TURN_SQL = (
@@ -1148,6 +1152,7 @@ def insert_turn(
                     (str(record.placement_host).strip() or None)
                     if record.placement_host is not None
                     else None,
+                    str(record.model_slot).strip() if record.model_slot is not None else None,
                 ),
             )
             if provisional and cur.rowcount == 0:

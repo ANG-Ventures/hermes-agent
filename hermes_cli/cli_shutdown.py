@@ -240,6 +240,7 @@ def _emit_interrupted_session_end(
             turn_id=turn_id,
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             provider=getattr(agent, "provider", None) or "",
+            model_slot=getattr(agent, "_model_slot", None) or "",
             terminal_error=terminal_error,
         )
     finally:
