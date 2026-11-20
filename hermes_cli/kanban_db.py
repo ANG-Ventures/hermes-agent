@@ -7878,7 +7878,8 @@ def assign_task(
                 "ORDER BY id DESC LIMIT 1", (task_id,),
             ).fetchone()
             _append_event(conn, task_id, "review_requested", {
-                "summary": f"review hold: checks settled, handed to {profile}",
+                # t_9000e509: no read of the head's checks here, so the words claim nothing about CI.
+                "summary": f"review hold: handed to {profile} for an operator record",
                 "implementer": _review_handoff_implementer(conn, task_id),
                 "reviewer": profile, "handed_from": row["assignee"],
             }, run_id=replaced["run_id"] if replaced else None)
