@@ -81,119 +81,15 @@ def _navigate(monkeypatch, cdp_url):
     return json.loads(registry.dispatch("browser_navigate", {"url": "https://example.com"}, task_id="rail"))
 
 
-def _browser_host_probe(monkeypatch, answer):
-    """``lease_forwarder_probe`` as run on the browser's host; records each probed port."""
-    seen = []
-
-    def fake(port):
-        seen.append(port)
-        return answer() if callable(answer) else answer
-    monkeypatch.setattr(rp, "_probe_on_browser_host", fake)
-    return seen
-
-
-NOT_A_LEASE = {"ok": False, "why": "/usr/bin/brave is not the installed lease-cdp-forward.py"}
-LIVE_LEASE = {"ok": True, "identity": "id-github-kyzcreig", "class": "read", "pid": 4242}
-
-
 def test_placed_worker_with_live_loopback_cdp_gets_exact_message(monkeypatch):
     # The ace-ai case: a different Brave answers 127.0.0.1:9222, so liveness passes — placement must still refuse.
     _worker(monkeypatch)
     _placed(monkeypatch, "ace-ai")
     calls = _cdp_requests(monkeypatch, answers=True)
-    seen = _browser_host_probe(monkeypatch, NOT_A_LEASE)
     out = _navigate(monkeypatch, "http://127.0.0.1:9222")
     assert out.get("success") is False
     assert out["error"] == EXPECTED_BROWSER.format(host="ace-ai")
-    assert calls == [], "a placed worker never probes this process's loopback"
-    assert seen == [9222], "only the lease probe runs, on the browser's host"
-
-
-def test_placed_worker_may_drive_a_live_lease_and_every_call_rechecks(monkeypatch):
-    # t_ce9bd5a3: a live lease forwarder may be driven by a placed worker's own browser tools. Prism
-    # 40878f845b06: no grant is cached, so the call after the lease ends (or another process takes the
-    # port) is refused.
-    _worker(monkeypatch)
-    _placed(monkeypatch, "ace-ai")
-    state = {"answer": LIVE_LEASE}
-    seen = _browser_host_probe(monkeypatch, lambda: state["answer"])
-    assert rp.browser_rail_error("http://127.0.0.1:52656") is None
-    assert rp.browser_rail_error("ws://127.0.0.1:52656/devtools/browser/lease") is None
-    assert seen == [52656, 52656], "every call re-runs the probe"
-    assert rp.take_rail_absent() is None
-    for gone in ({"ok": False, "why": "lease id-github-kyzcreig is not live at the gateway (/json/list 500)"},
-                 {"ok": False, "why": "0 listeners on port 52656"}, {"ok": "yes", "identity": "x"}, None):
-        state["answer"] = gone
-        assert rp.browser_rail_error("http://127.0.0.1:52656") == EXPECTED_BROWSER.format(host="ace-ai"), gone
-
-
-def test_lease_probe_runs_inside_the_terminal_backend(monkeypatch):
-    # The forwarder listens on the POOL host's loopback: the probe runs where agent-browser runs
-    # (the terminal backend), never from this process, as an isolated stdlib-only interpreter.
-    import subprocess
-    from tools import lease_forwarder_probe as probe
-    from tools.bot_desktop import placement
-    from tools.environments import streams
-    calls = _cdp_requests(monkeypatch, answers=True)
-    monkeypatch.setattr(placement, "resolve", lambda: placement.Placement(placement.TERMINAL, "ssh"))
-    env = object()
-    monkeypatch.setattr(placement, "terminal_environment", lambda create=True: env)
-    ran = []
-
-    def run_in(e, argv, **kw):
-        ran.append((e, argv))
-        return subprocess.CompletedProcess(argv, 0, (json.dumps(LIVE_LEASE) + "\n").encode(), b"")
-    monkeypatch.setattr(streams, "run_in", run_in)
-    assert rp.lease_forwarder("http://127.0.0.1:52656") == "id-github-kyzcreig"
-    with open(probe.__file__, encoding="utf-8") as f:
-        source = f.read()
-    assert ran == [(env, ["/usr/bin/python3", "-I", "-c", source, "52656"])]
-    assert calls == []
-    assert rp.lease_forwarder("http://10.0.0.5:52656") is None and len(ran) == 1, "only loopback is a forwarder"
-
-
-def test_placed_loopback_override_is_not_discovered_or_supervised_here(monkeypatch):
-    # Discovery / the CDP supervisor from this process would dial ITS loopback, another machine's.
-    from tools import browser_tool_cdp as cdp
-    from tools import browser_supervisor
-    _worker(monkeypatch)
-    _placed(monkeypatch, "ace-ai")
-    calls = _cdp_requests(monkeypatch, answers=True)
-    started = []
-    monkeypatch.setattr(browser_supervisor.SUPERVISOR_REGISTRY, "get_or_start", lambda **kw: started.append(kw))
-    monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:52656")
-    assert cdp._get_cdp_override() == "http://127.0.0.1:52656"
-    cdp._ensure_cdp_supervisor("rail")
-    assert calls == [] and started == []
-    assert rp.placed_loopback("ws://10.0.0.5:9222") is False
-    monkeypatch.delenv(kwh.PLACEMENT_ENV)
-    assert rp.placed_loopback("http://127.0.0.1:52656") is False
-
-
-def test_navigate_lease_cdp_port_connects_only_a_lease(monkeypatch):
-    from tools import browser_tool as bt
-    _worker(monkeypatch)
-    _placed(monkeypatch, "ace-ai")
-    import model_tools  # noqa: F401
-    from tools.registry import registry
-    monkeypatch.setattr(bt, "browser_navigate", lambda url, task_id=None: json.dumps({"success": True, "url": url}))
-    monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: None)
-    monkeypatch.setenv("BROWSER_CDP_URL", "")  # restored at teardown: the connect sets it process-wide
-
-    def nav(port):
-        return json.loads(registry.dispatch("browser_navigate", {"url": "https://github.com", "lease_cdp_port": port},
-                                            task_id="rail"))
-    _browser_host_probe(monkeypatch, NOT_A_LEASE)
-    out = nav(9222)
-    assert out["success"] is False and "is not a browser lease forwarder" in out["error"]
-    assert __import__("os").environ["BROWSER_CDP_URL"] == ""
-    assert "TCP port" in nav("x")["error"]
-    _browser_host_probe(monkeypatch, LIVE_LEASE)
-    assert nav(52656) == {"success": True, "url": "https://github.com"}
-    assert __import__("os").environ["BROWSER_CDP_URL"] == "http://127.0.0.1:52656"
-    assert rp.take_rail_absent() is None
-    monkeypatch.delenv("HERMES_KANBAN_TASK")
-    assert "interactive session uses /browser connect" in nav(52656)["error"]
+    assert calls == [], "a placed worker is refused before any CDP probe"
 
 
 def test_unplaced_worker_unreachable_endpoint_gets_exact_message(monkeypatch):

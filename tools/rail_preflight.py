@@ -11,8 +11,8 @@ minutes in (t_db491366).
 Scope: only the dispatcher-owned worker (``owned_kanban_task``); interactive sessions, in-process
 cron and delegate children never see these errors. A configured LOOPBACK CDP override is the
 operator's browser: the browser_* tools (whose agent-browser runs on the pool host under
-placement) are refused up front off the dispatcher host unless the endpoint is a Studio identity lease
-forwarded onto the pool host (``lease_forwarder``, t_ce9bd5a3), while ``browser_cdp`` (which connects from
+placement) are refused up front off the dispatcher host, except the port of the identity lease the
+tool itself started (``tools.browser_lease``, t_ce9bd5a3), while ``browser_cdp`` (which connects from
 the dispatcher process itself) only gets the liveness probe. The agent's own Chromium and the
 computer_use desktop are not operator rails: a placed worker keeps both wherever the pool host can
 host them, and only when that placement fails is the failure reported as this rail
@@ -27,7 +27,6 @@ turn loop, and only it, parks the card ``needs_input`` with the message verbatim
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 import threading
@@ -167,53 +166,6 @@ def record_absent(message: str) -> Optional[str]:
     return message
 
 
-def _probe_on_browser_host(port: int) -> dict:
-    """``tools/lease_forwarder_probe.py`` run on the host agent-browser runs on: inside the terminal
-    backend when the browser is placed there (a pool host's loopback is not this process's), else here."""
-    from tools import lease_forwarder_probe as probe
-    from tools.bot_desktop import placement
-    if placement.resolve().where != placement.TERMINAL:
-        return json.loads(_probe_main(probe, port))
-    from tools.environments import streams
-    env = placement.terminal_environment(create=True)
-    if env is None:
-        return {"ok": False, "why": "no terminal backend"}
-    with open(probe.__file__, encoding="utf-8") as f:
-        source = f.read()
-    proc = streams.run_in(env, ["/usr/bin/python3", "-I", "-c", source, str(port)], timeout=30)
-    lines = (proc.stdout or b"").decode("utf-8", "replace").strip().splitlines()
-    return json.loads(lines[-1]) if lines else {"ok": False, "why": "probe printed nothing"}
-
-
-def _probe_main(probe, port: int) -> str:
-    import contextlib
-    import io
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        probe.main([str(port)])
-    return buf.getvalue().strip().splitlines()[-1]
-
-
-def lease_forwarder(cdp_url: str) -> Optional[str]:
-    """The identity name when ``cdp_url`` is a LIVE browser lease forwarder on the browser's host, else
-    None. A ``/json/version`` string is not trusted: ``lease_forwarder_probe`` binds the port to the
-    root-installed forwarder under ``browserctl with <identity> --class read|act`` and to a gateway call
-    that succeeds now (Prism e44cea4791ec). Nothing is cached, so a released or expired lease, or another
-    process on the same port, is refused on the very next call (Prism 40878f845b06). The token is never
-    read."""
-    from agent.proxy_bypass import is_loopback_host, split_host_port
-    host, port = split_host_port((cdp_url or "").strip())
-    if not port or not is_loopback_host(host):
-        return None
-    try:
-        res = _probe_on_browser_host(int(port))
-    except Exception:
-        return None
-    if not isinstance(res, dict) or res.get("ok") is not True:
-        return None
-    return str(res.get("identity") or "") or None
-
-
 def placed_loopback(cdp_url: str) -> bool:
     """A dispatcher-owned worker on a pool host with a loopback CDP override: the endpoint lives on the
     pool host, so this process must not discover or attach to it (its own loopback is another machine's)."""
@@ -221,6 +173,10 @@ def placed_loopback(cdp_url: str) -> bool:
         return False
     from agent.proxy_bypass import is_loopback_host, split_host_port
     return is_loopback_host(split_host_port(cdp_url.strip())[0])
+
+
+LEASE_HOST_SIDE = ("BROWSER_LEASE_TOOLS_ONLY: the identity lease is driven by the browser_* tools; "
+                   "browser_cdp connects from this process and cannot reach it")
 
 
 def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str]:
@@ -234,10 +190,12 @@ def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str
     from agent.proxy_bypass import is_loopback_host, split_host_port
     if not is_loopback_host(split_host_port(cdp_url)[0]):
         return None  # a remote CDP endpoint is reachable from any host
+    from tools.browser_lease import is_lease_url
+    if is_lease_url(cdp_url):
+        # the port the lease client this tool started printed, while that child lives (t_ce9bd5a3)
+        return LEASE_HOST_SIDE if host_side else None
     placed = None if host_side else _placed_host()
     if placed:
-        if lease_forwarder(cdp_url):
-            return None  # a Studio identity lease forwarded onto this pool host (t_ce9bd5a3)
         return _emit(task, rail_absent_message("browser", placed))
     if not _endpoint_answers(cdp_url):
         return _emit(task, rail_absent_message("browser", socket.gethostname()))
