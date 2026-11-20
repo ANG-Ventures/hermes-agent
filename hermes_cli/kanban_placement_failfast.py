@@ -336,10 +336,10 @@ def decide(cmap, host: str, requirements: Iterable[str], modes: Mapping[str, str
     refusal line for ``requirements`` on ``host`` under ``cmap``, else None. An unresolved
     ``unknown:<word>`` parks before any routable known miss (470af3484c95): a re-route can never
     satisfy a word no host serves. An absent/invalid map gates nothing (F11)."""
-    from hermes_cli.kanban_host_capabilities import UNKNOWN_PREFIX
+    from hermes_cli.kanban_host_capabilities import UNKNOWN_PREFIX, mapped_caps
     if cmap is None or not cmap.valid:
         return None
-    have = cmap.hosts.get(host.lower(), frozenset())
+    have = mapped_caps(cmap, host.lower())
     for cap in sorted(dict.fromkeys(requirements), key=lambda c: not c.startswith(UNKNOWN_PREFIX)):
         if (line := _refusal(cap, have, host, modes)) is not None:
             return line

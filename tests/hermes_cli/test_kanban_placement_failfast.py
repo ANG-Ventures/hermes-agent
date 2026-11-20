@@ -287,6 +287,20 @@ def test_capability_gate_is_inert_on_a_capable_host_unplaced_or_warn(board, monk
     assert pff.capability_gate("browser-session") is None
 
 
+def test_capability_gate_reads_the_browser_remote_grant(board, monkeypatch):
+    # t_ce9bd5a3: Layer 1b reads the host's MAPPED browser-session, the same reading placement
+    # uses: a pool host whose browser_remote row proves both lease legs has it; one failed leg does not.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1, host="ace-ai")
+    assert pff.capability_gate("browser-session") is not None    # no producer row: still refused
+    doc = json.loads((board / khc.MAP_FILE).read_text())
+    for record, refused in (({"front_door": True, "ssh": True}, False), ({"front_door": True, "ssh": False}, True)):
+        doc["hosts"]["ace-ai"]["browser_remote"] = record
+        (board / khc.MAP_FILE).write_text(json.dumps(doc))
+        assert (pff.capability_gate("browser-session") is not None) is refused, record
+
+
 def test_preload_is_never_gated(board, monkeypatch, tmp_path):
     # F14: the preload calls skill_view() directly. A gate there would make the skill
     # "missing" and cli.py would continue WITHOUT it. The preload must still load it;

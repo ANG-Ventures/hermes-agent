@@ -478,6 +478,15 @@ BROWSER_TOOL_SCHEMAS = [
                 "url": {
                     "type": "string",
                     "description": "The URL to navigate to (e.g., 'https://example.com')"
+                },
+                "lease_identity": {
+                    "type": "string",
+                    "description": "Kanban workers only: a Studio browser identity to lease (e.g. 'id-github-kyzcreig'). The tool acquires the lease itself and points every browser_* tool at that signed-in browser until the run ends or another identity is leased."
+                },
+                "lease_class": {
+                    "type": "string",
+                    "enum": ["read", "act"],
+                    "description": "Lease class for lease_identity: 'read' (default) or 'act'."
                 }
             },
             "required": ["url"]
@@ -1312,6 +1321,25 @@ def check_browser_routed_requirements(action: str = "browser_snapshot") -> bool:
     return _install.check_browser_requirements() or extension_controller_available(action)
 
 
+def _connect_lease(identity: Any, klass: Any = None) -> Optional[str]:
+    """``browser_navigate(lease_identity=<id>)``: the tool starts the host's lease client as its own child
+    (``tools.browser_lease``) and the browser tools use the port that child printed, nothing else. Only a
+    dispatcher-owned worker (t_ce9bd5a3). Error text, or None."""
+    from tools import browser_lease
+    from tools.rail_preflight import _owned_task
+    task = _owned_task()
+    if not task:
+        return "lease_identity is for kanban workers; an interactive session uses /browser connect"
+    before = browser_lease.active_url()
+    lease, err = browser_lease.open_lease(str(identity or ""), str(klass or "read"), card=task)
+    if err:
+        return err
+    if lease.url != before:
+        from tools.browser_tool_lifecycle import cleanup_all_browsers
+        cleanup_all_browsers()  # the next command opens a session on the lease, as /browser connect does
+    return None
+
+
 def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple = ()):
     """Adapter from the registry's ``(args, kw)`` to ``<fn_name>(**schema_args, task_id=...)``;
     the function is looked up in module globals at call time so monkeypatching works."""
@@ -1319,7 +1347,10 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
         # t_db491366: refuse before any session/CDP discovery when the operator's browser
         # cannot exist here (placed kanban worker, or a dead loopback endpoint).
         from tools.rail_preflight import browser_capability_error, browser_rail_error
-        rail = browser_capability_error() or browser_rail_error(_cdp._get_cdp_override_raw())
+        # acquiring a lease is identity work even before any override exists (#477 split)
+        rail = (browser_capability_error(identity=bool(args.get("lease_identity")))
+                or (args.get("lease_identity") and _connect_lease(args["lease_identity"], args.get("lease_class")))
+                or browser_rail_error(_cdp._get_cdp_override_raw()))
         if rail:
             return _dumps(_err(rail))
         params = {a: args.get(a, d) for a, d in arg_defaults.items()}

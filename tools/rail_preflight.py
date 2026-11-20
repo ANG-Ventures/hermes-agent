@@ -11,7 +11,8 @@ minutes in (t_db491366).
 Scope: only the dispatcher-owned worker (``owned_kanban_task``); interactive sessions, in-process
 cron and delegate children never see these errors. A configured LOOPBACK CDP override is the
 operator's browser: the browser_* tools (whose agent-browser runs on the pool host under
-placement) are refused up front off the dispatcher host, while ``browser_cdp`` (which connects from
+placement) are refused up front off the dispatcher host, except the port of the identity lease the
+tool itself started (``tools.browser_lease``, t_ce9bd5a3), while ``browser_cdp`` (which connects from
 the dispatcher process itself) only gets the liveness probe. The agent's own Chromium and the
 computer_use desktop are not operator rails: a placed worker keeps both wherever the pool host can
 host them, and only when that placement fails is the failure reported as this rail
@@ -165,17 +166,37 @@ def record_absent(message: str) -> Optional[str]:
     return message
 
 
+def placed_loopback(cdp_url: str) -> bool:
+    """A dispatcher-owned worker on a pool host with a loopback CDP override: the endpoint lives on the
+    pool host, so this process must not discover or attach to it (its own loopback is another machine's)."""
+    if not cdp_url or not _owned_task() or not _placed_host():
+        return False
+    from agent.proxy_bypass import is_loopback_host, split_host_port
+    return is_loopback_host(split_host_port(cdp_url.strip())[0])
+
+
+LEASE_HOST_SIDE = ("BROWSER_LEASE_TOOLS_ONLY: the identity lease is driven by the browser_* tools; "
+                   "browser_cdp connects from this process and cannot reach it")
+
+
 def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str]:
     """``BROWSER_RAIL_ABSENT`` for a configured loopback CDP override (the operator's browser),
     or None to proceed. ``cdp_url`` is the configured, unresolved override. ``host_side``: the
     caller connects from this (dispatcher) process, not from the pool host, so placement does
     not move the endpoint and only liveness counts."""
+    from tools.browser_lease import is_lease_url, unavailable_error
+    gone = unavailable_error()
+    if gone:   # a selected identity whose lease child exited: refuse, never fall back (Prism 52ec81c4713e)
+        return gone
     task = _owned_task()
     if not task or not cdp_url:
         return None
     from agent.proxy_bypass import is_loopback_host, split_host_port
     if not is_loopback_host(split_host_port(cdp_url)[0]):
         return None  # a remote CDP endpoint is reachable from any host
+    if is_lease_url(cdp_url):
+        # the port the lease client this tool started printed, while that child lives (t_ce9bd5a3)
+        return LEASE_HOST_SIDE if host_side else None
     placed = None if host_side else _placed_host()
     if placed:
         return _emit(task, rail_absent_message("browser", placed))

@@ -100,6 +100,9 @@ def is_camofox_mode() -> bool:
     """
     if os.getenv("BROWSER_CDP_URL", "").strip() or _config_cdp_url():
         return False
+    from tools import browser_lease
+    if browser_lease.selected() is not None:   # a selected identity lease is a CDP override too (t_ce9bd5a3)
+        return False
     try:
         from tools.tool_backend_helpers import read_selection
         selected = read_selection("browser")
