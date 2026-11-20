@@ -3669,7 +3669,7 @@ _SWITCH_STATE_ATTRS = (
     "_anthropic_client", "_is_anthropic_oauth", "client", "_client_kwargs",
     "_use_prompt_caching", "_use_native_cache_layout", "request_overrides",
     "_cached_system_prompt", "_provider_fallback_active",
-    "_provider_fallback_route",
+    "_provider_fallback_route", "_fallback_model_slot",
 )
 
 
@@ -3918,7 +3918,8 @@ def try_activate_fallback(
         # A rung named by slot (``sol``) runs on the slot's current id: every check below, the
         # client and the wire see the id.
         from hermes_cli.model_registry import slot_resolve
-        fb_model = slot_resolve(fb_model)[0] or fb_model
+        _fb_resolved, _fb_slot = slot_resolve(fb_model)
+        fb_model = _fb_resolved or fb_model
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
         quota_skipped = getattr(agent, "_quota_gate_skipped_providers", set()) or set()
@@ -4065,6 +4066,7 @@ def try_activate_fallback(
             if hasattr(agent, "_transport_cache"):
                 agent._transport_cache.clear()
             agent._fallback_activated = True
+            agent._fallback_model_slot = _fb_slot or ""  # the turn row's model_slot on this rung
 
             # Per-entry reasoning effort override (#21256), else ONLY a per-MODEL
             # override — never the global default (the 2026-08-05 xhigh→medium

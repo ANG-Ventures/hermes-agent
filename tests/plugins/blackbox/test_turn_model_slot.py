@@ -238,3 +238,92 @@ def test_signaled_worker_turn_records_the_slot(bb, monkeypatch):
     cli_mod._finalize_signaled_kanban_worker(SimpleNamespace(agent=agent, session_id="sig"), 15)
     row = store.get_turn("sig:t1")
     assert (row["model"], row["model_slot"], row["terminal_error"]) == (SOL_ID, "sol", "signal_15")
+
+
+# ── fallback rungs (Apollo ruling 2026-11-20 03:40 on #483) ───────────────────
+# model_slot names the seat that SERVED the turn, the same seat ``model`` describes. A turn that
+# ends on a fallback rung records the rung's slot when the rung was named by a slot, '' when the
+# rung was a literal id, and never the primary's slot.
+
+OPUS_ID = "claude-opus-5-5"
+
+
+def _fb_agent(primary, chain):
+    from unittest.mock import MagicMock, patch
+
+    from run_agent import AIAgent
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(model=primary, api_key="test-key", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        fallback_model=chain)
+        agent.client = MagicMock()
+    return agent
+
+
+def _fail_over(agent):
+    from unittest.mock import MagicMock, patch
+
+    client = MagicMock()
+    client.base_url = "http://127.0.0.1:8317/v1"
+    client.api_key = "fb-key"
+    with (
+        patch("agent.chat_completion_helpers._fallback_entry_unavailable_without_network", return_value=None),
+        patch("agent.auxiliary_client.resolve_provider_client",
+              side_effect=lambda p, model=None, **kw: (client, model)),
+        patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+    ):
+        assert agent._try_activate_fallback() is True
+
+
+def _record_via_finalizer(bb, monkeypatch, agent, turn_id):
+    import hermes_cli.lifecycle as lifecycle
+    from agent import turn_finalizer as tf
+    from plugins.blackbox import store
+
+    def invoke_hook(name, **kwargs):
+        if name == "on_session_end":
+            bb._on_session_end(**kwargs)
+        return []
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", invoke_hook)
+    call = dict(USAGE_CALL, reasoning_tokens=0, latency_s=0.1,
+                total_tokens=USAGE_CALL["input_tokens"] + USAGE_CALL["output_tokens"])
+    agent._current_turn_id = turn_id
+    tf.emit_session_end(
+        agent, turn_id=turn_id, effective_task_id=None, completed=True, failed=False,
+        interrupted=False, turn_exit_reason=None, original_user_message="hi",
+        final_response="ok", turn_calls=[call],
+    )
+    return store.get_turn(turn_id)
+
+
+def _rung_price(model_id, provider):
+    from plugins.blackbox.cost import compute_turn_cost
+
+    cost, status, _ = compute_turn_cost(model_id, provider, None, [dict(USAGE_CALL)])
+    assert status == "estimated" and cost and cost > 0, (model_id, provider, status, cost)
+    return cost
+
+
+@pytest.mark.parametrize("rung, want_model, want_slot", [
+    ({"provider": "openrouter", "model": "opus"}, OPUS_ID, "opus"),        # slot-named rung
+    ({"provider": "cpa", "model": FLIP_ID}, FLIP_ID, ""),                  # literal rung
+])
+def test_fallback_turn_records_the_rungs_slot_never_the_primarys(bb, monkeypatch, rung, want_model, want_slot):
+    _write_view(bb._root, {"sol": SOL_ID, "opus": OPUS_ID})
+    agent = _fb_agent("sol", [dict(rung, base_url="http://127.0.0.1:8317/v1")])
+    assert (agent.model, agent._model_slot) == (SOL_ID, "sol")
+    _fail_over(agent)
+    assert agent.model == want_model
+
+    row = _record_via_finalizer(bb, monkeypatch, agent, f"turn_fb_{want_slot or 'literal'}")
+    assert (row["model"], row["model_slot"]) == (want_model, want_slot)
+    assert row["provider"] == rung["provider"]
+    assert row["cost_usd"] == pytest.approx(_rung_price(want_model, rung["provider"]))
+    # The primary's slot is unchanged: the next restored turn re-resolves sol.
+    assert agent._model_slot == "sol"

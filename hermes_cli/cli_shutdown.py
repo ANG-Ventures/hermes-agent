@@ -200,6 +200,7 @@ def _emit_interrupted_session_end(
     (``signal_15``); blackbox stores it on the turn row so a killed worker's
     turn is distinguishable from a user interrupt.
     """
+    from agent.model_slots import served_slot
     from cli import _invoke_interrupted_session_end, _oneshot_agent_and_session
     agent, session_id = _oneshot_agent_and_session(cli)
     if agent is None:
@@ -240,7 +241,7 @@ def _emit_interrupted_session_end(
             turn_id=turn_id,
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             provider=getattr(agent, "provider", None) or "",
-            model_slot=getattr(agent, "_model_slot", None) or "",
+            model_slot=served_slot(agent),
             terminal_error=terminal_error,
         )
     finally:

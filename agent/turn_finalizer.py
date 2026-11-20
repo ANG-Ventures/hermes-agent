@@ -21,6 +21,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.model_slots import served_slot
 from agent.served_model import result_model_fields
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
@@ -1060,7 +1061,7 @@ def emit_session_end(
                     turn_id=turn_id,
                     reason=turn_exit_reason,
                     model=agent.model,
-                    model_slot=getattr(agent, "_model_slot", None) or "",
+                    model_slot=served_slot(agent),
                     platform=getattr(agent, "platform", None) or "",
                     provider=getattr(agent, "provider", None) or "",
                     chat_id=getattr(agent, "_chat_id", None) or "",
@@ -1096,8 +1097,8 @@ def emit_session_end(
                 turn_exit_reason=turn_exit_reason,
                 terminal_error=_terminal_error,
                 model=agent.model,
-                # The slot the seat asked for ('' for a literal id); model is its resolved id.
-                model_slot=getattr(agent, "_model_slot", None) or "",
+                # The slot of the seat that served the turn (a fallback rung's, '' for a literal id); model is its id.
+                model_slot=served_slot(agent),
                 platform=getattr(agent, "platform", None) or "",
                 provider=getattr(agent, "provider", None) or "",
                 chat_id=getattr(agent, "_chat_id", None) or "",
