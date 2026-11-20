@@ -421,7 +421,9 @@ def attached_skill_gap(skills: Iterable[str], host: str, caps) -> Optional[str]:
     if caps is None or not caps.cmap.valid or caps.cmap.index_error is not None:
         return None
     from hermes_cli import kanban_host_capabilities as khc
-    have = caps.cmap.hosts.get(host.lower(), frozenset())
+    # The host's EFFECTIVE capabilities (browser_remote grant/veto applied), the one reading
+    # dispatch, boot and the mid-run gates share (Prism 17187502307d, t_6e8eac1c).
+    have = khc.mapped_caps(caps.cmap, host.lower())
     for s in dict.fromkeys(skills or ()):
         if not isinstance(s, str):
             continue
