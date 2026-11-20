@@ -70,10 +70,10 @@ def _get_cdp_override_raw() -> str:
     :func:`_get_cdp_override`: its 10s HTTP discovery against a stale ``cdp_url`` would stall every startup's
     schema build with no error.
     """
-    from tools.browser_lease import active_url
-    lease = active_url()   # the identity lease browser_navigate started (t_ce9bd5a3); never from env
+    from tools.browser_lease import override_url
+    lease = override_url()   # the identity lease browser_navigate selected (t_ce9bd5a3); never from env
     if lease:
-        return lease
+        return lease   # DEAD_URL once its child exited: fail closed, never the configured CDP (52ec81c4713e)
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     return env_override or _origin()._browser_cfg("cdp_url", "", lambda v: str(v or "").strip(), "browser.cdp_url from config")
 

@@ -184,13 +184,16 @@ def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str
     or None to proceed. ``cdp_url`` is the configured, unresolved override. ``host_side``: the
     caller connects from this (dispatcher) process, not from the pool host, so placement does
     not move the endpoint and only liveness counts."""
+    from tools.browser_lease import is_lease_url, unavailable_error
+    gone = unavailable_error()
+    if gone:   # a selected identity whose lease child exited: refuse, never fall back (Prism 52ec81c4713e)
+        return gone
     task = _owned_task()
     if not task or not cdp_url:
         return None
     from agent.proxy_bypass import is_loopback_host, split_host_port
     if not is_loopback_host(split_host_port(cdp_url)[0]):
         return None  # a remote CDP endpoint is reachable from any host
-    from tools.browser_lease import is_lease_url
     if is_lease_url(cdp_url):
         # the port the lease client this tool started printed, while that child lives (t_ce9bd5a3)
         return LEASE_HOST_SIDE if host_side else None

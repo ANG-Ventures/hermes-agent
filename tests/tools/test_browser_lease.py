@@ -30,7 +30,7 @@ EXPECTED = (
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    bl.close_lease()
+    bl.clear_lease()
     rp._emitted.clear()
     rp._probe_ok.clear()
     monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
@@ -40,7 +40,7 @@ def _clean(monkeypatch):
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
     monkeypatch.delenv("KANBAN_PLACEMENT_CAPS", raising=False)
     yield
-    bl.close_lease()
+    bl.clear_lease()
     rp._emitted.clear()
 
 
@@ -86,12 +86,17 @@ def test_the_lease_port_is_admitted_only_while_the_tools_own_child_lives(monkeyp
     assert rp.browser_rail_error(f"http://127.0.0.1:{port + 1}") == EXPECTED.format(host="ace-ai")
     # browser_cdp connects from this process: never to the pool host's lease port
     assert rp.browser_rail_error(url, host_side=True) == rp.LEASE_HOST_SIDE
-    # (2) the child ends (lease released or expired: browserctl exits) -> the same port is refused
+    # (2) the child ends (lease released or expired: browserctl exits) -> the same port is refused,
+    # and the selection holds: no fallback to the configured CDP (Prism 52ec81c4713e)
     lease.proc.stdin.close()
     lease.proc.wait(10)
     assert bl.active_url() == ""
-    assert rp.browser_rail_error(url) == EXPECTED.format(host="ace-ai")
+    assert rp.browser_rail_error(url).startswith("BROWSER_LEASE_UNAVAILABLE identity id-github-kyzcreig")
+    assert cdp._get_cdp_override_raw() == bl.DEAD_URL
+    # only an explicit clear gives the configured override back
+    bl.clear_lease()
     assert cdp._get_cdp_override_raw() == "http://127.0.0.1:9222"
+    assert rp.browser_rail_error(url) == EXPECTED.format(host="ace-ai")
 
 
 def test_an_expired_lease_is_refused_on_the_next_call(monkeypatch):
@@ -101,7 +106,7 @@ def test_an_expired_lease_is_refused_on_the_next_call(monkeypatch):
     if lease is not None:
         lease.proc.wait(10)
     assert bl.active_url() == ""
-    assert rp.browser_rail_error(f"http://127.0.0.1:{port}") == EXPECTED.format(host="ace-ai")
+    assert rp.browser_rail_error(f"http://127.0.0.1:{port}").startswith("BROWSER_LEASE_UNAVAILABLE")
 
 
 def test_a_refused_acquire_gives_no_port(monkeypatch):
@@ -110,6 +115,7 @@ def test_a_refused_acquire_gives_no_port(monkeypatch):
     lease, err = bl.open_lease("id-github-kyzcreig", "read", timeout=10)
     assert lease is None and "BROWSER_REMOTE_CLASS_REFUSED" in err
     assert bl.active_url() == ""
+    assert bl.unavailable_error().startswith("BROWSER_LEASE_UNAVAILABLE"), "a failed lease fails closed too"
 
 
 @pytest.mark.parametrize("klass", ["buy", "human", "identity", "--class=buy"])
@@ -214,7 +220,9 @@ def test_watcher_releases_when_the_tool_closes_its_stdin(tmp_path):
     assert p.stdout.readline().strip() == b"port=4711"
     p.stdin.close()
     assert _wait(released)
-    assert released.read_text(encoding="utf-8-sig") == f"with id-github-kyzcreig --class read --card t_lease001 -- {fwd} --serve"
+    got = released.read_text(encoding="utf-8-sig")
+    assert got.startswith("with id-github-kyzcreig --class read --card t_lease001 -- /usr/bin/python3 -I -c ")
+    assert got.endswith(f" {fwd} --serve") and bl.EXIT_LINE in got
     assert p.wait(15) == 143
 
 
@@ -238,3 +246,125 @@ def test_watcher_refuses_without_an_installed_client(tmp_path):
     out = subprocess.run([sys.executable, "-I", "-c", bl.watch_source(str(tmp_path / "nope"), ((str(tmp_path / "x"),),)),
                           "id-github-kyzcreig", "read", "t"], input=b"", capture_output=True, timeout=15)
     assert out.returncode == 2 and b"BROWSER_LEASE_CLIENT_ABSENT" in out.stdout
+
+
+def _cdp_server():
+    """A reachable CDP-shaped endpoint that is NOT the lease: /json/version answers 200."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"Browser": "configured", "webSocketDebuggerUrl": ""}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@pytest.mark.parametrize("where", ["placed-remote-cdp", "studio-loopback-cdp"])
+def test_a_dead_lease_never_falls_back_to_the_configured_browser(monkeypatch, where):
+    """Prism 52ec81c4713e: a reachable non-lease BROWSER_CDP_URL is set, the lease child is killed, and
+    browser_snapshot must refuse instead of running on the configured browser."""
+    import model_tools  # noqa: F401
+    from tools import browser_tool as bt
+    from tools.registry import registry
+    srv = None
+    if where == "placed-remote-cdp":
+        configured = "http://192.0.2.10:9222"   # not loopback: the rail admits it from any host
+    else:
+        monkeypatch.delenv(kwh.PLACEMENT_ENV)  # a worker on the dispatcher host: loopback is its own
+        srv = _cdp_server()
+        configured = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        monkeypatch.setenv("BROWSER_CDP_URL", configured)
+        monkeypatch.setattr("tools.rail_preflight.browser_capability_error", lambda: None)
+        monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: None)
+        ran = []
+        monkeypatch.setattr(bt, "browser_snapshot", lambda **kw: ran.append(kw) or json.dumps({"success": True}))
+        monkeypatch.setattr(bt, "browser_navigate", lambda url, task_id=None: json.dumps({"success": True}))
+        snap = lambda: json.loads(registry.dispatch("browser_snapshot", {}, task_id="t"))  # noqa: E731
+        assert snap() == {"success": True}, "control: before any lease the configured browser is used"
+        ran.clear()
+        _fake_client(monkeypatch, _free_port())
+        nav = json.loads(registry.dispatch("browser_navigate", {"url": "https://github.com",
+                                                                "lease_identity": "id-github-kyzcreig"}, task_id="t"))
+        assert nav == {"success": True}
+        lease = bl._active
+        os.kill(lease.proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        lease.proc.wait(10)
+        out = snap()
+        assert out.get("success") is not True and ran == []
+        assert out["error"].startswith("BROWSER_LEASE_UNAVAILABLE identity id-github-kyzcreig (read)")
+    finally:
+        if srv is not None:
+            srv.shutdown()
+
+
+def test_a_forwarder_exit_kills_the_grant_while_the_watcher_still_lives(monkeypatch):
+    """Prism f81ab96c1c7d: the forwarder exits (its port may be reused) while the watcher/browserctl are
+    still alive and releasing; the port is refused at once."""
+    port = _free_port()
+    body = textwrap.dedent(f"""
+        import sys
+        print("port={port}", flush=True)
+        sys.stdin.readline()                       # the test's go: the forwarder exits now
+        print("{bl.EXIT_LINE} rc=1", flush=True)   # what FORWARDER_SHIM prints
+        sys.stdin.read()                           # the watcher itself stays alive
+    """)
+    monkeypatch.setattr(bl, "_spawn", lambda *a: subprocess.Popen(
+        [sys.executable, "-c", body], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
+    lease, err = bl.open_lease("id-github-kyzcreig", timeout=10)
+    assert err is None
+    url = lease.url
+    assert rp.browser_rail_error(url) is None
+    lease.proc.stdin.write(b"go\n")
+    lease.proc.stdin.flush()
+    assert lease.gone.wait(10)
+    assert lease.proc.poll() is None, "the watcher is still alive"
+    assert not lease.alive() and not bl.is_lease_url(url)
+    assert rp.browser_rail_error(url).startswith("BROWSER_LEASE_UNAVAILABLE")
+
+
+def test_the_shim_announces_the_forwarder_exit_through_the_real_watcher(tmp_path, monkeypatch):
+    """End to end on the real watcher + FORWARDER_SHIM: browserctl stays up after its child exits (it is
+    still releasing), the forwarder is gone, and the tool drops the grant from the shim's line."""
+    if not os.path.exists("/usr/bin/python3"):
+        pytest.skip("the watcher runs the shim under /usr/bin/python3")
+    port = _free_port()
+    go = tmp_path / "go"
+    fwd = tmp_path / "fwd"
+    fwd.write_text(textwrap.dedent(f"""\
+        #!{sys.executable}
+        import os, time
+        print("port={port}", flush=True)
+        while not os.path.exists({str(go)!r}):
+            time.sleep(0.05)
+        """), encoding="utf-8")
+    fwd.chmod(0o755)
+    ctl = tmp_path / "browserctl"
+    ctl.write_text(textwrap.dedent(f"""\
+        #!{sys.executable}
+        import subprocess, sys, time
+        cmd = sys.argv[sys.argv.index("--") + 1:]
+        subprocess.Popen(cmd).wait()
+        time.sleep(60)                      # releasing: still alive after the forwarder exited
+        """), encoding="utf-8")
+    ctl.chmod(0o755)
+    monkeypatch.setattr(bl, "_spawn", lambda i, k, c: subprocess.Popen(
+        [sys.executable, "-I", "-c", bl.watch_source(str(ctl), ((str(fwd),),)), i, k, c],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
+    lease, err = bl.open_lease("id-github-kyzcreig", timeout=15)
+    assert err is None and lease.port == port
+    assert rp.browser_rail_error(lease.url) is None
+    go.write_text("", encoding="utf-8")
+    assert lease.gone.wait(15)
+    assert lease.proc.poll() is None, "watcher and browserctl still alive"
+    assert rp.browser_rail_error(lease.url).startswith("BROWSER_LEASE_UNAVAILABLE")
+    assert any(t.startswith(bl.EXIT_LINE) for t in lease.tail)
