@@ -2403,7 +2403,8 @@ def _provider_models_cache_path() -> Path:
 def _credential_fingerprint(provider: str) -> str:
     """Short hash of the credentials ``provider_model_ids(provider)`` would see right now.
 
-    API-key providers include their configured values and credential-file mtimes. Codex uses the
+    API-key providers include their configured values and credential-file mtimes; one probed by the
+    generic profile path uses only the key + base URL that probe resolves. Codex uses the
     stable principal selected by its read-only resolver: routine token and pool-state writes must
     not discard an account-scoped catalog, while a real account switch must invalidate it.
     """
@@ -2478,10 +2479,15 @@ def _credential_fingerprint(provider: str) -> str:
         except Exception:
             pass
 
+    profile_credential = _profile_probe_credential(provider)
     if provider == "openai-codex":
         from hermes_cli.codex_models import codex_catalog_credential_identity
 
         parts.append(f"codex_identity={codex_catalog_credential_identity()}")
+    elif profile_credential is not None:
+        # The generic profile probe reads exactly this key + base URL; a write to an unrelated
+        # shared credential file (auth.json pool state) must not orphan its live row (t_9523d203).
+        parts.append(f"profile_credential={profile_credential}")
     else:
         try:
             from hermes_constants import get_hermes_home
@@ -2498,6 +2504,25 @@ def _credential_fingerprint(provider: str) -> str:
     # blake2b, not sha256: fingerprint only (collisions = a harmless cache miss), and CodeQL's
     # weak-sensitive-data-hashing rule flags sha256 over env vars named *API_KEY*/*TOKEN*.
     return hashlib.blake2b(blob, digest_size=8).hexdigest()
+
+
+def _profile_probe_credential(provider: str) -> Optional[str]:
+    """``api_key|base_url`` that :func:`_profile_live_catalog` probes *provider* with, or ``None``
+    when its catalog comes from somewhere else (a dedicated fetcher, a relay, a non-api-key auth)."""
+    if provider in _PROVIDER_CATALOG_FETCHERS:
+        return None
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider)
+        if profile is None or profile.auth_type != "api_key" or not profile.base_url:
+            return None
+        if _configured_relay_base_url(provider):
+            return None
+        api_key, base_url = _api_key_credentials(provider)
+        return f"{api_key}|{base_url or profile.base_url}"
+    except Exception:
+        return None
 
 
 def _load_provider_models_cache() -> dict:
