@@ -476,3 +476,86 @@ def test_cron_job_pinned_to_a_slot_records_the_slot(bb, monkeypatch):
     # A resolve-time fallback rung replaced the model: the slot no longer describes it.
     monkeypatch.setattr(sched, "_resolve_job_runtime", lambda job, jid, c: ({"provider": "x"}, "other-id"))
     assert sched._resolve_cron_agent_setup({"model": "sol"}, "j1", "job", jc).model_slot == ""
+
+
+# ── t_a8fd1cfa round 2: Prism keys from #484 ──────────────────────────────────
+
+def test_cron_adopt_slot_on_a_startup_literal_rung_leaves_the_rungs_slot(bb, monkeypatch):
+    # Prism c-6d13182ef4419be1: a cron job pinned to sol whose primary has no credentials at init
+    # starts on a literal rung. adopt_slot must leave the active _model_slot as the rung's: the row
+    # is (rung id, ''). The init snapshot here is the RUNG's route (restore returns to qwen-lit,
+    # not gpt-6.2-sol), so the slot must not go into it either: that would record (qwen-lit, 'sol')
+    # and refresh_slot_for_turn would then switch the rung's provider to sol.
+    from unittest.mock import MagicMock, patch
+
+    from agent import fallback_policy as fp
+    from agent.model_slots import adopt_slot, refresh_slot_for_turn, served_slot
+    from run_agent import AIAgent
+
+    client = MagicMock()
+    client.base_url = "http://127.0.0.1:8317/v1"
+    client.api_key = "fb-key"
+
+    def _resolve(provider, model=None, **kw):
+        return (client, model) if provider == "custom" else (None, None)
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve),
+        patch("hermes_cli.fallback_config.resolve_entry_api_key", lambda entry: None),
+    ):
+        agent = AIAgent(model=SOL_ID, provider="alibaba-coding-plan",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True,
+                        fallback_model=[{"provider": "custom", "model": "qwen-lit",
+                                         "base_url": "http://127.0.0.1:8317/v1"}])
+    agent.client = MagicMock()
+    assert agent._fallback_activated and (agent.model, agent.provider) == ("qwen-lit", "custom")
+
+    adopt_slot(agent, "sol")  # what _construct_cron_agent does for a job pinned to sol
+    assert not agent._model_slot and agent._primary_runtime["model_slot"] is None
+    row = _end(bb, "turn_cron_rung", agent.model, model_slot=served_slot(agent))
+    assert (row["model"], row["model_slot"]) == ("qwen-lit", "")
+
+    monkeypatch.setattr("agent.fallback_wiring.restore_allowed",
+                        lambda *a, **k: fp.Decision(True, None, "test"))
+    monkeypatch.setattr("agent.agent_runtime_helpers._rebuild_primary_client", lambda *a, **k: None)
+    switched = []
+    monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                        lambda a, m, p, **k: switched.append((m, p)))
+    assert agent._restore_primary_runtime() is True
+    assert (agent.model, agent.provider, served_slot(agent)) == ("qwen-lit", "custom", "")
+    assert refresh_slot_for_turn(agent) is False and switched == []
+
+
+def test_reprice_does_not_read_a_recorded_slot_row_through_todays_view(bb):
+    # Prism c-4d6b1a8a83f7d416: a non-empty recorded slot already decides. A row that ran on the
+    # literal id 'sol' through slot 'opus' is not unresolved just because today's view maps 'sol'.
+    from plugins.blackbox import store
+    from plugins.blackbox.cost import compute_turn_cost
+
+    assert store._unresolved_slot_row("sol", "opus") is False
+    assert store._unresolved_slot_row("sol", "sol") is True
+    assert store._unresolved_slot_row("sol", "") is True
+    assert store._unresolved_slot_row("sol", None) is False
+
+    (bb._root / "config" / "model-slots.json").unlink()
+    _end(bb, "turn_opus_sol", "sol", model_slot="opus")
+    con = sqlite3.connect(str(store._db_path()))
+    con.execute("UPDATE turns SET cost_usd=NULL, cost_status=NULL, cost_uncached_usd=NULL, "
+                "cost_cache_read_usd=NULL, cost_cache_write_usd=NULL, cost_output_usd=NULL "
+                "WHERE turn_id='turn_opus_sol'")
+    con.commit()
+    con.close()
+    _write_view(bb._root, {"sol": FLIP_ID})
+    seen = []
+
+    def fn(m, p, t):
+        seen.append(m)
+        return compute_turn_cost(m, p, None, [dict(
+            input_tokens=t["input_tokens"], output_tokens=t["output_tokens"],
+            cache_read_tokens=t["cache_read_tokens"], cache_write_tokens=t["cache_write_tokens"])])
+
+    store.reprice_unpriced(fn, apply=False)
+    assert "sol" in seen  # the row reached pricing by its recorded id

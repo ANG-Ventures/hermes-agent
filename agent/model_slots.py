@@ -65,13 +65,15 @@ def adopt_slot(agent: Any, slot: str) -> None:
     """Record ``slot`` as the slot of an agent built from its already-resolved id (cron, t_a8fd1cfa).
 
     Routing is untouched: ``agent.model`` stays the id the caller resolved. The init snapshot gets
-    the slot too, so a later primary restore keeps it. No-op when init already found a slot.
+    the slot too, so a later primary restore keeps it. No-op when init already found a slot, and
+    when init started on a fallback rung: then the rung serves and the init snapshot is the rung's
+    route, so neither may carry the primary's slot (the row would pair it with the rung's id).
     """
-    if not slot or getattr(agent, "_model_slot", None):
+    if not slot or getattr(agent, "_model_slot", None) or getattr(agent, "_fallback_activated", False):
         return
     agent._model_slot = slot
     rt = getattr(agent, "_primary_runtime", None)
-    if isinstance(rt, dict) and not getattr(agent, "_fallback_activated", False):
+    if isinstance(rt, dict):
         rt["model_slot"] = slot
 
 

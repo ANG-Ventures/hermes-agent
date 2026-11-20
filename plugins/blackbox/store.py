@@ -1836,14 +1836,14 @@ _ZERO_PERCLASS = {"uncached": 0.0, "cache_read": 0.0, "cache_write": 0.0, "outpu
 def _unresolved_slot_row(model: Any, model_slot: Any) -> bool:
     """True when a row written with the model_slot column still carries a slot name as its model.
 
-    Either the recorded slot itself, or (``model_slot`` ``''``) a model that is a slot name in
-    today's view (t_a8fd1cfa). Only pre-column rows (``model_slot`` NULL) are read through the view.
+    Either the recorded slot itself, or (only for ``model_slot`` ``''``) a model that is a slot name
+    in today's view (t_a8fd1cfa). Only pre-column rows (``model_slot`` NULL) are read through the view.
     """
     if model_slot is None:
         return False
     slot = str(model_slot).strip().lower()
-    if slot and str(model or "").strip().lower().rsplit("/", 1)[-1] == slot.rsplit("/", 1)[-1]:
-        return True
+    if slot:  # a recorded slot already decides; today's view is not consulted
+        return str(model or "").strip().lower().rsplit("/", 1)[-1] == slot.rsplit("/", 1)[-1]
     try:
         from hermes_cli.model_registry import slot_resolve
 
