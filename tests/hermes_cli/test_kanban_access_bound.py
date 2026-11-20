@@ -3,8 +3,9 @@ Phase 2c, AC-23; card t_e99ef75c).
 
 A card whose WORK is on host X (or the board) but whose ACCESS exists only on
 the Studio is named ``access_bound:<cap>``: ``ssh-root:<host>`` (``ssh <alias>
-... sudo ...``) or ``control-plane-read`` (a path to kanban.db / gateway.log /
-load_gate.json / kanban-pool.json, or ``requires: control-plane-read``). It
+... sudo ...``) or ``control-plane-read`` (``requires: control-plane-read``; since t_b720fdea a
+live path to kanban.db / gateway.log / load_gate.json / kanban-pool.json no
+longer binds, it is a create-time notice). It
 used to fall out as ``host_reach`` (fail-closed residue) or needed a
 hand-typed ``host: studio``. Evaluated before ``host_reach`` (Momus pass 2
 R-F) and before every pin branch: a pool pin on such a card parks
@@ -29,7 +30,8 @@ ALIASES = ("ci-box", "ace-ai", "ace-media", "ci", "ci.ace", "mac-studio-m3u")
 PIN_ALIASES = {"ci": "ci-box", "ci.ace": "ci-box", "ci-box": "ci-box", "ace-ai": "ace-ai",
                "ace-media": "ace-media", "studio": "studio"}
 SETPCI = "Step 1: ssh ci-box sudo setpci -s 01:00.0 CAP_EXP+30.w=0003:000f\n"
-KANBAN_DB = "P0-1: sqlite3 -readonly ~/.hermes/kanban.db 'select count(*) from task_links'\n"
+KANBAN_DB_PROSE = "P0-1: sqlite3 -readonly ~/.hermes/kanban.db 'select count(*) from task_links'\n"
+KANBAN_DB = "requires: control-plane-read\n" + KANBAN_DB_PROSE
 
 
 @pytest.fixture(autouse=True)
@@ -115,11 +117,8 @@ def test_kanban_db_path_is_access_bound_control_plane_read():
 
 
 @pytest.mark.parametrize("body", [
-    "tail -n 200 ~/.hermes/logs/gateway.log | grep pin_host\n",
-    "cat ~/.hermes/fleet/kanban-pool.json\n",
-    "jq . $HERMES_HOME/load_gate.json\n",
-    "jq . \"${HERMES_HOME}/load_gate.json\"\n",
     "requires: control-plane-read\nRead the board.\n",
+    "requires: control-plane-read\ntail -n 200 ~/.hermes/logs/gateway.log | grep pin_host\n",
 ])
 def test_every_control_plane_trigger(body):
     assert _portable(body) == (False, "access_bound:control-plane-read", None)
@@ -151,19 +150,44 @@ def test_repo_relative_control_plane_path_is_portable(body):
     assert _portable(body) == (True, None, "policy")
 
 
+LIVE_PATHS = [
+    (KANBAN_DB_PROSE, "~/.hermes/kanban.db"),                                   # ~-rooted live board
+    ("sqlite3 /Users/alexgierczyk/.hermes/kanban.db .tables\n", "/Users/alexgierczyk/.hermes/kanban.db"),
+    ("jq . $HOME/.hermes/fleet/kanban-pool.json\n", "$HOME/.hermes/fleet/kanban-pool.json"),
+    ("tail -n 200 ~/.hermes/logs/gateway.log | grep pin_host\n", "~/.hermes/logs/gateway.log"),
+    ("jq . $HERMES_HOME/load_gate.json\n", "$HERMES_HOME/load_gate.json"),
+    ("jq . \"${HERMES_HOME}/load_gate.json\"\n", "${HERMES_HOME}/load_gate.json"),
+    ("tail logs/gateway.log\n", "logs/gateway.log"),                             # the live logs/ dir
+    ("jq . state/load_gate.json\n", "state/load_gate.json"),                     # the live state/ dir
+    ("cat ./kanban.db\n", "./kanban.db"),
+    ("Edit fleet/kanban-pool.json, then check ~/.hermes/kanban.db\n", "~/.hermes/kanban.db"),
+]
+
+
+@pytest.mark.parametrize("body,path", LIVE_PATHS)
+def test_live_control_plane_path_no_longer_pins(body, path):
+    """t_b720fdea, RED ON BASE: (False, 'access_bound:control-plane-read', None). A body that only NAMES a live
+    control-plane file runs on a pool host (it reads the Studio copy over ``ssh studio``); the path is reported."""
+    ok, rule, _rc = _portable(body)
+    assert not (rule or "").startswith(pr.ACCESS_BOUND), rule
+    assert kwp.control_plane_prose(body) == (path,)
+
+
+@pytest.mark.parametrize("body,_path", LIVE_PATHS)
+def test_declared_control_plane_read_still_binds_and_is_not_reported(body, _path):
+    """MUTATION (bind nothing): the explicit declaration keeps the card on the Studio, and no notice fires."""
+    declared = "requires: control-plane-read\n" + body
+    assert _portable(declared) == (False, "access_bound:control-plane-read", None)
+    assert kwp.control_plane_prose(declared) == ()
+
+
 @pytest.mark.parametrize("body", [
-    KANBAN_DB,                                                       # ~-rooted live board
-    "sqlite3 /Users/alexgierczyk/.hermes/kanban.db .tables\n",       # absolute home path
-    "jq . $HOME/.hermes/fleet/kanban-pool.json\n",                   # $HOME-rooted live pool file
-    "tail logs/gateway.log\n",                                        # the live logs/ dir
-    "jq . state/load_gate.json\n",                                    # the live state/ dir
-    "cat ./kanban.db\n",
-    "Edit fleet/kanban-pool.json, then check ~/.hermes/kanban.db\n",  # one live path on the line binds
-    "requires: control-plane-read\nEdit fleet/kanban-pool.json in a PR.\n",  # explicit override still binds
+    "Edit fleet/kanban-pool.json in hermes-home: add ace-media to priority, open a PR.\n",
+    "Fix the kanban.db schema migration in hermes_cli/kanban_db.py\n",
+    "The board database file in the Studio home is read over ssh studio.\n",
 ])
-def test_live_control_plane_path_still_binds(body):
-    """MUTATION (bind nothing): every live form and the explicit declaration keep the card on the Studio."""
-    assert _portable(body) == (False, "access_bound:control-plane-read", None)
+def test_prose_without_a_live_path_is_not_reported(body):
+    assert kwp.control_plane_prose(body) == ()
 
 
 def test_quoted_remote_command_with_and_and_still_binds():
@@ -428,3 +452,29 @@ def test_nas_admin_card_starts_on_a_pool_host_that_advertises_it(home, monkeypat
         res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_limit=4, spillover=p,
                                 reconcile_orphans=False)
     assert spawned and spawned[0][0] == tid and spawned[0][1] in ("ci-box", "ace-media"), (spawned, res.routes)
+
+
+# -- t_b720fdea: the create-time notice that replaced the body pin --------------------------
+
+def _comments(conn, tid):
+    return [r[0] for r in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (tid,))]
+
+
+def test_create_names_the_live_path_and_the_fix(home, capsys):
+    """RED ON BASE: no notice (the path pinned the card to the Studio instead)."""
+    from hermes_cli import kanban_studio_pin as ksp
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="p0", assignee="alpha", body=KANBAN_DB_PROSE)
+        notes = [c for c in _comments(conn, tid) if c.startswith(ksp.CP_PROSE_PREFIX)]
+    assert len(notes) == 1, notes
+    assert "`~/.hermes/kanban.db`" in notes[0]
+    assert "requires: control-plane-read" in notes[0] and "ssh studio" in notes[0]
+    assert ksp.CP_PROSE_PREFIX in capsys.readouterr().err
+
+
+def test_create_with_the_declaration_posts_no_notice(home, capsys):
+    from hermes_cli import kanban_studio_pin as ksp
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="p0", assignee="alpha", body=KANBAN_DB)
+        assert not [c for c in _comments(conn, tid) if c.startswith(ksp.CP_PROSE_PREFIX)]
+    assert ksp.CP_PROSE_PREFIX not in capsys.readouterr().err
