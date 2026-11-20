@@ -25,6 +25,7 @@ worker exited, or the worker was killed and the ssh session dropped) or it gets 
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import re
 import subprocess
@@ -122,6 +123,10 @@ class Lease:
     tail: List[str] = field(default_factory=list)
     # set when the forwarder announced its exit or the child's stdout ended (``_read_port``)
     gone: threading.Event = field(default_factory=threading.Event)
+    # t_62be0ba9: lease_id / identity / class / expires_at from browserctl's grant line; ``released`` its release line
+    grant: dict = field(default_factory=dict)
+    # set when the child's stdout ended: every line it printed (the release line too) has been read
+    closed: threading.Event = field(default_factory=threading.Event)
 
     @property
     def url(self) -> str:
@@ -160,11 +165,32 @@ def _redact(line: str) -> str:
     return _URL_VALUE.sub(r'\1"<redacted>"', line)
 
 
+GRANT_KEYS = ("lease_id", "identity", "class", "expires_at")   # t_62be0ba9: never a *_url, token or ticket
+RELEASE_LINE = "browserctl with: released="
+
+
+def _grant_fields(line: str) -> dict:
+    """The grant JSON browserctl prints on stderr before it runs the forwarder: only ``GRANT_KEYS``."""
+    if not line.startswith("{"):
+        return {}
+    try:
+        g = json.loads(line)
+    except ValueError:
+        return {}
+    if not isinstance(g, dict) or "lease_id" not in g:
+        return {}
+    return {k: g.get(k) for k in GRANT_KEYS}
+
+
 def _read_port(proc: subprocess.Popen, tail: List[str], timeout: float,
-               gone: Optional[threading.Event] = None) -> Optional[int]:
+               gone: Optional[threading.Event] = None, grant: Optional[dict] = None,
+               closed: Optional[threading.Event] = None) -> Optional[int]:
     """Drain the child's stdout for its whole life (keeps tail lines); return the first ``port=N``.
-    ``gone`` is set when the forwarder announces its exit or the stdout ends."""
+    ``gone`` is set when the forwarder announces its exit or the stdout ends; ``grant`` gets the grant's
+    ``GRANT_KEYS`` and browserctl's release line; ``closed`` is set when the stdout ends."""
     gone = gone if gone is not None else threading.Event()
+    grant = grant if grant is not None else {}
+    closed = closed if closed is not None else threading.Event()
     got: dict = {}
     ready = threading.Event()
 
@@ -175,6 +201,10 @@ def _read_port(proc: subprocess.Popen, tail: List[str], timeout: float,
                 continue
             tail.append(_redact(line)[:300])
             del tail[:-8]
+            if "lease_id" not in grant:
+                grant.update(_grant_fields(line))
+            if line.startswith(RELEASE_LINE):
+                grant["released"] = line[len(RELEASE_LINE):].split()[0]
             if line.startswith(EXIT_LINE):
                 gone.set()
                 ready.set()
@@ -189,6 +219,7 @@ def _read_port(proc: subprocess.Popen, tail: List[str], timeout: float,
                     ready.set()
         gone.set()
         ready.set()
+        closed.set()
     threading.Thread(target=drain, name="browser-lease-stdout", daemon=True).start()
     ready.wait(timeout)
     return got.get("port")
@@ -249,9 +280,9 @@ def open_lease(identity: str, klass: str = "read", *, card: str = "",
         except Exception as e:
             return None, f"could not start the lease client: {e}"
         tail: List[str] = []
-        gone = threading.Event()
-        port = _read_port(proc, tail, timeout, gone)
-        lease = Lease(identity, klass, port or 0, proc, tail, gone)
+        gone, closed, grant = threading.Event(), threading.Event(), {}
+        port = _read_port(proc, tail, timeout, gone, grant, closed)
+        lease = Lease(identity, klass, port or 0, proc, tail, gone, grant, closed)
         if port is None or not lease.alive():
             _end(lease)
             time.sleep(0.05)
@@ -259,6 +290,39 @@ def open_lease(identity: str, klass: str = "read", *, card: str = "",
             return None, f"browser lease {identity} ({klass}) not granted: {why}"
         _active = lease
         return lease, None
+
+
+def lease_info(lease: Optional[Lease] = None) -> Optional[dict]:
+    """t_62be0ba9: what the model may know about the live lease: its id, identity, class and expiry (the grant's;
+    heartbeats renew it while the lease is held). None when no lease is live."""
+    with _lock:
+        lease = lease if lease is not None else _active
+    if lease is None or not lease.alive():
+        return None
+    g = lease.grant
+    return {"lease_id": g.get("lease_id"), "identity": g.get("identity") or lease.identity,
+            "class": g.get("class") or lease.klass, "expires_at": g.get("expires_at"),
+            "release": "browser_lease_release"}
+
+
+def release_lease() -> dict:
+    """t_62be0ba9: release THIS process's own lease (the one its browser_navigate started) and nothing else, and
+    wait for browserctl's release answer. The selection stays, so later browser calls fail closed."""
+    global _active
+    with _lock:
+        lease, _active = _active, None
+    if lease is None:
+        return {"success": True, "released": False, "detail": "this run holds no browser lease"}
+    _end(lease)
+    lease.closed.wait(5)
+    g = lease.grant
+    ans = g.get("released") or ""
+    # browserctl prints ``released=<lease id>`` (browserd's release answer) or ``released=<refusal token>``
+    ok = ans.isdigit() and (g.get("lease_id") is None or ans == str(g.get("lease_id")))
+    out = {"lease_id": g.get("lease_id"), "identity": lease.identity, "class": lease.klass,
+           "released": ok, "release_answer": ans or "no release line read"}
+    out["success"] = out["released"]
+    return out
 
 
 def selected() -> Optional[Tuple[str, str]]:
