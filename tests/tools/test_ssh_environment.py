@@ -198,7 +198,7 @@ def test_remote_group_kill_reaps_the_whole_tree(body, monkeypatch, tmp_path):
 
     monkeypatch.setenv("HOME", str(tmp_path))
     token = uuid.uuid4().hex
-    tree = subprocess.Popen(["bash", "-c", ssh_env._run_preamble(token) + body], start_new_session=True,
+    tree = subprocess.Popen(["bash", "-c", ssh_env._run_script(token, body)], start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     want = 3 if body.startswith("(") else 2
     try:
@@ -232,9 +232,70 @@ def test_remote_group_kill_reaps_the_whole_tree(body, monkeypatch, tmp_path):
 def test_finished_command_leaves_no_pidfile_and_kill_is_a_noop(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     token = uuid.uuid4().hex
-    subprocess.run(["bash", "-c", ssh_env._run_preamble(token) + "true"], check=True, timeout=10)
+    subprocess.run(["bash", "-c", ssh_env._run_script(token, "true")], check=True, timeout=10)
     assert not os.path.exists(_pidfile(token))
     assert subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=10).returncode == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+@pytest.mark.parametrize("body,rc", [
+    # write_file's atomic-write script sets its own EXIT trap, then clears it (t_70090b16: one
+    # leaked pidfile per write_file/patch on every pool host).
+    ("trap 'rm -f /nonexistent' EXIT; true; trap - EXIT", 0),
+    ("trap 'true' EXIT; exit 4", 4),
+    ("exec true", 0),
+    ("eval 'exec sh -c \"exit 5\"'", 5),
+    ("kill -KILL $BASHPID", 128 + 9),
+    ("echo \"$$\" >&2; true", 0),
+], ids=["user-trap-cleared", "user-trap-exit", "top-level-exec", "eval-exec", "command-sigkilled", "dollar-dollar"])
+def test_command_end_removes_pidfile_whatever_the_command_does(body, rc, monkeypatch, tmp_path):
+    """t_70090b16: the pidfile goes when the command ends, even when the command replaces the
+    EXIT trap, ``exec``s, or is SIGKILLed; exit status passes through."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = uuid.uuid4().hex
+    res = subprocess.run(["bash", "-c", ssh_env._run_script(token, body)], timeout=10,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    assert res.returncode == rc
+    assert not os.path.exists(_pidfile(token))
+    if body.startswith("echo"):
+        # ``$$`` is still the pid the pidfile recorded (the group leader the kill path signals)
+        assert res.stderr.strip().isdigit()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_stale_pidfile_sweep_removes_dead_keeps_live_and_foreign(monkeypatch, tmp_path):
+    """t_70090b16: a wrapper killed outright cannot clean up; the next start sweeps files whose pid
+    is dead, and touches nothing outside its own name pattern."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    run_dir = tmp_path / ".hermes-run"
+    run_dir.mkdir(mode=0o700)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    live = subprocess.Popen(["sleep", "60"])
+    try:
+        files = {
+            "dead": (f"hermes-run-{uuid.uuid4().hex}.pid", f"{dead.pid}\n"),
+            "live": (f"hermes-run-{uuid.uuid4().hex}.pid", f"{live.pid}\n"),
+            "empty": (f"hermes-run-{uuid.uuid4().hex}.pid", ""),  # pid not written yet
+            "foreign_name": (f"other-{uuid.uuid4().hex}.pid", f"{dead.pid}\n"),
+            "short_token": ("hermes-run-abc.pid", f"{dead.pid}\n"),
+        }
+        for name, content in files.values():
+            (run_dir / name).write_text(content)
+        rc = subprocess.run(["sh", "-c", ssh_env._stale_pidfile_sweep_command()], timeout=30).returncode
+        assert rc == 0
+        left = {k for k, (name, _) in files.items() if (run_dir / name).exists()}
+        assert left == {"live", "empty", "foreign_name", "short_token"}
+    finally:
+        live.kill()
+        live.wait()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_stale_pidfile_sweep_without_dir_is_a_noop(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert subprocess.run(["sh", "-c", ssh_env._stale_pidfile_sweep_command()], timeout=10).returncode == 0
+    assert not (tmp_path / ".hermes-run").exists()
 
 
 class TestControlSocketPath:
@@ -375,6 +436,7 @@ def _mock_ssh_runtime(monkeypatch, tmp_path):
     hooks = {
         "_establish_connection": MagicMock(),
         "_detect_remote_home": MagicMock(return_value="/home/alice"),
+        "_sweep_stale_pidfiles": MagicMock(),
         "_ensure_remote_dirs": MagicMock(),
         "init_session": MagicMock(),
     }
