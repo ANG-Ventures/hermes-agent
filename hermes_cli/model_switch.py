@@ -134,6 +134,15 @@ def format_model_for_display(model_name: str) -> str:
     return model_name
 
 
+def format_switch_target(model_name: str) -> str:
+    """/model confirmation text: ``sol -> gpt-6.2-sol`` for a slot, else :func:`format_model_for_display`."""
+    from hermes_cli.model_registry import slot_resolve
+    resolved, slot = slot_resolve(model_name)
+    if slot:
+        return f"{format_model_for_display(slot)} -> {format_model_for_display(resolved)}"
+    return format_model_for_display(model_name)
+
+
 def is_nous_hermes_non_agentic(model_name: str) -> bool:
     """True if *model_name* is a real Nous Hermes 3/4 chat model (single owner; cli.py uses it too)."""
     return bool(model_name and _NOUS_HERMES_NON_AGENTIC_RE.search(model_name))

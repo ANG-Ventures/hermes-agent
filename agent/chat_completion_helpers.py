@@ -3915,6 +3915,10 @@ def try_activate_fallback(
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
+        # A rung named by slot (``sol``) runs on the slot's current id: every check below, the
+        # client and the wire see the id.
+        from hermes_cli.model_registry import slot_resolve
+        fb_model = slot_resolve(fb_model)[0] or fb_model
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
         quota_skipped = getattr(agent, "_quota_gate_skipped_providers", set()) or set()

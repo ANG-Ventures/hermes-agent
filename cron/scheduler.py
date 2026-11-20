@@ -2767,6 +2767,9 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             f"`hermes cron edit {job_id} --model <name>` or set a "
             "default with `hermes model <name>`."
         )
+    # A slot (``sol``, ``cpa/sol``) in the job, cron.model or the profile default runs as its id.
+    from hermes_cli.model_registry import slot_resolve
+    model = slot_resolve(model)[0]
 
     with contextlib.suppress(Exception):
         from hermes_constants import apply_ipv4_preference

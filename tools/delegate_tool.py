@@ -4097,6 +4097,9 @@ def _delegate_task_impl(
         from hermes_cli.model_policy import flagship_model_match, validate_worker_model
 
         model, provider = resolve_model_pair_for_storage(model, provider)
+        # A slot (``sol``) is checked by policy and the registry, and run, as its current id.
+        from hermes_cli.model_registry import slot_resolve
+        model = slot_resolve(model)[0]
         try:
             reason = validate_worker_model(model, allow_flagship_reason=allow_flagship_reason)
             # An id the lane does not serve fails every child turn with a 404 (t_d564a8dd);
