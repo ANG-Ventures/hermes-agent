@@ -289,6 +289,28 @@ def test_reader_takes_a_per_host_ssh_user_and_falls_back_to_the_top_level(tmp_pa
     assert by == {"ace-ai": "ace", "ace-media": "alexgierczyk"}
 
 
+def test_reader_ignores_a_reach_row_probed_under_another_login(tmp_path):
+    """Prism dcd859b63482: the matrix cron re-probes once a day (rows stay fresh 36 h). After a
+    host flips to its owner login, its kanbanw row proves nothing for the new login: its reach,
+    caps and logins are dropped until a row probed as the new login arrives."""
+    side = _write_pool(tmp_path)
+    side["hosts"]["ace-ai"]["ssh_user"] = "ace"
+    _write_pool(tmp_path, sidecar=side)
+    row = {"at": time.time(), "reach": {"studio": 0}, "caps": {"studio-state": True},
+           "logins": {"studio": "kanbanw"}, "user": "kanbanw"}
+    doc = {"schema": 1, "hosts": {"ace-ai": dict(row), "ace-media": dict(row)}}
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(cfg.reach) == {"ace-media"} and cfg.reach_status == "ok"
+    assert set(cfg.caps) == {"ace-media"} and set(cfg.reach_logins) == {"ace-media"}
+    assert any("ace-ai was probed as kanbanw" in w for w in cfg.warnings)
+    # the re-probe as the new login is read again
+    doc["hosts"]["ace-ai"]["user"] = "ace"
+    (tmp_path / kwp.REACH_FILE).write_text(json.dumps(doc))
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert set(cfg.reach) == {"ace-ai", "ace-media"} and not any("probed as" in w for w in cfg.warnings)
+
+
 @pytest.mark.parametrize("where,value", [
     ("top", None), ("top", ""), ("top", "root"), ("top", "a b"), ("top", 5), ("top", "-oProxyCommand=x"),
     ("row", ""), ("row", "root"), ("row", "ace@ci-box"), ("row", None),

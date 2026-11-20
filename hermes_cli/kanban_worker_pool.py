@@ -485,6 +485,20 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     # Not a pool-drift warning: a missing matrix is the normal pre-cron state
     # and the classifier is fail-closed without it (reach_status carries it).
     reach, aliases, reach_status = read_reach(fleet_dir)
+    caps, reach_logins = read_caps(fleet_dir), read_reach_logins(fleet_dir)
+    # A row probed under another login (the kanbanw row of a host just cut over
+    # to its owner, t_5e87455b) proves nothing for the new login: drop its
+    # reach, caps and logins until the matrix cron re-probes it (fail closed).
+    probed = read_reach_users(fleet_dir)
+    for h in hosts:
+        was = probed.get(h.name.lower())
+        if was is not None and was != h.ssh_user:
+            warnings.append(f"kanban pool: reach row for {h.name} was probed as {was}, "
+                            f"worker login is {h.ssh_user} (row ignored until re-probed)")
+            for table in (reach, caps, reach_logins):
+                table.pop(h.name.lower(), None)
+    if reach_status == "ok" and not reach:
+        reach_status = "stale"
     # ``hosts`` is every host the pool files KNOW, placement-eligible or not:
     # a pin on a dropped host (role but no row, row not in priority) must
     # still resolve as a pin and wait at take(), never fall back (Prism 4271004b).
@@ -496,8 +510,8 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         reach=reach, reach_aliases=aliases, reach_status=reach_status,
         ssh_hosts=known_ssh_hosts(fleet_dir),
         pin_aliases=pin_aliases(fleet_dir),
-        caps=read_caps(fleet_dir),
-        reach_logins=read_reach_logins(fleet_dir),
+        caps=caps,
+        reach_logins=reach_logins,
     )
 
 
@@ -646,6 +660,18 @@ def read_reach_logins(fleet_dir: Path) -> Dict[str, Dict[str, str]]:
             out[hid.lower()] = {a.lower(): u for a, u in table.items()
                                 if isinstance(a, str) and a and isinstance(u, str) and u}
     return out
+
+
+def read_reach_users(fleet_dir: Path) -> Dict[str, str]:
+    """``{host: login the matrix row was probed as}`` (each row's ``user``).
+    Rows without one are left out."""
+    try:
+        doc = _read_json(Path(fleet_dir) / REACH_FILE)
+    except (OSError, ValueError):
+        return {}
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    return {hid.lower(): row["user"] for hid, row in (hosts.items() if isinstance(hosts, dict) else ())
+            if isinstance(hid, str) and isinstance(row, dict) and isinstance(row.get("user"), str)}
 
 
 _HOST_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
