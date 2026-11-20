@@ -43,6 +43,12 @@ def _placed_lease_env_names() -> tuple[str, ...]:
     return tuple(n for n in LEASE_ENV_NAMES if os.environ.get(n))
 
 
+# exits 97 unless the forced command fleet-worker-shell set FLEET_WORKER_SESSION=1 (t_3911e84c);
+# kept byte-identical to hermes_cli.kanban_worker_pool.WORKER_SESSION_GUARD (a test pins it)
+WORKER_SESSION_GUARD = ('[ "${FLEET_WORKER_SESSION:-}" = 1 ] || '
+                        '{ echo "not a fleet worker session" >&2; exit 97; }; ')
+
+
 def control_socket_path(user: str, host: str, port: int, control_scope: str = "", *, probe: str = "",
                         key_path: str = "") -> Path:
     """The plain ControlMaster socket for ``user@host:port`` (+ a kanban run's ``control_scope``). The kanban
@@ -205,8 +211,11 @@ class SSHEnvironment(BaseEnvironment):
         # key turns auth off: ssh would fall back to the ssh_config IdentityFile, the owner's key (t_3911e84c).
         if not self.key_path:
             return flags
-        flags += ["-i", self.key_path, "-o", "IdentitiesOnly=yes"]
-        if not os.access(self.key_path, os.R_OK):
+        # expanded once, here: os.access() reads a literal "~/..." as missing (a04c57100fc5)
+        key = os.path.expanduser(self.key_path)
+        # IdentityAgent=none: no agent key (the owner's, if loaded) is ever offered (fb4485599af6)
+        flags += ["-i", key, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none"]
+        if not os.access(key, os.R_OK):
             flags += ["-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no",
                       "-o", "KbdInteractiveAuthentication=no"]
         return flags
@@ -235,9 +244,15 @@ class SSHEnvironment(BaseEnvironment):
         cmd.append(f"{self.user}@{self.host}")
         return cmd
 
+    def _guarded(self, remote_cmd: str) -> str:
+        """``remote_cmd`` behind the worker-session guard when a worker key is pinned (t_3911e84c
+        fb4485599af6): ssh may still log in with the ssh_config IdentityFile, the owner's key, past the
+        forced command that exports FLEET_WORKER_SESSION=1. Same text as kanban_worker_pool's guard."""
+        return WORKER_SESSION_GUARD + remote_cmd if self.key_path else remote_cmd
+
     def _run_ssh(self, remote_cmd: str, timeout: float) -> subprocess.CompletedProcess:
         """Run one remote shell command over the multiplexed connection, capturing output."""
-        return run_capture(self._build_ssh_command() + [remote_cmd], timeout=timeout)
+        return run_capture(self._build_ssh_command() + [self._guarded(remote_cmd)], timeout=timeout)
 
     def _run_ssh_checked(self, remote_cmd: str, timeout: float, reason: str, subject: str) -> None:
         result = self._run_ssh(remote_cmd, timeout=timeout)
@@ -299,7 +314,7 @@ class SSHEnvironment(BaseEnvironment):
             # then fails and retries on every tool call. (Not run_capture: that
             # closes stdin.)
             result = subprocess.run(
-                self._build_ssh_command() + ["xargs -0 mkdir -p --"],
+                self._build_ssh_command() + [self._guarded("xargs -0 mkdir -p --")],
                 input="\0".join(parents) + "\0", capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=30)
             if result.returncode != 0:
@@ -328,7 +343,8 @@ class SSHEnvironment(BaseEnvironment):
 
             # --no-overwrite-dir keeps tar from stamping the staging dir's mode onto
             # existing dirs (e.g. /home/<user>); a umask-002 0775 home breaks sshd StrictModes.
-            ssh_cmd = self._build_ssh_command() + [f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}"]
+            ssh_cmd = self._build_ssh_command() + [
+                self._guarded(f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}")]
             tar_proc = subprocess.Popen(["tar", "-chf", "-", "-C", staging, "."], stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
@@ -372,7 +388,7 @@ class SSHEnvironment(BaseEnvironment):
         # "socket ignored" and some builds exit 2, which failed every sync-back and left a
         # multi-GB temp tar behind on each retry. Exclude them up front.
         ssh_cmd = self._build_ssh_command() + [
-            f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}"]
+            self._guarded(f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}")]
         with open(dest, "wb") as f:
             result = subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.PIPE, timeout=120)
         if result.returncode != 0:
@@ -405,7 +421,7 @@ class SSHEnvironment(BaseEnvironment):
         values, unset_names = resolve_passthrough_env(explicit_forward=_placed_lease_env_names(),
                                                       hermes_env_loader=_load_hermes_env_vars)
         token = uuid.uuid4().hex
-        remote = _run_preamble(token) + prepend_unset(cmd_string, unset_names)
+        remote = _run_preamble(token) + self._guarded(prepend_unset(cmd_string, unset_names))
         cmd = self._build_ssh_command(send_env=values, log_to_file=True) + bash_argv(shlex.quote(remote), login)
         client_env = client_env_with(values)
         proc = _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
