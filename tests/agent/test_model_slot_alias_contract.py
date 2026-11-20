@@ -389,3 +389,132 @@ def test_view_deleted_between_stat_and_read_is_missing(vhome):
 
     with patch.object(Path, "read_text", _gone):
         assert slot_resolve("sol") == ("sol", None)
+
+
+def test_view_deleted_then_torn_recreate_does_not_revive_the_old_mapping(vhome):
+    # Prism a8cda9522c00: a missing file must drop the cached view, or a torn re-create falls
+    # back to it and routes to the deleted mapping.
+    from hermes_cli.model_registry import slot_resolve
+
+    assert slot_resolve("sol") == (SOL_ID, "sol")
+    path = vhome / "config" / "model-slots.json"
+    path.unlink()
+    assert slot_resolve("sol") == ("sol", None)
+    path.write_text('{"slots": {"sol": "gpt-6', encoding="utf-8")  # re-created, mid-write
+    assert slot_resolve("sol") == ("sol", None)
+
+
+def test_view_deleted_between_stat_and_read_then_torn_does_not_revive(vhome):
+    from hermes_cli.model_registry import slot_resolve
+
+    assert slot_resolve("sol") == (SOL_ID, "sol")
+    path = vhome / "config" / "model-slots.json"
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 7_000_000_000))
+    real = Path.read_text
+
+    def _gone(self, *a, **k):
+        if self == path:
+            raise FileNotFoundError(str(path))
+        return real(self, *a, **k)
+
+    with patch.object(Path, "read_text", _gone):
+        assert slot_resolve("sol") == ("sol", None)
+    path.write_text('{"slots": {"sol": "gpt-6', encoding="utf-8")
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 9_000_000_000))
+    assert slot_resolve("sol") == ("sol", None)
+
+
+# ── aggregator lanes (openrouter): the id sent is the id validated ───────────────
+# Real view ids carry no vendor prefix (kimi -> kimi-k3.1-pro); openrouter needs one on the
+# wire. Apollo send-back on f69ad85c: head probed moonshotai/kimi-k3.1-pro but sent kimi-k3.1-pro.
+
+_OR_URL = "https://openrouter.ai/api/v1"
+_OR_CASES = {
+    "k3-or": ("kimi", "kimi-k3.1-pro", "moonshotai/kimi-k3.1-pro"),
+    "gemini-pro": ("gemini-pro", "gemini-3.1-pro", "google/gemini-3.1-pro"),
+    "grok-fast": ("grok-fast", "grok-4.5-fast", "x-ai/grok-4.5-fast"),
+}
+
+
+def _real_agent(model, provider, base_url):
+    from run_agent import AIAgent
+
+    cfg = {"model": {"default": model, "provider": provider}}
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        return AIAgent(model=model, provider=provider, api_key="fake-test-token", base_url=base_url,
+                       quiet_mode=True, skip_context_files=True, skip_memory=True)
+
+
+def _wire(agent):
+    return agent._build_api_kwargs([{"role": "user", "content": "hi"}])["model"]
+
+
+@pytest.mark.parametrize("alias", sorted(_OR_CASES))
+def test_aggregator_slot_sends_the_id_it_validated(vhome, monkeypatch, alias):
+    slot, view_id, wire_id = _OR_CASES[alias]
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-test-token")
+    _write_view(vhome, {slot: view_id, "opus": OPUS_ID})
+    (vhome / "config.yaml").write_text(yaml.safe_dump({
+        "model": {"default": "opus", "provider": "claude-alr", "aliases": {alias: f"openrouter/{slot}"}},
+        "providers": _LANES,
+    }), encoding="utf-8")
+    _reset_aliases()
+    validate, seen = _catalog_only(wire_id)
+    with patch("hermes_cli.models._validate_requested_model_seam", return_value=validate):
+        res = _switch(alias, probe=True)
+    assert res.success, res.error_message
+    assert (res.target_provider, res.new_model) == ("openrouter", slot)
+    assert seen == [wire_id]
+
+    # A fresh agent on the stored route (next start, kanban/cron spawn).
+    fresh = _real_agent(res.new_model, res.target_provider, _OR_URL)
+    assert _wire(fresh) == wire_id
+
+    # A live agent switched in place (gateway/CLI /model), then a flip at turn start.
+    from agent.agent_runtime_helpers import switch_model as live_switch
+    from agent.model_slots import refresh_slot_for_turn
+
+    live = _real_agent(OPUS_ID, "claude-alr", _LANES["claude-alr"]["base_url"])
+    live_switch(live, res.new_model, res.target_provider, api_key="fake-test-token", base_url=_OR_URL,
+                api_mode="chat_completions", persist_billing_route=False, persist_fallback=False)
+    assert _wire(live) == wire_id
+    assert refresh_slot_for_turn(live) is False  # unchanged view: no churn
+    _write_view(vhome, {slot: view_id + "-next", "opus": OPUS_ID})
+    assert refresh_slot_for_turn(live) is True
+    assert _wire(live) == wire_id + "-next"
+    assert _wire(_real_agent(res.new_model, res.target_provider, _OR_URL)) == wire_id + "-next"
+
+
+def test_slot_resolve_does_not_double_a_vendor_prefix_the_target_carries(vhome):
+    from hermes_cli.model_registry import slot_resolve
+
+    _write_view(vhome, {"gemini": "google/gemini-2.5-pro"})
+    assert slot_resolve("google/gemini") == ("google/gemini-2.5-pro", "google/gemini")
+    assert slot_resolve("openrouter/gemini") == ("openrouter/google/gemini-2.5-pro", "openrouter/gemini")
+
+
+def test_gateway_does_not_evict_an_aggregator_slot_default_every_turn(vhome):
+    # The cached agent now runs moonshotai/kimi-k3.1-pro; the config default ``kimi`` must compare
+    # as that id, or every gateway turn evicts the agent (and its prompt cache).
+    from gateway.run_turn import GatewayTurnMixin
+
+    _write_view(vhome, {"kimi": "kimi-k3.1-pro"})
+    evicted = []
+    gw = SimpleNamespace(_is_intentional_model_switch=lambda *a: False,
+                         _evict_cached_agent=evicted.append)
+    agent = SimpleNamespace(model="moonshotai/kimi-k3.1-pro", provider="openrouter")
+    ctx = SimpleNamespace(session_key="s1", agent_holder=[agent], result_holder=[{}])
+    with patch("gateway.run._resolve_gateway_model", return_value="kimi"):
+        GatewayTurnMixin._run_agent_evict_on_fallback(gw, ctx)
+    assert evicted == []
+    agent.model = "moonshotai/kimi-k3"  # a different model on the agent still evicts
+    with patch("gateway.run._resolve_gateway_model", return_value="kimi"):
+        GatewayTurnMixin._run_agent_evict_on_fallback(gw, ctx)
+    assert evicted == ["s1"]

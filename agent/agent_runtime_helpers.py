@@ -2681,6 +2681,11 @@ def switch_model(
     # so the next turns follow a re-rendered view (agent/model_slots.py).
     from hermes_cli.model_registry import slot_resolve as _resolve_slot
     new_model, _new_slot = _resolve_slot(new_model)
+    if _new_slot:
+        # Callers normalize the name they pass (the slot), not its id: an aggregator lane needs the
+        # vendor prefix on the id (kimi -> moonshotai/kimi-k3.1-pro), the id /model validated.
+        from hermes_cli.model_normalize import normalize_model_for_provider
+        new_model = normalize_model_for_provider(new_model, new_provider)
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,

@@ -267,6 +267,12 @@ _slot_view_memo: dict[str, tuple[int, int, dict[str, str]]] = {}
 _slot_view_lock = threading.Lock()
 
 
+def _drop_slot_view(key: str) -> None:
+    """A missing file evicts its cached view, so a torn re-create cannot fall back to it."""
+    with _slot_view_lock:
+        _slot_view_memo.pop(key, None)
+
+
 def slot_view() -> dict[str, str]:
     """``{slot: id}`` from ``<root>/config/model-slots.json`` (rendered by ``model-registry.py``).
 
@@ -287,12 +293,14 @@ def slot_view() -> dict[str, str]:
         try:
             st = path.stat()
         except FileNotFoundError:
+            _drop_slot_view(key)
             return {}
         if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
             return hit[2]
         try:
             text = path.read_text(encoding="utf-8-sig")
         except FileNotFoundError:  # deleted between stat and read: missing, not torn
+            _drop_slot_view(key)
             return {}
         data = json.loads(text)
         table = data.get("slots") if isinstance(data.get("slots"), dict) else data
@@ -323,7 +331,10 @@ def slot_resolve(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     target = slot_view().get(bare)
     if not target or target == bare:
         return model, None
-    return (f"{prefix}/{target}" if prefix else target), spec
+    # ``google/gemini`` with target ``google/gemini-2.5-pro``: the target already carries it.
+    if prefix and not target.startswith(f"{prefix}/"):
+        target = f"{prefix}/{target}"
+    return target, spec
 
 
 __all__ = [
