@@ -1834,11 +1834,22 @@ _ZERO_PERCLASS = {"uncached": 0.0, "cache_read": 0.0, "cache_write": 0.0, "outpu
 
 
 def _unresolved_slot_row(model: Any, model_slot: Any) -> bool:
-    """True when a row with a recorded slot still carries the slot name as its model."""
-    slot = str(model_slot or "").strip().lower()
-    if not slot:
+    """True when a row written with the model_slot column still carries a slot name as its model.
+
+    Either the recorded slot itself, or (``model_slot`` ``''``) a model that is a slot name in
+    today's view (t_a8fd1cfa). Only pre-column rows (``model_slot`` NULL) are read through the view.
+    """
+    if model_slot is None:
         return False
-    return str(model or "").strip().lower().rsplit("/", 1)[-1] == slot.rsplit("/", 1)[-1]
+    slot = str(model_slot).strip().lower()
+    if slot and str(model or "").strip().lower().rsplit("/", 1)[-1] == slot.rsplit("/", 1)[-1]:
+        return True
+    try:
+        from hermes_cli.model_registry import slot_resolve
+
+        return bool(slot_resolve(model)[1])
+    except Exception:
+        return False
 
 
 def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = None) -> dict:
@@ -1886,7 +1897,8 @@ def reprice_unpriced(pricing_fn, *, apply: bool = False, limit: int | None = Non
                 # A row written with the model_slot column holds the id the turn ran on; when it
                 # still holds the slot name, the view could not resolve it at turn time and no id
                 # was observed. Pricing it from today's view would book a model the turn never ran
-                # on (t_5c87d313). Pre-column rows (model_slot NULL) keep the legacy heal below.
+                # on (t_5c87d313). The same holds for model_slot '' with a model that is a slot
+                # name today (t_a8fd1cfa). Pre-column rows (model_slot NULL) keep the legacy heal.
                 if not usage_unknown and r["i"] + r["o"] + r["cr"] + r["cw"] == 0:
                     candidates.append((r["turn_id"], 0.0, "priced_zero", dict(_ZERO_PERCLASS), True))
                 continue

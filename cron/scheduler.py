@@ -2722,6 +2722,7 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
+    model_slot: str = ""  # the slot ``model`` resolved from (``sol``), '' for a literal id
 
 
 def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
@@ -2772,14 +2773,14 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
         )
     # A slot (``sol``, ``cpa/sol``) in the job, cron.model or the profile default runs as its id.
     from hermes_cli.model_registry import slot_resolve
-    model = slot_resolve(model)[0]
+    model, model_slot = slot_resolve(model)
 
     with contextlib.suppress(Exception):
         from hermes_constants import apply_ipv4_preference
         _net_cfg = _cfg.get("network", {})
         if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
             apply_ipv4_preference(force=True)
-    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider)
+    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider, model_slot or "")
 
 
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
@@ -3535,6 +3536,7 @@ class _CronAgentSetup:
     fallback_model: Any = None
     credential_pool: Any = None
     fallback_notice: Optional[str] = None
+    model_slot: str = ""
 
 
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
@@ -3561,6 +3563,9 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
     setup.fallback_notice = setup.runtime.pop("_fallback_notice", None)
+    # The slot rides beside the resolved id for the turn row only; a resolve-time fallback rung
+    # replaced the model, so the slot no longer describes it.
+    setup.model_slot = getattr(jc, "model_slot", "") if setup.model == jc.model else ""
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
@@ -3582,7 +3587,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
-    return AIAgent(
+    agent = AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -3614,6 +3619,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         session_id=session_id,
         session_db=session_db,
     )
+    if setup.model_slot:
+        from agent.model_slots import adopt_slot
+        adopt_slot(agent, setup.model_slot)
+    return agent
 
 
 class _FireAudit:

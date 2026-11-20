@@ -61,6 +61,20 @@ def refresh_slot_for_turn(agent: Any) -> bool:
     return True
 
 
+def adopt_slot(agent: Any, slot: str) -> None:
+    """Record ``slot`` as the slot of an agent built from its already-resolved id (cron, t_a8fd1cfa).
+
+    Routing is untouched: ``agent.model`` stays the id the caller resolved. The init snapshot gets
+    the slot too, so a later primary restore keeps it. No-op when init already found a slot.
+    """
+    if not slot or getattr(agent, "_model_slot", None):
+        return
+    agent._model_slot = slot
+    rt = getattr(agent, "_primary_runtime", None)
+    if isinstance(rt, dict) and not getattr(agent, "_fallback_activated", False):
+        rt["model_slot"] = slot
+
+
 def served_slot(agent: Any) -> str:
     """Slot of the seat that is serving now, for the turn row (``model_slot``; t_5c87d313).
 
@@ -75,4 +89,4 @@ def served_slot(agent: Any) -> str:
     return slot if isinstance(slot, str) else ""
 
 
-__all__ = ["apply_slot_at_init", "refresh_slot_for_turn", "served_slot"]
+__all__ = ["adopt_slot", "apply_slot_at_init", "refresh_slot_for_turn", "served_slot"]
