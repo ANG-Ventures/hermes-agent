@@ -985,6 +985,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban create: {studio}", 2)
     from hermes_cli import kanban_requires_words as _krw
     unknown_ok = (getattr(args, "requires_unknown_ok", None) or "").strip()
+    if unknown_ok and kb._process_is_gateway():  # operator flag: not from a gateway chat (Prism b882bd7e5b1c)
+        return _err("kanban create: --requires-unknown-ok is an operator CLI flag; run it from a terminal", 2)
     unknown = _krw.refusal(args.body)
     if unknown and not unknown_ok:
         return _err(f"kanban create: {unknown}", 2)
@@ -1116,7 +1118,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 i_mean_blocks=bool(getattr(args, "i_mean_blocks", False)),
             )
             kanban_access_bound_pin.bind_created(handoff_row, task_id)
-            if unknown and unknown_ok:
+            # Only a card THIS call created holds the overridden body: an idempotent hit returns an older
+            # card whose body never had these words (Prism c460b998ad15).
+            if unknown and unknown_ok and conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'created' AND id > ?",
+                    (task_id, _event_mark)).fetchone():
                 _krw.record_override(conn, task_id, args.body, unknown_ok, verb="create",
                                      actor=_profile_author())
             task = kb.get_task(conn, task_id)
@@ -3753,6 +3759,8 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             "--skill, --clear-skills, --boomerang-wake or --no-boomerang-wake)", 2)
     from hermes_cli import kanban_requires_words as _krw
     unknown_ok = (getattr(args, "requires_unknown_ok", None) or "").strip()
+    if unknown_ok and kb._process_is_gateway():  # operator flag: not from a gateway chat (Prism b882bd7e5b1c)
+        return _err("kanban edit: --requires-unknown-ok is an operator CLI flag; run it from a terminal", 2)
     unknown = _krw.refusal(body) if body is not None else None
     if unknown and not unknown_ok:
         return _err(f"kanban edit: {unknown}", 2)

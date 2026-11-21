@@ -151,8 +151,7 @@ def wake_stranded(conn, *, now: Optional[int] = None, fleet_dir: Optional[Path] 
             "AND claim_lock IS NULL AND COALESCE(no_worker, 0) = 0").fetchall():
         try:
             assignee = (row["assignee"] or "").strip()
-            low = assignee.lower()
-            if not assignee or assignee in kb.OPERATOR_PROFILES or low == "human" or low.startswith("human:"):
+            if not assignee or assignee in kb.OPERATOR_PROFILES or kb.is_human_reviewer(assignee):
                 continue
             since = _ready_since(conn, row)
             if not since or now - since < after_s:

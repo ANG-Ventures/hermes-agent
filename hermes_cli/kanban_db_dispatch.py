@@ -7313,6 +7313,14 @@ def _dispatch_once_locked(
         result.stranded_by_triage = _kb.find_stranded_by_triage(conn)
         # Scheduled cards nothing will ever wake (no timed wake, parked > 24h).
         result.unwoken_scheduled = _kb.find_unwoken_scheduled(conn)
+    if not dry_run:
+        # t_c754f664: one home-session wake per stranded ready card per cause. Before the budget/cap gates
+        # below, which return early on a saturated tick (Prism bbaa4c47da9a).
+        try:
+            from hermes_cli.kanban_requires_words import wake_stranded
+            wake_stranded(conn, now=_tick_now)
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban ready-stranded wake failed: %s", exc)
     _lw.mark("reclaim_promote")
 
     # Fan-out brake: per-board rolling-window USD ceiling. Evaluated AFTER all
@@ -9606,11 +9614,6 @@ def _dispatch_once_locked(
                 notify_holds(conn, result.placement_waits)
             except Exception as exc:  # never break a dispatcher tick
                 _kb._log.warning("kanban studio default-deny notify failed: %s", exc)
-        try:  # t_c754f664: one home-session wake per stranded ready card per cause
-            from hermes_cli.kanban_requires_words import wake_stranded
-            wake_stranded(conn, now=_tick_now)
-        except Exception as exc:  # never break a dispatcher tick
-            _kb._log.warning("kanban ready-stranded wake failed: %s", exc)
         try:
             starved = find_priority_starved(conn, now=_tick_now)
             result.priority_starved = [

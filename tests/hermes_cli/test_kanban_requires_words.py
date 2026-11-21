@@ -187,6 +187,38 @@ def test_backstop_skips_a_live_rate_limit_cooldown(board):
         assert krw.wake_stranded(conn, now=int(time.time()) + 1000) == [(tid, krw.STRANDED_CAUSE)]
 
 
-def test_dispatcher_tick_calls_the_backstop():
-    src = (Path(kb.__file__).parent / "kanban_db_dispatch.py").read_text(encoding="utf-8")
-    assert "from hermes_cli.kanban_requires_words import wake_stranded" in src
+def test_saturated_dispatch_tick_still_runs_the_backstop(board):
+    """max_spawn reached returns before the spawn loop; the wake runs before that gate (Prism bbaa4c47da9a)."""
+    tid = _card("x\nrequires: bambu")
+    _age(tid, 31 * 60)
+    with kbc.connect_closing() as conn:
+        res = kb.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)
+    assert res.spawned == []
+    [w] = _events(tid, krw.WAKE_EVENT)
+    assert w["cause"] == krw.UNKNOWN_CAUSE
+
+
+def test_idempotent_hit_records_no_override(board):
+    """A create that returns an existing card did not store this body: no audit row (Prism c460b998ad15)."""
+    assert kc._cmd_create(_parse("create", "print plate", "--body", "x\n" + LEGAL, "--unhomed",
+                                 "--assignee", "peer", "--idempotency-key", "slice-1")) == 0
+    assert kc._cmd_create(_parse("create", "print plate", "--body", "x\nrequires: typo", "--unhomed",
+                                 "--assignee", "peer", "--idempotency-key", "slice-1",
+                                 "--requires-unknown-ok", "temporary")) == 0
+    [tid] = _ids()
+    assert _events(tid, krw.OVERRIDE_EVENT) == []
+
+
+def test_override_refused_inside_the_gateway(board, monkeypatch, capsys):
+    """The operator flag is CLI-only: a gateway /kanban chat command cannot use it (Prism b882bd7e5b1c)."""
+    monkeypatch.setattr(kb, "_process_is_gateway", lambda: True)
+    assert kc._cmd_create(_parse("create", "p", "--body", "x\nrequires: bambu", "--unhomed",
+                                 "--assignee", "peer", "--requires-unknown-ok", "why")) == 2
+    assert "operator CLI flag" in capsys.readouterr().err
+    assert _ids() == []
+    monkeypatch.setattr(kb, "_process_is_gateway", lambda: False)
+    tid = _card()
+    monkeypatch.setattr(kb, "_process_is_gateway", lambda: True)
+    assert kc._cmd_edit(_parse("edit", tid, "--body", "x\nrequires: bambu",
+                               "--requires-unknown-ok", "why")) == 2
+    assert _events(tid, krw.OVERRIDE_EVENT) == []
