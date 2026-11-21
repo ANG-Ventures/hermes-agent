@@ -632,8 +632,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             and _is_jsonrpc_session_refusal(exc)):
                         raise _SessionRejectedBeforeDispatch(str(exc)) from exc
                     if not isinstance(getattr(getattr(exc, "error", None), "message", None), str):
-                        # Ended with no reply (timeout, cancel, transport loss): its POST may still be answered,
-                        # and a late 404 cannot be told from a later identical call's. No resend on this session.
+                        # No MCPError message, so no reply (our tool-timeout cancel, a raw transport exception): its
+                        # POST may still be answered, and a late 404 cannot be told from a later identical call's. No
+                        # resend on this session. The SDK's "Connection closed" / "Request timed out" carry a message.
                         server._resend_blocked_session = session  # Prism 6260596e067d
                     raise
                 finally:
