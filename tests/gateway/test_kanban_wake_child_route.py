@@ -118,11 +118,65 @@ def test_provider_slash_model():
 
 
 @pytest.mark.parametrize("value", ["opsu", "claude-alr/claude-nope-1", "nolane/claude-opus-5-5"])
-def test_unknown_value_falls_back_to_the_parent_with_one_line(caplog, value):
-    with caplog.at_level(logging.WARNING, logger=wcr.__name__):
-        assert wcr.resolve_route(value, "claude-alr", source="card", task_id="t_x") is None
-    lines = [r.getMessage() for r in caplog.records]
-    assert len(lines) == 1 and "t_x" in lines[0] and repr(value) in lines[0] and "parent's model" in lines[0]
+def test_unknown_value_is_unusable(value):
+    with pytest.raises(wcr.Unusable):
+        wcr.resolve_route(value, "claude-alr", source="global", task_id="t_x")
+
+
+# --- the card line takes a slot name only (Prism cdec138fffac) -------------------------------
+
+
+@pytest.mark.parametrize("value", ["claude-dtlr/claude-opus-5-5", "claude-opus-5-5", "claude-alr/opus"])
+def test_card_line_refuses_anything_but_a_slot(value):
+    with pytest.raises(wcr.Unusable, match="slot name only"):
+        wcr.resolve_route(value, "claude-elr", source="card")
+    # the operator's config keys still take provider/model and bare ids
+    assert wcr.resolve_route(value, "claude-elr", source="session")["model"] == "claude-opus-5-5"
+
+
+# --- unreadable config values are reported, not skipped -------------------------------------------
+
+
+@pytest.mark.parametrize("cfg", [_cfg(model=123), _cfg(sessions="opus"), _cfg(sessions={"home-1": ["opus"]})])
+def test_unreadable_config_value_is_unusable(cfg):
+    with pytest.raises(wcr.Unusable, match="unreadable"):
+        value, source = wcr.requested(None, "home-1", cfg)
+        wcr.resolve_route(value, "claude-elr", source=source)
+    assert wcr.requested("opus", "home-1", cfg) == ("opus", "card")   # a card line still wins
+
+
+# --- Prism bd8cd36ed8a8: a slot's target id is never split into provider/model ---------------------
+
+
+def test_slot_target_with_a_namespace_stays_one_model_id(monkeypatch):
+    from hermes_cli import model_registry
+
+    monkeypatch.setattr(model_registry, "slot_view", lambda: {"opus": "anthropic/claude-opus-4.6"})
+    monkeypatch.setattr(model_registry, "catalog_for",
+                        lambda p, **_k: ("anthropic/claude-opus-4.6",) if p == "openrouter" else ())
+    route = wcr.resolve_route("opus", "openrouter", source="card")
+    assert (route["model"], route["provider"]) == ("anthropic/claude-opus-4.6", "openrouter")
+
+
+# --- Prism 8b65f0d36f77: the session override is keyed by the RESOLVED home session id -------------
+
+
+def test_session_override_found_by_the_resolved_home_session_id(monkeypatch):
+    monkeypatch.setattr(wcr, "_delegation_cfg", lambda: _cfg(sessions={"sid-parent": "opus"}))
+    route = ah._wake_route({"task_id": "t_1", "home_sid": "agent:main:discord:group:123"}, _parent())
+    assert (route["source"], route["model"]) == ("session", "claude-opus-5-5")
+
+
+# --- Prism 3d5c62bd0009: a same-lane override never drops the parent's privacy/routing filters ------
+
+
+def test_same_lane_override_with_parent_filters_is_unusable():
+    parent = SimpleNamespace(**vars(_parent()), provider_data_collection="deny")
+    with pytest.raises(wcr.Unusable, match="provider_data_collection"):
+        wcr.resolve_route("opus", "claude-elr", source="card", parent=parent)
+    # another lane chosen by the operator is an explicit route of its own
+    assert wcr.resolve_route("claude-alr/opus", "claude-elr", source="global", parent=parent)["provider"] == "claude-alr"
+    assert wcr.resolve_route("opus", "claude-elr", source="card", parent=_parent())["provider"] == "claude-elr"
 
 
 def test_override_runs_summary_pinned(monkeypatch):
@@ -168,6 +222,64 @@ def test_failed_override_reruns_on_the_parent_route(monkeypatch, caplog):
     assert second["inherit_mode"] == "fork"
     assert route["fell_back"] == ("wake-model opus failed (provider claude-elr: 529 overloaded), "
                                   "ran on parent claude-elr/claude-fable-5-2")
+
+
+_RAISE = object()
+
+
+@pytest.mark.parametrize("override_result, why", [
+    ({"status": "timeout", "summary": "child timed out after 600s"}, "timeout: child timed out after 600s"),
+    ({"status": "error", "error": "401 unauthorized"}, "error: 401 unauthorized"),
+    ({"status": "interrupted", "interrupt_message": "watchdog"}, "interrupted: watchdog"),
+    ({"status": "failed", "failure_reason": "content_policy_blocked", "summary": "refused"}, "refused: refused"),
+    ({"status": "completed", "summary": ""}, "completed: empty final message"),
+    ({"status": "failed", "error": "lane exhausted"}, "lane exhausted"),
+    (_RAISE, "error: RuntimeError: delegate_task blew up"),
+])
+def test_any_non_success_override_reruns_on_the_parent(monkeypatch, override_result, why):
+    """Ace msg 1573514581643370666: whatever goes wrong on the override, the wake runs on the parent."""
+    from tools import delegate_tool
+
+    calls = []
+
+    def fake(**kw):
+        calls.append(kw)
+        if kw.get("provider"):
+            if override_result is _RAISE:
+                raise RuntimeError("delegate_task blew up")
+            return json.dumps({"results": [override_result]})
+        return json.dumps({"results": [{"status": "completed", "summary": "ok"}]})
+
+    monkeypatch.setattr(delegate_tool, "delegate_task", fake)
+    route = {**wcr.resolve_route("opus", "claude-elr"), "parent_mode": "fork"}
+    tok = wcr.CURRENT_ROUTE.set(route)
+    try:
+        assert ah._run_child_delegate(_parent(), "goal", "summary") == ("completed", "ok")
+    finally:
+        wcr.CURRENT_ROUTE.reset(tok)
+    first, second = calls
+    assert first["provider"] == "claude-elr" and "provider" not in second and second["inherit_mode"] == "fork"
+    assert route["fell_back"] == f"wake-model opus failed ({why}), ran on parent claude-elr/claude-fable-5-2"
+
+
+def test_a_stop_on_an_overridden_child_is_not_rerun(monkeypatch):
+    from gateway.run import _INTERRUPT_REASON_STOP
+    from tools import delegate_tool
+
+    calls = []
+
+    def fake(**kw):
+        calls.append(kw)
+        return json.dumps({"results": [{"status": "interrupted", "interrupt_message": _INTERRUPT_REASON_STOP}]})
+
+    monkeypatch.setattr(delegate_tool, "delegate_task", fake)
+    route = wcr.resolve_route("opus", "claude-elr")
+    tok = wcr.CURRENT_ROUTE.set(route)
+    try:
+        assert ah._run_child_delegate(_parent(), "goal", "summary")[0] == "stopped"
+    finally:
+        wcr.CURRENT_ROUTE.reset(tok)
+    assert len(calls) == 1 and "fell_back" not in route
 
 
 # --- through dispatch -> run_entry --------------------------------------------------------------
@@ -218,6 +330,39 @@ def test_unknown_card_value_still_runs_the_wake_on_the_parent(env):
     _worker_close(tid)
     seen, claim = _run_capturing(env, _claimed_entry(env, tid))
     assert seen == [("fork", None)] and not claim.get("wake_model_override")
+    assert claim["wake_model_fallback"].startswith("wake-model opsu not usable (")
+
+
+@pytest.mark.parametrize("body, why", [
+    ("wake-model: opsu", "the card line takes a model-routing slot name only"),
+    ("wake-model: claude-dtlr/claude-opus-5-5", "the card line takes a model-routing slot name only"),
+])
+def test_unusable_override_is_surfaced_on_the_wake_line(env, body, why):
+    """Item 2: an override that cannot be used is SURFACED to the home, not only logged."""
+    tid = _card(env, body=body)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    calls = []
+
+    async def resolved():
+        return _parent(), "fork"
+
+    def fake(**kw):
+        calls.append(kw)
+        return json.dumps({"results": [{"status": "completed", "summary": "no verdict"}]})
+
+    from tools import delegate_tool
+
+    mp = env["monkeypatch"]
+    mp.setattr(ah, "parent_resolver", lambda *_a, **_k: resolved())
+    mp.setattr(ah, "run_child", ah._run_child_delegate)
+    mp.setattr(delegate_tool, "delegate_task", fake)
+    asyncio.run(_REAL_RUN_ENTRY(env["runner"], entry, ah.BoomerangWakeState()))
+    assert len(calls) == 1 and "provider" not in calls[0] and calls[0]["inherit_mode"] == "fork"
+    label = body.split(": ", 1)[1]
+    want = f"wake-model {label} not usable ({why}), ran on parent claude-elr/claude-fable-5-2"
+    turns = [t.text for t in env["adapter"].handled]
+    assert turns and all(want in t.split("\n")[0] for t in turns), turns
 
 
 def test_failed_override_surfaces_the_fallback_line_through_run_entry(env):
@@ -256,6 +401,122 @@ def test_surfaced_line_names_an_overridden_model():
                            {"summary": "s"}, "child surfaced").split("\n")[0]
     assert "(completed, summary, model claude-alr/claude-opus-5-5," in over
     note = "wake-model opus failed (lane down), ran on parent claude-elr/claude-fable-5-2"
-    fell = ah.finding_text({**base, "wake_model_override": "claude-alr/claude-opus-5-5", "wake_model_fallback": note},
-                           {"summary": "s"}, "child completed").split("\n")[0]
+    fell = ah.finding_text({**base, "wake_model_override": "claude-alr/claude-opus-5-5", "wake_model_fallback": note,
+                            "wake_model_fallback_ran": True}, {"summary": "s"}, "child completed").split("\n")[0]
     assert f"(completed, summary, {note}," in fell
+    eff = ah.finding_text({**base, "wake_effort": "medium"}, {"summary": "s"}, "child surfaced").split("\n")[0]
+    assert "(completed, summary, effort medium," in eff
+
+
+# --- item 5: the effort override (Ace msgs 1573526187576401950, 1573526653924151358) ---------------
+
+
+@pytest.mark.parametrize("body, want", [
+    ("wake-effort: medium", "medium"), ("  Wake-Effort:  xhigh ", "xhigh"), ("the wake-effort: low inline", None),
+])
+def test_card_effort_line(body, want):
+    assert wcr.card_wake_effort(body) == want
+
+
+def test_effort_accepts_every_runtime_level_and_nothing_else():
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    for word in ("none", *VALID_REASONING_EFFORTS):
+        assert wcr.resolve_effort(word.upper(), source="card") == word
+    assert wcr.resolve_effort("inherit", source="card") is None
+    for bad in ("hgih", "claude-alr/claude-opus-5-5", "medium; rm -rf"):
+        with pytest.raises(wcr.Unusable, match="effort must be one of none"):
+            wcr.resolve_effort(bad, source="card")
+
+
+def test_effort_precedence_card_session_global():
+    cfg = _cfg(effort="low", effort_sessions={"home-1": "high"})
+    assert wcr.requested_effort("medium", "home-1", cfg) == ("medium", "card")
+    assert wcr.requested_effort(None, ["sid-x", "home-1"], cfg) == ("high", "session")
+    assert wcr.requested_effort(None, "home-2", cfg) == ("low", "global")
+    assert wcr.requested_effort(None, "home-2", _cfg(model="opus")) == (None, None)
+
+
+def test_default_effort_unchanged_no_reasoning_kwarg(monkeypatch):
+    calls = _capture_delegate(monkeypatch)
+    ah._run_child_delegate(_parent(), "goal", "fork")
+    assert "reasoning_effort" not in calls[0]
+
+
+def test_effort_alone_keeps_the_parent_route_and_fork(monkeypatch):
+    """Effort without wake-model: parent model, lane and mode (a fork stays a fork), new effort."""
+    monkeypatch.setattr(wcr, "_delegation_cfg", lambda: _cfg(effort="medium"))
+    route = ah._wake_route({"task_id": "t_1", "home_sid": "home-1"}, _parent())
+    assert route == {"effort": "medium", "label": "effort medium"}
+    calls = _capture_delegate(monkeypatch)
+    tok = wcr.CURRENT_ROUTE.set(route)
+    try:
+        assert ah._run_child_delegate(_parent(), "goal", "fork") == ("completed", "ok")
+    finally:
+        wcr.CURRENT_ROUTE.reset(tok)
+    [kw] = calls
+    assert kw == {"goal": "goal", "inherit_context": True, "parent_agent": kw["parent_agent"],
+                  "inherit_mode": "fork", "reasoning_effort": "medium"}
+
+
+def test_effort_with_model_rides_the_summary_pin(monkeypatch):
+    route = {**wcr.resolve_route("opus", "claude-elr"), "effort": "high"}
+    kw = wcr.delegate_kwargs(route, "fork")
+    assert (kw["inherit_mode"], kw["model"], kw["reasoning_effort"]) == ("summary", "claude-opus-5-5", "high")
+
+
+def test_unusable_effort_is_surfaced_and_the_model_override_still_applies(monkeypatch):
+    monkeypatch.setattr(wcr, "_delegation_cfg", lambda: _cfg(effort="hgih"))
+    route = ah._wake_route({"task_id": "t_1", "home_sid": "home-1", "wake_model": "opus"}, _parent())
+    assert route["model"] == "claude-opus-5-5" and "effort" not in route
+    assert route["unusable"].startswith("wake-effort hgih not usable (effort must be one of none|")
+    assert route["unusable"].endswith("), ran at the parent's effort")
+
+
+def test_card_effort_through_dispatch_names_the_effort(env):
+    tid = _card(env, body="wake-effort: medium")
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    assert entry["wake_effort"] == "medium"
+    seen, claim = _run_capturing(env, entry)
+    [(mode, route)] = seen
+    assert mode == "fork" and route["effort"] == "medium" and not route.get("model")
+    assert claim["wake_effort"] == "medium" and claim["inherit_mode"] == "fork"
+
+
+# --- the delegate_task kwarg reaches the child build, fork path included ---------------------------
+
+
+@pytest.mark.parametrize("mode", ["fork", "summary"])
+def test_reasoning_override_replaces_the_child_effort_on_every_path(monkeypatch, mode):
+    from tools import delegate_tool as dt
+    from tools import delegate_tool_fork as fork
+
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_agent(**kw):
+        seen.update(kw)
+        raise Stop
+
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    monkeypatch.setattr(fork, "fork_eligible", lambda *a, **k: (True, ""))
+    parent = SimpleNamespace(provider="claude-elr", model="claude-fable-5-2", base_url="http://x", api_key="k",
+                             api_mode="anthropic_messages", reasoning_config={"enabled": True, "effort": "high"},
+                             session_id="sid-parent", _delegate_depth=0, _fallback_chain=[], request_overrides={},
+                             _client_kwargs={}, _session_messages=[], enabled_toolsets=["file"])
+    with pytest.raises(Exception):
+        dt._build_child_agent(task_index=0, goal="g", context=None, toolsets=None, model=None, max_iterations=3,
+                              task_count=1, parent_agent=parent, inherit_context=True, inherit_mode=mode,
+                              reasoning_override={"enabled": True, "effort": "medium"})
+    assert seen, "the child build never reached AIAgent"
+    assert seen["reasoning_config"] == {"enabled": True, "effort": "medium"}
+
+
+def test_delegate_task_refuses_an_unknown_effort():
+    from tools import delegate_tool as dt
+
+    out = json.loads(dt.delegate_task(goal="g", reasoning_effort="hgih", parent_agent=_parent()))
+    assert "not a known effort" in out["error"]
