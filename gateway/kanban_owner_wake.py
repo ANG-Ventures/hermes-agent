@@ -55,6 +55,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -630,6 +631,7 @@ class WakeState:
         self.last_wake: dict[str, float] = {}
         self.row_failures: dict[str, int] = {}  # "board|event" -> failed classifications
         self.red_seen: dict[str, float] = {}  # S5: red_key -> when it last woke an owner
+        self._persisted: Optional[str] = None
         self._load()
 
     def _load(self) -> None:
@@ -642,21 +644,33 @@ class WakeState:
             self.pending = dict(raw.get("pending") or {})
             self.last_wake = {str(k): float(v) for k, v in (raw.get("last_wake") or {}).items()}
             self.red_seen = {str(k): float(v) for k, v in (raw.get("red_seen") or {}).items()}
+            self._persisted = self._serialize()
 
-    def write_owner_wake_state(self, now: float) -> None:
-        """Blocking (fsync + rename): call via ``asyncio.to_thread`` only."""
+    def _serialize(self) -> str:
+        # Compare immutable snapshots: pending items can be edited in place.
+        return json.dumps({"cursors": self.cursors, "pending": self.pending,
+                           "last_wake": self.last_wake, "red_seen": self.red_seen},
+                          sort_keys=True)
+
+    def write_owner_wake_state(self, now: float) -> bool:
+        """Return whether state is durable. Blocking: call via ``asyncio.to_thread``."""
         self.last_wake = {k: v for k, v in self.last_wake.items() if now - v < COALESCE_SECONDS * 6}
         _ns.note_red_seen(self.red_seen, (), now)
-        data = {"cursors": self.cursors, "pending": self.pending, "last_wake": self.last_wake,
-                "red_seen": self.red_seen}
+        snapshot = self._serialize()
+        if snapshot == self._persisted:
+            return True
+        # A failed write (including a directory fsync after rename) cannot seed a cache hit.
+        self._persisted = None
+        tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".owner-wake-", dir=str(self.path.parent))
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
+                fh.write(snapshot)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            tmp = None
             dfd = os.open(str(self.path.parent), os.O_RDONLY)
             try:
                 os.fsync(dfd)
@@ -664,6 +678,12 @@ class WakeState:
                 os.close(dfd)
         except OSError as exc:
             logger.warning("kanban owner-wake: cannot persist state %s: %s", self.path, exc)
+            if tmp is not None:
+                with suppress(OSError):
+                    os.unlink(tmp)
+            return False
+        self._persisted = snapshot
+        return True
 
 
 def state_path() -> Path:
@@ -1193,6 +1213,10 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     if pr_health is None and use_default_pr_health:
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
+    # Commit the cursor and queued inputs before a boomerang claim or owner turn
+    # can act on them. Keep the pending items for retry if durability failed.
+    if state.pending and not await asyncio.to_thread(state.write_owner_wake_state, now):
+        return 0
 
     from gateway import kanban_boomerang_wake as _ah
 

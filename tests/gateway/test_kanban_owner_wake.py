@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -1026,12 +1027,73 @@ def test_p1r2_profile_gate_applies_to_the_owner_session(env):
     assert env["runner"]._kanban_owner_wake_state.pending == {}, "dropped at the gate, not held"
 
 
+def test_unchanged_owner_wake_tick_does_not_write_or_sync(env, monkeypatch):
+    runner = env["runner"]
+    assert asyncio.run(ow.tick(runner, use_default_pr_health=False)) == 0
+    path = ow.state_path()
+    before = (path.stat().st_mtime_ns, path.parent.stat().st_mtime_ns)
+    # Exercise the actual idle scan after a reload, not just an in-memory cache hit.
+    runner._kanban_owner_wake_state = None
+    create_temp = Mock(wraps=ow.tempfile.mkstemp)
+    fsync = Mock(wraps=ow.os.fsync)
+    monkeypatch.setattr(ow.tempfile, "mkstemp", create_temp)
+    monkeypatch.setattr(ow.os, "fsync", fsync)
+    assert asyncio.run(ow.tick(runner, use_default_pr_health=False)) == 0
+    create_temp.assert_not_called()
+    fsync.assert_not_called()
+    assert (path.stat().st_mtime_ns, path.parent.stat().st_mtime_ns) == before
+
+
 def test_p1r2_state_write_is_fsynced(env, monkeypatch):
     synced = []
     real = ow.os.fsync
     monkeypatch.setattr(ow.os, "fsync", lambda fd: (synced.append(fd), real(fd))[1])
-    ow.WakeState(Path(get_hermes_home()) / "gateway" / "fs.json").write_owner_wake_state(1.0)
+    path = Path(get_hermes_home()) / "gateway" / "fs.json"
+    state = ow.WakeState(path)
+    state.write_owner_wake_state(1.0)
     assert len(synced) == 2, "file and directory are both fsynced"
+    replace = Mock(wraps=ow.os.replace)
+    monkeypatch.setattr(ow.os, "replace", replace)
+    synced.clear()
+    state.cursors["default"] = 10
+    state.write_owner_wake_state(2.0)
+    state.write_owner_wake_state(3.0)
+    replace.assert_called_once()
+    assert len(synced) == 2
+    assert ow.WakeState(path).cursors == {"default": 10}
+
+
+def test_owner_wake_waits_for_durable_pending_state(env, monkeypatch):
+    tid = _card(env)
+    _blocked(tid)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    runner = env["runner"]
+    now = 1_000.0
+    state = _held_state(env, 0)
+    path = state.path
+    real_fsync = ow.os.fsync
+    real_deliver = ow.deliver_turn
+    calls = 0
+
+    def fail_directory_sync(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("directory sync failed after rename")
+        real_fsync(fd)
+
+    async def deliver(*args):
+        assert calls == 4, "retry must fsync the file and directory before delivering"
+        assert ow.WakeState(path).pending, "restart can recover the queued event"
+        await real_deliver(*args)
+
+    monkeypatch.setattr(ow.os, "fsync", fail_directory_sync)
+    monkeypatch.setattr(ow, "deliver_turn", deliver)
+    assert asyncio.run(ow.tick(runner, now=now, state=state, use_default_pr_health=False)) == 0
+    assert env["adapter"].handled == [] and state.pending and path.exists()
+    assert asyncio.run(ow.tick(runner, now=now + 5, state=state, use_default_pr_health=False)) == 1
+    restored = ow.WakeState(path)
+    assert not restored.pending and restored.last_wake
 
 
 def test_worker_only_gateway_skips_the_scan(env, monkeypatch):
