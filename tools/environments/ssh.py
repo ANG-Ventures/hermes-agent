@@ -107,17 +107,17 @@ def _run_pidfile(token: str) -> str:
     return f"{_RUN_DIR}/{_RUN_MARK}{token}.pid"
 
 
-def _enter_runtime_dir() -> str:
+def _enter_runtime_dir(variable: str = "XDG_RUNTIME_DIR") -> str:
     """Enter a private tmpfs XDG directory before checking it. Using relative paths after
     checking the cwd keeps a replaced path component from redirecting a pidfile operation.
     Shell builtins check path/owner; one find checks both exact mode and filesystem type."""
-    return ('case "${XDG_RUNTIME_DIR:-}" in /*) '
-            'CDPATH= cd -P -- "$XDG_RUNTIME_DIR" && [ -O . ] && '
+    return (f'case "${{{variable}:-}}" in /*) '
+            f'CDPATH= cd -P -- "${variable}" && [ -O . ] && '
             '[ "$(PATH=/usr/bin:/bin exec find . -maxdepth 0 -perm 0700 -fstype tmpfs -print)" = . ];; '
             '*) false;; esac')
 
 
-def _run_preamble(token: str) -> str:
+def _run_preamble(token: str, runtime_var: str = "XDG_RUNTIME_DIR") -> str:
     """First lines of every remote command: sweep dead pidfiles, then record the ``bash -c`` pid
     (= its process group, as sshd starts each command in its own session) where the kill path can
     find it. A file, not the argv: a top-level ``exec`` replaces the argv but keeps the pid and the
@@ -130,10 +130,11 @@ def _run_preamble(token: str) -> str:
         '[ "${HERMES_SSH_RUNTIME_PIDFILES:-}" != 0 ]')
     return (f": {_RUN_MARK}{token}\n"
             f"{_stale_pidfile_sweep()}\n"
-            f"if ({{ {_enter_runtime_dir()}; }} || exit 1;\n"
+            f"if ({{ {_enter_runtime_dir(runtime_var)}; }} || exit 1;\n"
             f"{_stale_pidfile_sweep('.')};\n"
-            f"{enabled} && umask 077 && echo $$ >| '{name}') 2>/dev/null; then\n"
-            'printf -v _vr_dir %q "$XDG_RUNTIME_DIR"\n'
+            f"{enabled} || exit 1; umask 077;\n"
+            f"echo $$ >| '{name}' || {{ rm -f -- '{name}'; exit 1; }}) 2>/dev/null; then\n"
+            f'printf -v _vr_dir %q "${runtime_var}"\n'
             # Only unlink on exit, never read or write a PID. Quote/freeze the original path.
             f'''trap "CDPATH= cd -P -- $_vr_dir && [ -O . ] && rm -f -- '{name}'" EXIT\n'''
             "unset _vr_dir\n"
@@ -166,15 +167,16 @@ def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
     f = _run_pidfile(token)
     name = f"{_RUN_MARK}{token}.pid"
     script = (
+        '_vr_runtime=$1; '
         f'''if [ -f "{f}" ]; then p=$(cat "{f}" 2>/dev/null); rm -f "{f}"; '''
-        f'''else p=$({{ {_enter_runtime_dir()}; }} && [ -f './{name}' ] && '''
+        f'''else p=$({{ {_enter_runtime_dir('_vr_runtime')}; }} && [ -f './{name}' ] && '''
         f'''{{ cat './{name}'; rm -f -- './{name}'; }}) 2>/dev/null; fi; '''
         "case \"$p\" in ''|*[!0-9]*) exit 0;; esac; "
         "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); [ -n \"$g\" ] || exit 0; "
         "[ \"$g\" = \"$p\" ] && t=\"-$g\" || t=\"$p\"; "
         f"for sig in {sigs}; do kill -s $sig -- \"$t\" 2>/dev/null || exit 0; echo {_KILLED_MARK}; "
         "[ $sig = TERM ] && sleep 1; done; exit 0")
-    return "sh -c " + shlex.quote(script)
+    return "sh -c " + shlex.quote(script) + ' sh "${XDG_RUNTIME_DIR:-}"'
 
 
 def _ensure_ssh_available() -> None:
@@ -471,9 +473,13 @@ class SSHEnvironment(BaseEnvironment):
         values, unset_names = resolve_passthrough_env(explicit_forward=_placed_lease_env_names(),
                                                       hermes_env_loader=_load_hermes_env_vars)
         token = uuid.uuid4().hex
-        remote = _run_preamble(token) + self._guarded(_placed_kanban_exports()
-                                                      + prepend_unset(cmd_string, unset_names))
-        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + bash_argv(shlex.quote(remote), login)
+        # Capture XDG from the SSH login shell, the same context used by the kill command.
+        # Bash startup (including login profiles and BASH_ENV) may set a different value.
+        remote = ('_vr_runtime=$1; shift\n' + _run_preamble(token, "_vr_runtime")
+                  + 'unset _vr_runtime\n' + self._guarded(_placed_kanban_exports()
+                                                         + prepend_unset(cmd_string, unset_names)))
+        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + ["exec"] + (
+            bash_argv(shlex.quote(remote), login) + ["bash", '"${XDG_RUNTIME_DIR:-}"'])
         client_env = client_env_with(values)
         proc = _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
         proc._hermes_run_token = token
