@@ -2247,20 +2247,24 @@ def test_row_knob_off_restores_todays_rows(answered_env):
     assert env["dispatched"] == []
 
 
-def test_all_answered_child_brief_carries_the_four_steps_and_the_refusal_rule(answered_env):
+def test_all_answered_child_brief_carries_the_three_steps_and_the_refusal_rule(answered_env):
     env = answered_env
     tid = _answered_handback(env, 3204, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
                                          f"prism-verdict: {KEY_B} by-design advisory"])
     _tick(env)
     goal = ah.build_goal(env["dispatched"][0])
-    for n, needle in enumerate(("handback SUMMARY", "prism-verdict lines", "--coverage-only",
-                                "landing_queue.py enqueue"), start=1):
+    for n, needle in enumerate(("handback SUMMARY", "prism-verdict lines", "--coverage-only"), start=1):
         step = next(ln for ln in goal.splitlines() if ln.startswith(f"{n}. "))
         assert needle in step, (n, step)
+    # Retired-lander PR A: no step 4 (landing_queue.py enqueue answered rc 61); step 3 is a refresh that lands nothing, so the child surfaces for the operator APPROVE.
+    assert not any(ln.startswith("4. ") for ln in goal.splitlines())
+    assert "landing_queue" not in goal and "fm_arg" not in goal
     assert f"--head {ANSWERED_HEAD}" in goal and f"{REPO} --pr 3204" in goal and tid in goal
     assert "never write an APPROVE on a head that has an unanswered Prism key" in goal
-    assert "never add, drop or widen an fm_arg" in goal
     assert "post ONE card comment" in goal and "return action `surface`" in goal
+    assert (f"`coverage recorded at {ANSWERED_HEAD} (a refresh, which lands nothing); "
+            f"an operator APPROVE at {ANSWERED_HEAD} is still needed to land`") in goal
+    assert "land_on_approve lands it" not in goal
     assert "allowed actions: handled, surface" in goal
 
 

@@ -28,21 +28,16 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
     Merge-queue repos are left to fleet-merge's own stale-base gate. A far-behind
     head whose ``mergeable_state`` is not computed yet (null/``unknown``) is
     deferred: neither updated nor armed (t_6395b273).
-(c) GREEN -> arm. A fresh, non-draft PR whose head check-runs are all green on a
-    non-milestone card is handed to ``scripts/fleet-merge.sh`` (the only
-    sanctioned merge lane; it applies the FleetReview gate, attribution and
-    SHA-bound arm itself). Spawned detached: the handoff never waits on it.
-    Pipeline v2 (t_7dbacbbc): when ``config/merge-gate-profile.json`` reads v2
-    for the repo (:func:`merge_gate_profile`), a red/pending/no-CI head is armed
-    too, its CI state REPORTED in the fleet-merge ``--reason`` (CI gates deploy,
-    not merge). Absent/unreadable/unknown profile = v1 = green only.
-    Forge L0 EV-A (t_d343020c): while ``event_land`` is on (hermes-home
-    ``config/landing-policy.json``, kill file ``state/event-land.disabled``) (c)
-    never arms. It records ``waiting:<fast-tier|prism>`` and spawns
-    ``land_evaluator.py evaluate --event E6``; off = (c) as above (I1).
+(c) GREEN -> hand to the evaluator. A fresh, non-draft PR on a non-milestone card records
+    what it waits on (``waiting:fast-tier`` when CI is not green, ``waiting:prism`` when it is)
+    and, while ``event_land`` is on (hermes-home ``config/landing-policy.json``, kill file
+    ``state/event-land.disabled``), spawns ``land_evaluator.py evaluate --event E6`` (Forge L0
+    EV-A, t_d343020c). The handoff never arms a lander: the old ``fleet-merge.sh`` arm was retired
+    (it answered rc 61) and removed (retired-lander deletion plan, PR A). Event-land off = waiting
+    recorded, nothing spawned.
 
 Fail-OPEN everywhere except (a): a GitHub lookup error, an update-branch
-failure or a missing fleet-merge.sh is recorded and the handoff proceeds —
+failure or a missing evaluator is recorded and the handoff proceeds —
 the pre-existing behavior. A draft is only refused on a positive ``draft: true``
 read, with one exception (t_5c6c67c5): the PR lookup is retried once, and the card's
 own handoff PR in a ``config/worker-pr-draft.json`` repo that is still unreadable (or no
@@ -228,81 +223,12 @@ def _ci_green(gh: GhFn, repo: str, sha: str) -> bool:
     return _ci_report(gh, repo, sha) == ""
 
 
-def merge_gate_profile(repo: str, path: Optional[str] = None) -> str:
-    """Pipeline v2 merge-gate profile for ``repo`` (t_7dbacbbc): ``"v2"`` or ``"v1"``.
-
-    Same semantics as hermes-home ``scripts/lib/merge_gate_profile.py`` (this package cannot import it): reads
-    ``<hermes root>/config/merge-gate-profile.json`` (``{"profile": "v1"|"v2", "repos": [...]}``). Absent,
-    unreadable or unknown -> v1; v2 only when the profile is v2 AND ``repo`` is listed (case-insensitive).
-    ``KANBAN_MERGE_GATE_PROFILE`` overrides the path (tests).
-    """
-    if path is None:
-        path = os.environ.get("KANBAN_MERGE_GATE_PROFILE") or ""
-        if not path:
-            try:
-                from hermes_constants import get_default_hermes_root
-                path = str(get_default_hermes_root() / "config" / "merge-gate-profile.json")
-            except Exception:  # noqa: BLE001 -- fail-safe: v1
-                return "v1"
-    try:
-        with open(path, encoding="utf-8-sig") as fh:
-            d = json.load(fh)
-    except (OSError, ValueError):
-        return "v1"
-    if not isinstance(d, dict) or d.get("profile") not in ("v1", "v2"):
-        return "v1"
-    repos = d.get("repos", ["ANG-Ventures/hermes-home"])
-    if not isinstance(repos, list) or not all(isinstance(r, str) for r in repos):
-        return "v1"
-    return "v2" if d["profile"] == "v2" and repo.casefold() in {r.casefold() for r in repos} else "v1"
-
-
-def _fleet_merge_path() -> Optional[Path]:
-    override = os.environ.get("KANBAN_HANDOFF_FLEET_MERGE")
-    if override:
-        p = Path(override)
-    else:
-        from hermes_constants import get_default_hermes_root
-        p = get_default_hermes_root() / "scripts" / "fleet-merge.sh"
-    return p if p.is_file() else None
-
-
-def spawn_arm(repo: str, number: int, sha: str, task_id: str, ci_report: str = "") -> Optional[str]:
-    """Hand the PR to fleet-merge.sh, detached. Returns the log path or None.
-
-    ``ci_report`` (t_7dbacbbc, profile v2 only): the non-green CI state, carried into ``--reason``."""
-    script = _fleet_merge_path()
-    if script is None:
-        return None
-    from hermes_constants import get_default_hermes_root
-    log_dir = get_default_hermes_root() / "logs" / "handoff-automerge"
-    log_path = log_dir / f"{task_id}-{repo.replace('/', '_')}-{number}.log"
-    reason = (f"handoff freshness gate: CI reported not green on head {sha[:12]} ({ci_report}; "
-              f"v2: CI gates deploy), card {task_id}") if ci_report else \
-        f"handoff freshness gate: CI green on head {sha[:12]}, card {task_id}"
-    argv = [
-        "bash", str(script), repo, str(number),
-        "--by", "kanban-handoff/freshness-gate",
-        "--reason", reason,
-        "--sha", sha, "--card", task_id,
-    ]
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)  # inside the fail-open handler (P2 #15)
-        with open(log_path, "ab") as fh:
-            subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
-    except OSError as exc:
-        _log.warning("handoff freshness: fleet-merge spawn failed: %s", exc)
-        return None
-    return str(log_path)
-
-
 def event_land_enabled(root: Optional[Path] = None) -> bool:
     """Forge L0 EV kill switch, read exactly as hermes-home ``scripts/lib/land_evaluator.py enabled()`` reads it.
 
     True only when ``<hermes root>/config/landing-policy.json`` has ``"event_land": true`` AND
     ``<root>/state/event-land.disabled`` is absent. Missing/unreadable config = off (I1): off, the
-    handoff keeps arming through :func:`spawn_arm` exactly as before EV-A (t_d343020c)."""
+    handoff records what the PR waits on and spawns nothing."""
     try:
         if root is None:
             from hermes_constants import get_default_hermes_root
@@ -319,8 +245,8 @@ def event_land_enabled(root: Optional[Path] = None) -> bool:
 def spawn_evaluate(repo: str, number: int, sha: str, task_id: str) -> Optional[str]:
     """E6 (card handoff with an open PR): ``land_evaluator.py evaluate --source event --event E6``, detached.
 
-    Replaces :func:`spawn_arm` while event_land is on (Forge L0 EV-A, spec 2.2.2 E6): the evaluator,
-    not the handoff, decides READY and is the only one that submits a land request. Returns the log
+    Runs while event_land is on (Forge L0 EV-A, spec 2.2.2 E6): the evaluator, not the handoff,
+    classifies the PR. Returns the log
     path, or None when the evaluator is missing or the spawn failed (fail-open: E1-E3 and the sweep
     re-evaluate the PR)."""
     from hermes_constants import get_default_hermes_root
@@ -343,7 +269,7 @@ def spawn_evaluate(repo: str, number: int, sha: str, task_id: str) -> Optional[s
     return str(log_path)
 
 
-ArmFn = Callable[..., Optional[str]]   # (repo, number, sha, task_id[, ci_report]) -> log path
+ArmFn = Callable[..., Optional[str]]   # (repo, number, sha, task_id) -> log path
 ReadyFn = Callable[[str, int], Optional[int]]   # (repo, number) -> ace_gate.py rc, None = not run
 
 
@@ -460,7 +386,7 @@ def _unread_refuses(ref, key: str, armable_keys) -> bool:
 
 
 def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
-          arm: Optional[ArmFn] = None, behind_max: int = STALE_BEHIND_MAX,
+          behind_max: int = STALE_BEHIND_MAX,
           armable=None, draft_ok: bool = False, ready: Optional[ReadyFn] = None,
           flipped: Optional[dict] = None, evaluate: Optional[ArmFn] = None,
           event_land: Optional[bool] = None, intent=None) -> dict:
@@ -468,7 +394,7 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
 
     ``armable`` is the set of ``"o/r#n"`` keys this card actually handed off
     (``metadata.pr_url``/``pr``/``pr_urls`` or ``--survivor-pr``). Only those
-    are ever armed for merge: a PR merely MENTIONED in summary/result prose is
+    are ever handed to the evaluator: a PR merely MENTIONED in summary/result prose is
     context, not merge authorization. ``complete_task`` always passes it;
     ``None`` (direct callers) keeps the legacy every-ref behavior.
 
@@ -480,11 +406,10 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
     ``flipped``: persisted flip records ``{"o/r#n": {"head": sha, "at": epoch}}`` from earlier
     handoffs of this card (t_c1ee61ae); a recorded PR is armed only on post-flip CI evidence.
 
-    Forge L0 EV-A (t_d343020c): while :func:`event_land_enabled` (``event_land`` None = read it) the
-    handoff never arms. Where (c) would have called ``arm``, it records ``entry["waiting"]`` =
-    ``waiting:fast-tier`` (CI not green / not started) or ``waiting:prism`` (CI green; the evaluator
-    reads tier, Prism and review) and calls ``evaluate`` (default :func:`spawn_evaluate`, E6).
-    Off: (c) is unchanged, ``spawn_arm`` and all.
+    (c) records ``entry["waiting"]`` = ``waiting:fast-tier`` (CI not green / not started) or
+    ``waiting:prism`` (CI green; the evaluator reads tier, Prism and review). While
+    :func:`event_land_enabled` (``event_land`` None = read it) it calls ``evaluate`` (default
+    :func:`spawn_evaluate`, E6); off, nothing is spawned (the retired fleet-merge arm is gone).
 
     ``intent`` (t_deee5435): ``(repo, number) -> status`` from :func:`kanban_pr_intent.applier`. It writes the
     card's Intent block into each OWN PR body (:func:`_owns_draft`, draft or not) after every refusal check and
@@ -509,7 +434,6 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             if unread:
                 raise DraftLookupError(task_id, unread)
             return report
-    arm = arm or spawn_arm
     evaluate = evaluate or spawn_evaluate
     ev_on = event_land_enabled() if event_land is None else event_land
     flip_records = {str(k).lower(): v for k, v in (flipped or {}).items() if isinstance(v, dict)}
@@ -621,12 +545,12 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             entry["update_branch"] = "requested" if upd is not None else "failed (fail-open)"
             if ev_on and allow_arm:
                 entry["waiting"] = "waiting:fast-tier"   # EV-A: E1 on the new head's CI evaluates it
-            # The new head has fresh CI; arming is fleet-merge's job once it is green.
+            # The new head has fresh CI; E1 on it evaluates the PR.
             continue
         if entry.get("draft_flip"):
             # Just un-drafted: the head's only check-runs are the draft-skipped ones (`skipped`
             # counts green), so arming now would land on CI that never ran. CI + Prism start on
-            # the ready event; the lander arms it from there.
+            # the ready event; the evaluator takes it from there.
             if allow_arm:
                 entry["automerge"] = "not armed: flipped ready at handback, CI starts now"
                 if ev_on:
@@ -652,23 +576,13 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
                                           if items is not None else "not armed: check-runs unreadable")
                     continue
             ci = _ci_report(gh, ref.repo, head, items)
+            # EV-A (spec 2.2.2 E6): the handoff records what the PR waits on and hands it to the
+            # evaluator; it never asks a lander itself.
+            entry["waiting"] = "waiting:fast-tier" if ci else "waiting:prism"
             if ev_on:
-                # EV-A (spec 2.2.2 E6): the handoff records what the PR waits on and hands it to the
-                # evaluator; it never asks the lander itself (spawn_arm is off while event_land is on).
-                entry["waiting"] = "waiting:fast-tier" if ci else "waiting:prism"
                 log = evaluate(ref.repo, ref.number, head, task_id)
                 entry["automerge"] = (f"event-land: evaluate E6 spawned ({log})" if log
                                       else "event-land: evaluate not spawned")
-            elif not ci:
-                log = arm(ref.repo, ref.number, head, task_id)
-                entry["automerge"] = f"fleet-merge spawned ({log})" if log else "not spawned"
-            elif ci != "check-runs unreadable" and merge_gate_profile(ref.repo) == "v2":
-                # t_7dbacbbc (pipeline v2 D1): CI gates deploy, not merge. Not green is REPORTED into the
-                # fleet-merge --reason, never a reason to skip the arm. v1: unchanged ("ci not green").
-                entry["ci_reported"] = ci
-                log = arm(ref.repo, ref.number, head, task_id, ci)
-                entry["automerge"] = (f"fleet-merge spawned, CI reported not green ({log})" if log
-                                      else "not spawned")
             else:
-                entry["automerge"] = "ci not green; not armed"
+                entry["automerge"] = "event-land off: not armed (no automated lander)"
     return report

@@ -1175,16 +1175,13 @@ REVIEW_ALL_ANSWERED_STEPS = (
     "3. `python3 {home}/skills-shared/kanban/kanban-review-handback-operator/scripts/land-handback.py {repo} "
     "{number} {task_id} \"<reason: every open Prism key answered in the handback>\" --coverage-only`; its "
     "COVERAGE_AT= must equal {head}.",
-    "4. `python3 {home}/scripts/lib/landing_queue.py enqueue --repo {repo} --pr {number} --card {task_id} "
-    "--head {head} --by apollo/operator --reason \"<same reason>\" -- <fm_args>`, carrying the fm_args of the "
-    "PR's existing landing-queue row ({home}/state/landing-queue/{row} or landing-queue.done/{row}; e.g. "
-    "--allow-red-ci) unchanged; no row -> no extra args.",
 )
 REVIEW_ALL_ANSWERED_RULE = (
     "HARD RULE: never write an APPROVE on a head that has an unanswered Prism key (step 2's round check "
-    "comes first, and the head must still be {head}); never add, drop or widen an fm_arg. If any step "
-    "refuses or reads anything else, post ONE card comment naming the step and its output, run nothing "
-    "after it, and return action `surface`. Return `handled` only when all four steps succeeded."
+    "comes first, and the head must still be {head}). If any step refuses or reads anything else, post ONE "
+    "card comment naming the step and its output, run nothing after it, and return action `surface`. When "
+    "all three steps succeeded, return action `surface` with the summary `coverage recorded at {head} (a "
+    "refresh, which lands nothing); an operator APPROVE at {head} is still needed to land`."
 )
 
 
@@ -1194,10 +1191,9 @@ def _review_all_answered_brief(entry: dict) -> str:
     repo, _, number = str(entry.get("pr") or "?#?").partition("#")
     fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"], "repo": repo,
               "number": number, "head": entry.get("head") or "<unknown head: surface>",
-              "home": display_hermes_home(get_default_hermes_root()),
-              "row": f"{repo.replace('/', '__')}__{number}.json"}
+              "home": display_hermes_home(get_default_hermes_root())}
     steps = "\n".join(s.format(**fields) for s in REVIEW_ALL_ANSWERED_STEPS)
-    return f"Do these four steps, in order:\n{steps}\n{REVIEW_ALL_ANSWERED_RULE.format(**fields)}\n"
+    return f"Do these three steps, in order:\n{steps}\n{REVIEW_ALL_ANSWERED_RULE.format(**fields)}\n"
 
 
 REVIEW_DEADMAN_STEPS = (

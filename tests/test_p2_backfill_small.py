@@ -62,15 +62,3 @@ def test_moa_never_logs_prompt_content(monkeypatch, caplog):  # backfill #100
         except Exception:
             pass
     assert secret not in caplog.text
-
-
-def test_spawn_arm_fails_open_when_the_log_dir_cannot_be_created(monkeypatch, tmp_path):  # #15
-    from hermes_cli import kanban_pr_freshness as fr
-    import hermes_constants
-    script = tmp_path / "fleet-merge.sh"
-    script.write_text("exit 0\n")
-    blocker = tmp_path / "root"
-    blocker.write_text("a file where the root dir should be\n")
-    monkeypatch.setattr(fr, "_fleet_merge_path", lambda: script)
-    monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: blocker)
-    assert fr.spawn_arm("o/r", 1, "a" * 40, "t_x") is None

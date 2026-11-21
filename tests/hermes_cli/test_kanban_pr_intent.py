@@ -22,7 +22,6 @@ CARD_BODY = ("origin: discord\n\nWrite the Intent block into worker PR bodies.\n
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o"})
-    monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(tmp_path / "absent-mgp.json"))
     cfg = tmp_path / "worker-pr-draft.json"
     cfg.write_text(json.dumps({"enabled": False, "repos": ["O/R"]}))
     monkeypatch.setenv("KANBAN_WORKER_PR_DRAFT", str(cfg))
@@ -69,8 +68,7 @@ def _card(body=CARD_BODY):
 
 
 def _check(g, intent):
-    return fr.check(op.extract_pr_refs(PR_URL), task_id=TASK, allow_arm=True, gh=g.fresh,
-                    arm=lambda *a: None, ready=g.ready, intent=intent, event_land=False)
+    return fr.check(op.extract_pr_refs(PR_URL), task_id=TASK, allow_arm=True, gh=g.fresh, ready=g.ready, intent=intent, event_land=False)
 
 
 # ---- handback wiring (t_12cdc480's acceptance, carried here) -------------------------------------------------------
