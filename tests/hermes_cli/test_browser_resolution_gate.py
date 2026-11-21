@@ -11,6 +11,7 @@ asks browserd's ``identity`` verb over its unix socket). No browserd, no Docker.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -586,6 +587,49 @@ def test_d598b2a71104_a_failed_spawn_releases_the_joined_lease(home, ledger, joi
         assert released == [("ci-box", "L" * 64)]
         assert [e["why"] for e in _events(conn, tid, "browser_lease_released")] == ["spawn_failed"]
         assert "L" * 64 not in json.dumps([tuple(r) for r in conn.execute("SELECT * FROM task_events")])
+
+
+@pytest.fixture
+def run_end(monkeypatch):
+    out = []
+
+    def rel(host, card, run, lease_id):
+        out.append((host, card, run, lease_id))
+        return {"ok": True, "released": [lease_id], "destroyed": ["eph-ci-box-x"]}
+    monkeypatch.setattr(kbd, "_browser_release_run", rel)
+    return out
+
+
+def test_t7758072d_an_ended_run_releases_its_joined_lease_once(home, ledger, join, released, run_end):
+    """A finished run's ephemeral went at ttl (1800 s) + idle (900 s); the next tick now releases it, once."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        _, got = _live_env(conn)
+        assert tid in got
+        run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        assert kbd.release_ended_run_leases(conn) == [] and run_end == []   # still running: the lease stays
+        conn.execute("UPDATE task_runs SET ended_at=?, status='done', outcome='completed' WHERE id=?",
+                     (int(time.time()), run))
+        conn.commit()
+        _live_env(conn)   # the live tick runs the sweep
+        assert run_end == [("ci-box", tid, str(run), 9)]
+        ev = _events(conn, tid, "browser_lease_released")
+        assert [(e["why"], e["ok"], e["destroyed"]) for e in ev] == [("run_ended", True, ["eph-ci-box-x"])]
+        _live_env(conn)
+        assert len(run_end) == 1 and released == []   # one attempt per run; never the spawn-failure path
+        assert "L" * 64 not in json.dumps([tuple(r) for r in conn.execute("SELECT * FROM task_events")])
+
+
+def test_t7758072d_a_spawn_failure_release_is_not_repeated_at_run_end(home, ledger, join, released, run_end):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+
+        def spawn(task, workspace, *, board=None, placement=None, browser_env=None):
+            raise OSError("exec failed")
+        kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_limit=4, spawn_paused="test",
+                          spillover=_pool(), reconcile_orphans=False)
+        assert released == [("ci-box", "L" * 64)]
+        assert kbd.release_ended_run_leases(conn) == [] and run_end == []
 
 
 def test_d598b2a71104_a_spawn_that_succeeds_keeps_its_lease(home, ledger, join, released):
