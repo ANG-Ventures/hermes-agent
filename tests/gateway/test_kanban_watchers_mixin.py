@@ -813,6 +813,33 @@ def test_active_pr_mergeable_hold_pages_the_stamp_verb_never_enqueues(tmp_path, 
             "~/.hermes/scripts/lib/operator_approve.py --card t_0000abcd --head '<head sha>' "
             "--pr 'ANG-Ventures/prism-router#281' --by apollo/operator`") in text
     assert "fleet-merge" not in text
+    head_rule = "Read the diff at a full 40-character head first and paste only that head.\n"
+    assert head_rule + "Wanted: **LAND**" in text
+
+
+def test_page_that_replaced_an_enqueue_cannot_starve_a_page_main_sent(tmp_path, monkeypatch):
+    """Outside read at 8a2d1659: A (own mergeable PR, finished: main enqueued it, no
+    page) ahead of B (a mentioned PR: main paged it). A's page spends the whole tick
+    budget; B must still go out this tick, since its row may be gone by the next."""
+    import gateway.kanban_watchers as kw
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(kw.time, "monotonic", lambda: clock["t"])
+    a = _mergeable_hold()
+    b = _mergeable_hold(task_id="t_0000beef", pr_owned=False,
+                        pr="https://github.com/ANG-Ventures/prism-router/pull/282")
+    sent = []
+
+    def send(board, row):
+        sent.append(row["task_id"])
+        if row["task_id"] == a["task_id"]:
+            clock["t"] += kw._GUARD_STUCK_PAGE_BUDGET_S
+        return True
+
+    notifier = kw._GuardStuckNotifier(tmp_path / "g.json")
+    notifier.observe([("default", a), ("default", b)], send, now=10_000.0)
+    notifier.observe([("default", a)], send, now=10_001.0)  # B left READY
+    assert sent == ["t_0000beef", "t_0000abcd"]
 
 
 @pytest.mark.parametrize("over", [

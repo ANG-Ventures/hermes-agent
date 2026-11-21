@@ -927,7 +927,10 @@ class _GuardStuckNotifier:
         # budget every tick, starving every card behind it.
         deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
         self._attempted = {k: at for k, at in self._attempted.items() if k in current}
-        rest.sort(key=lambda row: self._attempted.get(row[2], -1))
+        # A finished card's own mergeable PR was enqueued (no page) before the
+        # retired-lander deletion; its page now goes after every page that was
+        # already sent, so it cannot spend the budget those pages had.
+        rest.sort(key=lambda row: (_page_replaces_enqueue(row[1]), self._attempted.get(row[2], -1)))
         for board, item, key, last in rest:
             if time.monotonic() >= deadline:
                 break
@@ -961,6 +964,18 @@ def _github_pr(pr_url) -> Optional[tuple[str, int]]:
     if not m or m.group(2) in (".", ".."):
         return None
     return f"{m.group(1)}/{m.group(2)}", int(m.group(3))
+
+
+def _page_replaces_enqueue(item: dict) -> bool:
+    """A hold the retired land queue was handed instead of a page: active_pr,
+    mergeable, last run finished, PR owned by the card, legal GitHub PR URL."""
+    from hermes_cli import kanban_db as kb
+
+    return (item.get("reason") in (None, "active_pr")
+            and item.get("hold") == kb.RESPAWN_GUARD_HOLD_MERGEABLE
+            and item.get("last_outcome") in _FINISHED_RUN_OUTCOMES
+            and item.get("pr_owned") is True
+            and _github_pr(item.get("pr")) is not None)
 
 
 def _land_verb(pr_url: str, card=None) -> Optional[str]:
@@ -1000,11 +1015,14 @@ def _active_pr_detail(board: str, item: dict) -> str:
         lines.append(f"Holding PR: {item['pr']} · last run: `{outcome or 'none'}`")
         if not owned:
             lines.append(f"That PR is not this card's (the card only mentions it): {item['pr']}")
+    head_rule = "Read the diff at a full 40-character head first and paste only that head."
     if unfinished:
         lines.append(f"Wanted: **REQUEUE** (worker resumes on its PR): `{item['clear_verb']}`")
         if land:
+            lines.append(head_rule)
             lines.append(f"Or, if the PR is complete + CI-green, LAND it: `{land}`")
     else:
+        lines.append(head_rule)
         lines.append(f"Wanted: **LAND** the PR if CI is green, then complete the card: `{land}`")
         lines.append(f"Or, if it needs more work, REQUEUE: `{item['clear_verb']}`")
     return "\n".join(lines)
