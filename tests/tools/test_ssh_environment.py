@@ -229,10 +229,59 @@ def _pidfile(token):
     return os.path.expandvars(ssh_env._run_pidfile(token))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pidfile_env(monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("HERMES_SSH_RUNTIME_PIDFILES", raising=False)
+
+
+@pytest.fixture
+def runtime_dir(monkeypatch):
+    """Use a private directory on Linux tmpfs, not pytest's disk-backed tmp_path."""
+    import tempfile
+
+    if not os.path.isdir("/dev/shm") or not os.access("/dev/shm", os.W_OK):
+        pytest.skip("requires writable Linux tmpfs")
+    with tempfile.TemporaryDirectory(prefix="hermes pidfiles '", dir="/dev/shm") as directory:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", directory)
+        from pathlib import Path
+        yield Path(directory)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+@pytest.mark.parametrize("location", ["runtime", "missing", "wrong-mode", "wrong-owner", "disabled"])
+def test_pidfile_location(location, monkeypatch, tmp_path, runtime_dir):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    setup = ""
+    if location == "missing":
+        monkeypatch.delenv("XDG_RUNTIME_DIR")
+    if location == "wrong-mode":
+        runtime_dir.chmod(0o755)
+    if location == "wrong-owner":
+        # Unprivileged CI cannot chown a private directory to another user. Inject only
+        # the failed ownership result; the real cwd, tmpfs and 0700 checks still run.
+        setup = 'function [ { if [[ $1 == -O && $2 == . ]]; then return 1; fi; builtin [ "$@"; }\n'
+    if location == "disabled":
+        monkeypatch.setenv("HERMES_SSH_RUNTIME_PIDFILES", "0")
+
+    token = uuid.uuid4().hex
+    legacy = _pidfile(token)
+    runtime_pid = runtime_dir / os.path.basename(legacy)
+    if location == "runtime":
+        expected, unexpected = runtime_pid, tmp_path / ".hermes-run"
+    else:
+        expected, unexpected = legacy, runtime_pid
+    body = f'[ -f {shlex.quote(str(expected))} ] && [ ! -e {shlex.quote(str(unexpected))} ]'
+    subprocess.run(["bash", "-c", setup + ssh_env._run_preamble(token) + body],
+                   stdin=subprocess.DEVNULL, check=True, timeout=10)
+    assert not os.path.exists(expected)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
 @pytest.mark.parametrize("body", ["(sleep 600 &); sleep 601 & sleep 602; true", "sleep 601 & exec sleep 602"],
                          ids=["background-grandchild", "top-level-exec"])
-def test_remote_group_kill_reaps_the_whole_tree(body, monkeypatch, tmp_path):
+@pytest.mark.parametrize("use_runtime", [False, True], ids=["legacy", "runtime"])
+def test_remote_group_kill_reaps_the_whole_tree(body, use_runtime, request, monkeypatch, tmp_path):
     """t_44017fbc: run the real remote kill script against a ``bash -c`` started the way sshd starts
     it (own session). Every sleep in its group dies, incl. a ``(cmd &)`` grandchild re-parented to
     init and a top-level ``exec`` that replaced the tagged bash; the pidfile is removed."""
@@ -240,7 +289,13 @@ def test_remote_group_kill_reaps_the_whole_tree(body, monkeypatch, tmp_path):
     import time
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    runtime = request.getfixturevalue("runtime_dir") if use_runtime else None
+    monkeypatch.delenv("HERMES_SSH_RUNTIME_PIDFILES", raising=False)
+    if not use_runtime:
+        # Start in the legacy location, then present XDG to the new kill command.
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     token = uuid.uuid4().hex
+    pidfile = runtime / os.path.basename(_pidfile(token)) if use_runtime else _pidfile(token)
     tree = subprocess.Popen(["bash", "-c", ssh_env._run_preamble(token) + body], start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     want = 3 if body.startswith("(") else 2
@@ -249,11 +304,12 @@ def test_remote_group_kill_reaps_the_whole_tree(body, monkeypatch, tmp_path):
         while len(_group_sleeps(tree.pid)) < want and time.monotonic() < deadline:
             time.sleep(0.05)
         assert len(_group_sleeps(tree.pid)) == want
-        assert os.path.exists(_pidfile(token))
-        # owner-only, under the user's home: no other account can plant a pid for the kill to signal
-        assert _pidfile(token).startswith(str(tmp_path) + os.sep)
-        assert stat.S_IMODE(os.stat(os.path.dirname(_pidfile(token))).st_mode) == 0o700
-        assert stat.S_IMODE(os.stat(_pidfile(token)).st_mode) == 0o600
+        assert os.path.exists(pidfile)
+        assert stat.S_IMODE(os.stat(os.path.dirname(pidfile)).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(pidfile).st_mode) == 0o600
+        if not use_runtime:
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "other-runtime"))
+        monkeypatch.setenv("HERMES_SSH_RUNTIME_PIDFILES", "0")
         rc = subprocess.run(["sh", "-c", ssh_env._remote_group_kill_command(token)], timeout=30).returncode
         assert rc == 0
         tree.wait(timeout=5)
@@ -261,14 +317,14 @@ def test_remote_group_kill_reaps_the_whole_tree(body, monkeypatch, tmp_path):
         while _group_sleeps(tree.pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert _group_sleeps(tree.pid) == []
-        assert not os.path.exists(_pidfile(token))
+        assert not os.path.exists(pidfile)
     finally:
         for p in _group_sleeps(tree.pid):
             p.kill()
         tree.kill()
         tree.wait()
         with contextlib.suppress(FileNotFoundError):
-            os.unlink(_pidfile(token))
+            os.unlink(pidfile)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
@@ -319,7 +375,8 @@ def test_kill_dollar_dollar_still_ends_the_command(monkeypatch, tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
-def test_stale_pidfile_sweep_removes_dead_keeps_live_and_foreign(monkeypatch, tmp_path):
+@pytest.mark.parametrize("both_dirs", [False, True], ids=["legacy", "both"])
+def test_stale_pidfile_sweep_removes_dead_keeps_live_and_foreign(both_dirs, request, monkeypatch, tmp_path):
     """t_70090b16: a wrapper killed outright cannot clean up; the next start sweeps files whose pid
     is dead, and touches nothing outside its own name pattern."""
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -336,12 +393,17 @@ def test_stale_pidfile_sweep_removes_dead_keeps_live_and_foreign(monkeypatch, tm
             "foreign_name": (f"other-{uuid.uuid4().hex}.pid", f"{dead.pid}\n"),
             "short_token": ("hermes-run-abc.pid", f"{dead.pid}\n"),
         }
-        for name, content in files.values():
-            (run_dir / name).write_text(content)
-        rc = subprocess.run(["bash", "-c", ssh_env._stale_pidfile_sweep()], timeout=30).returncode
-        assert rc == 0
-        left = {k for k, (name, _) in files.items() if (run_dir / name).exists()}
-        assert left == {"live", "empty", "foreign_name", "short_token"}
+        dirs = [run_dir, request.getfixturevalue("runtime_dir")] if both_dirs else [run_dir]
+        for directory in dirs:
+            for name, content in files.values():
+                (directory / name).write_text(content)
+        # Even with writes rolled back, sweep leftover files from both versions.
+        monkeypatch.setenv("HERMES_SSH_RUNTIME_PIDFILES", "0")
+        subprocess.run(["bash", "-c", ssh_env._run_preamble(uuid.uuid4().hex) + "true"],
+                       stdin=subprocess.DEVNULL, check=True, timeout=10)
+        for directory in dirs:
+            left = {k for k, (name, _) in files.items() if (directory / name).exists()}
+            assert left == {"live", "empty", "foreign_name", "short_token"}
     finally:
         live.kill()
         live.wait()
