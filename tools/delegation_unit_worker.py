@@ -248,6 +248,7 @@ def build_parent(record: Dict[str, Any]):
     """Step 3: the parent ``AIAgent`` from the CLI's resolver, keyed on the recorded route; the
     parent never runs a turn. Children get the profile's own ``delegation:`` config (read by the
     sync path); no provider override derived from the route is ADDED here."""
+    from gateway.run_config_loaders import provider_routing_agent_kwargs
     from run_agent import AIAgent
     from hermes_cli.config import load_config
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -274,10 +275,7 @@ def build_parent(record: Dict[str, Any]):
         "max_iterations": int(execution.get("max_iterations") or 45),
         "quiet_mode": True, "skip_memory": True, "skip_context_files": True,
         "prefill_messages": _prefill_messages(),
-        "providers_allowed": pr.get("only"), "providers_ignored": pr.get("ignore"),
-        "providers_order": pr.get("order"), "provider_sort": pr.get("sort"),
-        "provider_require_parameters": bool(pr.get("require_parameters", False)),
-        "provider_data_collection": pr.get("data_collection"),
+        **provider_routing_agent_kwargs(pr),
     }
     enabled = (execution["parent_toolsets"] if execution.get("parent_toolsets") is not None
                else execution.get("toolsets"))
