@@ -3,11 +3,15 @@ writes names its reader (ppid, argv, parent, cwd), and a clock-shifted process w
 
 Writers covered: the three byte-vendored fleet_placement copies (env:PLACEMENT_HOME), the fork's own
 allocation_policy.count_deprecated_read (module/file names), and the `kanban placement` deprecated verb.
+
+The tag never parses argv (Apollo 11-20 ruling after Prism 918779febe18 / 86eec040fec9): own process = the
+executable's basename + sys.argv[0]; parent = its executable name only; cwd.
 """
 from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +20,8 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.fleet_placement import admission_demand, alloc_client, placement
 
 COPIES = [placement, admission_demand, alloc_client]
+REPO = Path(__file__).resolve().parents[2]
+PY = os.path.basename(sys.executable)
 
 
 @pytest.fixture
@@ -29,7 +35,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("FAKETIME", raising=False)
     for mod in COPIES:
         monkeypatch.setattr(mod, "_OLD_ENV_COUNTED", set())
-    monkeypatch.setattr(sys, "orig_argv", ["/usr/bin/python3", "-I", "-c", "probe", "ignored"])
+    monkeypatch.setattr(sys, "argv", ["/srv/x/reader.py", "--token", "ignored"])
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
@@ -38,7 +44,7 @@ def _logs(env):
     """Lines of every deprecated-name-reads.log under the sandbox (vendored copies: $HERMES_HOME; fork: kanban home)."""
     paths = {env / "vh" / "var" / "ci-box" / "deprecated-name-reads.log",
              kb.kanban_home() / "var" / "ci-box" / "deprecated-name-reads.log"}
-    return [ln for p in paths if p.exists() for ln in p.read_text(encoding="utf-8").splitlines()]
+    return [ln for p in paths if p.exists() for ln in p.read_text(encoding="utf-8-sig").splitlines()]
 
 
 def _copy_writer(mod):
@@ -71,57 +77,74 @@ def test_counter_line_names_the_reader(env, monkeypatch, name, call, label):
     # `cli:kanban placement` keeps its space (field 1-2); normalise it so the field checks line up.
     f = line.replace("cli:kanban placement", "cli:kanban+placement").split(" ")
     assert f[1] == label and f[2] == f"pid={os.getpid()}", line
-    assert f[3] == f"ppid={os.getppid()}" and f[4] == "argv=python3+-c", line
-    assert f[5].startswith("parent=") and f[5] != "parent=-" and f[6] == f"cwd={env}", line
+    assert f[3] == f"ppid={os.getppid()}" and f[4] == f"argv={PY}+/srv/x/reader.py", line
+    assert f[5].startswith("parent=") and f[5] != "parent=-" and "+" not in f[5] and f[6] == f"cwd={env}", line
     assert len(f) == 7, line
 
 
-SECRETS = ("ghp_T5931SECRETtoken0123456789", "x:hunter2secret@host", "FOO=envsecret")
+TOKEN = "ExampleSecret_123"
+SECRETS = (TOKEN, "ghp" + "_T5931D620FAKEFAKEFAKEFAKE01", "x:hunter2secret@host", "FOO=envsecret")
+READERS = {   # one real reader process per writer kind
+    "kanban_placement_verb": "from hermes_cli import kanban as k; k._count_deprecated_verb('placement', 'allocation')",
+    "placement": "from hermes_cli.fleet_placement import placement as p; p._allocation_home_env()",
+    "allocation_policy": "from hermes_cli import allocation_policy as a; "
+                         "a.count_deprecated_read('module:hermes_cli.placement_policy')",
+}
 
 
-@pytest.mark.parametrize("argv,want", [
-    (["/usr/bin/python3", "-u", "{script}", "--token", SECRETS[0], f"https://{SECRETS[1]}/r.git"], "python3+{script}"),
-    (["/opt/bin/python3.13", "-m", "pkg.mod", "--token", SECRETS[0]], "python3.13+-m+pkg.mod"),
-    (["/bin/sh", "-c", f"{SECRETS[2]} hermes kanban placement --token {SECRETS[0]}"], "sh+-c"),
-    (["/usr/bin/curl", "-H", f"Authorization: token {SECRETS[0]}", f"https://{SECRETS[1]}/r"], "curl"),
-], ids=["script", "module", "dash-c", "no-script"])
-@pytest.mark.parametrize("name,call,label", WRITERS, ids=[w[0] for w in WRITERS])
-def test_counter_line_records_names_never_argument_values(env, monkeypatch, name, call, label, argv, want):
-    """Prism 918779febe18 / Apollo 11-20: a command line can carry a credential (--token <v>, a URL password, an
-    env-prefix or a `-c` body). The line records the executable basename, then `-c`, `-m <module>` or a script path."""
-    script = env / "reader.py"
-    script.write_text("")
-    argv = [a.replace("{script}", str(script)) for a in argv]
-    want = want.replace("{script}", str(script))
-    monkeypatch.setattr(sys, "orig_argv", argv)
-    before = set(_logs(env))
-    call(env, monkeypatch)
-    (line,) = [ln for ln in _logs(env) if ln not in before]
-    assert f" argv={want} " in line, line
-    for s in SECRETS:
-        assert s.split("=")[-1] not in line, line
-
-
-def test_parent_command_line_values_never_reach_the_line(tmp_path):
-    """The parent side through a real process tree, on the deprecated verb's path:
-    `sh -c 'FOO=<secret> python3 -c <count the verb> --token <secret>'`."""
-    import shlex
+def _run_reader(tmp_path, cmd, stdin=None):
+    """Run a real reader with an isolated home; return its one counter line."""
     import subprocess
-    code = "from hermes_cli import kanban as k; k._count_deprecated_verb('placement', 'allocation')"
-    inner = f"{SECRETS[2]} {shlex.quote(sys.executable)} -c {shlex.quote(code)} --token {SECRETS[0]}; :"
-    envv = {k: v for k, v in os.environ.items() if k not in ("HERMES_CLOCK_SHIFT_DAYS", "FAKETIME")}
-    envv.pop("HERMES_KANBAN_SANDBOX", None)
+    envv = {k: v for k, v in os.environ.items()
+            if k not in ("HERMES_CLOCK_SHIFT_DAYS", "FAKETIME", "ALLOCATION_HOME")}
     envv["HERMES_HOME"] = envv["HERMES_KANBAN_HOME"] = str(tmp_path / "vh")
-    envv["PYTHONPATH"] = os.pathsep.join([str(__import__("pathlib").Path(__file__).resolve().parents[2])]
-                                         + ([envv["PYTHONPATH"]] if envv.get("PYTHONPATH") else []))
-    (tmp_path / "vh").mkdir()
-    subprocess.run(["sh", "-c", inner], env=envv, cwd=tmp_path, check=True, timeout=120, capture_output=True)
-    lines = [ln for p in tmp_path.rglob("deprecated-name-reads.log") for ln in p.read_text().splitlines()]
+    envv["PLACEMENT_HOME"] = str(tmp_path / "old")
+    envv["PYTHONPATH"] = os.pathsep.join([str(REPO), str(tmp_path)] + ([envv["PYTHONPATH"]] if envv.get("PYTHONPATH") else []))
+    (tmp_path / "vh").mkdir(exist_ok=True)
+    subprocess.run(cmd, env=envv, cwd=tmp_path, input=stdin, text=True, encoding="utf-8", check=True, timeout=120,
+                   capture_output=True)
+    lines = [ln for p in tmp_path.rglob("deprecated-name-reads.log") for ln in p.read_text(encoding="utf-8-sig").splitlines()]
     assert len(lines) == 1, lines
-    assert " cli:kanban placement " in lines[0], lines
-    assert f" argv={os.path.basename(sys.executable)}+-c " in lines[0] and " parent=sh+-c " in lines[0], lines
+    return lines[0]
+
+
+OWN_CASES = {   # argv builder, stdin builder, expected argv= field
+    "stdin-dash-m-token": (lambda t, c: [sys.executable, "-", "-m", TOKEN], lambda c: c, f"{PY}+-"),
+    "dash-c-program-text": (lambda t, c: [sys.executable, "-c", f"{c}  # {SECRETS[1]}", "--token", TOKEN],
+                            None, f"{PY}+-c"),
+    "script-then-token-flag": (lambda t, c: [sys.executable, str(t / "reader.py"), "--token", SECRETS[1]],
+                               None, f"{PY}+{{tmp}}/reader.py"),
+    "script-then-token-positional": (lambda t, c: [sys.executable, str(t / "reader.py"), TOKEN,
+                                                   f"https://{SECRETS[2]}/r.git"], None, f"{PY}+{{tmp}}/reader.py"),
+    "module-then-token": (lambda t, c: [sys.executable, "-m", "t_reader_mod", "-m", TOKEN], None,
+                          f"{PY}+{{tmp}}/t_reader_mod.py"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(OWN_CASES))
+@pytest.mark.parametrize("reader", sorted(READERS))
+def test_own_argv_values_never_reach_the_line(tmp_path, reader, case):
+    """Prism 918779febe18 / 86eec040fec9: `python3 - -m <token>`, `-c <program text>`, a script followed by
+    `--token <token>` or a token-shaped positional, `-m mod -m <token>`: none of the token text is logged."""
+    code = READERS[reader]
+    (tmp_path / "reader.py").write_text(code + "\n", encoding="utf-8")
+    (tmp_path / "t_reader_mod.py").write_text(code + "\n", encoding="utf-8")
+    argv, stdin, want = OWN_CASES[case]
+    line = _run_reader(tmp_path, argv(tmp_path, code), stdin(code) if stdin else None)
+    assert f" argv={want.format(tmp=tmp_path)} " in line, line
     for s in SECRETS:
-        assert s.split("=")[-1] not in lines[0], lines
+        assert s not in line and s.split("=")[-1] not in line and "hunter2" not in line, line
+
+
+@pytest.mark.parametrize("reader", sorted(READERS))
+def test_parent_is_its_executable_name_only(tmp_path, reader):
+    """The parent side through a real process tree: `sh -s -m <token>` reading a script that runs the reader."""
+    import shlex
+    script = f"FOO=envsecret {shlex.quote(sys.executable)} -c {shlex.quote(READERS[reader])} --token {TOKEN}\n:\n"
+    line = _run_reader(tmp_path, ["sh", "-s", "-m", TOKEN], stdin=script)
+    assert f" argv={PY}+-c " in line and any(f" parent={p} " in line for p in ("sh", "dash", "bash")), line
+    for s in SECRETS:
+        assert s not in line and s.split("=")[-1] not in line, line
 
 
 @pytest.mark.parametrize("var,val", [("HERMES_CLOCK_SHIFT_DAYS", "45"), ("FAKETIME", "+400d")])
@@ -134,7 +157,7 @@ def test_clock_shifted_process_never_counts(env, monkeypatch, name, call, label,
 
 
 def test_vendored_reader_tag_is_the_fork_reader_tag():
-    """The fork's copy of the helper stays the vendored text (one shape of line in one log)."""
+    """The fork's helper is the vendored text, docstring included (one shape of line in one log)."""
     import inspect
-    body = inspect.getsource(placement._reader_tag).split('"""')[-1]
-    assert inspect.getsource(ap._reader_tag).split('"""')[-1] == body
+    texts = {m.__name__: inspect.getsource(m._reader_tag) for m in COPIES + [ap]}
+    assert len(set(texts.values())) == 1, sorted(texts)

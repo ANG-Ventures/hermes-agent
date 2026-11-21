@@ -1,8 +1,8 @@
 {
   "_doc": "Byte copies of hermes-home files (card t_29403e19). Never edit the copies; re-vendor and update this pin. tests/hermes_cli/test_fleet_placement_vendored.py checks each sha256 and fails once vendored_at is older than max_age_days. Fork-side differences live in __init__.py (the state root), never in a copy.",
   "source_repo": "ANG-Ventures/hermes-home",
-  "source_ref": "50bfdc0477e41e15214e6c15fa177ff49d2ace60",
-  "source_note": "Byte-equal re-vendor of placement/admission_demand/alloc_client from hermes-home#13696 head (t_bab23582, reader tag on deprecated-name-reads lines, names only); admission.py and work_estimate.py are byte-identical at that commit and keep their 4b6121b5 pin.",
+  "source_ref": "d15e595b32aece47ceab638405764c3bf09c9d98",
+  "source_note": "Byte-equal re-vendor of placement/admission_demand/alloc_client from hermes-home#13696 head (t_bab23582, reader tag on deprecated-name-reads lines: exe + sys.argv[0], parent exe name only, no argv parsing); admission.py and work_estimate.py are byte-identical at that commit and keep their 4b6121b5 pin.",
   "vendored_at": "2026-11-20",
   "max_age_days": 21,
   "files": {
@@ -13,18 +13,18 @@
     },
     "admission_demand.py": {
       "source_path": "scripts/lib/admission_demand.py",
-      "source_ref": "50bfdc0477e41e15214e6c15fa177ff49d2ace60",
-      "sha256": "23e4be342c5c0287c1e34e53ecd8d79ca2329887b042b194910404362eeb7d63"
+      "source_ref": "d15e595b32aece47ceab638405764c3bf09c9d98",
+      "sha256": "b055140bcd40ad6a346215d478e7b9851651e96b93b7b66aa1459385bec55234"
     },
     "alloc_client.py": {
       "source_path": "scripts/lib/alloc_client.py",
-      "source_ref": "50bfdc0477e41e15214e6c15fa177ff49d2ace60",
-      "sha256": "de9e6e0de3f1bdeea9a94bec2f0e10b0b282dbd1efcb5b80336605a629ffb854"
+      "source_ref": "d15e595b32aece47ceab638405764c3bf09c9d98",
+      "sha256": "3cf3f7e218611aa85e90a529bdc7b82669b4ddc4685d15f32214564dbc88e47e"
     },
     "placement.py": {
       "source_path": "scripts/lib/placement.py",
-      "source_ref": "50bfdc0477e41e15214e6c15fa177ff49d2ace60",
-      "sha256": "f9b56cb954fb77250cad3cb78ab957c871a92e3842f25816114d7cd0157f5f84"
+      "source_ref": "d15e595b32aece47ceab638405764c3bf09c9d98",
+      "sha256": "082a2eff32d2359027c7526d6adf88562e41e1b1763f463671b5fec8d62f3ae5"
     },
     "work_estimate.py": {
       "source_path": "scripts/lib/work_estimate.py",

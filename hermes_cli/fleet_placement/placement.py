@@ -160,55 +160,39 @@ class LedgerError(PlacementError):
 
 
 def _reader_tag() -> str:
-    """`` ppid=N argv=<own identity> parent=<parent identity> cwd=<cwd>`` for a deprecated-name-reads line, so a reader
-    that has exited by the time someone reads the log can still be named (t_5931d620; a pid alone never could).
-    Identity is NAMES only, never an argument value (Prism 80bdcd765cc9 / 918779febe18: a command line can carry a
-    credential): the executable's basename, then the first of `-c` (its program text is never written), `-m <module>`
-    or an existing script path; no other argv word. Whitespace becomes ``+``, 160 chars a field. Never raises.
+    """`` ppid=N argv=<exe>+<argv0> parent=<exe> cwd=<cwd>`` for a deprecated-name-reads line, so a reader that has
+    exited by the time someone reads the log can still be named (t_5931d620; a pid alone never could).
+    No argv word is ever parsed or written past ``sys.argv[0]`` (Apollo 11-20 ruling after Prism 80bdcd765cc9 /
+    918779febe18 / 86eec040fec9: any rule that reads argv to pick a name leaks a value): own process = the executable's
+    basename and ``sys.argv[0]`` as Python gives it (script path, the module's file under -m, or ``-c`` / ``-`` / empty);
+    parent = its executable name only (/proc/<ppid>/comm, else the basename of /proc/<ppid>/exe, else ``ps -o comm=``).
+    Whitespace becomes ``+``, 160 chars a field. Never raises.
     One text in hermes-home scripts/lib and the hermes-agent copies (t_bab23582)."""
     import sys
 
-    def ident(argv, base):
-        argv = [str(a) for a in argv if a]
-        if not argv:
-            return "-"
-        out = [os.path.basename(argv[0])]
-        for i, a in enumerate(argv[1:], 1):
-            if a == "-c":
-                out.append("-c")
-                break
-            if a == "-m":
-                if i + 1 < len(argv) and argv[i + 1].replace(".", "_").isidentifier():
-                    out += ["-m", argv[i + 1]]
-                break
-            try:
-                script = not a.startswith("-") and os.path.isfile(os.path.join(base, a))
-            except Exception:  # noqa: BLE001 -- one unreadable word must not drop the whole tag
-                script = False
-            if script:
-                out.append(a)
-                break
-        return "".join("+" if c.isspace() else c for c in " ".join(out))[:160] or "-"
+    def field(s):
+        return "".join("+" if c.isspace() else c for c in str(s))[:160] or "-"
     try:
         ppid = os.getppid()
+        parent = ""
         try:
-            with open(f"/proc/{ppid}/cmdline", "rb") as fh:
-                parent = [p.decode("utf-8", "replace") for p in fh.read().split(b"\0")]
-        except OSError:   # macOS: no /proc
-            import subprocess
-            parent = subprocess.run(["ps", "-o", "command=", "-p", str(ppid)], capture_output=True, timeout=2,
-                                    text=True, encoding="utf-8", errors="replace").stdout.split()
+            with open(f"/proc/{ppid}/comm", "rb") as fh:
+                parent = fh.read().decode("utf-8", "replace").strip()
+        except OSError:
+            try:
+                parent = os.path.basename(os.readlink(f"/proc/{ppid}/exe"))
+            except OSError:   # macOS: no /proc
+                import subprocess
+                parent = os.path.basename(subprocess.run(
+                    ["ps", "-o", "comm=", "-p", str(ppid)], capture_output=True, timeout=2,
+                    text=True, encoding="utf-8", errors="replace").stdout.strip())
         try:
             cwd = os.getcwd()
         except OSError:
             cwd = ""
-        own = getattr(sys, "orig_argv", None) or [sys.executable] + list(sys.argv)
-        try:   # a parent's relative script path resolves against the PARENT's cwd
-            pcwd = os.readlink(f"/proc/{ppid}/cwd")
-        except OSError:   # macOS, or not ours to read
-            pcwd = cwd
-        tag = f" ppid={ppid} argv={ident(own, cwd)} parent={ident(parent, pcwd)} cwd="
-        return tag + ("".join("+" if c.isspace() else c for c in cwd)[:160] or "-")
+        argv0 = sys.argv[0] if sys.argv else ""
+        own = os.path.basename(sys.executable or "") + "+" + str(argv0)
+        return f" ppid={ppid} argv={field(own)} parent={field(parent)} cwd={field(cwd)}"
     except Exception:  # noqa: BLE001 -- a counter must never break a reader
         return ""
 
