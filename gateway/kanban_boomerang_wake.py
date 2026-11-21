@@ -1832,6 +1832,9 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     state = state or BoomerangWakeState()
     key = entry["key"]
     live = state.get_claim(key) or entry
+    if entry.get("wake_model_fallback_ran") and not live.get("wake_model_fallback_ran"):
+        # t_d3b04ec1: the gate's note write failed; the caller's copy carries why the override did not run it.
+        live = {**live, "wake_model_fallback_ran": True, "wake_model_fallback": entry.get("wake_model_fallback")}
     if live.get("state") in (STATE_TERMINAL, STATE_CANCELLED):
         return {"ok": False, "action": None, "reason": "replay", "summary": "", "noop": True}
     try:
@@ -2318,10 +2321,14 @@ def finding_text(entry: dict, result: dict, header: str) -> str:
     """What the child learned, ahead of the original wake (D-14: wake WITH the reason)."""
     secs = int(max(0.0, _time.time() - float(entry.get("claimed_at") or _time.time())))
     mode = entry.get("inherit_mode") or entry.get("mode") or "fork"
+    from gateway.kanban_wake_child_route import shown
+
+    # t_d3b04ec1: only what was APPLIED (written when the override is used); ``wake_effort`` /
+    # ``wake_model`` hold the card's raw value and never reach this header.
     if entry.get("wake_model_override") and not entry.get("wake_model_fallback_ran"):
-        mode = f"{mode}, model {entry['wake_model_override']}"   # t_54bbaca0: names the model it ran on
-    if entry.get("wake_effort") and not entry.get("wake_model_fallback_ran"):
-        mode = f"{mode}, effort {entry['wake_effort']}"
+        mode = f"{mode}, model {shown(entry['wake_model_override'])}"   # t_54bbaca0: names the model it ran on
+    if entry.get("wake_effort_applied") and not entry.get("wake_model_fallback_ran"):
+        mode = f"{mode}, effort {shown(entry['wake_effort_applied'])}"
     if entry.get("wake_model_fallback"):   # t_54bbaca0: an override failed or was not usable; the home hears it
         mode = f"{mode}, {entry['wake_model_fallback']}"
     lines = [f"{MARKER} {header} {entry['task_id']} ({entry.get('row')}, {mode}, {secs}s): "
@@ -2746,7 +2753,9 @@ def _run_child_delegate(parent: Any, goal: str, mode: str) -> tuple:
     why = _first_line(final, 160) if str(final or "").strip() else "empty final message"
     if status != "failed":
         why = f"{status}: {why}"
-    what = f"wake-model {route['label']}" if route.get("model") else f"wake-effort {route.get('effort')}"
+    from gateway.kanban_wake_child_route import shown
+
+    what = f"wake-model {shown(route['label'])}" if route.get("model") else f"wake-effort {route.get('effort')}"
     line = f"{what} failed ({why}), ran on parent {_ran_on(parent)}"
     # The dispatcher's gate: no rerun while the gateway stops or once the claim is cancelled (budget);
     # otherwise it writes the note to the claim BEFORE the parent dispatch, so a raise there keeps it.
@@ -2957,7 +2966,7 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
         if route:
             route["parent_mode"] = mode
         if route and route.get("effort"):   # t_54bbaca0: an effort override keeps the parent's model and lane
-            extra["wake_effort"] = route["effort"]
+            extra["wake_effort_applied"] = route["effort"]   # t_d3b04ec1: not the card's raw ``wake_effort``
             if mode == "fork" and not _same_effort(route["effort"], parent):
                 # A changed effort changes the request fingerprint: the fork would be rebuilt as a summary
                 # fold (tools/delegate_tool.py same_request_params), so run and report what actually runs.

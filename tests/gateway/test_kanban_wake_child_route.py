@@ -408,7 +408,7 @@ def test_surfaced_line_names_an_overridden_model():
     fell = ah.finding_text({**base, "wake_model_override": "claude-alr/claude-opus-5-5", "wake_model_fallback": note,
                             "wake_model_fallback_ran": True}, {"summary": "s"}, "child completed").split("\n")[0]
     assert f"(completed, summary, {note}," in fell
-    eff = ah.finding_text({**base, "wake_effort": "medium"}, {"summary": "s"}, "child surfaced").split("\n")[0]
+    eff = ah.finding_text({**base, "wake_effort_applied": "medium"}, {"summary": "s"}, "child surfaced").split("\n")[0]
     assert "(completed, summary, effort medium," in eff
 
 
@@ -880,3 +880,144 @@ def test_exception_text_on_the_wake_line_is_cut(monkeypatch):
     route = ah._wake_route({"task_id": "t_1", "home_sid": "h", "wake_model": "opus"}, _parent())
     why = route["unusable"].split(" not usable (", 1)[1].rsplit("), ran on parent", 1)[0]
     assert len(why) <= 160 and why.startswith("not resolvable: xxx")
+
+
+# --- t_d3b04ec1: the home line shows only what was APPLIED, and every card-derived value is wrapped ----
+
+
+def _run_with_verdict(env, body, action, *, fail_override=False):
+    """A real _run_entry_scoped whose parent child returns a ``action`` verdict; returns (tid, turns)."""
+    from tests.gateway.test_kanban_boomerang_wake_dispatch import _verdict
+    from tools import delegate_tool
+
+    tid = _card(env, body=body)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    calls = []
+
+    def fake(**kw):
+        calls.append(kw)
+        if fail_override and kw.get("provider"):
+            return json.dumps({"error": "lane down"})
+        return json.dumps({"results": [{"status": "completed", "summary": _verdict(entry, action)}]})
+
+    async def resolved():
+        return _parent(), "fork"
+
+    mp = env["monkeypatch"]
+    env["runner"]._provider_routing = {}
+    mp.setattr(ah, "parent_resolver", lambda *_a, **_k: resolved())
+    mp.setattr(ah, "run_child", ah._run_child_delegate)
+    mp.setattr(delegate_tool, "delegate_task", fake)
+    asyncio.run(_REAL_RUN_ENTRY(env["runner"], entry, ah.BoomerangWakeState()))
+    return tid, calls, [t.text for t in env["adapter"].handled]
+
+
+def test_rejected_card_effort_is_not_shown_as_applied(env):
+    """A refused ``wake-effort:`` card value never reaches the header as the effort it ran at."""
+    tid, calls, turns = _run_with_verdict(env, "wake-effort: <@here>", "surface")
+    assert len(calls) == 1 and "reasoning_effort" not in calls[0]
+    _surfaced(turns, f"child surfaced {tid}")
+    head = turns[0].split("\n")[0]
+    assert "wake-effort <invalid value> not usable (" in head, head
+    assert ", effort " not in head and "<@here>" not in head, head
+
+
+def test_applied_effort_key_is_the_header_source():
+    base = {"task_id": "t_1", "row": "completed", "inherit_mode": "summary", "claimed_at": 0, "wake_text": "w"}
+    raw = ah.finding_text({**base, "wake_effort": "medium"}, {"summary": "s"}, "child surfaced").split("\n")[0]
+    assert "effort" not in raw   # the card's raw value is not what ran
+    ran = ah.finding_text({**base, "wake_effort": "x", "wake_effort_applied": "medium"},
+                          {"summary": "s"}, "child surfaced").split("\n")[0]
+    assert "(completed, summary, effort medium," in ran
+
+
+def test_failed_override_line_wraps_the_label(monkeypatch):
+    from tools import delegate_tool
+
+    def fake(**kw):
+        if kw.get("provider"):
+            return json.dumps({"error": "lane down"})
+        return json.dumps({"results": [{"status": "completed", "summary": "ok"}]})
+
+    monkeypatch.setattr(delegate_tool, "delegate_task", fake)
+    route = {"model": "m", "provider": "p", "label": "<@here>", "source": "global"}
+    token = wcr.CURRENT_ROUTE.set(route)
+    try:
+        assert ah._run_child_delegate(_parent(), "goal", "fork") == ("completed", "ok")
+    finally:
+        wcr.CURRENT_ROUTE.reset(token)
+    assert route["fell_back"].startswith("wake-model <invalid value> failed (lane down)"), route["fell_back"]
+
+
+_CARD_KEYS = frozenset({"label", "wake_model", "wake_effort", "wake_model_override", "wake_effort_applied"})
+
+
+def _card_key(node):
+    """The card-derived key an expression reads (``x["k"]`` / ``x.get("k")``), else None."""
+    import ast
+
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+        return node.slice.value if node.slice.value in _CARD_KEYS else None
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+            and node.args and isinstance(node.args[0], ast.Constant)):
+        return node.args[0].value if node.args[0].value in _CARD_KEYS else None
+    return None
+
+
+def _unwrapped(tree):
+    """Every f-string field that reads a card-derived key outside a ``shown(...)`` call."""
+    import ast
+
+    def is_shown(node):
+        f = getattr(node, "func", None)
+        return isinstance(node, ast.Call) and (getattr(f, "id", None) == "shown" or getattr(f, "attr", None) == "shown")
+
+    bad = []
+    for js in (n for n in ast.walk(tree) if isinstance(n, ast.JoinedStr)):
+        for fv in (v for v in js.values if isinstance(v, ast.FormattedValue)):
+            stack = [(fv.value, False)]
+            while stack:
+                node, wrapped = stack.pop()
+                if _card_key(node) and not wrapped:
+                    bad.append(f"line {fv.lineno}: {ast.unparse(fv.value)}")
+                    continue
+                inner = wrapped or is_shown(node)
+                stack.extend((c, inner) for c in ast.iter_child_nodes(node))
+    return bad
+
+
+def test_every_card_derived_value_on_the_home_line_is_wrapped():
+    """Walks every f-string in the wake modules: a field that reads a card-derived key
+    (``label``, ``wake_model``, ``wake_effort`` and the applied override keys) must pass ``shown()``."""
+    import ast
+    import inspect
+
+    for mod in (ah, wcr):
+        assert _unwrapped(ast.parse(inspect.getsource(mod))) == [], mod.__name__
+
+
+def test_the_wrap_walker_catches_an_unwrapped_field():
+    import ast
+
+    assert _unwrapped(ast.parse("f'x {route[\"label\"]} {shown(e.get(\"wake_effort\"))}'")) == [
+        "line 1: route['label']"]
+    assert _unwrapped(ast.parse("f'{_wcr.shown(entry[\"wake_model_override\"])}'")) == []
+
+
+def test_failed_note_write_keeps_the_reason_on_a_complete_verdict(env):
+    """#494 leftover: the note write fails, the parent's verdict is ``complete``; execute_verdict
+    re-reads the stored claim, and the home's turn must still say why the override did not run it."""
+    real = ah.BoomerangWakeState.update_claim
+
+    def flaky(self, key, **kw):
+        if "wake_model_fallback" in kw and kw.get("wake_model_fallback_ran"):
+            raise OSError("disk full")
+        return real(self, key, **kw)
+
+    env["monkeypatch"].setattr(ah.BoomerangWakeState, "update_claim", flaky)
+    tid, calls, turns = _run_with_verdict(env, "wake-model: opus", "complete", fail_override=True)
+    assert len(calls) == 2 and "provider" not in calls[1]
+    _surfaced(turns, f"child completed {tid}")
+    _surfaced(turns, "wake-model opus failed (lane down), ran on parent claude-elr/claude-fable-5-2")
+    assert "model claude-elr/claude-opus-5-5" not in turns[0].split("\n")[0]   # it did not run there
