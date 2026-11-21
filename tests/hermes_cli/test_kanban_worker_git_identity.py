@@ -452,3 +452,28 @@ def test_dispatch_profile_refusal_charges_the_card_and_quarantines_no_host(kanba
     assert "alpha" in runs[0]["error"] and "GIT_AUTHOR_EMAIL" in runs[0]["error"]
     assert not kwp.board_fault("ace-media", "default") and not kwp.board_fault("ace-ai", "default")
     assert pages == []
+
+
+def test_workspace_cd_denied_is_a_host_workspace_fault_not_a_card_retry(rig, policy, monkeypatch):
+    """t_b6205005: t_18dd8603's ACL-less workspace on ace-ai refused the worker's terminal user (`cd: ...: Permission
+    denied`, rc 126); the probe error was charged as a card spawn_failed three times and the card gave up. It is a
+    host/workspace fault: one named error, no retry charged, the host paged once, no (host, board) quarantine."""
+    if os.geteuid() == 0:
+        pytest.skip("root can cd into a 0000 dir")
+    rig.gitconfig(BOT)
+    # the dispatcher host's own cwd is not the pool host's dir: only the probe's remote `cd` meets the denial
+    monkeypatch.setattr(kwh, "worker_spawn_cwd", lambda ws: None)
+    rig.ws.chmod(0)
+    try:
+        with pytest.raises(kwh.WorkerWorkspaceAccessDenied) as ei:
+            rig.check()
+    finally:
+        rig.ws.chmod(0o770)
+    assert isinstance(ei.value, kwh.WorkerIdentityProbeError)          # existing callers still see a probe error
+    assert "no retry charged" in str(ei.value) and str(rig.ws) in str(ei.value)
+    noted = []
+    monkeypatch.setattr(kwh, "note_identity_fault", lambda *a: noted.append(a) or True)
+    assert kbd._host_fault(ei.value) == {"workspace_access_denied": {"host": "ace-media", "workspace": str(rig.ws)}}
+    assert noted == [("ace-media", None, str(ei.value))]
+    assert kwp.board_fault("ace-media", "default") is None
+    rig.check()                                                          # access back: admitted
