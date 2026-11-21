@@ -12,23 +12,18 @@ Precedence, first set wins:
 3. global: ``delegation.boomerang.wake_child.model`` (lane: ``wake_child.provider``);
 4. the parent's route.
 
-Session and global values (operator-written config) take a slot, a bare model id or an explicit
-``provider/model``. A slot keeps its target id whole (``anthropic/claude-x`` stays one model id) on
-the parent's lane unless ``wake_child.provider`` names one. ``inherit`` at any level means the parent.
+Session and global values take a slot, a bare model id or ``provider/model``; a slot's target id stays
+whole, on the parent's lane unless ``wake_child.provider`` names one. ``inherit`` = the parent.
 
 An override that cannot be used (unknown slot or model, a lane that does not list it, an unreadable
-value, a same-lane override, on the RESOLVED provider, while the gateway's ``provider_routing``
-sets a filter or cannot be read) is NOT dropped:
-the wake runs on the parent and its surfaced line says ``wake-model <x> not usable (<why>)``. An
-overridden child runs as a summary fold with no fallback chain of its own; any non-success outcome
-reruns the wake on the parent's model and chain, and its surfaced line says so.
+value; any MODEL override while a provider routing filter is configured or unreadable) is NOT
+dropped: the wake runs on the parent and its line says ``wake-model <x> not usable (<why>)``. An
+overridden child is a summary fold with no fallback chain; any non-success reruns it on the parent.
 
-Effort (item 5): ``wake-effort: <level>`` on the card, ``wake_child.effort_sessions.<home sid>``
-and ``wake_child.effort``, same precedence. A level is ``none`` or one of
-``hermes_constants.VALID_REASONING_EFFORTS`` (a fixed word list, so the card line is safe). It
-works alone (the parent's model and lane; a level other than the parent's runs as a summary fold,
-since it changes the fork's request fingerprint) or with a model override, and
-reaches the child as ``delegate_task(reasoning_effort=...)``. No setting = the home's effort.
+Effort: ``wake-effort: <level>`` on the card, ``wake_child.effort_sessions.<home sid>`` and
+``wake_child.effort``, same precedence; ``none`` or a ``hermes_constants.VALID_REASONING_EFFORTS``
+level. Alone it keeps the parent's model and lane (a changed level runs as a summary fold: it
+changes the fork's request fingerprint); it reaches the child as ``delegate_task(reasoning_effort=)``.
 """
 from __future__ import annotations
 
@@ -51,8 +46,7 @@ def _efforts() -> tuple:
 # Parent attributes a pinned provider resets (tools/delegate_tool_config._ROUTING_FILTER_DEFAULTS).
 _FILTERS = ("providers_allowed", "providers_ignored", "providers_order", "provider_sort",
             "provider_require_parameters", "provider_data_collection")
-# The gateway's ``provider_routing`` keys a live parent is built from (gateway/run_turn_runner.py).
-_ROUTING_KEYS = ("only", "ignore", "order", "sort", "require_parameters", "data_collection")
+_EMPTY = (None, "", False, [], (), {})
 
 #: The resolved override of the wake whose child runs in this context (set by the dispatcher;
 #: ``asyncio.to_thread`` copies it into the worker thread). None = the parent's route.
@@ -137,32 +131,38 @@ def requested(card_value: Optional[str], home_sids: Any, delegation_cfg: Optiona
     return None, None
 
 
-def _filters_set(parent: Any, routing: Any) -> list:
-    """The routing/privacy filters the parent runs with: the gateway's ``provider_routing`` (the
-    source a live parent is built from; a cold rebuild after a restart carries none) plus any on the
-    parent object. ``routing`` None or not a mapping = cannot be read: raises :class:`Unusable`."""
-    if not isinstance(routing, dict):
-        raise Unusable("the parent's routing filters cannot be read")
-    empty = (None, "", False, [], ())
-    return ([k for k in _ROUTING_KEYS if routing.get(k) not in empty]
-            + [a for a in _FILTERS if getattr(parent, a, None) not in empty])
+def shown(value: Any) -> str:   # a value echoed to the home line (card comment 443064 item 4)
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:/-]{1,64}", value) else "<invalid value>"
 
 
-def _canon(provider: Any) -> str:
-    from hermes_cli.providers import normalize_provider
+def read_provider_routing() -> Any:
+    """The config's ``provider_routing`` (None when absent); a read error raises, never ``{}``."""
+    from gateway.run import _gateway_config_home
+    from hermes_cli.config_effective import load_user_config_effective
 
-    return normalize_provider(str(provider or ""))
+    return load_user_config_effective(_gateway_config_home() / "config.yaml", fail_closed=True).get("provider_routing")
+
+
+def _refuse_if_filtered(parent: Any, live_routing: Any) -> None:
+    """A model override pins a provider, which resets the parent's routing/privacy filters: refuse it
+    while ANY filter is configured (a non-empty ``provider_routing`` key in the config or the
+    gateway's in-memory copy, ``models`` included, or a filter attribute on the parent)."""
+    try:
+        sources = (read_provider_routing(), live_routing)
+        if not all(src is None or isinstance(src, dict) for src in sources):
+            raise TypeError("provider_routing is not a mapping")
+    except Exception as exc:
+        raise Unusable("provider routing could not be read") from exc
+    if (any(v not in _EMPTY for src in sources if src for v in src.values())
+            or any(getattr(parent, a, None) not in _EMPTY for a in _FILTERS)):
+        raise Unusable("provider routing filters are configured")
 
 
 def resolve_route(value: Any, parent_provider: Optional[str], *, source: str = "", task_id: str = "",
                   delegation_cfg: Optional[dict] = None, parent: Any = None,
-                  routing: Any = None) -> Optional[dict]:
+                  live_routing: Any = None) -> Optional[dict]:
     """``{"model", "provider", "label", "source"}`` for an override value, or None for the parent's
-    route (no value or ``inherit``). Raises :class:`Unusable` for a value that cannot be used.
-
-    ``routing``: the gateway's ``provider_routing`` mapping. A same-lane override (decided on the
-    RESOLVED provider) would reset the parent's filters, so it is unusable when any is set or when
-    ``routing`` cannot be read (None)."""
+    route (no value or ``inherit``). Raises :class:`Unusable` for a value that cannot be used."""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -185,15 +185,13 @@ def resolve_route(value: Any, parent_provider: Optional[str], *, source: str = "
     else:
         model_id = spec
     try:
-        verdict = resolve(_canon(lane) or None, model_id, resolve_aliases=False)
+        verdict = resolve(lane or None, model_id, resolve_aliases=False)
     except Exception as exc:
         raise Unusable(f"not resolvable: {exc}") from exc
     if verdict.reason != "known":   # only a model its lane lists
-        raise Unusable(f"{verdict.reason}: {verdict.model} on {verdict.provider or 'no lane'}")
-    same_lane = _canon(verdict.provider) == _canon(parent_provider)
-    kept = _filters_set(parent, routing) if same_lane else []
-    if kept:   # Prism 3d5c62bd0009: a provider pin resets these; never drop the parent's filters
-        raise Unusable(f"would drop the parent's routing filters ({', '.join(kept)})")
+        raise Unusable(f"{verdict.reason}: {shown(verdict.model)} on {shown(verdict.provider) if verdict.provider else 'no lane'}")
+    # Prism 3d5c62bd0009 / card comment 443064: never drop the parent's routing or privacy filters.
+    _refuse_if_filtered(parent, live_routing)
     return {"model": verdict.model, "provider": verdict.provider, "label": spec, "source": source}
 
 
