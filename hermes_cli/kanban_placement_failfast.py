@@ -102,6 +102,19 @@ def parse_absent(message: Optional[str]) -> Optional[Tuple[str, Optional[str], O
     return token, cap, host
 
 
+def absent_cause(message: Optional[str]) -> Optional[str]:
+    """The ``cause:`` line under an ABSENT token line (t_f1a3ee84): why the tool could not run there."""
+    for line in str(message or "").splitlines()[1:]:
+        if line.startswith("cause: "):
+            return line[len("cause: "):].strip() or None
+    return None
+
+
+def _cause_suffix(message: str) -> str:
+    cause = absent_cause(message)
+    return f"\ncause: {cause}" if cause else ""
+
+
 # -- the board decision (F1) ----------------------------------------------------
 
 def prior_reroutes(conn, task_id: str) -> int:
@@ -168,7 +181,8 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
                             summary=message.split("\n", 1)[0])
                 kb._append_event(conn, task_id, REROUTE_EVENT,
                                  {"from": host, "cap": cap, "run_id": int(run_id), "token": token,
-                                  "to": back_to},
+                                  "to": back_to,
+                                  **({"cause": absent_cause(message)} if absent_cause(message) else {})},
                                  run_id=int(run_id))
                 kb.add_comment(conn, task_id, "dispatcher",
                                f're-routed: {cap}, ran on {host}; I added a "requires: {cap} (...)" line to the body. '
@@ -184,7 +198,7 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
                   f"Second placement miss: the first ({prev.get('token')} cap={prev.get('cap')} "
                   f"host={prev.get('from')}) was re-routed once already, so the capability map or "
                   f"the derivation is wrong. Fix fleet/host-capabilities.json or the skill index, "
-                  f"or pin the card by hand.")
+                  f"or pin the card by hand.{_cause_suffix(message)}")
     else:
         reason = message
     # The re-route ledger, not block_recurrences, decided this: the loop
@@ -210,7 +224,7 @@ def _custody_hold(conn, task_id: str, run_id: int, message: str, *, cap: str, ho
               f"Placement custody hold: run {run_id} on {host} may have left work in its workspace "
               f"{workspace or '(unknown path)'} on {host}. Workspaces are host-local (no sync), so the "
               f"pool cannot move that work to another host. Recover or discard it on {host}, add "
-              f"`requires: {cap}` to pin the next run, then unblock.")
+              f"`requires: {cap}` to pin the next run, then unblock.{_cause_suffix(message)}")
     if not kb.block_task(conn, task_id, reason=reason, kind="needs_input",
                          expected_run_id=int(run_id), loop_breaker=False):
         return None

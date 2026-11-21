@@ -27,6 +27,7 @@ turn loop, and only it, parks the card ``needs_input`` with the message verbatim
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import threading
@@ -34,6 +35,8 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Dict, Iterator, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 RAIL_ABSENT_SUFFIX = "_RAIL_ABSENT"
 _PROBE_TIMEOUT_S = 2.0
@@ -230,18 +233,62 @@ def browser_capability_error(*, identity: bool = False) -> Optional[str]:
     return absent
 
 
-def placed_browser_rail_error() -> Optional[str]:
+def _card_requires(cap: str) -> bool:
+    """Whether this worker's card HARD-requires ``cap`` (declared or via an attached skill): the
+    dispatcher's placement stamp when present, else derived from the card and the fleet map now.
+    Unknown (no card row, unreadable map) reads as required, the pre-t_f1a3ee84 behaviour."""
+    from hermes_cli import kanban_placement_failfast as pff
+    from hermes_cli import kanban_worker_hosts as kwh
+    try:
+        import json
+        record = json.loads(os.environ.get(kwh.PLACEMENT_ENV) or "{}")
+        stamped = record.get(pff.REQUIRES_KEY) if isinstance(record, dict) else None
+        if isinstance(stamped, list):
+            return cap in stamped
+        from hermes_cli import kanban_db as kb
+        with kb.connect_closing() as conn:
+            row = conn.execute("SELECT body, skills FROM tasks WHERE id = ?", (_owned_task(),)).fetchone()
+        if row is None:
+            return True
+        skills = [s for s in (json.loads(row["skills"] or "[]") or []) if isinstance(s, str)]
+        cmap = pff.snapshot_map(pff._fleet_bytes(pff._fleet_dir()))
+        return cap in pff.hard_requirements(cmap, row["body"], skills)
+    except Exception:
+        logger.debug("rail preflight: could not read the card's requirements", exc_info=True)
+        return True
+
+
+def placed_browser_rail_error(cause: str = "") -> Optional[str]:
     """The agent's own browser could not be placed on this worker's pool host (no desktop stack
     in its sandbox): report it as a missing ``browser-public`` (t_f935cb6f), never as Ace's
     browser rail, so the re-route goes to a pool host whose agent-browser works, not the Studio.
     None for anything but a placed, dispatcher-owned worker. Never recorded for parking from a
-    background cleanup ``close`` (``background_cleanup``)."""
+    background cleanup ``close`` (``background_cleanup``).
+
+    ``cause`` (t_f1a3ee84): the placement error this replaces. It is logged at WARNING and its
+    first line rides on a ``cause:`` line under the token line (``parse_absent`` reads line one
+    only), so the card event and park reason say why. A card that does not require
+    ``browser-public`` gets a plain tool error it can route around, never recorded: only a
+    declared need ends the run."""
     task = _owned_task()
     placed = _placed_host() if task else None
     if not placed:
         return None
     from hermes_cli.kanban_placement_failfast import absent_line
-    message = absent_line("browser-public", placed)
+    first = next((ln.strip() for ln in str(cause or "").splitlines() if ln.strip()), "")[:300]
+    sid = ""
+    try:
+        from gateway.session_context import get_session_env
+        sid = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        pass
+    logger.warning("agent browser could not start on placed host %s (task %s, session %s): %s",
+                   placed, task, sid or "?", cause or "(no error text)")
+    if not _card_requires("browser-public"):
+        return (f"No browser on {placed} for this card: {first or 'the agent browser could not start'}. "
+                "Use web_extract, or curl in the terminal, instead; add `requires: browser-public` "
+                "to the card body only if a real browser is essential.")
+    message = absent_line("browser-public", placed) + (f"\ncause: {first}" if first else "")
     return message if _in_cleanup.get() else _emit(task, message)
 
 

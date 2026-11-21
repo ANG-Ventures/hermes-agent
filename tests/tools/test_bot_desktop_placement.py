@@ -154,6 +154,20 @@ def _placed(monkeypatch, setting, backend):
     monkeypatch.setattr(placement, "_terminal_backend", lambda: backend)
 
 
+def test_ssh_sandbox_desktop_root_is_per_login():
+    # t_f1a3ee84: a pool host's /tmp is shared by every login; kanbanw's 0700 root refused the owner's
+    # mkdir, so every placed browser failed. An ssh host keys the root by login; docker keeps the old one.
+    from tools.bot_desktop import sandbox_host
+    from tools.environments.docker import DockerEnvironment
+    from tools.environments.ssh import SSHEnvironment
+    ssh = SSHEnvironment.__new__(SSHEnvironment)
+    ssh.user = "ace"
+    assert sandbox_host.remote_root(ssh) == "/tmp/hermes-bot-desktop-ace"
+    assert sandbox_host._remote_dir(ssh, "daedalus") == "/tmp/hermes-bot-desktop-ace/daedalus"
+    docker = DockerEnvironment.__new__(DockerEnvironment)
+    assert sandbox_host.remote_root(docker) == "/tmp/hermes-bot-desktop"
+
+
 def test_terminal_placement_starts_the_sandbox_screen_instead_of_running_on_the_host(monkeypatch, isolated_home):
     """The placement boundary is policy, not liveness: with ``placement: terminal`` and the screen not yet
     up, the browser preflight and the CUA invocation bring the sandbox screen up (no ``auto_start`` opt-in
