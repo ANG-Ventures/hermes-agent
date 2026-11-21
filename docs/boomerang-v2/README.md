@@ -240,6 +240,9 @@ path: every wake surfaces to the home session as a plain `wake`.
 |---|---|---|
 | file `<HERMES_HOME>/state/boomerang-wake.disabled` | absent (on) | Present: no card is boomerang-woken; every wake surfaces as `wake`. One #logs line on each on/off transition. `touch` to stop, `rm` to resume. |
 | `delegation.boomerang.fork_enabled` | on (unset = forks allowed) | Disables fork mode (P2). Every boomerang, including boomerang-wake children, runs `summary`; logs `reason=fork_enabled`. |
+| card body line `wake-model: <slot or provider/model>` | absent (the parent's model) | Overrides the wake child's model for that card (t_54bbaca0). Wins over the two keys below. |
+| `delegation.boomerang.wake_child.sessions.<home session id>` | unset | Same override for every wake homed to that session. |
+| `delegation.boomerang.wake_child.model` / `.provider` | unset (the parent's model and lane) | Global override. A slot or bare id keeps the parent's lane unless `provider` is set. An overridden child runs `summary` (no fork: a different model cannot read the parent's cache) and its surfaced line names the model. A value whose lane does not list the model falls back to the parent with one WARNING line; the wake still runs. |
 
 Scope: boomerang wake is armed for the `default` (Apollo) profile only (spec §2).
 
