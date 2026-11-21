@@ -100,3 +100,35 @@ def test_a_mirror_missing_the_head_objects_is_reported_incomplete(borrowed, monk
 def test_a_fresh_workspace_reports_nothing(tmp_path):
     assert kwh.prepare_remote_workspace(_host(), str(tmp_path / "default" / "t_new"), runner=_local,
                                         board="default") == []
+
+
+def test_the_head_check_never_starts_a_promisor_fetch(borrowed):
+    """Prism bc54b6ee5dd9 / f5a9c86ede9f: the post-repoint HEAD check must stay local. A partial clone whose new
+    mirror lacks HEAD would otherwise lazy-fetch from its promisor remote and run the workspace's core.sshCommand."""
+    mine = borrowed["tmp"] / "home" / ".hermes" / "mirrors"
+    empty = mine / "ANG-Ventures" / "hermes-agent.git"
+    empty.parent.mkdir(parents=True)
+    assert _git("init", "-q", "--bare", str(empty)).returncode == 0
+    repo = borrowed["ws"] / "repo"
+    marker = borrowed["tmp"] / "helper-ran"
+    for k, v in (("core.repositoryformatversion", "1"), ("extensions.partialClone", "origin"),
+                 ("remote.origin.promisor", "true"), ("remote.origin.url", "ssh://example.invalid/r.git"),
+                 ("core.sshCommand", f"touch {marker}; false")):
+        assert _git("config", k, v, cwd=repo).returncode == 0
+    report = kwh.prepare_remote_workspace(_host(), str(borrowed["ws"]), runner=_local, board="default")
+    assert len(report) == 1 and report[0].startswith("incomplete ")
+    assert not marker.exists()
+
+
+def test_an_owner_named_mirrors_keeps_its_owner(borrowed):
+    """Prism 224231057132: /old/mirrors/mirrors/demo.git/objects maps to <root>/mirrors/demo.git/objects."""
+    ws, alt = borrowed["ws"], borrowed["alt"]
+    gone = borrowed["tmp"] / "kanbanw" / ".hermes" / "mirrors" / "mirrors" / "demo.git" / "objects"
+    alt.write_text(f"{gone}\n")
+    mine = borrowed["tmp"] / "home" / ".hermes-worker" / "mirrors"
+    new = mine / "mirrors" / "demo.git"
+    new.parent.mkdir(parents=True)
+    assert _git("clone", "-q", "--bare", str(borrowed["origin"]), str(new)).returncode == 0
+    report = kwh.prepare_remote_workspace(_host(), str(ws), runner=_local, board="default")
+    assert alt.read_text().strip() == str(new / "objects")
+    assert len(report) == 1 and report[0].startswith("repointed ")

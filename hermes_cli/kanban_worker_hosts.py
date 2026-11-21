@@ -145,7 +145,7 @@ def _repair_alternates(w: str) -> str:
         "while IFS= read -r p || [ -n \"$p\" ]; do "
         "o=$p; "
         "if [ -n \"$p\" ] && [ \"${p#/}\" != \"$p\" ] && ! { [ -r \"$p\" ] && [ -x \"$p\" ]; }; then "
-        "tl=''; case \"$p\" in */mirrors/*/*.git/objects) tl=${p##*/mirrors/};; esac; "
+        "tl=''; case \"$p\" in */mirrors/*/*.git/objects) x=${p%/*/*/*}; tl=${p#\"$x\"/};; esac; "
         "o=''; if [ -n \"$tl\" ]; then "
         "for r in \"${HERMES_KANBAN_MIRRORS_ROOT:-}\" \"${HERMES_HOME:+$HERMES_HOME/mirrors}\" "
         "\"$HOME/.hermes-worker/mirrors\" \"$HOME/.hermes/mirrors\"; do "
@@ -154,7 +154,9 @@ def _repair_alternates(w: str) -> str:
         "fi; out=\"$out$o\n\"; done < \"$af\"; "  # a real newline; printf '%s' below, never a format
         "if [ \"$chg\" = 1 ]; then "
         "if printf '%s' \"$out\" > \"$af.hermes-tmp\" 2>/dev/null && mv -f -- \"$af.hermes-tmp\" \"$af\" 2>/dev/null; then "
-        "if git --git-dir=\"${af%/objects/info/alternates}\" cat-file -e 'HEAD^{tree}' 2>/dev/null; "
+        # Local only (Prism bc54b6ee5dd9): no promisor lazy fetch, no transport, so no repo-configured helper runs.
+        "if GIT_NO_LAZY_FETCH=1 git -c protocol.allow=never --git-dir=\"${af%/objects/info/alternates}\" "
+        "cat-file -e 'HEAD^{tree}' 2>/dev/null; "
         "then s=repointed; else s=incomplete; fi; "
         f"echo \"{t} $s $af$new\"; "
         "else rm -f -- \"$af.hermes-tmp\" 2>/dev/null; bad=\"$bad$new\"; fi; fi; "
