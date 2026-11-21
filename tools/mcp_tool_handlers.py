@@ -21,7 +21,7 @@ from tools.mcp_tool_content import (
     _MCP_HARD_RESULT_CAP_CHARS, _cache_mcp_audio_block, _cache_mcp_image_block,
     _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
     _truncate_mcp_text_result)
-from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error
+from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error, _is_session_rejected_before_dispatch
 
 logger = logging.getLogger("tools.mcp_tool")
 _MISSING = object()
@@ -233,6 +233,8 @@ def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retr
     if not _is_session_expired_error(exc):
         return None
     srv = _lookup_reconnectable_server(server_name, require_loop=True)
+    if call_may_have_side_effects and srv is not None and _is_session_rejected_before_dispatch(exc):
+        return _resend_session_rejected_write(server_name, srv, retry_call, op_description)
     if call_may_have_side_effects:
         # Even without a signallable server the outcome is still uncertain: a generic "call failed"
         # would invite the model to re-invoke a write that may already have landed.
@@ -257,6 +259,27 @@ def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retr
                        "falling through to error response.", server_name)
         return None
     return _retry_once(server_name, retry_call, op_description, "session reconnect")
+
+
+def _resend_session_rejected_write(server_name: str, srv: Any, retry_call, op_description: str):
+    """A write the server refused with "session not found" never ran (a tier3 restart drops the session
+    table, so the first call after it got this, t_90d34dcf): reconnect and send it ONCE more. None (the
+    generic error) when the reconnect fails or the resend is refused the same way: still nothing ran. Any
+    other resend failure may have reached the tool, so it is outcome-uncertain and never sent again."""
+    logger.info("MCP server '%s': %s was refused with an unknown session before it ran; reconnecting and "
+                "sending it once more.", server_name, op_description)
+    if not _loop._signal_reconnect_and_wait(server_name, srv, op_description=op_description, timeout=15):
+        return None
+    try:
+        result = retry_call()
+    except Exception as retry_exc:
+        if _is_session_rejected_before_dispatch(retry_exc):
+            return None
+        logger.warning("MCP server '%s': resend of %s failed after it may have been dispatched (%s); NOT "
+                       "sending it again.", server_name, op_description, retry_exc)
+        return tool_error(_SESSION_OUTCOME_UNCERTAIN_MSG.format(s=server_name, state="been re-established"),
+                          outcome_uncertain=True, server=server_name)
+    return _record_call_outcome(server_name, result)
 
 
 class _StdioChildExited(RuntimeError):

@@ -515,3 +515,77 @@ def test_tool_is_read_only_fails_safe():
         assert _tool_is_read_only("known", "unlisted") is False
     finally:
         mcp_tool._tool_read_only_hints.pop("known", None)
+
+
+# ---------------------------------------------------------------------------
+# A write the server REFUSED with "session not found" never ran (t_90d34dcf: the first tool call
+# after every tier3 restart). That refusal is the server's JSON-RPC reply to this request, so the
+# write is resent once on the rebuilt session; any other failure of the resend stays at-most-once.
+# ---------------------------------------------------------------------------
+
+
+def _session_refusal(message="Session not found"):
+    from mcp.shared.exceptions import MCPError
+    return MCPError(-32600, message)
+
+
+@pytest.mark.parametrize("exc, expected", [
+    (_session_refusal(), True),
+    (_session_refusal("Session terminated"), True),  # mcp 2.x's stand-in for a bare HTTP 404
+    (RuntimeError("Session not found"), False),  # no JSON-RPC reply: cannot prove nothing ran
+    (_session_refusal("Invalid params"), False),
+    (ExceptionGroup("g", [_session_refusal()]), False),  # groups are not trusted
+])
+def test_is_session_rejected_before_dispatch(exc, expected):
+    from tools.mcp_tool_errors import _is_session_rejected_before_dispatch
+    assert _is_session_rejected_before_dispatch(exc) is expected
+
+
+def _ok_result(text="fresh data"):
+    result = MagicMock()
+    result.is_error = False
+    result.content = [MagicMock(type="text", text=text)]
+    result.structured_content = None
+    return result
+
+
+@pytest.mark.parametrize("second, want_calls, want", [
+    (None, 2, "result"),  # refused, then resent once on the new session: the tool runs exactly once
+    (RuntimeError("Connection closed"), 2, "outcome_uncertain"),  # resend may have run: never a 3rd send
+    ("refused", 2, "error"),  # refused again: nothing ran, plain error, no 3rd send
+], ids=["resent-once", "resend-uncertain", "resend-refused"])
+def test_write_refused_with_unknown_session_is_resent_once(monkeypatch, tmp_path, second, want_calls, want):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    server, reconnect_flag = _install_stub_server("srv")
+    calls = {"n": 0}
+
+    async def _sequence(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _session_refusal()
+        if second == "refused":
+            raise _session_refusal()
+        if second is not None:
+            raise second
+        return _ok_result()
+
+    server.session.call_tool = _sequence
+    mcp_tool._servers["srv"] = server
+    mcp_tool._server_error_counts.pop("srv", None)
+    try:  # no readOnlyHint: write-capable
+        parsed = json.loads(_make_tool_handler("srv", "tool", 10.0)({}))
+        assert reconnect_flag.is_set()
+        assert calls["n"] == want_calls
+        if want == "result":
+            assert parsed.get("result") == "fresh data", parsed
+        elif want == "outcome_uncertain":
+            assert parsed.get("outcome_uncertain") is True, parsed
+        else:
+            assert "error" in parsed and not parsed.get("outcome_uncertain"), parsed
+    finally:
+        mcp_tool._servers.pop("srv", None)
+        mcp_tool._server_error_counts.pop("srv", None)
+        mcp_tool._server_breaker_opened_at.pop("srv", None)

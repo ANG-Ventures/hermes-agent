@@ -515,3 +515,18 @@ def _is_session_expired_error(exc: BaseException) -> bool:
         msg = str(current).lower()
         found = found or isinstance(current, transport_error_types) or any(m in msg for m in _SESSION_EXPIRED_MARKERS)
     return found
+
+
+# The server's JSON-RPC answer to THIS request saying it does not know the session id. Streamable HTTP
+# servers send it (HTTP 404) when a restart dropped their session table; mcp 2.x relays the server's
+# body ("Session not found") or, for a bare 404 on a session request, synthesizes "Session terminated".
+_SESSION_REJECTED_MESSAGES: tuple = ("session not found", "session terminated")
+
+
+def _is_session_rejected_before_dispatch(exc: BaseException) -> bool:
+    """True only when *exc* itself is a JSON-RPC error reply (``exc.error.message``) refusing the session.
+    The server refused the request at the session lookup, so no tool ran and one resend is safe even for a
+    write. Transport failures (closed stream, broken pipe, a mid-call session loss) carry no such reply and
+    stay outcome-uncertain; exception groups are not unwrapped, so a refusal mixed with other errors is too."""
+    message = getattr(getattr(exc, "error", None), "message", None)
+    return isinstance(message, str) and message.strip().lower() in _SESSION_REJECTED_MESSAGES
