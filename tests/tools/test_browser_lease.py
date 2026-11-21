@@ -205,12 +205,13 @@ def test_navigate_returns_the_lease_id_and_release_ends_only_this_runs_lease(mon
 @pytest.mark.parametrize("answer,after,want", [
     ("12473", 1.5, {"released": True, "release_answer": "12473", "success": True}),
     ("BROWSER_LEASE_UNKNOWN", 1.5, {"released": False, "release_answer": "BROWSER_LEASE_UNKNOWN", "success": False}),
-    ("12473", 60.0, {"released": None, "release_answer": "not read", "success": True,
-                    "detail": "release sent, answer not read: check egress-status --lease 12473"}),
+    ("12473", 60.0, {"released": None, "release_answer": "not read", "outcome": "unknown", "success": True,
+                    "detail": "release attempted, outcome unknown: check egress-status --lease 12473; "
+                              "the lease also ends at its expiry once this run's client is gone"}),
 ])
 def test_a_slow_release_answer_is_reported_as_it_is(monkeypatch, answer, after, want):
     """t_239fe5ae: a release answer that comes slowly is still read (released, or refused); one that has not come
-    within RELEASE_WAIT_S is 'release sent, answer not read', never released: false."""
+    within RELEASE_WAIT_S is 'release attempted, outcome unknown', never released: false."""
     monkeypatch.setattr(bl, "RELEASE_WAIT_S", 3.0)
     _fake_client(monkeypatch, _free_port(), release_after=after, release_answer=answer)
     lease, err = bl.open_lease("id-github-kyzcreig", "read", card="t_lease001", timeout=10)

@@ -331,9 +331,12 @@ def release_lease() -> dict:
                     detail=f"lease client had already exited; no release sent: check egress-status --lease "
                            f"{g.get('lease_id')}")
     if not ans:
-        # t_239fe5ae: the release was sent (the watcher has its EOF) but its answer was not read: not a refusal
-        return dict(out, released=None, release_answer="not read", success=True,
-                    detail=f"release sent, answer not read: check egress-status --lease {g.get('lease_id')}")
+        # t_239fe5ae / Prism a0356f510f32: no answer read, and the watcher may have died before handling its stdin
+        # EOF, so whether a release went out is unknown. success stays true (nothing known was refused); outcome
+        # "unknown" keeps a caller from reading it as released.
+        return dict(out, released=None, release_answer="not read", outcome="unknown", success=True,
+                    detail=f"release attempted, outcome unknown: check egress-status --lease {g.get('lease_id')}; "
+                           f"the lease also ends at its expiry once this run's client is gone")
     # browserctl prints ``released=<lease id>`` (browserd's release answer) or ``released=<refusal token>``
     ok = ans.isdigit() and (g.get("lease_id") is None or ans == str(g.get("lease_id")))
     out.update(released=ok, release_answer=ans)
