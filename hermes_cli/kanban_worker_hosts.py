@@ -122,10 +122,59 @@ def _inherit_root_acl(w: str, b: str) -> str:
     )
 
 
+ALTERNATES_TAG = "hermes-alternates:"
+
+
+def _repair_alternates(w: str) -> str:
+    """t_be0453f9: repoint a workspace clone's git alternates the worker's login cannot read.
+
+    A clone made by ``hermes kanban clone`` borrows objects from ``<root>/mirrors/<owner>/<repo>.git/objects``
+    through ``objects/info/alternates``. Clones made while pool workers ran as kanbanw point at
+    /home/kanbanw/.hermes/mirrors, which the owner login (Option A, 2026-11-20) cannot read: every git command in
+    a retried card's checkout then fails (2026-11-20: 71 such files on ci-box, 21 on ace-ai, 164 on ace-media).
+    Each unreadable entry of that shape is rewritten to the same ``<owner>/<repo>.git/objects`` under the first
+    readable mirror root of this login. One line per touched entry goes to stdout, prefixed ``ALTERNATES_TAG``:
+    ``repointed`` (HEAD's tree resolves), ``incomplete`` (repointed, HEAD's tree still missing: the new mirror
+    lacks objects the old one had) or ``unreadable`` (no readable mirror, or the file could not be rewritten).
+    Readable entries are left as they are; nothing is deleted. Never through a symlink (``find -P``)."""
+    t = ALTERNATES_TAG
+    return (
+        f"find -P {w} -maxdepth 6 \\( -name node_modules -o -name .venv \\) -prune -o "
+        "-path '*/objects/info/alternates' -type f -print 2>/dev/null | while IFS= read -r af; do "
+        "chg=0; bad=''; new=''; out=''; "
+        "while IFS= read -r p || [ -n \"$p\" ]; do "
+        "o=$p; "
+        "if [ -n \"$p\" ] && [ \"${p#/}\" != \"$p\" ] && ! { [ -r \"$p\" ] && [ -x \"$p\" ]; }; then "
+        "tl=''; case \"$p\" in */mirrors/*/*.git/objects) tl=${p##*/mirrors/};; esac; "
+        "o=''; if [ -n \"$tl\" ]; then "
+        "for r in \"${HERMES_KANBAN_MIRRORS_ROOT:-}\" \"${HERMES_HOME:+$HERMES_HOME/mirrors}\" "
+        "\"$HOME/.hermes-worker/mirrors\" \"$HOME/.hermes/mirrors\"; do "
+        "[ -n \"$r\" ] && [ -r \"$r/$tl\" ] && [ -x \"$r/$tl\" ] && { o=$r/$tl; break; }; done; fi; "
+        "if [ -n \"$o\" ]; then chg=1; new=\"$new $p->$o\"; else o=$p; bad=\"$bad $p\"; fi; "
+        "fi; out=\"$out$o\n\"; done < \"$af\"; "  # a real newline; printf '%s' below, never a format
+        "if [ \"$chg\" = 1 ]; then "
+        "if printf '%s' \"$out\" > \"$af.hermes-tmp\" 2>/dev/null && mv -f -- \"$af.hermes-tmp\" \"$af\" 2>/dev/null; then "
+        "if git --git-dir=\"${af%/objects/info/alternates}\" cat-file -e 'HEAD^{tree}' 2>/dev/null; "
+        "then s=repointed; else s=incomplete; fi; "
+        f"echo \"{t} $s $af$new\"; "
+        "else rm -f -- \"$af.hermes-tmp\" 2>/dev/null; bad=\"$bad$new\"; fi; fi; "
+        f"[ -n \"$bad\" ] && echo \"{t} unreadable $af$bad\"; "
+        "done; "
+    )
+
+
+def alternates_report(stdout: str) -> List[str]:
+    """The ``_repair_alternates`` lines of a prepare's stdout, tag stripped."""
+    return [ln[len(ALTERNATES_TAG):].strip() for ln in (stdout or "").splitlines() if ln.startswith(ALTERNATES_TAG)]
+
+
 def prepare_remote_workspace(host: PoolHost, workspace: str,
                              runner: Callable = subprocess.run, *,
-                             board: Optional[str] = None) -> None:
-    """Create the card's workspace at the same absolute path on the host."""
+                             board: Optional[str] = None) -> List[str]:
+    """Create the card's workspace at the same absolute path on the host.
+
+    Returns the alternates repair report (``alternates_report``): empty when no clone in the workspace borrowed
+    objects from a mirror this login cannot read."""
     # rc _BOARD_ROOT_RC only when the BOARD root itself is unusable (missing,
     # unwritable): a card-specific failure (its path exists as a file) stays a
     # card failure and is charged (Prism d72c091b628d).
@@ -133,7 +182,7 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
     proc = runner(
         # The root is proven by CREATING under it (ENOSPC / inodes / quota pass
         # an access test; Prism d762ee26a639), then the probe dir is removed.
-        _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && {{ {_inherit_root_acl(w, b)}exit 0; }}; "
+        _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && {{ {_inherit_root_acl(w, b)}{_repair_alternates(w)}exit 0; }}; "
                         f"t=$(mktemp -d {b}/.hermes-root-probe.XXXXXX 2>/dev/null) && "
                         f"{{ rmdir -- \"$t\"; exit 1; }}; exit {_BOARD_ROOT_RC}"),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -147,6 +196,10 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
         if rc != _BOARD_ROOT_RC or not board:
             raise RuntimeError(msg)  # ssh failed, a card-path fault, or no pool board: not a board fact
         raise RemoteWorkspaceUnavailable(host.name, board, msg)
+    report = alternates_report(getattr(proc, "stdout", "") or "")
+    for line in report:
+        _log.warning("kanban: worker host %s: workspace git alternates %s", host.name, line)
+    return report
 
 
 class WorkerGitIdentityRefused(RuntimeError):
