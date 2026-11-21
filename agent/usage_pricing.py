@@ -2129,6 +2129,27 @@ _OPENAI_ULTRAFAST_PRICING: Dict[str, PricingEntry] = {
         cache_write_cost_per_million_above=Decimal("30.00"),
     ),
 }
+# GPT-6.2 Sol / Astra (t_9720ecae): "Ultrafast costs 3 times the Standard rate through February 28,
+# 2027, and 6 times the Standard rate starting March 1, 2027 (Pacific time)" (same pricing page,
+# checked 2026-11-20; its 6.2 table reads $6/$30/$0.30/$7.50 Sol and $24/$120/$1.20/$30 Astra).
+# Built from the Standard rows so the weekly Standard drift lint covers them too.
+_ULTRAFAST_62_SWITCH = datetime(2027, 3, 1, 8, tzinfo=timezone.utc)  # 2027-03-01 00:00 PST
+
+
+def _ultrafast_times_standard(model: str, factor: int, version: str, **extra: Any) -> PricingEntry:
+    std = _OFFICIAL_DOCS_PRICING[("openai", model)]
+    scaled = {f.name: getattr(std, f.name) * factor for f in fields(PricingEntry)
+              if f.name.endswith("_per_million") or f.name.endswith("_per_million_above")
+              if getattr(std, f.name) is not None}
+    return replace(std, **scaled, source_url="https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast",
+                   pricing_version=version, **extra)
+
+
+for _m62 in ("gpt-6.2-sol", "gpt-6.2-astra"):
+    _OPENAI_ULTRAFAST_PRICING[_m62] = _ultrafast_times_standard(
+        _m62, 3, "openai-ultrafast-6.2-intro-2026-11", superseded_at=_ULTRAFAST_62_SWITCH,
+        superseded_by=_ultrafast_times_standard(_m62, 6, "openai-ultrafast-6.2-2027-03"))
+del _m62
 # The Hermes-side "-900k" Codex picker variant requests Ultrafast too (model_supports_ultrafast strips it),
 # and is the same model on the wire: alias it so its served-ultrafast turns price.
 _OPENAI_ULTRAFAST_PRICING.update({f"{_m}-900k": _e for _m, _e in list(_OPENAI_ULTRAFAST_PRICING.items())})
@@ -3609,7 +3630,7 @@ def estimate_usage_cost(
         if not entry:
             return _unknown_cost("official_docs_snapshot", "fast-mode pricing unavailable for model")
     if route.provider == "openai" and _served_openai_tier(usage) == "ultrafast":
-        entry = _OPENAI_ULTRAFAST_PRICING.get(route.model)
+        entry = _effective_pricing_entry(_OPENAI_ULTRAFAST_PRICING.get(route.model))
         if not entry:
             return _unknown_cost("official_docs_snapshot", "ultrafast pricing unavailable for model")
     if not entry:
