@@ -46,15 +46,35 @@ _log = logging.getLogger(__name__)
 
 
 def _reader_tag() -> str:
-    """`` ppid=N argv=<own argv> parent=<parent argv> cwd=<cwd>`` for a deprecated-name-reads line, so a reader that has
-    exited by the time someone reads the log can still be named (t_5931d620; a pid alone never could). Whitespace
-    becomes ``+`` so field 2 stays the name; at most 3 argv words, 160 chars each field. Never raises.
-    Same text as hermes-home ``scripts/lib/allocation_policy._reader_tag`` (hermes-home#13696, t_bab23582)."""
+    """`` ppid=N argv=<own identity> parent=<parent identity> cwd=<cwd>`` for a deprecated-name-reads line, so a reader
+    that has exited by the time someone reads the log can still be named (t_5931d620; a pid alone never could).
+    Identity is NAMES only, never an argument value (Prism 80bdcd765cc9 / 918779febe18: a command line can carry a
+    credential): the executable's basename, then the first of `-c` (its program text is never written), `-m <module>`
+    or an existing script path; no other argv word. Whitespace becomes ``+``, 160 chars a field. Never raises.
+    One text in hermes-home scripts/lib and the hermes-agent copies (t_bab23582)."""
     import sys
 
-    def w(parts):
-        s = " ".join(str(p) for p in parts[:3] if p)
-        return "".join("+" if c.isspace() else c for c in s)[:160] or "-"
+    def ident(argv):
+        argv = [str(a) for a in argv if a]
+        if not argv:
+            return "-"
+        out = [os.path.basename(argv[0])]
+        for i, a in enumerate(argv[1:], 1):
+            if a == "-c":
+                out.append("-c")
+                break
+            if a == "-m":
+                if i + 1 < len(argv) and argv[i + 1].replace(".", "_").isidentifier():
+                    out += ["-m", argv[i + 1]]
+                break
+            try:
+                script = not a.startswith("-") and os.path.isfile(a)
+            except Exception:  # noqa: BLE001 -- one unreadable word must not drop the whole tag
+                script = False
+            if script:
+                out.append(a)
+                break
+        return "".join("+" if c.isspace() else c for c in " ".join(out))[:160] or "-"
     try:
         ppid = os.getppid()
         try:
@@ -68,7 +88,9 @@ def _reader_tag() -> str:
             cwd = os.getcwd()
         except OSError:
             cwd = ""
-        return f" ppid={ppid} argv={w(sys.argv or [sys.executable])} parent={w(parent)} cwd={w([cwd])}"
+        own = getattr(sys, "orig_argv", None) or [sys.executable] + list(sys.argv)
+        cwd = "".join("+" if c.isspace() else c for c in cwd)[:160] or "-"
+        return f" ppid={ppid} argv={ident(own)} parent={ident(parent)} cwd={cwd}"
     except Exception:  # noqa: BLE001 -- a counter must never break a reader
         return ""
 
