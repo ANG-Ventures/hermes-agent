@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -1044,6 +1046,7 @@ def test_unchanged_owner_wake_tick_does_not_write_or_sync(env, monkeypatch):
     assert (path.stat().st_mtime_ns, path.parent.stat().st_mtime_ns) == before
 
 
+@pytest.mark.skipif(ow._WINDOWS, reason="POSIX directory fsync")
 def test_p1r2_state_write_is_fsynced(env, monkeypatch):
     synced = []
     real = ow.os.fsync
@@ -1063,6 +1066,28 @@ def test_p1r2_state_write_is_fsynced(env, monkeypatch):
     assert ow.WakeState(path).cursors == {"default": 10}
 
 
+def test_windows_owner_wake_checkpoint_uses_write_through_replace(tmp_path, monkeypatch):
+    class WindowsError(Exception):
+        pass
+
+    def move(src, dst, flags):
+        assert flags == 0x9  # replace existing + write through
+        ow.os.replace(src, dst)
+
+    replace = Mock(side_effect=WindowsError("sharing violation"))
+    monkeypatch.setitem(sys.modules, "pywintypes", SimpleNamespace(error=WindowsError))
+    monkeypatch.setitem(sys.modules, "win32file", SimpleNamespace(MoveFileEx=replace))
+    monkeypatch.setattr(ow, "_WINDOWS", True)
+    state = ow.WakeState(tmp_path / ow.STATE_FILENAME)
+    assert not state.write_owner_wake_state(1.0)
+    assert not state.path.exists() and not list(tmp_path.glob(".owner-wake-*"))
+    replace.side_effect = move
+    assert state.write_owner_wake_state(2.0)
+    assert state.write_owner_wake_state(3.0)
+    assert state.path.exists() and replace.call_count == 2
+
+
+@pytest.mark.skipif(ow._WINDOWS, reason="injects a POSIX directory fsync failure")
 def test_owner_wake_waits_for_durable_pending_state(env, monkeypatch):
     tid = _card(env)
     _blocked(tid)

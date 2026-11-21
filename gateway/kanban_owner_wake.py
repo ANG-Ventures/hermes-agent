@@ -63,6 +63,7 @@ from gateway import kanban_notify_suppress as _ns
 from gateway import kanban_wake_freshness as _fresh
 
 logger = logging.getLogger(__name__)
+_WINDOWS = os.name == "nt"
 
 COALESCE_SECONDS = 600.0
 FIRST_RUN_LOOKBACK_SECONDS = 600
@@ -669,13 +670,25 @@ class WakeState:
                 fh.write(snapshot)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
-            tmp = None
-            dfd = os.open(str(self.path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            if _WINDOWS:
+                # Native Windows cannot fsync a directory opened with os.open.
+                # Use the same write-through replacement as the Windows SSH runtime.
+                import pywintypes
+                import win32file
+
+                try:
+                    win32file.MoveFileEx(tmp, str(self.path), 0x1 | 0x8)  # REPLACE_EXISTING | WRITE_THROUGH
+                except pywintypes.error as exc:
+                    raise OSError(str(exc)) from exc
+                tmp = None
+            else:
+                os.replace(tmp, self.path)
+                tmp = None
+                dfd = os.open(str(self.path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
         except OSError as exc:
             logger.warning("kanban owner-wake: cannot persist state %s: %s", self.path, exc)
             if tmp is not None:
