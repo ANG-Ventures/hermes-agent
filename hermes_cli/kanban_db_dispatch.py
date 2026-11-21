@@ -4107,6 +4107,8 @@ def check_respawn_guard(
                 if _kb._prior_worker_still_alive(conn, task_id) is None:
                     continue
                 hold = "worker alive"
+            elif health.get("hold_label"):
+                hold = _kb.RESPAWN_GUARD_HOLD_LABELLED
             elif merge_state in _kb._PR_MERGEABLE_STATES:
                 hold = _kb.RESPAWN_GUARD_HOLD_MERGEABLE
             else:
@@ -9614,6 +9616,12 @@ def _dispatch_once_locked(
                 notify_holds(conn, result.placement_waits)
             except Exception as exc:  # never break a dispatcher tick
                 _kb._log.warning("kanban studio default-deny notify failed: %s", exc)
+        if result.respawn_guard_details:
+            try:
+                from hermes_cli import kanban_held_pr_wake as _khpw
+                _khpw.notify(conn, result.respawn_guard_details, kcfg=_root_kanban_cfg(), board=board)
+            except Exception as exc:  # never break a dispatcher tick
+                _kb._log.warning("kanban held-PR wake failed: %s", exc)
         try:
             starved = find_priority_starved(conn, now=_tick_now)
             result.priority_starved = [
