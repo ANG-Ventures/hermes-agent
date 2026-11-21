@@ -343,3 +343,24 @@ def test_existing_workspace_gets_the_board_roots_default_acl(tmp_path):
         assert named in _acl(board / d, default=True), d       # default: what it creates inherits
     assert f"user:{uid}:rw-" in _acl(board / "t_old" / "sub" / "f")   # rwX: a file is not made executable
     assert ((board / "t_new").stat().st_mode & 0o007) == 0     # still never world-searchable (t_69e47673)
+
+
+def test_acl_repair_never_follows_a_symlinked_workspace(tmp_path):
+    """Prism 45c7d7490c19: `mkdir -p` accepts a workspace that is a symlink to a dir, and `setfacl -R` follows a
+    symlink ARGUMENT, so the repair would grant the worker's user an ACL on a private dir outside the board. A
+    symlinked workspace is skipped, and a symlink inside a real workspace is not followed either."""
+    board = tmp_path / "default"
+    board.mkdir()
+    private = tmp_path / "private"
+    (private / "inner").mkdir(parents=True)
+    uid = _acl_or_skip(board)
+    named = f"user:{uid}:rwx"
+    (board / "t_link").symlink_to(private)
+    (board / "t_real").mkdir()
+    (board / "t_real" / "out").symlink_to(private / "inner")
+    for card in ("t_link", "t_real"):
+        kwh.prepare_remote_workspace(_host("ace-ai"), str(board / card), runner=_local_mkdir, board="default")
+    for p in (private, private / "inner"):
+        assert named not in _acl(p), p
+        assert named not in _acl(p, default=True), p
+    assert named in _acl(board / "t_real")                     # the real workspace still heals

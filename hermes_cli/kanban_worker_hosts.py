@@ -105,9 +105,10 @@ def _inherit_root_acl(w: str, b: str) -> str:
     ace-media, 2026-11-20 ~06:00, ``user:ace:rwx``) keeps no entry for the worker's terminal user on a re-run: the
     identity probe's ``cd`` was refused (rc 126) and t_18dd8603 gave up. Applied once per such dir (it is skipped
     when the first entry is present and not masked), access ``rwX`` recursively, default on every dir. Best effort:
-    no getfacl/setfacl (macOS) or no default ACL on the root = nothing to do."""
+    no getfacl/setfacl (macOS) or no default ACL on the root = nothing to do. Never through a symlink (Prism
+    45c7d7490c19): a symlinked workspace is skipped, and ``setfacl -P`` / ``find -P`` do not follow one inside."""
     return (
-        "if command -v getfacl >/dev/null 2>&1 && command -v setfacl >/dev/null 2>&1; then "
+        f"if [ ! -L {w} ] && command -v getfacl >/dev/null 2>&1 && command -v setfacl >/dev/null 2>&1; then "
         f"ed=$(getfacl -dpc -- {b} 2>/dev/null | sed 's/[[:space:]].*//' | grep -E '^(user|group):[^:]+:' "
         "| tr '\\n' ','); ed=${ed%,}; "
         "if [ -n \"$ed\" ]; then f=${ed%%,*}; "
@@ -115,8 +116,8 @@ def _inherit_root_acl(w: str, b: str) -> str:
         f"|| getfacl -pc -- {w} 2>/dev/null | grep -F \"$f\" | grep -q effective; then "
         "ea=$(printf '%s\\n' \"$ed\" | tr ',' '\\n' | awk -F: '{p=$3; sub(/x/, \"X\", p); "
         "printf \"%s%s:%s:%s\", (NR > 1 ? \",\" : \"\"), $1, $2, p}'); "
-        f"setfacl -R -m \"$ea\" -- {w} 2>/dev/null; "
-        f"find {w} -type d -exec setfacl -d -m \"$ed\" -- {{}} + 2>/dev/null; "
+        f"setfacl -R -P -m \"$ea\" -- {w} 2>/dev/null; "
+        f"find -P {w} -type d -exec setfacl -d -m \"$ed\" -- {{}} + 2>/dev/null; "
         "fi; fi; fi; "
     )
 
