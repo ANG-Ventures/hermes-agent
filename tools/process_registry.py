@@ -1286,7 +1286,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
         the supervised gateway (own cgroup: an OOM kills only the worker, not the
         gateway and its messaging control plane)."""
-        argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
+        from tools.environments.delegated_child_qos import background_prefix
+        # Darwin-only prefix, so it never meets the Linux systemd scope below (t_ba9c58b0).
+        argv = [*background_prefix(), _find_shell(), "-lic", f"set +m; {safe_command}"]
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         if in_supervised_gateway and _systemd_run_user_scope_available():
