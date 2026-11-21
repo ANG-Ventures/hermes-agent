@@ -4479,6 +4479,8 @@ class GatewayRunner(
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
         self._provider_routing = self._load_provider_routing()
+        # A read error is not "no filters": the cold boomerang parent refuses on it (t_a9bbc4ad).
+        self._provider_routing_error = self._provider_routing_read_error()
         self._fallback_model = self._load_fallback_model()
 
     def _init_session_store(self) -> None:
