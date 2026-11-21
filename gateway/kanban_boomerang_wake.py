@@ -2640,7 +2640,15 @@ def _db_parent(runner: Any, home: Any) -> Any:
     """Summary-mode parent when no idle live agent exists: an AIAgent on the gateway's runtime
     whose transcript is the session DB's (the v1 fold reads ``_session_messages``)."""
     from run_agent import AIAgent
+    from gateway.run_config_loaders import provider_routing_agent_kwargs
 
+    # Fail closed on an unreadable provider_routing: building the parent anyway would send the
+    # child's requests with no allowlist and no data_collection deny (t_a9bbc4ad). The raise
+    # becomes the claim's "dispatch failed" line to the home.
+    routing_error = getattr(runner, "_provider_routing_error", None)
+    if routing_error:
+        raise RuntimeError(f"provider_routing unreadable ({routing_error}); cold wake refused, "
+                           "not run without the gateway's routing filters")
     model, runtime = runner._resolve_session_agent_runtime(
         source=home.origin, session_key=home.session_key, background=True,
     )
@@ -2650,6 +2658,8 @@ def _db_parent(runner: Any, home: Any) -> Any:
     # every turn sent model="" (400, puppet lane 2026-10-24). Same precedence as a gateway turn.
     kw["model"] = model
     kw["fallback_model"] = runner._refresh_fallback_model()
+    # The same routing filters a live gateway turn builds its agent with; the child inherits them.
+    kw.update(provider_routing_agent_kwargs(getattr(runner, "_provider_routing", None) or {}))
     agent = AIAgent(**kw, session_id=getattr(home, "session_id", None), quiet_mode=True,
                     skip_memory=True, skip_context_files=True)
     agent._boomerang_route_source = "session-rehydrated"

@@ -23,6 +23,7 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
+from gateway.run_config_loaders import provider_routing_agent_kwargs
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import (
@@ -3002,12 +3003,7 @@ class GatewayTurnMixin:
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
-                    providers_allowed=pr.get("only"),
-                    providers_ignored=pr.get("ignore"),
-                    providers_order=pr.get("order"),
-                    provider_sort=pr.get("sort"),
-                    provider_require_parameters=pr.get("require_parameters", False),
-                    provider_data_collection=pr.get("data_collection"),
+                    **provider_routing_agent_kwargs(pr),
                     session_id=task_id,
                     platform=platform_key,
                     **{k: getattr(source, k) for k in (
