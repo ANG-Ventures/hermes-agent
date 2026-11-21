@@ -103,30 +103,53 @@ _RUN_DIR = "$HOME/.hermes-run"
 
 
 def _run_pidfile(token: str) -> str:
-    """Shell path (``$HOME`` expands remotely) of ``token``'s pidfile. Under the remote user's own
-    home in a 0700 dir, so no other account can plant a pid for the kill path to signal."""
+    """Legacy shell path (``$HOME`` expands remotely), in a private 0700 directory."""
     return f"{_RUN_DIR}/{_RUN_MARK}{token}.pid"
 
 
-def _run_preamble(token: str) -> str:
+def _enter_runtime_dir(variable: str = "XDG_RUNTIME_DIR") -> str:
+    """Enter a private tmpfs XDG directory before checking it. Using relative paths after
+    checking the cwd keeps a replaced path component from redirecting a pidfile operation.
+    Shell builtins check path/owner; one find checks both exact mode and filesystem type."""
+    return (f'case "${{{variable}:-}}" in /*) '
+            f'CDPATH= cd -P -- "${variable}" && [ -O . ] && '
+            '[ "$(PATH=/usr/bin:/bin exec find . -maxdepth 0 -perm 0700 -fstype tmpfs -print)" = . ];; '
+            '*) false;; esac')
+
+
+def _run_preamble(token: str, runtime_var: str = "XDG_RUNTIME_DIR") -> str:
     """First lines of every remote command: sweep dead pidfiles, then record the ``bash -c`` pid
     (= its process group, as sshd starts each command in its own session) where the kill path can
     find it. A file, not the argv: a top-level ``exec`` replaces the argv but keeps the pid and the
     group. The EXIT trap is best effort (a command that replaces it, ``exec``s or is SIGKILLed
     leaves its file), so the next command on the host removes such leftovers (t_70090b16)."""
-    f = _run_pidfile(token)
+    legacy = _run_pidfile(token)
+    name = f"{_RUN_MARK}{token}.pid"
+    # The off switch affects new writes only: kills and sweeps still see in-flight runtime files.
+    enabled = "false" if os.getenv("HERMES_SSH_RUNTIME_PIDFILES") == "0" else (
+        '[ "${HERMES_SSH_RUNTIME_PIDFILES:-}" != 0 ]')
     return (f": {_RUN_MARK}{token}\n"
             f"{_stale_pidfile_sweep()}\n"
-            f"(umask 077; mkdir -p \"{_RUN_DIR}\" && echo $$ >| \"{f}\") 2>/dev/null; "
-            f"trap \"rm -f \\\"{f}\\\"\" EXIT\n")
+            f"if ({{ {_enter_runtime_dir(runtime_var)}; }} || exit 1;\n"
+            f"{_stale_pidfile_sweep('.')};\n"
+            f"{enabled} || exit 1; umask 077;\n"
+            f"echo $$ >| '{name}' || {{ rm -f -- '{name}'; exit 1; }}) 2>/dev/null; then\n"
+            f'printf -v _vr_dir %q "${runtime_var}"\n'
+            # Only unlink on exit, never read or write a PID. Quote/freeze the original path.
+            f'''trap "CDPATH= cd -P -- $_vr_dir && [ -O . ] && rm -f -- '{name}'" EXIT\n'''
+            "unset _vr_dir\n"
+            "else\n"
+            f'''(umask 077; mkdir -p "{_RUN_DIR}" && echo $$ >| "{legacy}") 2>/dev/null;\n'''
+            f'''trap "rm -f \\"{legacy}\\"" EXIT\n'''
+            "fi\n")
 
 
-def _stale_pidfile_sweep() -> str:
+def _stale_pidfile_sweep(directory: str = _RUN_DIR) -> str:
     """Shell that removes this writer's pidfiles (``hermes-run-<32 hex>.pid`` only) whose pid is
     gone. Builtins only (no fork unless a file is removed); an empty or non-numeric file (pid not
     written yet) is kept; its loop variables are unset so the command never sees them."""
     name = _RUN_MARK + "[0-9a-f]" * 32 + ".pid"
-    return (f"for _vr_f in \"{_RUN_DIR}\"/{name}; do "
+    return (f"for _vr_f in \"{directory}\"/{name}; do "
             "[ -f \"$_vr_f\" ] || continue; _vr_p=; read -r _vr_p < \"$_vr_f\" 2>/dev/null; "
             "case \"$_vr_p\" in ''|*[!0-9]*) continue;; esac; "
             "kill -0 \"$_vr_p\" 2>/dev/null || rm -f -- \"$_vr_f\"; done 2>/dev/null; unset _vr_f _vr_p")
@@ -142,8 +165,11 @@ def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
     Prints ``_KILLED_MARK`` once a signal reached a live process."""
     sigs = "TERM KILL" if grace else "KILL"
     f = _run_pidfile(token)
+    name = f"{_RUN_MARK}{token}.pid"
     script = (
-        f"p=$(cat \"{f}\" 2>/dev/null); rm -f \"{f}\"; "
+        f'''if [ -f "{f}" ]; then p=$(cat "{f}" 2>/dev/null); rm -f "{f}"; '''
+        f'''else p=$({{ {_enter_runtime_dir()}; }} && [ -f './{name}' ] && '''
+        f'''{{ cat './{name}'; rm -f -- './{name}'; }}) 2>/dev/null; fi; '''
         "case \"$p\" in ''|*[!0-9]*) exit 0;; esac; "
         "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); [ -n \"$g\" ] || exit 0; "
         "[ \"$g\" = \"$p\" ] && t=\"-$g\" || t=\"$p\"; "
@@ -446,9 +472,18 @@ class SSHEnvironment(BaseEnvironment):
         values, unset_names = resolve_passthrough_env(explicit_forward=_placed_lease_env_names(),
                                                       hermes_env_loader=_load_hermes_env_vars)
         token = uuid.uuid4().hex
-        remote = _run_preamble(token) + self._guarded(_placed_kanban_exports()
-                                                      + prepend_unset(cmd_string, unset_names))
-        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + bash_argv(shlex.quote(remote), login)
+        # Capture XDG from the SSH login shell, the same context used by the kill command.
+        # Bash startup (including login profiles and BASH_ENV) may set a different value.
+        remote = ('_vr_runtime=$1; shift\n' + _run_preamble(token, "_vr_runtime")
+                  + 'unset _vr_runtime\n' + self._guarded(_placed_kanban_exports()
+                                                         + prepend_unset(cmd_string, unset_names)))
+        # Read XDG in POSIX sh, not the user's login shell or Bash startup files.
+        # exec keeps the original SSH process group and the final argv is still the Bash script.
+        dispatch = 'exec bash "$@" bash "${XDG_RUNTIME_DIR:-}"'
+        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + [
+            "exec", "sh", "-c", shlex.quote(dispatch), "sh",
+            *bash_argv(shlex.quote(remote), login)[1:],
+        ]
         client_env = client_env_with(values)
         proc = _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
         proc._hermes_run_token = token
