@@ -1039,7 +1039,9 @@ class LocalEnvironment(BaseEnvironment):
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
         if login:
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
-        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        from tools.environments.delegated_child_qos import background_prefix
+        # A delegated child's shell starts under darwin background QoS, inherited by its whole tree (t_ba9c58b0).
+        args = [*background_prefix(), bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
         popen_kwargs = dict(
             text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
