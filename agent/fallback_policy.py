@@ -1631,8 +1631,9 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
         return _window_cause(row, t) or "account rate limit"
     if cls == "auth" and "third-party apps" in t:
         return THIRD_PARTY_CAUSE
-    if cls == "auth" and any(n in t for n in _CREDIT_NEEDLES):
-        # "credit exhausted" over "OAuth revoked (401)" (t_94a2b0e4): one cause.
+    if cls in ("auth", "unclassified") and any(n in t for n in _CREDIT_NEEDLES):
+        # "credit exhausted" over "OAuth revoked (401)" (t_94a2b0e4) or over
+        # "unclassified error" (t_2ff17f3d: the runtime labels it billing): one cause.
         return CREDITS_CAUSE
     return {
         "rate_upstream": "account rate limit",
@@ -1659,7 +1660,8 @@ def _seat_token(row: Mapping[str, Any], seat_names: bool) -> str:
 
 
 def _hop_segment(hop: Optional[str], seat: str, status: Any) -> str:
-    st = status if status else "error"
+    # A 200 with an error is the error event a relay sent in-stream (t_2ff17f3d).
+    st = "in-stream error" if status == 200 else status if status else "error"
     if seat == SUB_UNKNOWN:
         known = {
             "client→relay": "to the relay",

@@ -326,6 +326,25 @@ def credit_lane_head(code: str, exc: Optional[str] = None) -> Optional[str]:
     return entry.head
 
 
+def in_stream_error_body(body: Any) -> bool:
+    """True for an Anthropic-shaped error event (``{"type": "error", "error":
+    {...}}``): the error JSON a relay sends in-stream after it answered 200."""
+    return (isinstance(body, dict) and body.get("type") == "error"
+            and isinstance(body.get("error"), dict))
+
+
+def anthropic_credit_refusal(body: Any) -> bool:
+    """True when ``body`` is Anthropic's own error (its ``req_`` request id)
+    whose message says the key's credits ran out ("Your credit balance is too
+    low", t_2ff17f3d). Never a relay's own answer: those carry no request id."""
+    if not in_stream_error_body(body) or not str(body.get("request_id") or "").startswith("req_"):
+        return False
+    from agent.fallback_policy import _CREDIT_NEEDLES
+
+    msg = str(body["error"].get("message") or "").lower()
+    return any(n in msg for n in _CREDIT_NEEDLES)
+
+
 _CONN_EXC_NAMES = frozenset((
     "APIConnectionError", "APITimeoutError", "ConnectError", "ConnectTimeout",
     "ReadError", "ReadTimeout", "RemoteProtocolError", "IncompleteRead",
@@ -1578,8 +1597,8 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
     else:
         trigger_class, class_source = None, None
     err_head = None
-    if kind == "failover" and text and isinstance(status, int) and status >= 400 \
-            and isinstance(body, dict):
+    if kind == "failover" and text and isinstance(status, int) and isinstance(body, dict) \
+            and (status >= 400 or in_stream_error_body(body)):
         err_head = _scrub(text)[:ERR_HEAD_MAX] or None
     turn_id = str(getattr(agent, "_current_turn_id", "") or "") or None
     session_id = str(getattr(agent, "session_id", "") or "") or None
@@ -1713,6 +1732,13 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
                 m_el = _CREDIT_ELAPSED_RE.search(_credit_message(body, text))
                 if m_el:
                     row["credit_elapsed_s"] = m_el.group(1)
+        if (not row.get("hop") and not ccode and status == 200
+                and anthropic_credit_refusal(body)):
+            # t_2ff17f3d: Anthropic's own credit-balance refusal (its request_id),
+            # relayed in-stream after a 200. A req_ id names who answered, not the
+            # route: a direct API-key 400 refusal keeps its hop empty (Prism
+            # 97aa866b62d0), so only the measured in-stream case is inferred.
+            row["hop"] = "proxy→anthropic"
         # §4.8: a direct pin's seat and hop are knowable locally (no relay
         # headers by design, #1260). Pooled rows are left as they are.
         try:
