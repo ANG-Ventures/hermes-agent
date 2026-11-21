@@ -261,6 +261,11 @@ _FORCE_MODEL = _arg(
     help="Pin a model id the lane's live model list does not know (normally refused with the "
          "valid list; incident t_d564a8dd). Requires a non-empty reason, recorded as a comment.",
 )
+_REQUIRES_UNKNOWN_OK = _arg(
+    "--requires-unknown-ok", dest="requires_unknown_ok", metavar="REASON",
+    help="Store a body whose requires: line names words the capability map does not define "
+         "(normally refused; t_c754f664). The reason is recorded as a requires_unknown_override event.",
+)
 _ALLOW_FLAGSHIP = _arg(
     "--allow-flagship", "--firepower", dest="allow_flagship", metavar="REASON",
     help="Allow an orchestrator-only flagship model for this task. Requires a non-empty "
@@ -434,6 +439,7 @@ _SPECS = [
                   "card with the same title created in the last 24h, or an OPEN card with "
                   "a >=0.6 similar title head or the same 'Momus pass N' + spec. The reason "
                   "is recorded as a near_duplicate_forced event."),
+        _REQUIRES_UNKNOWN_OK,
         _arg("--until", metavar="TS",
              help="Mint the card parked in 'scheduled' until TS (ISO-8601, epoch, or +<N>[smhd]); "
                   "the dispatcher wakes it then (todo while parents are open). Use this for a "
@@ -799,6 +805,7 @@ _SPECS = [
         _TASK_ID,
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
+        _REQUIRES_UNKNOWN_OK,
         _arg("--priority", type=int, metavar="N",
              help="Set the dispatch priority (higher first); records priority_set."),
         _group(

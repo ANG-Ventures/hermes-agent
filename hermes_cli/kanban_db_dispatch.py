@@ -9606,6 +9606,11 @@ def _dispatch_once_locked(
                 notify_holds(conn, result.placement_waits)
             except Exception as exc:  # never break a dispatcher tick
                 _kb._log.warning("kanban studio default-deny notify failed: %s", exc)
+        try:  # t_c754f664: one home-session wake per stranded ready card per cause
+            from hermes_cli.kanban_requires_words import wake_stranded
+            wake_stranded(conn, now=_tick_now)
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban ready-stranded wake failed: %s", exc)
         try:
             starved = find_priority_starved(conn, now=_tick_now)
             result.priority_starved = [
