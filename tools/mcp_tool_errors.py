@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import errno
 import importlib
+import json
 import logging
 import os
 import re
@@ -517,16 +518,55 @@ def _is_session_expired_error(exc: BaseException) -> bool:
     return found
 
 
-# The server's JSON-RPC answer to THIS request saying it does not know the session id. Streamable HTTP
-# servers send it (HTTP 404) when a restart dropped their session table; mcp 2.x relays the server's
-# body ("Session not found") or, for a bare 404 on a session request, synthesizes "Session terminated".
+# The server's JSON-RPC answer saying it does not know the session id. Streamable HTTP servers send it
+# (HTTP 404) when a restart dropped their session table; mcp 2.x relays the server's body ("Session not
+# found") or, for a bare 404 on a session request, synthesizes "Session terminated".
 _SESSION_REJECTED_MESSAGES: tuple = ("session not found", "session terminated")
 
 
-def _is_session_rejected_before_dispatch(exc: BaseException) -> bool:
-    """True only when *exc* itself is a JSON-RPC error reply (``exc.error.message``) refusing the session.
-    The server refused the request at the session lookup, so no tool ran and one resend is safe even for a
-    write. Transport failures (closed stream, broken pipe, a mid-call session loss) carry no such reply and
-    stay outcome-uncertain; exception groups are not unwrapped, so a refusal mixed with other errors is too."""
+def _is_jsonrpc_session_refusal(exc: BaseException) -> bool:
+    """True when *exc* itself is a JSON-RPC error reply (``exc.error.message``) refusing the session. The
+    message alone does not prove nothing ran: a tool can commit and then answer HTTP 200 with the same
+    error. Only :func:`_make_session_rejection_recorder`'s HTTP 404 evidence makes it pre-dispatch."""
     message = getattr(getattr(exc, "error", None), "message", None)
     return isinstance(message, str) and message.strip().lower() in _SESSION_REJECTED_MESSAGES
+
+
+class _SessionRejectedBeforeDispatch(RuntimeError):
+    """A tools/call the server answered with HTTP 404 for the session id it carried (the transport
+    saw the status) AND a session-refusal JSON-RPC error: refused at the session lookup, the tool never ran."""
+
+
+def _make_session_rejection_recorder(server: Any):
+    """httpx response hook for the owned Streamable HTTP client: when a POST that carried an ``mcp-session-id``
+    and a JSON-RPC ``tools/call`` request is answered HTTP 404 (the spec's reply to an unknown session id, sent
+    before any dispatch), stores that request's ``params`` in ``server._tool_call_session_rejected``. The
+    handler clears it before each send (tools/call RPCs are serialized by ``_rpc_lock``) and only trusts it
+    when the recorded tool name and arguments are its own. A 200 carrying the same JSON-RPC error never sets
+    it (t_90d34dcf, Prism 36d0ba56a234)."""
+
+    async def _record(response):
+        request = response.request
+        if response.status_code != 404 or request.method != "POST" or not request.headers.get("mcp-session-id"):
+            return
+        try:
+            body = json.loads(request.content)
+        except Exception:  # streamed or non-JSON body: no evidence, stay outcome-uncertain
+            return
+        if isinstance(body, dict) and body.get("method") == "tools/call" and isinstance(body.get("params"), dict):
+            server._tool_call_session_rejected = body["params"]
+
+    return _record
+
+
+def _session_rejection_is_for(recorded: Any, tool_name: str, args: Any) -> bool:
+    """True when the recorder's 404 entry is this call's own POST (same tool name and arguments)."""
+    return (isinstance(recorded, dict) and recorded.get("name") == tool_name
+            and (recorded.get("arguments") or {}) == (args or {}))
+
+
+def _is_session_rejected_before_dispatch(exc: BaseException) -> bool:
+    """True only for :class:`_SessionRejectedBeforeDispatch` (HTTP 404 seen by the transport + a session
+    refusal reply): no tool ran, so one resend is safe even for a write. A bare JSON-RPC refusal, transport
+    failures and exception groups stay outcome-uncertain."""
+    return isinstance(exc, _SessionRejectedBeforeDispatch)

@@ -21,7 +21,9 @@ from tools.mcp_tool_content import (
     _MCP_HARD_RESULT_CAP_CHARS, _cache_mcp_audio_block, _cache_mcp_image_block,
     _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
     _truncate_mcp_text_result)
-from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error, _is_session_rejected_before_dispatch
+from tools.mcp_tool_errors import (
+    _SessionRejectedBeforeDispatch, _is_auth_error, _is_jsonrpc_session_refusal, _is_session_expired_error,
+    _is_session_rejected_before_dispatch, _session_rejection_is_for)
 
 logger = logging.getLogger("tools.mcp_tool")
 _MISSING = object()
@@ -46,6 +48,14 @@ _SESSION_OUTCOME_UNCERTAIN_MSG = (
     "UNKNOWN — the operation may or may not have taken effect server-side. It was NOT automatically retried to "
     "avoid a duplicate side effect. The connection has {state}. Verify whether the operation took effect (e.g. "
     "with a read-only tool) before re-invoking it.")
+
+# A refused-then-resent write whose RESEND failed after it may have run: it WAS sent a second time, so the
+# no-retry wording above would be false (Prism 9820a365b56b).
+_RESEND_OUTCOME_UNCERTAIN_MSG = (
+    "The MCP server '{s}' refused this write-capable call with an unknown session before it ran, so it was "
+    "resent once on a re-established connection; that resend failed after it may have reached the server, so "
+    "the outcome is UNKNOWN. It was not sent a third time. Verify whether the operation took effect (e.g. with "
+    "a read-only tool) before re-invoking it.")
 
 
 def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
@@ -277,8 +287,8 @@ def _resend_session_rejected_write(server_name: str, srv: Any, retry_call, op_de
             return None
         logger.warning("MCP server '%s': resend of %s failed after it may have been dispatched (%s); NOT "
                        "sending it again.", server_name, op_description, retry_exc)
-        return tool_error(_SESSION_OUTCOME_UNCERTAIN_MSG.format(s=server_name, state="been re-established"),
-                          outcome_uncertain=True, server=server_name)
+        return tool_error(_RESEND_OUTCOME_UNCERTAIN_MSG.format(s=server_name), outcome_uncertain=True,
+                          server=server_name)
     return _record_call_outcome(server_name, result)
 
 
@@ -611,8 +621,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
+                server._tool_call_session_rejected = None  # the transport's 404 recorder fills it for THIS send
                 try:
                     result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                except Exception as exc:
+                    if (_session_rejection_is_for(getattr(server, "_tool_call_session_rejected", None), tool_name, args)
+                            and _is_jsonrpc_session_refusal(exc)):
+                        raise _SessionRejectedBeforeDispatch(str(exc)) from exc
+                    raise
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
