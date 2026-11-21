@@ -30,7 +30,7 @@ from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_files import (
     _fs_path, _managed_broken_entry, _managed_file_entry, _managed_response_meta,
-    _resolve_managed_path,
+    _path_is_under, _resolve_managed_path,
 )
 from hermes_cli.web_models import (
     ChatImageUpload, FsWriteText, ManagedDirectoryCreate, ManagedFileDelete, ManagedFileUpload,
@@ -503,10 +503,21 @@ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = N
 
 
 def _managed_listing_entry(policy, path: Path) -> Dict[str, Any]:
-    """One entry that cannot be stat'd or followed must not fail the listing."""
+    """A symlink in the listed directory that cannot be followed must not fail the
+    listing. Anything else (a non-link, or an entry whose own directory is not
+    under the locked root) raises as _managed_file_entry does."""
     try:
         return _managed_file_entry(policy, path)
     except HTTPException:
+        if not path.is_symlink():
+            raise
+        if policy.locked_root is not None:
+            try:
+                parent = path.parent.resolve(strict=True)
+            except (OSError, RuntimeError):
+                parent = None
+            if parent is None or not _path_is_under(policy.locked_root, parent):
+                raise
         return _managed_broken_entry(path)
 
 
