@@ -672,14 +672,15 @@ class WakeState:
                 os.fsync(fh.fileno())
             if _WINDOWS:
                 # Native Windows cannot fsync a directory opened with os.open.
-                # Use the same write-through replacement as the Windows SSH runtime.
-                import pywintypes
-                import win32file
+                # Use the Win32 write-through rename without optional dependencies.
+                import ctypes
+                from ctypes import wintypes
 
-                try:
-                    win32file.MoveFileEx(tmp, str(self.path), 0x1 | 0x8)  # REPLACE_EXISTING | WRITE_THROUGH
-                except pywintypes.error as exc:
-                    raise OSError(str(exc)) from exc
+                move_file_ex = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+                move_file_ex.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+                move_file_ex.restype = wintypes.BOOL
+                if not move_file_ex(tmp, str(self.path), 0x1 | 0x8):  # REPLACE_EXISTING | WRITE_THROUGH
+                    raise ctypes.WinError(ctypes.get_last_error())
                 tmp = None
             else:
                 os.replace(tmp, self.path)
@@ -1351,10 +1352,13 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     for session_key, (entry, cards) in by_session.items():
         text = render_prompt([c for _k, c in cards])
         try:
-            await deliver_turn(runner, entry, text, [c for _k, c in cards])
+            accepted = await deliver_turn(runner, entry, text, [c for _k, c in cards])
         except Exception as exc:
             logger.warning("kanban owner-wake: wake of %s failed (%s); held for retry",
                            session_key, exc)
+            continue
+        if not accepted:
+            logger.debug("kanban owner-wake: wake of %s not accepted; held for retry", session_key)
             continue
         turns += 1
         for key, card in cards:
