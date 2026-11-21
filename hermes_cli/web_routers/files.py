@@ -29,7 +29,8 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_files import (
-    _fs_path, _managed_file_entry, _managed_response_meta, _resolve_managed_path,
+    _fs_path, _managed_broken_entry, _managed_file_entry, _managed_response_meta,
+    _path_is_under, _resolve_managed_path,
 )
 from hermes_cli.web_models import (
     ChatImageUpload, FsWriteText, ManagedDirectoryCreate, ManagedFileDelete, ManagedFileUpload,
@@ -501,6 +502,25 @@ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = N
     return await asyncio.to_thread(_run)
 
 
+def _managed_listing_entry(policy, path: Path) -> Dict[str, Any]:
+    """A symlink in the listed directory that cannot be followed must not fail the
+    listing. Anything else (a non-link, or an entry whose own directory is not
+    under the locked root) raises as _managed_file_entry does."""
+    try:
+        return _managed_file_entry(policy, path)
+    except HTTPException:
+        if not path.is_symlink():
+            raise
+        if policy.locked_root is not None:
+            try:
+                parent = path.parent.resolve(strict=True)
+            except (OSError, RuntimeError):
+                parent = None
+            if parent is None or not _path_is_under(policy.locked_root, parent):
+                raise
+        return _managed_broken_entry(path)
+
+
 @router.get("/api/files")
 async def list_managed_files(request: Request, path: Optional[str] = None):
     policy, target, display_path = _resolve_managed_path(path, request)
@@ -511,7 +531,7 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
     with _io_errors("Directory is not readable", "Could not read directory"), os.scandir(target) as scan:
         entries = [
-            _managed_file_entry(policy, Path(entry.path))
+            _managed_listing_entry(policy, Path(entry.path))
             for entry in scan
             if not _is_sensitive_path(Path(entry.path))
         ]

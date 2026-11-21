@@ -2252,8 +2252,11 @@ export interface ManagedFileEntry {
   path: string;
   is_directory: boolean;
   size: number | null;
-  mtime: number;
+  mtime: number | null;
   mime_type: string | null;
+  /** Set on an entry the server could not follow (dangling link, loop). */
+  type?: "link";
+  broken?: boolean;
 }
 
 export interface ManagedFilesResponse {

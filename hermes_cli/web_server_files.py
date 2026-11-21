@@ -178,6 +178,25 @@ def _managed_response_meta(policy: ManagedFilesPolicy) -> Dict[str, Any]:
     return {"root": locked_root, "locked_root": locked_root, "can_change_path": policy.can_change_path}
 
 
+def _managed_broken_entry(target: Path) -> Dict[str, Any]:
+    """A listing entry that could not be followed (dangling link, loop, outside
+    the root, vanished): its own name and path, lstat where readable, no size."""
+    try:
+        mtime = target.lstat().st_mtime
+    except OSError:
+        mtime = None
+    return {
+        "name": target.name,
+        "path": str(target),
+        "is_directory": False,
+        "size": None,
+        "mtime": mtime,
+        "mime_type": None,
+        "type": "link",
+        "broken": True,
+    }
+
+
 def _managed_file_entry(policy: ManagedFilesPolicy, target: Path) -> Dict[str, Any]:
     try:
         resolved = target.resolve()
