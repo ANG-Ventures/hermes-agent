@@ -307,3 +307,39 @@ def test_root_probe_leaves_no_residue_on_a_card_path_fault(tmp_path):
     with pytest.raises(RuntimeError):
         kwh.prepare_remote_workspace(_host("ci-box"), str(board / "t_x"), runner=_local_mkdir, board="subs-ace")
     assert sorted(p.name for p in board.iterdir()) == ["t_x"]
+
+
+def _acl_or_skip(path):
+    import shutil as _sh
+    if not (_sh.which("setfacl") and _sh.which("getfacl")):
+        pytest.skip("no setfacl/getfacl (POSIX ACLs are Linux-only here)")
+    uid = os.getuid()
+    if subprocess.run(["setfacl", "-d", "-m", f"u:{uid}:rwx", str(path)], capture_output=True).returncode:
+        pytest.skip("filesystem without POSIX ACLs")
+    return uid
+
+
+def _acl(path, default=False):
+    argv = ["getfacl", "-pcn"] + (["-d"] if default else []) + ["--", str(path)]
+    return subprocess.run(argv, capture_output=True, text=True).stdout.split()
+
+
+def test_existing_workspace_gets_the_board_roots_default_acl(tmp_path):
+    """t_b6205005: ace-ai's board root got ``default:user:ace:rwx`` on 11-20 ~06:00; workspaces made before it kept
+    no entry, `mkdir -p` left them alone on a re-run, and the identity probe (terminal user ace) got
+    `cd: Permission denied` until t_18dd8603 gave up. The re-run's prepare now gives the old dir (and its tree) the
+    root's named entries; a fresh dir already inherits them and is left as is."""
+    board = tmp_path / "default"
+    board.mkdir()
+    (board / "t_old" / "sub").mkdir(parents=True)             # predates the root's default ACL
+    (board / "t_old" / "sub" / "f").write_text("x")
+    uid = _acl_or_skip(board)
+    named = f"user:{uid}:rwx"
+    assert named not in _acl(board / "t_old")                  # the 18:16 shape: no entry, ace refused
+    kwh.prepare_remote_workspace(_host("ace-ai"), str(board / "t_old"), runner=_local_mkdir, board="default")
+    kwh.prepare_remote_workspace(_host("ace-ai"), str(board / "t_new"), runner=_local_mkdir, board="default")
+    for d in ("t_old", "t_old/sub", "t_new"):
+        assert named in _acl(board / d), d                     # access: the worker's user can cd
+        assert named in _acl(board / d, default=True), d       # default: what it creates inherits
+    assert f"user:{uid}:rw-" in _acl(board / "t_old" / "sub" / "f")   # rwX: a file is not made executable
+    assert ((board / "t_new").stat().st_mode & 0o007) == 0     # still never world-searchable (t_69e47673)

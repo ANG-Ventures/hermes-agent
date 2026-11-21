@@ -98,6 +98,29 @@ def _mkdir_mode(host: PoolHost) -> str:
     return f"-m {WORKSPACE_MODE} " if host.name != LOCAL_HOST_NAME else ""
 
 
+def _inherit_root_acl(w: str, b: str) -> str:
+    """t_b6205005: the board root's NAMED default ACL entries onto an existing workspace that lacks them.
+
+    `mkdir -p` leaves an existing dir as it is, so a workspace made before the root got its default ACL (ace-ai and
+    ace-media, 2026-11-20 ~06:00, ``user:ace:rwx``) keeps no entry for the worker's terminal user on a re-run: the
+    identity probe's ``cd`` was refused (rc 126) and t_18dd8603 gave up. Applied once per such dir (it is skipped
+    when the first entry is present and not masked), access ``rwX`` recursively, default on every dir. Best effort:
+    no getfacl/setfacl (macOS) or no default ACL on the root = nothing to do."""
+    return (
+        "if command -v getfacl >/dev/null 2>&1 && command -v setfacl >/dev/null 2>&1; then "
+        f"ed=$(getfacl -dpc -- {b} 2>/dev/null | sed 's/[[:space:]].*//' | grep -E '^(user|group):[^:]+:' "
+        "| tr '\\n' ','); ed=${ed%,}; "
+        "if [ -n \"$ed\" ]; then f=${ed%%,*}; "
+        f"if ! getfacl -dpc -- {w} 2>/dev/null | grep -qxF \"$f\" "
+        f"|| getfacl -pc -- {w} 2>/dev/null | grep -F \"$f\" | grep -q effective; then "
+        "ea=$(printf '%s\\n' \"$ed\" | tr ',' '\\n' | awk -F: '{p=$3; sub(/x/, \"X\", p); "
+        "printf \"%s%s:%s:%s\", (NR > 1 ? \",\" : \"\"), $1, $2, p}'); "
+        f"setfacl -R -m \"$ea\" -- {w} 2>/dev/null; "
+        f"find {w} -type d -exec setfacl -d -m \"$ed\" -- {{}} + 2>/dev/null; "
+        "fi; fi; fi; "
+    )
+
+
 def prepare_remote_workspace(host: PoolHost, workspace: str,
                              runner: Callable = subprocess.run, *,
                              board: Optional[str] = None) -> None:
@@ -109,7 +132,7 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
     proc = runner(
         # The root is proven by CREATING under it (ENOSPC / inodes / quota pass
         # an access test; Prism d762ee26a639), then the probe dir is removed.
-        _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && exit 0; "
+        _ssh_argv(host, f"mkdir -p {_mkdir_mode(host)}-- {w} && {{ {_inherit_root_acl(w, b)}exit 0; }}; "
                         f"t=$(mktemp -d {b}/.hermes-root-probe.XXXXXX 2>/dev/null) && "
                         f"{{ rmdir -- \"$t\"; exit 1; }}; exit {_BOARD_ROOT_RC}"),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -161,6 +184,22 @@ class WorkerIdentityProbeError(RuntimeError):
     """The probe booted but its ssh terminal could not launch (Prism f7be64ebab1a: ``ssh -E <log>`` with no log dir
     fails before the remote command runs). The worker's terminal would fail the same way, so the spawn is refused
     with the reason, never admitted as "unread"."""
+
+
+class WorkerWorkspaceAccessDenied(WorkerIdentityProbeError):
+    """The worker's terminal user cannot ``cd`` into the card's workspace (t_b6205005: an ACL-less workspace on
+    ace-ai, ``cd: ...: Permission denied``, rc 126). A host/workspace fault, never the card's: the run is closed
+    ``infrastructure: true`` (no retry charged, spaced retries) and the host is paged once."""
+
+    def __init__(self, host: str, board: Optional[str], workspace: str, detail: str):
+        super().__init__(f"worker host {host}: workspace {workspace} refuses the worker's terminal user "
+                         f"(cd: Permission denied), a host/workspace fault, no retry charged "
+                         f"(fix on {host}: give it the board root's default ACL, e.g. "
+                         f"setfacl -R -m u:<user>:rwX -- {workspace}): {detail}")
+        self.host, self.board, self.workspace = host, board, workspace
+
+
+_CD_DENIED_RE = re.compile(r"\bcd: (?P<path>[^\n]*?): Permission denied")
 
 
 def worker_spawn_cwd(workspace: str) -> Optional[str]:
@@ -234,6 +273,9 @@ def check_worker_identity(host: PoolHost, workspace: str, env: Mapping[str, str]
         return
     first = _run_ident_probe(profile, workspace, env, without_profile_git=False, runner=runner)
     if (first or {}).get("error"):
+        denied = _CD_DENIED_RE.search(first["error"])
+        if denied and denied.group("path").rstrip("/") == workspace.rstrip("/"):
+            raise WorkerWorkspaceAccessDenied(host.name, board, workspace, first["error"])
         raise WorkerIdentityProbeError(f"worker host {host.name}: identity probe error, refusing to start a "
                                        f"worker: {first['error']}")
     emails = (first or {}).get("emails")

@@ -3229,6 +3229,12 @@ def _host_fault(exc: BaseException) -> Optional[dict]:
         if not exc.board:
             return None
         return {"board_fault": {"host": exc.host, "board": exc.board}, "git_identity_refused": exc.email}
+    # t_b6205005: the worker's terminal user cannot cd into THIS card's workspace (an ACL-less dir; t_18dd8603 gave
+    # up after 3 charged retries). A host/workspace fault: never charged, retried after the infrastructure cooldown
+    # (prepare_remote_workspace heals the ACL), paged once per host. No (host, board) quarantine: one dir, not the root.
+    if isinstance(exc, _kb._kwh.WorkerWorkspaceAccessDenied):
+        _kb._kwh.note_identity_fault(exc.host, None, str(exc))
+        return {"workspace_access_denied": {"host": exc.host, "workspace": exc.workspace}}
     return None
 
 
