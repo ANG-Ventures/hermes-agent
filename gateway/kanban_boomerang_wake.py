@@ -482,11 +482,17 @@ class BoomerangWakeState:
             entry = self._claims_of(self._read()).get(key)
         return dict(entry) if isinstance(entry, dict) else None
 
-    def update_claim(self, key: str, *, handback: Optional[tuple] = None, **fields) -> Optional[dict]:
+    def update_claim(self, key: str, *, handback: Optional[tuple] = None, unless_state: tuple = (),
+                     **fields) -> Optional[dict]:
         """``handback=(delegation_id, row)`` persists that pending row (unless one exists) in the
-        SAME file write as the claim fields: a claim never turns terminal without its handback."""
+        SAME file write as the claim fields: a claim never turns terminal without its handback.
+        ``unless_state``: compare-and-set; a claim already in one of these states is returned
+        unchanged and nothing is written (t_54bbaca0: a cancel between read and write wins)."""
         with _LOCK:
             data = self._read()
+            live = self._claims_of(data).get(key)
+            if unless_state and isinstance(live, dict) and live.get("state") in unless_state:
+                return dict(live)
             if handback is not None:
                 rows = self._handbacks_of(data)
                 rows.setdefault(handback[0], dict(handback[1]))
@@ -2312,6 +2318,12 @@ def finding_text(entry: dict, result: dict, header: str) -> str:
     """What the child learned, ahead of the original wake (D-14: wake WITH the reason)."""
     secs = int(max(0.0, _time.time() - float(entry.get("claimed_at") or _time.time())))
     mode = entry.get("inherit_mode") or entry.get("mode") or "fork"
+    if entry.get("wake_model_override") and not entry.get("wake_model_fallback_ran"):
+        mode = f"{mode}, model {entry['wake_model_override']}"   # t_54bbaca0: names the model it ran on
+    if entry.get("wake_effort") and not entry.get("wake_model_fallback_ran"):
+        mode = f"{mode}, effort {entry['wake_effort']}"
+    if entry.get("wake_model_fallback"):   # t_54bbaca0: an override failed or was not usable; the home hears it
+        mode = f"{mode}, {entry['wake_model_fallback']}"
     lines = [f"{MARKER} {header} {entry['task_id']} ({entry.get('row')}, {mode}, {secs}s): "
              f"{result.get('detail') or result.get('summary') or ''}"]
     if result.get("evidence"):
@@ -2578,9 +2590,12 @@ async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState
     # t_d712444b round 3: a superseded WRITE verdict re-delivers the child's read (superseded_text). It keeps that
     # identity on the pending row, so delivery never takes it for a legacy surface and drops it as stale (a merged PR).
     read = superseded and bool(tried) and text is not None
+    no_text = text is None
+    if text is None and entry.get("wake_model_fallback"):   # t_54bbaca0: the home hears the override failed
+        text = f"{MARKER} {entry['wake_model_fallback']}; {reason}\n---\n{entry.get('wake_text') or ''}"
     handback = handback_row(entry, {"summary": reason, **({"action": SUPERSEDED_READ} if read else {})},
                             turn_text=text if text is not None else str(entry.get("wake_text") or ""))
-    if fork_died and text is None:
+    if fork_died and no_text:
         handback[1]["fork_died"] = True
     status = await asyncio.to_thread(_card_status, entry) if superseded else ""
     # Quiet only when the re-delivered wake has somewhere to land. With no live home the turn part
@@ -2707,10 +2722,51 @@ async def resolve_parent(runner: Any, entry: dict, *, wait_s: float = PARENT_BUS
 
 
 def _run_child_delegate(parent: Any, goal: str, mode: str) -> tuple:
-    """``(status, final_message)`` of one boomerang child (blocking; worker thread)."""
+    """``(status, final_message)`` of one boomerang child (blocking; worker thread).
+
+    t_54bbaca0: no override = the parent's route, chain and mode, exactly as before. An overridden
+    child that does not complete with a final message (any other status, or an exception) runs
+    again on the parent's route; ``route["fell_back"]`` carries the line. A /stop is the operator's
+    and is not rerun."""
+    from gateway.kanban_wake_child_route import CURRENT_ROUTE
+
+    route = CURRENT_ROUTE.get()
+    if not route:
+        return _run_child_once(parent, goal, mode, None)
+    try:
+        status, final = _run_child_once(parent, goal, mode, route)
+    except Exception as exc:
+        status, final = "error", f"{type(exc).__name__}: {exc}"
+    if status == "stopped" or (status == "completed" and str(final or "").strip()):
+        return status, final
+    from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART
+
+    if status == "interrupted" and final == _INTERRUPT_REASON_GATEWAY_RESTART:
+        return status, final   # the restart's: the claim stays open for the next boot, no second child
+    why = _first_line(final, 160) if str(final or "").strip() else "empty final message"
+    if status != "failed":
+        why = f"{status}: {why}"
+    what = f"wake-model {route['label']}" if route.get("model") else f"wake-effort {route.get('effort')}"
+    line = f"{what} failed ({why}), ran on parent {_ran_on(parent)}"
+    # The dispatcher's gate: no rerun while the gateway stops or once the claim is cancelled (budget);
+    # otherwise it writes the note to the claim BEFORE the parent dispatch, so a raise there keeps it.
+    gate = route.get("fall_back")
+    if gate is not None and not gate(line):
+        return ("interrupted" if status == "interrupted" or gate.stopping() else status), final
+    route["fell_back"] = line
+    logger.warning("kanban boomerang-wake: %s", line)
+    return _run_child_once(parent, goal, route.get("parent_mode") or mode, None)
+
+
+def _ran_on(parent: Any) -> str:
+    return f"{getattr(parent, 'provider', None) or '?'}/{getattr(parent, 'model', None) or '?'}"
+
+
+def _run_child_once(parent: Any, goal: str, mode: str, route: Optional[dict]) -> tuple:
+    from gateway.kanban_wake_child_route import delegate_kwargs
     from tools.delegate_tool import delegate_task
 
-    raw = delegate_task(goal=goal, inherit_context=True, inherit_mode=mode, parent_agent=parent)
+    raw = delegate_task(goal=goal, inherit_context=True, parent_agent=parent, **delegate_kwargs(route, mode))
     data = json.loads(raw) if isinstance(raw, str) else {}
     if data.get("error"):
         return "failed", str(data["error"])
@@ -2806,6 +2862,83 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
             await deliver_handbacks(runner, state, delegation_id=entry["delegation_id"])
 
 
+def _wake_route(entry: dict, parent: Any, routing: Any = None) -> Optional[dict]:
+    """t_54bbaca0: the operator's wake-model and wake-effort overrides (card, session, global), None =
+    the parent's route and effort. Returns ``{model..., "effort", "unusable"}``: a model route (or
+    none), an effort word (or none), and the line for every override that cannot be used (the wake
+    runs on the parent's model / effort and the line goes on its surfaced text). Never raises: an
+    override never drops the wake. ``routing``: the gateway's in-memory ``provider_routing``.
+    Values echoed to the home line pass :func:`~gateway.kanban_wake_child_route.shown`."""
+    from gateway import kanban_wake_child_route as _wcr
+
+    # The session overrides are looked up by the RESOLVED home session id first (the parent the
+    # resolver built for this home), then the card's raw reference (Prism 8b65f0d36f77).
+    sids = [getattr(parent, "session_id", None), entry.get("home_sid")]
+    out: dict = {}
+    notes = []
+    label = _wcr.shown(entry["wake_model"]) if entry.get("wake_model") else "config"
+    try:
+        value, source = _wcr.requested(entry.get("wake_model"), sids)
+        label = _wcr.shown(value)
+        out.update(_wcr.resolve_route(value, getattr(parent, "provider", None), source=source or "",
+                                      task_id=str(entry.get("task_id") or ""), parent=parent,
+                                      live_routing=routing) or {})
+    except Exception as exc:
+        why = str(exc) if isinstance(exc, _wcr.Unusable) else f"not read: {type(exc).__name__}: {exc}"
+        notes.append(f"wake-model {label} not usable ({_first_line(why, 160)}), ran on parent {_ran_on(parent)}")
+    label = _wcr.shown(entry["wake_effort"]) if entry.get("wake_effort") else "config"
+    try:
+        value, source = _wcr.requested_effort(entry.get("wake_effort"), sids)
+        label = _wcr.shown(value)
+        effort = _wcr.resolve_effort(value, source=source or "")
+        if effort:
+            out["effort"] = effort
+            out.setdefault("label", f"effort {effort}")
+    except Exception as exc:
+        why = str(exc) if isinstance(exc, _wcr.Unusable) else f"not read: {type(exc).__name__}: {exc}"
+        notes.append(f"wake-effort {label} not usable ({_first_line(why, 160)}), ran at the parent's effort")
+    for line in notes:
+        logger.warning("kanban boomerang-wake: %s %s", entry.get("task_id"), line)
+    if notes:
+        out["unusable"] = "; ".join(notes)
+    return out or None
+
+
+def _same_effort(effort: str, parent: Any) -> bool:
+    from hermes_constants import parse_reasoning_effort
+
+    return parse_reasoning_effort(effort) == getattr(parent, "reasoning_config", None)
+
+
+class _FallBackGate:
+    """Called on the child's thread before an overridden wake reruns on the parent (t_54bbaca0):
+    False while the gateway stops or once the claim is cancelled (budget), so no second child
+    starts; else the fallback note goes on the claim first, so a failed parent dispatch keeps it."""
+
+    def __init__(self, runner: Any, state: BoomerangWakeState, key: str, unusable: Optional[str], mode: str):
+        self.runner, self.state, self.key, self.unusable, self.mode = runner, state, key, unusable, mode
+
+    def stopping(self) -> bool:
+        return _gateway_stopping(self.runner)
+
+    def __call__(self, line: str) -> bool:
+        """True = rerun on the parent. The note write is a compare-and-set against a cancel; a write
+        that fails is logged and the rerun goes ahead (the dispatcher carries ``route["fell_back"]``
+        into the home's text instead)."""
+        if self.stopping():
+            return False
+        note = "; ".join(filter(None, (self.unusable, line)))
+        try:
+            live = self.state.update_claim(self.key, unless_state=(STATE_CANCELLED, STATE_TERMINAL),
+                                           wake_model_fallback=note, wake_model_fallback_ran=True,
+                                           inherit_mode=self.mode)
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: fallback note not written (%s); rerunning on the parent",
+                           _first_line(f"{type(exc).__name__}: {exc}", 160))
+            return True
+        return not (live and live.get("state") in (STATE_CANCELLED, STATE_TERMINAL))
+
+
 async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState) -> None:
     """The dispatched task: parent → child → verdict executor → one origin line."""
     key = entry["key"]
@@ -2814,17 +2947,48 @@ async def _run_entry_scoped(runner: Any, entry: dict, state: BoomerangWakeState)
         if live.get("state") not in (STATE_CANCELLED, STATE_TERMINAL) and not live.get("resurfaced"):
             await _fail(runner, live, "blocked assessment budget exhausted; owner assessment required", state)
         return
+    route, extra = None, {}
     try:
         parent, mode = await parent_resolver(runner, entry)
-        entry = await asyncio.to_thread(state.update_claim, key, state=STATE_RUNNING, inherit_mode=mode) or entry
-        watcher = asyncio.ensure_future(_note_child_session(entry, state))
-        try:
-            status, final = await asyncio.to_thread(run_child, parent, build_goal(entry), mode)
-        finally:
-            watcher.cancel()
+        route = await asyncio.to_thread(_wake_route, entry, parent, getattr(runner, "_provider_routing", None))
+        if route and route.get("unusable"):   # t_54bbaca0: the parent runs it; the home is told why
+            extra["wake_model_fallback"] = route.pop("unusable")
+            route = route if (route.get("model") or route.get("effort")) else None
+        if route:
+            route["parent_mode"] = mode
+        if route and route.get("effort"):   # t_54bbaca0: an effort override keeps the parent's model and lane
+            extra["wake_effort"] = route["effort"]
+            if mode == "fork" and not _same_effort(route["effort"], parent):
+                # A changed effort changes the request fingerprint: the fork would be rebuilt as a summary
+                # fold (tools/delegate_tool.py same_request_params), so run and report what actually runs.
+                mode = "summary"
+        if route and route.get("model"):   # t_54bbaca0: a model override runs as a summary fold on its own model
+            mode = "summary"
+            extra["wake_model_override"] = f"{route['provider']}/{route['model']}"
+        # Compare-and-set: a claim cancelled (budget, /stop) while the route was read starts no child.
+        entry = await asyncio.to_thread(state.update_claim, key, unless_state=(STATE_CANCELLED, STATE_TERMINAL),
+                                        state=STATE_RUNNING, inherit_mode=mode, **extra) or entry
+        if entry.get("state") in (STATE_CANCELLED, STATE_TERMINAL):
+            status, final = "interrupted", "claim closed before the child started"
+        else:
+            from gateway.kanban_wake_child_route import CURRENT_ROUTE
+
+            if route:
+                route["fall_back"] = _FallBackGate(runner, state, key, extra.get("wake_model_fallback"),
+                                                   route.get("parent_mode") or mode)
+            CURRENT_ROUTE.set(route)   # asyncio.to_thread copies it into the child's thread
+            watcher = asyncio.ensure_future(_note_child_session(entry, state))
+            try:
+                status, final = await asyncio.to_thread(run_child, parent, build_goal(entry), mode)
+            finally:
+                watcher.cancel()
     except Exception as exc:
         status, final = "failed", f"dispatch failed: {exc}"
     live = await asyncio.to_thread(state.get_claim, key) or entry
+    if route and route.get("fell_back") and not live.get("wake_model_fallback_ran"):
+        # The gate's note write failed: the home still hears why the override did not run it.
+        live = {**live, "wake_model_fallback_ran": True, "wake_model_fallback": "; ".join(
+            filter(None, (extra.get("wake_model_fallback"), route["fell_back"])))}
     if live.get("state") in (STATE_CANCELLED, STATE_TERMINAL) or live.get("resurfaced"):
         logger.info("kanban boomerang-wake: %s %s late handoff dropped", LATE_TAG, live["task_id"])
         # A replay never noops past a pending handback: it retries the send (Prism d74bf844f9a4).
@@ -2948,6 +3112,8 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         logger.info("kanban notifier: boomerang-wake %s disposition=auto row=%s path=%s deferred: the review "
                     "first-read child of this episode is still running", task_id, disposition.row, path)
         return True
+    from gateway.kanban_wake_child_route import card_wake_effort, card_wake_model
+
     snap = await asyncio.to_thread(card_snapshot, board, task_id)
     entry = {
         "key": key, "board": board, "task_id": task_id, "event_id": int(event_id), "kind": kind,
@@ -2959,6 +3125,8 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
         "home_sid": home_sid or "", "route": dict(route or {}), "path": path,
         "title": str(_field(task, "title") or "")[:160], "wake_text": wake_text,
         "verdict_nonce": secrets.token_hex(8), "delegation_id": mint_delegation_id(),
+        "wake_model": card_wake_model((snap["card_text"] or [None, None])[1]),
+        "wake_effort": card_wake_effort((snap["card_text"] or [None, None])[1]),
         "child_session": None, "subagent_id": None, "state": STATE_CLAIMED,
         "claimed_at": _time.time(), "max_minutes": MAX_MINUTES, "resurfaced": False,
     }

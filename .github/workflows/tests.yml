@@ -599,6 +599,17 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+      - name: Run posix integration files no slice selects
+        # t_54bbaca0: the slices exclude tests/integration and the only lane that selected this
+        # file (OS-specific tests, macOS) is skipped on most PRs, so 8 failures here once read
+        # green. Real loopback HTTP providers, no network, no credentials.
+        run: |
+          scripts/run_tests.sh --include-integration tests/integration/test_boomerang_parent_routing_http.py -- -v
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
   e2e:
     needs: [generate, placement]
     if: always() && !cancelled() && needs.generate.result == 'success' && inputs.e2e

@@ -1969,6 +1969,9 @@ def _build_child_agent(
     inherit_parent_route: bool = False,
     explicit_child_route: bool = False,
     parent_route_snapshot: Any = None,
+    # A parsed per-call reasoning config (internal callers only, t_54bbaca0): replaces the child's
+    # effort on every path, fork included. None = today's rule (delegation.reasoning_effort > parent).
+    reasoning_override: Optional[Dict[str, Any]] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -2079,6 +2082,8 @@ def _build_child_agent(
                 _reason = "explicit_child_route"
             _fork.log_ineligible(_reason, parent_agent, delegation_id=delegation_id, task_index=task_index)
             mode = "summary"
+    if reasoning_override is not None:
+        rt = {**rt, "reasoning_config": copy.deepcopy(reasoning_override)}
     # ── Boomerang context inheritance (spec v0.8 D-4 / P0.3) ────────────
     # When inherit_context is set, fold the PARENT's conversation history into
     # ONE user-role context message and seed the child with it. Verbatim copy of
@@ -4049,6 +4054,7 @@ def _delegate_task_impl(
     _recovery_spec: Optional[Dict[str, Any]] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
     sign_grant: Optional[Dict[str, Any]] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -4091,6 +4097,13 @@ def _delegate_task_impl(
     provider = str(provider or "").strip() or None
     if provider and not model:
         return tool_error("delegate_task provider requires a model override.")
+    _reasoning_override = None
+    if reasoning_effort is not None:   # internal callers only (t_54bbaca0); never model-facing
+        from hermes_constants import parse_reasoning_effort
+
+        _reasoning_override = parse_reasoning_effort(reasoning_effort)
+        if _reasoning_override is None:
+            return tool_error(f"delegate_task reasoning_effort {reasoning_effort!r} is not a known effort.")
     audit_reason = None
     if model:
         from hermes_cli.model_switch import resolve_model_pair_for_storage
@@ -4534,6 +4547,7 @@ def _delegate_task_impl(
                 delegation_id=live_deleg_id,
                 inherit_parent_route=_task_inherits_route,
                 explicit_child_route=bool(model or provider or credentials_cfg is not None),
+                reasoning_override=_reasoning_override,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
