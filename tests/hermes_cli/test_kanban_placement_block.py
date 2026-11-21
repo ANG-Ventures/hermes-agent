@@ -26,6 +26,14 @@ NAMED_UNKNOWN = "Needs host: nas-1 (the ZFS pool), which no worker reaches."
 LOCAL_REAL = "Pinning needs the Kyzcreig admin login, which this worker lacks."
 
 
+@pytest.fixture(autouse=True)
+def _legacy_reroute(monkeypatch):
+    """This suite pins the kill-switch-off path (``kanban.placement_block_no_default_studio: false``): every pool-host
+    capability block re-routes to the Studio. The default-on path is test_kanban_placement_block_no_default_studio.py
+    (t_9392860c)."""
+    monkeypatch.setattr(kpb, "strict_enabled", lambda: False)
+
+
 def _host(name, enabled=True):
     return kwp.PoolHost(name=name, ssh_host=name, ssh_user=kwp.SSH_USER, slots=2, capacity_pct=0.8,
                         absence="required", profiles=("alpha",), state="active", enabled=enabled, priority=0)
