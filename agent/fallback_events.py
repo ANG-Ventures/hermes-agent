@@ -1732,10 +1732,12 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
                 m_el = _CREDIT_ELAPSED_RE.search(_credit_message(body, text))
                 if m_el:
                     row["credit_elapsed_s"] = m_el.group(1)
-        if not row.get("hop") and not ccode and anthropic_credit_refusal(body):
+        if (not row.get("hop") and not ccode and status == 200
+                and anthropic_credit_refusal(body)):
             # t_2ff17f3d: Anthropic's own credit-balance refusal (its request_id),
-            # relayed in-stream after a 200. Only an API-key leg has a credit
-            # balance, so the leg is the proxy's.
+            # relayed in-stream after a 200. A req_ id names who answered, not the
+            # route: a direct API-key 400 refusal keeps its hop empty (Prism
+            # 97aa866b62d0), so only the measured in-stream case is inferred.
             row["hop"] = "proxy→anthropic"
         # §4.8: a direct pin's seat and hop are knowable locally (no relay
         # headers by design, #1260). Pooled rows are left as they are.

@@ -292,6 +292,23 @@ def test_in_stream_credit_balance_refusal_label_and_detail_agree(_home, monkeypa
         time.tzset()
 
 
+def test_http_400_credit_refusal_with_req_id_keeps_hop_empty(_home, monkeypatch):
+    # Prism 97aa866b62d0: a req_ id says who answered, not the route. A direct
+    # API-key call refused with HTTP 400 must not be attributed to a proxy.
+    from agent.error_classifier import FailoverReason
+    from tests.agent.test_fallback_rider_truth import _Err
+
+    _pst(monkeypatch)
+    try:
+        err = _Err(CREDIT_BALANCE_BODY, 400, {})
+        _elr_failover(monkeypatch, err, FailoverReason.billing)
+        row = _rows(_home)[0]
+        assert not row.get("hop"), row.get("hop")
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
 def test_credit_balance_message_is_one_cause_class():
     # Label (FailoverReason.billing -> "credit exhausted") and detail must name
     # the same cause class for the recorded shape.
