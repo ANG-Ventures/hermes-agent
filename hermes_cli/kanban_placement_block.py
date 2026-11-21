@@ -193,14 +193,17 @@ _REQUIRES_HEAD_RE = re.compile(r"^([ \t]*requires:[ \t]*)", re.IGNORECASE | re.M
 def supported_studio_words(reason: str, studio_reasons: Optional[frozenset]) -> Tuple[str, ...]:
     """The ``requires:`` words the block reason itself supports (t_9392860c): a word the reason names literally,
     then a :data:`_REQUIRES_HINTS` word whose wording the reason uses, each only if ``studio_reasons`` lists it.
-    ``studio_reasons`` None (no map this tick): the hint words alone, unchecked. Never a word the reason lacks."""
+    ``studio_reasons`` None (no map this tick): nothing, since no word can be confirmed Studio-only (Prism
+    ca8c4e1d4422). Never a word the reason lacks."""
+    if studio_reasons is None:
+        return ()
     text = reason or ""
     # A word named literally wins over a hint, and a hint never matches inside a hyphenated name: "browser" in
     # "browser-identity" is that capability, not browser-session (Prism ff96bb11f1f1).
-    out = [w for w in sorted(studio_reasons or ())
+    out = [w for w in sorted(studio_reasons)
            if re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text, re.IGNORECASE)]
     for w, rx in _REQUIRES_HINTS:
-        if w not in out and (studio_reasons is None or w in studio_reasons) and _bare_hit(rx, text):
+        if w not in out and w in studio_reasons and _bare_hit(rx, text):
             out.append(w)
     return tuple(out)
 

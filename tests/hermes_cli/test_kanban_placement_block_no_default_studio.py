@@ -77,6 +77,15 @@ def test_reason_naming_a_pool_host_still_reroutes_there():
     assert _c("Re-dispatch with host: ci-box, it has the login.") == ("reroute", "ci-box")
 
 
+def test_no_map_this_tick_never_reroutes_to_the_studio():
+    # Prism ca8c4e1d4422: without a map no hint word can be confirmed Studio-only (docker is on pool rows).
+    action, arg = kpb.classify(kind="capability", reason="Needs Docker", placed_host="ace-ai", body=T84_BODY,
+                               pool=POOL, rerouted_before=False, assignee="alpha", workspace_kind="scratch",
+                               studio_reasons=None, strict=True)
+    assert action == kpb.OWNER_WAKE and arg == "Needs Docker"
+    assert kpb.studio_requires_word("Needs Docker", None, strict=True) is None
+
+
 def test_switch_is_default_on_and_config_turns_it_off(monkeypatch):
     import hermes_cli.config as cfg
     monkeypatch.setattr(cfg, "load_config_readonly", lambda: {})

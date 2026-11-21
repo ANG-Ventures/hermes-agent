@@ -266,7 +266,8 @@ def test_a_capability_block_from_a_pool_host_is_rerouted_to_the_studio():
     pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), pool_hosts=(_host("ci-box"),))
     verdict = kpb.classify(kind="capability", reason="needs the vault only the Studio has; re-run on the Studio",
                            placed_host="ci-box", body=VAULT, pool=pool, rerouted_before=False,
-                           assignee="alpha", workspace_kind="scratch")
+                           assignee="alpha", workspace_kind="scratch",
+                           studio_reasons=frozenset({"obsidian-vault"}))   # no map = no Studio route (t_9392860c)
     assert verdict == ("reroute", kwp.PIN_STUDIO)
     assert 'kind="capability"' in khc.prose_advisory_comment(
         [{"source": "body", "rule": "studio_needs", "need": "vault", "evidence": "vault"}])
