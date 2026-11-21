@@ -703,3 +703,121 @@ def test_404_recorded_for_another_call_does_not_license_a_resend(monkeypatch, tm
         assert sends["B"] == 1 and ran["B"] == 1
     finally:
         _cleanup("srv")
+
+
+def test_owned_streamable_client_records_a_404_for_its_own_server(monkeypatch):
+    """The owned Streamable HTTP client that ``_streamable_http_transport`` builds carries the 404 recorder
+    for THIS server (round-3 send-back item 1: the other tests set the record by hand)."""
+    from tools import mcp_tool_transport
+    from tools.mcp_tool import MCPServerTask, sdk_httpx
+
+    httpx = sdk_httpx()
+    seen = {}
+
+    def _fake_stripper(*_a, **_k):
+        def _build_client(**client_kwargs):
+            seen.update(client_kwargs)
+            raise AssertionError("the client is never built in this test")
+        return _build_client
+
+    monkeypatch.setattr(mcp_tool_transport, "_make_redirect_header_stripper", _fake_stripper)
+    task = MCPServerTask("srv")
+    cm = task._streamable_http_transport("http://127.0.0.1:1/mcp", {}, 5.0, True, None, None, False, set())
+
+    async def _enter():
+        try:
+            async with cm:
+                pass
+        except AssertionError:
+            pass
+
+    asyncio.run(_enter())
+    hooks = seen["event_hooks"]["response"]
+    response = _http_response(404, _CALL)
+
+    async def _fire():
+        for hook in hooks:
+            await hook(response)
+
+    asyncio.run(_fire())
+    assert task._tool_call_session_rejected == _CALL["params"]
+
+
+def test_404_left_from_an_earlier_call_does_not_license_a_later_identical_call(monkeypatch, tmp_path):
+    """Item 2: call A is refused by 404 and resent; then an identical call B runs and answers HTTP 200 with
+    "Session not found". A's old record must not license resending B: B runs once, outcome_uncertain."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_tool_handlers import _make_tool_handler
+    ran = {"n": 0}
+
+    def _behaviour(n, server, tool, args):
+        if n == 1:
+            _refuse_with_404(server, tool, args)  # A's first send: refused, nothing ran
+        ran["n"] += 1
+        if n == 2:
+            return _ok_result()  # A's resend
+        raise _session_refusal()  # B (and any resend of B): the write ran, then the tool raised
+
+    _server, _flag, calls = _install_write_server("srv", _behaviour)
+    try:
+        handler = _make_tool_handler("srv", "set_timer", 10.0)
+        assert json.loads(handler({"m": 5})).get("result") == "fresh data"
+        assert calls["n"] == 2 and ran["n"] == 1
+        parsed = json.loads(handler({"m": 5}))
+        assert calls["n"] == 3 and ran["n"] == 2, "B was resent"
+        assert parsed.get("outcome_uncertain") is True, parsed
+    finally:
+        _cleanup("srv")
+
+
+def test_404_with_a_reply_that_is_not_a_session_refusal_is_not_resent(monkeypatch, tmp_path):
+    """Item 3: the transport saw a 404 for this POST, but the reply the call raised is not a session
+    refusal (e.g. a proxy or a server that answers 404 with some other error). Not proven pre-dispatch:
+    sent once, outcome_uncertain."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from mcp.shared.exceptions import MCPError
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    def _behaviour(n, server, tool, args):
+        server._tool_call_session_rejected = {"name": tool, "arguments": args}
+        raise MCPError(-32603, "Internal error: session not found in tenant table")
+
+    _server, _flag, calls = _install_write_server("srv", _behaviour)
+    try:
+        parsed = json.loads(_make_tool_handler("srv", "set_timer", 10.0)({"m": 5}))
+        assert calls["n"] == 1
+        assert "result" not in parsed, parsed
+    finally:
+        _cleanup("srv")
+
+
+def test_late_404_for_a_timed_out_call_does_not_license_resending_an_identical_call(monkeypatch, tmp_path):
+    """Prism 6260596e067d: call A times out while its POST is still pending; an identical call B runs, commits
+    and answers HTTP 200 with "Session not found"; A's late 404 lands in the record after B cleared it.
+    B must not be resent: it runs once and returns outcome_uncertain."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_tool_handlers import _make_tool_handler
+    ran = {"B": 0}
+    sends = {"n": 0}
+
+    server, _flag, _calls = _install_write_server("srv", lambda *a: None)
+
+    async def _call_tool(tool, arguments=None):
+        sends["n"] += 1
+        if sends["n"] == 1:  # A: the server never answers in time
+            await asyncio.sleep(30)
+        ran["B"] += 1  # B: the write lands...
+        server._tool_call_session_rejected = {"name": tool, "arguments": arguments}  # ...A's late 404 arrives
+        raise _session_refusal()  # ...and B's own reply is the tool's "Session not found" over HTTP 200
+
+    server.session.call_tool = _call_tool
+    server._reconnecting = False  # the timeout is a plain cancel, not a teardown
+    try:
+        handler = _make_tool_handler("srv", "set_timer", 0.5)
+        first = json.loads(handler({"m": 5}))
+        assert "result" not in first, first
+        parsed = json.loads(handler({"m": 5}))
+        assert ran["B"] == 1 and sends["n"] == 2, "B was resent"
+        assert parsed.get("outcome_uncertain") is True, parsed
+    finally:
+        _cleanup("srv")

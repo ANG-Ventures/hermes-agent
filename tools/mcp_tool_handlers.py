@@ -622,12 +622,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 server._tool_call_session_rejected = None  # the transport's 404 recorder fills it for THIS send
+                session = server.session
                 try:
                     result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
-                except Exception as exc:
-                    if (_session_rejection_is_for(getattr(server, "_tool_call_session_rejected", None), tool_name, args)
+                except BaseException as exc:
+                    if (getattr(server, "_resend_blocked_session", None) is not session
+                            and _session_rejection_is_for(getattr(server, "_tool_call_session_rejected", None),
+                                                          tool_name, args)
                             and _is_jsonrpc_session_refusal(exc)):
                         raise _SessionRejectedBeforeDispatch(str(exc)) from exc
+                    if not isinstance(getattr(getattr(exc, "error", None), "message", None), str):
+                        # Ended with no reply (timeout, cancel, transport loss): its POST may still be answered,
+                        # and a late 404 cannot be told from a later identical call's. No resend on this session.
+                        server._resend_blocked_session = session  # Prism 6260596e067d
                     raise
                 finally:
                     server._pending_call_context = None
