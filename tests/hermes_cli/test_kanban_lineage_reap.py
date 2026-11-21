@@ -136,15 +136,23 @@ def test_normal_board_spawn_differs_from_base_by_exactly_the_tag(tmp_path):
     if not bases:
         pytest.skip("no merge-base with main (shallow clone)")
     base_sha = max(bases)[1]
+    # Export the base tree with `git archive` instead of `git worktree add`: a worktree
+    # writes into the checkout's shared registry, and a concurrent or leftover entry
+    # from another test on the same runner fails the add (main CI run 44858018251).
     base_tree = tmp_path / "base"
-    subprocess.run([*git, "worktree", "add", "-q", "--detach", str(base_tree), base_sha], check=True)
-    try:
-        (tmp_path / "rb").mkdir()
-        (tmp_path / "rh").mkdir()
-        base = _capture(base_tree, tmp_path / "rb")
-        head = _capture(repo, tmp_path / "rh")
-    finally:
-        subprocess.run([*git, "worktree", "remove", "--force", str(base_tree)], check=False)
+    base_tree.mkdir()
+    archive = subprocess.run([*git, "archive", "--format=tar", base_sha], capture_output=True)
+    assert archive.returncode == 0, (
+        f"git archive {base_sha} rc={archive.returncode}: "
+        f"{archive.stderr.decode('utf-8', 'replace').strip()}")
+    untar = subprocess.run(["tar", "-x", "-C", str(base_tree)], input=archive.stdout,
+                           capture_output=True)
+    assert untar.returncode == 0, (
+        f"tar -x rc={untar.returncode}: {untar.stderr.decode('utf-8', 'replace').strip()}")
+    (tmp_path / "rb").mkdir()
+    (tmp_path / "rh").mkdir()
+    base = _capture(base_tree, tmp_path / "rb")
+    head = _capture(repo, tmp_path / "rh")
     if kb.KANBAN_LINEAGE_ENV in base["env"]:
         pytest.skip("base already carries the tag (this PR has landed)")
 
