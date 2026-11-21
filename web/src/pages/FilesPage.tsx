@@ -444,6 +444,7 @@ export default function FilesPage() {
                     size="icon"
                     type="button"
                     onClick={() => setPendingDelete(entry)}
+                    disabled={entry.broken === true}
                     aria-label={`Delete ${entry.name}`}
                     className="text-destructive hover:text-destructive"
                   >
