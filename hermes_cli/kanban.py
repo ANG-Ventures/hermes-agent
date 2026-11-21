@@ -2858,17 +2858,14 @@ def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
 
 def _count_deprecated_verb(verb: str, new: str) -> None:
     """The old (pre-rename) verb was used: one deprecation line on stderr, and one
-    ``<utc iso> cli:kanban <verb> pid=<pid>`` line in <root>/var/ci-box/deprecated-name-reads.log (same
-    format as hermes-home scripts/lib/allocation_policy.count_deprecated_read). Never raises."""
+    ``<utc iso> cli:kanban <verb> pid=<pid> ppid=.. argv=.. parent=.. cwd=..`` line in
+    <root>/var/ci-box/deprecated-name-reads.log via ``allocation_policy.count_deprecated_read`` (the reader
+    tag names the caller, t_bab23582). Never raises."""
     print(f"kanban {verb}: deprecated, use `kanban {new}` (the `{verb}` alias goes after one release)",
           file=sys.stderr)
     try:
-        import datetime
-        d = kb.kanban_home() / "var" / "ci-box"
-        d.mkdir(parents=True, exist_ok=True)
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with open(d / "deprecated-name-reads.log", "a", encoding="utf-8") as fh:
-            fh.write(f"{ts} cli:kanban {verb} pid={os.getpid()}\n")
+        from hermes_cli.allocation_policy import count_deprecated_read
+        count_deprecated_read(f"cli:kanban {verb}")
     except Exception:  # noqa: BLE001 -- a counter must never break the verb
         pass
 

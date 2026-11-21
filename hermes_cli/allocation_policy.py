@@ -45,9 +45,56 @@ LAST_RESORT_ENV = "FLEET_LAST_RESORT_HOSTS"
 _log = logging.getLogger(__name__)
 
 
+def _reader_tag() -> str:
+    """`` ppid=N argv=<exe>+<argv0> parent=<exe> cwd=<cwd>`` for a deprecated-name-reads line, so a reader that has
+    exited by the time someone reads the log can still be named (t_5931d620; a pid alone never could).
+    No argv word is ever parsed or written past ``sys.argv[0]`` (Apollo 11-20 ruling after Prism 80bdcd765cc9 /
+    918779febe18 / 86eec040fec9: any rule that reads argv to pick a name leaks a value): own process = the executable's
+    basename and ``sys.argv[0]`` as Python gives it (script path, the module's file under -m, or ``-c`` / ``-`` / empty);
+    parent = its executable name only (/proc/<ppid>/comm, else the basename of /proc/<ppid>/exe, else ``ps -o comm=``).
+    Whitespace becomes ``+``, 160 chars a field. Never raises.
+    One text in hermes-home scripts/lib and the hermes-agent copies (t_bab23582)."""
+    import sys
+
+    def field(s):
+        return "".join("+" if c.isspace() else c for c in str(s))[:160] or "-"
+    try:
+        ppid = os.getppid()
+        parent = ""
+        try:
+            with open(f"/proc/{ppid}/comm", "rb") as fh:
+                parent = fh.read().decode("utf-8", "replace").strip()
+        except OSError:
+            try:
+                parent = os.path.basename(os.readlink(f"/proc/{ppid}/exe"))
+            except OSError:   # macOS: no /proc
+                import subprocess
+                parent = os.path.basename(subprocess.run(
+                    ["ps", "-o", "comm=", "-p", str(ppid)], capture_output=True, timeout=2,
+                    text=True, encoding="utf-8", errors="replace").stdout.strip())
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = ""
+        argv0 = sys.argv[0] if sys.argv else ""
+        own = os.path.basename(sys.executable or "") + "+" + str(argv0)
+        return f" ppid={ppid} argv={field(own)} parent={field(parent)} cwd={field(cwd)}"
+    except Exception:  # noqa: BLE001 -- a counter must never break a reader
+        return ""
+
+
+def _clock_shifted() -> bool:
+    """A clock-shifted test process (hermes-home scripts/lib/clock_shift.py exports both) stamps a FUTURE date: never
+    count it into a real log (t_5931d620: 191 rows dated 2026-12 .. 2027-12)."""
+    return bool(os.environ.get("HERMES_CLOCK_SHIFT_DAYS") or os.environ.get("FAKETIME"))
+
+
 def count_deprecated_read(name: str) -> None:
-    """Append ``<utc iso> <name> pid=<pid>`` to <kanban home>/var/ci-box/deprecated-name-reads.log, the log
-    hermes-home ``allocation_policy.count_deprecated_read`` writes. Never raises."""
+    """Append ``<utc iso> <name> pid=<pid> ppid=.. argv=.. parent=.. cwd=..`` to <kanban home>/var/ci-box/
+    deprecated-name-reads.log, the log hermes-home ``allocation_policy.count_deprecated_read`` writes. A
+    clock-shifted process writes nothing. Never raises."""
+    if _clock_shifted():
+        return
     try:
         import datetime
 
@@ -57,7 +104,7 @@ def count_deprecated_read(name: str) -> None:
         d.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         with open(d / "deprecated-name-reads.log", "a", encoding="utf-8") as fh:
-            fh.write(f"{ts} {name} pid={os.getpid()}\n")
+            fh.write(f"{ts} {name} pid={os.getpid()}{_reader_tag()}\n")
     except Exception:  # noqa: BLE001 -- a counter must never break a reader
         pass
 
