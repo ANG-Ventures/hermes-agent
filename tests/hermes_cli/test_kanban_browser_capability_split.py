@@ -292,7 +292,7 @@ def test_public_absent_reroutes_to_a_pool_host_never_the_studio(board, monkeypat
 def test_sandbox_failure_of_the_agents_own_browser_names_browser_public(board, monkeypatch):
     from tools import browser_tool_session as bts
     from tools.bot_desktop import runtime as bd
-    tid = _card()
+    tid = _card("open https://example.com and summarize it\n\nrequires: browser-public")
     _placed(monkeypatch, board, tid, 1, "ace-media")
 
     def refused():
@@ -300,6 +300,63 @@ def test_sandbox_failure_of_the_agents_own_browser_names_browser_public(board, m
     monkeypatch.setattr(bd, "tool_placement", refused)
     err = bts._browser_command_preflight()["error"]
     assert pff.parse_absent(err) == ("BROWSER_PUBLIC_ABSENT", "browser-public", "ace-media")
+
+
+def _claimed_card(body="open https://example.com and summarize it"):
+    tid = _card(body)
+    with kb.connect_closing() as conn:
+        assert kb.claim_task(conn, tid) is not None
+        return tid, kb.latest_run(conn, tid).id
+
+
+def test_declared_public_miss_keeps_the_swallowed_cause_on_the_card(board, monkeypatch, caplog):
+    # t_f1a3ee84: the RuntimeError the ABSENT line replaces is logged and rides into the card's event,
+    # beside the token line (parse_absent still reads line one).
+    from tools import browser_tool_session as bts
+    from tools import rail_preflight as rp
+    from tools.bot_desktop import runtime as bd
+    tid, run = _claimed_card("open https://example.com and summarize it\n\nrequires: browser-public")
+    _placed(monkeypatch, board, tid, run, "ace-ai")
+
+    def refused():
+        raise RuntimeError("could not seed the sandbox desktop dir: rm: cannot remove 'X': Permission denied")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    with caplog.at_level("WARNING", logger="tools.rail_preflight"):
+        err = bts._browser_command_preflight()["error"]
+    assert pff.parse_absent(err) == ("BROWSER_PUBLIC_ABSENT", "browser-public", "ace-ai")
+    assert "Permission denied" in caplog.text and tid in caplog.text
+    line = rp.take_rail_absent()
+    assert line == err
+    assert kwe.block_on_rail_absent(line) is True
+    with kb.connect_closing() as conn:
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+                          (tid, pff.REROUTE_EVENT)).fetchone()
+    payload = json.loads(ev["payload"])
+    assert payload["cap"] == "browser-public"
+    assert payload["cause"] == "could not seed the sandbox desktop dir: rm: cannot remove 'X': Permission denied"
+
+
+def test_undeclared_public_miss_is_a_plain_tool_error_and_never_ends_the_run(board, monkeypatch, caplog):
+    # t_f1a3ee84 (Apollo's default): a card that never asked for a browser gets an error it can route
+    # around; nothing is recorded, so the turn loop does not park or re-route it.
+    from tools import browser_tool_session as bts
+    from tools import rail_preflight as rp
+    from tools.bot_desktop import runtime as bd
+    tid, run = _claimed_card()
+    _placed(monkeypatch, board, tid, run, "ace-ai")
+
+    def refused():
+        raise RuntimeError("could not seed the sandbox desktop dir: Permission denied")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    with caplog.at_level("WARNING", logger="tools.rail_preflight"):
+        out = bts._browser_command_preflight()
+    assert out["success"] is False
+    assert pff.parse_absent(out["error"]) is None
+    assert "web_extract" in out["error"] and "Permission denied" in out["error"]
+    assert "Permission denied" in caplog.text
+    assert rp.take_rail_absent() is None
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "running"
 
 
 # -- tokens ------------------------------------------------------------------------------

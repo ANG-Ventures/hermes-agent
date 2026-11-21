@@ -3,7 +3,7 @@
 Same launcher, same lease, same pane: only WHERE Xvnc + Xfce run changes. ``runtime`` decides between the
 gateway host and this module via ``placement()``; callers keep using ``runtime.start/stop/status/desktop_env``.
 
-Layout inside the sandbox, under ``<sandbox tmp>/hermes-bot-desktop/<profile>/``: ``launcher.sh`` (copied in
+Layout inside the sandbox, under ``remote_root()/<profile>/``: ``launcher.sh`` (copied in
 at start), ``env`` (published DISPLAY/XAUTHORITY/DBUS), ``rfb.sock`` (Xvnc's unix socket), ``launcher.pid``.
 Host-side state under ``<HERMES_HOME>/bot-desktop/``: ``sandbox.json`` = ``{"env_key": ..., "display": ...}``
 so status() knows which terminal environment owns the screen without re-deriving it.
@@ -99,8 +99,17 @@ def marker_sandbox_alive(marker: Dict[str, Any]) -> bool:
     return alive
 
 
+def remote_root(env: Any) -> str:
+    """``<sandbox tmp>/hermes-bot-desktop``, suffixed with the login on an ssh host. A pool host's /tmp is
+    shared by every login that works there: a root another login made 0700 refused mkdir to the next one
+    (kanbanw's, left when workers moved to the host owner's login), so every placed browser failed (t_f1a3ee84)."""
+    base = f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop"
+    login = getattr(env, "user", None) if streams.shell_joined(env) else None
+    return f"{base}-{login}" if login else base
+
+
 def _remote_dir(env: Any, profile: str) -> str:
-    return f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/{profile}"
+    return f"{remote_root(env)}/{profile}"
 
 
 def desktop_home(env: Any) -> str:
@@ -239,9 +248,8 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     proc = streams.run_in(env, ["bash", "-c", seed], user=user, timeout=30)
     if proc.returncode != 0:
         raise RuntimeError(f"could not seed the sandbox desktop dir: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
-    num = 20  # one profile per sandbox; the launcher's stale-lock logic handles a leftover :20
     child_env = {
-        "HERMES_BD_PROFILE": profile, "HERMES_BD_DISPLAY_NUM": str(num), "HERMES_BD_SOCKET": f"{rdir}/rfb.sock",
+        "HERMES_BD_PROFILE": profile, "HERMES_BD_SOCKET": f"{rdir}/rfb.sock",
         "HERMES_BD_XAUTH": f"{rdir}/Xauthority", "HERMES_BD_ENV_FILE": f"{rdir}/env",
         "HERMES_BD_CONFIG_HOME": f"{rdir}/xdg", "HERMES_BD_GEOMETRY": geometry, "HERMES_BD_WALLPAPER": f"{rdir}/wallpaper.png",
     }
@@ -251,7 +259,13 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     # The launcher must outlive this exec (docker exec / ssh) and be its own session so stop() can take the
     # whole group (Xvnc, dbus, Xfce) with one kill. `setsid -f` forks, so `$!` would be the wrong pid: the
     # launcher records ITS OWN pid (= its session id) before doing anything else.
-    spawn = (f"cd {shlex.quote(rdir)} && setsid -f bash -c "
+    # The display: the first of :20.. that no live server holds. A docker sandbox gets :20; an ssh host may
+    # already run other logins' and other profiles' screens (t_f1a3ee84: kanbanw's Xvnc held :20 on ace-media).
+    # A lock we own whose server died is free again (the launcher clears it).
+    pick = ("for n in $(seq 20 99); do l=/tmp/.X$n-lock; "  # no-tmp: ok — X11 lock path, fixed by the protocol
+            "{ [ ! -e $l ] && [ ! -e /tmp/.X11-unix/X$n ]; } && break; "  # no-tmp: ok — X11 socket path
+            "[ -O $l ] && ! kill -0 \"$(tr -d ' ' < $l)\" 2>/dev/null && break; done; export HERMES_BD_DISPLAY_NUM=$n; ")
+    spawn = (f"{pick}cd {shlex.quote(rdir)} && setsid -f bash -c "
              f"'echo $$ > launcher.pid; exec bash launcher.sh' > launcher.log 2>&1 < /dev/null; "
              f"for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s launcher.pid ] && break; sleep 0.1; done; [ -s launcher.pid ]")
     proc = streams.run_in(env, ["bash", "-c", spawn], child_env=child_env, user=user, timeout=30)
