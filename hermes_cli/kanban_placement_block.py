@@ -11,7 +11,10 @@ Each tick, for every ``blocked``/``capability`` card whose latest block ended a 
 * re-routes it ONCE: prepends a ``host:`` pin line to the body (the same pin an operator writes, so
   :func:`kanban_worker_pool.resolve_pin` honours it and the body shows why) and unblocks it with a
   comment. The target is the host a ``host: <x>`` line in the reason names, else the Studio (the
-  dispatcher's own machine, which holds every Studio-only resource);
+  dispatcher's own machine, which holds every Studio-only resource). The Studio only when the reason
+  names a Studio-only capability the map lists (t_9392860c): otherwise the card stays blocked and its
+  owner session is woken with the reason (``placement_owner_woken``), and a re-route never writes a
+  ``requires:`` word the reason does not support;
 * records ``placement_unroutable`` ONCE when it cannot: the named host is not an enabled pool host,
   is the host that already failed, the card carries an operator pin to another host, or a re-routed
   run blocked again. kanban-placement-watch (hermes-home) pages #alerts through episode_pager once
@@ -30,6 +33,25 @@ from hermes_cli import kanban_placement_reasons as _pr
 
 REROUTED_EVENT = _pr.PLACEMENT_REROUTED_EVENT
 UNROUTABLE_EVENT = "placement_unroutable"
+# t_9392860c: a pool-host capability block whose reason names no Studio-only capability stays blocked and goes to
+# the card's owner session (verdict OWNER_WAKE). The marker records it once per block; a card without boomerang
+# wake also gets a ``mechanical_wake`` (a boomerang card's own ``blocked`` event already wakes it as blocked_assess).
+OWNER_WAKE = "owner"
+OWNER_WAKE_EVENT = "placement_owner_woken"
+OWNER_WAKE_SOURCE = "kanban-placement-block"
+# Kill switch (default True). False = the pre-t_9392860c behaviour: every such block re-routes to the Studio and the
+# requires: word falls back to studio-state, then the alphabetically first Studio-only word.
+STRICT_SWITCH = "placement_block_no_default_studio"
+
+
+def strict_enabled() -> bool:
+    """``kanban.placement_block_no_default_studio`` (default True; non-bool -> default)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        value = (load_config_readonly().get("kanban") or {}).get(STRICT_SWITCH, True)
+    except Exception:
+        return True
+    return value if isinstance(value, bool) else True
 # A block older than this is not re-routed (the work may be stale): it is recorded unroutable, so the
 # watch pages it once for a human to re-pin or close.
 REROUTE_MAX_AGE_SECONDS = 24 * 3600
@@ -81,8 +103,15 @@ def _reason_pin(reason: str, pool) -> Optional[str]:
 
 def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], body: Optional[str],
              pool, rerouted_before: bool, assignee: Optional[str] = None,
-             workspace_kind: Optional[str] = None) -> Optional[Tuple[str, Optional[str]]]:
-    """``("reroute", host)``, ``("clone", None)``, ``("unroutable", why)`` or None (not a placement block).
+             workspace_kind: Optional[str] = None, studio_reasons: Optional[frozenset] = None,
+             strict: Optional[bool] = None) -> Optional[Tuple[str, Optional[str]]]:
+    """``("reroute", host)``, ``("clone", None)``, ``("unroutable", why)``, ``("owner", reason)`` or None (not a
+    placement block).
+
+    ``strict`` (None = :func:`strict_enabled`, t_9392860c): a Studio re-route needs a Studio-only word the reason
+    supports (:func:`supported_studio_words` against ``studio_reasons``). Without one, a reason that names no host
+    is :data:`OWNER_WAKE` (stays blocked, the owner session is woken with the reason) and a reason that asks for the
+    Studio by pin is unroutable; neither ever reaches the Studio.
 
     ``placed_host`` is the pool host of the blocked run's ``worker_placed`` event (None = local run).
     ``host`` is ``studio`` or an enabled pool host id. ``clone`` (:data:`CLONE_CURE`): an unpinned
@@ -107,6 +136,12 @@ def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], bo
         if (placed_host is not None and card_pin is None and workspace_kind == "scratch"
                 and _missing_repo_path_only(reason, body)):
             return CLONE_CURE, None          # t_dde97120: requeue unpinned; the next run clones
+        if (strict_enabled() if strict is None else strict) \
+                and not supported_studio_words(reason, studio_reasons):
+            if want == _kwp.PIN_STUDIO:
+                return "unroutable", (f"the reason asks for host:studio but names no Studio-only capability the "
+                                      f"map lists: {(reason or '')[:160]}")
+            return OWNER_WAKE, (reason or "")[:1000]
         return "reroute", _kwp.PIN_STUDIO
     if card_pin == _kwp.PIN_STUDIO:
         return "unroutable", f"operator pin host:studio conflicts with the reason's host:{want}; not overridden"
@@ -129,11 +164,14 @@ def _latest_blocks(conn) -> list:
         "(SELECT p.payload FROM task_events p WHERE p.run_id = b.run_id AND p.kind IN (?, ?) "
         " ORDER BY p.id DESC LIMIT 1) AS placed, "
         "EXISTS(SELECT 1 FROM task_events r WHERE r.task_id = t.id AND r.kind IN (?, ?)) AS rerouted, "
-        "EXISTS(SELECT 1 FROM task_events u WHERE u.task_id = t.id AND u.kind = ? AND u.id > b.id) AS noted "
+        "EXISTS(SELECT 1 FROM task_events u WHERE u.task_id = t.id AND u.kind = ? AND u.id > b.id) AS noted, "
+        "EXISTS(SELECT 1 FROM task_events w WHERE w.task_id = t.id AND w.kind = ? AND w.id > b.id) AS owner_woken, "
+        "t.boomerang_wake "
         "FROM tasks t JOIN task_events b ON b.id = (SELECT MAX(e.id) FROM task_events e "
         " WHERE e.task_id = t.id AND e.kind IN ('blocked', 'block_loop_detected')) "
         "WHERE t.status IN ('blocked', 'triage') AND t.block_kind = 'capability'",
-        (*_pr.kind_names(_pr.WORKER_PLACED_EVENT), *_pr.kind_names(REROUTED_EVENT), UNROUTABLE_EVENT),
+        (*_pr.kind_names(_pr.WORKER_PLACED_EVENT), *_pr.kind_names(REROUTED_EVENT), UNROUTABLE_EVENT,
+         OWNER_WAKE_EVENT),
     ).fetchall()
 
 
@@ -145,14 +183,34 @@ _REQUIRES_HINTS = (
     ("fleet-ssh", re.compile(r"\bssh\b", re.IGNORECASE)),
     ("docker", re.compile(r"\bdocker\b", re.IGNORECASE)),
     ("browser-session", re.compile(r"\bbrowser\b", re.IGNORECASE)),
+    # The word "vault" only: a path under ~/Obsidian is the notes-sync tree pool hosts have (t_b4ca4ff0, t_9392860c).
+    ("obsidian-vault", re.compile(r"(?<![\w-])vault(?![\w-])", re.IGNORECASE)),
     ("studio-state", re.compile(r"\b(?:launchd|relay|logs?)\b", re.IGNORECASE)),
 )
 _REQUIRES_HEAD_RE = re.compile(r"^([ \t]*requires:[ \t]*)", re.IGNORECASE | re.MULTILINE)
 
 
-def studio_requires_word(reason: str, studio_reasons: Optional[frozenset]) -> str:
+def supported_studio_words(reason: str, studio_reasons: Optional[frozenset]) -> Tuple[str, ...]:
+    """The ``requires:`` words the block reason itself supports (t_9392860c): a :data:`_REQUIRES_HINTS` word whose
+    wording the reason uses, then a word the reason names literally, each only if ``studio_reasons`` lists it.
+    ``studio_reasons`` None (no map this tick): the hint words alone, unchecked. Never a word the reason lacks."""
+    text = reason or ""
+    out = [w for w, rx in _REQUIRES_HINTS if (studio_reasons is None or w in studio_reasons) and rx.search(text)]
+    for w in sorted(studio_reasons or ()):
+        if w not in out and re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text, re.IGNORECASE):
+            out.append(w)
+    return tuple(out)
+
+
+def studio_requires_word(reason: str, studio_reasons: Optional[frozenset],
+                         strict: Optional[bool] = None) -> Optional[str]:
     """The ``requires:`` word for a re-route to the Studio: the first hint the block reason names that the map's
-    Studio row serves, else ``studio-state``. ``studio_reasons`` None (no map this tick) = ``studio-state``."""
+    Studio row serves, else ``studio-state``. ``studio_reasons`` None (no map this tick) = ``studio-state``.
+    ``strict`` (None = :func:`strict_enabled`): the first :func:`supported_studio_words` word, else None; no
+    default and no alphabetical fallback."""
+    if strict_enabled() if strict is None else strict:
+        words = supported_studio_words(reason, studio_reasons)
+        return words[0] if words else None
     if studio_reasons is None:
         return DEFAULT_STUDIO_REQUIRES
     for word, rx in _REQUIRES_HINTS:
@@ -175,12 +233,13 @@ def reroute_note(reason: str) -> str:
 
 
 def pin_body(body: Optional[str], host: str, *, reason: str, studio_reasons: Optional[frozenset],
-             pool) -> str:
+             pool, strict: Optional[bool] = None) -> Optional[str]:
     """THE body a re-route writes: ``host: <host>`` unless the body already resolves to that pin, and for the
     Studio a ``requires:`` word :func:`kanban_worker_pool.studio_pin_justified` accepts (the same predicate
     dispatch drops a bare pin with) unless one is already there. An existing ``requires:`` line that names no
     Studio reason gets the word on that line, never a second line. ``studio_reasons`` None = judged against
-    ``studio-state`` alone."""
+    ``studio-state`` alone. None (t_9392860c): a Studio pin the body does not already justify and the reason
+    supports no word for; the caller records the card unroutable instead of inventing one."""
     from hermes_cli import kanban_worker_pool as _kwp
     text = body or ""
     head = []
@@ -191,7 +250,9 @@ def pin_body(body: Optional[str], host: str, *, reason: str, studio_reasons: Opt
         vocab = studio_reasons if studio_reasons is not None else frozenset({DEFAULT_STUDIO_REQUIRES})
         if not _kwp.studio_pin_justified(text, vocab):
             from hermes_cli import kanban_studio_pin as _ksp
-            word = studio_requires_word(reason, studio_reasons)
+            word = studio_requires_word(reason, studio_reasons, strict=strict)
+            if word is None:
+                return None
             note = reroute_note(reason)
             if _REQUIRES_HEAD_RE.search(text):
                 text = _ksp.add_requires_word(text, word, note)
@@ -217,16 +278,34 @@ def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None,
     now = int(time.time()) if now is None else int(now)
     rerouted: List[Tuple[str, str]] = []
     unroutable: List[str] = []
+    strict = strict_enabled()
     for row in _latest_blocks(conn):
         blk = _json(row["blk"])
         placed_host = _json(row["placed"]).get("host") if row["placed"] else None
         verdict = classify(kind=blk.get("kind"), reason=str(blk.get("reason") or ""), placed_host=placed_host,
                            body=row["body"], pool=pool, rerouted_before=bool(row["rerouted"]),
-                           assignee=row["assignee"], workspace_kind=row["workspace_kind"])
+                           assignee=row["assignee"], workspace_kind=row["workspace_kind"],
+                           studio_reasons=studio_reasons, strict=strict)
         if verdict is None:
             continue
         action, arg = verdict
         tid = row["id"]
+        if action == OWNER_WAKE:
+            # t_9392860c: the card stays blocked; its owner session decides, now, with the worker's reason.
+            if row["owner_woken"]:
+                continue
+            payload = {"placed_host": placed_host, "run_id": row["run_id"], "reason": arg}
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, tid, OWNER_WAKE_EVENT, payload)
+                if not row["boomerang_wake"]:
+                    # A boomerang card's own ``blocked`` event already wakes it (blocked_assess); others need this.
+                    _kb._append_event(conn, tid, "mechanical_wake", {
+                        "source": OWNER_WAKE_SOURCE,
+                        "text": (f"{tid}: run {row['run_id']} on {placed_host or 'a pool host'} blocked "
+                                 f"kind=capability and the reason names no Studio-only capability, so it was not "
+                                 f"re-routed to the Studio (t_9392860c). Decide: pin a pool host that has it, "
+                                 f"correct the card, or ask for a studio-override. Reason: {arg}")})
+            continue
         if action == CLONE_CURE and row["status"] == "blocked" \
                 and now - int(row["blocked_at"] or now) <= REROUTE_MAX_AGE_SECONDS:
             note = (f"placement re-route: run {row['run_id']} ran on {placed_host} and blocked kind=capability "
@@ -257,7 +336,17 @@ def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None,
             unroutable.append(tid)
             continue
         reason = str(blk.get("reason") or "")
-        new_body = pin_body(row["body"], arg, reason=reason, studio_reasons=studio_reasons, pool=pool)
+        new_body = pin_body(row["body"], arg, reason=reason, studio_reasons=studio_reasons, pool=pool,
+                            strict=strict)
+        if new_body is None:
+            # t_9392860c: no word the reason supports; never invent one.
+            if not row["noted"]:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, tid, UNROUTABLE_EVENT, {
+                        "placed_host": placed_host, "run_id": row["run_id"],
+                        "why": f"no Studio-only capability the reason supports: {reason[:160]}"})
+                unroutable.append(tid)
+            continue
         from hermes_cli import kanban_host_capabilities as _khc
         words = _khc.declared_words(new_body)
         carries = f"`host: {arg}`" + (f" and `requires: {', '.join(words)}` (a bare Studio pin is dropped at "

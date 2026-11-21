@@ -91,7 +91,8 @@ def test_prepare_body_auto_derived_line_passes_create_refusal(hook, monkeypatch,
     "exists in mac-studio-m3u's ~/.hermes. Re-run on the Studio.\nsecond line # with a cut",
 ])
 def test_pin_body_reroute_line_passes_create_refusal(hook, body, reason):
-    out = kpb.pin_body(body, kwp.PIN_STUDIO, reason=reason, studio_reasons=None, pool=_Pool())
+    # strict=False: the kill-switch-off path, which still writes the default word (t_9392860c).
+    out = kpb.pin_body(body, kwp.PIN_STUDIO, reason=reason, studio_reasons=None, pool=_Pool(), strict=False)
     lines = _requires_lines(out)
     print(lines)
     assert len(lines) == 1 and "re-routed after capability block" in lines[0]
