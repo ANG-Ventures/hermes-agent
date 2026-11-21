@@ -17,7 +17,8 @@ Session and global values (operator-written config) take a slot, a bare model id
 the parent's lane unless ``wake_child.provider`` names one. ``inherit`` at any level means the parent.
 
 An override that cannot be used (unknown slot or model, a lane that does not list it, an unreadable
-value, a same-lane override that would drop the parent's routing/privacy filters) is NOT dropped:
+value, a same-lane override, on the RESOLVED provider, while the gateway's ``provider_routing``
+sets a filter or cannot be read) is NOT dropped:
 the wake runs on the parent and its surfaced line says ``wake-model <x> not usable (<why>)``. An
 overridden child runs as a summary fold with no fallback chain of its own; any non-success outcome
 reruns the wake on the parent's model and chain, and its surfaced line says so.
@@ -25,7 +26,8 @@ reruns the wake on the parent's model and chain, and its surfaced line says so.
 Effort (item 5): ``wake-effort: <level>`` on the card, ``wake_child.effort_sessions.<home sid>``
 and ``wake_child.effort``, same precedence. A level is ``none`` or one of
 ``hermes_constants.VALID_REASONING_EFFORTS`` (a fixed word list, so the card line is safe). It
-works alone (the parent's model, lane and mode, a fork stays a fork) or with a model override, and
+works alone (the parent's model and lane; a level other than the parent's runs as a summary fold,
+since it changes the fork's request fingerprint) or with a model override, and
 reaches the child as ``delegate_task(reasoning_effort=...)``. No setting = the home's effort.
 """
 from __future__ import annotations
@@ -49,6 +51,8 @@ def _efforts() -> tuple:
 # Parent attributes a pinned provider resets (tools/delegate_tool_config._ROUTING_FILTER_DEFAULTS).
 _FILTERS = ("providers_allowed", "providers_ignored", "providers_order", "provider_sort",
             "provider_require_parameters", "provider_data_collection")
+# The gateway's ``provider_routing`` keys a live parent is built from (gateway/run_turn_runner.py).
+_ROUTING_KEYS = ("only", "ignore", "order", "sort", "require_parameters", "data_collection")
 
 #: The resolved override of the wake whose child runs in this context (set by the dispatcher;
 #: ``asyncio.to_thread`` copies it into the worker thread). None = the parent's route.
@@ -101,10 +105,14 @@ def _delegation_cfg() -> dict:
 
 
 def wake_child_cfg(delegation_cfg: Optional[dict] = None) -> dict:
+    """The ``delegation.boomerang.wake_child`` mapping; ``{}`` when absent. A section that is set but
+    is not a mapping raises :class:`Unusable` (surfaced like a bad value inside it)."""
     cfg = _delegation_cfg() if delegation_cfg is None else delegation_cfg
     boom = cfg.get("boomerang") if isinstance(cfg, dict) else None
     wc = boom.get("wake_child") if isinstance(boom, dict) else None
-    return wc if isinstance(wc, dict) else {}
+    if wc is not None and not isinstance(wc, dict):
+        raise Unusable(f"unreadable wake_child section {type(wc).__name__}")
+    return wc or {}
 
 
 def requested(card_value: Optional[str], home_sids: Any, delegation_cfg: Optional[dict] = None, *,
@@ -129,14 +137,32 @@ def requested(card_value: Optional[str], home_sids: Any, delegation_cfg: Optiona
     return None, None
 
 
-def _filters_set(parent: Any) -> list:
-    return [a for a in _FILTERS if getattr(parent, a, None) not in (None, "", False, [], ())]
+def _filters_set(parent: Any, routing: Any) -> list:
+    """The routing/privacy filters the parent runs with: the gateway's ``provider_routing`` (the
+    source a live parent is built from; a cold rebuild after a restart carries none) plus any on the
+    parent object. ``routing`` None or not a mapping = cannot be read: raises :class:`Unusable`."""
+    if not isinstance(routing, dict):
+        raise Unusable("the parent's routing filters cannot be read")
+    empty = (None, "", False, [], ())
+    return ([k for k in _ROUTING_KEYS if routing.get(k) not in empty]
+            + [a for a in _FILTERS if getattr(parent, a, None) not in empty])
+
+
+def _canon(provider: Any) -> str:
+    from hermes_cli.providers import normalize_provider
+
+    return normalize_provider(str(provider or ""))
 
 
 def resolve_route(value: Any, parent_provider: Optional[str], *, source: str = "", task_id: str = "",
-                  delegation_cfg: Optional[dict] = None, parent: Any = None) -> Optional[dict]:
+                  delegation_cfg: Optional[dict] = None, parent: Any = None,
+                  routing: Any = None) -> Optional[dict]:
     """``{"model", "provider", "label", "source"}`` for an override value, or None for the parent's
-    route (no value or ``inherit``). Raises :class:`Unusable` for a value that cannot be used."""
+    route (no value or ``inherit``). Raises :class:`Unusable` for a value that cannot be used.
+
+    ``routing``: the gateway's ``provider_routing`` mapping. A same-lane override (decided on the
+    RESOLVED provider) would reset the parent's filters, so it is unusable when any is set or when
+    ``routing`` cannot be read (None)."""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -159,13 +185,13 @@ def resolve_route(value: Any, parent_provider: Optional[str], *, source: str = "
     else:
         model_id = spec
     try:
-        verdict = resolve(lane or None, model_id, resolve_aliases=False)
+        verdict = resolve(_canon(lane) or None, model_id, resolve_aliases=False)
     except Exception as exc:
         raise Unusable(f"not resolvable: {exc}") from exc
     if verdict.reason != "known":   # only a model its lane lists
         raise Unusable(f"{verdict.reason}: {verdict.model} on {verdict.provider or 'no lane'}")
-    same_lane = str(verdict.provider or "").lower() == str(parent_provider or "").lower()
-    kept = _filters_set(parent) if same_lane and parent is not None else []
+    same_lane = _canon(verdict.provider) == _canon(parent_provider)
+    kept = _filters_set(parent, routing) if same_lane else []
     if kept:   # Prism 3d5c62bd0009: a provider pin resets these; never drop the parent's filters
         raise Unusable(f"would drop the parent's routing filters ({', '.join(kept)})")
     return {"model": verdict.model, "provider": verdict.provider, "label": spec, "source": source}
