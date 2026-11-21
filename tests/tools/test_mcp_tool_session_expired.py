@@ -515,3 +515,309 @@ def test_tool_is_read_only_fails_safe():
         assert _tool_is_read_only("known", "unlisted") is False
     finally:
         mcp_tool._tool_read_only_hints.pop("known", None)
+
+
+# ---------------------------------------------------------------------------
+# A write the server REFUSED with HTTP 404 for its session id never ran (t_90d34dcf: the first tool call
+# after every tier3 restart), so it is resent once on the rebuilt session. The JSON-RPC message alone is
+# not evidence (a tool can commit, then answer HTTP 200 with the same error: Prism 36d0ba56a234); only the
+# transport's 404 for THIS call's POST is. Any other failure of the resend stays at-most-once.
+# ---------------------------------------------------------------------------
+
+
+def _session_refusal(message="Session not found"):
+    from mcp.shared.exceptions import MCPError
+    return MCPError(-32600, message)
+
+
+@pytest.mark.parametrize("exc, expected", [
+    (_session_refusal(), True),
+    (_session_refusal("Session terminated"), True),  # mcp 2.x's stand-in for a bare HTTP 404
+    (RuntimeError("Session not found"), False),  # no JSON-RPC reply
+    (_session_refusal("Invalid params"), False),
+    (ExceptionGroup("g", [_session_refusal()]), False),  # groups are not trusted
+])
+def test_is_jsonrpc_session_refusal(exc, expected):
+    from tools.mcp_tool_errors import _is_jsonrpc_session_refusal
+    assert _is_jsonrpc_session_refusal(exc) is expected
+
+
+def test_bare_jsonrpc_refusal_is_not_pre_dispatch_evidence():
+    from tools.mcp_tool_errors import _SessionRejectedBeforeDispatch, _is_session_rejected_before_dispatch
+    assert _is_session_rejected_before_dispatch(_session_refusal()) is False
+    assert _is_session_rejected_before_dispatch(_SessionRejectedBeforeDispatch("Session not found")) is True
+
+
+def _http_response(status, body, *, session_id="sid-1", method="POST"):
+    from tools.mcp_tool import sdk_httpx
+    httpx = sdk_httpx()
+    headers = {"mcp-session-id": session_id} if session_id else {}
+    request = httpx.Request(method, "http://127.0.0.1:1/mcp", json=body, headers=headers)
+    return httpx.Response(status, request=request, json={"jsonrpc": "2.0", "id": 1,
+                                                          "error": {"code": -32600, "message": "Session not found"}})
+
+
+_CALL = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "set_timer", "arguments": {"m": 5}}}
+
+
+@pytest.mark.parametrize("status, body, session_id, recorded", [
+    (404, _CALL, "sid-1", _CALL["params"]),  # the spec's unknown-session reply: recorded
+    (200, _CALL, "sid-1", None),  # same JSON-RPC error over 200: the tool may have run
+    (404, _CALL, None, None),  # no session id sent: 404 means method-not-found, not a session refusal
+    (404, {"jsonrpc": "2.0", "id": 8, "method": "ping"}, "sid-1", None),  # only tools/call counts
+    (400, _CALL, "sid-1", None),
+])
+def test_session_rejection_recorder(status, body, session_id, recorded):
+    from types import SimpleNamespace
+    from tools.mcp_tool_errors import _make_session_rejection_recorder
+    server = SimpleNamespace(_tool_call_session_rejected=None)
+    asyncio.run(_make_session_rejection_recorder(server)(_http_response(status, body, session_id=session_id)))
+    assert server._tool_call_session_rejected == recorded
+
+
+def _ok_result(text="fresh data"):
+    result = MagicMock()
+    result.is_error = False
+    result.content = [MagicMock(type="text", text=text)]
+    result.structured_content = None
+    return result
+
+
+def _install_write_server(name, behaviour):
+    """Stub server whose call_tool runs ``behaviour(n, server, tool, args)`` (n = 1-based send count)."""
+    from tools import mcp_tool
+    server, reconnect_flag = _install_stub_server(name)
+    server._rpc_lock = asyncio.Lock()
+    server._inflight_tasks = None
+    server._tool_call_session_rejected = None
+    calls = {"n": 0}
+
+    async def _call_tool(tool, arguments=None):
+        calls["n"] += 1
+        return behaviour(calls["n"], server, tool, arguments)
+
+    server.session.call_tool = _call_tool
+    mcp_tool._servers[name] = server
+    mcp_tool._server_error_counts.pop(name, None)
+    return server, reconnect_flag, calls
+
+
+def _cleanup(name):
+    from tools import mcp_tool
+    mcp_tool._servers.pop(name, None)
+    mcp_tool._server_error_counts.pop(name, None)
+    mcp_tool._server_breaker_opened_at.pop(name, None)
+
+
+def _refuse_with_404(server, tool, args):
+    server._tool_call_session_rejected = {"name": tool, "arguments": args}  # what the transport hook records
+    raise _session_refusal()
+
+
+@pytest.mark.parametrize("second, want_calls, want", [
+    (None, 2, "result"),  # refused by 404, then resent once on the new session: the tool runs exactly once
+    (RuntimeError("Connection closed"), 2, "outcome_uncertain"),  # resend may have run: never a 3rd send
+    ("refused", 2, "error"),  # refused by 404 again: nothing ran, plain error, no 3rd send
+], ids=["resent-once", "resend-uncertain", "resend-refused"])
+def test_write_refused_by_404_is_resent_once(monkeypatch, tmp_path, second, want_calls, want):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    def _behaviour(n, server, tool, args):
+        if n == 1 or second == "refused":
+            _refuse_with_404(server, tool, args)
+        if second is not None:
+            raise second
+        return _ok_result()
+
+    _server, reconnect_flag, calls = _install_write_server("srv", _behaviour)
+    try:  # no readOnlyHint: write-capable
+        parsed = json.loads(_make_tool_handler("srv", "tool", 10.0)({"m": 5}))
+        assert reconnect_flag.is_set()
+        assert calls["n"] == want_calls
+        if want == "result":
+            assert parsed.get("result") == "fresh data", parsed
+        elif want == "outcome_uncertain":
+            assert parsed.get("outcome_uncertain") is True, parsed
+            assert "NOT automatically retried" not in parsed["error"]  # it WAS resent (Prism 9820a365b56b)
+            assert "resent once" in parsed["error"]
+        else:
+            assert "error" in parsed and not parsed.get("outcome_uncertain"), parsed
+    finally:
+        _cleanup("srv")
+
+
+def test_write_that_ran_then_answered_session_not_found_is_not_resent(monkeypatch, tmp_path):
+    """Prism 36d0ba56a234 repro: the tool commits (counter 1), then answers HTTP 200 with JSON-RPC -32600
+    "Session not found". No 404 was recorded, so the write is never resent: counter stays 1, outcome_uncertain."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_tool_handlers import _make_tool_handler
+    timers = {"n": 0}
+
+    def _behaviour(n, server, tool, args):
+        timers["n"] += 1  # the write landed
+        raise _session_refusal()  # ...and the reply looks like a session refusal, over HTTP 200
+
+    _server, _flag, calls = _install_write_server("srv", _behaviour)
+    try:
+        parsed = json.loads(_make_tool_handler("srv", "set_timer", 10.0)({"m": 5}))
+        assert timers["n"] == 1 and calls["n"] == 1
+        assert parsed.get("outcome_uncertain") is True, parsed
+    finally:
+        _cleanup("srv")
+
+
+def test_404_recorded_for_another_call_does_not_license_a_resend(monkeypatch, tmp_path):
+    """Two concurrent write calls on one server: A is refused by 404, B ran and answered 200 with the same
+    error. Only A is resent; B (whose recorded 404 entry is not its own) stays outcome_uncertain and is sent once."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_tool_handlers import _make_tool_handler
+    sends = {"A": 0, "B": 0}
+    ran = {"A": 0, "B": 0}
+
+    def _behaviour(n, server, tool, args):
+        who = args["who"]
+        sends[who] += 1
+        if who == "A" and sends["A"] == 1:
+            _refuse_with_404(server, tool, args)
+        ran[who] += 1
+        if who == "B":
+            # B's POST got 200; the last 404 the transport saw is A's, still in the sink.
+            server._tool_call_session_rejected = {"name": tool, "arguments": {"who": "A"}}
+            raise _session_refusal()
+        return _ok_result()
+
+    _server, _flag, _calls = _install_write_server("srv", _behaviour)
+    try:
+        handler = _make_tool_handler("srv", "set_timer", 10.0)
+        out = {}
+        threads = [threading.Thread(target=lambda w=w: out.__setitem__(w, json.loads(handler({"who": w}))))
+                   for w in ("A", "B")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        assert out["A"].get("result") == "fresh data", out["A"]
+        assert sends["A"] == 2 and ran["A"] == 1
+        assert out["B"].get("outcome_uncertain") is True, out["B"]
+        assert sends["B"] == 1 and ran["B"] == 1
+    finally:
+        _cleanup("srv")
+
+
+def test_owned_streamable_client_records_a_404_for_its_own_server(monkeypatch):
+    """The owned Streamable HTTP client that ``_streamable_http_transport`` builds carries the 404 recorder
+    for THIS server (round-3 send-back item 1: the other tests set the record by hand)."""
+    from tools import mcp_tool_transport
+    from tools.mcp_tool import MCPServerTask, sdk_httpx
+
+    httpx = sdk_httpx()
+    seen = {}
+
+    def _fake_stripper(*_a, **_k):
+        def _build_client(**client_kwargs):
+            seen.update(client_kwargs)
+            raise AssertionError("the client is never built in this test")
+        return _build_client
+
+    monkeypatch.setattr(mcp_tool_transport, "_make_redirect_header_stripper", _fake_stripper)
+    task = MCPServerTask("srv")
+    cm = task._streamable_http_transport("http://127.0.0.1:1/mcp", {}, 5.0, True, None, None, False, set())
+
+    async def _enter():
+        try:
+            async with cm:
+                pass
+        except AssertionError:
+            pass
+
+    asyncio.run(_enter())
+    hooks = seen["event_hooks"]["response"]
+    response = _http_response(404, _CALL)
+
+    async def _fire():
+        for hook in hooks:
+            await hook(response)
+
+    asyncio.run(_fire())
+    assert task._tool_call_session_rejected == _CALL["params"]
+
+
+def test_404_left_from_an_earlier_call_does_not_license_a_later_identical_call(monkeypatch, tmp_path):
+    """Item 2: call A is refused by 404 and resent; then an identical call B runs and answers HTTP 200 with
+    "Session not found". A's old record must not license resending B: B runs once, outcome_uncertain."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_tool_handlers import _make_tool_handler
+    ran = {"n": 0}
+
+    def _behaviour(n, server, tool, args):
+        if n == 1:
+            _refuse_with_404(server, tool, args)  # A's first send: refused, nothing ran
+        ran["n"] += 1
+        if n == 2:
+            return _ok_result()  # A's resend
+        raise _session_refusal()  # B (and any resend of B): the write ran, then the tool raised
+
+    _server, _flag, calls = _install_write_server("srv", _behaviour)
+    try:
+        handler = _make_tool_handler("srv", "set_timer", 10.0)
+        assert json.loads(handler({"m": 5})).get("result") == "fresh data"
+        assert calls["n"] == 2 and ran["n"] == 1
+        parsed = json.loads(handler({"m": 5}))
+        assert calls["n"] == 3 and ran["n"] == 2, "B was resent"
+        assert parsed.get("outcome_uncertain") is True, parsed
+    finally:
+        _cleanup("srv")
+
+
+def test_404_with_a_reply_that_is_not_a_session_refusal_is_not_resent(monkeypatch, tmp_path):
+    """Item 3: the transport saw a 404 for this POST, but the reply the call raised is not a session
+    refusal (e.g. a proxy or a server that answers 404 with some other error). Not proven pre-dispatch:
+    sent once, outcome_uncertain."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from mcp.shared.exceptions import MCPError
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    def _behaviour(n, server, tool, args):
+        server._tool_call_session_rejected = {"name": tool, "arguments": args}
+        raise MCPError(-32603, "Internal error: session not found in tenant table")
+
+    _server, _flag, calls = _install_write_server("srv", _behaviour)
+    try:
+        parsed = json.loads(_make_tool_handler("srv", "set_timer", 10.0)({"m": 5}))
+        assert calls["n"] == 1
+        assert "result" not in parsed, parsed
+    finally:
+        _cleanup("srv")
+
+
+def test_late_404_for_a_timed_out_call_does_not_license_resending_an_identical_call(monkeypatch, tmp_path):
+    """Prism 6260596e067d: call A times out while its POST is still pending; an identical call B runs, commits
+    and answers HTTP 200 with "Session not found"; A's late 404 lands in the record after B cleared it.
+    B must not be resent: it runs once and returns outcome_uncertain."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_tool_handlers import _make_tool_handler
+    ran = {"B": 0}
+    sends = {"n": 0}
+
+    server, _flag, _calls = _install_write_server("srv", lambda *a: None)
+
+    async def _call_tool(tool, arguments=None):
+        sends["n"] += 1
+        if sends["n"] == 1:  # A: the server never answers in time
+            await asyncio.sleep(30)
+        ran["B"] += 1  # B: the write lands...
+        server._tool_call_session_rejected = {"name": tool, "arguments": arguments}  # ...A's late 404 arrives
+        raise _session_refusal()  # ...and B's own reply is the tool's "Session not found" over HTTP 200
+
+    server.session.call_tool = _call_tool
+    server._reconnecting = False  # the timeout is a plain cancel, not a teardown
+    try:
+        handler = _make_tool_handler("srv", "set_timer", 0.5)
+        first = json.loads(handler({"m": 5}))
+        assert "result" not in first, first
+        parsed = json.loads(handler({"m": 5}))
+        assert ran["B"] == 1 and sends["n"] == 2, "B was resent"
+        assert parsed.get("outcome_uncertain") is True, parsed
+    finally:
+        _cleanup("srv")

@@ -357,6 +357,8 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         # Status/URL/body of the last HTTP rejection the Streamable HTTP client saw; names the real
         # cause when the SDK reports only ``Server returned an error response``.
         self._http_rejection: dict = {}
+        # params of the in-flight tools/call the server answered HTTP 404 for its session id (never ran).
+        self._tool_call_session_rejected: Optional[dict] = None
         # True from park until proven healthy again; logs the revival once.
         self._was_parked: bool = False
         # Why the server is parked (the revival_reason handed to _park), None once healthy again.
