@@ -18,7 +18,6 @@ HEAD = "a" * 40
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o"})
-    monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(tmp_path / "absent-mgp.json"))
     cfg = tmp_path / "worker-pr-draft.json"
     cfg.write_text(json.dumps({"enabled": False, "repos": ["O/R"]}))  # flip keys on the repo list only
     monkeypatch.setenv("KANBAN_WORKER_PR_DRAFT", str(cfg))
@@ -53,7 +52,7 @@ def _refs():
 def test_own_draft_is_flipped_ready_and_not_armed():
     ready, armed = [], []
     rep = fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"),
-                   arm=lambda *a: armed.append(a) or "log", ready=lambda r, n: ready.append((r, n)) or 0)
+                   evaluate=lambda *a: armed.append(a) or "log", event_land=True, ready=lambda r, n: ready.append((r, n)) or 0)
     assert ready == [("o/r", 5)]
     assert rep["draft_flipped"] == ["o/r#5"]
     entry = rep["prs"]["o/r#5"]
@@ -68,7 +67,7 @@ def test_foreign_draft_still_refused_and_never_flipped(monkeypatch, head_ref):
     ready = []
     monkeypatch.setattr(fr, "_default_ready", lambda: (lambda r, n: ready.append((r, n)) or 0), raising=False)
     with pytest.raises(fr.DraftPrError):
-        fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh(head_ref), arm=lambda *a: None)
+        fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh(head_ref))
     assert ready == []
 
 
@@ -77,16 +76,14 @@ def test_own_draft_on_unlisted_repo_refused(monkeypatch, tmp_path):
     cfg.write_text(json.dumps({"repos": ["o/other"]}))
     monkeypatch.setenv("KANBAN_WORKER_PR_DRAFT", str(cfg))
     with pytest.raises(fr.DraftPrError):
-        fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"),
-                 arm=lambda *a: None, ready=lambda r, n: 0)
+        fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"), ready=lambda r, n: 0)
 
 
 @pytest.mark.parametrize("rc", [21, 20, 3, None])
 def test_failed_flip_refuses(rc):
     """Review hold (21), Ace gate (20), read failure (3) or ace_gate missing (None): refuse as before."""
     with pytest.raises(fr.DraftPrError) as exc:
-        fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"),
-                 arm=lambda *a: None, ready=lambda r, n: rc)
+        fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"), ready=lambda r, n: rc)
     assert exc.value.prs == ["o/r#5"]
 
 
@@ -94,8 +91,7 @@ def test_kill_switch(monkeypatch):
     monkeypatch.setenv("KANBAN_HANDOFF_DRAFT_FLIP", "0")
     ready = []
     with pytest.raises(fr.DraftPrError):
-        fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"),
-                 arm=lambda *a: None, ready=lambda r, n: ready.append(1) or 0)
+        fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"), ready=lambda r, n: ready.append(1) or 0)
     assert ready == []
 
 
@@ -110,7 +106,7 @@ def test_mixed_own_and_foreign_draft_refuses_before_any_flip():
     ready = []
     with pytest.raises(fr.DraftPrError) as exc:
         fr.check(op.extract_pr_refs(f"{PR_URL} https://github.com/o/r/pull/6"), task_id="t_c1ee61ae",
-                 allow_arm=True, gh=gh, arm=lambda *a: None, ready=lambda r, n: ready.append(n) or 0)
+                 allow_arm=True, gh=gh, ready=lambda r, n: ready.append(n) or 0)
     assert ready == [] and sorted(exc.value.prs) == ["o/r#5", "o/r#6"]
 
 
@@ -141,13 +137,12 @@ def test_retry_after_partial_flip_does_not_arm_already_flipped_pr():
     refs = op.extract_pr_refs(f"{PR_URL} https://github.com/o/r/pull/6")
     rcs = {5: 0, 6: 3}
     with pytest.raises(fr.DraftPrError) as exc:
-        fr.check(refs, task_id="t_c1ee61ae", allow_arm=True, gh=_gh_two({"5": True, "6": True}, SKIPPED),
-                 arm=lambda *a: None, ready=lambda r, n: rcs[n])
+        fr.check(refs, task_id="t_c1ee61ae", allow_arm=True, gh=_gh_two({"5": True, "6": True}, SKIPPED), ready=lambda r, n: rcs[n])
     assert exc.value.prs == ["o/r#6"]
     assert set(exc.value.flipped) == {"o/r#5"} and exc.value.flipped["o/r#5"]["head"] == HEAD
     armed = []
     rep = fr.check(refs, task_id="t_c1ee61ae", allow_arm=True, gh=_gh_two({"5": False, "6": True}, SKIPPED),
-                   arm=lambda *a: armed.append(a) or "log", ready=lambda r, n: 0, flipped=exc.value.flipped)
+                   evaluate=lambda *a: armed.append(a) or "log", event_land=True, ready=lambda r, n: 0, flipped=exc.value.flipped)
     assert armed == []
     assert "no CI started after the ready flip" in rep["prs"]["o/r#5"]["automerge"]
     assert "flipped ready" in rep["prs"]["o/r#6"]["automerge"]
@@ -174,11 +169,11 @@ def test_prism_d34048_pre_ready_lint_success_does_not_arm_flipped_pr():
     armed = []
     rep = fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True,
                    gh=_gh_two({"5": False}, [PRE_READY_LINT, SKIPPED_TESTS]),
-                   arm=lambda *a: armed.append(a) or "log", flipped=RECORD)
+                   evaluate=lambda *a: armed.append(a) or "log", event_land=True, flipped=RECORD)
     assert armed == [] and "not armed" in rep["prs"]["o/r#5"]["automerge"]
     rep = fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True,
                    gh=_gh_two({"5": False}, [PRE_READY_LINT, POST_READY_TESTS]),
-                   arm=lambda *a: armed.append(a) or "log", flipped=RECORD)
+                   evaluate=lambda *a: armed.append(a) or "log", event_land=True, flipped=RECORD)
     assert len(armed) == 1 and "spawned" in rep["prs"]["o/r#5"]["automerge"]
 
 
@@ -193,7 +188,7 @@ def test_prism_d34048_flip_record_also_binds_a_non_card_branch():
             out["head"]["ref"] = "feature/x"
         return out
     fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True, gh=gh,
-             arm=lambda *a: armed.append(a) or "log", flipped=RECORD)
+             evaluate=lambda *a: armed.append(a) or "log", event_land=True, flipped=RECORD)
     assert armed == []
 
 
@@ -211,7 +206,7 @@ def test_prism_d34048_none_then_success_race_does_not_arm():
         return green(*args)
     armed = []
     rep = fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True, gh=gh,
-                   arm=lambda *a: armed.append(a) or "log", flipped=RECORD)
+                   evaluate=lambda *a: armed.append(a) or "log", event_land=True, flipped=RECORD)
     assert armed == [] and "unreadable" in rep["prs"]["o/r#5"]["automerge"]
     assert len(reads) == 1
 
@@ -220,7 +215,7 @@ def test_own_pr_with_post_ready_ci_is_armed():
     armed = []
     runs = SKIPPED + [{"status": "completed", "conclusion": "success"}]
     rep = fr.check(op.extract_pr_refs(PR_URL), task_id="t_c1ee61ae", allow_arm=True,
-                   gh=_gh_two({"5": False}, runs), arm=lambda *a: armed.append(a) or "log")
+                   gh=_gh_two({"5": False}, runs), evaluate=lambda *a: armed.append(a) or "log", event_land=True)
     assert len(armed) == 1 and "spawned" in rep["prs"]["o/r#5"]["automerge"]
 
 
@@ -230,7 +225,7 @@ def test_operator_redraft_after_flip_is_left_draft():
     someone else re-drafted it: leave it draft, do not refuse, do not arm."""
     ready, armed = [], []
     rep = fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"),
-                   arm=lambda *a: armed.append(a) or "log", ready=lambda r, n: ready.append((r, n)) or 0,
+                   evaluate=lambda *a: armed.append(a) or "log", event_land=True, ready=lambda r, n: ready.append((r, n)) or 0,
                    flipped=RECORD)
     assert ready == [] and armed == []
     assert "o/r#5" in rep["draft_held"] and "left draft as-is" in rep["draft_held"]["o/r#5"]
@@ -240,8 +235,7 @@ def test_operator_redraft_after_flip_is_left_draft():
 def test_worker_redraft_before_push_still_flips():
     """The worker's own re-draft comes with a new head (pre-push hook): today's rule, flip it ready."""
     ready = []
-    rep = fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"),
-                   arm=lambda *a: None, ready=lambda r, n: ready.append((r, n)) or 0,
+    rep = fr.check(_refs(), task_id="t_c1ee61ae", allow_arm=True, gh=_gh("daedalus/t_c1ee61ae-x"), ready=lambda r, n: ready.append((r, n)) or 0,
                    flipped={"o/r#5": {"head": "b" * 40, "at": FLIP_AT}})
     assert ready == [("o/r", 5)] and rep["draft_flipped"] == ["o/r#5"] and "draft_held" not in rep
 
@@ -286,7 +280,7 @@ def _wire(monkeypatch, head_ref_for, ready, armed):
     monkeypatch.setattr(fr, "_default_gh", lambda: _gh(head_ref_for()))
     monkeypatch.setattr(fr, "_default_ready", lambda: (lambda r, n: ready.append((r, n)) or 0),
                         raising=False)
-    monkeypatch.setattr(fr, "spawn_arm", lambda *a: armed.append(a) or "/tmp/log")
+    monkeypatch.setattr(fr, "spawn_evaluate", lambda *a: armed.append(a) or "/tmp/log")
 
 
 def test_e2e_own_draft_flipped_and_routed_to_review(board, monkeypatch):
@@ -443,7 +437,7 @@ def test_e2e_partial_flip_record_persists_across_handoffs(board, monkeypatch):
     armed = []
     monkeypatch.setattr(fr, "_default_gh", lambda: gh)
     monkeypatch.setattr(fr, "_default_ready", lambda: (lambda r, n: rcs[n]))
-    monkeypatch.setattr(fr, "spawn_arm", lambda *a: armed.append(a[1]) or "/tmp/log")
+    monkeypatch.setattr(fr, "spawn_evaluate", lambda *a: armed.append(a[1]) or "/tmp/log")
     monkeypatch.setattr(fr.time, "time", lambda: FLIP_AT)
     urls = f"{PR_URL} https://github.com/o/r/pull/6"
     with kb.connect() as conn:

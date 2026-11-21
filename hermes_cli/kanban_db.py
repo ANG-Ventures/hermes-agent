@@ -11715,7 +11715,7 @@ class NotLandableError(ValueError):
         self.task_id = task_id
         self.prs = [pr for pr, _ in refusals]
         super().__init__(
-            "handoff refused by the pre-PR verifier (fleet-merge would refuse it at land):\n"
+            "handoff refused by the pre-PR verifier (scripts/lib/landable.py check; fix the PR, then hand back):\n"
             + "\n".join(text for _, text in refusals)
             + f"\n{task_id} is still in-flight (no state change)."
         )

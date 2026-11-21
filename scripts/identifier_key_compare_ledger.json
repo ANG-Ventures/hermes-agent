@@ -377,11 +377,6 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
    "where": "hermes_cli/kanban_pr_acceptance.py:218 collect_acceptance"
   },
-  "hermes_cli/kanban_pr_freshness.py::merge_gate_profile::fold::repo::return \"v2\" if d[\"profile\"] == \"v2\" and repo.casefold() in {r.casefold() for r in repos} else \"v1\"": {
-   "verdict": "kept",
-   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
-   "where": "hermes_cli/kanban_pr_freshness.py:173 merge_gate_profile"
-  },
   "hermes_cli/kanban_pr_gate.py::_Resolver.resolve::fold::repo::key = (ref.repo.lower(), ref.number)": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",

@@ -21,18 +21,6 @@ def _fixture_owner_is_fleet(monkeypatch):
     monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o"})
 
 
-@pytest.fixture(autouse=True)
-def _profile_v1_unless_set(monkeypatch, tmp_path):
-    """t_7dbacbbc: never read the host's live merge-gate profile; absent file = v1."""
-    monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(tmp_path / "absent-merge-gate-profile.json"))
-
-
-def _profile(monkeypatch, tmp_path, profile, repos):
-    p = tmp_path / "merge-gate-profile.json"
-    p.write_text(__import__("json").dumps({"profile": profile, "repos": list(repos)}))
-    monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(p))
-
-
 class FakeGh:
     def __init__(self, *, draft=False, behind=0, checks=("success",), status="success", ms="clean"):
         self.draft, self.behind, self.checks, self.status, self.ms = draft, behind, checks, status, ms
@@ -69,7 +57,7 @@ def test_draft_is_refused_before_any_mutation():
     gh = FakeGh(draft=True, behind=50)
     armed = []
     with pytest.raises(fr.DraftPrError) as exc:
-        fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a))
+        fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, evaluate=lambda *a: armed.append(a), event_land=True)
     assert exc.value.prs == ["o/r#5"]
     assert gh.updates() == [] and armed == []
     msg = str(exc.value)
@@ -80,7 +68,7 @@ def test_draft_is_refused_before_any_mutation():
 def test_stale_head_is_updated_bound_to_measured_sha_and_not_armed():
     gh = FakeGh(behind=21, ms="behind")
     armed = []
-    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a))
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, evaluate=lambda *a: armed.append(a), event_land=True)
     assert gh.updates() == [("-X", "PUT", "repos/o/r/pulls/5/update-branch",
                              "-f", f"expected_head_sha={HEAD}")]
     assert rep["prs"]["o/r#5"]["update_branch"] == "requested"
@@ -91,7 +79,7 @@ def test_behind_without_strict_rule_is_not_updated_and_armed():
     # t_39a33e70: far behind but GitHub does not block on it (no strict up-to-date rule):
     # the head merges as is, so no update-branch push; a green head is armed like a fresh one.
     gh, armed = FakeGh(behind=40, ms="blocked"), []
-    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a) or "log")
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, evaluate=lambda *a: armed.append(a) or "log", event_land=True)
     assert gh.updates() == []
     assert "update_branch" not in rep["prs"]["o/r#5"]
     assert armed == [("o/r", 5, HEAD, "t_x")]
@@ -103,7 +91,7 @@ def test_far_behind_with_uncomputed_mergeable_state_is_deferred(ms):
     # mergeability job finishes. A far-behind head may still be blocked by a strict
     # up-to-date rule, so it is neither updated nor armed on the stale SHA: deferred.
     gh, armed = FakeGh(behind=40, ms=ms), []
-    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a) or "log")
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, evaluate=lambda *a: armed.append(a) or "log", event_land=True)
     assert gh.updates() == []
     assert armed == []
     assert "deferred" in rep["prs"]["o/r#5"]
@@ -112,13 +100,13 @@ def test_far_behind_with_uncomputed_mergeable_state_is_deferred(ms):
 def test_near_head_with_uncomputed_mergeable_state_is_still_armed():
     # Within behind_max the strict rule cannot have made it unlandable via staleness alone.
     gh, armed = FakeGh(behind=3, ms="unknown"), []
-    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a) or "log")
+    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, evaluate=lambda *a: armed.append(a) or "log", event_land=True)
     assert armed == [("o/r", 5, HEAD, "t_x")]
 
 
 def test_at_threshold_is_not_updated():
     gh = FakeGh(behind=20, checks=("failure",))
-    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: None)
+    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh)
     assert gh.updates() == []
 
 
@@ -126,7 +114,7 @@ def test_green_fresh_pr_is_armed_with_head_sha():
     gh = FakeGh(behind=3)
     armed = []
     rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh,
-                   arm=lambda *a: armed.append(a) or "/tmp/log")
+                   evaluate=lambda *a: armed.append(a) or "/tmp/log", event_land=True)
     assert armed == [(REPO, 5, HEAD, "t_x")]
     assert "spawned" in rep["prs"]["o/r#5"]["automerge"]
 
@@ -135,106 +123,36 @@ def test_green_fresh_pr_is_armed_with_head_sha():
                                            (("failure",), "success"),
                                            ((), "success"),
                                            (("success",), "failure")])
-def test_not_green_is_not_armed(checks, status):
+def test_not_green_waits_on_fast_tier(checks, status):
     gh = FakeGh(checks=checks, status=status)
-    armed = []
-    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a))
-    assert armed == []
+    evaluated = []
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, evaluate=lambda *a: evaluated.append(a),
+                   event_land=True)
+    assert evaluated == [(REPO, 5, HEAD, "t_x")]
+    assert rep["prs"]["o/r#5"]["waiting"] == "waiting:fast-tier"
 
 
 def test_milestone_and_kill_switches_do_not_arm(monkeypatch):
     armed = []
-    fr.check(_refs(), task_id="t_x", allow_arm=False, gh=FakeGh(), arm=lambda *a: armed.append(a))
+    fr.check(_refs(), task_id="t_x", allow_arm=False, gh=FakeGh(), evaluate=lambda *a: armed.append(a), event_land=True)
     monkeypatch.setenv("KANBAN_HANDOFF_AUTOMERGE", "0")
-    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(), arm=lambda *a: armed.append(a))
+    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(), evaluate=lambda *a: armed.append(a), event_land=True)
     assert armed == []
     monkeypatch.setenv("KANBAN_HANDOFF_FRESHNESS", "0")
-    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(draft=True), arm=None)  # no raise
+    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(draft=True))  # no raise
 
 
 def test_foreign_pr_is_never_updated_or_armed():
     """t_06dccfe3: the gate never touches a PR the fleet does not own."""
     gh, armed = FakeGh(draft=True, behind=50), []
     refs = op.extract_pr_refs("https://github.com/stephenschoettler/hermes-lcm/pull/5")
-    rep = fr.check(refs, task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a))
+    rep = fr.check(refs, task_id="t_x", allow_arm=True, gh=gh, evaluate=lambda *a: armed.append(a), event_land=True)
     assert rep["prs"] == {} and gh.calls == [] and armed == []
 
 
 def test_lookup_failure_fails_open():
-    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=lambda *a: None, arm=None)
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=lambda *a: None)
     assert "fail-open" in rep["prs"]["o/r#5"]["lookup"]
-
-
-# --- t_7dbacbbc: pipeline v2 merge-gate profile ---------------------------
-
-
-@pytest.mark.parametrize("checks,status,want", [(("failure",), "success", "red: "),
-                                                ((), "success", "no check runs"),
-                                                (("success",), "failure", "commit status failure")])
-def test_v2_not_green_head_is_armed_with_the_state_reported(monkeypatch, tmp_path, checks, status, want):
-    _profile(monkeypatch, tmp_path, "v2", ["O/R"])   # case-insensitive, like merge_gate_profile.py
-    gh, armed = FakeGh(checks=checks, status=status), []
-    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh,
-                   arm=lambda *a: armed.append(a) or "/tmp/log")
-    assert len(armed) == 1 and armed[0][:4] == (REPO, 5, HEAD, "t_x")
-    assert want in armed[0][4]
-    entry = rep["prs"]["o/r#5"]
-    assert want in entry["ci_reported"] and "CI reported not green" in entry["automerge"]
-
-
-def test_v2_pending_head_is_armed_with_pending_reported(monkeypatch, tmp_path):
-    _profile(monkeypatch, tmp_path, "v2", ["o/r"])
-    gh = FakeGh()
-    real = gh.__call__
-
-    def g(*args):
-        if args[-1].endswith("check-runs?per_page=100"):
-            return {"check_runs": [{"name": "ci", "status": "in_progress", "conclusion": None}]}
-        return real(*args)
-    armed = []
-    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=g, arm=lambda *a: armed.append(a) or "/tmp/log")
-    assert len(armed) == 1 and armed[0][4] == "pending: ci"
-
-
-@pytest.mark.parametrize("profile,repos,body", [("v1", ["o/r"], None), ("v2", ["o/other"], None),
-                                                (None, None, "{not json"), (None, None, '{"profile": "v3"}')])
-def test_v1_absent_unknown_or_unlisted_keeps_green_only(monkeypatch, tmp_path, profile, repos, body):
-    if body is None:
-        _profile(monkeypatch, tmp_path, profile, repos)
-    else:
-        p = tmp_path / "mgp.json"
-        p.write_text(body)
-        monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(p))
-    armed = []
-    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(checks=("failure",)),
-                   arm=lambda *a: armed.append(a))
-    assert armed == [] and rep["prs"]["o/r#5"]["automerge"] == "ci not green; not armed"
-
-
-def test_v2_unreadable_check_runs_is_never_armed(monkeypatch, tmp_path):
-    _profile(monkeypatch, tmp_path, "v2", ["o/r"])
-    gh = FakeGh()
-    real = gh.__call__
-
-    def g(*args):
-        return None if "check-runs" in args[-1] else real(*args)
-    armed = []
-    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=g, arm=lambda *a: armed.append(a))
-    assert armed == []
-
-
-def test_spawn_arm_reason_reports_ci(monkeypatch, tmp_path):
-    fm = tmp_path / "fleet-merge.sh"
-    fm.write_text("")
-    monkeypatch.setenv("KANBAN_HANDOFF_FLEET_MERGE", str(fm))
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    seen = []
-    monkeypatch.setattr(fr.subprocess, "Popen", lambda argv, **kw: seen.append(argv))
-    fr.spawn_arm(REPO, 5, HEAD, "t_x", "red: ci")
-    fr.spawn_arm(REPO, 5, HEAD, "t_x")
-    reasons = [a[a.index("--reason") + 1] for a in seen]
-    assert "CI reported not green" in reasons[0] and "red: ci" in reasons[0]
-    assert reasons[1].startswith("handoff freshness gate: CI green on head")
 
 
 def test_default_gh_disabled_under_pytest():
@@ -257,7 +175,7 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 def _use_gh(monkeypatch, gh, armed):
     monkeypatch.setattr(fr, "_default_gh", lambda: gh)
-    monkeypatch.setattr(fr, "spawn_arm", lambda *a: armed.append(a) or "/tmp/log")
+    monkeypatch.setattr(fr, "spawn_evaluate", lambda *a: armed.append(a) or "/tmp/log")
 
 
 def _claimed(conn, title="slice"):
@@ -308,6 +226,7 @@ def test_e2e_stale_head_updated_then_routed_to_review(board, monkeypatch):
 
 
 def test_e2e_green_slice_armed_milestone_not(board, monkeypatch):
+    _landing_policy(board, True)
     armed = []
     _use_gh(monkeypatch, FakeGh(), armed)
     with kb.connect() as conn:
@@ -323,7 +242,7 @@ def test_e2e_green_slice_armed_milestone_not(board, monkeypatch):
 def test_e2e_pr_only_mentioned_in_prose_is_routed_but_never_armed(board, monkeypatch):
     """FleetReview #1234: a green fleet PR named only in summary prose (context,
     not this card's handoff) routes the card to review but is NOT handed to
-    fleet-merge.sh. Only metadata.pr_url / --survivor-pr authorize arming."""
+    the evaluator. Only metadata.pr_url / --survivor-pr authorize it."""
     armed = []
     _use_gh(monkeypatch, FakeGh(), armed)
     with kb.connect() as conn:
@@ -350,7 +269,7 @@ def test_draft_ok_reports_override_and_skips_mutation():
     gh = FakeGh(draft=True, behind=50)
     armed = []
     rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh,
-                   arm=lambda *a: armed.append(a), draft_ok=True)
+                   evaluate=lambda *a: armed.append(a), event_land=True, draft_ok=True)
     assert rep["draft_override"] == ["o/r#5"]
     assert gh.updates() == [] and armed == []
 
@@ -441,7 +360,7 @@ def test_cli_draft_ok_flag_refused_then_audited(board, monkeypatch):
             {"prs": ["o/r#5"], "reason": "CI vehicle"}]
 
 
-# --- Forge L0 EV-A (t_d343020c): spawn_arm removed while event_land is on --------
+# --- Forge L0 EV-A (t_d343020c); the fleet-merge arm is gone (retired-lander PR A) --------
 
 
 def _landing_policy(home: Path, event_land, disabled: bool = False) -> None:
@@ -468,29 +387,26 @@ def test_event_land_switch_reads_like_land_evaluator(tmp_path):
     assert fr.event_land_enabled(tmp_path) is False
 
 
-@pytest.mark.parametrize("checks,profile,waiting", [
-    (("success",), "v1", "waiting:prism"),
-    (("failure",), "v1", "waiting:fast-tier"),
-    (("failure",), "v2", "waiting:fast-tier"),   # v2 used to arm a red head; under event_land it waits
+@pytest.mark.parametrize("checks,waiting", [
+    (("success",), "waiting:prism"),
+    (("failure",), "waiting:fast-tier"),
 ])
-def test_spawn_arm_removed(monkeypatch, tmp_path, checks, profile, waiting):
-    """event_land on: the handoff never asks the lander. It records waiting:<what> and calls evaluate (E6)."""
-    _profile(monkeypatch, tmp_path, profile, [REPO])
-    armed, evaluated = [], []
+def test_spawn_arm_removed(checks, waiting):
+    """event_land on: the handoff never asks a lander. It records waiting:<what> and calls evaluate (E6)."""
+    evaluated = []
     rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(checks=checks), event_land=True,
-                   arm=lambda *a: armed.append(a) or "/arm", evaluate=lambda *a: evaluated.append(a) or "/ev")
+                   evaluate=lambda *a: evaluated.append(a) or "/ev")
     entry = rep["prs"]["o/r#5"]
-    assert armed == []
     assert evaluated == [(REPO, 5, HEAD, "t_x")]
     assert entry["waiting"] == waiting
     assert "evaluate E6 spawned (/ev)" in entry["automerge"]
 
 
 def test_spawn_arm_removed_stale_head_waits_on_fast_tier():
-    gh, armed, evaluated = FakeGh(behind=40, ms="behind"), [], []
+    gh, evaluated = FakeGh(behind=40, ms="behind"), []
     rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, event_land=True,
-                   arm=lambda *a: armed.append(a), evaluate=lambda *a: evaluated.append(a))
-    assert len(gh.updates()) == 1 and armed == [] and evaluated == []
+                   evaluate=lambda *a: evaluated.append(a))
+    assert len(gh.updates()) == 1 and evaluated == []
     assert rep["prs"]["o/r#5"]["waiting"] == "waiting:fast-tier"
 
 
@@ -511,34 +427,33 @@ def test_spawn_evaluate_argv(monkeypatch, tmp_path):
 
 
 def test_e2e_spawn_arm_removed_records_waiting(board, monkeypatch):
-    """Through complete_task with the live config shape: no fleet-merge spawn, waiting:<what> on the card."""
+    """Through complete_task with the live config shape: E6 spawned, waiting:<what> on the card."""
     _landing_policy(board, True)
-    armed, evaluated = [], []
-    _use_gh(monkeypatch, FakeGh(), armed)
-    monkeypatch.setattr(fr, "spawn_evaluate", lambda *a: evaluated.append(a) or "/tmp/ev")
+    evaluated = []
+    _use_gh(monkeypatch, FakeGh(), evaluated)
     with kb.connect() as conn:
         tid, run = _claimed(conn)
         assert kb.complete_task(conn, tid, summary=f"done {PR_URL}",
                                 metadata={"pr_url": PR_URL}, expected_run_id=run)
         meta = kb.latest_run(conn, tid).metadata
-    assert armed == []
     assert evaluated == [(REPO, 5, HEAD, tid)]
     assert meta["handoff_freshness"]["prs"]["o/r#5"]["waiting"] == "waiting:prism"
 
 
 @pytest.mark.parametrize("event_land,disabled", [(None, False), (False, False), (True, True)])
 def test_event_land_off(board, monkeypatch, event_land, disabled):
-    """I1: missing/false event_land, or state/event-land.disabled, = today: spawn_arm arms, no evaluate, no waiting."""
+    """I1: missing/false event_land, or state/event-land.disabled: no evaluate and no fleet-merge spawn (the
+    retired arm is gone); the handoff records what the PR waits on."""
     _landing_policy(board, event_land, disabled)
-    armed, evaluated = [], []
-    _use_gh(monkeypatch, FakeGh(), armed)
-    monkeypatch.setattr(fr, "spawn_evaluate", lambda *a: evaluated.append(a) or "/tmp/ev")
+    evaluated, spawned = [], []
+    _use_gh(monkeypatch, FakeGh(), evaluated)
+    monkeypatch.setattr(fr.subprocess, "Popen", lambda argv, **kw: spawned.append(argv))
     with kb.connect() as conn:
         tid, run = _claimed(conn)
         assert kb.complete_task(conn, tid, summary=f"done {PR_URL}",
                                 metadata={"pr_url": PR_URL}, expected_run_id=run)
         meta = kb.latest_run(conn, tid).metadata
-    assert armed == [(REPO, 5, HEAD, tid)]
-    assert evaluated == []
+    assert evaluated == [] and spawned == []
     entry = meta["handoff_freshness"]["prs"]["o/r#5"]
-    assert "waiting" not in entry and entry["automerge"] == "fleet-merge spawned (/tmp/log)"
+    assert entry["waiting"] == "waiting:prism"
+    assert entry["automerge"] == "event-land off: not armed (no automated lander)"

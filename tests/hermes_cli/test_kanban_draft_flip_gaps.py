@@ -26,7 +26,6 @@ HEAD = "a" * 40
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o", "u"})
-    monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(tmp_path / "absent-mgp.json"))
     cfg = tmp_path / "worker-pr-draft.json"
     cfg.write_text(json.dumps({"enabled": True, "repos": ["O/R"]}))
     monkeypatch.setenv("KANBAN_WORKER_PR_DRAFT", str(cfg))
@@ -78,7 +77,7 @@ def test_lookup_failing_twice_refuses_own_pr_in_worker_draft_repo():
     gh = _gh("daedalus/t_5c6c67c5-x", fail_first=2)
     with pytest.raises(fr.DraftLookupError) as exc:
         fr.check(op.extract_pr_refs(PR_URL), task_id="t_5c6c67c5", allow_arm=True, gh=gh,
-                 armable={"o/r#5"}, arm=lambda *a: pytest.fail("armed"))
+                 armable={"o/r#5"}, evaluate=lambda *a: pytest.fail("evaluated"), event_land=True)
     assert exc.value.prs == ["o/r#5"]
     assert isinstance(exc.value, fr.DraftPrError)
     assert "failed twice" in str(exc.value) and "draft_ok" in str(exc.value)
@@ -165,7 +164,7 @@ def test_no_github_client_refuses_own_pr_in_worker_draft_repo(monkeypatch):
     monkeypatch.setattr(fr, "_default_gh", lambda: None)
     with pytest.raises(fr.DraftLookupError) as exc:
         fr.check(op.extract_pr_refs(PR_URL), task_id="t_5c6c67c5", allow_arm=True, armable={"o/r#5"},
-                 arm=lambda *a: pytest.fail("armed"))
+                 evaluate=lambda *a: pytest.fail("evaluated"), event_land=True)
     assert exc.value.prs == ["o/r#5"]
 
 
