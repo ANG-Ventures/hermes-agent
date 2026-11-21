@@ -1,6 +1,7 @@
 """OpenAI Ultrafast (``service_tier: "ultrafast"``): one tier word table, a per-model request gate,
 and pricing from the tier the response was SERVED at. Relationship tests, no catalog snapshots."""
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -90,15 +91,56 @@ def _usage(prompt_uncached: int, served_tier=None) -> CanonicalUsage:
     return with_served_service_tier(usage, SimpleNamespace(service_tier=served_tier))
 
 
+# t_9720ecae: GPT-6.2 Sol / Astra Ultrafast is 3x Standard through 2027-02-28 PT, 6x from 2027-03-01 PT.
+_SIX_X_FROM = {"gpt-6.2-sol": datetime(2027, 3, 1, 8, tzinfo=timezone.utc),
+               "gpt-6.2-astra": datetime(2027, 3, 1, 8, tzinfo=timezone.utc)}
+BEFORE_62_SWITCH = datetime(2027, 3, 1, 7, 59, tzinfo=timezone.utc)
+AFTER_62_SWITCH = datetime(2027, 3, 1, 8, tzinfo=timezone.utc)
+
+
+def _factor(model: str, now: datetime) -> int:
+    switch = _SIX_X_FROM.get(model.removesuffix("-900k"))
+    return 3 if switch is not None and now < switch else 6
+
+
+@pytest.mark.parametrize("now", [BEFORE_62_SWITCH, AFTER_62_SWITCH])
 @pytest.mark.parametrize("prompt_uncached", [50_000, 400_000])  # below / above the 272K whole-request tier
-def test_served_ultrafast_bills_at_the_ultrafast_row_and_requested_only_does_not(prompt_uncached):
+def test_served_ultrafast_bills_at_the_ultrafast_row_and_requested_only_does_not(prompt_uncached, now,
+                                                                               monkeypatch):
+    import agent.usage_pricing as up
+
+    monkeypatch.setattr(up, "_UTC_NOW", lambda: now)
     for model in _OPENAI_ULTRAFAST_PRICING:
         standard = estimate_usage_cost(model, _usage(prompt_uncached), provider="openai-api")
         served_default = estimate_usage_cost(model, _usage(prompt_uncached, "default"), provider="openai-api")
         ultra = estimate_usage_cost(model, _usage(prompt_uncached, "ultrafast"), provider="openai-api")
         assert served_default.amount_usd == standard.amount_usd  # asked for Ultrafast, served at Standard
-        assert ultra.pricing_version == _OPENAI_ULTRAFAST_PRICING[model].pricing_version
-        assert ultra.amount_usd == standard.amount_usd * 6  # every bucket, both context tiers
+        assert ultra.status == "estimated", (model, ultra.notes)
+        assert ultra.pricing_version == up._effective_pricing_entry(
+            _OPENAI_ULTRAFAST_PRICING[model], now).pricing_version
+        # every bucket, both context tiers
+        assert ultra.amount_usd == standard.amount_usd * _factor(model, now), model
+
+
+@pytest.mark.parametrize("model", ["gpt-6.2-sol", "openai/gpt-6.2-astra", "gpt-6.2-sol-900k"])
+def test_served_ultrafast_gpt_6_2_is_priced_not_unknown(model, monkeypatch):
+    """t_9720ecae: #462 sends Ultrafast for both 6.2 slugs; a served-ultrafast turn priced unknown."""
+    import agent.usage_pricing as up
+
+    monkeypatch.setattr(up, "_UTC_NOW", lambda: datetime(2026, 11, 20, tzinfo=timezone.utc))
+    ultra = estimate_usage_cost(model, _usage(50_000, "ultrafast"), provider="openai-api")
+    assert ultra.status == "estimated", ultra.notes
+    assert ultra.amount_usd == estimate_usage_cost(model, _usage(50_000), provider="openai-api").amount_usd * 3
+
+
+def test_gpt_6_2_ultrafast_rows_match_the_published_table():
+    sol = _OPENAI_ULTRAFAST_PRICING["gpt-6.2-sol"]
+    astra = _OPENAI_ULTRAFAST_PRICING["gpt-6.2-astra"]
+    got = [(str(e.input_cost_per_million), str(e.output_cost_per_million), str(e.cache_read_cost_per_million),
+            str(e.cache_write_cost_per_million)) for e in (sol, astra, sol.superseded_by, astra.superseded_by)]
+    assert [tuple(f"{float(x):.2f}" for x in row) for row in got] == [
+        ("6.00", "30.00", "0.30", "7.50"), ("24.00", "120.00", "1.20", "30.00"),     # 3x, through 2027-02-28
+        ("12.00", "60.00", "0.60", "15.00"), ("48.00", "240.00", "2.40", "60.00")]   # "list rates", 6x
 
 
 @pytest.mark.parametrize("model", ["gpt-6.1-sol", "openai/gpt-6.1-sol", "gpt-6.1-sol-900k"])
@@ -120,6 +162,11 @@ def test_every_ultrafast_row_is_six_times_its_standard_row():
               "cache_write_cost_per_million")
     for model, ultra in _OPENAI_ULTRAFAST_PRICING.items():
         standard = _OFFICIAL_DOCS_PRICING[("openai", model)]
+        if ultra.superseded_by is not None:  # 6.2: 3x until the dated switch, then 6x
+            assert _factor(model, BEFORE_62_SWITCH) == 3 and ultra.superseded_at == AFTER_62_SWITCH, model
+            for field in fields + tuple(f"{f}_above" for f in fields):
+                assert getattr(ultra, field) == getattr(standard, field) * 3, (model, field)
+            ultra = ultra.superseded_by
         assert ultra.tier_threshold_tokens == standard.tier_threshold_tokens, model
         for field in fields + tuple(f"{f}_above" for f in fields):
             assert getattr(ultra, field) == getattr(standard, field) * 6, (model, field)
