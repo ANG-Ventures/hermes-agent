@@ -516,3 +516,67 @@ def test_unreadable_directory_still_errors(forced_files_client):
         locked.chmod(0o755)
     assert listing.status_code == 403
     assert listing.json()["detail"] == "Directory is not readable"
+
+
+def test_link_inside_locked_root_pointing_outside_is_one_broken_entry(forced_files_client, tmp_path):
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret-name.txt").write_text("secret")
+    (root / "a.txt").write_text("hi")
+    (root / "out").symlink_to(outside / "secret-name.txt")
+
+    listing = client.get("/api/files", params={"path": str(root)})
+
+    assert listing.status_code == 200, listing.text
+    entries = {e["name"]: e for e in listing.json()["entries"]}
+    assert set(entries) == {"a.txt", "out"}
+    assert entries["out"]["broken"] is True
+    assert entries["out"]["path"] == str(root.resolve() / "out")
+    assert "secret-name" not in listing.text
+    assert str(outside) not in listing.text
+
+
+def test_listed_directory_swapped_for_outside_link_still_403s(forced_files_client, tmp_path, monkeypatch):
+    """The listed dir replaced by a link to an outside dir between validation and
+    scandir must not list the outside dir (Prism 6beec0bd4d34)."""
+    client, root = forced_files_client
+    listed = root / "sub"
+    listed.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "plain-outside.txt").write_text("secret")
+    (outside / "link-outside").symlink_to(outside / "plain-outside.txt")
+
+    real_scandir = os.scandir
+    listed_real = str(listed.resolve())
+
+    def swapping_scandir(path=None):
+        if str(path) == listed_real:
+            os.rmdir(listed_real)
+            os.symlink(str(outside), listed_real)
+        return real_scandir(path)
+
+    monkeypatch.setattr(_rt_files.os, "scandir", swapping_scandir)
+    listing = client.get("/api/files", params={"path": str(listed)})
+
+    assert listing.status_code == 403, listing.text
+    assert "plain-outside" not in listing.text
+    assert "link-outside" not in listing.text
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads any directory")
+def test_non_link_whose_stat_fails_is_not_returned_as_a_link(forced_files_client):
+    client, root = forced_files_client
+    noexec = root / "noexec"
+    noexec.mkdir(parents=True)
+    (noexec / "plain.txt").write_text("hi")
+    (noexec / "child").mkdir()
+    noexec.chmod(0o444)
+    try:
+        listing = client.get("/api/files", params={"path": str(noexec)})
+    finally:
+        noexec.chmod(0o755)
+    assert listing.status_code != 200, listing.text
+    assert '"link"' not in listing.text
