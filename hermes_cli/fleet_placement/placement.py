@@ -159,6 +159,39 @@ class LedgerError(PlacementError):
     """The reservation ledger exists but cannot be read or parsed: it is never overwritten (Prism P1 51e7cfc6)."""
 
 
+def _reader_tag() -> str:
+    """`` ppid=N argv=<own argv> parent=<parent argv> cwd=<cwd>`` for a deprecated-name-reads line, so a reader that has
+    exited by the time someone reads the log can still be named (t_5931d620; a pid alone never could). Whitespace
+    becomes ``+`` so field 2 stays the name; at most 3 argv words, 160 chars each field. Never raises."""
+    import sys
+
+    def w(parts):
+        s = " ".join(str(p) for p in parts[:3] if p)
+        return "".join("+" if c.isspace() else c for c in s)[:160] or "-"
+    try:
+        ppid = os.getppid()
+        try:
+            with open(f"/proc/{ppid}/cmdline", "rb") as fh:
+                parent = [p.decode("utf-8", "replace") for p in fh.read().split(b"\0")]
+        except OSError:   # macOS: no /proc
+            import subprocess
+            parent = subprocess.run(["ps", "-o", "command=", "-p", str(ppid)], capture_output=True, text=True,
+                                    timeout=2).stdout.split()
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = ""
+        return f" ppid={ppid} argv={w(sys.argv or [sys.executable])} parent={w(parent)} cwd={w([cwd])}"
+    except Exception:  # noqa: BLE001 -- a counter must never break a reader
+        return ""
+
+
+def _clock_shifted() -> bool:
+    """A clock-shifted test process (scripts/lib/clock_shift.py exports both) stamps a FUTURE date: never count it into
+    a real log (t_5931d620: 191 rows dated 2026-12 .. 2027-12)."""
+    return bool(os.environ.get("HERMES_CLOCK_SHIFT_DAYS") or os.environ.get("FAKETIME"))
+
+
 _OLD_ENV_COUNTED = set()
 
 
@@ -174,6 +207,8 @@ def _allocation_home_env(now=None):
     v = os.environ.get("PLACEMENT_HOME")
     if v and "PLACEMENT_HOME" not in _OLD_ENV_COUNTED:
         _OLD_ENV_COUNTED.add("PLACEMENT_HOME")
+        if _clock_shifted():
+            return v
         try:
             import sys
             import time
@@ -193,7 +228,7 @@ def _allocation_home_env(now=None):
             d = home / "var" / "ci-box"
             d.mkdir(parents=True, exist_ok=True)
             with open(d / "deprecated-name-reads.log", "a", encoding="utf-8") as fh:
-                fh.write(f"{ts} env:PLACEMENT_HOME pid={os.getpid()}\n")
+                fh.write(f"{ts} env:PLACEMENT_HOME pid={os.getpid()}{_reader_tag()}\n")
         except Exception:  # noqa: BLE001 -- a counter must never break a reader
             pass
     return v
