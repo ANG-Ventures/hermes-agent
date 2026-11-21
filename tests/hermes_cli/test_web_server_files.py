@@ -1,6 +1,7 @@
 """Tests for the dashboard-managed file browser API."""
 
 import base64
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -458,3 +459,60 @@ def test_git_branch_decodes_utf8_under_a_gbk_default_codec(tmp_path, monkeypatch
     monkeypatch.setattr(subprocess, "_text_encoding", lambda: "gbk")
 
     assert _rt_files._fs_git_branch(str(tmp_path)) == branch
+
+
+def _listed(client, root):
+    listing = client.get("/api/files", params={"path": str(root)})
+    assert listing.status_code == 200, listing.text
+    return {e["name"]: e for e in listing.json()["entries"]}
+
+
+@pytest.mark.parametrize("client_fixture", ["local_files_client", "forced_files_client"])
+def test_listing_survives_a_dangling_symlink(client_fixture, request):
+    """One dangling symlink used to 500 the whole listing (Bombadil trial, t_58581647)."""
+    client, root = request.getfixturevalue(client_fixture)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "a.txt").write_text("hi")
+    (root / "broken").symlink_to("/nonexistent/target")
+
+    entries = _listed(client, root)
+
+    assert entries["a.txt"]["size"] == 2
+    assert "broken" not in entries["a.txt"]
+    broken = entries["broken"]
+    assert broken["path"] == str(root.resolve() / "broken")
+    assert broken["type"] == "link"
+    assert broken["broken"] is True
+    assert broken["is_directory"] is False
+    assert broken["size"] is None
+
+
+@pytest.mark.parametrize("client_fixture", ["local_files_client", "forced_files_client"])
+def test_listing_survives_a_symlink_loop(client_fixture, request):
+    client, root = request.getfixturevalue(client_fixture)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "a.txt").write_text("hi")
+    (root / "loop1").symlink_to(root / "loop2")
+    (root / "loop2").symlink_to(root / "loop1")
+
+    entries = _listed(client, root)
+
+    assert entries["a.txt"]["size"] == 2
+    for name in ("loop1", "loop2"):
+        assert entries[name]["broken"] is True
+        assert entries[name]["size"] is None
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads any directory")
+def test_unreadable_directory_still_errors(forced_files_client):
+    client, root = forced_files_client
+    locked = root / "locked"
+    locked.mkdir(parents=True)
+    (locked / "a.txt").write_text("hi")
+    locked.chmod(0)
+    try:
+        listing = client.get("/api/files", params={"path": str(locked)})
+    finally:
+        locked.chmod(0o755)
+    assert listing.status_code == 403
+    assert listing.json()["detail"] == "Directory is not readable"
