@@ -2649,6 +2649,10 @@ DEFAULT_CONFIG = {
         # free turn slots (max_inflight - active_turns); an unreadable
         # /health admits none (fail closed). false = off.
         "pool_relay_capacity": True,
+        # t_c754f664: `kanban create` / `edit --body` refuse a requires: line naming words the
+        # capability map does not define, and a ready card holding one wakes its home session
+        # once after 30 min (hermes_cli/kanban_requires_words.py). false = both off.
+        "requires_unknown_guard": True,
         # ── Fan-out brakes (2026-09-22 incident) ─────────────────────────
         # ~200 human-carded items became ~730 worked cards / ~$13K in two
         # days: dispatched workers created 310 child cards via kanban_create

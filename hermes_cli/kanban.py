@@ -983,6 +983,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
     studio = kanban_access_bound_pin.studio_refusal(args.body)
     if studio:
         return _err(f"kanban create: {studio}", 2)
+    from hermes_cli import kanban_requires_words as _krw
+    unknown_ok = (getattr(args, "requires_unknown_ok", None) or "").strip()
+    if unknown_ok and kb._process_is_gateway():  # operator flag: not from a gateway chat (Prism b882bd7e5b1c)
+        return _err("kanban create: --requires-unknown-ok is an operator CLI flag; run it from a terminal", 2)
+    unknown = _krw.refusal(args.body)
+    if unknown and not unknown_ok:
+        return _err(f"kanban create: {unknown}", 2)
     handoff, handoff_row = kanban_access_bound_pin.handoff_check(
         "create", None, getattr(args, "assignee", None), title=args.title)
     if handoff:
@@ -1111,6 +1118,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 i_mean_blocks=bool(getattr(args, "i_mean_blocks", False)),
             )
             kanban_access_bound_pin.bind_created(handoff_row, task_id)
+            # Only a card THIS call created holds the overridden body: an idempotent hit returns an older
+            # card whose body never had these words (Prism c460b998ad15).
+            if unknown and unknown_ok and conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'created' AND id > ?",
+                    (task_id, _event_mark)).fetchone():
+                _krw.record_override(conn, task_id, args.body, unknown_ok, verb="create",
+                                     actor=_profile_author())
             task = kb.get_task(conn, task_id)
             # Notice only when THIS call created the card and auto-added the
             # skill: an idempotent hit returns an older card whose created
@@ -3743,6 +3757,13 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             "kanban: nothing to edit (pass --title, --body, --result, --model, --clear-model, "
             "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
             "--skill, --clear-skills, --boomerang-wake or --no-boomerang-wake)", 2)
+    from hermes_cli import kanban_requires_words as _krw
+    unknown_ok = (getattr(args, "requires_unknown_ok", None) or "").strip()
+    if unknown_ok and kb._process_is_gateway():  # operator flag: not from a gateway chat (Prism b882bd7e5b1c)
+        return _err("kanban edit: --requires-unknown-ok is an operator CLI flag; run it from a terminal", 2)
+    unknown = _krw.refusal(body) if body is not None else None
+    if unknown and not unknown_ok:
+        return _err(f"kanban edit: {unknown}", 2)
 
     rc = 0
     with kbc.connect_closing() as conn:
@@ -3825,6 +3846,9 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             )
             if not ok:
                 return _err(f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)")
+            if unknown and unknown_ok:
+                _krw.record_override(conn, args.task_id, body, unknown_ok, verb="edit",
+                                     actor=_profile_author())
             print(f"Edited {args.task_id}")
     return rc
 

@@ -1678,7 +1678,8 @@ def _handle_create(args: dict, **kw) -> str:
     from hermes_cli import kanban_access_bound_pin as _pin
     body = args.get("body")
     body = body if isinstance(body, str) else None
-    for why in (_pin.refusal(body), _pin.studio_refusal(body)):
+    from hermes_cli import kanban_requires_words as _krw
+    for why in (_pin.refusal(body), _pin.studio_refusal(body), _krw.refusal(body)):
         _check(not why, f"kanban_create: {why}")
     from hermes_cli import kanban_worker_policy as _worker_policy
     # allow_flagship authority (operator label, not a dispatched worker) is
