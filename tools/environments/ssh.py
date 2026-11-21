@@ -167,16 +167,15 @@ def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
     f = _run_pidfile(token)
     name = f"{_RUN_MARK}{token}.pid"
     script = (
-        '_vr_runtime=$1; '
         f'''if [ -f "{f}" ]; then p=$(cat "{f}" 2>/dev/null); rm -f "{f}"; '''
-        f'''else p=$({{ {_enter_runtime_dir('_vr_runtime')}; }} && [ -f './{name}' ] && '''
+        f'''else p=$({{ {_enter_runtime_dir()}; }} && [ -f './{name}' ] && '''
         f'''{{ cat './{name}'; rm -f -- './{name}'; }}) 2>/dev/null; fi; '''
         "case \"$p\" in ''|*[!0-9]*) exit 0;; esac; "
         "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); [ -n \"$g\" ] || exit 0; "
         "[ \"$g\" = \"$p\" ] && t=\"-$g\" || t=\"$p\"; "
         f"for sig in {sigs}; do kill -s $sig -- \"$t\" 2>/dev/null || exit 0; echo {_KILLED_MARK}; "
         "[ $sig = TERM ] && sleep 1; done; exit 0")
-    return "sh -c " + shlex.quote(script) + ' sh "${XDG_RUNTIME_DIR:-}"'
+    return "sh -c " + shlex.quote(script)
 
 
 def _ensure_ssh_available() -> None:
@@ -478,8 +477,13 @@ class SSHEnvironment(BaseEnvironment):
         remote = ('_vr_runtime=$1; shift\n' + _run_preamble(token, "_vr_runtime")
                   + 'unset _vr_runtime\n' + self._guarded(_placed_kanban_exports()
                                                          + prepend_unset(cmd_string, unset_names)))
-        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + ["exec"] + (
-            bash_argv(shlex.quote(remote), login) + ["bash", '"${XDG_RUNTIME_DIR:-}"'])
+        # Read XDG in POSIX sh, not the user's login shell or Bash startup files.
+        # exec keeps the original SSH process group and the final argv is still the Bash script.
+        dispatch = 'exec bash "$@" bash "${XDG_RUNTIME_DIR:-}"'
+        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + [
+            "exec", "sh", "-c", shlex.quote(dispatch), "sh",
+            *bash_argv(shlex.quote(remote), login)[1:],
+        ]
         client_env = client_env_with(values)
         proc = _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
         proc._hermes_run_token = token

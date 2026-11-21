@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -187,8 +188,8 @@ class TestBuildSSHCommand:
         assert env._run_bash("echo ok") is proc
         token = proc._hermes_run_token
         assert token and len(token) == 32
-        assert captured["cmd"][-6:-3] == ["exec", "bash", "-c"]
-        remote = shlex.split(captured["cmd"][-3])[0]
+        assert captured["cmd"][-7:-4] == ["exec", "sh", "-c"]
+        remote = shlex.split(captured["cmd"][-1])[0]
         assert ssh_env._run_preamble(token, "_vr_runtime") in remote
         assert ssh_env._run_pidfile(token) in remote
 
@@ -280,7 +281,14 @@ def test_pidfile_location(location, monkeypatch, tmp_path, runtime_dir):
 
 
 @pytest.mark.parametrize("outer_runtime", [False, True], ids=["absent", "valid"])
-def test_runtime_dir_lookup_ignores_bash_startup_override(outer_runtime, monkeypatch, tmp_path, runtime_dir):
+@pytest.mark.parametrize("login_shell", ["sh", "fish"])
+def test_runtime_dir_lookup_ignores_bash_startup_override(
+    login_shell, outer_runtime, monkeypatch, tmp_path, runtime_dir,
+):
+    shell = shutil.which(login_shell)
+    if shell is None:
+        pytest.skip(f"requires {login_shell}")
+    shell_argv = [shell, "--no-config", "-c"] if login_shell == "fish" else [shell, "-c"]
     monkeypatch.setenv("HOME", str(tmp_path))
     alternate = runtime_dir / "from-bash"
     alternate.mkdir(mode=0o700)
@@ -294,10 +302,10 @@ def test_runtime_dir_lookup_ignores_bash_startup_override(outer_runtime, monkeyp
 
     def spawn(argv, stdin_data, **kwargs):
         command = " ".join(argv[argv.index("u@h") + 1:])
-        return _REAL_POPEN(["sh", "-c", command], start_new_session=True, stdin=subprocess.DEVNULL)
+        return _REAL_POPEN([*shell_argv, command], start_new_session=True, stdin=subprocess.DEVNULL)
 
     def kill_remote(command, timeout):
-        return subprocess.run(["sh", "-c", command], timeout=timeout,
+        return subprocess.run([*shell_argv, command], timeout=timeout,
                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
     monkeypatch.setattr(ssh_env, "_popen_bash", spawn)
@@ -311,6 +319,7 @@ def test_runtime_dir_lookup_ignores_bash_startup_override(outer_runtime, monkeyp
         deadline = time.monotonic() + 5
         while not any(p.exists() for p in (expected, alternate_pid)) and time.monotonic() < deadline:
             time.sleep(.01)
+        assert expected.is_file() and not alternate_pid.exists()
         assert env._remote_group_kill(token, grace=False)
         tree.wait(timeout=5)
         assert not any(p.exists() for p in (runtime_pid, alternate_pid, Path(_pidfile(token))))
