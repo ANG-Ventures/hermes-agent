@@ -990,11 +990,16 @@ def _active_pr_detail(board: str, item: dict) -> str:
     decides the recommendation; both commands are given (r19, t_f1af5dcd).
     """
     outcome = item.get("last_outcome")
-    land = _land_verb(item.get("pr"), item.get("task_id"))
+    # A PR the card only mentions gets no stamp verb: a stamp names this card,
+    # and for another card's PR it is refused or recorded against the wrong card.
+    owned = item.get("pr_owned") is True
+    land = _land_verb(item.get("pr"), item.get("task_id")) if owned else None
     unfinished = outcome not in _FINISHED_RUN_OUTCOMES or land is None
     lines = ["READY card held behind its open PR (active_pr >30 min)"]
     if item.get("pr"):
         lines.append(f"Holding PR: {item['pr']} · last run: `{outcome or 'none'}`")
+        if not owned:
+            lines.append(f"That PR is not this card's (the card only mentions it): {item['pr']}")
     if unfinished:
         lines.append(f"Wanted: **REQUEUE** (worker resumes on its PR): `{item['clear_verb']}`")
         if land:

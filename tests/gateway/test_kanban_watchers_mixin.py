@@ -586,7 +586,7 @@ def test_timed_out_cohort_page_does_not_starve_per_card_pages(tmp_path, monkeypa
     for tick in range(2):  # the failed cohort stays due; the active_pr page still goes out once
         sent.clear()
         notifier.observe(cohort + [held], send, now=10_000.0 + 60 * tick)
-        assert sent == ["prior_worker_still_alive", "active_pr"] if tick == 0 else ["prior_worker_still_alive"]
+        assert sent == (["prior_worker_still_alive", "active_pr"] if tick == 0 else ["prior_worker_still_alive"])
     assert any("|active_pr|pr=" in k for k in notifier._sent)
 
 
@@ -709,7 +709,7 @@ def test_legacy_entry_left_by_a_prior_migration_is_consumed(tmp_path):
 def test_active_pr_page_names_the_wanted_verb():
     from gateway.kanban_watchers import _active_pr_detail
     requeue = "hermes kanban --board default requeue t_x '<reason>'"
-    base = {"task_id": "t_x", "reason": "active_pr", "clear_verb": requeue,
+    base = {"task_id": "t_x", "reason": "active_pr", "clear_verb": requeue, "pr_owned": True,
             "pr": "https://github.com/ANG-Ventures/hermes-home/pull/1838"}
     timed_out = _active_pr_detail("default", {**base, "last_outcome": "timed_out"})
     assert f"Wanted: **REQUEUE** (worker resumes on its PR): `{requeue}`" in timed_out
@@ -831,6 +831,20 @@ def test_active_pr_hold_that_is_not_landable_pages_the_operator(tmp_path, monkey
     assert _send_guard_stuck_alert("default", _mergeable_hold(**over)) is True
     assert len(calls) == 1 and str(calls[0][1]).endswith("notify.py")
     assert "enqueue" not in calls[0]
+
+
+def test_active_pr_hold_on_a_mentioned_pr_prints_no_stamp_verb(tmp_path, monkeypatch):
+    """A PR the card only mentions (pr_owned False) gets no operator_approve verb:
+    the stamp would name THIS card. The page says the PR is not this card's."""
+    from gateway.kanban_watchers import _send_guard_stuck_alert
+
+    _root, calls = _land_rig(tmp_path, monkeypatch)
+    assert _send_guard_stuck_alert("default", _mergeable_hold(pr_owned=False)) is True
+    text = _page_text(calls[0])
+    assert "operator_approve" not in text and "fleet-merge" not in text
+    assert ("That PR is not this card's (the card only mentions it): "
+            "https://github.com/ANG-Ventures/prism-router/pull/281") in text
+    assert "Wanted: **REQUEUE**" in text
 
 
 def test_active_pr_page_is_once_per_card_and_pr(tmp_path, monkeypatch):
