@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import time
 import uuid
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -244,7 +245,6 @@ def runtime_dir(monkeypatch):
         pytest.skip("requires writable Linux tmpfs")
     with tempfile.TemporaryDirectory(prefix="hermes pidfiles '", dir="/dev/shm") as directory:
         monkeypatch.setenv("XDG_RUNTIME_DIR", directory)
-        from pathlib import Path
         yield Path(directory)
 
 

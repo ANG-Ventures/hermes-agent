@@ -113,7 +113,7 @@ def _enter_runtime_dir() -> str:
     Shell builtins check path/owner; one find checks both exact mode and filesystem type."""
     return ('case "${XDG_RUNTIME_DIR:-}" in /*) '
             'CDPATH= cd -P -- "$XDG_RUNTIME_DIR" && [ -O . ] && '
-            '[ "$(exec find . -maxdepth 0 -perm 0700 -fstype tmpfs -print)" = . ];; '
+            '[ "$(PATH=/usr/bin:/bin exec find . -maxdepth 0 -perm 0700 -fstype tmpfs -print)" = . ];; '
             '*) false;; esac')
 
 
