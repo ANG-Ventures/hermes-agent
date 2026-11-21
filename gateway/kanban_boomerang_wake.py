@@ -1180,8 +1180,8 @@ REVIEW_ALL_ANSWERED_RULE = (
     "HARD RULE: never write an APPROVE on a head that has an unanswered Prism key (step 2's round check "
     "comes first, and the head must still be {head}). If any step refuses or reads anything else, post ONE "
     "card comment naming the step and its output, run nothing after it, and return action `surface`. When "
-    "all three steps succeeded, return action `surface` with the summary `stamped at {head}; land_on_approve "
-    "lands it`."
+    "all three steps succeeded, return action `surface` with the summary `coverage recorded at {head} (a "
+    "refresh, which lands nothing); an operator APPROVE at {head} is still needed to land`."
 )
 
 
