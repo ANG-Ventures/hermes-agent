@@ -20,6 +20,7 @@ _SSH_PORT = int(os.getenv("TERMINAL_SSH_PORT", "22"))
 _SSH_KEY = os.getenv("TERMINAL_SSH_KEY", "")
 
 _has_ssh = bool(_SSH_HOST and _SSH_USER)
+_REAL_POPEN = subprocess.Popen  # TestBuildSSHCommand mocks subprocess.Popen/run module-wide
 
 requires_ssh = pytest.mark.skipif(
     not _has_ssh,
@@ -133,6 +134,47 @@ class TestBuildSSHCommand:
         captured = self._capture_run_bash(monkeypatch, SSHEnvironment(host="h", user="u"))
         assert not any(a.startswith("SendEnv=") for a in captured["cmd"])
         assert captured["env"] is None
+
+    def _run_remote_text_locally(self, captured, tmp_path):
+        """Run the remote ``bash -c`` text the way the pool host's shell would, with a bare env."""
+        remote = shlex.split(captured["cmd"][-1])[0]
+        with _REAL_POPEN(["bash", "-c", remote], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                         env={"HOME": str(tmp_path), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}) as proc:
+            return proc.communicate(timeout=20)[0].strip()
+
+    def test_placed_worker_shell_carries_task_and_host_workspace(self, monkeypatch, tmp_path):
+        """t_dad3fadc: a placed worker's remote shell had HERMES_KANBAN_TASK/WORKSPACE empty on every
+        pool host (kanbanw and owner login alike): ssh carries no env. The task id and the HOST
+        workspace (the placement's TERMINAL_CWD, not the Studio path) ride the command, with an owner
+        marker no remote pid can equal, so a remote ``hermes`` never takes the grant."""
+        monkeypatch.setenv("KANBAN_WORKER_PLACEMENT", json.dumps(
+            {"host": "ace-media", "env": {"TERMINAL_CWD": "/Volumes/fleet-scratch/workspaces/default/t_abc"}}))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/Users/x/.hermes/kanban/workspaces/t_abc")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/Users/x/.hermes/kanban.db")
+        env = SSHEnvironment(host="h", user="u")
+        captured = self._capture_run_bash(
+            monkeypatch, env,
+            'echo "$HERMES_KANBAN_TASK|$HERMES_KANBAN_WORKSPACE|$HERMES_KANBAN_OWNER_PID|${HERMES_KANBAN_DB-unset}"')
+        task, ws, owner, db = self._run_remote_text_locally(captured, tmp_path).split("|")
+        assert (task, ws, db) == ("t_abc", "/Volumes/fleet-scratch/workspaces/default/t_abc", "unset")
+        with pytest.raises(ValueError):
+            int(owner)  # owns_kanban_worker_authority() refuses a non-pid marker
+        assert owner
+
+    def test_unplaced_or_delegated_shell_gets_no_kanban_identity(self, monkeypatch, tmp_path):
+        """No placement (a plain ssh backend) or a delegate_task child: nothing is exported."""
+        from agent import delegation_context
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+        probe = 'echo "[${HERMES_KANBAN_TASK-}]"'
+        monkeypatch.delenv("KANBAN_WORKER_PLACEMENT", raising=False)
+        captured = self._capture_run_bash(monkeypatch, SSHEnvironment(host="h", user="u"), probe)
+        assert self._run_remote_text_locally(captured, tmp_path) == "[]"
+        monkeypatch.setenv("KANBAN_WORKER_PLACEMENT", json.dumps({"host": "h", "env": {"TERMINAL_CWD": "/w"}}))
+        monkeypatch.setattr(delegation_context, "is_delegated_child_process_context", lambda: True)
+        captured = self._capture_run_bash(monkeypatch, SSHEnvironment(host="h", user="u"), probe)
+        assert self._run_remote_text_locally(captured, tmp_path) == "[]"
 
     def test_run_bash_tags_remote_command_with_its_run_token(self, monkeypatch):
         """t_44017fbc: the remote ``bash -c`` records its pid where the kill path can find it."""

@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import shlex
@@ -41,6 +42,30 @@ def _placed_lease_env_names() -> tuple[str, ...]:
         return ()
     from hermes_cli.kanban_browser_lease import LEASE_ENV_NAMES
     return tuple(n for n in LEASE_ENV_NAMES if os.environ.get(n))
+
+
+def _placed_kanban_exports() -> str:
+    """``export`` line giving a dispatcher-placed worker's remote shell its card identity (t_dad3fadc).
+    ssh carries no env and no host AcceptEnv's these names, so on every pool host (kanbanw and owner
+    login alike) ``$HERMES_KANBAN_TASK``/``$HERMES_KANBAN_WORKSPACE`` were empty and host scripts that
+    key on them (test-gate's card stamp and operator escape, prism-change's worker refusal) saw no card.
+    WORKSPACE is the HOST path (the placement's TERMINAL_CWD). The owner marker is not a pid, so a
+    ``hermes`` started on the host never resolves itself as the worker (``owns_kanban_worker_authority``
+    refuses a non-pid). Not secrets: a card id and a path. None for a delegate_task child."""
+    raw, task = os.environ.get("KANBAN_WORKER_PLACEMENT"), os.environ.get("HERMES_KANBAN_TASK")
+    if not raw or not task:
+        return ""
+    try:
+        from agent.delegation_context import KANBAN_OWNER_PID_ENV, is_delegated_child_process_context
+        if is_delegated_child_process_context():
+            return ""
+        workspace = (json.loads(raw).get("env") or {}).get("TERMINAL_CWD") or ""
+    except Exception:
+        return ""
+    values = {"HERMES_KANBAN_TASK": task, KANBAN_OWNER_PID_ENV: f"placed:{os.getpid()}"}
+    if workspace:
+        values["HERMES_KANBAN_WORKSPACE"] = workspace
+    return "export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(values.items())) + "\n"
 
 
 # exits 97 unless the forced command fleet-worker-shell set FLEET_WORKER_SESSION=1 (t_3911e84c);
@@ -421,7 +446,8 @@ class SSHEnvironment(BaseEnvironment):
         values, unset_names = resolve_passthrough_env(explicit_forward=_placed_lease_env_names(),
                                                       hermes_env_loader=_load_hermes_env_vars)
         token = uuid.uuid4().hex
-        remote = _run_preamble(token) + self._guarded(prepend_unset(cmd_string, unset_names))
+        remote = _run_preamble(token) + self._guarded(_placed_kanban_exports()
+                                                      + prepend_unset(cmd_string, unset_names))
         cmd = self._build_ssh_command(send_env=values, log_to_file=True) + bash_argv(shlex.quote(remote), login)
         client_env = client_env_with(values)
         proc = _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
