@@ -8,7 +8,6 @@ the adapter the wake hands it to. PR health is the one stub (no GitHub).
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -1067,62 +1066,45 @@ def test_p1r2_state_write_is_fsynced(env, monkeypatch):
     assert ow.WakeState(path).cursors == {"default": 10}
 
 
-def test_windows_owner_wake_checkpoint_uses_write_through_replace(tmp_path, monkeypatch):
-    def move(src, dst, flags):
-        assert flags == 0x9  # replace existing + write through
-        ow.os.replace(src, dst)
-        return 1
-
-    replace = Mock(return_value=0)
-    dll = Mock(return_value=SimpleNamespace(MoveFileExW=replace))
-    win_error = Mock(return_value=OSError("sharing violation"))
-    monkeypatch.setattr(ctypes, "WinDLL", dll, raising=False)
-    monkeypatch.setattr(ctypes, "get_last_error", lambda: 32, raising=False)
-    monkeypatch.setattr(ctypes, "WinError", win_error, raising=False)
-    monkeypatch.setattr(ow, "_WINDOWS", True)
+def test_owner_wake_retries_directory_sync_failure(tmp_path, monkeypatch):
+    if ow._WINDOWS:
+        pytest.skip("POSIX directory fsync")
     state = ow.WakeState(tmp_path / ow.STATE_FILENAME)
-    assert not state.write_owner_wake_state(1.0)
-    dll.assert_called_once_with("kernel32", use_last_error=True)
-    win_error.assert_called_once_with(32)
-    assert not state.path.exists() and not list(tmp_path.glob(".owner-wake-*"))
-    replace.side_effect = move
-    assert state.write_owner_wake_state(2.0)
-    assert state.write_owner_wake_state(3.0)
-    assert state.path.exists() and replace.call_count == 2
+    replace = Mock(wraps=ow.os.replace)
+    fsync = ow.os.fsync
+    sync = Mock(side_effect=[None, OSError("directory sync failed"), None, None])
+
+    def sync_fd(fd):
+        sync(fd)
+        fsync(fd)
+
+    monkeypatch.setattr(ow.os, "replace", replace)
+    monkeypatch.setattr(ow.os, "fsync", sync_fd)
+    state.write_owner_wake_state(1.0)
+    state.write_owner_wake_state(2.0)
+    state.write_owner_wake_state(3.0)
+    assert state.path.exists()
+    assert replace.call_count == 2 and sync.call_count == 4
 
 
-@pytest.mark.skipif(ow._WINDOWS, reason="injects a POSIX directory fsync failure")
-def test_owner_wake_waits_for_durable_pending_state(env, monkeypatch):
+def test_owner_wake_delivers_during_state_write_failure(env, monkeypatch, caplog):
     tid = _card(env)
     _blocked(tid)
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
     runner = env["runner"]
-    now = 1_000.0
     state = _held_state(env, 0)
-    path = state.path
-    real_fsync = ow.os.fsync
-    real_deliver = ow.deliver_turn
-    calls = 0
+    with monkeypatch.context() as mp:
+        mp.setattr(ow.os, "replace", Mock(side_effect=OSError("checkpoint unavailable")))
+        assert asyncio.run(ow.tick(runner, now=1000, state=state, use_default_pr_health=False)) == 1
+    assert tid in _one_turn(env, env["adapter"].handled)
+    assert "checkpoint unavailable" in caplog.text
+    assert not state.path.exists() and not state.pending and state.last_wake
+    assert not list(state.path.parent.glob(".owner-wake-*"))
 
-    def fail_directory_sync(fd):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise OSError("directory sync failed after rename")
-        real_fsync(fd)
-
-    async def deliver(*args):
-        assert calls == 4, "retry must fsync the file and directory before delivering"
-        assert ow.WakeState(path).pending, "restart can recover the queued event"
-        return await real_deliver(*args)
-
-    monkeypatch.setattr(ow.os, "fsync", fail_directory_sync)
-    monkeypatch.setattr(ow, "deliver_turn", deliver)
-    assert asyncio.run(ow.tick(runner, now=now, state=state, use_default_pr_health=False)) == 0
-    assert env["adapter"].handled == [] and state.pending and path.exists()
-    assert asyncio.run(ow.tick(runner, now=now + 5, state=state, use_default_pr_health=False)) == 1
-    restored = ow.WakeState(path)
-    assert not restored.pending and restored.last_wake
+    assert asyncio.run(ow.tick(runner, now=1005, state=state, use_default_pr_health=False)) == 0
+    restored = ow.WakeState(state.path)
+    assert not restored.pending and restored.last_wake == state.last_wake
+    assert len(env["adapter"].handled) == 1
 
 
 def test_owner_wake_retries_rejected_turn_after_restart(env, monkeypatch):

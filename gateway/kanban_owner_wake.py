@@ -653,13 +653,13 @@ class WakeState:
                            "last_wake": self.last_wake, "red_seen": self.red_seen},
                           sort_keys=True)
 
-    def write_owner_wake_state(self, now: float) -> bool:
-        """Return whether state is durable. Blocking: call via ``asyncio.to_thread``."""
+    def write_owner_wake_state(self, now: float) -> None:
+        """Checkpoint changed state. Blocking: call via ``asyncio.to_thread``."""
         self.last_wake = {k: v for k, v in self.last_wake.items() if now - v < COALESCE_SECONDS * 6}
         _ns.note_red_seen(self.red_seen, (), now)
         snapshot = self._serialize()
         if snapshot == self._persisted:
-            return True
+            return
         # A failed write (including a directory fsync after rename) cannot seed a cache hit.
         self._persisted = None
         tmp = None
@@ -670,21 +670,10 @@ class WakeState:
                 fh.write(snapshot)
                 fh.flush()
                 os.fsync(fh.fileno())
-            if _WINDOWS:
-                # Native Windows cannot fsync a directory opened with os.open.
-                # Use the Win32 write-through rename without optional dependencies.
-                import ctypes
-                from ctypes import wintypes
-
-                move_file_ex = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
-                move_file_ex.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
-                move_file_ex.restype = wintypes.BOOL
-                if not move_file_ex(tmp, str(self.path), 0x1 | 0x8):  # REPLACE_EXISTING | WRITE_THROUGH
-                    raise ctypes.WinError(ctypes.get_last_error())
-                tmp = None
-            else:
-                os.replace(tmp, self.path)
-                tmp = None
+            os.replace(tmp, self.path)
+            tmp = None
+            # Native Windows cannot open directories with os.open for fsync.
+            if not _WINDOWS:
                 dfd = os.open(str(self.path.parent), os.O_RDONLY)
                 try:
                     os.fsync(dfd)
@@ -695,9 +684,8 @@ class WakeState:
             if tmp is not None:
                 with suppress(OSError):
                     os.unlink(tmp)
-            return False
+            return
         self._persisted = snapshot
-        return True
 
 
 def state_path() -> Path:
@@ -1227,10 +1215,10 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     if pr_health is None and use_default_pr_health:
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
-    # Commit the cursor and queued inputs before a boomerang claim or owner turn
-    # can act on them. Keep the pending items for retry if durability failed.
-    if state.pending and not await asyncio.to_thread(state.write_owner_wake_state, now):
-        return 0
+    # Checkpoint queued inputs before dispatch when storage is available, but
+    # don't withhold an owner wake if the checkpoint fails.
+    if state.pending:
+        await asyncio.to_thread(state.write_owner_wake_state, now)
 
     from gateway import kanban_boomerang_wake as _ah
 
