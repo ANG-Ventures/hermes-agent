@@ -149,42 +149,47 @@ def _status(tid):
         return kb.get_task(conn, tid).status
 
 
-def test_backstop_wakes_once_per_cause_and_not_again(board):
+def test_backstop_wakes_once_for_an_unknown_word_and_not_again(board):
     bad = _card("x\n" + PROSE)            # a card that got there anyway (stored before the refusal)
-    plain = _card("plain work")
-    fresh = _card("plain work too")
-    op = None
+    young = _card("x\nrequires: bambu")
+    plain = _card("plain work")           # merely unclaimed: ordinary queueing, never woken
     with kbc.connect_closing() as conn:
-        op = kb.create_task(conn, title="op", assignee="apollo", body="x", session_id="none",
-                            session_explicit=True)
-    assert {_status(t) for t in (bad, plain, fresh, op)} == {"ready"}
+        op = kb.create_task(conn, title="op", assignee="apollo", body="x\nrequires: bambu",
+                            session_id="none", session_explicit=True)
+    assert {_status(t) for t in (bad, young, plain, op)} == {"ready"}
     for t in (bad, plain, op):
         _age(t, 31 * 60)
-    _age(fresh, 10 * 60)
+    _age(young, 10 * 60)
     with kbc.connect_closing() as conn:
-        woke = krw.wake_stranded(conn)
-        assert sorted(woke) == sorted([(bad, krw.UNKNOWN_CAUSE), (plain, krw.STRANDED_CAUSE)])
+        assert krw.wake_stranded(conn) == [(bad, krw.UNKNOWN_CAUSE)]
         assert krw.wake_stranded(conn) == []                 # once, not again
         later = int(__import__("time").time()) + 7200      # only the young card has crossed 30 min since
-        assert krw.wake_stranded(conn, now=later) == [(fresh, krw.STRANDED_CAUSE)]
+        assert krw.wake_stranded(conn, now=later) == [(young, krw.UNKNOWN_CAUSE)]
         assert krw.wake_stranded(conn, now=later) == []
     [w] = _events(bad, krw.WAKE_EVENT)
-    assert w["source"] == krw.WAKE_SOURCE and "host=studio" in w["text"]
-    assert len(_events(plain, krw.WAKE_EVENT)) == 1
-    assert len(_events(fresh, krw.WAKE_EVENT)) == 1
+    assert w["source"] == krw.WAKE_SOURCE and w["cause"] == krw.UNKNOWN_CAUSE and "host=studio" in w["text"]
+    assert len(_events(young, krw.WAKE_EVENT)) == 1
+    assert _events(plain, krw.WAKE_EVENT) == []                 # unclaimed alone: no wake
     assert _events(op, krw.WAKE_EVENT) == []                    # operator lane: never
 
 
-def test_backstop_skips_a_live_rate_limit_cooldown(board):
-    import time
-    tid = _card("plain")
+def test_switch_off_stores_the_line_and_writes_no_wake(board):
+    """``kanban.requires_unknown_guard: false`` turns off both halves."""
+    (board / "config.yaml").write_text(json.dumps({"kanban": {krw.SWITCH: False}}), encoding="utf-8")
+    assert krw.enabled() is False
+    args = _parse("create", "print plate", "--body", "slice it\n" + PROSE, "--unhomed", "--assignee", "peer")
+    assert kc._cmd_create(args) == 0
+    [tid] = _ids()
+    with kbc.connect_closing() as conn:
+        assert PROSE in kb.get_task(conn, tid).body
+    assert _events(tid, krw.OVERRIDE_EVENT) == []
     _age(tid, 31 * 60)
     with kbc.connect_closing() as conn:
-        with kb.write_txn(conn):
-            kb._append_event(conn, tid, "respawn_guarded",
-                             {"reason": "rate_limit_cooldown", "eligible_at": int(time.time()) + 900})
         assert krw.wake_stranded(conn) == []
-        assert krw.wake_stranded(conn, now=int(time.time()) + 1000) == [(tid, krw.STRANDED_CAUSE)]
+        kb.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)
+    assert _events(tid, krw.WAKE_EVENT) == []
+    (board / "config.yaml").write_text(json.dumps({"kanban": {krw.SWITCH: "nope"}}), encoding="utf-8")
+    assert krw.enabled() is True                               # non-bool -> default ON
 
 
 def test_saturated_dispatch_tick_still_runs_the_backstop(board):

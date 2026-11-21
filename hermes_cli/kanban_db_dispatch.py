@@ -7314,8 +7314,8 @@ def _dispatch_once_locked(
         # Scheduled cards nothing will ever wake (no timed wake, parked > 24h).
         result.unwoken_scheduled = _kb.find_unwoken_scheduled(conn)
     if not dry_run:
-        # t_c754f664: one home-session wake per stranded ready card per cause. Before the budget/cap gates
-        # below, which return early on a saturated tick (Prism bbaa4c47da9a).
+        # t_c754f664: one home-session wake per ready card with an unknown capability word. Before the
+        # budget/cap gates below, which return early on a saturated tick (Prism bbaa4c47da9a).
         try:
             from hermes_cli.kanban_requires_words import wake_stranded
             wake_stranded(conn, now=_tick_now)

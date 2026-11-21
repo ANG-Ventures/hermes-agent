@@ -11,11 +11,14 @@ card on the Mac Studio and it sat ``ready`` 4 h 5 min with no wake.
    invalid map refuses nothing (F11). The CLI override ``--requires-unknown-ok <reason>`` lets it
    through and records :data:`OVERRIDE_EVENT` on the card.
 2. :func:`wake_stranded` -- the dispatcher backstop for a card that still gets there (a worker edited
-   it, the map changed under it): a ``ready`` card past :data:`STRANDED_AFTER_S` writes ONE
-   ``mechanical_wake`` per cause per ready episode, the event the gateway owner-wake turns into a
-   turn in the card's home session (``kanban_owner_wake.SCAN_KINDS``). Causes: ``unknown_capability``
-   (the line above) and ``stranded_in_ready`` (the ``kanban diagnostics`` rule of that name: a worker
-   card nothing claimed).
+   it, the map changed under it): a ``ready`` card whose capability line holds an unknown word, past
+   :data:`STRANDED_AFTER_S`, writes ONE ``mechanical_wake`` per ready episode, the event the gateway
+   owner-wake turns into a turn in the card's home session (``kanban_owner_wake.SCAN_KINDS``). A card
+   that is merely unclaimed is NOT woken: ordinary queueing (a saturated host, a cap, a pause) looks
+   the same and clears itself.
+
+Switch: ``kanban.requires_unknown_guard`` in config.yaml (default True; non-bool -> default, the
+``kanban.pool_box_health`` convention). False turns off both the refusal and the wake.
 """
 from __future__ import annotations
 
@@ -29,7 +32,17 @@ WAKE_EVENT = "mechanical_wake"
 WAKE_SOURCE = "kanban-ready-stranded"
 STRANDED_AFTER_S = 30 * 60
 UNKNOWN_CAUSE = "unknown_capability"
-STRANDED_CAUSE = "stranded_in_ready"
+SWITCH = "requires_unknown_guard"
+
+
+def enabled() -> bool:
+    """``kanban.requires_unknown_guard`` (default True): the refusal and the wake. Non-bool -> default."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        value = (load_config_readonly().get("kanban") or {}).get(SWITCH, True)
+    except Exception:
+        return True
+    return value if isinstance(value, bool) else True
 
 
 def _fleet_dir() -> Path:
@@ -58,7 +71,7 @@ def unknown_words(body: Optional[str], cmap) -> List[str]:
 
 def refusal(body: Optional[str], *, fleet_dir: Optional[Path] = None) -> Optional[str]:
     """The refusal text for ``body``, or None (no unknown word, or no valid map)."""
-    if not body:
+    if not body or not enabled():
         return None
     cmap = _load(fleet_dir)
     bad = unknown_words(body, cmap)
@@ -115,36 +128,25 @@ def _woken(conn, task_id: str, cause: str, since: int) -> bool:
     return False
 
 
-def _cooling(conn, task_id: str, since: int, now: int) -> bool:
-    """A live rate-limit cooldown names its own end: not stranded (a quota wall would wake every card)."""
-    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded' "
-                       "AND created_at >= ? ORDER BY id DESC LIMIT 1", (task_id, since)).fetchone()
-    try:
-        p = json.loads(row[0] or "{}") if row else {}
-    except (TypeError, ValueError):
-        return False
-    return (isinstance(p, dict) and p.get("reason") == "rate_limit_cooldown"
-            and isinstance(p.get("eligible_at"), (int, float)) and p["eligible_at"] > now)
-
-
-def wake_text(task_id: str, cause: str, age_s: int, words: List[str]) -> str:
-    mins = age_s // 60
-    if cause == UNKNOWN_CAUSE:
-        return (f"{task_id} has been ready {mins} min and no host can take it: its requires: line names "
-                f"words the capability map does not define ({', '.join(words)}). Rewrite the line as "
-                "`requires: <capability> (note)` or a separate `host: <pool host>` line "
-                f"(`hermes kanban edit {task_id} --body ...`).")
-    return (f"{task_id} has been ready {mins} min and no worker has claimed it. Check its assignee and "
-            f"placement (`hermes kanban placement {task_id}`, `hermes kanban diagnostics`).")
+def wake_text(task_id: str, age_s: int, words: List[str]) -> str:
+    return (f"{task_id} has been ready {age_s // 60} min and no host can take it: its requires: line names "
+            f"words the capability map does not define ({', '.join(words)}). Rewrite the line as "
+            "`requires: <capability> (note)` or a separate `host: <pool host>` line "
+            f"(`hermes kanban edit {task_id} --body ...`).")
 
 
 def wake_stranded(conn, *, now: Optional[int] = None, fleet_dir: Optional[Path] = None,
                   after_s: int = STRANDED_AFTER_S) -> list:
-    """ONE ``mechanical_wake`` per (card, cause, ready episode) for ready cards older than ``after_s``.
-    Operator and human-lane cards and ``no_worker`` cards are skipped. Returns ``[(task_id, cause)]``."""
+    """ONE ``mechanical_wake`` per (card, ready episode) for a ready card older than ``after_s`` whose
+    capability line holds an unknown word. Operator, human-lane and ``no_worker`` cards are skipped.
+    Returns ``[(task_id, cause)]``; ``[]`` with the switch off."""
+    if not enabled():
+        return []
     from hermes_cli import kanban_db as kb
     now = int(time.time()) if now is None else int(now)
     cmap = _load(fleet_dir)
+    if cmap is None:
+        return []
     woke = []
     for row in conn.execute(
             "SELECT id, assignee, body, created_at FROM tasks WHERE status = 'ready' "
@@ -157,15 +159,13 @@ def wake_stranded(conn, *, now: Optional[int] = None, fleet_dir: Optional[Path] 
             if not since or now - since < after_s:
                 continue
             words = unknown_words(row["body"], cmap)
-            cause = UNKNOWN_CAUSE if words else STRANDED_CAUSE
-            if _woken(conn, row["id"], cause, since):
-                continue
-            if cause == STRANDED_CAUSE and _cooling(conn, row["id"], since, now):
+            cause = UNKNOWN_CAUSE
+            if not words or _woken(conn, row["id"], cause, since):
                 continue
             with kb.write_txn(conn):
                 kb._append_event(conn, row["id"], WAKE_EVENT, {
                     "source": WAKE_SOURCE, "cause": cause, "ready_since": since,
-                    "text": wake_text(row["id"], cause, now - since, words)})
+                    "text": wake_text(row["id"], now - since, words)})
             woke.append((row["id"], cause))
         except Exception as exc:  # one bad card never stops the tick
             kb._log.warning("kanban ready-stranded wake on %s failed: %s", row["id"], exc)
