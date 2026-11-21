@@ -119,7 +119,7 @@ def _reader_tag() -> str:
     One text in hermes-home scripts/lib and the hermes-agent copies (t_bab23582)."""
     import sys
 
-    def ident(argv):
+    def ident(argv, base):
         argv = [str(a) for a in argv if a]
         if not argv:
             return "-"
@@ -133,7 +133,7 @@ def _reader_tag() -> str:
                     out += ["-m", argv[i + 1]]
                 break
             try:
-                script = not a.startswith("-") and os.path.isfile(a)
+                script = not a.startswith("-") and os.path.isfile(os.path.join(base, a))
             except Exception:  # noqa: BLE001 -- one unreadable word must not drop the whole tag
                 script = False
             if script:
@@ -147,15 +147,19 @@ def _reader_tag() -> str:
                 parent = [p.decode("utf-8", "replace") for p in fh.read().split(b"\0")]
         except OSError:   # macOS: no /proc
             import subprocess
-            parent = subprocess.run(["ps", "-o", "command=", "-p", str(ppid)], capture_output=True, text=True,
-                                    timeout=2).stdout.split()
+            parent = subprocess.run(["ps", "-o", "command=", "-p", str(ppid)], capture_output=True, timeout=2,
+                                    text=True, encoding="utf-8", errors="replace").stdout.split()
         try:
             cwd = os.getcwd()
         except OSError:
             cwd = ""
         own = getattr(sys, "orig_argv", None) or [sys.executable] + list(sys.argv)
-        cwd = "".join("+" if c.isspace() else c for c in cwd)[:160] or "-"
-        return f" ppid={ppid} argv={ident(own)} parent={ident(parent)} cwd={cwd}"
+        try:   # a parent's relative script path resolves against the PARENT's cwd
+            pcwd = os.readlink(f"/proc/{ppid}/cwd")
+        except OSError:   # macOS, or not ours to read
+            pcwd = cwd
+        tag = f" ppid={ppid} argv={ident(own, cwd)} parent={ident(parent, pcwd)} cwd="
+        return tag + ("".join("+" if c.isspace() else c for c in cwd)[:160] or "-")
     except Exception:  # noqa: BLE001 -- a counter must never break a reader
         return ""
 
