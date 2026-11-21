@@ -19131,7 +19131,7 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
     """
     key = (repo.lower(), int(number))
     base_fields = "state,mergedAt,headRefName"
-    for fields in (f"{base_fields},mergeStateStatus,statusCheckRollup", base_fields):
+    for fields in (f"{base_fields},mergeStateStatus,statusCheckRollup,labels", base_fields):
         try:
             proc = subprocess.run(
                 ["gh", "pr", "view", str(number), "-R", repo, "--json", fields],
@@ -19166,6 +19166,7 @@ def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
         _PR_MERGE_HEALTH_CACHE[key] = {
             "merge_state": str(payload.get("mergeStateStatus") or "").upper() or None,
             "ci_red": _pr_rollup_is_red(payload.get("statusCheckRollup")),
+            "hold_label": _pr_has_hold_label(payload.get("labels")),
         }
     while len(_PR_MERGE_HEALTH_CACHE) > _PR_HEAD_REF_CACHE_LIMIT:
         _PR_MERGE_HEALTH_CACHE.pop(next(iter(_PR_MERGE_HEALTH_CACHE)))
@@ -19190,6 +19191,14 @@ _PR_RED_CHECK_VALUES = frozenset({
 
 # States in which the PR can land without its worker.
 _PR_MERGEABLE_STATES = frozenset({"CLEAN", "HAS_HOOKS", "BLOCKED"})
+
+
+def _pr_has_hold_label(labels) -> bool:
+    """True when the PR carries the ``hold`` label: no closer lands it, the operator decides (t_4cface27)."""
+    if not isinstance(labels, list):
+        return False
+    return any(isinstance(item, dict) and str(item.get("name") or "").strip().lower() == "hold"
+               for item in labels)
 
 
 def _pr_rollup_is_red(rollup) -> bool:
@@ -21582,6 +21591,9 @@ def _reassign_stale_pr_owners(
 # ``hold`` of an active_pr decline whose OPEN own-PR is mergeable. The gateway
 # watcher enqueues that PR on the land queue instead of paging (t_5a9deed5).
 RESPAWN_GUARD_HOLD_MERGEABLE = "PR mergeable, closer will land it"
+# ``hold`` of an active_pr decline whose own PR carries the ``hold`` label: no closer lands it, so the card waits
+# on the operator. kanban_held_pr_wake wakes the card's home session once (t_4cface27).
+RESPAWN_GUARD_HOLD_LABELLED = "PR carries the hold label, the operator decides"
 
 # A READY+assigned card continuously deferred as ``respawn_guarded:active_pr``
 # for this long is STUCK, not cooling down: nothing automatic will clear it.
