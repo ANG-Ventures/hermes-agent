@@ -136,6 +136,18 @@ def test_streak_restarts_after_requeue(kanban_home):
         assert khpw.notify(conn, detail, now=now - 300 + 31 * 60) == [tid]
 
 
+def test_time_before_hold_label_does_not_count(kanban_home):
+    """Prism a86dc01b30e6: 25 min mergeable then the label goes on must not wake 5 min later."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="alice")
+        _guarded_at(conn, tid, now - 25 * 60, kb.RESPAWN_GUARD_HOLD_MERGEABLE)
+        _guarded_at(conn, tid, now - 5 * 60, kb.RESPAWN_GUARD_HOLD_LABELLED)
+        detail = {tid: {"pr": PR, "hold": kb.RESPAWN_GUARD_HOLD_LABELLED}}
+        assert khpw.notify(conn, detail, now=now + 10 * 60) == []  # 35 min guarded, only 15 min labelled
+        assert khpw.notify(conn, detail, now=now - 5 * 60 + 31 * 60) == [tid]
+
+
 @pytest.mark.parametrize("value", [False, "off"])
 def test_switch_off_is_silent(kanban_home, value):
     now = int(time.time())

@@ -49,7 +49,8 @@ def _held_since(conn, task_id: str, pr: str) -> Optional[int]:
     """Start of the current continuous active_pr streak on ``pr``, or None.
 
     The streak restarts at the last event that can change the guard's answer (same reset set as
-    ``kanban_db.respawn_guard_stuck_tasks``) or at a guard decline for another reason or another PR."""
+    ``kanban_db.respawn_guard_stuck_tasks``) or at a guard decline for another reason, another PR, or
+    without the hold label (time spent waiting on a mergeable PR before the label went on does not count)."""
     from hermes_cli import kanban_db as _kb
     resets = _kb._RESPAWN_GUARD_STUCK_RESET_KINDS
     first = None
@@ -62,7 +63,8 @@ def _held_since(conn, task_id: str, pr: str) -> Optional[int]:
             p = json.loads(raw or "{}")
         except (TypeError, ValueError):
             p = {}
-        if not isinstance(p, dict) or p.get("reason") != "active_pr" or p.get("pr") != pr:
+        if (not isinstance(p, dict) or p.get("reason") != "active_pr" or p.get("pr") != pr
+                or p.get("hold") != _kb.RESPAWN_GUARD_HOLD_LABELLED):
             break
         first = int(created)
     return first
