@@ -359,6 +359,8 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         self._http_rejection: dict = {}
         # params of the in-flight tools/call the server answered HTTP 404 for its session id (never ran).
         self._tool_call_session_rejected: Optional[dict] = None
+        # Session on which a tools/call ended with no reply: a 404 there is never resent (see the handler).
+        self._resend_blocked_session = None
         # True from park until proven healthy again; logs the revival once.
         self._was_parked: bool = False
         # Why the server is parked (the revival_reason handed to _park), None once healthy again.

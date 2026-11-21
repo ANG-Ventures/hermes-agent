@@ -821,3 +821,30 @@ def test_late_404_for_a_timed_out_call_does_not_license_resending_an_identical_c
         assert parsed.get("outcome_uncertain") is True, parsed
     finally:
         _cleanup("srv")
+
+
+def test_an_error_reply_does_not_block_a_later_404_resend(monkeypatch, tmp_path):
+    """A call that ended WITH a JSON-RPC error reply leaves no POST pending, so it must not block the resend of
+    a later call the server refuses with 404. Without this, "block on every failure" passes the whole file and
+    the fix goes inert after the first failed tool call on a session."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from mcp.shared.exceptions import MCPError
+    from tools.mcp_tool_handlers import _make_tool_handler
+    ran = {"n": 0}
+
+    def _behaviour(n, server, tool, args):
+        if n == 1:
+            raise MCPError(-32602, "Invalid params: minutes must be positive")  # a reply: nothing is pending
+        if n == 2:
+            _refuse_with_404(server, tool, args)  # the server restarted: refused, nothing ran
+        ran["n"] += 1
+        return _ok_result()
+
+    _server, _flag, calls = _install_write_server("srv", _behaviour)
+    try:
+        handler = _make_tool_handler("srv", "set_timer", 10.0)
+        assert "result" not in json.loads(handler({"m": 0}))
+        assert json.loads(handler({"m": 5})).get("result") == "fresh data"
+        assert calls["n"] == 3 and ran["n"] == 1
+    finally:
+        _cleanup("srv")
