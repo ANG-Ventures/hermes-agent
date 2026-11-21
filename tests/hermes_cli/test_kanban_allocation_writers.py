@@ -127,4 +127,4 @@ def test_allocation_verb_and_deprecated_placement_alias(home, capsys):
     assert old.out == new.out  # same output under either verb
     assert old.err.count("\n") == 1 and "deprecated, use `kanban allocation`" in old.err
     (line,) = log.read_text(encoding="utf-8-sig").splitlines()
-    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ cli:kanban placement pid=\d+", line), line
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ cli:kanban placement pid=\d+ ppid=\d+ argv=\S+ parent=\S+ cwd=\S+", line), line
