@@ -198,3 +198,11 @@ def test_tick_reroutes_a_keychain_block_with_the_supported_word(kanban_home):
         assert res.placement_rerouted == [(tid, "studio")]
         words = khc.declared_words(_body(conn, tid))
         assert words == ["keychain"]
+
+
+def test_hint_does_not_match_inside_a_hyphenated_capability():
+    # Prism ff96bb11f1f1: "browser" inside "browser-identity" is that capability, not browser-session.
+    both = frozenset({"browser-identity", "browser-session"})
+    assert kpb.studio_requires_word("Needs browser-identity", both, strict=True) == "browser-identity"
+    assert kpb.supported_studio_words("Needs browser-identity", both) == ("browser-identity",)
+    assert kpb.studio_requires_word("open it in a browser", both, strict=True) == "browser-session"

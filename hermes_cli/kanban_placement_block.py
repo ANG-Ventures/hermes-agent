@@ -191,15 +191,28 @@ _REQUIRES_HEAD_RE = re.compile(r"^([ \t]*requires:[ \t]*)", re.IGNORECASE | re.M
 
 
 def supported_studio_words(reason: str, studio_reasons: Optional[frozenset]) -> Tuple[str, ...]:
-    """The ``requires:`` words the block reason itself supports (t_9392860c): a :data:`_REQUIRES_HINTS` word whose
-    wording the reason uses, then a word the reason names literally, each only if ``studio_reasons`` lists it.
+    """The ``requires:`` words the block reason itself supports (t_9392860c): a word the reason names literally,
+    then a :data:`_REQUIRES_HINTS` word whose wording the reason uses, each only if ``studio_reasons`` lists it.
     ``studio_reasons`` None (no map this tick): the hint words alone, unchecked. Never a word the reason lacks."""
     text = reason or ""
-    out = [w for w, rx in _REQUIRES_HINTS if (studio_reasons is None or w in studio_reasons) and rx.search(text)]
-    for w in sorted(studio_reasons or ()):
-        if w not in out and re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text, re.IGNORECASE):
+    # A word named literally wins over a hint, and a hint never matches inside a hyphenated name: "browser" in
+    # "browser-identity" is that capability, not browser-session (Prism ff96bb11f1f1).
+    out = [w for w in sorted(studio_reasons or ())
+           if re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text, re.IGNORECASE)]
+    for w, rx in _REQUIRES_HINTS:
+        if w not in out and (studio_reasons is None or w in studio_reasons) and _bare_hit(rx, text):
             out.append(w)
     return tuple(out)
+
+
+def _bare_hit(rx, text: str) -> bool:
+    """``rx`` matches ``text`` somewhere not joined by a hyphen to a neighbouring word."""
+    for m in rx.finditer(text):
+        before = text[m.start() - 1] if m.start() else ""
+        after = text[m.end()] if m.end() < len(text) else ""
+        if before != "-" and after != "-":
+            return True
+    return False
 
 
 def studio_requires_word(reason: str, studio_reasons: Optional[frozenset],
