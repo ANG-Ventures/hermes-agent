@@ -55,6 +55,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -62,6 +63,7 @@ from gateway import kanban_notify_suppress as _ns
 from gateway import kanban_wake_freshness as _fresh
 
 logger = logging.getLogger(__name__)
+_WINDOWS = os.name == "nt"
 
 COALESCE_SECONDS = 600.0
 FIRST_RUN_LOOKBACK_SECONDS = 600
@@ -630,6 +632,7 @@ class WakeState:
         self.last_wake: dict[str, float] = {}
         self.row_failures: dict[str, int] = {}  # "board|event" -> failed classifications
         self.red_seen: dict[str, float] = {}  # S5: red_key -> when it last woke an owner
+        self._persisted: Optional[str] = None
         self._load()
 
     def _load(self) -> None:
@@ -642,28 +645,47 @@ class WakeState:
             self.pending = dict(raw.get("pending") or {})
             self.last_wake = {str(k): float(v) for k, v in (raw.get("last_wake") or {}).items()}
             self.red_seen = {str(k): float(v) for k, v in (raw.get("red_seen") or {}).items()}
+            self._persisted = self._serialize()
+
+    def _serialize(self) -> str:
+        # Compare immutable snapshots: pending items can be edited in place.
+        return json.dumps({"cursors": self.cursors, "pending": self.pending,
+                           "last_wake": self.last_wake, "red_seen": self.red_seen},
+                          sort_keys=True)
 
     def write_owner_wake_state(self, now: float) -> None:
-        """Blocking (fsync + rename): call via ``asyncio.to_thread`` only."""
+        """Checkpoint changed state. Blocking: call via ``asyncio.to_thread``."""
         self.last_wake = {k: v for k, v in self.last_wake.items() if now - v < COALESCE_SECONDS * 6}
         _ns.note_red_seen(self.red_seen, (), now)
-        data = {"cursors": self.cursors, "pending": self.pending, "last_wake": self.last_wake,
-                "red_seen": self.red_seen}
+        snapshot = self._serialize()
+        if snapshot == self._persisted:
+            return
+        # A failed write (including a directory fsync after rename) cannot seed a cache hit.
+        self._persisted = None
+        tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".owner-wake-", dir=str(self.path.parent))
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
+                fh.write(snapshot)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
-            dfd = os.open(str(self.path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            tmp = None
+            # Native Windows cannot open directories with os.open for fsync.
+            if not _WINDOWS:
+                dfd = os.open(str(self.path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
         except OSError as exc:
             logger.warning("kanban owner-wake: cannot persist state %s: %s", self.path, exc)
+            if tmp is not None:
+                with suppress(OSError):
+                    os.unlink(tmp)
+            return
+        self._persisted = snapshot
 
 
 def state_path() -> Path:
@@ -1193,6 +1215,10 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     if pr_health is None and use_default_pr_health:
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
+    # Checkpoint queued inputs before dispatch when storage is available, but
+    # don't withhold an owner wake if the checkpoint fails.
+    if state.pending:
+        await asyncio.to_thread(state.write_owner_wake_state, now)
 
     from gateway import kanban_boomerang_wake as _ah
 
@@ -1314,10 +1340,13 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     for session_key, (entry, cards) in by_session.items():
         text = render_prompt([c for _k, c in cards])
         try:
-            await deliver_turn(runner, entry, text, [c for _k, c in cards])
+            accepted = await deliver_turn(runner, entry, text, [c for _k, c in cards])
         except Exception as exc:
             logger.warning("kanban owner-wake: wake of %s failed (%s); held for retry",
                            session_key, exc)
+            continue
+        if not accepted:
+            logger.debug("kanban owner-wake: wake of %s not accepted; held for retry", session_key)
             continue
         turns += 1
         for key, card in cards:

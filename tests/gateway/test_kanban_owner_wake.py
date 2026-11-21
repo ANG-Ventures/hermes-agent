@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -39,6 +41,7 @@ class Adapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+        event._gateway_accepted = True
 
 
 @pytest.fixture
@@ -1026,12 +1029,109 @@ def test_p1r2_profile_gate_applies_to_the_owner_session(env):
     assert env["runner"]._kanban_owner_wake_state.pending == {}, "dropped at the gate, not held"
 
 
+def test_unchanged_owner_wake_tick_does_not_write_or_sync(env, monkeypatch):
+    runner = env["runner"]
+    assert asyncio.run(ow.tick(runner, use_default_pr_health=False)) == 0
+    path = ow.state_path()
+    before = (path.stat().st_mtime_ns, path.parent.stat().st_mtime_ns)
+    # Exercise the actual idle scan after a reload, not just an in-memory cache hit.
+    runner._kanban_owner_wake_state = None
+    create_temp = Mock(wraps=ow.tempfile.mkstemp)
+    fsync = Mock(wraps=ow.os.fsync)
+    monkeypatch.setattr(ow.tempfile, "mkstemp", create_temp)
+    monkeypatch.setattr(ow.os, "fsync", fsync)
+    assert asyncio.run(ow.tick(runner, use_default_pr_health=False)) == 0
+    create_temp.assert_not_called()
+    fsync.assert_not_called()
+    assert (path.stat().st_mtime_ns, path.parent.stat().st_mtime_ns) == before
+
+
+@pytest.mark.skipif(ow._WINDOWS, reason="POSIX directory fsync")
 def test_p1r2_state_write_is_fsynced(env, monkeypatch):
     synced = []
     real = ow.os.fsync
     monkeypatch.setattr(ow.os, "fsync", lambda fd: (synced.append(fd), real(fd))[1])
-    ow.WakeState(Path(get_hermes_home()) / "gateway" / "fs.json").write_owner_wake_state(1.0)
+    path = Path(get_hermes_home()) / "gateway" / "fs.json"
+    state = ow.WakeState(path)
+    state.write_owner_wake_state(1.0)
     assert len(synced) == 2, "file and directory are both fsynced"
+    replace = Mock(wraps=ow.os.replace)
+    monkeypatch.setattr(ow.os, "replace", replace)
+    synced.clear()
+    state.cursors["default"] = 10
+    state.write_owner_wake_state(2.0)
+    state.write_owner_wake_state(3.0)
+    replace.assert_called_once()
+    assert len(synced) == 2
+    assert ow.WakeState(path).cursors == {"default": 10}
+
+
+def test_owner_wake_retries_directory_sync_failure(tmp_path, monkeypatch):
+    if ow._WINDOWS:
+        pytest.skip("POSIX directory fsync")
+    state = ow.WakeState(tmp_path / ow.STATE_FILENAME)
+    replace = Mock(wraps=ow.os.replace)
+    fsync = ow.os.fsync
+    sync = Mock(side_effect=[None, OSError("directory sync failed"), None, None])
+
+    def sync_fd(fd):
+        sync(fd)
+        fsync(fd)
+
+    monkeypatch.setattr(ow.os, "replace", replace)
+    monkeypatch.setattr(ow.os, "fsync", sync_fd)
+    state.write_owner_wake_state(1.0)
+    state.write_owner_wake_state(2.0)
+    state.write_owner_wake_state(3.0)
+    assert state.path.exists()
+    assert replace.call_count == 2 and sync.call_count == 4
+
+
+def test_owner_wake_delivers_during_state_write_failure(env, monkeypatch, caplog):
+    tid = _card(env)
+    _blocked(tid)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    runner = env["runner"]
+    state = _held_state(env, 0)
+    with monkeypatch.context() as mp:
+        mp.setattr(ow.os, "replace", Mock(side_effect=OSError("checkpoint unavailable")))
+        assert asyncio.run(ow.tick(runner, now=1000, state=state, use_default_pr_health=False)) == 1
+    assert tid in _one_turn(env, env["adapter"].handled)
+    assert "checkpoint unavailable" in caplog.text
+    assert not state.path.exists() and not state.pending and state.last_wake
+    assert not list(state.path.parent.glob(".owner-wake-*"))
+
+    assert asyncio.run(ow.tick(runner, now=1005, state=state, use_default_pr_health=False)) == 0
+    restored = ow.WakeState(state.path)
+    assert not restored.pending and restored.last_wake == state.last_wake
+    assert len(env["adapter"].handled) == 1
+
+
+def test_owner_wake_retries_rejected_turn_after_restart(env, monkeypatch):
+    tid = _card(env)
+    _blocked(tid)
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    runner = env["runner"]
+    adapter = env["adapter"]
+    state = _held_state(env, 0)
+    rejected = []
+
+    async def reject(event):
+        rejected.append((event._gateway_accepted, bool(ow.WakeState(state.path).pending)))
+
+    with monkeypatch.context() as mp:
+        mp.setattr(adapter, "handle_message", reject)
+        assert asyncio.run(ow.tick(runner, now=1000, state=state, use_default_pr_health=False)) == 0
+    assert rejected == [(False, True)]
+
+    restored = ow.WakeState(state.path)
+    assert restored.pending and not restored.last_wake
+    assert asyncio.run(ow.tick(runner, now=1005, state=restored, use_default_pr_health=False)) == 1
+    assert tid in _one_turn(env, adapter.handled)
+    restored = ow.WakeState(state.path)
+    assert not restored.pending and restored.last_wake
+    assert asyncio.run(ow.tick(runner, now=1010, state=restored, use_default_pr_health=False)) == 0
+    assert len(adapter.handled) == 1
 
 
 def test_worker_only_gateway_skips_the_scan(env, monkeypatch):
@@ -1182,9 +1282,19 @@ def test_needs_input_drop_logs_at_info(env, caplog):
     assert len(lines) == 1 and tid in lines[0] and "no live session-store entry" in lines[0], lines
 
 
-def test_rejected_sub_wake_falls_back_to_the_owner_wake(env):
+def test_rejected_sub_wake_falls_back_to_the_owner_wake(env, monkeypatch):
     """t_156cc147: a sub wake the adapter does not accept (WakeNotAccepted) marks nothing, so the
     owner still gets its turn. Before the fix the sub's existence alone withheld it."""
+    adapter = env["adapter"]
+    accept = adapter.handle_message
+
+    async def reject_sub(event):
+        if (event.metadata or {}).get("kanban_owner_wake"):
+            await accept(event)
+        else:
+            adapter.handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", reject_sub)
     tid = _card(env)
     with kb.connect_closing() as conn:
         kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
