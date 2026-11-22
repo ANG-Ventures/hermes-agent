@@ -436,6 +436,8 @@ def _find_write_target(name: str) -> Optional[Dict[str, Any]]:
     would write (batch snapshot/rollback and the audit ledger must see the same dir)."""
     if existing := _find_skill(name):
         return existing
+    if _is_background_review():  # same rule as _locate_for_write: the fork never touches an unmounted package
+        return None
     skill_dir, _ambiguous = find_library_skill(name)
     return {"path": skill_dir} if skill_dir is not None else None
 

@@ -173,6 +173,27 @@ def test_background_review_keeps_its_scope(tmp_path):
             shared / "media-aux" / "audio-cleanup-separation" / "SKILL.md").read_text()
 
 
+def test_background_review_batch_leaves_an_unmounted_package_untouched(tmp_path):
+    """Prism a4f168ebc53a: the fork's batch answered not-found and still replaced the unmounted skill's directory
+    (snapshot + rollback resolved it through the library). Same directory, same symlink, nothing for git."""
+    with _fleet(tmp_path) as (_root, _local, shared):
+        sd = shared / "media-aux" / "audio-cleanup-separation"
+        (sd / "references").mkdir()
+        (sd / "references" / "real.md").write_text("real\n")
+        (sd / "references" / "alias.md").symlink_to("real.md")
+        _git(shared, "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
+        _git(shared, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "link")
+        ino = sd.stat().st_ino
+        with patch.object(smt, "_is_background_review", return_value=True):
+            assert smt._find_write_target("audio-cleanup-separation") is None
+            r = _op(action="patch", name="audio-cleanup-separation",
+                    old_string="Step 1: do the thing.", new_string="Step 1: X.")
+        assert r["success"] is False and "not found" in r["error"], r
+        assert sd.stat().st_ino == ino, "the package directory was replaced"
+        assert (sd / "references" / "alias.md").is_symlink()
+        assert _git(shared, "status", "--porcelain").strip() == ""
+
+
 def test_symlinked_package_out_of_the_library_is_not_a_hit(tmp_path):
     with _fleet(tmp_path) as (_root, _local, shared):
         outside = _skill(tmp_path / "outside", "escapee")
