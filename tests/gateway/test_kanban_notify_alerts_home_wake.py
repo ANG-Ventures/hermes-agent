@@ -315,3 +315,18 @@ def test_inbox_bound_lane_failure_does_not_silence_a_chat_bound_one(env, inbox):
     assert inbox == []
     assert len(sent) == 1 and sent[0]["chat_id"] == APOLLO
     assert all(t in sent[0]["text"] for t in ids), sent[0]["text"]
+
+
+def test_offline_session_key_home_still_posts_in_its_own_chat():
+    """c14995a04781: a key home with no live entry has no target; the key itself names its chat."""
+    key = f"agent:main:discord:group:{ALERTS}"
+    home = hr.HomeResolution(None, "unknown-session")
+
+    class Store:
+        lookup_by_session_id = staticmethod(lambda sid: None)
+        lookup_by_session_key = staticmethod(lambda key: None)
+
+    own = {"platform": "discord", "chat_id": ALERTS, "task_id": "t_x"}
+    assert ni.no_live_owner(Store(), own, key, home, lambda sid: None) is None
+    other = dict(own, chat_id=APOLLO)
+    assert ni.no_live_owner(Store(), other, key, home, lambda sid: None) == "home-not-live"

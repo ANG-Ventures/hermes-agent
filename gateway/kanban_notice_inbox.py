@@ -47,6 +47,8 @@ def no_live_owner(store: Any, sub: dict, home_sid: Optional[str], home_res: Any,
     target = getattr(home_res, "target", None)
     if _hr.same_chat(target, sub.get("platform"), sub.get("chat_id"), sub.get("thread_id")):
         return None  # the sub is the owning session's own chat
+    if target is None and ":" in sid and _key_names_sub_chat(sid, sub):
+        return None  # a session-key home names its chat in the key itself
     if not sid:
         return "no-home"
     try:
@@ -60,6 +62,25 @@ def no_live_owner(store: Any, sub: dict, home_sid: Optional[str], home_res: Any,
         logger.debug("kanban notice-inbox: home %s unreadable (%s); today's route", sid, exc)
         return None
     return "home-not-live"
+
+
+def _key_names_sub_chat(key: str, sub: dict) -> bool:
+    """True when a session-key home (``agent:<ns>:<platform>:<type>:<chat>...``) is the sub's chat.
+
+    HomeCache reads state.db by raw id only, so a key home has no target once it is not live.
+    A key with no thread part matches on platform + chat (doubt keeps today's post)."""
+    from gateway import kanban_home_route as _hr
+    from gateway.run import _parse_session_key
+
+    parsed = _parse_session_key(key) or {}
+    if not parsed.get("platform") or not parsed.get("chat_id"):
+        return False
+    if parsed.get("thread_id"):
+        target = _hr.HomeTarget(str(parsed["platform"]).lower(), str(parsed["chat_id"]),
+                                str(parsed.get("thread_id")))
+        return _hr.same_chat(target, sub.get("platform"), sub.get("chat_id"), sub.get("thread_id"))
+    return (str(parsed["platform"]).lower() == str(sub.get("platform") or "").strip().lower()
+            and str(parsed["chat_id"]) == str(sub.get("chat_id") or "").strip())
 
 
 def write_inbox(task_id: str, board: Optional[str], kind: str, text: str, why: str) -> bool:
