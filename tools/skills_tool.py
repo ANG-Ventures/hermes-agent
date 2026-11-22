@@ -668,8 +668,8 @@ def skill_view(
         project_dirs, all_dirs, active_skills_dir = _skill_search_dirs()
         error, skill_dir, skill_md = _locate_skill(
             name, local_category_name, project_dirs, all_dirs, not_found_ok=True)
-        if error is not None:
-            return error
+        if error is not None:  # an empty loadout still reads the library
+            return (_view_library_skill(name, file_path) or error) if not all_dirs else error
         if skill_md is None:  # not in this profile's dirs: the shared library, read-only
             return _view_library_skill(name, file_path) or _skill_not_found(name)
         try:  # read once — reused for platform check and main content

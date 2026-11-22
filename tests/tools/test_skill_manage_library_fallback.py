@@ -161,3 +161,31 @@ def test_skill_index_is_byte_identical(tmp_path, monkeypatch):
         assert _op(action="patch", name="audio-cleanup-separation",
                    old_string="Step 1", new_string="Step 9")["success"] is True
         assert index() == before
+
+
+def test_background_review_keeps_its_scope(tmp_path):
+    """The autonomous curator fork gets no library fallback: an unmounted skill stays not-found."""
+    with _fleet(tmp_path) as (_root, _local, shared), \
+            patch.object(smt, "_is_background_review", return_value=True):
+        skill_dir, err = smt._locate_for_write("audio-cleanup-separation", "patch")
+        assert skill_dir is None and "not found" in err["error"], err
+        assert "Step 1: do the thing." in (
+            shared / "media-aux" / "audio-cleanup-separation" / "SKILL.md").read_text()
+
+
+def test_symlinked_package_out_of_the_library_is_not_a_hit(tmp_path):
+    with _fleet(tmp_path) as (_root, _local, shared):
+        outside = _skill(tmp_path / "outside", "escapee")
+        (shared / "media-aux" / "escapee").symlink_to(outside, target_is_directory=True)
+        assert smt.find_library_skill("escapee") == (None, None)
+        assert smt.find_library_skill("media-aux/escapee") == (None, None)
+
+
+def test_skill_view_library_fallback_with_empty_loadout(tmp_path, monkeypatch):
+    import tools.skills_tool as st
+    with _fleet(tmp_path) as (_root, local, _shared):
+        monkeypatch.setattr(st, "_skill_search_dirs", lambda: ([], [], local))
+        r = json.loads(st.skill_view("audio-cleanup-separation"))
+        assert r["success"] is True and r["library"] is True, r
+        miss = json.loads(st.skill_view("no-such-skill"))
+        assert miss["success"] is False and "does not exist yet" in miss["error"], miss

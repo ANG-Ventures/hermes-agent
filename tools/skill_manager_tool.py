@@ -414,11 +414,14 @@ def find_library_skill(name: str) -> Tuple[Optional[Path], Optional[str]]:
     groups = [g for g in _valid_shared_groups()
               if not g.startswith("_") and (len(parts) == 1 or g == parts[0])]
     from agent.skill_utils import is_excluded_skill_path
+    shared_r = shared.resolve()
     hits = []
     for group in groups:
         skill_md = shared / group / bare / "SKILL.md"
-        with suppress(OSError):
-            if skill_md.is_file() and not is_excluded_skill_path(skill_md):
+        with suppress(OSError, ValueError):
+            # resolve(): a symlinked package or SKILL.md must not lead out of the library.
+            if (skill_md.is_file() and not is_excluded_skill_path(skill_md)
+                    and skill_md.resolve().is_relative_to(shared_r)):
                 hits.append((group, skill_md.parent))
     if len(hits) > 1:
         qualified = ", ".join(f"'{g}/{bare}'" for g, _ in hits)
@@ -599,7 +602,8 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
     """Find the skill; run the org-mirror (unless ``org_guard=False``) and background-review
     write guards -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
     existing = _find_skill(name)
-    if not existing and action in _LIBRARY_WRITE_ACTIONS:
+    # The autonomous curator keeps its existing scope: no library fallback in the review fork.
+    if not existing and action in _LIBRARY_WRITE_ACTIONS and not _is_background_review():
         library_dir, ambiguous = find_library_skill(name)
         if ambiguous:
             return None, _err(ambiguous)
