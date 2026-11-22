@@ -1430,7 +1430,9 @@ def _tracker_field_sub(m: re.Match) -> str:
 _CONNINFO_HINT_RE = re.compile(r"(?<![A-Za-z0-9_])(?:host|hostaddr|user|dbname|port)\s*=\s*\S", re.IGNORECASE)
 _CONNINFO_PW_RE = re.compile(
     r"(?<![A-Za-z0-9_])(password\s*=\s*)"
-    r"(''(?:[^']|'''')*''|\\'(?:[^'\\]|\\[^'])*\\'|'(?:[^'\\]|\\.)*'|[^\s']+)",
+    # escapes are consumed before the closing quote is tested: a libpq \' inside the SQL-doubled
+    # form reads \'' (or \\'' with the backslash doubled), and a bare value may hold "\ "
+    r"(''(?:\\(?:'')?|''''|[^'\\])*''|\\'.*?\\'(?=\s+[A-Za-z_]+\s*=|'|\s*$)|'(?:[^'\\]|\\.)*'|(?:\\.|[^\s'\\])+)",
     re.IGNORECASE,
 )
 

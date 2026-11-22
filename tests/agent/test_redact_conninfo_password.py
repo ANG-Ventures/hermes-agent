@@ -16,6 +16,11 @@ CMD = "docker exec mem0-selfhost-postgres-1 sh -c 'cat $PGDATA/postgresql.auto.c
     f"primary_conninfo = 'user=mem0_repl password=''{PW}'' host=primary-link'",
     f"primary_conninfo = 'user=mem0_repl password=''a b{PW}'' host=primary-link'",
     f"primary_conninfo = 'user=mem0_repl password=\\'{PW}\\' host=primary-link'",
+    # Prism 2d39fdf9ff97: escapes inside the value must not end the match early
+    f"primary_conninfo = 'user=repl password=''pre\\''{PW}'' host=db'",
+    f"primary_conninfo = 'user=repl password=''pre\\\\''{PW}'' host=db'",
+    f"primary_conninfo = 'user=repl password=pre\\ {PW} host=db'",
+    f"psql 'host=db user=x password=\\'pre\\\\\\'{PW}\\' dbname=y'",
     f"psql 'host=db user=x password={PW} dbname=y'",
     f"PASSWORD={PW} user=x host=y",
 ])
