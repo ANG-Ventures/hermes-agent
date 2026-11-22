@@ -113,9 +113,14 @@ def _validate_batch_ops(operations, default_name, tool_error):
             return fail(i, f": create for '{nm}' must precede that skill's other ops.")
         if (preflight := _background_review_preflight(act, nm)) is not None:
             return None, json.dumps(preflight, ensure_ascii=False)
-    # Clobber guard: a DESTRUCTIVE op (create/write_file/remove_file/full rewrite) on
-    # a file an earlier op touched would SILENTLY discard its work — reject it.
-    # Additive patches are always legal. Paths are normalized against spelling variants.
+    return names, None
+
+
+def _clobber_error(operations, names, dirs):
+    """A DESTRUCTIVE op (create/write_file/remove_file/full rewrite) on a file an earlier op
+    touched would SILENTLY discard its work: the error text for the first such op, or None.
+    Keyed on the skill's resolved dir (``dirs``), so two spellings of one skill are one skill.
+    Additive patches are always legal. Paths are normalized against spelling variants."""
     touched_files = set()
     for i, op in enumerate(operations):
         act, nm = op["action"], names[i]
@@ -124,33 +129,37 @@ def _validate_batch_ops(operations, default_name, tool_error):
         fp = (op.get("file_path") or "").strip()
         target = ("SKILL.md" if (act == "create" or full_rewrite or not fp)
                   else posixpath.normpath(fp.lstrip("/")))
-        key = (nm, target)
+        key = (dirs.get(nm) or nm, target)
         if (act in ("create", "write_file", "remove_file") or full_rewrite) and key in touched_files:
-            return fail(i, f": {act} on '{target}' of skill '{nm}' — an earlier op in this "
-                           f"batch already touched that file, and this op would silently discard its work. "
-                           f"One destructive op (write_file/remove_file/full rewrite) per file per batch; put "
-                           f"it first, or fold the change in. Patch chains are fine.")
+            return (f"operations[{i}]: {act} on '{target}' of skill '{nm}' — an earlier op in this "
+                    f"batch already touched that file, and this op would silently discard its work. "
+                    f"One destructive op (write_file/remove_file/full rewrite) per file per batch; put "
+                    f"it first, or fold the change in. Patch chains are fine.")
         touched_files.add(key)
-    return names, None
+    return None
 
 
-def _snapshot_skills(names, snap_root, find_skill, create_targets):
-    """Copy every touched skill aside. Returns (snapshots, None) or (None, error_text).
+def _snapshot_skills(dirs, snap_root, create_targets):
+    """Copy every touched skill aside. ``dirs`` maps each name to the dir resolved for it once,
+    before any op ran (None: no such skill). Returns (snapshots, None) or (None, error_text).
 
     ``create_targets`` maps a name with no skill yet to the dir its ``create`` op will use.
     An EMPTY pre-existing dir there has no SKILL.md to snapshot, yet create adopts it (see
     ``_create_skill``): record that it pre-dated the batch so rollback never rmtree()s it."""
     snapshots = {}  # skill name -> (pre_dir or None, snapshot_dir or None, dir_pre_existed)
-    for nm in dict.fromkeys(names):  # ordered unique
-        pre = find_skill(nm)
-        pre_dir = Path(pre["path"]) if pre else None
-        snap = snap_root / nm if pre_dir is not None and pre_dir.is_dir() else None
+    seen = set()
+    for i, (nm, pre_dir) in enumerate(dirs.items()):
+        if pre_dir in seen:
+            continue  # a second spelling of a skill already snapshotted: restore it once
+        if pre_dir is not None:
+            seen.add(pre_dir)
+        snap = snap_root / str(i) if pre_dir is not None and pre_dir.is_dir() else None
         if snap is not None:
             try:
-                shutil.copytree(pre_dir, snap)
+                shutil.copytree(pre_dir, snap, symlinks=True)
             except Exception as exc:  # noqa: BLE001 — no snapshot, no atomicity
                 return None, f"Could not snapshot '{nm}' for atomic batch: {exc}"
-        target = create_targets.get(nm) if pre is None else None
+        target = create_targets.get(nm) if pre_dir is None else None
         snapshots[nm] = (pre_dir, snap, target is not None and target.is_dir())
     return snapshots, None
 
@@ -179,7 +188,7 @@ def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()
             post_dir.rmdir()
         return
     if not post_exists:
-        shutil.copytree(snap, pre_dir)
+        shutil.copytree(snap, pre_dir, symlinks=True)
         return
     # Move the broken state aside and delete it only after the snapshot is
     # back, so a failed copytree (disk full, locked file) can't mean total loss.
@@ -187,7 +196,7 @@ def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()
     shutil.rmtree(aside, ignore_errors=True)
     post_dir.rename(aside)
     try:
-        shutil.copytree(snap, pre_dir)
+        shutil.copytree(snap, pre_dir, symlinks=True)
     except Exception:
         # Restore failed: put the half-applied state back rather than nothing.
         shutil.rmtree(pre_dir, ignore_errors=True)
@@ -196,13 +205,13 @@ def _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed=False, written=()
     shutil.rmtree(aside, ignore_errors=True)
 
 
-def _rollback(snapshots, find_skill, results, create_targets=None):
-    """Restore every snapshot. ``results`` are the ops applied so far (their name/file_path
-    tell an adopted dir's rollback which files were the batch's). A skill the batch CREATED is
-    located by its ``create_targets`` dir, never ``find_skill`` (loaded roots only): a create into an
-    unsubscribed shared group is invisible to it and would survive the rollback (f26dc060e98b).
-    Only a create that SUCCEEDED in ``results`` owns that dir: a create that failed or never ran
-    may point at a foreign skill find_skill cannot see, which rollback must not touch (ccb4d869f7f9).
+def _rollback(snapshots, results, create_targets=None):
+    """Restore every snapshot into the dir it was taken from; no name is looked up again (an op
+    may have changed what a name resolves to: a removed SKILL.md, a twin in another group).
+    ``results`` are the ops applied so far (their name/file_path tell an adopted dir's rollback
+    which files were the batch's). A skill the batch CREATED is located by its ``create_targets``
+    dir. Only a create that SUCCEEDED in ``results`` owns that dir: a create that failed or never
+    ran may point at a foreign skill, which rollback must not touch (ccb4d869f7f9).
     Returns (note, failed)."""
     create_targets = create_targets or {}
     created = {r["name"] for r in results if r["action"] == "create" and r.get("success")}
@@ -211,11 +220,12 @@ def _rollback(snapshots, find_skill, results, create_targets=None):
         written = [posixpath.normpath(r["file_path"].lstrip("/")) for r in results
                    if r["name"] == nm and r["action"] == "write_file" and r["file_path"]]
         try:
-            if pre_dir is None and nm in create_targets and nm in created:
+            if pre_dir is not None:
+                post_dir = pre_dir
+            elif nm in create_targets and nm in created:
                 post_dir = Path(create_targets[nm])
             else:
-                post = find_skill(nm)
-                post_dir = Path(post["path"]) if post else None
+                continue  # no skill before, none created: nothing of this batch's to undo
             _restore_snapshot(pre_dir, snap, post_dir, dir_pre_existed, written)
         except Exception as exc:  # noqa: BLE001
             notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
@@ -272,10 +282,15 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
             return tool_error(str(e), success=False)
         # A name the batch does not create may live in an unmounted shared group (the ops reach
         # the whole library); snapshot and roll back that same dir. A create keeps the narrow scan.
-        def find(nm):
-            return _smt._find_skill(nm) if nm in create_targets else _smt._find_write_target(nm)
+        # Resolved ONCE: the clobber guard, the snapshot and the rollback all use these dirs.
+        dirs = {}
+        for nm in dict.fromkeys(names):  # ordered unique
+            hit = _smt._find_skill(nm) if nm in create_targets else _smt._find_write_target(nm)
+            dirs[nm] = Path(hit["path"]) if hit else None
+        if (clobber := _clobber_error(operations, names, dirs)) is not None:
+            return tool_error(clobber, success=False)
         snap_root = Path(tempfile.mkdtemp(prefix="skill_batch_"))
-        snapshots, snap_err = _snapshot_skills(names, snap_root, find, create_targets)
+        snapshots, snap_err = _snapshot_skills(dirs, snap_root, create_targets)
         if snap_err is not None:
             shutil.rmtree(snap_root, ignore_errors=True)
             return tool_error(snap_err, success=False)
@@ -285,14 +300,17 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
         token = _smt._skill_gate_bypass.set(True)
         try:
             for i, op in enumerate(operations):
-                raw = _smt._skill_manage_from({**op, "name": names[i], "operations": None},
-                                              task_id=task_id, session_id=session_id)
+                try:
+                    raw = _smt._skill_manage_from({**op, "name": names[i], "operations": None},
+                                                  task_id=task_id, session_id=session_id)
+                except Exception as exc:  # noqa: BLE001 — an op that raises is an op that failed
+                    raw = json.dumps({"success": False, "error": f"{type(exc).__name__}: {exc}"})
                 try:
                     parsed = json.loads(raw)
                 except Exception:  # noqa: BLE001
                     parsed = {"success": False, "error": "unparseable op result"}
                 if not parsed.get("success"):
-                    note, rollback_failed = _rollback(snapshots, find, results, create_targets)
+                    note, rollback_failed = _rollback(snapshots, results, create_targets)
                     fail = {  # key order is wire-visible
                         "success": False,
                         "error": (f"operations[{i}] ({op['action']} on '{names[i]}') failed: "
