@@ -93,7 +93,7 @@ def test_seed_makes_root_and_profile_dir_0700(tmp_path, monkeypatch):
 
     def run_in(e, argv, **kw):
         calls.append(argv)
-        if len(calls) == 1:
+        if len(calls) <= 2:  # the root check, then the seed
             return _local_run_in(e, argv, **kw)
         raise RuntimeError("stop after the seed")  # the launcher spawn is not under test
 
@@ -143,3 +143,20 @@ def test_symlinked_shots_dir_is_refused(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="is a symlink"):
         bts._sandbox_wrap(["agent-browser", "open", "https://example.com"], {"PATH": "/usr/bin"}, "/unused")
     assert _mode(target) == 0o755
+
+
+def test_symlinked_root_is_refused_before_stale_desktop_cleanup(tmp_path, monkeypatch):
+    # Prism 93fcbc3526c4: with no live display, start() used to run stop() through the unchecked root, and its
+    # `rm -f <root>/<profile>/env` deleted files in the symlink's target before the seed refused the root.
+    env = _Env(tmp_path)
+    target = tmp_path / "victim"
+    (target / "default").mkdir(parents=True)
+    (target / "default" / "env").write_text("keep me")
+    os.symlink(target, sandbox_host.remote_root(env))
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda e: None)
+    monkeypatch.setattr(sandbox_host, "_marker", lambda: tmp_path / "marker.json")
+    monkeypatch.setattr(sandbox_host, "missing_binaries", lambda e: [])
+    monkeypatch.setattr(streams, "run_in", _local_run_in)
+    with pytest.raises(RuntimeError, match="symlink"):
+        sandbox_host.start(env, "default", geometry="1280x800")
+    assert (target / "default" / "env").read_text() == "keep me"

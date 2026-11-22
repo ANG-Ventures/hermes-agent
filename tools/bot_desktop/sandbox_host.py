@@ -233,14 +233,15 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     """Bring the screen up inside ``env`` (idempotent); returns the published env. Raises RuntimeError naming
     the blocker."""
     rdir = _remote_dir(env, profile)
+    # Check (and tighten) the root before anything reads or deletes through it: the probe and the stale-desktop
+    # stop() below both act on <root>/<profile>, so a symlinked root must be refused first.
+    proc = streams.run_in(env, ["bash", "-c", private_root_sh(env)], user=_user_for(env), timeout=15)
+    if proc.returncode != 0:
+        raise RuntimeError(f"could not secure the sandbox desktop root: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
     live = _published(env, rdir)
     if live.get("DISPLAY"):
         # Adopting a screen the sandbox kept while this host's state was lost (fresh HERMES_HOME, a stop()
         # whose kill missed): without the marker, status/thumbnail/stop would not know it is ours.
-        # A root left 775 by an older seed is tightened here too, not only on a fresh seed.
-        proc = streams.run_in(env, ["bash", "-c", private_root_sh(env)], user=_user_for(env), timeout=15)
-        if proc.returncode != 0:
-            raise RuntimeError(f"could not secure the sandbox desktop root: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
         return _record(env, rdir, profile, live)
     stop(env, profile)  # a dead launcher may have left Xvnc holding :20; the relaunch needs it gone
     missing = missing_binaries(env)
