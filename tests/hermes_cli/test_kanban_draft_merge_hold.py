@@ -200,3 +200,101 @@ def test_cli_draft_kind_flag(board, calls):
     with kb.connect() as conn:
         assert _row(conn, tid)["status"] == "done"
     assert log == []
+
+
+# --- the real writer seam (pr_hold_set) against a stand-in pr_hold.py under the board root -------------------------
+# Mirrors hermes-home scripts/lib/pr_hold.py's contract: _root() (the readers' ledger root), held() (newest row wins,
+# "operator hold (<by> at <at>): <why>"), write("set", ...). READER and WRITE roots are pinned per test.
+_FAKE_PR_HOLD = """
+import json, os
+LEDGER = os.path.join("state", "pr-hold.jsonl")
+READER, WRITE = @READER@, @WRITE@
+def _root(root=None):
+    return root or READER
+def held(repo, pr, root=None):
+    path = os.path.join(_root(root), LEDGER)
+    why = None
+    if not os.path.exists(path):
+        return None
+    for line in open(path, encoding="utf-8"):
+        r = json.loads(line)
+        if (r["repo"].casefold(), r["pr"]) == (repo.casefold(), int(pr)):
+            why = ("operator hold (%s at %s): %s" % (r["by"], r["at"], r["why"] or "-")
+                   if r["action"] == "set" else None)
+    return why
+def write(action, repo, pr, why, by, root=None, **_):
+    path = os.path.join(root or WRITE, LEDGER)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"at": "2026-11-21T00:00:00Z", "repo": repo, "pr": int(pr), "action": action,
+                            "by": by, "why": why}) + "\\n")
+    return {}
+"""
+
+
+@pytest.fixture
+def real_writer(board, monkeypatch):
+    """complete_task -> mh.pr_hold_set (the production writer) with a stand-in pr_hold.py; ready is recorded."""
+    root = kb.kanban_home()
+    flips: list = []
+
+    def install(reader, write):
+        lib = root / "scripts" / "lib"
+        lib.mkdir(parents=True, exist_ok=True)
+        (lib / "pr_hold.py").write_text(_FAKE_PR_HOLD.replace("@READER@", repr(str(reader))).replace("@WRITE@", repr(str(write))))
+
+    monkeypatch.setattr(mh, "_default_hold", lambda: mh.pr_hold_set)
+    monkeypatch.setattr(fr, "_default_ready", lambda: (lambda repo, n: flips.append((repo, n)) or 0))
+    return root, install, flips
+
+
+def _ledger(root):
+    path = Path(root) / "state" / "pr-hold.jsonl"
+    return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_real_writer_on_the_board_root_holds_reads_back_and_flips(real_writer):
+    root, install, flips = real_writer
+    install(root, root)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert _complete(conn, tid, run) is True
+        assert tuple(_row(conn, tid)) == ("review", HOLDER)
+    assert flips == [("o/r", 5)]
+    assert [(r["repo"], r["pr"], r["action"], r["why"]) for r in _ledger(root)] == [("o/r", 5, "set", REASON)]
+
+
+def test_pool_host_shape_reader_root_elsewhere_no_write_no_flip(real_writer, tmp_path):
+    """The kernel's pr_hold resolves a ledger that is not the board's (a pool host's own root): refuse, no flip."""
+    root, install, flips = real_writer
+    pool = tmp_path / "pool-host-root"
+    install(pool, pool)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert _complete(conn, tid, run) is True
+        assert tuple(_row(conn, tid)) == ("review", "human:apollo")
+        res = _events(conn, tid, "completion_draft_override")[0]["merge_hold"]["o/r#5"]
+    assert flips == [] and _ledger(pool) == [] and _ledger(root) == []
+    assert res["ok"] is False and "not the board root" in res["hold"]
+
+
+def test_write_landing_in_a_non_reader_root_fails_read_back_no_flip(real_writer, tmp_path):
+    """The write lands in a ledger the readers do not read: held() reads nothing back, so the PR stays draft."""
+    root, install, flips = real_writer
+    elsewhere = tmp_path / "local-ledger"
+    install(root, elsewhere)
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert _complete(conn, tid, run) is True
+        assert tuple(_row(conn, tid)) == ("review", "human:apollo")
+        res = _events(conn, tid, "completion_draft_override")[0]["merge_hold"]["o/r#5"]
+    assert _ledger(elsewhere) and _ledger(root) == []
+    assert flips == [] and res["ok"] is False and "read-back failed" in res["hold"]
+
+
+def test_ready_raising_is_recorded_not_raised(monkeypatch):
+    def boom(repo, n):
+        raise OSError("ace_gate.py missing")
+    out = mh.apply(["o/r#5"], why="w", by="b", hold=lambda *a: None, ready=boom)
+    assert out["o/r#5"]["hold"] == "set" and out["o/r#5"]["ok"] is False
+    assert out["o/r#5"]["ready"].startswith("raised:")

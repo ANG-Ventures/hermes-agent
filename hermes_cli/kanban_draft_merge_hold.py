@@ -9,7 +9,8 @@ completes with ``draft_ok``. That closed the card ``done`` with nothing reviewed
 
 - ``merge_hold`` (the default when unset): for each of the card's OWN draft PRs (handoff metadata /
   ``--survivor-pr`` / head branch names the card) the kernel (1) sets a ledger hold through ``pr_hold.write`` (the
-  writer ``pr_hold.py set`` uses; by = the worker run, why = the reason), (2) marks the PR ready through
+  writer ``pr_hold.py set`` uses, from the BOARD root, read back through the readers' ``held()``; by = the
+  worker run, why = the reason), (2) marks the PR ready through
   ``ace_gate.py ready`` so CI and Prism run, and (3) keeps it on the open-PR route, so the card goes to review
   through the review hold and the settle tick hands it to the operator. A PR whose hold could not be written is
   NOT flipped (an unheld ready PR merges); it stays draft and the card goes straight to the human reviewer.
@@ -67,9 +68,19 @@ def by_of(assignee: Optional[str], run_id: Optional[int], task_id: str) -> str:
     return f"{who} run {run_id} ({task_id})" if run_id is not None else f"{who} ({task_id})"
 
 
-def _load_pr_hold():
-    from hermes_constants import get_default_hermes_root
-    path = get_default_hermes_root() / "scripts" / "lib" / "pr_hold.py"
+def _board_root():
+    """The root beside the board DB: where the hold's readers run (derived-approve-tick, land_on_approve).
+
+    The kanban kernel runs in the worker PROCESS, which is always the dispatcher's child on the board host; a
+    pool-placed worker gets only its terminal/file tools over ssh (``kanban_worker_hosts`` module docstring). The
+    pr-hold ledger the readers use is ``<board root>/state/pr-hold.jsonl``, so the hold is written there or not at
+    all."""
+    from hermes_cli.kanban_db import kanban_home
+    return kanban_home()
+
+
+def _load_pr_hold(root):
+    path = root / "scripts" / "lib" / "pr_hold.py"
     if not path.is_file():
         return None
     spec = importlib.util.spec_from_file_location("_kanban_pr_hold", str(path))
@@ -78,12 +89,31 @@ def _load_pr_hold():
     return mod
 
 
+def _same(a, b) -> bool:
+    return os.path.realpath(str(a)) == os.path.realpath(str(b))
+
+
 def pr_hold_set(repo: str, number: int, why: str, by: str) -> None:
-    """``pr_hold.write("set", ...)`` from the hermes root: ledger row first, then the ``hold`` label."""
-    mod = _load_pr_hold()
+    """Set the hold through the board root's ``pr_hold.write("set", ...)``, then read it back. Raises unless the
+    readers' own ``held()`` now returns THIS hold.
+
+    Refuses before any write when the ledger ``pr_hold`` resolves for its readers is not the board root's (a
+    kernel off the board host, or a linked-worktree root): a hold in a ledger nobody reads, followed by a ready
+    flip, is a PR the derived approver merges in ~2 min. After the write, ``held(repo, n)`` with NO root (the
+    resolution derived-approve-tick and land_on_approve use) must name this run's ``by`` and ``why``; anything
+    else (no hold, someone else's, an unreadable ledger) is a failed hold and the PR is not flipped."""
+    root = _board_root()
+    mod = _load_pr_hold(root)
     if mod is None:
-        raise RuntimeError("scripts/lib/pr_hold.py not found under the hermes root")
+        raise RuntimeError(f"scripts/lib/pr_hold.py not found under the board root {root}")
+    reader_root = mod._root()
+    if not _same(reader_root, root):
+        raise RuntimeError(f"pr_hold readers resolve ledger root {reader_root}, not the board root {root}; "
+                           f"no write")
     mod.write("set", repo, int(number), why, by)
+    got = mod.held(repo, int(number))
+    if not (isinstance(got, str) and got.startswith(f"operator hold ({by} at ") and got.endswith(f"): {why or '-'}")):
+        raise RuntimeError(f"hold read-back failed: held() = {str(got)[:120]!r}")
 
 
 def _default_hold() -> Optional[HoldFn]:
@@ -119,7 +149,11 @@ def apply(keys: Iterable[str], *, why: str, by: str, hold: Optional[HoldFn] = No
             _log.warning("draft merge hold: %s hold failed: %s", key, exc)
             continue
         entry["at"] = int(time.time())   # BEFORE the flip: every post-ready run starts after it
-        rc = ready(repo, int(num)) if ready is not None else None
+        try:
+            rc = ready(repo, int(num)) if ready is not None else None
+        except Exception as exc:  # noqa: BLE001 -- held, still draft: the human takes it (Prism b4aec6063a55)
+            rc = f"raised: {str(exc)[:160]}"
+            _log.warning("draft merge hold: %s ready flip raised: %s", key, exc)
         entry["ready"] = rc
         entry["ok"] = rc == 0
     return out
