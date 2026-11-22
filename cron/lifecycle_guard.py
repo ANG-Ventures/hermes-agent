@@ -1387,9 +1387,14 @@ class _LifecycleScanBudget:
     cloud placeholder) so the caller can tell the model the real reason (#113944)."""
 
     __slots__ = ("bytes_remaining", "lines_remaining", "paths_remaining", "remote_reads_remaining",
-                 "refusal", "hit")
+                 "refusal", "hit", "local_reads")
 
-    def __init__(self) -> None:
+    def __init__(self, *, local_reads: bool = False) -> None:
+        # t_7eff4af6: on the local backend the "remote" callback is an in-process open() of a path
+        # the walk already found missing, not a backend roundtrip, so the roundtrip cap does not
+        # apply; the unique-path cap (charged first) still bounds those reads. scripts/test-gate
+        # names ~71 such paths and was refused at 64 on every direct call.
+        self.local_reads = local_reads
         # Read the module constants at construction so tests/operators can lower them at runtime.
         self.bytes_remaining = _MAX_LIFECYCLE_SCAN_BYTES
         self.lines_remaining = _MAX_LIFECYCLE_SCAN_LINES
@@ -1430,6 +1435,8 @@ class _LifecycleScanBudget:
 
     def charge_remote_read(self) -> bool:
         """Charge one remote-backend read (a network roundtrip each)."""
+        if self.local_reads:
+            return True
         if self.remote_reads_remaining <= 0:
             return False
         self.remote_reads_remaining -= 1
@@ -3832,11 +3839,14 @@ def scan_gateway_lifecycle_detail(
     *,
     cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    read_remote_script_is_local: bool = False,
 ) -> tuple[bool, Optional[str], Optional[str]]:
     """``(unsafe, refusal, hit)``: :func:`scan_gateway_lifecycle` plus *hit*, a one-line
     description of the token and position that tripped the guard (``None`` when allowed or when
-    the verdict is a non-lifecycle refusal)."""
-    budget = _LifecycleScanBudget()
+    the verdict is a non-lifecycle refusal). ``read_remote_script_is_local``: the callback reads
+    the host filesystem in-process (local backend), so its reads are not charged to the
+    roundtrip cap ``_MAX_LIFECYCLE_SCAN_REMOTE_READS``; every other cap still applies."""
+    budget = _LifecycleScanBudget(local_reads=read_remote_script_is_local)
     try:
         # Includes the direct regex/submit scans at depth 0.
         unsafe = _contains_unsafe_gateway_action(
