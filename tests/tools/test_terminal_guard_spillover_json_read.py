@@ -187,6 +187,28 @@ def test_cd_chains_and_quoted_targets_are_resolved(tmp_path, cd_chain, subdir):
     assert _scan(f"{cd_chain} && {body}", tmp_path) == (False, None, None)
 
 
+@pytest.mark.parametrize("target", ['"project"$SUFFIX', "'project'$SUFFIX", '"project"-files', "~nosuchuser_t_bb509376/x"])
+def test_mixed_quoted_words_and_unknown_tilde_users_are_unresolved(target):
+    """A quoted prefix glued to more text, or a `~user` with no such user, is unknown
+    (Prism 9195f0beb18c at 3d140df9, 3c803e2d3cf2)."""
+    from cron.lifecycle_guard import _python_import_dirs
+
+    assert _python_import_dirs(f"cd {target}", "/work") is None
+
+
+def test_a_quoted_tilde_is_a_literal_directory_and_the_walk_still_runs(tmp_path):
+    """The shell does not expand a quoted `~`; no user lookup, no aborted walk (Prism 3c803e2d3cf2)."""
+    from cron.lifecycle_guard import _python_import_dirs
+
+    assert _python_import_dirs("cd '~root work'", str(tmp_path)) == [tmp_path, tmp_path / "~root work"]
+    (tmp_path / "~root work").mkdir()
+    big = tmp_path / "big.sh"
+    big.write_text("echo " + "x" * 70_000 + "\n", encoding="utf-8")
+    command = f"bash {big}; cd '~root work' && python3 - <<'EOF'\nprint(1)\nEOF"
+    unsafe, refusal, _hit = _scan(command, tmp_path)
+    assert unsafe is True and "longest-line cap" in refusal
+
+
 @pytest.mark.parametrize("init_file", ["__init__.pyc", "__init__.so", "__init__.cpython-312-x86_64-linux-gnu.so"])
 def test_sourceless_or_extension_package_shadow_keeps_the_body_visible(tmp_path, init_file):
     """A `json/` package with only a compiled `__init__` still shadows (Prism 2fd390fee2b6)."""

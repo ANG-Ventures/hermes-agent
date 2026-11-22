@@ -3710,8 +3710,9 @@ def _mask_read_only_python_paths(body: str) -> str:
 
 _PY_CD_RE = re.compile(
     r"(?:^|[;&|(\s])(?:cd|pushd)(?=[\s;&|)]|$)"
-    r"(?:[ \t]+('[^']*'|\"[^\"]*\"|[^\s;&|)<>]+))?"
+    r"(?:[ \t]+((?:'[^']*'|\"[^\"]*\"|[^\s;&|)<>'\"]+)+))?"
 )
+_PY_CD_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 _PY_IMPORT_DIRS_MAX = 64
 
 
@@ -3732,13 +3733,22 @@ def _python_import_dirs(shell_text: str, cwd: Optional[str]) -> Optional[list[Pa
         if arg is None:
             dirs.append(Path.home())
             continue
-        if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "'\"":
+        quoted = _PY_CD_QUOTED_RE.fullmatch(arg) is not None
+        if quoted:
             arg = arg[1:-1]
         elif any(c in arg for c in "'\""):
-            return None  # a partly quoted word: not resolved here
+            return None  # a partly quoted word (`"a"$X`, `"a"b`): not resolved here
         if not arg or arg == "-" or any(c in arg for c in "$`*?[{\\"):
             return None
-        target = Path(arg).expanduser()
+        if quoted:
+            target = Path(arg)  # the shell does not expand a quoted `~`
+        else:
+            try:
+                target = Path(arg).expanduser()
+            except (RuntimeError, KeyError):
+                return None  # `~user` with no such user: unknown, fail closed
+        if not quoted and arg.startswith("~") and str(target).startswith("~"):
+            return None
         if target.is_absolute():
             dirs.append(target)
         else:
