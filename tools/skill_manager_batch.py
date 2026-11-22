@@ -298,6 +298,10 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
         results = []
         rollback_failed = False
         token = _smt._skill_gate_bypass.set(True)
+        # Pin every op to the dir resolved above (a created skill: its create target), so no op
+        # writes into a dir this batch never snapshotted (135d6b4ff1b0).
+        pin_token = _smt._BATCH_SKILL_DIRS.set(
+            {nm: dirs[nm] if dirs[nm] is not None else create_targets.get(nm) for nm in dirs})
         try:
             for i, op in enumerate(operations):
                 try:
@@ -329,6 +333,7 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
                 entry.update({k: parsed[k] for k in _ADVISORY_KEYS if parsed.get(k) is not None})
                 results.append(entry)
         finally:
+            _smt._BATCH_SKILL_DIRS.reset(pin_token)
             _smt._skill_gate_bypass.reset(token)
             if rollback_failed:
                 # Keep the snapshots so the operator can still recover by hand.

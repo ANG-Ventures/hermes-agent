@@ -97,3 +97,20 @@ def test_clobber_guard_sees_one_skill_under_two_spellings(tmp_path):
                     "file_path": "references/a.md", "file_content": "second\n"})
         assert r["success"] is False and "already touched" in r["error"], r
         assert not ref.exists(), "a refused batch applies nothing"
+
+
+def test_ops_write_only_into_the_dirs_resolved_at_batch_start(tmp_path):
+    """135d6b4ff1b0: after op 0 removes media-aux/twin's SKILL.md, bare 'twin' (ambiguous when the
+    batch started) names research-aux/twin. An op writing through it reached a dir the batch never
+    snapshotted, so the write survived the failed batch."""
+    with _fleet(tmp_path) as (_root, _local, shared):
+        a = shared / "media-aux" / "twin" / "SKILL.md"
+        b_dir = shared / "research-aux" / "twin"
+        before_a = a.read_text()
+        r = _batch({"action": "remove_file", "name": "media-aux/twin", "file_path": "SKILL.md"},
+                   {"action": "write_file", "name": "twin",
+                    "file_path": "references/a.md", "file_content": "stray\n"},
+                   {**_MISS, "name": "twin"})
+        assert r["success"] is False, r
+        assert not (b_dir / "references" / "a.md").exists(), "no write outside the resolved dirs"
+        assert a.read_text() == before_a
