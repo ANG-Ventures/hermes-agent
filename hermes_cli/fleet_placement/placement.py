@@ -334,6 +334,7 @@ class HostSpec:
     aliases: tuple
     clock_mhz: float = 0.0           # max single-core clock (core_class "fast")
     default_preference: str = "normal"   # "low" = the headroom layer takes it only when no normal host has headroom
+    yields_overrides: bool = False       # true = never wins by continuity / the fast pick while an unflagged host is eligible
     unmeasurable_axes: tuple = ()        # axes this host's OS cannot report (darwin: no PSI, no %system); never required
     cpu_saturable: bool = False          # v1 only: negative cpu headroom is a score penalty, not a refusal (t_bfb88c23)
     # scorer v2 (t_f8a3b6c3): the active scorer and the host's MEASURED speed (var/placement/host-speed.json, R2b),
@@ -579,6 +580,8 @@ def validate(doc) -> List[str]:
             errs.append(f"hosts.{hid}.power_policy must be one of {list(POWER_POLICIES)} when present")
         if isinstance(h, dict) and h.get("default_preference", "normal") not in ("normal", "low"):
             errs.append(f"hosts.{hid}.default_preference must be normal|low (never an ordinal)")
+        if isinstance(h, dict) and "yields_overrides" in h and not isinstance(h["yields_overrides"], bool):
+            errs.append(f"hosts.{hid}.yields_overrides must be true|false")
         if isinstance(h, dict) and "fleet_cap" in h:     # the ONE per-host fleet-work cap (t_31911eb0)
             errs.extend(f"hosts.{hid}.{e}" for e in admission.fleet_cap_errors(h["fleet_cap"]))
         if isinstance(h, dict) and "cpu_saturable" in h:
@@ -802,6 +805,7 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
             ceilings={c: ceiling_of(v) for c, v in h["consumers"].items() if ceiling_of(v) is not None},
             aliases=tuple(h.get("aliases", [])), clock_mhz=float(f.get("clock_mhz", 0.0)),
             default_preference=str(h.get("default_preference", "normal")),
+            yields_overrides=h.get("yields_overrides") is True,
             unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])),
             cpu_saturable=hid in saturable, scorer=scorer,
             mt_yield=meas.get("mt_yield", SEED_MT_YIELD_SMT2 if threads == 2 * cores else 1.0),
@@ -2190,19 +2194,24 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     def pick(row: Headroom, rule: str, kept: bool = False) -> Decision:
         return done(Decision(row.host, "", rows, consumer, fp, kept_previous=kept, rule=rule))
 
-    # layer 3: per-job overrides (an ineligible target falls through; the gate always wins)
+    # layer 3: per-job overrides (an ineligible target falls through; the gate always wins). A yields_overrides host
+    # (mbp-2026) never wins by continuity or the fast pick while an unflagged host is eligible (Ace msg
+    # 1573943702118998158, t_6388e879: lower the MacBook's priority); affinity still wins anywhere
+    unflagged = [r for r in eligible if not table.hosts[r.host].yields_overrides]
     for field in ("affinity", "continuity"):
         want = table.resolve(getattr(job, field) or "")
-        if want and want in by_id:
+        if want and want in by_id and not (field == "continuity" and unflagged
+                                           and table.hosts[want].yields_overrides):
             return pick(by_id[want], field)
     core_class = job.core_class or ("fast" if job.priority is not None and job.priority <= 1 else None)
     if core_class == "fast":
         rule = "priority" if job.core_class is None else "core_class:fast"
-        if v2 and any(table.hosts[r.host].st_speed_src == "measured" for r in eligible):
+        fast = unflagged or eligible
+        if v2 and any(table.hosts[r.host].st_speed_src == "measured" for r in fast):
             # measured st_speed replaces the lscpu clock as the FIRST key (F5); until R2b measures, the clock rule stands
             speed = (lambda r: table.hosts[r.host].st_speed) if table.fast_pick == "speed" else (lambda r: 0.0)
-            return pick(max(eligible, key=lambda r: (speed(r), r.score, table.hosts[r.host].clock_mhz, r.host)), rule)
-        best = max(eligible, key=lambda r: (table.hosts[r.host].clock_mhz, r.score, r.host))
+            return pick(max(fast, key=lambda r: (speed(r), r.score, table.hosts[r.host].clock_mhz, r.host)), rule)
+        best = max(fast, key=lambda r: (table.hosts[r.host].clock_mhz, r.score, r.host))
         return pick(best, rule)
     if core_class == "wide":
         best = max(eligible, key=lambda r: (table.hosts[r.host].threads, r.score, r.host))
