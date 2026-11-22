@@ -121,7 +121,11 @@ def test_json_re_body_with_a_lifecycle_argv_is_still_blocked(tmp_path, spill):
         f"python3 - <<'EOF'\nimport json,re,subprocess\nd=json.load(open('{spill}'))\n"
         f"if re.search('x', d['content']):\n    subprocess.run([{argv}])\nEOF"
     )
-    assert _scan(command, tmp_path)[0] is True
+    unsafe, refusal, hit = _scan(command, tmp_path)
+    # A lifecycle hit, not a budget refusal: the masked body never walks the spill file, so a
+    # scanner that missed the argv would allow this, not refuse it on the longest-line cap.
+    assert unsafe is True and refusal is None
+    assert hit is not None and "python heredoc body" in hit
 
 
 def test_json_load_object_hook_must_be_a_pure_builtin(tmp_path, spill):
@@ -158,5 +162,53 @@ def test_an_executed_script_over_the_cap_gets_the_split_hint_not_the_read_hint(t
     big.write_text("echo " + "x" * 70_000 + "\n", encoding="utf-8")
     unsafe, refusal, _hit = _scan(f"bash {big}", tmp_path)
     assert unsafe is True and "longest-line cap" in refusal
-    assert "split it into smaller files" in refusal
-    assert "sys.argv[1]" not in refusal
+    assert "break that line into shorter ones" in refusal
+    assert "sys.argv[1]" not in refusal and "share one 1 MiB" not in refusal
+
+
+def test_an_executed_script_that_the_shared_walk_budget_cannot_fit_names_the_walk(tmp_path):
+    """Two runnable scripts that each fit alone but not together: the second one is refused
+    on the walk's shared budget, and the hint says so instead of "break that line"."""
+    first = tmp_path / "first.sh"
+    second = tmp_path / "second.sh"
+    first.write_text("true\n" * 10_000, encoding="utf-8")
+    second.write_text("true\n" * 10_000, encoding="utf-8")
+    unsafe, refusal, _hit = _scan(f"bash {first}; bash {second}", tmp_path)
+    assert unsafe is True and "lines left of the 16384-line walk cap" in refusal
+    assert "share one 1 MiB / 16384-line scan budget" in refusal
+    assert "break that line" not in refusal
+
+
+def test_control_characters_in_the_path_are_not_echoed(tmp_path, caplog):
+    weird = tmp_path / "evil\x1b[2Jname\x07.sh"
+    weird.write_text("echo " + "x" * 70_000 + "\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="cron.lifecycle_guard"):
+        unsafe, refusal, _hit = _scan(f"bash '{weird}'", tmp_path)
+    assert unsafe is True and "longest-line cap" in refusal
+    assert "evil?[2Jname?.sh" in refusal
+    assert "\x1b" not in refusal and "\x07" not in refusal
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "evil?[2Jname?.sh" in logged and "\x1b" not in logged
+
+
+def test_a_raising_path_lookup_cannot_skip_a_blocking_sh_c_payload(tmp_path, monkeypatch):
+    """The shell-named set only feeds refusal wording: a path lookup that raises on the outer
+    command (Path.resolve on a symlink loop, Python 3.11) must not pre-empt the `sh -c` payload
+    walk, whose nested script blocks the command, the same verdict as on main e03d0a7abe."""
+    from cron import lifecycle_guard
+
+    restart = tmp_path / "restart.sh"
+    restart.write_text(RESTART + "\n", encoding="utf-8")
+    loop = tmp_path / "loop"
+    real = lifecycle_guard._iter_referenced_shell_scripts
+
+    def raising(text, *args, **kwargs):
+        if str(loop) in text:
+            raise RuntimeError(f"Symlink loop from {loop!r}")
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(lifecycle_guard, "_iter_referenced_shell_scripts", raising)
+    command = f"sh -c 'bash {restart}'; cat {loop}"
+    unsafe, refusal, hit = _scan(command, tmp_path)
+    assert unsafe is True and refusal is None
+    assert hit is not None and "referenced script" in hit

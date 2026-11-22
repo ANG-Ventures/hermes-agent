@@ -1387,7 +1387,7 @@ class _LifecycleScanBudget:
     cloud placeholder) so the caller can tell the model the real reason (#113944)."""
 
     __slots__ = ("bytes_remaining", "lines_remaining", "paths_remaining", "remote_reads_remaining",
-                 "refusal", "hit", "local_reads", "over")
+                 "refusal", "hit", "local_reads", "over", "over_walk")
 
     def __init__(self, *, local_reads: bool = False) -> None:
         # t_7eff4af6: on the local backend the "remote" callback is an in-process open() of a path
@@ -1407,10 +1407,13 @@ class _LifecycleScanBudget:
         self.hit: Optional[str] = None
         # Which text cap the last refused charge_text hit, for the refusal message (t_bb509376).
         self.over: Optional[str] = None
+        # True when what ran out is the walk's SHARED byte/line budget, not the per-line cap.
+        self.over_walk = False
 
     def charge_text(self, text: str) -> bool:
         """Charge *text* before tokenization; False when it does not fit."""
         # UTF-8 is >= one byte per code point, so the char count is a free lower bound.
+        self.over_walk = True
         if len(text) > self.bytes_remaining:
             self.over = f"{len(text)} chars, over the {self.bytes_remaining} bytes left of the 1 MiB walk cap"
             return False
@@ -1429,6 +1432,7 @@ class _LifecycleScanBudget:
         if longest > _MAX_LIFECYCLE_SCAN_LINE_BYTES:
             self.over = (f"a {longest}-char line, over the {_MAX_LIFECYCLE_SCAN_LINE_BYTES}-char "
                          "longest-line cap")
+            self.over_walk = False
             return False
         self.bytes_remaining -= encoded
         self.lines_remaining -= lines
@@ -1485,8 +1489,21 @@ _TEXT_CAP_WAY_THROUGH = (
 # A file the shell itself names (`bash big.sh`, `python3 big.py`) is run, not read: the read-as-data
 # shapes above do not apply to it (Prism 8e4887a66a56).
 _TEXT_CAP_EXECUTED = (
-    "a file the command runs is scanned whole and must fit these caps: split it into smaller files"
+    "a file the command runs is scanned whole and no line may exceed the longest-line cap: "
+    "break that line into shorter ones"
 )
+# The 1 MiB / 16384-line budget is shared by the command and every file the walk reads, so a
+# file can fail it because earlier text used it up: splitting that file does not help.
+_TEXT_CAP_EXECUTED_WALK = (
+    "the command and every file it runs share one 1 MiB / 16384-line scan budget, and what was "
+    "left did not fit this file: run it in a command of its own, or make it smaller"
+)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _printable_path(path: Path) -> str:
+    """*path* with control characters replaced, safe for a refusal or a log line."""
+    return _CONTROL_CHARS_RE.sub("?", str(path))
 
 
 def _budget_exhausted(
@@ -1495,7 +1512,8 @@ def _budget_exhausted(
 ) -> bool:
     detail = ""
     if what == "text" and budget.over:
-        detail = f": {'`%s`' % source if source is not None else 'the text'} is {budget.over}"
+        named = f"`{_printable_path(source)}`" if source is not None else "the text"
+        detail = f": {named} is {budget.over}"
     logger.warning(
         "lifecycle guard scan budget exhausted (%s at depth %d%s); "
         "failing closed — see _MAX_LIFECYCLE_SCAN_* in cron/lifecycle_guard.py",
@@ -1503,7 +1521,11 @@ def _budget_exhausted(
     )
     budget.refusal = f"the scan budget was exhausted ({what} at depth {depth}{detail})"
     if what == "text" and source is not None:
-        budget.refusal += f"; {_TEXT_CAP_WAY_THROUGH if read_as_data else _TEXT_CAP_EXECUTED}"
+        if read_as_data:
+            hint = _TEXT_CAP_WAY_THROUGH
+        else:
+            hint = _TEXT_CAP_EXECUTED_WALK if budget.over_walk else _TEXT_CAP_EXECUTED
+        budget.refusal += f"; {hint}"
     return True
 
 
@@ -3776,12 +3798,18 @@ def _contains_unsafe_gateway_action(
     # oversized data file mentioned there otherwise fails closed as a "script".
     shell_command = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
     masked_bodies = [_mask_read_only_python_paths(body) for body in python_bodies]
-    shell_named = set(_iter_referenced_shell_scripts(shell_command, cwd=cwd))
     referenced_command = shell_command + "\n" + "\n".join(masked_bodies)
 
     for payload in _iter_shell_command_payloads(shell_command):
         if recurse(payload, cwd, executed):
             return True
+
+    # Files the shell itself names; feeds only the refusal wording (read-as-data vs executed), so
+    # it is computed after the payload walk and can never change a verdict (Apollo, #529).
+    try:
+        shell_named = set(_iter_referenced_shell_scripts(shell_command, cwd=cwd))
+    except Exception:
+        shell_named = set()
 
     # Paths named only inside a masked body are still READ: an interpreter body that hands
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
@@ -4074,7 +4102,7 @@ def check_gateway_lifecycle(
             f"Blocked: the lifecycle guard could not scan this cron job or referenced script: {refusal}. "
             "Nothing in the job is known to contain a gateway lifecycle command, but a script "
             "the job executes must be scannable (a regular text file under 1 MiB, at most 16384 "
-            "lines, no line over 64 KiB) before it can run."
+            "lines, no line over 65,536 characters) before it can run."
         )
     if unsafe:
         raise GatewayLifecycleBlocked(
