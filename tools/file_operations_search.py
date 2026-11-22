@@ -75,6 +75,32 @@ def _normalized_filename_search_root(env: Any, root: str, fallback_cwd: str) -> 
     return posixpath.normpath(root)
 
 
+# A file-name walk rooted at one of these lists every file under it before -g filters a name (Studio
+# 24 h, 2026-11-21: 30 such searches = 5,341 cpu-s, 0.062 cores, 1-7 min each). os.pathsep-separated;
+# "off" or empty turns the refusal off. A "~" entry is expanded only for a local backend.
+HEAVY_FILENAME_ROOTS_ENV = "HERMES_FILE_SEARCH_HEAVY_ROOTS"
+HEAVY_FILENAME_ROOTS_DEFAULT = os.pathsep.join(("/", "~", "/Volumes/fleet-scratch", "/Volumes/fleet-scratch/tmp"))
+_HEAVY_FILENAME_ROOT_REFUSAL = (
+    "File search refused: a file-name search rooted at {root} walks every file under it (24 h on the "
+    "Studio: 0.062 cores, 1-7 min a search). Narrow 'path' to the dir you wrote it in (your card's dir, "
+    "one clone, one state/<sub> dir), or for a top-level name run `ls {root}` or `find {root} -maxdepth 2 "
+    "-name '<glob>'`; a deliberate full walk: terminal `HERMES_FULL_WALK=1 rg --files -g '<glob>' {root}`. "
+    "Off switch: " + HEAVY_FILENAME_ROOTS_ENV + "=off.")
+
+
+def _heavy_filename_root(env: Any, roots: List[str], fallback_cwd: str) -> Optional[str]:
+    """The first root that is a configured heavy filename-walk root, else None (t_31e5ab30)."""
+    from tools.environments.local import LocalEnvironment
+
+    spec = os.environ.get(HEAVY_FILENAME_ROOTS_ENV, HEAVY_FILENAME_ROOTS_DEFAULT).strip()
+    if spec.lower() in ("", "off"):
+        return None
+    local = isinstance(env, LocalEnvironment)
+    heavy = {_normalized_filename_search_root(env, os.path.expanduser(x) if local else x, fallback_cwd)
+             for x in spec.split(os.pathsep) if x and (local or not x.startswith("~"))}
+    return next((r for r in roots if _normalized_filename_search_root(env, r, fallback_cwd) in heavy), None)
+
+
 def _filename_search_root_keys(env: Any, roots: List[str], fallback_cwd: str) -> tuple[tuple[str, str, str], ...]:
     """Unique backend/root admission keys in deterministic order."""
     env_type = type(env)
@@ -693,6 +719,9 @@ class SearchMixin:
         roots = [path] if isinstance(path, str) else path
         if not roots:
             return SearchResult(error="File search requires at least one search root in 'path'.")
+        heavy = _heavy_filename_root(self.env, roots, self.cwd)
+        if heavy:
+            return SearchResult(error=_HEAVY_FILENAME_ROOT_REFUSAL.format(root=heavy))
 
         # Prefer ripgrep: bounded parallel traversal with ignore semantics. Resolve
         # the engine and exact-order capability BEFORE admission so a queued request
