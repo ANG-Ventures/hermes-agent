@@ -277,12 +277,14 @@ def gateway_lifecycle_block(
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
+    local_backend = env_type == "local"
     unsafe, refusal, hit = scan_gateway_lifecycle_detail(
         command,
         cwd=guard_cwd,
         read_remote_script=lambda p: _read_script_for_guard(
-            env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES, local_backend=env_type == "local",
+            env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES, local_backend=local_backend,
         ),
+        read_remote_script_is_local=local_backend,
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,

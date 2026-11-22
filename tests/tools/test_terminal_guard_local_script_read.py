@@ -208,3 +208,57 @@ def test_pre_exec_timeout_message_does_not_blame_the_identity_probe(monkeypatch)
     assert "pre-execution safety checks did not finish" in error
     assert "not run" in error
     assert ran == []
+
+
+# --- t_7eff4af6: local fallback reads are not charged to the remote-roundtrip cap -----------
+# scripts/test-gate (hermes-home, 311 KB of Python) names ~71 paths that do not exist on the
+# host; each missed host read fell to the local "remote" callback and spent one of the 64
+# roundtrip charges, so every direct `scripts/test-gate ...` failed closed with "remote reads at
+# depth 1". The stub below is that shape: an executed Python script naming more missing paths
+# than the cap.
+
+_MISSING_PATHS = 3 * 64  # well over _MAX_LIFECYCLE_SCAN_REMOTE_READS
+
+
+def _gate_stub(root, tail=""):
+    # The walk tokenizes the gate's Python as shell text; each absolute path it lands at command
+    # position is a candidate. These lines model that: one missing command-position path each.
+    names = "\n".join(f"/nonexistent-t7eff/bin/probe-{i} --help" for i in range(_MISSING_PATHS))
+    return _write(root / "scripts" / "test-gate", f'#!/usr/bin/python3\n"""test-gate stub."""\n{names}\n{tail}')
+
+
+def _pytest_guard_pool_cmd(root):
+    # The exact line scripts/lib/studio_pytest_guard.py pool_cmd() prints in its refusal:
+    # "cd %s && %s %s" % (quote(cwd), quote(<root>/scripts/test-gate), shlex.join(orig)).
+    return (f"cd {root} && {root}/scripts/test-gate /usr/bin/python3 -m pytest "
+            "scripts/tests/test_studio_pytest_guard.py")
+
+
+def test_local_pytest_guard_pool_command_passes_the_lifecycle_guard(tmp_path, local_env):
+    _gate_stub(tmp_path)
+    cmd = _pytest_guard_pool_cmd(tmp_path)
+    assert _block(cmd, local_env, cwd=str(tmp_path)) is None
+    assert local_env.calls == []
+
+
+def test_local_direct_test_gate_command_passes_the_lifecycle_guard(tmp_path, local_env):
+    _gate_stub(tmp_path)
+    cmd = "scripts/test-gate python3 -m pytest -q scripts/tests/test_studio_pytest_guard.py"
+    assert _block(cmd, local_env, cwd=str(tmp_path)) is None
+
+
+def test_local_lifecycle_command_behind_many_missing_paths_is_still_blocked(tmp_path, local_env):
+    # Not a widening: the walk now reaches the end of the script and still finds the restart.
+    _gate_stub(tmp_path, tail=f"{RESTART}\n")
+    blocked = _block(_pytest_guard_pool_cmd(tmp_path), local_env, cwd=str(tmp_path))
+    assert blocked is not None
+    error = json.loads(blocked)["error"]
+    assert "cannot restart" in error and "scan budget" not in error
+
+
+def test_remote_backend_keeps_the_roundtrip_cap(tmp_path):
+    _gate_stub(tmp_path)
+    env = _SentinelEnv(str(tmp_path), output="", returncode=1)
+    blocked = _block(_pytest_guard_pool_cmd(tmp_path), env, env_type="ssh", cwd=str(tmp_path))
+    assert blocked is not None
+    assert "remote reads at depth 1" in json.loads(blocked)["error"]
