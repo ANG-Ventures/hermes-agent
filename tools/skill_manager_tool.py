@@ -604,19 +604,44 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
                       org_guard: bool = True):
     """Find the skill; run the org-mirror (unless ``org_guard=False``) and background-review
     write guards -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
-    existing = _find_skill(name)
-    # The autonomous curator keeps its existing scope: no library fallback in the review fork.
-    if not existing and action in _LIBRARY_WRITE_ACTIONS and not _is_background_review():
-        library_dir, ambiguous = find_library_skill(name)
-        if ambiguous:
-            return None, _err(ambiguous)
-        existing = {"path": library_dir} if library_dir is not None else None
+    pins = _BATCH_SKILL_DIRS.get()
+    pinned = pins.get(name) if pins is not None else None
+    if pinned is not None and (pinned / "SKILL.md").is_file():
+        # Inside a batch: the dir resolved once at batch start, never a fresh name lookup.
+        existing = {"path": pinned}
+    else:
+        existing = _locate_by_name(name, action)
+        if isinstance(existing, dict) and "error" in existing:
+            return None, existing
+        if existing and pins is not None and name in pins:
+            # The name now resolves to a dir it did not name at batch start (an earlier op
+            # removed a twin's SKILL.md): that dir was never snapshotted, so refuse.
+            return None, _err(f"Skill '{name}' now resolves to '{existing['path']}', not the skill "
+                              "it named when this batch started; pass the qualified name "
+                              "'<group>/<name>'.")
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
     guard = ((org_guard and _org_mirror_write_guard(name, skill_dir, action))
              or _background_review_write_guard(name, skill_dir, action))
     return (None, guard) if guard else (skill_dir, None)
+
+
+# Set by a skill_manage batch while its ops run: name -> the dir resolved for it at batch start
+# (None: it named no single skill then). _locate_for_write writes only into these dirs.
+_BATCH_SKILL_DIRS = _ctxvars.ContextVar("skill_batch_dirs", default=None)
+
+
+def _locate_by_name(name: str, action: str):
+    """The name lookup: ``{"path": dir}`` | None | an ambiguity error dict."""
+    existing = _find_skill(name)
+    # The autonomous curator keeps its existing scope: no library fallback in the review fork.
+    if not existing and action in _LIBRARY_WRITE_ACTIONS and not _is_background_review():
+        library_dir, ambiguous = find_library_skill(name)
+        if ambiguous:
+            return _err(ambiguous)
+        existing = {"path": library_dir} if library_dir is not None else None
+    return existing
 
 
 def _load_tier_module(root: Path):
