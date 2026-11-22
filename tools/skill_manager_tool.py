@@ -388,6 +388,60 @@ def _find_existing_skill_anywhere(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Ops that may reach a skill in a shared group this profile does not mount. Not delete, not
+# create (create already scans every group), and nothing about which skills a profile LOADS.
+_LIBRARY_WRITE_ACTIONS = frozenset({"edit", "patch", "write_file", "remove_file"})
+
+
+def find_library_skill(name: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Look ``name`` up in the WHOLE shared library (``skills-shared/<group>/<name>/``), mounted
+    or not -> ``(skill_dir, None)`` | ``(None, error)`` when ambiguous | ``(None, None)``.
+
+    The fallback for ops on a skill the profile's own dirs do not hold: skills-shared is a
+    library, not a loadout. A bare name with matches in more than one group refuses and lists
+    each ``<group>/<name>``; that qualified form names exactly one."""
+    shared = _shared_skills_root()
+    try:
+        if not shared.is_dir():
+            return None, None
+    except OSError:
+        return None, None
+    parts = name.replace("\\", "/").split("/")
+    bare = parts[-1]
+    if len(parts) > 2 or _validate_name(bare):
+        return None, None
+    # `_`-prefixed dirs (_bindings, _registry) are tree plumbing, not skill groups.
+    groups = [g for g in _valid_shared_groups()
+              if not g.startswith("_") and (len(parts) == 1 or g == parts[0])]
+    from agent.skill_utils import is_excluded_skill_path
+    shared_r = shared.resolve()
+    hits = []
+    for group in groups:
+        skill_md = shared / group / bare / "SKILL.md"
+        with suppress(OSError, ValueError):
+            # resolve(): a symlinked package or SKILL.md must not lead out of the library.
+            if (skill_md.is_file() and not is_excluded_skill_path(skill_md)
+                    and skill_md.resolve().is_relative_to(shared_r)
+                    and skill_md.parent.resolve().is_relative_to(shared_r)):
+                hits.append((group, skill_md.parent))
+    if len(hits) > 1:
+        qualified = ", ".join(f"'{g}/{bare}'" for g, _ in hits)
+        return None, (f"Skill '{name}' is in {len(hits)} shared groups: {qualified}. Refusing to "
+                      "guess; pass the qualified name '<group>/<name>'.")
+    return (hits[0][1], None) if hits else (None, None)
+
+
+def _find_write_target(name: str) -> Optional[Dict[str, Any]]:
+    """``_find_skill``, then an unambiguous shared-library hit: the skill a library-reaching op
+    would write (batch snapshot/rollback and the audit ledger must see the same dir)."""
+    if existing := _find_skill(name):
+        return existing
+    if _is_background_review():  # same rule as _locate_for_write: the fork never touches an unmounted package
+        return None
+    skill_dir, _ambiguous = find_library_skill(name)
+    return {"path": skill_dir} if skill_dir is not None else None
+
+
 def _iter_skill_dirs(root: Path):
     from agent.skill_utils import is_excluded_skill_path
     for skill_md in root.rglob("SKILL.md"):
@@ -551,6 +605,12 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
     """Find the skill; run the org-mirror (unless ``org_guard=False``) and background-review
     write guards -> ``(skill_dir, None)`` | ``(None, error_dict)``."""
     existing = _find_skill(name)
+    # The autonomous curator keeps its existing scope: no library fallback in the review fork.
+    if not existing and action in _LIBRARY_WRITE_ACTIONS and not _is_background_review():
+        library_dir, ambiguous = find_library_skill(name)
+        if ambiguous:
+            return None, _err(ambiguous)
+        existing = {"path": library_dir} if library_dir is not None else None
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
@@ -1068,7 +1128,7 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
     clear, curator telemetry, debounced sync push."""
     with suppress(Exception):
         from tools import skill_ledger as _ledger
-        _post = _find_skill(name)
+        _post = _find_write_target(name) if action in _LIBRARY_WRITE_ACTIONS else _find_skill(name)
         # delete: consolidation vs prune, and whether the recoverable archive handled it
         _evidence = ({"absorbed_into": absorbed_into, "archived": bool(result.get("_archived"))}
                      if action == "delete" else {})
@@ -1160,7 +1220,7 @@ def skill_manage(
         _ledger_before = None
         with suppress(Exception):
             from tools import skill_ledger as _ledger
-            _pre = _find_skill(name)
+            _pre = _find_write_target(name) if action in _LIBRARY_WRITE_ACTIONS else _find_skill(name)
             _ledger_before = _ledger.capture_before(
                 _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(

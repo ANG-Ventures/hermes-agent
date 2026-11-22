@@ -270,8 +270,12 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
                               for i, op in enumerate(operations) if op.get("action") == "create"}
         except _smt.SkillCreateError as e:
             return tool_error(str(e), success=False)
+        # A name the batch does not create may live in an unmounted shared group (the ops reach
+        # the whole library); snapshot and roll back that same dir. A create keeps the narrow scan.
+        def find(nm):
+            return _smt._find_skill(nm) if nm in create_targets else _smt._find_write_target(nm)
         snap_root = Path(tempfile.mkdtemp(prefix="skill_batch_"))
-        snapshots, snap_err = _snapshot_skills(names, snap_root, _smt._find_skill, create_targets)
+        snapshots, snap_err = _snapshot_skills(names, snap_root, find, create_targets)
         if snap_err is not None:
             shutil.rmtree(snap_root, ignore_errors=True)
             return tool_error(snap_err, success=False)
@@ -288,7 +292,7 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
                 except Exception:  # noqa: BLE001
                     parsed = {"success": False, "error": "unparseable op result"}
                 if not parsed.get("success"):
-                    note, rollback_failed = _rollback(snapshots, _smt._find_skill, results, create_targets)
+                    note, rollback_failed = _rollback(snapshots, find, results, create_targets)
                     fail = {  # key order is wire-visible
                         "success": False,
                         "error": (f"operations[{i}] ({op['action']} on '{names[i]}') failed: "

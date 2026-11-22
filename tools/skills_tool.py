@@ -535,10 +535,50 @@ def _provably_same_skill(candidates) -> bool:
         return False
 
 
-def _locate_skill(name: str, local_category_name: Optional[str], project_dirs: list, all_dirs):
+def _skill_not_found(name: str) -> str:
+    available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+    return _fail(f"Skill '{name}' not found.", available_skills=available,
+                 hint="Use skills_list to see all available skills")
+
+
+def _view_library_skill(name: str, file_path: Optional[str]) -> Optional[str]:
+    """Read-only skill_view of a skill in a shared group this profile does not mount (the same
+    lookup skill_manage's patch/write_file/remove_file fall back to), so an agent can read what
+    it is about to patch. Raw text only: no preprocessing, setup capture or dep install (that is
+    loading), and nothing joins the skill index. None when the library has no such skill."""
+    from tools.skill_manager_tool import find_library_skill
+    skill_dir, ambiguous = find_library_skill(name)
+    if ambiguous:
+        return _fail(ambiguous)
+    if skill_dir is None:
+        return None
+    if file_path:
+        served = _serve_skill_file(skill_dir, file_path, name, list_available=True, mark_read=True,
+                                   hint="Use a relative path within the skill directory")
+        parsed = json.loads(served)
+        return _json({**parsed, "library": True}) if parsed.get("success") else served
+    skill_md = skill_dir / "SKILL.md"
+    content = _read_skill_text(skill_md)
+    frontmatter = _safe_frontmatter(content=content)
+    linked_files = _skill_linked_files(skill_dir)
+    _mark_background_review_read(skill_md)
+    return _json({
+        "success": True, "name": frontmatter.get("name", skill_dir.name),
+        "description": frontmatter.get("description", ""), "content": content,
+        "path": f"{skill_dir.parent.name}/{skill_dir.name}/SKILL.md", "skill_dir": str(skill_dir),
+        "library": True,
+        "library_note": (f"Not mounted by this profile: read from the shared library "
+                         f"({skill_dir.parent.name}/). skill_manage patch/write_file/remove_file "
+                         "reach it by this name; it is not loaded into this profile."),
+        "linked_files": linked_files or None,
+        "_source_path": str(skill_md)})
+
+
+def _locate_skill(name: str, local_category_name: Optional[str], project_dirs: list, all_dirs, *,
+                  not_found_ok: bool = False):
     """Unique on-disk skill for *name*: collision refusal, project-tier precedence, same-root
     precedence, quarantine gate, not-found listing. ``(error_json, skill_dir, skill_md)``;
-    skill_md set iff no error."""
+    skill_md set iff no error. ``not_found_ok``: no candidate at all -> ``(None, None, None)``."""
     if not all_dirs:
         return _fail(
             "Skills directory does not exist yet. It will be created on first install."), None, None
@@ -581,10 +621,10 @@ def _locate_skill(name: str, local_category_name: Optional[str], project_dirs: l
                 "dangerous. It will not load until the repo's skill content changes and passes a re-scan.",
                 hint="Inspect the skill in the repo checkout, or untrust the repo with "
                 "`hermes skills untrust`."), None, None
+    if not_found_ok and skill_md is None:
+        return None, None, None
     if not skill_md or not skill_md.exists():
-        available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
-        return _fail(f"Skill '{name}' not found.", available_skills=available,
-                     hint="Use skills_list to see all available skills"), None, None
+        return _skill_not_found(name), None, None
     return None, skill_dir, skill_md
 
 
@@ -627,9 +667,11 @@ def skill_view(
             return _fail(lookup_error, hint=_LOOKUP_HINT)
         project_dirs, all_dirs, active_skills_dir = _skill_search_dirs()
         error, skill_dir, skill_md = _locate_skill(
-            name, local_category_name, project_dirs, all_dirs)
-        if error is not None:
-            return error
+            name, local_category_name, project_dirs, all_dirs, not_found_ok=True)
+        if error is not None:  # an empty loadout still reads the library
+            return (_view_library_skill(name, file_path) or error) if not all_dirs else error
+        if skill_md is None:  # not in this profile's dirs: the shared library, read-only
+            return _view_library_skill(name, file_path) or _skill_not_found(name)
         try:  # read once — reused for platform check and main content
             content = _read_skill_text(skill_md)
         except Exception as e:
@@ -784,7 +826,8 @@ def _skill_view_with_bump(args, **kw):
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
             _record_skill_view(dedup_task_id, name, args.get("file_path"), parsed)
-            if resolved := parsed.get("name") or name:  # qualified forms return the canonical name
+            # A library read (unmounted group) is not a load: no usage telemetry in this profile.
+            if not parsed.get("library") and (resolved := parsed.get("name") or name):
                 from tools.skill_usage import bump_use, bump_view
                 bump_view(str(resolved))
                 # Viewing is actively loading the skill to act on it — that counts as use
