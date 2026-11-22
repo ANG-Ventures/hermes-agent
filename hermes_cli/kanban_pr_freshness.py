@@ -87,7 +87,9 @@ class DraftPrError(ValueError):
             f"the right PR), then retry; rc=21 = a reviewer review-hold: leave it "
             f"draft and complete with --draft-ok 'reviewer hold: <who>'. "
             f"If the draft is otherwise INTENTIONALLY left open, complete with "
-            f"--draft-ok/draft_ok \"<reason>\" (audited). "
+            f"--draft-ok/draft_ok \"<reason>\" (audited): by default that is a merge hold "
+            f"(ledger hold, PR marked ready, card to review); a stacked/pinned PR that must stay "
+            f"draft adds --draft-kind/draft_kind keep_draft. "
             f"{task_id} is still in-flight (no state change)."
         )
 

@@ -178,7 +178,7 @@ _UNDECLARED_ARGS: dict[str, frozenset[str]] = {
     "kanban_attach_url": frozenset({"title"}),
     "kanban_list": frozenset({"all"}),
     "kanban_complete": _FORK_MUTATION_ARGS | frozenset({
-        "superseded_by", "draft_ok", "survivor_pr", "survivor_ref"}),
+        "superseded_by", "draft_ok", "draft_kind", "survivor_pr", "survivor_ref"}),
     "kanban_block": _FORK_MUTATION_ARGS,
     "kanban_unblock": _FORK_MUTATION_ARGS,
     "kanban_request_review": _FORK_MUTATION_ARGS,
@@ -1050,6 +1050,9 @@ def _handle_complete(args: dict, **kw) -> str:
     _check(draft_ok is None or isinstance(draft_ok, str),
            f"draft_ok must be a string reason, got {type(draft_ok).__name__}")
     draft_ok = _redact_opt(draft_ok)
+    draft_kind = args.get("draft_kind")
+    _check(draft_kind is None or draft_kind in ("merge_hold", "keep_draft"),
+           f"draft_kind must be 'merge_hold' or 'keep_draft', got {draft_kind!r}")
     _check(summary or result or superseded_by is not None,
            "provide at least one of: summary (preferred), result — or "
            "superseded_by if the card's premise was already satisfied elsewhere")
@@ -1072,7 +1075,8 @@ def _handle_complete(args: dict, **kw) -> str:
                 conn, tid, result=result, summary=summary, metadata=metadata,
                 created_cards=created_cards, expected_run_id=_worker_run_id(tid),
                 survivor_pr=survivor_pr, survivor_ref=survivor_ref,
-                superseded_by=superseded_by, draft_ok=draft_ok, scheduled_ok=True)
+                superseded_by=superseded_by, draft_ok=draft_ok, draft_kind=draft_kind,
+                scheduled_ok=True)
         except kb.EmptyDraftOverrideError as draft_err:
             return tool_error(f"kanban_complete blocked: {draft_err}.")
         except kb.EmptySupersedeError as supersede_err:

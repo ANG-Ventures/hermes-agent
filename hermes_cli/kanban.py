@@ -3606,6 +3606,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     survivor_reason=survivor_reason,
                     superseded_by=superseded_by,
                     draft_ok=draft_ok,
+                    draft_kind=getattr(args, "draft_kind", None),
                     external=external,
                     watcher=watcher,
                     abandon_routed_pr=abandon_routed_pr,

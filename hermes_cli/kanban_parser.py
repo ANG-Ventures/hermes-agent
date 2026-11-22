@@ -755,8 +755,12 @@ _SPECS = [
         _arg("--draft-ok", metavar="REASON",
              help="Audited per-card override for the DRAFT-PR refusal: the handoff names a "
                   "draft PR that is intentionally left open (e.g. a CI vehicle for an upstream "  # windows-footgun: ok (string literal, not a call)
-                  "PR). The draft is not routed to review; a completion_draft_override event "
+                  "PR). --draft-kind says what happens to the PR; a completion_draft_override event "
                   "records the PRs and REASON. An empty REASON is refused."),
+        _arg("--draft-kind", choices=("merge_hold", "keep_draft"), default=None,
+             help="With --draft-ok: merge_hold (default) sets a ledger hold on the card's own draft PR(s), "
+                  "marks them ready so CI and Prism run, and routes the card to review, not done; "
+                  "keep_draft (a stacked/pinned PR that must stay draft) closes it done as before."),
         _arg("--abandon-routed-pr", metavar="REASON",
              help="Audited override: the card was routed to review on its own PR, that PR is still "
                   "OPEN, and the --survivor-pr/--survivor-ref claim names something else. Without "
