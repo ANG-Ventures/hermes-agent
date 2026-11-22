@@ -234,8 +234,14 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     the blocker."""
     rdir = _remote_dir(env, profile)
     # Check (and tighten) the root before anything reads or deletes through it: the probe and the stale-desktop
-    # stop() below both act on <root>/<profile>, so a symlinked root must be refused first.
-    proc = streams.run_in(env, ["bash", "-c", private_root_sh(env)], user=_user_for(env), timeout=15)
+    # stop() below both act on <root>/<profile>, so a symlinked root must be refused first. A root that was 0775
+    # may hold a <profile> entry someone else swapped in: unlink it unless it is a real dir this login owns
+    # (rm -rf on a symlink removes the link, not its target); the seed recreates it anyway.
+    q = shlex.quote(rdir)
+    profile_sh = (f"if [ -e {q} ] || [ -L {q} ]; then {{ [ ! -L {q} ] && [ -d {q} ] && [ -O {q} ]; }} || rm -rf -- {q}; fi;"
+                  f" [ ! -e {q} ] && [ ! -L {q} ] || {{ [ ! -L {q} ] && [ -d {q} ] && [ -O {q} ]; }} ||"
+                  f" {{ echo \"{rdir} is not a directory owned by $(id -un); refusing to use it\" >&2; exit 1; }}")
+    proc = streams.run_in(env, ["bash", "-c", f"{private_root_sh(env)}; {profile_sh}"], user=_user_for(env), timeout=15)
     if proc.returncode != 0:
         raise RuntimeError(f"could not secure the sandbox desktop root: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
     live = _published(env, rdir)

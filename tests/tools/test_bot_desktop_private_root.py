@@ -160,3 +160,25 @@ def test_symlinked_root_is_refused_before_stale_desktop_cleanup(tmp_path, monkey
     with pytest.raises(RuntimeError, match="symlink"):
         sandbox_host.start(env, "default", geometry="1280x800")
     assert (target / "default" / "env").read_text() == "keep me"
+
+
+def test_symlinked_profile_entry_in_legacy_root_is_dropped_before_cleanup(tmp_path, monkeypatch):
+    # Prism 93fcbc3526c4 (round 3): an owned 0775 root whose <profile> entry was swapped for a symlink passed the
+    # root check, and stop() then deleted <target>/env through it. The entry is now unlinked first.
+    env = _Env(tmp_path)
+    root = sandbox_host.remote_root(env)
+    os.makedirs(root)
+    os.chmod(root, 0o775)
+    target = tmp_path / "victim"
+    target.mkdir()
+    (target / "env").write_text("keep me")
+    os.symlink(target, os.path.join(root, "default"))
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda e: None)
+    monkeypatch.setattr(sandbox_host, "_marker", lambda: tmp_path / "marker.json")
+    monkeypatch.setattr(sandbox_host, "missing_binaries", lambda e: ["Xvnc"])
+    monkeypatch.setattr(streams, "run_in", _local_run_in)
+    with pytest.raises(RuntimeError, match="Xvnc"):
+        sandbox_host.start(env, "default", geometry="1280x800")
+    assert (target / "env").read_text() == "keep me"
+    assert not os.path.lexists(os.path.join(root, "default"))
+    assert _mode(root) == 0o700
