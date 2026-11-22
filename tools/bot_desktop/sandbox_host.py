@@ -111,10 +111,10 @@ def remote_root(env: Any) -> str:
 def private_root_sh(env: Any) -> str:
     """Shell that makes ``remote_root()`` exist mode 0700 and owned by the running login, or exits 1. Under a
     0002 umask a bare ``mkdir -p`` left the root 775 (t_7dd130bf); only this login's processes use it, so an
-    existing own root is tightened and a root another login owns is refused."""
+    existing own root is tightened, and a symlink or a root another login owns is refused."""
     root = shlex.quote(remote_root(env))
-    return (f"mkdir -p -m 0700 {root}; [ -O {root} ] || {{ echo \"{remote_root(env)} is not owned by\" "
-            f"\"$(id -un); refusing to use it\" >&2; exit 1; }}; chmod 0700 {root}")
+    return (f"mkdir -p -m 0700 {root}; {{ [ ! -L {root} ] && [ -O {root} ]; }} || {{ echo \"{remote_root(env)} is a\" "
+            f"\"symlink or not owned by $(id -un); refusing to use it\" >&2; exit 1; }}; chmod 0700 {root}")
 
 
 def _remote_dir(env: Any, profile: str) -> str:
@@ -237,6 +237,10 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     if live.get("DISPLAY"):
         # Adopting a screen the sandbox kept while this host's state was lost (fresh HERMES_HOME, a stop()
         # whose kill missed): without the marker, status/thumbnail/stop would not know it is ours.
+        # A root left 775 by an older seed is tightened here too, not only on a fresh seed.
+        proc = streams.run_in(env, ["bash", "-c", private_root_sh(env)], user=_user_for(env), timeout=15)
+        if proc.returncode != 0:
+            raise RuntimeError(f"could not secure the sandbox desktop root: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
         return _record(env, rdir, profile, live)
     stop(env, profile)  # a dead launcher may have left Xvnc holding :20; the relaunch needs it gone
     missing = missing_binaries(env)

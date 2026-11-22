@@ -668,6 +668,7 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
     if not getattr(env, "_bd_browser_dirs_ready", False):
         priv = " ".join(shlex.quote(d) for d in (_sandbox_socket_dir(env), f"{sandbox_host.remote_root(env)}/shots"))
         made = streams.run_in(env, ["bash", "-c", f"set -e; {sandbox_host.private_root_sh(env)}; mkdir -p -m 0700 {priv};"
+                                    f" for d in {priv}; do [ ! -L \"$d\" ] || {{ echo \"$d is a symlink\" >&2; exit 1; }}; done;"
                                     f" chmod 0700 {priv}; mkdir -p {shlex.quote(remote_env['AGENT_BROWSER_PROFILE'])}"],
                               user=sandbox_host._user_for(env), timeout=15)
         if made.returncode != 0:
