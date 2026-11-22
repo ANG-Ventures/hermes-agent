@@ -228,6 +228,8 @@ def write(action, repo, pr, why, by, root=None, **_):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps({"at": "2026-11-21T00:00:00Z", "repo": repo, "pr": int(pr), "action": action,
                             "by": by, "why": why}) + "\\n")
+    if os.environ.get("FAKE_PR_HOLD_LABEL_FAIL"):   # the real write(): row appended first, then the label
+        raise RuntimeError("label add rc=1 HTTP 403")
     return {}
 """
 
@@ -298,3 +300,36 @@ def test_ready_raising_is_recorded_not_raised(monkeypatch):
     out = mh.apply(["o/r#5"], why="w", by="b", hold=lambda *a: None, ready=boom)
     assert out["o/r#5"]["hold"] == "set" and out["o/r#5"]["ok"] is False
     assert out["o/r#5"]["ready"].startswith("raised:")
+
+
+def test_label_failure_after_the_row_records_held_label_missing_no_flip(real_writer, monkeypatch):
+    """write() appends the ledger row, then the label add fails: the event says held (label missing), matching the
+    ledger, and the PR is not flipped (Apollo note, 11-21 22:1x)."""
+    root, install, flips = real_writer
+    install(root, root)
+    monkeypatch.setenv("FAKE_PR_HOLD_LABEL_FAIL", "1")
+    with kb.connect() as conn:
+        tid, run = _claimed(conn)
+        assert _complete(conn, tid, run) is True
+        assert tuple(_row(conn, tid)) == ("review", "human:apollo")
+        res = _events(conn, tid, "completion_draft_override")[0]["merge_hold"]["o/r#5"]
+    assert [r["action"] for r in _ledger(root)] == ["set"] and flips == []
+    assert res["ok"] is False and res["hold"].startswith(mh.CAUSE_LABEL_MISSING) and "403" in res["hold"]
+    assert "label add failed" in mh.note({"o/r#5": res})[0]
+
+
+def test_write_failure_with_no_row_stays_failed(board, monkeypatch):
+    """A write that raised and left no hold readable is a plain failure, never reported as held."""
+    class Mod:
+        @staticmethod
+        def _root(root=None):
+            return str(kb.kanban_home())
+        @staticmethod
+        def write(*a, **k):
+            raise RuntimeError("ledger append failed")
+        @staticmethod
+        def held(*a, **k):
+            return None
+    monkeypatch.setattr(mh, "_load_pr_hold", lambda root: Mod)
+    out = mh.apply(["o/r#5"], why="w", by="b", hold=mh.pr_hold_set, ready=lambda *a: 0)
+    assert out["o/r#5"]["ok"] is False and out["o/r#5"]["hold"] == "failed: ledger append failed"

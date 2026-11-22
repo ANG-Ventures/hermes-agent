@@ -41,6 +41,13 @@ ReadyFn = Callable[[str, int], Optional[int]]          # ace_gate.py ready rc, N
 CAUSE_NO_WRITER = "no pr_hold.py under the board root"
 CAUSE_READER_ROOT = "reader root is not the board root"
 CAUSE_READ_BACK = "hold read-back failed"
+CAUSE_LABEL_MISSING = "held, label missing"
+
+
+class HeldLabelMissing(RuntimeError):
+    """The ledger row is written and ``held()`` reads it back, but the ``hold`` label step failed. The ledger is
+    what the readers gate on, so the PR IS held; recorded as such (not "failed") so event and ledger agree. The PR
+    still stays draft and goes to the human: the label half of the operator's hold is missing."""
 
 
 def enabled() -> bool:
@@ -115,9 +122,21 @@ def pr_hold_set(repo: str, number: int, why: str, by: str) -> None:
     reader_root = mod._root()
     if not _same(reader_root, root):
         raise RuntimeError(f"{CAUSE_READER_ROOT}; no write (readers {reader_root}, board {root})")
-    mod.write("set", repo, int(number), why, by)
+    def ours(got) -> bool:
+        return isinstance(got, str) and got.startswith(f"operator hold ({by} at ") and got.endswith(f"): {why or '-'}")
+
+    try:
+        mod.write("set", repo, int(number), why, by)
+    except Exception as exc:  # noqa: BLE001 -- write() appends the row BEFORE the label: is the ledger hold there?
+        try:
+            got = mod.held(repo, int(number))
+        except Exception:  # noqa: BLE001 -- unreadable: report the write failure as is
+            got = None
+        if ours(got):
+            raise HeldLabelMissing(f"{CAUSE_LABEL_MISSING}: {exc}") from exc
+        raise
     got = mod.held(repo, int(number))
-    if not (isinstance(got, str) and got.startswith(f"operator hold ({by} at ") and got.endswith(f"): {why or '-'}")):
+    if not ours(got):
         raise RuntimeError(f"{CAUSE_READ_BACK}: held() = {str(got)[:120]!r}")
 
 
@@ -149,6 +168,10 @@ def apply(keys: Iterable[str], *, why: str, by: str, hold: Optional[HoldFn] = No
                 raise RuntimeError("no pr_hold writer")
             hold(repo, int(num), why, by)
             entry["hold"] = "set"
+        except HeldLabelMissing as exc:   # ledger-held, label absent: say so; no flip, the human takes it
+            entry["hold"] = str(exc)[:200]
+            _log.warning("draft merge hold: %s %s", key, exc)
+            continue
         except Exception as exc:  # noqa: BLE001 -- recorded; the PR stays draft
             entry["hold"] = f"failed: {str(exc)[:160]}"
             _log.warning("draft merge hold: %s hold failed: %s", key, exc)
@@ -171,6 +194,9 @@ def note(result: dict) -> list:
         if e.get("ok"):
             lines.append(f"{key}: merge hold set (pr_hold ledger) and marked ready; CI and Prism run, "
                          f"the operator lifts the hold to land")
+        elif str(e.get("hold") or "").startswith(CAUSE_LABEL_MISSING):
+            lines.append(f"{key}: merge hold in the pr_hold ledger but the `hold` label add failed ({e.get('hold')}); "
+                         f"left DRAFT, needs the operator (pr_hold.py status reads held)")
         elif e.get("hold") == "set":
             lines.append(f"{key}: merge hold set but ready flip failed (ace_gate rc={e.get('ready')}); "
                          f"still DRAFT, needs the operator")
