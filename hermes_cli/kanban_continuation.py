@@ -216,6 +216,43 @@ def remote_cleanup_host(conn, task_id):
     return next((h for h in pool.pool_hosts if h.name == row[0]), None)
 
 
+def remote_run_host(conn, task_id: str) -> Optional[str]:
+    """The pool host the card's latest placed run ran on, or None (local or never placed).
+
+    Its scratch tree lives on that host; the dispatcher's copy of the path is
+    only the placeholder ``resolve_workspace`` made, so a missing local dir
+    there is not a lost mount (t_8721e331).
+    """
+    row = conn.execute("SELECT host FROM task_runs WHERE task_id=? AND host IS NOT NULL ORDER BY id DESC LIMIT 1",
+                       (task_id,)).fetchone()
+    if row is None or not row[0] or row[0] == STUDIO:
+        return None
+    return row[0]
+
+
+def restore_remote_placeholder(conn, task) -> Optional[str]:
+    """Re-create the local placeholder of a scratch card whose last run was on a pool host.
+
+    Returns that host when the placeholder now exists, else None. The path is
+    unchanged, so the card's state on its origin host stays bound to it (an
+    enforce-mode origin route sends it back there; elsewhere it starts in an
+    empty dir, as any re-placed scratch card does). Mount checks stay in
+    :func:`_materialize_fresh`: an unmounted root raises and nothing is made.
+    """
+    import os
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+    if (task.workspace_kind or "scratch") != "scratch" or not task.workspace_path:
+        return None
+    host = remote_run_host(conn, task.id)
+    if host is None:
+        return None
+    try:
+        _materialize_fresh(conn, task.workspace_path)
+    except (WorkspaceUnavailable, OSError):
+        return None
+    return host if os.path.isdir(os.path.expanduser(task.workspace_path)) else None
+
+
 def _fresh_path(path: str, tag: str) -> str:
     """A sibling path no card owns: a NULL path is no fresh start, because a
     scratch card's NULL path re-resolves to ``<root>/<id>``, the old dir."""
