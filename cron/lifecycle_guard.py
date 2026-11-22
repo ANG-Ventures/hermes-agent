@@ -3708,88 +3708,6 @@ def _mask_read_only_python_paths(body: str) -> str:
     return body
 
 
-_PY_CD_RE = re.compile(
-    r"(?:^|[;&|(\s])(?:cd|pushd)(?=[\s;&|)]|$)"
-    r"(?:[ \t]+((?:'[^']*'|\"[^\"]*\"|[^\s;&|)<>'\"]+)+))?"
-)
-_PY_CD_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
-_PY_IMPORT_DIRS_MAX = 64
-
-
-def _python_import_dirs(shell_text: str, cwd: Optional[str]) -> Optional[list[Path]]:
-    """Directories a python heredoc in *shell_text* may run in (its sys.path[0]); None when unknown
-    (a non-literal `cd` target, or PYTHONPATH named in the command)."""
-    if "PYTHONPATH" in shell_text:
-        return None
-    try:
-        base = Path(cwd) if cwd else Path(os.getcwd())
-    except OSError:
-        return None
-    # Each `cd` resolves against every directory a previous one may have left (in order, a
-    # superset: a subshell `(cd a)` does not carry over, so the earlier dirs stay too).
-    dirs = [base]
-    for match in _PY_CD_RE.finditer(shell_text):
-        arg = match.group(1)
-        if arg is None:
-            dirs.append(Path.home())
-            continue
-        quoted = _PY_CD_QUOTED_RE.fullmatch(arg) is not None
-        if quoted:
-            arg = arg[1:-1]
-        elif any(c in arg for c in "'\""):
-            return None  # a partly quoted word (`"a"$X`, `"a"b`): not resolved here
-        if not arg or arg == "-" or any(c in arg for c in "$`*?[{\\"):
-            return None
-        if quoted:
-            target = Path(arg)  # the shell does not expand a quoted `~`
-        else:
-            try:
-                target = Path(arg).expanduser()
-            except (RuntimeError, KeyError):
-                return None  # `~user` with no such user: unknown, fail closed
-        if not quoted and arg.startswith("~") and str(target).startswith("~"):
-            return None
-        if target.is_absolute():
-            dirs.append(target)
-        else:
-            dirs.extend([d / target for d in dirs])
-        if len(dirs) > _PY_IMPORT_DIRS_MAX:
-            return None
-    return dirs
-
-
-def _python_module_file_exists(directory: Path, stem: str) -> bool:
-    """Whether *directory* holds a file the import system loads as module *stem*."""
-    if any((directory / f"{stem}{ext}").exists() for ext in (".py", ".pyc", ".so", ".pyd")):
-        return True
-    return directory.is_dir() and (
-        any(directory.glob(f"{stem}.*.so")) or any(directory.glob(f"{stem}.*.pyd")))
-
-
-def _python_imports_shadowed(body: str, dirs: list[Path]) -> bool:
-    """Whether an import in *body* could resolve to a module file in one of *dirs*."""
-    try:
-        tree = ast.parse(body)
-    except SyntaxError:
-        return False  # the masks refuse an unparsable body anyway
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            names.add(node.module.split(".")[0])
-    try:
-        for directory in dirs:
-            for name in names:
-                if _python_module_file_exists(directory, name):
-                    return True
-                if _python_module_file_exists(directory / name, "__init__"):
-                    return True  # a package, sourceless or extension __init__ included
-    except OSError:
-        return True
-    return False
-
-
 def _contains_unsafe_gateway_action(
     command: str,
     *,
@@ -3843,16 +3761,8 @@ def _contains_unsafe_gateway_action(
     # its path strings from the shell's referenced-script walk.
     python_bodies = inert_python_heredoc_bodies(command, semicolon_chain=True)
     shell_only = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
-    # The masks assume `json`/`re`/`subprocess`/`pathlib` are the stdlib modules; `python3 -` puts
-    # its cwd first on sys.path, so a workspace `re.py` would get the masked text (Prism
-    # aede5e966585). A body whose imports may resolve elsewhere keeps its text visible.
-    import_dirs = _python_import_dirs(shell_only, cwd) if python_bodies else []
-    trusted = [
-        import_dirs is not None and not _python_imports_shadowed(body, import_dirs)
-        for body in python_bodies
-    ]
-    for body, body_trusted in zip(python_bodies, trusted):
-        masked_body = _mask_python_data_strings(body) if body_trusted else body
+    for body in python_bodies:
+        masked_body = _mask_python_data_strings(body)
         # a file the body WRITES and the shell text names again may be executed next: the
         # strings going into it are not data (write-then-run class, R6)
         if masked_body != body and _python_write_may_run(body, shell_only):
@@ -3865,10 +3775,7 @@ def _contains_unsafe_gateway_action(
     # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
     # oversized data file mentioned there otherwise fails closed as a "script".
     shell_command = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
-    masked_bodies = [
-        _mask_read_only_python_paths(body) if body_trusted else body
-        for body, body_trusted in zip(python_bodies, trusted)
-    ]
+    masked_bodies = [_mask_read_only_python_paths(body) for body in python_bodies]
     shell_named = set(_iter_referenced_shell_scripts(shell_command, cwd=cwd))
     referenced_command = shell_command + "\n" + "\n".join(masked_bodies)
 

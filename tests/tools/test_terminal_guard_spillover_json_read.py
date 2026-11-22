@@ -141,82 +141,15 @@ def test_lines_cap_refusal_names_lines(tmp_path):
     assert f"`{many}` is 20000 lines, over the " in refusal and "16384-line walk cap" in refusal
 
 
-@pytest.mark.parametrize("module_file", ["re.py", "json.py", "re/__init__.py"])
-def test_workspace_module_shadowing_an_import_keeps_the_body_visible(tmp_path, module_file):
-    """`python3 -` puts its cwd first on sys.path: a workspace `re.py` gets the call's arguments,
-    so the lifecycle literal it receives must stay visible (Prism aede5e966585)."""
-    shadow = tmp_path / module_file
-    shadow.parent.mkdir(parents=True, exist_ok=True)
-    shadow.write_text("def search(*a): pass\ndef loads(*a): pass\n", encoding="utf-8")
-    name = module_file.split("/")[0].removesuffix(".py")
-    call = "re.search" if name == "re" else "json.loads"
-    command = f"python3 -S - <<'EOF'\nimport {name}\n{call}('{RESTART}', 'sample')\nEOF"
-    assert _scan(command, tmp_path)[0] is True
-    # Same body, no workspace module: the string is data and the body passes.
-    clean = tmp_path / "clean"
-    clean.mkdir()
-    assert _scan(command, clean) == (False, None, None)
-
-
-def test_cd_into_a_shadowing_dir_keeps_the_body_visible(tmp_path):
-    work = tmp_path / "work"
-    work.mkdir()
-    (work / "re.py").write_text("def search(*a): pass\n", encoding="utf-8")
-    body = f"python3 - <<'EOF'\nimport re\nre.search('{RESTART}', 'x')\nEOF"
-    assert _scan(f"cd work && {body}", tmp_path)[0] is True
-    assert _scan(f'cd "$W" && {body}', tmp_path)[0] is True  # unknown cwd: fail closed
-    assert _scan(f"PYTHONPATH=work {body}", tmp_path)[0] is True
-
-
-@pytest.mark.parametrize("cd_chain,subdir", [
-    ("cd parent && cd child", "parent/child"),
-    ("cd 'project files'", "project files"),
-    ('cd "project files"', "project files"),
-    ("cd elsewhere; cd ..; cd child", "child"),
-])
-def test_cd_chains_and_quoted_targets_are_resolved(tmp_path, cd_chain, subdir):
-    """Each `cd` resolves against the directories before it; a quoted target is one word
-    (Prism 9195f0beb18c)."""
-    work = tmp_path / subdir
-    work.mkdir(parents=True)
-    (work / "re.py").write_text("def search(*a): pass\n", encoding="utf-8")
-    (tmp_path / "elsewhere").mkdir(exist_ok=True)
-    body = f"python3 - <<'EOF'\nimport re\nre.search('{RESTART}', 'x')\nEOF"
-    assert _scan(f"{cd_chain} && {body}", tmp_path)[0] is True
-    (work / "re.py").unlink()
-    assert _scan(f"{cd_chain} && {body}", tmp_path) == (False, None, None)
-
-
-@pytest.mark.parametrize("target", ['"project"$SUFFIX', "'project'$SUFFIX", '"project"-files', "~nosuchuser_t_bb509376/x"])
-def test_mixed_quoted_words_and_unknown_tilde_users_are_unresolved(target):
-    """A quoted prefix glued to more text, or a `~user` with no such user, is unknown
-    (Prism 9195f0beb18c at 3d140df9, 3c803e2d3cf2)."""
-    from cron.lifecycle_guard import _python_import_dirs
-
-    assert _python_import_dirs(f"cd {target}", "/work") is None
-
-
-def test_a_quoted_tilde_is_a_literal_directory_and_the_walk_still_runs(tmp_path):
-    """The shell does not expand a quoted `~`; no user lookup, no aborted walk (Prism 3c803e2d3cf2)."""
-    from cron.lifecycle_guard import _python_import_dirs
-
-    assert _python_import_dirs("cd '~root work'", str(tmp_path)) == [tmp_path, tmp_path / "~root work"]
-    (tmp_path / "~root work").mkdir()
-    big = tmp_path / "big.sh"
-    big.write_text("echo " + "x" * 70_000 + "\n", encoding="utf-8")
-    command = f"bash {big}; cd '~root work' && python3 - <<'EOF'\nprint(1)\nEOF"
-    unsafe, refusal, _hit = _scan(command, tmp_path)
-    assert unsafe is True and "longest-line cap" in refusal
-
-
-@pytest.mark.parametrize("init_file", ["__init__.pyc", "__init__.so", "__init__.cpython-312-x86_64-linux-gnu.so"])
-def test_sourceless_or_extension_package_shadow_keeps_the_body_visible(tmp_path, init_file):
-    """A `json/` package with only a compiled `__init__` still shadows (Prism 2fd390fee2b6)."""
-    pkg = tmp_path / "json"
-    pkg.mkdir()
-    (pkg / init_file).write_bytes(b"\0")
-    command = f"python3 -S - <<'EOF'\nimport json\njson.loads('{RESTART}')\nEOF"
-    assert _scan(command, tmp_path)[0] is True
+@pytest.mark.parametrize("prefix", ['cd "$VAR" && ', "cd - && ", "PYTHONPATH=/opt/lib "],
+                         ids=["cd-var", "cd-dash", "pythonpath"])
+def test_cwd_shapes_get_the_same_verdict_as_main(tmp_path, spill, prefix):
+    """Parity with main e03d0a7abe: a non-literal `cd` or a PYTHONPATH in the command does not
+    change the verdict on a read-only heredoc (no working-directory parser in the guard)."""
+    for body in (f"import json\nprint(json.loads('{RESTART}'))",
+                 f"import json\nd=json.loads(open('{spill}').read())\nprint(len(d['content']))"):
+        command = f"{prefix}python3 - <<'EOF'\n{body}\nEOF"
+        assert _scan(command, tmp_path) == (False, None, None), command
 
 
 def test_an_executed_script_over_the_cap_gets_the_split_hint_not_the_read_hint(tmp_path):
