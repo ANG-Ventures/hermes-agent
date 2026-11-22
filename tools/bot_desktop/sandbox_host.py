@@ -108,6 +108,15 @@ def remote_root(env: Any) -> str:
     return f"{base}-{login}" if login else base
 
 
+def private_root_sh(env: Any) -> str:
+    """Shell that makes ``remote_root()`` exist mode 0700 and owned by the running login, or exits 1. Under a
+    0002 umask a bare ``mkdir -p`` left the root 775 (t_7dd130bf); only this login's processes use it, so an
+    existing own root is tightened and a root another login owns is refused."""
+    root = shlex.quote(remote_root(env))
+    return (f"mkdir -p -m 0700 {root}; [ -O {root} ] || {{ echo \"{remote_root(env)} is not owned by\" "
+            f"\"$(id -un); refusing to use it\" >&2; exit 1; }}; chmod 0700 {root}")
+
+
 def _remote_dir(env: Any, profile: str) -> str:
     return f"{remote_root(env)}/{profile}"
 
@@ -240,7 +249,8 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     launcher = (Path(__file__).with_name("launcher.sh").read_bytes())
     wallpaper = Path(__file__).with_name("wallpaper.png").read_bytes()
     seed = (
-        f"set -e; rm -rf {shlex.quote(rdir)}; mkdir -p {shlex.quote(rdir)}; cd {shlex.quote(rdir)};"
+        f"set -e; {private_root_sh(env)}; rm -rf {shlex.quote(rdir)}; mkdir -m 0700 {shlex.quote(rdir)};"
+        f" cd {shlex.quote(rdir)};"
         f" echo {shlex.quote(base64.b64encode(launcher).decode())} | base64 -d > launcher.sh;"
         f" echo {shlex.quote(base64.b64encode(wallpaper).decode())} | base64 -d > wallpaper.png;"
         " chmod 0700 . launcher.sh"

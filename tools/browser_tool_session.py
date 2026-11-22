@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -665,8 +666,12 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
     remote_env["AGENT_BROWSER_PROFILE"] = sandbox_host.browser_profile_dir(env)  # persists with the container, not its tmpfs
     remote_env["TMPDIR"] = env.get_temp_dir()
     if not getattr(env, "_bd_browser_dirs_ready", False):
-        streams.run_in(env, ["mkdir", "-p", _sandbox_socket_dir(env), f"{sandbox_host.remote_root(env)}/shots",
-                             remote_env["AGENT_BROWSER_PROFILE"]], user=sandbox_host._user_for(env), timeout=15)
+        priv = " ".join(shlex.quote(d) for d in (_sandbox_socket_dir(env), f"{sandbox_host.remote_root(env)}/shots"))
+        made = streams.run_in(env, ["bash", "-c", f"set -e; {sandbox_host.private_root_sh(env)}; mkdir -p -m 0700 {priv};"
+                                    f" chmod 0700 {priv}; mkdir -p {shlex.quote(remote_env['AGENT_BROWSER_PROFILE'])}"],
+                              user=sandbox_host._user_for(env), timeout=15)
+        if made.returncode != 0:
+            raise RuntimeError(f"could not make the sandbox browser dirs: {made.stderr.decode('utf-8', 'replace')[-500:]}")
         env._bd_browser_dirs_ready = True
     remote_env["AGENT_BROWSER_ARGS"] = ",".join(CHROMIUM_SANDBOX_BYPASS_ARGS)  # container: no userns for Chromium's own sandbox
     # cmd_parts = <agent-browser argv0 (+npx spec)> + backend args + command; keep everything after argv0.
