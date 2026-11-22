@@ -2625,6 +2625,17 @@ class GatewayKanbanWatchersMixin:
                             # the recipient is the home, so only the home's own events stay echoes.
                             for _eid in (_alerts_ids & set(d.get("self_event_ids") or ())) - _alerts_own_ids:
                                 (d.get("suppressed") or {}).pop(_eid, None)
+                    # t_10556779: no live owning session and the sub is not the home's own chat:
+                    # the line goes to the agent inbox, not another session's chat.
+                    _no_owner = None
+                    if send_passive and _alerts_entry is None:
+                        from gateway import kanban_notice_inbox as _kni
+
+                        _no_owner = await asyncio.to_thread(
+                            _kni.no_live_owner, getattr(self, "session_store", None), sub,
+                            getattr(task, "session_id", None) if task else None,
+                            d.get("home_res"), _hr.read_session_row,
+                        )
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -2975,6 +2986,21 @@ class GatewayKanbanWatchersMixin:
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
                             continue
+                        if _no_owner and _routed is None:
+                            _inbox_msg = (
+                                _hr.tag_line(msg, kanban_artifact_names_tag(_art_paths)) if _art_upload else msg
+                            )
+                            if await asyncio.to_thread(
+                                _kni.write_inbox, sub["task_id"], board_slug, kind, _inbox_msg, _no_owner,
+                            ):
+                                logger.info(
+                                    "kanban notifier: %s notice for %s to agent inbox, not %s/%s (%s)",
+                                    kind, sub["task_id"], platform_str, sub["chat_id"], _no_owner,
+                                )
+                                _sent_event_ids.add(ev.id)
+                                lane_dedupe.mark_sent(lane_key)
+                                sub_fail_counts.pop(sub_key, None)
+                                continue
                         # A target the adapter classified as gone (deleted
                         # chat/thread) never comes back: drop on the first
                         # failure instead of burning MAX_SEND_FAILURES ticks.

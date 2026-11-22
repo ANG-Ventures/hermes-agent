@@ -16,6 +16,7 @@ import pytest
 
 from gateway import kanban_alerts_home as ah
 from gateway import kanban_home_route as hr
+from gateway import kanban_notice_inbox as ni
 from gateway import kanban_owner_wake as ow
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
@@ -47,7 +48,7 @@ class Adapter:
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     for var in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_SESSION_ID",
-                "DISCORD_ALERTS_CHANNEL", ah.KILL_SWITCH_ENV):
+                "DISCORD_ALERTS_CHANNEL", ah.KILL_SWITCH_ENV, ni.KILL_SWITCH_ENV):
         monkeypatch.delenv(var, raising=False)
     kb.init_db()
     store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
@@ -70,6 +71,19 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ow, "default_pr_health", lambda: None)
     return {"runner": runner, "adapter": adapter, "session": session, "monkeypatch": monkeypatch,
             "apollo": session(APOLLO)}
+
+
+@pytest.fixture
+def inbox(monkeypatch):
+    """Agent-inbox rows the notifier wrote: (task_id, board, kind, text, why)."""
+    rows: list = []
+
+    def fake_write(task_id, board, kind, text, why):
+        rows.append((task_id, board, kind, text, why))
+        return True
+
+    monkeypatch.setattr(ni, "write_inbox", fake_write)
+    return rows
 
 
 def _tick(env):
@@ -127,13 +141,15 @@ def test_live_alerts_home_is_woken_itself_and_nothing_posts(env):
                                          kinds=["review_requested"])[1] == []
 
 
-def test_alerts_home_without_live_session_keeps_todays_route(env):
+def test_alerts_home_without_live_session_goes_to_agent_inbox(env, inbox):
+    """t_10556779: the home is not live, so the line is an agent-inbox row, never #apollo's chat."""
     tid = _handed_off("20261115_gone_000000")   # state.db row, no live gateway session
     _tick(env)
     adapter = env["adapter"]
-    assert _chats(adapter.handled) == [APOLLO]
-    assert [s["chat_id"] for s in adapter.sent] == [APOLLO]
-    assert tid in adapter.sent[0]["text"]
+    assert _chats(adapter.handled) == [APOLLO]  # the wake is unchanged
+    assert adapter.sent == []
+    assert [(r[0], r[2], r[4]) for r in inbox] == [(tid, "review_requested", "home-not-live")]
+    assert tid in inbox[0][3]
 
 
 def test_card_homed_elsewhere_is_unchanged(env):
@@ -191,3 +207,67 @@ def test_subscriber_sessions_completion_still_wakes_the_alerts_home(env):
     assert _chats(adapter.handled) == [ALERTS], adapter.handled
     assert adapter.handled[0].metadata["gateway_session_id"] == home.session_id
     assert adapter.sent == []
+
+
+# t_10556779 (Ace 2026-11-21 20:38): a notice with no live owning session goes to the agent inbox.
+
+
+def test_card_with_no_home_goes_to_agent_inbox(env, inbox):
+    tid = _handed_off(None)
+    _tick(env)
+    assert env["adapter"].sent == []
+    assert [(r[0], r[4]) for r in inbox] == [(tid, "no-home")]
+
+
+def test_sub_in_the_homes_own_chat_still_posts(env, inbox):
+    """Home not live, but the sub IS the home's chat: today's post stays."""
+    rows = {"20261121_gone_apollo": {"source": "discord", "session_key": None,
+                                     "origin_json": '{"platform": "discord", "chat_id": "%s"}' % APOLLO}}
+    env["monkeypatch"].setattr(hr, "read_session_row", lambda sid: rows.get(sid))
+    _handed_off("20261121_gone_apollo")
+    _tick(env)
+    assert [s["chat_id"] for s in env["adapter"].sent] == [APOLLO]
+    assert inbox == []
+
+
+def test_operator_home_still_posts(env, inbox):
+    _handed_off("operator:ace")
+    _tick(env)
+    assert [s["chat_id"] for s in env["adapter"].sent] == [APOLLO]
+    assert inbox == []
+
+
+def test_no_owner_kill_switch_posts(env, inbox):
+    env["monkeypatch"].setenv(ni.KILL_SWITCH_ENV, "post")
+    _handed_off("20261115_gone_000000")
+    _tick(env)
+    assert [s["chat_id"] for s in env["adapter"].sent] == [APOLLO]
+    assert inbox == []
+
+
+def test_failed_inbox_write_posts_the_line(env, monkeypatch):
+    monkeypatch.setattr(ni, "write_inbox", lambda *a: False)
+    _handed_off("20261115_gone_000000")
+    _tick(env)
+    assert [s["chat_id"] for s in env["adapter"].sent] == [APOLLO]
+
+
+def test_write_inbox_uses_the_fleet_agent_log(tmp_path, monkeypatch):
+    import json
+
+    home = tmp_path / "home"
+    lib = home / "scripts" / "lib"
+    lib.mkdir(parents=True)
+    out = tmp_path / "agent-log.jsonl"
+    (lib / "agent_inbox.py").write_text(
+        "import json\n"
+        "def write_agent_log(root, producer, sev, message, **extra):\n"
+        f"    open({str(out)!r}, 'a').write(json.dumps(dict(producer=producer, sev=sev, text=message, **extra)) + '\\n')\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert ni.write_inbox("t_abc", "default", "blocked", "line", "home-not-live") is True
+    row = json.loads(out.read_text())
+    assert row == {"producer": "kanban-notifier", "sev": "info", "text": "line", "task_id": "t_abc",
+                   "board": "default", "kind": "blocked", "why": "home-not-live"}
+    (lib / "agent_inbox.py").unlink()
+    assert ni.write_inbox("t_abc", "default", "blocked", "line", "home-not-live") is False
