@@ -1431,8 +1431,11 @@ _CONNINFO_HINT_RE = re.compile(r"(?<![A-Za-z0-9_])(?:host|hostaddr|user|dbname|p
 _CONNINFO_PW_RE = re.compile(
     r"(?<![A-Za-z0-9_])(password\s*=\s*)"
     # escapes are consumed before the closing quote is tested: a libpq \' inside the SQL-doubled
-    # form reads \'' (or \\'' with the backslash doubled), and a bare value may hold "\ "
-    r"(''(?:\\(?:'')?|''''|[^'\\])*''|\\'.*?\\'(?=\s+[A-Za-z_]+\s*=|'|\s*$)|'(?:[^'\\]|\\.)*'|(?:\\.|[^\s'\\])+)",
+    # form reads \'' (or \\'' with the backslash doubled), and a bare value may hold "\ ". In the
+    # backslash-SQL form a libpq escape is \\ + one SQL char (\\\' is a quote), and the value ends
+    # at the first other \' even when the next key follows with no space (Prism d4c034283b10)
+    r"(''(?:\\(?:'')?|''''|[^'\\])*''|\\'(?:\\\\(?:\\.|''|[^\\'])|\\[^'\\]|[^'\\])*\\'"
+    r"|'(?:[^'\\]|\\.)*'|(?:\\.|[^\s'\\])+)",
     re.IGNORECASE,
 )
 

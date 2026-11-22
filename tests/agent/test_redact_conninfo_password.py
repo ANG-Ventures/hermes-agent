@@ -21,6 +21,9 @@ CMD = "docker exec mem0-selfhost-postgres-1 sh -c 'cat $PGDATA/postgresql.auto.c
     f"primary_conninfo = 'user=repl password=''pre\\\\''{PW}'' host=db'",
     f"primary_conninfo = 'user=repl password=pre\\ {PW} host=db'",
     f"psql 'host=db user=x password=\\'pre\\\\\\'{PW}\\' dbname=y'",
+    # Prism d4c034283b10: a closing \' directly followed by the next key (libpq needs no space)
+    f"primary_conninfo = 'user=repl password=\\'pre {PW}\\'host=db'",
+    f"primary_conninfo = 'user=repl password=\\'pre\\\\\\'x {PW}\\'host=db'",
     f"psql 'host=db user=x password={PW} dbname=y'",
     f"PASSWORD={PW} user=x host=y",
 ])
