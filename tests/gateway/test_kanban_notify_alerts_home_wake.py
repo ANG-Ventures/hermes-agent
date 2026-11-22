@@ -271,3 +271,47 @@ def test_write_inbox_uses_the_fleet_agent_log(tmp_path, monkeypatch):
                    "board": "default", "kind": "blocked", "why": "home-not-live"}
     (lib / "agent_inbox.py").unlink()
     assert ni.write_inbox("t_abc", "default", "blocked", "line", "home-not-live") is False
+
+
+# Prism round 1 on #519.
+
+
+def test_sub_in_the_homes_own_thread_is_the_homes_chat():
+    """746a097dbf67: the own-chat check reads the sub's thread_id, not a session_id."""
+    home = hr.HomeResolution(hr.HomeTarget("telegram", "-100", "42"))
+    sub = {"platform": "telegram", "chat_id": "-100", "thread_id": "42", "task_id": "t_x"}
+    assert ni.no_live_owner(None, sub, "20261121_gone_thread", home, lambda sid: {"session_key": None}) is None
+    other = dict(sub, thread_id="7")
+    assert ni.no_live_owner(None, other, "20261121_gone_thread", home,
+                            lambda sid: {"session_key": None}) == "home-not-live"
+
+
+def test_raw_home_with_no_row_here_is_unknown_not_offline():
+    """fbd4a6131be6: a raw id this state.db has no row for may be a secondary profile's live session."""
+    sub = {"platform": "discord", "chat_id": APOLLO, "session_id": "", "task_id": "t_x"}
+    home = hr.HomeResolution(None, "no-row")
+
+    class Store:
+        lookup_by_session_id = staticmethod(lambda sid: None)
+        lookup_by_session_key = staticmethod(lambda key: None)
+
+    assert ni.no_live_owner(Store(), sub, "20261121_beta_rotated", home, lambda sid: None) is None
+
+
+def test_inbox_bound_lane_failure_does_not_silence_a_chat_bound_one(env, inbox):
+    """68ab04922c22: lane-grouped failure notices post as before, covering every card in the group."""
+    with kb.connect_closing() as conn:
+        ids = []
+        for home in ("20261115_gone_000000", "operator:ace"):
+            tid = kb.create_task(conn, boomerang_wake=False, title="lane card", assignee="worker", session_id=home)
+            kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=APOLLO, chat_type="group",
+                               user_id=HUMAN, delivery_mode="notify")
+            ids.append(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        for tid in ids:
+            kb._append_event(conn, tid, "crashed", {"error": "provider unavailable"})
+    _tick(env)
+    sent = env["adapter"].sent
+    assert inbox == []
+    assert len(sent) == 1 and sent[0]["chat_id"] == APOLLO
+    assert all(t in sent[0]["text"] for t in ids), sent[0]["text"]

@@ -45,16 +45,21 @@ def no_live_owner(store: Any, sub: dict, home_sid: Optional[str], home_res: Any,
     if sid.startswith("operator:") or _hr.home_lookup_failed(home_res):
         return None
     target = getattr(home_res, "target", None)
-    if _hr.same_chat(target, sub.get("platform"), sub.get("chat_id"), sub.get("session_id")):
+    if _hr.same_chat(target, sub.get("platform"), sub.get("chat_id"), sub.get("thread_id")):
         return None  # the sub is the owning session's own chat
     if not sid:
         return "no-home"
     try:
-        entry = _ow.resolve_owner(store, sid, read_row)
+        if _ow.resolve_owner(store, sid, read_row) is not None:
+            return None
+        # A raw id with no row in this gateway's state.db may be a secondary profile's session
+        # (its rows live in that profile's state.db): unknown, not offline, so today's post stays.
+        if ":" not in sid and read_row(sid) is None:
+            return None
     except _hr.SessionLookupError as exc:
         logger.debug("kanban notice-inbox: home %s unreadable (%s); today's route", sid, exc)
         return None
-    return None if entry is not None else "home-not-live"
+    return "home-not-live"
 
 
 def write_inbox(task_id: str, board: Optional[str], kind: str, text: str, why: str) -> bool:

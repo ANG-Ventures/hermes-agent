@@ -2986,7 +2986,9 @@ class GatewayKanbanWatchersMixin:
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
                             continue
-                        if _no_owner and _routed is None:
+                        # A lane-failure notice (lane_key set) was grouped by chat before this
+                        # choice, so it may carry other cards' failures: it posts as before.
+                        if _no_owner and _routed is None and lane_key is None:
                             _inbox_msg = (
                                 _hr.tag_line(msg, kanban_artifact_names_tag(_art_paths)) if _art_upload else msg
                             )
@@ -2998,7 +3000,6 @@ class GatewayKanbanWatchersMixin:
                                     kind, sub["task_id"], platform_str, sub["chat_id"], _no_owner,
                                 )
                                 _sent_event_ids.add(ev.id)
-                                lane_dedupe.mark_sent(lane_key)
                                 sub_fail_counts.pop(sub_key, None)
                                 continue
                         # A target the adapter classified as gone (deleted
