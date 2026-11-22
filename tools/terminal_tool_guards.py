@@ -293,8 +293,8 @@ def gateway_lifecycle_block(
         return _blocked_json(
             f"Blocked: the lifecycle guard could not scan this command or referenced script: {refusal}. "
             "Nothing in the command is known to contain a gateway lifecycle command, but a "
-            "script the command executes must be scannable (a regular text file under 1 MiB) "
-            "before it can run inside the gateway process.",
+            "script the command executes must be scannable (a regular text file under 1 MiB, at most "
+            "16384 lines, no line over 64 KiB) before it can run inside the gateway process.",
             "error", blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER,
         )
     if unsafe:
