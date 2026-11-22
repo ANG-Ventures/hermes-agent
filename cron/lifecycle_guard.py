@@ -3708,7 +3708,11 @@ def _mask_read_only_python_paths(body: str) -> str:
     return body
 
 
-_PY_CD_RE = re.compile(r"(?:^|[;&|(\s])(?:cd|pushd)(?=[\s;&|)]|$)(?:[ \t]+([^\s;&|)<>]+))?")
+_PY_CD_RE = re.compile(
+    r"(?:^|[;&|(\s])(?:cd|pushd)(?=[\s;&|)]|$)"
+    r"(?:[ \t]+('[^']*'|\"[^\"]*\"|[^\s;&|)<>]+))?"
+)
+_PY_IMPORT_DIRS_MAX = 64
 
 
 def _python_import_dirs(shell_text: str, cwd: Optional[str]) -> Optional[list[Path]]:
@@ -3720,18 +3724,36 @@ def _python_import_dirs(shell_text: str, cwd: Optional[str]) -> Optional[list[Pa
         base = Path(cwd) if cwd else Path(os.getcwd())
     except OSError:
         return None
+    # Each `cd` resolves against every directory a previous one may have left (in order, a
+    # superset: a subshell `(cd a)` does not carry over, so the earlier dirs stay too).
     dirs = [base]
     for match in _PY_CD_RE.finditer(shell_text):
         arg = match.group(1)
         if arg is None:
             dirs.append(Path.home())
             continue
-        arg = arg.strip("'\"")
+        if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "'\"":
+            arg = arg[1:-1]
+        elif any(c in arg for c in "'\""):
+            return None  # a partly quoted word: not resolved here
         if not arg or arg == "-" or any(c in arg for c in "$`*?[{\\"):
             return None
         target = Path(arg).expanduser()
-        dirs.append(target if target.is_absolute() else base / target)
+        if target.is_absolute():
+            dirs.append(target)
+        else:
+            dirs.extend([d / target for d in dirs])
+        if len(dirs) > _PY_IMPORT_DIRS_MAX:
+            return None
     return dirs
+
+
+def _python_module_file_exists(directory: Path, stem: str) -> bool:
+    """Whether *directory* holds a file the import system loads as module *stem*."""
+    if any((directory / f"{stem}{ext}").exists() for ext in (".py", ".pyc", ".so", ".pyd")):
+        return True
+    return directory.is_dir() and (
+        any(directory.glob(f"{stem}.*.so")) or any(directory.glob(f"{stem}.*.pyd")))
 
 
 def _python_imports_shadowed(body: str, dirs: list[Path]) -> bool:
@@ -3749,12 +3771,10 @@ def _python_imports_shadowed(body: str, dirs: list[Path]) -> bool:
     try:
         for directory in dirs:
             for name in names:
-                if any((directory / f"{name}{ext}").exists() for ext in (".py", ".pyc", ".so", ".pyd")):
+                if _python_module_file_exists(directory, name):
                     return True
-                if (directory / name / "__init__.py").exists():
-                    return True
-                if any(directory.glob(f"{name}.*.so")) or any(directory.glob(f"{name}.*.pyd")):
-                    return True
+                if _python_module_file_exists(directory / name, "__init__"):
+                    return True  # a package, sourceless or extension __init__ included
     except OSError:
         return True
     return False

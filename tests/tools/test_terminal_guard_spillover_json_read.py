@@ -168,6 +168,35 @@ def test_cd_into_a_shadowing_dir_keeps_the_body_visible(tmp_path):
     assert _scan(f"PYTHONPATH=work {body}", tmp_path)[0] is True
 
 
+@pytest.mark.parametrize("cd_chain,subdir", [
+    ("cd parent && cd child", "parent/child"),
+    ("cd 'project files'", "project files"),
+    ('cd "project files"', "project files"),
+    ("cd elsewhere; cd ..; cd child", "child"),
+])
+def test_cd_chains_and_quoted_targets_are_resolved(tmp_path, cd_chain, subdir):
+    """Each `cd` resolves against the directories before it; a quoted target is one word
+    (Prism 9195f0beb18c)."""
+    work = tmp_path / subdir
+    work.mkdir(parents=True)
+    (work / "re.py").write_text("def search(*a): pass\n", encoding="utf-8")
+    (tmp_path / "elsewhere").mkdir(exist_ok=True)
+    body = f"python3 - <<'EOF'\nimport re\nre.search('{RESTART}', 'x')\nEOF"
+    assert _scan(f"{cd_chain} && {body}", tmp_path)[0] is True
+    (work / "re.py").unlink()
+    assert _scan(f"{cd_chain} && {body}", tmp_path) == (False, None, None)
+
+
+@pytest.mark.parametrize("init_file", ["__init__.pyc", "__init__.so", "__init__.cpython-312-x86_64-linux-gnu.so"])
+def test_sourceless_or_extension_package_shadow_keeps_the_body_visible(tmp_path, init_file):
+    """A `json/` package with only a compiled `__init__` still shadows (Prism 2fd390fee2b6)."""
+    pkg = tmp_path / "json"
+    pkg.mkdir()
+    (pkg / init_file).write_bytes(b"\0")
+    command = f"python3 -S - <<'EOF'\nimport json\njson.loads('{RESTART}')\nEOF"
+    assert _scan(command, tmp_path)[0] is True
+
+
 def test_an_executed_script_over_the_cap_gets_the_split_hint_not_the_read_hint(tmp_path):
     """`bash big.sh` runs the file: the read-as-data shapes do not apply (Prism 8e4887a66a56)."""
     big = tmp_path / "big.sh"
