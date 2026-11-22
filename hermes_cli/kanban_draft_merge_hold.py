@@ -37,6 +37,11 @@ KINDS = (MERGE_HOLD, KEEP_DRAFT)
 HoldFn = Callable[[str, int, str, str], None]          # (repo, number, why, by); raises on failure
 ReadyFn = Callable[[str, int], Optional[int]]          # ace_gate.py ready rc, None = not run
 
+# Stable causes that lead every pr_hold_set failure (and so the recorded ``hold: failed: ...`` text).
+CAUSE_NO_WRITER = "no pr_hold.py under the board root"
+CAUSE_READER_ROOT = "reader root is not the board root"
+CAUSE_READ_BACK = "hold read-back failed"
+
 
 def enabled() -> bool:
     return os.environ.get("KANBAN_DRAFT_MERGE_HOLD", "1").strip() != "0"
@@ -102,18 +107,18 @@ def pr_hold_set(repo: str, number: int, why: str, by: str) -> None:
     flip, is a PR the derived approver merges in ~2 min. After the write, ``held(repo, n)`` with NO root (the
     resolution derived-approve-tick and land_on_approve use) must name this run's ``by`` and ``why``; anything
     else (no hold, someone else's, an unreadable ledger) is a failed hold and the PR is not flipped."""
+    # Each message LEADS with a short stable cause, paths after: apply() truncates, and the cause must survive.
     root = _board_root()
     mod = _load_pr_hold(root)
     if mod is None:
-        raise RuntimeError(f"scripts/lib/pr_hold.py not found under the board root {root}")
+        raise RuntimeError(f"{CAUSE_NO_WRITER}: scripts/lib/pr_hold.py not found under {root}")
     reader_root = mod._root()
     if not _same(reader_root, root):
-        raise RuntimeError(f"pr_hold readers resolve ledger root {reader_root}, not the board root {root}; "
-                           f"no write")
+        raise RuntimeError(f"{CAUSE_READER_ROOT}; no write (readers {reader_root}, board {root})")
     mod.write("set", repo, int(number), why, by)
     got = mod.held(repo, int(number))
     if not (isinstance(got, str) and got.startswith(f"operator hold ({by} at ") and got.endswith(f"): {why or '-'}")):
-        raise RuntimeError(f"hold read-back failed: held() = {str(got)[:120]!r}")
+        raise RuntimeError(f"{CAUSE_READ_BACK}: held() = {str(got)[:120]!r}")
 
 
 def _default_hold() -> Optional[HoldFn]:

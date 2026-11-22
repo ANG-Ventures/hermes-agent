@@ -267,7 +267,7 @@ def test_real_writer_on_the_board_root_holds_reads_back_and_flips(real_writer):
 def test_pool_host_shape_reader_root_elsewhere_no_write_no_flip(real_writer, tmp_path):
     """The kernel's pr_hold resolves a ledger that is not the board's (a pool host's own root): refuse, no flip."""
     root, install, flips = real_writer
-    pool = tmp_path / "pool-host-root"
+    pool = tmp_path / ("long-ci-tmp-" * 16) / "pool-host-root"   # CI tmp paths are long: the cause must survive
     install(pool, pool)
     with kb.connect() as conn:
         tid, run = _claimed(conn)
@@ -275,7 +275,7 @@ def test_pool_host_shape_reader_root_elsewhere_no_write_no_flip(real_writer, tmp
         assert tuple(_row(conn, tid)) == ("review", "human:apollo")
         res = _events(conn, tid, "completion_draft_override")[0]["merge_hold"]["o/r#5"]
     assert flips == [] and _ledger(pool) == [] and _ledger(root) == []
-    assert res["ok"] is False and "not the board root" in res["hold"]
+    assert res["ok"] is False and res["hold"].startswith(f"failed: {mh.CAUSE_READER_ROOT}")
 
 
 def test_write_landing_in_a_non_reader_root_fails_read_back_no_flip(real_writer, tmp_path):
@@ -289,7 +289,7 @@ def test_write_landing_in_a_non_reader_root_fails_read_back_no_flip(real_writer,
         assert tuple(_row(conn, tid)) == ("review", "human:apollo")
         res = _events(conn, tid, "completion_draft_override")[0]["merge_hold"]["o/r#5"]
     assert _ledger(elsewhere) and _ledger(root) == []
-    assert flips == [] and res["ok"] is False and "read-back failed" in res["hold"]
+    assert flips == [] and res["ok"] is False and res["hold"].startswith(f"failed: {mh.CAUSE_READ_BACK}")
 
 
 def test_ready_raising_is_recorded_not_raised(monkeypatch):
