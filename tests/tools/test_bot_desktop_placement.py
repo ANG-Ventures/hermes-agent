@@ -228,6 +228,8 @@ def test_start_adopting_a_screen_the_sandbox_kept_records_the_marker(monkeypatch
 
     monkeypatch.setattr(sandbox_host, "_published", lambda env, rdir: {"DISPLAY": ":20", "XAUTHORITY": f"{rdir}/Xauthority"})
     monkeypatch.setattr(sandbox_host, "_remote_dir", lambda env, profile: f"/scratch/hermes-bot-desktop/{profile}")
+    # adopting also tightens the root (t_7dd130bf); the fake container cannot exec, so that call succeeds here
+    monkeypatch.setattr(streams, "run_in", lambda env, argv, **kw: subprocess.CompletedProcess(argv, 0, b"", b""))
     env = _FakeDocker()
     assert sandbox_host.start(env, "default", geometry="1280x800")["DISPLAY"] == ":20"
     marker = json.loads(sandbox_host._marker().read_text())

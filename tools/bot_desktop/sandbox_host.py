@@ -108,6 +108,18 @@ def remote_root(env: Any) -> str:
     return f"{base}-{login}" if login else base
 
 
+def private_root_sh(env: Any) -> str:
+    """Shell that makes ``remote_root()`` exist mode 0700 and owned by the running login, or exits 1. Under a
+    0002 umask a bare ``mkdir -p`` left the root 775 (t_7dd130bf); only this login's processes use it, so an
+    existing own root is tightened, and a symlink, a non-directory or a root another login owns is refused. The
+    path is printed with printf '%s' from its shlex-quoted form, never inside double-quoted shell text."""
+    root = shlex.quote(remote_root(env))
+    return (f"mkdir -p -m 0700 {root} || :; if [ -L {root} ]; then why='is a symlink'; elif [ ! -d {root} ];"
+            f" then why='is not a directory'; elif [ ! -O {root} ]; then why=\"is not owned by $(id -un)\"; else why=;"
+            f" fi; [ -z \"$why\" ] || {{ printf '%s %s; refusing to use it\\n' {root} \"$why\" >&2; exit 1; }};"
+            f" chmod 0700 {root}")
+
+
 def _remote_dir(env: Any, profile: str) -> str:
     return f"{remote_root(env)}/{profile}"
 
@@ -224,6 +236,17 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     """Bring the screen up inside ``env`` (idempotent); returns the published env. Raises RuntimeError naming
     the blocker."""
     rdir = _remote_dir(env, profile)
+    # Check (and tighten) the root before anything reads or deletes through it: the probe and the stale-desktop
+    # stop() below both act on <root>/<profile>, so a symlinked root must be refused first. A root that was 0775
+    # may hold a <profile> entry someone else swapped in: unlink it unless it is a real dir this login owns
+    # (rm -rf on a symlink removes the link, not its target); the seed recreates it anyway.
+    q = shlex.quote(rdir)
+    profile_sh = (f"if [ -e {q} ] || [ -L {q} ]; then {{ [ ! -L {q} ] && [ -d {q} ] && [ -O {q} ]; }} || rm -rf -- {q}; fi;"
+                  f" [ ! -e {q} ] && [ ! -L {q} ] || {{ [ ! -L {q} ] && [ -d {q} ] && [ -O {q} ]; }} ||"
+                  f" {{ printf '%s is not a directory owned by %s; refusing to use it\\n' {q} \"$(id -un)\" >&2; exit 1; }}")
+    proc = streams.run_in(env, ["bash", "-c", f"{private_root_sh(env)}; {profile_sh}"], user=_user_for(env), timeout=15)
+    if proc.returncode != 0:
+        raise RuntimeError(f"could not secure the sandbox desktop root: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
     live = _published(env, rdir)
     if live.get("DISPLAY"):
         # Adopting a screen the sandbox kept while this host's state was lost (fresh HERMES_HOME, a stop()
@@ -240,7 +263,8 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     launcher = (Path(__file__).with_name("launcher.sh").read_bytes())
     wallpaper = Path(__file__).with_name("wallpaper.png").read_bytes()
     seed = (
-        f"set -e; rm -rf {shlex.quote(rdir)}; mkdir -p {shlex.quote(rdir)}; cd {shlex.quote(rdir)};"
+        f"set -e; {private_root_sh(env)}; rm -rf {shlex.quote(rdir)}; mkdir -m 0700 {shlex.quote(rdir)};"
+        f" cd {shlex.quote(rdir)};"
         f" echo {shlex.quote(base64.b64encode(launcher).decode())} | base64 -d > launcher.sh;"
         f" echo {shlex.quote(base64.b64encode(wallpaper).decode())} | base64 -d > wallpaper.png;"
         " chmod 0700 . launcher.sh"
