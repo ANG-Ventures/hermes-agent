@@ -182,3 +182,129 @@ def test_symlinked_profile_entry_in_legacy_root_is_dropped_before_cleanup(tmp_pa
     assert (target / "env").read_text() == "keep me"
     assert not os.path.lexists(os.path.join(root, "default"))
     assert _mode(root) == 0o700
+
+
+# Review round (Apollo 11-22): the refusal line printed the raw root path inside double-quoted shell text, so a
+# path carrying shell syntax ran a substitution, and a double quote broke (or silently passed) the check.
+_ODD_NAMES = ["a $(touch PWNED_SUB) b", "a `touch PWNED_TICK` b", 'a "q b', "a b"]
+
+
+def _odd_env(tmp_path, name):
+    tmp = tmp_path / name
+    tmp.mkdir()
+    target = tmp_path / "victim"
+    (target / "default").mkdir(parents=True)
+    (target / "default" / "env").write_text("keep me")
+    os.chmod(target, 0o755)
+    env = _Env(tmp)
+    os.symlink(target, sandbox_host.remote_root(env))
+    return env, target
+
+
+def _nothing_planted(tmp_path, cwd):
+    planted = [p for base in (tmp_path, cwd) for p in base.rglob("PWNED_*")]
+    assert planted == []
+
+
+@pytest.mark.parametrize("name", _ODD_NAMES)
+def test_odd_root_path_is_refused_without_running_it(tmp_path, monkeypatch, name):
+    env, target = _odd_env(tmp_path, name)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    proc = _sh(env)
+    assert proc.returncode == 1, proc.stderr
+    assert "refusing to use it" in proc.stderr and "symlink" in proc.stderr
+    _nothing_planted(tmp_path, cwd)
+    assert _mode(target) == 0o755
+
+
+@pytest.mark.parametrize("name", _ODD_NAMES)
+def test_odd_root_path_start_precheck_refuses(tmp_path, monkeypatch, name):
+    env, target = _odd_env(tmp_path, name)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda e: None)
+    monkeypatch.setattr(sandbox_host, "_marker", lambda: tmp_path / "marker.json")
+    monkeypatch.setattr(sandbox_host, "missing_binaries", lambda e: [])
+    monkeypatch.setattr(streams, "run_in", _local_run_in)
+    with pytest.raises(RuntimeError, match="refusing to use it"):
+        sandbox_host.start(env, "default", geometry="1280x800")
+    assert (target / "default" / "env").read_text() == "keep me"
+    _nothing_planted(tmp_path, cwd)
+
+
+@pytest.mark.parametrize("name", _ODD_NAMES)
+def test_odd_profile_path_start_precheck_refuses(tmp_path, monkeypatch, name):
+    # the profile-entry refusal line: a root this login owns, whose <profile> entry cannot be removed
+    tmp = tmp_path / name
+    tmp.mkdir()
+    env = _Env(tmp)
+    root = sandbox_host.remote_root(env)
+    os.mkdir(root, 0o700)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    real_sh = sandbox_host.private_root_sh
+    # simulate an entry that survives rm (e.g. a foreign-owned dir in a sticky root): make rm a no-op
+    monkeypatch.setattr(sandbox_host, "private_root_sh", lambda e: real_sh(e) + "; rm() { :; }")
+    os.symlink(tmp_path, os.path.join(root, "default"))
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda e: None)
+    monkeypatch.setattr(streams, "run_in", _local_run_in)
+    with pytest.raises(RuntimeError, match="refusing to use it"):
+        sandbox_host.start(env, "default", geometry="1280x800")
+    _nothing_planted(tmp_path, cwd)
+
+
+@pytest.mark.parametrize("name", _ODD_NAMES)
+def test_odd_root_path_browser_dirs_refuse(tmp_path, monkeypatch, name):
+    from tools import browser_tool_session as bts
+    env, target = _odd_env(tmp_path, name)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(bts, "_browser_in_sandbox", lambda: True)
+    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: env)
+    monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":20"})
+    monkeypatch.setattr(sandbox_host, "browser_profile_dir", lambda e: str(tmp_path / "home" / "browser-profile"))
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda e: None)
+    monkeypatch.setattr(streams, "run_in", _local_run_in)
+    monkeypatch.setattr(streams, "remote_command", lambda e, argv, **kw: ["true"])
+    with pytest.raises(RuntimeError, match="refusing to use it"):
+        bts._sandbox_wrap(["agent-browser", "open", "https://example.com"], {"PATH": "/usr/bin"}, "/unused")
+    assert not (target / "agent-browser").exists() and not (target / "shots").exists()
+    _nothing_planted(tmp_path, cwd)
+
+
+def test_regular_file_root_is_refused_at_the_check(tmp_path):
+    env = _Env(tmp_path)
+    root = sandbox_host.remote_root(env)
+    with open(root, "w") as fh:
+        fh.write("x")
+    os.chmod(root, 0o644)
+    proc = _sh(env)
+    assert proc.returncode == 1 and "not a directory" in proc.stderr and "refusing to use it" in proc.stderr
+    assert _mode(root) == 0o644
+
+
+def test_no_desktop_user_adopts_a_live_screen_in_an_own_root(tmp_path, monkeypatch):
+    # docker sandbox where `id -u <DESKTOP_USER>` failed and None was cached: commands run as the container's
+    # default user, who owns the existing root, so start() still adopts the published screen as main does.
+    env = _Env(tmp_path)
+    root = sandbox_host.remote_root(env)
+    os.mkdir(root, 0o700)
+    os.mkdir(os.path.join(root, "default"), 0o700)
+    env._bd_desktop_user = None
+    seen = []
+
+    def run_in(e, argv, **kw):
+        seen.append(kw.get("user"))
+        return _local_run_in(e, argv, **kw)
+
+    monkeypatch.setattr(sandbox_host, "_published", lambda e, rdir: {"DISPLAY": ":20"})
+    monkeypatch.setattr(sandbox_host, "_record", lambda e, rdir, profile, live: live)
+    monkeypatch.setattr(streams, "run_in", run_in)
+    assert sandbox_host.start(env, "default", geometry="1280x800") == {"DISPLAY": ":20"}
+    assert seen == [None]
+    assert os.path.isdir(os.path.join(root, "default"))

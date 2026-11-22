@@ -111,10 +111,13 @@ def remote_root(env: Any) -> str:
 def private_root_sh(env: Any) -> str:
     """Shell that makes ``remote_root()`` exist mode 0700 and owned by the running login, or exits 1. Under a
     0002 umask a bare ``mkdir -p`` left the root 775 (t_7dd130bf); only this login's processes use it, so an
-    existing own root is tightened, and a symlink or a root another login owns is refused."""
+    existing own root is tightened, and a symlink, a non-directory or a root another login owns is refused. The
+    path is printed with printf '%s' from its shlex-quoted form, never inside double-quoted shell text."""
     root = shlex.quote(remote_root(env))
-    return (f"mkdir -p -m 0700 {root}; {{ [ ! -L {root} ] && [ -O {root} ]; }} || {{ echo \"{remote_root(env)} is a\" "
-            f"\"symlink or not owned by $(id -un); refusing to use it\" >&2; exit 1; }}; chmod 0700 {root}")
+    return (f"mkdir -p -m 0700 {root} || :; if [ -L {root} ]; then why='is a symlink'; elif [ ! -d {root} ];"
+            f" then why='is not a directory'; elif [ ! -O {root} ]; then why=\"is not owned by $(id -un)\"; else why=;"
+            f" fi; [ -z \"$why\" ] || {{ printf '%s %s; refusing to use it\\n' {root} \"$why\" >&2; exit 1; }};"
+            f" chmod 0700 {root}")
 
 
 def _remote_dir(env: Any, profile: str) -> str:
@@ -240,7 +243,7 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     q = shlex.quote(rdir)
     profile_sh = (f"if [ -e {q} ] || [ -L {q} ]; then {{ [ ! -L {q} ] && [ -d {q} ] && [ -O {q} ]; }} || rm -rf -- {q}; fi;"
                   f" [ ! -e {q} ] && [ ! -L {q} ] || {{ [ ! -L {q} ] && [ -d {q} ] && [ -O {q} ]; }} ||"
-                  f" {{ echo \"{rdir} is not a directory owned by $(id -un); refusing to use it\" >&2; exit 1; }}")
+                  f" {{ printf '%s is not a directory owned by %s; refusing to use it\\n' {q} \"$(id -un)\" >&2; exit 1; }}")
     proc = streams.run_in(env, ["bash", "-c", f"{private_root_sh(env)}; {profile_sh}"], user=_user_for(env), timeout=15)
     if proc.returncode != 0:
         raise RuntimeError(f"could not secure the sandbox desktop root: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
