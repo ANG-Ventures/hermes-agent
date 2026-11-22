@@ -1433,9 +1433,11 @@ _CONNINFO_PW_RE = re.compile(
     # escapes are consumed before the closing quote is tested: a libpq \' inside the SQL-doubled
     # form reads \'' (or \\'' with the backslash doubled), and a bare value may hold "\ ". In the
     # backslash-SQL form a libpq escape is \\ + one SQL char (\\\' is a quote), and the value ends
-    # at the first other \' even when the next key follows with no space (Prism d4c034283b10)
-    r"(''(?:\\(?:'')?|''''|[^'\\])*''|\\'(?:\\\\(?:\\.|''|[^\\'])|\\[^'\\]|[^'\\])*\\'"
-    r"|'(?:[^'\\]|\\.)*'|(?:\\.|[^\s'\\])+)",
+    # at the first other \' even when the next key follows with no space (Prism d4c034283b10).
+    # A quoted form counts only when its close is followed by a value boundary (space, quote, end,
+    # or the next key=); otherwise the bare form, then the whole token, is masked (Prism 33d2d39f)
+    r"((?:''(?:\\(?:'')?|''''|[^'\\])*''|\\'(?:\\\\(?:\\.|''|[^\\'])|\\[^'\\]|[^'\\])*\\'"
+    r"|'(?:[^'\\]|\\.)*')(?=[\s']|$|[A-Za-z_]\w*\s*=)|(?:\\.|[^\s'\\])+|\S+)",
     re.IGNORECASE,
 )
 
