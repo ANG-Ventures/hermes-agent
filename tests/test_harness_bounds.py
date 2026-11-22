@@ -24,11 +24,15 @@ pytestmark = pytest.mark.slow_test(180, reason="each case is a child pytest run 
 
 
 def _run_child(tmp_path: Path, body: str, *extra: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    target = ROOT / "tests" / "hermes_cli" / f"test_bounds_child_{tmp_path.name.lower()}.py"
+    # The child lives under tmp_path, never in the repo tree: a file written there is read by every
+    # repo-wide walker test running beside this one (t_9500be90). ``-p tests.conftest`` loads the
+    # real harness wiring that directory discovery would otherwise have given it.
+    target = tmp_path / f"test_bounds_child_{tmp_path.name.lower()}.py"
     target.write_text(textwrap.dedent(body), encoding="utf-8")
     try:
         return subprocess.run(
-            [sys.executable, "-m", "pytest", str(target), "-q", "-p", "no:cacheprovider", "-x", *extra],
+            [sys.executable, "-m", "pytest", str(target), "-q", "-p", "no:cacheprovider", "-p", "tests.conftest",
+             "-x", *extra],
             cwd=ROOT, capture_output=True, text=True, timeout=150,
             env={**os.environ, **(env or {})}, stdin=subprocess.DEVNULL,
         )
@@ -457,20 +461,19 @@ def test_a_suite_with_its_own_pytest_ini_still_gets_the_bounds(tmp_path):
     directory's pytest.ini, the root conftest is never loaded, and nothing would bound the run.
     That conftest registers the harness itself; a 3 s sleep under a 1 s budget must fail by name."""
     nested = ROOT / "optional-skills" / "creative" / "comfyui" / "tests"
-    probe_dir = nested.parent / f"tests_bounds_probe_{tmp_path.name.lower()}"
-    probe_dir.mkdir()
-    try:
-        for name in ("conftest.py", "pytest.ini"):
-            (probe_dir / name).write_bytes((nested / name).read_bytes())
-        (probe_dir / "test_probe.py").write_text("import time\ndef test_slow():\n    time.sleep(3)\n", encoding="utf-8")
-        out = subprocess.run(
-            [sys.executable, "-m", "pytest", "test_probe.py", "-q", "-p", "no:cacheprovider", "-o", "bounds_wall_seconds=1"],
-            cwd=probe_dir, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
-        )
-    finally:
-        import shutil
-
-        shutil.rmtree(probe_dir, ignore_errors=True)
+    # Outside the repo tree (t_9500be90): the copied conftest finds the harness by walking its
+    # parents for tests/_fixtures/bounds.py, so give tmp_path that one file as a link to the real one.
+    (tmp_path / "tests" / "_fixtures").mkdir(parents=True)
+    (tmp_path / "tests" / "_fixtures" / "bounds.py").symlink_to(ROOT / "tests" / "_fixtures" / "bounds.py")
+    probe_dir = tmp_path / "comfyui" / "tests_bounds_probe"
+    probe_dir.mkdir(parents=True)
+    for name in ("conftest.py", "pytest.ini"):
+        (probe_dir / name).write_bytes((nested / name).read_bytes())
+    (probe_dir / "test_probe.py").write_text("import time\ndef test_slow():\n    time.sleep(3)\n", encoding="utf-8")
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", "test_probe.py", "-q", "-p", "no:cacheprovider", "-o", "bounds_wall_seconds=1"],
+        cwd=probe_dir, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+    )
     assert out.returncode == 1 and "test_slow ran past 1s of wall clock" in out.stdout, out.stdout + out.stderr
 
 
