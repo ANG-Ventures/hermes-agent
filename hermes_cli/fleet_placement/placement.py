@@ -149,6 +149,30 @@ ALPHA_DEFAULT, ALPHA_FAST, ALPHA_WIDE = 0.5, 1.0, 0.0     # D2: P0/P1 or core_cl
 # back to the pre-F5 pick (max headroom_fraction x st_speed), which sent 49/199 fast picks to the slower ace-media.
 FAST_PICKS = ("speed", "score")
 OCCUPANCY_TAU_S = 60.0       # the sampler's EWMA time constant for procs_running - 1
+# ── the points score (t_b01ab307, Ace msgs 1573974283267350589 / 1573979972475949168) ─────────────────────────────
+# Among the hosts the gate left open: used = cpu_busy + (lease threads + this job's threads) / host threads (CPU only,
+# clamped 0..0.99); score = hosts.<h>.points + bonuses - 10 x used / (1 - used). Highest wins; tie -> more points ->
+# host id (lexically first). The previous pick is kept unless another host beats it by keep_margin. The dials live
+# in the table's top-level ``points_score`` block; a consumer not listed there as "points" keeps the old layers.
+POINTS_TOGGLES = ("off", "points")
+POINTS_CONTINUITY = ("bonus", "override")
+POINTS_USED_MAX = 0.99
+POINTS_COST_K = 10.0
+
+
+@dataclasses.dataclass(frozen=True)
+class PointsDials:
+    """The ``points_score`` block: per-consumer toggle (off | points; absent = off), the two bonuses, the keep
+    margin and the continuity mode (bonus = +bonus_continuity on the job's previous host; override = pin there when
+    it is open, the old behaviour)."""
+    consumers: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    bonus_continuity: float = 25.0
+    bonus_fast_core: float = 60.0
+    keep_margin: float = 5.0
+    continuity: str = "bonus"
+
+    def on(self, consumer: str) -> bool:
+        return self.consumers.get(consumer) == "points"
 
 
 class PlacementError(ValueError):
@@ -335,6 +359,9 @@ class HostSpec:
     clock_mhz: float = 0.0           # max single-core clock (core_class "fast")
     default_preference: str = "normal"   # "low" = the headroom layer takes it only when no normal host has headroom
     yields_overrides: bool = False       # true = never wins by continuity / the fast pick while an unflagged host is eligible
+    #                                      (old layers only: a consumer on the points score never reads it)
+    points: float = 0.0                  # the points score's preference (hosts.<h>.points; absent = 0)
+    fast_core: bool = False              # hosts.<h>.fast_core: core_class fast gets the bonus here, fast-only runs only here
     unmeasurable_axes: tuple = ()        # axes this host's OS cannot report (darwin: no PSI, no %system); never required
     cpu_saturable: bool = False          # v1 only: negative cpu headroom is a score penalty, not a refusal (t_bfb88c23)
     # scorer v2 (t_f8a3b6c3): the active scorer and the host's MEASURED speed (var/placement/host-speed.json, R2b),
@@ -390,6 +417,7 @@ class HostTable:
     # included: resource-domain membership is the registry's, not candidate eligibility's, so a closed guest's live
     # leases and reservations still count on its source (Prism 7e9f3e2ed307 / c2f0087775e6 / 03f3bf40fe6b)
     declared: Mapping[str, tuple] = dataclasses.field(default_factory=dict)
+    points: PointsDials = dataclasses.field(default_factory=PointsDials)   # the ``points_score`` block (t_b01ab307)
 
     def declared_id(self, name) -> Optional[str]:
         """Canonical id for ``name`` over the admitted hosts first, then every declared row (left-out ones too)."""
@@ -582,6 +610,10 @@ def validate(doc) -> List[str]:
             errs.append(f"hosts.{hid}.default_preference must be normal|low (never an ordinal)")
         if isinstance(h, dict) and "yields_overrides" in h and not isinstance(h["yields_overrides"], bool):
             errs.append(f"hosts.{hid}.yields_overrides must be true|false")
+        if isinstance(h, dict) and "points" in h and not _num(h["points"]):
+            errs.append(f"hosts.{hid}.points must be a finite number")
+        if isinstance(h, dict) and "fast_core" in h and not isinstance(h["fast_core"], bool):
+            errs.append(f"hosts.{hid}.fast_core must be true|false")
         if isinstance(h, dict) and "fleet_cap" in h:     # the ONE per-host fleet-work cap (t_31911eb0)
             errs.extend(f"hosts.{hid}.{e}" for e in admission.fleet_cap_errors(h["fleet_cap"]))
         if isinstance(h, dict) and "cpu_saturable" in h:
@@ -594,6 +626,7 @@ def validate(doc) -> List[str]:
     sc = doc.get("scorer", DEFAULT_SCORER)
     if sc not in SCORERS:
         errs.append(f"scorer must be one of {list(SCORERS)}, not {sc!r}")
+    errs.extend(_points_errors(doc.get("points_score")))
     fp_mode = doc.get("fast_pick", "speed")
     if fp_mode not in FAST_PICKS:
         errs.append(f"fast_pick must be one of {list(FAST_PICKS)}, not {fp_mode!r}")
@@ -620,6 +653,38 @@ def validate(doc) -> List[str]:
         if bad:
             errs.append(f"closed_when names unsupported axis(es) {bad}; supported: {list(REQUIRED_AXES)}")
     return errs
+
+
+def _points_errors(ps) -> List[str]:
+    """The top-level ``points_score`` block (t_b01ab307); absent = every consumer off."""
+    if ps is None:
+        return []
+    if not isinstance(ps, dict):
+        return ["points_score must be an object"]
+    errs = []
+    cons = ps.get("consumers", {})
+    if not isinstance(cons, dict) or any(not k.startswith("_") and v not in POINTS_TOGGLES for k, v in cons.items()):
+        errs.append(f"points_score.consumers must map consumer -> one of {list(POINTS_TOGGLES)}")
+    bonus = ps.get("bonus", {})
+    if not isinstance(bonus, dict) or any(k in bonus and not _num(bonus[k]) for k in ("continuity", "fast_core")):
+        errs.append("points_score.bonus must be {continuity: number, fast_core: number}")
+    if "keep_margin" in ps and (not _num(ps["keep_margin"]) or ps["keep_margin"] < 0):
+        errs.append("points_score.keep_margin must be a number >= 0")
+    if ps.get("continuity", "bonus") not in POINTS_CONTINUITY:
+        errs.append(f"points_score.continuity must be one of {list(POINTS_CONTINUITY)}")
+    return errs
+
+
+def _points_dials(ps) -> PointsDials:
+    if not isinstance(ps, dict):
+        return PointsDials()
+    bonus = ps.get("bonus") or {}
+    d = PointsDials()
+    return PointsDials(consumers={k: v for k, v in (ps.get("consumers") or {}).items() if not k.startswith("_")},
+                       bonus_continuity=float(bonus.get("continuity", d.bonus_continuity)),
+                       bonus_fast_core=float(bonus.get("fast_core", d.bonus_fast_core)),
+                       keep_margin=float(ps.get("keep_margin", d.keep_margin)),
+                       continuity=str(ps.get("continuity", d.continuity)))
 
 
 INVENTORY_REL = Path("var") / "placement" / "host-inventory.json"
@@ -806,6 +871,7 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
             aliases=tuple(h.get("aliases", [])), clock_mhz=float(f.get("clock_mhz", 0.0)),
             default_preference=str(h.get("default_preference", "normal")),
             yields_overrides=h.get("yields_overrides") is True,
+            points=float(h["points"]) if _num(h.get("points")) else 0.0, fast_core=h.get("fast_core") is True,
             unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])),
             cpu_saturable=hid in saturable, scorer=scorer,
             mt_yield=meas.get("mt_yield", SEED_MT_YIELD_SMT2 if threads == 2 * cores else 1.0),
@@ -842,7 +908,8 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     declared = {hid: (h.get("pressure_from"), tuple(h.get("aliases", []))) for hid, h in doc["hosts"].items()}
     return HostTable(hosts=hosts, footprints=fps, closed_when=cw, path=p, default_first=doc.get("default_first"),
                      saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)), profile_footprints=pfps,
-                     scorer=scorer, declared=declared, fast_pick=doc.get("fast_pick", "speed"))
+                     scorer=scorer, declared=declared, fast_pick=doc.get("fast_pick", "speed"),
+                     points=_points_dials(doc.get("points_score")))
 
 
 class ExclusionsError(PlacementError):
@@ -1082,6 +1149,11 @@ class Headroom:
     alpha: Optional[float] = None        # the speed exponent choose() applied
     need: Optional["admission.Estimate"] = None   # utilization: this job's estimate on THIS host (reserved on a pick)
     cpu_busy: Optional[float] = None
+    # the points score (t_b01ab307), set only on a host a points-mode choose() scored (None = not scored)
+    used: Optional[float] = None
+    cost: Optional[float] = None
+    points: Optional[float] = None
+    bonus: Optional[float] = None
 
     def line(self, spec: HostSpec) -> str:
         """`<host> load N / Cc.Tt, avail X GB, headroom Y GB / Z cores (binding axis), score S` or the refusal.
@@ -2062,6 +2134,10 @@ class Decision:
             # utilization mode: the cpu_busy the PSI busy-floor exemption read, so a grader can prove it (t_5a9f9e88)
             if r.cpu_busy is not None:
                 row["hosts"][r.host]["cpu_busy"] = r.cpu_busy
+            # the points score's terms on every host it scored (t_b01ab307); score above is then the points score
+            if r.used is not None:
+                row["hosts"][r.host].update({"used": round(r.used, 4), "cost": round(r.cost, 4),
+                                             "points": r.points, "bonus": r.bonus})
         if self.scorer == "v2":
             # v2 denominators on every host row (doctrine rule 2); a v1 row stays byte for byte what it was
             row["scorer"] = "v2"
@@ -2194,6 +2270,12 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     def pick(row: Headroom, rule: str, kept: bool = False) -> Decision:
         return done(Decision(row.host, "", rows, consumer, fp, kept_previous=kept, rule=rule))
 
+    if table.points.on(consumer):
+        # the points score replaces layers 3-5 for this consumer (t_b01ab307); affinity and core_class wide stay
+        # overrides, continuity is one only under ``continuity: override``. yields_overrides is not consulted.
+        return _choose_points(table, eligible, by_id, job, fp, previous, pick,
+                              lambda why: done(Decision(None, why, rows, consumer, fp)))
+
     # layer 3: per-job overrides (an ineligible target falls through; the gate always wins). A yields_overrides host
     # (mbp-2026) never wins by continuity or the fast pick while an unflagged host is eligible (Ace msg
     # 1573943702118998158, t_6388e879: lower the MacBook's priority); affinity still wins anywhere
@@ -2245,6 +2327,62 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
             and table.hosts[prev_id].default_preference == table.hosts[best.host].default_preference:
         return pick(by_id[prev_id], "headroom", kept=True)
     return pick(best, "headroom" if normal else "headroom:low-preference")
+
+
+def points_used(r: Headroom, spec: HostSpec, fp: Footprint) -> float:
+    """The points score's ``used`` for one open host: cpu_busy + (lease threads + this job's threads) / host threads,
+    clamped to 0..POINTS_USED_MAX. CPU only. cpu_busy is the sample's (utilization mode); a legacy-mode row has none,
+    so the gate's load (the larger of load1 and load5) / threads stands in, the same figure the legacy gate reads.
+    This job's threads: its estimate on this host (utilization), else the footprint. An unmeasured host (no
+    cpu_busy AND no load) is never read as idle: it returns POINTS_USED_MAX, so the score
+    does not depend on the gate having closed it."""
+    thr = float(spec.threads) if spec.threads else 1.0
+    if not _num(r.cpu_busy) and not _num(r.load):
+        return POINTS_USED_MAX
+    busy = r.cpu_busy if _num(r.cpu_busy) else float(r.load) / thr
+    mine = float(r.need.cpus) if r.need is not None else float(fp.threads)
+    return min(max(busy + (float(r.reserved_threads or 0.0) + mine) / thr, 0.0), POINTS_USED_MAX)
+
+
+def _choose_points(table: HostTable, eligible: List[Headroom], by_id: Dict[str, Headroom], job: "Job",
+                   fp: Footprint, previous: Optional[str], pick, refuse) -> Decision:
+    """Layers 3-5 under the points score (t_b01ab307). ``eligible`` = the hosts the gate left open."""
+    dials = table.points
+    pool = eligible
+    if job.core_class == "fast-only":
+        # the restriction binds every target, overrides included: a non-fast affinity/continuity host falls through
+        pool = [r for r in eligible if table.hosts[r.host].fast_core]
+        if not pool:
+            return refuse("no_fast_core: core_class fast-only and no fast_core host is open")
+    in_pool = {r.host: r for r in pool}
+    want = table.resolve(job.affinity or "")
+    if want and want in in_pool:
+        return pick(in_pool[want], "affinity")
+    cont = table.resolve(job.continuity or "")
+    if dials.continuity == "override" and cont and cont in in_pool:
+        return pick(in_pool[cont], "continuity")
+    if job.core_class == "wide":
+        return pick(max(eligible, key=lambda r: (table.hosts[r.host].threads, r.score, r.host)), "core_class:wide")
+    bonus: Dict[str, tuple] = {}
+    for r in pool:
+        spec = table.hosts[r.host]
+        bc = dials.bonus_continuity if dials.continuity == "bonus" and r.host == cont else 0.0
+        bf = dials.bonus_fast_core if job.core_class == "fast" and spec.fast_core else 0.0
+        u = points_used(r, spec, fp)
+        r.used, r.cost, r.points, r.bonus = u, POINTS_COST_K * u / (1.0 - u), spec.points, bc + bf
+        r.score, r.alpha = spec.points + bc + bf - r.cost, None
+        bonus[r.host] = (bc, bf)
+
+    def best(minus: int = -1) -> Headroom:
+        # highest score; a tie goes to more points, then the host id (lexically first)
+        return min(pool, key=lambda r: (-(r.score - (bonus[r.host][minus] if minus >= 0 else 0.0)),
+                                        -table.hosts[r.host].points, r.host))
+    win = best()
+    prev_id = table.resolve(previous) if previous else None
+    if prev_id and prev_id != win.host and prev_id in bonus and win.score - by_id[prev_id].score < dials.keep_margin:
+        return pick(by_id[prev_id], "points", kept=True)
+    rule = "points:continuity" if best(0).host != win.host else "points:fast" if best(1).host != win.host else "points"
+    return pick(win, rule)
 
 
 
