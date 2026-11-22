@@ -17823,6 +17823,28 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
                 return _workspace_admission_refused(
                     conn, task_id, result, board=board, dry_run=dry_run,
                 )
+        # t_8721e331: the card's last run was on a pool host, so its tree lives
+        # there and the dir here was only a placeholder. Re-create it at the
+        # same path (origin state stays bound) and re-admit; never a page.
+        if (
+            not dry_run
+            and reason.startswith("stranded_by_mount_loss:")
+            and task.status in ("ready", "review")
+        ):
+            from hermes_cli import kanban_continuation as _kcont
+            remote = _kcont.restore_remote_placeholder(conn, task)
+            if remote is not None:
+                with write_txn(conn):
+                    _append_event(conn, task_id, "workspace_placeholder_restored", {
+                        "host": remote, "path": task.workspace_path,
+                    })
+                _log.warning(
+                    "kanban dispatch: workspace placeholder restored task=%s "
+                    "(last run on %s; local dir absent)", task_id, remote,
+                )
+                return _workspace_admission_refused(
+                    conn, task_id, result, board=board, dry_run=dry_run,
+                )
         if (
             not dry_run
             and reason.startswith("stranded_by_mount_loss:")

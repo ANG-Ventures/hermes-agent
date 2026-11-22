@@ -814,3 +814,74 @@ def test_dir_lost_after_a_post_completion_spawn_stays_stranded(home, monkeypatch
         result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
         assert task_id in result.stranded_by_mount_loss
         assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+def _sent_back_after_remote_run(conn, root, host='ace-media'):
+    """The incident shape (t_8721e331, card t_e43250de): the last run ran on a
+    pool host, handed to review, a sendback set it ready, and the dispatcher's
+    own placeholder dir is gone while the volume is mounted."""
+    task_id, path = _stranded_card(conn, root, title='remote')
+    kb._append_event(conn, task_id, 'spawned', {'pid': 4242, 'host': host})
+    conn.execute(
+        "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at, host) "
+        "VALUES (?, 'default', 'review_requested', 'review_requested', 1, 2, ?)",
+        (task_id, host),
+    )
+    # The sendback's own run carries no host.
+    conn.execute(
+        "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at) "
+        "VALUES (?, 'default', 'changes_requested', 'changes_requested', 3, 4)",
+        (task_id,),
+    )
+    conn.execute("UPDATE tasks SET origin_host=? WHERE id=?", (host, task_id))
+    kb._append_event(conn, task_id, 'continuation_observed', {'host': host, 'state': 'nonempty'})
+    shutil.rmtree(path)
+    return task_id, path
+
+
+def test_sent_back_remote_run_card_is_admitted_without_stranding(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root)
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id in calls
+        assert task_id not in result.stranded_by_mount_loss
+        assert task_id not in [t for t, _ in result.workspace_refused]
+        assert kb.claim_workspace_refusal_pages(conn, result.workspace_refused) == []
+        kinds = [r[0] for r in conn.execute(
+            'SELECT kind FROM task_events WHERE task_id=? ORDER BY id', (task_id,))]
+        assert 'stranded_by_mount_loss' not in kinds
+        assert 'workspace_refusal_paged' not in kinds
+        assert 'workspace_placeholder_restored' in kinds
+        # Same path: the state on the origin host stays bound to the card.
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+        assert path.is_dir()
+
+
+def test_remote_run_card_with_root_unmounted_still_refuses(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root)
+        shutil.rmtree(root)
+        monkeypatch.setattr('os.path.ismount', lambda p: False)
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert not calls
+        assert task_id in result.stranded_by_mount_loss
+        assert any(r.startswith('workspaces_root_unmounted')
+                   for t, r in result.workspace_refused if t == task_id)
+        assert not path.exists()
+
+
+def test_local_run_card_dir_lost_stays_stranded(home, monkeypatch):
+    # Last run was on this host (host='studio'): the missing dir held its work.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='studio')
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        assert task_id in result.stranded_by_mount_loss
+        assert not path.exists()
+        kinds = [r[0] for r in conn.execute(
+            'SELECT kind FROM task_events WHERE task_id=?', (task_id,))]
+        assert 'workspace_placeholder_restored' not in kinds
