@@ -271,7 +271,9 @@ def test_read_only_mask_requires_whole_body_allowlist(tmp_path, prefix):
     "subprocess.run(cmd)",
     "subprocess.Popen(['sqlite3', 'x'])",
     "subprocess.run(['sqlite3', 'x'], env=dict())",
-    "json.load(open('/dev/null'))",
+    # t_bb509376: `json.load(fp)` is allowlisted now (it only calls fp.read()); the decoder
+    # class is not.
+    "json.JSONDecoder().decode('1')",
 ])
 def test_read_only_mask_refuses_non_allowlisted_calls(tmp_path, call):
     log = tmp_path / "intake.jsonl"
