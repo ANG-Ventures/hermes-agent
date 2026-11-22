@@ -179,6 +179,12 @@ def test_symlinked_package_out_of_the_library_is_not_a_hit(tmp_path):
         (shared / "media-aux" / "escapee").symlink_to(outside, target_is_directory=True)
         assert smt.find_library_skill("escapee") == (None, None)
         assert smt.find_library_skill("media-aux/escapee") == (None, None)
+        # package dir out of the library, its SKILL.md a symlink back in: still not a hit.
+        back = tmp_path / "outside2"
+        back.mkdir()
+        (back / "SKILL.md").symlink_to(shared / "media-aux" / "audio-cleanup-separation" / "SKILL.md")
+        (shared / "media-aux" / "boomerang").symlink_to(back, target_is_directory=True)
+        assert smt.find_library_skill("boomerang") == (None, None)
 
 
 def test_skill_view_library_fallback_with_empty_loadout(tmp_path, monkeypatch):

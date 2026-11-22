@@ -421,7 +421,8 @@ def find_library_skill(name: str) -> Tuple[Optional[Path], Optional[str]]:
         with suppress(OSError, ValueError):
             # resolve(): a symlinked package or SKILL.md must not lead out of the library.
             if (skill_md.is_file() and not is_excluded_skill_path(skill_md)
-                    and skill_md.resolve().is_relative_to(shared_r)):
+                    and skill_md.resolve().is_relative_to(shared_r)
+                    and skill_md.parent.resolve().is_relative_to(shared_r)):
                 hits.append((group, skill_md.parent))
     if len(hits) > 1:
         qualified = ", ".join(f"'{g}/{bare}'" for g, _ in hits)
