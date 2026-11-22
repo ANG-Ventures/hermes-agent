@@ -11954,6 +11954,7 @@ def complete_task(
     watcher: Optional[str] = None,
     abandon_routed_pr: Optional[str] = None,
     scheduled_ok: bool = False,
+    draft_kind: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -11978,7 +11979,9 @@ def complete_task(
     draft PR. The draft is dropped from the open-PR route, and a
     ``completion_draft_override`` event records the PRs and the reason. A blank
     reason is refused (:class:`EmptyDraftOverrideError`); without it the
-    default :class:`DraftPrError` refusal is unchanged.
+    default :class:`DraftPrError` refusal is unchanged. ``draft_kind`` (t_12401145) says which override:
+    ``merge_hold`` (default) turns the card's OWN drafts into a ledger hold + ready PR that routes to review
+    (:mod:`kanban_draft_merge_hold`); ``keep_draft`` is the override above. Invalid values raise ValueError.
 
     ``superseded_by`` closes a card whose premise is ALREADY SATISFIED on
     current main — the sibling card, PR or sha that did the work. The closing
@@ -12079,6 +12082,9 @@ def complete_task(
                     {"reason": "overlong_draft_ok" if too_long else "empty_draft_ok"},
                 )
             raise EmptyDraftOverrideError(task_id, too_long)
+    if draft_kind is not None:
+        from hermes_cli import kanban_draft_merge_hold as _mh
+        draft_kind = _mh.normalize_kind(draft_kind)   # ValueError before any mutation
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -12207,6 +12213,7 @@ def complete_task(
         negative_trigger = _neg.match(_neg.handoff_texts(summary, result), metadata)
     from hermes_cli import kanban_open_pr as _open_pr
     _pr_query = None
+    merge_held: dict = {}   # t_12401145: {"o/r#n": hold/ready result} for merge-hold drafts
     if candidate.status != 'review' and not parked_review and not approve_head_sha:
         # Foreign-owner PRs (upstream / third-party repos) are mentions, not a
         # gate: the fleet cannot merge them (t_06dccfe3). Record, never route.
@@ -12343,11 +12350,25 @@ def complete_task(
                 override = {"prs": list(overridden), "reason": draft_ok}
                 if freshness.get("draft_held"):
                     override["held"] = freshness["draft_held"]  # t_62389c4f: the hold stays visible
+                # t_12401145: a merge-hold override on the card's OWN draft becomes a ledger hold + ready
+                # PR that stays on the open-PR route (review, not done); keep_draft is the override above.
+                from hermes_cli import kanban_draft_merge_hold as _mh
+                hold_keys = _mh.plan(
+                    overridden, kind=_mh.normalize_kind(draft_kind),
+                    own_keys=armable | {f"{r.repo}#{r.number}" for r in branch_owned_prs},
+                    held=(freshness.get("draft_held") or {}).keys())
+                if draft_kind is not None or hold_keys:
+                    override["kind"] = _mh.normalize_kind(draft_kind)
+                if hold_keys:
+                    merge_held = _mh.apply(hold_keys, why=draft_ok, by=_mh.by_of(
+                        candidate.assignee, candidate.current_run_id, task_id))
+                    override["merge_hold"] = merge_held
                 with write_txn(conn):
                     _append_event(conn, task_id, "completion_draft_override", override)
                 metadata = dict(metadata or {}, draft_override=override)
                 still_open = [
-                    r for r in still_open if f"{r.repo}#{r.number}" not in overridden
+                    r for r in still_open
+                    if f"{r.repo}#{r.number}" not in overridden or f"{r.repo}#{r.number}" in merge_held
                 ]
         if no_new is not None:
             # The freshness gate can update-branch after the verdict; a moved head is
@@ -12423,6 +12444,16 @@ def complete_task(
                 open_pr_reviewer = configured_review_hold_assignee()
                 if open_pr_reviewer:
                     routed_meta["review_hold"] = open_pr_reviewer
+                if any(not e.get("ok") for e in merge_held.values()):
+                    # t_12401145: a merge-hold PR still DRAFT runs no checks to settle; the human takes it now.
+                    _human = configured_review_assignee()
+                    open_pr_reviewer = (_human.casefold() if is_human_reviewer(_human)
+                                        else HUMAN_REVIEWER_SENTINEL)
+                    routed_meta.pop("review_hold", None)
+            if merge_held:
+                from hermes_cli import kanban_draft_merge_hold as _mh
+                note = "\n".join([note, *_mh.note(merge_held)])
+                routed_meta["draft_merge_hold"] = merge_held
             routed_summary = _neg.routed_summary(note, summary, result)
             routed_meta, staged = _stage_routed_scratch_artifacts(
                 conn, task_id, routed_meta, summary=summary, result=result,

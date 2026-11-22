@@ -1,0 +1,154 @@
+"""Merge-hold drafts: a worker's ``draft_ok`` becomes a ledger hold + ready PR + review (t_12401145).
+
+A worker cannot set a ledger hold (hermes-home ``scripts/lib/pr_hold.py`` refuses in a kanban worker) and the
+derived approver merges an unheld ready PR in ~2 min, so a worker that wants a merge hold leaves its PR a DRAFT and
+completes with ``draft_ok``. That closed the card ``done`` with nothing reviewed, and a draft skips CI and Prism
+(78 ``completion_draft_override`` events on 62 cards in 7 days to 2026-11-21).
+
+``draft_kind`` on the completion says which override it is. It is an explicit field, never read from the reason:
+
+- ``merge_hold`` (the default when unset): for each of the card's OWN draft PRs (handoff metadata /
+  ``--survivor-pr`` / head branch names the card) the kernel (1) sets a ledger hold through ``pr_hold.write`` (the
+  writer ``pr_hold.py set`` uses; by = the worker run, why = the reason), (2) marks the PR ready through
+  ``ace_gate.py ready`` so CI and Prism run, and (3) keeps it on the open-PR route, so the card goes to review
+  through the review hold and the settle tick hands it to the operator. A PR whose hold could not be written is
+  NOT flipped (an unheld ready PR merges); it stays draft and the card goes straight to the human reviewer.
+- ``keep_draft``: today's override, unchanged (a stacked/pinned PR that must stay draft; the card closes done).
+
+A draft the card merely mentions, or one someone else re-drafted after this card flipped it (``draft_held``), keeps
+today's override. Kill switch ``KANBAN_DRAFT_MERGE_HOLD=0``: every override behaves as ``keep_draft``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import logging
+import os
+import time
+from typing import Callable, Iterable, Optional
+
+_log = logging.getLogger(__name__)
+
+MERGE_HOLD = "merge_hold"
+KEEP_DRAFT = "keep_draft"
+KINDS = (MERGE_HOLD, KEEP_DRAFT)
+
+HoldFn = Callable[[str, int, str, str], None]          # (repo, number, why, by); raises on failure
+ReadyFn = Callable[[str, int], Optional[int]]          # ace_gate.py ready rc, None = not run
+
+
+def enabled() -> bool:
+    return os.environ.get("KANBAN_DRAFT_MERGE_HOLD", "1").strip() != "0"
+
+
+def normalize_kind(value) -> str:
+    """``draft_kind`` -> one of :data:`KINDS`; unset/blank = :data:`MERGE_HOLD`. Raises ValueError otherwise."""
+    if value is None or not str(value).strip():
+        return MERGE_HOLD
+    kind = str(value).strip().lower().replace("-", "_")
+    if kind not in KINDS:
+        raise ValueError(f"draft_kind must be one of {', '.join(KINDS)}, got {value!r}")
+    return kind
+
+
+def plan(overridden: Iterable[str], *, kind: str, own_keys: Iterable[str],
+         held: Iterable[str] = ()) -> list:
+    """The overridden draft keys this completion merge-holds (in order); [] = today's override for all."""
+    if not enabled() or kind != MERGE_HOLD:
+        return []
+    own = {str(k).lower() for k in own_keys}
+    skip = {str(k).lower() for k in held}
+    return [k for k in overridden if k.lower() in own and k.lower() not in skip]
+
+
+def by_of(assignee: Optional[str], run_id: Optional[int], task_id: str) -> str:
+    """The ledger row's ``by``: the worker run that asked for the hold."""
+    who = (assignee or "worker").strip() or "worker"
+    return f"{who} run {run_id} ({task_id})" if run_id is not None else f"{who} ({task_id})"
+
+
+def _load_pr_hold():
+    from hermes_constants import get_default_hermes_root
+    path = get_default_hermes_root() / "scripts" / "lib" / "pr_hold.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("_kanban_pr_hold", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)   # type: ignore[union-attr]
+    return mod
+
+
+def pr_hold_set(repo: str, number: int, why: str, by: str) -> None:
+    """``pr_hold.write("set", ...)`` from the hermes root: ledger row first, then the ``hold`` label."""
+    mod = _load_pr_hold()
+    if mod is None:
+        raise RuntimeError("scripts/lib/pr_hold.py not found under the hermes root")
+    mod.write("set", repo, int(number), why, by)
+
+
+def _default_hold() -> Optional[HoldFn]:
+    # Same seam as kanban_pr_freshness._default_gh: no live ledger or GitHub write from pytest.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    return pr_hold_set
+
+
+def apply(keys: Iterable[str], *, why: str, by: str, hold: Optional[HoldFn] = None,
+          ready: Optional[ReadyFn] = None) -> dict:
+    """Hold then flip each ``"o/r#n"`` key. -> ``{key: {"hold", "ready", "ok", "at"}}``; never raises.
+
+    The hold is written first and the flip runs only after it succeeded: a ready PR with no hold is exactly what
+    the derived approver merges. ``ok`` = held AND ready (CI and Prism will run)."""
+    if hold is None:
+        hold = _default_hold()
+    if ready is None:
+        from hermes_cli import kanban_pr_freshness as _fresh
+        ready = _fresh._default_ready()
+    out: dict = {}
+    for key in keys:
+        repo, _, num = key.rpartition("#")
+        entry: dict = {"ok": False}
+        out[key] = entry
+        try:
+            if hold is None:
+                raise RuntimeError("no pr_hold writer")
+            hold(repo, int(num), why, by)
+            entry["hold"] = "set"
+        except Exception as exc:  # noqa: BLE001 -- recorded; the PR stays draft
+            entry["hold"] = f"failed: {str(exc)[:160]}"
+            _log.warning("draft merge hold: %s hold failed: %s", key, exc)
+            continue
+        entry["at"] = int(time.time())   # BEFORE the flip: every post-ready run starts after it
+        rc = ready(repo, int(num)) if ready is not None else None
+        entry["ready"] = rc
+        entry["ok"] = rc == 0
+    return out
+
+
+def note(result: dict) -> list:
+    """One handback line per merge-held PR."""
+    lines = []
+    for key, e in sorted(result.items()):
+        if e.get("ok"):
+            lines.append(f"{key}: merge hold set (pr_hold ledger) and marked ready; CI and Prism run, "
+                         f"the operator lifts the hold to land")
+        elif e.get("hold") == "set":
+            lines.append(f"{key}: merge hold set but ready flip failed (ace_gate rc={e.get('ready')}); "
+                         f"still DRAFT, needs the operator")
+        else:
+            lines.append(f"{key}: merge hold NOT set ({e.get('hold')}); left DRAFT, needs the operator")
+    return lines
+
+
+def replay_route(payload: dict, own_keys: Iterable[str]) -> str:
+    """How a recorded ``completion_draft_override`` event routes under this change (the 7-day replay).
+
+    ``merge_hold`` events with an own draft go to review (``review_hold`` when hold+flip work); everything else
+    keeps today's ``done``. Old events carry no ``kind``, so they read as the default."""
+    try:
+        kind = normalize_kind(payload.get("kind"))
+    except ValueError:
+        kind = KEEP_DRAFT
+    keys = plan(payload.get("prs") or [], kind=kind, own_keys=own_keys,
+                held=(payload.get("held") or {}).keys())
+    return "review" if keys else "done"

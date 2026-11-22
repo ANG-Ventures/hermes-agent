@@ -640,9 +640,18 @@ _FORK_PROPERTIES: dict[str, dict[str, Any]] = {'KANBAN_LIST_SCHEMA': {'all': {'t
                                                         'INTENTIONALLY left open, e.g. a CI '
                                                         'vehicle for an upstream PR: the reason. '
                                                         'Recorded as an audited '
-                                                        'completion_draft_override event; the '
-                                                        'draft is not routed to review. Empty is '
-                                                        'refused.'},
+                                                        'completion_draft_override event. See '
+                                                        'draft_kind for what happens to the PR. '
+                                                        'Empty is refused.'},
+                            'draft_kind': {'type': 'string', 'enum': ['merge_hold', 'keep_draft'],
+                                           'description': 'With draft_ok: which override. '
+                                                          'merge_hold (default): you want a merge '
+                                                          'hold; the kernel sets a ledger hold on '
+                                                          'your own draft PR(s), marks them ready so '
+                                                          'CI and Prism run, and routes the card to '
+                                                          'review (not done). keep_draft: the PR must '
+                                                          'stay a draft (stacked or pinned); the card '
+                                                          'closes done as before.'},
                             'survivor_pr': {'type': ['string', 'array'],
                                             'items': {'type': 'string'},
                                             'description': 'Only when completion already REFUSED '
