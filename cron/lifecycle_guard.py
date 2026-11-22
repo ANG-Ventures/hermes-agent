@@ -1478,14 +1478,20 @@ def lifecycle_scan_root_within_budget(text: str) -> bool:
 _TEXT_CAP_WAY_THROUGH = (
     "the guard scans a file the command names as a script unless it can prove the file is only "
     "read. To read it as data: in a python heredoc use only json/re/open/str operations "
-    "(`json.load(open(p))`, no sys/os/lambda/other imports), or pass the path as an argument "
+    "(`json.load(open(p))`, no sys/os/lambda/other imports), or pass the path as an argument "  # windows-footgun: ok
     "(`python3 - \"$F\" <<'EOF'` and `sys.argv[1]`), or put the script in a .py file and run "
     "`python3 that.py`"
+)
+# A file the shell itself names (`bash big.sh`, `python3 big.py`) is run, not read: the read-as-data
+# shapes above do not apply to it (Prism 8e4887a66a56).
+_TEXT_CAP_EXECUTED = (
+    "a file the command runs is scanned whole and must fit these caps: split it into smaller files"
 )
 
 
 def _budget_exhausted(
     budget: _LifecycleScanBudget, what: str, depth: int, source: Optional[Path] = None,
+    read_as_data: bool = False,
 ) -> bool:
     detail = ""
     if what == "text" and budget.over:
@@ -1497,7 +1503,7 @@ def _budget_exhausted(
     )
     budget.refusal = f"the scan budget was exhausted ({what} at depth {depth}{detail})"
     if what == "text" and source is not None:
-        budget.refusal += f"; {_TEXT_CAP_WAY_THROUGH}"
+        budget.refusal += f"; {_TEXT_CAP_WAY_THROUGH if read_as_data else _TEXT_CAP_EXECUTED}"
     return True
 
 
@@ -3702,6 +3708,58 @@ def _mask_read_only_python_paths(body: str) -> str:
     return body
 
 
+_PY_CD_RE = re.compile(r"(?:^|[;&|(\s])(?:cd|pushd)(?=[\s;&|)]|$)(?:[ \t]+([^\s;&|)<>]+))?")
+
+
+def _python_import_dirs(shell_text: str, cwd: Optional[str]) -> Optional[list[Path]]:
+    """Directories a python heredoc in *shell_text* may run in (its sys.path[0]); None when unknown
+    (a non-literal `cd` target, or PYTHONPATH named in the command)."""
+    if "PYTHONPATH" in shell_text:
+        return None
+    try:
+        base = Path(cwd) if cwd else Path(os.getcwd())
+    except OSError:
+        return None
+    dirs = [base]
+    for match in _PY_CD_RE.finditer(shell_text):
+        arg = match.group(1)
+        if arg is None:
+            dirs.append(Path.home())
+            continue
+        arg = arg.strip("'\"")
+        if not arg or arg == "-" or any(c in arg for c in "$`*?[{\\"):
+            return None
+        target = Path(arg).expanduser()
+        dirs.append(target if target.is_absolute() else base / target)
+    return dirs
+
+
+def _python_imports_shadowed(body: str, dirs: list[Path]) -> bool:
+    """Whether an import in *body* could resolve to a module file in one of *dirs*."""
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return False  # the masks refuse an unparsable body anyway
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module.split(".")[0])
+    try:
+        for directory in dirs:
+            for name in names:
+                if any((directory / f"{name}{ext}").exists() for ext in (".py", ".pyc", ".so", ".pyd")):
+                    return True
+                if (directory / name / "__init__.py").exists():
+                    return True
+                if any(directory.glob(f"{name}.*.so")) or any(directory.glob(f"{name}.*.pyd")):
+                    return True
+    except OSError:
+        return True
+    return False
+
+
 def _contains_unsafe_gateway_action(
     command: str,
     *,
@@ -3712,14 +3770,16 @@ def _contains_unsafe_gateway_action(
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
     executed: bool = True,
     source: Optional[Path] = None,
+    read_as_data: bool = False,
 ) -> bool:
-    """``source`` is the referenced file *command* was read from (None for command text).
+    """``source`` is the referenced file *command* was read from (None for command text);
+    ``read_as_data`` says only a python heredoc body named it (the refusal's way through).
     ``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
     depth, size, device, live SQLite, cloud) is "nothing to scan" there, never a block (#113944)."""
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
-        return _budget_exhausted(budget, "text", depth, source) if executed else False
+        return _budget_exhausted(budget, "text", depth, source, read_as_data) if executed else False
     hit = _describe_direct_lifecycle_scan(command)
     if hit is not None:
         budget.hit = budget.hit or hit + ("" if depth == 0 else f" (in a referenced script, depth {depth})")
@@ -3732,7 +3792,10 @@ def _contains_unsafe_gateway_action(
         strip_inert_heredoc_bodies,
     )
 
-    def recurse(text: str, cwd: Optional[str], executed: bool, source: Optional[Path] = None) -> bool:
+    def recurse(
+        text: str, cwd: Optional[str], executed: bool, source: Optional[Path] = None,
+        read_as_data: bool = False,
+    ) -> bool:
         return _contains_unsafe_gateway_action(
             text,
             cwd=cwd,
@@ -3742,6 +3805,7 @@ def _contains_unsafe_gateway_action(
             read_remote_script=read_remote_script,
             executed=executed,
             source=source,
+            read_as_data=read_as_data,
         )
 
     # Python stdin is executable Python source, but not a sequence of shell
@@ -3749,8 +3813,16 @@ def _contains_unsafe_gateway_action(
     # its path strings from the shell's referenced-script walk.
     python_bodies = inert_python_heredoc_bodies(command, semicolon_chain=True)
     shell_only = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
-    for body in python_bodies:
-        masked_body = _mask_python_data_strings(body)
+    # The masks assume `json`/`re`/`subprocess`/`pathlib` are the stdlib modules; `python3 -` puts
+    # its cwd first on sys.path, so a workspace `re.py` would get the masked text (Prism
+    # aede5e966585). A body whose imports may resolve elsewhere keeps its text visible.
+    import_dirs = _python_import_dirs(shell_only, cwd) if python_bodies else []
+    trusted = [
+        import_dirs is not None and not _python_imports_shadowed(body, import_dirs)
+        for body in python_bodies
+    ]
+    for body, body_trusted in zip(python_bodies, trusted):
+        masked_body = _mask_python_data_strings(body) if body_trusted else body
         # a file the body WRITES and the shell text names again may be executed next: the
         # strings going into it are not data (write-then-run class, R6)
         if masked_body != body and _python_write_may_run(body, shell_only):
@@ -3763,7 +3835,11 @@ def _contains_unsafe_gateway_action(
     # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
     # oversized data file mentioned there otherwise fails closed as a "script".
     shell_command = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
-    masked_bodies = [_mask_read_only_python_paths(body) for body in python_bodies]
+    masked_bodies = [
+        _mask_read_only_python_paths(body) if body_trusted else body
+        for body, body_trusted in zip(python_bodies, trusted)
+    ]
+    shell_named = set(_iter_referenced_shell_scripts(shell_command, cwd=cwd))
     referenced_command = shell_command + "\n" + "\n".join(masked_bodies)
 
     for payload in _iter_shell_command_payloads(shell_command):
@@ -3848,7 +3924,8 @@ def _contains_unsafe_gateway_action(
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
         script_dir = _resolve_script_directory(str(resolved)) or cwd
-        if recurse(script_text, script_dir, candidate_executed, script_path):
+        if recurse(script_text, script_dir, candidate_executed, script_path,
+                   script_path not in shell_named):
             return True
     return False
 

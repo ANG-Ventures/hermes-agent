@@ -139,3 +139,40 @@ def test_lines_cap_refusal_names_lines(tmp_path):
     unsafe, refusal, _hit = _scan(command, tmp_path)
     assert unsafe is True
     assert f"`{many}` is 20000 lines, over the " in refusal and "16384-line walk cap" in refusal
+
+
+@pytest.mark.parametrize("module_file", ["re.py", "json.py", "re/__init__.py"])
+def test_workspace_module_shadowing_an_import_keeps_the_body_visible(tmp_path, module_file):
+    """`python3 -` puts its cwd first on sys.path: a workspace `re.py` gets the call's arguments,
+    so the lifecycle literal it receives must stay visible (Prism aede5e966585)."""
+    shadow = tmp_path / module_file
+    shadow.parent.mkdir(parents=True, exist_ok=True)
+    shadow.write_text("def search(*a): pass\ndef loads(*a): pass\n", encoding="utf-8")
+    name = module_file.split("/")[0].removesuffix(".py")
+    call = "re.search" if name == "re" else "json.loads"
+    command = f"python3 -S - <<'EOF'\nimport {name}\n{call}('{RESTART}', 'sample')\nEOF"
+    assert _scan(command, tmp_path)[0] is True
+    # Same body, no workspace module: the string is data and the body passes.
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    assert _scan(command, clean) == (False, None, None)
+
+
+def test_cd_into_a_shadowing_dir_keeps_the_body_visible(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "re.py").write_text("def search(*a): pass\n", encoding="utf-8")
+    body = f"python3 - <<'EOF'\nimport re\nre.search('{RESTART}', 'x')\nEOF"
+    assert _scan(f"cd work && {body}", tmp_path)[0] is True
+    assert _scan(f'cd "$W" && {body}', tmp_path)[0] is True  # unknown cwd: fail closed
+    assert _scan(f"PYTHONPATH=work {body}", tmp_path)[0] is True
+
+
+def test_an_executed_script_over_the_cap_gets_the_split_hint_not_the_read_hint(tmp_path):
+    """`bash big.sh` runs the file: the read-as-data shapes do not apply (Prism 8e4887a66a56)."""
+    big = tmp_path / "big.sh"
+    big.write_text("echo " + "x" * 70_000 + "\n", encoding="utf-8")
+    unsafe, refusal, _hit = _scan(f"bash {big}", tmp_path)
+    assert unsafe is True and "longest-line cap" in refusal
+    assert "split it into smaller files" in refusal
+    assert "sys.argv[1]" not in refusal
