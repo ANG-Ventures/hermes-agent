@@ -1422,6 +1422,34 @@ def _tracker_field_sub(m: re.Match) -> str:
     return f'{m.group(1)}{m.group(2)}"***"'
 
 
+# libpq conninfo ``password=`` (t_7a36b3f0): ``cat $PGDATA/postgresql.auto.conf`` prints
+# ``primary_conninfo = 'user=r password=X host=h ...'``; the line-start / ENV passes skip a
+# mid-line lowercase ``password=``, so the replication password printed verbatim. Masked only on a
+# line that also carries another conninfo keyword, so prose ``password=foo`` is left alone. Value
+# forms: bare, libpq-quoted ('x'), and that quoting inside a SQL literal (''x'' or \'x\').
+_CONNINFO_HINT_RE = re.compile(r"(?<![A-Za-z0-9_])(?:host|hostaddr|user|dbname|port)\s*=\s*\S", re.IGNORECASE)
+_CONNINFO_PW_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(password\s*=\s*)"
+    # escapes are consumed before the closing quote is tested: a libpq \' inside the SQL-doubled
+    # form reads \'' (or \\'' with the backslash doubled), and a bare value may hold "\ ". In the
+    # backslash-SQL form a libpq escape is \\ + one SQL char (\\\' is a quote), and the value ends
+    # at the first other \' even when the next key follows with no space (Prism d4c034283b10).
+    # A quoted form counts only when its close is followed by a value boundary (space, quote, end,
+    # or the next key=); otherwise the bare form, then the whole token, is masked (Prism 33d2d39f)
+    r"((?:''(?:\\(?:'')?|''''|[^'\\])*''|\\'(?:\\\\(?:\\.|''|[^\\'])|\\[^'\\]|[^'\\])*\\'"
+    r"|'(?:[^'\\]|\\.)*')(?=[\s']|$|[A-Za-z_]\w*\s*=)|(?:\\.|[^\s'\\])+|\S+)",
+    re.IGNORECASE,
+)
+
+
+def _redact_conninfo_passwords(text: str) -> str:
+    return "\n".join(
+        _CONNINFO_PW_RE.sub(lambda m: m.group(1) + "***", line)
+        if "password" in line.lower() and _CONNINFO_HINT_RE.search(line) else line
+        for line in text.split("\n")
+    )
+
+
 def redact_terminal_output(output: str, command: str | None = None, *, force: bool = False) -> str:
     """Single redaction policy for ALL terminal-output surfaces: the ENV/YAML-assignment
     pass runs only when ``command`` is an env dump or reads a secret-bearing file (``.env``,
@@ -1441,6 +1469,8 @@ def redact_terminal_output(output: str, command: str | None = None, *, force: bo
     # where {'BRAVE_API_KEY': '…'} leaks, not in source dumps.
     if code_file and (force or _redact_enabled()) and ":" in redacted and "'" in redacted:
         redacted = _redact_python_diagnostic_repr_fields(redacted)
+    if (force or _redact_enabled()) and "password" in redacted.lower():
+        redacted = _redact_conninfo_passwords(redacted)
     return redacted
 
 
