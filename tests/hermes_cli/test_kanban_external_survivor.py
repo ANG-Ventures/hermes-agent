@@ -163,6 +163,37 @@ def test_explicit_pr_keeps_dirty_workspace_capture(board, remote, tmp_path):
     assert not ws.exists()
 
 
+def test_merged_pr_close_does_not_bundle_checkout_history(board, remote, monkeypatch):
+    tid = kb.create_task(board, title="merged implementation with local residue")
+    _bind(remote, tid)
+    ws = kbw.resolve_workspace(kb.get_task(board, tid))
+    repo = ws / "preview.git"
+    repo.mkdir()
+    kbw.set_workspace_path(board, tid, ws)
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                              stdin=subprocess.DEVNULL, capture_output=True)
+    git("init", "-b", "main")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "local history")
+    (repo / "local.py").write_text("local_only = True\n")
+    real_git = survivor._git
+    def time_out_bundle(repo, *args, **kwargs):
+        if args[:2] == ("bundle", "create"):
+            raise subprocess.TimeoutExpired(args, 30)
+        return real_git(repo, *args, **kwargs)
+    monkeypatch.setattr(survivor, "_git", time_out_bundle)
+
+    assert _cli(board, monkeypatch, ["complete", tid, "--result", "shipped", "--survivor-pr", PR]) == 0
+    assert kb.get_task(board, tid).status == "done"
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert saved["kind"] == "ref"
+    assert saved["refs"][0]["sha"] == MERGE
+    assert (repo / "local.py").read_text() == "local_only = True\n"
+    assert not kb.safe_remove_workspace_dir(ws, task_id=tid, reason="test retry", conn=board)
+    assert "workspace retained" in survivor._state(board, tid)[1]
+    assert not any(a.filename.endswith(".bundle") for a in kb.list_attachments(board, tid))
+
+
 def _cli(board, monkeypatch, argv):
     """Drive the real parser + handler so the flag->preserve() binding is gated."""
     import argparse
