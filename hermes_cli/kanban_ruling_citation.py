@@ -17,9 +17,13 @@ def _fleet_root() -> Path:
 
 
 def validate_fields(conn, fields) -> None:
-    if os.environ.get("RULING_CITATION_LINT", "").strip().lower() in ("0", "off", "false", "no"):
-        return
+    # RULING_CITATION_LINT=0 turns off the citation rule and the broken-checker
+    # refusal, not the checker's merge-hold-body rule (own off switch in
+    # hermes-home: state/merge-hold-body.off; t_d478320e).
+    disabled = os.environ.get("RULING_CITATION_LINT", "").strip().lower() in ("0", "off", "false", "no")
     fields = [(name, text) for name, text in fields if text]
+    if disabled:
+        fields = [(name, text) for name, text in fields if name == "body"]
     if not fields:
         return
     path = _fleet_root() / "scripts/lints/ruling-citation-lint.py"
@@ -36,8 +40,14 @@ def validate_fields(conn, fields) -> None:
             row = conn.execute("SELECT body FROM task_comments WHERE id=?", (cid,)).fetchone()
             return bool(row) and module.direct_citation(row[0] or "")
 
-        reason = module.check_fields(fields, comment_cites)
+        if disabled:
+            rule = getattr(module, "merge_hold_body", None)
+            reason = next((r for _, text in fields if rule and (r := rule(text))), None)
+        else:
+            reason = module.check_fields(fields, comment_cites)
     except Exception as exc:
+        if disabled:
+            return
         raise ValueError(
             "BLOCKED by ruling-citation: checker unavailable; repair the checker "
             "or set RULING_CITATION_LINT=0."
