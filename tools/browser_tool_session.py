@@ -643,10 +643,23 @@ def _browser_in_sandbox() -> bool:
     return placement.resolve().where == placement.TERMINAL
 
 
-def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket_dir: str) -> "tuple[List[str], Dict[str, str]]":
+_SCREEN_ENV_KEYS = ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def _is_lease_cdp(cdp_url: str) -> bool:
+    """t_ba46cfe3: ``cdp_url`` is the loopback port of THIS process's live identity lease. The page renders in the
+    Studio's identity browser; agent-browser only has to reach the lease forwarder's port on the terminal host,
+    so no screen is needed there (a pool host with no worker desktop: mbp-2026, nas-fleet)."""
+    from tools.browser_lease import is_lease_url
+    return is_lease_url(cdp_url or "")
+
+
+def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket_dir: str,
+                  *, screenless: bool = False) -> "tuple[List[str], Dict[str, str]]":
     """Rewrite one agent-browser invocation to run inside the sandbox: exec prefix + the CLI by name, with the
     browser-relevant variables exported there (the daemon's socket dir mirrors the host path so the host-side
-    liveness probes keep their shape) and a screen-published DISPLAY. Identity on a gateway-hosted screen."""
+    liveness probes keep their shape) and a screen-published DISPLAY. Identity on a gateway-hosted screen.
+    ``screenless`` (a lease CDP session, t_ba46cfe3): no screen is required or exported, but the CLI must exist."""
     if not _browser_in_sandbox():
         return cmd_parts, browser_env
     from tools.bot_desktop import runtime as _bd_runtime, sandbox_host
@@ -654,12 +667,23 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
     env = _bd_runtime._sandbox_env(create=True)
     if env is None:
         raise RuntimeError("the terminal backend's sandbox is not running, so there is nowhere to run the browser")
-    published = _bd_runtime.published_env()
-    if not published.get("DISPLAY"):
+    published = {} if screenless else _bd_runtime.published_env()
+    if not screenless and not published.get("DISPLAY"):
         # The sandbox died under a live screen (container removed, ssh host rebooted). Fail here rather than
         # let a DISPLAY-less agent-browser run headless inside a dead sandbox or, worse, fall back to the host.
         raise RuntimeError("the screen inside the terminal backend's sandbox is gone; start it again")
-    remote_env = {k: v for k, v in browser_env.items() if k in _SANDBOX_ENV_KEYS}
+    if screenless and not getattr(env, "_bd_lease_cli_ready", False):
+        probe = streams.run_in(env, ["bash", "-c", f"command -v {_SANDBOX_AGENT_BROWSER}"],
+                               user=sandbox_host._user_for(env), timeout=15)
+        if probe.returncode != 0:
+            where = f"{getattr(env, 'user', None) or '?'}@{getattr(env, 'host', None) or type(env).__name__}"
+            raise RuntimeError(
+                f"BROWSER_LEASE_CLI_ABSENT: {_SANDBOX_AGENT_BROWSER} is not on PATH for {where}. The lease's CDP port "
+                f"listens on that machine's loopback, so the browser tools run the {_SANDBOX_AGENT_BROWSER} CLI there; "
+                f"install it for that login (no screen or Chromium is needed for a lease)")
+        env._bd_lease_cli_ready = True
+    remote_env = {k: v for k, v in browser_env.items()
+                  if k in _SANDBOX_ENV_KEYS and not (screenless and k in _SCREEN_ENV_KEYS)}
     remote_env.update(published)
     remote_env["AGENT_BROWSER_SOCKET_DIR"] = _sandbox_socket_dir(env)
     remote_env.pop("AGENT_BROWSER_EXECUTABLE_PATH", None)  # the sandbox image's Playwright Chromium, not a host path
@@ -689,6 +713,13 @@ def _browser_command_preflight() -> Dict[str, Any]:
     """Fail fast before spawning (missing CLI, Termux gap, interrupt, no Chromium in local
     mode — else every call hangs for command_timeout). Error result, or ``{"browser_cmd": path}``."""
     from tools.bot_desktop import placement, runtime as _bd_runtime
+    if _is_lease_cdp(_cdp._get_cdp_override_raw()) and placement.resolve().where == placement.TERMINAL:
+        # t_ba46cfe3: a live identity lease renders in the Studio's browser; agent-browser runs in the terminal
+        # backend next to the lease forwarder and needs no screen there, so never start or require one.
+        from tools.interrupt import is_interrupted
+        if is_interrupted():
+            return {"success": False, "error": "Interrupted"}
+        return {"browser_cmd": _SANDBOX_AGENT_BROWSER}
     try:
         where = _bd_runtime.tool_placement()  # starts the sandbox screen on demand; raises for refused / down
     except RuntimeError as e:
@@ -734,7 +765,8 @@ def _spawn_and_collect(
     task_socket_dir = _prepare_session_socket_dir(session_info["session_name"])
     _bt.logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
                  command, task_id, task_socket_dir, len(task_socket_dir))
-    if engine != "lightpanda":
+    screenless = _is_lease_cdp(str(session_info.get("cdp_url") or ""))
+    if engine != "lightpanda" and not screenless:
         _ensure_screen_for_headed_chromium()  # first command forks the daemon; a headed window needs the screen up
     browser_env = _agent_browser_command_env(task_socket_dir)
 
@@ -751,7 +783,7 @@ def _spawn_and_collect(
 
     stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
     stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
-    cmd_parts, browser_env = _sandbox_wrap(cmd_parts, browser_env, task_socket_dir)
+    cmd_parts, browser_env = _sandbox_wrap(cmd_parts, browser_env, task_socket_dir, screenless=screenless)
     proc = _popen_agent_browser(cmd_parts, browser_env, task_socket_dir, command, stdin_payload)
 
     try:
