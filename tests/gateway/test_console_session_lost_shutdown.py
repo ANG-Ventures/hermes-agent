@@ -156,3 +156,9 @@ def test_diag_block_lists_processes_with_ps_unavailable(monkeypatch, fleet_root,
     listing = block[block.index("--- processes (in-process, no ps;"):].splitlines()
     assert listing[1] == "PID PPID USER STAT COMM"
     assert any(line.split()[0] == str(os.getpid()) for line in listing[2:-1]), listing[:5]
+    assert len(listing) > 4  # more than self: a real table
+
+    t0 = time.monotonic()  # the in-process block alone stays inside the 1 s budget
+    assert forensics.write_inprocess_diagnostic(tmp_path / "d.log", "SIGTERM", console_uid=ROOT_UID,
+                                                baseline_console_uid=OWN_UID, restart_requested=None)
+    assert time.monotonic() - t0 <= 1.0
