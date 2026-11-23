@@ -56,10 +56,15 @@ NEGATIVE = [
     "PR o/r#1 is open.\nStatus: NOT proven live.",
     "Please do not merge until the live check passes.",
     "PR o/r#1 is open. Please don't land it yet.",
-    # Prism round 2 on #536: a ``` mentioned mid-prose is not a fence; a bold label is still a label.
-    "The formatter recognizes ``` markers.\nAcceptance NOT met: live soak pending.",
+    # Prism round 2 on #536: a bold label is still a label.
     "PR o/r#1 is open.\n**Status:** NOT proven live.",
     "__Result__: not proven yet.",
+    # Operator send-back on #536: ``` fences get no special handling, so a ``` never hides a later verdict and
+    # pasted negative output in a fence keeps the draft (fail toward the draft).
+    "The formatter recognizes ``` markers.\nAcceptance NOT met: live soak pending.",
+    "- ```text\n  sample output\n  ```\n\nAcceptance NOT met: live soak pending.",
+    "Done. The probe printed:\n```\nResult: FAIL\nNot proven: idle\n```\nThat is the expected refusal.",
+    "Done. Output:\n```text\nverdict: FAIL\n",
 ]
 # Ordinary green handoffs, including the bare-word FAIL prose the caps-scoped
 # form exists to ignore (385/1392 false positives in 14 d).
@@ -82,9 +87,6 @@ POSITIVE = [
     "Done. If two halves carry the same step key, the halves do not merge.",
     "PR o/r#1 is green; I do not merge.",
     "Done. It looks like a process race, but I have not proven that.",
-    # Prism 5154e0a63aa9: pasted output in a ``` fence describes a run, it is not the worker's verdict.
-    "Done. The probe printed:\n```\nResult: FAIL\nNot proven: idle\n```\nThat is the expected refusal.",
-    "Done. Output:\n```text\nverdict: FAIL\n",
 ]
 
 

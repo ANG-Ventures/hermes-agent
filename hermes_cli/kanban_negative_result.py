@@ -30,11 +30,7 @@ NEG_RESULT_RE = re.compile(
 # 14 d of review_negative_result (292): "not met" 106/106 real; "not proven" 78 real / 57 false; the FAIL arm
 # 14/15 false; "do not merge" 12/14 false. So: quoted text is blanked; "not proven" needs a verdict position;
 # merge/land only as an instruction; FAIL only as a line's own label. Every other arm is unchanged.
-# A ``` fence (pasted output, closed or running to the end) is quoted too (Prism 5154e0a63aa9), but only when the
-# ``` opens a line: a ``` mentioned mid-prose is not a fence and must not hide the rest of the text.
-_QUOTED_RE = re.compile(
-    r'(?m)^[ \t]{0,3}```[\s\S]*?(?:^[ \t]{0,3}```|\Z)|"[^"\n]*"|`[^`\n]*`|\u201c[^\u201d\n]*\u201d'
-)
+_QUOTED_RE = re.compile(r'"[^"\n]*"|`[^`\n]*`|\u201c[^\u201d\n]*\u201d')
 # The worker's own verdict label before "not proven": "Result: not proven" (Prism dc37cf6bbd2e), also in Markdown
 # emphasis: "**Status:** not proven", "__Result__: not proven" (Prism 120fcd92d994).
 _VERDICT_LABEL_RE = re.compile(
@@ -82,8 +78,7 @@ def _verdict_position(text: str, m: re.Match) -> bool:
 
 
 def _first_verdict(text: str) -> Optional[str]:
-    # Newlines survive the blanking so line and sentence starts after a fence stay where they were.
-    blanked = _QUOTED_RE.sub(lambda q: re.sub(r"[^\n]", " ", q.group(0)), text)
+    blanked = _QUOTED_RE.sub(lambda q: " " * len(q.group(0)), text)
     for m in NEG_RESULT_RE.finditer(blanked):
         if _verdict_position(blanked, m):
             return m.group(0)
