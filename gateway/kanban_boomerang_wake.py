@@ -1692,12 +1692,11 @@ _OPERATOR_STEP_RE = re.compile(
     re.I | re.M)
 
 
-#: t_c9540659: a merged PR refuses a surface only when the card is closed, or not open on a human, or the child found
-#: nothing for the owner. 11-19..11-23: 92 of 227 merged refusals (20.9/day) dropped a read with a staged file or an
-#: operator line on a card still in review on human:apollo (home#14243: the only read sat 70 min). Kill switch:
-#: BOOMERANG_MERGED_OPEN_DELIVER=0 (every merged PR refuses again).
-_OPERATOR_LINE_RE = re.compile(r"\b(?:for the operator|operator (?:must|needs|should|to)|needs? an? operator)\b"
-                               r"|\bfor the owner:", re.I)   # the wake children write "...; for the owner: <finding>"
+#: t_c9540659 / t_2db728c5: a merged PR refuses a `surface` only when the card is closed or not open on a human. The
+#: child's verdict is the signal, not its wording: #538 matched operator lines / a staged file and still refused
+#: "operator owes an after-read" and "nightly confirmation still owed" (t_b605afd1, t_d9d11bfe, 11-23). 11-18..11-23:
+#: 212 of 259 merged refusals were a surface on a card open on a human (35.3/day; #538's wording rule: 92). Kill
+#: switch: BOOMERANG_MERGED_OPEN_DELIVER=0 (every merged PR refuses again).
 MERGED_OPEN_STATUSES = frozenset({"review", "blocked"})
 
 
@@ -1705,13 +1704,7 @@ def merged_open_deliver_enabled() -> bool:
     return os.environ.get("BOOMERANG_MERGED_OPEN_DELIVER") != "0"
 
 
-def found_for_owner(entry: dict, result: dict) -> bool:
-    """The child has something for the owner: a staged read file, or an operator line in its summary/evidence."""
-    texts = [result.get("detail"), *(result.get("evidence") or []), result.get("summary")]
-    return bool(any(_OPERATOR_LINE_RE.search(str(t or "")) for t in texts) or _staged_read(entry, texts))
-
-
-def stale_surface_reason(entry: dict, *, fork_died: bool = False, found: bool = False) -> Optional[str]:
+def stale_surface_reason(entry: dict, *, fork_died: bool = False, surfaced: bool = False) -> Optional[str]:
     """Re-read the summarized handback, owner comments and PRs, never the child snapshot.
 
     Keep the original event cursor across retries/restarts: a deadman event's timestamp
@@ -1722,8 +1715,8 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False, found: bool = 
     An EVENT_CURSOR_ROWS wake is never refused by the merged-PR rule, and a release/hold line refuses it only
     when posted after its own event (t_59d62680).
 
-    ``found`` (t_c9540659): the child found something for the owner (:func:`found_for_owner`); the merged-PR rule
-    then refuses nothing while the card is in review or blocked on a human.
+    ``surfaced`` (t_2db728c5): the child's verdict is ``surface``; the merged-PR rule then refuses nothing while the
+    card is in review or blocked on a human.
     """
     if os.environ.get("BOOMERANG_STALE_GUARD") == "0":
         return None
@@ -1799,8 +1792,8 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False, found: bool = 
         # rollout refused 12 min as "summarized PR merged"). The card body is the dispatcher's, so it decides.
         if _OPERATOR_STEP_RE.search(str(_field(task, "body") or "")):
             refs = []
-        # t_c9540659: the merge is not the end while the card waits on a human and the child has a read for them.
-        if (found and merged_open_deliver_enabled()
+        # t_c9540659 / t_2db728c5: the merge is not the end while the card waits on a human and the child surfaced.
+        if (surfaced and merged_open_deliver_enabled()
                 and str(_field(task, "status") or "") in MERGED_OPEN_STATUSES
                 and kb.is_human_reviewer(str(_field(task, "assignee") or ""))):
             refs = []
@@ -1826,9 +1819,9 @@ def stale_surface_reason(entry: dict, *, fork_died: bool = False, found: bool = 
     return None
 
 
-def _stale_refusal(entry: dict, stage: str, *, fork_died: bool = False, found: bool = False) -> Optional[str]:
+def _stale_refusal(entry: dict, stage: str, *, fork_died: bool = False, surfaced: bool = False) -> Optional[str]:
     try:
-        reason = stale_surface_reason(entry, fork_died=fork_died, found=found)
+        reason = stale_surface_reason(entry, fork_died=fork_died, surfaced=surfaced)
     except Exception as exc:
         # An unavailable read is not evidence that a card is stale. Keep the existing
         # visible failure path, rather than silently losing an actionable wake.
@@ -1883,9 +1876,9 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     if action == "surface":
         why = _stale_refusal(live, "execute_verdict")
         merged = None
-        if why and why.startswith(_MERGED_REFUSAL) and found_for_owner(live, {**finding, "summary": summary}):
-            # t_c9540659: re-read with the child's finding; a card still open on a human gets the read.
-            merged, why = why[len(_MERGED_REFUSAL) + 2:], _stale_refusal(live, "execute_verdict", found=True)
+        if why and why.startswith(_MERGED_REFUSAL) and merged_open_deliver_enabled():
+            # t_2db728c5: the child chose surface; a card still open on a human gets the read, whatever its wording.
+            merged, why = why[len(_MERGED_REFUSAL) + 2:], _stale_refusal(live, "execute_verdict", surfaced=True)
         if why:
             return {"ok": False, "action": action, "reason": why, "summary": summary, "stale": True, **finding}
         if merged:
@@ -2039,7 +2032,7 @@ def handback_row(entry: dict, result: dict, *, turn_text: Optional[str] = None) 
         "event_ts": entry.get("event_ts"), "event_id": entry.get("event_id"),
         "assignee": entry.get("assignee"), "pr": entry.get("pr"),
         "claim_key": entry.get("key"), "parts": parts, "action": result.get("action"),
-        "merged_open": bool(result.get("merged")),   # t_c9540659: the deliver-stage guard re-reads with found=True
+        "merged_open": bool(result.get("merged")),   # t_c9540659: the deliver-stage guard re-reads with surfaced=True
         "line": f"{HANDLED_PREFIX}{entry['task_id']} ({row}): {summary}", "turn": turn_text,
         "attempts": 0, "created_at": _time.time()}
 
@@ -2198,7 +2191,7 @@ async def _deliver_one(runner: Any, state: BoomerangWakeState, delegation_id: st
                     guard_entry[field] = claim.get(field)
             # t_525de3f0: a dead fork's ORIGINAL wake skips the owner-comment rule only.
             why = await asyncio.to_thread(_stale_refusal, guard_entry, "deliver_one",
-                                          fork_died=bool(row.get("fork_died")), found=bool(row.get("merged_open")))
+                                          fork_died=bool(row.get("fork_died")), surfaced=bool(row.get("merged_open")))
             if why:
                 await asyncio.to_thread(state.drop_handback, delegation_id)
                 return sent

@@ -223,6 +223,9 @@ def test_stale_surface_timeline(env, arm, phase, author, cursor):
     if arm == "disabled":
         env["monkeypatch"].setenv("BOOMERANG_STALE_GUARD", "0")
     blocked = arm not in {"open", "disabled"} and not (cursor == "trigger" and arm == "merged")
+    # t_2db728c5: a surface verdict on a merged PR whose card is still in review on a human is delivered; a merge
+    # that lands between the verdict and the delivery (the delivery phases) is still refused (out of scope).
+    blocked = blocked and not (phase == "verdict" and arm == "merged")
     if phase != "verdict":
         sent = asyncio.run(ah.deliver_handbacks(env["runner"], state))
         assert sent == (0 if blocked else 2)
@@ -459,8 +462,10 @@ def test_refused_surface_for_merged_pr_leaves_one_card_comment(env, staged):
     ("operator_line", True),  # no file, a line for the operator in the summary
     ("owner_line", True),     # no file, "...; for the owner: <finding>", the wording the wake children write
     ("unresolvable_path", True),  # an operator line naming ~<unknown account>/x.md: still delivered
+    ("nothing", True),        # t_2db728c5: no file, no operator wording; the surface verdict alone delivers
+    ("after_read", True),     # t_b605afd1 (home#14286) 11-23 10:28, refused under #538's wording rule
+    ("still_owed", True),     # t_d9d11bfe (home#14292) 11-23 10:48, refused under #538's wording rule
     ("done", False),          # card already closed: the merge is the end
-    ("nothing", False),       # the child found nothing for the owner
     ("worker", False),        # card in review on a worker, not a human
     ("switch_off", False),    # BOOMERANG_MERGED_OPEN_DELIVER=0
 ])
@@ -480,13 +485,18 @@ def test_merged_pr_surface_delivered_while_card_open_on_a_human(env, arm, delive
     if arm == "switch_off":
         env["monkeypatch"].setenv("BOOMERANG_MERGED_OPEN_DELIVER", "0")
     summary = "No send-back: #71 merged during the read and the card's items are met"
+    if arm == "after_read":
+        summary = ("already MERGED on a derived approve with 4 checks still running; operator owes an after-read and "
+                   "a look at main's next closure-test run")
+    if arm == "still_owed":
+        summary = "5 checks were still running at merge; MacBook nightly confirmation still owed"
     if arm == "owner_line":
         summary += "; for the owner: the card needs a LIVE-EVIDENCE comment and a hand install"
     if arm in ("operator_line", "unresolvable_path"):
         summary += "; for the operator: the card needs a LIVE-EVIDENCE comment and a hand install"
     if arm == "unresolvable_path":   # Prism fbcf025cb460: expanduser() raises on an unknown account
         summary += "; Operator must check ~nosuchuser-c9540659/read.md"
-    if arm not in ("operator_line", "owner_line", "unresolvable_path", "nothing"):
+    if arm not in ("operator_line", "owner_line", "unresolvable_path", "nothing", "after_read", "still_owed"):
         path = get_hermes_home() / "cache/scratch" / entry["delegation_id"] / "staged" / f"read-{tid}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("Verdict: surface\nOperator must record LIVE-EVIDENCE\n")
@@ -504,6 +514,27 @@ def test_merged_pr_surface_delivered_while_card_open_on_a_human(env, arm, delive
     else:
         assert turns == [] and len(_stale_read_comments(tid)) == 1
         assert _claims()[entry["key"]]["outcome"] == "stale"
+
+
+def test_acknowledge_on_a_merged_pr_card_open_on_a_human_keeps_todays_behaviour(env):
+    """t_2db728c5: only a `surface` verdict is delivered on a merged PR; an acknowledge on a card in review on a human
+    is the receipt + one comment it always was, never a "the PR has merged" turn."""
+    tid = _card(env)
+    _handback(tid, 71)
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "mechanical_wake", json.dumps({"by": "card-mechanical-wake", "source": "detached-run",
+                                                          "episode": "detached:r1", "text": "job x rc=1"}),
+                      int(time.time())))
+    _tick(env)
+    keys = [e["key"] for e in env["dispatched"] if e["row"] == "mechanical_wake"]
+    assert len(keys) == 1, env["dispatched"]
+    entry = ah.BoomerangWakeState().get_claim(keys[0])
+    res = ah.execute_verdict(entry, _verdict(entry, "acknowledge", summary="operator owes an after-read"))
+    assert res["ok"] and res["action"] == "acknowledge" and not res.get("merged") and not res.get("surface"), res
+    assert _stale_read_comments(tid) == []
 
 
 def test_refused_acknowledge_or_other_reason_leaves_no_stale_read_comment(env):
