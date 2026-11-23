@@ -1696,7 +1696,8 @@ _OPERATOR_STEP_RE = re.compile(
 #: nothing for the owner. 11-19..11-23: 92 of 227 merged refusals (20.9/day) dropped a read with a staged file or an
 #: operator line on a card still in review on human:apollo (home#14243: the only read sat 70 min). Kill switch:
 #: BOOMERANG_MERGED_OPEN_DELIVER=0 (every merged PR refuses again).
-_OPERATOR_LINE_RE = re.compile(r"\b(?:for the operator|operator (?:must|needs|should|to)|needs? an? operator)\b", re.I)
+_OPERATOR_LINE_RE = re.compile(r"\b(?:for the operator|operator (?:must|needs|should|to)|needs? an? operator)\b"
+                               r"|\bfor the owner:", re.I)   # the wake children write "...; for the owner: <finding>"
 MERGED_OPEN_STATUSES = frozenset({"review", "blocked"})
 
 
