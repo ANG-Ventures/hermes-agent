@@ -56,6 +56,10 @@ NEGATIVE = [
     "PR o/r#1 is open.\nStatus: NOT proven live.",
     "Please do not merge until the live check passes.",
     "PR o/r#1 is open. Please don't land it yet.",
+    # Prism round 2 on #536: a ``` mentioned mid-prose is not a fence; a bold label is still a label.
+    "The formatter recognizes ``` markers.\nAcceptance NOT met: live soak pending.",
+    "PR o/r#1 is open.\n**Status:** NOT proven live.",
+    "__Result__: not proven yet.",
 ]
 # Ordinary green handoffs, including the bare-word FAIL prose the caps-scoped
 # form exists to ignore (385/1392 false positives in 14 d).
