@@ -1888,9 +1888,13 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
         if why:
             return {"ok": False, "action": action, "reason": why, "summary": summary, "stale": True, **finding}
         if merged:
+            # Prism 0e902bbbf0f3: the read may live only in the staged file; the turn, line and card comment name it.
+            staged = _staged_read(live, [finding.get("detail"), *(finding.get("evidence") or []), summary])
+            # Up front: the passive line keeps only the first 300 chars of the summary.
+            where = f"staged read {staged}: " if staged else ""
             return {"ok": False, "action": action, "reason": "child surfaced it; PR merged",
-                    "summary": f"the PR has merged ({merged}): {summary}", "surface": True, "merged": merged,
-                    **finding}
+                    "summary": f"the PR has merged ({merged}): {where}{summary}", "surface": True, "merged": merged,
+                    **finding, "detail": f"{where}{finding.get('detail') or summary}", "staged_read": staged}
         return {"ok": False, "action": action, "reason": "child surfaced it", "summary": summary, "surface": True,
                 **finding}
     conn = kb.connect(board=live.get("board"))

@@ -483,11 +483,16 @@ def test_merged_pr_surface_delivered_while_card_open_on_a_human(env, arm, delive
     if arm not in ("operator_line", "nothing"):
         path = get_hermes_home() / "cache/scratch" / entry["delegation_id"] / "staged" / f"read-{tid}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("Verdict: surface\n")
+        path.write_text("Verdict: surface\nOperator must record LIVE-EVIDENCE\n")
     _run(env, entry, "completed", _verdict(entry, "surface", summary=summary))
     turns = [str(getattr(e, "text", "")) for e in env["adapter"].handled]
     if delivered:
         assert len(turns) == 1 and turns[0].startswith(f"[boomerang-wake] the PR has merged ({REPO}#71)"), turns
+        if arm == "staged":   # Prism 0e902bbbf0f3: the finding lives only in the file; turn and card name it
+            assert f"staged read {path}:" in turns[0], turns
+            with kb.connect_closing() as conn:
+                ours = [c.body for c in kb.list_comments(conn, tid) if c.body.startswith("[boomerang-wake] surfaced:")]
+            assert len(ours) == 1 and str(path) in ours[0], ours
         assert _stale_read_comments(tid) == []
         assert _claims()[entry["key"]]["outcome"] == "surfaced"
     else:
