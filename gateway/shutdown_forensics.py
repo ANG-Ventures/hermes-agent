@@ -265,12 +265,18 @@ def _process_rows(deadline: float) -> tuple:
     except ImportError:
         psutil = None
     if psutil is not None:
-        for proc in psutil.process_iter(["pid", "ppid", "username", "status", "name"], ad_value="?"):
+        attrs = ["pid", "ppid", "username", "status", "name"]
+
+        def _row(i: Dict[str, Any]) -> str:
+            return f"{i.get('pid')} {i.get('ppid')} {i.get('username')} {i.get('status')} {i.get('name')}"
+        with contextlib.suppress(Exception):  # self first: a budget cut must not drop the gateway's own row
+            rows.append(_row(psutil.Process().as_dict(attrs, ad_value="?")))
+        for proc in psutil.process_iter(attrs, ad_value="?"):
             if time.monotonic() >= deadline:
                 truncated = True
                 break
-            i = proc.info
-            rows.append(f"{i.get('pid')} {i.get('ppid')} {i.get('username')} {i.get('status')} {i.get('name')}")
+            if proc.pid != os.getpid():
+                rows.append(_row(proc.info))
         return rows, len(rows), truncated
     with contextlib.suppress(OSError):
         for entry in os.listdir("/proc"):
