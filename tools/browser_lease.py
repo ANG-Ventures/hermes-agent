@@ -245,6 +245,22 @@ def _end(lease: Lease, timeout: float = 40.0) -> None:
         proc.kill()
 
 
+_end_hooks: list = []   # t_db945925: run after a lease ends (the browser tools drop that lease's socket dirs)
+
+
+def on_lease_end(fn) -> None:
+    if fn not in _end_hooks:
+        _end_hooks.append(fn)
+
+
+def _ended() -> None:
+    for fn in list(_end_hooks):
+        try:
+            fn()
+        except Exception:
+            pass
+
+
 def close_lease() -> None:
     """End the active lease (if any) and wait for its release. The selection stays: later browser
     calls fail closed until ``open_lease`` replaces it or ``clear_lease`` drops it."""
@@ -253,6 +269,7 @@ def close_lease() -> None:
         lease, _active = _active, None
     if lease is not None:
         _end(lease)
+        _ended()
 
 
 def clear_lease() -> None:
@@ -322,6 +339,7 @@ def release_lease() -> dict:
         return {"success": True, "released": False, "detail": "this run holds no browser lease"}
     already_exited = lease.proc.poll() is not None   # Prism ba98afcb8f7a: then closing stdin sends no release
     _end(lease, RELEASE_WAIT_S)
+    _ended()
     lease.closed.wait(5)
     g = lease.grant
     ans = g.get("released") or ""
