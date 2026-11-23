@@ -2242,12 +2242,11 @@ def _snapshot(repo, base, prefix, *, irreversible_delete=False):
 _SNAPSHOT_TIMEOUT = 300
 
 
-def _capture(repo, key, workspace, recorded=None):
+def _capture(repo, key, workspace, recorded=None, *, retain_unbased_history=False):
     """One repository's survivor material: (remote ref, base, snapshot bytes).
 
-    Extracted verbatim from `preserve`'s loop so the object-reading steps sit
-    inside a single `try` the caller can classify. ``recorded`` is the
-    repository's dispatch-time base from `bases` (see `_recorded_base`).
+    ``recorded`` is the dispatch-time base. With ``retain_unbased_history``,
+    (None, None, None) means retain the checkout instead of bundling its history.
     """
     storage_cache = {}
     published = list(_published_refs(repo, workspace, storage_cache))
@@ -2275,6 +2274,8 @@ def _capture(repo, key, workspace, recorded=None):
             return ref, None, None
     base = _recorded_base(repo, recorded, published, _base(repo, published))
     if base is None:
+        if retain_unbased_history and head.returncode == 0:
+            return None, None, None
         _require_live_boundary(repo, published)
     prefix = "" if key == "." else key + "/"
     return None, base, _snapshot(repo, base, prefix)
@@ -3183,7 +3184,7 @@ def _merge_refs(fresh, recorded):
                           if not isinstance(ref, dict) or ref.get("repository") not in seen]
 
 
-def _record(conn, task_id, survivor, previous):
+def _record(conn, task_id, survivor, previous, *, retain_reason=None):
     """The ONLY writer of the survivor column -- and therefore the only place
     the non-shrink invariant can be enforced for every exit at once.
 
@@ -3205,6 +3206,8 @@ def _record(conn, task_id, survivor, previous):
         )
         if survivor and survivor != previous:
             kb._append_event(conn, task_id, "workspace_survivor", survivor)
+        if retain_reason:
+            _hold_in_txn(conn, task_id, retain_reason)
     return survivor
 
 
@@ -3754,6 +3757,14 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # external path below records `explicit` on its own; seeding it
                 # here too would duplicate the ref.
                 carried = [dict(ref, repository=key) for key, ref in sorted(explicit.items())]
+        # A bound, explicitly named merge proves delivery, not the contents of
+        # a surviving checkout. Prefer the normal ref/patch proof, but do not
+        # pack that checkout's entire history just to close the card. Limit the
+        # fallback to one present repository with no competing recovery claims.
+        merge = explicit.get(None) if survivor_pr and len(explicit) == 1 else None
+        retain_unbased_history = (not cleanup and len(repos) == 1 and not missing
+                                  and merge is not None and merge.get("state") == "MERGED"
+                                  and not merge.get("unbound"))
         patches, refs, bundles, repositories = [], list(carried), list(carried_bundles), []
         for repo in repos:
             key = str(repo.relative_to(workspace))
@@ -3765,7 +3776,14 @@ def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 refs.append(dict(stub_ref, repository=key))
                 continue
             try:
-                ref, base, data = _capture(repo, key, workspace, (bases or {}).get(key))
+                ref, base, data = _capture(repo, key, workspace, (bases or {}).get(key),
+                                           retain_unbased_history=retain_unbased_history)
+                if (ref, base, data) == (None, None, None):
+                    # Publish the hold with the PR evidence: local cleanup must
+                    # not try to recapture or delete the retained workspace.
+                    return _record(conn, task_id, {"kind": "ref", "refs": [dict(merge, repository=key)]},
+                                   previous, retain_reason="survivor_unavailable: workspace retained after "
+                                   "merged PR close; no verified base for local history")
                 irreversible = False
                 if base is not None and data and len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
                     # Only deleted-file preimages are dropped, and those are
