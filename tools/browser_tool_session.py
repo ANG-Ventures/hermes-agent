@@ -297,7 +297,8 @@ def _local_backend_process_dead(session_info: Dict[str, Any]) -> bool:
 
 def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     """Session connecting to a user-supplied CDP endpoint."""
-    info = _session_record("cdp", cdp_url, {"cdp_override": True})
+    # t_f68d74f9: remember a lease URL; once that lease ends the session must never run again (see _lease_ended).
+    info = _session_record("cdp", cdp_url, {"cdp_override": True, "lease": _is_lease_cdp(cdp_url)})
     _bt.logger.info("Created CDP browser session %s → %s for task %s",
                 info["session_name"], _bt._sanitize_url_for_logs(cdp_url), task_id)
     return info
@@ -676,6 +677,14 @@ def _is_lease_cdp(cdp_url: str) -> bool:
     return is_lease_url(cdp_url or "")
 
 
+def _lease_ended(session_info: Optional[Dict[str, Any]]) -> bool:
+    """t_f68d74f9: the session was opened on an identity lease that has since ended. Its ``cdp_url`` is a dead,
+    ephemeral forwarder port: a command on it would take the non-lease path (shared socket dir, session "default")
+    and could attach to another worker's new lease on the same port, so no agent-browser may start for it."""
+    info = session_info or {}
+    return bool((info.get("features") or {}).get("lease")) and not _is_lease_cdp(str(info.get("cdp_url") or ""))
+
+
 def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket_dir: str,
                   *, screenless: bool = False, session_name: str = "") -> "tuple[List[str], Dict[str, str]]":
     """Rewrite one agent-browser invocation to run inside the sandbox: exec prefix + the CLI by name, with the
@@ -948,6 +957,14 @@ def _run_browser_command(
     if timeout is None:
         timeout = _bt._safe_command_timeout()
     args = args or []
+
+    with _bt._cleanup_lock:
+        current = _bt._active_sessions.get(task_id)
+    if _lease_ended(current):   # before preflight: it can bring up a screen for the non-lease path
+        if command == "close":  # lease end already stopped the lease daemon and removed its socket dir
+            return {"success": True, "data": {"skipped": "lease ended"}}
+        return {"success": False, "error": "BROWSER_LEASE_ENDED: this browser session was on an identity lease that "
+                "has ended; call browser_navigate with lease_identity=<id> to lease it again"}
 
     preflight = _browser_command_preflight()
     if "browser_cmd" not in preflight:
