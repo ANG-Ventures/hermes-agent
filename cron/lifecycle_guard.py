@@ -3843,6 +3843,55 @@ def _python_body_can_run(body: str) -> bool:
     return False
 
 
+# t_5ae81e6e: process calls in a python body whose argv the walk reads as a typed shell command.
+_PY_SUBPROCESS_ARGV_CALLS = frozenset({"run", "call", "check_call", "check_output", "Popen"})
+
+
+def _constant_str(node: Optional[ast.AST]) -> Optional[str]:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _python_process_commands(body: str) -> list[tuple[str, Optional[str]]]:
+    """The processes a python *body* starts with an argv it spells as constants, as shell text:
+    ``subprocess.run(['bash', p])`` is ``bash p``; ``os.system('bash p')`` and
+    ``subprocess.run('...', shell=True)`` are their string. Each comes with its constant ``cwd=``
+    keyword or None. A non-constant argv is left out, as before (its 48 h replay: test rigs running
+    `bash -c <cmd from data>`, 11 calls; refusing them would block the rig, not a file the guard
+    could read). Only ``subprocess.<call>`` / ``os.<call>`` spellings; unparseable body: nothing."""
+    try:
+        tree = ast.parse(body)
+    except (SyntaxError, ValueError):
+        return []
+    commands: list[tuple[str, Optional[str]]] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)):
+            continue
+        module, attr = node.func.value.id, node.func.attr
+        keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
+        argv = node.args[0] if node.args else keywords.get("args")
+        if module == "os" and attr in {"system", "popen"}:
+            text = _constant_str(argv)
+            if text is not None:
+                commands.append((text, None))
+            continue
+        if module != "subprocess" or attr not in _PY_SUBPROCESS_ARGV_CALLS or argv is None:
+            continue
+        run_cwd = _constant_str(keywords.get("cwd"))
+        shell = keywords.get("shell")
+        text = _constant_str(argv)
+        if text is not None:
+            as_shell = isinstance(shell, ast.Constant) and bool(shell.value)
+            commands.append((text if as_shell else shlex.quote(text), run_cwd))
+            continue
+        if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
+            continue
+        words = [_constant_str(item) for item in argv.elts]
+        if all(word is not None for word in words):
+            commands.append((shlex.join(words), run_cwd))
+    return commands
+
+
 def _same_file_key(path: Path) -> str:
     """One key per file however it is spelled: ``./x``, ``a/../x`` and a symlink to x agree."""
     try:
@@ -3924,6 +3973,23 @@ def _contains_unsafe_gateway_action(
     for payload in _iter_shell_command_payloads(shell_command):
         if recurse(payload, cwd, executed):
             return True
+
+    # t_5ae81e6e: a python body's `subprocess.run(['bash', p])` runs `bash p`, but p is never at
+    # command position in the body's text, so it was never read. Walk each process the body
+    # starts with a constant argv as that command typed at the shell, in every directory the
+    # body may run in (its `cwd=` constant, else the shell's `cd`s).
+    process_cwds: Optional[list[Optional[str]]] = None
+    for body in python_bodies:
+        process_commands = _python_process_commands(body)
+        if process_commands and process_cwds is None:
+            process_cwds = _shell_cwds(shell_command, cwd)
+        for process_command, run_cwd in process_commands:
+            for body_cwd in process_cwds or [cwd]:
+                run_in = body_cwd if run_cwd is None else str(
+                    _resolve_terminal_script_path(run_cwd, body_cwd) or run_cwd
+                )
+                if recurse(process_command, run_in, executed):
+                    return True
 
     # Files the shell itself names; feeds only the refusal wording (read-as-data vs executed), so
     # it is computed after the payload walk and can never change a verdict (Apollo, #529).
