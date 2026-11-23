@@ -213,6 +213,153 @@ def spawn_async_diagnostic(log_path: Path, signal_name: str, *,
             os.close(fd)
 
 
+# ── console-session loss (t_06816049) ────────────────────────────────────────
+# 2026-11-22 21:23:35 PT launchd SIGTERM'd all 9 gateways because the console session was torn down
+# (WindowServer exited a second earlier). The detached ``ps`` above listed nothing during that teardown
+# and the home-channel notice read like a routine restart. The owner of /dev/console is the cheap,
+# in-process witness: on macOS it is the logged-in GUI user and reverts to root when the session dies.
+CONSOLE_PATH = "/dev/console"
+SESSION_LOST_FIRST_LINE = (
+    "console session lost: every service of this user is being stopped; not a planned restart")
+SESSION_LOST_PRODUCER = "gateway-console-session-lost"
+INPROCESS_DIAG_BUDGET_S = 1.0
+
+
+def console_owner_uid() -> Optional[int]:
+    """uid owning /dev/console, None when it cannot be read. One stat, never blocks."""
+    try:
+        return os.stat(CONSOLE_PATH).st_uid
+    except (OSError, AttributeError):
+        return None
+
+
+def _user_name(uid: Optional[int]) -> str:
+    if uid is None:
+        return "?"
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError, OSError):
+        return str(uid)
+
+
+def _own_uid() -> Optional[int]:
+    getuid = getattr(os, "getuid", None)
+    return getuid() if callable(getuid) else None
+
+
+def console_session_lost(baseline_uid: Optional[int], current_uid: Optional[int]) -> bool:
+    """True when the console WAS this process's user (at gateway start) and no longer is. A host whose
+    console never belonged to the gateway user (a Linux service, a headless Mac) never reads as lost."""
+    own = _own_uid()
+    return own is not None and baseline_uid == own and current_uid is not None and current_uid != own
+
+
+def _process_rows(deadline: float) -> tuple:
+    """(rows, total_seen, truncated): the process table read in-process (psutil = sysctl/libproc on macOS,
+    /proc on Linux), no fork. Stops at ``deadline`` (monotonic). Identity columns only, never argv."""
+    rows: List[str] = []
+    truncated = False
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        attrs = ["pid", "ppid", "username", "status", "name"]
+
+        def _row(i: Dict[str, Any]) -> str:
+            return f"{i.get('pid')} {i.get('ppid')} {i.get('username')} {i.get('status')} {i.get('name')}"
+        with contextlib.suppress(Exception):  # self first: a budget cut must not drop the gateway's own row
+            rows.append(_row(psutil.Process().as_dict(attrs, ad_value="?")))
+        for proc in psutil.process_iter(attrs, ad_value="?"):
+            if time.monotonic() >= deadline:
+                truncated = True
+                break
+            if proc.pid != os.getpid():
+                rows.append(_row(proc.info))
+        return rows, len(rows), truncated
+    with contextlib.suppress(OSError):
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            if time.monotonic() >= deadline:
+                truncated = True
+                break
+            s = _proc_summary(int(entry))
+            rows.append(f"{s.get('pid')} {s.get('ppid', '?')} {_user_name(int(s['uid'])) if str(s.get('uid', '')).isdigit() else '?'} "
+                        f"{s.get('state', '?')} {s.get('name', '?')}")
+    return rows, len(rows), truncated
+
+
+def write_inprocess_diagnostic(log_path: Path, signal_name: str, *, console_uid: Optional[int],
+                               baseline_console_uid: Optional[int], restart_requested: Optional[str],
+                               budget_s: float = INPROCESS_DIAG_BUDGET_S) -> bool:
+    """Append a diagnostic block that needs no child process: console user, restart record and the process
+    table. Bounded by ``budget_s`` (the listing stops at the deadline and says so). True when written."""
+    deadline = time.monotonic() + max(0.05, budget_s * 0.8)
+    own = _own_uid()
+    lines = [
+        f"=== shutdown diagnostic (in-process) @ {signal_name} ===",
+        "--- date ---", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "--- console ---",
+        f"console_user={_user_name(console_uid)} (uid {console_uid}) "
+        f"console_user_at_start={_user_name(baseline_console_uid)} (uid {baseline_console_uid}) "
+        f"gateway_user={_user_name(own)} (uid {own}) "
+        f"session_lost={'yes' if console_session_lost(baseline_console_uid, console_uid) else 'no'}",
+        "--- restart requested ---", f"restart_requested={restart_requested or 'no'}",
+    ]
+    try:
+        rows, seen, truncated = _process_rows(deadline)
+    except Exception as exc:  # noqa: BLE001 — a diagnostic never raises into the signal handler
+        rows, seen, truncated = [f"process table unreadable: {type(exc).__name__}: {exc}"], 0, False
+    lines.append(f"--- processes (in-process, no ps; {seen} listed{', TRUNCATED at budget' if truncated else ''}) ---")
+    lines.append("PID PPID USER STAT COMM")
+    lines.extend(rows)
+    lines.append("=== end ===")
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    except OSError:
+        return False
+    try:
+        with contextlib.suppress(OSError):
+            os.fchmod(fd, 0o600)
+        os.write(fd, ("\n".join(lines) + "\n").encode("utf-8", errors="replace"))
+        return True
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def session_lost_page_text(signal_name: str, console_uid: Optional[int], hermes_home: str) -> str:
+    import socket
+    return (f"{SESSION_LOST_FIRST_LINE}\n"
+            f"host {socket.gethostname()}: gateway `{hermes_home}` got {signal_name} with no restart requested; "
+            f"/dev/console now belongs to {_user_name(console_uid)}, not {_user_name(_own_uid())}.")
+
+
+def page_console_session_lost(text: str) -> bool:
+    """Fire-and-forget critical page through the fleet pager (episode_pager.py -> fleet_alert -> notify.py, which
+    writes the notify-sends ledger). One key per 10-min window, so the N gateways of one teardown page once.
+    Popen only (no wait): the sender is in its own session and outlives this process. False when not started."""
+    try:
+        from hermes_constants import get_default_hermes_root
+        script = get_default_hermes_root() / "scripts" / "lib" / "episode_pager.py"
+        if not script.is_file():
+            return False
+        key = f"console-lost-{int(time.time() // 600)}"
+        subprocess.Popen(
+            [sys.executable, str(script), "page", "--producer", SESSION_LOST_PRODUCER, "--key", key,
+             "--via", "fleet-alert", "--severity", "critical", "--text", text],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def format_context_for_log(ctx: Dict[str, Any]) -> str:
     """Render a shutdown context dict as one scannable log line (parent identity, never argv)."""
     parent = ctx.get("parent") or {}

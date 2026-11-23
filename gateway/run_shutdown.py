@@ -1157,6 +1157,10 @@ class GatewayShutdownMixin:
     def _shutdown_notice_text(self, *, active: bool, profile=None) -> str:
         """Render inside the owning profile scope; recovery is not scheduled at stop time."""
         msg = t("gateway.shutdown.notice_restart" if self._restart_requested else "gateway.shutdown.notice_shutdown")
+        if getattr(self, "_console_session_lost", False) and not self._restart_requested:
+            # Set by the SIGTERM handler only when no restart was requested and the console left this user.
+            from gateway.shutdown_forensics import SESSION_LOST_FIRST_LINE
+            msg = f"{SESSION_LOST_FIRST_LINE}\n{msg}"
         if not active:
             return msg
         from gateway.run import _resume_interrupted_turns_mode, _RESUME_UNATTENDED_MODES

@@ -10914,6 +10914,13 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
     planned_stop_seen = [False]
 
+    def _console_uid():
+        from gateway.shutdown_forensics import console_owner_uid
+        return console_owner_uid()
+
+    # Who owned the console when this gateway started: a SIGTERM after it changed hands is a session loss.
+    baseline_console_uid = _best_effort(_console_uid, "console owner read failed: %s")
+
     def shutdown_signal_handler(received_signal=None):
         # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
         def _takeover() -> bool:
@@ -10941,6 +10948,25 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             planned_stop = True
         _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
+        restart_how = ("--replace takeover" if planned_takeover else "planned stop" if planned_stop
+                       else f"in-band restart (requester={getattr(runner, '_restart_requester', None) or 'unknown'})"
+                       if getattr(runner, "_restart_requested", False) else None)
+        console_uid = _best_effort(_console_uid, "console owner read failed: %s")
+
+        def _session_lost() -> bool:
+            from gateway.shutdown_forensics import console_session_lost
+            return console_session_lost(baseline_console_uid, console_uid)
+
+        if restart_how is None and _best_effort(_session_lost, "console session check failed: %s"):
+            runner._console_session_lost = True
+
+            def _page() -> None:
+                from gateway.shutdown_forensics import page_console_session_lost, session_lost_page_text
+                page_console_session_lost(session_lost_page_text(sig_name or "SIGTERM", console_uid, str(_hermes_home)))
+
+            logger.warning("Console session lost (console uid %s, was %s): not a planned restart; paging",
+                           console_uid, baseline_console_uid)
+            _best_effort(_page, "console session-lost page failed: %s")
 
         if planned_takeover:
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
@@ -10961,7 +10987,13 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             def _diagnostic() -> None:
                 # Heavyweight (comm-only ps, pstree, dmesg), detached so it finishes even if our cgroup is torn
                 # down; bounded by an internal timeout, never blocks.
-                from gateway.shutdown_forensics import spawn_async_diagnostic
+                from gateway.shutdown_forensics import spawn_async_diagnostic, write_inprocess_diagnostic
+                # In-process block first (no fork, <=1 s): the detached ps listed nothing during the
+                # 2026-11-22 console-session teardown.
+                write_inprocess_diagnostic(
+                    _hermes_home / "logs" / "gateway-shutdown-diag.log", _shutdown_ctx["signal"],
+                    console_uid=console_uid, baseline_console_uid=baseline_console_uid,
+                    restart_requested=restart_how)
                 spawn_async_diagnostic(
                     _hermes_home / "logs" / "gateway-shutdown-diag.log", _shutdown_ctx["signal"], timeout_seconds=5.0)
 
