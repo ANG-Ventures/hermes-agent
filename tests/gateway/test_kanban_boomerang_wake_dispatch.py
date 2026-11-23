@@ -454,6 +454,47 @@ def test_refused_surface_for_merged_pr_leaves_one_card_comment(env, staged):
     assert len(_stale_read_comments(tid)) == 1
 
 
+@pytest.mark.parametrize("arm,delivered", [
+    ("staged", True),         # the 11-23 case: read staged in the child's staged/ folder
+    ("operator_line", True),  # no file, a line for the operator in the summary
+    ("done", False),          # card already closed: the merge is the end
+    ("nothing", False),       # the child found nothing for the owner
+    ("worker", False),        # card in review on a worker, not a human
+    ("switch_off", False),    # BOOMERANG_MERGED_OPEN_DELIVER=0
+])
+def test_merged_pr_surface_delivered_while_card_open_on_a_human(env, arm, delivered):
+    """t_c9540659 (t_e299a396, 2026-11-23 05:47-05:56 PT): home#14243 merged on a derived stamp while the read child
+    read it; the child's read (the only one; it owed a LIVE-EVIDENCE comment and a hand install) was refused as
+    "summarized PR merged" and the card sat in review on human:apollo 70 min. RED on e023b5f30d for the delivered arms."""
+    from hermes_constants import get_hermes_home
+
+    tid = _card(env)
+    _handback(tid, 71)
+    entry = _claimed_entry(env, tid, row="own_repo_review_human", kind="review_requested", pr=f"{REPO}#71")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET assignee = ?, status = ? WHERE id = ?",
+                     ("worker" if arm == "worker" else "human:apollo", "done" if arm == "done" else "review", tid))
+    env["health"][(REPO, 71)] = {"state": "merged"}
+    if arm == "switch_off":
+        env["monkeypatch"].setenv("BOOMERANG_MERGED_OPEN_DELIVER", "0")
+    summary = "No send-back: #71 merged during the read and the card's items are met"
+    if arm == "operator_line":
+        summary += "; for the operator: the card needs a LIVE-EVIDENCE comment and a hand install"
+    if arm not in ("operator_line", "nothing"):
+        path = get_hermes_home() / "cache/scratch" / entry["delegation_id"] / "staged" / f"read-{tid}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Verdict: surface\n")
+    _run(env, entry, "completed", _verdict(entry, "surface", summary=summary))
+    turns = [str(getattr(e, "text", "")) for e in env["adapter"].handled]
+    if delivered:
+        assert len(turns) == 1 and turns[0].startswith(f"[boomerang-wake] the PR has merged ({REPO}#71)"), turns
+        assert _stale_read_comments(tid) == []
+        assert _claims()[entry["key"]]["outcome"] == "surfaced"
+    else:
+        assert turns == [] and len(_stale_read_comments(tid)) == 1
+        assert _claims()[entry["key"]]["outcome"] == "stale"
+
+
 def test_refused_acknowledge_or_other_reason_leaves_no_stale_read_comment(env):
     """t_e86eeab2: only a surface refused for a merged PR is recorded; an acknowledge or another refusal is not."""
     tid = _card(env)
