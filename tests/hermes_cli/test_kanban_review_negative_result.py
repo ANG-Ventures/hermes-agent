@@ -44,6 +44,13 @@ NEGATIVE = [
     "verdict: FAIL on live read",
     "gate=DEFERRED to next window",
     "result FAILED",
+    # t_1938555e: real verdicts from the 14 d sample, each outside the first line.
+    "PR o/r#1 is open.\nThe done criterion is NOT yet proven: no live-portal check after a bake.",
+    "PR o/r#1 is open.\nNot proven:\n- no live train has run this yet",
+    "Opened two PRs.\nWhat is not proven:\n- the added-file case on the Studio",
+    "Opened o/r#1. Live acceptance is still NOT met: there is no completed .backup yet.",
+    "Draft PR o/r#1. It is still a DRAFT, do not land.",
+    "Card test met on mbp. Acceptance is not proven:\n- ACE-AI",
 ]
 # Ordinary green handoffs, including the bare-word FAIL prose the caps-scoped
 # form exists to ignore (385/1392 false positives in 14 d).
@@ -55,6 +62,17 @@ POSITIVE = [
     "untrusted input is now escaped",
     "the result fail path is covered",
     "met the acceptance bar; merged",
+    # t_1938555e: prose that DESCRIBES code, a test or quoted output, measured in the 14 d sample.
+    "Done.\n- f67496fc94d3 (P2): Any other failure is reported as not proven and is not cached.",
+    "Done. A timeout or a refused admit counts as not proven, so the card stays port_stranded.",
+    "Done. The journal says `NOT proven (idle: no delivery in N min ...)`, rc 6.",
+    'Done. It pages "NOT proven back" only when that limit expires.',
+    "Done. A forced abort gave rc 1 and result.json with verdict FAIL and error KeyError.",
+    "Done. The guard script now checks chmod and mv, so a failed replace prints RESULT FAIL.",
+    "Proof: I ran the H14 block and graded it. Result: FAIL on the live root, as intended.",
+    "Done. If two halves carry the same step key, the halves do not merge.",
+    "PR o/r#1 is green; I do not merge.",
+    "Done. It looks like a process race, but I have not proven that.",
 ]
 
 
@@ -72,6 +90,9 @@ def test_metadata_is_scanned():
     assert negative_result_match("done", {"acceptance_met": False}) == '"acceptance_met": false'
     assert negative_result_match("done", {"close_on": "NOT met"}) is not None
     assert negative_result_match("done", {"tests_run": 3}) is None
+    assert negative_result_match("done", {"gates": {"acceptance_met": False}}) == '"acceptance_met": false'
+    assert negative_result_match("done", {"pr_state": "draft, label hold, do not land"}) == "do not land"
+    assert negative_result_match("done", {"decisions": ["held reads stay rc 1 since the fault is not proven gone"]}) is None
 
 
 @pytest.mark.parametrize("policy", ["milestone_only", "none"])
