@@ -85,3 +85,33 @@ def test_non_constant_argv_stays_as_before(tmp_path):
     for src in ("cmd = 'true'\nsubprocess.run(['bash', '-e', '-c', cmd])",
                 "m = 'x.py'\nsubprocess.run(['python3', m, 'cmd'])", "r = '.'\nsubprocess.run(['git', '-C', r, 'status'])"):
         assert scan_gateway_lifecycle(_body(src), cwd=str(tmp_path)) == (False, None), src
+
+
+def test_shell_true_list_runs_only_its_first_element(tmp_path):
+    # Prism 1fb6e76054b8: `run(['sh', './big.sh'], shell=True)` is `sh -c sh ./big.sh`; big.sh is $0
+    _script(tmp_path / "big.sh", 1_200_000)
+    src = "subprocess.run(['sh', './big.sh'], shell=True, stdin=subprocess.DEVNULL)"
+    assert scan_gateway_lifecycle(_body(src), cwd=str(tmp_path)) == (False, None)
+    # the first element is still shell text
+    assert scan_gateway_lifecycle(_body("subprocess.run(['bash ./big.sh'], shell=True)"), cwd=str(tmp_path))[0]
+
+
+def test_an_inert_mention_in_a_child_does_not_hide_the_outer_executed_script(tmp_path):
+    # Prism 2c9839444bc2: the child only prints ./big.sh; the outer shell runs it
+    big = _script(tmp_path / "big.sh", 1_200_000)
+    big.chmod(0o755)
+    command = ("python3 - <<'PY'; bash ./big.sh\nimport os\n"
+               "os.system(\"cat <<'DATA'\\n./big.sh\\nDATA\\n\")\nPY")
+    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+    assert unsafe and "scan cap" in refusal
+
+
+@pytest.mark.parametrize("command", [
+    "python3 - <<-'PY'\n\timport subprocess\n\tsubprocess.run(['bash', './big.sh'])\n\tPY",
+    "python3 - <<'PY END'\nimport subprocess\nsubprocess.run(['bash', './big.sh'])\nPY END",
+])
+def test_body_is_parsed_as_python_receives_it(tmp_path, command):
+    # Prism bb95e5a5c478: `<<-` strips leading tabs, and the closing delimiter is not python
+    _script(tmp_path / "big.sh", 1_200_000)
+    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+    assert unsafe and "scan cap" in refusal

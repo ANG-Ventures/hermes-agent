@@ -3857,10 +3857,19 @@ def _python_process_commands(body: str) -> list[tuple[str, Optional[str]]]:
     ``subprocess.run('...', shell=True)`` are their string. Each comes with its constant ``cwd=``
     keyword or None. A non-constant argv is left out, as before (its 48 h replay: test rigs running
     `bash -c <cmd from data>`, 11 calls; refusing them would block the rig, not a file the guard
-    could read). Only ``subprocess.<call>`` / ``os.<call>`` spellings; unparseable body: nothing."""
-    try:
-        tree = ast.parse(body)
-    except (SyntaxError, ValueError):
+    could read). Only ``subprocess.<call>`` / ``os.<call>`` spellings; unparseable body: nothing.
+
+    *body* is an ``inert_python_heredoc_bodies`` range, which ends with the closing delimiter line;
+    python never sees that line, and under ``<<-`` it sees every line with its leading tabs removed
+    (Prism bb95e5a5c478)."""
+    source = body.rpartition("\n")[0]
+    for text in (source, "\n".join(line.lstrip("\t") for line in source.split("\n"))):
+        try:
+            tree = ast.parse(text)
+            break
+        except (SyntaxError, ValueError):
+            continue
+    else:
         return []
     commands: list[tuple[str, Optional[str]]] = []
     for node in ast.walk(tree):
@@ -3879,12 +3888,19 @@ def _python_process_commands(body: str) -> list[tuple[str, Optional[str]]]:
             continue
         run_cwd = _constant_str(keywords.get("cwd"))
         shell = keywords.get("shell")
+        as_shell = isinstance(shell, ast.Constant) and bool(shell.value)
         text = _constant_str(argv)
         if text is not None:
-            as_shell = isinstance(shell, ast.Constant) and bool(shell.value)
             commands.append((text if as_shell else shlex.quote(text), run_cwd))
             continue
         if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
+            continue
+        if as_shell:
+            # POSIX `sh -c argv[0] argv[1:]`: only the first element is shell text, the rest are
+            # positional parameters the shell never opens (Prism 1fb6e76054b8)
+            first = _constant_str(argv.elts[0])
+            if first is not None:
+                commands.append((first, run_cwd))
             continue
         words = [_constant_str(item) for item in argv.elts]
         if all(word is not None for word in words):
@@ -3905,7 +3921,7 @@ def _contains_unsafe_gateway_action(
     *,
     cwd: Optional[str],
     depth: int,
-    visited: set[Path],
+    visited: set,  # resolved Path (executed visit) or ("mention", Path)
     budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
     executed: bool = True,
@@ -4068,13 +4084,17 @@ def _contains_unsafe_gateway_action(
                 )
             continue
         resolved = _resolve_lenient(script_path)
-        if resolved in visited:
+        # A mention's visit is recorded apart from an executed one: it swallows "could not scan",
+        # so it must never stand in for a later walk of the same file as executed (Prism
+        # 2c9839444bc2: a child process only printing ./big.sh hid the outer `bash ./big.sh`).
+        visit_key = resolved if candidate_executed else ("mention", resolved)
+        if resolved in visited or visit_key in visited:
             continue
         if not budget.charge_path():
             if candidate_executed:
                 return _budget_exhausted(budget, "paths", depth)
             break  # remaining candidates are all mentions
-        visited.add(resolved)
+        visited.add(visit_key)
         # Never read more than the walk can still afford to tokenize; a file larger than the
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
