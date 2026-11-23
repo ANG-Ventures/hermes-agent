@@ -3851,7 +3851,12 @@ def _constant_str(node: Optional[ast.AST]) -> Optional[str]:
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 
 
-def _python_process_commands(body: str) -> list[tuple[str, Optional[str]]]:
+# POSIX python runs a shell=True sequence as `sh -c argv[0] argv[1:]`; Windows python joins the
+# whole sequence into one cmd.exe line (Prism 9c150993c6d7).
+_SHELL_SEQUENCE_ARGV0_ONLY = os.name != "nt"
+
+
+def _python_process_commands(source: str) -> list[tuple[str, Optional[str]]]:
     """The processes a python *body* starts with an argv it spells as constants, as shell text:
     ``subprocess.run(['bash', p])`` is ``bash p``; ``os.system('bash p')`` and
     ``subprocess.run('...', shell=True)`` are their string. Each comes with its constant ``cwd=``
@@ -3859,17 +3864,12 @@ def _python_process_commands(body: str) -> list[tuple[str, Optional[str]]]:
     `bash -c <cmd from data>`, 11 calls; refusing them would block the rig, not a file the guard
     could read). Only ``subprocess.<call>`` / ``os.<call>`` spellings; unparseable body: nothing.
 
-    *body* is an ``inert_python_heredoc_bodies`` range, which ends with the closing delimiter line;
-    python never sees that line, and under ``<<-`` it sees every line with its leading tabs removed
-    (Prism bb95e5a5c478)."""
-    source = body.rpartition("\n")[0]
-    for text in (source, "\n".join(line.lstrip("\t") for line in source.split("\n"))):
-        try:
-            tree = ast.parse(text)
-            break
-        except (SyntaxError, ValueError):
-            continue
-    else:
+    *source* is a ``python_heredoc_sources`` entry: the text python reads, without the closing
+    delimiter line and with ``<<-`` tabs already removed (Prism bb95e5a5c478, 291ae5bff48c,
+    8091e3b19f7b)."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
         return []
     commands: list[tuple[str, Optional[str]]] = []
     for node in ast.walk(tree):
@@ -3895,7 +3895,7 @@ def _python_process_commands(body: str) -> list[tuple[str, Optional[str]]]:
             continue
         if not isinstance(argv, (ast.List, ast.Tuple)) or not argv.elts:
             continue
-        if as_shell:
+        if as_shell and _SHELL_SEQUENCE_ARGV0_ONLY:
             # POSIX `sh -c argv[0] argv[1:]`: only the first element is shell text, the rest are
             # positional parameters the shell never opens (Prism 1fb6e76054b8)
             first = _constant_str(argv.elts[0])
@@ -3945,6 +3945,7 @@ def _contains_unsafe_gateway_action(
 
     from tools.shell_heredoc import (
         inert_python_heredoc_bodies,
+        python_heredoc_sources,
         strip_inert_heredoc_bodies,
     )
 
@@ -3995,8 +3996,8 @@ def _contains_unsafe_gateway_action(
     # starts with a constant argv as that command typed at the shell, in every directory the
     # body may run in (its `cwd=` constant, else the shell's `cd`s).
     process_cwds: Optional[list[Optional[str]]] = None
-    for body in python_bodies:
-        process_commands = _python_process_commands(body)
+    for source in python_heredoc_sources(command, semicolon_chain=True):
+        process_commands = _python_process_commands(source)
         if process_commands and process_cwds is None:
             process_cwds = _shell_cwds(shell_command, cwd)
         for process_command, run_cwd in process_commands:

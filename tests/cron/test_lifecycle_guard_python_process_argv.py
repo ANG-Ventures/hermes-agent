@@ -109,9 +109,27 @@ def test_an_inert_mention_in_a_child_does_not_hide_the_outer_executed_script(tmp
 @pytest.mark.parametrize("command", [
     "python3 - <<-'PY'\n\timport subprocess\n\tsubprocess.run(['bash', './big.sh'])\n\tPY",
     "python3 - <<'PY END'\nimport subprocess\nsubprocess.run(['bash', './big.sh'])\nPY END",
+    # Prism 291ae5bff48c: a newline (and more shell) after the closing line
+    "python3 - <<'PY END'\nimport subprocess\nsubprocess.run(['bash', './big.sh'])\nPY END\n",
+    "python3 - <<'PY END'\nimport subprocess\nsubprocess.run(['bash', './big.sh'])\nPY END\necho done",
+    "python3 - <<-'PY'\n\timport subprocess\n\tsubprocess.run(['bash', './big.sh'])\n\tPY\n",
+    # Prism 8091e3b19f7b: the raw body parses too, but names `./big<TAB>.sh`; python gets `./big.sh`
+    "python3 - <<-'PY'\nimport subprocess\nsubprocess.run(['bash', '''./big\\\n\t.sh'''])\nPY",
 ])
 def test_body_is_parsed_as_python_receives_it(tmp_path, command):
     # Prism bb95e5a5c478: `<<-` strips leading tabs, and the closing delimiter is not python
     _script(tmp_path / "big.sh", 1_200_000)
     unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+    assert unsafe and "scan cap" in refusal
+
+
+def test_shell_true_list_on_windows_runs_the_whole_sequence(tmp_path, monkeypatch):
+    # Prism 9c150993c6d7: Windows python joins a shell=True sequence into one cmd.exe line
+    import cron.lifecycle_guard as guard
+
+    _script(tmp_path / "big.sh", 1_200_000)
+    src = "subprocess.run(['bash', './big.sh'], shell=True)"
+    assert scan_gateway_lifecycle(_body(src), cwd=str(tmp_path)) == (False, None)  # POSIX: $0 only
+    monkeypatch.setattr(guard, "_SHELL_SEQUENCE_ARGV0_ONLY", False)
+    unsafe, refusal = scan_gateway_lifecycle(_body(src), cwd=str(tmp_path))
     assert unsafe and "scan cap" in refusal

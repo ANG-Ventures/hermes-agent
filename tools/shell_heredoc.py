@@ -193,7 +193,17 @@ def _find_heredoc_close(
 def _inert_heredoc_ranges(
     command: str, *, python_semicolon_chain: bool = False
 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    """Return safely masked body ranges and the subset that is Python stdin source.
+    """Return safely masked body ranges and the subset that is Python stdin source."""
+    ranges, python_ranges, _python_strip_tabs = _inert_heredoc_ranges_detail(
+        command, python_semicolon_chain=python_semicolon_chain)
+    return ranges, python_ranges
+
+
+def _inert_heredoc_ranges_detail(
+    command: str, *, python_semicolon_chain: bool = False
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[bool]]:
+    """Return safely masked body ranges, the subset that is Python stdin source, and each Python
+    range's ``<<-`` strip-tabs flag.
 
     Qualification rules are in the module docstring. ``python_semicolon_chain`` (fork #920/#933,
     cron lifecycle guard) additionally accepts a single quoted heredoc whose OWNING simple command
@@ -206,9 +216,10 @@ def _inert_heredoc_ranges(
     """
     ranges: list[tuple[int, int]] = []
     python_ranges: list[tuple[int, int]] = []
+    python_strip_tabs: list[bool] = []
     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
     if "<<" not in command:
-        return ranges, python_ranges
+        return ranges, python_ranges, python_strip_tabs
     last_opener_index = command.rfind("<<")
     command_start = 0
     while command_start <= last_opener_index:
@@ -222,20 +233,20 @@ def _inert_heredoc_ranges(
             owner_piped,
         ) = _scan_heredoc_command_unit(command, command_start)
         if unknown_operator:
-            return [], []
+            return [], [], []
         if not specs:
             if command_end >= len(command):
                 break
             command_start = command_end + 1
             continue
         if command_end >= len(command):
-            return [], []  # opener with no body line: unterminated — leave visible
+            return [], [], []  # opener with no body line: unterminated — leave visible
         body_cursor = command_end + 1
         body_ranges: list[tuple[int, int]] = []
         for delimiter, strip_tabs, _quoted in specs:
             close_end = _find_heredoc_close(command, body_cursor, delimiter, strip_tabs)
             if close_end is None:
-                return [], []  # unterminated
+                return [], [], []  # unterminated
             body_ranges.append((body_cursor, close_end))
             body_cursor = close_end
         if all(quoted for _delimiter, _strip_tabs, quoted in specs):
@@ -258,8 +269,9 @@ def _inert_heredoc_ranges(
                 ranges.extend(body_ranges)
                 if re.search(r"(?i)python(?:3(?:\.\d+)*)?$", consumer_match.group(0)):
                     python_ranges.extend(body_ranges)
+                    python_strip_tabs.extend(strip_tabs for _d, strip_tabs, _q in specs)
         command_start = body_cursor
-    return ranges, python_ranges
+    return ranges, python_ranges, python_strip_tabs
 
 
 def inert_python_heredoc_bodies(
@@ -270,6 +282,21 @@ def inert_python_heredoc_bodies(
     (fork #920)."""
     _ranges, python_ranges = _inert_heredoc_ranges(command, python_semicolon_chain=semicolon_chain)
     return tuple(command[start:end] for start, end in python_ranges)
+
+
+def python_heredoc_sources(command: str, *, semicolon_chain: bool = False) -> tuple[str, ...]:
+    """The source python reads from each ``inert_python_heredoc_bodies`` range: the closing
+    delimiter line dropped (with or without a newline after it), and under ``<<-`` every line's
+    leading tabs removed, as the shell delivers it."""
+    _ranges, python_ranges, strip_tabs = _inert_heredoc_ranges_detail(
+        command, python_semicolon_chain=semicolon_chain)
+    sources: list[str] = []
+    for (start, end), strip in zip(python_ranges, strip_tabs):
+        source = command[start:end].removesuffix("\n").rpartition("\n")[0]
+        if strip:
+            source = "\n".join(line.lstrip("\t") for line in source.split("\n"))
+        sources.append(source)
+    return tuple(sources)
 
 
 def strip_inert_heredoc_bodies(command: str, *, python_semicolon_chain: bool = False) -> str:
