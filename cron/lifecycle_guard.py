@@ -3755,14 +3755,16 @@ _PY_UNREAD_PATH_CALLS = frozenset({
 _PY_UNREAD_PATH_METHODS = frozenset({"stat", "lstat", "exists", "is_file", "is_dir", "is_symlink"})
 
 
-def _python_unread_literals(body: str) -> set[str]:
-    """String literals *body* uses ONLY as the path of a call in ``_PY_UNREAD_PATH_CALLS`` or the
-    receiver of a ``_PY_UNREAD_PATH_METHODS`` call (each optionally under ``_PY_PATH_WRAPPERS``).
-    Unparseable body: none (fail closed)."""
+def _python_literal_uses(body: str) -> tuple[set[str], set[str]]:
+    """``(unread, other)``: string literals *body* uses as the path of a call in
+    ``_PY_UNREAD_PATH_CALLS`` or the receiver of a ``_PY_UNREAD_PATH_METHODS`` call (each optionally
+    under ``_PY_PATH_WRAPPERS``), and literals it uses any other way. A literal can be in both.
+    The caller compares them by the FILE they name, not the spelling (Prism ecbd1c8f1080).
+    Unparseable body: no unread literals (fail closed)."""
     try:
         tree = ast.parse(body)
     except (SyntaxError, ValueError):
-        return set()
+        return set(), set()
     parent = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     unread: set[str] = set()
     other: set[str] = set()
@@ -3782,7 +3784,15 @@ def _python_unread_literals(body: str) -> set[str]:
             and isinstance(parent.get(id(up)), ast.Call) and parent[id(up)].func is up
         )
         (unread if is_unread else other).add(node.value)
-    return unread - other
+    return unread, other
+
+
+def _same_file_key(path: Path) -> str:
+    """One key per file however it is spelled: ``./x``, ``a/../x`` and a symlink to x agree."""
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return str(path)
 
 
 def _contains_unsafe_gateway_action(
@@ -3881,14 +3891,19 @@ def _contains_unsafe_gateway_action(
     # the refusal `bash <file>` gets. Not a literal the body only stats or hands to sqlite3.connect.
     kept = {path for path, _ in candidates}
     for body, masked in zip(python_bodies, masked_bodies):
-        unread = {
-            resolved for resolved in (
-                _resolve_terminal_script_path(literal, cwd)
-                for literal in _python_unread_literals(body)
-            ) if resolved is not None
-        }
+        unread_literals, other_literals = _python_literal_uses(body)
+
+        def _keys(literals: set[str]) -> set[str]:
+            return {
+                _same_file_key(resolved) for resolved in (
+                    _resolve_terminal_script_path(literal, cwd) for literal in literals
+                ) if resolved is not None
+            }
+
+        # By file, not spelling: `os.stat('/w/big')` must not exempt `open('./big')`.
+        unread = _keys(unread_literals) - _keys(other_literals)
         for path in _iter_referenced_shell_scripts(masked, cwd=cwd, keep_oversized=True):
-            if path not in kept and path not in unread:
+            if path not in kept and _same_file_key(path) not in unread:
                 kept.add(path)
                 candidates.append((path, executed))
     if shell_command != command:

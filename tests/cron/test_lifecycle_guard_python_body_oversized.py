@@ -108,3 +108,21 @@ def test_sqlite_connect_literal_used_elsewhere_is_not_carved_out(tmp_path):
         f"c = sqlite3.connect('{data}')\nexec(open('{data}').read())\nPY"
     )
     assert scan_gateway_lifecycle(also_exec, cwd=str(tmp_path))[0]
+
+
+def test_stat_exemption_does_not_cover_an_aliased_read_of_the_same_file(tmp_path):
+    """Prism ecbd1c8f1080: the stat-only exemption compared literal spellings, so `os.stat` on the
+    absolute path plus `open()` on another spelling of the same file skipped the scan-cap refusal.
+    Uses are compared by the file they name, not by how it is spelled."""
+    data = _json_line(tmp_path / "big.json", BIG)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "link.json").symlink_to(data)
+    for spelling in ("./big.json", "sub/../big.json", str(tmp_path / "link.json")):
+        command = (
+            "python3 - <<'EOF'\nimport json, os\n"
+            f"os.stat('{data}')\n"
+            f"d = json.load(open('{spelling}'))\nprint(len(d))\nEOF"
+        )
+        unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+        assert unsafe, spelling
+        assert "larger than the scan cap" in refusal, spelling
