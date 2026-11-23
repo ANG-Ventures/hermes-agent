@@ -3800,6 +3800,49 @@ def _python_literal_uses(body: str) -> tuple[set[str], set[str]]:
     return unread, other
 
 
+# t_94a8d819 (operator round): what lets a python body RUN a file or hand it to something that
+# does. A body with none of these only reads what it opens, so a file too large to scan is not
+# refused: reading a big log as data is not the hazard this guard exists for.
+_PY_RUNNER_MODULES = frozenset({"subprocess", "runpy", "importlib", "pty", "pickle", "code", "builtins"})
+_PY_RUNNER_BUILTINS = frozenset({"exec", "eval", "compile", "__import__", "getattr", "__builtins__"})
+_PY_RUNNER_ATTRS = frozenset({"create_subprocess_exec", "create_subprocess_shell"})
+
+
+def _is_os_runner(name: str) -> bool:
+    return name in {"system", "popen", "startfile"} or name.startswith(("exec", "spawn", "posix_spawn"))
+
+
+def _python_body_can_run(body: str) -> bool:
+    """True when *body* can execute a file or pass it to a process: exec/eval/compile/getattr,
+    runpy, importlib, subprocess, pty, pickle, os.system/popen/exec*/spawn*, asyncio subprocesses.
+    An aliased ``os`` or an unparseable body: True (fail closed)."""
+    try:
+        tree = ast.parse(body)
+    except (SyntaxError, ValueError):
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] in _PY_RUNNER_MODULES
+                   or (alias.name == "os" and alias.asname is not None) for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.split(".")[0] in _PY_RUNNER_MODULES or any(
+                (module == "os" and _is_os_runner(alias.name)) or alias.name in _PY_RUNNER_ATTRS
+                for alias in node.names
+            ):
+                return True
+        elif isinstance(node, ast.Name):
+            if node.id in _PY_RUNNER_BUILTINS:
+                return True
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _PY_RUNNER_ATTRS or (
+                isinstance(node.value, ast.Name) and node.value.id == "os" and _is_os_runner(node.attr)
+            ):
+                return True
+    return False
+
+
 def _same_file_key(path: Path) -> str:
     """One key per file however it is spelled: ``./x``, ``a/../x`` and a symlink to x agree."""
     try:
@@ -3908,6 +3951,8 @@ def _contains_unsafe_gateway_action(
     # ecbd1c8f1080, round 2).
     body_cwds = _shell_cwds(shell_command, cwd)
     for body, masked in zip(python_bodies, masked_bodies):
+        if not _python_body_can_run(body):
+            continue  # it only reads what it opens: a big log read as data is not the hazard
         unread_literals, other_literals = _python_literal_uses(body)
 
         def _keys(literals: set[str]) -> set[str]:

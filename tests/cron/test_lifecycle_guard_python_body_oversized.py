@@ -6,6 +6,11 @@ Live probes (runtime ffcfb208ff0b, 11-22 23:2x PT), same body each time:
 64 KiB longest-line cap; a 2,508,900-byte one RAN, because `_references_at` dropped an oversized
 file without the x bit as "not a script" (#36a78f6a), a shell-only fact. Main before #529
 (e03d0a7a) behaved the same. `bash <1.2 MB file>` was refused on the scan cap.
+
+Operator round: refusing every such body cost 270 newly refused commands in a 48 h replay of the
+default gateway (big logs and JSON read as data). So the refusal applies only to a body that can run
+a file or hand it on (exec/eval/compile, subprocess, runpy, importlib, os.system/exec*/spawn*):
+10 newly refused in the same replay.
 """
 
 from pathlib import Path
@@ -14,6 +19,7 @@ from cron.lifecycle_guard import _MAX_REFERENCED_SCRIPT_BYTES, scan_gateway_life
 
 SMALL = 147_700
 BIG = 2_508_900
+RUNS = "os.system('true')\n"  # makes a body able to run what it names
 
 
 def _json_line(path: Path, size: int) -> Path:
@@ -41,13 +47,29 @@ def test_probe1_147kb_line_in_non_read_only_body_is_refused_on_line_cap(tmp_path
     assert str(data) in refusal and "longest-line cap" in refusal
 
 
-def test_probe2_2_5mb_file_in_non_read_only_body_is_refused_on_scan_cap(tmp_path):
+def test_probe2_2_5mb_file_a_body_only_reads_runs(tmp_path):
+    """Operator round: a body that imports os but only opens and reads the file is not the hazard
+    (48 h replay: refusing it would have blocked large-log reads every day), so it runs."""
     data = _json_line(tmp_path / "big.json", BIG)
-    unsafe, refusal = scan_gateway_lifecycle(_heredoc(data), cwd=str(tmp_path))
-    assert unsafe
-    assert f"`{data}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes)" in refusal
-    # python-body path: the refusal also says how to read it as data
-    assert "json.load(open(p))" in refusal
+    assert scan_gateway_lifecycle(_heredoc(data), cwd=str(tmp_path)) == (False, None)
+
+
+def test_probe2_2_5mb_file_in_a_body_that_can_run_is_refused_on_scan_cap(tmp_path):
+    data = _json_line(tmp_path / "big.json", BIG)
+    for extra in (RUNS, "subprocess.call(['true'])\n", "import runpy\n", "eval('1')\n"):
+        imports = "json, os, subprocess" if "subprocess" in extra else "json, os"
+        unsafe, refusal = scan_gateway_lifecycle(_heredoc(data, imports, extra), cwd=str(tmp_path))
+        assert unsafe, extra
+        assert f"`{data}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes)" in refusal
+        # python-body path: the refusal also says how to read it as data
+        assert "json.load(open(p))" in refusal
+
+
+def test_sqlite_execute_is_not_a_way_to_run_a_file(tmp_path):
+    data = _json_line(tmp_path / "big.json", BIG)
+    body = "c = sqlite3.connect(':memory:')\nc.execute('select 1')\nos.path.join('a', 'b')\n"
+    assert scan_gateway_lifecycle(_heredoc(data, "json, os, sqlite3", body), cwd=str(tmp_path)) == (
+        False, None)
 
 
 def test_probe3_bash_oversized_file_is_refused_on_scan_cap(tmp_path):
@@ -119,7 +141,7 @@ def test_stat_exemption_does_not_cover_an_aliased_read_of_the_same_file(tmp_path
     (tmp_path / "link.json").symlink_to(data)
     for spelling in ("./big.json", "sub/../big.json", str(tmp_path / "link.json")):
         command = (
-            "python3 - <<'EOF'\nimport json, os\n"
+            "python3 - <<'EOF'\nimport json, os\n" + RUNS +
             f"os.stat('{data}')\n"
             f"d = json.load(open('{spelling}'))\nprint(len(d))\nEOF"
         )
@@ -139,7 +161,7 @@ def test_cd_before_the_heredoc_sets_the_directory_the_body_reads_from(tmp_path):
     for stat in ("", f"os.stat('{data}')\n"):
         for tail in ("", "\ncd /"):
             command = (
-                f"cd {work} && python3 - <<'EOF'\nimport json, os\n{stat}"
+                f"cd {work} && python3 - <<'EOF'\nimport json, os\n{RUNS}{stat}"
                 "d = json.load(open('./big.json'))\nprint(len(d))\nEOF" + tail
             )
             unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(start))
@@ -156,7 +178,7 @@ def test_cd_options_do_not_hide_the_directory(tmp_path):
     data = _json_line(work / "big.json", BIG)
     for cd in (f"cd -- {work}", f"cd -P {work}", f"cd -L -- {work}"):
         command = (
-            f"{cd} && python3 - <<'EOF'\nimport json, os\n"
+            f"{cd} && python3 - <<'EOF'\nimport json, os\n{RUNS}"
             "d = json.load(open('./big.json'))\nprint(len(d))\nEOF"
         )
         unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(start))
