@@ -376,7 +376,10 @@ def test_a_file_name_is_not_proof_but_a_declaration_beside_one_is(root):
                                   "Review is ready for handback (delegation d1)")
     real = _card(d, "f1 B: declaration beside a file", status="review")
     kb.add_comment(d, real, "w", "live-verified on the Studio, log in notes/run.md")
+    valued = _card(d, "f1 C: declaration whose value is a file", status="review")
+    kb.add_comment(d, valued, "w", "live proof: receipts/run-t_abcd1234.json")
     d.commit(); d.close()
     by = {c["id"]: c for c in sc.build(root, [SID], network=False)["cards"]}
     assert not by[named]["proof"]
     assert by[real]["proof"]
+    assert by[valued]["proof"]  # Prism 9e4e512e3e1a: the file is the evidence, not noise
