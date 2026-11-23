@@ -3089,11 +3089,18 @@ def _references_at(
 
 def _cwd_after_cd(segment: list[str], index: int, effective_cwd: Optional[str]) -> Optional[str]:
     """The directory after the ``cd`` at *index*. ``cd`` with no argument goes $HOME; ``cd -`` is
-    untrackable (previous dir unknown) so conservatively stop trusting the cwd from here on."""
-    if len(segment) <= index + 1:
+    untrackable (previous dir unknown) so conservatively stop trusting the cwd from here on.
+    Options (``-L``, ``-P``, ``-e``, ``-@``) and the ``--`` end marker are skipped: the directory is
+    the first operand (Prism 40a3a2a5fa2f)."""
+    position = index + 1
+    while position < len(segment) and segment[position].startswith("-") and segment[position] != "-":
+        position += 1
+        if segment[position - 1] == "--":
+            break
+    if position >= len(segment):
         return str(Path.home())
-    target = segment[index + 1]
-    if target == "-":
+    target = segment[position]
+    if target == "-" and segment[position - 1] != "--":
         return None
     resolved_target = _resolve_terminal_script_path(target, effective_cwd)
     return str(resolved_target) if resolved_target is not None else None

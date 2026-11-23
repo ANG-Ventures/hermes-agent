@@ -145,3 +145,20 @@ def test_cd_before_the_heredoc_sets_the_directory_the_body_reads_from(tmp_path):
             unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(start))
             assert unsafe, (stat, tail)
             assert f"`{data}` is larger than the scan cap" in refusal, (stat, tail)
+
+
+def test_cd_options_do_not_hide_the_directory(tmp_path):
+    """Prism 40a3a2a5fa2f (round 3): `cd -- DIR` / `cd -P DIR` took the option as the target, so
+    the body's `./big.json` resolved under `<start>/--` and ran unscanned."""
+    start, work = tmp_path / "start", tmp_path / "work"
+    start.mkdir()
+    work.mkdir()
+    data = _json_line(work / "big.json", BIG)
+    for cd in (f"cd -- {work}", f"cd -P {work}", f"cd -L -- {work}"):
+        command = (
+            f"{cd} && python3 - <<'EOF'\nimport json, os\n"
+            "d = json.load(open('./big.json'))\nprint(len(d))\nEOF"
+        )
+        unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(start))
+        assert unsafe, cd
+        assert f"`{data}` is larger than the scan cap" in refusal, cd
