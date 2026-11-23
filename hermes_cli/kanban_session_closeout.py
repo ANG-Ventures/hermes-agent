@@ -66,6 +66,8 @@ _ABSENT_VALUE = re.compile(r"\b(?:live|native)[ -]proof\s*:\s*(?:none|n/?a|nil|n
 # A proof mention on a line that also negates it ("no live proof", "native proof failed") is not proof.
 _NEGATED = re.compile(r"\b(?:no|not|without|missing|failed|fails|pending|unproven|cannot|can't|blocked|todo|"
                       r"please|need|needs|attach|collect)\b|\?", re.I)
+# A file name is not a declaration ("staged read .../read-t_x-live-verified.md", Prism 0e902bbbf0f3 on hermes-agent#538).
+_FILE_TOKEN = re.compile(r"[\w~./-]+\.(?:md|txt|json|log)\b")
 _CLOSE_ON = re.compile(r"close-on:\s*([^\n]{1,200})", re.I)
 _CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
 _CLOSE_RECORD = re.compile(r"SUPERSED|\bCLOSED:|\bclosed\b", re.I)
@@ -500,7 +502,7 @@ def build(root: Path, sids: list[str], *, pr_query: Optional[PrQuery] = None, ne
         texts = [c.get("result") or ""] + [x.get("body") or "" for x in c["comments"]] + \
                 [r.get("summary") or "" for r in c["runs"]]
         c["proof"] = any(_md_live_evidence(r.get("metadata")) for r in c["runs"]) or any(
-            _PROOF.search(ln) and not _NEGATED.search(ln) and not _ABSENT_VALUE.search(ln)
+            _PROOF.search(_FILE_TOKEN.sub(" ", ln)) and not _NEGATED.search(ln) and not _ABSENT_VALUE.search(ln)
             for t in texts for ln in t.splitlines())
         c["retracted"] = any(_RETRACT.search(x.get("body") or "") for x in c["comments"])
         c["prs"] = [(r, states.get(r)) for r in pr_map[c["id"]]]

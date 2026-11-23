@@ -2440,10 +2440,13 @@ def _staged_read(entry: dict, texts: list) -> Optional[str]:
     home = Path(get_hermes_home())
     for text in texts:
         for token in _PATH_RE.findall(str(text or "")):
-            path = Path(token).expanduser()
-            path = path if path.is_absolute() else home / path
-            if path.is_file():
-                return str(path)
+            try:   # Prism fbcf025cb460: "~nosuchuser/x.md" raises; an unresolvable name is skipped, never fatal
+                path = Path(token).expanduser()
+                path = path if path.is_absolute() else home / path
+                if path.is_file():
+                    return str(path)
+            except (RuntimeError, OSError, ValueError):
+                continue
     did, tid = str(entry.get("delegation_id") or ""), str(entry.get("task_id") or "")
     scratch = home / "cache" / "scratch"
     found = [p for d in {did, f"del-{did[-4:]}"} if did and tid and (scratch / d).is_dir()

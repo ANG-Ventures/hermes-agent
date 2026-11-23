@@ -364,3 +364,19 @@ def test_prism_r3_empty_turns_ledger_and_unreadable_state_db_are_reported(root):
     assert any(u.startswith("argus:") for u in r["cost"]["workers"]["unreadable"])
     assert any(u.startswith("argus:") for u in r["cost"]["session_unreadable"])
     assert "Session cost INCOMPLETE" in sc.render(r)
+
+
+def test_a_file_name_is_not_proof_but_a_declaration_beside_one_is(root):
+    """Prism 0e902bbbf0f3 (hermes-agent#538): the boomerang wake names the child's staged read in its surfaced comment;
+    a file named ``read-<card>-live-verified.md`` must not mark the card proven. A real declaration on the same line does."""
+    d = _conn(root)
+    named = _card(d, "f1 A: staged file name only", status="review")
+    kb.add_comment(d, named, "w", "[boomerang-wake] surfaced: the PR has merged (ANG-Ventures/a#1): staged read "
+                                  "/home/x/cache/scratch/del-ab12/staged/read-t_abcd1234-live-verified.md: "
+                                  "Review is ready for handback (delegation d1)")
+    real = _card(d, "f1 B: declaration beside a file", status="review")
+    kb.add_comment(d, real, "w", "live-verified on the Studio, log in notes/run.md")
+    d.commit(); d.close()
+    by = {c["id"]: c for c in sc.build(root, [SID], network=False)["cards"]}
+    assert not by[named]["proof"]
+    assert by[real]["proof"]

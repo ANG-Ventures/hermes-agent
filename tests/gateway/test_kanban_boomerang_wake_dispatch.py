@@ -457,6 +457,7 @@ def test_refused_surface_for_merged_pr_leaves_one_card_comment(env, staged):
 @pytest.mark.parametrize("arm,delivered", [
     ("staged", True),         # the 11-23 case: read staged in the child's staged/ folder
     ("operator_line", True),  # no file, a line for the operator in the summary
+    ("unresolvable_path", True),  # an operator line naming ~<unknown account>/x.md: still delivered
     ("done", False),          # card already closed: the merge is the end
     ("nothing", False),       # the child found nothing for the owner
     ("worker", False),        # card in review on a worker, not a human
@@ -478,9 +479,11 @@ def test_merged_pr_surface_delivered_while_card_open_on_a_human(env, arm, delive
     if arm == "switch_off":
         env["monkeypatch"].setenv("BOOMERANG_MERGED_OPEN_DELIVER", "0")
     summary = "No send-back: #71 merged during the read and the card's items are met"
-    if arm == "operator_line":
+    if arm in ("operator_line", "unresolvable_path"):
         summary += "; for the operator: the card needs a LIVE-EVIDENCE comment and a hand install"
-    if arm not in ("operator_line", "nothing"):
+    if arm == "unresolvable_path":   # Prism fbcf025cb460: expanduser() raises on an unknown account
+        summary += "; Operator must check ~nosuchuser-c9540659/read.md"
+    if arm not in ("operator_line", "unresolvable_path", "nothing"):
         path = get_hermes_home() / "cache/scratch" / entry["delegation_id"] / "staged" / f"read-{tid}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("Verdict: surface\nOperator must record LIVE-EVIDENCE\n")
