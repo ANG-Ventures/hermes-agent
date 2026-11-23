@@ -3087,6 +3087,29 @@ def _references_at(
                 yield resolved
 
 
+def _cwd_after_cd(segment: list[str], index: int, effective_cwd: Optional[str]) -> Optional[str]:
+    """The directory after the ``cd`` at *index*. ``cd`` with no argument goes $HOME; ``cd -`` is
+    untrackable (previous dir unknown) so conservatively stop trusting the cwd from here on."""
+    if len(segment) <= index + 1:
+        return str(Path.home())
+    target = segment[index + 1]
+    if target == "-":
+        return None
+    resolved_target = _resolve_terminal_script_path(target, effective_cwd)
+    return str(resolved_target) if resolved_target is not None else None
+
+
+def _shell_cwds(command: str, cwd: Optional[str]) -> list[Optional[str]]:
+    """Every directory *command*'s ``cd`` segments move through, *cwd* first, in order. A python
+    heredoc body runs in one of them (Prism ecbd1c8f1080, t_94a8d819)."""
+    seen = [cwd]
+    for segment in _iter_command_segments(command):
+        index = _command_token_index(segment)
+        if index is not None and _executable_name(segment[index]) == "cd":
+            seen.append(_cwd_after_cd(segment, index, seen[-1]))
+    return list(dict.fromkeys(seen))
+
+
 def _iter_referenced_shell_scripts(
     command: str,
     *,
@@ -3116,24 +3139,7 @@ def _iter_referenced_shell_scripts(
             continue
         executable_name = _executable_name(segment[index])
         if executable_name == "cd":
-            # Model the directory change for subsequent segments. `cd` with
-            # no argument goes $HOME; `cd -` is untrackable (previous dir
-            # unknown) so conservatively stop trusting the cwd from here on.
-            if len(segment) <= index + 1:
-                effective_cwd = str(Path.home())
-            else:
-                target = segment[index + 1]
-                if target == "-":
-                    effective_cwd = None
-                else:
-                    resolved_target = _resolve_terminal_script_path(
-                        target, effective_cwd
-                    )
-                    effective_cwd = (
-                        str(resolved_target)
-                        if resolved_target is not None
-                        else None
-                    )
+            effective_cwd = _cwd_after_cd(segment, index, effective_cwd)
             continue
         yield from _references_at(segment, index, effective_cwd, keep_oversized)
         peeled = _peel_transparent_prefixes(segment, index)
@@ -3890,22 +3896,28 @@ def _contains_unsafe_gateway_action(
     # read-only mask is kept whatever its size, and one too large to scan fails closed below with
     # the refusal `bash <file>` gets. Not a literal the body only stats or hands to sqlite3.connect.
     kept = {path for path, _ in candidates}
+    # The body runs in whichever directory the shell's `cd`s left it in; check under every one
+    # of them, so neither the exemption nor the candidate is read in the wrong place (Prism
+    # ecbd1c8f1080, round 2).
+    body_cwds = _shell_cwds(shell_command, cwd)
     for body, masked in zip(python_bodies, masked_bodies):
         unread_literals, other_literals = _python_literal_uses(body)
 
         def _keys(literals: set[str]) -> set[str]:
             return {
                 _same_file_key(resolved) for resolved in (
-                    _resolve_terminal_script_path(literal, cwd) for literal in literals
+                    _resolve_terminal_script_path(literal, body_cwd)
+                    for literal in literals for body_cwd in body_cwds
                 ) if resolved is not None
             }
 
         # By file, not spelling: `os.stat('/w/big')` must not exempt `open('./big')`.
         unread = _keys(unread_literals) - _keys(other_literals)
-        for path in _iter_referenced_shell_scripts(masked, cwd=cwd, keep_oversized=True):
-            if path not in kept and _same_file_key(path) not in unread:
-                kept.add(path)
-                candidates.append((path, executed))
+        for body_cwd in body_cwds:
+            for path in _iter_referenced_shell_scripts(masked, cwd=body_cwd, keep_oversized=True):
+                if path not in kept and _same_file_key(path) not in unread:
+                    kept.add(path)
+                    candidates.append((path, executed))
     if shell_command != command:
         # Fork: a path `_mask_read_only_python_paths` removed is a file the body provably only
         # READS as data (#1017/#1348) — its contents are never executed, so it is not even a

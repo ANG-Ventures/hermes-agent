@@ -126,3 +126,22 @@ def test_stat_exemption_does_not_cover_an_aliased_read_of_the_same_file(tmp_path
         unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
         assert unsafe, spelling
         assert "larger than the scan cap" in refusal, spelling
+
+
+def test_cd_before_the_heredoc_sets_the_directory_the_body_reads_from(tmp_path):
+    """Prism ecbd1c8f1080 (round 2): the oversized pass resolved the body's relative paths against
+    the scan's starting cwd, not the directory a preceding `cd` moved to, so both the candidate and
+    the stat-only exemption looked in the wrong place and `./big.json` ran unscanned."""
+    start, work = tmp_path / "start", tmp_path / "work"
+    start.mkdir()
+    work.mkdir()
+    data = _json_line(work / "big.json", BIG)
+    for stat in ("", f"os.stat('{data}')\n"):
+        for tail in ("", "\ncd /"):
+            command = (
+                f"cd {work} && python3 - <<'EOF'\nimport json, os\n{stat}"
+                "d = json.load(open('./big.json'))\nprint(len(d))\nEOF" + tail
+            )
+            unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(start))
+            assert unsafe, (stat, tail)
+            assert f"`{data}` is larger than the scan cap" in refusal, (stat, tail)
