@@ -51,6 +51,11 @@ NEGATIVE = [
     "Opened o/r#1. Live acceptance is still NOT met: there is no completed .backup yet.",
     "Draft PR o/r#1. It is still a DRAFT, do not land.",
     "Card test met on mbp. Acceptance is not proven:\n- ACE-AI",
+    # Prism round 1 on #536: a labelled verdict and a polite instruction are verdicts.
+    "Result: not proven; the live check is pending.",
+    "PR o/r#1 is open.\nStatus: NOT proven live.",
+    "Please do not merge until the live check passes.",
+    "PR o/r#1 is open. Please don't land it yet.",
 ]
 # Ordinary green handoffs, including the bare-word FAIL prose the caps-scoped
 # form exists to ignore (385/1392 false positives in 14 d).
@@ -73,6 +78,9 @@ POSITIVE = [
     "Done. If two halves carry the same step key, the halves do not merge.",
     "PR o/r#1 is green; I do not merge.",
     "Done. It looks like a process race, but I have not proven that.",
+    # Prism 5154e0a63aa9: pasted output in a ``` fence describes a run, it is not the worker's verdict.
+    "Done. The probe printed:\n```\nResult: FAIL\nNot proven: idle\n```\nThat is the expected refusal.",
+    "Done. Output:\n```text\nverdict: FAIL\n",
 ]
 
 

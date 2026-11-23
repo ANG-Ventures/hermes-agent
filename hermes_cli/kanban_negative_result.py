@@ -30,7 +30,11 @@ NEG_RESULT_RE = re.compile(
 # 14 d of review_negative_result (292): "not met" 106/106 real; "not proven" 78 real / 57 false; the FAIL arm
 # 14/15 false; "do not merge" 12/14 false. So: quoted text is blanked; "not proven" needs a verdict position;
 # merge/land only as an instruction; FAIL only as a line's own label. Every other arm is unchanged.
-_QUOTED_RE = re.compile(r'"[^"\n]*"|`[^`\n]*`|\u201c[^\u201d\n]*\u201d')
+# A ``` fence (pasted output, closed or running to the end) is quoted too (Prism 5154e0a63aa9).
+_QUOTED_RE = re.compile(r'```[\s\S]*?(?:```|\Z)|"[^"\n]*"|`[^`\n]*`|\u201c[^\u201d\n]*\u201d')
+# The worker's own verdict label before "not proven": "Result: not proven" (Prism dc37cf6bbd2e).
+_VERDICT_LABEL_RE = re.compile(r"(?i)[\s>*#\-\u2022]*(?:result|status|verdict|outcome|conclusion)\s*[:=\-]\s*$")
+_PLEASE_RE = re.compile(r"(?i)\bplease\s*$")
 _NOT_PROVEN_RE = re.compile(r"(?i)\bnot\s+(?:yet\s+)?proven\b")
 _DONT_LAND_RE = re.compile(r"(?i)\b(?:do\s+not|don'?t)\s+(?:merge|land)\b")
 _FAIL_ARM_RE = re.compile(r"(?i:\b(?:verdict|result|gate))\s*[:=]?\s*(?:FAIL(?:ED)?|DEFERRED)\b")
@@ -58,10 +62,13 @@ def _verdict_position(text: str, m: re.Match) -> bool:
         return bool(_LINE_LEAD_RE.match(text[line_start:m.start()]))
     if _DONT_LAND_RE.fullmatch(phrase):
         # An instruction ("Do not land.", "draft, do not merge"), never a description ("I do not merge").
+        prefix = _PLEASE_RE.sub("", prefix)  # "Please do not merge" is the same instruction (Prism 01d8577b1e47)
         return bool(re.search(r"(?:^|[,:(\-])\s*$", prefix)) or bool(_LINE_LEAD_RE.match(prefix))
     if _NOT_PROVEN_RE.fullmatch(phrase):
         if _LINE_LEAD_RE.match(prefix):
             return True  # "Not proven: ...", "NOT YET PROVEN: ...", "- Not proven live"
+        if _VERDICT_LABEL_RE.match(prefix):
+            return True  # "Result: not proven", "Status: NOT proven"
         if re.match(r"\s*(?:yet|here|live)?\s*:", text[m.end():]):
             return True  # a heading: "What is not proven:"
         return bool(_GATE_NOUN_RE.search(prefix))
@@ -69,7 +76,8 @@ def _verdict_position(text: str, m: re.Match) -> bool:
 
 
 def _first_verdict(text: str) -> Optional[str]:
-    blanked = _QUOTED_RE.sub(lambda q: " " * len(q.group(0)), text)
+    # Newlines survive the blanking so line and sentence starts after a fence stay where they were.
+    blanked = _QUOTED_RE.sub(lambda q: re.sub(r"[^\n]", " ", q.group(0)), text)
     for m in NEG_RESULT_RE.finditer(blanked):
         if _verdict_position(blanked, m):
             return m.group(0)
