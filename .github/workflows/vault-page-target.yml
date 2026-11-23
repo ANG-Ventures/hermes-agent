@@ -14,7 +14,7 @@ jobs:
       - run: uv sync --group dev --python 3.14
       - run: uv pip install playwright==1.62.0
       - run: uv run playwright install --with-deps chromium
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - run: npm install --global agent-browser@0.26.0
