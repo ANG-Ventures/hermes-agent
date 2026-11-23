@@ -184,3 +184,44 @@ def test_comment_reference_uses_target_board(board):
         kb.add_comment(board, tid, "operator", f"Ace decided ship it (comment {bad})")
     with pytest.raises(ValueError, match="ruling-citation"):
         kb.add_comment(board, tid, "operator", "Ace decided ship it (comment 999999)")
+
+
+def _with_merge_hold_rule(home):
+    target = home / "scripts/lints/ruling-citation-lint.py"
+    target.write_text(target.read_text() + '''
+
+def merge_hold_body(text):
+    return "BLOCKED by merge-hold-body: x" if "merge-hold:" in text else None
+
+_citation_only = check_fields
+
+def check_fields(fields, comment_cites):
+    held = next((merge_hold_body(t) for n, t in fields if n == "body" and merge_hold_body(t)), None)
+    return held or _citation_only(fields, comment_cites)
+''')
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_merge_hold_body_survives_ruling_citation_off(board, monkeypatch, disabled):
+    """t_d478320e: RULING_CITATION_LINT=0 turns off the citation rule, not the checker's merge-hold-body rule."""
+    from hermes_cli import kanban_ruling_citation as guard
+    _with_merge_hold_rule(guard._fleet_root())
+    if disabled:
+        monkeypatch.setenv("RULING_CITATION_LINT", "0")
+    tid = kb.create_task(board, title="scratch", assignee="human", require_home=False)
+    with pytest.raises(ValueError, match="merge-hold-body"):
+        kb.create_task(board, title="t", body="merge-hold: operator read first", assignee="human",
+                       require_home=False)
+    with pytest.raises(ValueError, match="merge-hold-body"):
+        kb.edit_task(board, tid, body="merge-hold: operator read first")
+    # Comments are not judged by the body rule; the uncited claim passes only with the citation rule off.
+    assert kb.add_comment(board, tid, "operator", "merge-hold: operator read first")
+    if disabled:
+        assert kb.create_task(board, title="Ace said ship it", body="x", assignee="human", require_home=False)
+
+
+def test_broken_checker_with_ruling_citation_off_still_writes(board, monkeypatch):
+    from hermes_cli import kanban_ruling_citation as guard
+    (guard._fleet_root() / "scripts/lints/ruling-citation-lint.py").write_text("raise RuntimeError('broken')\n")
+    monkeypatch.setenv("RULING_CITATION_LINT", "0")
+    assert kb.create_task(board, title="t", body="merge-hold: x", assignee="human", require_home=False)
