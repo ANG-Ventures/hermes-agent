@@ -544,9 +544,31 @@ def _sandbox_close_daemon(session_name: str) -> None:
         _bt.logger.debug("sandbox browser close for %s failed: %s", session_name, exc)
 
 
-def _sandbox_socket_dir(env) -> str:
+def _sandbox_socket_dir(env, lease_session: str = "") -> str:
+    """The daemon socket dir in the terminal backend. One per login is safe for ``--session <unique>`` commands,
+    but a lease command passes ``--cdp`` and no ``--session`` (agent-browser then uses session "default"), so every
+    lease session gets its own dir: two workers on one login must not share a daemon (t_db945925)."""
     from tools.bot_desktop import sandbox_host
-    return f"{sandbox_host.remote_root(env)}/agent-browser"
+    base = f"{sandbox_host.remote_root(env)}/agent-browser"
+    return f"{base}-{lease_session}" if lease_session else base
+
+
+_lease_socket_dirs: Dict[str, Any] = {}  # remote lease socket dir -> its sandbox env; emptied on lease end
+
+
+def _sandbox_drop_lease_dirs() -> None:
+    """On lease end: stop each lease session's daemon and remove its private socket dir (t_db945925)."""
+    from tools.bot_desktop import sandbox_host
+    from tools.environments import streams
+    while _lease_socket_dirs:
+        sock, env = _lease_socket_dirs.popitem()
+        d = shlex.quote(sock)
+        try:
+            streams.run_in(env, ["bash", "-c", f"p=$(cat {d}/default.pid 2>/dev/null) && ps -p \"$p\" -o command="
+                                 f" | grep -q agent-browser && kill \"$p\"; rm -rf -- {d}"],
+                           user=sandbox_host._user_for(env), timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _bt.logger.debug("lease socket dir cleanup for %s failed: %s", sock, exc)
 
 
 def sandbox_screenshot_path(host_path: "Path") -> Optional[str]:
@@ -655,7 +677,7 @@ def _is_lease_cdp(cdp_url: str) -> bool:
 
 
 def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket_dir: str,
-                  *, screenless: bool = False) -> "tuple[List[str], Dict[str, str]]":
+                  *, screenless: bool = False, session_name: str = "") -> "tuple[List[str], Dict[str, str]]":
     """Rewrite one agent-browser invocation to run inside the sandbox: exec prefix + the CLI by name, with the
     browser-relevant variables exported there (the daemon's socket dir mirrors the host path so the host-side
     liveness probes keep their shape) and a screen-published DISPLAY. Identity on a gateway-hosted screen.
@@ -685,12 +707,14 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
     remote_env = {k: v for k, v in browser_env.items()
                   if k in _SANDBOX_ENV_KEYS and not (screenless and k in _SCREEN_ENV_KEYS)}
     remote_env.update(published)
-    remote_env["AGENT_BROWSER_SOCKET_DIR"] = _sandbox_socket_dir(env)
+    sock = _sandbox_socket_dir(env, session_name if screenless else "")
+    remote_env["AGENT_BROWSER_SOCKET_DIR"] = sock
     remote_env.pop("AGENT_BROWSER_EXECUTABLE_PATH", None)  # the sandbox image's Playwright Chromium, not a host path
     remote_env["AGENT_BROWSER_PROFILE"] = sandbox_host.browser_profile_dir(env)  # persists with the container, not its tmpfs
     remote_env["TMPDIR"] = env.get_temp_dir()
-    if not getattr(env, "_bd_browser_dirs_ready", False):
-        priv = " ".join(shlex.quote(d) for d in (_sandbox_socket_dir(env), f"{sandbox_host.remote_root(env)}/shots"))
+    if not getattr(env, "_bd_browser_dirs_ready", False) or (screenless and sock not in _lease_socket_dirs):
+        dirs = dict.fromkeys((_sandbox_socket_dir(env), sock, f"{sandbox_host.remote_root(env)}/shots"))
+        priv = " ".join(shlex.quote(d) for d in dirs)
         made = streams.run_in(env, ["bash", "-c", f"set -e; {sandbox_host.private_root_sh(env)}; mkdir -p -m 0700 {priv};"
                                     f" for d in {priv}; do [ ! -L \"$d\" ] || {{ echo \"$d is a symlink\" >&2; exit 1; }}; done;"
                                     f" chmod 0700 {priv}; mkdir -p {shlex.quote(remote_env['AGENT_BROWSER_PROFILE'])}"],
@@ -698,6 +722,10 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
         if made.returncode != 0:
             raise RuntimeError(f"could not make the sandbox browser dirs: {made.stderr.decode('utf-8', 'replace')[-500:]}")
         env._bd_browser_dirs_ready = True
+        if screenless:
+            from tools import browser_lease
+            browser_lease.on_lease_end(_sandbox_drop_lease_dirs)
+            _lease_socket_dirs[sock] = env
     remote_env["AGENT_BROWSER_ARGS"] = ",".join(CHROMIUM_SANDBOX_BYPASS_ARGS)  # container: no userns for Chromium's own sandbox
     # cmd_parts = <agent-browser argv0 (+npx spec)> + backend args + command; keep everything after argv0.
     tail = cmd_parts[len(_agent_browser_argv(cmd_parts[0])):]
@@ -783,7 +811,8 @@ def _spawn_and_collect(
 
     stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
     stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
-    cmd_parts, browser_env = _sandbox_wrap(cmd_parts, browser_env, task_socket_dir, screenless=screenless)
+    cmd_parts, browser_env = _sandbox_wrap(cmd_parts, browser_env, task_socket_dir, screenless=screenless,
+                                           session_name=session_info["session_name"])
     proc = _popen_agent_browser(cmd_parts, browser_env, task_socket_dir, command, stdin_payload)
 
     try:
