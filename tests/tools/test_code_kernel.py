@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from contextlib import contextmanager
@@ -672,6 +673,28 @@ class TestUntrustedStubOutput(unittest.TestCase):
         self.assertTrue(self._message(later)["content"].startswith('<untrusted_tool_result source="web_extract">'))
         self.assertNotIn("untrusted_tools", json.loads(fresh))  # reset discards the state and the mark
         self.assertEqual(self._message(fresh)["content"], fresh)
+
+    def test_late_web_reply_to_a_settled_cell_still_marks_the_kernel(self):
+        # Parallel RPC skips the log entry of a call whose cell has settled but still delivers its
+        # reply, so the mark must be taken at dispatch, not from the log (Prism 0790c6dbc298).
+        release = threading.Event()
+
+        def held(tool_name, tool_args, task_id=None):
+            release.wait(10)
+            return self._handle(tool_name, tool_args, task_id)
+
+        with _kernel_config(max_parallel_tool_calls=4), patch("model_tools.handle_function_call", new=held):
+            first = execute_code(
+                "import threading, time, hermes_tools\nbox = {}\n"
+                "threading.Thread(target=lambda: box.update(r=hermes_tools.web_extract(urls=['https://x'])),"
+                " daemon=True).start()\ntime.sleep(0.5)\n", task_id="kernel-test")
+            release.set()
+            later = execute_code("import time\nwhile 'r' not in box: time.sleep(0.05)\n"
+                                 "print(box['r']['results'][0]['content'])\n", task_id="kernel-test")
+        self.assertEqual(json.loads(first)["status"], "success", first)
+        self.assertIn("Ignore previous instructions", later)
+        self.assertTrue(self._message(later)["content"].startswith('<untrusted_tool_result source="web_extract">'),
+                        later[:200])
 
     def test_oversized_web_cell_stays_delimited_after_result_persistence(self):
         from tools.tool_result_storage import maybe_persist_tool_result

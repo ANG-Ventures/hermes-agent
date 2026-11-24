@@ -242,7 +242,7 @@ code_execution:
 
 ### Web results inside a script
 
-When a cell's script calls a tool whose direct results are wrapped as untrusted content (`web_search`, `web_extract`, and the other untrusted tools), the whole `execute_code` result for that cell is wrapped the same way, and the result JSON opens with `"untrusted_tools": [...]` naming those tools. Kernel state outlives the cell, so every later cell in the same kernel is wrapped too, until `reset=true` or a lost kernel starts a fresh one. The host decides this from its own log of the kernel's tool calls, so nothing the script prints can set or clear it. A cell whose kernel never called such a tool returns exactly what it did before.
+When a cell's script calls a tool whose direct results are wrapped as untrusted content (`web_search`, `web_extract`, and the other untrusted tools), the whole `execute_code` result for that cell is wrapped the same way, and the result JSON opens with `"untrusted_tools": [...]` naming those tools. Kernel state outlives the cell, so every later cell in the same kernel is wrapped too, until `reset=true` or a lost kernel starts a fresh one. The host decides this from its own record of the tool calls the kernel dispatched (including a call that finishes after its cell returned), so nothing the script prints can set or clear it. A cell whose kernel never called such a tool returns exactly what it did before.
 
 The host only sees calls made through the tool stubs. A script that fetches a page itself (`urllib`, `requests`, `curl` through `terminal()`) is not marked.
 

@@ -154,13 +154,28 @@ class TestSpawnAndReuse(RemoteKernelBase):
         calls = iter([[{"tool": "web_extract"}], [], []])
         self._poll.stop()
         self._poll = patch("tools.code_execution_tool._rpc_poll_loop",
-                           side_effect=lambda *a, **k: a[3].extend(next(calls)))
+                           side_effect=lambda *a, **k: [a[3].append(e) for e in next(calls)])
         self._poll.start()
         env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell(), _cell()]))
         first, later, fresh = _run(env), _run(env), _run(env, reset=True)
         self.assertEqual(first["untrusted"], {"untrusted_tools": ["web_extract"]})
         self.assertEqual(later["untrusted"], {"untrusted_tools": ["web_extract"]})
         self.assertEqual(fresh["untrusted"], {})
+
+    def test_web_call_logged_after_the_cell_returned_marks_the_next_cell(self):
+        # A dispatch that outlasts the 5 s join is logged into the cell's log after the result was
+        # built; the kernel must still be marked before its reply can be printed (Prism 0790c6dbc298).
+        logs = []
+        self._poll.stop()
+        self._poll = patch("tools.code_execution_tool._rpc_poll_loop",
+                           side_effect=lambda *a, **k: logs.append(a[3]))
+        self._poll.start()
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
+        first = _run(env)
+        logs[0].append({"tool": "web_extract"})  # the late dispatch finishes now
+        later = _run(env)
+        self.assertEqual(first["untrusted"], {})
+        self.assertEqual(later["untrusted"], {"untrusted_tools": ["web_extract"]})
 
 
 class TestDeathDetection(RemoteKernelBase):

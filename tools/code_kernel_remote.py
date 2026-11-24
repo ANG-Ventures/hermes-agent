@@ -370,11 +370,25 @@ def execute_in_remote_kernel(
             kernel.last_used = time.monotonic()
 
 
+class _MarkingLog(list):
+    """A cell's tool-call log that also marks its kernel on each untrusted entry. The poll loop logs a
+    call before it writes the reply, so a call that outlives the cell's join still marks the kernel."""
+
+    def __init__(self, kernel: "RemoteKernel"):
+        super().__init__()
+        self.kernel = kernel
+
+    def append(self, entry) -> None:
+        from agent.tool_dispatch_helpers import _is_untrusted_tool
+        if isinstance(entry, dict) and _is_untrusted_tool(entry.get("tool")):
+            self.kernel.untrusted_calls.append({"tool": entry["tool"]})
+        super().append(entry)
+
+
 def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task_env_id: str,
                        sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
                        reused: bool, state_reset: bool, state_lost: bool) -> Dict[str, Any]:
     from tools.code_execution_rpc import tool_errors_since
-    from agent.tool_dispatch_helpers import EXECUTE_CODE_UNTRUSTED_KEY
     from tools.code_execution_tool import _rpc_poll_loop, _untrusted_marker
     from tools.thread_context import propagate_context_to_thread
     # Clean stale tool-RPC requests from a previous cell before arming this cell's poll loop, so
@@ -384,7 +398,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
         kernel.sh(f"rm -f {q_rpc}/req_* {q_rpc}/res_*", timeout=10)
     except Exception:
         pass
-    tool_call_counter, tool_call_log, stop_event = [0], [], threading.Event()
+    tool_call_counter, tool_call_log, stop_event = [0], _MarkingLog(kernel), threading.Event()
     # Per-cell RPC thread carrying THIS call's approval/session context — the remote analogue
     # of CellAuthority: authority lives exactly as long as the cell's poll loop.
     rpc_thread = threading.Thread(
@@ -407,7 +421,6 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
         stop_event.set()
         rpc_thread.join(timeout=5)
     kernel_info: Dict[str, Any] = {"reused": reused, "remote": True}
-    kernel.untrusted_calls.extend({"tool": name} for name in _untrusted_marker(tool_call_log).get(EXECUTE_CODE_UNTRUSTED_KEY, ()))
     result: Dict[str, Any] = {
         "status": "error", "stdout": cell_payload.get("stdout", ""), "stderr": cell_payload.get("stderr", ""),
         "traceback": cell_payload.get("traceback", ""), "tool_calls_made": tool_call_counter[0], "kernel": kernel_info,
