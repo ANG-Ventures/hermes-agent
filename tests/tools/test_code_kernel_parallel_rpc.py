@@ -16,8 +16,6 @@ from unittest.mock import patch
 
 import pytest
 
-os.environ["TERMINAL_ENV"] = "local"
-
 from tools.code_execution_tool import execute_code
 from tools.code_kernel import shutdown_all_kernels
 
@@ -221,6 +219,134 @@ def test_description_pins_batching_web_stub_and_parallel_guidance():
     assert "Do not wrap a single call or a two-call lookup in a script" in description
     assert ("Fetch web content in a script only through web_search/web_extract, never a direct HTTP "
             "client") in description
-    assert "Stub calls run in parallel: parallel(fn1, fn2, ...)" in description
+    assert "parallel(fn1, fn2, ...)" in description
+    assert "max_parallel_tool_calls" in description  # overlap is qualified: cap 1 / remote stay serial
     no_web = build_execute_code_schema({"terminal", "read_file"}, mode="project")["description"]
     assert "web_extract" not in no_web
+
+
+def test_unparseable_cap_falls_back_to_default():
+    from tools.code_execution_tool import DEFAULT_MAX_PARALLEL_TOOL_CALLS, _max_parallel_tool_calls
+
+    for bad in (float("inf"), float("nan"), "x", None):
+        assert _max_parallel_tool_calls({"max_parallel_tool_calls": bad}) == DEFAULT_MAX_PARALLEL_TOOL_CALLS
+
+
+# ---- RPC server against a bare kernel (no child process) -------------------------------------
+
+class _Authority:
+    """Stand-in CellAuthority: records every dispatch it actually runs."""
+
+    def __init__(self, delay=0.0):
+        self.active, self.delay, self.lock = True, delay, threading.Lock()
+        self.ran, self.inflight, self.peak = [], 0, 0
+
+    def dispatch(self, tool_name, tool_args, *, isolated=False):
+        with self.lock:
+            self.inflight += 1
+            self.peak = max(self.peak, self.inflight)
+            self.ran.append(tool_args.get("query"))
+        try:
+            time.sleep(self.delay)
+            return json.dumps({"echo": tool_args.get("query")})
+        finally:
+            with self.lock:
+                self.inflight -= 1
+
+    def dispatch_isolated(self, tool_name, tool_args):
+        return self.dispatch(tool_name, tool_args, isolated=True)
+
+
+@contextmanager
+def _bare_kernel(max_parallel):
+    import socket as _socket
+    from tools.code_kernel import SessionKernel, _bind_rpc_socket, _rpc_forever
+
+    kernel = SessionKernel(("owner", "strict"))
+    endpoint = _bind_rpc_socket(kernel)
+    kernel.rpc_token = "tok"
+    server = threading.Thread(target=_rpc_forever, daemon=True,
+                              args=(kernel, 50, frozenset({"web_search"}), max_parallel))
+    server.start()
+
+    def connect():
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.connect(endpoint)
+        return s
+    try:
+        yield kernel, connect
+    finally:
+        kernel.stop_event.set()
+        server.join(5)
+        kernel.server_sock.close()
+        os.unlink(endpoint)
+
+
+def _send(sock, *queries):
+    for q in queries:
+        sock.sendall((json.dumps({"id": q, "tool": "web_search", "args": {"query": q},
+                                  "token": "tok"}) + "\n").encode())
+
+
+def _replies(sock, n):
+    buf, out = b"", {}
+    sock.settimeout(10)
+    while len(out) < n:
+        chunk = sock.recv(65536)
+        assert chunk, out
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            reply = json.loads(line)
+            out[reply["id"]] = reply["result"]
+    return out
+
+
+def test_cap_holds_across_a_reconnect():
+    """Calls still running from a dropped connection count against the per-kernel cap."""
+    authority = _Authority(delay=0.6)
+    with _bare_kernel(2) as (kernel, connect):
+        kernel.cell_authority = authority
+        first = connect()
+        _send(first, "a", "b")
+        time.sleep(0.2)
+        first.close()
+        second = connect()
+        _send(second, "c", "d")
+        assert set(_replies(second, 2)) == {"c", "d"}
+        second.close()
+    assert authority.peak == 2, authority.peak
+
+
+def test_queued_requests_do_not_each_get_a_thread():
+    authority = _Authority(delay=0.6)
+    with _bare_kernel(2) as (kernel, connect):
+        kernel.cell_authority = authority
+        sock = connect()
+        _send(sock, *[f"q{i}" for i in range(6)])
+        time.sleep(0.3)
+        rpc_threads = [t for t in threading.enumerate() if t.name.startswith("hermes-rpc")]
+        assert len(_replies(sock, 6)) == 6
+        sock.close()
+    assert len(rpc_threads) <= 2, [t.name for t in rpc_threads]
+
+
+def test_call_arriving_with_no_cell_is_refused_not_run_under_the_next_cell():
+    """A request admitted while no cell authority is installed is refused, even if a cell
+    installs its authority before a worker picks the request up."""
+    old, new = _Authority(delay=0.6), _Authority()
+    with _bare_kernel(2) as (kernel, connect):
+        kernel.cell_authority = old
+        sock = connect()
+        _send(sock, "busy1", "busy2")       # both slots taken
+        time.sleep(0.2)
+        with kernel.rpc_lock:
+            kernel.cell_authority = None    # cell settled
+        _send(sock, "orphan")               # admitted with no authority, waits for a slot
+        time.sleep(0.1)
+        with kernel.rpc_lock:
+            kernel.cell_authority = new     # next cell starts before a slot frees
+        replies = _replies(sock, 3)
+        sock.close()
+    assert new.ran == [], new.ran
+    assert "No active execute_code cell" in replies["orphan"], replies["orphan"]

@@ -9,6 +9,7 @@ files via ``env.execute()``.
 import base64
 import json
 import logging
+import queue
 import secrets
 import shlex
 import socket
@@ -156,17 +157,39 @@ def tool_errors_since(tool_call_log: list, start: int = 0) -> list:
     return [{"tool": e["tool"], "error": e["error"]} for e in tool_call_log[start:] if e.get("error")][:5]
 
 
+class CallPool:
+    """``size`` daemon workers draining one queue: the per-kernel in-flight cap. Shared by every
+    connection of the kernel, so calls still running from a dropped connection count against it,
+    and a queued request holds no thread."""
+
+    def __init__(self, size: int):
+        self._q: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._size = size
+        for _ in range(size):
+            threading.Thread(target=self._work, daemon=True, name="hermes-rpc-call").start()
+
+    def _work(self) -> None:
+        while (job := self._q.get()) is not None:
+            job()
+
+    def submit(self, job) -> None:
+        self._q.put(job)
+
+    def close(self) -> None:
+        for _ in range(self._size):
+            self._q.put(None)
+
+
 def _serve_parallel(conn: socket.socket, *, allowed_tools: frozenset, tool_call_counter: list,
-                    max_tool_calls: int, tool_call_log: list, rpc_token: str, max_parallel: int,
+                    max_tool_calls: int, tool_call_log: list, rpc_token: str, pool: CallPool,
                     bind, budget_lock) -> None:
     """Serve id-tagged requests ``{"id", "tool", "args", "token"}`` concurrently; each reply is
     ``{"id", "result"}`` and may arrive in any order. Token, allow-list and budget are decided
     on this reader thread, in arrival order; the budget slot is reserved under ``budget_lock``
     together with ``bind()``, which snapshots the dispatch target (session kernels: the cell
-    authority current at ARRIVAL) and a ``current()`` predicate. Up to ``max_parallel`` workers
-    dispatch at once. A call whose binding is no longer current when it finishes is not logged,
+    authority current at ARRIVAL) and a ``current()`` predicate. ``pool`` runs the dispatches. A call whose binding is no longer current when it finishes is not logged,
     so a late call never shows up in a later cell's ``tool_errors``."""
-    send_lock, slots, inflight = threading.Lock(), threading.BoundedSemaphore(max_parallel), [0]
+    send_lock, inflight = threading.Lock(), [0]
 
     def reply(req_id, resp: str) -> None:
         line = json.dumps({"id": req_id, "result": resp}, ensure_ascii=False) + "\n"
@@ -178,8 +201,7 @@ def _serve_parallel(conn: socket.socket, *, allowed_tools: frozenset, tool_call_
 
     def work(req_id, tool_name, tool_args, dispatch, current, call_start) -> None:
         try:
-            with slots:
-                result = _dispatch_one(dispatch, tool_name, tool_args, "sandbox")
+            result = _dispatch_one(dispatch, tool_name, tool_args, "sandbox")
             with budget_lock:
                 if current():
                     tool_call_log.append(_log_entry(tool_name, tool_args, result, call_start))
@@ -230,20 +252,19 @@ def _serve_parallel(conn: socket.socket, *, allowed_tools: frozenset, tool_call_
                 reply(req_id, refusal)
                 continue
             _strip_blocked_params(tool_name, tool_args)
-            threading.Thread(target=work, daemon=True, name="hermes-rpc-call",
-                             args=(req_id, tool_name, tool_args, dispatch, current, call_start)).start()
+            pool.submit(lambda job=(req_id, tool_name, tool_args, dispatch, current, call_start): work(*job))
 
 
 def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: list,
                      tool_call_counter: list, max_tool_calls: int, allowed_tools: frozenset,
                      stop_event: threading.Event, rpc_token: str, dispatch=None, *,
-                     max_parallel: int = 1, bind=None, budget_lock=None):
+                     pool: "CallPool | None" = None, bind=None, budget_lock=None):
     """Accept one client and serve newline-delimited JSON requests until it disconnects, idles
     300s, or the call limit is reached. ``tool_call_counter`` is a mutable ``[int]``. ``dispatch``
     overrides how an allowed, budgeted call runs: per-call sandboxes use the default (the thread
     carries the cell's context); session kernels rebind each call to the CURRENT cell's authority.
-    ``max_parallel`` > 1 switches to the id-tagged concurrent protocol (``_serve_parallel``);
-    1 is the original one-request-at-a-time wire.
+    A ``pool`` (with ``bind`` and ``budget_lock``) switches to the id-tagged concurrent protocol
+    (``_serve_parallel``); without one this is the original one-request-at-a-time wire.
     """
     if dispatch is None:
         dispatch = _default_dispatch(task_id)
@@ -259,12 +280,10 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
         if conn is None:
             return
         conn.settimeout(300)
-        if max_parallel > 1:
+        if pool is not None:
             _serve_parallel(conn, allowed_tools=allowed_tools, tool_call_counter=tool_call_counter,
                             max_tool_calls=max_tool_calls, tool_call_log=tool_call_log,
-                            rpc_token=rpc_token, max_parallel=max_parallel,
-                            bind=bind or (lambda: (dispatch, lambda: True)),
-                            budget_lock=budget_lock or threading.Lock())
+                            rpc_token=rpc_token, pool=pool, bind=bind, budget_lock=budget_lock)
             return
         buf = b""
         while True:

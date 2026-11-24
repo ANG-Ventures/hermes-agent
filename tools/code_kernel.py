@@ -499,26 +499,34 @@ def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
     its 300s idle timeout, and a kernel idles longer between cells, so re-accept until teardown
     (the client stub reconnects: HERMES_RPC_PERSISTENT). The serving thread carries NO frozen
     authority — every dispatch routes through the CURRENT cell's ``CellAuthority``."""
-    from tools.code_execution_rpc import _rpc_server_loop
+    from tools.code_execution_rpc import CallPool, _rpc_server_loop
     from tools.registry import tool_error
     def _dispatch(tool_name: str, tool_args: dict) -> str:
         authority = kernel.cell_authority
         if authority is None:
             return tool_error("No active execute_code cell: this kernel has no cell authority installed.")
         return authority.dispatch(tool_name, tool_args)
+    def _no_cell(tool_name: str, tool_args: dict) -> str:
+        return tool_error("No active execute_code cell: this kernel has no cell authority installed.")
     def _bind():
         # Concurrent path: snapshot the authority at ARRIVAL. A call queued behind the cap
         # when its cell settles dispatches into that (retired) authority and is refused,
-        # never run under the next cell's authority or budget.
+        # never run under the next cell's authority or budget; one that arrives with no cell
+        # is bound to a fixed refusal, never to a later lookup.
         authority = kernel.cell_authority
         if authority is None:
-            return _dispatch, lambda: False
+            return _no_cell, lambda: False
         return authority.dispatch_isolated, lambda: authority.active
-    while not kernel.stop_event.is_set():
-        _rpc_server_loop(kernel.server_sock, "", kernel.tool_call_log, kernel.tool_call_counter,
-                         max_tool_calls, sandbox_tools, kernel.stop_event, kernel.rpc_token,
-                         dispatch=_dispatch, max_parallel=max_parallel, bind=_bind,
-                         budget_lock=kernel.rpc_lock)
+    # One pool per kernel: the cap holds across reconnects, and a queued call holds no thread.
+    pool = CallPool(max_parallel) if max_parallel > 1 else None
+    try:
+        while not kernel.stop_event.is_set():
+            _rpc_server_loop(kernel.server_sock, "", kernel.tool_call_log, kernel.tool_call_counter,
+                             max_tool_calls, sandbox_tools, kernel.stop_event, kernel.rpc_token,
+                             dispatch=_dispatch, pool=pool, bind=_bind, budget_lock=kernel.rpc_lock)
+    finally:
+        if pool is not None:
+            pool.close()
 
 
 def _stdout_reader(kernel: SessionKernel) -> None:

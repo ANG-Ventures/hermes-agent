@@ -995,7 +995,7 @@ def _max_parallel_tool_calls(cfg: dict) -> int:
     spawn: a changed value applies to the next kernel (``reset=true`` or a new session)."""
     try:
         return max(1, int(cfg.get("max_parallel_tool_calls", DEFAULT_MAX_PARALLEL_TOOL_CALLS)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_MAX_PARALLEL_TOOL_CALLS
 
 
@@ -1123,8 +1123,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         f"Available via `from agent_tools import ...` (alias of the generated RPC stub module):\n\n"
         f"{tool_lines}\n\n"
         f"{web_note}"
-        "Stub calls run in parallel: parallel(fn1, fn2, ...) runs them concurrently and returns "
-        "results in order; calls from your own threads also overlap.\n\n"
+        "Stub calls run in parallel on a local kernel, up to code_execution.max_parallel_tool_calls "
+        "(default 4): parallel(fn1, fn2, ...) returns results in order; calls from your own threads "
+        "also overlap.\n\n"
         "Limits: 5-minute timeout, max 50 tool calls per call. Stdout over "
         "50KB shows head/tail inline; the FULL text is auto-saved to a file whose path rides in the result.\n\n"
         f"{cwd_note}\n\n"
