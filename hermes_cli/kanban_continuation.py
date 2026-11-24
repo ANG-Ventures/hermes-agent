@@ -236,20 +236,57 @@ def remote_run_host(conn, task_id: str) -> Optional[str]:
 
 
 def _ran_on_studio_at_current_path(conn, task_id: str) -> bool:
-    """True when a run of the card executed on the Studio since its path was last reassigned.
+    """True when any card that held the current path ran on the Studio while holding it.
 
-    ``drop_origin`` is the only in-place path change; a Studio run before it
-    used the abandoned dir. Runs with a NULL host never spawned (or predate
-    host recording) and are not counted.
+    The path is held from the card's latest ``origin_dropped`` (the only
+    in-place path change) to now, and back through the ``--continues`` chain:
+    each source held it up to its ``workspace_transferred`` event (Prism
+    e641269822db). Run order against those events is by event id, so a run
+    in the same second as the event is placed exactly (Prism c920880fe89d);
+    a run with no events falls back to ``started_at`` and a tie counts
+    (fail closed: the stranded refusal stays). Runs with a NULL host never
+    spawned (or predate host recording) and are not counted.
     """
-    dropped = conn.execute(
-        "SELECT MAX(created_at) FROM task_events WHERE task_id=? AND kind='origin_dropped'", (task_id,),
-    ).fetchone()
-    since = int(dropped[0] or 0) if dropped else 0
-    return conn.execute(
-        "SELECT 1 FROM task_runs WHERE task_id=? AND LOWER(host)=? AND started_at>=? LIMIT 1",
-        (task_id, STUDIO, since),
-    ).fetchone() is not None
+    card, upper, seen = task_id, None, set()
+    while card and card not in seen and len(seen) < 32:
+        seen.add(card)
+        lower = conn.execute(
+            "SELECT id, created_at FROM task_events WHERE task_id=? AND kind='origin_dropped'"
+            " AND id<? ORDER BY id DESC LIMIT 1",
+            (card, upper[0] if upper else 2**62),
+        ).fetchone()
+        for run_id, started in conn.execute(
+            "SELECT id, COALESCE(started_at, 0) FROM task_runs WHERE task_id=? AND LOWER(host)=?",
+            (card, STUDIO),
+        ).fetchall():
+            first = conn.execute(
+                "SELECT MIN(id) FROM task_events WHERE task_id=? AND run_id=?", (card, run_id),
+            ).fetchone()[0]
+            after = lower is None or (first > lower[0] if first is not None else started >= lower[1])
+            before = upper is None or (first < upper[0] if first is not None else started <= upper[1])
+            if after and before:
+                return True
+        if lower is not None:
+            return False  # the path began at that drop; earlier holders used another dir
+        cont = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='continues' ORDER BY id DESC LIMIT 1",
+            (card,),
+        ).fetchone()
+        try:
+            parent = json.loads(cont[0]).get("parent") if cont else None
+        except (TypeError, ValueError, AttributeError):
+            parent = None
+        if not parent:
+            return False
+        upper = conn.execute(
+            "SELECT id, created_at FROM task_events WHERE task_id=? AND kind='workspace_transferred'"
+            " AND json_extract(payload, '$.to')=? ORDER BY id DESC LIMIT 1",
+            (parent, card),
+        ).fetchone()
+        if upper is None:
+            return True  # a chain we cannot place: keep the refusal
+        card = parent
+    return False
 
 
 def restore_remote_placeholder(conn, task) -> Optional[str]:
