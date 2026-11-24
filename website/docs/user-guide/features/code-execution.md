@@ -240,6 +240,12 @@ code_execution:
   max_parallel_tool_calls: 4   # in-flight tool calls per kernel; 1 = serial
 ```
 
+### Web results inside a script
+
+When a cell's script calls a tool whose direct results are wrapped as untrusted content (`web_search`, `web_extract`, and the other untrusted tools), the whole `execute_code` result for that cell is wrapped the same way, and the result JSON opens with `"untrusted_tools": [...]` naming those tools. The host decides this from its own log of the cell's tool calls, so nothing the script prints can set or clear it. A cell that called no such tool returns exactly what it did before.
+
+The host only sees calls made through the tool stubs. A script that fetches a page itself (`urllib`, `requests`, `curl` through `terminal()`) is not marked.
+
 ## Error Handling
 
 When a script fails, the agent receives structured error information:

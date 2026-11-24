@@ -833,7 +833,9 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
     stdout_text, stdout_metadata = _truncate_stdout_text(clean(str(payload.get("stdout", "")) + kernel.raw.drain()))
     cell_stderr = clean(str(payload.get("stderr", "")) + stderr_raw)
     cell_status = payload.get("status", "")
+    from tools.code_execution_tool import _untrusted_marker
     result: Dict[str, Any] = {
+        **_untrusted_marker(kernel.tool_call_log, kernel.cell_log_start),
         "status": status, "output": stdout_text, "exit_code": 0,
         "tool_calls_made": kernel.tool_call_counter[0], "duration_seconds": duration,
         "kernel": {"mode": "session", "reused": reused,

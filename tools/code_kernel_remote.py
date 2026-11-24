@@ -372,7 +372,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
                        sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
                        reused: bool, state_reset: bool, state_lost: bool) -> Dict[str, Any]:
     from tools.code_execution_rpc import tool_errors_since
-    from tools.code_execution_tool import _rpc_poll_loop
+    from tools.code_execution_tool import _rpc_poll_loop, _untrusted_marker
     from tools.thread_context import propagate_context_to_thread
     # Clean stale tool-RPC requests from a previous cell before arming this cell's poll loop, so
     # a background thread the last cell leaked cannot smuggle a call into this authority window.
@@ -407,7 +407,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
     result: Dict[str, Any] = {
         "status": "error", "stdout": cell_payload.get("stdout", ""), "stderr": cell_payload.get("stderr", ""),
         "traceback": cell_payload.get("traceback", ""), "tool_calls_made": tool_call_counter[0], "kernel": kernel_info,
-        "tool_errors": tool_errors_since(tool_call_log),
+        "tool_errors": tool_errors_since(tool_call_log), "untrusted": _untrusted_marker(tool_call_log),
     }
     if cell_status in ("timeout", "protocol-error", "no-result"):
         # No safe way to interrupt one cell in place (same contract as local): kill, report, respawn.
