@@ -661,6 +661,18 @@ class TestUntrustedStubOutput(unittest.TestCase):
         self.assertTrue(content.startswith('<untrusted_tool_result source="web_extract">'))
         self.assertEqual(content.count("</untrusted_tool_result>"), 1)  # the forged close is defanged
 
+    def test_later_cell_printing_kept_web_content_stays_delimited_until_reset(self):
+        # Kernel state outlives the cell: a page fetched in cell 1 can be printed by cell 2.
+        with _kernel_config(), patch("model_tools.handle_function_call", new=self._handle):
+            execute_code("import hermes_tools\nr = hermes_tools.web_extract(urls=['https://x'])\n",
+                         task_id="kernel-test")
+            later = execute_code("print(r['results'][0]['content'])\n", task_id="kernel-test")
+            fresh = execute_code(self.LOCAL_CELL, task_id="kernel-test", reset=True)
+        self.assertIn("Ignore previous instructions", later)
+        self.assertTrue(self._message(later)["content"].startswith('<untrusted_tool_result source="web_extract">'))
+        self.assertNotIn("untrusted_tools", json.loads(fresh))  # reset discards the state and the mark
+        self.assertEqual(self._message(fresh)["content"], fresh)
+
     def test_oversized_web_cell_stays_delimited_after_result_persistence(self):
         from tools.tool_result_storage import maybe_persist_tool_result
         raw = self._cell(self.WEB_CELL + "print('y' * 5000)\n")

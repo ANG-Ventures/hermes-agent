@@ -149,6 +149,19 @@ class TestSpawnAndReuse(RemoteKernelBase):
         self.assertFalse(result["kernel"]["reused"])
         self.assertEqual(sum(1 for c in env.commands if "nohup" in c), 2)
 
+    def test_untrusted_mark_outlives_the_cell_until_reset(self):
+        # Cell 1 calls web_extract; cell 2 (no call) can print what cell 1 kept in kernel state (t_8c7ce09e).
+        calls = iter([[{"tool": "web_extract"}], [], []])
+        self._poll.stop()
+        self._poll = patch("tools.code_execution_tool._rpc_poll_loop",
+                           side_effect=lambda *a, **k: a[3].extend(next(calls)))
+        self._poll.start()
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell(), _cell()]))
+        first, later, fresh = _run(env), _run(env), _run(env, reset=True)
+        self.assertEqual(first["untrusted"], {"untrusted_tools": ["web_extract"]})
+        self.assertEqual(later["untrusted"], {"untrusted_tools": ["web_extract"]})
+        self.assertEqual(fresh["untrusted"], {})
+
 
 class TestDeathDetection(RemoteKernelBase):
     def test_dead_kernel_is_reported_and_respawned(self):

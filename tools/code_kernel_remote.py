@@ -123,6 +123,8 @@ class RemoteKernel:
     attached: int = 0
     # Owned by a live delegate_task child: exempt from LRU eviction (the child's teardown disposes it).
     pinned: bool = False
+    # Untrusted tool calls any cell of this kernel made (state outlives the cell): marks every later cell.
+    untrusted_calls: List[Dict[str, Any]] = field(default_factory=list)
 
     def sh(self, cmd: str, timeout: int = 15) -> str:
         return _sh(self.env, cmd, timeout)
@@ -372,6 +374,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
                        sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
                        reused: bool, state_reset: bool, state_lost: bool) -> Dict[str, Any]:
     from tools.code_execution_rpc import tool_errors_since
+    from agent.tool_dispatch_helpers import EXECUTE_CODE_UNTRUSTED_KEY
     from tools.code_execution_tool import _rpc_poll_loop, _untrusted_marker
     from tools.thread_context import propagate_context_to_thread
     # Clean stale tool-RPC requests from a previous cell before arming this cell's poll loop, so
@@ -404,10 +407,11 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
         stop_event.set()
         rpc_thread.join(timeout=5)
     kernel_info: Dict[str, Any] = {"reused": reused, "remote": True}
+    kernel.untrusted_calls.extend({"tool": name} for name in _untrusted_marker(tool_call_log).get(EXECUTE_CODE_UNTRUSTED_KEY, ()))
     result: Dict[str, Any] = {
         "status": "error", "stdout": cell_payload.get("stdout", ""), "stderr": cell_payload.get("stderr", ""),
         "traceback": cell_payload.get("traceback", ""), "tool_calls_made": tool_call_counter[0], "kernel": kernel_info,
-        "tool_errors": tool_errors_since(tool_call_log), "untrusted": _untrusted_marker(tool_call_log),
+        "tool_errors": tool_errors_since(tool_call_log), "untrusted": _untrusted_marker(kernel.untrusted_calls),
     }
     if cell_status in ("timeout", "protocol-error", "no-result"):
         # No safe way to interrupt one cell in place (same contract as local): kill, report, respawn.

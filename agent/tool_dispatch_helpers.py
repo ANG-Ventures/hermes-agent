@@ -631,13 +631,8 @@ _EXECUTE_CODE_UNTRUSTED_RE = re.compile(
 def _execute_code_trust_name(content: Any) -> Optional[str]:
     """The first untrusted tool an execute_code cell called, read from the host-set key, else None."""
     match = _EXECUTE_CODE_UNTRUSTED_RE.match(content) if isinstance(content, str) else None
-    if match is None:
-        return None
-    try:
-        names = json.loads(match.group(1))
-    except ValueError:
-        return None
-    return next((n for n in names if isinstance(n, str) and _is_untrusted_tool(n)), None)
+    names = json.loads(match.group(1)) if match else None  # host-built by _untrusted_marker, already filtered
+    return names[0] if names else None
 
 
 def _trust_name(name: Optional[str], call_args: Optional[dict], content: Any = None) -> Optional[str]:

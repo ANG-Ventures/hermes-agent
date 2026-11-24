@@ -835,7 +835,9 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
     cell_status = payload.get("status", "")
     from tools.code_execution_tool import _untrusted_marker
     result: Dict[str, Any] = {
-        **_untrusted_marker(kernel.tool_call_log, kernel.cell_log_start),
+        # Whole kernel log, not this cell's: state outlives the cell, so a page an earlier cell fetched
+        # can be printed by this one. A reset or a dead kernel starts a new log.
+        **_untrusted_marker(kernel.tool_call_log),
         "status": status, "output": stdout_text, "exit_code": 0,
         "tool_calls_made": kernel.tool_call_counter[0], "duration_seconds": duration,
         "kernel": {"mode": "session", "reused": reused,
