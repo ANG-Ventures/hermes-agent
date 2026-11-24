@@ -72,6 +72,7 @@ NEGATIVE = [
     "**Verdict:** FAIL",
     "Final verdict: FAILED",
     "PR o/r#1 is open.\n- **QA verdict**: FAIL on ACE-AI",
+    "__Verdict__: FAIL",
 ]
 # Ordinary green handoffs, including the bare-word FAIL prose the caps-scoped
 # form exists to ignore (385/1392 false positives in 14 d).
@@ -99,6 +100,10 @@ POSITIVE = [
     "Test result FAIL on base, PASS on head.",
     "Done. The QA verdict: FAIL arm is now covered.",
     "prints QA VERDICT: FAIL on a bad gate",
+    "Prints RESULT FAIL on a bad gate.",
+    "Ensure verdict=FAIL is refused.",
+    "Sets gate=DEFERRED while the lease is held.",
+    "The enum result_FAILED is new.",
 ]
 
 
