@@ -550,5 +550,5 @@ def cmd_studio_override(args) -> int:
     if p.get("held_by_other"):
         print(f"kanban studio-override: WARNING {args.task_id}'s latest placement wait is {p['held_by_other']}, "
               f"not a studio_default_deny hold: this override does not release it. Read "
-              f"`hermes kanban placement {args.task_id}` for the rule that holds it", file=sys.stderr)
+              f"`hermes kanban allocation {args.task_id}` for the rule that holds it", file=sys.stderr)
     return 0

@@ -199,7 +199,7 @@ def _notify_priority_starved(
             from hermes_cli.kanban_placement_starvation import fix_for
             if fix_for(h["reason"].split(" (", 1)[0]) is not None:
                 body += (" A structural hold: it will not clear on its own; the card comment "
-                         f"names the body fix (`kanban placement {h['task_id']}`).")
+                         f"names the body fix (`kanban allocation {h['task_id']}`).")
             _kb._log.warning("PHASE=kanban_priority_starved %s", body)
             delivered = None
             if script is not None:

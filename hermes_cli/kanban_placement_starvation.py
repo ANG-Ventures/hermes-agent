@@ -66,7 +66,7 @@ _FIXES = (
      "is not honoured while that edge is live. Fix: drop the pin, or relink the edge "
      "`--kind derived-from` if it is lineage only."),
     ("not_portable:",
-     "a placement rule keeps it off every host that has room. Fix: read `kanban placement <id>` "
+     "a placement rule keeps it off every host that has room. Fix: read `kanban allocation <id>` "
      "and correct the body line that rule names."),
 )
 
@@ -140,7 +140,7 @@ def starved_holds(conn, waits: Mapping[str, str], now: int, *,
 def comment_body(hit: Mapping) -> str:
     return (f"⏳ placement: held `{hit['code']}` for {hit['waited'] // 60} min "
             f"({hit['events']} placement_wait events) and it will not clear on its own: "
-            f"{hit['fix']} Then `kanban placement {hit['task_id']}` shows the new route.")
+            f"{hit['fix']} Then `kanban allocation {hit['task_id']}` shows the new route.")
 
 
 def notify_starved_holds(conn, waits: Mapping[str, str], now: int) -> list[dict]:

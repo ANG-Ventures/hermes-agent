@@ -653,7 +653,7 @@ _SPECS = [
              help="Read-only pool placement view: band, streak and projected() per host, "
                   "and the rung take() would pick now (no probe, no streak advance)"),
         _arg("--fleet", action="store_true",
-             help="With --placement: the fleet view (alias of `kanban placement --fleet`)"),
+             help="With --placement: the fleet view (alias of `kanban allocation --fleet`)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the board named by --board or the DB pin"),
     _cmd("allocation", [
