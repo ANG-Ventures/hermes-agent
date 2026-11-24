@@ -217,21 +217,43 @@ def remote_cleanup_host(conn, task_id):
 
 
 def remote_run_host(conn, task_id: str) -> Optional[str]:
-    """The pool host the card's latest placed run ran on, or None (local or never placed).
+    """The pool host holding the card's scratch tree, or None.
 
-    Its scratch tree lives on that host; the dispatcher's copy of the path is
-    only the placeholder ``resolve_workspace`` made, so a missing local dir
-    there is not a lost mount (t_8721e331).
+    Read from ``tasks.origin_host``, the field enforce-mode placement routes
+    on (:func:`origin_route`), so a restored placeholder and the next
+    placement name the same host (Prism c544a7721690). The dispatcher's copy
+    of the path is only the placeholder ``resolve_workspace`` made, so a
+    missing local dir there is not a lost mount (t_8721e331). None when the
+    card has no remote origin, or when it ran on the Studio at its current
+    path: that dir held real work and its loss stays a stranded refusal
+    (Prism 029eb26d973c).
     """
-    row = conn.execute("SELECT host FROM task_runs WHERE task_id=? AND host IS NOT NULL ORDER BY id DESC LIMIT 1",
-                       (task_id,)).fetchone()
-    if row is None or not row[0] or row[0] == STUDIO:
+    row = conn.execute("SELECT origin_host FROM tasks WHERE id=?", (task_id,)).fetchone()
+    host = row[0] if row else None
+    if not host or host.lower() == STUDIO or _ran_on_studio_at_current_path(conn, task_id):
         return None
-    return row[0]
+    return host
+
+
+def _ran_on_studio_at_current_path(conn, task_id: str) -> bool:
+    """True when a run of the card executed on the Studio since its path was last reassigned.
+
+    ``drop_origin`` is the only in-place path change; a Studio run before it
+    used the abandoned dir. Runs with a NULL host never spawned (or predate
+    host recording) and are not counted.
+    """
+    dropped = conn.execute(
+        "SELECT MAX(created_at) FROM task_events WHERE task_id=? AND kind='origin_dropped'", (task_id,),
+    ).fetchone()
+    since = int(dropped[0] or 0) if dropped else 0
+    return conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id=? AND LOWER(host)=? AND started_at>=? LIMIT 1",
+        (task_id, STUDIO, since),
+    ).fetchone() is not None
 
 
 def restore_remote_placeholder(conn, task) -> Optional[str]:
-    """Re-create the local placeholder of a scratch card whose last run was on a pool host.
+    """Re-create the local placeholder of a scratch card whose tree lives on a pool host.
 
     Returns that host when the placeholder now exists, else None. The path is
     unchanged, so the card's state on its origin host stays bound to it (an
