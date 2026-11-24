@@ -21,7 +21,7 @@ _NEG_ACCEPT = (
 )
 NEG_RESULT_RE = re.compile(
     r"(?i:" + _NEG_ACCEPT + r"|\bnot\s+(?:yet\s+)?proven\b)|\bUNTRUSTED\b"
-    r"|(?i:\b(?:verdict|result|gate))\s*[:=]?\s*(?:FAIL(?:ED)?|DEFERRED)\b"
+    r"|(?i:\b(?:verdict|result|gate))[*_]*\s*[:=]?[*_]*\s*(?:FAIL(?:ED)?|DEFERRED)\b"
 )
 
 
@@ -39,7 +39,10 @@ _VERDICT_LABEL_RE = re.compile(
 _PLEASE_RE = re.compile(r"(?i)\bplease\s*$")
 _NOT_PROVEN_RE = re.compile(r"(?i)\bnot\s+(?:yet\s+)?proven\b")
 _DONT_LAND_RE = re.compile(r"(?i)\b(?:do\s+not|don'?t)\s+(?:merge|land)\b")
-_FAIL_ARM_RE = re.compile(r"(?i:\b(?:verdict|result|gate))\s*[:=]?\s*(?:FAIL(?:ED)?|DEFERRED)\b")
+_FAIL_ARM_RE = re.compile(r"(?i:\b(?:verdict|result|gate))[*_]*\s*[:=]?[*_]*\s*(?:FAIL(?:ED)?|DEFERRED)\b")
+# t_647c2995: a label may carry 1-3 capitalised words in front at a line start ("QA VERDICT: FAIL", "Final verdict:
+# FAILED", "- **QA verdict**: FAIL"), counted only with a colon/= or a caps label, so "Test result FAIL on base" is prose.
+_LABEL_WORDS_RE = re.compile(r"[\s>*_#\-\u2022]*(?:\(?\w{1,3}[.)]\s*)?(?:[A-Z][\w'\-]*\s+){1,3}[*_]*$")
 # The card's own gate named in the sentence before "not proven": "The done criterion is NOT yet proven".
 _GATE_NOUN_RE = re.compile(
     r"(?i)\b(?:accept\w*|done|done-when|card|target|criteri\w*|condition|requirement|goal|item|close\w*|AC\d+)\b"
@@ -61,7 +64,11 @@ def _verdict_position(text: str, m: re.Match) -> bool:
     if _FAIL_ARM_RE.fullmatch(phrase):
         # "Verdict: FAIL" as the line's own label; "prints RESULT FAIL" / "on verdict=FAIL" describe output.
         line_start = text.rfind("\n", 0, m.start()) + 1
-        return bool(_LINE_LEAD_RE.match(text[line_start:m.start()]))
+        lead = text[line_start:m.start()]
+        if _LINE_LEAD_RE.match(lead):
+            return True
+        labelled = bool(re.search(r"[:=]", phrase)) or re.match(r"[A-Za-z]+", phrase).group(0).isupper()
+        return labelled and bool(_LABEL_WORDS_RE.match(lead))
     if _DONT_LAND_RE.fullmatch(phrase):
         # An instruction ("Do not land.", "draft, do not merge"), never a description ("I do not merge").
         prefix = _PLEASE_RE.sub("", prefix)  # "Please do not merge" is the same instruction (Prism 01d8577b1e47)
