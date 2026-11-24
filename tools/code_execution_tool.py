@@ -44,6 +44,9 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
+# In-flight tool calls per local session kernel (code_execution.max_parallel_tool_calls).
+# 1 = the serial one-call-at-a-time wire; > 1 opts in to concurrent stub calls.
+DEFAULT_MAX_PARALLEL_TOOL_CALLS = 1
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 # Hard ceiling on the spilled file (as web_tools' MAX_STORED_TEXT_CHARS): a runaway print loop must not fill the disk.
@@ -150,7 +153,7 @@ _TOOL_STUBS = {
 
 def _missing_hermes_tools_import_hint(m, enabled_tools) -> str:
     missing = m.group(1)
-    if missing in {"json_parse", "shell_quote", "retry"}:
+    if missing in {"json_parse", "shell_quote", "retry", "parallel"}:
         return (f"Import helpers with `from hermes_tools import {missing}`. "
                 "If that import failed, the generated module may be stale or another "
                 "hermes_tools may be first on sys.path. Check hermes_tools.__file__ "
@@ -167,7 +170,7 @@ def _missing_hermes_tools_import_hint(m, enabled_tools) -> str:
 # imports, treating tool results as strings, importing third-party packages absent from the sandbox.
 _FAILURE_HINT_RULES = (
     (r"cannot import name '(\w+)' from 'hermes_tools'", _missing_hermes_tools_import_hint),
-    (r"NameError: name '(json_parse|shell_quote|retry)' is not defined",
+    (r"NameError: name '(json_parse|shell_quote|retry|parallel)' is not defined",
      lambda m, _: f"Import {m.group(1)} before calling it: "
                   f"from hermes_tools import {m.group(1)}"),
     (r"ModuleNotFoundError: No module named '([\w.]+)'",
@@ -248,6 +251,21 @@ def retry(fn, max_attempts=3, delay=2):
                 time.sleep(delay * (2 ** attempt))
     raise last_err
 
+
+def parallel(*calls):
+    """Run zero-argument callables at the same time; return their results in order
+    (the first exception is re-raised). Tool calls overlap up to the host's
+    code_execution.max_parallel_tool_calls (1 = they still run one at a time):
+        a, b = parallel(lambda: terminal("make test"), lambda: read_file("log.txt"))
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    if not calls:
+        return []
+    workers = min(len(calls), max(1, int(os.environ.get("HERMES_RPC_PARALLEL") or 1)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(call) for call in calls]
+        return [future.result() for future in futures]
+
 '''
 
 # ---- UDS transport (local backend) ---------------------------------------
@@ -300,6 +318,8 @@ def _call(tool_name, args):
     # connection can be legitimately gone by the next cell. The server
     # re-accepts (HERMES_RPC_PERSISTENT=1); retry once on a fresh socket.
     _attempts = 2 if os.environ.get("HERMES_RPC_PERSISTENT") == "1" else 1
+    if _PARALLEL_RPC:
+        return _call_parallel(tool_name, args, _attempts)
     with _call_lock:
         for _attempt in range(_attempts):
             try:
@@ -324,7 +344,10 @@ def _call(tool_name, args):
                 _sock = None
                 if _attempt + 1 >= _attempts:
                     raise
-    raw = buf.decode().strip()
+    return _decode(buf.decode().strip())
+
+
+def _decode(raw):
     result = json.loads(raw)
     if isinstance(result, str):
         try:
@@ -332,6 +355,96 @@ def _call(tool_name, args):
         except (json.JSONDecodeError, TypeError):
             return result
     return result
+
+
+# Concurrent wire (opt-in: HERMES_RPC_PARALLEL > 1, set by the host only when
+# code_execution.max_parallel_tool_calls > 1). One shared socket; each request
+# carries an "id" the reply echoes, and a reader thread hands each reply to the
+# thread waiting on it, so _call_lock is not needed on this path.
+_PARALLEL_RPC = int(os.environ.get("HERMES_RPC_PARALLEL") or 1) > 1
+_mux_lock = threading.Lock()   # guards _sock, _mux_pending
+_mux_send_lock = threading.Lock()
+_mux_pending = {}              # id -> [done Event, reply envelope or None, socket, started Event]
+
+
+def _mux_reader(sock):
+    buf = b""
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\\n" in buf:
+                line, buf = buf.split(b"\\n", 1)
+                try:
+                    reply = json.loads(line)
+                except ValueError:
+                    continue
+                with _mux_lock:
+                    slot = _mux_pending.get(reply.get("id")) if isinstance(reply, dict) else None
+                if slot is not None and reply.get("started") is True:
+                    slot[3].set()
+                elif slot is not None:
+                    slot[1] = reply
+                    slot[0].set()
+                    slot[3].set()
+    except OSError:
+        pass
+    finally:
+        global _sock
+        with _mux_lock:
+            if _sock is sock:
+                _sock = None
+            orphans = [s for s in _mux_pending.values() if s[2] is sock]
+        for slot in orphans:  # connection gone: wake every caller still waiting on it
+            slot[0].set()
+            slot[3].set()
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _call_parallel(tool_name, args, attempts):
+    global _sock
+    for _attempt in range(attempts):
+        req_id = os.urandom(8).hex()
+        slot = [threading.Event(), None, None, threading.Event()]
+        with _mux_lock:
+            fresh = _sock is None
+            sock = _connect()
+            if fresh:
+                sock.settimeout(None)
+                threading.Thread(target=_mux_reader, args=(sock,), daemon=True).start()
+            slot[2] = sock
+            _mux_pending[req_id] = slot
+        request = json.dumps({"id": req_id, "tool": tool_name, "args": args,
+                              "token": os.environ.get("HERMES_RPC_TOKEN", "")}) + "\\n"
+        try:
+            with _mux_send_lock:
+                sock.sendall(request.encode())
+            # Waiting for a slot is not timed (the serial wire waited on its lock the same
+            # way); the 300 s reply timer starts once the host dispatches the call.
+            slot[3].wait()
+            if not slot[0].wait(300):
+                raise RuntimeError(f"RPC timeout: no response for {tool_name} after 300s")
+        except OSError:
+            slot[1] = None
+            with _mux_lock:
+                if _sock is sock:
+                    _sock = None
+            try:
+                sock.close()
+            except OSError:
+                pass
+        finally:
+            with _mux_lock:
+                _mux_pending.pop(req_id, None)
+        if slot[1] is not None:
+            return _decode(slot[1].get("result", "null"))
+        if _attempt + 1 >= attempts:
+            raise RuntimeError("Agent process disconnected")
 
 '''
 
@@ -806,7 +919,17 @@ def execute_code(
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
         reset=bool(reset), is_interrupted=_is_interrupted,
         session_id=session_id, turn_id=turn_id, conversation_id=conversation_id,
+        max_parallel=_max_parallel_tool_calls(_cfg),
     ))
+
+
+def _max_parallel_tool_calls(cfg: dict) -> int:
+    """``code_execution.max_parallel_tool_calls`` (>= 1; invalid -> default). Read at kernel
+    spawn: a changed value applies to the next kernel (``reset=true`` or a new session)."""
+    try:
+        return max(1, int(cfg.get("max_parallel_tool_calls", DEFAULT_MAX_PARALLEL_TOOL_CALLS)))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_MAX_PARALLEL_TOOL_CALLS
 
 
 def _load_config() -> dict:
@@ -862,14 +985,21 @@ _TOOL_DOC_LINES = [
 
 
 def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
-                              mode: str | None = None) -> dict:
+                              mode: str | None = None, max_parallel: int | None = None) -> dict:
     """execute_code schema listing only *enabled_sandbox_tools* — a disabled tool (e.g. web off)
-    must not appear or the model keeps trying it. ``mode`` (None → config) picks the cwd sentence."""
+    must not appear or the model keeps trying it. ``mode`` (None → config) picks the cwd sentence;
+    ``max_parallel`` (None → config) adds the parallel-calls sentence only when it is above 1."""
     if enabled_sandbox_tools is None:
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
     if mode is None:
         mode = _get_execution_mode()
+    if max_parallel is None:
+        max_parallel = _max_parallel_tool_calls(_load_config())
     tool_lines = "\n".join(doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools)
+    parallel_note = (
+        f"On a local kernel up to {max_parallel} stub calls can overlap: call them from threads "
+        "or `parallel(fn1, fn2, ...)` (results in order, `from hermes_tools import parallel`).\n\n"
+    ) if max_parallel > 1 else ""
     if mode == "strict":
         cwd_note = (
             "Scripts run in their own temp dir, not the session's CWD — pass "
@@ -899,6 +1029,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
         "work instead of re-loading it. A timed-out or interrupted call loses that state.\n\n"
         "Available via `from hermes_tools import ...` (each returns a dict):\n\n"
         f"{tool_lines}\n\n"
+        f"{parallel_note}"
         "Limits: 5-minute timeout, max 50 tool calls per call. Stdout over "
         "50KB shows head/tail inline; the FULL text is auto-saved to a file whose path rides in the result.\n\n"
         f"{cwd_note}\n\n"

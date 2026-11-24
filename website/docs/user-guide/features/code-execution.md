@@ -221,6 +221,31 @@ When your script calls a function like `web_search("query")`:
 
 This means tool calls inside scripts behave identically to normal tool calls — same rate limits, same error handling, same capabilities. The only restriction is that `terminal()` is foreground-only (no `background` or `pty` parameters).
 
+### Parallel tool calls (opt-in)
+
+By default a script's tool calls run one at a time, even when the script makes them from several threads. Set `code_execution.max_parallel_tool_calls` above 1 to let calls from different threads run at the same time on the local session kernel, up to that many at once:
+
+```yaml
+# ~/.hermes/config.yaml
+code_execution:
+  max_parallel_tool_calls: 4   # in-flight tool calls per kernel; 1 = one at a time (default)
+```
+
+With it on, each request carries an id that its reply echoes, so every thread gets its own result. Use plain threads, `concurrent.futures`, or the `parallel` helper, which returns results in order:
+
+```python
+from hermes_tools import parallel, terminal, read_file
+build, log = parallel(lambda: terminal("make test"), lambda: read_file("build.log"))
+```
+
+`parallel` also works with the default of 1; the calls then simply run one after another.
+
+Every call still passes the same checks, one at a time, as it arrives: the token, the allow-list, the per-cell budget (a slot is reserved before the call runs, so the 50-call limit stays exact), and the approval path. A call that is still waiting for a slot when its cell ends or is interrupted is refused; it never runs under the next cell.
+
+Concurrent `terminal()` calls share the session's working directory and exported variables, and the last one to finish wins, so a `cd` or `export` in one of several concurrent calls may not carry over to the next call; pass `workdir=` instead.
+
+The value is read when a kernel starts, so a change applies to the next kernel (`reset: true` or a new session). Remote backends always run tool calls one at a time.
+
 ## Error Handling
 
 When a script fails, the agent receives structured error information:

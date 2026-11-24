@@ -1926,6 +1926,10 @@ DEFAULT_CONFIG = {
         # rebound per cell — that runtime boundary is the cross-cell enforcement.
         "kernel_idle_timeout": 1800,
         "max_session_kernels": 4,
+        # Tool calls a script may have in flight at once on a local session kernel (from threads
+        # or the stub's parallel() helper). 1 = one at a time over the serial wire (default);
+        # > 1 opts in to the concurrent wire. Read at kernel spawn (reset=true to apply).
+        "max_parallel_tool_calls": 1,
     },
     # Tool Search replaces deferred tools in the model-facing array with the
     # tool_search / tool_describe / tool_call bridges and surfaces them on demand.
