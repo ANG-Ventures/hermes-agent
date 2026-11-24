@@ -680,7 +680,21 @@ _SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNO
 # quadratic, one core at 100% for hours while holding the GIL.
 _TELEGRAM_RE = re.compile(r"(?<!\d)(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
 
-_PRIVATE_KEY_RE = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----")
+# A BEGIN header with no END after it (tool output truncated mid-block) is still
+# a key: redact from the header to the end of the text (t_7c575aa0).
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN[A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----|[\s\S]*\Z)"
+)
+
+# A GitHub / Anthropic token whose middle a tool elided (``ghs_123_eyJhbG...aDOQ``,
+# ``ghp_AbCd…WxYz``): the prefix regexes stop at the marker and leave the visible
+# head/tail behind, so the whole run, marker included, is redacted (t_7c575aa0).
+# At least one token char must follow the marker, so the ``«redacted:ghp_…»``
+# sentinel and prose like ``ghp_...`` never match.
+_ELIDED_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:gh[pousr]_|github_pat_|sk-ant-)[A-Za-z0-9_.-]*?(?:\.{3,}|…)"
+    r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*"
+)
 
 # Database connection strings: protocol://user:PASSWORD@host. The userinfo and
 # password groups forbid whitespace so a match can never span a line break (a
@@ -1180,6 +1194,8 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     # Control/zero-width chars can split a token body so _PREFIX_RE alone misses it.
     if _has_known_prefix_substring(text):
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
+        if "..." in text or "…" in text:  # runs first: on the raw text, never on our own masks
+            text = _ELIDED_TOKEN_RE.sub(lambda m: _mask_token_nonreusable(m.group(0)), text)
         # Control/zero-width chars (\\n, \\r, ESC, U+200B, …) split a token body so _PREFIX_RE cannot match
         # across them — a secret smuggled as ``sk-abc\\x1bdef…`` leaks verbatim (issue #77484). Mask such
         # runs by first matching on a control-stripped copy, then re-masking the corresponding span in the
