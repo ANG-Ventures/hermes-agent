@@ -123,6 +123,8 @@ class RemoteKernel:
     attached: int = 0
     # Owned by a live delegate_task child: exempt from LRU eviction (the child's teardown disposes it).
     pinned: bool = False
+    # Untrusted tool calls any cell of this kernel made (state outlives the cell): marks every later cell.
+    untrusted_calls: List[Dict[str, Any]] = field(default_factory=list)
 
     def sh(self, cmd: str, timeout: int = 15) -> str:
         return _sh(self.env, cmd, timeout)
@@ -368,11 +370,26 @@ def execute_in_remote_kernel(
             kernel.last_used = time.monotonic()
 
 
+class _MarkingLog(list):
+    """A cell's tool-call log that also marks its kernel on each untrusted entry. The poll loop logs a
+    call before it writes the reply, so a call that outlives the cell's join still marks the kernel."""
+
+    def __init__(self, kernel: "RemoteKernel"):
+        super().__init__()
+        self.kernel = kernel
+
+    def append(self, entry) -> None:
+        from agent.tool_dispatch_helpers import _is_untrusted_tool
+        if isinstance(entry, dict) and _is_untrusted_tool(entry.get("tool")):
+            self.kernel.untrusted_calls.append({"tool": entry["tool"]})
+        super().append(entry)
+
+
 def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task_env_id: str,
                        sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
                        reused: bool, state_reset: bool, state_lost: bool) -> Dict[str, Any]:
     from tools.code_execution_rpc import tool_errors_since
-    from tools.code_execution_tool import _rpc_poll_loop
+    from tools.code_execution_tool import _rpc_poll_loop, _untrusted_marker
     from tools.thread_context import propagate_context_to_thread
     # Clean stale tool-RPC requests from a previous cell before arming this cell's poll loop, so
     # a background thread the last cell leaked cannot smuggle a call into this authority window.
@@ -381,7 +398,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
         kernel.sh(f"rm -f {q_rpc}/req_* {q_rpc}/res_*", timeout=10)
     except Exception:
         pass
-    tool_call_counter, tool_call_log, stop_event = [0], [], threading.Event()
+    tool_call_counter, tool_call_log, stop_event = [0], _MarkingLog(kernel), threading.Event()
     # Per-cell RPC thread carrying THIS call's approval/session context — the remote analogue
     # of CellAuthority: authority lives exactly as long as the cell's poll loop.
     rpc_thread = threading.Thread(
@@ -407,7 +424,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
     result: Dict[str, Any] = {
         "status": "error", "stdout": cell_payload.get("stdout", ""), "stderr": cell_payload.get("stderr", ""),
         "traceback": cell_payload.get("traceback", ""), "tool_calls_made": tool_call_counter[0], "kernel": kernel_info,
-        "tool_errors": tool_errors_since(tool_call_log),
+        "tool_errors": tool_errors_since(tool_call_log), "untrusted": _untrusted_marker(kernel.untrusted_calls),
     }
     if cell_status in ("timeout", "protocol-error", "no-result"):
         # No safe way to interrupt one cell in place (same contract as local): kill, report, respawn.

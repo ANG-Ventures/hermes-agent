@@ -328,6 +328,9 @@ class SessionKernel:
         self.death_pipe_w: Optional[int] = None
         self.tool_call_log: List = []
         self.cell_log_start = 0
+        # Untrusted tool calls any cell dispatched (state outlives the cell): marks every later cell.
+        # Taken at dispatch, so a late reply the per-cell log skips still marks the kernel.
+        self.untrusted_calls: List = []
         self.tool_call_counter: List[int] = [0]
         # Cells currently attached (bumped under the registry lock on selection, dropped when the
         # cell settles). Reaping/cap-eviction skip attached kernels: tearing one down mid-spawn
@@ -499,8 +502,18 @@ def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
     its 300s idle timeout, and a kernel idles longer between cells, so re-accept until teardown
     (the client stub reconnects: HERMES_RPC_PERSISTENT). The serving thread carries NO frozen
     authority — every dispatch routes through the CURRENT cell's ``CellAuthority``."""
+    from agent.tool_dispatch_helpers import _is_untrusted_tool
     from tools.code_execution_rpc import CallPool, _rpc_server_loop
     from tools.registry import tool_error
+    def _marking(run):
+        # Mark the kernel before the call runs: its reply reaches the script even when the
+        # per-cell log skips it (a call that outlives its cell).
+        def dispatch(tool_name: str, tool_args: dict) -> str:
+            if _is_untrusted_tool(tool_name):
+                kernel.untrusted_calls.append({"tool": tool_name})
+            return run(tool_name, tool_args)
+        return dispatch
+    @_marking
     def _dispatch(tool_name: str, tool_args: dict) -> str:
         authority = kernel.cell_authority
         if authority is None:
@@ -516,7 +529,7 @@ def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
         authority = kernel.cell_authority
         if authority is None:
             return _no_cell, lambda: False
-        return authority.dispatch_isolated, lambda: authority.active
+        return _marking(authority.dispatch_isolated), lambda: authority.active
     # One pool per kernel: the cap holds across reconnects, and a queued call holds no thread.
     pool = CallPool(max_parallel) if max_parallel > 1 else None
     try:
@@ -833,7 +846,11 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
     stdout_text, stdout_metadata = _truncate_stdout_text(clean(str(payload.get("stdout", "")) + kernel.raw.drain()))
     cell_stderr = clean(str(payload.get("stderr", "")) + stderr_raw)
     cell_status = payload.get("status", "")
+    from tools.code_execution_tool import _untrusted_marker
     result: Dict[str, Any] = {
+        # Every untrusted call the kernel dispatched, not this cell's: state outlives the cell, so a page
+        # an earlier cell fetched can be printed by this one. A reset or a dead kernel starts clean.
+        **_untrusted_marker(kernel.untrusted_calls),
         "status": status, "output": stdout_text, "exit_code": 0,
         "tool_calls_made": kernel.tool_call_counter[0], "duration_seconds": duration,
         "kernel": {"mode": "session", "reused": reused,

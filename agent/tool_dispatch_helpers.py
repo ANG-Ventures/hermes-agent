@@ -554,7 +554,7 @@ def make_tool_result_message(
     ``call_args`` are the call's arguments: a ``tool_call`` bridge row keeps the wrapper name, so its
     trust is decided by the calls it carries (``_trust_name``).
     """
-    trust_name = _trust_name(name, call_args)
+    trust_name = _trust_name(name, call_args, content)
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
     # E11: remote tool output never carries the harness's route-note marker. Local output
@@ -618,10 +618,30 @@ def _is_untrusted_tool(name: Optional[str]) -> bool:
     return name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES)
 
 
-def _trust_name(name: Optional[str], call_args: Optional[dict]) -> Optional[str]:
+# execute_code's host-built result JSON opens with this key when the cell's script called an untrusted
+# tool stub (from the host's per-cell call log). Every ``"`` the script prints is escaped inside the JSON
+# string value, so script output cannot produce it at the anchor: the start of the result, or the start
+# of the preview when the result was persisted as a ``<persisted-output>`` stub.
+EXECUTE_CODE_UNTRUSTED_KEY = "untrusted_tools"
+_EXECUTE_CODE_UNTRUSTED_RE = re.compile(
+    r'(?:\A|\A<persisted-output>\n(?:.*\n)*?Preview \(first \d+ chars\):\n)'
+    r'\{"' + EXECUTE_CODE_UNTRUSTED_KEY + r'": (\[[^\]\n]*\])')
+
+
+def _execute_code_trust_name(content: Any) -> Optional[str]:
+    """The first untrusted tool an execute_code cell called, read from the host-set key, else None."""
+    match = _EXECUTE_CODE_UNTRUSTED_RE.match(content) if isinstance(content, str) else None
+    names = json.loads(match.group(1)) if match else None  # host-built by _untrusted_marker, already filtered
+    return names[0] if names else None
+
+
+def _trust_name(name: Optional[str], call_args: Optional[dict], content: Any = None) -> Optional[str]:
     """The name whose trust class governs this result. A ``tool_call`` bridge row that kept the wrapper
     name (a connector batch) carries remote output when ANY inner call is untrusted: return that inner
-    name. Every other row is classified by its own name."""
+    name. An ``execute_code`` cell that called an untrusted stub is classified by that stub. Every
+    other row is classified by its own name."""
+    if name and _own_mcp_tool_name(name) == "execute_code":
+        return _execute_code_trust_name(content) or name
     if not isinstance(call_args, dict):
         return name
     try:
