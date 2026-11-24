@@ -692,7 +692,7 @@ _PEM_NL = r"(?:\r?\n|(?:\\r)?\\n)"
 _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN[A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
     rf"|(?:{_PEM_NL}(?:(?:Proc-Type|DEK-Info):[^\r\n\\]*|[ \t]*)(?={_PEM_NL}|\Z))*"
-    rf"(?:{_PEM_NL}[A-Za-z0-9+/=]+(?={_PEM_NL}|\Z|\"))+)"
+    rf"(?:{_PEM_NL}[ \t]*[A-Za-z0-9+/=]+[ \t]*(?={_PEM_NL}|\Z|\"))+)"
 )
 
 # A known-prefix token whose middle a tool elided (``ghs_123_eyJhbG...aDOQ``,
@@ -700,10 +700,12 @@ _PRIVATE_KEY_RE = re.compile(
 # marker and leave the visible fragments behind, so the whole run, through the
 # last fragment after any number of markers, is redacted (t_7c575aa0). At least
 # one token char must follow a marker, so the ``«redacted:ghp_…»`` sentinel and
-# prose like ``ghp_...`` never match; a run with fewer than 8 visible chars after
-# the prefix (``SGTM...ok``) is left to the other passes.
+# prose like ``ghp_...`` never match. For prefixes other than the GitHub /
+# Anthropic ones, a run with fewer than 8 visible chars after the prefix
+# (``SGTM...ok``) is left to the other passes.
 _ELIDED_MARKER = r"(?:\.{3,}|…)"
 _ELIDED_MIN_VISIBLE = 8
+_ELIDED_ALWAYS_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-ant-")
 _ELIDED_RE_CACHE: dict = {}
 
 
@@ -721,7 +723,8 @@ def _elided_token_re(prefixes):
 
 def _mask_elided(m):
     visible = len(re.sub(r"[.…]", "", m.group("rest")))
-    if visible < _ELIDED_MIN_VISIBLE:
+    always = m.group(0).startswith(_ELIDED_ALWAYS_PREFIXES)
+    if visible < _ELIDED_MIN_VISIBLE and not always:
         return m.group(0)
     return _mask_token_nonreusable(m.group(0))
 

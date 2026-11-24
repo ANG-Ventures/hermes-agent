@@ -68,6 +68,13 @@ def test_openssh_block_cut_mid_line():
     assert _r("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9u") == _R
 
 
+def test_cut_block_body_lines_with_surrounding_whitespace():
+    out = _r("-----BEGIN PRIVATE KEY-----\nMIIEowIBAAKCAQEA \n[truncated]")
+    assert out == f"{_R}\n[truncated]"
+    out = _r("-----BEGIN PRIVATE KEY-----\n  MIIEowIBAAKCAQEA\t\n\tZm9vYmFyYmF6\nexit 0")
+    assert out == f"{_R}\nexit 0"
+
+
 def test_header_without_key_lines_untouched():
     for text in (
         'PEM = "-----BEGIN OPENSSH PRIVATE KEY-----\\n"\n\ndef f():\n    return 1\n',
@@ -97,11 +104,11 @@ def test_token_with_two_elision_markers_redacted_whole():
 
 
 def test_token_with_unicode_elision_marker_redacted_whole():
-    for tok in ("ghp_AbCdEfGh…WxYz", "github_pat_11AB…Q9rS", "sk-ant-api03-AbCd…x9Yz", "glpat-AbCdEfGh…WxYz"):
+    for tok in ("ghp_AbC…WxYz", "ghs_A...Bc", "ghp_AbCdEfGh…WxYz", "github_pat_11AB…Q9rS", "sk-ant-api03-AbCd…x9Yz", "glpat-AbCdEfGh…WxYz"):
         out = _r(f"x {tok} y")
         assert out.startswith("x ") and out.endswith(" y"), out
-        assert tok.split("…")[1] not in out, out
-        assert tok.split("…")[0][-4:] not in out, out
+        head, tail = tok.replace("...", "…").split("…")
+        assert tail not in out and head[-3:] not in out, out
 
 
 def test_ordinary_text_untouched():
