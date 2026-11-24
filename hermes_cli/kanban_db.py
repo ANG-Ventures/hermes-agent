@@ -17823,9 +17823,10 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
                 return _workspace_admission_refused(
                     conn, task_id, result, board=board, dry_run=dry_run,
                 )
-        # t_8721e331: the card's last run was on a pool host, so its tree lives
-        # there and the dir here was only a placeholder. Re-create it at the
-        # same path (origin state stays bound) and re-admit; never a page.
+        # t_8721e331: the card's origin_host is a pool host (the field
+        # placement routes on) and it never ran here at this path, so its tree
+        # lives there and the dir here was only a placeholder. Re-create it at
+        # the same path (origin state stays bound) and re-admit; never a page.
         if (
             not dry_run
             and reason.startswith("stranded_by_mount_loss:")
@@ -17840,7 +17841,7 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
                     })
                 _log.warning(
                     "kanban dispatch: workspace placeholder restored task=%s "
-                    "(last run on %s; local dir absent)", task_id, remote,
+                    "(origin %s; local dir absent)", task_id, remote,
                 )
                 return _workspace_admission_refused(
                     conn, task_id, result, board=board, dry_run=dry_run,

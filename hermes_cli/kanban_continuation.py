@@ -217,21 +217,82 @@ def remote_cleanup_host(conn, task_id):
 
 
 def remote_run_host(conn, task_id: str) -> Optional[str]:
-    """The pool host the card's latest placed run ran on, or None (local or never placed).
+    """The pool host holding the card's scratch tree, or None.
 
-    Its scratch tree lives on that host; the dispatcher's copy of the path is
-    only the placeholder ``resolve_workspace`` made, so a missing local dir
-    there is not a lost mount (t_8721e331).
+    Read from ``tasks.origin_host``, the field enforce-mode placement routes
+    on (:func:`origin_route`), so a restored placeholder and the next
+    placement name the same host (Prism c544a7721690). The dispatcher's copy
+    of the path is only the placeholder ``resolve_workspace`` made, so a
+    missing local dir there is not a lost mount (t_8721e331). None when the
+    card has no remote origin, or when it ran on the Studio at its current
+    path: that dir held real work and its loss stays a stranded refusal
+    (Prism 029eb26d973c).
     """
-    row = conn.execute("SELECT host FROM task_runs WHERE task_id=? AND host IS NOT NULL ORDER BY id DESC LIMIT 1",
-                       (task_id,)).fetchone()
-    if row is None or not row[0] or row[0] == STUDIO:
+    row = conn.execute("SELECT origin_host FROM tasks WHERE id=?", (task_id,)).fetchone()
+    host = row[0] if row else None
+    if not host or host.lower() == STUDIO or _ran_on_studio_at_current_path(conn, task_id):
         return None
-    return row[0]
+    return host
+
+
+def _ran_on_studio_at_current_path(conn, task_id: str) -> bool:
+    """True when any card that held the current path ran on the Studio while holding it.
+
+    The path is held from the card's latest ``origin_dropped`` or outgoing
+    ``workspace_transferred`` (both leave the card on a fresh path) to now,
+    and back through the ``--continues`` chain: each source held it up to its
+    ``workspace_transferred`` event (Prism e641269822db), and from its
+    previous drop or transfer (Prism f98378c58467). Run order against those events is by event id, so a run
+    in the same second as the event is placed exactly (Prism c920880fe89d);
+    a run with no events falls back to ``started_at`` and a tie counts
+    (fail closed: the stranded refusal stays). Runs with a NULL host never
+    spawned (or predate host recording) and are not counted.
+    """
+    card, upper, seen = task_id, None, set()
+    while card and card not in seen and len(seen) < 32:
+        seen.add(card)
+        lower = conn.execute(
+            "SELECT id, created_at FROM task_events WHERE task_id=?"
+            " AND kind IN ('origin_dropped','workspace_transferred')"
+            " AND id<? ORDER BY id DESC LIMIT 1",
+            (card, upper[0] if upper else 2**62),
+        ).fetchone()
+        for run_id, started in conn.execute(
+            "SELECT id, COALESCE(started_at, 0) FROM task_runs WHERE task_id=? AND LOWER(host)=?",
+            (card, STUDIO),
+        ).fetchall():
+            first = conn.execute(
+                "SELECT MIN(id) FROM task_events WHERE task_id=? AND run_id=?", (card, run_id),
+            ).fetchone()[0]
+            after = lower is None or (first > lower[0] if first is not None else started >= lower[1])
+            before = upper is None or (first < upper[0] if first is not None else started <= upper[1])
+            if after and before:
+                return True
+        if lower is not None:
+            return False  # the path began at that drop/transfer; earlier holders used another dir
+        cont = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='continues' ORDER BY id DESC LIMIT 1",
+            (card,),
+        ).fetchone()
+        try:
+            parent = json.loads(cont[0]).get("parent") if cont else None
+        except (TypeError, ValueError, AttributeError):
+            parent = None
+        if not parent:
+            return False
+        upper = conn.execute(
+            "SELECT id, created_at FROM task_events WHERE task_id=? AND kind='workspace_transferred'"
+            " AND json_extract(payload, '$.to')=? ORDER BY id DESC LIMIT 1",
+            (parent, card),
+        ).fetchone()
+        if upper is None:
+            return True  # a chain we cannot place: keep the refusal
+        card = parent
+    return False
 
 
 def restore_remote_placeholder(conn, task) -> Optional[str]:
-    """Re-create the local placeholder of a scratch card whose last run was on a pool host.
+    """Re-create the local placeholder of a scratch card whose tree lives on a pool host.
 
     Returns that host when the placeholder now exists, else None. The path is
     unchanged, so the card's state on its origin host stays bound to it (an

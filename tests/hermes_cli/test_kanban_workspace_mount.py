@@ -1,4 +1,5 @@
 """Mount-loss admission at the real workspace/dispatcher boundary."""
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -885,3 +886,195 @@ def test_local_run_card_dir_lost_stays_stranded(home, monkeypatch):
         kinds = [r[0] for r in conn.execute(
             'SELECT kind FROM task_events WHERE task_id=?', (task_id,))]
         assert 'workspace_placeholder_restored' not in kinds
+
+
+def _restored_host(conn, task_id):
+    rows = [r[0] for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='workspace_placeholder_restored'",
+        (task_id,))]
+    return json.loads(rows[-1])['host'] if rows else None
+
+
+def test_placeholder_restore_names_origin_host_not_latest_run_host(home, monkeypatch):
+    # Prism c544a7721690: the latest run finished on ace-ai while origin_host
+    # (the field enforce-mode placement routes on) still names ace-media.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        conn.execute(
+            "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at, host) "
+            "VALUES (?, 'default', 'review_requested', 'review_requested', 5, 6, 'ace-ai')",
+            (task_id,),
+        )
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id in calls
+        assert task_id not in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) == 'ace-media'
+        assert path.is_dir()
+
+
+def test_no_origin_host_keeps_stranded_refusal_even_after_a_remote_run(home, monkeypatch):
+    # Placement has no host to route to, so restoration has none either.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root)
+        conn.execute("UPDATE tasks SET origin_host=NULL WHERE id=?", (task_id,))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        assert task_id in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) is None
+        assert not path.exists()
+
+
+def _pool_run_after(conn, task_id, host):
+    # The latest placed run is on the pool host (higher id than the Studio run).
+    conn.execute(
+        "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at, host) "
+        "VALUES (?, 'default', 'review_requested', 'review_requested', 7, 8, ?)",
+        (task_id, host),
+    )
+
+
+def test_studio_run_then_pool_run_at_same_path_stays_stranded(home, monkeypatch):
+    # Prism 029eb26d973c: the card ran on the Studio first, so the vanished
+    # local dir held real work; a later pool run must not hide that loss.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        conn.execute(
+            "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at, host) "
+            "VALUES (?, 'default', 'crashed', 'crashed', 0, 1, 'studio')",
+            (task_id,),
+        )
+        _pool_run_after(conn, task_id, 'ace-media')
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert not calls
+        assert task_id in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) is None
+        assert not path.exists()
+
+
+def test_studio_run_before_origin_drop_does_not_block_restore(home, monkeypatch):
+    # The Studio run used the path abandoned by drop_origin; the current path
+    # only ever ran on the pool host, so its local dir is a placeholder.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        conn.execute(
+            "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at, host) "
+            "VALUES (?, 'default', 'crashed', 'crashed', 0, 1, 'studio')",
+            (task_id,),
+        )
+        _pool_run_after(conn, task_id, 'ace-media')
+        conn.execute(
+            "INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'origin_dropped', '{}', 1)",
+            (task_id,),
+        )
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id in calls
+        assert task_id not in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) == 'ace-media'
+
+
+def _studio_run_with_event(conn, task_id, started_at):
+    cur = conn.execute(
+        "INSERT INTO task_runs(task_id, profile, status, outcome, started_at, ended_at, host) "
+        "VALUES (?, 'default', 'crashed', 'crashed', ?, ?, 'studio')",
+        (task_id, started_at, started_at),
+    )
+    kb._append_event(conn, task_id, 'claimed', {'lock': 'studio'}, run_id=cur.lastrowid)
+
+
+def _drop_at(conn, task_id, created_at):
+    conn.execute(
+        "INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'origin_dropped', '{}', ?)",
+        (task_id, created_at),
+    )
+
+
+def test_studio_run_in_same_second_before_drop_does_not_block_restore(home, monkeypatch):
+    # Prism c920880fe89d: the Studio run and the drop share a second; the
+    # run's event id places it before the drop, on the abandoned path.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        _studio_run_with_event(conn, task_id, 5)
+        _drop_at(conn, task_id, 5)
+        _pool_run_after(conn, task_id, 'ace-media')
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id in calls
+        assert task_id not in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) == 'ace-media'
+
+
+def test_studio_run_in_same_second_after_drop_stays_stranded(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        _drop_at(conn, task_id, 5)
+        _studio_run_with_event(conn, task_id, 5)
+        _pool_run_after(conn, task_id, 'ace-media')
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        assert task_id in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) is None
+        assert not path.exists()
+
+
+def _continued_from(conn, child_id, *, parent_ran_on_studio):
+    parent_id = kb.create_task(conn, title='source', assignee='default')
+    if parent_ran_on_studio:
+        _studio_run_with_event(conn, parent_id, 0)
+    kb._append_event(conn, parent_id, 'workspace_transferred', {'to': child_id, 'path': 'p'})
+    kb._append_event(conn, child_id, 'continues', {'parent': parent_id, 'host': 'ace-media'})
+    return parent_id
+
+
+def test_studio_run_on_continuation_source_keeps_child_stranded(home, monkeypatch):
+    # Prism e641269822db: the source card ran on the Studio in this dir, then
+    # handed it to the child with --continues; the child's own runs are all
+    # pool runs, but the vanished dir still held the source's work.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        _continued_from(conn, task_id, parent_ran_on_studio=True)
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id not in calls
+        assert task_id in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) is None
+        assert not path.exists()
+
+
+def test_earlier_transfer_bounds_source_studio_history(home, monkeypatch):
+    # Prism f98378c58467: A ran on the Studio at P, handed P to B, then ran
+    # only on the pool at its fresh path Q and handed Q to C. A's Studio run
+    # was at P, so C's vanished placeholder at Q is restorable.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        parent_id = kb.create_task(conn, title='source', assignee='default')
+        _studio_run_with_event(conn, parent_id, 0)
+        first_child = kb.create_task(conn, title='first child', assignee='default')
+        kb._append_event(conn, parent_id, 'workspace_transferred', {'to': first_child, 'path': 'P'})
+        kb._append_event(conn, first_child, 'continues', {'parent': parent_id, 'host': None})
+        kb._append_event(conn, parent_id, 'workspace_transferred', {'to': task_id, 'path': 'Q'})
+        kb._append_event(conn, task_id, 'continues', {'parent': parent_id, 'host': 'ace-media'})
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id in calls
+        assert task_id not in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) == 'ace-media'
+
+
+def test_continuation_source_without_studio_run_allows_restore(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        _continued_from(conn, task_id, parent_ran_on_studio=False)
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id in calls
+        assert _restored_host(conn, task_id) == 'ace-media'
