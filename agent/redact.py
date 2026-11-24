@@ -681,20 +681,50 @@ _SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNO
 _TELEGRAM_RE = re.compile(r"(?<!\d)(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})")
 
 # A BEGIN header with no END after it (tool output truncated mid-block) is still
-# a key: redact from the header to the end of the text (t_7c575aa0).
+# a key: redact the header and its key body, i.e. the contiguous lines after it
+# that look like key material (optional Proc-Type/DEK-Info/blank lines, then
+# lines of base64 chars only, any length; a cut last line may end at a JSON
+# string's closing quote). It stops at the first other line, and a header with
+# no such line after it (source, regex, docs, grep hits) is left alone. An
+# escaped newline (backslash-n inside a JSON string) counts as a line break.
+# With an END line the behaviour is unchanged (t_7c575aa0).
+_PEM_NL = r"(?:\r?\n|(?:\\r)?\\n)"
 _PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN[A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----|[\s\S]*\Z)"
+    r"-----BEGIN[A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
+    rf"|(?:{_PEM_NL}(?:(?:Proc-Type|DEK-Info):[^\r\n\\]*|[ \t]*)(?={_PEM_NL}|\Z))*"
+    rf"(?:{_PEM_NL}[A-Za-z0-9+/=]+(?={_PEM_NL}|\Z|\"))+)"
 )
 
-# A GitHub / Anthropic token whose middle a tool elided (``ghs_123_eyJhbG...aDOQ``,
-# ``ghp_AbCd…WxYz``): the prefix regexes stop at the marker and leave the visible
-# head/tail behind, so the whole run, marker included, is redacted (t_7c575aa0).
-# At least one token char must follow the marker, so the ``«redacted:ghp_…»``
-# sentinel and prose like ``ghp_...`` never match.
-_ELIDED_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:gh[pousr]_|github_pat_|sk-ant-)[A-Za-z0-9_.-]*?(?:\.{3,}|…)"
-    r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*"
-)
+# A known-prefix token whose middle a tool elided (``ghs_123_eyJhbG...aDOQ``,
+# ``ghs_..._eyJhbG...aDOQ``, ``ghp_AbCd…WxYz``): the prefix regexes stop at the
+# marker and leave the visible fragments behind, so the whole run, through the
+# last fragment after any number of markers, is redacted (t_7c575aa0). At least
+# one token char must follow a marker, so the ``«redacted:ghp_…»`` sentinel and
+# prose like ``ghp_...`` never match; a run with fewer than 8 visible chars after
+# the prefix (``SGTM...ok``) is left to the other passes.
+_ELIDED_MARKER = r"(?:\.{3,}|…)"
+_ELIDED_MIN_VISIBLE = 8
+_ELIDED_RE_CACHE: dict = {}
+
+
+def _elided_token_re(prefixes):
+    cached = _ELIDED_RE_CACHE.get(prefixes)
+    if cached is not None:
+        return cached
+    alts = "|".join(re.escape(p) for p in sorted(set(prefixes), key=len, reverse=True))
+    cached = _ELIDED_RE_CACHE[prefixes] = re.compile(
+        rf"(?<![A-Za-z0-9_-])(?P<prefix>{alts})(?P<rest>[A-Za-z0-9_.-]*?{_ELIDED_MARKER}"
+        r"[A-Za-z0-9_-]+(?:(?:\.+|…)[A-Za-z0-9_-]+)*)"
+    )
+    return cached
+
+
+def _mask_elided(m):
+    visible = len(re.sub(r"[.…]", "", m.group("rest")))
+    if visible < _ELIDED_MIN_VISIBLE:
+        return m.group(0)
+    return _mask_token_nonreusable(m.group(0))
+
 
 # Database connection strings: protocol://user:PASSWORD@host. The userinfo and
 # password groups forbid whitespace so a match can never span a line break (a
@@ -1195,7 +1225,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if _has_known_prefix_substring(text):
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
         if "..." in text or "…" in text:  # runs first: on the raw text, never on our own masks
-            text = _ELIDED_TOKEN_RE.sub(lambda m: _mask_token_nonreusable(m.group(0)), text)
+            text = _elided_token_re(_PREFIX_SUBSTRINGS).sub(_mask_elided, text)
         # Control/zero-width chars (\\n, \\r, ESC, U+200B, …) split a token body so _PREFIX_RE cannot match
         # across them — a secret smuggled as ``sk-abc\\x1bdef…`` leaks verbatim (issue #77484). Mask such
         # runs by first matching on a control-stripped copy, then re-masking the corresponding span in the
