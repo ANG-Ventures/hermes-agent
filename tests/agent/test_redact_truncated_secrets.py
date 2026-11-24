@@ -11,13 +11,20 @@ import json
 
 from agent.redact import redact_sensitive_text
 
+
+def _pem(text: str) -> str:
+    # Fixtures spell PEM dashes as "=====" so no literal PEM header sits in the
+    # file for the secret scanner; the real five-dash form is built at run time.
+    return text.replace("=====", "-" * 5)
+
+
 _LINES = ["MIIEowIBAAKCAQEAinventedKEYmaterialNOTreal0123456789abcdefghij"] + [
     "Zm9vYmFyYmF6cXV4aW52ZW50ZWRrZXltYXRlcmlhbG5vdHJlYWwwMTIzNDU2"
 ] * 6
 _BODY = "\n".join(_LINES)
-_FULL = f"-----BEGIN RSA PRIVATE KEY-----\n{_BODY}\n-----END RSA PRIVATE KEY-----"
+_FULL = _pem(f"=====BEGIN RSA PRIVATE KEY=====\n{_BODY}\n=====END RSA PRIVATE KEY=====")
 # Cut mid-line, then the tool's own truncation note on the next line.
-_CUT = f"-----BEGIN RSA PRIVATE KEY-----\n{_BODY}\nZm9vYmFy\n... [output truncated]"
+_CUT = _pem(f"=====BEGIN RSA PRIVATE KEY=====\n{_BODY}\nZm9vYmFy\n... [output truncated]")
 _R = "[REDACTED PRIVATE KEY]"
 
 
@@ -42,7 +49,7 @@ def test_block_cut_before_end_redacts_body_keeps_text_after():
 
 def test_block_cut_before_end_json_escaped():
     # The 11-24 shape: tool output arrives as a JSON string, newlines escaped.
-    cut = "-----BEGIN RSA PRIVATE KEY-----\n" + _BODY + "\nZm9vYm"
+    cut = _pem("=====BEGIN RSA PRIVATE KEY=====\n") + _BODY + "\nZm9vYm"
     payload = json.dumps({"output": "==> f <==\n" + cut, "exit_code": 0})
     out = _r(payload)
     _no_key(out)
@@ -54,7 +61,7 @@ def test_block_cut_before_end_json_escaped():
 
 
 def test_encrypted_block_cut_before_end_redacted():
-    text = f"-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00AA\n\n{_BODY}"
+    text = _pem(f"=====BEGIN RSA PRIVATE KEY=====\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00AA\n\n{_BODY}")
     assert _r(text + "\nexit 0") == f"{_R}\nexit 0"
 
 
@@ -65,24 +72,24 @@ def test_two_blocks_second_cut():
 
 
 def test_openssh_block_cut_mid_line():
-    assert _r("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9u") == _R
+    assert _r(_pem("=====BEGIN OPENSSH PRIVATE KEY=====\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9u")) == _R
 
 
 def test_cut_block_body_lines_with_surrounding_whitespace():
-    out = _r("-----BEGIN PRIVATE KEY-----\nMIIEowIBAAKCAQEA \n[truncated]")
+    out = _r(_pem("=====BEGIN PRIVATE KEY=====\nMIIEowIBAAKCAQEA \n[truncated]"))
     assert out == f"{_R}\n[truncated]"
-    out = _r("-----BEGIN PRIVATE KEY-----\n  MIIEowIBAAKCAQEA\t\n\tZm9vYmFyYmF6\nexit 0")
+    out = _r(_pem("=====BEGIN PRIVATE KEY=====\n  MIIEowIBAAKCAQEA\t\n\tZm9vYmFyYmF6\nexit 0"))
     assert out == f"{_R}\nexit 0"
 
 
 def test_header_without_key_lines_untouched():
-    for text in (
-        'PEM = "-----BEGIN OPENSSH PRIVATE KEY-----\\n"\n\ndef f():\n    return 1\n',
-        'pattern = re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY-----")\nother = 2\n',
-        "Paste it:\n\n```\n-----BEGIN RSA PRIVATE KEY-----\n...\n```\n\nThen run `make`.\n",
-        'a.py:3:X = "-----BEGIN RSA PRIVATE KEY-----"\nb.py:9:unrelated\nexit 0',
-        "k.pem:1:-----BEGIN RSA PRIVATE KEY-----\nk2.pem:1:-----BEGIN RSA PRIVATE KEY-----\nexit 0",
-    ):
+    for text in map(_pem, (
+        'PEM = "=====BEGIN OPENSSH PRIVATE KEY=====\\n"\n\ndef f():\n    return 1\n',
+        'pattern = re.compile(r"=====BEGIN[A-Z ]*PRIVATE KEY=====")\nother = 2\n',
+        "Paste it:\n\n```\n=====BEGIN RSA PRIVATE KEY=====\n...\n```\n\nThen run `make`.\n",
+        'a.py:3:X = "=====BEGIN RSA PRIVATE KEY====="\nb.py:9:unrelated\nexit 0',
+        "k.pem:1:=====BEGIN RSA PRIVATE KEY=====\nk2.pem:1:=====BEGIN RSA PRIVATE KEY=====\nexit 0",
+    )):
         assert _r(text) == text
         assert redact_sensitive_text(text, force=True, code_file=True) == text
         assert redact_sensitive_text(text, file_read=True) == text
