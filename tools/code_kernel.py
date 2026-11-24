@@ -262,13 +262,19 @@ class CellAuthority:
     def retire(self) -> None:
         self.active = False
 
-    def dispatch(self, tool_name: str, tool_args: dict) -> str:
-        """Run one tool call under THIS cell's context and callbacks."""
+    def dispatch(self, tool_name: str, tool_args: dict, *, isolated: bool = False) -> str:
+        """Run one tool call under THIS cell's context and callbacks. ``isolated`` runs it in a
+        copy of the cell's context: a Context can be entered by one thread at a time, so
+        concurrent calls each get their own copy (the serial path keeps the shared one)."""
         from tools.registry import tool_error
         if not self.active:
             return tool_error("No active execute_code cell: the cell this kernel call "
                               "belonged to has settled, so its tool authority is retired.")
-        return self.ctx.run(self._invoke, tool_name, tool_args)
+        ctx = self.ctx.copy() if isolated else self.ctx
+        return ctx.run(self._invoke, tool_name, tool_args)
+
+    def dispatch_isolated(self, tool_name: str, tool_args: dict) -> str:
+        return self.dispatch(tool_name, tool_args, isolated=True)
 
     def _invoke(self, tool_name: str, tool_args: dict) -> str:
         from model_tools import handle_function_call
@@ -333,6 +339,9 @@ class SessionKernel:
         self.raw, self.stderr = _BoundedBuffer(), _BoundedBuffer()
         self.execution_count, self.last_used = 0, time.monotonic()
         self.cell_authority: Optional[CellAuthority] = None
+        # Serializes a cell's budget reset + authority install against the RPC reader's
+        # bind-and-reserve, so a call is charged to exactly the cell it was bound to.
+        self.rpc_lock = threading.Lock()
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -485,22 +494,39 @@ atexit.register(shutdown_all_kernels)
 
 
 def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
-                 sandbox_tools: frozenset) -> None:
+                 sandbox_tools: frozenset, max_parallel: int = 1) -> None:
     """Serve tool RPC for the kernel's whole life: ``_rpc_server_loop`` returns on disconnect or
     its 300s idle timeout, and a kernel idles longer between cells, so re-accept until teardown
     (the client stub reconnects: HERMES_RPC_PERSISTENT). The serving thread carries NO frozen
     authority — every dispatch routes through the CURRENT cell's ``CellAuthority``."""
-    from tools.code_execution_rpc import _rpc_server_loop
+    from tools.code_execution_rpc import CallPool, _rpc_server_loop
     from tools.registry import tool_error
     def _dispatch(tool_name: str, tool_args: dict) -> str:
         authority = kernel.cell_authority
         if authority is None:
             return tool_error("No active execute_code cell: this kernel has no cell authority installed.")
         return authority.dispatch(tool_name, tool_args)
-    while not kernel.stop_event.is_set():
-        _rpc_server_loop(kernel.server_sock, "", kernel.tool_call_log, kernel.tool_call_counter,
-                         max_tool_calls, sandbox_tools, kernel.stop_event, kernel.rpc_token,
-                         dispatch=_dispatch)
+    def _no_cell(tool_name: str, tool_args: dict) -> str:
+        return tool_error("No active execute_code cell: this kernel has no cell authority installed.")
+    def _bind():
+        # Concurrent path: snapshot the authority at ARRIVAL. A call queued behind the cap
+        # when its cell settles dispatches into that (retired) authority and is refused,
+        # never run under the next cell's authority or budget; one that arrives with no cell
+        # is bound to a fixed refusal, never to a later lookup.
+        authority = kernel.cell_authority
+        if authority is None:
+            return _no_cell, lambda: False
+        return authority.dispatch_isolated, lambda: authority.active
+    # One pool per kernel: the cap holds across reconnects, and a queued call holds no thread.
+    pool = CallPool(max_parallel) if max_parallel > 1 else None
+    try:
+        while not kernel.stop_event.is_set():
+            _rpc_server_loop(kernel.server_sock, "", kernel.tool_call_log, kernel.tool_call_counter,
+                             max_tool_calls, sandbox_tools, kernel.stop_event, kernel.rpc_token,
+                             dispatch=_dispatch, pool=pool, bind=_bind, budget_lock=kernel.rpc_lock)
+    finally:
+        if pool is not None:
+            pool.close()
 
 
 def _stdout_reader(kernel: SessionKernel) -> None:
@@ -616,7 +642,8 @@ def _parent_process_handle(child_env: Dict[str, str]):
 
 
 def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
-           sandbox_tools: frozenset, max_tool_calls: int, task_id: str = "") -> None:
+           sandbox_tools: frozenset, max_tool_calls: int, task_id: str = "",
+           max_parallel: int = 1) -> None:
     from tools.code_execution_env import _build_child_env
     from tools.code_execution_tool import generate_hermes_tools_module, _AGENT_TOOLS_ALIAS_MODULE
     kernel.tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
@@ -634,6 +661,8 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     child_env["HERMES_KERNEL_SPILL_DIR"] = kernel.tmpdir
     # Generated client reconnects after the RPC server's 300s idle timeout between cells.
     child_env["HERMES_RPC_PERSISTENT"] = "1"
+    # Client and server must agree on the wire: >1 = id-tagged concurrent calls, 1 = serial.
+    child_env["HERMES_RPC_PARALLEL"] = str(max_parallel)
     # Parent-death watchdog plumbing: Windows inherits a SYNCHRONIZE handle to this process; POSIX
     # inherits the read end of a pipe whose only write end we hold (EOF == host gone, any cause).
     parent_handle, close_handle, startupinfo = _parent_process_handle(child_env) if _IS_WINDOWS else (None, None, None)
@@ -659,7 +688,7 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
             os.close(death_r)
     # Deliberately NOT propagate_context_to_thread: that would freeze the spawning cell's
     # context/callbacks into the server thread for life. Authority is rebound per cell.
-    for target, args in ((_rpc_forever, (kernel, max_tool_calls, sandbox_tools)),
+    for target, args in ((_rpc_forever, (kernel, max_tool_calls, sandbox_tools, max_parallel)),
                          (_stdout_reader, (kernel,)), (_stderr_reader, (kernel,))):
         threading.Thread(target=target, args=args, daemon=True).start()
     _ensure_background_reaper()
@@ -858,6 +887,7 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
+    max_parallel: int = 1,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
     session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
@@ -868,7 +898,8 @@ def execute_in_session_kernel(
     try:
         return _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                          sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset,
+                         max_parallel=max_parallel)
     finally:
         with _REGISTRY.lock:
             kernel.attached -= 1
@@ -882,7 +913,7 @@ def execute_in_session_kernel(
 
 def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, child_python: str,
               child_cwd: str, sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-              is_interrupted, exec_start: float, state_reset: bool) -> str:
+              is_interrupted, exec_start: float, state_reset: bool, max_parallel: int = 1) -> str:
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
@@ -891,18 +922,23 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
         try:
             if kernel.proc is None:
                 _spawn(kernel, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
-                       sandbox_tools=sandbox_tools, max_tool_calls=max_tool_calls)
+                       sandbox_tools=sandbox_tools, max_tool_calls=max_tool_calls,
+                       max_parallel=max_parallel)
             assert kernel.proc is not None and kernel.proc.stdin is not None
             # Per-cell tool budget: the RPC loop enforces counter < max; reset without restarting.
-            kernel.tool_call_counter[0] = 0
-            kernel.cell_log_start = len(kernel.tool_call_log)
+            with kernel.rpc_lock:
+                kernel.tool_call_counter[0] = 0
+                kernel.cell_log_start = len(kernel.tool_call_log)
+                kernel.cell_authority = authority
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
-            kernel.cell_authority = authority
             from tools.code_execution_env import _session_identity_env
             request = {"id": uuid.uuid4().hex, "code": code, "env": _session_identity_env()}
             kernel.proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)
+            # Settled: retire BEFORE a timeout/interrupt teardown, which can wait 5 s on a child
+            # ignoring SIGTERM; a call still queued behind the parallel cap must not start then.
+            authority.retire()
             result = _cell_result(
                 kernel, key, status, payload,
                 timeout=timeout, sandbox_tools=sandbox_tools, reused=reused,
