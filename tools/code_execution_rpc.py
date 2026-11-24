@@ -184,7 +184,8 @@ def _serve_parallel(conn: socket.socket, *, allowed_tools: frozenset, tool_call_
                     max_tool_calls: int, tool_call_log: list, rpc_token: str, pool: CallPool,
                     bind, budget_lock) -> None:
     """Serve id-tagged requests ``{"id", "tool", "args", "token"}`` concurrently; each reply is
-    ``{"id", "result"}`` and may arrive in any order. Token, allow-list and budget are decided
+    ``{"id", "result"}`` and may arrive in any order, preceded by ``{"id", "started": true}`` when
+    a worker takes the call off the queue. Token, allow-list and budget are decided
     on this reader thread, in arrival order; the budget slot is reserved under ``budget_lock``
     together with ``bind()``, which snapshots the dispatch target (session kernels: the cell
     authority current at ARRIVAL) and a ``current()`` predicate. ``pool`` runs the dispatches. A call whose binding is no longer current when it finishes is not logged,
@@ -201,6 +202,13 @@ def _serve_parallel(conn: socket.socket, *, allowed_tools: frozenset, tool_call_
 
     def work(req_id, tool_name, tool_args, dispatch, current, call_start) -> None:
         try:
+            # Tell the stub the call left the queue: its reply timer starts here, as it did
+            # once a call held the serial wire's lock, so slot wait never times a call out.
+            with send_lock:
+                try:
+                    conn.sendall((json.dumps({"id": req_id, "started": True}) + "\n").encode())
+                except OSError as exc:
+                    logger.debug("RPC start notice dropped: %s", exc)
             result = _dispatch_one(dispatch, tool_name, tool_args, "sandbox")
             with budget_lock:
                 if current():
