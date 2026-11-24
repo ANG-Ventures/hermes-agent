@@ -444,13 +444,15 @@ def make_tool_result_message(
     """Build a tool-result message: OpenAI ``name`` (wire format) plus internal ``tool_name``
     (session DB). High-risk tool content (web_extract, web_search, browser_*, mcp_*) is
     wrapped in untrusted-data delimiters — the defense against indirect prompt injection.
+    An ``execute_code`` cell whose script called one of those tools is wrapped like that tool.
     """
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
     # Elision notice is appended to the RAW content first, THEN wrapped, so it sits inside
     # the untrusted block next to the data it describes — once, at construction (cache-safe).
     content = _redact_secret_source_content(content)
-    wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, content))
+    trust_name = _trust_name(name, content)
+    wrapped = _maybe_wrap_untrusted(trust_name, _maybe_append_elision_notice(trust_name, content))
     message = stamp_message_timestamp({
         "role": "tool",
         "name": name,
@@ -459,7 +461,7 @@ def make_tool_result_message(
         "tool_call_id": tool_call_id,
     })
     try:
-        risk_metadata = _tool_output_risk_metadata(name, content)
+        risk_metadata = _tool_output_risk_metadata(trust_name, content)
     except Exception as exc:
         logger.debug("Tool output risk scan failed for %s: %s", name, exc)
     else:
@@ -481,6 +483,29 @@ _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 
 def _is_untrusted_tool(name: Optional[str]) -> bool:
     return bool(name) and (name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES))
+
+
+# execute_code's host-built result JSON opens with this key when the cell's kernel called an untrusted
+# tool stub; its value is the first such tool, taken from the host's own tool-call log. Script output
+# cannot produce it at the anchors read below: inside a JSON string every ``"`` and newline the script
+# prints is escaped, and the anchors are the start of the result, the start of a ``<persisted-output>``
+# preview, or a line of the scalar ``<tool-result-metadata>`` block that preview opens with when the
+# result was reshaped for paging (one ``"key": value`` per line, every value JSON-escaped).
+EXECUTE_CODE_UNTRUSTED_KEY = "untrusted_tool"
+_EXECUTE_CODE_UNTRUSTED_RE = re.compile(
+    r'(?:\A|\A<persisted-output>\n(?:(?!Preview \(first )[^\n]*\n)*Preview \(first \d+ chars\):\n)'
+    r'(?:\{|<tool-result-metadata>\n\{\n(?: "[a-z_]+": [^\n]*,\n)*? )'
+    r'"' + EXECUTE_CODE_UNTRUSTED_KEY + r'": ("[^"\\\n]*")')
+
+
+def _trust_name(name: Optional[str], content: Any) -> Optional[str]:
+    """The name whose trust class governs this result: an ``execute_code`` cell whose kernel called an
+    untrusted stub is classified by that stub; every other row by its own name."""
+    if name != "execute_code" or not isinstance(content, str):
+        return name
+    match = _EXECUTE_CODE_UNTRUSTED_RE.match(content)
+    stub = json.loads(match.group(1)) if match else None
+    return stub if _is_untrusted_tool(stub) else name
 
 
 def _is_text_item(item: Any) -> bool:

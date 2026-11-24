@@ -943,7 +943,11 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
     stdout_text, stdout_metadata = _truncate_stdout_text(clean(str(payload.get("stdout", "")) + kernel.raw.drain()))
     cell_stderr = clean(str(payload.get("stderr", "")) + stderr_raw)
     cell_status = payload.get("status", "")
+    from tools.code_execution_tool import _untrusted_marker
     result: dict[str, Any] = {
+        # Every untrusted call this kernel made, not only this cell's: kernel state outlives the cell, so
+        # a page an earlier cell fetched can be printed by this one. A reset or dead kernel starts clean.
+        **_untrusted_marker(kernel.tool_call_log),
         "status": status, "output": stdout_text, "exit_code": 0,
         "tool_calls_made": kernel.tool_call_counter[0], "duration_seconds": duration,
         "kernel": {"mode": "session", "reused": reused,

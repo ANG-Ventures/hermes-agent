@@ -550,12 +550,22 @@ def _remote_failure(exc: BaseException, exec_start: float, tool_calls_made: int)
 _REMOTE_EXIT_STATUS = {124: "timeout", 130: "interrupted"}
 
 
+def _untrusted_marker(tool_call_log: list) -> dict[str, Any]:
+    """``{"untrusted_tool": <name>}`` for the first untrusted tool (the dispatch helpers' own predicate)
+    in the host's tool-call log; empty when there is none, so the result is unchanged. It leads the
+    result dict: ``make_tool_result_message`` reads it at the start of the result."""
+    from agent.tool_dispatch_helpers import EXECUTE_CODE_UNTRUSTED_KEY, _is_untrusted_tool
+    name = next((e.get("tool") for e in list(tool_call_log) if _is_untrusted_tool(e.get("tool"))), None)
+    return {EXECUTE_CODE_UNTRUSTED_KEY: name} if name else {}
+
+
 def _remote_result(status: str, raw_stdout: str, exec_start: float, fields: dict[str, Any],
-                   kernel: Optional[dict[str, Any]] = None, *, env: Any = None) -> dict[str, Any]:
-    """Common remote reply shape: status, cleaned output, *fields*, duration, optional kernel
-    info, then truncation metadata (key order is part of the result contract)."""
+                   kernel: Optional[dict[str, Any]] = None, *, env: Any = None,
+                   untrusted: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Common remote reply shape: [untrusted marker,] status, cleaned output, *fields*, duration,
+    optional kernel info, then truncation metadata (key order is part of the result contract)."""
     stdout_text, stdout_metadata = _clean_output(raw_stdout, env)
-    result: dict[str, Any] = {"status": status, "output": stdout_text, **fields,
+    result: dict[str, Any] = {**(untrusted or {}), "status": status, "output": stdout_text, **fields,
                               "duration_seconds": round(time.monotonic() - exec_start, 2)}
     if kernel is not None:
         result["kernel"] = kernel
@@ -581,7 +591,8 @@ def _finish_remote_kernel_result(kernel_result: dict[str, Any], *,
         stdout_text = stdout_text + "\n--- stderr ---\n" + stderr_text + traceback_text
     result = _remote_result(kernel_result.get("status", "error"), stdout_text, exec_start,
                             {"tool_calls_made": kernel_result.get("tool_calls_made", 0)},
-                            kernel=kernel_result.get("kernel", {"remote": True}), env=env)
+                            kernel=kernel_result.get("kernel", {"remote": True}), env=env,
+                            untrusted=kernel_result.get("untrusted"))
     if kernel_result.get("tool_errors"):
         result["tool_errors"] = kernel_result["tool_errors"]
     if result["status"] == "timeout":
@@ -653,7 +664,8 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         except Exception:
             logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
     result = _remote_result(status, stdout_text, exec_start,
-                            {"exit_code": exit_code, "tool_calls_made": tool_call_counter[0]}, env=env)
+                            {"exit_code": exit_code, "tool_calls_made": tool_call_counter[0]}, env=env,
+                            untrusted=_untrusted_marker(tool_call_log))
     tool_errors = tool_errors_since(tool_call_log)
     if tool_errors:
         result["tool_errors"] = tool_errors

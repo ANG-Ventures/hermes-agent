@@ -221,6 +221,12 @@ When your script calls a function like `web_search("query")`:
 
 This means tool calls inside scripts behave identically to normal tool calls — same rate limits, same error handling, same capabilities. The only restriction is that `terminal()` is foreground-only (no `background` or `pty` parameters).
 
+### Web results inside a script
+
+When a script calls a tool whose direct results are wrapped as untrusted content (`web_search`, `web_extract`, `browser_*`, `mcp_*`), the whole `execute_code` result is wrapped the same way, and the result JSON opens with `"untrusted_tool": "<name>"` naming the first such tool. Kernel state outlives the call, so every later call in the same session kernel is wrapped too, until `reset=true` or a lost kernel starts a fresh one. The parent decides this from its own record of the tool calls it dispatched, so nothing the script prints can set or clear it. A call whose kernel never used such a tool returns exactly what it did before.
+
+The parent only sees calls made through the tool functions. A script that fetches a page itself (`urllib`, `requests`, `curl` through `terminal()`) is not marked.
+
 ## Error Handling
 
 When a script fails, the agent receives structured error information:

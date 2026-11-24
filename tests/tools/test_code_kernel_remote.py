@@ -152,6 +152,43 @@ class TestSpawnAndReuse(RemoteKernelBase):
         self.assertFalse(result["kernel"]["reused"])
         self.assertEqual(sum(1 for c in env.commands if "nohup" in c), 2)
 
+    def test_untrusted_mark_outlives_the_cell_until_reset(self):
+        # Cell 1 calls web_extract; cell 2 (no call) can print what cell 1 kept in kernel state.
+        calls = iter([[{"tool": "web_extract"}], [], []])
+        self._poll.stop()
+        self._poll = patch("tools.code_execution_tool._rpc_poll_loop",
+                           side_effect=lambda *a, **k: [a[3].append(e) for e in next(calls)])
+        self._poll.start()
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell(), _cell()]))
+        first, later, fresh = _run(env), _run(env), _run(env, reset=True)
+        self.assertEqual(first["untrusted"], {"untrusted_tool": "web_extract"})
+        self.assertEqual(later["untrusted"], {"untrusted_tool": "web_extract"})
+        self.assertEqual(fresh["untrusted"], {})
+
+    def test_web_call_logged_after_the_cell_returned_marks_the_next_cell(self):
+        # A dispatch that outlasts the 5 s join is logged into the cell's log after the result was
+        # built; the kernel must still be marked before its reply can be printed.
+        logs = []
+        self._poll.stop()
+        self._poll = patch("tools.code_execution_tool._rpc_poll_loop",
+                           side_effect=lambda *a, **k: logs.append(a[3]))
+        self._poll.start()
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
+        first = _run(env)
+        logs[0].append({"tool": "web_extract"})  # the late dispatch finishes now
+        later = _run(env)
+        self.assertEqual(first["untrusted"], {})
+        self.assertEqual(later["untrusted"], {"untrusted_tool": "web_extract"})
+
+    def test_kernel_result_leads_with_the_marker_only_when_marked(self):
+        from tools.code_execution_tool import _finish_remote_kernel_result
+        plain = {"status": "success", "stdout": "x", "untrusted": {}}
+        marked = {**plain, "untrusted": {"untrusted_tool": "web_search"}}
+        self.assertTrue(_finish_remote_kernel_result(plain, timeout=5, exec_start=time.monotonic())
+                        .startswith('{"status": "success"'))
+        self.assertTrue(_finish_remote_kernel_result(marked, timeout=5, exec_start=time.monotonic())
+                        .startswith('{"untrusted_tool": "web_search", "status": "success"'))
+
 
 class TestDeathDetection(RemoteKernelBase):
     def test_dead_kernel_is_reported_and_respawned(self):
@@ -452,6 +489,32 @@ class TestRemotePerCallSpillE2E(RemoteKernelBase):
         self.assertNotIn("\x1b[", body)
         self.assertEqual(os.stat(spill).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(os.path.dirname(spill)).st_mode & 0o777, 0o700)
+
+
+@pytest.mark.platforms("posix")
+class TestRemotePerCallUntrustedMark(RemoteKernelBase):
+    """The per-call remote path marks its result from that call's own tool-call log."""
+
+    def _per_call(self, logged):
+        self._ship.stop()
+        self._poll.stop()
+        self._poll = patch("tools.code_execution_tool._rpc_poll_loop",
+                           side_effect=lambda *a, **k: a[3].extend(logged))
+        self._poll.start()
+        from tools.environments.local import LocalEnvironment
+        from tools.code_execution_tool import _run_remote_per_call
+        return _run_remote_per_call(LocalEnvironment(cwd="/", timeout=60), "local", "print('hi')\n",
+                                    "t-per-call-mark", frozenset(), timeout=60, max_tool_calls=5,
+                                    exec_start=time.monotonic())
+
+    def test_web_call_marks_the_per_call_result(self):
+        raw = self._per_call([{"tool": "read_file"}, {"tool": "web_extract"}])
+        self.assertTrue(raw.startswith('{"untrusted_tool": "web_extract", "status": "success"'), raw[:120])
+
+    def test_local_only_per_call_result_is_unchanged(self):
+        raw = self._per_call([{"tool": "read_file"}])
+        self.assertTrue(raw.startswith('{"status": "success"'), raw[:120])
+        self.assertNotIn("untrusted_tool", json.loads(raw))
 
 
 if __name__ == "__main__":
