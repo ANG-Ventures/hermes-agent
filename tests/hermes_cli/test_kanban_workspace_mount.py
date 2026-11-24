@@ -1048,6 +1048,27 @@ def test_studio_run_on_continuation_source_keeps_child_stranded(home, monkeypatc
         assert not path.exists()
 
 
+def test_earlier_transfer_bounds_source_studio_history(home, monkeypatch):
+    # Prism f98378c58467: A ran on the Studio at P, handed P to B, then ran
+    # only on the pool at its fresh path Q and handed Q to C. A's Studio run
+    # was at P, so C's vanished placeholder at Q is restorable.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _sent_back_after_remote_run(conn, root, host='ace-media')
+        parent_id = kb.create_task(conn, title='source', assignee='default')
+        _studio_run_with_event(conn, parent_id, 0)
+        first_child = kb.create_task(conn, title='first child', assignee='default')
+        kb._append_event(conn, parent_id, 'workspace_transferred', {'to': first_child, 'path': 'P'})
+        kb._append_event(conn, first_child, 'continues', {'parent': parent_id, 'host': None})
+        kb._append_event(conn, parent_id, 'workspace_transferred', {'to': task_id, 'path': 'Q'})
+        kb._append_event(conn, task_id, 'continues', {'parent': parent_id, 'host': 'ace-media'})
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id in calls
+        assert task_id not in result.stranded_by_mount_loss
+        assert _restored_host(conn, task_id) == 'ace-media'
+
+
 def test_continuation_source_without_studio_run_allows_restore(home, monkeypatch):
     root = _mounted_root(home, monkeypatch)
     with kb.connect_closing() as conn:

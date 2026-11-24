@@ -238,10 +238,11 @@ def remote_run_host(conn, task_id: str) -> Optional[str]:
 def _ran_on_studio_at_current_path(conn, task_id: str) -> bool:
     """True when any card that held the current path ran on the Studio while holding it.
 
-    The path is held from the card's latest ``origin_dropped`` (the only
-    in-place path change) to now, and back through the ``--continues`` chain:
-    each source held it up to its ``workspace_transferred`` event (Prism
-    e641269822db). Run order against those events is by event id, so a run
+    The path is held from the card's latest ``origin_dropped`` or outgoing
+    ``workspace_transferred`` (both leave the card on a fresh path) to now,
+    and back through the ``--continues`` chain: each source held it up to its
+    ``workspace_transferred`` event (Prism e641269822db), and from its
+    previous drop or transfer (Prism f98378c58467). Run order against those events is by event id, so a run
     in the same second as the event is placed exactly (Prism c920880fe89d);
     a run with no events falls back to ``started_at`` and a tie counts
     (fail closed: the stranded refusal stays). Runs with a NULL host never
@@ -251,7 +252,8 @@ def _ran_on_studio_at_current_path(conn, task_id: str) -> bool:
     while card and card not in seen and len(seen) < 32:
         seen.add(card)
         lower = conn.execute(
-            "SELECT id, created_at FROM task_events WHERE task_id=? AND kind='origin_dropped'"
+            "SELECT id, created_at FROM task_events WHERE task_id=?"
+            " AND kind IN ('origin_dropped','workspace_transferred')"
             " AND id<? ORDER BY id DESC LIMIT 1",
             (card, upper[0] if upper else 2**62),
         ).fetchone()
@@ -267,7 +269,7 @@ def _ran_on_studio_at_current_path(conn, task_id: str) -> bool:
             if after and before:
                 return True
         if lower is not None:
-            return False  # the path began at that drop; earlier holders used another dir
+            return False  # the path began at that drop/transfer; earlier holders used another dir
         cont = conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='continues' ORDER BY id DESC LIMIT 1",
             (card,),
