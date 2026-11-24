@@ -21,7 +21,7 @@ _NEG_ACCEPT = (
 )
 NEG_RESULT_RE = re.compile(
     r"(?i:" + _NEG_ACCEPT + r"|\bnot\s+(?:yet\s+)?proven\b)|\bUNTRUSTED\b"
-    r"|(?i:\b(?:verdict|result|gate))\s*[:=]?\s*(?:FAIL(?:ED)?|DEFERRED)\b"
+    r"|(?<![A-Za-z0-9])(?<![A-Za-z0-9]_)(?i:verdict|result|gate)(?:\*+|__?(?!\w))?\s*[:=]?(?:\*+|__?(?!\w))?\s*(?:FAIL(?:ED)?|DEFERRED)\b"
 )
 
 
@@ -39,7 +39,11 @@ _VERDICT_LABEL_RE = re.compile(
 _PLEASE_RE = re.compile(r"(?i)\bplease\s*$")
 _NOT_PROVEN_RE = re.compile(r"(?i)\bnot\s+(?:yet\s+)?proven\b")
 _DONT_LAND_RE = re.compile(r"(?i)\b(?:do\s+not|don'?t)\s+(?:merge|land)\b")
-_FAIL_ARM_RE = re.compile(r"(?i:\b(?:verdict|result|gate))\s*[:=]?\s*(?:FAIL(?:ED)?|DEFERRED)\b")
+_FAIL_ARM_RE = re.compile(r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]_)(?i:verdict|result|gate)(?:\*+|__?(?!\w))?\s*[:=]?(?:\*+|__?(?!\w))?\s*(?:FAIL(?:ED)?|DEFERRED)\b")
+# t_647c2995: a label may carry emphasis and 1-3 capitalised words in front at a line start ("QA verdict: FAIL",
+# "__Verdict__: FAIL", "- **QA verdict**: FAIL") with a colon, or caps words before a caps label ("QA VERDICT FAIL,").
+# "Test result FAIL on base", "Prints RESULT FAIL", "Ensure verdict=FAIL" describe output (Prism 6b1d299707d7).
+_LABEL_WORDS_RE = re.compile(r"[\s>*_#\-\u2022]*(?:[A-Z][\w'\-]*\s+){0,3}[*_]*$")
 # The card's own gate named in the sentence before "not proven": "The done criterion is NOT yet proven".
 _GATE_NOUN_RE = re.compile(
     r"(?i)\b(?:accept\w*|done|done-when|card|target|criteri\w*|condition|requirement|goal|item|close\w*|AC\d+)\b"
@@ -61,7 +65,15 @@ def _verdict_position(text: str, m: re.Match) -> bool:
     if _FAIL_ARM_RE.fullmatch(phrase):
         # "Verdict: FAIL" as the line's own label; "prints RESULT FAIL" / "on verdict=FAIL" describe output.
         line_start = text.rfind("\n", 0, m.start()) + 1
-        return bool(_LINE_LEAD_RE.match(text[line_start:m.start()]))
+        lead = text[line_start:m.start()]
+        if _LINE_LEAD_RE.match(lead):
+            return True
+        if not _LABEL_WORDS_RE.match(lead):
+            return False
+        if ":" in phrase:
+            return True
+        words = re.findall(r"[A-Za-z][\w'\-]*", lead)
+        return re.search(r"[A-Za-z]+", phrase).group(0).isupper() and all(w.isupper() for w in words)
     if _DONT_LAND_RE.fullmatch(phrase):
         # An instruction ("Do not land.", "draft, do not merge"), never a description ("I do not merge").
         prefix = _PLEASE_RE.sub("", prefix)  # "Please do not merge" is the same instruction (Prism 01d8577b1e47)
