@@ -234,3 +234,13 @@ def test_capacity_waits_are_never_reported(kanban_home):
     assert kps.fix_for("pin_host_full") is None
     assert kps.fix_for("not_portable:host_reach") is not None
     assert kps.fix_for("requires_unsatisfied:docker+studio_needs") is not None
+
+
+def test_the_comment_names_the_allocation_verb_never_the_deprecated_alias():
+    """Rename wave 3 (t_3a394860): a reader that follows this comment's advice must run `kanban allocation`, not the
+    `kanban placement` alias being deleted (an agent did, 2026-11-23 21:13Z, and it was the only old-name read)."""
+    hit = {"code": "not_portable:workspace_kind", "waited": 3600, "events": 4, "task_id": "t_x",
+           "fix": kps.fix_for("not_portable:workspace_kind")}
+    texts = [fix for _, fix in kps._FIXES] + [kps.comment_body(hit)]
+    assert "kanban allocation t_x" in kps.comment_body(hit)
+    assert not [t for t in texts if "kanban placement" in t]
