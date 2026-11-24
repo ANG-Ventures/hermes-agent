@@ -358,9 +358,10 @@ def test_call_arriving_with_no_cell_is_refused_not_run_under_the_next_cell():
 def test_time_waiting_for_a_slot_does_not_count_against_the_reply_timer():
     """The stub's reply timer runs from dispatch, as it did on the serial wire, so a call never
     reports "RPC timeout" while it waits for a slot and then runs anyway. The script scales the
-    stub's waits by 1/300, so its 300 s timer is 1 s: cap 2, three 0.7 s calls, the third waits
-    0.7 s for a slot and finishes 1.4 s after it was sent."""
-    tool = _SlowTool(0.7)
+    stub's waits by 1/150, so its 300 s timer is 2 s: cap 2, three 1.3 s calls, the third waits
+    1.3 s for a slot and finishes 2.6 s after it was sent. Run time alone is 0.7 s under the
+    timer; queue plus run is 0.6 s over it, so counting queue time turns this red."""
+    tool = _SlowTool(1.3)
     code = """
 import json, threading
 import hermes_tools
@@ -368,7 +369,7 @@ from hermes_tools import web_search
 
 class _ScaledEvent(threading.Event):
     def wait(self, timeout=None):
-        return super().wait(None if timeout is None else timeout / 300.0)
+        return super().wait(None if timeout is None else timeout / 150.0)
 
 class _Threading:
     def __getattr__(self, name):
