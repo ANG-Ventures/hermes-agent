@@ -29,7 +29,7 @@ TABLE = {
 def placement_home(tmp_path, monkeypatch):
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "fleet-hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path))
     return tmp_path
 
 

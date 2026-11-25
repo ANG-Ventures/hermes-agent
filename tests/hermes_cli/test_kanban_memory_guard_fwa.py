@@ -41,7 +41,7 @@ def _home(tmp_path, monkeypatch, admission, profile_admission=None, gate_enabled
     if lines:
         (home / "config.yaml").write_text("kanban:\n" + "\n".join(lines) + "\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("PLACEMENT_HOME", str(root))
+    monkeypatch.setenv("ALLOCATION_HOME", str(root))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: dict(LOW))
     kb.init_db()

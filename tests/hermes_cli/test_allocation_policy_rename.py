@@ -20,13 +20,13 @@ def _log_lines():
     return p.read_text().splitlines() if p.exists() else []
 
 
-def test_old_module_is_the_same_object_and_counted():
+def test_old_module_alias_is_gone():
+    """t_5931d620: the counted sys.modules alias hermes_cli.placement_policy is deleted."""
+    import pytest
+
     sys.modules.pop("hermes_cli.placement_policy", None)
-    before = len(_log_lines())
-    old = importlib.import_module("hermes_cli.placement_policy")
-    assert old is ap
-    new_lines = _log_lines()[before:]
-    assert len(new_lines) == 1 and " module:hermes_cli.placement_policy pid=" in new_lines[0]
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("hermes_cli.placement_policy")
 
 
 def test_new_file_name_is_read(tmp_path):
@@ -57,24 +57,23 @@ def test_neither_file_is_the_prd_fallback(tmp_path):
     assert pol.source == "fallback" and pol.stale_after_s == 120
 
 
-def test_fleet_placement_root_reads_allocation_home_and_counts_the_old_name(tmp_path, monkeypatch):
-    """The vendored fleet_placement root: ALLOCATION_HOME wins; the old PLACEMENT_HOME is still read and counted once
-    per process under HERMES_HOME (the vendored copy has no get_fleet_home)."""
+def test_fleet_placement_root_reads_only_allocation_home(tmp_path, monkeypatch):
+    """The vendored fleet_placement root: ALLOCATION_HOME wins. The old PLACEMENT_HOME alone is no longer read
+    (t_5931d620): the root is the kanban home, as with neither set, and nothing is counted."""
     from hermes_cli import fleet_placement as fp
-    from hermes_cli.fleet_placement import placement
+    from hermes_cli.fleet_placement import admission_demand, alloc_client, placement
 
     new, old, vh = tmp_path / "new", tmp_path / "old", tmp_path / "vh"
     vh.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(vh))
-    monkeypatch.setattr(placement, "_OLD_ENV_COUNTED", set())
     monkeypatch.setenv("ALLOCATION_HOME", str(new))
     monkeypatch.setenv("PLACEMENT_HOME", str(old))
     assert fp._fleet_root() == new
     monkeypatch.delenv("ALLOCATION_HOME")
-    assert fp._fleet_root() == old
-    assert fp._fleet_root() == old
-    log = (vh / "var" / "ci-box" / "deprecated-name-reads.log").read_text().splitlines()
-    assert len(log) == 1 and " env:PLACEMENT_HOME pid=" in log[0]
+    assert fp._fleet_root() == kb.kanban_home() != old
+    for mod in (placement, admission_demand, alloc_client):
+        assert mod._allocation_home_env() is None, mod.__name__
+    assert not list(tmp_path.rglob("deprecated-name-reads.log"))
 
 
 def test_sandbox_root_ignores_an_exported_allocation_home(tmp_path):

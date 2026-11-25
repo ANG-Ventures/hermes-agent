@@ -1679,7 +1679,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             f"{o['id']} ({o['status']}, {o['assignee'] or '-'})" for o in others) or "none other"))
     if placement and (placement.get("running_on") or placement.get("last_placement")
                       or placement.get("held")):
-        # The block `kanban placement <id>` prints (spec §4.3; one reader, I-S5).
+        # The block `kanban allocation <id>` prints (spec §4.3; one reader, I-S5).
         from hermes_cli import kanban_placement_view as kpv
         print()
         print("\n".join(kpv.format_task(placement)))
@@ -2870,25 +2870,9 @@ def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
     return 0
 
 
-def _count_deprecated_verb(verb: str, new: str) -> None:
-    """The old (pre-rename) verb was used: one deprecation line on stderr, and one
-    ``<utc iso> cli:kanban <verb> pid=<pid> ppid=.. argv=.. parent=.. cwd=..`` line in
-    <root>/var/ci-box/deprecated-name-reads.log via ``allocation_policy.count_deprecated_read`` (the reader
-    tag names the caller, t_bab23582). Never raises."""
-    print(f"kanban {verb}: deprecated, use `kanban {new}` (the `{verb}` alias goes after one release)",
-          file=sys.stderr)
-    try:
-        from hermes_cli.allocation_policy import count_deprecated_read
-        count_deprecated_read(f"cli:kanban {verb}")
-    except Exception:  # noqa: BLE001 -- a counter must never break the verb
-        pass
-
-
 def _cmd_placement(args: argparse.Namespace) -> int:
-    """``allocation --fleet`` / ``allocation <id>``: read-only (spec §4.3, Phase 3). ``placement`` is the
-    deprecated alias (rename wave 3, t_7be48220): it prints one deprecation line and is counted."""
-    if getattr(args, "kanban_action", None) == "placement":
-        _count_deprecated_verb("placement", "allocation")
+    """``allocation --fleet`` / ``allocation <id>``: read-only (spec §4.3, Phase 3). The old ``placement`` verb
+    alias is gone (rename wave 3 done, t_5931d620)."""
     from hermes_cli import kanban_load_gate as _klg
     from hermes_cli import kanban_placement_view as kpv
     from hermes_cli.config_effective import load_user_config_effective
@@ -2976,7 +2960,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
     runtime_config = load_config()
     if getattr(args, "placement", False):
-        if getattr(args, "fleet", False):  # Q5 alias, one release: `kanban placement --fleet`
+        if getattr(args, "fleet", False):  # alias of `kanban allocation --fleet` (Q5)
             args.task_id, args.gate = None, None
             return _cmd_placement(args)
         return _cmd_diagnostics_placement(args, runtime_config)
@@ -5373,7 +5357,6 @@ _HANDLERS = {
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "allocation": _cmd_placement,
-    "placement": _cmd_placement,  # deprecated alias of `allocation` (t_7be48220)
     "placement-holds": _cmd_placement_holds,
     "link": _cmd_link, "rehome": _cmd_rehome, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,

@@ -67,12 +67,12 @@ def test_candidate_receipt_package_closure(tmp_path):
         (package / name).write_bytes(blob)
     root = tmp_path / "fleet"
     receipt = tmp_path / "receipt.json"
-    env = {**os.environ, "PYTHONPATH": str(package.parents[1]), "PLACEMENT_HOME": str(root),
+    env = {**os.environ, "PYTHONPATH": str(package.parents[1]), "ALLOCATION_HOME": str(root),
            "PLACEMENT_ROOT_RECEIPT": str(receipt)}
     program = r'''import os
 from pathlib import Path
 from hermes_cli.fleet_placement import placement, admission_demand as dm, alloc_client
-root = Path(os.environ["PLACEMENT_HOME"])
+root = Path(os.environ["ALLOCATION_HOME"])
 receipt = Path(os.environ["PLACEMENT_ROOT_RECEIPT"])
 assert dm._root() == placement.fleet_root() == root
 try:
@@ -131,7 +131,9 @@ def test_adapter_binds_the_state_root_to_the_kanban_root(tmp_path, monkeypatch):
     assert root != Path(fp.placement.__file__).resolve().parents[2]   # not hermes-home's checkout default
     assert fp.placement.fleet_root() == root
     assert fp.admission_demand._root() == root
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path / "p"))
+    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path / "old"))   # t_5931d620: the old name alone is not read
+    assert fp.placement.fleet_root() == fp.admission_demand._root() == root
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path / "p"))
     assert fp.admission_demand._root() == tmp_path / "p"
 
 

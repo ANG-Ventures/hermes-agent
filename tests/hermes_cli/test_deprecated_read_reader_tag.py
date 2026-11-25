@@ -1,8 +1,8 @@
 """Rename wave 3 step 6 (t_bab23582, hermes-home#13696 / t_5931d620): every deprecated-name-reads line the fork
 writes names its reader (ppid, argv, parent, cwd), and a clock-shifted process writes no row.
 
-Writers covered: the three byte-vendored fleet_placement copies (env:PLACEMENT_HOME), the fork's own
-allocation_policy.count_deprecated_read (module/file names), and the `kanban placement` deprecated verb.
+Writer covered: the fork's own allocation_policy.count_deprecated_read (the legacy placement-policy.json file read).
+The vendored copies' env:PLACEMENT_HOME counter and the `kanban placement` verb are deleted (t_5931d620).
 
 The tag never parses argv (Apollo 11-20 ruling after Prism 918779febe18 / 86eec040fec9): own process = the
 executable's basename + sys.argv[0]; parent = its executable name only; cwd.
@@ -17,9 +17,6 @@ import pytest
 
 from hermes_cli import allocation_policy as ap
 from hermes_cli import kanban_db as kb
-from hermes_cli.fleet_placement import admission_demand, alloc_client, placement
-
-COPIES = [placement, admission_demand, alloc_client]
 REPO = Path(__file__).resolve().parents[2]
 PY = os.path.basename(sys.executable)
 
@@ -33,8 +30,6 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("PLACEMENT_HOME", raising=False)
     monkeypatch.delenv("HERMES_CLOCK_SHIFT_DAYS", raising=False)
     monkeypatch.delenv("FAKETIME", raising=False)
-    for mod in COPIES:
-        monkeypatch.setattr(mod, "_OLD_ENV_COUNTED", set())
     monkeypatch.setattr(sys, "argv", ["/srv/x/reader.py", "--token", "ignored"])
     monkeypatch.chdir(tmp_path)
     return tmp_path
@@ -47,26 +42,11 @@ def _logs(env):
     return [ln for p in paths if p.exists() for ln in p.read_text(encoding="utf-8-sig").splitlines()]
 
 
-def _copy_writer(mod):
-    def call(env, monkeypatch):
-        monkeypatch.setenv("PLACEMENT_HOME", str(env / "old"))
-        assert mod._allocation_home_env() == str(env / "old")
-    return call
-
-
 def _ap_writer(env, monkeypatch):
     ap.count_deprecated_read("module:hermes_cli.placement_policy")
 
 
-def _verb_writer(env, monkeypatch):
-    from hermes_cli import kanban as kcli
-    kcli._count_deprecated_verb("placement", "allocation")
-
-
-WRITERS = [(m.__name__.rsplit(".", 1)[1], _copy_writer(m), "env:PLACEMENT_HOME") for m in COPIES] + [
-    ("allocation_policy", _ap_writer, "module:hermes_cli.placement_policy"),
-    ("kanban_placement_verb", _verb_writer, "cli:kanban+placement"),
-]
+WRITERS = [("allocation_policy", _ap_writer, "module:hermes_cli.placement_policy")]
 
 
 @pytest.mark.parametrize("name,call,label", WRITERS, ids=[w[0] for w in WRITERS])
@@ -74,8 +54,7 @@ def test_counter_line_names_the_reader(env, monkeypatch, name, call, label):
     before = set(_logs(env))
     call(env, monkeypatch)
     (line,) = [ln for ln in _logs(env) if ln not in before]
-    # `cli:kanban placement` keeps its space (field 1-2); normalise it so the field checks line up.
-    f = line.replace("cli:kanban placement", "cli:kanban+placement").split(" ")
+    f = line.split(" ")
     assert f[1] == label and f[2] == f"pid={os.getpid()}", line
     assert f[3] == f"ppid={os.getppid()}" and f[4] == f"argv={PY}+/srv/x/reader.py", line
     assert f[5].startswith("parent=") and f[5] != "parent=-" and "+" not in f[5] and f[6] == f"cwd={env}", line
@@ -85,8 +64,6 @@ def test_counter_line_names_the_reader(env, monkeypatch, name, call, label):
 TOKEN = "ExampleSecret_123"
 SECRETS = (TOKEN, "ghp" + "_T5931D620FAKEFAKEFAKEFAKE01", "x:hunter2secret@host", "FOO=envsecret")
 READERS = {   # one real reader process per writer kind
-    "kanban_placement_verb": "from hermes_cli import kanban as k; k._count_deprecated_verb('placement', 'allocation')",
-    "placement": "from hermes_cli.fleet_placement import placement as p; p._allocation_home_env()",
     "allocation_policy": "from hermes_cli import allocation_policy as a; "
                          "a.count_deprecated_read('module:hermes_cli.placement_policy')",
 }
@@ -154,10 +131,3 @@ def test_clock_shifted_process_never_counts(env, monkeypatch, name, call, label,
     before = _logs(env)
     call(env, monkeypatch)
     assert _logs(env) == before
-
-
-def test_vendored_reader_tag_is_the_fork_reader_tag():
-    """The fork's helper is the vendored text, docstring included (one shape of line in one log)."""
-    import inspect
-    texts = {m.__name__: inspect.getsource(m._reader_tag) for m in COPIES + [ap]}
-    assert len(set(texts.values())) == 1, sorted(texts)

@@ -468,7 +468,7 @@ def decoy_placement(tmp_path, monkeypatch):
     reader must resolve aliases from the kanban home's registry, never from the placement root (abd3aba4b5be)."""
     d = tmp_path / "placement-root"
     _registry(d, {"ci-box": {"aliases": []}})
-    monkeypatch.setenv("PLACEMENT_HOME", str(d))
+    monkeypatch.setenv("ALLOCATION_HOME", str(d))
     return d
 
 

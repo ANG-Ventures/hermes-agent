@@ -197,7 +197,7 @@ def test_loadgate_default_clock_does_not_double_book_a_settled_foreign_lease(hom
     """Prism c-79e25e334a28b343: admit_now() samples on time.monotonic() while a shared-ledger lease is dated on the
     wall clock. A Prism review admitted an hour ago is already inside cpu_busy; read on mismatched clocks it looked
     newer than the sample and was counted a second time (0.85 + 2/32 + 1/32 > 0.90: saturated:cpu)."""
-    monkeypatch.setenv("PLACEMENT_HOME", str(home))
+    monkeypatch.setenv("ALLOCATION_HOME", str(home))
     placement.reserve("mac-studio", "prism", placement.Footprint(ram_gb=4, threads=2), ttl_s=7200, job_id="pr#1",
                       path=home / placement.RESERVATIONS_REL, now=time.time() - 3600)
     assert len(klg.shared_leases("mac-studio")) == 1
@@ -218,7 +218,7 @@ def test_loadgate_admission_and_book_local_read_the_same_table(home, tmp_path, m
     fleet = tmp_path / "fleet-root"
     (fleet / "config").mkdir(parents=True)
     (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(no_local), encoding="utf-8")
-    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    monkeypatch.setenv("ALLOCATION_HOME", str(fleet))
     assert kh.table_path(home).is_file()                          # board home: mac-studio carries the local alias
     assert klg.utilization_context()["host"] == "local" and klg.utilization_context()["ceiling"] is None
     assert kh.book_local("t_x#1", None) is None
@@ -294,7 +294,7 @@ def test_local_start_books_renews_and_releases_on_the_fleet_ledger_when_homes_di
     fleet = tmp_path / "fleet-root"
     (fleet / "config").mkdir(parents=True)
     (fleet / "config" / "fleet-hosts.json").write_text((home / "config" / "fleet-hosts.json").read_text())
-    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    monkeypatch.setenv("ALLOCATION_HOME", str(fleet))
     from hermes_cli import kanban_headroom as kh
     now = time.time()
     rid = kh.book_local("t_x#1", None, now=now)
@@ -314,7 +314,7 @@ def _fleet_only(home, tmp_path, monkeypatch, table=TABLE):
     (fleet / "config").mkdir(parents=True)
     (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(table), encoding="utf-8")
     (home / "config" / "fleet-hosts.json").unlink()
-    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    monkeypatch.setenv("ALLOCATION_HOME", str(fleet))
     return fleet
 
 
@@ -362,7 +362,7 @@ def test_target_signal_table_and_ledger_share_the_fleet_root(home, tmp_path, mon
     fleet = tmp_path / "fleet-root"
     (fleet / "config").mkdir(parents=True)
     (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
-    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    monkeypatch.setenv("ALLOCATION_HOME", str(fleet))
     from gateway import kanban_gate_tick as gt
     monkeypatch.setattr(gt, "read_signal_enabled", lambda cfg: True)
     sig = _builder().target_signal({})
@@ -376,7 +376,7 @@ def test_gate_tick_renewal_control_table_at_both_roots(home, tmp_path, monkeypat
     fleet = tmp_path / "fleet-root"
     (fleet / "config").mkdir(parents=True)
     (fleet / "config" / "fleet-hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
-    monkeypatch.setenv("PLACEMENT_HOME", str(fleet))
+    monkeypatch.setenv("ALLOCATION_HOME", str(fleet))
     with kb.connect_closing() as conn:
         kb.create_task(conn, title="local", assignee="alpha")
         _dispatch_one(conn, [])
