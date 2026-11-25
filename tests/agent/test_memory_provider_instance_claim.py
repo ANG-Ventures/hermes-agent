@@ -354,21 +354,19 @@ def test_two_profiles_each_get_a_working_mem0_provider(homes, monkeypatch, mux, 
         with _ProfileTurn(home):
             agent_init._init_memory(agent, {"memory": {"provider": "mem0"}}, False, "api_server")
         agents[home.name] = agent
+        if agent._memory_manager is not None:  # shut down even when a later build or assert fails
+            request.addfinalizer(agent._memory_manager.shutdown_all)
 
     alpha, beta = agents["alpha"]._memory_manager, agents["beta"]._memory_manager
     assert alpha is not None and beta is not None
     (pa,), (pb,) = alpha.providers, beta.providers
     assert pa.name == pb.name == "mem0" and pa is not pb
     assert alpha.has_tool("mem0_search") and beta.has_tool("mem0_search")
-    try:
-        for name, manager in (("alpha", alpha), ("beta", beta)):
-            home = next(h for h in homes if h.name == name)
-            with _ProfileTurn(home):
-                result = json.loads(manager.handle_tool_call("mem0_search", {"query": "needle"}))
-            assert result["count"] == 1, result
-            assert result["results"][0]["memory"] == f"fact from mem0-{name}.test"
-        searches = [c for c in calls if c[1] == "/search"]
-        assert searches == [("mem0-alpha.test", "/search", "user-alpha"), ("mem0-beta.test", "/search", "user-beta")]
-    finally:
-        for manager in (alpha, beta):
-            manager.shutdown_all()
+    for name, manager in (("alpha", alpha), ("beta", beta)):
+        home = next(h for h in homes if h.name == name)
+        with _ProfileTurn(home):
+            result = json.loads(manager.handle_tool_call("mem0_search", {"query": "needle"}))
+        assert result["count"] == 1, result
+        assert result["results"][0]["memory"] == f"fact from mem0-{name}.test"
+    searches = [c for c in calls if c[1] == "/search"]
+    assert searches == [("mem0-alpha.test", "/search", "user-alpha"), ("mem0-beta.test", "/search", "user-beta")]

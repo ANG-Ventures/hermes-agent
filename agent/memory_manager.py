@@ -16,7 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_caller_scope import bound_scope, claim_instance
+from agent.memory_caller_scope import SHARED_INSTANCE_REFUSAL, bound_scope, claim_instance
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
@@ -1000,17 +1000,15 @@ class MemoryManager:
             _SYNC_DRAIN_TIMEOUT_S, abandoned_writes, abandoned_prefetches, active_tasks,
         )
 
-    def initialize_for_agent(self, say: Optional[Callable[[str], None]] = None, **kwargs) -> bool:
+    def initialize_for_agent(self, **kwargs) -> bool:
         """``initialize_all`` for an agent build; True while an external provider is still served. One
-        refused as another profile's shared instance is dropped, and ``say`` tells the user this
-        profile now runs without it."""
+        refused by ``claim_instance`` is dropped and logged; this profile then runs without it."""
         before = [p for p in self._providers if p.name != "builtin"]
         self.initialize_all(**kwargs)
         for provider in (p for p in before if not any(p is kept for kept in self._providers)):
-            message = (f"⚠ Memory provider {provider.name!r} is disabled for this profile: it handed out the "
-                       "provider instance another profile already uses. Built-in memory still works; the "
-                       "operator can see why with `hermes logs errors`.")
-            (say or logger.warning)(message)
+            logger.warning("Memory provider %r is disabled for this profile: its provider instance was refused "
+                           "(%s; the refusal line above names the reason and both homes). Other memory "
+                           "providers are unaffected.", provider.name, SHARED_INSTANCE_REFUSAL)
         return self._has_external
 
     def initialize_all(self, session_id: str, **kwargs) -> None:
