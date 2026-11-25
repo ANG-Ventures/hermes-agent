@@ -463,7 +463,7 @@ def test_goal_complete_operator_judge_500_fails_open_with_event(monkeypatch, tmp
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification", "kind": "needs_input"})
+    out = kt._handle_block({"reason": "Need: x. Why: y. How to reply: z.", "kind": "needs_input"})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb

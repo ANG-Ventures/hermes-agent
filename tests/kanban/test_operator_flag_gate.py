@@ -217,7 +217,7 @@ def test_takeover_without_active_run_is_not_gated(home):
     task_id = json.loads(created.stdout)["id"]
     _write_token(home)
 
-    out = _run(home, "block", task_id, "idle block", "--kind", "needs_input", "--takeover", "r")
+    out = _run(home, "block", task_id, "idle block. Need: x. Why: y. How to reply: z.", "--kind", "needs_input", "--takeover", "r")
 
     assert out.returncode == 0, out.stdout + out.stderr
     assert _refusals(home, task_id) == []
@@ -353,7 +353,7 @@ def test_unblock_reset_failures_already_happens_q16_branch_a(home):
     no ``--reset-failures`` flag is added."""
     created = _run(home, "create", "breaker card", "--json", "--unhomed")
     task_id = json.loads(created.stdout)["id"]
-    blocked = _run(home, "block", task_id, "quota: no eligible sub", "--kind", "needs_input")
+    blocked = _run(home, "block", task_id, "quota: no eligible sub. Need: x. Why: y. How to reply: z.", "--kind", "needs_input")
     assert blocked.returncode == 0, blocked.stderr
     conn = sqlite3.connect(_db(home))
     conn.execute("UPDATE tasks SET consecutive_failures=2 WHERE id=?", (task_id,))

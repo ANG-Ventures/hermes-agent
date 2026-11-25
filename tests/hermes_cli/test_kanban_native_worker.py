@@ -252,7 +252,9 @@ def test_runner_hands_back_block_reason_verbatim(monkeypatch, tmp_path):
     task, events = _card(kb, tid)
     assert task.status == "blocked"
     reasons = [(p or {}).get("reason") for k, p in events if k == "blocked"]
-    assert reasons == ["tests_match_claim false [run metadata: x/receipt.json]"]
+    # The lane's text stays first and verbatim; Need/Why/How follow it (t_2fecb5d0).
+    assert len(reasons) == 1
+    assert reasons[0].startswith("tests_match_claim false [run metadata: x/receipt.json]\nNeed: ")
 
 
 def test_runner_blocks_when_lane_exits_without_reporting(monkeypatch, tmp_path):

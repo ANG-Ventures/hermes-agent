@@ -3874,6 +3874,10 @@ def _cmd_block(args: argparse.Namespace) -> int:
         return kvi.refuse("block", text_error)
     reason = reason or None
     kind = getattr(args, "kind", None)
+    from hermes_cli import kanban_human_ask
+    ask_refusal = kanban_human_ask.refusal(kind, reason)
+    if ask_refusal:
+        return _err(ask_refusal)
     until: Optional[int] = None
     if getattr(args, "until", None):
         try:

@@ -26,7 +26,7 @@
     "set_boomerang_wake": ["--board", "{board}", "edit", "{card}", "--boomerang-wake"],
     "complete": ["--board", "{board}", "complete", "{card}", "--summary", "bv2 smoke: forced completed event"],
     "block_needs_input": ["--board", "{board}", "block", "{card}", "--kind", "needs_input",
-                          "bv2 smoke: forced needs_input event. unblock_when: after:+1d"],
+                          "bv2 smoke: forced needs_input event.\nunblock_when: after:+1d"],
     "inject_failure": ["--board", "{board}", "comment", "{card}", "--body",
                        "bv2 smoke s1 fault: board write after the boomerang-wake claim; the verdict must be refused (state moved) and the wake re-surfaced"],
     "wirelog_sync": ["python3", "~/.hermes/scripts/wirelog-fleet.py", "sync", "--sub", "{sub}"]

@@ -1167,6 +1167,9 @@ def _handle_block(args: dict, **kw) -> str:
     with _board(args.get("board"), verb="block", card_ids=(tid,)) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
+        from hermes_cli import kanban_human_ask
+        ask_refusal = kanban_human_ask.refusal(kind, reason)
+        _check(ask_refusal is None, ask_refusal or "")
         until = None
         if until_raw not in (None, ""):
             try:
