@@ -35,6 +35,9 @@ def audience(producer, message, cfg, explicit=None):
     head = (message or "").strip().split("\\n", 1)[0]
     if any(m and m in head for m in cfg.get("human_markers") or []):
         return "human"
+    lines = (cfg.get("human_logs_lines") or {}).get("lines") or []
+    if any(head.startswith(ln["first_line_prefix"]) for ln in lines):
+        return "human"
     return "human" if cfg.get("default_audience") == "human" else "agent"
 def write_agent_log(root, producer, sev, message, now=None, **extra):
     if (Path(root) / "state" / "log-boom").exists():
@@ -72,7 +75,10 @@ def fleet(tmp_path, monkeypatch):
     (root / "fleet" / "notify-audience.json").write_text(json.dumps({
         "default_audience": "agent", "human_markers": ["NEEDS-ACE"],
         "human_producers": ["courierwatch"],
-        "human_logs_producers": ["cron:weekly-review", "daily-journal"]}), encoding="utf-8")
+        "human_logs_producers": ["cron:weekly-review", "daily-journal"],
+        "human_logs_lines": {"lines": [{"name": "gbrain-daily-digest-warn",
+                                        "first_line_prefix": "⚠️ **gbrain — daily**"}]}}),
+        encoding="utf-8")
     (root / "state").mkdir()
     home = root / "profiles" / "worker"  # profile home: library found by walking up
     home.mkdir(parents=True)
@@ -242,3 +248,53 @@ def test_no_fleet_library_is_inert(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler, "get_hermes_home", lambda: home)
     send = _deliver(_job(), "fleet allocation: 3 hosts idle")
     send.assert_called_once()
+
+
+DIGEST_LIB = '''
+import json
+from pathlib import Path
+LOGS_CHANNEL = "1480525090331561984"
+def state_dir(root):
+    return Path(root) / "state" / "logs-digest"
+def armed(d, now=None):
+    return (d / "flusher.heartbeat").exists()
+def spool(d, producer, sev, message, now=None):
+    with open(d / "spool.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"producer": producer, "sev": sev, "text": message}) + "\\n")
+'''
+
+
+@pytest.fixture()
+def fleet_with_digest(fleet):
+    (fleet / "scripts" / "lib" / "logs_digest.py").write_text(DIGEST_LIB, encoding="utf-8")
+    d = fleet / "state" / "logs-digest"
+    d.mkdir(parents=True)
+    (d / "flusher.heartbeat").touch()
+    return fleet
+
+
+def _spool(root):
+    return _rows(root, "logs-digest/spool.jsonl")
+
+
+def test_agreed_human_line_posts_now_and_skips_the_digest_spool(fleet_with_digest):
+    # t_b3cb7cf7: prefix as in fleet/notify-audience.json (the 11-24 09:15 line). The 4 h digest rollup is agent-audience, so a human line spooled there is never seen.
+    send = _deliver(_job(name="gbrain-daily-digest"), "⚠️ **gbrain — daily** (2026-11-24)\nservice: **ok** · launchd unknown")
+    send.assert_called_once()
+    assert str(send.call_args[0][2]) == LOGS
+    assert _spool(fleet_with_digest) == []
+    assert _log(fleet_with_digest) == []
+
+
+def test_agent_line_still_goes_to_the_agent_log_with_the_digest_armed(fleet_with_digest):
+    send = _deliver(_job(), "fleet allocation: 3 hosts idle")
+    send.assert_not_called()
+    assert len(_log(fleet_with_digest)) == 1
+    assert _spool(fleet_with_digest) == []
+
+
+def test_split_off_still_spools_a_green_no_agent_line(fleet_with_digest):
+    (fleet_with_digest / "state" / "notify-logs-audience.DISABLED").touch()
+    send = _deliver(_job(), "⚠️ **gbrain — daily** (2026-11-24)\nservice: **ok** · launchd unknown")
+    send.assert_not_called()
+    assert len(_spool(fleet_with_digest)) == 1
