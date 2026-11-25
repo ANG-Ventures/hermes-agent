@@ -3428,6 +3428,12 @@ class GatewaySlashCommandsMixin(
                 self._evict_cached_agent(session_key)
             except Exception:
                 pass
+            # The next turn resolves channel_overrides (exact id, else the platform's '*') before
+            # config.yaml, so name that route, not the global one (t_3639712d).
+            _ch = self._channel_override_for(source)
+            if _ch is not None:
+                configured_model = _ch.model or configured_model
+                configured_provider = _ch.provider or configured_provider
             await self._announce_switch(
                 event.source,
                 "Model",

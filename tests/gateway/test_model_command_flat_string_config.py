@@ -170,6 +170,28 @@ async def test_model_reset_clears_session_override_without_switching_global(
 
 
 @pytest.mark.asyncio
+async def test_model_reset_names_platform_wildcard_route(tmp_path, monkeypatch):
+    """``/model reset`` in a chat covered by ``channel_overrides['*']`` names the route the next
+    turn runs (the '*' entry), not config.yaml's (t_3639712d)."""
+    from gateway.config import ChannelOverride, PlatformConfig
+
+    _setup_isolated_home(tmp_path, monkeypatch, {"default": "fable", "provider": "openrouter"})
+    runner = _make_runner()
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(
+        enabled=True, channel_overrides={"*": ChannelOverride(model="opus", provider="claude-alr")})})
+    event = _make_event("/model reset")
+    session_key = runner._session_key_for_source(event.source)
+    runner._session_model_overrides[session_key] = {
+        "model": "pinned-model", "provider": "openai-codex", "api_key": "runtime-only"}
+
+    result = await runner._handle_model_command(event)
+
+    assert session_key not in runner._session_model_overrides
+    assert "`claude-alr/opus`" in result
+    assert "fable" not in result
+
+
+@pytest.mark.asyncio
 async def test_model_reset_persistence_failure_never_claims_success(
     tmp_path, monkeypatch
 ):
