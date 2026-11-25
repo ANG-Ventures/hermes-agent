@@ -28,11 +28,14 @@ NON_HUMAN_PREDICATES = frozenset({"pr_merged", "card_done", "after"})
 _UNBLOCK_WHEN = re.compile(r"(?im)^[ \t]*unblock_when:(.*)$")
 # A predicate exempts only with a target: ``pr_merged:o/r#1``, not ``pr_merged`` or ``pr_merged:``.
 _NON_HUMAN_PRED = re.compile(r"(?i)^[ \t]*(" + "|".join(sorted(NON_HUMAN_PREDICATES)) + r"):[ \t]*\S")
-# A field counts only when its value is text, not empty and not the next label.
-_NEXT_LABEL = r"(?!(?:need|why|how to reply):)"
+# A field counts only when its value (up to the next label or line end) holds a word,
+# so an empty field, ``Need: | Why: ...`` or ``Need: - Why: ...`` is still missing.
+_LABELS = ("Need:", "Why:", "How to reply:")
+_NOT_LABEL = r"(?!need:|why:|how to reply:)"
 _FIELDS = tuple(
-    (label, re.compile(r"(?i)(?:^|[\s.;|/])" + re.escape(label.lower()) + r"[ \t]*" + _NEXT_LABEL + r"[^\s]"))
-    for label in ("Need:", "Why:", "How to reply:")
+    (label, re.compile(r"(?i)(?:^|[\s.;|/])" + re.escape(label.lower())
+                       + r"(?:" + _NOT_LABEL + r"[^\n])*?" + _NOT_LABEL + r"\w"))
+    for label in _LABELS
 )
 
 REFUSAL = (

@@ -120,6 +120,8 @@ def test_malformed_or_mixed_predicate_is_still_a_human_wait(reason):
     ("Need: Why: How to reply:", "Need:, Why:, How to reply:"),
     ("Need: a host. Why: How to reply: A or B", "Why:"),
     ("Need:\nWhy: x\nHow to reply: y", "Need:"),
+    ("Need: | Why: | How to reply: |", "Need:, Why:, How to reply:"),   # separators are not answers
+    ("Need: - Why: x - How to reply: -", "Need:, How to reply:"),
 ])
 def test_empty_field_counts_as_missing(reason, missing):
     from hermes_cli import kanban_human_ask as ha
@@ -133,3 +135,13 @@ def test_machine_shape_keeps_the_reason_first():
     assert ha.refusal("needs_input", out) is None
     partial = ha.shaped_for_machine("Need: a disk. lane exited rc=3")
     assert partial.count("Need:") == 1 and ha.refusal("needs_input", partial) is None
+
+
+def test_boomerang_smoke_plan_block_passes_the_gate():
+    """The stock live Boomerang v2 smoke probe forces a needs_input block; the gate must not abort it."""
+    from pathlib import Path
+    from hermes_cli import kanban_human_ask as ha
+    plan = Path(__file__).resolve().parents[2] / "tools/dev_probes/boomerang_v2_smoke/fixtures/plan.json"
+    argv = json.loads(plan.read_text())["commands"]["block_needs_input"]
+    assert argv[argv.index("--kind") + 1] == "needs_input"
+    assert ha.refusal("needs_input", argv[-1]) is None
