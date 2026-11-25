@@ -39,7 +39,7 @@ def _write_pool(fleet: Path) -> None:
         h: {"roles": {"kanban-worker": {"slots": 1}}, "state": "active"}
         for h in ("ace-ai", "ace-media")}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ci-box", "ace-ai", "ace-media"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ci-box", "ace-ai", "ace-media"],
         "profiles": ["alpha"],
         "hosts": {"ci-box": {"enabled": False, "absence": "optional"},
                   "ace-ai": {"enabled": True, "absence": "required"},

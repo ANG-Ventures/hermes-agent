@@ -97,7 +97,7 @@ def home(tmp_path, monkeypatch):
         h: {"roles": {"kanban-worker": {"slots": 24}}, "state": "active"} for h in HOSTS}}), encoding="utf-8")
     # The sidecar order deliberately puts ci-box LAST: the scorer must not read it as an order.
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai", "ace-media", "ci-box"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ace-ai", "ace-media", "ci-box"],
         "profiles": ["alpha"], "hosts": {h: {"enabled": True, "absence": "optional"} for h in HOSTS}}),
         encoding="utf-8")
     (home / "config").mkdir()

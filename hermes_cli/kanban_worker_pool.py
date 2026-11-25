@@ -11,7 +11,8 @@ Hosts come from two files under the fleet root (``<kanban_home>/fleet``):
   legacy ``profiles`` allow-list, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
   capacity_pct?, profiles?, ssh_user?, ssh_identity?}``, ``ssh_user``: the worker login, a default that a
   host row may override, never ``root``; t_5e87455b, Option A; ``ssh_identity``: the worker
-  key's private-key path, same default/override, required for any login other than kanbanw).
+  key's private-key path, same default/override). kanbanw is retired (Ace msg 1573287525165043742,
+  t_aad02bc5): a host whose row resolves to no owner login plus key is not placed (one warning).
   Written
   only by hermes-home ``scripts/fleet-host``.
 
@@ -61,8 +62,10 @@ from hermes_cli import allocation_policy as _policy
 logger = logging.getLogger(__name__)
 
 ROLE = "kanban-worker"
-# The legacy worker login; the sidecar's ``ssh_user`` (and ``hosts.<id>.ssh_user``) decides
-# per host since Option A (Ace 2026-11-20, t_5e87455b: workers run as each host's owner).
+# The RETIRED worker login (t_aad02bc5): never a placement login. The sidecar's ``ssh_user`` (and
+# ``hosts.<id>.ssh_user``) plus ``ssh_identity`` decide per host (Option A, t_5e87455b); a host that
+# resolves to this login, or to no login or key, is dropped. Kept as a name: hermes-home's writer
+# still stamps it as the top-level ``ssh_user`` and schema-1 reach rows imply it.
 SSH_USER = "kanbanw"
 # A plain POSIX login (it lands in an ssh argv as ``user@host``), and never root.
 _SSH_USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
@@ -236,7 +239,7 @@ class PoolHost:
     enabled: bool
     priority: int
     ssh_port: int = 22
-    ssh_identity: Optional[str] = None   # the worker key; None = ssh's own defaults (kanbanw)
+    ssh_identity: Optional[str] = None   # the worker key; read_pool never places a host without one
 
     @property
     def target(self) -> str:
@@ -340,6 +343,17 @@ def _ssh_user_ok(user) -> bool:
             and user != "root")
 
 
+def worker_login(sidecar: Mapping, hid: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(login, key)`` a worker on ``hid`` uses: the row's value, else the top-level one. A login that
+    is absent or the retired kanbanw is None, as is an absent key: the caller does not place the host
+    (t_aad02bc5). Never returns kanbanw."""
+    row = (sidecar.get("hosts") or {}).get(hid) or {}
+    user = row.get("ssh_user", sidecar.get("ssh_user"))
+    ident = row.get("ssh_identity", sidecar.get("ssh_identity"))
+    return (user if _ssh_user_ok(user) and user != SSH_USER else None,
+            ident if _ssh_identity_ok(ident) else None)
+
+
 def validate_sidecar(doc) -> List[str]:
     """Structural errors of ``kanban-pool.json`` (any error refuses it whole)."""
     if not isinstance(doc, dict):
@@ -349,7 +363,7 @@ def validate_sidecar(doc) -> List[str]:
         errs.append(f"unknown top-level keys {sorted(set(doc) - _SIDECAR_TOP)}")
     if isinstance(doc.get("schema"), bool) or doc.get("schema") != 1:
         errs.append(f"schema must be 1, not {doc.get('schema')!r}")
-    if not _ssh_user_ok(doc.get("ssh_user")):
+    if "ssh_user" in doc and not _ssh_user_ok(doc["ssh_user"]):
         errs.append(f"ssh_user must be a plain login other than root, not {doc.get('ssh_user')!r}")
     if "ssh_identity" in doc and not _ssh_identity_ok(doc["ssh_identity"]):
         errs.append(f"ssh_identity must be an absolute key path, not {doc['ssh_identity']!r}")
@@ -374,10 +388,6 @@ def validate_sidecar(doc) -> List[str]:
             errs.append(f"hosts.{hid}.ssh_user must be a plain login other than root, not {row['ssh_user']!r}")
         if "ssh_identity" in row and not _ssh_identity_ok(row["ssh_identity"]):
             errs.append(f"hosts.{hid}.ssh_identity must be an absolute key path, not {row['ssh_identity']!r}")
-        user = row.get("ssh_user", doc.get("ssh_user"))
-        if user != SSH_USER and not row.get("ssh_identity", doc.get("ssh_identity")):
-            errs.append(f"hosts.{hid}: login {user!r} needs ssh_identity (a dedicated worker key: the "
-                        "owner's default key would skip the worker wrapper)")
         if set(row) - _SIDECAR_ROW:
             errs.append(f"hosts.{hid}: unknown keys {sorted(set(row) - _SIDECAR_ROW)}")
         if not isinstance(row.get("enabled"), bool):
@@ -486,10 +496,15 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         if hid not in with_role:
             warnings.append(f"kanban pool: {hid} is enabled but has no {ROLE} role (host dropped)")
             continue
+        user, ident = worker_login(sidecar, hid)
+        if user is None or ident is None:
+            missing = ", ".join(f for f, v in (("ssh_user", user), ("ssh_identity", ident)) if v is None)
+            warnings.append(f"kanban pool: {hid} has no owner login and key (missing {missing}; "
+                            f"{SSH_USER} is retired; host not placed)")
+            continue
         role_slots, state = roles[hid]
         hosts.append(PoolHost(
-            name=hid, ssh_host=hid, ssh_user=row.get("ssh_user", sidecar["ssh_user"]),
-            ssh_identity=row.get("ssh_identity", sidecar.get("ssh_identity")),
+            name=hid, ssh_host=hid, ssh_user=user, ssh_identity=ident,
             slots=role_slots[ROLE],
             capacity_pct=float(row.get("capacity_pct", gcap)), absence=row["absence"],
             profiles=tuple(p for p in row.get("profiles", gprofiles) if p.lower() not in deny),
