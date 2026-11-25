@@ -2154,8 +2154,15 @@ def switch_model(
     # candidate itself: the callback only accepts provider-name grammar, so a plain model id is a
     # no-op. Pinned by tests/fork_canaries/test_fork_canary_provider_seam.py.
     _typed = re.split(r"[:/]", st.new_model, maxsplit=1)
-    provider_seam.refresh(
-        "typed", explicit_provider or (_typed[0] if len(_typed) > 1 else (st.new_model or None)))
+    _typed_name = explicit_provider or (_typed[0] if len(_typed) > 1 else (st.new_model or None))
+    refusal = provider_seam.refresh("typed", _typed_name)
+    if refusal:
+        # t_f1cd7951: a plugin recognised the typed name as a provider name it will not serve.
+        # Refuse here; otherwise a bare token falls through to PATH B as a model id on the
+        # current provider and the switch "succeeds" onto the wrong lane.
+        return st.fail(
+            f"Unknown provider '{_typed_name}': {refusal}. No model switch was made. "
+            f"See 'hermes model' for the providers this process serves.")
 
     # Inline provider qualification (``xai-oauth:grok-4.6`` / ``xai-oauth/grok-4.6`` off an
     # aggregator) routes like ``--provider``: the left-hand side must be an EXACT provider id.
