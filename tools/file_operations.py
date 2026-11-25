@@ -29,6 +29,7 @@ from tools.file_operations_common import (
     _UTF8_BOM, _detect_line_ending, _has_bom, _normalize_line_endings, _strip_bom,
     _strip_terminal_fence_leaks, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_lint import LINTERS_INPROC, LintMixin, _FAIL_CLOSED_INPROC_EXTS
+from tools.file_operations_impact import check_callers, impact_check_enabled
 from tools.file_operations_search import SearchMixin
 
 logger = logging.getLogger(__name__)
@@ -1549,10 +1550,17 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         lsp_diagnostics: Optional[str] = None
         if lint_result.success or lint_result.skipped:
             lsp_diagnostics = self._maybe_lsp_diagnostics(path, pre_content=pre_content, post_content=content) or None
+        lint = lint_result.to_dict() if lint_result else None
+        # Rides inside ``lint`` so patch/V4A results carry it with no extra plumbing.
+        if lint is not None and ext == ".py" and pre_content and lint_result.success \
+                and not lint_result.skipped and impact_check_enabled():
+            broken = check_callers(self, path, pre_content, content)
+            if broken:
+                lint["broken_callers"] = broken
         return WriteResult(
             bytes_written=len(content_bytes), dirs_created=dirs_created, verified=content_verified,
             _content_sha256=hashlib.sha256(content_bytes).hexdigest(),
-            lint=lint_result.to_dict() if lint_result else None, lsp_diagnostics=lsp_diagnostics)
+            lint=lint, lsp_diagnostics=lsp_diagnostics)
 
     # --- PATCH (replace mode) -----------------------------------------------
 
@@ -1633,9 +1641,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         if verify_error is not None:
             return verify_error
         lint_result = self._check_lint_delta(path, pre_content=content, post_content=new_content)
+        lint = lint_result.to_dict() if lint_result else None
+        if lint is not None and (write_result.lint or {}).get("broken_callers"):
+            lint["broken_callers"] = write_result.lint["broken_callers"]
         return PatchResult(
             success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],
-            lint=lint_result.to_dict() if lint_result else None,
+            lint=lint,
             # From the internal write_file call, whose baseline was the pre-patch content.
             lsp_diagnostics=write_result.lsp_diagnostics)
 
