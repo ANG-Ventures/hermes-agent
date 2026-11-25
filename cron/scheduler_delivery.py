@@ -2123,17 +2123,19 @@ def _deliver_result(
         )
         # #logs carries only human lines (t_2b76e2d8): an agent-audience delivery
         # is one agent-log row (a failed run also an inbox item), as notify.py's are.
-        if logs_audience_gate.maybe_agent_log(
+        _logs_audience = logs_audience_gate.logs_audience(
             job, platform=target["platform"], chat_id=target["chat_id"],
             thread_id=target.get("thread_id"), success=success,
             has_media=bool(requested_media), demoted=bool(_host_down_prefix),
             text=mirror_text,  # redacted + unwrapped
             get_home=lambda: _sched.get_hermes_home(),
-        ):
+        )
+        if _logs_audience == "agent":
             continue
         # #logs is a digest, not a stream (t_42a9c32b): a green no_agent run
         # bound for #logs joins notify.py's digest spool while it is armed.
-        if logs_digest_gate.maybe_spool(
+        # A human-audience line posts now (t_b3cb7cf7): the digest rollup is agent-audience.
+        if _logs_audience != "human" and logs_digest_gate.maybe_spool(
             job, platform=target["platform"], chat_id=target["chat_id"],
             thread_id=target.get("thread_id"),
             success=success, has_media=bool(requested_media),
