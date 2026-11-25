@@ -252,3 +252,32 @@ def test_chat_pin_beats_wildcard(tmp_path, monkeypatch):
         source=source, session_key=entry.session_key)
     assert model == "opus"
     assert runtime["provider"] == "claude-alr"
+
+
+def test_multiplex_wildcard_stays_in_runtime_profile():
+    """Under multiplex the routed profile's own ``channel_overrides`` apply: the launch profile's '*'
+    never reaches a secondary profile's rooms, and the secondary's own '*' is honoured (Prism ba9e433fba77)."""
+    runner = object.__new__(GatewayRunner)
+    runner.config = _matrix_config({"*": ChannelOverride(model="opus", provider="claude-alr")})
+    runner.config.multiplex_profiles = True
+    runner._primary_profile_name = "default"
+    runner._profile_configs = {
+        "ops": GatewayConfig(platforms={Platform.MATRIX: PlatformConfig(enabled=True)}),
+        "lab": _matrix_config({"*": ChannelOverride(model="lab-model")}),
+    }
+    ops = SessionSource(platform=Platform.MATRIX, chat_id="!room:x", user_id="u1", profile="ops")
+    lab = SessionSource(platform=Platform.MATRIX, chat_id="!room:x", user_id="u1", profile="lab")
+    dflt = SessionSource(platform=Platform.MATRIX, chat_id="!room:x", user_id="u1", profile="default")
+    assert runner._channel_override_for(ops) is None
+    assert runner._channel_override_for(lab).model == "lab-model"
+    assert runner._channel_override_for(dflt).model == "opus"
+    # Unloaded secondary config: no override rather than the launch profile's.
+    ghost = SessionSource(platform=Platform.MATRIX, chat_id="!room:x", user_id="u1", profile="ghost")
+    assert runner._channel_override_for(ghost) is None
+    # Sourceless lookups (system prompt / model loaders) follow the bound runtime scope.
+    with patch.object(GatewayRunner, "_active_profile_name", return_value="ops"):
+        assert runner._resolve_model_for_channel(
+            Platform.MATRIX, "!room:x", user_config={"model": {"default": "fable"}}) == "fable"
+    with patch.object(GatewayRunner, "_active_profile_name", return_value="default"):
+        assert runner._resolve_model_for_channel(
+            Platform.MATRIX, "!room:x", user_config={"model": {"default": "fable"}}) == "opus"

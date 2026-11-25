@@ -5554,6 +5554,32 @@ class GatewayRunner(
             getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None))
         return None
 
+    def _channel_overrides_config(self, source: Optional[SessionSource] = None) -> Any:
+        """The GatewayConfig whose ``channel_overrides`` apply to this turn. Under multiplex that is the
+        RUNTIME profile's own config (``_profile_configs``), so a launch-profile ``'*'`` never leaks into a
+        secondary profile's rooms; None when that config is not loaded. Without *source* the bound
+        ``_profile_runtime_scope`` names the profile."""
+        cfg = getattr(self, "config", None)
+        if not getattr(cfg, "multiplex_profiles", False):
+            return cfg
+        name: Optional[str] = None
+        if source is None:
+            name = self._active_profile_name()
+        else:
+            from gateway.session_identity import identity_of
+            identity = identity_of(source)
+            if identity is not None:
+                name = identity.runtime_profile
+            else:
+                try:
+                    name = (getattr(source, "profile", None) or "").strip() or self._profile_name_for_source(source)
+                except Exception:
+                    name = None
+        primary = getattr(self, "_primary_profile_name", None) or "default"
+        if not name or name == primary:
+            return cfg
+        return (getattr(self, "_profile_configs", None) or {}).get(name)
+
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME serves this source: the pinned identity's runtime
         home, else ``source.profile``, then ``_profile_name_for_source`` (sources bypassing
@@ -7814,7 +7840,7 @@ class GatewayRunner(
 
         model, provider, api_mode = self._configured_route_identity(user_config)
 
-        cfg = getattr(self, "config", None)
+        cfg = self._channel_overrides_config(source) if source is not None else None
         if cfg and source is not None:
             ch = _get_channel_override(
                 cfg,
