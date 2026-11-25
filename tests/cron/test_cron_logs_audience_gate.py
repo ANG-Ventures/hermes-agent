@@ -76,8 +76,8 @@ def fleet(tmp_path, monkeypatch):
         "default_audience": "agent", "human_markers": ["NEEDS-ACE"],
         "human_producers": ["courierwatch"],
         "human_logs_producers": ["cron:weekly-review", "daily-journal"],
-        "human_logs_lines": {"lines": [{"name": "gbrain-daily",
-                                        "first_line_prefix": "🧠 **gbrain daily**"}]}}),
+        "human_logs_lines": {"lines": [{"name": "gbrain-daily-digest-warn",
+                                        "first_line_prefix": "⚠️ **gbrain — daily**"}]}}),
         encoding="utf-8")
     (root / "state").mkdir()
     home = root / "profiles" / "worker"  # profile home: library found by walking up
@@ -278,8 +278,8 @@ def _spool(root):
 
 
 def test_agreed_human_line_posts_now_and_skips_the_digest_spool(fleet_with_digest):
-    # t_b3cb7cf7: the 4 h digest rollup is agent-audience, so a human line spooled there is never seen.
-    send = _deliver(_job(name="gbrain-daily-digest"), "🧠 **gbrain daily** · 412 pages, 3 new")
+    # t_b3cb7cf7: prefix as in fleet/notify-audience.json (the 11-24 09:15 line). The 4 h digest rollup is agent-audience, so a human line spooled there is never seen.
+    send = _deliver(_job(name="gbrain-daily-digest"), "⚠️ **gbrain — daily** (2026-11-24)\nservice: **ok** · launchd unknown")
     send.assert_called_once()
     assert str(send.call_args[0][2]) == LOGS
     assert _spool(fleet_with_digest) == []
@@ -295,6 +295,6 @@ def test_agent_line_still_goes_to_the_agent_log_with_the_digest_armed(fleet_with
 
 def test_split_off_still_spools_a_green_no_agent_line(fleet_with_digest):
     (fleet_with_digest / "state" / "notify-logs-audience.DISABLED").touch()
-    send = _deliver(_job(), "🧠 **gbrain daily** · 412 pages, 3 new")
+    send = _deliver(_job(), "⚠️ **gbrain — daily** (2026-11-24)\nservice: **ok** · launchd unknown")
     send.assert_not_called()
     assert len(_spool(fleet_with_digest)) == 1
