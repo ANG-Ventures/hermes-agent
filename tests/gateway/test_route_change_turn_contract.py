@@ -513,6 +513,12 @@ def test_chat_pin_to_slot_name_matches_the_slots_current_id(monkeypatch):
     assert real == ("⚠️ replying on claude-btpr/claude-fable-5-1 — on fallback from "
                     "pinned claude-alr/opus")
     assert format_chat_pin_notice("claude-sonnet-5", "claude-alr", pin) is not None
+    # A lane-prefixed slot pin matches the live id with the prefix normalized off.
+    monkeypatch.setattr(model_registry, "slot_view", lambda: {"sol": "gpt-6.2-sol"})
+    cpa = {"model": "cpa/sol", "provider": "cpa"}
+    assert format_chat_pin_notice("gpt-6.2-sol", "cpa", cpa) is None
+    assert format_chat_pin_notice("cpa/gpt-6.2-sol", "cpa", cpa) is None
+    assert format_chat_pin_notice("gpt-6.1", "cpa", cpa) is not None
     # A literal (non-slot) pin compares as before.
     lit = {"model": "claude-opus-5-1", "provider": "claude-alr"}
     assert format_chat_pin_notice("claude-opus-5-1", "claude-alr", lit) is None
