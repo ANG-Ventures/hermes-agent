@@ -393,6 +393,66 @@ def test_remote_group_kill_reaps_the_whole_tree(body, use_runtime, request, monk
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
+def test_runtime_dir_case_arms_parse_inside_command_substitution():
+    """t_4786c7b1: the kill command nests ``_enter_runtime_dir()`` in ``$( )``. macOS /bin/sh is
+    bash 3.2, which reads a bare ``pattern)`` there as the closing paren: rc 2, no kill, and every
+    timed-out command on a Mac host lived on. Every arm must use the ``(pattern)`` form."""
+    import re
+
+    snippet = ssh_env._enter_runtime_dir()
+    arms = re.findall(r'(?:" in |;; )(\S+)', snippet)
+    assert arms[-1] == "esac" and len(arms) >= 3
+    assert all(a.startswith("(") for a in arms[:-1]), arms
+    for shell in ("sh", "bash", "/bin/bash", "dash", "zsh"):
+        if shutil.which(shell):
+            r = subprocess.run([shell, "-n", "-c", f"p=$({{ {snippet}; }} && echo x)"], capture_output=True,
+                               text=True, timeout=10)
+            assert r.returncode == 0, (shell, r.stderr)
+
+
+def _pgrep(pattern: str) -> list[str]:
+    out = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True).stdout
+    return out.split()
+
+
+@pytest.mark.skipif(os.name == "nt" or not shutil.which("pgrep"), reason="POSIX remote shell")
+def test_remote_deadline_hangs_up_the_command_and_spares_nohup(monkeypatch):
+    """t_4786c7b1: the plain-ssh wrapper, started the way sshd starts a command (own session): after
+    the deadline the command's group gets SIGHUP within 5 s; a nohup'd job in that group lives on."""
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    tag = f"{uuid.uuid4().int % 10**7}"
+    cmd = f"nohup sleep 71.{tag} >/dev/null 2>&1 & sleep 70.{tag}"
+    t0 = time.monotonic()
+    proc = subprocess.Popen(["sh", "-c", ssh_env.remote_deadline_command(cmd, 1)], start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert proc.wait(timeout=6) in (128 + signal.SIGHUP, -signal.SIGHUP)  # login shell may be HUPed too
+        assert time.monotonic() - t0 < 6
+        deadline = time.monotonic() + 5
+        while _pgrep(f"slee[p] 70.{tag}") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _pgrep(f"slee[p] 70.{tag}") == []
+        assert len(_pgrep(f"slee[p] 71.{tag}")) == 1
+    finally:
+        subprocess.run(["pkill", "-f", f"slee[p] 7[01].{tag}"])
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.skipif(os.name == "nt" or not shutil.which("pgrep"), reason="POSIX remote shell")
+def test_remote_deadline_passes_stdin_and_status_and_leaves_no_watchdog(monkeypatch):
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    timeout = f"3{uuid.uuid4().int % 10**6}.5"
+    r = subprocess.run(["sh", "-c", ssh_env.remote_deadline_command("cat; [ \"it's\" = \"it's\" ] && exit 7", float(timeout))],
+                       input="it's =here\n", capture_output=True, text=True, start_new_session=True, timeout=10)
+    assert (r.returncode, r.stdout) == (7, "it's =here\n")
+    deadline = time.monotonic() + 3
+    while _pgrep(f"slee[p] {timeout}") and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _pgrep(f"slee[p] {timeout}") == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
 def test_finished_command_leaves_no_pidfile_and_kill_is_a_noop(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     token = uuid.uuid4().hex
