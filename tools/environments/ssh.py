@@ -197,10 +197,16 @@ _DEADLINE_SH = (
 def remote_deadline_command(command: str, timeout: float) -> str:
     """The remote half of ``ssh host <this>`` for a caller that kills ssh after ``timeout`` s: runs
     ``command`` in the remote login shell, as plain ``ssh host command`` does, and hangs it up on the
-    remote side once ``timeout`` s pass. Single quotes always (zsh expands a bare leading ``=``)."""
+    remote side once ``timeout`` s pass. Single quotes always (zsh expands a bare leading ``=``).
+    A timeout that is not a positive finite number sets no deadline (``sleep 0`` would hang the
+    command up as it starts): ``command`` is returned unchanged."""
+    if not (isinstance(timeout, (int, float)) and 0 < timeout < float("inf")):
+        return command
+    secs = format(float(timeout), "f").rstrip("0").rstrip(".")  # no exponent: sleep(1) on macOS rejects 1e+06
+    if secs == "0":  # below 1 us: formats to sleep 0
+        return command
     def sq(s: str) -> str:
         return "'" + s.replace("'", "'\"'\"'") + "'"
-    secs = format(float(timeout), "f").rstrip("0").rstrip(".")  # no exponent: sleep(1) on macOS rejects 1e+06
     return f"sh -c {sq(_DEADLINE_SH)} sh {secs} {sq(command)}"
 
 

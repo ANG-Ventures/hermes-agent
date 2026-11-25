@@ -452,6 +452,13 @@ def test_remote_deadline_passes_stdin_and_status_and_leaves_no_watchdog(monkeypa
     assert _pgrep(f"slee[p] {timeout}") == []
 
 
+@pytest.mark.parametrize("timeout", [0, 0.0, -1, 1e-9, float("nan"), float("inf"), None])
+def test_remote_deadline_without_a_positive_timeout_sets_no_deadline(timeout):
+    """Prism 7573b7439bbf: ``sleep 0`` hung the command up as it started. No positive finite
+    deadline = the command, unwrapped, as plain ``ssh host cmd`` runs it."""
+    assert ssh_env.remote_deadline_command("echo hi", timeout) == "echo hi"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX remote shell")
 def test_finished_command_leaves_no_pidfile_and_kill_is_a_noop(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
