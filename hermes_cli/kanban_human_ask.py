@@ -25,11 +25,14 @@ HUMAN_WAIT_KIND = "needs_input"
 # unblock_when predicates that clear without a person answering.
 NON_HUMAN_PREDICATES = frozenset({"pr_merged", "card_done", "after"})
 
-_UNBLOCK_WHEN = re.compile(r"(?im)^[ \t]*unblock_when:[ \t]*([A-Za-z_]+)")
-_FIELDS = (
-    ("Need:", re.compile(r"(?i)(?:^|[\s.;|/])need:[ \t]*\S")),
-    ("Why:", re.compile(r"(?i)(?:^|[\s.;|/])why:[ \t]*\S")),
-    ("How to reply:", re.compile(r"(?i)(?:^|[\s.;|/])how to reply:[ \t]*\S")),
+_UNBLOCK_WHEN = re.compile(r"(?im)^[ \t]*unblock_when:(.*)$")
+# A predicate exempts only with a target: ``pr_merged:o/r#1``, not ``pr_merged`` or ``pr_merged:``.
+_NON_HUMAN_PRED = re.compile(r"(?i)^[ \t]*(" + "|".join(sorted(NON_HUMAN_PREDICATES)) + r"):[ \t]*\S")
+# A field counts only when its value is text, not empty and not the next label.
+_NEXT_LABEL = r"(?!(?:need|why|how to reply):)"
+_FIELDS = tuple(
+    (label, re.compile(r"(?i)(?:^|[\s.;|/])" + re.escape(label.lower()) + r"[ \t]*" + _NEXT_LABEL + r"[^\s]"))
+    for label in ("Need:", "Why:", "How to reply:")
 )
 
 REFUSAL = (
@@ -59,18 +62,24 @@ def enabled() -> bool:
 def is_human_wait(kind: Optional[str], reason: Optional[str]) -> bool:
     if kind != HUMAN_WAIT_KIND:
         return False
-    preds = [p.lower() for p in _UNBLOCK_WHEN.findall(reason or "")]
-    return not (preds and all(p in NON_HUMAN_PREDICATES for p in preds))
+    preds = _UNBLOCK_WHEN.findall(reason or "")
+    return not (preds and all(_NON_HUMAN_PRED.match(p) for p in preds))
 
 
 def shaped_for_machine(reason: str) -> str:
-    """Prefix a fixed Need/Why/How to a block a program (not a model it can re-prompt)
-    files on a worker's behalf, e.g. the native-worker handback, which gets ONE board call."""
+    """Append the missing Need/Why/How lines to a block a program (not a model it can
+    re-prompt) files on a worker's behalf, e.g. the native-worker handback, which gets ONE
+    board call. The worker's own reason stays first, so a pager or a one-line board view
+    still shows it."""
     if refusal(HUMAN_WAIT_KIND, reason) is None:
         return reason
-    return ("Need: read the block below and answer it. Why: the worker stopped and cannot ask "
-            "again this run. How to reply: comment the answer on the card, then unblock it.\n"
-            + reason)
+    filler = {
+        "Need:": "Need: an answer to the block above.",
+        "Why:": "Why: the worker stopped and cannot ask again this run.",
+        "How to reply:": "How to reply: comment the answer on the card, then unblock it.",
+    }
+    missing = [filler[label] for label, rx in _FIELDS if not rx.search(reason)]
+    return reason.rstrip() + "\n" + "\n".join(missing)
 
 
 def refusal(kind: Optional[str], reason: Optional[str]) -> Optional[str]:

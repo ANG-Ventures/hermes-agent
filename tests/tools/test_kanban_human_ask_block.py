@@ -104,3 +104,32 @@ def test_cli_block_refuses_then_lands(worker_env, monkeypatch, capsys):
     assert _status(tid) == "running"
     assert kanban._cmd_block(args(GOOD)) == 0
     assert _status(tid) == "blocked"
+
+
+@pytest.mark.parametrize("reason", [
+    "decide the host.\nunblock_when: pr_merged",            # predicate with no target
+    "decide the host.\nunblock_when: card_done:",           # predicate with an empty target
+    "decide the host.\nunblock_when: pr_merged:o/r#1\nunblock_when: ruling:t_x-host",  # one human line
+])
+def test_malformed_or_mixed_predicate_is_still_a_human_wait(reason):
+    from hermes_cli import kanban_human_ask as ha
+    assert ha.is_human_wait("needs_input", reason)
+
+
+@pytest.mark.parametrize("reason,missing", [
+    ("Need: Why: How to reply:", "Need:, Why:, How to reply:"),
+    ("Need: a host. Why: How to reply: A or B", "Why:"),
+    ("Need:\nWhy: x\nHow to reply: y", "Need:"),
+])
+def test_empty_field_counts_as_missing(reason, missing):
+    from hermes_cli import kanban_human_ask as ha
+    assert f"Missing: {missing}." in ha.refusal("needs_input", reason)
+
+
+def test_machine_shape_keeps_the_reason_first():
+    from hermes_cli import kanban_human_ask as ha
+    out = ha.shaped_for_machine("lane exited rc=3: disk full")
+    assert out.splitlines()[0] == "lane exited rc=3: disk full"
+    assert ha.refusal("needs_input", out) is None
+    partial = ha.shaped_for_machine("Need: a disk. lane exited rc=3")
+    assert partial.count("Need:") == 1 and ha.refusal("needs_input", partial) is None
