@@ -31,9 +31,9 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 @contextmanager
-def _fleet(tmp_path):
+def _fleet(tmp_path, root_profile=False):
     root = tmp_path / "root"
-    home = root / "profiles" / "athena"
+    home = root if root_profile else root / "profiles" / "athena"
     local = home / "skills"
     shared = root / "skills-shared"
     local.mkdir(parents=True)
@@ -216,3 +216,18 @@ def test_skill_view_library_fallback_with_empty_loadout(tmp_path, monkeypatch):
         assert r["success"] is True and r["library"] is True, r
         miss = json.loads(st.skill_view("no-such-skill"))
         assert miss["success"] is False and "does not exist yet" in miss["error"], miss
+
+
+def test_root_profile_skill_view_of_aux_skill_by_bare_name(tmp_path, monkeypatch):
+    """t_a7795676: the root profile (HERMES_HOME is the fleet root, Apollo's gateway) mounts no -aux group, and
+    every root skill_view of an aux skill by bare name answered 'Skill not found' from 10-18 until #523 deployed
+    (first success 11-24). A bare name must reach <root>/skills-shared/<group>-aux/<name>/ and stay out of the
+    index."""
+    import tools.skills_tool as st
+    with _fleet(tmp_path, root_profile=True) as (root, local, shared):
+        assert local == root / "skills"
+        monkeypatch.setattr(st, "_skill_search_dirs", lambda: ([], [local, shared / "devops"], local))
+        r = json.loads(st.skill_view("audio-cleanup-separation"))
+        assert r["success"] is True and r["library"] is True, r
+        assert Path(r["skill_dir"]) == shared / "media-aux" / "audio-cleanup-separation"
+        assert "Step 1: do the thing." in r["content"]
