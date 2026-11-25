@@ -321,7 +321,7 @@ def _status_cmd(verb, tid):
     if verb == "schedule":
         return f"schedule {tid} --at 2000000000 'why not'"
     if verb == "block":
-        return f"block {tid} --kind needs_input 'why not'"
+        return f"block {tid} --kind needs_input 'Need: x. Why: y. How to reply: z. why not'"
     return f"{verb} {tid} 'why not'"
 
 
@@ -355,7 +355,8 @@ def test_cli_successful_status_verb_writes_status_comment(kanban_home, monkeypat
         tid = _card(conn, session_id=HOME, blocked=blocked)
     kc.run_slash(_status_cmd(verb, tid))
     with kb.connect_closing() as conn:
-        assert _comments(conn, tid)[-1] == f"{prefix} why not"
+        shape = "Need: x. Why: y. How to reply: z. " if verb == "block" else ""
+        assert _comments(conn, tid)[-1] == f"{prefix} {shape}why not"
 
 
 def test_unblock_comment_commits_with_the_transition(kanban_home):
@@ -657,7 +658,7 @@ async def test_gateway_slash_binds_invoking_session(kanban_home, monkeypatch):
         assert kb.get_task(conn, tid).status != "blocked"
 
     out = await GatewayRunner._handle_kanban_command(
-        home_runner, _slash_event(f"/kanban block {tid} --kind needs_input 'mine to block'"))
+        home_runner, _slash_event(f"/kanban block {tid} --kind needs_input 'Need: x. Why: y. How to reply: z. mine to block'"))
     assert "refused" not in out, out
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "blocked"

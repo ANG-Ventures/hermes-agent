@@ -103,7 +103,7 @@ def test_cli_lifecycle_refuses_before_transition(board, monkeypatch, verb):
     import argparse
     from hermes_cli import kanban
     tid = kb.create_task(board, title="lifecycle scratch", assignee="human", require_home=False)
-    args = argparse.Namespace(task_id=tid, reason=["Ace said ship it"], why=False,
+    args = argparse.Namespace(task_id=tid, reason=["Need: x. Why: y. How to reply: z. Ace said ship it"], why=False,
                               kind="needs_input", until=None, now=False, at="2099-01-01T00:00:00Z")
     monkeypatch.setattr(kanban, "_bulk_ids", lambda args: [tid])
     before = kb.get_task(board, tid).status
