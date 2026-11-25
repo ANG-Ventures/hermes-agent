@@ -521,6 +521,8 @@ class GatewayModelCommandsMixin:
         """This chat's ``channel_overrides`` entry (model/provider), or None."""
         from gateway.run import _get_channel_override
         cfg = getattr(self, "config", None)
+        if cfg and source is not None:
+            cfg = self._channel_overrides_config(source)  # runtime profile's, under multiplex
         if not cfg or source is None:
             return None
         return _get_channel_override(

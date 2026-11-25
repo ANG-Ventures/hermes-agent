@@ -381,6 +381,8 @@ class GatewayTurnMixin:
 
         cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
         if cfg and source is not None:
+            cfg = self._channel_overrides_config(source)  # runtime profile's, under multiplex
+        if cfg and source is not None:
             ch = _get_channel_override(
                 cfg, source.platform, str(source.chat_id) if source.chat_id else "",
                 thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,

@@ -116,6 +116,8 @@ class GatewayConfigLoadersMixin:
         """``channel_overrides`` entry for this channel/thread, or None (also when no config is bound)."""
         from gateway.run import _get_channel_override
         config = getattr(self, "config", None)
+        if config:
+            config = self._channel_overrides_config()  # bound runtime scope names the profile
         if not config:
             return None
         return _get_channel_override(config, platform, chat_id, thread_id=thread_id, parent_id=parent_id)
