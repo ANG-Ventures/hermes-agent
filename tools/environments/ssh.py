@@ -110,11 +110,14 @@ def _run_pidfile(token: str) -> str:
 def _enter_runtime_dir(variable: str = "XDG_RUNTIME_DIR") -> str:
     """Enter a private tmpfs XDG directory before checking it. Using relative paths after
     checking the cwd keeps a replaced path component from redirecting a pidfile operation.
-    Shell builtins check path/owner; one find checks both exact mode and filesystem type."""
-    return (f'case "${{{variable}:-}}" in /*) '
+    Shell builtins check path/owner; one find checks both exact mode and filesystem type.
+    The ``(pattern)`` form is load-bearing: the kill command nests this inside ``$( )``, and
+    macOS /bin/sh (bash 3.2) reads a bare ``pattern)`` there as the closing paren (syntax error,
+    so on a Mac the remote kill never ran and timed-out commands lived on; t_4786c7b1)."""
+    return (f'case "${{{variable}:-}}" in (/*) '
             f'CDPATH= cd -P -- "${variable}" && [ -O . ] && '
             '[ "$(PATH=/usr/bin:/bin exec find . -maxdepth 0 -perm 0700 -fstype tmpfs -print)" = . ];; '
-            '*) false;; esac')
+            '(*) false;; esac')
 
 
 def _run_preamble(token: str, runtime_var: str = "XDG_RUNTIME_DIR") -> str:
@@ -176,6 +179,35 @@ def _remote_group_kill_command(token: str, *, grace: bool = True) -> str:
         f"for sig in {sigs}; do kill -s $sig -- \"$t\" 2>/dev/null || exit 0; echo {_KILLED_MARK}; "
         "[ $sig = TERM ] && sleep 1; done; exit 0")
     return "sh -c " + shlex.quote(script)
+
+
+# Remote half of a plain ``ssh host cmd`` timeout (t_4786c7b1). Killing the local client never reaches
+# the remote command: without a pty sshd sends it no SIGHUP, and under a ControlMaster the sshd that
+# owns it stays up. So the remote side keeps its own clock and, if the command still runs after
+# ``$1`` s, sends SIGHUP to its process group (sshd gives every command its own session), which is
+# what a terminal hangup does: nohup'd jobs ignore it, setsid / detached-run.py jobs are in another
+# group. POSIX sh + ps only: macOS has no setsid(1) and dash has no job control without a tty.
+_DEADLINE_SH = (
+    't=$1 c=$2; g=$(ps -o pgid= -p $$ | tr -d " "); '
+    '(trap "kill \\$p 2>/dev/null; exit 0" TERM; sleep "$t" & p=$!; wait $p && [ -n "$g" ] && kill -HUP -"$g") '
+    '</dev/null >/dev/null 2>&1 & w=$!; '
+    '"${SHELL:-/bin/sh}" -c "$c"; s=$?; kill $w 2>/dev/null; exit $s')
+
+
+def remote_deadline_command(command: str, timeout: float) -> str:
+    """The remote half of ``ssh host <this>`` for a caller that kills ssh after ``timeout`` s: runs
+    ``command`` in the remote login shell, as plain ``ssh host command`` does, and hangs it up on the
+    remote side once ``timeout`` s pass. Single quotes always (zsh expands a bare leading ``=``).
+    A timeout that is not a positive finite number sets no deadline (``sleep 0`` would hang the
+    command up as it starts): ``command`` is returned unchanged."""
+    if not (isinstance(timeout, (int, float)) and 0 < timeout < float("inf")):
+        return command
+    secs = format(float(timeout), "f").rstrip("0").rstrip(".")  # no exponent: sleep(1) on macOS rejects 1e+06
+    if secs == "0":  # below 1 us: formats to sleep 0
+        return command
+    def sq(s: str) -> str:
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+    return f"sh -c {sq(_DEADLINE_SH)} sh {secs} {sq(command)}"
 
 
 def _ensure_ssh_available() -> None:
