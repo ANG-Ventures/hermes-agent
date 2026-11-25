@@ -376,7 +376,7 @@ def test_gateway_plan_pool_reads_origin_state_in_the_load_probe(tmp_path, monkey
     (fleet / kwp.ROLES_FILE).write_text(json.dumps({'schema': 1, 'hosts': {
         'ace-media': {'roles': {'kanban-worker': {'slots': 4}}, 'state': 'active'}}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        'schema': 1, 'ssh_user': 'kanbanw', 'capacity_pct': 0.8, 'priority': ['ace-media'],
+        'schema': 1, 'ssh_user': 'ace', 'ssh_identity': '/k/worker', 'capacity_pct': 0.8, 'priority': ['ace-media'],
         'profiles': ['alpha'], 'hosts': {'ace-media': {'enabled': True, 'absence': 'optional'}}}))
     ws = str(tmp_path / 'ws')
     with kb.connect_closing() as conn:

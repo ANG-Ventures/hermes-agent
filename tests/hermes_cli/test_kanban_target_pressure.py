@@ -334,7 +334,7 @@ def board(tmp_path, monkeypatch):
     (fleet / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
         h: {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"} for h in ("ace-ai", "ace-media")}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ci-box", "ace-ai", "ace-media"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ci-box", "ace-ai", "ace-media"],
         "profiles": ["alpha"],
         "hosts": {"ci-box": {"enabled": False, "absence": "optional"},
                   "ace-ai": {"enabled": True, "absence": "required"},
@@ -346,7 +346,7 @@ def _ssh(fleet: Fleet):
     """A fake ``ssh`` runner answering the real probe command from the fixture."""
     def runner(argv, **kw):
         host = argv[-2].split("@", 1)[1]
-        assert argv[-1].startswith("python3 -c ")
+        assert argv[-1].startswith(kwp.WORKER_SESSION_GUARD + "python3 -c ")   # keyed owner login
         assert "@@hermes-probe-v1" in argv[-1]
         out = "@@hermes-probe-v1\n" + json.dumps(dict(
             schema=1, load1=fleet.load1[host], load5=1.0, ncpu=24,

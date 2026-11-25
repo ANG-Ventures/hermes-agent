@@ -152,7 +152,7 @@ def test_plan_pool_reads_the_flag_per_tick(home, monkeypatch):
     (fleet / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
         "ace-ai": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai"], "profiles": ["alpha"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ace-ai"], "profiles": ["alpha"],
         "hosts": {"ace-ai": {"enabled": True, "absence": "optional"}}}))
     cfg = {"placement": {"read_signal": False}, "worker_pool": {"overflow": False}}
     gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None)
@@ -539,7 +539,7 @@ def _builder(home, cfg, connect):
     (fleet / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
         "ace-ai": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}}}))
     (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
-        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai"], "profiles": ["alpha"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "priority": ["ace-ai"], "profiles": ["alpha"],
         "hosts": {"ace-ai": {"enabled": True, "absence": "optional"}}}))
     gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None)
     return kgt.GateTickBuilder(gate, fleet_dir=lambda: fleet, kanban_cfg=lambda: cfg,

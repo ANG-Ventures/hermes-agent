@@ -52,7 +52,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "alpha-box": {"roles": {"kanban-worker": {"slots": 2}}, "state": "active"},
         "mid-box": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}}})
     _write(h / "fleet" / "kanban-pool.json", {
-        "schema": 1, "ssh_user": "kanbanw", "capacity_pct": 0.8, "priority": LADDER,
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker", "capacity_pct": 0.8, "priority": LADDER,
         "profiles": ["alpha"], "hosts": {n: {"enabled": True, "absence": "optional"} for n in LADDER}})
     return h
 

@@ -32,7 +32,8 @@ def root(tmp_path: Path) -> Path:
         "ace-ai": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"},
         "ace-media": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}}})
     _write(r / "fleet" / "kanban-pool.json", {
-        "schema": 1, "ssh_user": "kanbanw", "capacity_pct": 0.8, "priority": ["ace-ai", "ace-media"],
+        "schema": 1, "ssh_user": "ace", "ssh_identity": "/k/worker",
+        "capacity_pct": 0.8, "priority": ["ace-ai", "ace-media"],
         "profiles": ["alpha"], "hosts": {"ace-ai": {"enabled": True, "absence": "required"},
                                           "ace-media": {"enabled": True, "absence": "optional"}}})
     # ace-ai: two kanban units placed 150 s ago, ramp 600 s -> 0.75 unrealised each.
