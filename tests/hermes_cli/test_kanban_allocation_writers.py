@@ -106,7 +106,7 @@ def _parse(*argv):
     return top.parse_args(["kanban", *argv])
 
 
-def test_allocation_verb_and_deprecated_placement_alias(home, capsys):
+def test_allocation_verb_and_no_placement_alias(home, capsys):
     from hermes_cli import kanban as kcli
     from hermes_cli.kanban_read import is_read
 
@@ -120,11 +120,8 @@ def test_allocation_verb_and_deprecated_placement_alias(home, capsys):
     new = capsys.readouterr()
     assert tid in new.out and "deprecated" not in new.err and not log.exists()
 
-    args = _parse("placement", tid)
-    assert args.kanban_action == "placement" and is_read(args)
-    assert kcli._HANDLERS["placement"](args) == 0
-    old = capsys.readouterr()
-    assert old.out == new.out  # same output under either verb
-    assert old.err.count("\n") == 1 and "deprecated, use `kanban allocation`" in old.err
-    (line,) = log.read_text(encoding="utf-8-sig").splitlines()
-    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ cli:kanban placement pid=\d+ ppid=\d+ argv=\S+ parent=\S+ cwd=\S+", line), line
+    assert "placement" not in kcli._HANDLERS     # t_5931d620: the old verb alias is gone
+    with pytest.raises(SystemExit):
+        _parse("placement", tid)
+    capsys.readouterr()
+    assert not log.exists()

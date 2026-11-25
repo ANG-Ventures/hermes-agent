@@ -20,7 +20,7 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     # the door state root (var/kanban, var/alloc) resolves PLACEMENT_HOME first; an ambient value pointed it at the
     # real ~/.hermes on the reviewer's host
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path / "fleet-root"))
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path / "fleet-root"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     kb.init_db()

@@ -45,13 +45,13 @@ integration remain mandatory before deployment/arming.
 
 Native gateway/allocd share the installation root, not a profile root:
 
-- PLACEMENT_HOME=/Users/alexgierczyk/.hermes
+- ALLOCATION_HOME=/Users/alexgierczyk/.hermes (the pre-rename PLACEMENT_HOME is no longer read)
 - PLACEMENT_ROOT_RECEIPT=/Users/alexgierczyk/Library/Application Support/FleetAdmission/hermes-root.receipt
 
 These are proposed service inputs, NOT installed configuration. Offline proof
 must precede writers/token minting, using the durable-anchor runbook. Receipt
 parent is outside .hermes and must be durably prepared with runtime read/fsync
-permissions. Preserve explicit PLACEMENT_HOME overrides and matching receipts.
+permissions. Preserve explicit ALLOCATION_HOME overrides and matching receipts.
 Prepare all actual gateway instance env through the normal release lane; never
 patch the loaded runtime. Gateway restart requires separate per-instance human
 approval. Verify final source hashes, effective env and new process/module

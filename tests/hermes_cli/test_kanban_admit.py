@@ -61,7 +61,7 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     kb.init_db()
     # The placement table (mem_reserve_gb, threads) is this test's, never the host's:
     # fleet_root() honours PLACEMENT_HOME first, and test-gate exports the live root (t_2105a835).
-    monkeypatch.setenv("PLACEMENT_HOME", str(kb.kanban_home()))
+    monkeypatch.setenv("ALLOCATION_HOME", str(kb.kanban_home()))
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "apollo", raising=False)
@@ -315,7 +315,7 @@ def test_admit_refuses_a_draining_pool_host(board, monkeypatch):
 def test_a_stale_remote_pressure_sample_is_unmeasured_memory(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))   # no table: never the host's (t_2105a835)
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path))   # no table: never the host's (t_2105a835)
 
     sample = kwp.HostSample(load1=1.0, ncpu=32, remote_now=2000.0, pressure_text=_pressure(1000.0))
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: sample)
@@ -333,7 +333,7 @@ def inherited_placement_home(tmp_path, monkeypatch):
     venue = tmp_path / "venue-fleet-root"
     (venue / pl.TABLE_REL).parent.mkdir(parents=True)
     (venue / pl.TABLE_REL).write_text("{not json")
-    monkeypatch.setenv("PLACEMENT_HOME", str(venue))
+    monkeypatch.setenv("ALLOCATION_HOME", str(venue))
     return venue
 
 

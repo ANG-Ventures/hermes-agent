@@ -587,7 +587,7 @@ def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, monkeypatch
     EMPTY, even for an unknown id; the same clock made live rows vanish from
     every reader. Any non-finite ``now`` is refused before the ledger is read,
     and the file is byte-identical afterwards."""
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))   # a ledger lives under its fleet root (hermes-home #9789)
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path))   # a ledger lives under its fleet root (hermes-home #9789)
     led = tmp_path / "r.json"
     rid = placement.reserve("ci-box", "kanban", placement.Footprint(3, 2), ttl_s=600, path=led, now=T0,
                             admissions_path=tmp_path / "a.jsonl")

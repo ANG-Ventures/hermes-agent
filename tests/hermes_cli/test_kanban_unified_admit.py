@@ -50,7 +50,7 @@ def studio(tmp_path, monkeypatch):
     root = tmp_path / "root"
     (root / "fleet").mkdir(parents=True)
     (root / "fleet" / "admission-priority.json").write_text(json.dumps(PRIORITY), encoding="utf-8")
-    monkeypatch.setenv("PLACEMENT_HOME", str(root))
+    monkeypatch.setenv("ALLOCATION_HOME", str(root))
     monkeypatch.setenv("KANBAN_UNIFIED_ADMIT", "1")
     c = {"host": "mac-studio", "ceiling": None, "ceiling_reason": "-",
          "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"),

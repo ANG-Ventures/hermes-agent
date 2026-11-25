@@ -10,7 +10,7 @@ def test_asap_is_explicit_persisted_and_never_inherited(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     # the door state root resolves PLACEMENT_HOME first (same pin as test_kanban_priority_door.board; reader rv70e)
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path / "fleet-root"))
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path / "fleet-root"))
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     kb.init_db()

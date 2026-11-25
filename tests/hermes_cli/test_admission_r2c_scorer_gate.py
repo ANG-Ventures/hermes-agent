@@ -80,7 +80,7 @@ def _gate_ctx(tmp_path, monkeypatch, scorer):
 
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "fleet-hosts.json").write_text(json.dumps(dict(_TABLE, scorer=scorer)), encoding="utf-8")
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path))
     monkeypatch.delenv("PLACEMENT_SCORER", raising=False)
     return klg.utilization_context()
 
@@ -106,5 +106,5 @@ def test_load_gate_at_the_line_avg10_closes_only_under_v2(tmp_path, monkeypatch,
 def test_load_gate_without_a_table_row_keeps_the_pre_r2c_predicate(tmp_path, monkeypatch):
     from hermes_cli import kanban_load_gate as klg
 
-    monkeypatch.setenv("PLACEMENT_HOME", str(tmp_path))        # no config/fleet-hosts.json
+    monkeypatch.setenv("ALLOCATION_HOME", str(tmp_path))        # no config/fleet-hosts.json
     assert klg.utilization_context()["limits"].r2c is False

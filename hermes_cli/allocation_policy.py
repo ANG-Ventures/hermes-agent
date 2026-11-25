@@ -1,8 +1,8 @@
 """Minimal vendored reader of ``fleet/allocation-policy.json`` for the kanban adapter.
 
 Renamed from ``hermes_cli.placement_policy`` / ``placement-policy.json`` in rename wave 3 (t_7be48220,
-t_fc257547). For one release the old names stay readable: ``hermes_cli.placement_policy`` is a counted
-sys.modules alias of this module, and a fleet dir holding only the old file name loads it, counted in
+t_fc257547). The ``hermes_cli.placement_policy`` module alias is gone (t_5931d620); a fleet dir holding only the
+old file name still loads it, counted in
 ``<kanban home>/var/ci-box/deprecated-name-reads.log`` (hermes-home ``allocation_policy.count_deprecated_read``
 format).
 
