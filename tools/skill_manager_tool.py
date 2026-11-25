@@ -778,6 +778,37 @@ def _attach_lint_findings(result: Dict[str, Any], skill_md: Path, before: Option
         "— fix them with skill_manage(action='patch') to match Hermes skill standards.")
 
 
+# The prose lane that carries a skills-shared/ edit to hermes-skills main (hermes-home); its --check grades one
+# file against the local origin ref with no fetch, lock or state (~0.2-0.4 s on the Studio, t_0fc9949e).
+_LANE_SCRIPT = ("scripts", "skills-prose-lane.py")
+
+
+def _attach_lane_check(result: Dict[str, Any], target: Path) -> Dict[str, Any]:
+    """ADVISORY: for a write under skills-shared/, attach the line the root's skills-prose-lane --check prints when
+    the lane will REFUSE the file (portability, load-notation, skill-bindings, refpath, ...), so the author fixes it
+    now instead of the lane holding it on disk. No script, a check that cannot run, or a pass: nothing attached."""
+    shared = _shared_skills_root()
+    script = shared.parent.joinpath(*_LANE_SCRIPT)
+    if not _is_within(target, shared) or not script.is_file():
+        return result
+    import subprocess
+    import sys
+    try:
+        r = subprocess.run([sys.executable, str(script), "--home", str(shared.parent), "--clone", str(shared),
+                            "--check", str(target)], capture_output=True, text=True, timeout=20,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("skills-prose-lane --check not run for %s: %s", target, e)
+        return result
+    if r.returncode == 1 and r.stdout.strip():
+        result["lane_warning"] = r.stdout.strip().splitlines()[-1]
+        result["lane_hint"] = ("The write succeeded, but the skills prose lane will not push this file to "
+                               "hermes-skills main until the reason above is fixed; it stays on this disk only.")
+    elif r.returncode not in (0, 1):
+        logger.debug("skills-prose-lane --check rc %s for %s: %s", r.returncode, target, r.stderr[-300:])
+    return result
+
+
 def _clip(text: str, n: int, ellipsis: str) -> str:
     return text[:n] + (ellipsis if len(text) > n else "")
 
@@ -865,7 +896,7 @@ def _create_skill_locked(name: str, content: str, category: str = None, *, local
             "local-skill-leak guard will flag it on its next run."
         )
     _attach_lint_findings(_add_description_prompt_preview(result, content), skill_md)
-    return result
+    return _attach_lane_check(result, skill_md)
 
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
@@ -879,7 +910,8 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     result = {
         "success": True, "message": f"Skill '{name}' updated (full rewrite).",
         "path": str(skill_dir), "_change": {"description": _description_preview(content)}}
-    return _add_description_prompt_preview(_attach_org_note(result, name, skill_dir), content)
+    return _attach_lane_check(_add_description_prompt_preview(_attach_org_note(result, name, skill_dir), content),
+                              skill_dir / "SKILL.md")
 
 
 def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = None,
@@ -931,7 +963,7 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
     # (oversized-body, incident-log-shape) — a clean patch attaches nothing and stays quiet.
     if not file_path:
         _attach_lint_findings(result, target, before=content)
-    return result
+    return _attach_lane_check(result, target)
 
 
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
@@ -999,7 +1031,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     # that crosses the line so the review fork sees it in the same turn.
     if file_path.startswith("references/") and (skill_dir / "SKILL.md").exists():
         _attach_lint_findings(result, skill_dir / "SKILL.md")
-    return result
+    return _attach_lane_check(result, target)
 
 
 def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
