@@ -492,6 +492,33 @@ def test_chat_pin_notice_branches():
     assert chat_pin_own_fallback(agent, pin) == (False, None)
 
 
+def test_chat_pin_to_slot_name_matches_the_slots_current_id(monkeypatch):
+    """t_13e3c18c: a chat pinned with ``!model opus`` replying on the slot's id is not a fallback."""
+    from agent.chat_completion_helpers import chat_pin_own_fallback, format_chat_pin_notice
+    from hermes_cli import model_registry
+
+    monkeypatch.setattr(model_registry, "slot_view", lambda: {"opus": "claude-opus-5-5"})
+    pin = {"model": "opus", "provider": "claude-alr"}
+    agent = SimpleNamespace(_primary_runtime={"model": "claude-opus-5-5", "provider": "claude-alr"},
+                            _last_fallback_event=None)
+    own, label = chat_pin_own_fallback(agent, pin)
+    assert own is True
+    assert format_chat_pin_notice("claude-opus-5-5", "claude-alr", pin,
+                                  own_fallback=own, fallback_label=label) is None
+    # A session override that stores the slot name is the pinned session too.
+    assert chat_pin_own_fallback(SimpleNamespace(_primary_runtime=None), pin,
+                                 {"model": "opus", "provider": "claude-alr"})[0] is True
+    # A real fallback off the slot still warns, naming the slot.
+    real = format_chat_pin_notice("claude-fable-5-1", "claude-btpr", pin, own_fallback=True)
+    assert real == ("⚠️ replying on claude-btpr/claude-fable-5-1 — on fallback from "
+                    "pinned claude-alr/opus")
+    assert format_chat_pin_notice("claude-sonnet-5", "claude-alr", pin) is not None
+    # A literal (non-slot) pin compares as before.
+    lit = {"model": "claude-opus-5-1", "provider": "claude-alr"}
+    assert format_chat_pin_notice("claude-opus-5-1", "claude-alr", lit) is None
+    assert format_chat_pin_notice("claude-opus-5-5", "claude-alr", lit) is not None
+
+
 def prepare_warm_fallback(monkeypatch, same_route):
     agent = make_agent(monkeypatch)
     agent.reasoning_config = {"effort": "medium"}
