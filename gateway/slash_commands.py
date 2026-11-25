@@ -3340,6 +3340,8 @@ class GatewaySlashCommandsMixin(
                     current_model = model_cfg.get("default", "")
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
+                elif isinstance(model_cfg, str):
+                    current_model = model_cfg
                 user_provs = cfg.get("providers")
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
@@ -3362,6 +3364,13 @@ class GatewaySlashCommandsMixin(
         session_key = self._session_key_for_source(source)
         _mct.annotate(session=session_key)
         _mct.phase("prepare")
+        # channel_overrides (exact id, else the platform's '*') sit between config.yaml and the
+        # session pin, as on a turn: baseline for "current", reset and bare switches (t_3639712d).
+        _ch = self._channel_override_for(source)
+        if _ch is not None:
+            if _ch.provider and _ch.provider != current_provider:
+                current_provider, current_base_url = _ch.provider, ""
+            current_model = _ch.model or current_model
         configured_model = current_model
         configured_provider = current_provider
         override = self._session_model_overrides.get(session_key, {})
@@ -3428,12 +3437,6 @@ class GatewaySlashCommandsMixin(
                 self._evict_cached_agent(session_key)
             except Exception:
                 pass
-            # The next turn resolves channel_overrides (exact id, else the platform's '*') before
-            # config.yaml, so name that route, not the global one (t_3639712d).
-            _ch = self._channel_override_for(source)
-            if _ch is not None:
-                configured_model = _ch.model or configured_model
-                configured_provider = _ch.provider or configured_provider
             await self._announce_switch(
                 event.source,
                 "Model",

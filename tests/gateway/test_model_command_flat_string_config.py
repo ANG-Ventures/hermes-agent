@@ -192,6 +192,49 @@ async def test_model_reset_names_platform_wildcard_route(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_model_reset_flat_model_with_provider_only_wildcard(tmp_path, monkeypatch):
+    """A flat-string ``model:`` plus a provider-only '*' keeps the configured model name."""
+    from gateway.config import ChannelOverride, PlatformConfig
+
+    _setup_isolated_home(tmp_path, monkeypatch, "fable")
+    runner = _make_runner()
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(
+        enabled=True, channel_overrides={"*": ChannelOverride(provider="claude-alr")})})
+    event = _make_event("/model reset")
+    runner._session_model_overrides[runner._session_key_for_source(event.source)] = {
+        "model": "pinned-model", "provider": "openai-codex"}
+
+    result = await runner._handle_model_command(event)
+
+    assert "`claude-alr/fable`" in result
+
+
+@pytest.mark.asyncio
+async def test_model_status_lists_platform_wildcard_as_current(tmp_path, monkeypatch):
+    """Plain ``/model`` in an unpinned '*'-covered chat names the '*' route as current, the
+    route the next turn runs (t_3639712d)."""
+    from gateway.config import ChannelOverride, PlatformConfig
+
+    _setup_isolated_home(tmp_path, monkeypatch, {"default": "fable", "provider": "openrouter"})
+    seen = {}
+
+    def _fake_list(**kw):
+        seen.update(kw)
+        return []
+
+    monkeypatch.setattr("hermes_cli.model_switch.list_authenticated_providers", _fake_list)
+    runner = _make_runner()
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(
+        enabled=True, channel_overrides={"*": ChannelOverride(model="opus", provider="claude-alr")})})
+
+    result = await runner._handle_model_command(_make_event("/model"))
+
+    assert "`opus`" in result
+    assert seen["current_model"] == "opus"
+    assert seen["current_provider"] == "claude-alr"
+
+
+@pytest.mark.asyncio
 async def test_model_reset_persistence_failure_never_claims_success(
     tmp_path, monkeypatch
 ):
