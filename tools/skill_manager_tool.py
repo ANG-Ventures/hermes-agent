@@ -795,7 +795,8 @@ def _attach_lane_check(result: Dict[str, Any], target: Path) -> Dict[str, Any]:
     import sys
     try:
         r = subprocess.run([sys.executable, str(script), "--home", str(shared.parent), "--clone", str(shared),
-                            "--check", str(target)], capture_output=True, text=True, timeout=20,
+                            "--check", str(target)], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=20,
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as e:
         logger.debug("skills-prose-lane --check not run for %s: %s", target, e)
