@@ -3257,9 +3257,27 @@ def _format_model_route_label(provider, model, effort=None):
     return f"{base} ({effort})" if effort else base
 
 
+def _slot_resolved(model, provider):
+    """``model`` through the slot view: a pin of ``opus`` matches the slot's current id.
+
+    The pin's own lane prefix is dropped (``cpa/sol`` -> ``cpa/gpt-6.2-sol`` -> ``gpt-6.2-sol``):
+    agent init may normalize it off the live id. Other prefixes (``vendor/model``) are kept."""
+    try:
+        from hermes_cli.model_registry import _bare_id, slot_resolve
+        resolved = slot_resolve(model)[0]
+        return _bare_id(provider or "", resolved) if isinstance(resolved, str) else resolved
+    except Exception:
+        return model
+
+
+def _model_matches_pin(model, pin) -> bool:
+    pinned, lane = pin.get("model"), pin.get("provider")
+    return bool(model) and (model == pinned or _slot_resolved(model, lane) == _slot_resolved(pinned, lane))
+
+
 def _route_matches_pin(route, pin) -> bool:
     return (isinstance(route, dict) and bool(route.get("model"))
-            and route.get("model") == pin.get("model")
+            and _model_matches_pin(route.get("model"), pin)
             and route.get("provider") == pin.get("provider"))
 
 
@@ -3287,7 +3305,7 @@ def format_chat_pin_notice(model, provider, pin, *, reason=None, own_fallback=Fa
     replied on its own failover route (t_40a9186f: that read "emitting session
     uses a different route"). ``fallback_label`` is the 🔄 line's head label."""
     if not model or not pin or (
-        model == pin.get("model") and provider == pin.get("provider")
+        _model_matches_pin(model, pin) and provider == pin.get("provider")
     ):
         return None
     live = _format_model_route_label(provider, model)
