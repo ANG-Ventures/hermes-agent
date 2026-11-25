@@ -16,6 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
+from agent.memory_caller_scope import bound_scope, claim_instance
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
@@ -347,6 +348,8 @@ class MemoryManager:
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[Dict[str, Any]] = None
         self._has_external: bool = False
+        # The profile ``initialize_all`` bound the providers to (#140058); hermes-webui reads it back.
+        self._bound_scope: Optional[Dict[str, Any]] = None
         timeout = external_prefetch_timeout
         timeout = _EXTERNAL_PREFETCH_TIMEOUT_S if timeout is None else float(timeout)
         if timeout <= 0:
@@ -377,6 +380,11 @@ class MemoryManager:
             except Exception as e:
                 logger.log(level, "Memory provider '%s' %s: %s", provider.name, label, e, exc_info=exc_info)
         return results
+
+    def _drop_provider(self, provider: MemoryProvider) -> None:
+        self._providers = [p for p in self._providers if p is not provider]
+        self._tool_to_provider = {t: p for t, p in self._tool_to_provider.items() if p is not provider}
+        self._has_external = any(p.name != "builtin" for p in self._providers)
 
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a provider; builtin always accepted, only ONE external allowed."""
@@ -992,11 +1000,30 @@ class MemoryManager:
             _SYNC_DRAIN_TIMEOUT_S, abandoned_writes, abandoned_prefetches, active_tasks,
         )
 
+    def initialize_for_agent(self, say: Optional[Callable[[str], None]] = None, **kwargs) -> bool:
+        """``initialize_all`` for an agent build; True while an external provider is still served. One
+        refused as another profile's shared instance is dropped, and ``say`` tells the user this
+        profile now runs without it."""
+        before = [p for p in self._providers if p.name != "builtin"]
+        self.initialize_all(**kwargs)
+        for provider in (p for p in before if not any(p is kept for kept in self._providers)):
+            message = (f"⚠ Memory provider {provider.name!r} is disabled for this profile: it handed out the "
+                       "provider instance another profile already uses. Built-in memory still works; the "
+                       "operator can see why with `hermes logs errors`.")
+            (say or logger.warning)(message)
+        return self._has_external
+
     def initialize_all(self, session_id: str, **kwargs) -> None:
         """Initialize all providers, injecting ``hermes_home`` so they resolve profile-scoped paths."""
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+        self._bound_scope = bound_scope(kwargs["hermes_home"], kwargs.get("agent_identity"))
+        # One instance, one profile: never rebind an instance another profile's manager bound (#140058).
+        for provider in [p for p in self._providers if p.name != "builtin"]:
+            if not claim_instance(provider, kwargs["hermes_home"], manager=self):
+                self._drop_provider(provider)
+
         def _init(p: MemoryProvider) -> None:
             p.initialize(session_id=session_id, **kwargs)
             try:
