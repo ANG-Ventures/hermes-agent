@@ -700,7 +700,8 @@ def _dispatch_on(home, *, door_on=False):
     assert (rid, via) == (None, None) if door_on else (rid and via == kh.VIA_ALLOC_CLIENT)
     placed = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'worker_allocated'",
                                      (tid,)).fetchone()[0])
-    return conn, tid, run_id, rid, placed["host"]
+    assert placed["target"].endswith(f"@{placed['host']}") and not placed["target"].startswith("kanbanw@")
+    return conn, tid, run_id, rid, placed["host"], placed["target"]   # target: the owner login the pool row names
 
 
 def _releases(allocd, rid):
@@ -720,12 +721,12 @@ def test_run_end_release_carries_actual_source_and_host(home, allocd, monkeypatc
         return {"host": fp["host"], "cpus": 0.4, "ram_gb": 1.25, "gpu_mib": 0.0, "cpu_s": 120.0, "wall_s": 300.0}
 
     monkeypatch.setattr(kh, "measure_run_footprint", measure)
-    conn, tid, run_id, rid, host = _dispatch_on(home)
+    conn, tid, run_id, rid, host, target = _dispatch_on(home)
     try:
         kb.complete_task(conn, tid, summary="done")
     finally:
         conn.close()
-    assert seen == [{"host": host, "target": f"kanbanw@{host}", "port": 22, "run_id": run_id}]
+    assert seen == [{"host": host, "target": target, "port": 22, "run_id": run_id}]
     [req] = _releases(allocd, rid)
     assert req["actual_source"] == kh.FOOTPRINT_SOURCE == "cgroup"
     assert req["actual"]["host"] == host and req["actual"]["ram_gb"] == 1.25
@@ -739,7 +740,7 @@ def test_measurement_failure_still_releases_without_actual(home, allocd, monkeyp
         raise RuntimeError("no live ssh master")
 
     monkeypatch.setattr(kh, "measure_run_footprint", measure)
-    conn, tid, run_id, rid, host = _dispatch_on(home)
+    conn, tid, run_id, rid, host, _target = _dispatch_on(home)
     with caplog.at_level("INFO", logger=kh.__name__):
         try:
             kb.complete_task(conn, tid, summary="done")
@@ -754,7 +755,7 @@ def test_measurement_failure_still_releases_without_actual(home, allocd, monkeyp
 def test_host_mismatch_is_the_servers_refusal_not_a_crash(home, allocd, monkeypatch, caplog):
     monkeypatch.setattr(kh, "measure_run_footprint",
                         lambda fp: {"host": "some-other-box", "cpus": 0.4, "ram_gb": 1.0, "gpu_mib": 0.0})
-    conn, tid, run_id, rid, host = _dispatch_on(home)
+    conn, tid, run_id, rid, host, _target = _dispatch_on(home)
     with caplog.at_level("WARNING", logger=kh.__name__):
         try:
             kb.complete_task(conn, tid, summary="done")
@@ -787,7 +788,7 @@ def _door_run_ended(home, monkeypatch, measure):
     _door_on(home)
     assert door.enabled()
     monkeypatch.setattr(kh, "measure_run_footprint", measure)
-    conn, tid, run_id, _cap_rid, host = _dispatch_on(home, door_on=True)
+    conn, tid, run_id, _cap_rid, host, target = _dispatch_on(home, door_on=True)
     try:
         grant = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
                                         (tid, run_id, door.EVENT)).fetchone()[0])
@@ -798,7 +799,7 @@ def _door_run_ended(home, monkeypatch, measure):
                                 (tid, run_id, door.RELEASED)).fetchone()[0]
     finally:
         conn.close()
-    return tid, run_id, grant, host, released
+    return tid, run_id, grant, host, target, released
 
 
 def test_door_run_release_carries_actual_through_the_lifecycle_sweep(home, allocd, monkeypatch):
@@ -808,9 +809,9 @@ def test_door_run_release_carries_actual_through_the_lifecycle_sweep(home, alloc
         seen.append(dict(fp))
         return {"host": fp["host"], "cpus": 0.4, "ram_gb": 1.25, "gpu_mib": 0.0, "cpu_s": 120.0, "wall_s": 300.0}
 
-    tid, run_id, grant, host, released = _door_run_ended(home, monkeypatch, measure)
+    tid, run_id, grant, host, target, released = _door_run_ended(home, monkeypatch, measure)
     assert grant["consumer"] == f"kanban@{host}"
-    assert seen == [{"host": host, "target": f"kanbanw@{host}", "port": 22, "run_id": run_id}]
+    assert seen == [{"host": host, "target": target, "port": 22, "run_id": run_id}]
     [req] = _releases(allocd, grant["reservation_id"])
     assert req["consumer"] == f"kanban@{host}"
     assert req["actual_source"] == kh.FOOTPRINT_SOURCE == "cgroup"
@@ -827,7 +828,7 @@ def test_door_run_measurement_failure_still_releases(home, allocd, monkeypatch, 
         raise RuntimeError("no live ssh master")
 
     with caplog.at_level("INFO"):
-        tid, run_id, grant, host, released = _door_run_ended(home, monkeypatch, measure)
+        tid, run_id, grant, host, _target, released = _door_run_ended(home, monkeypatch, measure)
     assert _releases(allocd, grant["reservation_id"]) == [
         {"consumer": f"kanban@{host}", "reservation_id": grant["reservation_id"]}]
     assert released == 1
@@ -839,7 +840,7 @@ def test_door_run_measurement_failure_still_releases(home, allocd, monkeypatch, 
 def test_door_run_refused_actual_is_a_warning_and_the_lease_ends(home, allocd, monkeypatch, caplog):
     measure = lambda fp: {"host": "some-other-box", "cpus": 0.4, "ram_gb": 1.0, "gpu_mib": 0.0}
     with caplog.at_level("WARNING"):
-        tid, run_id, grant, host, released = _door_run_ended(home, monkeypatch, measure)
+        tid, run_id, grant, host, _target, released = _door_run_ended(home, monkeypatch, measure)
     [req] = _releases(allocd, grant["reservation_id"])
     assert req["actual"]["host"] == "some-other-box"
     assert released == 1                                                        # marked: never released twice
