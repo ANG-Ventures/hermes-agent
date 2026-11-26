@@ -111,6 +111,33 @@ def test_fixed_cadence_ticker_fires_every_n_ticks_when_claim_lags_the_scan(clock
     assert fires == list(range(0, minutes * 6 + 1, minutes))
 
 
+def test_1m_row_with_45s_run_fires_on_every_tick_once(clock):
+    """t_ed8ce7a2 operator item 2: a 1m row whose run (45 s) outlasts half a tick is re-armed in
+    the past (fire + 60 s - 30 s < finish). It still fires on every tick, once per tick, and the
+    past slot never reads as late: at the next scan it is at most ~30 s old, under the 120 s
+    grace that both the catch-up fast-forward and cron_health's overdue gauge use."""
+    from agent.monitoring.cron_health import _is_overdue
+    from cron.jobs import _compute_grace_seconds, get_job
+
+    jid = _make_interval_job(1, T0 - timedelta(seconds=1))
+    scan_after, claim_after = timedelta(milliseconds=200), timedelta(milliseconds=1500)
+    fires = []
+    for i in range(13):
+        tick_at = T0 + timedelta(seconds=60 * i)
+        due = _due_ids(clock, tick_at + scan_after)
+        assert due.count(jid) <= 1
+        if jid in due:
+            job = get_job(jid)
+            lateness = (tick_at + scan_after - datetime.fromisoformat(job["next_run_at"])).total_seconds()
+            assert lateness < _compute_grace_seconds(job["schedule"])
+            assert not _is_overdue(job, tick_at + scan_after)
+            fires.append(i)
+            _fire_mid_tick(clock, jid, tick_at, claim_after, run_seconds=45)
+            nxt = datetime.fromisoformat(get_job(jid)["next_run_at"])
+            assert tick_at + claim_after < nxt <= clock["now"]  # past, but after this fire
+    assert fires == list(range(13))
+
+
 def test_external_provider_claim_rearms_at_exact_interval(clock):
     """Prism 589ad59a51f6 (t_ed8ce7a2): an external provider (Chronos) claims at the exact slot
     and re-arms its callback at the stored ``next_run_at``; no 60 s poll absorbs an offset, so

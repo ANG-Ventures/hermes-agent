@@ -309,7 +309,9 @@ GOLDEN_FILE = Path(__file__).with_name("fixtures") / "cron_lanes_tick_all_golden
 def test_ac2_default_tick_equals_main_golden(home, vclock):
     """The golden was produced by THIS scenario on origin/main 881b7d5601 (pre-S1):
     ``CRON_LANES_GOLDEN_WRITE=1 pytest tests/cron/test_cron_lanes.py -k ac2 -s`` in a main
-    worktree with this file copied in. S1 must reproduce it byte for byte."""
+    worktree with this file copied in. S1 must reproduce it byte for byte. t_ed8ce7a2 re-armed a
+    ticker-fired interval slot half a tick early: the six rows fired at 00:05 store next_run_at
+    00:09:30 (was 00:10:00), run on tick 00:10; nothing else in the golden moved."""
     clock, control = vclock
     got = json.dumps(_golden_scenario(home, clock, control), sort_keys=True, indent=1)
     out = os.environ.get("CRON_LANES_GOLDEN_WRITE")
@@ -1022,6 +1024,23 @@ def _expected_interval_fires(minutes, steps, step_s=60):
     return {T0 + period * k for k in range(1, steps * step_s // period + 1)}
 
 
+def _expected_interval_slots(minutes, steps, step_s=60):
+    """``scheduled_instant`` of each fire: the first slot is the create-time one; every later slot
+    was re-armed by a ticker fire half a tick early (t_ed8ce7a2), so it reads 30 s before the tick
+    that runs it. The RUN times are :func:`_expected_interval_fires` (see ``_fired_by_name``)."""
+    first = T0 + minutes * 60
+    return {t if t == first else t - 30 for t in _expected_interval_fires(minutes, steps, step_s)}
+
+
+def _fired_by_name(control):
+    """Virtual-clock instant each job actually started, from the harness run log."""
+    out: Dict[str, List[float]] = {}
+    for r in (json.loads(x) for x in control.runs.read_text().splitlines()):
+        if r["event"] == "start":
+            out.setdefault(r["name"], []).append(r["fired_at"])
+    return out
+
+
 def _started_by_job(home):
     out: Dict[str, List[float]] = {}
     for r in _ledger(home, "started_at IS NOT NULL"):
@@ -1035,12 +1054,14 @@ if __name__ != "__main__":
     @pytest.mark.slow_test(240, reason="two OS processes tick 120 virtual minutes")
     def test_e2e_agent_and_script_callers_share_one_store(home, vclock, tmp_path):
         clock, control = vclock
-        periods = {}
+        periods, names = {}, {}
         for i in range(50):
             m = (5, 10, 15, 30)[i % 4]
-            periods[_script_job(f"s{i:02d}", schedule=f"every {m}m")["id"]] = m
+            jid = _script_job(f"s{i:02d}", schedule=f"every {m}m")["id"]
+            periods[jid], names[jid] = m, f"s{i:02d}"
         for i in range(5):
-            periods[_agent_job(f"a{i}", schedule="every 15m")["id"]] = 15
+            jid = _agent_job(f"a{i}", schedule="every 15m")["id"]
+            periods[jid], names[jid] = 15, f"a{i}"
         ctl = control.root
         env = _child_env()
         agent = TickChild(ctl, "agent", "agent", env)
@@ -1056,8 +1077,11 @@ if __name__ != "__main__":
             agent.stop()
             script.stop()
         started = _started_by_job(home)
+        fired = _fired_by_name(control)
         for jid, minutes in periods.items():
-            assert sorted(started.get(jid, [])) == sorted(_expected_interval_fires(minutes, 120)), jid
+            assert sorted(started.get(jid, [])) == sorted(_expected_interval_slots(minutes, 120)), jid
+            # Two callers tick the store; every row still RUNS every N minutes, on the tick.
+            assert sorted(fired.get(names[jid], [])) == sorted(_expected_interval_fires(minutes, 120)), jid
         assert _ac3_rows(home) == []
         runs = [json.loads(x) for x in control.runs.read_text().splitlines()
                 if json.loads(x)["event"] == "start"]
@@ -1071,9 +1095,10 @@ if __name__ != "__main__":
     def test_ac3_no_double_run_across_processes(home, vclock):
         clock, control = vclock
         j1 = _script_job("j1", schedule="every 5m")["id"]
-        periods = {j1: 5}
+        periods, names = {j1: 5}, {j1: "j1"}
         for i in range(8):
-            periods[_script_job(f"s{i}", schedule=f"every {(5, 10)[i % 2]}m")["id"]] = (5, 10)[i % 2]
+            jid = _script_job(f"s{i}", schedule=f"every {(5, 10)[i % 2]}m")["id"]
+            periods[jid], names[jid] = (5, 10)[i % 2], f"s{i}"
         agent_ids = [_agent_job(f"a{i}")["id"] for i in range(2)]
         ctl = control.root
         (ctl / "j1").write_text(j1, encoding="utf-8")
@@ -1097,8 +1122,10 @@ if __name__ != "__main__":
         assert _ac3_rows(home) == []
         assert any(r["result"] == "timeout" for r in barriers), barriers
         started = _started_by_job(home)
+        fired = _fired_by_name(control)
         for jid, minutes in periods.items():
-            assert sorted(started.get(jid, [])) == sorted(_expected_interval_fires(minutes, 120)), jid
+            assert sorted(started.get(jid, [])) == sorted(_expected_interval_slots(minutes, 120)), jid
+            assert sorted(fired.get(names[jid], [])) == sorted(_expected_interval_fires(minutes, 120)), jid
         assert not any(started.get(jid) for jid in agent_ids)
         outcomes = {o["outcome"] for o in a.results() + b.results()}
         assert "LOCK_BUSY" in outcomes or len(barriers) >= 1

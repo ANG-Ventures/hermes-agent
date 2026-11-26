@@ -1565,7 +1565,11 @@ def _record_interval_fire(job: Dict[str, Any], now: datetime, *, tick: bool = Fa
 def _next_interval_slot(
     schedule: Dict[str, Any], fire_at: Optional[str], now: datetime, tick: bool = False
 ) -> Optional[str]:
-    """First ``fire_at + k*interval`` (k >= 1) strictly after ``now``.
+    """First ``fire_at + k*interval`` (k >= 1) strictly after ``now``, less the half-tick slack
+    for a ticker fire (``tick``). With the slack, a run that outlasts half a tick is re-armed up to
+    30 s BEFORE ``now``: it is due on the next tick and runs there once. Readers that treat a past
+    ``next_run_at`` as late all allow at least 120 s (``_compute_grace_seconds``: catch-up
+    fast-forward, ``cron_health._is_overdue``; ``_classify_dispatch_lateness``: 300 s).
 
     Slots that elapsed while an over-long run was in flight are skipped, never
     fired, so a slot cannot fire twice and missed slots do not burst. Returns
