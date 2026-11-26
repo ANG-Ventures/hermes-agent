@@ -140,6 +140,16 @@ async def _busy(runner, event, mode, agent):
     return outcome
 
 
+async def _until_in_vision(vision, *, polls: int = 1000):
+    """Wait until an image is inside its (gated) vision call. Session runtime resolution runs in a
+    worker thread first (asyncio.to_thread), so this polls real time, bounded by poll count."""
+    for _ in range(polls):
+        if vision.calls:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the image never reached the vision step")
+
+
 def _lines(caplog, needle):
     return [r for r in caplog.records if needle in r.getMessage() and r.levelno == logging.INFO]
 
@@ -181,10 +191,7 @@ async def test_image_then_text_while_description_runs_arrive_in_that_order(rig):
     runner, adapter, agent, _stt, vision, (shot, _) = rig
     vision.gate = asyncio.Event()
     image_task = asyncio.create_task(_busy(runner, _photo(shot), "steer", agent))
-    for _ in range(200):                           # until the image is inside its vision call
-        if vision.calls:
-            break
-        await asyncio.sleep(0)
+    await _until_in_vision(vision)
     assert vision.calls, "the image never reached the vision step"
     text_task = asyncio.create_task(_busy(runner, _text("see the rail", "m2"), "steer", agent))
     for _ in range(20):
@@ -214,8 +221,8 @@ async def test_two_images_are_both_steered_in_order(rig):
     vision.gate = asyncio.Event()
     first = asyncio.create_task(_busy(runner, _photo(shot, "i1"), "steer", agent))
     second = asyncio.create_task(_busy(runner, _photo(shot2, "i2"), "steer", agent))
-    for _ in range(20):
-        await asyncio.sleep(0)
+    await _until_in_vision(vision)
+    await asyncio.sleep(0.2)                       # room for a second (wrongly parallel) vision call
     assert vision.calls == [str(shot)], "the second image's description started before the first finished"
     vision.gate.set()
     await asyncio.gather(first, second)
@@ -456,10 +463,7 @@ async def test_fast_path_image_then_text_arrive_in_that_order(rig):
     runner, adapter, agent, _stt, vision, (shot, _) = rig
     vision.gate = asyncio.Event()
     image_task = asyncio.create_task(runner._hm_busy_steer(_photo(shot), agent, SK))
-    for _ in range(200):                           # until the image is inside its vision call
-        if vision.calls:
-            break
-        await asyncio.sleep(0)
+    await _until_in_vision(vision)
     assert vision.calls, "the image never reached the vision step"
     text_task = asyncio.create_task(runner._hm_busy_steer(_text("see the rail", "m2"), agent, SK))
     for _ in range(20):
@@ -534,3 +538,123 @@ async def test_fast_path_voice_interrupt_with_nothing_pending_is_unchanged(rig):
     await runner._hm_busy_interrupt(_voice(), _source(), agent, SK)
     assert agent.interrupted == ["this screenshot shows the paddle"]
     assert adapter._pending_messages == {} and not runner._overflow_queue(SK)
+
+
+# ── Independent review of #569 (pr-v3): turn end, deadline, exceptions ─────────────────────────
+
+TURN_ENDED_LOG = "turn ended during preparation"
+
+
+@pytest.mark.asyncio
+async def test_turn_ending_while_image_is_described_queues_it_for_the_next_turn(rig, caplog):
+    """The turn finishes while the image's description runs: the steer would land in a finished
+    agent's buffer (turn_finalizer already drained it). The image is queued as the next turn, and
+    a text that waited behind it folds into that turn instead of steering a dead turn."""
+    runner, adapter, agent, _stt, vision, (shot, _) = rig
+    caplog.set_level(logging.INFO, logger="gateway")
+    vision.gate = asyncio.Event()
+    photo = _photo(shot)
+    image_task = asyncio.create_task(_busy(runner, photo, "steer", agent))
+    await _until_in_vision(vision)
+    assert vision.calls, "the image never reached the vision step"
+    text_task = asyncio.create_task(_busy(runner, _text("see the rail", "m2"), "steer", agent))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    runner._session_state(SK).turn.agent = None        # the turn ended and released its slot
+    vision.gate.set()
+    image_out, text_out = await asyncio.gather(image_task, text_task)
+    assert agent.steered == [], "a follow-up was steered into a turn that had already ended"
+    assert image_out.steered is False and text_out.steered is False
+    assert adapter._pending_messages[SK] is photo
+    assert "see the rail" in adapter._pending_messages[SK].text
+    assert len(_lines(caplog, TURN_ENDED_LOG)) == 1
+    assert len(_lines(caplog, HELD_LOG)) == 1
+
+
+@pytest.mark.asyncio
+async def test_image_description_past_the_deadline_queues_and_later_text_holds(rig, monkeypatch, caplog):
+    """A vision call that does not return holds the session's steer order only until the deadline;
+    then the image is queued (vision runs again at turn start) and the next text queues behind it."""
+    runner, adapter, agent, _stt, vision, (shot, _) = rig
+    caplog.set_level(logging.INFO, logger="gateway")
+    monkeypatch.setattr("gateway.run_busy._BUSY_STEER_IMAGE_DEADLINE_S", 0.05)
+    vision.gate = asyncio.Event()                       # never released: the call hangs
+    photo = _photo(shot)
+    image_out = await asyncio.wait_for(_busy(runner, photo, "steer", agent), timeout=10)
+    assert image_out.steered is False and agent.steered == []
+    assert adapter._pending_messages[SK] is photo
+    assert len(_lines(caplog, "description exceeded")) == 1
+    later = await _busy(runner, _text("this screenshot", "m2"), "steer", agent)
+    assert later.steered is False and agent.steered == []
+    assert "this screenshot" in adapter._pending_messages[SK].text
+    assert not getattr(runner, "_busy_steer_order_locks", {}), "an idle per-session lock was kept"
+
+
+@pytest.mark.asyncio
+async def test_exception_while_preparing_releases_the_session_order(rig, monkeypatch):
+    """A raise inside preparation must not leave the per-session lock held or its entry behind."""
+    runner, adapter, agent, _stt, _vision, (shot, _) = rig
+
+    async def _boom(*_a, **_kw):
+        raise RuntimeError("prepare blew up")
+
+    runner._prepare_busy_steer_payload = _boom          # instance attribute shadows the method
+    with pytest.raises(RuntimeError):
+        await runner._steer_busy_followup(_photo(shot), SK, agent)
+    assert SK not in getattr(runner, "_busy_steer_order_locks", {})
+    del runner._prepare_busy_steer_payload
+    out = await asyncio.wait_for(_busy(runner, _text("still works", "m3"), "steer", agent), timeout=10)
+    assert out.steered is True and _body(agent.steered[0]) == "still works"
+
+
+def _photo_with_voice(path, mid: str = "img+voice") -> MessageEvent:
+    return MessageEvent(text="", source=_source(), message_id=mid, message_type=MessageType.PHOTO,
+                        media_urls=[str(path), "/tmp/note.ogg"], media_types=["image/png", "audio/ogg"])
+
+
+@pytest.mark.asyncio
+async def test_image_with_a_voice_note_steers_both_when_stt_succeeds(rig):
+    runner, adapter, agent, stt, vision, (shot, _) = rig
+    out = await _busy(runner, _photo_with_voice(shot), "steer", agent)
+    assert out.steered is True and vision.calls == [str(shot)]
+    stt.assert_awaited_once()
+    body = _body(agent.steered[0])
+    assert body.startswith("[The user sent an image~") and "this screenshot shows the paddle" in body
+
+
+@pytest.mark.asyncio
+async def test_image_with_an_untranscribed_voice_note_queues_the_whole_message(rig, caplog):
+    """Prism a88d8e2a80c0: steering the picture alone would consume the voice note with no
+    transcript. The message queues; its own turn retries STT and vision."""
+    runner, adapter, agent, stt, vision, (shot, _) = rig
+    caplog.set_level(logging.INFO, logger="gateway")
+    stt.return_value = ("", [])                         # STT failed
+    msg = _photo_with_voice(shot)
+    out = await _busy(runner, msg, "steer", agent)
+    assert out.steered is False and agent.steered == [] and vision.calls == []
+    assert adapter._pending_messages[SK] is msg
+    assert len(_lines(caplog, "voice note was not transcribed")) == 1
+
+
+@pytest.mark.asyncio
+async def test_pinned_native_image_mode_queues_the_image_without_auxiliary_vision(rig, monkeypatch, caplog):
+    """Prism f49146cc9631: agent.image_input_mode: native means never pre-describe with auxiliary
+    vision. A steer can only carry text, so the image waits for the next turn (pixels attached)."""
+    runner, adapter, agent, _stt, vision, (shot, _) = rig
+    caplog.set_level(logging.INFO, logger="gateway")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: {"agent": {"image_input_mode": "native"}})
+    photo = _photo(shot)
+    out = await _busy(runner, photo, "steer", agent)
+    assert out.steered is False and vision.calls == [] and agent.steered == []
+    assert adapter._pending_messages[SK] is photo
+    assert len(_lines(caplog, "image_input_mode is native")) == 1
+    text_out = await _busy(runner, _text("plain text still steers", "m9"), "steer", agent)
+    assert text_out.steered is False, "a later text must still queue behind the queued image"
+
+
+@pytest.mark.asyncio
+async def test_auto_image_mode_still_steers_the_image(rig, monkeypatch):
+    runner, adapter, agent, _stt, vision, (shot, _) = rig
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: {"agent": {"image_input_mode": "auto"}})
+    out = await _busy(runner, _photo(shot), "steer", agent)
+    assert out.steered is True and vision.calls == [str(shot)]

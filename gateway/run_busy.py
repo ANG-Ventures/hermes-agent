@@ -75,6 +75,11 @@ _STEER_ENTRIES_ATTR = "_gateway_steer_entries"
 _STEER_DRAINED_ATTR = "_gateway_steer_drained"
 _STEER_LOCK_ATTR = "_gateway_steer_lock"
 _STEER_ENTRIES_MAX = 64
+# The longest a mid-turn image's vision description may hold the session's steer order (t_086da8be).
+# Later follow-ups wait behind it, so this bounds how long a user's next message is held. On expiry
+# the image is queued for the next turn (vision runs again there) and later follow-ups queue behind
+# it. One vision attempt alone may take auxiliary.vision.timeout (120 s default), plus retries.
+_BUSY_STEER_IMAGE_DEADLINE_S = 45.0
 # The agent-side hook ``steer_user_row`` calls with the drained text (t_b8fbfc54); keep the name in step with
 # ``agent.prompt_builder.STEER_ROW_DISPLAY_METADATA_ATTR``.
 STEER_ROW_DISPLAY_METADATA_ATTR = "_steer_row_display_metadata"
@@ -883,13 +888,20 @@ class GatewayBusySessionMixin:
         silently degrade to queue mode. Uses the single out-of-band STT choke point, so STT runs at
         most once per message; on failure the caption (if any) is kept.
         """
+        return (await self._busy_steer_text_and_stt_ok(event))[0]
+
+    async def _busy_steer_text_and_stt_ok(self, event: MessageEvent) -> Tuple[str, bool]:
+        """``_prepare_busy_steer_text`` plus whether every voice clip it needed was transcribed
+        (True when there was no voice)."""
         text = (event.text or "").strip()
         if not self._pending_event_audio_paths(event):
-            return text
+            return text, True
         enriched_text, successful_transcripts = await self._transcribe_and_echo_pending_voice(
             event, self._delivery_adapter_for(event.source), event.source, text, log_context="Busy-steer"
         )
-        return (enriched_text or text).strip() if successful_transcripts else text
+        if successful_transcripts:
+            return (enriched_text or text).strip(), True
+        return text, False
 
     # -- Mid-turn steer of any follow-up a steer can carry: text, voice, images (t_086da8be) -----
     # Ace's ruling on #569: an image sent mid-turn interrupts the turn the way text does. A steer is
@@ -947,6 +959,21 @@ class GatewayBusySessionMixin:
             return None
         return block
 
+    async def _busy_steer_images_pinned_native(self, event: MessageEvent) -> bool:
+        """True when the routed profile's config pins ``agent.image_input_mode: native`` (auto and
+        text return False: auto pre-describes for a steer, since a steer cannot carry pixels)."""
+        def _read() -> bool:
+            try:
+                from agent.image_routing import _coerce_mode, _dict_or_empty
+                from hermes_cli.config import load_config
+                agent_cfg = _dict_or_empty(_dict_or_empty(load_config()).get("agent"))
+                return _coerce_mode(agent_cfg.get("image_input_mode")) == "native"
+            except Exception:
+                logger.debug("busy steer: image_input_mode read failed", exc_info=True)
+                return False
+        async with self._async_profile_scope_for_source(event.source):
+            return await asyncio.to_thread(_read)
+
     async def _prepare_busy_steer_payload(self, event: MessageEvent, session_key: str) -> str:
         """The steer text for a mid-turn follow-up, or "" when it cannot be steered (caller queues).
 
@@ -959,10 +986,29 @@ class GatewayBusySessionMixin:
         images = self._busy_steer_image_paths(event)
         if images is None:
             return ""
-        text = await self._prepare_busy_steer_text(event)
+        if images and await self._busy_steer_images_pinned_native(event):
+            # agent.image_input_mode: native is an explicit "attach pixels, never pre-describe with
+            # auxiliary vision". A steer can only carry text, so the image waits for the next turn.
+            logger.info("PRIORITY steer image queued: image_input_mode is native session=%s", session_key)
+            return ""
+        text, stt_ok = await self._busy_steer_text_and_stt_ok(event)
         if not images:
-            return text   # all voice
-        block = await self._describe_busy_steer_images(event, session_key)
+            return text   # all voice (pre-#569 behaviour, STT failure included)
+        if not stt_ok:
+            # Image + voice note whose STT failed: steering the picture alone would consume the
+            # voice note untranscribed. Queue the whole message; its turn retries STT and vision.
+            logger.info("PRIORITY steer image queued: its voice note was not transcribed session=%s", session_key)
+            return ""
+        try:
+            block = await asyncio.wait_for(
+                self._describe_busy_steer_images(event, session_key), _BUSY_STEER_IMAGE_DEADLINE_S,
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                "PRIORITY steer image description exceeded %.0fs session=%s",
+                _BUSY_STEER_IMAGE_DEADLINE_S, session_key,
+            )
+            block = None
         if block is None:
             return ""
         return self._prepend_media_prefix(block, text).strip()
@@ -974,28 +1020,52 @@ class GatewayBusySessionMixin:
         On ``"held"``/``"unsteerable"`` the caller queues the event synchronously (no await between
         the return and the queue call), so the next waiter sees it queued and holds behind it."""
         lock = self._busy_steer_order_lock(session_key)
-        async with lock:
-            if self._has_queued_human_followup(session_key, self._delivery_adapter_for(event.source)):
-                # Checked first: a held voice note or image is prepared when its own turn runs.
-                self._log_busy_followup_held(session_key, "steer")
-                outcome = "held"
-            else:
+        try:
+            # Awaited = waited behind an earlier steer, or prepares an image's description (seconds,
+            # up to the deadline): the turn may have ended meanwhile. A lone voice note keeps its
+            # pre-#569 behaviour (STT then steer, no re-check).
+            awaited = lock.locked()
+            async with lock:
+                if self._has_queued_human_followup(session_key, self._delivery_adapter_for(event.source)):
+                    # Checked first: a held voice note or image is prepared when its own turn runs.
+                    self._log_busy_followup_held(session_key, "steer")
+                    return "held"
+                awaited = awaited or bool(self._busy_steer_image_paths(event))
                 steer_text = await self._prepare_busy_steer_payload(event, session_key)
+                if steer_text and awaited and not self._busy_steer_turn_still_live(session_key, running_agent):
+                    # The turn ended while this follow-up waited or was prepared. A steer now would
+                    # sit in a finished agent's buffer (turn_finalizer already drained it) and
+                    # surface inside some later turn; queue it as the next turn instead.
+                    logger.info(
+                        "PRIORITY steer target turn ended during preparation session=%s: queued "
+                        "for the next turn", session_key,
+                    )
+                    return "unsteerable"
                 steered = bool(steer_text) and self._try_agent_verb(
                     running_agent, "steer", steer_text, session_key, event=event
                 )
                 if steered:
                     self._fold_into_running_turn(running_agent, session_key, event)
-                    outcome = "steered"
-                else:
-                    outcome = "unsteerable"
-                    if self._busy_steer_image_paths(event):
-                        logger.info(
-                            "PRIORITY steer image queued for the next turn session=%s: later follow-ups "
-                            "queue behind it to keep arrival order", session_key,
-                        )
-        self._drop_idle_busy_steer_order_lock(session_key, lock)
-        return outcome
+                    return "steered"
+                if self._busy_steer_image_paths(event):
+                    logger.info(
+                        "PRIORITY steer image queued for the next turn session=%s: later follow-ups "
+                        "queue behind it to keep arrival order", session_key,
+                    )
+                return "unsteerable"
+        finally:
+            self._drop_idle_busy_steer_order_lock(session_key, lock)
+
+    def _busy_steer_turn_still_live(self, session_key: str, running_agent: Any) -> bool:
+        """True while *running_agent* still owns the session's current turn (the same test
+        ``_fold_into_running_turn`` applies after a steer)."""
+        state = self._peek_session_state(session_key)
+        turn = state.turn if state is not None else None
+        if turn is None or turn.agent is not running_agent:
+            return False
+        ctx = getattr(running_agent, "_gateway_receiving_turn_context", turn.ctx)
+        still_current = getattr(ctx, "_run_still_current", None) if ctx is not None else None
+        return still_current is None or bool(still_current())
 
     def _steer_text_with_origin(self, text: str, event: MessageEvent) -> str:
         """Keep event origin in this injection, never in the cached system prompt."""

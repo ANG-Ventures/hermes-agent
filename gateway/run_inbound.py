@@ -1850,8 +1850,11 @@ class GatewayInboundMixin:
         # runtime explicitly rather than consulting process-global compatibility mirrors.
         vision_runtime = None
         try:
-            turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
-                source=source, session_key=session_key,
+            # Off the loop: provider resolution can probe a local model server over HTTP
+            # (_auto_detect_local_model), and the mid-turn image steer runs this inside the busy
+            # handler (tests/gateway/test_no_network_reachable_from_loop.py).
+            turn_model, runtime_kwargs = await asyncio.to_thread(
+                self._resolve_session_agent_runtime, source=source, session_key=session_key,
             )
             vision_runtime = {**(runtime_kwargs or {}), "model": turn_model}
         except Exception:
