@@ -1527,6 +1527,34 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
             pricing_version="google-gemini-4-carbon-2026-12-01",
         ),
     ),
+    # gemini-4-neon / gemini-4-hydrogen Standard paid tier, read 2026-11-26 from the
+    # pricing page: flat across the 1M window, no dated change listed. Neon $3 in /
+    # $15 out (thinking included) / $0.15 cached input per 1M; Hydrogen $1.50 /
+    # $7.50 / $0.075. Implicit caching only, so no cache-write price. The
+    # gemini-bridge serves them as gemini-4-{neon,hydrogen}-<effort>; those ids
+    # resolve here via _strip_gemini_effort_suffix (subs-bake price_coverage, t_469fa2ce).
+    (
+        "google",
+        "gemini-4-neon",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.15"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-gemini-4-neon-2026-11-26",
+    ),
+    (
+        "google",
+        "gemini-4-hydrogen",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.50"),
+        output_cost_per_million=Decimal("7.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-gemini-4-hydrogen-2026-11-26",
+    ),
     # gemini-3.8-flash Standard paid tier, read 2026-09-28 from the pricing page.
     # These are the launch rates Google lists "through December 31, 2026"; the
     # page lists $1.50 / $7.50 / $0.15 "starting January 1, 2027". Both are

@@ -1741,6 +1741,25 @@ def test_gemini_4_carbon_prices_intro_then_standard_rate(monkeypatch):
             assert got.amount_usd == want, (now, model, provider, got.amount_usd)
 
 
+def test_gemini_4_neon_and_hydrogen_price_bare_and_bridge():
+    """gemini-4-neon $3 / $15 / $0.15 cached and gemini-4-hydrogen $1.50 / $7.50 /
+    $0.075 per 1M (ai.google.dev pricing, read 2026-11-26, flat). The gemini-bridge
+    serves them as gemini-4-<family>-<effort> (subs-bake price_coverage red on
+    gemini-4-hydrogen-low / gemini-4-neon-low, t_469fa2ce); each prices as its base id."""
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000,
+                           cache_read_tokens=1_000_000)
+    for family, want in (("neon", Decimal("18.15")), ("hydrogen", Decimal("9.075"))):
+        cases = [(f"gemini-4-{family}", "google")] + [
+            (f"gemini-4-{family}-{s}", p)
+            for s in ("low", "medium", "high")
+            for p in ("google", "gemini-bridge")
+        ]
+        for model, provider in cases:
+            got = estimate_usage_cost(model, usage, provider=provider)
+            assert got.status == "estimated", (model, provider, got.status)
+            assert got.amount_usd == want, (model, provider, got.amount_usd)
+
+
 def test_gemini_bridge_effort_suffix_prices_as_base_model():
     """The gemini-bridge appends agy's effort tier (-low/-medium/-high). Effort is
     not a SKU, so each suffixed id prices exactly like its base id, and via the
