@@ -341,6 +341,24 @@ class GatewayBusySessionMixin:
             depth += 1
         return depth
 
+    def _has_queued_human_followup(self, session_key: str, adapter: Any) -> bool:
+        """True when the pending slot or the overflow queue holds a message from a person.
+
+        A busy steer or redirect must not overtake such a message: it would reach the running turn
+        before the earlier queued one (t_086da8be: a voice note steered in ahead of a queued
+        image-only message). Internal wakes (kanban, cron, delegation completions) do not count.
+        """
+        head = (getattr(adapter, "_pending_messages", None) or {}).get(session_key)
+        queued = [head, *(self._overflow_queue(session_key) or ())]
+        return any(item is not None and not getattr(item, "internal", False) for item in queued)
+
+    @staticmethod
+    def _log_busy_followup_held(session_key: str, verb: str) -> None:
+        logger.info(
+            "PRIORITY %s held behind queued follow-up session=%s: an earlier message from a person "
+            "is still queued, so this one queues behind it to keep arrival order", verb, session_key,
+        )
+
     def _rescue_orphaned_overflow(self, session_key: str, adapter: Any) -> Optional["MessageEvent"]:
         """Pop the oldest orphaned FIFO overflow event for an idle session (None if nothing to rescue).
 
@@ -1040,7 +1058,15 @@ class GatewayBusySessionMixin:
         plain_text = (
             event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
         )
-        if effective_mode == "steer":
+        if (
+            effective_mode == "steer" and agent_live and hasattr(running_agent, "steer")
+            and self._has_queued_human_followup(session_key, self._delivery_adapter_for(event.source))
+        ):
+            # Checked before _prepare_busy_steer_text: a held voice note is transcribed when its
+            # own queued turn runs, not here (no wasted STT pass or duplicate echo).
+            self._log_busy_followup_held(session_key, "steer")
+            effective_mode = "queue"
+        elif effective_mode == "steer":
             steer_text = await self._prepare_busy_steer_text(event)
             # Steerable: plain text, OR every attachment is voice media folded into steer_text.
             # A follow-up qualifies for steering when it is plain text, OR when every attachment is
@@ -1063,9 +1089,13 @@ class GatewayBusySessionMixin:
             and getattr(running_agent, "_supports_active_turn_redirect", False) is True
             and hasattr(running_agent, "redirect")
         ):
-            redirected = self._redirect_active_turn(
-                running_agent, (event.text or "").strip(), session_key, event
-            )
+            if self._has_queued_human_followup(session_key, self._delivery_adapter_for(event.source)):
+                # Not redirected: the caller queues this event behind the earlier one and interrupts.
+                self._log_busy_followup_held(session_key, "redirect")
+            else:
+                redirected = self._redirect_active_turn(
+                    running_agent, (event.text or "").strip(), session_key, event
+                )
         outcome = self._BusySteerOutcome(
             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,

@@ -731,7 +731,11 @@ class GatewayInboundMixin:
         """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
         steered = False
-        if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
+        steerable = bool(self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"))
+        if steerable and self._has_queued_human_followup(_quick_key, self._delivery_adapter_for(event.source)):
+            self._log_busy_followup_held(_quick_key, "steer")   # t_086da8be: never overtake it
+            steerable = False
+        if steerable:
             try:
                 steered = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event),
                                                     event=event, internal=bool(getattr(event, "internal", False)))
@@ -752,7 +756,14 @@ class GatewayInboundMixin:
         # Text-only corrections redirect the live turn (preserving displayed context) when the
         # runtime supports it; media/voice and older runtimes use the interrupt path below.
         _can_redirect = getattr(running_agent, "_supports_active_turn_redirect", False) is True
-        if self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect"):
+        _redirectable = self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect")
+        if _redirectable and self._has_queued_human_followup(_quick_key, self._delivery_adapter_for(source)):
+            # t_086da8be: a redirect would overtake the earlier queued message. Queue this one
+            # behind it, then interrupt: with a pending event the turn runner drains the queue
+            # and ignores the bare interrupt text, so queueing is what keeps the text.
+            self._log_busy_followup_held(_quick_key, "redirect")
+            self._queue_or_replace_pending_event(_quick_key, event)
+        elif _redirectable:
             if self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
                 logger.debug("PRIORITY redirect for session %s", _quick_key)
                 return
