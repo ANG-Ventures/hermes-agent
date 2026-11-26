@@ -433,9 +433,15 @@ def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> 
     return current
 
 
-def _symlink_hops(path: Path) -> int:
-    """How many components of ``path`` (itself included) are symlinks."""
-    return sum(1 for part in (path, *path.parents) if part.is_symlink())
+def _link_expansions(path: Path, limit: int = 40):
+    """The spellings ``path`` passes through as its links are followed, innermost link first."""
+    cur = Path(os.path.abspath(path))
+    for _ in range(limit):
+        link = next((part for part in (cur, *cur.parents) if part.is_symlink()), None)
+        if link is None:
+            return
+        cur = Path(os.path.normpath(link.parent / os.readlink(link) / cur.relative_to(link)))
+        yield cur
 
 
 def _current_store_spelling(target: Path, store_python: Path, repo_root: Path) -> Path:
@@ -445,8 +451,9 @@ def _current_store_spelling(target: Path, store_python: Path, repo_root: Path) -
     under a private path. Rewriting the shared launcher with that spelling exits 127 once
     the stand-in is removed (ci-box 11-25, 2 h 50 min, t_926efa60). Keep the launcher's
     own spelling, so an unchanged pin leaves it byte-identical and a repin stays durable,
-    unless the new spelling crosses fewer symlinks: a launcher already minted through a
-    stand-in is moved back to the direct path when the real home publishes.
+    unless following the old spelling's links reaches the new one: a launcher already
+    minted through a stand-in is moved back to the real spelling when the real home
+    publishes, even when that real home sits behind symlinks of its own.
     """
     if not _launcher_works(target):
         return store_python
@@ -455,8 +462,8 @@ def _current_store_spelling(target: Path, store_python: Path, repo_root: Path) -
         new_store = store_root(repo_root)
         if old_store == new_store or old_store.resolve() != new_store.resolve():
             return store_python
-        if _symlink_hops(new_store) < _symlink_hops(old_store):
-            return store_python  # the new spelling is the more direct one (a stand-in launcher)
+        if new_store in _link_expansions(old_store):
+            return store_python  # the old spelling reaches the store through the new one (a stand-in launcher)
         respelled = old_store / store_python.relative_to(new_store)
         return respelled if respelled.is_file() else store_python
     except (IndexError, OSError, RuntimeError, ValueError):

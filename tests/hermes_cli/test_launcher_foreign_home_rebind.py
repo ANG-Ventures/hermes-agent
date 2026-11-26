@@ -273,3 +273,31 @@ def test_real_home_publish_moves_a_stand_in_launcher_back_to_the_direct_path(ins
     (stand_in / "tools").unlink()
     for name in _launchers.ENTRY_POINTS:
         assert _launchers._launcher_works(local / name)
+
+
+def test_stand_in_cannot_respell_a_real_home_that_sits_behind_symlinks(tmp_path, monkeypatch):
+    # Prism 7d225792d1cb: /home -> /mnt/users and /home/w/.hermes -> /srv/hermes-home;
+    # a stand-in whose tools/ names the real spelling must not take the shared launchers.
+    (tmp_path / "mnt" / "users" / "w").mkdir(parents=True)
+    (tmp_path / "home").symlink_to(tmp_path / "mnt" / "users")
+    (tmp_path / "srv" / "hermes-home").mkdir(parents=True)
+    (tmp_path / "home" / "w" / ".hermes").symlink_to(tmp_path / "srv" / "hermes-home")
+    real_home = tmp_path / "home" / "w" / ".hermes"
+    real_python = _store(real_home)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home" / "w"))
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    local = repo / ".hermes" / "bin"
+    _launchers.ensure_install_launchers(repo, local)
+    before = _bytes(local)
+    stamps = {name: (local / name).stat().st_mtime_ns for name in _launchers.ENTRY_POINTS}
+    assert str(real_python).encode() in before["hermes"]
+    stand_in = _stand_in(tmp_path, real_home, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == before
+    assert {name: (local / name).stat().st_mtime_ns for name in _launchers.ENTRY_POINTS} == stamps
+    (stand_in / "tools").unlink()
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._launcher_works(local / name)
