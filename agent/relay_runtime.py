@@ -8,6 +8,7 @@ import contextlib
 import contextvars
 import functools
 import importlib
+import importlib.metadata
 import inspect
 import logging
 import os
@@ -314,6 +315,13 @@ class _ProcessRelayPluginConfiguration:
             return self._state
 
     def _activate(self, relay: Any) -> _RelayPluginConfigurationState:
+        if not _has_plugin_host_api(relay):
+            # A pre-0.9 binding (0.7.x has initialize(config) only) would raise TypeError on every boot.
+            logger.info(
+                "NeMo Relay %s predates the 0.9 plugin-host API; Hermes-managed Relay middleware is off "
+                "for this process (install nemo-relay>=0.9,<0.10)", _relay_version(relay)
+            )
+            return _RelayPluginConfigurationState.DISABLED
         try:
             if not self._initialize(relay):
                 return _RelayPluginConfigurationState.DISABLED
@@ -1307,6 +1315,27 @@ def current_profile_key() -> str:
     if not home.is_absolute():
         return str(home.resolve())
     return _PROFILE_KEY_CACHE.get(str(home)) or _PROFILE_KEY_CACHE.setdefault(str(home), str(home.resolve()))
+
+
+def _has_plugin_host_api(relay: Any) -> bool:
+    """True when ``relay.plugin.initialize`` takes the 0.9 ``additional_plugins_toml`` argument."""
+    initialize = getattr(getattr(relay, "plugin", None), "initialize", None)
+    if not callable(initialize):
+        return True  # not a Relay binding we can judge: let initialize() fail as before
+    try:
+        params = inspect.signature(initialize).parameters
+    except (TypeError, ValueError):
+        return True  # not introspectable: let initialize() decide, as before
+    return "additional_plugins_toml" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _relay_version(relay: Any) -> str:
+    try:
+        return importlib.metadata.version("nemo-relay")
+    except Exception:
+        return str(getattr(relay, "__version__", "") or "(unknown version)")
 
 
 def _load_nemo_relay() -> Any:

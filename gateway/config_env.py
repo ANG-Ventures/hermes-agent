@@ -31,9 +31,39 @@ logger = logging.getLogger("gateway.config")
 
 getenv = _getenv_str
 
-# Platforms already warned "explicitly disabled in config.yaml, but credentials present in
-# env": config reloads every turn, so the notice is one-time per platform per process.
+# (home, platform) pairs already warned "explicitly disabled in config.yaml, but credentials present
+# in env": config reloads every turn, so the notice is one-time per profile and platform per process.
 _EXPLICIT_DISABLE_WARNED: set = set()
+
+# True while a caller reads a profile's config only to inspect it (the multiplex preflight reads EVERY
+# profile's config on boot): no adapter starts from that load, so its adapter-start diagnostics are
+# DEBUG, not this gateway's WARNING/ERROR (t_da3c5285: argus logged a sibling's telegram state).
+_INSPECT_ONLY: "contextvars.ContextVar[bool]" = contextvars.ContextVar("gateway_config_inspect_only", default=False)
+
+
+@contextlib.contextmanager
+def inspect_only_load():
+    """Wrap a ``load_gateway_config()`` that starts no adapter (a preflight/inventory read)."""
+    token = _INSPECT_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _INSPECT_ONLY.reset(token)
+
+
+def _diag_level(level: int) -> int:
+    return logging.DEBUG if _INSPECT_ONLY.get() else level
+
+
+def _loaded_profile_label() -> str:
+    """``profile '<name>' (<home>)`` for the home this load reads (honors a profile-scope override)."""
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    home = get_hermes_home()
+    try:
+        name = profile_name_for_home(home)
+    except Exception:
+        name = None
+    return f"profile '{name or '?'}' ({home})"
 
 # Env var(s) whose presence drives each platform's env-enable branch, named in the explicit-disable WARNING.
 _ENV_ENABLE_CREDENTIALS: dict = {
@@ -63,19 +93,23 @@ _ENV_ENABLE_CREDENTIALS: dict = {
 def _warn_explicit_disable_beats_env(platform: Platform) -> None:
     """One-time WARNING: ``platforms.<x>.enabled: false`` wins over env creds (which
     used to force-enable), so users relying on "creds in .env = on" learn why it went dark."""
-    if platform in _EXPLICIT_DISABLE_WARNED:
+    label = _loaded_profile_label()
+    if (label, platform) in _EXPLICIT_DISABLE_WARNED:
         return
-    _EXPLICIT_DISABLE_WARNED.add(platform)
     names = _ENV_ENABLE_CREDENTIALS.get(platform) or ()
-    present = [n for n in names if (os.environ.get(n) or "").strip()]
+    # The loaded profile's scope, not os.environ: under a profile scope os.environ is the launcher's.
+    present = [n for n in names if (getenv(n) or "").strip()]
+    if not _INSPECT_ONLY.get():
+        _EXPLICIT_DISABLE_WARNED.add((label, platform))
     creds = ", ".join(present or names) or "its credentials"
-    logger.warning(
+    logger.log(
+        _diag_level(logging.WARNING),
         "Platform '%s' is explicitly disabled by platforms.%s.enabled: false in "
-        "config.yaml, so the credentials found in the environment (%s) will NOT "
+        "%s config.yaml, so the credentials found in the environment (%s) will NOT "
         "start its adapter. Environment credentials no longer override an "
         "explicit disable. Remove the key or set platforms.%s.enabled: true to "
         "turn it back on.",
-        platform.value, platform.value, creds, platform.value,
+        platform.value, platform.value, label, creds, platform.value,
     )
 
 
@@ -561,11 +595,12 @@ def _warn_configured_platforms_without_token(config: GatewayConfig) -> None:
             reasons.append(f"platforms.{platform.value}.enabled is true")
         if not reasons:
             continue
-        logger.error(
-            "PLATFORM TOKEN MISSING: %s is configured (%s) but %s is empty, "
+        logger.log(
+            _diag_level(logging.ERROR),
+            "PLATFORM TOKEN MISSING: %s is configured for %s (%s) but %s is empty, "
             "so the %s adapter will NOT start. Restore the token, or set "
             "platforms.%s.enabled: false if this profile intentionally has no %s.",
-            platform.value, "; ".join(reasons), env_name, platform.value,
+            platform.value, _loaded_profile_label(), "; ".join(reasons), env_name, platform.value,
             platform.value, platform.value,
         )
 
