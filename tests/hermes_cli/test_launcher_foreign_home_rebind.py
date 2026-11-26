@@ -254,3 +254,22 @@ def test_missing_launcher_target_is_still_repaired_from_a_normal_run(install, tm
     for name in _launchers.ENTRY_POINTS:
         assert _launchers._shell_launcher_python(local / name) == real_python
         assert _launchers._launcher_works(local / name)
+
+
+def test_real_home_publish_moves_a_stand_in_launcher_back_to_the_direct_path(install, tmp_path, monkeypatch):
+    repo, local, real_python = install
+    real_home = real_python.parents[3]
+    for name in _launchers.ENTRY_POINTS:
+        (local / name).unlink()
+    stand_in = _stand_in(tmp_path, real_home, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    for name in _launchers.ENTRY_POINTS:
+        assert str(stand_in).encode() in (local / name).read_bytes()
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    _launchers.ensure_install_launchers(repo, local)
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._shell_launcher_python(local / name) == real_python
+        assert str(stand_in).encode() not in (local / name).read_bytes()
+    (stand_in / "tools").unlink()
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._launcher_works(local / name)
