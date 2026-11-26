@@ -97,6 +97,10 @@ TERMINAL_FIELDS = frozenset({
 })
 #: Kill switch for the backoff, dead-letter and claim pruning (present = pre-t_827d5940 behaviour).
 BACKOFF_STOP_FILE = "boomerang-handback-backoff.disabled"
+# t_e861b07c: a wake turn still pending after this many attempts (~1.5 h on the backoff ladder: past a
+# restart or deploy window, well short of the 24 h dead-letter) pages #alerts ONCE, one line per drain.
+NOTICE_AFTER_ATTEMPTS = 12
+NOTICE_STOP_FILE = "boomerang-handback-notice.disabled"   # present = no notice (pre-t_e861b07c)
 # t_aad55db4 kill switch: while it exists a ``complete`` verdict posts only the passive line again.
 COMPLETE_TURN_STOP_FILE = "boomerang-complete-turn.disabled"
 # t_d712444b kill switch: while it exists ``_moved`` counts every newer event again (machine comments, the
@@ -743,6 +747,21 @@ def _default_post_logs(text: str) -> None:
 
 #: Seam (tests): ``(text) -> None`` posting one #logs line.
 post_logs = _default_post_logs
+
+
+def _default_post_alerts(text: str) -> None:
+    """One line to #alerts through notify.py (the needs-input pager's lane); blocking, worker thread."""
+    from gateway import kanban_watchers as _kw
+
+    script = _kw._alert_notify_script()  # noqa: SLF001
+    if script is None:
+        raise RuntimeError("notify.py unavailable")
+    if not _kw._notify_send(script, text, ["--target", _kw._needs_input_channels()[0]]):  # noqa: SLF001
+        raise RuntimeError("notify.py send failed")
+
+
+#: Seam (tests): ``(text) -> None`` posting one #alerts line; raises when it did not post.
+post_alerts = _default_post_alerts
 
 
 def enabled() -> bool:
@@ -2271,7 +2290,49 @@ async def deliver_handbacks(runner: Any, state: BoomerangWakeState, *,
             logger.warning("kanban boomerang-wake: handback %s not delivered: %s", did, exc)
         finally:
             _DELIVERING.discard(did)
+    if paced and delegation_id is None:
+        try:
+            await asyncio.to_thread(notice_stuck_handbacks, state, _time.time())
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: stuck-handback notice failed: %s", exc)
     return sent
+
+
+def notice_stuck_handbacks(state: BoomerangWakeState, now: float) -> int:
+    """t_e861b07c: page #alerts ONCE for wake turns still pending after NOTICE_AFTER_ATTEMPTS.
+
+    One line for every row that crossed the bound since the last drain; ``noticed_at`` is written
+    first, so a row is never paged twice (a failed post is logged, not retried). The row keeps
+    retrying until the 24 h dead-letter. Off while ``state/NOTICE_STOP_FILE`` exists."""
+    from hermes_constants import get_hermes_home
+
+    if (get_hermes_home() / "state" / NOTICE_STOP_FILE).exists():
+        return 0
+    due = []
+    for did, row in state.handbacks().items():
+        try:
+            attempts = int(row.get("attempts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if attempts >= NOTICE_AFTER_ATTEMPTS and PART_TURN in (row.get("parts") or []) and not row.get("noticed_at"):
+            due.append((did, row, attempts))
+    if not due:
+        return 0
+    for did, _row, _n in due:
+        state.update_handback(did, noticed_at=now)
+    first = due[0][1]
+    route = first.get("route") or {}
+    cards = " ".join(str(row.get("task_id")) for _d, row, _n in due[:12]) + (" ..." if len(due) > 12 else "")
+    text = (f"⚠️ boomerang-wake: {len(due)} wake turn(s) not delivered after {NOTICE_AFTER_ATTEMPTS}+ tries; the "
+            f"results are on the cards and the home session has not seen them: {cards}. First: home "
+            f"{first.get('home_sid') or '-'}, route {route.get('platform')}:{route.get('chat_id')} profile "
+            f"{route.get('profile')}; {_first_line(first.get('line'), 160)}")
+    logger.warning("kanban boomerang-wake: %s", text)
+    try:
+        post_alerts(text)
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: stuck-handback page not posted: %s", exc)
+    return len(due)
 
 
 # t_8ab5557d: the ``boomerang handled`` line is an agent receipt (Ace's three-bin ruling, Discord

@@ -243,3 +243,28 @@ def test_redirect_target_equals_what_the_home_itself_subscribes(kanban_home, mon
         monkeypatch.setenv(f"HERMES_SESSION_{name}", value)
     as_home = kt._resolve_notify_target(require_platform_identity=True, wake=wake)
     assert redirected == as_home
+
+
+def test_create_from_another_profiles_turn_subscribes_the_owning_profile(kanban_home, monkeypatch):
+    """t_e861b07c: an aegis Telegram turn ran ``hermes -p default kanban create --session <its own
+    sid>``. The bridged env names the chat but no profile, the process profile read "default", and the
+    default gateway claimed every wake of the card and could never deliver it. The sub must name the
+    profile whose state.db holds the session."""
+    import sqlite3
+
+    aegis_sid = "20261120_035316_c0a4b23b"
+    d = kanban_home / "profiles" / "aegis"
+    d.mkdir(parents=True)
+    c = sqlite3.connect(d / "state.db")
+    c.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    c.execute("INSERT INTO sessions (id) VALUES (?)", (aegis_sid,))
+    c.commit()
+    c.close()
+    for name, value in (("ID", aegis_sid), ("PLATFORM", "telegram"), ("CHAT_ID", "571820863"),
+                        ("CHAT_TYPE", "dm"), ("USER_ID", "571820863")):
+        monkeypatch.setenv(f"HERMES_SESSION_{name}", value)
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    tid = _create(aegis_sid)
+    with kb.connect_closing() as conn:
+        subs = kbn.list_notify_subs(conn, tid)
+    assert [(s["chat_id"], s["notifier_profile"]) for s in subs] == [("571820863", "aegis")]
