@@ -352,6 +352,12 @@ class GatewayBusySessionMixin:
         queued = [head, *(self._overflow_queue(session_key) or ())]
         return any(item is not None and not getattr(item, "internal", False) for item in queued)
 
+    def _session_has_queued_event(self, session_key: str, adapter: Any) -> bool:
+        """True when anything (a person's message or an internal wake) is queued for the session."""
+        if (getattr(adapter, "_pending_messages", None) or {}).get(session_key) is not None:
+            return True
+        return bool(self._overflow_queue(session_key))
+
     @staticmethod
     def _log_busy_followup_held(session_key: str, verb: str) -> None:
         logger.info(
@@ -885,6 +891,112 @@ class GatewayBusySessionMixin:
         )
         return (enriched_text or text).strip() if successful_transcripts else text
 
+    # -- Mid-turn steer of any follow-up a steer can carry: text, voice, images (t_086da8be) -----
+    # Ace's ruling on #569: an image sent mid-turn interrupts the turn the way text does. A steer is
+    # text, so an image is steered as the same block a queued image gets at turn start (vision
+    # description + cached path, run_inbound._describe_images_as_text). Preparing that block takes
+    # seconds, so steers are serialized per session in arrival order: a later follow-up waits for an
+    # earlier one's preparation and can never land ahead of it.
+
+    def _busy_steer_order_lock(self, session_key: str) -> asyncio.Lock:
+        locks = getattr(self, "_busy_steer_order_locks", None)
+        if locks is None:
+            locks = {}
+            self._busy_steer_order_locks = locks
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = locks[session_key] = asyncio.Lock()
+        return lock
+
+    def _drop_idle_busy_steer_order_lock(self, session_key: str, lock: asyncio.Lock) -> None:
+        locks = getattr(self, "_busy_steer_order_locks", None) or {}
+        if locks.get(session_key) is lock and not lock.locked() and not getattr(lock, "_waiters", None):
+            locks.pop(session_key, None)
+
+    def _busy_steer_image_paths(self, event: MessageEvent) -> Optional[List[str]]:
+        """The image attachments of a follow-up, or None when it carries media a steer cannot carry
+        (files, video, stickers, audio files): those keep queueing for the next turn."""
+        from gateway.run import _event_media_is_image
+        voice = set(self._pending_event_audio_paths(event))
+        images: List[str] = []
+        for i, path in enumerate(getattr(event, "media_urls", None) or []):
+            if _event_media_is_image(event, i):
+                images.append(path)
+            elif path not in voice:
+                return None
+        return images
+
+    async def _describe_busy_steer_images(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """Vision description + cached path for each image of *event*, or None when an image was not
+        downloaded (the adapter left a remote URL) or its description failed."""
+        from gateway.run import _event_media_is_image
+        from gateway.run_inbound import rehome_inbound_media
+        async with self._async_profile_scope_for_source(event.source):
+            rehome_inbound_media(event)   # same move as turn start: the routed profile's cache/
+            paths = [p for i, p in enumerate(event.media_urls or []) if _event_media_is_image(event, i)]
+            missing = [p for p in paths if not os.path.isfile(p)]
+            if missing:
+                logger.info("PRIORITY steer image not cached locally session=%s count=%d", session_key, len(missing))
+                return None
+            failures: List[str] = []
+            block = await self._describe_images_as_text(
+                event.source, session_key, "", paths, failures_out=failures,
+            )
+        if failures or not block:
+            logger.info("PRIORITY steer image description failed session=%s count=%d", session_key, len(failures))
+            return None
+        return block
+
+    async def _prepare_busy_steer_payload(self, event: MessageEvent, session_key: str) -> str:
+        """The steer text for a mid-turn follow-up, or "" when it cannot be steered (caller queues).
+
+        Plain text: the text. Voice: the transcript (#58780). Images, with or without a caption or a
+        voice note: the turn-start image block, then the caption/transcript."""
+        media = getattr(event, "media_urls", None) or []
+        if not media:
+            plain = event.message_type == MessageType.TEXT and not event.media_types
+            return (event.text or "").strip() if plain else ""
+        images = self._busy_steer_image_paths(event)
+        if images is None:
+            return ""
+        text = await self._prepare_busy_steer_text(event)
+        if not images:
+            return text   # all voice
+        block = await self._describe_busy_steer_images(event, session_key)
+        if block is None:
+            return ""
+        return self._prepend_media_prefix(block, text).strip()
+
+    async def _steer_busy_followup(self, event: MessageEvent, session_key: str, running_agent: Any) -> str:
+        """Steer *event* into the live turn, in arrival order → ``"steered"``, ``"held"`` (an earlier
+        message from a person is queued, so this one must queue behind it) or ``"unsteerable"``.
+
+        On ``"held"``/``"unsteerable"`` the caller queues the event synchronously (no await between
+        the return and the queue call), so the next waiter sees it queued and holds behind it."""
+        lock = self._busy_steer_order_lock(session_key)
+        async with lock:
+            if self._has_queued_human_followup(session_key, self._delivery_adapter_for(event.source)):
+                # Checked first: a held voice note or image is prepared when its own turn runs.
+                self._log_busy_followup_held(session_key, "steer")
+                outcome = "held"
+            else:
+                steer_text = await self._prepare_busy_steer_payload(event, session_key)
+                steered = bool(steer_text) and self._try_agent_verb(
+                    running_agent, "steer", steer_text, session_key, event=event
+                )
+                if steered:
+                    self._fold_into_running_turn(running_agent, session_key, event)
+                    outcome = "steered"
+                else:
+                    outcome = "unsteerable"
+                    if self._busy_steer_image_paths(event):
+                        logger.info(
+                            "PRIORITY steer image queued for the next turn session=%s: later follow-ups "
+                            "queue behind it to keep arrival order", session_key,
+                        )
+        self._drop_idle_busy_steer_order_lock(session_key, lock)
+        return outcome
+
     def _steer_text_with_origin(self, text: str, event: MessageEvent) -> str:
         """Keep event origin in this injection, never in the cached system prompt."""
         if not text.strip():
@@ -1058,31 +1170,12 @@ class GatewayBusySessionMixin:
         plain_text = (
             event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
         )
-        if (
-            effective_mode == "steer" and agent_live and hasattr(running_agent, "steer")
-            and self._has_queued_human_followup(session_key, self._delivery_adapter_for(event.source))
-        ):
-            # Checked before _prepare_busy_steer_text: a held voice note is transcribed when its
-            # own queued turn runs, not here (no wasted STT pass or duplicate echo).
-            self._log_busy_followup_held(session_key, "steer")
-            effective_mode = "queue"
-        elif effective_mode == "steer":
-            steer_text = await self._prepare_busy_steer_text(event)
-            # Steerable: plain text, OR every attachment is voice media folded into steer_text.
-            # A follow-up qualifies for steering when it is plain text, OR when every attachment is
-            # STT-eligible voice media whose transcript was just folded into steer_text — otherwise a voice
-            # note in steer mode silently degrades to queue mode (#58780).
-            _steer_media_urls = getattr(event, "media_urls", None) or []
-            _steer_all_voice = bool(_steer_media_urls) and (
-                len(self._pending_event_audio_paths(event)) == len(_steer_media_urls)
-            )
-            if steer_text and (plain_text or _steer_all_voice) and agent_live and hasattr(running_agent, "steer"):
-                steered = self._try_agent_verb(
-                    running_agent, "steer", steer_text, session_key, event=event
-                )
-            if steered:
-                self._fold_into_running_turn(running_agent, session_key, event)
-            else:
+        if effective_mode == "steer":
+            # Steerable: plain text, voice (#58780) and images (t_086da8be); files, video and
+            # stickers queue. Arrival order is kept per session (_steer_busy_followup).
+            if agent_live and hasattr(running_agent, "steer"):
+                steered = await self._steer_busy_followup(event, session_key, running_agent) == "steered"
+            if not steered:
                 effective_mode = "queue"
         elif (
             effective_mode == "interrupt" and plain_text and agent_live
