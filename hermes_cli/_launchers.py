@@ -440,7 +440,12 @@ def _link_expansions(path: Path, limit: int = 40):
         link = next((part for part in (cur, *cur.parents) if part.is_symlink()), None)
         if link is None:
             return
-        cur = Path(os.path.normpath(link.parent / os.readlink(link) / cur.relative_to(link)))
+        target = os.readlink(link)
+        if ".." in Path(target).parts:
+            # normpath would drop ``..`` before following the link it climbs out of (Prism ff1151e22154)
+            cur = Path(os.path.realpath(link)) / cur.relative_to(link)
+        else:
+            cur = Path(os.path.normpath(link.parent / target / cur.relative_to(link)))
         yield cur
 
 

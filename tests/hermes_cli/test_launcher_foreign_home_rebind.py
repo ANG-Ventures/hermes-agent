@@ -301,3 +301,34 @@ def test_stand_in_cannot_respell_a_real_home_that_sits_behind_symlinks(tmp_path,
     (stand_in / "tools").unlink()
     for name in _launchers.ENTRY_POINTS:
         assert _launchers._launcher_works(local / name)
+
+
+def test_dotdot_link_target_is_followed_not_collapsed(tmp_path, monkeypatch):
+    # Prism ff1151e22154: ~/.hermes -> alias/../hermes with alias -> durable/anchor resolves to
+    # durable/hermes; a lexical collapse reads it as ~/hermes, where a stand-in may sit.
+    w = tmp_path / "w"
+    (tmp_path / "durable" / "anchor").mkdir(parents=True)
+    (tmp_path / "durable" / "hermes").mkdir()
+    w.mkdir()
+    (w / "alias").symlink_to(tmp_path / "durable" / "anchor")
+    (w / ".hermes").symlink_to("alias/../hermes")
+    real_home = w / ".hermes"
+    real_python = _store(real_home)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HOME", str(w))
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    local = repo / ".hermes" / "bin"
+    _launchers.ensure_install_launchers(repo, local)
+    before = _bytes(local)
+    assert str(real_python).encode() in before["hermes"]
+    stand_in = w / "hermes"
+    stand_in.mkdir()
+    (stand_in / "tools").symlink_to(real_home / "tools")
+    monkeypatch.setenv("HERMES_HOME", str(stand_in))
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == before
+    (stand_in / "tools").unlink()
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._launcher_works(local / name)
