@@ -202,3 +202,55 @@ def test_tmpdir_home_repairs_dead_launcher_in_fresh_process():
             env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
         assert launched.returncode == 0, launched.stdout + launched.stderr
         assert launched.stdout.strip() == "fixture-launcher-ok"
+
+
+def _stand_in(tmp_path: Path, real_home: Path, monkeypatch) -> Path:
+    """A private home whose tools/ links to the real store (ci-box 11-25, t_926efa60)."""
+    stand_in = tmp_path / "stand-in" / "wh"
+    stand_in.mkdir(parents=True)
+    (stand_in / "tools").symlink_to(real_home / "tools")
+    monkeypatch.setenv("HERMES_HOME", str(stand_in))
+    return stand_in
+
+
+def test_stand_in_home_linked_to_the_real_store_leaves_launchers_untouched(install, tmp_path, monkeypatch):
+    repo, local, real_python = install
+    before = _bytes(local)
+    stamps = {name: (local / name).stat().st_mtime_ns for name in _launchers.ENTRY_POINTS}
+    inodes = {name: (local / name).stat().st_ino for name in _launchers.ENTRY_POINTS}
+    stand_in = _stand_in(tmp_path, real_python.parents[3], monkeypatch)
+    assert str(_launchers.resolve_store_python(repo)).startswith(str(stand_in))
+    written = _launchers.ensure_install_launchers(repo, local)
+    assert len(written) == len(_launchers.ENTRY_POINTS)
+    assert _bytes(local) == before
+    assert {name: (local / name).stat().st_mtime_ns for name in _launchers.ENTRY_POINTS} == stamps
+    assert {name: (local / name).stat().st_ino for name in _launchers.ENTRY_POINTS} == inodes
+    (stand_in.parent / "wh" / "tools").unlink()
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._launcher_works(local / name)
+
+
+def test_repin_seen_through_a_stand_in_home_keeps_the_real_spelling(install, tmp_path, monkeypatch):
+    repo, local, real_python = install
+    store = real_python.parents[2]
+    newer = store / "python-newer" / "bin" / "python3"
+    newer.parent.mkdir(parents=True)
+    newer.symlink_to(Path(sys._base_executable).resolve())
+    (store / "facts.json").write_text(json.dumps({"schema": 1, "packages": {"python": {
+        "version": "newer", "entry": "python-newer"}}}), encoding="utf-8")
+    stand_in = _stand_in(tmp_path, real_python.parents[3], monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._shell_launcher_python(local / name) == newer
+        assert str(stand_in).encode() not in (local / name).read_bytes()
+
+
+def test_missing_launcher_target_is_still_repaired_from_a_normal_run(install, tmp_path, monkeypatch):
+    repo, local, real_python = install
+    for name in _launchers.ENTRY_POINTS:
+        _launchers.mint_launcher(name, repo, local, real_python.parents[2] / "gone" / "bin" / "python3", None)
+        assert not _launchers._launcher_works(local / name)
+    _launchers.ensure_install_launchers(repo, local)
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._shell_launcher_python(local / name) == real_python
+        assert _launchers._launcher_works(local / name)

@@ -433,6 +433,27 @@ def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> 
     return current
 
 
+def _current_store_spelling(target: Path, store_python: Path, repo_root: Path) -> Path:
+    """``store_python`` spelled through the store path a working ``target`` already uses.
+
+    A stand-in HERMES_HOME whose tools/ links to the real store resolves the same store
+    under a private path. Rewriting the shared launcher with that spelling exits 127 once
+    the stand-in is removed (ci-box 11-25, 2 h 50 min, t_926efa60). Keep the launcher's
+    own spelling, so an unchanged pin leaves it byte-identical and a repin stays durable.
+    """
+    if not _launcher_works(target):
+        return store_python
+    try:
+        old_store = _shell_launcher_python(target).parents[2]
+        new_store = store_root(repo_root)
+        if old_store == new_store or old_store.resolve() != new_store.resolve():
+            return store_python
+        respelled = old_store / store_python.relative_to(new_store)
+        return respelled if respelled.is_file() else store_python
+    except (IndexError, OSError, RuntimeError, ValueError):
+        return store_python
+
+
 def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     """Publish one launcher bound to store Python, or refuse missing tools."""
     repo_root = Path(repo_root)
@@ -447,6 +468,7 @@ def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
                 "launchers: %s keeps %s; not rebinding to %s (another store, e.g. a test HERMES_HOME)",
                 target, kept, store_python)
             return target
+        store_python = _current_store_spelling(target, store_python, repo_root)
     if store_python is not None:
         path = mint_launcher(name, repo_root, out_dir, store_python, None)
         if path is not None and path.suffix == ".cmd":
