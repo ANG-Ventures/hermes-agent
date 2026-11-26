@@ -37,13 +37,26 @@ _FIELDS = tuple(
                        + r"(?:" + _NOT_LABEL + r"[^\n])*?" + _NOT_LABEL + r"\w"))
     for label in _LABELS
 )
+# The refusal's own placeholders: a field still holding one was copied, not filled in.
+_PLACEHOLDERS = (
+    "<the one decision or action you need from the operator>",
+    "<what it unblocks, or what breaks without it>",
+    "<the exact reply, e.g. 'A' or 'B', a time, or a command to run>",
+)
+
+
+def _missing(reason: str) -> list:
+    for placeholder in _PLACEHOLDERS:
+        reason = reason.replace(placeholder, "")
+    return [label for label, rx in _FIELDS if not rx.search(reason)]
+
 
 REFUSAL = (
     "refused: a needs_input block waits on a human, so its reason must say what you need, "
     "why, and how to answer. Missing: {missing}. Use this shape:\n"
-    "  Need: <the one decision or action you need from the operator>\n"
-    "  Why: <what it unblocks, or what breaks without it>\n"
-    "  How to reply: <the exact reply, e.g. 'A' or 'B', a time, or a command to run>\n"
+    f"  Need: {_PLACEHOLDERS[0]}\n"
+    f"  Why: {_PLACEHOLDERS[1]}\n"
+    f"  How to reply: {_PLACEHOLDERS[2]}\n"
     "    A) <option>   B) <option>   (optional lettered options)\n"
     "  unblock_when: ruling:<card>-<topic>\n"
     "A wait on a PR, a card or a time is not a human wait: use kind=dependency, "
@@ -81,7 +94,7 @@ def shaped_for_machine(reason: str) -> str:
         "Why:": "Why: the worker stopped and cannot ask again this run.",
         "How to reply:": "How to reply: comment the answer on the card, then unblock it.",
     }
-    missing = [filler[label] for label, rx in _FIELDS if not rx.search(reason)]
+    missing = [filler[label] for label in _missing(reason)]
     return reason.rstrip() + "\n" + "\n".join(missing)
 
 
@@ -89,7 +102,7 @@ def refusal(kind: Optional[str], reason: Optional[str]) -> Optional[str]:
     """The house refusal text for a malformed human-wait block, else ``None``."""
     if not is_human_wait(kind, reason) or not enabled():
         return None
-    missing = [label for label, rx in _FIELDS if not rx.search(reason or "")]
+    missing = _missing(reason or "")
     if not missing:
         return None
     return REFUSAL.format(missing=", ".join(missing))
