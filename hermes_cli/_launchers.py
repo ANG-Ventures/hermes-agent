@@ -433,42 +433,36 @@ def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> 
     return current
 
 
-def _link_expansions(path: Path, limit: int = 40):
-    """The spellings ``path`` passes through as its links are followed, innermost link first."""
-    cur = Path(os.path.abspath(path))
-    for _ in range(limit):
-        link = next((part for part in (cur, *cur.parents) if part.is_symlink()), None)
-        if link is None:
-            return
-        target = os.readlink(link)
-        if ".." in Path(target).parts:
-            # normpath would drop ``..`` before following the link it climbs out of (Prism ff1151e22154)
-            cur = Path(os.path.realpath(link)) / cur.relative_to(link)
-        else:
-            cur = Path(os.path.normpath(link.parent / target / cur.relative_to(link)))
-        yield cur
-
-
 def _current_store_spelling(target: Path, store_python: Path, repo_root: Path) -> Path:
     """``store_python`` spelled through the store path a working ``target`` already uses.
 
     A stand-in HERMES_HOME whose tools/ links to the real store resolves the same store
     under a private path. Rewriting the shared launcher with that spelling exits 127 once
-    the stand-in is removed (ci-box 11-25, 2 h 50 min, t_926efa60). Keep the launcher's
-    own spelling, so an unchanged pin leaves it byte-identical and a repin stays durable,
-    unless following the old spelling's links reaches the new one: a launcher already
-    minted through a stand-in is moved back to the real spelling when the real home
-    publishes, even when that real home sits behind symlinks of its own.
+    the stand-in is removed (ci-box 11-25, 2 h 50 min, t_926efa60). The direction is
+    decided by who owns the store, with one check on this run's own store path:
+
+    - it is a symlink (this home borrows another home's store): a working launcher whose
+      store resolves to the same store keeps its own spelling, so an unchanged pin is
+      byte-identical and a repin stays durable;
+    - it is a real directory (this home owns its store, however the home is reached), or
+      it was named by HERMES_RUNTIME_DIR, a payload manifest or an install stamp (those
+      come back resolved): publish this run's spelling, as before. That moves a launcher
+      minted through a stand-in back to the real home's path.
+
+    A missing or broken launcher is always repaired. Not covered here, same as before:
+    a stand-in that is a symlink to the whole real home (its tools/ is then a real
+    directory seen through the link) still respells, and a legacy-venv launcher (an
+    interpreter path with fewer than three parents) is still rewritten by a stand-in run.
     """
     if not _launcher_works(target):
         return store_python
     try:
-        old_store = _shell_launcher_python(target).parents[2]
         new_store = store_root(repo_root)
+        if not new_store.is_symlink():
+            return store_python  # this home owns its store
+        old_store = _shell_launcher_python(target).parents[2]
         if old_store == new_store or old_store.resolve() != new_store.resolve():
             return store_python
-        if new_store in _link_expansions(old_store):
-            return store_python  # the old spelling reaches the store through the new one (a stand-in launcher)
         respelled = old_store / store_python.relative_to(new_store)
         return respelled if respelled.is_file() else store_python
     except (IndexError, OSError, RuntimeError, ValueError):

@@ -332,3 +332,153 @@ def test_dotdot_link_target_is_followed_not_collapsed(tmp_path, monkeypatch):
     (stand_in / "tools").unlink()
     for name in _launchers.ENTRY_POINTS:
         assert _launchers._launcher_works(local / name)
+
+
+# Operator cut (t_926efa60, 11-25 19:15): the direction is chosen by store ownership, not link
+# topology. The real home sits behind two links (home -> mnt/users, .hermes -> data/hermes);
+# a stand-in's tools/ names the real store in one of four spellings.
+_SPELLINGS = ("literal", "half-resolved", "resolved", "relative-dotdot")
+
+
+def _linked_real_home(tmp_path: Path, monkeypatch) -> tuple[Path, Path, Path, Path]:
+    (tmp_path / "mnt" / "users" / "w").mkdir(parents=True)
+    (tmp_path / "home").symlink_to(tmp_path / "mnt" / "users")
+    (tmp_path / "data" / "hermes").mkdir(parents=True)
+    (tmp_path / "mnt" / "users" / "w" / ".hermes").symlink_to(tmp_path / "data" / "hermes")
+    real_home = tmp_path / "home" / "w" / ".hermes"
+    real_python = _store(real_home)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home" / "w"))
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    return repo, repo / ".hermes" / "bin", real_home, real_python
+
+
+def _spelled_stand_in(tmp_path: Path, spelling: str, monkeypatch, name: str = "wh") -> Path:
+    stand_in = tmp_path / "scratch" / name
+    stand_in.mkdir(parents=True)
+    target = {
+        "literal": tmp_path / "home" / "w" / ".hermes" / "tools",
+        "half-resolved": tmp_path / "mnt" / "users" / "w" / ".hermes" / "tools",
+        "resolved": tmp_path / "data" / "hermes" / "tools",
+        "relative-dotdot": Path("..", "..", "data", "hermes", "tools"),
+    }[spelling]
+    (stand_in / "tools").symlink_to(target)
+    monkeypatch.setenv("HERMES_HOME", str(stand_in))
+    return stand_in
+
+
+def _all_work(local: Path) -> bool:
+    return all(_launchers._launcher_works(local / name) for name in _launchers.ENTRY_POINTS)
+
+
+@pytest.mark.parametrize("spelling", _SPELLINGS)
+def test_real_home_behind_links_moves_a_stand_in_minted_launcher_back(tmp_path, monkeypatch, spelling):
+    # Independent read on 16f0c6d8: the head left these on the stand-in path; base moved them back.
+    repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
+    stand_in = _spelled_stand_in(tmp_path, spelling, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)  # missing -> minted through the stand-in
+    assert all(str(stand_in).encode() in (local / n).read_bytes() for n in _launchers.ENTRY_POINTS)
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    _launchers.ensure_install_launchers(repo, local)
+    assert all(str(stand_in).encode() not in (local / n).read_bytes() for n in _launchers.ENTRY_POINTS)
+    stand_in.rename(stand_in.with_name("gone"))
+    assert _all_work(local)
+
+
+@pytest.mark.parametrize("spelling", _SPELLINGS)
+def test_stand_in_leaves_working_launchers_byte_identical(tmp_path, monkeypatch, spelling):
+    repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    before = _bytes(local)
+    stamps = {name: (local / name).stat().st_mtime_ns for name in _launchers.ENTRY_POINTS}
+    stand_in = _spelled_stand_in(tmp_path, spelling, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == before
+    assert {name: (local / name).stat().st_mtime_ns for name in _launchers.ENTRY_POINTS} == stamps
+    stand_in.rename(stand_in.with_name("gone"))
+    assert _all_work(local)
+
+
+def test_publish_order_stand_in_real_stand_in_ends_unchanged(tmp_path, monkeypatch):
+    repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
+    stand_in = _spelled_stand_in(tmp_path, "resolved", monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    _launchers.ensure_install_launchers(repo, local)
+    after_real = _bytes(local)
+    monkeypatch.setenv("HERMES_HOME", str(stand_in))
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == after_real
+    stand_in.rename(stand_in.with_name("gone"))
+    assert _all_work(local)
+
+
+def test_real_home_under_a_second_symlinked_spelling_moves_launchers_back(tmp_path, monkeypatch):
+    repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))  # the second spelling is not under ~/.hermes
+    (tmp_path / "alias").symlink_to(tmp_path / "data")
+    second = tmp_path / "alias" / "hermes"
+    stand_in = _spelled_stand_in(tmp_path, "literal", monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    monkeypatch.setenv("HERMES_HOME", str(second))
+    _launchers.ensure_install_launchers(repo, local)
+    for name in _launchers.ENTRY_POINTS:
+        assert str(second).encode() in (local / name).read_bytes()
+    stand_in.rename(stand_in.with_name("gone"))
+    assert _all_work(local)
+
+
+def test_chained_stand_ins_leave_working_launchers_unchanged(tmp_path, monkeypatch):
+    repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    before = _bytes(local)
+    first = _spelled_stand_in(tmp_path, "literal", monkeypatch, name="first")
+    second = tmp_path / "scratch" / "second"
+    second.mkdir()
+    (second / "tools").symlink_to(first / "tools")
+    monkeypatch.setenv("HERMES_HOME", str(second))
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == before
+
+
+def test_dotdot_inside_a_stand_in_link_leaves_launchers_unchanged(tmp_path, monkeypatch):
+    repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    before = _bytes(local)
+    stand_in = tmp_path / "scratch" / "wh"
+    stand_in.mkdir(parents=True)
+    (stand_in / "tools").symlink_to(tmp_path / "scratch" / ".." / "home" / "w" / ".hermes" / "tools")
+    monkeypatch.setenv("HERMES_HOME", str(stand_in))
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == before
+
+
+def test_stand_in_link_loop_stops_without_raising(tmp_path, monkeypatch):
+    repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    before = _bytes(local)
+    stand_in = tmp_path / "scratch" / "wh"
+    stand_in.mkdir(parents=True)
+    (stand_in / "tools").symlink_to(stand_in / "loop")
+    (stand_in / "loop").symlink_to(stand_in / "tools")
+    monkeypatch.setenv("HERMES_HOME", str(stand_in))
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == before
+
+
+def test_launcher_whose_old_path_no_longer_resolves_is_repaired_then_moved_back(tmp_path, monkeypatch):
+    repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
+    for name in _launchers.ENTRY_POINTS:
+        _launchers.mint_launcher(name, repo, local, tmp_path / "old-home" / "tools" / "python-x" / "bin" / "python3", None)
+    assert not any(_launchers._launcher_works(local / n) for n in _launchers.ENTRY_POINTS)
+    stand_in = _spelled_stand_in(tmp_path, "half-resolved", monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    assert _all_work(local)
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    _launchers.ensure_install_launchers(repo, local)
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._shell_launcher_python(local / name) == real_python
+    stand_in.rename(stand_in.with_name("gone"))
+    assert _all_work(local)
