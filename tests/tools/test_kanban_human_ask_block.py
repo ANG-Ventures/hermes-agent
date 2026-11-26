@@ -128,6 +128,22 @@ def test_empty_field_counts_as_missing(reason, missing):
     assert f"Missing: {missing}." in ha.refusal("needs_input", reason)
 
 
+_TEMPLATE = ("Need: <the one decision or action you need from the operator>\n"
+             "Why: <what it unblocks, or what breaks without it>\n"
+             "How to reply: <the exact reply, e.g. 'A' or 'B', a time, or a command to run>")
+
+
+@pytest.mark.parametrize("reason,missing", [
+    (_TEMPLATE, "Need:, Why:, How to reply:"),            # the refusal's own shape, pasted unfilled
+    (_TEMPLATE.replace("<what it unblocks, or what breaks without it>", "the deploy waits"),
+     "Need:, How to reply:"),
+])
+def test_template_placeholder_counts_as_missing(reason, missing):
+    from hermes_cli import kanban_human_ask as ha
+    assert f"Missing: {missing}." in ha.refusal("needs_input", reason)
+    assert ha.refusal("needs_input", ha.shaped_for_machine(reason)) is None
+
+
 def test_machine_shape_keeps_the_reason_first():
     from hermes_cli import kanban_human_ask as ha
     out = ha.shaped_for_machine("lane exited rc=3: disk full")
