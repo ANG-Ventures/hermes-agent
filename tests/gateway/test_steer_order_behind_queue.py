@@ -630,10 +630,27 @@ async def test_image_with_an_untranscribed_voice_note_queues_the_whole_message(r
     caplog.set_level(logging.INFO, logger="gateway")
     stt.return_value = ("", [])                         # STT failed
     msg = _photo_with_voice(shot)
+    # What _transcribe_pending_audio_event_once caches on a failed run (Prism f095b8865489):
+    msg._gateway_pending_stt_text, msg._gateway_pending_stt_transcripts = "[voice: not transcribed]", []
     out = await _busy(runner, msg, "steer", agent)
     assert out.steered is False and agent.steered == [] and vision.calls == []
     assert adapter._pending_messages[SK] is msg
     assert len(_lines(caplog, "voice note was not transcribed")) == 1
+    assert not hasattr(msg, "_gateway_pending_stt_text"), "the queued turn would reuse the failed STT"
+    assert not hasattr(msg, "_gateway_pending_stt_transcripts")
+
+
+@pytest.mark.asyncio
+async def test_image_with_two_voice_clips_one_untranscribed_queues_the_whole_message(rig):
+    """Prism 404f63b197cd: a partial transcription must not steer (one clip would be lost)."""
+    runner, adapter, agent, stt, vision, (shot, _) = rig
+    stt.return_value = ("first clip", ["first clip"])  # 1 of 2 clips transcribed
+    msg = MessageEvent(text="", source=_source(), message_id="img+2v", message_type=MessageType.PHOTO,
+                       media_urls=[str(shot), "/tmp/a.ogg", "/tmp/b.ogg"],
+                       media_types=["image/png", "audio/ogg", "audio/ogg"])
+    out = await _busy(runner, msg, "steer", agent)
+    assert out.steered is False and agent.steered == [] and vision.calls == []
+    assert adapter._pending_messages[SK] is msg
 
 
 @pytest.mark.asyncio

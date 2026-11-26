@@ -891,17 +891,26 @@ class GatewayBusySessionMixin:
         return (await self._busy_steer_text_and_stt_ok(event))[0]
 
     async def _busy_steer_text_and_stt_ok(self, event: MessageEvent) -> Tuple[str, bool]:
-        """``_prepare_busy_steer_text`` plus whether every voice clip it needed was transcribed
-        (True when there was no voice)."""
+        """``_prepare_busy_steer_text`` plus whether EVERY voice clip was transcribed (True when
+        there was no voice). Partial success reads False (Prism 404f63b197cd)."""
         text = (event.text or "").strip()
-        if not self._pending_event_audio_paths(event):
+        audio_paths = self._pending_event_audio_paths(event)
+        if not audio_paths:
             return text, True
         enriched_text, successful_transcripts = await self._transcribe_and_echo_pending_voice(
             event, self._delivery_adapter_for(event.source), event.source, text, log_context="Busy-steer"
         )
         if successful_transcripts:
-            return (enriched_text or text).strip(), True
+            return (enriched_text or text).strip(), len(successful_transcripts) >= len(audio_paths)
         return text, False
+
+    @staticmethod
+    def _forget_cached_stt(event: MessageEvent) -> None:
+        """Drop the STT result ``_transcribe_pending_audio_event_once`` cached on *event*, so the
+        queued turn transcribes again instead of reusing a failure (Prism f095b8865489)."""
+        for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
+            if hasattr(event, attr):
+                delattr(event, attr)
 
     # -- Mid-turn steer of any follow-up a steer can carry: text, voice, images (t_086da8be) -----
     # Ace's ruling on #569: an image sent mid-turn interrupts the turn the way text does. A steer is
@@ -998,6 +1007,7 @@ class GatewayBusySessionMixin:
             # Image + voice note whose STT failed: steering the picture alone would consume the
             # voice note untranscribed. Queue the whole message; its turn retries STT and vision.
             logger.info("PRIORITY steer image queued: its voice note was not transcribed session=%s", session_key)
+            self._forget_cached_stt(event)
             return ""
         try:
             block = await asyncio.wait_for(
