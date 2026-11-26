@@ -1528,8 +1528,9 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 # the job was only due on tick k+N+1 and every ``every N m`` job ran every N+1
 # minutes. Why not the old ``next_run_at`` value: its phase is arbitrary, so a
 # slot a few seconds after the tick phase fires ~1 tick late and the skip rule
-# below then drops the next slot. The fire time IS a tick, and successive scans
-# are >= 60 s apart, so ``fire_at + N`` is due no later than tick k+N.
+# below then drops the next slot. The fire time is a tick, but scans run on a
+# fixed 60 s cadence and the stamp is taken after the scan, so the slot is armed
+# half a tick early (``_next_interval_slot``) to be due on tick k+N.
 INTERVAL_FIRE_AT_KEY = "interval_fire_at"
 
 
@@ -1577,7 +1578,12 @@ def _next_interval_slot(
     anchor_utc = anchor.astimezone(timezone.utc)
     now_utc = now.astimezone(timezone.utc)
     k = int((now_utc - anchor_utc) // period) + 1 if now_utc >= anchor_utc else 1
-    return (anchor_utc + k * period).astimezone(anchor.tzinfo).isoformat()
+    # Arm half a tick early (t_ed8ce7a2). The ticker runs on a fixed cadence, so tick k+N starts
+    # exactly N minutes after tick k, while ``fire_at`` was stamped at the claim, a moment after
+    # tick k's due scan: ``fire_at + N`` landed just after tick k+N's scan and every row ran one
+    # tick late. Half a tick early makes the slot due on the tick nearest ``fire_at + N``.
+    slack = min(timedelta(seconds=TICKER_INTERVAL_SECONDS / 2), period / 2)
+    return (anchor_utc + k * period - slack).astimezone(anchor.tzinfo).isoformat()
 
 
 def _write_marker(name: str, text: str, tmp_prefix: str) -> None:

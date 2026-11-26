@@ -80,6 +80,37 @@ def test_interval_job_fires_every_n_ticks_over_many_cycles(clock, minutes):
     assert fires == list(range(0, minutes * 6 + 1, minutes))
 
 
+def _fire_mid_tick(clock, jid, tick_at, claim_after, run_seconds):
+    """Rest of one fire after the due scan found the job: the advance + claim (which stamp the
+    fire instant) run ``claim_after`` into the tick, as on the live ticker."""
+    from cron.jobs import advance_next_runs, claim_job_for_fire, mark_job_run
+
+    clock["now"] = tick_at + claim_after
+    advance_next_runs([jid])
+    claimed = claim_job_for_fire(jid, return_job=True)
+    assert claimed
+    clock["now"] = tick_at + claim_after + timedelta(seconds=run_seconds)
+    assert mark_job_run(jid, True, expected_fire_owner=claimed["fire_claim"]["by"])
+
+
+@pytest.mark.parametrize("minutes", [1, 2, 5])
+def test_fixed_cadence_ticker_fires_every_n_ticks_when_claim_lags_the_scan(clock, minutes):
+    """t_ed8ce7a2: the ticker runs on a FIXED 60 s cadence (``next_tick += interval``), so tick
+    k+N starts exactly N minutes after tick k. The fire instant is stamped when the job is
+    claimed, a moment AFTER that tick's due scan; ``fire_at + N`` then lands just after tick
+    k+N's scan and the job waited for tick k+N+1 (live: 1m rows every 120 s, 2m every 180 s,
+    5m every 360 s, claim exactly 60 s after scheduled_instant)."""
+    jid = _make_interval_job(minutes, T0 - timedelta(seconds=1))
+    scan_after, claim_after = timedelta(milliseconds=200), timedelta(milliseconds=1500)
+    fires = []
+    for i in range(minutes * 6 + 1):
+        tick_at = T0 + timedelta(seconds=60 * i)  # fixed cadence: no per-tick drift
+        if jid in _due_ids(clock, tick_at + scan_after):
+            fires.append(i)
+            _fire_mid_tick(clock, jid, tick_at, claim_after, run_seconds=7)
+    assert fires == list(range(0, minutes * 6 + 1, minutes))
+
+
 def test_overlong_run_skips_missed_slots_without_double_fire(clock):
     """A 1m job whose run takes 150 s is re-armed in the future, once."""
     from cron.jobs import get_job
@@ -88,11 +119,11 @@ def test_overlong_run_skips_missed_slots_without_double_fire(clock):
     _fire(clock, jid, T0, run_seconds=150)
     finish = T0 + timedelta(seconds=150)
     nxt = datetime.fromisoformat(get_job(jid)["next_run_at"])
-    assert finish < nxt <= finish + timedelta(minutes=1)
-    assert nxt == T0 + timedelta(minutes=3)  # stays on the fire-time grid
-    # Not due again until that slot (no catch-up burst for skipped slots).
-    assert jid not in _due_ids(clock, finish + timedelta(seconds=1))
-    assert jid in _due_ids(clock, nxt)
+    # Stays on the fire-time grid, armed half a tick early (t_ed8ce7a2): due on tick T0+3m.
+    assert nxt == T0 + timedelta(minutes=3) - timedelta(seconds=30)
+    # The skipped slot (tick T0+2m) does not fire; the next one fires once, on tick T0+3m.
+    assert jid not in _due_ids(clock, T0 + timedelta(minutes=2))
+    assert jid in _due_ids(clock, T0 + timedelta(minutes=3))
 
 
 def test_fire_stamp_is_cleared_and_absent_stamp_falls_back_to_finish(clock):
@@ -129,7 +160,8 @@ def test_next_slot_steps_real_time_across_dst_fall_back(monkeypatch):
     """``fire_at + k*N`` is real elapsed time, not wall-clock arithmetic.
 
     America/New_York falls back at 2026-11-01 02:00 EDT -> 01:00 EST. A 2 h
-    interval fired at 00:11 EDT (04:11Z) is next due at 06:11Z = 01:11 EST.
+    interval fired at 00:11 EDT (04:11Z) is next due at 06:11Z = 01:11 EST (armed half a tick
+    early, t_ed8ce7a2).
     Aware local + timedelta would give 02:11 EST (07:11Z), an hour late
     (CI e2e test_cron_virtual_clock_soak[newyork_on_shanghai_fall]).
     """
@@ -144,5 +176,5 @@ def test_next_slot_steps_real_time_across_dst_fall_back(monkeypatch):
     monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
     slot = _next_interval_slot({"kind": "interval", "minutes": 120}, fire_at.isoformat(), now)
     assert datetime.fromisoformat(slot).astimezone(timezone.utc) == datetime(
-        2026, 11, 1, 6, 11, tzinfo=timezone.utc
+        2026, 11, 1, 6, 10, 30, tzinfo=timezone.utc
     )
