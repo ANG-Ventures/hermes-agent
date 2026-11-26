@@ -692,8 +692,9 @@ class GatewayInboundMixin:
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
 
         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
-        # photo-only follow-up; adapter-level batching absorbs them.
-        if event.message_type == MessageType.PHOTO:
+        # photo-only follow-up; adapter-level batching absorbs them. Steer mode is exempt: an image
+        # is steered into the running turn like text (t_086da8be, Ace's ruling on #569).
+        if event.message_type == MessageType.PHOTO and self._effective_busy_input_mode(source) != "steer":
             logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
             self._hm_merge_pending_for_source(source, _quick_key, event)
             return True, None
@@ -727,18 +728,16 @@ class GatewayInboundMixin:
     def _hm_text_only(event: "MessageEvent") -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
-    def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
-        """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
-        steer_text = (event.text or "").strip()
-        steered = False
-        if self._hm_text_only(event) and steer_text and hasattr(running_agent, "steer"):
+    async def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
+        """Steer mode: inject the follow-up mid-run via ``agent.steer()`` (text, voice transcript, or
+        image description + cached path, in arrival order), else fall back to queue semantics."""
+        outcome = "unsteerable"
+        if hasattr(running_agent, "steer"):
             try:
-                steered = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event),
-                                                    event=event, internal=bool(getattr(event, "internal", False)))
+                outcome = await self._steer_busy_followup(event, _quick_key, running_agent)
             except Exception as exc:
                 logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
-        if steered:
-            self._fold_into_running_turn(running_agent, _quick_key, event)
+        if outcome == "steered":
             logger.debug("PRIORITY steer for session %s", _quick_key)
             return
         logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
@@ -752,10 +751,21 @@ class GatewayInboundMixin:
         # Text-only corrections redirect the live turn (preserving displayed context) when the
         # runtime supports it; media/voice and older runtimes use the interrupt path below.
         _can_redirect = getattr(running_agent, "_supports_active_turn_redirect", False) is True
-        if self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect"):
-            if self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
-                logger.debug("PRIORITY redirect for session %s", _quick_key)
-                return
+        _redirectable = self._hm_text_only(event) and _can_redirect and hasattr(running_agent, "redirect")
+        if _redirectable and self._has_queued_human_followup(_quick_key, self._delivery_adapter_for(source)):
+            # t_086da8be: a redirect would overtake the earlier queued message. Queue this one
+            # behind it, then interrupt: with a pending event the turn runner drains the queue
+            # and ignores the bare interrupt text, so queueing is what keeps the text.
+            self._log_busy_followup_held(_quick_key, "redirect")
+            self._queue_or_replace_pending_event(_quick_key, event)
+        elif _redirectable and self._redirect_active_turn(running_agent, (event.text or "").strip(), _quick_key, event):
+            logger.debug("PRIORITY redirect for session %s", _quick_key)
+            return
+        elif self._session_has_queued_event(_quick_key, self._delivery_adapter_for(source)):
+            # The turn runner reads the bare interrupt text only when nothing is pending
+            # (run_turn ``not pending_event and interrupt_message``); with anything queued it would
+            # be dropped, so queue the event itself (its STT result is cached on it below).
+            self._queue_or_replace_pending_event(_quick_key, event)
         logger.debug("PRIORITY interrupt for session %s", _quick_key)
         _interrupt_text = event.text
         if self._pending_event_audio_paths(event):
@@ -892,7 +902,7 @@ class GatewayInboundMixin:
             self._queue_or_replace_pending_event(_quick_key, event)
             return None
         if effective_busy_input_mode == "steer":
-            self._hm_busy_steer(event, running_agent, _quick_key)
+            await self._hm_busy_steer(event, running_agent, _quick_key)
             return None
         # Subagent protection: an interrupt cascades through ``_active_children`` and aborts
         # in-flight delegate_task work (/stop reached its handler above — still an escape hatch).
@@ -1826,12 +1836,25 @@ class GatewayInboundMixin:
             "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
             _img_mode, len(image_paths),
         )
+        return await self._describe_images_as_text(source, session_key, message_text, image_paths)
+
+    async def _describe_images_as_text(
+        self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str],
+        *, failures_out: Optional[List[str]] = None,
+    ) -> str:
+        """The text-mode image step: each image's vision description and cached path, prepended to
+        ``message_text``. Shared by turn start and the mid-turn image steer (run_busy), so a steered
+        image reaches the model with exactly the block a queued image gets. ``failures_out`` collects
+        the paths whose description failed."""
         # Vision enrichment runs before AIAgent.run_conversation(), so bind this session's resolved
         # runtime explicitly rather than consulting process-global compatibility mirrors.
         vision_runtime = None
         try:
-            turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
-                source=source, session_key=session_key,
+            # Off the loop: provider resolution can probe a local model server over HTTP
+            # (_auto_detect_local_model), and the mid-turn image steer runs this inside the busy
+            # handler (tests/gateway/test_no_network_reachable_from_loop.py).
+            turn_model, runtime_kwargs = await asyncio.to_thread(
+                self._resolve_session_agent_runtime, source=source, session_key=session_key,
             )
             vision_runtime = {**(runtime_kwargs or {}), "model": turn_model}
         except Exception:
@@ -1840,7 +1863,7 @@ class GatewayInboundMixin:
         from agent.auxiliary_client import scoped_runtime_main
 
         with scoped_runtime_main(vision_runtime):
-            return await self._enrich_message_with_vision(message_text, image_paths)
+            return await self._enrich_message_with_vision(message_text, image_paths, failures_out=failures_out)
 
     async def _echo_stt_transcripts(
         self, adapter, source: SessionSource, transcripts: List[str], *, metadata=None, log_context: str = "Transcript"
@@ -2527,10 +2550,13 @@ class GatewayInboundMixin:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
 
-    async def _enrich_message_with_vision(self, user_text: str, image_paths: List[str]) -> str:
+    async def _enrich_message_with_vision(
+        self, user_text: str, image_paths: List[str], *, failures_out: Optional[List[str]] = None,
+    ) -> str:
         """Auto-analyze user-attached images with the vision tool and prepend the descriptions.
         Description *and* local cache path are injected so the model understands the image without
-        a tool call and can re-examine it with vision_analyze."""
+        a tool call and can re-examine it with vision_analyze. A path whose analysis failed is
+        appended to ``failures_out`` when given."""
         from tools.vision_tools import vision_analyze_tool
         from agent.memory_manager import sanitize_context
 
@@ -2554,6 +2580,8 @@ class GatewayInboundMixin:
                         f"image_url: {path} ~]"
                     )
                 else:
+                    if failures_out is not None:
+                        failures_out.append(path)
                     note = (
                         "[The user sent an image but I couldn't quite see it "
                         "this time (>_<) You can try looking at it yourself "
@@ -2561,6 +2589,8 @@ class GatewayInboundMixin:
                     )
             except Exception as e:
                 logger.error("Vision auto-analysis error: %s", e)
+                if failures_out is not None:
+                    failures_out.append(path)
                 note = (
                     f"[The user sent an image but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
