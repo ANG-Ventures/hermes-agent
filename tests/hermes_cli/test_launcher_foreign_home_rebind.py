@@ -264,7 +264,7 @@ def test_real_home_publish_moves_a_stand_in_launcher_back_to_the_direct_path(ins
     stand_in = _stand_in(tmp_path, real_home, monkeypatch)
     _launchers.ensure_install_launchers(repo, local)
     for name in _launchers.ENTRY_POINTS:
-        assert str(stand_in).encode() in (local / name).read_bytes()
+        assert str(stand_in).encode() not in (local / name).read_bytes()  # minted resolved
     monkeypatch.setenv("HERMES_HOME", str(real_home))
     _launchers.ensure_install_launchers(repo, local)
     for name in _launchers.ENTRY_POINTS:
@@ -378,8 +378,8 @@ def test_real_home_behind_links_moves_a_stand_in_minted_launcher_back(tmp_path, 
     # Independent read on 16f0c6d8: the head left these on the stand-in path; base moved them back.
     repo, local, real_home, real_python = _linked_real_home(tmp_path, monkeypatch)
     stand_in = _spelled_stand_in(tmp_path, spelling, monkeypatch)
-    _launchers.ensure_install_launchers(repo, local)  # missing -> minted through the stand-in
-    assert all(str(stand_in).encode() in (local / n).read_bytes() for n in _launchers.ENTRY_POINTS)
+    _launchers.ensure_install_launchers(repo, local)  # missing -> minted through the resolved store
+    assert all(str(stand_in).encode() not in (local / n).read_bytes() for n in _launchers.ENTRY_POINTS)
     monkeypatch.setenv("HERMES_HOME", str(real_home))
     _launchers.ensure_install_launchers(repo, local)
     assert all(str(stand_in).encode() not in (local / n).read_bytes() for n in _launchers.ENTRY_POINTS)
@@ -482,3 +482,43 @@ def test_launcher_whose_old_path_no_longer_resolves_is_repaired_then_moved_back(
         assert _launchers._shell_launcher_python(local / name) == real_python
     stand_in.rename(stand_in.with_name("gone"))
     assert _all_work(local)
+
+
+# Operator item (t_926efa60, 11-25 19:55): a borrower never writes its own spelling. A missing
+# launcher minted by a stand-in names the RESOLVED store, so it survives the stand-in going away
+# with no move-back needed, whether the real home's tools/ is a real directory or a symlink.
+def test_stand_in_minted_launcher_survives_the_stand_in_real_tools_dir(install, tmp_path, monkeypatch):
+    repo, local, real_python = install
+    for name in _launchers.ENTRY_POINTS:
+        (local / name).unlink()
+    stand_in = _stand_in(tmp_path, real_python.parents[3], monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._shell_launcher_python(local / name) == real_python.parents[2].resolve() / real_python.relative_to(real_python.parents[2])
+    stand_in.rename(stand_in.with_name("gone"))
+    assert _all_work(local)
+
+
+def test_stand_in_minted_launcher_survives_the_stand_in_real_tools_symlink(tmp_path, monkeypatch):
+    # The reader's probe on 31d52db8: the real home's own tools/ is a symlink, so the real home
+    # "borrows" too and keeps a working launcher; the stand-in must not have minted its spelling.
+    durable = tmp_path / "durable"
+    real_python = _store(durable)  # durable/tools/python-fixture/bin/python3
+    real_home = tmp_path / ".hermes"
+    real_home.mkdir()
+    (real_home / "tools").symlink_to(durable / "tools")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    local = repo / ".hermes" / "bin"
+    stand_in = _stand_in(tmp_path, real_home, monkeypatch)
+    _launchers.ensure_install_launchers(repo, local)  # missing -> minted
+    for name in _launchers.ENTRY_POINTS:
+        assert str(stand_in).encode() not in (local / name).read_bytes()
+    monkeypatch.setenv("HERMES_HOME", str(real_home))
+    _launchers.ensure_install_launchers(repo, local)  # working launcher kept
+    stand_in.rename(stand_in.with_name("gone"))
+    assert _all_work(local)
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._shell_launcher_python(local / name) == real_python

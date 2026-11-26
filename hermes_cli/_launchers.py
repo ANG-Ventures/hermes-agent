@@ -441,9 +441,11 @@ def _current_store_spelling(target: Path, store_python: Path, repo_root: Path) -
     the stand-in is removed (ci-box 11-25, 2 h 50 min, t_926efa60). The direction is
     decided by who owns the store, with one check on this run's own store path:
 
-    - it is a symlink (this home borrows another home's store): a working launcher whose
-      store resolves to the same store keeps its own spelling, so an unchanged pin is
-      byte-identical and a repin stays durable;
+    - it is a symlink (this home borrows another home's store): it never writes its own
+      spelling. A working launcher whose store resolves to the same store keeps its own
+      spelling, so an unchanged pin is byte-identical and a repin stays durable; a missing
+      or broken launcher is repaired through the RESOLVED store (when that file exists), so
+      a launcher minted by a stand-in never points through the stand-in;
     - it is a real directory (this home owns its store, however the home is reached), or
       it was named by HERMES_RUNTIME_DIR, a payload manifest or an install stamp (those
       come back resolved): publish this run's spelling, as before. That moves a launcher
@@ -454,10 +456,13 @@ def _current_store_spelling(target: Path, store_python: Path, repo_root: Path) -
     directory seen through the link) still respells, and a legacy-venv launcher (an
     interpreter path with fewer than three parents) is still rewritten by a stand-in run.
     """
-    if not _launcher_works(target):
-        return store_python
     try:
         new_store = store_root(repo_root)
+        if not _launcher_works(target):
+            if not new_store.is_symlink():
+                return store_python
+            resolved = new_store.resolve() / store_python.relative_to(new_store)
+            return resolved if resolved.is_file() else store_python
         if not new_store.is_symlink():
             return store_python  # this home owns its store
         old_store = _shell_launcher_python(target).parents[2]
