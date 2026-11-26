@@ -111,6 +111,24 @@ def test_fixed_cadence_ticker_fires_every_n_ticks_when_claim_lags_the_scan(clock
     assert fires == list(range(0, minutes * 6 + 1, minutes))
 
 
+def test_external_provider_claim_rearms_at_exact_interval(clock):
+    """Prism 589ad59a51f6 (t_ed8ce7a2): an external provider (Chronos) claims at the exact slot
+    and re-arms its callback at the stored ``next_run_at``; no 60 s poll absorbs an offset, so
+    the half-tick shift must not apply. Claim 12:00:00, finish 12:00:05 -> next 12:01:00."""
+    from cron.jobs import claim_job_for_fire, get_job, mark_job_run
+
+    t = datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc)
+    jid = _make_interval_job(1, t)
+    for i in range(3):
+        clock["now"] = t + timedelta(minutes=i)
+        assert get_job(jid)["next_run_at"] == clock["now"].isoformat()
+        claimed = claim_job_for_fire(jid, return_job=True)
+        assert claimed
+        clock["now"] += timedelta(seconds=5)
+        assert mark_job_run(jid, True, expected_fire_owner=claimed["fire_claim"]["by"])
+    assert get_job(jid)["next_run_at"] == (t + timedelta(minutes=3)).isoformat()
+
+
 def test_overlong_run_skips_missed_slots_without_double_fire(clock):
     """A 1m job whose run takes 150 s is re-armed in the future, once."""
     from cron.jobs import get_job
@@ -160,8 +178,7 @@ def test_next_slot_steps_real_time_across_dst_fall_back(monkeypatch):
     """``fire_at + k*N`` is real elapsed time, not wall-clock arithmetic.
 
     America/New_York falls back at 2026-11-01 02:00 EDT -> 01:00 EST. A 2 h
-    interval fired at 00:11 EDT (04:11Z) is next due at 06:11Z = 01:11 EST (armed half a tick
-    early, t_ed8ce7a2).
+    interval fired at 00:11 EDT (04:11Z) is next due at 06:11Z = 01:11 EST.
     Aware local + timedelta would give 02:11 EST (07:11Z), an hour late
     (CI e2e test_cron_virtual_clock_soak[newyork_on_shanghai_fall]).
     """
@@ -176,5 +193,5 @@ def test_next_slot_steps_real_time_across_dst_fall_back(monkeypatch):
     monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
     slot = _next_interval_slot({"kind": "interval", "minutes": 120}, fire_at.isoformat(), now)
     assert datetime.fromisoformat(slot).astimezone(timezone.utc) == datetime(
-        2026, 11, 1, 6, 10, 30, tzinfo=timezone.utc
+        2026, 11, 1, 6, 11, tzinfo=timezone.utc
     )

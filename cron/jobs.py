@@ -1529,17 +1529,22 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 # minutes. Why not the old ``next_run_at`` value: its phase is arbitrary, so a
 # slot a few seconds after the tick phase fires ~1 tick late and the skip rule
 # below then drops the next slot. The fire time is a tick, but scans run on a
-# fixed 60 s cadence and the stamp is taken after the scan, so the slot is armed
-# half a tick early (``_next_interval_slot``) to be due on tick k+N.
+# fixed 60 s cadence and the stamp is taken after the scan, so a TICKER fire
+# (``INTERVAL_FIRE_TICK_KEY``) is re-armed half a tick early to be due on tick
+# k+N. An external provider (Chronos) re-arms its callback at the exact stored
+# slot with no poll to absorb an offset, so it is re-armed at ``fire_at + N``.
 INTERVAL_FIRE_AT_KEY = "interval_fire_at"
+INTERVAL_FIRE_TICK_KEY = "interval_fire_tick"
 
 
-def _record_interval_fire(job: Dict[str, Any], now: datetime) -> None:
+def _record_interval_fire(job: Dict[str, Any], now: datetime, *, tick: bool = False) -> None:
     """Stash when an interval fire started (see INTERVAL_FIRE_AT_KEY).
 
     Only recorded when the job is actually due (``next_run_at <= now``), so a
     second fire-path call for the same fire (the ticker advances, then claims)
     sees the already-advanced future value and keeps the first stamp.
+    ``tick`` marks a built-in ticker fire (``advance_next_runs``), which is re-armed half a
+    tick early; an external provider's claim leaves it unset.
     """
     if (job.get("schedule") or {}).get("kind") != "interval":
         return
@@ -1549,12 +1554,16 @@ def _record_interval_fire(job: Dict[str, Any], now: datetime) -> None:
     try:
         if _ensure_aware(datetime.fromisoformat(slot)) <= now:
             job[INTERVAL_FIRE_AT_KEY] = now.isoformat()
+            if tick:
+                job[INTERVAL_FIRE_TICK_KEY] = True
+            else:
+                job.pop(INTERVAL_FIRE_TICK_KEY, None)
     except (TypeError, ValueError):
         pass
 
 
 def _next_interval_slot(
-    schedule: Dict[str, Any], fire_at: Optional[str], now: datetime
+    schedule: Dict[str, Any], fire_at: Optional[str], now: datetime, tick: bool = False
 ) -> Optional[str]:
     """First ``fire_at + k*interval`` (k >= 1) strictly after ``now``.
 
@@ -1578,11 +1587,11 @@ def _next_interval_slot(
     anchor_utc = anchor.astimezone(timezone.utc)
     now_utc = now.astimezone(timezone.utc)
     k = int((now_utc - anchor_utc) // period) + 1 if now_utc >= anchor_utc else 1
-    # Arm half a tick early (t_ed8ce7a2). The ticker runs on a fixed cadence, so tick k+N starts
-    # exactly N minutes after tick k, while ``fire_at`` was stamped at the claim, a moment after
-    # tick k's due scan: ``fire_at + N`` landed just after tick k+N's scan and every row ran one
-    # tick late. Half a tick early makes the slot due on the tick nearest ``fire_at + N``.
-    slack = min(timedelta(seconds=TICKER_INTERVAL_SECONDS / 2), period / 2)
+    # A ticker fire is armed half a tick early (t_ed8ce7a2). The ticker runs on a fixed cadence,
+    # so tick k+N starts exactly N minutes after tick k, while ``fire_at`` was stamped a moment
+    # after tick k's due scan: ``fire_at + N`` landed just after tick k+N's scan and every row
+    # ran one tick late. External providers re-arm at the exact slot, so they get no slack.
+    slack = min(timedelta(seconds=TICKER_INTERVAL_SECONDS / 2), period / 2) if tick else timedelta(0)
     return (anchor_utc + k * period - slack).astimezone(anchor.tzinfo).isoformat()
 
 
@@ -5235,9 +5244,10 @@ def _advance_after_run(job: Dict[str, Any], now: str) -> None:
 
     # An interval fire re-arms off the instant it started, not off this finish time (t_b2f58c48).
     fire_at = job.pop(INTERVAL_FIRE_AT_KEY, None)
+    tick = bool(job.pop(INTERVAL_FIRE_TICK_KEY, False))
     next_slot = None
     if kind == "interval":
-        next_slot = _next_interval_slot(job["schedule"], fire_at, datetime.fromisoformat(now))
+        next_slot = _next_interval_slot(job["schedule"], fire_at, datetime.fromisoformat(now), tick)
     job["next_run_at"] = next_slot or compute_next_run(job["schedule"], now)
     if job["next_run_at"] is not None:
         if job.get("state") != "paused":
@@ -5650,7 +5660,7 @@ def advance_next_runs(job_ids) -> int:
                 continue
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
-                _record_interval_fire(job, now_dt)
+                _record_interval_fire(job, now_dt, tick=True)
                 job["next_run_at"] = new_next
                 advanced += 1
         if advanced:
