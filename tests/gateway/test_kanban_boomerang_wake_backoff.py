@@ -221,3 +221,58 @@ def test_terminal_claims_older_than_ttl_are_pruned(env, clock):  # noqa: F811
                                     "finished_at": old})
     assert state.prune_claims(T0, ah.CLAIM_TTL_S) == 0
     assert "b|t5|5#restart1" in state.claims()
+
+
+# t_e861b07c -----------------------------------------------------------------------------------
+
+def test_stuck_wake_turn_pages_alerts_once_and_keeps_retrying(env, clock):  # noqa: F811
+    """A turn whose home is not live here (the aegis session the default gateway claimed) used to
+    retry silently until the 24 h dead-letter. After NOTICE_AFTER_ATTEMPTS it pages #alerts once."""
+    t1, t2 = _card(env), _card(env)
+    alerts: list = []
+    env["monkeypatch"].setattr(ah, "post_alerts", alerts.append)
+    state = ah.BoomerangWakeState()
+    state.put_handback("del-1", _row(t1, parts=[ah.PART_TURN], created_at=T0,
+                                     home_sid="20261120_035316_gone", turn="wake text"))
+    _ticks(env, clock, 3 * 3600)
+    row = state.handbacks()["del-1"]
+    assert row["attempts"] > ah.NOTICE_AFTER_ATTEMPTS and row.get("noticed_at")
+    assert state.dead_letters() == {}                     # still retrying toward the 24 h bound
+    assert len(alerts) == 1 and t1 in alerts[0] and "20261120_035316_gone" in alerts[0]
+    # a second row crossing later is its own single line; the first is not repeated
+    state.put_handback("del-2", _row(t2, parts=[ah.PART_TURN], created_at=clock.now,
+                                     home_sid="20261120_035316_gone", turn="wake text"))
+    _ticks(env, clock, 3 * 3600)
+    assert len(alerts) == 2 and t2 in alerts[1] and t1 not in alerts[1]
+
+
+def test_rows_already_past_the_bound_page_once_together(env, clock):  # noqa: F811
+    """The live shape when this loads: rows at ~70 tries with no notice yet -> ONE line naming all."""
+    tids = [_card(env) for _ in range(3)]
+    alerts: list = []
+    env["monkeypatch"].setattr(ah, "post_alerts", alerts.append)
+    state = ah.BoomerangWakeState()
+    for i, tid in enumerate(tids):
+        r = _row(tid, parts=[ah.PART_TURN], created_at=T0 - 16 * 3600, home_sid="20261120_035316_gone",
+                 turn="wake text")
+        r.update(attempts=70 + i, last_attempt_at=T0 - 60 * i)
+        state.put_handback(f"del-{i}", r)
+    _ticks(env, clock, 1800)
+    assert len(alerts) == 1 and all(t in alerts[0] for t in tids) and alerts[0].count("3 wake turn") == 1
+    assert set(state.handbacks()) == {"del-0", "del-1", "del-2"}   # nothing dropped or rewritten away
+
+
+def test_notice_stop_file_silences_the_page(env, clock):  # noqa: F811
+    from hermes_constants import get_hermes_home
+
+    tid = _card(env)
+    alerts: list = []
+    env["monkeypatch"].setattr(ah, "post_alerts", alerts.append)
+    (get_hermes_home() / "state").mkdir(parents=True, exist_ok=True)
+    (get_hermes_home() / "state" / ah.NOTICE_STOP_FILE).touch()
+    state = ah.BoomerangWakeState()
+    r = _row(tid, parts=[ah.PART_TURN], created_at=T0, home_sid="20261120_035316_gone", turn="wake text")
+    r.update(attempts=50, last_attempt_at=T0)
+    state.put_handback("del-s", r)
+    _ticks(env, clock, 1800)
+    assert alerts == [] and not state.handbacks()["del-s"].get("noticed_at")

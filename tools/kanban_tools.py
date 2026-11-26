@@ -1845,16 +1845,22 @@ def _resolve_notify_target(*, require_platform_identity: bool = False,
         "parent_chat_id": env("HERMES_SESSION_PARENT_CHAT_ID", ""),
         "message_id": env("HERMES_SESSION_MESSAGE_ID", ""),
         "profile": env("HERMES_SESSION_PROFILE", ""),
-    }, wake=wake)
+    }, wake=wake, session_id=env("HERMES_SESSION_ID", ""))
 
 
 def resolve_notify_target_for_source(source: dict[str, Any], *,
-                                     wake: Optional[bool] = None) -> dict[str, Any]:
+                                     wake: Optional[bool] = None,
+                                     session_id: Optional[str] = None) -> dict[str, Any]:
     """``add_notify_sub`` kwargs for a session identified by its ``SessionSource`` dict
     (``SessionSource.to_dict()`` shape: the persisted ``sessions.origin_json``, or the
     calling turn's bound vars). The ONE resolver: the calling session and a foreign home
     (t_ea40ff83, operator ruling 14:0x) both go through it, so a home's sub is exactly
-    what the home session itself would write. Pure apart from config/profile reads."""
+    what the home session itself would write. Pure apart from config/profile/state.db reads.
+
+    ``notifier_profile`` with no ``profile`` in the source: the profile whose state.db holds
+    ``session_id`` (t_e861b07c), else the process's profile. An aegis turn ran
+    ``hermes -p default kanban create --session <its own sid>``: the process profile read
+    "default", the default gateway claimed the card's wakes and could never deliver them."""
     def _s(key: str) -> str:
         value = source.get(key)
         return "" if value is None else str(value)
@@ -1876,6 +1882,9 @@ def resolve_notify_target_for_source(source: dict[str, Any], *,
     thread_id = _s("thread_id") or None
     message_id = _s("message_id")
     notifier_profile = _s("profile")
+    if not notifier_profile and session_id:
+        from hermes_cli.kanban_db import session_owner_profile
+        notifier_profile = session_owner_profile(session_id) or ""
     if not notifier_profile:
         from hermes_cli.profiles import current_profile_name
         notifier_profile = current_profile_name("default")
@@ -1966,7 +1975,8 @@ def routable_home_target(home_sid: Optional[str], *,
         return None
     if _hr.home_from_row(home_sid, row).target is None:
         return None
-    return resolve_notify_target_for_source(json.loads(row["origin_json"]), wake=wake)
+    return resolve_notify_target_for_source(json.loads(row["origin_json"]), wake=wake,
+                                            session_id=home_sid)
 
 
 def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
@@ -2006,7 +2016,7 @@ def _home_target(task_id: str, home_sid: str, caller_sid: Optional[str],
     origin = json.loads(row["origin_json"])
     logger.info("kanban: %s homed to %s; subscribing home %s (caller chat %s)",
                 task_id, home_sid, home.target.chat_id, target["chat_id"])
-    return resolve_notify_target_for_source(origin, wake=wake)
+    return resolve_notify_target_for_source(origin, wake=wake, session_id=home_sid)
 
 
 def subscribe_calling_session(

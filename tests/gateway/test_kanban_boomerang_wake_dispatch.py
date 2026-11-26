@@ -107,6 +107,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ah, "_alive", lambda key: key in alive)
     monkeypatch.setattr(ah, "_LAST_ENABLED", {})
     monkeypatch.setattr(ah, "post_logs", lambda text: None)
+    monkeypatch.setattr(ah, "post_alerts", lambda text: None)
     # Delivery-content tests: a reconcile retries a failed handback at once. The t_827d5940 pacing
     # (10 s doubling) is exercised in test_kanban_boomerang_wake_backoff.py.
     monkeypatch.setattr(ah, "BACKOFF_BASE_S", 0.0, raising=False)
