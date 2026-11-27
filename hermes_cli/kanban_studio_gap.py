@@ -24,10 +24,18 @@ A gap override needs ``--elsewhere`` (which pool host, what to install or move; 
 when the pool file is readable), ``--why-not-now`` (>= 20 chars) and ``--effort hours|days``:
 
 * hours: also ``--fix-card <id>``, an OPEN card that does the setup. Without it the override is refused and the
-  refusal prints the create command. It covers ONE run (``--until`` is refused); a second override for the same gap
-  passes while that card is open.
+  refusal prints the create command (on the override's board). It covers ONE run (``--until`` is refused).
 * days: passes with the answers recorded; the digest line lists it so the estimate can be challenged.
-* a card whose earlier override named a fix card that is now done: the gap is closed, every gap override is refused.
+
+The fix card is tracked per GAP KEY (the capability, the ``studio-capgap:<key>`` of the gap card), not per card:
+
+* while a fix card named for the key is open, a later override for that key on ANY card passes without the answers
+  and is counted on the fix card (one comment line each);
+* once that fix card is done, every override for the key is refused ("run it on a pool host: ..."); a NEW open fix
+  card (the gap reopened) is accepted with the answers. An archived fix card is abandoned, not done: it closes nothing
+  and cannot be named again.
+* the same refusal (key + problem) printed again within 24 h is one line plus the fix card, not the full screen
+  (``state/studio-capability-gap/gap-refusals.jsonl``).
 
 All answers go in the ``studio_override`` event and the overrides.jsonl ledger line.
 
@@ -47,7 +55,8 @@ STRUCTURAL = frozenset({"workspace_kind"})
 EFFORTS = ("hours", "days")
 MIN_TEXT = 20
 INHERENT, GAP = "inherent", "gap"
-_CLOSED = ("done", "archived")
+_CLOSED = ("done", "archived")   # not eligible as a --fix-card
+_DONE = ("done",)                # proof the gap was closed; an archived card was abandoned, not finished
 
 
 class GapRefused(ValueError):
@@ -91,14 +100,16 @@ def classify(capability: str, *, allow: Iterable[str] = (), studio_only: Optiona
 
 
 def pool_hosts(root: Path) -> tuple:
-    """Pool host names from the root's pool file (not reach aliases: those include the Studio), lower-case, in
-    pool order; () when unreadable."""
+    """Placement targets from the root's pool file (``PoolConfig.pool_hosts``: enabled, ``targets`` true, with a
+    worker login), lower-case, in pool order, never the Studio itself; () when unreadable. ``PoolConfig.hosts`` is the
+    pin vocabulary and can list the Studio, so naming it would not take the work off the Studio (Prism 9c2756fa53d1)."""
     try:
         from hermes_cli import kanban_db_dispatch as kbd
         from hermes_cli import kanban_worker_pool as kwp
         cfg = kwp.read_pool(Path(root) / "fleet", kanban_cfg=kbd._root_kanban_cfg())
-        names = [str(n).strip().lower() for n in (getattr(cfg, "hosts", ()) or ())]
-        return tuple(dict.fromkeys(n for n in names if n))
+        studio = {str(kwp.STUDIO_HOST).lower(), "studio"}
+        names = [str(getattr(h, "name", "")).strip().lower() for h in (getattr(cfg, "pool_hosts", ()) or ())]
+        return tuple(dict.fromkeys(n for n in names if n and n not in studio))
     except Exception:
         return ()
 
@@ -113,17 +124,19 @@ def _card_status(conn, card: str) -> Optional[str]:
     return row[0] if row else None
 
 
-def _closed_fix_cards(conn, task_id: str) -> list:
-    """Fix cards earlier overrides on ``task_id`` named that are now done/archived."""
+def key_fix_cards(conn, key: str) -> list:
+    """Fix cards for gap ``key`` (the capability; ``studio-capgap:<key>``), oldest first: every ``fix_card_given`` an
+    earlier ``studio_override`` on ANY card recorded for this key.
+    Per GAP, not per card (operator ruling 2026-11-27): 25 cards overrode one render-toolchain gap on 11-26."""
     import json
     out = []
-    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'studio_override' "
-                               "ORDER BY id", (task_id,)):
+    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE kind = 'studio_override' ORDER BY id"):
         try:
-            fc = (json.loads(raw or "{}") or {}).get("fix_card_given")
-        except (TypeError, ValueError, AttributeError):
-            fc = None
-        if fc and fc not in out and _card_status(conn, fc) in _CLOSED:
+            doc = json.loads(raw or "{}") or {}
+        except (TypeError, ValueError):
+            continue
+        fc = doc.get("fix_card_given") if isinstance(doc, dict) and doc.get("capability") == key else None
+        if fc and fc not in out:
             out.append(fc)
     return out
 
@@ -135,65 +148,150 @@ def _body_needs(conn, task_id: str) -> str:
     return "; ".join(lines) or "no requires: line"
 
 
-def create_command(capability: str) -> str:
-    return (f'hermes kanban create "Pool hosts: install what {capability} work needs so it runs off the Studio" '
+def create_command(capability: str, board: Optional[str] = None) -> str:
+    """The gap-card create command, on the override's board so the printed command runs in an unpinned shell and
+    the next override on that board finds the card (Prism 506ff9d7da6e)."""
+    b = f"--board {board} " if board else ""
+    return (f'hermes kanban {b}create "Pool hosts: install what {capability} work needs so it runs off the Studio" '
             f'--assignee daedalus --idempotency-key studio-capgap:{capability} '
             f'--body "capability-gap: {capability}\\nInstall <tools/models/checkout> on <pool host>; prove one card '
             f'of this kind runs there. Skill: fleet-host-gap-handling."')
 
 
-def _refusal(conn, task_id: str, capability: str, problem: str, hosts: tuple) -> GapRefused:
-    return GapRefused(
+class _Refusal(GapRefused):
+    """A refusal that knows its gap key and problem, so a repeat within 24 h prints the short form."""
+
+    def __init__(self, text: str, *, key: str, problem: str, fix_card: Optional[str] = None,
+                 short: Optional[str] = None):
+        super().__init__(text)
+        self.key, self.problem, self.fix_card, self.short = key, problem, fix_card, short
+
+
+def _refusal(conn, task_id: str, capability: str, problem: str, hosts: tuple,
+             board: Optional[str] = None) -> GapRefused:
+    return _Refusal(
         f"{problem}\n"
         f"  {task_id} wants the Studio for '{capability}', which is a host GAP (not Studio-only by nature). "
         f"The card says: {_body_needs(conn, task_id)}.\n"
         f"  Pool hosts: {', '.join(hosts) or '(pool file unreadable)'}.\n"
         f"  A gap override needs: --elsewhere \"<which pool host, what to install or move>\" "
-        f"--why-not-now \"<why it cannot run there now>\" --effort hours|days; with hours also --fix-card <open card>.\n"
-        f"  Create the gap card: {create_command(capability)}")
+        f"--why-not-now \"<why it cannot run there now>\" --effort hours|days; "
+        f"with hours also --fix-card <open card>.\n"
+        f"  Create the gap card: {create_command(capability, board)}",
+        key=capability, problem=problem,
+        short=f"(gap {capability}; fix card: none; create: hermes kanban "
+              f"{'--board ' + board + ' ' if board else ''}create ... --idempotency-key studio-capgap:{capability})")
+
+
+REPEAT_WINDOW = 24 * 3600
+REFUSALS_FILE = ("state", "studio-capability-gap", "gap-refusals.jsonl")
+
+
+def refusals_path(root: Path) -> Path:
+    return Path(root).joinpath(*REFUSALS_FILE)
+
+
+def _shorten(exc: GapRefused, task_id: str, root: Path, now: float) -> GapRefused:
+    """A refusal identical (gap key + problem) to one printed in the last 24 h prints one line plus the fix card,
+    not the full screen (operator ruling 2026-11-27). Every refusal is appended to ``gap-refusals.jsonl``."""
+    import json
+    if not isinstance(exc, _Refusal):
+        return exc
+    path = refusals_path(root)
+    earlier = None
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                continue
+            if (doc.get("key") == exc.key and doc.get("problem") == exc.problem
+                    and now - float(doc.get("at") or 0) < REPEAT_WINDOW):
+                earlier = doc
+    except OSError:
+        pass
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"at": int(now), "key": exc.key, "problem": exc.problem, "task_id": task_id,
+                                 "fix_card": exc.fix_card}, sort_keys=True) + "\n")
+    except OSError:
+        pass
+    if earlier is None:
+        return exc
+    first = exc.problem.splitlines()[0]
+    tail = exc.short or f"(gap {exc.key}; fix card: {exc.fix_card or 'none'})"
+    return _Refusal(f"{first} {tail} [repeat; full screen printed for {earlier.get('task_id')} "
+                    f"{int((now - float(earlier.get('at') or 0)) // 60)} min ago]",
+                    key=exc.key, problem=exc.problem, fix_card=exc.fix_card, short=exc.short)
 
 
 def check(conn, task_id: str, capability: str, *, elsewhere: Optional[str], why_not_now: Optional[str],
           effort: Optional[str], fix_card: Optional[str], until: Optional[str] = None, allow: Iterable[str] = (),
-          root: Path) -> dict:
+          root: Path, board: Optional[str] = None, now: Optional[float] = None) -> dict:
     """``{}`` when the gate is off; ``{"class": "inherent"}`` for an inherent capability; for a gap the recorded
-    answers. Raises :class:`GapRefused` with the operator screen."""
+    answers. Raises :class:`GapRefused` with the operator screen (one line when it repeats within 24 h)."""
+    import time
     if disabled(root):
         return {}
     cls = classify(capability, allow=allow, studio_only=studio_only_caps(root))
     if cls == INHERENT:
         return {"class": INHERENT}
+    try:
+        return _check_gap(conn, task_id, capability, elsewhere=elsewhere, why_not_now=why_not_now, effort=effort,
+                          fix_card=fix_card, until=until, root=root, board=board)
+    except GapRefused as exc:
+        raise _shorten(exc, task_id, root, time.time() if now is None else now) from None
+
+
+def _check_gap(conn, task_id: str, key: str, *, elsewhere, why_not_now, effort, fix_card, until, root, board) -> dict:
     hosts = pool_hosts(root)
-    closed = _closed_fix_cards(conn, task_id)
-    if closed:
-        raise GapRefused(f"the gap card {', '.join(closed)} for {task_id} is done: the gap is closed, run the card on "
-                         f"a pool host (pool hosts: {', '.join(hosts) or '(pool file unreadable)'})")
+    on_pool = f"run it on a pool host: {', '.join(hosts) or '(pool file unreadable)'}"
+    known = key_fix_cards(conn, key)
+    status = {c: _card_status(conn, c) for c in known}
+    open_known = [c for c in known if status[c] not in _CLOSED and c != task_id]
+    done_known = [c for c in known if status[c] in _DONE]
     ew, wn, eff = (elsewhere or "").strip(), (why_not_now or "").strip(), (effort or "").strip().lower()
-    if len(ew) < MIN_TEXT:
-        raise _refusal(conn, task_id, capability, f"--elsewhere is required ({MIN_TEXT}+ characters)", hosts)
-    if hosts and not _names_host(ew, hosts):
-        raise _refusal(conn, task_id, capability, "--elsewhere must name the pool host that would run it "
-                       "(it only restates the gap)", hosts)
-    if len(wn) < MIN_TEXT:
-        raise _refusal(conn, task_id, capability, f"--why-not-now is required ({MIN_TEXT}+ characters)", hosts)
-    if eff not in EFFORTS:
-        raise _refusal(conn, task_id, capability, "--effort is required: hours or days", hosts)
     fc = (fix_card or "").strip() or None
     if fc:
-        status = _card_status(conn, fc)
-        if status is None:
-            raise _refusal(conn, task_id, capability, f"--fix-card {fc}: no such card", hosts)
-        if status in _CLOSED:
-            raise GapRefused(f"--fix-card {fc} is {status}: the gap is closed, run {task_id} on a pool host "
-                             f"(pool hosts: {', '.join(hosts) or '(pool file unreadable)'})")
+        st = _card_status(conn, fc)
+        if st is None:
+            raise _refusal(conn, task_id, key, f"--fix-card {fc}: no such card", hosts, board)
         if fc == task_id:
-            raise _refusal(conn, task_id, capability, "--fix-card must be the card that closes the gap, not this card",
-                           hosts)
+            raise _refusal(conn, task_id, key, "--fix-card must be the card that closes the gap, not this card",
+                           hosts, board)
+        if st in _DONE:
+            p = f"--fix-card {fc} is done: the gap {key} is closed"
+            raise _Refusal(f"{p}, {on_pool}. If the gap has reopened, create a new fix card and name it with "
+                           f"--fix-card.", key=key, problem=p, fix_card=fc, short=f"({on_pool})")
+        if st in _CLOSED:
+            raise _refusal(conn, task_id, key, f"--fix-card {fc} is {st}, not open: name an open gap card",
+                           hosts, board)
+    # An open fix card for this gap already exists (named earlier on any card): this run is counted on it.
+    counted = fc if fc in open_known else (open_known[-1] if not fc and open_known else None)
+    if counted:
+        if until:
+            raise _Refusal(f"gap {key} is being closed by {counted}: an override covers ONE run, drop --until {until}",
+                           key=key, problem="until on a counted gap", fix_card=counted)
+        return {"class": GAP, "elsewhere": ew or None, "why_not_now": wn or None, "effort": eff or None,
+                "fix_card_given": counted, "counted": True}
+    if not fc and done_known:
+        p = f"the gap card {done_known[-1]} for {key} is done: the gap is closed"
+        raise _Refusal(f"{p}, {on_pool}. If the gap has reopened, create a new fix card and name it with --fix-card.",
+                       key=key, problem=p, fix_card=done_known[-1], short=f"({on_pool})")
+    if len(ew) < MIN_TEXT:
+        raise _refusal(conn, task_id, key, f"--elsewhere is required ({MIN_TEXT}+ characters)", hosts, board)
+    if hosts and not _names_host(ew, hosts):
+        raise _refusal(conn, task_id, key, "--elsewhere must name the pool host that would run it "
+                       "(it only restates the gap)", hosts, board)
+    if len(wn) < MIN_TEXT:
+        raise _refusal(conn, task_id, key, f"--why-not-now is required ({MIN_TEXT}+ characters)", hosts, board)
+    if eff not in EFFORTS:
+        raise _refusal(conn, task_id, key, "--effort is required: hours or days", hosts, board)
     if eff == "hours" and not fc:
-        raise _refusal(conn, task_id, capability, "--effort hours: setting it up elsewhere is the default, so name the "
-                       "open gap card with --fix-card (this override then covers this run only)", hosts)
+        raise _refusal(conn, task_id, key, "--effort hours: setting it up elsewhere is the default, so name the "
+                       "open gap card with --fix-card (this override then covers this run only)", hosts, board)
     if eff == "hours" and until:
-        raise GapRefused(f"--effort hours covers ONE run: drop --until {until} (override again for the next run "
-                         f"while {fc} is open)")
+        raise _Refusal(f"--effort hours covers ONE run: drop --until {until} (override again for the next run "
+                       f"while {fc} is open)", key=key, problem="until with effort hours", fix_card=fc)
     return {"class": GAP, "elsewhere": ew, "why_not_now": wn, "effort": eff, "fix_card_given": fc}
-

@@ -83,7 +83,7 @@ def test_gap_without_answers_is_refused_with_the_one_screen(operator):
     msg = str(e.value)
     assert "--elsewhere is required" in msg and "Pool hosts: ace-ai, ace-media, ci-box, nas-fleet" in msg
     assert "requires: studio-state (the board)" in msg
-    assert "hermes kanban create" in msg and "--idempotency-key studio-capgap:studio-state" in msg
+    assert "hermes kanban --board default create" in msg and "--idempotency-key studio-capgap:studio-state" in msg
     assert not ksa.ledger_path(operator).exists()
 
 
@@ -133,19 +133,134 @@ def test_hours_with_open_fix_card_passes_once_and_until_is_refused(operator):
     assert [r["fix_card"] for r in _ledger(operator)] == [fix, fix]
 
 
-def test_done_fix_card_closes_the_gap(operator):
+def test_per_gap_key_first_override_needs_answers_and_an_open_fix_card(operator):
+    """Case 1: the first hours override for a gap key needs both answers and an open fix card."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        with pytest.raises(ksa.OverrideRefused, match="--elsewhere is required"):
+            ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only")
+        with pytest.raises(ksa.OverrideRefused, match="name the open gap card with --fix-card"):
+            ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours")
+        fix = _card(conn, title="install the render toolchain on ci-box")
+        p = ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+    assert p["fix_card"] == fix and not p.get("counted")
+
+
+def test_per_gap_key_later_overrides_on_any_card_pass_and_are_counted_on_the_fix_card(operator):
+    """Case 2: while the key's fix card is open, any card's override for that key passes and is counted on it."""
+    with kb.connect_closing() as conn:
+        fix = _card(conn, title="install the render toolchain on ci-box")
+        first = _card(conn)
+        ksa.override(conn, first, "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+        others = [_card(conn) for _ in range(3)]
+        got = [ksa.override(conn, t, "operator_admit", "render toolchain is Studio-only") for t in others]
+        with pytest.raises(ksa.OverrideRefused, match="covers ONE run"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only", until="+8h")
+        # a different gap key is not covered by this fix card
+        with pytest.raises(ksa.OverrideRefused, match="--elsewhere is required"):
+            ksa.override(conn, _card(conn), "workspace_kind", "the worktree lives on the Studio")
+        comments = [b for (b,) in conn.execute("SELECT body FROM task_comments WHERE task_id=? ORDER BY id", (fix,))]
+    assert all(p["counted"] and p["fix_card"] == fix for p in got)
+    assert len(comments) == 4 and comments[-1].startswith("studio-override #4 for gap operator_admit: " + others[-1])
+
+
+def test_per_gap_key_done_fix_card_refuses_every_card(operator):
+    """Case 3: once the key's fix card is done, an override for the key is refused on every card, naming it."""
     with kb.connect_closing() as conn:
         fix = _card(conn, title="install the render toolchain on ci-box")
         tid = _card(conn)
         ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
                      elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
         _done(conn, fix)
-        with pytest.raises(ksa.OverrideRefused, match=f"--fix-card {fix} is done: the gap is closed"):
+        for card in (tid, _card(conn)):
+            with pytest.raises(ksa.OverrideRefused) as e:
+                ksa.override(conn, card, "operator_admit", "render toolchain is Studio-only",
+                             elsewhere=EW, why_not_now=WN, effort="days")
+            assert f"the gap card {fix} for operator_admit is done" in str(e.value)
+            assert "run it on a pool host: ace-ai, ace-media, ci-box, nas-fleet" in str(e.value)
+        with pytest.raises(ksa.OverrideRefused, match=f"--fix-card {fix} is done: the gap operator_admit is closed"):
             ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
                          elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
-        with pytest.raises(ksa.OverrideRefused, match=f"the gap card {fix} for {tid} is done"):
+
+
+def test_per_gap_key_reopened_gap_takes_a_new_fix_card(operator):
+    """Case 4: the gap reopened: a NEW open fix card with the answers is accepted, and later cards count on it."""
+    with kb.connect_closing() as conn:
+        old = _card(conn, title="install the render toolchain on ci-box")
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=old)
+        _done(conn, old)
+        new = _card(conn, title="reinstall the render toolchain on ci-box after the rebuild")
+        p = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=new)
+        q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert p["fix_card"] == new and q["counted"] and q["fix_card"] == new
+
+
+def test_repeated_identical_refusal_within_24h_is_one_line(operator):
+    """Operator ruling: the second identical refusal (same gap key + problem) within 24 h is one line + fix card."""
+    with kb.connect_closing() as conn:
+        a, b = _card(conn), _card(conn)
+        with pytest.raises(ksa.OverrideRefused) as first:
+            ksa.override(conn, a, "studio-state", "reads the live board db", now=1_000_000.0)
+        with pytest.raises(ksa.OverrideRefused) as second:
+            ksa.override(conn, b, "studio-state", "reads the live board db", now=1_000_000.0 + 3600)
+        with pytest.raises(ksa.OverrideRefused) as later:
+            ksa.override(conn, b, "studio-state", "reads the live board db", now=1_000_000.0 + 3600 + 25 * 3600)
+    assert "\n" in str(first.value) and "Pool hosts:" in str(first.value)
+    short = str(second.value)
+    assert "\n" not in short and "fix card: none" in short and f"full screen printed for {a} 60 min ago" in short
+    assert "studio-capgap:studio-state" in short
+    assert "Pool hosts:" in str(later.value)  # outside the window: the full screen again
+    assert len(ksg.refusals_path(operator).read_text().splitlines()) == 3
+
+
+def test_archived_fix_card_does_not_close_the_gap(operator):
+    """Prism 7a9922be2606: an archived (abandoned) fix card is not a closed gap; an open replacement passes."""
+    with kb.connect_closing() as conn:
+        fix_a = _card(conn, title="install the render toolchain on ci-box")
+        tid = _card(conn)
+        ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix_a)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (fix_a,))
+        with pytest.raises(ksa.OverrideRefused, match=f"--fix-card {fix_a} is archived, not open"):
             ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
-                         elsewhere=EW, why_not_now=WN, effort="days")
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix_a)
+        fix_b = _card(conn, title="install the render toolchain on ci-box, take 2")
+        p = ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix_b)
+    assert p["fix_card"] == fix_b
+
+
+def test_refusal_create_command_names_the_board(operator):
+    """Prism 506ff9d7da6e: the printed create command carries the override's board."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+        with pytest.raises(ksa.OverrideRefused) as e:
+            ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only", board="media")
+    assert "hermes kanban --board media create " in str(e.value)
+    assert ksg.create_command("operator_admit").startswith("hermes kanban create ")
+
+
+def test_pool_hosts_are_placement_targets_without_the_studio(tmp_path, monkeypatch):
+    """Prism 9c2756fa53d1: a registered but targets:false Studio is not a pool host, so --elsewhere naming it fails."""
+    from hermes_cli import kanban_db_dispatch as kbd
+    from tests.hermes_cli.test_kanban_worker_pool import _studio_registered
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    _studio_registered(fleet, {"mac-studio": {"class": "studio-source", "targets": False},
+                               "ace-ai": {"class": "linux-shared"}, "ace-media": {"class": "linux-shared"}})
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {})
+    hosts = ksg.pool_hosts(tmp_path)
+    assert hosts == ("ace-ai", "ace-media")
+    assert not ksg._names_host("mac-studio after installing ffmpeg", hosts)
+    # even when the Studio IS a placement target it never counts as "elsewhere"
+    _studio_registered(fleet, {"mac-studio": {"class": "linux-shared", "targets": True}})
+    assert ksg.pool_hosts(tmp_path) == ("ace-ai", "ace-media")
 
 
 # -- 5. kill switch -----------------------------------------------------------------------------------------------
@@ -187,10 +302,18 @@ def test_replay_explainer_session_overrides(operator):
         # as it was run on 11-26 (no answers): refused, with the gap-card command
         with pytest.raises(ksa.OverrideRefused) as e:
             ksa.override(conn, first_tid, first_cap, first_why, until="+8h")
-        assert "hermes kanban create" in str(e.value) and "--fix-card" in str(e.value)
+        assert "hermes kanban --board default create" in str(e.value) and "--fix-card" in str(e.value)
         fix = _card(conn, title="install the explainer render toolchain on ci-box")
+        seen = set()
         for tid, cap, why in seq:
-            p = ksa.override(conn, tid, cap, why, elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+            if cap in seen:  # per gap key: the open fix card already covers this gap, no answers asked again
+                p = ksa.override(conn, tid, cap, why)
+                assert p["counted"]
+            else:
+                p = ksa.override(conn, tid, cap, why, elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+                seen.add(cap)
             assert p["class"] == "gap" and p["fix_card"] == fix
+        counts = [b for (b,) in conn.execute("SELECT body FROM task_comments WHERE task_id=?", (fix,))]
     rows = _ledger(operator)
     assert len(rows) == 17 and {r["fix_card"] for r in rows} == {fix}
+    assert seen == {"operator_admit", "workspace_kind"} and len(counts) == 17 and "studio-override #17" in counts[-1]

@@ -659,3 +659,39 @@ def test_parser_need_choices_match_the_need_table():
     sub = next(a for a in top._actions if isinstance(a, argparse._SubParsersAction)).choices["kanban"]
     so = next(a for a in sub._actions if isinstance(a, argparse._SubParsersAction)).choices["studio-override"]
     assert tuple(next(a for a in so._actions if a.dest == "need").choices) == tuple(ksa.NEEDS)
+
+
+def test_every_path_onto_the_studio_for_a_gap_ends_at_the_gated_override(operator, monkeypatch, tmp_path):
+    """t_9d619fbb (operator ruling 2026-11-27): the gap gate sits on ``studio-override`` only, because each of the three
+    ways to put a gap card on the Studio waits on a default-deny hold only an override clears. With default-deny on:
+    1. ``create`` with a bare ``host: studio`` (no Studio-served ``requires:``): the pin is dropped, never local;
+    2. ``admit --host studio``: held ``studio_default_deny:operator_admit``;
+    3. a ``worktree:`` card on a Studio path: held ``studio_default_deny:workspace_kind:...``.
+    The held capability is a GAP, so the override that would release it is refused without the answers."""
+    from hermes_cli import kanban_studio_gap as ksg
+    _cfg(operator, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    monkeypatch.setattr(ksg, "pool_hosts", lambda root: ("ace-ai", "ci-box"))
+    spawned = []
+
+    def spawn(task, workspace, *, board=None, placement=None):
+        spawned.append((task.id, placement.name if placement else "studio"))
+        return 4242
+
+    studio_path = tmp_path / "studio-only-checkout"
+    studio_path.mkdir()
+    with kb.connect_closing() as conn:
+        bare = kb.create_task(conn, title="x", assignee="alpha", body="host: studio\nfix the lint")
+        assert _route(conn, bare)[0] != "local"
+        admitted = _card(conn, body="fix the lint")
+        res = kbd.admit_once(conn, admitted, "studio", spawn_fn=spawn, spillover=_plan(free=2))
+        assert res.placement_waits[admitted].startswith("studio_default_deny:operator_admit"), res.placement_waits
+        wt = kb.create_task(conn, title="wt", assignee="alpha", body="fix the lint", workspace_kind="worktree",
+                            workspace_path=str(studio_path))
+        route = _route(conn, wt)
+        assert route[0] == "wait" and route[1].startswith("studio_default_deny:workspace_kind"), route
+        held = route[1][len("studio_default_deny:"):].split(" (", 1)[0]
+        for tid, cap in ((admitted, "operator_admit"), (wt, held)):
+            with pytest.raises(ksa.OverrideRefused, match="--elsewhere is required"):
+                ksa.override(conn, tid, cap, "the toolchain is only on the studio", actor="apollo")
+    assert spawned == [], spawned
