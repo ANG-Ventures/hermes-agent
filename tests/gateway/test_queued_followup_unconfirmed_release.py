@@ -59,6 +59,8 @@ def _setup(*, deliver, consumer):
 
 
 def _run(GatewayRunner, runner, turn_ctx, pending_event):
+    from gateway.queue_mgmt import mark_inflight
+    mark_inflight(runner, turn_ctx.session_key, pending_event)   # as the drain does after its pop
     asyncio.run(GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=MagicMock(), pending="ace follow-up", pending_event=pending_event,
         response={"final_response": "first answer"}, result={"messages": []}, stream_task=None))

@@ -79,6 +79,8 @@ async def test_queued_followup_persists_authored_text():
         reply_expected=None,
     )
 
+    from gateway.queue_mgmt import mark_inflight
+    mark_inflight(runner, turn_ctx.session_key, pending_event)   # as the drain does after its pop
     await GatewayRunner._run_agent_queued_followup(
         runner, turn_ctx, adapter=None, pending="hi again", pending_event=pending_event,
         response="resp", result={"interrupted": True, "messages": []}, stream_task=None,

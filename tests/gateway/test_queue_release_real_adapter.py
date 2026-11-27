@@ -400,8 +400,9 @@ async def test_merged_mode_keeps_system_wake_as_its_own_turn_first(monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_stop_during_reply_send_puts_released_batch_back_into_held(monkeypatch, tmp_path, caplog):
-    """Prism 50373862d991 / Apollo send-back on PR 573: held=[a, b] merged; `ping` completes and
-    releases them; /stop lands while ping's reply is still sending. a, b go back to held in order."""
+    """Prism 50373862d991 / Apollo rulings on PR 573: held=[a, b] merged; `ping` completes and
+    releases them; /stop lands while ping's reply is still sending. The merged event goes back to
+    held as ONE item; `/queue edit 1 X` edits it and the next completed turn runs X once."""
     rig = _Rig(monkeypatch, tmp_path)
     rig.pause_on_stop = True
     rig.runner._queue_release_mode = "merged"
@@ -416,14 +417,19 @@ async def test_stop_during_reply_send_puts_released_batch_back_into_held(monkeyp
     await rig.settle(expect=1)
     await asyncio.sleep(0.3)
     assert rig.calls == ["ping"]
-    assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["a", "b"]
-    assert any("2 queued prompt(s) held" in s for s in rig.adapter.sent), rig.adapter.sent
-    assert "from=inflight" in caplog.text and caplog.text.count("queue_mgmt item op=hold ") == 2
+    assert _held(rig) == ["a\n\nb"]
+    assert any("1 queued prompt(s) held" in s for s in rig.adapter.sent), rig.adapter.sent
+    assert "from=inflight" in caplog.text and caplog.text.count("queue_mgmt item op=hold ") == 1
     rig.adapter.block_text = None
+    await rig.adapter.handle_message(_msg("/queue edit 1 X"))
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert _held(rig) == ["X"], rig.adapter.sent[-1:]
     await rig.adapter.handle_message(_msg("pong"))
     await rig.settle(expect=3)
     await asyncio.sleep(0.3)
-    assert rig.calls == ["ping", "pong", "a\n\nb"]
+    assert rig.calls == ["ping", "pong", "X"]
+    assert _held(rig) == []
     assert rig.max_live == 1
 
 
@@ -516,7 +522,7 @@ async def test_stop_while_drain_awaits_after_pop_holds_once_and_never_runs(monke
     assert rig.calls == ["ping"]
     assert _held(rig) == ["a"]
     state = rig.runner._session_state(KEY).conversation
-    assert state.held_queue[0]._queue_reclaimed is True and state.inflight_followup is None   # not re-marked
+    assert state.inflight_followup is None   # the reclaim cleared the mark: the old chain cannot claim it
     # (3) a later completed turn releases `a` and it runs exactly once.
     await rig.adapter.handle_message(_msg("pong"))
     await rig.settle(expect=3)
@@ -570,9 +576,9 @@ async def test_busy_queue_run_during_first_reply_send_runs_each_item_once(monkey
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode,cap", [("merged", None), ("per_item", None), ("merged", 0)])
 async def test_reclaimed_item_released_again_with_a_later_prompt_runs(monkeypatch, tmp_path, mode, cap):
-    """Apollo send-back on 54715102: `a` is reclaimed into held (flag set); a later completed turn
-    releases it together with `/queue b`. The merged copy must not inherit `_queue_reclaimed`, or
-    claim_inflight refuses it and it is in no store. cap=0 pops the batch at the recursion cap."""
+    """Apollo send-back on 54715102: `a` is reclaimed into held; a later completed turn releases it
+    together with `/queue b` and the batch runs once. cap=0: the claimed batch is popped at the
+    recursion cap, put back in the slot once, and runs once."""
     rig = _Rig(monkeypatch, tmp_path)
     rig.runner._queue_release_mode = mode
     gate, _task = await _queue_a_then_block_drain(rig, monkeypatch)
@@ -595,3 +601,18 @@ async def test_reclaimed_item_released_again_with_a_later_prompt_runs(monkeypatc
     assert rig.calls == expected
     assert _held(rig) == []
     assert rig.max_live == 1
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_event_at_the_recursion_cap_is_not_put_back(monkeypatch, tmp_path):
+    """Recursion cap: /stop reclaims `a` while the drain awaits after the pop; the cap branch must
+    not put the reclaimed event back in the slot (it is in held already)."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.runner._MAX_INTERRUPT_DEPTH = 0
+    gate, _task = await _queue_a_then_block_drain(rig, monkeypatch)
+    gate.set()
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping"]
+    assert _held(rig) == ["a"]
+    assert rig.adapter._pending_messages.get(KEY) is None

@@ -4486,6 +4486,7 @@ class GatewayTurnMixin:
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
+            claimed = pending_event is None or queue_mgmt.claim_inflight(self, session_key, pending_event)
             if adapter and pending_event is None and pending:
                 # An event-less follow-up (leftover /steer, interrupt text) has no slot entry to put
                 # back. No adapter defines ``queue_message``, so it used to vanish here; a completion
@@ -4493,7 +4494,7 @@ class GatewayTurnMixin:
                 _meta = _leftover_steer_meta(result, pending)
                 pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source,
                                              metadata=_meta, message_id=_leftover_steer_message_id(_meta))
-            if adapter and pending_event and queue_mgmt.claim_inflight(self, session_key, pending_event):
+            if adapter and pending_event and claimed:   # a reclaimed event is in held already
                 # The drain already promoted the overflow head into the slot; merging would REPLACE it
                 # (two internal TEXT wakes never merge), losing an accepted wake (t_f36d21e8). Put the
                 # dequeued event back at the head and the slot's occupant back on the overflow front.
@@ -4627,7 +4628,7 @@ class GatewayTurnMixin:
                 _followup_state.turn.started_ts = time.time()
                 _followup_state.turn.busy_ack_ts = 0.0
 
-            if not queue_mgmt.claim_inflight(self, session_key, pending_event):
+            if pending_event is not None and not queue_mgmt.claim_inflight(self, session_key, pending_event):
                 # A /stop or other invalidation put it back into held meanwhile: never run it twice.
                 await _run_followup_processing_hook(
                     _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))

@@ -213,10 +213,9 @@ def _unpark(runner: Any, key: str, event: Any) -> bool:
 # /queue run busy, lease reject), a scope clear or a cancelled task puts it back at the FRONT of held.
 
 def mark_inflight(runner: Any, key: str, event: Any) -> None:
-    """Record ``event`` as popped-but-unclaimed (user items only; None/system clears). Never raises."""
+    """The ONE record of a popped, unclaimed user follow-up (Apollo ruling on PR 573): a user event
+    sets it, None or a system event clears it. Nothing is written on the event. Never raises."""
     try:
-        if getattr(event, "_queue_reclaimed", False) is True:
-            return   # already back in held: never re-mark it (restage_held clears the flag on release)
         state = runner._session_state(key).conversation
         state.inflight_followup = event if event is not None and not is_system_event(runner, event) else None
     except Exception:
@@ -224,37 +223,36 @@ def mark_inflight(runner: Any, key: str, event: Any) -> None:
 
 
 def claim_inflight(runner: Any, key: str, event: Any) -> bool:
-    """The follow-up turn takes ``event``: clears the mark. False when it was reclaimed into held
-    meanwhile, so the caller must not run it (it would run twice)."""
+    """The follow-up turn takes ``event``: True only when the mark IS this event (then cleared). A
+    reclaim cleared the mark, so a reclaimed event is refused and never runs twice. System events
+    are never marked and always pass."""
+    if is_system_event(runner, event):
+        return True
     state = runner._peek_session_state(key)
-    if state is not None and getattr(state.conversation, "inflight_followup", None) is event:
-        state.conversation.inflight_followup = None
-    return getattr(event, "_queue_reclaimed", False) is not True
+    if state is None or getattr(state.conversation, "inflight_followup", None) is not event:
+        return False
+    state.conversation.inflight_followup = None
+    return True
 
 
 def reclaim_inflight(runner: Any, key: str, *, only: Any = None) -> int:
-    """Put the marked follow-up back at the front of held (a merged release expands to its original
-    items); ``only`` limits it to that event. Returns the user items put back. Never raises."""
+    """Clear the mark and put that event back at the FRONT of held (a merged release goes back as
+    the one merged item it is), unless held already has it; ``only`` limits it to that event.
+    Returns 1 or 0. Never raises."""
     try:
         state = runner._peek_session_state(key)
         event = getattr(state.conversation, "inflight_followup", None) if state else None
         if event is None or (only is not None and event is not only):
             return 0
         state.conversation.inflight_followup = None
-        event._queue_reclaimed = True
-        items = list(getattr(event, "_queue_merged_from", None) or [event])
         held = state.conversation.held_queue
-        if any(h is e for e in items for h in held):
-            return 0   # already in held: never insert it twice
-        for e in items:
-            try:
-                e._queue_released = False
-            except Exception:
-                pass
-        held[0:0] = items
-        logger.info("queue_mgmt op=hold session=%s moved=%d held=%d from=inflight", key, len(items), len(held))
-        log_items(runner, "hold", key, items)
-        return len(items)
+        if any(h is event for h in held):
+            return 0
+        event._queue_released = False
+        held.insert(0, event)
+        logger.info("queue_mgmt op=hold session=%s moved=1 held=%d from=inflight", key, len(held))
+        log_items(runner, "hold", key, [event])
+        return 1
     except Exception:
         logger.warning("queue_mgmt inflight reclaim failed for %s", key, exc_info=True)
         return 0
@@ -431,10 +429,6 @@ def merge_user_events(events: List[Any]) -> Any:
     # so the merged turn re-derives from every item (same rule as the adapter merge in base.py).
     for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
         head.__dict__.pop(attr, None)
-    # Queue marks describe the head's own history, not the new batch: an inherited reclaim flag
-    # makes claim_inflight refuse the merged turn and it is in no store (Apollo send-back on 54715102).
-    for attr in ("_queue_reclaimed", "_queue_merged_from", "_queue_released"):
-        head.__dict__.pop(attr, None)
     texts = [str(getattr(e, "text", "") or "").strip() for e in events]
     head.text = MERGE_SEPARATOR.join(t for t in texts if t)
     if len(events) > 1:
@@ -471,14 +465,7 @@ def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_r
     released = len(users) + len(system)
     merged = release_mode(runner) == "merged" and len(users) > 1
     if merged:
-        originals = users
         users = [merge_user_events(users)]
-        users[0]._queue_merged_from = originals   # a reclaim puts the items back one by one
-    for e in originals if merged else users:   # released again: a reclaimed item may be marked and run
-        try:
-            e._queue_reclaimed = False
-        except Exception:
-            pass
     for e in users:
         try:
             e._queue_released = True

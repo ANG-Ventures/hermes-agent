@@ -315,6 +315,8 @@ async def test_event_backed_followup_overrides_inherited_channel_prompt(monkeypa
     )
     result = {"final_response": "done", "messages": []}
 
+    from gateway.queue_mgmt import mark_inflight
+    mark_inflight(runner, turn_ctx.session_key, pending_event)   # as the drain does after its pop
     await runner._run_agent_queued_followup(
         turn_ctx, adapter, "queued", pending_event, "done", result, None
     )
