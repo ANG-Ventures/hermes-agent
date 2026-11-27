@@ -74,6 +74,8 @@ class _Rig:
         self.lock = threading.Lock()
         self.block_first = threading.Event()
         self.first_started = threading.Event()
+        self.gates = {"first": self.block_first}   # message -> turn blocks until /stop sets it
+        self.pause_on_stop = False                  # opt-in: model the real /stop's automatic pause
         rig = self
 
         class StubAgent:
@@ -91,9 +93,9 @@ class _Rig:
                     rig.max_live = max(rig.max_live, rig.live)
                     rig.calls.append(message)
                 try:
-                    if message == "first":
+                    if message in rig.gates:
                         rig.first_started.set()
-                        rig.block_first.wait(10)
+                        rig.gates[message].wait(10)
                         return {"final_response": "", "messages": [], "api_calls": 1, "interrupted": True}
                     return {"final_response": f"answer {message}", "messages": [], "api_calls": 1}
                 finally:
@@ -128,10 +130,16 @@ class _Rig:
         async def interrupt_and_clear(key, source, *, interrupt_reason, invalidation_reason,
                                       release_running_state=True):
             runner._invalidate_session_run_generation(key, reason=invalidation_reason)
+            if rig.pause_on_stop and invalidation_reason == "stop_command":  # as the real /stop does
+                runner._session_state(key).conversation.automatic_turns_paused = True
             qm.hold_user_items(runner, key, adapter)            # same order as the real function
-            rig.block_first.set()
+            for gate in rig.gates.values():
+                gate.set()
 
         runner._interrupt_and_clear_session = interrupt_and_clear
+        runner.session_store = SimpleNamespace(            # the /stop marker the resume gate clears
+            _entries={}, lookup_by_session_key=lambda key: None,
+            clear_user_stopped=lambda key, generation=None: True)
         self.runner = runner
         self.turn_running = 0
 
@@ -151,6 +159,8 @@ class _Rig:
             # thread it here so a release's item 2 (in overflow by design) is not misread as an
             # orphan and run ahead of item 1 (live E2E 2026-10-13 01:45: c ran before b).
             event, _src, _internal = runner._hm_rescue_orphaned_fifo(event, _source(), False, KEY)
+            if await qm.gate_stopped_event(runner, KEY, event, adapter):   # the real stopped-session gate
+                return None
             text = event.text or ""
             generation = runner._begin_session_run_generation(KEY)
             self.turn_running += 1
@@ -233,19 +243,70 @@ async def test_default_stop_holds_and_nothing_runs(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_plain_message_after_stop_runs_and_held_items_stay_held(monkeypatch, tmp_path):
-    """D14 end to end: after /stop, a plain message runs as its own turn; held items do not run."""
+@pytest.mark.parametrize("mode, expected", [("per_item", ["first", "ping", "a", "b", "c"]),
+                                            ("merged", ["first", "ping", "a\n\nb\n\nc"])])
+async def test_plain_message_after_stop_releases_held_items_when_it_completes(monkeypatch, tmp_path, caplog,
+                                                                             mode, expected):
+    """D5 (Ace 2026-11-26, Discord 1575714860740907081): after /stop a plain message runs as its own
+    turn; when it completes, the held a, b, c run next, oldest first, one turn at a time."""
     rig = _Rig(monkeypatch, tmp_path)
+    rig.pause_on_stop = True
+    rig.runner._queue_release_mode = mode
+    await rig.start_first_turn()
+    for text in ("/queue a", "/queue b", "/queue c"):
+        await rig.adapter.handle_message(_msg(text))
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):
+        await rig.adapter.handle_message(_msg("/stop"))
+        await rig.settle(expect=1)
+        assert rig.calls == ["first"]
+        await rig.adapter.handle_message(_msg("ping"))
+        await rig.settle(expect=len(expected))
+        await asyncio.sleep(0.3)
+    assert rig.calls == expected
+    assert rig.max_live == 1
+    assert rig.runner._session_state(KEY).conversation.held_queue == []
+    assert "trigger=turn_end" in caplog.text
+    assert caplog.text.count("queue_mgmt item op=hold ") == 3 and "msg_id=/queue c kind=user" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stopped_second_turn_releases_nothing_and_the_next_one_does(monkeypatch, tmp_path):
+    """D5: a turn that is itself stopped releases nothing; the next completed turn releases."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.pause_on_stop = True
     await rig.start_first_turn()
     for text in ("/queue a", "/queue b"):
         await rig.adapter.handle_message(_msg(text))
     await rig.adapter.handle_message(_msg("/stop"))
     await rig.settle(expect=1)
+    rig.gates["ping"] = threading.Event()
+    rig.first_started.clear()
     await rig.adapter.handle_message(_msg("ping"))
+    for _ in range(200):
+        if rig.first_started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    await rig.adapter.handle_message(_msg("/stop"))
     await rig.settle(expect=2)
     await asyncio.sleep(0.3)
     assert rig.calls == ["first", "ping"]
     assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["a", "b"]
+    await rig.adapter.handle_message(_msg("pong"))
+    await rig.settle(expect=5)
+    assert rig.calls == ["first", "ping", "pong", "a", "b"]
+    assert rig.max_live == 1
+
+
+@pytest.mark.asyncio
+async def test_restored_held_items_release_after_the_first_completed_turn(monkeypatch, tmp_path):
+    """D22 + D5: items restored HELD after a restart (no /stop in this process) release when the
+    first turn completes."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.runner._session_state(KEY).conversation.held_queue.extend([_msg("a"), _msg("b")])
+    await rig.adapter.handle_message(_msg("ping"))
+    await rig.settle(expect=3)
+    assert rig.calls == ["ping", "a", "b"]
+    assert rig.max_live == 1
 
 
 @pytest.mark.asyncio
