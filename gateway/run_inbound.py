@@ -1637,6 +1637,18 @@ class GatewayInboundMixin:
             return _limit_message
 
         _claim_state = self._session_state(_quick_key)
+        _lost_adapter = self._delivery_adapter_for(source)
+        if _claim_state.turn.agent is not None and getattr(_lost_adapter, "_pending_messages", None) is not None:
+            # Lost the claim race (Prism 03e7f19cf6dc): another idle handler took the session during
+            # the awaits above. Overwriting its sentinel bumped the generation and cancelled it, so
+            # one prompt never ran. Queue this one behind the winner's turn instead.
+            from gateway import queue_mgmt
+            if _checkout_ticket is not None:
+                _checkout_ticket.release()
+            self._enqueue_fifo(_quick_key, event, _lost_adapter)
+            queue_mgmt.log_items(self, "add", _quick_key, [event])
+            logger.info("PHASE=claim_race_queued session=%s", _quick_key)
+            return t("gateway.queue.queued")
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
