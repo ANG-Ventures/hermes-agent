@@ -192,3 +192,23 @@ async def test_idle_goal_wake_holding_a_lock_does_not_wait_on_an_inline_command_
     pause_task = asyncio.create_task(adapter.handle_message(pause))
     await asyncio.wait_for(asyncio.gather(watcher_task, pause_task), 3)
     assert ("start", "wake") in log and ("inline-done", "pause") in log, log
+
+
+@pytest.mark.asyncio
+async def test_an_idle_command_waits_for_an_image_still_being_prepared():
+    """Prism c2f91d63d749 (round 2): an idle ``/restart`` must not start ahead of an acknowledged
+    photo whose preparation has not settled (restart's work count does not see that handler)."""
+    adapter, log, gate = _rig()
+    adapter._active_sessions[SK] = asyncio.Event()
+    image_task = asyncio.create_task(adapter.handle_message(_photo()))
+    await _settle()
+    del adapter._active_sessions[SK]                         # the turn ends during the description
+    restart = MessageEvent(text="/restart", message_type=MessageType.TEXT, source=_source(),
+                           message_id="rs")
+    restart_task = asyncio.create_task(adapter.handle_message(restart))
+    await _settle()
+    assert ("start", "rs") not in log, "the idle /restart overtook the image in preparation"
+    gate.set()
+    await asyncio.wait_for(asyncio.gather(image_task, restart_task), 5)
+    assert log.index(("start", "img")) < len(log)
+    assert ("start", "rs") not in log[: log.index(("start", "img"))], log

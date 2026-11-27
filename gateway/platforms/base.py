@@ -5144,23 +5144,26 @@ class BasePlatformAdapter(ABC):
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
-        # Every recognized slash command is dispatched inline (``should_bypass_active_session``),
-        # never queued as a turn: it neither waits behind nor is counted as a follow-up. Counting
-        # one let an idle goal wake (it holds the goal lock across this call) wait on an inline
-        # ``/goal pause`` that needs that lock (Prism aa2f4134d3c7).
+        # A recognized slash command (``should_bypass_active_session``) is dispatched inline while a
+        # turn runs and is never counted as a follow-up in preparation: counting one let an idle
+        # goal wake (it holds the goal lock across this call) wait on an inline ``/goal pause`` that
+        # needs that lock (Prism aa2f4134d3c7). On an idle session it still waits its turn like any
+        # message, so an idle ``/restart`` cannot overtake an image still being prepared.
         from hermes_cli.commands import should_bypass_active_session
         ordered = not should_bypass_active_session(event.get_command())
         settled: Optional[asyncio.Event] = None
         # Admission runs in arrival order per session (Prism c2f91d63d749): asyncio.Lock wakes its
         # waiters FIFO and a newcomer cannot take a lock that has waiters, so a message that arrives
         # while an earlier one is parked below queues behind it even after a new turn has started.
-        # Uncontended, ``async with`` does not yield, so the ordinary path is unchanged.
-        async with (self._session_admission_lock(session_key) if ordered else contextlib.nullcontext()):
+        # Uncontended, ``async with`` does not yield, so the ordinary path is unchanged. A command
+        # for a running turn skips it (inline control commands never wait behind content).
+        use_lock = ordered or session_key not in self._active_sessions
+        async with (self._session_admission_lock(session_key) if use_lock else contextlib.nullcontext()):
             # An earlier follow-up may still be in the busy path (an image being described) while
             # the turn it targeted has ended. Starting this message now would run it ahead of that
             # one (t_04c0a6b0), so wait until it has steered or queued itself (and been started).
             # Before the admission check: nothing may await between that check and the claim.
-            if ordered and session_key not in self._active_sessions:
+            if session_key not in self._active_sessions:
                 await self._await_busy_followups_settled(session_key)
             # Atomic admission (Prism eb13daf988ed): a producer whose eligibility can go stale across
             # an adapter's own awaits (Discord resolves the channel first) re-checks here; nothing
