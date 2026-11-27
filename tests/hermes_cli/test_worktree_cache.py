@@ -792,6 +792,79 @@ def test_kanban_clone_options_the_cache_cannot_make_run_plain_with_a_row(env, co
     assert [r["reason"] for r in log(env)] == ["unsupported_opts"]
 
 
+# --------------------------------------------------------------------------- ZFS: EAGAIN on a dirty block (t_877a0b28)
+# nas-fleet (OpenZFS 2.3.4, block_cloning active, zfs_bclone_wait_dirty=0): cp --reflink=always of a file written
+# in the open txg fails "Resource temporarily unavailable"; the same file clones once the txg syncs. The probe wrote
+# a fresh file every time, so the host read as no_cow_fs on every create.
+
+
+def _eagain_then_real(monkeypatch, fails):
+    """subprocess.run that answers the first *fails* `cp` calls the way ZFS does for a dirty block."""
+    real = subprocess.run
+    calls = []
+
+    def fake(cmd, *a, **kw):
+        if cmd and cmd[0] == "cp":
+            calls.append(cmd)
+            if len(calls) <= fails:
+                return subprocess.CompletedProcess(cmd, 1, b"", b"cp: failed to clone 'x/p' from 'y/p': "
+                                                                 b"Resource temporarily unavailable\n")
+        return real(cmd, *a, **kw)
+
+    monkeypatch.setattr(wc.subprocess, "run", fake)
+    monkeypatch.setattr(wc, "EAGAIN_WAIT_S", 0)
+    monkeypatch.setattr(wc.sys, "platform", "linux")
+    return calls
+
+
+def test_cow_copy_retries_eagain_then_succeeds(tmp_path, monkeypatch):
+    (tmp_path / "s" / "d").mkdir(parents=True)
+    (tmp_path / "s" / "d" / "f").write_text("x")
+    (tmp_path / "dst").mkdir()
+    calls = _eagain_then_real(monkeypatch, fails=2)
+    monkeypatch.setattr(wc.subprocess, "run", _plain_cp(wc.subprocess.run))
+    wc._cow_copy(tmp_path / "s", ["d"], tmp_path / "dst")
+    assert (tmp_path / "dst" / "d" / "f").read_text() == "x" and len(calls) == 3
+
+
+def _plain_cp(run):
+    """Drop --reflink=always so the copy itself works on any filesystem (the retry logic is what is tested)."""
+    def inner(cmd, *a, **kw):
+        if cmd and cmd[0] == "cp" and "--reflink=always" in cmd:
+            cmd = [c for c in cmd if c != "--reflink=always"]
+        return run(cmd, *a, **kw)
+    return inner
+
+
+def test_cow_copy_gives_up_after_bounded_eagain(tmp_path, monkeypatch):
+    (tmp_path / "s").mkdir()
+    (tmp_path / "s" / "f").write_text("x")
+    (tmp_path / "dst").mkdir()
+    calls = _eagain_then_real(monkeypatch, fails=99)
+    with pytest.raises(OSError) as exc:
+        wc._cow_copy(tmp_path / "s", ["f"], tmp_path / "dst")
+    assert exc.value.errno == errno.EAGAIN and len(calls) == wc.EAGAIN_TRIES
+
+
+def test_cow_probe_passes_when_the_first_clone_is_eagain(tmp_path, monkeypatch):
+    calls = _eagain_then_real(monkeypatch, fails=1)
+    monkeypatch.setattr(wc.subprocess, "run", _plain_cp(wc.subprocess.run))
+    monkeypatch.setattr(wc, "_PROBE_CACHE", {})
+    assert wc.cow_probe(tmp_path) is True and len(calls) == 2
+
+
+def test_cow_probe_keeps_one_source_and_leaves_nothing_else(base, monkeypatch):
+    if not _real_cow(base):
+        pytest.skip("no clone-capable filesystem here; set HERMES_WORKTREE_CACHE_TEST_DIR")
+    monkeypatch.setattr(wc, "_PROBE_CACHE", {})
+    assert wc.cow_probe(base) is True
+    first = os.stat(base / wc.PROBE_SRC / "p").st_ino
+    monkeypatch.setattr(wc, "_PROBE_CACHE", {})
+    assert wc.cow_probe(base) is True
+    assert os.stat(base / wc.PROBE_SRC / "p").st_ino == first        # reused, not rewritten
+    assert sorted(p.name for p in base.iterdir() if p.name.startswith(".cow-probe")) == [wc.PROBE_SRC]
+
+
 def test_active_exit_code_follows_switch_scope_and_env(monkeypatch):
     import argparse
 

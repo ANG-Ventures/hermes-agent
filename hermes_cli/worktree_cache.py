@@ -627,7 +627,14 @@ _ERRNO_TEXT = (
     ("Invalid cross-device link", errno.EXDEV),
     ("Operation not supported", errno.EOPNOTSUPP),
     ("Not supported", errno.ENOTSUP),
+    ("Resource temporarily unavailable", errno.EAGAIN),
 )
+# OpenZFS block cloning refuses EAGAIN for blocks still dirty in the open txg (zfs_bclone_wait_dirty=0, the
+# default): a file written a moment ago clones once its txg syncs (zfs_txg_timeout, 5 s). Measured on nas-fleet
+# 2026-11-26 (ZFS 2.3.4, block_cloning active): cp --reflink=always of a fresh file -> EAGAIN, the same file
+# 12 s later -> rc 0 (t_877a0b28). Retried a bounded number of times; anything else fails at once.
+EAGAIN_TRIES = 4
+EAGAIN_WAIT_S = 2.5
 
 
 def _clonefile(src: Path, dst: Path) -> None:
@@ -661,35 +668,59 @@ def _cow_copy(src_dir: Path, names: Sequence[str], dst_dir: Path) -> None:
         for name in names:
             _clonefile(src_dir / name, dst_dir / name)
         return
-    res = subprocess.run(["cp", "-a", "--reflink=always", "--", *[str(src_dir / n) for n in names],
-                          str(dst_dir) + "/"], capture_output=True, check=False)
-    if res.returncode != 0:
+    for attempt in range(EAGAIN_TRIES):
+        res = subprocess.run(["cp", "-a", "--reflink=always", "--", *[str(src_dir / n) for n in names],
+                              str(dst_dir) + "/"], capture_output=True, check=False)
+        if res.returncode == 0:
+            return
         text = res.stderr.decode("utf-8", "replace")
         err = next((code for needle, code in _ERRNO_TEXT if needle in text), errno.EIO)
-        raise OSError(err, text.strip().splitlines()[-1] if text.strip() else "cp failed", str(src_dir))
+        if err != errno.EAGAIN or attempt == EAGAIN_TRIES - 1:
+            raise OSError(err, text.strip().splitlines()[-1] if text.strip() else "cp failed", str(src_dir))
+        time.sleep(EAGAIN_WAIT_S)   # cp -a again over the partial copy: it re-clones each entry in place
 
 
 _PROBE_CACHE: dict = {}
 
 
+PROBE_SRC = ".cow-probe-src"
+
+
+def _probe_source(directory: Path) -> Path:
+    """A 4 KiB probe file kept in *directory* across processes (non-zero bytes: a compressing filesystem
+    stores zeros as a hole). Kept, not rewritten per probe: on ZFS a fresh file only clones once its txg has
+    synced, so a per-process file would make every create wait out the EAGAIN retries (t_877a0b28)."""
+    src = directory / PROBE_SRC
+    if (src / "p").is_file():
+        return src
+    tmp = directory / f"{PROBE_SRC}.{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir()
+    (tmp / "p").write_bytes(b"cow-probe\n" * 409 + b"012345")
+    try:
+        os.rename(tmp, src)
+    except OSError:                        # another process placed it first (or a stale empty dir is there)
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not (src / "p").is_file():
+            raise
+    return src
+
+
 def cow_probe(directory: Path) -> bool:
-    """Can this filesystem clone? One 4 KiB file cloned once per ``st_dev`` per process."""
+    """Can this filesystem clone? The kept probe file cloned once per ``st_dev`` per process."""
     dev = _dev(directory)
     if dev in _PROBE_CACHE:
         return _PROBE_CACHE[dev]
-    src = directory / f".cow-probe-{os.getpid()}"
     dst = directory / f".cow-probe-{os.getpid()}.clone"
     ok = False
     try:
-        src.mkdir(exist_ok=True)
-        (src / "p").write_bytes(b"\0" * 4096)
+        src = _probe_source(directory)
         dst.mkdir(exist_ok=True)
         _cow_copy(src, ["p"], dst)
         ok = (dst / "p").stat().st_size == 4096
     except OSError:
         ok = False
     finally:
-        shutil.rmtree(src, ignore_errors=True)
         shutil.rmtree(dst, ignore_errors=True)
     _PROBE_CACHE[dev] = ok
     return ok
