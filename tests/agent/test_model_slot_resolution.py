@@ -32,6 +32,10 @@ def home(tmp_path, monkeypatch):
     root = tmp_path / "vhome"
     (root / "config").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(root))
+    # Offline models.dev: the live registry lists gpt-6.2-sol under several providers with
+    # different windows (vivgrid 1,000,000, cortecs 1,050,000), and its provider order decides
+    # what a provider-only lookup returns. The seat's base_url lookup never reads it.
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda *args, **kwargs: {})
     _write_view(root, {"sol": SOL_ID, "opus": "claude-opus-5-5"})
     return root
 
