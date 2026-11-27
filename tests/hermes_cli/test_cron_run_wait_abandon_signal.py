@@ -60,13 +60,40 @@ _CHILD = textwrap.dedent(
 
     sched.run_job_now = _fake_run_job_now
 
-    from hermes_cli.cron import cron_run_now
+    from hermes_cli.cron import _abandon_record_wait_secs, cron_run_now
+    print("WAIT", _abandon_record_wait_secs(), flush=True)  # the handler's own bound, for the parent
     sys.exit(cron_run_now("job1"))
     """
 )
 
 
-def _run_and_sigterm(tmp_path, *extra, hook_callback_timeout=None, wait_s=30):
+# Slack past the handler's own bound (``_abandon_record_wait_secs``, printed by the child) for
+# the flush and ``os._exit`` after the join. The wait follows the bound, so a slow record path
+# under load fails here only when it overruns the bound the product itself promises.
+_EXIT_MARGIN_S = 10.0
+
+
+def _capture_hung_child(proc, tmp_path):
+    """Keep evidence of a child still alive past its bound (t_32c2a03c): thread list and, on macOS,
+    ``sample`` stacks. On CI into ``test-results/`` (gitignored; the macOS job uploads it on failure),
+    else ``tmp_path``."""
+    base = REPO_ROOT / "test-results" if os.environ.get("CI") else tmp_path
+    diag = base / f"cron-wait-hung-{proc.pid}"
+    diag.mkdir(parents=True, exist_ok=True)
+    pid = str(proc.pid)
+    cmds = [("ps.txt", ["ps", "-M", "-p", pid] if sys.platform == "darwin" else ["ps", "-L", "-p", pid])]
+    if sys.platform == "darwin":
+        cmds.append(("sample.txt", ["sample", pid, "3"]))
+    for name, cmd in cmds:
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            (diag / name).write_text(res.stdout + res.stderr)
+        except (OSError, subprocess.SubprocessError) as exc:
+            (diag / name).write_text(f"{cmd}: {exc!r}\n")
+    return diag
+
+
+def _run_and_sigterm(tmp_path, *extra, hook_callback_timeout=None):
     out = tmp_path / "hooks.json"
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
@@ -82,14 +109,23 @@ def _run_and_sigterm(tmp_path, *extra, hook_callback_timeout=None, wait_s=30):
     try:
         deadline = time.monotonic() + 60
         line = ""
+        record_wait = None
         while time.monotonic() < deadline:
             line = proc.stdout.readline()
+            if line.startswith("WAIT "):
+                record_wait = float(line.split()[1])
             if "READY" in line or not line:
                 break
         assert "READY" in line, proc.stderr.read()
+        assert record_wait is not None, "child did not report the handler's record wait"
         sent = time.monotonic()
         proc.send_signal(signal.SIGTERM)
-        rc = proc.wait(timeout=wait_s)
+        try:
+            rc = proc.wait(timeout=record_wait + _EXIT_MARGIN_S)
+        except subprocess.TimeoutExpired:
+            diag = _capture_hung_child(proc, tmp_path)
+            pytest.fail(f"child alive {record_wait + _EXIT_MARGIN_S:.0f}s after SIGTERM "
+                        f"(handler bound {record_wait:.0f}s); stacks in {diag}")
         elapsed = time.monotonic() - sent
     finally:
         if proc.poll() is None:
@@ -109,7 +145,7 @@ def test_sigterm_during_cron_run_wait_records_abandoned_turn(tmp_path):
 def test_slow_record_within_hook_budget_lands_before_exit(tmp_path):
     """A recorder that takes 15 s (inside the 30 s default hook budget) still writes its row
     before the process exits (Prism 33a31a0e74cc: a literal 10 s wait killed it first)."""
-    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=15", wait_s=60)
+    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=15")
     assert rc == 128 + signal.SIGTERM
     assert out.exists(), f"record cut before it landed (exit after {elapsed:.1f}s)"
     calls = json.loads(out.read_text())
@@ -120,7 +156,7 @@ def test_slow_record_within_hook_budget_lands_before_exit(tmp_path):
 def test_record_wait_follows_configured_hook_budget(tmp_path):
     """The wait is the configured hook budget plus a margin, not a constant: with a 1 s budget a
     15 s recorder is abandoned and the process exits well before the record would land."""
-    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=15", hook_callback_timeout=1, wait_s=60)
+    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=15", hook_callback_timeout=1)
     assert rc == 128 + signal.SIGTERM
     assert not out.exists()
     assert elapsed < 15
@@ -141,8 +177,34 @@ def test_non_finite_hook_budget_still_waits_for_record(tmp_path, budget):
     """A non-finite ``plugins.hook_callback_timeout`` must not reach ``Thread.join`` (Prism
     f094fa505f02): ``join(timeout=nan)`` raises ValueError inside the handler, the process dies
     without ``os._exit(143)`` and the slow record is lost. Fall back to the finite default."""
-    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=3", hook_callback_timeout=budget, wait_s=60)
+    rc, out, elapsed = _run_and_sigterm(tmp_path, "delay=3", hook_callback_timeout=budget)
     assert rc == 128 + signal.SIGTERM
     assert out.exists(), f"record cut before it landed (exit after {elapsed:.1f}s)"
     calls = json.loads(out.read_text())
     assert calls == [{"hook": "on_turn_abandoned", "turn_id": "cron_x:turn1", "reason": "signal_15"}]
+
+
+@pytest.mark.platforms("posix")
+def test_record_path_import_runs_no_subprocess(tmp_path):
+    """The record path's modules are imported when the handler is installed, and importing them
+    must start no process (t_32c2a03c): ``agent.auxiliary_client`` read the version at import, 8
+    ``git`` calls that took ~3 s each on a loaded Mac and ran the handler past its bound."""
+    probe = textwrap.dedent(
+        """
+        import subprocess
+        spawned = []
+        _init = subprocess.Popen.__init__
+        def _spy(self, args, *a, **k):
+            spawned.append(args)
+            return _init(self, args, *a, **k)
+        subprocess.Popen.__init__ = _spy
+        import agent.turn_finalizer, cron.scheduler
+        print(spawned)
+        """
+    )
+    env = dict(os.environ, HERMES_HOME=str(tmp_path))
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    res = subprocess.run([sys.executable, "-c", probe], cwd=str(REPO_ROOT), env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip().splitlines()[-1] == "[]"
