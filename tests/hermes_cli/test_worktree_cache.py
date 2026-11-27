@@ -733,7 +733,50 @@ def test_kanban_clone_blob_none_fallback_still_forwards_the_filter(env, cow, mon
     assert row["reason"] == "no_template" and row["opts_served"] == ["--filter=blob:none"]
 
 
-@pytest.mark.parametrize("opts", [["--depth", "1"], ["--no-checkout"], ["--single-branch"], ["-o", "up"], ["-v"],
+def _refs_and_config(dest):
+    refs = _git("for-each-ref", "--format=%(refname) %(objectname)", cwd=dest)
+    cfg = subprocess.run(["git", "config", "--get-regexp", r"^remote\.origin\."], cwd=dest, text=True,
+                         capture_output=True).stdout
+    return refs, sorted(line for line in cfg.splitlines() if not line.startswith("remote.origin.url "))
+
+
+@pytest.mark.parametrize("opts", [["--single-branch"], ["--no-tags"], ["--single-branch", "--no-tags", "-b", "feat"]])
+def test_kanban_clone_single_branch_and_no_tags_are_served_from_the_template(env, cow, monkeypatch, opts):
+    """4 --single-branch and 1 --no-tags clones fell back ``unsupported_opts`` on the Studio (t_877a0b28):
+    both only shape the registering clone's refs and remote config, never the working tree, so the cache
+    passes them to that clone and the result equals a plain clone with the same options."""
+    _git("tag", "v1", env["c1"], cwd=env["bare"])
+    built(env)
+    want = env["base"] / "ws" / "plain"
+    long_opts = [o for o in opts if o.startswith("--")] + (["--branch=feat"] if "-b" in opts else [])
+    assert kc.clone(URL, str(want), ["--quiet", *long_opts]) == 0
+    seen = []
+    real = kc.clone
+    monkeypatch.setattr(kc, "clone", lambda url, dest, o: seen.append(list(o)) or real(url, dest, o))
+    dest = env["base"] / "ws" / "k"
+    assert _kanban_cli(["-q", *opts, URL, str(dest)], env["s"], monkeypatch) == 0
+    assert seen == []                                                   # no plain git clone
+    assert snapshot(dest) == snapshot(want)
+    assert _refs_and_config(dest) == _refs_and_config(want)
+    assert _status(dest) == ""
+    assert ledger(env) == []
+    (row,) = log(env)
+    assert row["cow"] is True and row["reason"] is None
+    assert row["opts_passed"] == [o for o in opts if o.startswith("--")]
+
+
+def test_kanban_clone_single_branch_fallback_forwards_the_options(env, cow, monkeypatch):
+    """No template: plain git gets --single-branch/--no-tags unchanged."""
+    seen = []
+    monkeypatch.setattr(kc, "clone", lambda url, dest, o: seen.append(list(o)) or 0)
+    dest = env["base"] / "ws" / "k"
+    assert _kanban_cli(["--single-branch", "--no-tags", URL, str(dest)], env["s"], monkeypatch) == 0
+    assert len(seen) == 1 and "--single-branch" in seen[0] and "--no-tags" in seen[0]
+    (row,) = log(env)
+    assert row["reason"] == "no_template"
+
+
+@pytest.mark.parametrize("opts", [["--depth", "1"], ["--no-checkout"], ["--no-single-branch"], ["-o", "up"], ["-v"],
                                   ["--filter", "tree:0"], ["--filter", "blob:none", "--depth", "1"]])
 def test_kanban_clone_options_the_cache_cannot_make_run_plain_with_a_row(env, cow, monkeypatch, opts):
     built(env)
