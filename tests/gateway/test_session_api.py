@@ -1,6 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
 import asyncio
+import contextlib
 import json
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1397,3 +1398,93 @@ async def test_session_sse_keeps_a_thread_event_whose_put_lands_after_the_run_re
     names = [ln[7:] for ln in sse.splitlines() if ln.startswith("event: ")]
     assert "assistant.commentary" in names, names
     assert names.index("assistant.commentary") < names.index("assistant.completed"), names
+
+
+@pytest.mark.asyncio
+async def test_session_sse_disconnect_during_flush_keeps_the_completed_reply(adapter, session_db, monkeypatch):
+    """``_run_agent`` has returned (agent unregistered) and the run coroutine waits in
+    ``events.flush()`` for a late thread-side put. A disconnect handled in that window cancels
+    the task. The completed reply must stay readable from the run record, not turn into
+    ``cancelled`` with no output (Prism d68ecf28d6a8 on #583)."""
+    import gateway.platforms.api_server as api_mod
+
+    class _LateLoop:
+        def __init__(self, loop):
+            self._loop = loop
+
+        def call_soon_threadsafe(self, cb, *args):
+            return self._loop.call_soon_threadsafe(self._loop.call_later, 0.05, cb, *args)
+
+    queues = []
+
+    class _LateQueue(api_mod._SessionEventQueue):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.loop = _LateLoop(self.loop)
+            self.flushing = False
+            queues.append(self)
+
+        async def flush(self):
+            self.flushing = True
+            await super().flush()
+
+    monkeypatch.setattr(api_mod, "_SessionEventQueue", _LateQueue)
+    session_id = session_db.create_session("flush-disconnect-session", "api_server")
+    go = threading.Event()
+    writes = {"count": 0}
+
+    class FakeAgent:
+        session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
+
+        def __init__(self, kw):
+            self._delta, self._interim = kw["stream_delta_callback"], kw["interim_assistant_callback"]
+            self.session_id = session_id
+
+        def interrupt(self, _message=None):
+            go.set()
+
+        def run_conversation(self, **_kw):
+            self._delta("partial ")
+            go.wait(timeout=5)
+            self._interim("Checking the docs first.", already_streamed=False)
+            return {"final_response": "Done.", "session_id": session_id}
+
+    class DisconnectDuringFlush:
+        async def prepare(self, request):
+            del request
+
+        async def write(self, payload):
+            del payload
+            writes["count"] += 1
+            if writes["count"] < 3:  # run.started, message.started
+                return
+            go.set()  # the delta was written: let the agent emit commentary and return
+            run_id = next(iter(adapter._run_statuses))
+            for _ in range(500):
+                if queues[0].flushing and run_id not in adapter._active_run_agents:
+                    break
+                await asyncio.sleep(0.005)
+            assert queues[0].flushing and queues[0]._pending
+            raise ConnectionResetError("simulated client disconnect during flush")
+
+    request = MagicMock()
+    request.headers = {}
+    request.match_info = {"session_id": session_id}
+    with patch.object(
+        adapter, "_get_existing_session_or_404", return_value=({"id": session_id}, None)
+    ), patch.object(
+        adapter, "_read_json_body", return_value=({"message": "go"}, None)
+    ), patch.object(
+        adapter, "_create_agent", side_effect=lambda **kw: FakeAgent(kw)
+    ), patch(
+        "gateway.platforms.api_server.web.StreamResponse", return_value=DisconnectDuringFlush(),
+    ):
+        # The disconnect drain cancels the run task (agent already unregistered) and awaits it,
+        # so the handler ends with that CancelledError; the run record is what this test reads.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(adapter._handle_session_chat_stream(request), timeout=10)
+
+    assert writes["count"] == 3
+    record = adapter._run_statuses[next(iter(adapter._run_statuses))]
+    assert record["status"] == "completed", record
+    assert record.get("output") == "Done."

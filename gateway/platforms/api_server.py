@@ -3791,6 +3791,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         approval_notify = self._register_session_stream_approval(run_id, events, message_id)
 
         async def _run_and_signal() -> None:
+            # Set once the turn's outcome is recorded; a disconnect that cancels the flush after
+            # that point must not overwrite it with "cancelled".
+            outcome_recorded = False
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
@@ -3803,7 +3806,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
                     active_run_id=run_id, approval_notify_callback=approval_notify,
                     approval_session_key=run_id, **ctx["run_kwargs"])
-                await events.flush()  # thread-side events land before assistant.completed
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
@@ -3812,25 +3814,31 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # Terminal status and flags come from the result (interrupted -> cancelled,
                 # unfinished -> failed); a late steer rides along as ``pending_steer`` for replay.
                 status, fields = _api_runs.terminal_run_status(result if is_dict else {})
-                await queue.put(_event_payload("assistant.completed", {
-                    "session_id": effective_session_id, "message_id": message_id,
-                    "content": final_response, **fields, "runtime": effective_runtime}))
-                await queue.put(_event_payload(f"run.{status}", {
-                    "session_id": effective_session_id, "message_id": message_id, **fields,
-                    "messages": turn_messages, "usage": usage, "runtime": effective_runtime}))
+                # Record before the flush below: it suspends, and a disconnect handled then
+                # (agent already gone) cancels this task.
                 self._set_run_status(
                     run_id, status, session_id=effective_session_id,
                     # The reply text, so a caller whose stream died can still read it from
                     # GET /v1/runs/{run_id}; POST /v1/runs already records output in `_finish`.
                     output=final_response, usage=usage,
                     last_event=f"run.{status}", **fields)
+                outcome_recorded = True
+                await events.flush()  # thread-side events land before assistant.completed
+                await queue.put(_event_payload("assistant.completed", {
+                    "session_id": effective_session_id, "message_id": message_id,
+                    "content": final_response, **fields, "runtime": effective_runtime}))
+                await queue.put(_event_payload(f"run.{status}", {
+                    "session_id": effective_session_id, "message_id": message_id, **fields,
+                    "messages": turn_messages, "usage": usage, "runtime": effective_runtime}))
             except asyncio.CancelledError:
-                self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
+                if not outcome_recorded:
+                    self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
                 raise
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 self._set_run_status(
                     run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
+                outcome_recorded = True
                 await events.flush()
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
