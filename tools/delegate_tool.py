@@ -1822,7 +1822,11 @@ def _start_late_completion(
             steer = getattr(parent_agent, "steer", None)
             if callable(steer):
                 try:
-                    delivered = bool(steer(text))
+                    # Buffered even if the parent's turn has closed steering: the parent's next
+                    # turn drains it, as on main (t_2b16f0e6). The only caller of this bypass.
+                    from agent.interrupt_control import late_result_nudge
+                    with late_result_nudge():
+                        delivered = bool(steer(text))
                 except Exception as exc:
                     logger.debug("late result steer into parent failed: %s", exc)
         logger.info(

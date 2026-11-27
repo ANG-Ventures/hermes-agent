@@ -841,7 +841,10 @@ def finalize_turn(
         result["cleanup_errors"] = _cleanup_errors
     # A /steer landing after the final assistant turn has no tool batch to drain into;
     # hand it back so it becomes the next user turn instead of being lost.
-    _leftover_steer = agent._drain_pending_steer()
+    # Drain and close steering under one lock (t_2b16f0e6): a later steer() is refused and the
+    # surface queues it, instead of it waiting unread in this finished agent.
+    _drain_and_close = getattr(agent, "_drain_pending_steer_and_close", None)
+    _leftover_steer = _drain_and_close() if callable(_drain_and_close) else agent._drain_pending_steer()
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
