@@ -1526,9 +1526,6 @@ class GatewayBusySessionMixin:
             event.message_type == MessageType.TEXT
             and self._effective_busy_text_mode(event.source) == "queue"
             and effective_mode != "steer"
-            # With messages waiting behind the head, the adapter's debounce flush would merge this
-            # text into the head, ahead of them: take the runner FIFO instead (Prism f20c674fe70b).
-            and not self._overflow_queue(session_key)
         ):
             return False
 
