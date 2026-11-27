@@ -1,6 +1,7 @@
 """Cron subcommand for hermes CLI."""
 
 import contextlib
+import importlib
 import json
 import math
 import re
@@ -406,6 +407,13 @@ def _install_abandon_on_signal() -> Dict[int, Any]:
         return previous
     fired = threading.Event()
     record_wait = _abandon_record_wait_secs()
+    # Load the record path's modules now, not in the handler (t_32c2a03c): imported after the
+    # signal, agent.turn_finalizer pulled ~190 modules on the recorder thread and the handler's
+    # bounded wait ran out on a loaded host. The job itself imports them anyway. A failure here
+    # is left to the recorder, which swallows it.
+    for module in ("agent.turn_finalizer", "cron.scheduler"):
+        with contextlib.suppress(Exception):
+            importlib.import_module(module)
 
     def _handler(signum, _frame):
         # One-shot: a second signal (SIGHUP after SIGTERM) must not record twice.

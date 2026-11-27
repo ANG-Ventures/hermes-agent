@@ -195,6 +195,17 @@ jobs:
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
 
+      # tests/hermes_cli/test_cron_run_wait_abandon_signal.py leaves `ps -M` + `sample` of a child
+      # still alive past its SIGTERM bound in test-results/cron-wait-hung-<pid> (t_32c2a03c).
+      - name: Upload hung-child stacks
+        if: failure() && runner.os == 'macOS'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cron-wait-hung-stacks
+          path: test-results/cron-wait-hung-*
+          if-no-files-found: ignore
+          retention-days: 14
+
   install-update-e2e:
     # The real scripts/install.ps1 -> `hermes update` HEAD -> NEXT journey on a real Windows
     # host (tests/e2e/core/windows_update): fresh install, gateway across the update,
