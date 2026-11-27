@@ -25,6 +25,10 @@ FORWARDED_UV_SETTINGS = frozenset({
     "UV_INDEX_URL", "UV_EXTRA_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX", "UV_NO_INDEX",
     "UV_FIND_LINKS", "UV_INDEX_STRATEGY", "UV_KEYRING_PROVIDER",
     "UV_NATIVE_TLS", "UV_INSECURE_HOST", "UV_HTTP_TIMEOUT",
+    # How uv links cache files into an environment. It never selects what gets
+    # installed; setup-pm sets it on ZFS, where cloning a just-written file
+    # fails EAGAIN (os error 11) until the pool commits (t_7ba9f134).
+    "UV_LINK_MODE",
 })
 
 _UV_INDEX_KNOBS = ("UV_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX")

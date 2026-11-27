@@ -25,6 +25,7 @@ def test_pip_index_reaches_uv_but_ambient_uv_selection_does_not(clean_index_env,
     monkeypatch.setenv("PIP_TRUSTED_HOST", "mirror.example")
     monkeypatch.setenv("UV_HTTP_TIMEOUT", "300")
     monkeypatch.setenv("UV_INDEX_CORP_PASSWORD", "s3cret")
+    monkeypatch.setenv("UV_LINK_MODE", "hardlink")
     monkeypatch.setenv("UV_PYTHON", "/poison/python")
     monkeypatch.setenv("UV_CACHE_DIR", "/poison/cache")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/poison/venv")
@@ -35,6 +36,7 @@ def test_pip_index_reaches_uv_but_ambient_uv_selection_does_not(clean_index_env,
     assert env["UV_INSECURE_HOST"] == "mirror.example"
     assert env["UV_HTTP_TIMEOUT"] == "300"
     assert env["UV_INDEX_CORP_PASSWORD"] == "s3cret"
+    assert env["UV_LINK_MODE"] == "hardlink"
     assert not {"UV_PYTHON", "UV_CACHE_DIR", "UV_PROJECT_ENVIRONMENT"} & env.keys()
 
 
