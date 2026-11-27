@@ -660,3 +660,7 @@ def test_every_transition_logs_one_line_per_item(rig, caplog):
         qm.log_items(runner, "hold", KEY, [_ev("esc\x1b[2Jcode")])
     assert "preview=-" in caplog.text and "secret" not in caplog.text
     assert "preview=esc?[2Jcode" in caplog.text and "\x1b" not in caplog.text   # control chars (222226ef4636)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):   # redact before the 60-char cut (8e6f86bd338c)
+        qm.log_items(runner, "add", KEY, [_ev("postgresql://user:" + "x" * 42 + "@db.example/app")])
+    assert "x" * 20 not in caplog.text, caplog.text

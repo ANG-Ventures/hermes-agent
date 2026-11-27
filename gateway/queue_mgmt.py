@@ -64,7 +64,14 @@ def log_items(runner: Any, op: str, key: str, items: Any, *, with_preview: bool 
     try:
         for pos, e in enumerate(list(items or ()), 1):
             kind = "system" if is_system_event(runner, e) else "user"
-            text = "".join(c if c.isprintable() else "?" for c in preview(e)) if with_preview else "-"
+            text = "-"
+            if with_preview:   # redact the FULL text first: a cut can drop the delimiter a pattern needs
+                from types import SimpleNamespace
+
+                from agent.redact import redact_sensitive_text
+                full = SimpleNamespace(text=redact_sensitive_text(str(getattr(e, "text", "") or "")),
+                                       media_urls=getattr(e, "media_urls", None))
+                text = "".join(c if c.isprintable() else "?" for c in preview(full))
             logger.info("queue_mgmt item op=%s session=%s pos=%d msg_id=%s kind=%s preview=%s",
                         op, key, pos, getattr(e, "message_id", None), kind, text)
     except Exception:
