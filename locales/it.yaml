@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ Fermato. Puoi continuare questa sessione."
     no_active: "Nessuna attività attiva da fermare."
     force_stopped_pending: "⚡ Interruzione forzata. L'agente si stava ancora avviando — sessione sbloccata."
-    queue_held: "{count} prompt in coda trattenuti. /queue run li rilascia, /queue list li mostra, /queue clear li elimina."
+    queue_held: "{count} prompt in coda trattenuti. Partono dopo il prossimo turno completato; /queue run li avvia ora, /queue clear li elimina."
     queue_released: "Rilascio ora {count} prompt in coda, in ordine."
   title:
     db_unavailable: "Database delle sessioni non disponibile."

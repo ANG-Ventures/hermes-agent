@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ Gestoppt. Sie können diese Sitzung fortsetzen."
     no_active: "Keine aktive Aufgabe zum Stoppen."
     force_stopped_pending: "⚡ Erzwungen gestoppt. Der Agent war noch am Starten — Sitzung entsperrt."
-    queue_held: "{count} eingereihte(r) Prompt(s) zurückgehalten. /queue run gibt sie frei, /queue list zeigt sie an, /queue clear verwirft sie."
+    queue_held: "{count} eingereihte(r) Prompt(s) zurückgehalten. Sie laufen nach dem nächsten abgeschlossenen Zug; /queue run startet sie sofort, /queue clear verwirft sie."
     queue_released: "Gebe jetzt {count} eingereihte(n) Prompt(s) der Reihe nach frei."
   title:
     db_unavailable: "Sitzungsdatenbank nicht verfügbar."

@@ -492,7 +492,7 @@ gateway:
     stopped: "⚡ Stopping — finishing the current step and halting. You can continue this session."
     no_active: "No active task to stop."
     force_stopped_pending: "⚡ Force-stopped. The agent was still starting — session unlocked."
-    queue_held: "{count} queued prompt(s) held. /queue run releases them, /queue list shows them, /queue clear drops them."
+    queue_held: "{count} queued prompt(s) held. They run after the next completed turn; /queue run runs them now, /queue clear drops them."
     queue_released: "Releasing {count} queued prompt(s) now, in order."
   title:
     db_unavailable: "Session database not available."

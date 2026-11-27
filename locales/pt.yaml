@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ Parado. Podes continuar esta sessão."
     no_active: "Não há nenhuma tarefa ativa para parar."
     force_stopped_pending: "⚡ Interrupção forçada. O agente ainda estava iniciando — sessão desbloqueada."
-    queue_held: "{count} prompt(s) na fila retido(s). /queue run liberta-os, /queue list mostra-os, /queue clear descarta-os."
+    queue_held: "{count} prompt(s) na fila retido(s). Correm após o próximo turno concluído; /queue run corre-os já, /queue clear descarta-os."
     queue_released: "A libertar agora {count} prompt(s) da fila, por ordem."
   title:
     db_unavailable: "Base de dados de sessões indisponível."

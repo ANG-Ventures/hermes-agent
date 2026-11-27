@@ -491,7 +491,7 @@ gateway:
     stopped: "⚡ Leállítva. Folytathatod ezt a munkamenetet."
     no_active: "Nincs leállítható aktív feladat."
     force_stopped_pending: "⚡ Kényszerített leállítás. Az ügynök még csak indult — a munkamenet feloldva."
-    queue_held: "{count} sorban álló prompt visszatartva. A /queue run elindítja, a /queue list megmutatja, a /queue clear eldobja őket."
+    queue_held: "{count} sorban álló prompt visszatartva. A következő befejezett kör után futnak; a /queue run most elindítja, a /queue clear eldobja őket."
     queue_released: "{count} sorban álló prompt elindítása most, sorrendben."
   title:
     db_unavailable: "A munkamenet-adatbázis nem érhető el."

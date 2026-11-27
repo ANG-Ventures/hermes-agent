@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ Durduruldu. Bu oturuma devam edebilirsin."
     no_active: "Durdurulacak aktif görev yok."
     force_stopped_pending: "⚡ Zorla durduruldu. Ajan henüz başlıyordu — oturum kilidi açıldı."
-    queue_held: "Kuyruktaki {count} istem bekletiliyor. /queue run onları serbest bırakır, /queue list gösterir, /queue clear siler."
+    queue_held: "Kuyruktaki {count} istem bekletiliyor. Bir sonraki tamamlanan turdan sonra çalışırlar; /queue run hemen çalıştırır, /queue clear siler."
     queue_released: "Kuyruktaki {count} istem şimdi sırayla serbest bırakılıyor."
   title:
     db_unavailable: "Oturum veritabanı kullanılamıyor."

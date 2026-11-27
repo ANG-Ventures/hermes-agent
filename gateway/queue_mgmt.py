@@ -9,8 +9,13 @@ Stores (spec 2026-10-12_gateway-queue-management-spec.md):
 * **active** — today's queue: the adapter slot ``adapter._pending_messages[key]`` (item 1, a
   run-next trigger several drains consume) + ``SessionState.conversation.queued_events``.
 * **held** — ``SessionState.conversation.held_queue``. ``/stop`` moves every user item here (D14).
-  No drain, rescue, or promotion path reads it; only ``/queue run`` / ``/queue clear`` /
-  a session boundary empty it.
+  No drain, rescue, or promotion path reads it; ``/queue run`` / ``/queue clear`` / a session
+  boundary empty it, and so does the next human turn of the session that completes normally
+  (D5, Ace 2026-11-26, Discord 1575714860740907081): ``release_on_turn_end``, called from that
+  turn's own post-turn drain after its run generation proved current.
+
+Every transition logs one ``queue_mgmt item op=...`` line per item moved (``log_items``; Ace
+2026-11-26, Discord 1575715843738705972) next to its summary line.
 
 A new ``/queue <prompt>`` (and ``/queue add``) always joins the ACTIVE queue, held or not (D14,
 Ace 2026-11-26, Discord 1575705667786776607): busy it runs after the current turn, idle it runs now;
@@ -51,6 +56,17 @@ def preview(event: Any) -> str:
 
 
 # --------------------------------------------------------------------------- stores
+
+def log_items(runner: Any, op: str, key: str, items: Any) -> None:
+    """One line per item, so gateway.log alone answers what was held and where it went. Never raises."""
+    try:
+        for pos, e in enumerate(list(items or ()), 1):
+            kind = "system" if is_system_event(runner, e) else "user"
+            logger.info("queue_mgmt item op=%s session=%s pos=%d msg_id=%s kind=%s preview=%r",
+                        op, key, pos, getattr(e, "message_id", None), kind, preview(e))
+    except Exception:
+        logger.debug("queue_mgmt item log failed for %s (%s)", key, op, exc_info=True)
+
 
 def held_list(runner: Any, key: str) -> Optional[List[Any]]:
     state = runner._peek_session_state(key)
@@ -112,6 +128,7 @@ def hold_user_items(runner: Any, key: str, adapter: Any) -> int:
                 del held_store[before:]
                 return before
             logger.info("queue_mgmt op=hold session=%s moved=%d held=%d", key, len(users), len(held_store))
+            log_items(runner, "hold", key, users)
         return len(held_list(runner, key) or [])
     except Exception:
         logger.warning("queue_mgmt hold failed for %s; queue left as-is", key, exc_info=True)
@@ -133,6 +150,7 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
     if is_system_event(runner, event):
         state.held_queue.append(event)
         logger.info("queue_mgmt op=hold_wake session=%s held=%d", key, len(state.held_queue))
+        log_items(runner, "hold_wake", key, [event])
         return True
     if event.get_command():
         return False
@@ -237,6 +255,7 @@ def apply_management(runner: Any, op: QueueOp, key: str, adapter: Any) -> str:
         if not _write_store(runner, key, adapter, which, kept):
             return t("gateway.queue.unavailable")
         logger.info("queue_mgmt op=clear session=%s store=%s depth_before=%d depth_after=%d", key, which, before, len(kept))
+        log_items(runner, "clear", key, [e for e in items if not is_system_event(runner, e)])
         if not dropped:
             return t("gateway.queue.empty")
         return t("gateway.queue.cleared_one" if dropped == 1 else "gateway.queue.cleared_other", count=dropped)
@@ -251,6 +270,7 @@ def apply_management(runner: Any, op: QueueOp, key: str, adapter: Any) -> str:
         if not _write_store(runner, key, adapter, which, items):
             return t("gateway.queue.unavailable")
         logger.info("queue_mgmt op=rm session=%s store=%s depth_before=%d depth_after=%d", key, which, before, len(items))
+        log_items(runner, "rm", key, [removed])
         return t("gateway.queue.removed", index=idx, preview=preview(removed))
     if op.kind == "edit":
         if not op.text:
@@ -315,9 +335,9 @@ def cap_reply(runner: Any, key: str, adapter: Any) -> Optional[str]:
 
 def held_note(runner: Any, key: str) -> str:
     """D14 (Ace 2026-11-26): a new /queue item goes to the active queue; this line tells the user
-    the older held prompts are still waiting. Empty when nothing is held."""
-    held = held_list(runner, key)
-    return ("\n" + t("gateway.queue.still_held", count=len(held))) if held else ""
+    the older held prompts are still waiting. Counts user items only; empty when none is held."""
+    count = sum(1 for e in held_list(runner, key) or () if not is_system_event(runner, e))
+    return ("\n" + t("gateway.queue.still_held", count=count)) if count else ""
 
 
 MERGE_SEPARATOR = "\n\n"
@@ -362,7 +382,7 @@ def merge_user_events(events: List[Any]) -> Any:
     return head
 
 
-def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
+def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_run") -> Optional[int]:
     """Move held items back into the active store (slot = item 1) and return the user-item count
     released. The adapter's existing end-of-task / post-command drain is the ONLY dispatcher
     (spec D16/I9: single door); this function never starts a task. None = no slot storage.
@@ -394,9 +414,30 @@ def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
         return None
     if held:
         del held[:]
-    logger.info("queue_mgmt op=release session=%s released=%d mode=%s armed=%d", key, released,
-                release_mode(runner), len(system) + len(users))
+    logger.info("queue_mgmt op=release session=%s released=%d mode=%s armed=%d trigger=%s", key, released,
+                release_mode(runner), len(system) + len(users), trigger)
+    log_items(runner, "release", key, [e for e in combined if is_system_event(runner, e)]
+              + [e for e in combined if not is_system_event(runner, e)])
     return released
+
+
+def release_on_turn_end(runner: Any, key: str, adapter: Any) -> int:
+    """D5 (Ace 2026-11-26, Discord 1575714860740907081): the next completed human turn releases the
+    held store through ``restage_held`` (same writer as ``/queue run``), oldest first; that turn's
+    own post-turn drain then dispatches item 1. The caller has already checked the turn's run
+    generation is current, its reply was produced and a human started it. Nothing to release while
+    automatic work is paused or when only ``[system]`` items are held. Never raises."""
+    try:
+        state = runner._peek_session_state(key)
+        held = getattr(getattr(state, "conversation", None), "held_queue", None) or []
+        if state is None or state.conversation.automatic_turns_paused is True:
+            return 0
+        if not any(not is_system_event(runner, e) for e in held):
+            return 0
+        return restage_held(runner, key, adapter, trigger="turn_end") or 0
+    except Exception:
+        logger.warning("queue_mgmt turn-end release failed for %s; items stay held", key, exc_info=True)
+        return 0
 
 
 async def release(runner: Any, key: str, source: Any, adapter: Any, *, busy: bool) -> str:
@@ -443,7 +484,7 @@ def stop_reply_suffix(runner: Any, key: str, adapter: Any) -> str:
             return ""
         if (getattr(runner, "_stop_releases_queue", False) is True
                 and runner._session_state(key).conversation.automatic_turns_paused is not True):
-            count = restage_held(runner, key, adapter)
+            count = restage_held(runner, key, adapter, trigger="stop")
             if count:
                 return "\n" + t("gateway.stop.queue_released", count=count)
         return "\n" + t("gateway.stop.queue_held", count=len(held_list(runner, key) or []))
@@ -494,6 +535,7 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
         users_overflow = [e for e in overflow if not is_system_event(runner, e)]
         if reason in USER_RESET_REASONS:
             note_reset_drop(runner, key, len(held) + len(users_overflow))
+            log_items(runner, "reset_drop", key, held + users_overflow)
             return None
         # Automatic resets have no reply target, so they must not drop anything (D5/D21): carry the
         # held items AND any active user items into the held store. An unknown reason is treated
@@ -505,6 +547,7 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
         elif users_overflow:
             logger.info("queue_mgmt op=auto_reset session=%s carried %d active item(s) into held",
                         key, len(users_overflow))
+        log_items(runner, "auto_reset", key, carried)
         return carried or None
     except Exception:
         logger.warning("queue_mgmt before_scope_clear failed for %s (%s); clearing without carry",

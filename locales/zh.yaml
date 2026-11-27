@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ 已停止。你可以继续此会话。"
     no_active: "没有可停止的活跃任务。"
     force_stopped_pending: "⚡ 已强制停止。代理仍在启动中——会话已解锁。"
-    queue_held: "已暂留 {count} 条排队的提示词。/queue run 释放、/queue list 查看、/queue clear 丢弃。"
+    queue_held: "已暂留 {count} 条排队的提示词，将在下一轮完成后运行。/queue run 立即运行、/queue clear 丢弃。"
     queue_released: "正在按顺序释放 {count} 条排队的提示词。"
   title:
     db_unavailable: "会话数据库不可用。"
