@@ -70,6 +70,9 @@ DEFAULT_REPOS = (
     "ANG-Ventures/pipecat-house-voice",
     "ANG-Ventures/prism-router",
 )
+# dispatcher_worktree stays unwired (t_877a0b28): 11 of 2,161 Studio cards in the 7 days to 2026-11-26 were
+# worktree-kind, all anchored in non-fleet repos under /Users (Projects/explainer-video, golden-display-config):
+# not in ``repos`` and on another volume than the templates root, so every create would fall back.
 KNOWN_SCOPES = ("dispatcher_worktree", "kanban_clone", "port_clone", "manual", "deploy_selftest")
 
 REASONS = (
@@ -627,7 +630,14 @@ _ERRNO_TEXT = (
     ("Invalid cross-device link", errno.EXDEV),
     ("Operation not supported", errno.EOPNOTSUPP),
     ("Not supported", errno.ENOTSUP),
+    ("Resource temporarily unavailable", errno.EAGAIN),
 )
+# OpenZFS block cloning refuses EAGAIN for blocks still dirty in the open txg (zfs_bclone_wait_dirty=0, the
+# default): a file written a moment ago clones once its txg syncs (zfs_txg_timeout, 5 s). Measured on nas-fleet
+# 2026-11-26 (ZFS 2.3.4, block_cloning active): cp --reflink=always of a fresh file -> EAGAIN, the same file
+# 12 s later -> rc 0 (t_877a0b28). Retried a bounded number of times; anything else fails at once.
+EAGAIN_TRIES = 4
+EAGAIN_WAIT_S = 2.5
 
 
 def _clonefile(src: Path, dst: Path) -> None:
@@ -661,35 +671,59 @@ def _cow_copy(src_dir: Path, names: Sequence[str], dst_dir: Path) -> None:
         for name in names:
             _clonefile(src_dir / name, dst_dir / name)
         return
-    res = subprocess.run(["cp", "-a", "--reflink=always", "--", *[str(src_dir / n) for n in names],
-                          str(dst_dir) + "/"], capture_output=True, check=False)
-    if res.returncode != 0:
+    for attempt in range(EAGAIN_TRIES):
+        res = subprocess.run(["cp", "-a", "--reflink=always", "--", *[str(src_dir / n) for n in names],
+                              str(dst_dir) + "/"], capture_output=True, check=False)
+        if res.returncode == 0:
+            return
         text = res.stderr.decode("utf-8", "replace")
         err = next((code for needle, code in _ERRNO_TEXT if needle in text), errno.EIO)
-        raise OSError(err, text.strip().splitlines()[-1] if text.strip() else "cp failed", str(src_dir))
+        if err != errno.EAGAIN or attempt == EAGAIN_TRIES - 1:
+            raise OSError(err, text.strip().splitlines()[-1] if text.strip() else "cp failed", str(src_dir))
+        time.sleep(EAGAIN_WAIT_S)   # cp -a again over the partial copy: it re-clones each entry in place
 
 
 _PROBE_CACHE: dict = {}
 
 
+PROBE_SRC = ".cow-probe-src"
+
+
+def _probe_source(directory: Path) -> Path:
+    """A 4 KiB probe file kept in *directory* across processes (non-zero bytes: a compressing filesystem
+    stores zeros as a hole). Kept, not rewritten per probe: on ZFS a fresh file only clones once its txg has
+    synced, so a per-process file would make every create wait out the EAGAIN retries (t_877a0b28)."""
+    src = directory / PROBE_SRC
+    if (src / "p").is_file():
+        return src
+    tmp = directory / f"{PROBE_SRC}.{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir()
+    (tmp / "p").write_bytes(b"cow-probe\n" * 409 + b"012345")
+    try:
+        os.rename(tmp, src)
+    except OSError:                        # another process placed it first (or a stale empty dir is there)
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not (src / "p").is_file():
+            raise
+    return src
+
+
 def cow_probe(directory: Path) -> bool:
-    """Can this filesystem clone? One 4 KiB file cloned once per ``st_dev`` per process."""
+    """Can this filesystem clone? The kept probe file cloned once per ``st_dev`` per process."""
     dev = _dev(directory)
     if dev in _PROBE_CACHE:
         return _PROBE_CACHE[dev]
-    src = directory / f".cow-probe-{os.getpid()}"
     dst = directory / f".cow-probe-{os.getpid()}.clone"
     ok = False
     try:
-        src.mkdir(exist_ok=True)
-        (src / "p").write_bytes(b"\0" * 4096)
+        src = _probe_source(directory)
         dst.mkdir(exist_ok=True)
         _cow_copy(src, ["p"], dst)
         ok = (dst / "p").stat().st_size == 4096
     except OSError:
         ok = False
     finally:
-        shutil.rmtree(src, ignore_errors=True)
         shutil.rmtree(dst, ignore_errors=True)
     _PROBE_CACHE[dev] = ok
     return ok
@@ -743,16 +777,19 @@ def _rm(path: Optional[Path]) -> None:
 
 def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional[str] = None,
           rev: Optional[str] = None, quiet: bool = True, s: Optional[Settings] = None,
-          served_opts: Sequence[str] = ()) -> int:
+          served_opts: Sequence[str] = (), register_opts: Sequence[str] = ()) -> int:
     """Clone mode (spec 5.3/5.4): an independent clone borrowing from the mirror whose
     working files come from the template. Same exit code as the git command it replaces.
 
     *served_opts* are caller options a full template copy already satisfies (``--filter=blob:none``):
-    the cached path ignores them and logs them, a plain-git fallback forwards them unchanged."""
+    the cached path ignores them and logs them, a plain-git fallback forwards them unchanged.
+    *register_opts* (``--single-branch``, ``--no-tags``) only shape refs and remote config: the
+    registering clone gets them, and so does a plain-git fallback."""
     s = s or settings()
     dest = dest or kanban_clone.default_dest(url)
+    plain_opts = [*served_opts, *register_opts]
     if not cache_active(caller, s):
-        return plain_clone(url, dest, branch, rev, quiet, served_opts)
+        return plain_clone(url, dest, branch, rev, quiet, plain_opts)
 
     t0 = time.monotonic()
     dest_p = Path(dest).absolute()
@@ -761,6 +798,8 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
            "cow": False, "reason": None, "T": None, "C": None, "bytes_logical": None}
     if served_opts:
         row["opts_served"] = list(served_opts)
+    if register_opts:
+        row["opts_passed"] = list(register_opts)
     gen: Optional[Path] = None
     staging: Optional[Path] = None
 
@@ -769,13 +808,13 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
         meta = read_meta(gen) if gen else None
         nbytes = (meta or {}).get("tree_bytes")
         record_fallback(caller, reason, slug, gen, dest_p, err=err, nbytes=nbytes)
-        rc = plain_clone(url, dest, branch, rev, quiet, served_opts)
+        rc = plain_clone(url, dest, branch, rev, quiet, plain_opts)
         row.update(reason=reason, bytes_logical=nbytes, rc=rc, ms=round((time.monotonic() - t0) * 1000))
         _log(row)
         return rc
 
     if dest_p.exists() and (not dest_p.is_dir() or any(dest_p.iterdir())):
-        return plain_clone(url, dest, branch, rev, quiet, served_opts)     # git reports the real error
+        return plain_clone(url, dest, branch, rev, quiet, plain_opts)      # git reports the real error
     if slug is None or slug not in s.repos:
         return fallback("no_template")
     troot = templates_root(dest_p.parent)       # the root on the destination's volume (t_259301d7)
@@ -853,7 +892,7 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
     # Register (step 5): an ordinary --no-checkout clone of the real remote.
     index_src = staging.with_name(staging.name + ".idx")
     try:
-        res = _git(*_clone_cmd(url, dest_p, [f"--branch={branch}"] if branch else []))
+        res = _git(*_clone_cmd(url, dest_p, ([f"--branch={branch}"] if branch else []) + list(register_opts)))
         if res.returncode != 0:
             sys.stderr.write(res.stderr.decode("utf-8", "replace"))
             _rm(staging)
@@ -921,9 +960,12 @@ def clone(url: str, dest: Optional[str] = None, *, caller: str, branch: Optional
 # --------------------------------------------------------------------------- callers (build card 3)
 
 # `hermes kanban clone` options the cache reproduces exactly: everything else (a shallow clone, a
-# filter other than blob:none, --no-checkout, --single-branch, --origin, ...) asks for a .git the cache does
-# not make, so it runs plain git with an ``unsupported_opts`` row.
+# filter other than blob:none, --no-checkout, --origin, ...) asks for a .git the cache does not make, so it
+# runs plain git with an ``unsupported_opts`` row.
 _KANBAN_CLONE_OK = ("--quiet",)
+# Options that only shape the registering clone's refs and remote config (which branches and tags it
+# fetches, remote.origin.fetch / tagOpt), never the working tree: passed to that clone (t_877a0b28).
+_KANBAN_CLONE_REGISTER = ("--single-branch", "--no-tags")
 # Options a full template copy satisfies: a blob:none partial clone is a strict subset of the
 # full-object clone the cache registers (same refs, same history; blobs present, not lazy).
 # Served from the cache and logged as ``opts_served``; a fallback forwards them to plain git.
@@ -940,11 +982,14 @@ def kanban_clone_entry(url: str, dest: Optional[str], git_opts: Sequence[str] = 
     branch: Optional[str] = None
     other = []
     served = []
+    register = []
     for opt in git_opts:
         if opt.startswith("--branch="):
             branch = opt.split("=", 1)[1]
         elif opt in _KANBAN_CLONE_SERVED:
             served.append(opt)
+        elif opt in _KANBAN_CLONE_REGISTER:
+            register.append(opt)
         elif opt not in _KANBAN_CLONE_OK:
             other.append(opt)
     if other:
@@ -954,7 +999,7 @@ def kanban_clone_entry(url: str, dest: Optional[str], git_opts: Sequence[str] = 
               "dest": str(target), "cow": False, "reason": "unsupported_opts", "opts": other})
         return kanban_clone.clone(url, dest, git_opts)
     return clone(url, dest, caller="kanban_clone", branch=branch, quiet="--quiet" in git_opts, s=s,
-                 served_opts=served)
+                 served_opts=served, register_opts=register)
 
 
 # --------------------------------------------------------------------------- status + CLI
