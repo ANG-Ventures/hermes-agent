@@ -258,7 +258,8 @@ async def test_new_queue_item_goes_active_while_held(rig):
 # --------------------------------------------------------------------------- R8: held releases on the next completed turn
 # Ace 2026-11-26 (Discord 1575714860740907081): /stop still holds (R4), but the session's next completed human
 # turn releases the held items oldest first through restage_held. Red if release_on_turn_end stops restaging,
-# releases while automatic work is paused or with only [system] items held, or _run_agent_inner stops calling it.
+# releases while automatic work is paused or with only [system] items held, or _run_agent_inner stops calling it
+# or stops requiring an explicit completed=True result (a truncated reply must not release).
 
 def test_completed_turn_releases_held_oldest_first(rig):
     runner, adapter = rig
@@ -280,4 +281,6 @@ def test_turn_end_drain_calls_the_release():  # noqa: source-proxy structural: t
     import inspect
 
     from gateway.run_turn import GatewayTurnMixin
-    assert "queue_mgmt.release_on_turn_end(" in inspect.getsource(GatewayTurnMixin._run_agent_inner)
+    src = inspect.getsource(GatewayTurnMixin._run_agent_inner)
+    assert "queue_mgmt.release_on_turn_end(" in src
+    assert 'result.get("completed") is True' in src   # only an explicitly complete turn releases

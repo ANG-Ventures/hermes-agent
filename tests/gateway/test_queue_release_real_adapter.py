@@ -76,6 +76,7 @@ class _Rig:
         self.first_started = threading.Event()
         self.gates = {"first": self.block_first}   # message -> turn blocks until /stop sets it
         self.pause_on_stop = False                  # opt-in: model the real /stop's automatic pause
+        self.truncated = set()                      # messages whose turn ends partial (truncated reply)
         rig = self
 
         class StubAgent:
@@ -97,7 +98,11 @@ class _Rig:
                         rig.first_started.set()
                         rig.gates[message].wait(10)
                         return {"final_response": "", "messages": [], "api_calls": 1, "interrupted": True}
-                    return {"final_response": f"answer {message}", "messages": [], "api_calls": 1}
+                    if message in rig.truncated:   # the result the 4x finish_reason="length" path ends with
+                        from agent.turn_truncation import partial_result
+                        return partial_result([], 5, f"partial {message}",
+                                              "Response remained truncated after 4 continuation attempts")
+                    return {"final_response": f"answer {message}", "messages": [], "api_calls": 1, "completed": True}
                 finally:
                     with rig.lock:
                         rig.live -= 1
@@ -294,6 +299,24 @@ async def test_stopped_second_turn_releases_nothing_and_the_next_one_does(monkey
     await rig.adapter.handle_message(_msg("pong"))
     await rig.settle(expect=5)
     assert rig.calls == ["first", "ping", "pong", "a", "b"]
+    assert rig.max_live == 1
+
+
+@pytest.mark.asyncio
+async def test_truncated_reply_releases_nothing_and_the_next_complete_turn_does(monkeypatch, tmp_path):
+    """Prism bc69cb1f1b99: a turn that ends completed=False, partial=True (reply still truncated after
+    four finish_reason="length" continuations) is not a completed turn; held items wait for the next."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.truncated.add("long")
+    rig.runner._session_state(KEY).conversation.held_queue.extend([_msg("a"), _msg("b")])
+    await rig.adapter.handle_message(_msg("long"))
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["long"]
+    assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["a", "b"]
+    await rig.adapter.handle_message(_msg("pong"))
+    await rig.settle(expect=4)
+    assert rig.calls == ["long", "pong", "a", "b"]
     assert rig.max_live == 1
 
 

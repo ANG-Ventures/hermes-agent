@@ -57,13 +57,16 @@ def preview(event: Any) -> str:
 
 # --------------------------------------------------------------------------- stores
 
-def log_items(runner: Any, op: str, key: str, items: Any) -> None:
-    """One line per item, so gateway.log alone answers what was held and where it went. Never raises."""
+def log_items(runner: Any, op: str, key: str, items: Any, *, with_preview: bool = True) -> None:
+    """One line per item, so gateway.log alone answers what was held and where it went. Never raises.
+    ``with_preview=False`` for the restart sweeps: they log under the launch profile's home, so a
+    secondary profile's prompt text stays out of it (its hold line already carries the preview)."""
     try:
         for pos, e in enumerate(list(items or ()), 1):
             kind = "system" if is_system_event(runner, e) else "user"
+            text = "".join(c if c.isprintable() else "?" for c in preview(e)) if with_preview else "-"
             logger.info("queue_mgmt item op=%s session=%s pos=%d msg_id=%s kind=%s preview=%s",
-                        op, key, pos, getattr(e, "message_id", None), kind, preview(e))
+                        op, key, pos, getattr(e, "message_id", None), kind, text)
     except Exception:
         logger.debug("queue_mgmt item log failed for %s (%s)", key, op, exc_info=True)
 

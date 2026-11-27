@@ -101,7 +101,7 @@ async def _drive(monkeypatch, tmp_path, on_first_turn, *, first_interrupted=True
                 on_first_turn(runner, adapter)
                 if first_interrupted:
                     return {"final_response": "", "messages": [], "api_calls": 1, "interrupted": True}
-            return {"final_response": f"answer to {message}", "messages": [], "api_calls": 1}
+            return {"final_response": f"answer to {message}", "messages": [], "api_calls": 1, "completed": True}
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = StubAgent

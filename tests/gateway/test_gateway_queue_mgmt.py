@@ -654,3 +654,9 @@ def test_every_transition_logs_one_line_per_item(rig, caplog):
     assert [ln.split()[2] for ln in lines] == ["op=hold", "op=hold", "op=release", "op=release"]
     assert "pos=2 msg_id=None kind=user preview=line one line two " in lines[1] and "\n" not in lines[1]
     assert "trigger=queue_run" in caplog.text
+    caplog.clear()
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):   # restart sweeps: no prompt text (bf25489bb43e)
+        qm.log_items(runner, "restart_spool", KEY, [_ev("secret\x1b[2Jprompt")], with_preview=False)
+        qm.log_items(runner, "hold", KEY, [_ev("esc\x1b[2Jcode")])
+    assert "preview=-" in caplog.text and "secret" not in caplog.text
+    assert "preview=esc?[2Jcode" in caplog.text and "\x1b" not in caplog.text   # control chars (222226ef4636)

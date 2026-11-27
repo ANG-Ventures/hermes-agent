@@ -5099,10 +5099,13 @@ class GatewayTurnMixin:
                     if result.get("pending_steer"):
                         result["_pending_steer_internal"] = _internal
                         result[_LEFTOVER_STEER_META] = _steer_meta
-                    if (not result.get("interrupted") and not result.get("failed")
+                    if (result.get("completed") is True and not result.get("partial")
+                            and not result.get("interrupted") and not result.get("failed")
                             and not getattr(self, "_draining", False) and turn_ctx.effective_display_kind is None):
                         # D5 (Ace 2026-11-26, Discord 1575714860740907081): a completed, current, human
                         # turn releases the /stop-held items; this drain dispatches them next, in order.
+                        # Only an explicit completed=True releases: a truncated (partial) reply or any
+                        # new result shape leaves them held (Prism bc69cb1f1b99).
                         from gateway import queue_mgmt
                         queue_mgmt.release_on_turn_end(self, session_key, adapter)
                 pending_event, pending = await self._run_agent_drain_pending(

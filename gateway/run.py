@@ -8582,7 +8582,7 @@ class GatewayRunner(
                     from gateway.fork_ext.restart_followups import acknowledge_followup
                     self._session_state(record["session_key"]).conversation.held_queue.append(event)
                     from gateway import queue_mgmt
-                    queue_mgmt.log_items(self, "restart_restore", record["session_key"], [event])
+                    queue_mgmt.log_items(self, "restart_restore", record["session_key"], [event], with_preview=False)
                     self._note_held_platform_message(source, source._restart_followup_message_id)
                     await asyncio.to_thread(acknowledge_followup, record["_spool_path"])
                     held_restored += 1
@@ -9671,7 +9671,7 @@ class GatewayRunner(
                     if await self._preserve_followup_across_restart(key, event, None, reason="queue_held"):
                         spooled += 1
                         from gateway import queue_mgmt
-                        queue_mgmt.log_items(self, "restart_spool", key, [event])
+                        queue_mgmt.log_items(self, "restart_spool", key, [event], with_preview=False)
                         with suppress(ValueError):
                             events.remove(event)
         return spooled
