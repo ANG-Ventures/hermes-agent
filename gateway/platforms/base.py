@@ -5144,6 +5144,12 @@ class BasePlatformAdapter(ABC):
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
+        # An earlier follow-up may still be in the busy path (an image being described) while the
+        # turn it targeted has ended. Starting this message now would run it ahead of that one
+        # (t_04c0a6b0), so wait until it has steered or queued itself (and been started). Before
+        # the admission check: nothing may await between that check and the claim.
+        if session_key not in self._active_sessions:
+            await self._await_busy_followups_settled(session_key)
         # Atomic admission (Prism eb13daf988ed): a producer whose eligibility can go stale across an
         # adapter's own awaits (Discord resolves the channel first) re-checks here; nothing awaits
         # between this check and the claim or queue below. False = refused: not accepted, not queued.
@@ -5155,10 +5161,40 @@ class BasePlatformAdapter(ABC):
             if not admit(session_key):
                 return
         if session_key in self._active_sessions:
-            await self._handle_message_while_active(event, session_key)
+            settled = self._busy_followup_begin(session_key)
+            try:
+                await self._handle_message_while_active(event, session_key)
+            finally:
+                self._busy_followup_end(session_key, settled)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
+
+    def _busy_followup_begin(self, session_key: str) -> asyncio.Event:
+        """Count a follow-up entering the busy path for *session_key*; returns its settle event."""
+        inflight = self.__dict__.setdefault("_busy_followups_inflight", {})
+        entry = inflight.get(session_key)
+        if entry is None:
+            entry = inflight[session_key] = [0, asyncio.Event()]
+        entry[0] += 1
+        return entry[1]
+
+    def _busy_followup_end(self, session_key: str, settled: asyncio.Event) -> None:
+        inflight = self.__dict__.get("_busy_followups_inflight") or {}
+        entry = inflight.get(session_key)
+        if entry is None or entry[1] is not settled:
+            settled.set()
+            return
+        entry[0] -= 1
+        if entry[0] <= 0:
+            del inflight[session_key]
+            settled.set()
+
+    async def _await_busy_followups_settled(self, session_key: str) -> None:
+        """Wait until no follow-up for *session_key* is still in the busy path (FIFO wake-up)."""
+        entry = (self.__dict__.get("_busy_followups_inflight") or {}).get(session_key)
+        if entry is not None:
+            await entry[1].wait()
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
