@@ -485,8 +485,13 @@ class CLILoopsMixin:
             else:
                 if accepted:
                     _cprint(f"  {t('cli.steer.queued', preview=_preview(payload))}")
-                else:
+                elif not payload.strip():
                     _cprint(f"  {t('cli.steer.rejected_empty')}")
+                else:
+                    # Steering is closed (the turn's last drain has run, or the next turn has not
+                    # opened yet): queue it as the next turn, as the TUI busy path does (t_2b16f0e6).
+                    self._pending_input.put(payload)
+                    _cprint(f"  {t('cli.queue.queued_next_turn', preview=_preview(payload))}")
         else:
             self._pending_input.put(payload)
             _cprint(f"  {t('cli.steer.no_agent_queued', preview=_preview(payload))}")

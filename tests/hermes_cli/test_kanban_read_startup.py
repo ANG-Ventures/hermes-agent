@@ -40,7 +40,7 @@ def test_read_connection_never_initializes_and_is_sqlite_readonly(tmp_path, monk
     assert not (tmp_path / "missing.db").exists()
 
 
-@pytest.mark.parametrize("action", ["show", "placement", "context", "runs", "attachments"])
+@pytest.mark.parametrize("action", ["show", "allocation", "context", "runs", "attachments"])
 def test_cli_reads_under_held_writer_and_init_lock(tmp_path, action):
     if sys.platform == "win32":
         pytest.skip("POSIX init-lock contention")

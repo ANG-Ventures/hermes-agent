@@ -2481,6 +2481,9 @@ def run_conversation(
     from agent.turn_context import export_current_turn_boundary
     from tools.vision_tools_history_budget import native_turn_images
 
+    _open_steer = getattr(agent, "_open_steer", None)   # a new turn accepts steers (t_2b16f0e6)
+    if callable(_open_steer):
+        _open_steer()
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):
@@ -2502,6 +2505,11 @@ def run_conversation(
                 title_user_message=title_user_message,
             )
         finally:
+            # Exit paths that skip finalize_turn (which drains and closes) still close steering
+            # (t_2b16f0e6). No drain here: anything already buffered keeps main's behaviour.
+            _close_steer = getattr(agent, "_close_steer", None)
+            if callable(_close_steer):
+                _close_steer()
             # t_634b4ddf: a fallback line held for same-cause collapse posts by
             # turn end at the latest (chain exhausted, terminal error, interrupt).
             from agent.fallback_cause import flush_banner

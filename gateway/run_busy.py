@@ -318,7 +318,14 @@ class GatewayBusySessionMixin:
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
-            pending_slot[session_key] = queued_event
+            overflow = self._session_state(session_key).conversation.queued_events
+            if overflow:
+                # Slot empty, older items still in overflow (a marked head was just popped to run):
+                # the oldest becomes item 1 again so the new one cannot jump it (Prism e40b259b1e29).
+                pending_slot[session_key] = overflow.pop(0)
+                overflow.append(queued_event)
+            else:
+                pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
 
     def _promote_queued_event(
@@ -772,10 +779,20 @@ class GatewayBusySessionMixin:
             getattr(existing, "message_type", None),
             getattr(event, "message_type", None),
         }
+        # Merge only while the head is the newest queued message: with anything waiting in the
+        # overflow behind it, the merge would move this message ahead of those (t_3ee12123).
+        # At the queue cap a new slot would be refused: merging out of order beats dropping it.
+        # The helper merges a TEXT/PHOTO pair only when a photo carries media; otherwise (a photo
+        # whose download failed) it REPLACES the head, so that pair takes its own slot (Prism
+        # bad37f463754).
         if (
             same_security_context
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
+            and (merge_types == {MessageType.PHOTO}
+                 or getattr(existing, "media_urls", None) or getattr(event, "media_urls", None))
+            and (not self._overflow_queue(session_key)
+                 or self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING)
         ):
             merge_pending_message_event(
                 adapter._pending_messages, session_key, event,
@@ -1800,7 +1817,11 @@ class GatewayBusySessionMixin:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)
         if not accepted:
-            return t("gateway.steer.rejected_empty")
+            # The payload is not empty (checked above): the turn has returned and closed steering
+            # (t_2b16f0e6), so queue it as the next turn instead of dropping it (Prism ed7e5f5d5936).
+            # A queued slash command would run as a command at dequeue: refuse it (Prism 028df965e393).
+            from gateway import queue_mgmt
+            return queue_mgmt.refuse_command_prompt(steer_text) or _queue_fallback(t("gateway.queue.queued"))
         self._fold_into_running_turn(running_agent, quick_key, event)
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = (t("gateway.steer.target_subagents") if self._agent_has_active_subagents(running_agent)

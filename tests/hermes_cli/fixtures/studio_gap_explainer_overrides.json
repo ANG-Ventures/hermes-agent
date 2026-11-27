@@ -1,0 +1,87 @@
+[
+ [
+  "t_4bc6ddd8",
+  "operator_admit",
+  "explainer render toolchain (ffmpeg libx264, Kokoro, WhisperX, Manim, TeX, retained builds) exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_e8f51762",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_b900154d",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_012566de",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_8ec98a15",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_287d8b11",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_324289cf",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_012566de",
+  "workspace_kind",
+  "explainer render toolchain exists only on the Studio; worktree with pushed WIP lives there"
+ ],
+ [
+  "t_287d8b11",
+  "workspace_kind",
+  "explainer render toolchain exists only on the Studio; worktree with pushed WIP lives there"
+ ],
+ [
+  "t_722eb5dd",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_80063f3e",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; measured absent on ci-box"
+ ],
+ [
+  "t_8ec98a15",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; merge round on PR 89"
+ ],
+ [
+  "t_287d8b11",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; operator rounds on the wave PRs"
+ ],
+ [
+  "t_324289cf",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; operator rounds on the wave PRs"
+ ],
+ [
+  "t_80063f3e",
+  "operator_admit",
+  "explainer render toolchain exists only on the Studio; operator rounds on the wave PRs"
+ ],
+ [
+  "t_cc6c17f3",
+  "operator_admit",
+  "needs the Studio render toolchain (ffmpeg, Chrome, Kokoro) to build the comparison videos"
+ ],
+ [
+  "t_c063690f",
+  "operator_admit",
+  "needs the Studio render toolchain for the caption and sound proofs"
+ ]
+]

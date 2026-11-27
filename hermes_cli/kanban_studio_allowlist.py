@@ -28,7 +28,8 @@ capability only when it names one of its parts. Every override also writes one l
 ``<root>/state/studio-capability-gap/overrides.jsonl`` (t_b3884ae0's state dir). A ``browser-session`` override
 needs ``--need`` from a fixed set (:data:`NEEDS`, t_9d6a5d75): only ``signed-in-identity`` is accepted, ``other`` is
 accepted and recorded, every other need is refused with the capability that serves it. The ``--why`` text is never
-parsed for the need.
+parsed for the need. A GAP capability (not Studio-only by nature) also needs ``--elsewhere``, ``--why-not-now`` and
+``--effort hours|days`` (hours: plus an open ``--fix-card``): :mod:`hermes_cli.kanban_studio_gap` (t_9d619fbb).
 
 Holding: the first tick that holds a card in an episode writes ONE ``mechanical_wake`` event (source
 ``studio-default-deny``). The gateway owner-wake turns that into a silent turn in the card's home session, not a chat
@@ -149,7 +150,7 @@ def _live_overrides(conn, task_id: str, now: Optional[float]):
             p = json.loads(raw or "{}")
         except (TypeError, ValueError):
             continue
-        if not isinstance(p, dict):
+        if not isinstance(p, dict) or p.get("gc_retained"):  # kept by gc as a gap registration only
             continue
         until = p.get("until")
         if isinstance(until, (int, float)):
@@ -473,9 +474,36 @@ def need_refusal(capability: str, need: Optional[str]) -> Optional[str]:
             f"and drop the {BROWSER_CAP} hold at its source (the card's requires: line or the attached skill)")
 
 
+def _count_comment(conn, fix: str, cap: str, task_id: str, actor: Optional[str], now: float) -> None:
+    """At most ONE count comment per gap key per day on the fix card, with the running total (operator ruling 8:
+    one comment per override would have put 138 on one card in 14 days). The events carry every run."""
+    import json as _json
+    from hermes_cli import kanban_db as _kb
+    n = 0
+    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE kind = ?", (OVERRIDE_EVENT,)).fetchall():
+        try:
+            doc = _json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(doc, dict) and doc.get("fix_card_given") == fix and doc.get("capability") == cap:
+            n += 1
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    head = f"studio-override count for gap {cap} on {day}:"
+    body = (f"{head} {n} Studio run(s) so far for this gap, latest {task_id} (by {actor or 'operator'}); "
+            f"one line per day, updated in place, the events carry each run")
+    row = next((r for r in conn.execute("SELECT id, body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+                                        (fix,)).fetchall() if (r[1] or "").startswith(head)), None)
+    if row:  # the day's line already exists: move its running total, do not add a comment
+        with _kb.write_txn(conn):
+            conn.execute("UPDATE task_comments SET body = ? WHERE id = ?", (body, row[0]))
+        return
+    _kb.add_comment(conn, fix, "kanban", body)
+
+
 def override(conn, task_id: str, capability: str, why: str, *, once: bool = True, until: Optional[str] = None,
              actor: Optional[str] = None, now: Optional[float] = None, root: Optional[Path] = None,
-             need: Optional[str] = None) -> dict:
+             need: Optional[str] = None, elsewhere: Optional[str] = None, why_not_now: Optional[str] = None,
+             effort: Optional[str] = None, fix_card: Optional[str] = None, board: Optional[str] = None) -> dict:
     """Record one override. Raises :class:`OverrideRefused` with the line to print."""
     from hermes_cli import kanban_db as _kb
     now = time.time() if now is None else now
@@ -494,11 +522,26 @@ def override(conn, task_id: str, capability: str, why: str, *, once: bool = True
     if row is None:
         raise OverrideRefused(f"unknown card {task_id}")
     until_ts = _parse_until(until, now) if until else None
+    # t_9d619fbb: a GAP capability (not Studio-only by nature) must say how it would run elsewhere.
+    from hermes_cli import kanban_studio_gap as _gap
+    gap_root = Path(root) if root is not None else _kb.kanban_home()
+    try:
+        gap = _gap.check(conn, task_id, cap, elsewhere=elsewhere, why_not_now=why_not_now, effort=effort,
+                         fix_card=fix_card, until=until, allow=config(_kb._board_home_kanban_cfg())[1], root=gap_root,
+                         board=board or _kb.get_current_board(), now=now)
+    except _gap.GapRefused as exc:
+        raise OverrideRefused(str(exc)) from exc
     payload = {"capability": cap, "why": why.strip(), "by": actor or "operator", "at": int(now),
-               "once": until_ts is None, "until": until_ts, "fix_card": _fix_card(conn, cap),
-               **({"need": need.strip().lower()} if need else {})}
+               "once": until_ts is None, "until": until_ts,
+               "fix_card": gap.get("fix_card_given") or _fix_card(conn, cap),
+               **({"need": need.strip().lower()} if need else {}), **gap}
     with _kb.write_txn(conn):
         _kb._append_event(conn, task_id, OVERRIDE_EVENT, payload)
+    if gap.get("fix_card_given"):  # t_9d619fbb: every Studio run for a gap is counted on the card that closes it
+        try:
+            _count_comment(conn, gap["fix_card_given"], cap, task_id, actor, now)
+        except Exception as exc:  # the event is the record; the count line is a courtesy
+            payload["fix_card_comment_error"] = str(exc)
     line = {"kind": "override", "task_id": task_id, **payload}
     path = ledger_path(root)
     try:
@@ -535,7 +578,9 @@ def cmd_studio_override(args) -> int:
     try:
         with _kb.connect_closing(board=getattr(args, "board", None)) as conn:
             p = override(conn, args.task_id, args.capability, args.why, until=getattr(args, "until", None),
-                         actor=actor, need=getattr(args, "need", None))
+                         actor=actor, need=getattr(args, "need", None), elsewhere=getattr(args, "elsewhere", None),
+                         why_not_now=getattr(args, "why_not_now", None), effort=getattr(args, "effort", None),
+                         fix_card=getattr(args, "fix_card", None), board=getattr(args, "board", None))
     except OverrideRefused as exc:
         print(f"kanban studio-override: REFUSED {exc}", file=sys.stderr)
         return 1

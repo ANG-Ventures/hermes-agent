@@ -116,6 +116,25 @@ runs:
         "$bootstrap" -S "$_PM_ACTION/../../../scripts/ci/setup_toolchain.py" prepare \
           --toolchain "$_PM_TOOLCHAIN" --extras "$_PM_EXTRAS" --packages "$_PM_PACKAGES" --home "$RUNNER_TEMP/setup-pm"
 
+    # ZFS (nas-fleet, OpenZFS 2.3 block cloning) refuses to clone a file
+    # written a moment ago with EAGAIN until the pool commits, and uv clones
+    # the wheels it has just unpacked into the cache: `Failed to clone ...
+    # Resource temporarily unavailable (os error 11)` (t_793a6db7, t_7ba9f134).
+    # Hardlink instead: the uv cache is per job under RUNNER_TEMP, so sharing
+    # inodes with it cannot leak into another job. Measured on nas-fleet with
+    # zfs_bclone_wait_dirty=0 (PM deps phase): default 0/3 green (os error 11),
+    # copy 3/3 median 11.7 s, hardlink 8/8 median 8.4 s. XFS hosts (ci-box,
+    # ace-ai, ace-media) keep uv's default clone.
+    - name: Link uv files instead of cloning them on ZFS
+      if: runner.environment == 'self-hosted' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        fs=$(stat -f -c %T "$RUNNER_TEMP" 2>/dev/null || true)
+        if [ "$fs" = zfs ] && [ -z "${UV_LINK_MODE:-}" ]; then
+          printf 'UV_LINK_MODE=hardlink\n' >> "$GITHUB_ENV"
+        fi
+        printf 'uv link mode: %s (RUNNER_TEMP fs: %s)\n' "${UV_LINK_MODE:-$([ "$fs" = zfs ] && echo hardlink || echo default)}" "${fs:-unknown}"
+
     # The key covers the PM code and this action, not only the lock: a
     # provisioning change must re-run the cold path on every lane rather
     # than restore a store the previous code wrote.

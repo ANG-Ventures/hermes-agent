@@ -1813,6 +1813,11 @@ class TurnRunner:
         # Bind policy synchronously before accepting steering; the async slot tracker
         # may still hold the previous context when this cached agent is reused.
         agent._gateway_receiving_turn_context = ctx
+        # A cached agent is still closed to steers from its previous turn (t_2b16f0e6); a steer
+        # that arrives now belongs to this turn, so reopen before the agent becomes reachable.
+        _open_steer = getattr(agent, "_open_steer", None)
+        if callable(_open_steer):
+            _open_steer()
         ctx.agent_holder[0] = agent  # interrupt support
         # The titler fires from the turn prologue, so attach the rename lane before the run.
         self._attach_session_title_callback(agent, ctx)

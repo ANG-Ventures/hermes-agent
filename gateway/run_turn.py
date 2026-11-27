@@ -4506,7 +4506,12 @@ class GatewayTurnMixin:
                 occupant = adapter._pending_messages.get(session_key)
                 if occupant is not None and occupant is not pending_event:
                     self._session_state(session_key).conversation.queued_events.insert(0, occupant)
+                # The adapter drain hands this head to a fresh _handle_message with the rest still in
+                # overflow; the release mark keeps the orphan rescue from running item N+1 first
+                # (Prism 4f2cff4414e2: z1, z2, z3, z5, z4).
+                pending_event._queue_released = True
                 adapter._pending_messages[session_key] = pending_event
+                queue_mgmt.log_items(self, "put_back", session_key, [pending_event])
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
