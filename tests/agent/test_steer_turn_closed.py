@@ -62,6 +62,26 @@ def test_a_steer_before_the_finalizer_drain_is_still_handed_back():
     assert agent._pending_steer is None
 
 
+def test_the_finalizer_drain_still_goes_through_an_instance_wrapper():
+    """The gateway and the delegate ledger wrap ``_drain_pending_steer`` on the instance to keep the
+    drained text's provenance; the closing drain must pass through that wrapper (Prism d1e7cd8d823d)."""
+    agent = _SteerableStub()
+    seen = []
+    inner = agent._drain_pending_steer
+
+    def wrapper():
+        text = inner()
+        seen.append(text)
+        return text
+
+    agent._drain_pending_steer = wrapper
+    agent.steer("landed during the final API call")
+    result = _run(agent, final_response="done")
+    assert seen == ["landed during the final API call"]
+    assert result.get("pending_steer") == "landed during the final API call"
+    assert agent.steer("after the drain") is False
+
+
 @pytest.fixture
 def bare_turn(monkeypatch):
     """Run ``run_conversation`` around a scripted turn body (no model, no session store)."""

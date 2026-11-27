@@ -350,15 +350,15 @@ class InterruptControlMixin:
         return text
 
     def _drain_pending_steer_and_close(self) -> Optional[str]:
-        """The turn's LAST steer collection (``finalize_turn``): drain the pending steer and close
-        steering in ONE lock acquisition (t_2b16f0e6). A steer either landed before (and is handed
-        back here) or is refused by ``steer()`` and becomes the surface's next turn; none can be
-        accepted into a finished agent's buffer between the drain and the close."""
+        """The turn's LAST steer collection (``finalize_turn``, t_2b16f0e6): close steering under the
+        steer lock, then drain. Once closed, ``steer()`` refuses, so nothing can enter between the
+        close and the drain: a steer either landed before (and is handed back here) or is refused
+        and becomes the surface's next turn; none waits unread in a finished agent. The drain goes
+        through ``self._drain_pending_steer`` so the instance wrappers the gateway and the delegate
+        ledger install there still see the leftover (Prism d1e7cd8d823d)."""
         with _ic_lock(self, "_pending_steer_lock"):
-            text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            self._pending_steer = None
             self._steer_closed = True
-        return text
+        return self._drain_pending_steer()
 
     def _close_steer(self) -> None:
         """Refuse further ``steer()`` calls until :meth:`_open_steer` (t_2b16f0e6), without draining:
