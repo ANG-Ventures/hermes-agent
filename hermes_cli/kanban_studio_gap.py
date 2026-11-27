@@ -131,25 +131,35 @@ def _card_status(conn, card: str) -> Optional[str]:
     return row[0] if row else None
 
 
-def key_fix_cards(conn, key: str) -> list:
-    """Fix cards for gap ``key`` (the capability; ``studio-capgap:<key>``), ordered by their LAST naming, oldest
-    first: every ``fix_card_given`` an earlier ``studio_override`` on ANY card recorded for this key.
-    These events survive ``kanban gc`` (``gc_events`` keeps a studio_override that names a fix card), so a closed
-    gap stays closed past the 30-day event retention (Prism 506ff9d7da6e).
+def key_fix_cards(conn, key: str) -> dict:
+    """Fix cards REGISTERED for gap ``key`` (the capability; ``studio-capgap:<key>``): ``{card: event id of its last
+    registration}``, oldest first. A registration is a ``studio_override`` on ANY card that recorded
+    ``fix_card_given`` for this key with the answers; a ``counted`` run only uses a registration and never moves it
+    (Prism be1f77072d51). These events survive ``kanban gc`` (``gc_events`` keeps a studio_override that names a fix
+    card), so a closed gap stays closed past the 30-day event retention (Prism 506ff9d7da6e).
     Per GAP, not per card (operator ruling 2026-11-27): 25 cards overrode one render-toolchain gap on 11-26."""
     import json
-    out = []
-    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE kind = 'studio_override' ORDER BY id"):
+    out: dict = {}
+    for ev_id, raw in conn.execute("SELECT id, payload FROM task_events WHERE kind = 'studio_override' ORDER BY id"):
         try:
             doc = json.loads(raw or "{}") or {}
         except (TypeError, ValueError):
             continue
-        fc = doc.get("fix_card_given") if isinstance(doc, dict) and doc.get("capability") == key else None
+        if not isinstance(doc, dict) or doc.get("capability") != key or doc.get("counted"):
+            continue
+        fc = doc.get("fix_card_given")
         if fc:
-            if fc in out:
-                out.remove(fc)
-            out.append(fc)
+            out.pop(fc, None)
+            out[fc] = ev_id
     return out
+
+
+def _closed_at(conn, card: str) -> float:
+    """Event id at which a done fix card closed its gap: its newest event (the completion or later). With none left
+    (pruned), after every registration: an unknown closure must not let an older open card count (Prism
+    434fc10f5122)."""
+    row = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (card,)).fetchone()
+    return float(row[0]) if row and row[0] is not None else float("inf")
 
 
 def _body_needs(conn, task_id: str) -> str:
@@ -258,12 +268,14 @@ def check(conn, task_id: str, capability: str, *, elsewhere: Optional[str], why_
 def _check_gap(conn, task_id: str, key: str, *, elsewhere, why_not_now, effort, fix_card, until, root, board) -> dict:
     hosts = pool_hosts(root)
     on_pool = f"run it on a pool host: {_hosts_text(hosts)}"
-    known = key_fix_cards(conn, key)
+    reg = key_fix_cards(conn, key)
+    known = list(reg)
     status = {c: _card_status(conn, c) for c in known}
-    done_known = [c for c in known if status[c] in _DONE]
-    # Only a fix card named AFTER the latest done one can count a run (Prism 434fc10f5122): an older card left open
-    # when a newer one closed the gap predates the closure.
-    since = known[known.index(done_known[-1]) + 1:] if done_known else known
+    done_known = sorted((c for c in known if status[c] in _DONE), key=lambda c: _closed_at(conn, c))
+    # Only a fix card registered AFTER the latest closure can count a run (Prism 434fc10f5122, be1f77072d51): an
+    # older card left open when another one closed the gap predates the closure.
+    closure = _closed_at(conn, done_known[-1]) if done_known else float("-inf")
+    since = [c for c in known if reg[c] > closure]
     open_known = [c for c in since if status[c] not in _CLOSED and c != task_id]
     ew, wn, eff = (elsewhere or "").strip(), (why_not_now or "").strip(), (effort or "").strip().lower()
     fc = (fix_card or "").strip() or None

@@ -255,6 +255,63 @@ def test_open_fix_card_older_than_the_closing_one_does_not_count(operator):
     assert not p.get("counted") and q["counted"] and q["fix_card"] == a
 
 
+def _complete(conn, tid):
+    """Done the way a real completion leaves it: the status AND a newer event on the card."""
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        kb._append_event(conn, tid, "completed", {})
+
+
+def test_counted_run_does_not_reregister_an_older_fix_card(operator):
+    """Prism be1f77072d51: A then B registered, a run counted on A explicitly, B done: A no longer counts runs."""
+    with kb.connect_closing() as conn:
+        a, b = _card(conn, title="install A"), _card(conn, title="install B")
+        for fix in (a, b):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+        c = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only", fix_card=a)
+        assert c["counted"] and c["fix_card"] == a
+        _complete(conn, b)
+        with pytest.raises(ksa.OverrideRefused, match=f"the gap card {b} for operator_admit is done"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+
+
+def test_closure_is_when_the_fix_card_became_done_not_when_it_was_named(operator):
+    """Prism 434fc10f5122: A, B, then A re-registered; B done AFTER that: A's registration predates the closure."""
+    with kb.connect_closing() as conn:
+        a, b = _card(conn, title="install A"), _card(conn, title="install B")
+        for fix in (a, b, a):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+        _complete(conn, b)
+        with pytest.raises(ksa.OverrideRefused, match=f"the gap card {b} for operator_admit is done"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+        # registering A again after the closure is the reopened path, and then it counts
+        ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=a)
+        q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert q["counted"] and q["fix_card"] == a
+
+
+def test_gc_kept_override_no_longer_grants_a_studio_run(operator):
+    """Prism 066c453617e1: gc keeps the registration but prunes the spawn that spent it, so it must not be live."""
+    with kb.connect_closing() as conn:
+        fix, a = _card(conn, title="install the render toolchain on ci-box"), _card(conn)
+        ksa.override(conn, a, "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+        assert ksa.live_override(conn, a, "operator_admit") is not None
+        _done(conn, a)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET created_at = 1 WHERE task_id = ?", (a,))
+        kb.gc_events(conn)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (a,))
+        assert ksa.live_override(conn, a, "operator_admit") is None
+        # the gap registry still reads it: fix is the open card, a later run is counted on it
+        q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert q["counted"] and q["fix_card"] == fix
+
+
 def test_readable_pool_with_no_off_studio_host_refuses_a_gap(operator, monkeypatch):
     """Prism 0363103a464a: an empty (but readable) pool is not 'unreadable'; --elsewhere cannot name the Studio."""
     monkeypatch.setattr(ksg, "pool_hosts", lambda root: ())
@@ -294,7 +351,7 @@ def test_gc_keeps_the_override_that_registers_a_fix_card(operator):
     assert kinds == ["studio_override"]  # every other old event on the done card was pruned
 
 
-def test_refusal_create_command_names_the_board(operator):
+def test_refusal_create_command_names_the_board(operator, kanban_identity):
     """Prism 506ff9d7da6e: the printed create command carries the override's board."""
     with kb.connect_closing() as conn:
         tid = _card(conn)

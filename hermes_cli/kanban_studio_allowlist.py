@@ -150,7 +150,7 @@ def _live_overrides(conn, task_id: str, now: Optional[float]):
             p = json.loads(raw or "{}")
         except (TypeError, ValueError):
             continue
-        if not isinstance(p, dict):
+        if not isinstance(p, dict) or p.get("gc_retained"):  # kept by gc as a gap registration only
             continue
         until = p.get("until")
         if isinstance(until, (int, float)):
