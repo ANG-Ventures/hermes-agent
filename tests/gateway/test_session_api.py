@@ -1350,3 +1350,50 @@ async def test_interim_commentary_reaches_session_sse_and_responses_stream(adapt
     monkeypatch.setattr("run_agent.AIAgent", CapturingAgent)
     adapter._create_agent(session_id="gated", interim_assistant_callback=lambda *_a, **_k: None)
     assert captured["interim_assistant_callback"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_sse_keeps_a_thread_event_whose_put_lands_after_the_run_returns(
+        adapter, session_db, monkeypatch):
+    """The executor thread's ``call_soon_threadsafe`` put can run after the loop has resumed the
+    run coroutine and queued the terminal events + ``None`` (seen ~1 in 16 under load, t_0f5301b3).
+    Force that order: every thread-side put runs 50 ms late. The event must still be written, and
+    before ``assistant.completed``."""
+    import gateway.platforms.api_server as api_mod
+
+    class _LateLoop:
+        def __init__(self, loop):
+            self._loop = loop
+
+        def call_soon_threadsafe(self, cb, *args):
+            return self._loop.call_soon_threadsafe(self._loop.call_later, 0.05, cb, *args)
+
+    class _LateQueue(api_mod._SessionEventQueue):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.loop = _LateLoop(self.loop)
+
+    monkeypatch.setattr(api_mod, "_SessionEventQueue", _LateQueue)
+    session_id = session_db.create_session("late-put-session", "api_server")
+
+    def fake_create_agent(**kwargs):
+        interim = kwargs["interim_assistant_callback"]
+
+        class FakeAgent:
+            provider, model = "openai-codex", "gpt-5"
+            session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
+
+            def run_conversation(self, **_kw):
+                interim("Checking the docs first.", already_streamed=False)
+                return {"final_response": "Done.", "messages": [], "api_calls": 1}
+
+        return FakeAgent()
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_create_agent", side_effect=fake_create_agent):
+        async with TestClient(TestServer(app)) as cli:
+            sse = await (await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "go"})).text()
+
+    names = [ln[7:] for ln in sse.splitlines() if ln.startswith("event: ")]
+    assert "assistant.commentary" in names, names
+    assert names.index("assistant.commentary") < names.index("assistant.completed"), names

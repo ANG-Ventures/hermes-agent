@@ -1205,6 +1205,23 @@ class _SessionEventQueue:
         self.session_id = session_id
         self.run_id = run_id
         self.seq = 0
+        # Thread-side puts scheduled on ``loop`` but not yet run. The loop can resume the run
+        # coroutine (executor returned) before those callbacks run, so ``flush`` waits for them
+        # before terminal events and the ``None`` sentinel are queued.
+        self._pending = 0
+        self._pending_lock = threading.Lock()
+
+    def _put_from_thread(self, event: tuple[str, Dict[str, Any]]) -> None:
+        try:
+            self.queue.put_nowait(event)
+        finally:
+            with self._pending_lock:
+                self._pending -= 1
+
+    async def flush(self) -> None:
+        """Yield until every thread-side ``enqueue`` has landed in ``queue``."""
+        while self._pending:
+            await asyncio.sleep(0)
 
     def payload(self, name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         self.seq += 1
@@ -1220,11 +1237,16 @@ class _SessionEventQueue:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
             running_loop = None
-        with suppress(RuntimeError):
-            if running_loop is self.loop:
-                self.queue.put_nowait(event)
-            else:
-                self.loop.call_soon_threadsafe(self.queue.put_nowait, event)
+        if running_loop is self.loop:
+            self.queue.put_nowait(event)
+            return
+        with self._pending_lock:
+            self._pending += 1
+        try:
+            self.loop.call_soon_threadsafe(self._put_from_thread, event)
+        except RuntimeError:  # loop closed: the put will never run
+            with self._pending_lock:
+                self._pending -= 1
 
 
 def _room_grant_delegate(name: str):
@@ -3781,6 +3803,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
                     active_run_id=run_id, approval_notify_callback=approval_notify,
                     approval_session_key=run_id, **ctx["run_kwargs"])
+                await events.flush()  # thread-side events land before assistant.completed
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
@@ -3808,6 +3831,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 logger.exception("[api_server] session chat stream failed")
                 self._set_run_status(
                     run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
+                await events.flush()
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
                 self._active_run_agents.pop(run_id, None)
