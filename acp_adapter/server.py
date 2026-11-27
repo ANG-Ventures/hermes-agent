@@ -989,11 +989,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         finally:
             # Go idle before draining so recursive prompt() calls can acquire the session.
             with state.runtime_lock:
-                # A steer the turn handed back (it landed after the last steer collection) was acked
-                # for the turn that just ended, so it runs next (t_2b16f0e6, Prism b472c065ea57).
-                leftover = result.get("pending_steer") if isinstance(result, dict) else None
-                if isinstance(leftover, str) and leftover.strip():
-                    state.queued_prompts.insert(0, leftover)
                 state.is_running = False
                 state.current_prompt_text = ""
             await self._drain_queued_prompts(state, session_id, conn)

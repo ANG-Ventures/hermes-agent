@@ -1,21 +1,65 @@
-"""A steer that lands after the turn's last steer collection becomes the next turn (t_2b16f0e6).
+"""A steer that arrives after the turn's last steer collection is refused, not buffered (t_2b16f0e6).
 
-The finalizer drains ``_pending_steer`` once (``turn_finalizer``), but the gateway keeps the agent
-as the session's running agent until ``run_conversation`` has returned and the slot is released.
-A ``steer()`` in that window was accepted, so the gateway acked it as "steered" and did not queue
-it, yet nothing drained it again: it waited in the finished agent's buffer and reached some later
-turn after its first tool batch (out of order), or was lost with the agent.
+``finalize_turn`` drains ``_pending_steer`` once, but the gateway keeps the agent as the session's
+running agent until ``run_conversation`` has returned and the slot is released. On main a
+``steer()`` in that window was accepted: the gateway acked it as "steered" and did not queue it,
+yet nothing drained it again, so it waited in the finished agent's buffer and reached a later turn
+out of order, or was lost with the agent.
 
-Fix: ``run_conversation`` closes steering when the turn returns and hands anything still buffered
-back as ``result["pending_steer"]``; ``steer()`` refuses while closed, so the gateway queues the
-message as the next turn. The next ``run_conversation`` reopens steering.
+Fix: the finalizer's drain also closes steering, in the same lock acquisition, so a later
+``steer()`` returns False and the surface queues the message as the next turn. The next turn
+reopens steering. These run the real ``finalize_turn``; the first is red on main.
 """
 from __future__ import annotations
+
+import threading
 
 import pytest
 
 import agent.conversation_loop as loop
-from tests.agent.test_steer import _bare_agent
+from agent.interrupt_control import InterruptControlMixin
+from tests.agent.test_turn_finalizer_cleanup_guard import _run, _StubAgent
+
+
+class _SteerableStub(_StubAgent):
+    """The finalizer's stub agent with the real steer buffer methods (the rest stays stubbed)."""
+
+    steer = InterruptControlMixin.steer
+    _drain_pending_steer = InterruptControlMixin._drain_pending_steer
+    # getattr: on main these do not exist, so the red run fails on the behaviour, not at import.
+    _drain_pending_steer_and_close = getattr(InterruptControlMixin, "_drain_pending_steer_and_close", None)
+    _close_steer = getattr(InterruptControlMixin, "_close_steer", None)
+    _open_steer = getattr(InterruptControlMixin, "_open_steer", None)
+
+    def __init__(self):
+        super().__init__(raise_in=())
+        self._pending_steer = None
+        self._pending_steer_lock = threading.Lock()
+
+
+def finished_agent():
+    """An agent whose turn has just been through the real ``finalize_turn``."""
+    agent = _SteerableStub()
+    result = _run(agent, final_response="done")
+    assert "pending_steer" not in result
+    return agent
+
+
+def test_a_steer_after_the_finalizer_drain_is_refused_not_buffered():
+    agent = finished_agent()
+    assert agent.steer("arrived after the last drain") is False, (
+        "accepted into a finished agent: acked as steered, then never read by this turn"
+    )
+    assert agent._pending_steer is None
+
+
+def test_a_steer_before_the_finalizer_drain_is_still_handed_back():
+    """Main's path, unchanged: a steer the last API call missed becomes result["pending_steer"]."""
+    agent = _SteerableStub()
+    assert agent.steer("landed during the final API call") is True
+    result = _run(agent, final_response="done")
+    assert result.get("pending_steer") == "landed during the final API call"
+    assert agent._pending_steer is None
 
 
 @pytest.fixture
@@ -34,43 +78,8 @@ def bare_turn(monkeypatch):
     return run
 
 
-def _finalizer_then_late_steer(late_text):
-    def body(agent):
-        result = {"final_response": "done", "messages": []}
-        leftover = agent._drain_pending_steer()          # the finalizer's one drain
-        if leftover:
-            result["pending_steer"] = leftover
-        agent.steer(late_text)                            # arrives after that drain
-        return result
-    return body
-
-
-def test_steer_after_the_final_drain_is_handed_back_as_the_next_turn(bare_turn):
-    agent = _bare_agent()
-    result = bare_turn(agent, _finalizer_then_late_steer("late message"))
-    assert result.get("pending_steer") == "late message", (
-        "a steer accepted after the finalizer's drain was neither in the turn nor handed back"
-    )
-    assert agent._pending_steer is None
-
-
-def test_steer_is_refused_once_the_turn_has_returned(bare_turn):
-    agent = _bare_agent()
-    bare_turn(agent, _finalizer_then_late_steer("late message"))
-    assert agent.steer("after the turn returned") is False
-    assert agent._pending_steer is None
-
-
-def test_late_steer_joins_an_earlier_leftover_in_arrival_order(bare_turn):
-    agent = _bare_agent()
-    agent.steer("first")                                  # pending when the finalizer drains
-    result = bare_turn(agent, _finalizer_then_late_steer("second"))
-    assert result.get("pending_steer") == "first\nsecond"
-
-
 def test_next_turn_reopens_steering(bare_turn):
-    agent = _bare_agent()
-    bare_turn(agent, _finalizer_then_late_steer("late"))
+    agent = finished_agent()
     seen = {}
 
     def body(a):
@@ -83,7 +92,7 @@ def test_next_turn_reopens_steering(bare_turn):
 
 def test_steer_mid_turn_is_unchanged(bare_turn):
     """Control for ordinary steers: accepted while the turn runs, drained by the turn."""
-    agent = _bare_agent()
+    agent = _SteerableStub()
     seen = {}
 
     def body(a):
@@ -96,8 +105,23 @@ def test_steer_mid_turn_is_unchanged(bare_turn):
     assert "pending_steer" not in result
 
 
+def test_an_exit_that_skips_the_finalizer_closes_without_draining(bare_turn):
+    """A turn body that raises never reaches finalize_turn: steering still closes, and text
+    already buffered stays for the next turn's first drain (main's behaviour)."""
+    agent = _SteerableStub()
+
+    def body(a):
+        a.steer("buffered before the raise")
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        bare_turn(agent, body)
+    assert agent.steer("after the raise") is False
+    assert agent._pending_steer == "buffered before the raise"
+
+
 def test_explicit_open_after_close_accepts_again():
-    agent = _bare_agent()
+    agent = _SteerableStub()
     agent._close_steer()
     assert agent.steer("refused") is False
     agent._open_steer()

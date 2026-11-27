@@ -349,10 +349,20 @@ class InterruptControlMixin:
             self._pending_steer = None
         return text
 
+    def _drain_pending_steer_and_close(self) -> Optional[str]:
+        """The turn's LAST steer collection (``finalize_turn``): drain the pending steer and close
+        steering in ONE lock acquisition (t_2b16f0e6). A steer either landed before (and is handed
+        back here) or is refused by ``steer()`` and becomes the surface's next turn; none can be
+        accepted into a finished agent's buffer between the drain and the close."""
+        with _ic_lock(self, "_pending_steer_lock"):
+            text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+            self._pending_steer = None
+            self._steer_closed = True
+        return text
+
     def _close_steer(self) -> None:
-        """Refuse further ``steer()`` calls until :meth:`_open_steer` (t_2b16f0e6). Set under the steer
-        lock when a turn returns, so every steer either landed before (and is drained after this)
-        or is refused and becomes the surface's next turn; none waits in a finished agent."""
+        """Refuse further ``steer()`` calls until :meth:`_open_steer` (t_2b16f0e6), without draining:
+        for turn exits that skip ``finalize_turn``; text already buffered keeps main's behaviour."""
         with _ic_lock(self, "_pending_steer_lock"):
             self._steer_closed = True
 

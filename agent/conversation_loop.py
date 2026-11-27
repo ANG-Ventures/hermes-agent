@@ -2481,12 +2481,11 @@ def run_conversation(
     from agent.turn_context import export_current_turn_boundary
     from tools.vision_tools_history_budget import native_turn_images
 
-    # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
-    # it does not embed the same pixels a second time into the same request (#76411).
-    _open_steer = getattr(agent, "_open_steer", None)
+    _open_steer = getattr(agent, "_open_steer", None)   # a new turn accepts steers (t_2b16f0e6)
     if callable(_open_steer):
         _open_steer()
-    result = None
+    # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
+    # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):
         try:
             result = _run_conversation_turn(
@@ -2506,31 +2505,18 @@ def run_conversation(
                 title_user_message=title_user_message,
             )
         finally:
+            # Exit paths that skip finalize_turn (which drains and closes) still close steering
+            # (t_2b16f0e6). No drain here: anything already buffered keeps main's behaviour.
+            _close_steer = getattr(agent, "_close_steer", None)
+            if callable(_close_steer):
+                _close_steer()
             # t_634b4ddf: a fallback line held for same-cause collapse posts by
             # turn end at the latest (chain exhausted, terminal error, interrupt).
             from agent.fallback_cause import flush_banner
             flush_banner(agent)
-            _close_steer_and_hand_back(agent, result)
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)
     return result
-
-
-def _close_steer_and_hand_back(agent, result: Any) -> None:
-    """Close steering as the turn returns and hand back a steer that landed after the finalizer's
-    drain (t_2b16f0e6), or on an exit path that never reached it, as ``result["pending_steer"]``,
-    after any leftover already there (arrival order). Before this, such a steer was acked as
-    "steered" but waited in the finished agent: injected into a later turn, or lost with the agent."""
-    close = getattr(agent, "_close_steer", None)
-    if not callable(close):
-        return
-    close()
-    if not isinstance(result, dict):
-        return  # the turn raised: the text stays buffered for the next turn's first drain
-    late = agent._drain_pending_steer()
-    if late:
-        earlier = result.get("pending_steer")
-        result["pending_steer"] = f"{earlier}\n{late}" if earlier else late
 
 
 def _close_durable_failed_turn(agent, result: Any) -> None:

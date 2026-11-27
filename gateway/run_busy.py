@@ -1568,8 +1568,6 @@ class GatewayBusySessionMixin:
             demoted_for_compression=_steer.demoted_for_compression,
             demoted_for_startup_resume=getattr(_steer, "demoted_for_startup_resume", False),
         )
-        if is_steer_mode:
-            self._session_state(session_key).turn.steer_acked = True
         await self._send_busy_ack_reply(event, adapter, message)
         return True
 
@@ -1802,9 +1800,11 @@ class GatewayBusySessionMixin:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)
         if not accepted:
-            # The payload is not empty (checked above): the turn has already returned and closed
-            # steering, so the text becomes the next turn rather than being lost (Prism ed7e5f5d5936).
-            return _queue_fallback(t("gateway.steer.queued_no_agent"))
+            # The payload is not empty (checked above): the turn has returned and closed steering
+            # (t_2b16f0e6), so queue it as the next turn instead of dropping it (Prism ed7e5f5d5936).
+            # A queued slash command would run as a command at dequeue: refuse it (Prism 028df965e393).
+            from gateway import queue_mgmt
+            return queue_mgmt.refuse_command_prompt(steer_text) or _queue_fallback(t("gateway.queue.queued"))
         self._fold_into_running_turn(running_agent, quick_key, event)
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = (t("gateway.steer.target_subagents") if self._agent_has_active_subagents(running_agent)
