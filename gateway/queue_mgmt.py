@@ -203,6 +203,57 @@ def _unpark(runner: Any, key: str, event: Any) -> bool:
     return False
 
 
+# Pop-to-claim span (Apollo send-back on PR 573, Prism 50373862d991): the post-turn drain pops the
+# next user follow-up, then awaits the first reply's delivery before the follow-up turn claims it.
+# Meanwhile the event is in no store, so it is marked here; any generation invalidation (/stop, /new,
+# /queue run busy, lease reject), a scope clear or a cancelled task puts it back at the FRONT of held.
+
+def mark_inflight(runner: Any, key: str, event: Any) -> None:
+    """Record ``event`` as popped-but-unclaimed (user items only; None/system clears). Never raises."""
+    try:
+        state = runner._session_state(key).conversation
+        state.inflight_followup = event if event is not None and not is_system_event(runner, event) else None
+    except Exception:
+        logger.debug("queue_mgmt inflight mark failed for %s", key, exc_info=True)
+
+
+def claim_inflight(runner: Any, key: str, event: Any) -> bool:
+    """The follow-up turn takes ``event``: clears the mark. False when it was reclaimed into held
+    meanwhile, so the caller must not run it (it would run twice)."""
+    state = runner._peek_session_state(key)
+    if state is None or event is None or is_system_event(runner, event):
+        return True
+    if getattr(state.conversation, "inflight_followup", None) is event:
+        state.conversation.inflight_followup = None
+        return True
+    return False
+
+
+def reclaim_inflight(runner: Any, key: str, *, only: Any = None) -> int:
+    """Put the marked follow-up back at the front of held (a merged release expands to its original
+    items); ``only`` limits it to that event. Returns the user items put back. Never raises."""
+    try:
+        state = runner._peek_session_state(key)
+        event = getattr(state.conversation, "inflight_followup", None) if state else None
+        if event is None or (only is not None and event is not only):
+            return 0
+        state.conversation.inflight_followup = None
+        items = list(getattr(event, "_queue_merged_from", None) or [event])
+        for e in items:
+            try:
+                e._queue_released = False
+            except Exception:
+                pass
+        state.conversation.held_queue[0:0] = items
+        logger.info("queue_mgmt op=hold session=%s moved=%d held=%d from=inflight", key, len(items),
+                    len(state.conversation.held_queue))
+        log_items(runner, "hold", key, items)
+        return len(items)
+    except Exception:
+        logger.warning("queue_mgmt inflight reclaim failed for %s", key, exc_info=True)
+        return 0
+
+
 # --------------------------------------------------------------------------- verbs
 
 def _store_for_verbs(runner: Any, key: str, adapter: Any) -> Tuple[str, List[Any]]:
@@ -409,7 +460,9 @@ def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_r
         return 0
     released = len(users) + len(system)
     if release_mode(runner) == "merged" and len(users) > 1:
+        originals = users
         users = [merge_user_events(users)]
+        users[0]._queue_merged_from = originals   # a reclaim puts the items back one by one
     for e in users:
         try:
             e._queue_released = True
@@ -534,6 +587,7 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
     # This runs inside THE conversation-boundary funnel: it must never raise, or a /new would fail
     # half-way. Any surprise (odd state shape) fails open: no carry, no count, the clear proceeds.
     try:
+        reclaim_inflight(runner, key)   # the clear below would wipe the mark: count/carry it as held
         state = runner._peek_session_state(key)
         if state is None:
             return None

@@ -664,3 +664,13 @@ def test_every_transition_logs_one_line_per_item(rig, caplog):
     with caplog.at_level("INFO", logger="gateway.queue_mgmt"):   # redact before the 60-char cut (8e6f86bd338c)
         qm.log_items(runner, "add", KEY, [_ev("postgresql://user:" + "x" * 42 + "@db.example/app")])
     assert "x" * 20 not in caplog.text, caplog.text
+
+
+def test_user_reset_counts_a_popped_unclaimed_follow_up(rig):
+    """Prism 50373862d991: a /new in the pop-to-claim window drops the popped item WITH a count."""
+    runner, adapter = rig
+    ev = _ev("a")
+    qm.mark_inflight(runner, KEY, ev)
+    qm.before_scope_clear(runner, KEY, "session_reset")
+    assert qm.take_reset_drop_suffix(runner, KEY).strip().startswith("Dropped 1 ")
+    assert qm.claim_inflight(runner, KEY, ev) is False   # the old chain must not run it

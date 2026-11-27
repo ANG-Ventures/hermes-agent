@@ -4296,10 +4296,13 @@ class GatewayTurnMixin:
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            from gateway import queue_mgmt
+            queue_mgmt.mark_inflight(self, session_key, pending_event)   # popped: in no store now
             from gateway.kanban_wake_freshness import drop_stale
             while pending_event is not None and await drop_stale(pending_event):
                 pending_event = self._promote_queued_event(
                     session_key, adapter, _dequeue_pending_event(adapter, session_key))
+                queue_mgmt.mark_inflight(self, session_key, pending_event)
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
@@ -4468,6 +4471,7 @@ class GatewayTurnMixin:
             turn_ctx._interrupt_depth, turn_ctx.history, turn_ctx._status_thread_metadata,
         )
         logger.debug("Processing pending message: '%s...'", pending[:40])
+        from gateway import queue_mgmt
 
         # Clear the interrupt event so the recursive _run_agent isn't re-interrupted (infinite loop).
         _active = getattr(adapter, "_active_sessions", None) if adapter else None
@@ -4489,7 +4493,7 @@ class GatewayTurnMixin:
                 _meta = _leftover_steer_meta(result, pending)
                 pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source,
                                              metadata=_meta, message_id=_leftover_steer_message_id(_meta))
-            if adapter and pending_event:
+            if adapter and pending_event and queue_mgmt.claim_inflight(self, session_key, pending_event):
                 # The drain already promoted the overflow head into the slot; merging would REPLACE it
                 # (two internal TEXT wakes never merge), losing an accepted wake (t_f36d21e8). Put the
                 # dequeued event back at the head and the slot's occupant back on the overflow front.
@@ -4538,6 +4542,7 @@ class GatewayTurnMixin:
                 session_id=session_id,
             )
             if next_message is None:
+                queue_mgmt.claim_inflight(self, session_key, pending_event)   # refused: consumed
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
@@ -4622,6 +4627,11 @@ class GatewayTurnMixin:
                 _followup_state.turn.started_ts = time.time()
                 _followup_state.turn.busy_ack_ts = 0.0
 
+            if not queue_mgmt.claim_inflight(self, session_key, pending_event):
+                # A /stop or other invalidation put it back into held meanwhile: never run it twice.
+                await _run_followup_processing_hook(
+                    _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
+                return result
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
@@ -5111,6 +5121,9 @@ class GatewayTurnMixin:
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )
+                if session_key:   # a discarded command or a spooled item is no longer in flight
+                    from gateway import queue_mgmt
+                    queue_mgmt.mark_inflight(self, session_key, pending_event)
             # Snapshot after drain awaits, before any queued/depth-cap return.
             # Either result object may be returned by the follow-up helper.
             for turn_result in (response, result):
@@ -5118,9 +5131,14 @@ class GatewayTurnMixin:
                     turn_result["effective_display_kind"] = turn_ctx.effective_display_kind
                     turn_result["effective_reply_expected"] = turn_ctx.reply_expected
             if pending_event or pending:
-                return await self._run_agent_queued_followup(
-                    turn_ctx, adapter, pending, pending_event, response, result, stream_task,
-                )
+                try:
+                    return await self._run_agent_queued_followup(
+                        turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                    )
+                finally:   # cancelled or failed before the follow-up claimed it: back to held
+                    if session_key and pending_event is not None:
+                        from gateway import queue_mgmt
+                        queue_mgmt.reclaim_inflight(self, session_key, only=pending_event)
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,

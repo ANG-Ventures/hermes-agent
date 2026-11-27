@@ -29,6 +29,7 @@ class _Adapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
         self.sent = []
+        self.block_text, self.send_entered, self.send_gate = None, None, None   # hold one final send
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -37,6 +38,9 @@ class _Adapter(BasePlatformAdapter):
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if self.block_text and self.block_text in str(content):
+            self.send_entered.set()
+            await self.send_gate.wait()
         self.sent.append(str(content))
         return SendResult(success=True, message_id="m1")
 
@@ -77,6 +81,7 @@ class _Rig:
         self.gates = {"first": self.block_first}   # message -> turn blocks until /stop sets it
         self.pause_on_stop = False                  # opt-in: model the real /stop's automatic pause
         self.truncated = set()                      # messages whose turn ends partial (truncated reply)
+        self.gate_completes = set()                 # gated messages that end completed, not interrupted
         rig = self
 
         class StubAgent:
@@ -97,6 +102,9 @@ class _Rig:
                     if message in rig.gates:
                         rig.first_started.set()
                         rig.gates[message].wait(10)
+                        if message in rig.gate_completes:
+                            return {"final_response": f"answer {message}", "messages": [], "api_calls": 1,
+                                    "completed": True}
                         return {"final_response": "", "messages": [], "api_calls": 1, "interrupted": True}
                     if message in rig.truncated:   # the result the 4x finish_reason="length" path ends with
                         from agent.turn_truncation import partial_result
@@ -388,3 +396,69 @@ async def test_merged_mode_keeps_system_wake_as_its_own_turn_first(monkeypatch, 
     await rig.adapter.handle_message(_msg("/queue run"))
     await rig.settle(expect=2)
     assert rig.calls == ["[wake] batch done", "a\n\nb"]
+
+
+@pytest.mark.asyncio
+async def test_stop_during_reply_send_puts_released_batch_back_into_held(monkeypatch, tmp_path, caplog):
+    """Prism 50373862d991 / Apollo send-back on PR 573: held=[a, b] merged; `ping` completes and
+    releases them; /stop lands while ping's reply is still sending. a, b go back to held in order."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.pause_on_stop = True
+    rig.runner._queue_release_mode = "merged"
+    rig.runner._session_state(KEY).conversation.held_queue.extend([_msg("a"), _msg("b")])
+    rig.adapter.block_text, rig.adapter.send_entered = "answer ping", asyncio.Event()
+    rig.adapter.send_gate = asyncio.Event()
+    await rig.adapter.handle_message(_msg("ping"))
+    await _wait(rig.adapter.send_entered)
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):
+        await rig.adapter.handle_message(_msg("/stop"))
+    rig.adapter.send_gate.set()
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping"]
+    assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["a", "b"]
+    assert any("2 queued prompt(s) held" in s for s in rig.adapter.sent), rig.adapter.sent
+    assert "from=inflight" in caplog.text and caplog.text.count("queue_mgmt item op=hold ") == 2
+    rig.adapter.block_text = None
+    await rig.adapter.handle_message(_msg("pong"))
+    await rig.settle(expect=3)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping", "pong", "a\n\nb"]
+    assert rig.max_live == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_during_reply_send_puts_ordinary_queued_prompt_into_held(monkeypatch, tmp_path):
+    """Same window on main, nothing held: `/queue z` during ping; /stop during ping's reply send."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.pause_on_stop = True
+    rig.gates = {"ping": threading.Event()}
+    rig.gate_completes.add("ping")
+    rig.adapter.block_text, rig.adapter.send_entered = "answer ping", asyncio.Event()
+    rig.adapter.send_gate = asyncio.Event()
+    rig.adapter._start_session_processing(_msg("ping"), KEY)
+    await _wait(rig.first_started)
+    await rig.adapter.handle_message(_msg("/queue z"))
+    rig.gates["ping"].set()
+    await _wait(rig.adapter.send_entered)
+    await rig.adapter.handle_message(_msg("/stop"))
+    rig.adapter.send_gate.set()
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping"]
+    assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["z"]
+    assert any("1 queued prompt(s) held" in s for s in rig.adapter.sent), rig.adapter.sent
+    rig.adapter.block_text = None
+    await rig.adapter.handle_message(_msg("pong"))
+    await rig.settle(expect=3)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping", "pong", "z"]
+    assert rig.max_live == 1
+
+
+async def _wait(flag):
+    for _ in range(500):
+        if flag.is_set():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("never set")
