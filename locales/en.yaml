@@ -837,7 +837,7 @@ gateway:
     moved: "Moved queue item {source} to {destination}."
     refused_command: "Not queued: /{command} is a command, and commands can't be queued as prompts. Send it on its own."
     cap_reached: "Not queued: the queue is full ({cap} items). Use /queue list, /queue rm N or /queue clear."
-    added_to_held: "Added to the held queue ({count} held). /queue run releases them."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "Released {count} queued prompt(s); they run next, in order."
     released_interrupting: "Interrupting the current turn; releasing {count} queued prompt(s) in order."
     dropped_on_reset: "Dropped {count} queued prompt(s) with the old conversation."

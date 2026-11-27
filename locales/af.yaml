@@ -827,7 +827,7 @@ gateway:
     moved: "Tou-item {source} na {destination} verplaas."
     refused_command: "Nie in die tou geplaas nie: /{command} is 'n opdrag, en opdragte kan nie as prompts in die tou geplaas word nie. Stuur dit op sy eie."
     cap_reached: "Nie in die tou geplaas nie: die tou is vol ({cap} items). Gebruik /queue list, /queue rm N of /queue clear."
-    added_to_held: "By die teruggehoue tou gevoeg ({count} teruggehou). /queue run stel hulle vry."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "{count} prompt(s) in die tou vrygestel; hulle loop volgende, in volgorde."
     released_interrupting: "Onderbreek die huidige beurt; stel {count} prompt(s) in die tou in volgorde vry."
     dropped_on_reset: "{count} prompt(s) in die tou saam met die ou gesprek verwyder."

@@ -827,7 +827,7 @@ gateway:
     moved: "キュー項目 {source} を {destination} に移動しました。"
     refused_command: "キューに追加されませんでした: /{command} はコマンドであり、コマンドはプロンプトとしてキューに追加できません。単独で送信してください。"
     cap_reached: "キューに追加されませんでした: キューが満杯です（{cap} 件）。/queue list、/queue rm N または /queue clear を使ってください。"
-    added_to_held: "保留中のキューに追加しました（{count} 件保留中）。/queue run で解放します。"
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "キュー内のプロンプト {count} 件を解放しました。次に順番に実行されます。"
     released_interrupting: "現在のターンを中断し、キュー内のプロンプト {count} 件を順番に解放します。"
     dropped_on_reset: "古い会話とともにキュー内のプロンプト {count} 件を破棄しました。"

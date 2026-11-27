@@ -953,7 +953,7 @@ gateway:
     moved: "Élément {source} de la file déplacé vers {destination}."
     refused_command: "Non mis en file : /{command} est une commande, et les commandes ne peuvent pas être mises en file comme prompts. Envoyez-la seule."
     cap_reached: "Non mis en file : la file est pleine ({cap} éléments). Utilisez /queue list, /queue rm N ou /queue clear."
-    added_to_held: "Ajouté à la file retenue ({count} retenu(s)). /queue run les libère."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "{count} prompt(s) en file libéré(s) ; ils s'exécutent ensuite, dans l'ordre."
     released_interrupting: "Interruption du tour en cours ; libération de {count} prompt(s) en file dans l'ordre."
     dropped_on_reset: "{count} prompt(s) en file supprimé(s) avec l'ancienne conversation."

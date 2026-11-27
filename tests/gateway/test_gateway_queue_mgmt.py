@@ -5,6 +5,7 @@ Store-level tests drive ``gateway/queue_mgmt.py`` against a real ``GatewayRunner
 entry-point tests drive ``_busy_queue_command`` / ``_hm_cmd_queue`` themselves.
 """
 
+import asyncio
 import importlib
 from types import SimpleNamespace
 
@@ -194,14 +195,6 @@ def test_mutate_held_keeps_rest_held_and_never_arms_the_slot(rig):
     assert _active(runner, adapter) == []
 
 
-def test_new_queue_item_joins_held(rig):
-    runner, adapter = rig
-    _seed(runner, adapter, "a")
-    qm.hold_user_items(runner, KEY, adapter)
-    reply = qm.append_if_held(runner, KEY, _ev("z"))
-    assert "2 held" in reply and _held(runner) == ["a", "z"]
-
-
 def test_restage_moves_held_into_slot_then_overflow(rig):
     runner, adapter = rig
     _seed(runner, adapter, "a", "b", "c")
@@ -367,13 +360,72 @@ async def test_rm_all_with_extra_words_is_still_a_prompt(rig):
     assert _active(runner, adapter) == ["a", "rm all of them"]
 
 
+_STILL_HELD = "1 older prompt(s) still held: /queue run releases them, /queue clear drops them."
+
+
 @pytest.mark.asyncio
-async def test_busy_queue_prompt_joins_held_when_held(rig):
+async def test_busy_queue_prompt_goes_active_while_held(rig):
+    """D14 (Ace 2026-11-26, Discord 1575705667786776607): a new /queue item never joins held."""
     runner, adapter = rig
     _seed(runner, adapter, "a")
     qm.hold_user_items(runner, KEY, adapter)
-    reply = await runner._busy_queue_command(_cmd("/queue next thing"), KEY, _source())
-    assert "2 held" in reply and _held(runner) == ["a", "next thing"]
+    reply = await runner._busy_queue_command(_cmd("/queue y"), KEY, _source())
+    assert reply == "Queued for the next turn.\n" + _STILL_HELD
+    reply = await runner._busy_queue_command(_cmd("/queue add z"), KEY, _source())
+    assert reply == "Queued for the next turn. (2 queued)\n" + _STILL_HELD
+    assert adapter._pending_messages[KEY].text == "y"                  # armed: runs when the turn ends
+    assert _active(runner, adapter) == ["y", "z"] and _held(runner) == ["a"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text, prompt", [("/queue z", "z"), ("/queue add z", "z")])
+async def test_idle_queue_prompt_runs_now_while_held(rig, text, prompt):
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    qm.hold_user_items(runner, KEY, adapter)
+    calls = []
+    async def _ack(source, ack, label):
+        calls.append(("ack", ack))
+    runner._send_command_ack = _ack
+    ev = _cmd(text)
+    handled, reply = await runner._hm_cmd_queue(ev, _source(), KEY)
+    calls.append(("turn", ev.text) if handled is False else ("reply", reply))
+    await asyncio.sleep(0)                                   # the note is sent in the background
+    assert calls == [("turn", prompt), ("ack", _STILL_HELD)]
+    assert _held(runner) == ["a"] and KEY not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_idle_queue_while_held_never_awaits_the_note_before_the_claim(rig):
+    """Prism 03e7f19cf6dc: a pending note send must not hold the idle path open for a second /queue."""
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    qm.hold_user_items(runner, KEY, adapter)
+    never = asyncio.Event()
+    async def _stuck_ack(source, ack, label):
+        await never.wait()
+    runner._send_command_ack = _stuck_ack
+    ev = _cmd("/queue z")
+    assert await asyncio.wait_for(runner._hm_cmd_queue(ev, _source(), KEY), 1) == (False, None)
+    never.set()
+    await asyncio.sleep(0)
+
+
+def test_verbs_while_held_and_a_later_active_item(rig):
+    """Report-only (t_0990175d): verbs index the held store; a later active item is shown, not indexed."""
+    runner, adapter = rig
+    _seed(runner, adapter, "a", "b")
+    qm.hold_user_items(runner, KEY, adapter)
+    _seed(runner, adapter, "z")
+    out = qm.apply_management(runner, qm.QueueOp("list"), KEY, adapter)
+    assert "1. a" in out and "2. b" in out and "Also waiting (1)" in out and "· z" in out
+    assert qm.apply_management(runner, qm.QueueOp("edit", index=1, text="A"), KEY, adapter).startswith("Updated")
+    assert qm.apply_management(runner, qm.QueueOp("move", index=2, to=1), KEY, adapter) == "Moved queue item 2 to 1."
+    assert _held(runner) == ["b", "A"] and _active(runner, adapter) == ["z"]
+    assert qm.apply_management(runner, qm.QueueOp("rm", index=3), KEY, adapter) == "Queue item 3 not found. Current size: 2"
+    assert qm.apply_management(runner, qm.QueueOp("rm", index=1), KEY, adapter) == "Removed queue item 1: b"
+    assert qm.apply_management(runner, qm.QueueOp("clear"), KEY, adapter) == "Cleared 1 queued prompt."
+    assert _held(runner) == [] and _active(runner, adapter) == ["z"] and adapter._pending_messages[KEY].text == "z"
 
 
 @pytest.mark.asyncio

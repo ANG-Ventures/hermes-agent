@@ -827,7 +827,7 @@ gateway:
     moved: "Елемент черги {source} переміщено на {destination}."
     refused_command: "Не поставлено в чергу: /{command} — це команда, а команди не можна ставити в чергу як запити. Надішліть її окремо."
     cap_reached: "Не поставлено в чергу: черга заповнена ({cap} елементів). Використайте /queue list, /queue rm N або /queue clear."
-    added_to_held: "Додано до утримуваної черги (утримано: {count}). /queue run випускає їх."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "Випущено запитів із черги: {count}; вони виконаються наступними, по порядку."
     released_interrupting: "Перериваю поточний хід; випускаю запити з черги по порядку: {count}."
     dropped_on_reset: "Видалено запитів із черги разом зі старою розмовою: {count}."

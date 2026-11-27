@@ -827,7 +827,7 @@ gateway:
     moved: "Item {source} da fila movido para {destination}."
     refused_command: "Não enfileirado: /{command} é um comando, e comandos não podem ser enfileirados como prompts. Envia-o sozinho."
     cap_reached: "Não enfileirado: a fila está cheia ({cap} itens). Usa /queue list, /queue rm N ou /queue clear."
-    added_to_held: "Adicionado à fila retida ({count} retido(s)). /queue run liberta-os."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "{count} prompt(s) da fila libertado(s); são executados a seguir, por ordem."
     released_interrupting: "A interromper o turno atual; a libertar {count} prompt(s) da fila por ordem."
     dropped_on_reset: "{count} prompt(s) da fila descartado(s) com a conversa antiga."

@@ -827,7 +827,7 @@ gateway:
     moved: "Kuyruk öğesi {source}, {destination} konumuna taşındı."
     refused_command: "Kuyruğa alınmadı: /{command} bir komuttur ve komutlar istem olarak kuyruğa alınamaz. Tek başına gönder."
     cap_reached: "Kuyruğa alınmadı: kuyruk dolu ({cap} öğe). /queue list, /queue rm N veya /queue clear kullan."
-    added_to_held: "Bekletilen kuyruğa eklendi ({count} bekletiliyor). /queue run onları serbest bırakır."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "Kuyruktaki {count} istem serbest bırakıldı; sırayla bir sonraki olarak çalışacaklar."
     released_interrupting: "Geçerli tur kesiliyor; kuyruktaki {count} istem sırayla serbest bırakılıyor."
     dropped_on_reset: "Kuyruktaki {count} istem eski konuşmayla birlikte silindi."

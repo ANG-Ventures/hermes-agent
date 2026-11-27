@@ -827,7 +827,7 @@ gateway:
     moved: "Elemento {source} della coda spostato in posizione {destination}."
     refused_command: "Non messo in coda: /{command} è un comando, e i comandi non possono essere messi in coda come prompt. Invialo da solo."
     cap_reached: "Non messo in coda: la coda è piena ({cap} elementi). Usa /queue list, /queue rm N o /queue clear."
-    added_to_held: "Aggiunto alla coda trattenuta ({count} trattenuti). /queue run li rilascia."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "Rilasciati {count} prompt in coda; verranno eseguiti subito dopo, in ordine."
     released_interrupting: "Interruzione del turno corrente; rilascio di {count} prompt in coda in ordine."
     dropped_on_reset: "Eliminati {count} prompt in coda insieme alla vecchia conversazione."

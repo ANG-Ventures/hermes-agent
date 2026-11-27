@@ -827,7 +827,7 @@ gateway:
     moved: "Warteschlangeneintrag {source} nach {destination} verschoben."
     refused_command: "Nicht eingereiht: /{command} ist ein Befehl, und Befehle können nicht als Prompts eingereiht werden. Sende ihn einzeln."
     cap_reached: "Nicht eingereiht: Die Warteschlange ist voll ({cap} Einträge). Verwende /queue list, /queue rm N oder /queue clear."
-    added_to_held: "Zur zurückgehaltenen Warteschlange hinzugefügt ({count} zurückgehalten). /queue run gibt sie frei."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "{count} eingereihte(r) Prompt(s) freigegeben; sie laufen als Nächstes, der Reihe nach."
     released_interrupting: "Unterbreche den aktuellen Zug; gebe {count} eingereihte(n) Prompt(s) der Reihe nach frei."
     dropped_on_reset: "{count} eingereihte(r) Prompt(s) mit der alten Unterhaltung verworfen."

@@ -827,7 +827,7 @@ gateway:
     moved: "نُقل عنصر قائمة الانتظار من {source} إلى {destination}."
     refused_command: "لم تُضف إلى قائمة الانتظار: /{command} أمر، ولا يمكن إضافة الأوامر كمطالبات. أرسله بمفرده."
     cap_reached: "لم تُضف إلى قائمة الانتظار: القائمة ممتلئة ({cap} عنصرًا). استخدم /queue list أو /queue rm N أو /queue clear."
-    added_to_held: "أُضيفت إلى قائمة الانتظار المعلّقة ({count} معلّقة). /queue run يطلقها."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "أُطلقت {count} مطالبة من قائمة الانتظار؛ ستُنفَّذ تاليًا، بالترتيب."
     released_interrupting: "جارٍ مقاطعة الدور الحالي؛ وإطلاق {count} مطالبة من قائمة الانتظار بالترتيب."
     dropped_on_reset: "حُذفت {count} مطالبة من قائمة الانتظار مع المحادثة القديمة."

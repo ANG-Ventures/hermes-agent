@@ -160,3 +160,31 @@ async def test_current_turn_still_drains_its_queue(monkeypatch, tmp_path):
 
     _runner, _adapter, calls = await _drive(monkeypatch, tmp_path, queue_only)
     assert calls == ["first", "a"]
+
+
+def _run_sync(coro):
+    """Drive a coroutine that never suspends (the /queue add path) from the stub agent's sync turn."""
+    try:
+        coro.send(None)
+    except StopIteration as done:
+        return done.value
+    coro.close()
+    raise AssertionError("coroutine suspended")
+
+
+@pytest.mark.asyncio
+async def test_queue_while_held_runs_after_the_turn_and_held_stays(monkeypatch, tmp_path):
+    """D14 (Ace 2026-11-26, Discord 1575705667786776607): held=[a]; turn running; `/queue z`;
+    the turn ends; z runs as the next turn; held is still [a]."""
+    from gateway import queue_mgmt
+    replies = []
+
+    def queue_mid_turn(runner, adapter):
+        runner._session_state(SESSION_KEY).conversation.held_queue.append(_event("a"))
+        ev = MessageEvent(text="/queue z", message_type=MessageType.TEXT, source=_source())
+        replies.append(_run_sync(runner._busy_queue_command(ev, SESSION_KEY, _source())))
+
+    runner, adapter, calls = await _drive(monkeypatch, tmp_path, queue_mid_turn)
+    assert calls == ["first", "z"]
+    assert [e.text for e in queue_mgmt.held_list(runner, SESSION_KEY)] == ["a"]
+    assert replies[0].startswith("Queued for the next turn.") and "1 older prompt(s) still held" in replies[0]
