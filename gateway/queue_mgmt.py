@@ -314,7 +314,7 @@ def cap_reply(runner: Any, key: str, adapter: Any) -> Optional[str]:
 
 
 def held_note(runner: Any, key: str) -> str:
-    """D14 (Ace 2026-11-26): a new /queue item never joins the held store; this line tells the user
+    """D14 (Ace 2026-11-26): a new /queue item goes to the active queue; this line tells the user
     the older held prompts are still waiting. Empty when nothing is held."""
     held = held_list(runner, key)
     return ("\n" + t("gateway.queue.still_held", count=len(held))) if held else ""

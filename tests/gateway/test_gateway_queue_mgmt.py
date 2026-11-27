@@ -5,6 +5,7 @@ Store-level tests drive ``gateway/queue_mgmt.py`` against a real ``GatewayRunner
 entry-point tests drive ``_busy_queue_command`` / ``_hm_cmd_queue`` themselves.
 """
 
+import asyncio
 import importlib
 from types import SimpleNamespace
 
@@ -389,8 +390,25 @@ async def test_idle_queue_prompt_runs_now_while_held(rig, text, prompt):
     ev = _cmd(text)
     handled, reply = await runner._hm_cmd_queue(ev, _source(), KEY)
     calls.append(("turn", ev.text) if handled is False else ("reply", reply))
-    assert calls == [("ack", _STILL_HELD), ("turn", prompt)]
+    await asyncio.sleep(0)                                   # the note is sent in the background
+    assert calls == [("turn", prompt), ("ack", _STILL_HELD)]
     assert _held(runner) == ["a"] and KEY not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_idle_queue_while_held_never_awaits_the_note_before_the_claim(rig):
+    """Prism 03e7f19cf6dc: a pending note send must not hold the idle path open for a second /queue."""
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    qm.hold_user_items(runner, KEY, adapter)
+    never = asyncio.Event()
+    async def _stuck_ack(source, ack, label):
+        await never.wait()
+    runner._send_command_ack = _stuck_ack
+    ev = _cmd("/queue z")
+    assert await asyncio.wait_for(runner._hm_cmd_queue(ev, _source(), KEY), 1) == (False, None)
+    never.set()
+    await asyncio.sleep(0)
 
 
 def test_verbs_while_held_and_a_later_active_item(rig):

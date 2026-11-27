@@ -1146,7 +1146,13 @@ class GatewayInboundMixin:
             event.text = op.text  # strips the /queue prefix (and an explicit `add`)
         note = queue_mgmt.held_note(self, _quick_key)
         if note:
-            await self._send_command_ack(source, note.lstrip("\n"), "queue")
+            # No await before the session claim: a second /queue must find the session busy (Prism
+            # 03e7f19cf6dc). The note goes out in the background.
+            task = asyncio.ensure_future(self._send_command_ack(source, note.lstrip("\n"), "queue"))
+            tasks = getattr(self, "_background_tasks", None)
+            if isinstance(tasks, set):
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
         return False, None
 
     async def _hm_cmd_steer(self, event, source, _quick_key):
