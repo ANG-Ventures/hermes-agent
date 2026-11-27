@@ -207,13 +207,13 @@ def test_record_path_import_runs_no_subprocess(tmp_path):
     probe = textwrap.dedent(
         """
         import subprocess
-        import hermes_cli.version_info as version_info
         spawned, version_reads = [], []
         _init = subprocess.Popen.__init__
         def _spy(self, args, *a, **k):
             spawned.append(args)
             return _init(self, args, *a, **k)
         subprocess.Popen.__init__ = _spy
+        import hermes_cli.version_info as version_info
         _read = version_info.get_version_info
         def _read_spy():
             version_reads.append(1)
