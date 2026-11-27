@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ Detenido. Puedes continuar esta sesión."
     no_active: "No hay ninguna tarea activa que detener."
     force_stopped_pending: "⚡ Detención forzada. El agente aún estaba iniciándose: sesión desbloqueada."
-    queue_held: "{count} prompt(s) en cola retenidos. /queue run los libera, /queue list los muestra, /queue clear los descarta."
+    queue_held: "{count} prompt(s) en cola retenidos. Se ejecutan tras el próximo turno completado; /queue run los ejecuta ya, /queue clear los descarta."
     queue_released: "Liberando ahora {count} prompt(s) en cola, en orden."
   title:
     db_unavailable: "Base de datos de sesiones no disponible."

@@ -76,7 +76,7 @@ def _make_runner(adapter):
     return runner
 
 
-async def _drive(monkeypatch, tmp_path, on_first_turn):
+async def _drive(monkeypatch, tmp_path, on_first_turn, *, first_interrupted=True, **turn_kwargs):
     """Run one tracked turn; ``on_first_turn(runner, adapter)`` plays /stop mid-turn."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
     fake_dotenv = types.ModuleType("dotenv")
@@ -99,8 +99,9 @@ async def _drive(monkeypatch, tmp_path, on_first_turn):
             calls.append(message)
             if len(calls) == 1:
                 on_first_turn(runner, adapter)
-                return {"final_response": "", "messages": [], "api_calls": 1, "interrupted": True}
-            return {"final_response": f"answer to {message}", "messages": [], "api_calls": 1}
+                if first_interrupted:
+                    return {"final_response": "", "messages": [], "api_calls": 1, "interrupted": True}
+            return {"final_response": f"answer to {message}", "messages": [], "api_calls": 1, "completed": True}
 
     fake_run_agent = types.ModuleType("run_agent")
     fake_run_agent.AIAgent = StubAgent
@@ -112,7 +113,7 @@ async def _drive(monkeypatch, tmp_path, on_first_turn):
     generation = runner._begin_session_run_generation(SESSION_KEY)
     await runner._run_agent(message="first", context_prompt="", history=[], source=_source(),
                             session_id="sess-stale-drain", session_key=SESSION_KEY,
-                            run_generation=generation)
+                            run_generation=generation, **turn_kwargs)
     return runner, adapter, calls
 
 
@@ -173,9 +174,9 @@ def _run_sync(coro):
 
 
 @pytest.mark.asyncio
-async def test_queue_while_held_runs_after_the_turn_and_held_stays(monkeypatch, tmp_path):
+async def test_queue_while_held_runs_after_the_turn_then_held_releases(monkeypatch, tmp_path):
     """D14 (Ace 2026-11-26, Discord 1575705667786776607): held=[a]; turn running; `/queue z`;
-    the turn ends; z runs as the next turn; held is still [a]."""
+    the (interrupted) turn ends; z runs as the next turn, and z's completion releases a (D5)."""
     from gateway import queue_mgmt
     replies = []
 
@@ -185,6 +186,21 @@ async def test_queue_while_held_runs_after_the_turn_and_held_stays(monkeypatch, 
         replies.append(_run_sync(runner._busy_queue_command(ev, SESSION_KEY, _source())))
 
     runner, adapter, calls = await _drive(monkeypatch, tmp_path, queue_mid_turn)
-    assert calls == ["first", "z"]
-    assert [e.text for e in queue_mgmt.held_list(runner, SESSION_KEY)] == ["a"]
+    assert calls == ["first", "z", "a"]
+    assert queue_mgmt.held_list(runner, SESSION_KEY) == []
     assert replies[0].startswith("Queued for the next turn.") and "1 older prompt(s) still held" in replies[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind, expected", [(None, ["first", "a"]), ("internal_notification", ["first"])])
+async def test_only_a_completed_human_turn_releases_held(monkeypatch, tmp_path, kind, expected):
+    """D5: a completed internal-wake turn leaves held items held; a completed human turn releases."""
+    from gateway import queue_mgmt
+
+    def hold_one(runner, adapter):
+        runner._session_state(SESSION_KEY).conversation.held_queue.append(_event("a"))
+
+    runner, _adapter, calls = await _drive(monkeypatch, tmp_path, hold_one, first_interrupted=False,
+                                           persist_user_display_kind=kind)
+    assert calls == expected
+    assert len(queue_mgmt.held_list(runner, SESSION_KEY)) == (1 if kind else 0)

@@ -61,6 +61,8 @@ class ConversationState:
     # User /queue items held by /stop: no drain/rescue/promotion reads this; only /queue run|clear
     # or a session boundary empties it (gateway/queue_mgmt.py, spec 2026-10-12 D14).
     held_queue: List[Any] = field(default_factory=list)
+    # Follow-up the drain popped that no turn has claimed yet (queue_mgmt.mark_inflight).
+    inflight_followup: Any = None
     automatic_turns_paused: Optional[bool] = None  # None: hydrate the durable /stop marker
     sidecar_notes: List[str] = field(default_factory=list)  # one-shot must-deliver notes
     ephemeral_pin: Optional[Tuple[Any, ...]] = None  # pinned session-context (change_key, text, redact_pii)

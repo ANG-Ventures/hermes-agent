@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ Stoptha. Is féidir leat leanúint leis an seisiún seo."
     no_active: "Níl aon tasc gníomhach le stopadh."
     force_stopped_pending: "⚡ Stoptha le fórsa. Bhí an gníomhaire fós ag tosú — seisiún díghlasáilte."
-    queue_held: "{count} leid scuainithe á gcoinneáil. Scaoileann /queue run iad, taispeánann /queue list iad, glanann /queue clear iad."
+    queue_held: "{count} leid scuainithe á gcoinneáil. Rithfear iad tar éis an chéad seal eile a chríochnaítear; ritheann /queue run anois iad, glanann /queue clear iad."
     queue_released: "{count} leid scuainithe á scaoileadh anois, in ord."
   title:
     db_unavailable: "Níl bunachar sonraí na seisiún ar fáil."

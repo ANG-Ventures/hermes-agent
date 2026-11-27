@@ -572,6 +572,9 @@ class GatewayAgentCacheMixin:
         Settles a pending one-shot model override first: the displaced turn's finalizer is
         generation-guarded and would otherwise leave ``/moa`` / ``/model --once`` in force."""
         self._restore_pending_one_turn_model_override(session_key)
+        # A popped, unclaimed follow-up goes back to held before the bump makes its turn stale.
+        from gateway import queue_mgmt
+        queue_mgmt.reclaim_inflight(self, session_key)
         persistent = self._session_state(session_key).persistent
         # Every generation up to the one in flight is now "stopped and draining"; record it BEFORE
         # the bump so the turn-lease stale test (``_is_session_run_invalidated``) can tell this
@@ -823,6 +826,7 @@ class GatewayAgentCacheMixin:
                 try:
                     from gateway import queue_mgmt as _qm
                     _qm.note_reset_drop(self, session_key, 1)
+                    _qm.log_items(self, "reset_drop", session_key, [parked])
                 except Exception:
                     logger.warning("reset-drop count skipped for %s", session_key, exc_info=True)
             wake = parked if getattr(parked, "internal", False) else None

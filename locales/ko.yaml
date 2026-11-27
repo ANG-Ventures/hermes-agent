@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ 중지되었습니다. 이 세션을 계속할 수 있습니다."
     no_active: "중지할 활성 작업이 없습니다."
     force_stopped_pending: "⚡ 강제 중지했어요. 에이전트가 아직 시작 중이었어요 — 세션 잠금을 해제했어요."
-    queue_held: "대기 중인 프롬프트 {count}개를 보류했어요. /queue run으로 해제하고, /queue list로 보고, /queue clear로 버릴 수 있어요."
+    queue_held: "대기 중인 프롬프트 {count}개를 보류했어요. 다음 턴이 끝나면 실행돼요. /queue run으로 지금 실행하고, /queue clear로 버릴 수 있어요."
     queue_released: "대기 중인 프롬프트 {count}개를 지금 순서대로 해제할게요."
   title:
     db_unavailable: "세션 데이터베이스를 사용할 수 없습니다."

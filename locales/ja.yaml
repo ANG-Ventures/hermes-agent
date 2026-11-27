@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ 停止しました。このセッションを続行できます。"
     no_active: "停止できるアクティブなタスクはありません。"
     force_stopped_pending: "⚡ 強制停止しました。エージェントはまだ起動中でした — セッションのロックを解除しました。"
-    queue_held: "キュー内のプロンプト {count} 件を保留しました。/queue run で解放、/queue list で表示、/queue clear で破棄します。"
+    queue_held: "キュー内のプロンプト {count} 件を保留しました。次のターン完了後に実行されます。/queue run で今すぐ実行、/queue clear で破棄します。"
     queue_released: "キュー内のプロンプト {count} 件を順番に解放します。"
   title:
     db_unavailable: "セッションデータベースは利用できません。"

@@ -1763,6 +1763,7 @@ class GatewayBusySessionMixin:
                 wake_kind=getattr(event, "wake_kind", None),
             )
             self._enqueue_fifo(quick_key, _queued_event, adapter)
+            queue_mgmt.log_items(self, "add", quick_key, [_queued_event])
         depth = self._queue_depth(quick_key, adapter=adapter)
         return (t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
                 + queue_mgmt.held_note(self, quick_key))

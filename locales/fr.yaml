@@ -528,7 +528,7 @@ gateway:
     stopped: "⚡ Arrêté. Vous pouvez continuer cette session."
     no_active: "Aucune tâche active à arrêter."
     force_stopped_pending: "⚡ Arrêt forcé. L'agent était encore en cours de démarrage — session déverrouillée."
-    queue_held: "{count} prompt(s) en file retenu(s). /queue run les libère, /queue list les affiche, /queue clear les supprime."
+    queue_held: "{count} prompt(s) en file retenu(s). Ils s'exécutent après le prochain tour terminé ; /queue run les lance maintenant, /queue clear les supprime."
     queue_released: "Libération de {count} prompt(s) en file maintenant, dans l'ordre."
   title:
     db_unavailable: "Base de données des sessions indisponible."

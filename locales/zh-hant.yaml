@@ -488,7 +488,7 @@ gateway:
     stopped: "⚡ 已停止。你可以繼續此工作階段。"
     no_active: "沒有可停止的作用中任務。"
     force_stopped_pending: "⚡ 已強制停止。代理當時仍在啟動 — 工作階段已解鎖。"
-    queue_held: "已暫留 {count} 則排入佇列的提示。/queue run 釋放、/queue list 顯示、/queue clear 捨棄。"
+    queue_held: "已暫留 {count} 則排入佇列的提示，將在下一輪完成後執行。/queue run 立即執行、/queue clear 捨棄。"
     queue_released: "正在依序釋放 {count} 則排入佇列的提示。"
   title:
     db_unavailable: "工作階段資料庫無法使用。"

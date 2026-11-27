@@ -630,3 +630,47 @@ def test_per_item_release_marks_every_released_event(rig):
     qm.hold_user_items(runner, KEY, adapter)
     qm.restage_held(runner, KEY, adapter)
     assert [e._queue_released for e in qm.active_items(runner, KEY, adapter)] == [True, True]
+
+
+def test_held_note_counts_user_items_only(rig):
+    """Prism 9ebebc545090 (PR 572): parked [system] wakes are not "older prompts"."""
+    runner, adapter = rig
+    held = runner._session_state(KEY).conversation.held_queue
+    held.append(_ev("wake", internal=True))
+    assert qm.held_note(runner, KEY) == ""
+    held.extend([_ev("a"), _ev("b")])
+    assert qm.held_note(runner, KEY) == "\n2 older prompt(s) still held: /queue run releases them, /queue clear drops them."
+
+
+def test_every_transition_logs_one_line_per_item(rig, caplog):
+    """Ace 2026-11-26 (Discord 1575715843738705972): gateway.log alone says what moved where."""
+    runner, adapter = rig
+    runner._queue_release_mode = "merged"
+    _seed(runner, adapter, "a", "line one\nline two " + "x" * 80)
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):
+        qm.hold_user_items(runner, KEY, adapter)
+        qm.restage_held(runner, KEY, adapter)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("queue_mgmt item ")]
+    assert [ln.split()[2] for ln in lines] == ["op=hold", "op=hold", "op=release", "op=release"]
+    assert "pos=2 msg_id=None kind=user preview=line one line two " in lines[1] and "\n" not in lines[1]
+    assert "trigger=queue_run" in caplog.text
+    caplog.clear()
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):   # restart sweeps: no prompt text (bf25489bb43e)
+        qm.log_items(runner, "restart_spool", KEY, [_ev("secret\x1b[2Jprompt")], with_preview=False)
+        qm.log_items(runner, "hold", KEY, [_ev("esc\x1b[2Jcode")])
+    assert "preview=-" in caplog.text and "secret" not in caplog.text
+    assert "preview=esc?[2Jcode" in caplog.text and "\x1b" not in caplog.text   # control chars (222226ef4636)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):   # redact before the 60-char cut (8e6f86bd338c)
+        qm.log_items(runner, "add", KEY, [_ev("postgresql://user:" + "x" * 42 + "@db.example/app")])
+    assert "x" * 20 not in caplog.text, caplog.text
+
+
+def test_user_reset_counts_a_popped_unclaimed_follow_up(rig):
+    """Prism 50373862d991: a /new in the pop-to-claim window drops the popped item WITH a count."""
+    runner, adapter = rig
+    ev = _ev("a")
+    qm.mark_inflight(runner, KEY, ev)
+    qm.before_scope_clear(runner, KEY, "session_reset")
+    assert qm.take_reset_drop_suffix(runner, KEY).strip().startswith("Dropped 1 ")
+    assert qm.claim_inflight(runner, KEY, ev) is False   # the old chain must not run it
