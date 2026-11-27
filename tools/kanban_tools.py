@@ -779,10 +779,14 @@ def inject_new_comments_from_env(agent: Any) -> bool:
             + " on your kanban task from the operator (delivered mid-run). "
             + "Take it into account for the work you're doing right now:\n" + "\n".join(lines))
     try:
-        return bool(agent.steer(note))
+        accepted = bool(agent.steer(note))
     except Exception:
         logger.debug("comment-inject: steer failed", exc_info=True)
-        return False
+        accepted = False
+    if not accepted:
+        # Refused (steering is closed between turns since #575): re-read these rows next poll.
+        _comment_watermark[tid] = seen
+    return accepted
 
 
 # --- Handlers ---
