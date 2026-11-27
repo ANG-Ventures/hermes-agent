@@ -86,3 +86,15 @@ def test_second_photo_right_after_the_first_still_merges():
     queued = _order(runner, adapter, sk)
     assert len(queued) == 1
     assert queued[0].media_urls == ["/tmp/p1.png", "/tmp/p2.png"]
+
+
+def test_at_the_queue_cap_a_photo_still_merges_rather_than_being_dropped():
+    """Prism bad37f463754: with the queue full, a new slot is refused, so the photo merges into the
+    head (as before this change) instead of being dropped."""
+    runner, adapter, sk = _setup()
+    runner._queue_or_replace_pending_event(sk, _ev("", MessageType.PHOTO, "p1", ["/tmp/p1.png"]))
+    for i in range(runner._BUSY_QUEUE_MAX_PENDING - 1):
+        runner._queue_or_replace_pending_event(sk, _ev("", MessageType.DOCUMENT, f"d{i}"))
+    assert runner._queue_depth(sk, adapter=adapter) == runner._BUSY_QUEUE_MAX_PENDING
+    runner._queue_or_replace_pending_event(sk, _ev("", MessageType.PHOTO, "p2", ["/tmp/p2.png"]))
+    assert adapter._pending_messages[sk].media_urls == ["/tmp/p1.png", "/tmp/p2.png"]
