@@ -32,7 +32,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "studio_gap_explainer_overrides.j
 def operator(kanban_home, monkeypatch):
     p = kb.operator_token_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("tok")
+    p.write_text("tok", encoding="utf-8")
     monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, "tok")
     monkeypatch.setattr(ksg, "studio_only_caps", lambda root: frozenset({"keychain", "browser-identity"}))
     monkeypatch.setattr(ksg, "pool_hosts", lambda root: HOSTS)
@@ -50,7 +50,7 @@ def _fix(conn, title="install the render toolchain on ci-box", keys=("operator_a
 
 
 def _ledger(home):
-    return [json.loads(x) for x in ksa.ledger_path(home).read_text().splitlines()]
+    return [json.loads(x) for x in ksa.ledger_path(home).read_text(encoding="utf-8-sig").splitlines()]
 
 
 def _done(conn, tid):
@@ -222,7 +222,7 @@ def test_repeated_identical_refusal_within_24h_is_one_line(operator):
     assert "\n" not in short and "fix card: none" in short and f"full screen printed for {a} 60 min ago" in short
     assert "studio-capgap:studio-state" in short
     assert "Pool hosts:" in str(later.value)  # outside the window: the full screen again
-    assert len(ksg.refusals_path(operator).read_text().splitlines()) == 3
+    assert len(ksg.refusals_path(operator).read_text(encoding="utf-8-sig").splitlines()) == 3
 
 
 def test_archived_fix_card_does_not_close_the_gap(operator):
@@ -351,7 +351,7 @@ def test_pool_hosts_absent_or_malformed_pool_file_is_none(tmp_path, monkeypatch)
 def test_malformed_pool_file_does_not_refuse_a_fully_answered_days_override(kanban_home, monkeypatch):
     p = kb.operator_token_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("tok")
+    p.write_text("tok", encoding="utf-8")
     monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, "tok")
     from hermes_cli import kanban_db_dispatch as kbd
     monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {})
@@ -523,7 +523,7 @@ def test_refusal_log_is_rotated_to_the_repeat_window(operator, monkeypatch):
     with kb.connect_closing() as conn:
         with pytest.raises(ksa.OverrideRefused):
             ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
     assert len(lines) == 1 and json.loads(lines[0])["key"] == "operator_admit"
 
 
@@ -582,7 +582,7 @@ def test_studio_state_refusal_names_the_studio_host_route(operator):
 def test_kill_switch_file_restores_todays_behaviour(operator):
     path = ksg.kill_path(operator)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("off\n")
+    path.write_text("off\n", encoding="utf-8")
     with kb.connect_closing() as conn:
         tid = _card(conn)
         p = ksa.override(conn, tid, "operator_admit", "render toolchain is Studio-only", until="+8h")
@@ -607,7 +607,7 @@ def test_parser_takes_the_gap_flags():
 # -- 6. replay of the explainer session --------------------------------------------------------------------------
 
 def test_replay_explainer_session_overrides(operator):
-    seq = json.loads(FIXTURE.read_text())
+    seq = json.loads(FIXTURE.read_text(encoding="utf-8-sig"))
     assert len(seq) == 17
     with kb.connect_closing() as conn:
         card = {orig: _card(conn) for orig in dict.fromkeys(t for t, _, _ in seq)}  # 11 cards
