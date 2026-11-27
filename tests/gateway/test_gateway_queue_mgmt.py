@@ -630,3 +630,27 @@ def test_per_item_release_marks_every_released_event(rig):
     qm.hold_user_items(runner, KEY, adapter)
     qm.restage_held(runner, KEY, adapter)
     assert [e._queue_released for e in qm.active_items(runner, KEY, adapter)] == [True, True]
+
+
+def test_held_note_counts_user_items_only(rig):
+    """Prism 9ebebc545090 (PR 572): parked [system] wakes are not "older prompts"."""
+    runner, adapter = rig
+    held = runner._session_state(KEY).conversation.held_queue
+    held.append(_ev("wake", internal=True))
+    assert qm.held_note(runner, KEY) == ""
+    held.extend([_ev("a"), _ev("b")])
+    assert qm.held_note(runner, KEY) == "\n2 older prompt(s) still held: /queue run releases them, /queue clear drops them."
+
+
+def test_every_transition_logs_one_line_per_item(rig, caplog):
+    """Ace 2026-11-26 (Discord 1575715843738705972): gateway.log alone says what moved where."""
+    runner, adapter = rig
+    runner._queue_release_mode = "merged"
+    _seed(runner, adapter, "a", "line one\nline two " + "x" * 80)
+    with caplog.at_level("INFO", logger="gateway.queue_mgmt"):
+        qm.hold_user_items(runner, KEY, adapter)
+        qm.restage_held(runner, KEY, adapter)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("queue_mgmt item ")]
+    assert [ln.split()[2] for ln in lines] == ["op=hold", "op=hold", "op=release", "op=release"]
+    assert "pos=2 msg_id=None kind=user preview='line one line two " in lines[1] and "\n" not in lines[1]
+    assert "trigger=queue_run" in caplog.text
