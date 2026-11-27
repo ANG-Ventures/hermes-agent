@@ -462,3 +462,106 @@ async def _wait(flag):
             return
         await asyncio.sleep(0.01)
     raise AssertionError("never set")
+
+
+def _block_drain_on(monkeypatch, text, *, swallow_cancel=True):
+    """Hold the drain's ``drop_stale`` await for ``text`` (after the pop, before the follow-up claims
+    it). ``swallow_cancel`` keeps the task alive through a cancel: the claim then runs uncancelled."""
+    import gateway.kanban_wake_freshness as kwf
+    entered, gate, real = asyncio.Event(), asyncio.Event(), kwf.drop_stale
+
+    async def drop_stale(event):
+        if (getattr(event, "text", "") or "") == text and not gate.is_set():
+            entered.task = asyncio.current_task()
+            entered.set()
+            while not gate.is_set():
+                try:
+                    await gate.wait()
+                except asyncio.CancelledError:
+                    if not swallow_cancel:
+                        raise
+        return await real(event)
+
+    monkeypatch.setattr(kwf, "drop_stale", drop_stale)
+    return entered, gate
+
+
+async def _queue_a_then_block_drain(rig, monkeypatch):
+    rig.pause_on_stop = True
+    rig.gates = {"ping": threading.Event()}
+    rig.gate_completes.add("ping")
+    entered, gate = _block_drain_on(monkeypatch, "a")
+    rig.adapter._start_session_processing(_msg("ping"), KEY)
+    await _wait(rig.first_started)
+    await rig.adapter.handle_message(_msg("/queue a"))
+    rig.gates["ping"].set()
+    await _wait(entered)
+    await rig.adapter.handle_message(_msg("/stop"))
+    return gate, entered.task
+
+
+def _held(rig):
+    return [e.text for e in rig.runner._session_state(KEY).conversation.held_queue]
+
+
+@pytest.mark.asyncio
+async def test_stop_while_drain_awaits_after_pop_holds_once_and_never_runs(monkeypatch, tmp_path):
+    """Apollo send-back on fa32b6eb (1): /stop reclaims `a` while the drain still awaits; the drain's
+    return must not re-mark it, so the uncancelled chain never runs it and held is exactly [a]."""
+    rig = _Rig(monkeypatch, tmp_path)
+    gate, _task = await _queue_a_then_block_drain(rig, monkeypatch)
+    gate.set()
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping"]
+    assert _held(rig) == ["a"]
+    state = rig.runner._session_state(KEY).conversation
+    assert state.held_queue[0]._queue_reclaimed is True and state.inflight_followup is None   # not re-marked
+    # (3) a later completed turn releases `a` and it runs exactly once.
+    await rig.adapter.handle_message(_msg("pong"))
+    await rig.settle(expect=3)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping", "pong", "a"]
+    assert _held(rig) == []
+    assert rig.max_live == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_while_drain_awaits_then_cancel_after_drain_holds_once(monkeypatch, tmp_path):
+    """(2) Same, the task is cancelled after the drain returns (during the first reply's send):
+    the finally reclaim must not insert `a` a second time."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.adapter.block_text, rig.adapter.send_entered = "answer ping", asyncio.Event()
+    rig.adapter.send_gate = asyncio.Event()
+    gate, task = await _queue_a_then_block_drain(rig, monkeypatch)
+    gate.set()
+    await _wait(rig.adapter.send_entered)
+    task.cancel()
+    rig.adapter.send_gate.set()
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["ping"]
+    assert _held(rig) == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_busy_queue_run_during_first_reply_send_runs_each_item_once(monkeypatch, tmp_path):
+    """(4) /queue run while ping's reply is being sent after the drain popped `a`."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.gates = {"ping": threading.Event()}
+    rig.gate_completes.add("ping")
+    rig.adapter.block_text, rig.adapter.send_entered = "answer ping", asyncio.Event()
+    rig.adapter.send_gate = asyncio.Event()
+    rig.adapter._start_session_processing(_msg("ping"), KEY)
+    await _wait(rig.first_started)
+    for text in ("/queue a", "/queue b"):
+        await rig.adapter.handle_message(_msg(text))
+    rig.gates["ping"].set()
+    await _wait(rig.adapter.send_entered)
+    await rig.adapter.handle_message(_msg("/queue run"))
+    rig.adapter.send_gate.set()
+    await rig.settle(expect=3)
+    await asyncio.sleep(0.5)
+    assert rig.calls == ["ping", "a", "b"]
+    assert _held(rig) == []
+    assert rig.max_live == 1

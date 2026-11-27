@@ -5121,9 +5121,9 @@ class GatewayTurnMixin:
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )
-                if session_key:   # a discarded command or a spooled item is no longer in flight
-                    from gateway import queue_mgmt
-                    queue_mgmt.mark_inflight(self, session_key, pending_event)
+                if session_key and pending_event is None:   # a discarded command or a spooled item
+                    from gateway import queue_mgmt              # is no longer in flight; clear only
+                    queue_mgmt.mark_inflight(self, session_key, None)
             # Snapshot after drain awaits, before any queued/depth-cap return.
             # Either result object may be returned by the follow-up helper.
             for turn_result in (response, result):

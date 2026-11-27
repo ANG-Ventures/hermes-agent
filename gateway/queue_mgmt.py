@@ -215,10 +215,10 @@ def _unpark(runner: Any, key: str, event: Any) -> bool:
 def mark_inflight(runner: Any, key: str, event: Any) -> None:
     """Record ``event`` as popped-but-unclaimed (user items only; None/system clears). Never raises."""
     try:
+        if getattr(event, "_queue_reclaimed", False) is True:
+            return   # already back in held: never re-mark it (restage_held clears the flag on release)
         state = runner._session_state(key).conversation
         state.inflight_followup = event if event is not None and not is_system_event(runner, event) else None
-        if state.inflight_followup is not None:
-            event._queue_reclaimed = False   # a re-released item runs again
     except Exception:
         logger.debug("queue_mgmt inflight mark failed for %s", key, exc_info=True)
 
@@ -243,14 +243,16 @@ def reclaim_inflight(runner: Any, key: str, *, only: Any = None) -> int:
         state.conversation.inflight_followup = None
         event._queue_reclaimed = True
         items = list(getattr(event, "_queue_merged_from", None) or [event])
+        held = state.conversation.held_queue
+        if any(h is e for e in items for h in held):
+            return 0   # already in held: never insert it twice
         for e in items:
             try:
                 e._queue_released = False
             except Exception:
                 pass
-        state.conversation.held_queue[0:0] = items
-        logger.info("queue_mgmt op=hold session=%s moved=%d held=%d from=inflight", key, len(items),
-                    len(state.conversation.held_queue))
+        held[0:0] = items
+        logger.info("queue_mgmt op=hold session=%s moved=%d held=%d from=inflight", key, len(items), len(held))
         log_items(runner, "hold", key, items)
         return len(items)
     except Exception:
@@ -463,10 +465,16 @@ def restage_held(runner: Any, key: str, adapter: Any, *, trigger: str = "queue_r
     if not users and not system:
         return 0
     released = len(users) + len(system)
-    if release_mode(runner) == "merged" and len(users) > 1:
+    merged = release_mode(runner) == "merged" and len(users) > 1
+    if merged:
         originals = users
         users = [merge_user_events(users)]
         users[0]._queue_merged_from = originals   # a reclaim puts the items back one by one
+    for e in originals if merged else users:   # released again: a reclaimed item may be marked and run
+        try:
+            e._queue_reclaimed = False
+        except Exception:
+            pass
     for e in users:
         try:
             e._queue_released = True
