@@ -74,6 +74,22 @@ def test_a_raising_steer_also_leaves_the_note_for_the_next_poll(worker_home, mon
     assert len(agent.steers) == 1 and "v2 API" in agent.steers[0]
 
 
+def test_a_refused_poll_does_not_rewind_past_a_later_poll(worker_home, monkeypatch):
+    """Prism 9569ba55281b: if another poll moved the watermark while this steer was refused,
+    rewinding would make the next poll re-deliver that poll's notes."""
+    tid, _ = _live_worker(monkeypatch, "overlap")
+    _comment(tid, "apollo", "first note")
+
+    class OverlappedThenRefused:
+        def steer(self, text):
+            kt._comment_watermark[tid] = 10_000  # another poll delivered later rows meanwhile
+            return False
+
+    _unthrottle()
+    assert kt.inject_new_comments_from_env(OverlappedThenRefused()) is False
+    assert kt._comment_watermark[tid] == 10_000
+
+
 def test_an_accepted_steer_advances_the_watermark_with_no_duplicate(worker_home, monkeypatch):
     tid, agent = _live_worker(monkeypatch, "accepted")
     seeded = kt._comment_watermark[tid]

@@ -761,7 +761,8 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     if seen is None or not rows:
         return False
     # Advance past everything read (including our own notes) so nothing is re-injected.
-    _comment_watermark[tid] = max(c.id for c in rows)
+    newest = max(c.id for c in rows)
+    _comment_watermark[tid] = newest
     # Same resolution the write side used, so a worker skips its OWN comments even
     # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
     # re-enter the live turn as fake operator steering).
@@ -783,8 +784,9 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     except Exception:
         logger.debug("comment-inject: steer failed", exc_info=True)
         accepted = False
-    if not accepted:
-        # Refused (steering is closed between turns since #575): re-read these rows next poll.
+    if not accepted and _comment_watermark.get(tid) == newest:
+        # Refused (steering is closed between turns since #575): re-read these rows next poll,
+        # unless another poll has moved the watermark since (it would re-deliver its notes).
         _comment_watermark[tid] = seen
     return accepted
 
