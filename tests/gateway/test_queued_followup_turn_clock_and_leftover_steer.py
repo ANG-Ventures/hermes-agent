@@ -184,9 +184,38 @@ async def test_leftover_steer_not_dropped_when_followup_is_queued(monkeypatch, t
 
     _runner, _adapter, calls, _result = await _drive(monkeypatch, tmp_path, script)
 
+    # Arrival order (t_2b16f0e6, Prism 6cff67d57be0; owner, Discord 1575444644152614992:
+    # everything arrives in the order sent). This test used to pin the reverse: the queued
+    # follow-up first, the handed-back steer behind it. But a steer is accepted only while no
+    # message from a person is queued (#569), so a person's follow-up queued at turn end arrived
+    # AFTER the steer, and running it first reversed the two.
     messages = [c["message"] for c in calls]
-    assert messages[:2] == ["first", "queued follow-up"]
-    assert any("late steer text" in m for m in messages[2:]), messages
+    assert messages[:3] == ["first", "late steer text", "queued follow-up"], messages
+
+
+@pytest.mark.asyncio
+async def test_leftover_steer_stays_behind_a_queued_internal_wake(monkeypatch, tmp_path):
+    """An internal wake may have been queued before the steer was accepted (internal items do not
+    hold a steer back), so the handed-back steer keeps its place behind it."""
+    seen = {}
+
+    def prepare(runner):
+        seen["adapter"] = runner.adapters[next(iter(runner.adapters))]
+
+    def script(idx, queue_followup):
+        if idx == 0:
+            seen["adapter"]._pending_messages[SESSION_KEY] = MessageEvent(
+                text="wake text", message_type=MessageType.TEXT, source=_source(), internal=True)
+            return {"final_response": "first answer", "messages": [], "api_calls": 1,
+                    "pending_steer": "late steer text"}
+        return {"final_response": f"answer {idx}", "messages": [], "api_calls": 1}
+
+    _runner, _adapter, calls, _result = await _drive(monkeypatch, tmp_path, script, prepare=prepare)
+    messages = [c["message"] for c in calls]
+    assert messages[0] == "first"
+    wake_at = next(i for i, m in enumerate(messages) if "wake text" in m)
+    steer_at = next(i for i, m in enumerate(messages) if "late steer text" in m)
+    assert wake_at < steer_at, messages
 
 
 @pytest.mark.asyncio
@@ -214,8 +243,7 @@ async def test_leftover_steer_survives_recursion_depth_cap(monkeypatch, tmp_path
     head = adapter._pending_messages.get(SESSION_KEY)
     overflow = list(runner._session_state(SESSION_KEY).conversation.queued_events)
     texts = ([head.text] if head else []) + [e.text for e in overflow]
-    assert "queued follow-up" in texts
-    assert "late steer text" in texts, texts
+    assert texts == ["late steer text", "queued follow-up"], texts   # arrival order (t_2b16f0e6)
 
 
 @pytest.mark.asyncio

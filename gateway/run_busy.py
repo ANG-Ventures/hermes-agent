@@ -1802,7 +1802,9 @@ class GatewayBusySessionMixin:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)
         if not accepted:
-            return t("gateway.steer.rejected_empty")
+            # The payload is not empty (checked above): the turn has already returned and closed
+            # steering, so the text becomes the next turn rather than being lost (Prism ed7e5f5d5936).
+            return _queue_fallback(t("gateway.steer.queued_no_agent"))
         self._fold_into_running_turn(running_agent, quick_key, event)
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = (t("gateway.steer.target_subagents") if self._agent_has_active_subagents(running_agent)

@@ -54,6 +54,8 @@ logger = logging.getLogger("gateway.run")
 
 # result key: the inbound record a leftover /steer carries into the user turn it becomes (t_b8fbfc54).
 _LEFTOVER_STEER_META = "_pending_steer_display_metadata"
+# Set on a turn result whose end released /stop-held items: those predate any leftover steer.
+_HELD_RELEASED_KEY = "_held_released_at_turn_end"
 
 
 def _leftover_steer_meta(result: Any, pending: Optional[str]) -> Dict[str, Any]:
@@ -4279,6 +4281,42 @@ class GatewayTurnMixin:
             session_key, len(text),
         )
 
+    @staticmethod
+    def _leftover_steer_runs_first(result: Any, pending_event: Any) -> bool:
+        """True when a person's handed-back steer must run before the dequeued ``pending_event``.
+
+        A steer is accepted only while no message from a person is queued (#569), so a person's
+        message queued at turn end arrived after the steer. Kept in the old order (steer behind):
+        an internal wake (it may predate the steer: wakes do not hold a steer back), an internal
+        steer, an interrupted turn, and a turn that just released /stop-held items (those predate it).
+        """
+        return bool(
+            isinstance(result, dict) and result.get("pending_steer")
+            and not result.get("_pending_steer_internal") and not result.get("interrupted")
+            and not result.get(_HELD_RELEASED_KEY)
+            and not getattr(pending_event, "internal", False)
+        )
+
+    def _followup_shares_session_key(self, event: Any, session_key: str) -> bool:
+        """True when ``event`` runs in the conversation that handed the steer back. A follow-up for
+        another conversation keeps the documented order (the steer stays on the parent key)."""
+        try:
+            return self._session_key_for_source(event.source) == session_key
+        except Exception:
+            return False
+
+    def _requeue_at_head(self, session_key: str, adapter: Any, event: Any) -> None:
+        """Put a dequeued follow-up back at the queue head; the slot's occupant goes to the
+        overflow front (the drain may already have promoted it), so nothing is overwritten."""
+        slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(slot, dict):
+            self._session_state(session_key).conversation.queued_events.insert(0, event)
+            return
+        occupant = slot.get(session_key)
+        if occupant is not None and occupant is not event:
+            self._session_state(session_key).conversation.queued_events.insert(0, occupant)
+        slot[session_key] = event
+
     async def _correct_steer_ack_for_leftover(self, adapter: Any, source: SessionSource, session_key: str) -> None:
         """This turn acked a message as "steered into current run ... after the next tool call",
         but the turn ended first and handed the steer back: it runs as the next turn. Say so, once,
@@ -4320,6 +4358,13 @@ class GatewayTurnMixin:
                 pending_event = self._promote_queued_event(
                     session_key, adapter, _dequeue_pending_event(adapter, session_key))
                 queue_mgmt.mark_inflight(self, session_key, pending_event)
+            if (pending_event is not None and self._leftover_steer_runs_first(result, pending_event)
+                    and self._followup_shares_session_key(pending_event, session_key)):
+                # Arrival order (t_2b16f0e6, Prism 6cff67d57be0): the handed-back steer is older than
+                # this follow-up, so the follow-up goes back to the queue head and the steer runs next.
+                self._requeue_at_head(session_key, adapter, pending_event)
+                queue_mgmt.mark_inflight(self, session_key, None)
+                pending_event = None
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
@@ -5143,7 +5188,8 @@ class GatewayTurnMixin:
                         # Only an explicit completed=True releases: a truncated (partial) reply or any
                         # new result shape leaves them held (Prism bc69cb1f1b99).
                         from gateway import queue_mgmt
-                        queue_mgmt.release_on_turn_end(self, session_key, adapter)
+                        if queue_mgmt.release_on_turn_end(self, session_key, adapter):
+                            result[_HELD_RELEASED_KEY] = True   # released items predate a leftover steer
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )
