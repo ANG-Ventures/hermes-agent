@@ -28,7 +28,8 @@ capability only when it names one of its parts. Every override also writes one l
 ``<root>/state/studio-capability-gap/overrides.jsonl`` (t_b3884ae0's state dir). A ``browser-session`` override
 needs ``--need`` from a fixed set (:data:`NEEDS`, t_9d6a5d75): only ``signed-in-identity`` is accepted, ``other`` is
 accepted and recorded, every other need is refused with the capability that serves it. The ``--why`` text is never
-parsed for the need.
+parsed for the need. A GAP capability (not Studio-only by nature) also needs ``--elsewhere``, ``--why-not-now`` and
+``--effort hours|days`` (hours: plus an open ``--fix-card``): :mod:`hermes_cli.kanban_studio_gap` (t_9d619fbb).
 
 Holding: the first tick that holds a card in an episode writes ONE ``mechanical_wake`` event (source
 ``studio-default-deny``). The gateway owner-wake turns that into a silent turn in the card's home session, not a chat
@@ -475,7 +476,8 @@ def need_refusal(capability: str, need: Optional[str]) -> Optional[str]:
 
 def override(conn, task_id: str, capability: str, why: str, *, once: bool = True, until: Optional[str] = None,
              actor: Optional[str] = None, now: Optional[float] = None, root: Optional[Path] = None,
-             need: Optional[str] = None) -> dict:
+             need: Optional[str] = None, elsewhere: Optional[str] = None, why_not_now: Optional[str] = None,
+             effort: Optional[str] = None, fix_card: Optional[str] = None) -> dict:
     """Record one override. Raises :class:`OverrideRefused` with the line to print."""
     from hermes_cli import kanban_db as _kb
     now = time.time() if now is None else now
@@ -494,9 +496,18 @@ def override(conn, task_id: str, capability: str, why: str, *, once: bool = True
     if row is None:
         raise OverrideRefused(f"unknown card {task_id}")
     until_ts = _parse_until(until, now) if until else None
+    # t_9d619fbb: a GAP capability (not Studio-only by nature) must say how it would run elsewhere.
+    from hermes_cli import kanban_studio_gap as _gap
+    gap_root = Path(root) if root is not None else _kb.kanban_home()
+    try:
+        gap = _gap.check(conn, task_id, cap, elsewhere=elsewhere, why_not_now=why_not_now, effort=effort,
+                         fix_card=fix_card, until=until, allow=config(_kb._board_home_kanban_cfg())[1], root=gap_root)
+    except _gap.GapRefused as exc:
+        raise OverrideRefused(str(exc)) from exc
     payload = {"capability": cap, "why": why.strip(), "by": actor or "operator", "at": int(now),
-               "once": until_ts is None, "until": until_ts, "fix_card": _fix_card(conn, cap),
-               **({"need": need.strip().lower()} if need else {})}
+               "once": until_ts is None, "until": until_ts,
+               "fix_card": gap.get("fix_card_given") or _fix_card(conn, cap),
+               **({"need": need.strip().lower()} if need else {}), **gap}
     with _kb.write_txn(conn):
         _kb._append_event(conn, task_id, OVERRIDE_EVENT, payload)
     line = {"kind": "override", "task_id": task_id, **payload}
@@ -535,7 +546,9 @@ def cmd_studio_override(args) -> int:
     try:
         with _kb.connect_closing(board=getattr(args, "board", None)) as conn:
             p = override(conn, args.task_id, args.capability, args.why, until=getattr(args, "until", None),
-                         actor=actor, need=getattr(args, "need", None))
+                         actor=actor, need=getattr(args, "need", None), elsewhere=getattr(args, "elsewhere", None),
+                         why_not_now=getattr(args, "why_not_now", None), effort=getattr(args, "effort", None),
+                         fix_card=getattr(args, "fix_card", None))
     except OverrideRefused as exc:
         print(f"kanban studio-override: REFUSED {exc}", file=sys.stderr)
         return 1

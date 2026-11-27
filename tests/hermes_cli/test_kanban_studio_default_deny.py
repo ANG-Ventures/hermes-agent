@@ -495,7 +495,9 @@ def test_admit_to_the_studio_is_held_until_an_override_is_recorded(operator, mon
         assert res.placement_waits[tid].startswith("studio_default_deny:operator_admit"), res.placement_waits
         line = ka.refusal_from(res, tid)
         assert f"hermes kanban studio-override {tid} --capability operator_admit" in line, line
-        ksa.override(conn, tid, "operator_admit", "operator ruling needs the studio", actor="apollo")
+        ksa.override(conn, tid, "operator_admit", "operator ruling needs the studio", actor="apollo",
+                     elsewhere="ace-media once the lint toolchain is installed there",
+                     why_not_now="the lint toolchain is not packaged for linux yet", effort="days")
         kbd.admit_once(conn, tid, "studio", spawn_fn=spawn, spillover=_plan(free=2))
         kinds = [k for (k,) in conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
     assert spawned == [(tid, "studio")], spawned
@@ -539,7 +541,10 @@ def test_override_warning_uses_the_live_override_match(operator, capsys):
                              {"reason": "studio_default_deny:workspace_kind:origin_not_github (structural: x)"})
         why = {"capability": "workspace_kind:origin_not_github", "source": "structural", "evidence": "x"}
         ksa.cmd_studio_override(argparse.Namespace(task_id=tid, capability="workspace_kind",
-                                                   why="the port is not built yet", until=None, board=None))
+                                                   why="the port is not built yet", until=None, board=None,
+                                                   elsewhere="ace-media after the worktree port is built",
+                                                   why_not_now="the worktree port is not built yet",
+                                                   effort="days"))
         released = ksa.decide(conn, _row(conn, tid), why, enabled=True, allow=frozenset()) is None
     err = capsys.readouterr().err
     assert released and "WARNING" not in err, err
