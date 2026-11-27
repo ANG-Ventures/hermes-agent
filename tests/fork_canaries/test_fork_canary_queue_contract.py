@@ -287,19 +287,37 @@ def test_turn_end_drain_calls_the_release():  # noqa: source-proxy structural: t
 
 
 # --------------------------------------------------------------------------- R9: order holds past the recursion cap
-# Prism 4f2cff4414e2 (t_e4f2074d): five or more prompts queued during one turn run in arrival order. Red if the
-# recursion-cap put-back in run_turn._run_agent_queued_followup stops setting `_queue_released` on the head it puts
-# back in the slot (the orphan rescue then runs z5 before z4), or the rescue stops honouring that mark.
-# R10: two idle `/queue` prompts racing to the claim both run, in order. Red if run_inbound._handle_message stops
-# routing the claim-race loser to the FIFO and overwrites the winner's sentinel again (the winner is cancelled).
+# Prism 4f2cff4414e2 (t_e4f2074d): five or more prompts queued during one turn run in arrival order; end to end in
+# tests/gateway/test_queue_order_races.py. Red if the recursion-cap put-back in _run_agent_queued_followup stops
+# setting `_queue_released` on the head it puts back in the slot (the orphan rescue then runs z5 before z4), or a
+# new /queue item put in an empty slot jumps the older overflow (Prism e40b259b1e29: z4, z6, z5).
 
-@pytest.mark.asyncio
-async def test_many_queued_prompts_keep_order_past_the_recursion_cap(monkeypatch, tmp_path):
-    from tests.gateway import test_queue_order_races as races
-    await races.test_many_queued_prompts_run_in_order_across_recursion_cap(monkeypatch, tmp_path, 5)
+def test_recursion_cap_put_back_carries_the_release_mark():  # noqa: source-proxy structural: behaviour in tests/gateway/test_queue_order_races.py
+    import inspect
+
+    from gateway.run_turn import GatewayTurnMixin
+    src = inspect.getsource(GatewayTurnMixin._run_agent_queued_followup)
+    assert "pending_event._queue_released = True" in src
 
 
-@pytest.mark.asyncio
-async def test_idle_queue_claim_race_loser_is_queued_not_cancelled(monkeypatch, tmp_path):
-    from tests.gateway import test_queue_order_races as races
-    await races.test_two_idle_queue_prompts_racing_to_the_claim_both_run_in_order(monkeypatch, tmp_path)
+def test_new_item_in_empty_slot_goes_behind_older_overflow(rig):
+    runner, adapter = rig
+    runner._session_state(KEY).conversation.queued_events.extend([_ev("z5")])
+    runner._enqueue_fifo(KEY, _ev("z6"), adapter)
+    assert _active(runner, adapter) == ["z5", "z6"]
+
+
+# --------------------------------------------------------------------------- R10: idle claim-race loser is queued
+# Prism 03e7f19cf6dc (t_e4f2074d): two idle `/queue` prompts racing to the claim both run, in order. Red if
+# _handle_message stops routing the claim-race loser to the FIFO before it writes the sentinel (overwriting the
+# winner's sentinel bumps the generation and cancels the winner).
+
+def test_claim_race_loser_goes_to_the_fifo_before_the_sentinel():  # noqa: source-proxy structural: behaviour in tests/gateway/test_queue_order_races.py
+    import inspect
+
+    from gateway.run_inbound import GatewayInboundMixin
+    src = inspect.getsource(GatewayInboundMixin._handle_message)
+    race = src.index("PHASE=claim_race_queued")
+    assert "if _claim_state.turn.agent is not None and" in src[:race]   # the claim-taken check guards the branch
+    assert "self._enqueue_fifo(_quick_key, event, _lost_adapter)" in src[:race]
+    assert race < src.index("_claim_state.turn.agent = _AGENT_PENDING_SENTINEL")
