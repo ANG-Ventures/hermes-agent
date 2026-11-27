@@ -14,6 +14,10 @@ Stores (spec 2026-10-12_gateway-queue-management-spec.md):
   (D5, Ace 2026-11-26, Discord 1575714860740907081): ``release_on_turn_end``, called from that
   turn's own post-turn drain after its run generation proved current.
 
+A user follow-up the drain popped but no turn has claimed yet (the first reply is still being sent)
+is marked ``conversation.inflight_followup``; an invalidation, scope clear or cancel puts it back at
+the front of held (``reclaim_inflight``, Prism 50373862d991).
+
 Every transition logs one ``queue_mgmt item op=...`` line per item moved (``log_items``; Ace
 2026-11-26, Discord 1575715843738705972) next to its summary line.
 
@@ -213,6 +217,8 @@ def mark_inflight(runner: Any, key: str, event: Any) -> None:
     try:
         state = runner._session_state(key).conversation
         state.inflight_followup = event if event is not None and not is_system_event(runner, event) else None
+        if state.inflight_followup is not None:
+            event._queue_reclaimed = False   # a re-released item runs again
     except Exception:
         logger.debug("queue_mgmt inflight mark failed for %s", key, exc_info=True)
 
@@ -221,12 +227,9 @@ def claim_inflight(runner: Any, key: str, event: Any) -> bool:
     """The follow-up turn takes ``event``: clears the mark. False when it was reclaimed into held
     meanwhile, so the caller must not run it (it would run twice)."""
     state = runner._peek_session_state(key)
-    if state is None or event is None or is_system_event(runner, event):
-        return True
-    if getattr(state.conversation, "inflight_followup", None) is event:
+    if state is not None and getattr(state.conversation, "inflight_followup", None) is event:
         state.conversation.inflight_followup = None
-        return True
-    return False
+    return getattr(event, "_queue_reclaimed", False) is not True
 
 
 def reclaim_inflight(runner: Any, key: str, *, only: Any = None) -> int:
@@ -238,6 +241,7 @@ def reclaim_inflight(runner: Any, key: str, *, only: Any = None) -> int:
         if event is None or (only is not None and event is not only):
             return 0
         state.conversation.inflight_followup = None
+        event._queue_reclaimed = True
         items = list(getattr(event, "_queue_merged_from", None) or [event])
         for e in items:
             try:
