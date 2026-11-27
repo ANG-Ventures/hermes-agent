@@ -8,6 +8,8 @@ document. Owner's requirement (Discord 1575444644152614992): everything arrives 
 """
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from gateway.platforms.event import MessageEvent, MessageType
@@ -98,3 +100,61 @@ def test_at_the_queue_cap_a_photo_still_merges_rather_than_being_dropped():
     assert runner._queue_depth(sk, adapter=adapter) == runner._BUSY_QUEUE_MAX_PENDING
     runner._queue_or_replace_pending_event(sk, _ev("", MessageType.PHOTO, "p2", ["/tmp/p2.png"]))
     assert adapter._pending_messages[sk].media_urls == ["/tmp/p1.png", "/tmp/p2.png"]
+
+
+def test_at_the_queue_cap_a_photo_without_media_does_not_replace_the_head():
+    """Prism bad37f463754 (round 2): a PHOTO whose download failed has no media; the helper would
+    REPLACE a text head instead of merging, so the cap fallback must not take it."""
+    runner, adapter, sk = _setup()
+    runner._queue_or_replace_pending_event(sk, _ev("t1", MessageType.TEXT, "t1"))
+    for i in range(runner._BUSY_QUEUE_MAX_PENDING - 1):
+        runner._queue_or_replace_pending_event(sk, _ev("", MessageType.DOCUMENT, f"d{i}"))
+    assert runner._queue_depth(sk, adapter=adapter) == runner._BUSY_QUEUE_MAX_PENDING
+    runner._queue_or_replace_pending_event(sk, _ev("please check this", MessageType.PHOTO, "p2"))
+    head = adapter._pending_messages[sk]
+    assert head.message_id == "t1" and head.text == "t1", "the accepted text head was replaced"
+
+
+def test_photo_without_media_after_a_queued_text_takes_its_own_turn():
+    """Same helper limit with nothing else queued: the media-less photo must not overwrite t1."""
+    runner, adapter, sk = _setup()
+    runner._queue_or_replace_pending_event(sk, _ev("t1", MessageType.TEXT, "t1"))
+    runner._queue_or_replace_pending_event(sk, _ev("caption only", MessageType.PHOTO, "p2"))
+    assert [e.message_id for e in _order(runner, adapter, sk)] == ["t1", "p2"]
+
+
+def _queue_mode_runner():
+    runner, adapter, sk = _setup()
+    runner._is_user_authorized_for_source = lambda _s: True
+    runner._admit_bot_message_for_source = lambda _s: True
+    runner._effective_busy_input_mode = lambda _s: "queue"
+    runner._effective_busy_text_mode = lambda _s: "queue"
+    runner._draining = False
+    runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
+    runner._delivery_adapter_for = lambda _s: adapter
+    return runner, adapter, sk
+
+
+@pytest.mark.asyncio
+async def test_queue_mode_text_waits_behind_a_document_queued_after_the_photo(monkeypatch):
+    """Prism f20c674fe70b: in busy_input_mode queue a text went back to the adapter's debounce
+    path, whose flush merges it into the photo head ahead of the queued document. With anything
+    waiting behind the head, the text must take the runner FIFO instead."""
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")   # ack wording is not under test
+    runner, adapter, sk = _queue_mode_runner()
+    runner._queue_or_replace_pending_event(sk, _ev("", MessageType.PHOTO, "p1", ["/tmp/p1.png"]))
+    runner._queue_or_replace_pending_event(sk, _ev("", MessageType.DOCUMENT, "d1"))
+    runner._resolve_busy_steer_or_redirect = AsyncMock(
+        return_value=type("S", (), {"effective_mode": "queue", "redirected": False, "steered": False})())
+    text = _ev("after the document", MessageType.TEXT, "t2")
+    handled = await runner._handle_active_session_busy_message(text, sk)
+    assert handled is True, "the text went to the adapter debounce, which merges it into the photo"
+    assert [e.message_id for e in _order(runner, adapter, sk)] == ["p1", "d1", "t2"]
+
+
+@pytest.mark.asyncio
+async def test_queue_mode_text_still_debounces_when_nothing_waits_behind_the_head():
+    """Control: no overflow, so the text keeps the adapter's debounce path (returns False)."""
+    runner, adapter, sk = _queue_mode_runner()
+    runner._queue_or_replace_pending_event(sk, _ev("", MessageType.PHOTO, "p1", ["/tmp/p1.png"]))
+    assert await runner._handle_active_session_busy_message(_ev("x", MessageType.TEXT, "t2"), sk) is False

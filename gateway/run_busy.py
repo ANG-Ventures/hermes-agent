@@ -775,10 +775,15 @@ class GatewayBusySessionMixin:
         # Merge only while the head is the newest queued message: with anything waiting in the
         # overflow behind it, the merge would move this message ahead of those (t_3ee12123).
         # At the queue cap a new slot would be refused: merging out of order beats dropping it.
+        # The helper merges a TEXT/PHOTO pair only when a photo carries media; otherwise (a photo
+        # whose download failed) it REPLACES the head, so that pair takes its own slot (Prism
+        # bad37f463754).
         if (
             same_security_context
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
+            and (merge_types == {MessageType.PHOTO}
+                 or getattr(existing, "media_urls", None) or getattr(event, "media_urls", None))
             and (not self._overflow_queue(session_key)
                  or self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING)
         ):
@@ -1521,6 +1526,9 @@ class GatewayBusySessionMixin:
             event.message_type == MessageType.TEXT
             and self._effective_busy_text_mode(event.source) == "queue"
             and effective_mode != "steer"
+            # With messages waiting behind the head, the adapter's debounce flush would merge this
+            # text into the head, ahead of them: take the runner FIFO instead (Prism f20c674fe70b).
+            and not self._overflow_queue(session_key)
         ):
             return False
 
