@@ -1316,7 +1316,7 @@ naming a Studio-served capability. By default, create and body edits accept an
 unjustified pin unchanged, print a warning listing accepted words, and persist
 one placement notice shared with dispatch. The words come from
 `fleet/host-capabilities.json` (the Studio row plus `control-plane-read`). Add `requires: studio-state` only when the task
-needs that state; otherwise remove the pin. When `CARD_NEEDS` already identifies
+needs that state; otherwise remove the pin. Work that acts ON the Studio machine itself (its disk, containers, services, GUI) uses `requires: studio-host`, a Studio-only word that needs no gap fix card. When `CARD_NEEDS` already identifies
 Studio relay, launchd, Obsidian vault, skills tree or live Studio tree work, the
 entry path adds `requires: studio-state` and create reports the derivation.
 `kanban.studio_pin_requires_reason` accepts `notice` (default), `refuse` (opt-in

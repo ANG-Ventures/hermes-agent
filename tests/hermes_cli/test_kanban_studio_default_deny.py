@@ -482,6 +482,8 @@ def test_admit_to_the_studio_is_held_until_an_override_is_recorded(operator, mon
     from hermes_cli import kanban_admit as ka
     _cfg(operator, True, [])
     monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    from hermes_cli import kanban_studio_gap as ksg
+    monkeypatch.setattr(ksg, "pool_hosts", lambda root: ("ace-ai", "ace-media"))
     spawned = []
 
     def spawn(task, workspace, *, board=None, placement=None):
@@ -495,7 +497,9 @@ def test_admit_to_the_studio_is_held_until_an_override_is_recorded(operator, mon
         assert res.placement_waits[tid].startswith("studio_default_deny:operator_admit"), res.placement_waits
         line = ka.refusal_from(res, tid)
         assert f"hermes kanban studio-override {tid} --capability operator_admit" in line, line
-        ksa.override(conn, tid, "operator_admit", "operator ruling needs the studio", actor="apollo")
+        ksa.override(conn, tid, "operator_admit", "operator ruling needs the studio", actor="apollo",
+                     elsewhere="ace-media once the lint toolchain is installed there",
+                     why_not_now="the lint toolchain is not packaged for linux yet", effort="days")
         kbd.admit_once(conn, tid, "studio", spawn_fn=spawn, spillover=_plan(free=2))
         kinds = [k for (k,) in conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
     assert spawned == [(tid, "studio")], spawned
@@ -528,10 +532,12 @@ def test_a_cleared_placement_wait_ends_the_hold_episode(kanban_home):
     assert pager.sent == [], pager.sent  # the new episode began at the second wake, not two hours ago
 
 
-def test_override_warning_uses_the_live_override_match(operator, capsys):
+def test_override_warning_uses_the_live_override_match(operator, capsys, monkeypatch):
     """c-8a854f5bdb779ec7: an override naming the capability HEAD releases ``workspace_kind:x`` (live_override),
     so the command must not warn that it does not."""
     import argparse
+    from hermes_cli import kanban_studio_gap as ksg
+    monkeypatch.setattr(ksg, "pool_hosts", lambda root: ("ace-ai", "ace-media"))
     with kb.connect_closing() as conn:
         tid = _card(conn)
         with kb.write_txn(conn):
@@ -539,7 +545,10 @@ def test_override_warning_uses_the_live_override_match(operator, capsys):
                              {"reason": "studio_default_deny:workspace_kind:origin_not_github (structural: x)"})
         why = {"capability": "workspace_kind:origin_not_github", "source": "structural", "evidence": "x"}
         ksa.cmd_studio_override(argparse.Namespace(task_id=tid, capability="workspace_kind",
-                                                   why="the port is not built yet", until=None, board=None))
+                                                   why="the port is not built yet", until=None, board=None,
+                                                   elsewhere="ace-media after the worktree port is built",
+                                                   why_not_now="the worktree port is not built yet",
+                                                   effort="days"))
         released = ksa.decide(conn, _row(conn, tid), why, enabled=True, allow=frozenset()) is None
     err = capsys.readouterr().err
     assert released and "WARNING" not in err, err
@@ -654,3 +663,39 @@ def test_parser_need_choices_match_the_need_table():
     sub = next(a for a in top._actions if isinstance(a, argparse._SubParsersAction)).choices["kanban"]
     so = next(a for a in sub._actions if isinstance(a, argparse._SubParsersAction)).choices["studio-override"]
     assert tuple(next(a for a in so._actions if a.dest == "need").choices) == tuple(ksa.NEEDS)
+
+
+def test_every_path_onto_the_studio_for_a_gap_ends_at_the_gated_override(operator, monkeypatch, tmp_path):
+    """t_9d619fbb (operator ruling 2026-11-27): the gap gate sits on ``studio-override`` only, because each of the three
+    ways to put a gap card on the Studio waits on a default-deny hold only an override clears. With default-deny on:
+    1. ``create`` with a bare ``host: studio`` (no Studio-served ``requires:``): the pin is dropped, never local;
+    2. ``admit --host studio``: held ``studio_default_deny:operator_admit``;
+    3. a ``worktree:`` card on a Studio path: held ``studio_default_deny:workspace_kind:...``.
+    The held capability is a GAP, so the override that would release it is refused without the answers."""
+    from hermes_cli import kanban_studio_gap as ksg
+    _cfg(operator, True, [])
+    monkeypatch.setattr(kbd, "_capability_tick", lambda cfg: _caps())
+    monkeypatch.setattr(ksg, "pool_hosts", lambda root: ("ace-ai", "ci-box"))
+    spawned = []
+
+    def spawn(task, workspace, *, board=None, placement=None):
+        spawned.append((task.id, placement.name if placement else "studio"))
+        return 4242
+
+    studio_path = tmp_path / "studio-only-checkout"
+    studio_path.mkdir()
+    with kb.connect_closing() as conn:
+        bare = kb.create_task(conn, title="x", assignee="alpha", body="host: studio\nfix the lint")
+        assert _route(conn, bare)[0] != "local"
+        admitted = _card(conn, body="fix the lint")
+        res = kbd.admit_once(conn, admitted, "studio", spawn_fn=spawn, spillover=_plan(free=2))
+        assert res.placement_waits[admitted].startswith("studio_default_deny:operator_admit"), res.placement_waits
+        wt = kb.create_task(conn, title="wt", assignee="alpha", body="fix the lint", workspace_kind="worktree",
+                            workspace_path=str(studio_path))
+        route = _route(conn, wt)
+        assert route[0] == "wait" and route[1].startswith("studio_default_deny:workspace_kind"), route
+        held = route[1][len("studio_default_deny:"):].split(" (", 1)[0]
+        for tid, cap in ((admitted, "operator_admit"), (wt, held)):
+            with pytest.raises(ksa.OverrideRefused, match="--elsewhere is required"):
+                ksa.override(conn, tid, cap, "the toolchain is only on the studio", actor="apollo")
+    assert spawned == [], spawned

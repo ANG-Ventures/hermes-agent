@@ -1024,6 +1024,12 @@ _SPECS = [
         _arg("--need", choices=("signed-in-identity", "public-page", "lan-reach", "ssh", "gmail", "other"),
              help="Required with --capability browser-session: what the card needs. Only signed-in-identity (and "
                   "other, recorded) is accepted; the rest are refused with the capability to use instead"),
+        _arg("--elsewhere", help="Gap capability (t_9d619fbb): which pool host would run it and what must be installed "
+                                 "or moved there (20+ characters, names the host)"),
+        _arg("--why-not-now", dest="why_not_now", help="Gap capability: why it cannot run there right now (20+ chars)"),
+        _arg("--effort", choices=("hours", "days"), help="Gap capability: estimate to set it up on a pool host. hours "
+                                                        "needs --fix-card and covers one run; days is recorded"),
+        _arg("--fix-card", dest="fix_card", help="Gap capability: the OPEN card that sets it up on a pool host"),
         _group(
             _arg("--once", action="store_true", help="One run only (default): the next spawn uses it up"),
             _arg("--until", metavar="TIME", help="Hold until TIME (ISO-8601, epoch, or +N[smhd])"),
