@@ -70,6 +70,9 @@ DEFAULT_REPOS = (
     "ANG-Ventures/pipecat-house-voice",
     "ANG-Ventures/prism-router",
 )
+# dispatcher_worktree stays unwired (t_877a0b28): 11 of 2,161 Studio cards in the 7 days to 2026-11-26 were
+# worktree-kind, all anchored in non-fleet repos under /Users (Projects/explainer-video, golden-display-config):
+# not in ``repos`` and on another volume than the templates root, so every create would fall back.
 KNOWN_SCOPES = ("dispatcher_worktree", "kanban_clone", "port_clone", "manual", "deploy_selftest")
 
 REASONS = (
