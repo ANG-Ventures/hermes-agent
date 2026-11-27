@@ -62,7 +62,7 @@ def log_items(runner: Any, op: str, key: str, items: Any) -> None:
     try:
         for pos, e in enumerate(list(items or ()), 1):
             kind = "system" if is_system_event(runner, e) else "user"
-            logger.info("queue_mgmt item op=%s session=%s pos=%d msg_id=%s kind=%s preview=%r",
+            logger.info("queue_mgmt item op=%s session=%s pos=%d msg_id=%s kind=%s preview=%s",
                         op, key, pos, getattr(e, "message_id", None), kind, preview(e))
     except Exception:
         logger.debug("queue_mgmt item log failed for %s (%s)", key, op, exc_info=True)
@@ -429,10 +429,9 @@ def release_on_turn_end(runner: Any, key: str, adapter: Any) -> int:
     automatic work is paused or when only ``[system]`` items are held. Never raises."""
     try:
         state = runner._peek_session_state(key)
-        held = getattr(getattr(state, "conversation", None), "held_queue", None) or []
         if state is None or state.conversation.automatic_turns_paused is True:
             return 0
-        if not any(not is_system_event(runner, e) for e in held):
+        if not any(not is_system_event(runner, e) for e in state.conversation.held_queue):
             return 0
         return restage_held(runner, key, adapter, trigger="turn_end") or 0
     except Exception:

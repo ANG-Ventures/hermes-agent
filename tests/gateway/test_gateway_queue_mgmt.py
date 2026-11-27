@@ -652,5 +652,5 @@ def test_every_transition_logs_one_line_per_item(rig, caplog):
         qm.restage_held(runner, KEY, adapter)
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("queue_mgmt item ")]
     assert [ln.split()[2] for ln in lines] == ["op=hold", "op=hold", "op=release", "op=release"]
-    assert "pos=2 msg_id=None kind=user preview='line one line two " in lines[1] and "\n" not in lines[1]
+    assert "pos=2 msg_id=None kind=user preview=line one line two " in lines[1] and "\n" not in lines[1]
     assert "trigger=queue_run" in caplog.text
