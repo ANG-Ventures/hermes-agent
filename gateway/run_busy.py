@@ -772,10 +772,13 @@ class GatewayBusySessionMixin:
             getattr(existing, "message_type", None),
             getattr(event, "message_type", None),
         }
+        # Merge only while the head is the newest queued message: with anything waiting in the
+        # overflow behind it, the merge would move this message ahead of those (t_3ee12123).
         if (
             same_security_context
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
+            and not self._overflow_queue(session_key)
         ):
             merge_pending_message_event(
                 adapter._pending_messages, session_key, event,
