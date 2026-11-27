@@ -318,7 +318,14 @@ class GatewayBusySessionMixin:
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
-            pending_slot[session_key] = queued_event
+            overflow = self._session_state(session_key).conversation.queued_events
+            if overflow:
+                # Slot empty, older items still in overflow (a marked head was just popped to run):
+                # the oldest becomes item 1 again so the new one cannot jump it (Prism e40b259b1e29).
+                pending_slot[session_key] = overflow.pop(0)
+                overflow.append(queued_event)
+            else:
+                pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
 
     def _promote_queued_event(

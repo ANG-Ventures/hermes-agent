@@ -33,6 +33,30 @@ async def test_many_queued_prompts_run_in_order_across_recursion_cap(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_new_queue_item_during_capped_head_runs_after_the_older_backlog(monkeypatch, tmp_path):
+    """Prism e40b259b1e29: while the capped head z4 runs, the slot is empty and z5 is in overflow;
+    a new `/queue z6` must still run after z5."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.gates = {"first": threading.Event(), "z4": threading.Event()}
+    rig.gate_completes.update({"first", "z4"})
+    await rig.start_first_turn()
+    for text in ("z1", "z2", "z3", "z4", "z5"):
+        await rig.adapter.handle_message(_msg(f"/queue {text}"))
+    rig.first_started.clear()
+    rig.gates["first"].set()
+    for _ in range(500):
+        if "z4" in rig.calls:
+            break
+        await asyncio.sleep(0.01)
+    await rig.adapter.handle_message(_msg("/queue z6"))
+    rig.gates["z4"].set()
+    await rig.settle(expect=7)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["first", "z1", "z2", "z3", "z4", "z5", "z6"]
+    assert rig.max_live == 1
+
+
+@pytest.mark.asyncio
 async def test_two_idle_queue_prompts_racing_to_the_claim_both_run_in_order(monkeypatch, tmp_path):
     """Fault A through the real ``_handle_message``: `/queue a` and `/queue b` both pass the idle
     check; a takes the sentinel and is held at the lease claim; b reaches the claim while a holds
