@@ -72,6 +72,15 @@ _CHILD = textwrap.dedent(
 # under load fails here only when it overruns the bound the product itself promises.
 _EXIT_MARGIN_S = 10.0
 
+# Latest point, from the child's spawn, at which a still-alive child is captured (t_25132dfc).
+# ``.inf`` clamps the handler's bound to 600 + 5 s, and two outer limits stop the test long before
+# that with no stacks: the harness's per-test wall clock (``_TEST_WALL_SECONDS`` = 60 s in
+# tests/_fixtures/bounds.py, every pytest run) and, looser, the per-file runner's 240 s idle kill
+# (``_DEFAULT_IDLE_TIMEOUT_SECONDS`` in scripts/run_tests_parallel.py, the macOS lane). 60 - 45 =
+# 15 s is left for ``ps`` + ``sample 3``. A healthy slow record (delay=15) lands ~15 s after the
+# signal, well inside this, so the cap cuts only a hang.
+_CAPTURE_BY_S = 45.0
+
 
 def _capture_hung_child(proc, tmp_path):
     """Keep evidence of a child still alive past its bound (t_32c2a03c): thread list and, on macOS,
@@ -102,6 +111,7 @@ def _run_and_sigterm(tmp_path, *extra, hook_callback_timeout=None):
     env = dict(os.environ)
     env["HERMES_HOME"] = str(home)
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    spawned = time.monotonic()
     proc = subprocess.Popen(
         [sys.executable, "-c", _CHILD, str(out), *extra],
         cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -120,12 +130,14 @@ def _run_and_sigterm(tmp_path, *extra, hook_callback_timeout=None):
         assert record_wait is not None, "child did not report the handler's record wait"
         sent = time.monotonic()
         proc.send_signal(signal.SIGTERM)
+        wait = min(record_wait + _EXIT_MARGIN_S, spawned + _CAPTURE_BY_S - sent)
         try:
-            rc = proc.wait(timeout=record_wait + _EXIT_MARGIN_S)
+            rc = proc.wait(timeout=wait)
         except subprocess.TimeoutExpired:
             diag = _capture_hung_child(proc, tmp_path)
-            pytest.fail(f"child alive {record_wait + _EXIT_MARGIN_S:.0f}s after SIGTERM "
-                        f"(handler bound {record_wait:.0f}s); stacks in {diag}")
+            pytest.fail(f"child alive {wait:.0f}s after SIGTERM "
+                        f"(handler bound {record_wait:.0f}s, capture by {_CAPTURE_BY_S:.0f}s "
+                        f"after spawn); stacks in {diag}")
         elapsed = time.monotonic() - sent
     finally:
         if proc.poll() is None:
@@ -188,17 +200,27 @@ def test_non_finite_hook_budget_still_waits_for_record(tmp_path, budget):
 def test_record_path_import_runs_no_subprocess(tmp_path):
     """The record path's modules are imported when the handler is installed, and importing them
     must start no process (t_32c2a03c): ``agent.auxiliary_client`` read the version at import, 8
-    ``git`` calls that took ~3 s each on a loaded Mac and ran the handler past its bound."""
+    ``git`` calls that took ~3 s each on a loaded Mac and ran the handler past its bound.
+
+    The version read is spied on directly (t_25132dfc): on a tree with no ``.git`` it spawns
+    nothing, so the Popen spy alone passed there with the fix reverted."""
     probe = textwrap.dedent(
         """
         import subprocess
-        spawned = []
+        spawned, version_reads = [], []
         _init = subprocess.Popen.__init__
         def _spy(self, args, *a, **k):
             spawned.append(args)
             return _init(self, args, *a, **k)
         subprocess.Popen.__init__ = _spy
+        import hermes_cli.version_info as version_info
+        _read = version_info.get_version_info
+        def _read_spy():
+            version_reads.append(1)
+            return _read()
+        version_info.get_version_info = _read_spy
         import agent.turn_finalizer, cron.scheduler
+        print(len(version_reads))
         print(spawned)
         """
     )
@@ -207,4 +229,6 @@ def test_record_path_import_runs_no_subprocess(tmp_path):
     res = subprocess.run([sys.executable, "-c", probe], cwd=str(REPO_ROOT), env=env,
                          capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, res.stderr
-    assert res.stdout.strip().splitlines()[-1] == "[]"
+    reads, spawned = res.stdout.strip().splitlines()[-2:]
+    assert reads == "0", f"version read called {reads}x at import"
+    assert spawned == "[]"
