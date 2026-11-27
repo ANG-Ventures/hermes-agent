@@ -99,10 +99,11 @@ def classify(capability: str, *, allow: Iterable[str] = (), studio_only: Optiona
     return INHERENT if all(ksa._covered(p, words) for p in ps) else GAP
 
 
-def pool_hosts(root: Path) -> tuple:
+def pool_hosts(root: Path) -> Optional[tuple]:
     """Placement targets from the root's pool file (``PoolConfig.pool_hosts``: enabled, ``targets`` true, with a
-    worker login), lower-case, in pool order, never the Studio itself; () when unreadable. ``PoolConfig.hosts`` is the
-    pin vocabulary and can list the Studio, so naming it would not take the work off the Studio (Prism 9c2756fa53d1)."""
+    worker login), lower-case, in pool order, never the Studio itself; ``None`` when unreadable, ``()`` when the read
+    worked and no off-Studio target exists (Prism 0363103a464a: the two must not look alike). ``PoolConfig.hosts`` is
+    the pin vocabulary and can list the Studio, so naming it would not take the work off the Studio (Prism 9c2756fa53d1)."""
     try:
         from hermes_cli import kanban_db_dispatch as kbd
         from hermes_cli import kanban_worker_pool as kwp
@@ -111,12 +112,18 @@ def pool_hosts(root: Path) -> tuple:
         names = [str(getattr(h, "name", "")).strip().lower() for h in (getattr(cfg, "pool_hosts", ()) or ())]
         return tuple(dict.fromkeys(n for n in names if n and n not in studio))
     except Exception:
-        return ()
+        return None
 
 
 def _names_host(text: str, hosts: Iterable[str]) -> bool:
     low = (text or "").lower()
     return any(re.search(rf"(?<![\w-]){re.escape(h)}(?![\w-])", low) for h in hosts)
+
+
+def _hosts_text(hosts: Optional[tuple]) -> str:
+    if hosts is None:
+        return "(pool file unreadable)"
+    return ", ".join(hosts) or "(none off the Studio)"
 
 
 def _card_status(conn, card: str) -> Optional[str]:
@@ -125,8 +132,10 @@ def _card_status(conn, card: str) -> Optional[str]:
 
 
 def key_fix_cards(conn, key: str) -> list:
-    """Fix cards for gap ``key`` (the capability; ``studio-capgap:<key>``), oldest first: every ``fix_card_given`` an
-    earlier ``studio_override`` on ANY card recorded for this key.
+    """Fix cards for gap ``key`` (the capability; ``studio-capgap:<key>``), ordered by their LAST naming, oldest
+    first: every ``fix_card_given`` an earlier ``studio_override`` on ANY card recorded for this key.
+    These events survive ``kanban gc`` (``gc_events`` keeps a studio_override that names a fix card), so a closed
+    gap stays closed past the 30-day event retention (Prism 506ff9d7da6e).
     Per GAP, not per card (operator ruling 2026-11-27): 25 cards overrode one render-toolchain gap on 11-26."""
     import json
     out = []
@@ -136,7 +145,9 @@ def key_fix_cards(conn, key: str) -> list:
         except (TypeError, ValueError):
             continue
         fc = doc.get("fix_card_given") if isinstance(doc, dict) and doc.get("capability") == key else None
-        if fc and fc not in out:
+        if fc:
+            if fc in out:
+                out.remove(fc)
             out.append(fc)
     return out
 
@@ -173,7 +184,7 @@ def _refusal(conn, task_id: str, capability: str, problem: str, hosts: tuple,
         f"{problem}\n"
         f"  {task_id} wants the Studio for '{capability}', which is a host GAP (not Studio-only by nature). "
         f"The card says: {_body_needs(conn, task_id)}.\n"
-        f"  Pool hosts: {', '.join(hosts) or '(pool file unreadable)'}.\n"
+        f"  Pool hosts: {_hosts_text(hosts)}.\n"
         f"  A gap override needs: --elsewhere \"<which pool host, what to install or move>\" "
         f"--why-not-now \"<why it cannot run there now>\" --effort hours|days; "
         f"with hours also --fix-card <open card>.\n"
@@ -246,11 +257,14 @@ def check(conn, task_id: str, capability: str, *, elsewhere: Optional[str], why_
 
 def _check_gap(conn, task_id: str, key: str, *, elsewhere, why_not_now, effort, fix_card, until, root, board) -> dict:
     hosts = pool_hosts(root)
-    on_pool = f"run it on a pool host: {', '.join(hosts) or '(pool file unreadable)'}"
+    on_pool = f"run it on a pool host: {_hosts_text(hosts)}"
     known = key_fix_cards(conn, key)
     status = {c: _card_status(conn, c) for c in known}
-    open_known = [c for c in known if status[c] not in _CLOSED and c != task_id]
     done_known = [c for c in known if status[c] in _DONE]
+    # Only a fix card named AFTER the latest done one can count a run (Prism 434fc10f5122): an older card left open
+    # when a newer one closed the gap predates the closure.
+    since = known[known.index(done_known[-1]) + 1:] if done_known else known
+    open_known = [c for c in since if status[c] not in _CLOSED and c != task_id]
     ew, wn, eff = (elsewhere or "").strip(), (why_not_now or "").strip(), (effort or "").strip().lower()
     fc = (fix_card or "").strip() or None
     if fc:
@@ -281,6 +295,9 @@ def _check_gap(conn, task_id: str, key: str, *, elsewhere, why_not_now, effort, 
                        key=key, problem=p, fix_card=done_known[-1], short=f"({on_pool})")
     if len(ew) < MIN_TEXT:
         raise _refusal(conn, task_id, key, f"--elsewhere is required ({MIN_TEXT}+ characters)", hosts, board)
+    if hosts == ():
+        raise _refusal(conn, task_id, key, "the pool file has no off-Studio placement target, so no --elsewhere "
+                       "can name one: add a pool host first", hosts, board)
     if hosts and not _names_host(ew, hosts):
         raise _refusal(conn, task_id, key, "--elsewhere must name the pool host that would run it "
                        "(it only restates the gap)", hosts, board)

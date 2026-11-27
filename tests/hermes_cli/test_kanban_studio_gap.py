@@ -236,6 +236,64 @@ def test_archived_fix_card_does_not_close_the_gap(operator):
     assert p["fix_card"] == fix_b
 
 
+def test_open_fix_card_older_than_the_closing_one_does_not_count(operator):
+    """Prism 434fc10f5122: fix cards A then B for one key, B done, A still open: no-answer overrides are refused."""
+    with kb.connect_closing() as conn:
+        a, b = _card(conn, title="install A"), _card(conn, title="install B")
+        for fix in (a, b):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+        _done(conn, b)
+        with pytest.raises(ksa.OverrideRefused, match=f"the gap card {b} for operator_admit is done"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+        # naming the older open card explicitly is the reopened path: it needs the answers
+        with pytest.raises(ksa.OverrideRefused, match="--elsewhere is required"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only", fix_card=a)
+        p = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="hours", fix_card=a)
+        q = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only")
+    assert not p.get("counted") and q["counted"] and q["fix_card"] == a
+
+
+def test_readable_pool_with_no_off_studio_host_refuses_a_gap(operator, monkeypatch):
+    """Prism 0363103a464a: an empty (but readable) pool is not 'unreadable'; --elsewhere cannot name the Studio."""
+    monkeypatch.setattr(ksg, "pool_hosts", lambda root: ())
+    with kb.connect_closing() as conn:
+        with pytest.raises(ksa.OverrideRefused, match="no off-Studio placement target") as e:
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere="Install the toolchain on mac-studio", why_not_now=WN, effort="days")
+    assert "Pool hosts: (none off the Studio)" in str(e.value)
+    monkeypatch.setattr(ksg, "pool_hosts", lambda root: None)  # unreadable: host check skipped, as before
+    with kb.connect_closing() as conn:
+        p = ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere="Install the toolchain on mac-studio", why_not_now=WN, effort="days")
+    assert p["class"] == "gap"
+
+
+def test_pool_hosts_unreadable_is_none(tmp_path, monkeypatch):
+    from hermes_cli import kanban_worker_pool as kwp
+    monkeypatch.setattr(kwp, "read_pool", lambda *a, **k: (_ for _ in ()).throw(OSError("gone")))
+    assert ksg.pool_hosts(tmp_path) is None
+
+
+def test_gc_keeps_the_override_that_registers_a_fix_card(operator):
+    """Prism 506ff9d7da6e: kanban gc past 30 days must not forget a closed gap."""
+    with kb.connect_closing() as conn:
+        fix, a = _card(conn, title="install the render toolchain on ci-box"), _card(conn)
+        ksa.override(conn, a, "operator_admit", "render toolchain is Studio-only",
+                     elsewhere=EW, why_not_now=WN, effort="hours", fix_card=fix)
+        _done(conn, a)
+        _done(conn, fix)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_events SET created_at = 1 WHERE task_id = ?", (a,))
+        kb.gc_events(conn)
+        kinds = [k for (k,) in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (a,))]
+        with pytest.raises(ksa.OverrideRefused, match=f"the gap card {fix} for operator_admit is done"):
+            ksa.override(conn, _card(conn), "operator_admit", "render toolchain is Studio-only",
+                         elsewhere=EW, why_not_now=WN, effort="days")
+    assert kinds == ["studio_override"]  # every other old event on the done card was pruned
+
+
 def test_refusal_create_command_names_the_board(operator):
     """Prism 506ff9d7da6e: the printed create command carries the override's board."""
     with kb.connect_closing() as conn:

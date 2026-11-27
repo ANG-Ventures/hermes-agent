@@ -23884,8 +23884,12 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' "
+            # a studio_override naming a gap fix card is the gap registry (kanban_studio_gap.key_fix_cards):
+            # pruning it would reopen a closed gap (t_9d619fbb, Prism 506ff9d7da6e)
+            "AND (CASE WHEN kind = 'studio_override' AND json_valid(payload) "
+            "THEN json_extract(payload, '$.fix_card_given') END) IS NULL "
+            "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
         )
     return int(cur.rowcount or 0)
 
