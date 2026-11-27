@@ -5144,31 +5144,59 @@ class BasePlatformAdapter(ABC):
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
-        # An earlier follow-up may still be in the busy path (an image being described) while the
-        # turn it targeted has ended. Starting this message now would run it ahead of that one
-        # (t_04c0a6b0), so wait until it has steered or queued itself (and been started). Before
-        # the admission check: nothing may await between that check and the claim.
-        if session_key not in self._active_sessions:
-            await self._await_busy_followups_settled(session_key)
-        # Atomic admission (Prism eb13daf988ed): a producer whose eligibility can go stale across an
-        # adapter's own awaits (Discord resolves the channel first) re-checks here; nothing awaits
-        # between this check and the claim or queue below. False = refused: not accepted, not queued.
-        # One-shot (Prism 199961bfd516): consumed here, so a queued event replayed through this path
-        # later is never refused after its producer has stopped watching (it could not roll back).
-        admit = getattr(event, "_admission_check", None)
-        if admit is not None:
-            event._admission_check = None
-            if not admit(session_key):
+        # Every recognized slash command is dispatched inline (``should_bypass_active_session``),
+        # never queued as a turn: it neither waits behind nor is counted as a follow-up. Counting
+        # one let an idle goal wake (it holds the goal lock across this call) wait on an inline
+        # ``/goal pause`` that needs that lock (Prism aa2f4134d3c7).
+        from hermes_cli.commands import should_bypass_active_session
+        ordered = not should_bypass_active_session(event.get_command())
+        settled: Optional[asyncio.Event] = None
+        # Admission runs in arrival order per session (Prism c2f91d63d749): asyncio.Lock wakes its
+        # waiters FIFO and a newcomer cannot take a lock that has waiters, so a message that arrives
+        # while an earlier one is parked below queues behind it even after a new turn has started.
+        # Uncontended, ``async with`` does not yield, so the ordinary path is unchanged.
+        async with (self._session_admission_lock(session_key) if ordered else contextlib.nullcontext()):
+            # An earlier follow-up may still be in the busy path (an image being described) while
+            # the turn it targeted has ended. Starting this message now would run it ahead of that
+            # one (t_04c0a6b0), so wait until it has steered or queued itself (and been started).
+            # Before the admission check: nothing may await between that check and the claim.
+            if ordered and session_key not in self._active_sessions:
+                await self._await_busy_followups_settled(session_key)
+            # Atomic admission (Prism eb13daf988ed): a producer whose eligibility can go stale across
+            # an adapter's own awaits (Discord resolves the channel first) re-checks here; nothing
+            # awaits between this check and the claim or queue below. False = refused: not accepted,
+            # not queued. One-shot (Prism 199961bfd516): consumed here, so a queued event replayed
+            # through this path later is never refused after its producer has stopped watching (it
+            # could not roll back).
+            admit = getattr(event, "_admission_check", None)
+            if admit is not None:
+                event._admission_check = None
+                if not admit(session_key):
+                    return
+            busy = session_key in self._active_sessions
+            if busy:
+                # Counted before the lock is released, so the next message in line sees it.
+                settled = self._busy_followup_begin(session_key) if ordered else None
+            else:
+                # Guard installed synchronously BEFORE the task spawns so a second message can't
+                # race in.
+                event._gateway_accepted = self._start_session_processing(event, session_key)
                 return
-        if session_key in self._active_sessions:
-            settled = self._busy_followup_begin(session_key)
-            try:
-                await self._handle_message_while_active(event, session_key)
-            finally:
+        try:
+            await self._handle_message_while_active(event, session_key)
+        finally:
+            if settled is not None:
                 self._busy_followup_end(session_key, settled)
-            return
-        # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
-        event._gateway_accepted = self._start_session_processing(event, session_key)
+
+    def _session_admission_lock(self, session_key: str) -> asyncio.Lock:
+        """Per-session FIFO admission lock; dropped once no coroutine holds or awaits it."""
+        locks = self.__dict__.get("_session_admission_locks")
+        if locks is None:
+            locks = self.__dict__["_session_admission_locks"] = weakref.WeakValueDictionary()
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = locks[session_key] = asyncio.Lock()
+        return lock
 
     def _busy_followup_begin(self, session_key: str) -> asyncio.Event:
         """Count a follow-up entering the busy path for *session_key*; returns its settle event."""
@@ -5182,7 +5210,7 @@ class BasePlatformAdapter(ABC):
     def _busy_followup_end(self, session_key: str, settled: asyncio.Event) -> None:
         inflight = self.__dict__.get("_busy_followups_inflight") or {}
         entry = inflight.get(session_key)
-        if entry is None or entry[1] is not settled:
+        if entry is None or entry[1] is not settled:   # defensive: never leave a waiter parked
             settled.set()
             return
         entry[0] -= 1

@@ -111,3 +111,84 @@ async def test_busy_handler_bookkeeping_is_released_when_it_raises():
     adapter._busy_session_handler = None
     await asyncio.wait_for(adapter.handle_message(_text()), 5)
     assert ("start", "txt") in log
+
+
+def _photo_n(mid):
+    return MessageEvent(text="", message_type=MessageType.PHOTO, source=_source(), message_id=mid,
+                        media_urls=[f"/tmp/{mid}.png"], media_types=["image/png"])
+
+
+def _text_n(mid):
+    return MessageEvent(text=f"text {mid}", message_type=MessageType.TEXT, source=_source(), message_id=mid)
+
+
+@pytest.mark.asyncio
+async def test_a_later_text_does_not_overtake_a_text_still_waiting_once_a_new_turn_starts():
+    """Prism c2f91d63d749: photos A and B are being described when turn 1 ends; text C waits.
+    A finishes and its orphan start begins turn 2 while B is still being described. Text D,
+    arriving now, found the new guard and went straight to the busy path ahead of C."""
+    adapter, log, _gate = _rig()
+    gates = {"A": asyncio.Event(), "B": asyncio.Event()}
+
+    async def busy_handler(event, session_key):
+        log.append(("busy", event.message_id))
+        if event.message_type == MessageType.PHOTO:
+            await gates[event.message_id].wait()
+            adapter._pending_messages[session_key] = event   # turn gone: queue it (orphan-started)
+            event._gateway_accepted = True
+        else:
+            adapter._pending_messages.setdefault(session_key, event)
+        return True
+
+    adapter._busy_session_handler = busy_handler
+    adapter._active_sessions[SK] = asyncio.Event()           # turn 1 is running
+    tasks = [asyncio.create_task(adapter.handle_message(_photo_n("A")))]
+    await _settle()
+    tasks.append(asyncio.create_task(adapter.handle_message(_photo_n("B"))))
+    await _settle()
+    del adapter._active_sessions[SK]                         # turn 1 ends during both descriptions
+    tasks.append(asyncio.create_task(adapter.handle_message(_text_n("C"))))
+    await _settle()
+    gates["A"].set()                                         # A queued + orphan-started: turn 2
+    await _settle()
+    assert ("start", "A") in log and SK in adapter._active_sessions
+    tasks.append(asyncio.create_task(adapter.handle_message(_text_n("D"))))
+    await _settle()
+    gates["B"].set()
+    await asyncio.wait_for(asyncio.gather(*tasks), 5)
+
+    assert ("busy", "C") in log and ("busy", "D") in log, log
+    assert log.index(("busy", "C")) < log.index(("busy", "D")), f"D overtook C: {log}"
+
+
+@pytest.mark.asyncio
+async def test_idle_goal_wake_holding_a_lock_does_not_wait_on_an_inline_command_needing_it():
+    """Prism aa2f4134d3c7: the idle-goal watcher holds the goal lock across handle_message, and an
+    inline ``/goal pause`` needs that lock. If the inline command counted as a follow-up in
+    preparation, the wake waited for it and it waited for the lock: a deadlock."""
+    adapter, log, _gate = _rig()
+    goal_lock = asyncio.Lock()
+
+    async def inline_reply(event):
+        log.append(("inline", event.message_id))
+        async with goal_lock:                                # /goal pause takes the goal lock
+            log.append(("inline-done", event.message_id))
+
+    adapter._dispatch_inline_reply = inline_reply
+    adapter._active_sessions[SK] = asyncio.Event()           # a turn is running
+
+    async def watcher():
+        async with goal_lock:                                # held across handle_message
+            await _settle()                                  # the off-loop recheck
+            del adapter._active_sessions[SK]                 # the turn has ended
+            wake = MessageEvent(text="goal wake", message_type=MessageType.TEXT, source=_source(),
+                                message_id="wake", internal=True)
+            await adapter.handle_message(wake)
+
+    watcher_task = asyncio.create_task(watcher())
+    await asyncio.sleep(0)
+    pause = MessageEvent(text="/goal pause", message_type=MessageType.TEXT, source=_source(),
+                         message_id="pause")
+    pause_task = asyncio.create_task(adapter.handle_message(pause))
+    await asyncio.wait_for(asyncio.gather(watcher_task, pause_task), 3)
+    assert ("start", "wake") in log and ("inline-done", "pause") in log, log
