@@ -27,6 +27,9 @@ class TurnState:
     started_ts: float = 0.0  # 0.0 = not running
     lease: Any = None  # cross-process active-session slot lease
     busy_ack_ts: float = 0.0  # debounce; 0.0 = never acked
+    # A "steered into current run" ack went out during this turn: if a steer is then handed back
+    # as the next turn (result["pending_steer"]), the user is told so (t_2b16f0e6).
+    steer_acked: bool = False
     # True from the moment /stop (or /new) starts tearing this turn down until the slot is released.
     # The slot is freed only at the END of that teardown (durable marker write, adapter interrupt),
     # so a command the busy path would reject waits on this instead of bouncing.
@@ -43,7 +46,7 @@ class TurnState:
         """Reset the per-turn slot.  The caller pops ``lease`` first to release it."""
         self.agent = self.lease = self.event = self.ctx = None
         self.started_ts = self.busy_ack_ts = 0.0
-        self.stopping = False
+        self.stopping = self.steer_acked = False
 
 
 @dataclass

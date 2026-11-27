@@ -264,6 +264,8 @@ class InterruptControlMixin:
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
+            if getattr(self, "_steer_closed", False):
+                return False  # the turn has returned; the surface queues it as the next turn
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
         return True
@@ -346,3 +348,15 @@ class InterruptControlMixin:
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = None
         return text
+
+    def _close_steer(self) -> None:
+        """Refuse further ``steer()`` calls until :meth:`_open_steer` (t_2b16f0e6). Set under the steer
+        lock when a turn returns, so every steer either landed before (and is drained after this)
+        or is refused and becomes the surface's next turn; none waits in a finished agent."""
+        with _ic_lock(self, "_pending_steer_lock"):
+            self._steer_closed = True
+
+    def _open_steer(self) -> None:
+        """Accept steers again: a new turn is starting on this agent."""
+        with _ic_lock(self, "_pending_steer_lock"):
+            self._steer_closed = False

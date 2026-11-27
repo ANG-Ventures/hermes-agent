@@ -1568,6 +1568,8 @@ class GatewayBusySessionMixin:
             demoted_for_compression=_steer.demoted_for_compression,
             demoted_for_startup_resume=getattr(_steer, "demoted_for_startup_resume", False),
         )
+        if is_steer_mode:
+            self._session_state(session_key).turn.steer_acked = True
         await self._send_busy_ack_reply(event, adapter, message)
         return True
 

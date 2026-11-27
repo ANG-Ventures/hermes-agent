@@ -4279,6 +4279,23 @@ class GatewayTurnMixin:
             session_key, len(text),
         )
 
+    async def _correct_steer_ack_for_leftover(self, adapter: Any, source: SessionSource, session_key: str) -> None:
+        """This turn acked a message as "steered into current run ... after the next tool call",
+        but the turn ended first and handed the steer back: it runs as the next turn. Say so, once,
+        so the ack does not stand as a wrong promise (t_2b16f0e6, rig case C1)."""
+        turn = self._session_state(session_key).turn
+        if not turn.steer_acked:
+            return
+        turn.steer_acked = False
+        try:
+            await adapter._send_with_retry(
+                chat_id=source.chat_id,
+                content="⏳ Your last message reached this run as it was finishing, so it is queued as the next turn.",
+                reply_to=None, metadata=self._thread_metadata_for_source(source),
+            )
+        except Exception as exc:
+            logger.debug("Leftover-steer ack correction failed for %s: %s", session_key, exc)
+
     async def _run_agent_drain_pending(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str],
         session_id: Optional[str] = None,
@@ -4335,6 +4352,8 @@ class GatewayTurnMixin:
 
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         _steer_internal = bool(result and result.get("_pending_steer_internal"))
+        if result and result.get("pending_steer") and adapter and session_key and not _steer_internal:
+            await self._correct_steer_ack_for_leftover(adapter, source, session_key)
         if result and not pending and not pending_event and result.get("pending_steer"):
             pending = result.get("pending_steer")
             if _steer_internal:
@@ -4632,6 +4651,7 @@ class GatewayTurnMixin:
             if _followup_state is not None and _followup_state.turn.started_ts:
                 _followup_state.turn.started_ts = time.time()
                 _followup_state.turn.busy_ack_ts = 0.0
+                _followup_state.turn.steer_acked = False
 
             if pending_event is not None and not queue_mgmt.claim_inflight(self, session_key, pending_event):
                 # A /stop or other invalidation put it back into held meanwhile: never run it twice.
