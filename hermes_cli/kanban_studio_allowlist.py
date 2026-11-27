@@ -491,8 +491,8 @@ def _count_comment(conn, fix: str, cap: str, task_id: str, actor: Optional[str],
     head = f"studio-override count for gap {cap} on {day}:"
     body = (f"{head} {n} Studio run(s) so far for this gap, latest {task_id} (by {actor or 'operator'}); "
             f"one line per day, updated in place, the events carry each run")
-    row = conn.execute("SELECT id FROM task_comments WHERE task_id = ? AND body LIKE ? ORDER BY id DESC LIMIT 1",
-                       (fix, head + "%")).fetchone()
+    row = next((r for r in conn.execute("SELECT id, body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+                                        (fix,)).fetchall() if (r[1] or "").startswith(head)), None)
     if row:  # the day's line already exists: move its running total, do not add a comment
         with _kb.write_txn(conn):
             conn.execute("UPDATE task_comments SET body = ? WHERE id = ?", (body, row[0]))
