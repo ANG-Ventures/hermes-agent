@@ -24,6 +24,23 @@ _REASON_NEW_MESSAGE = "user sent a new message"
 _REASON_USER_INTERRUPT = "user interrupt"
 USER_INTERRUPT_REASONS = frozenset({_REASON_HARD_STOP, _REASON_NEW_MESSAGE, _REASON_USER_INTERRUPT})
 
+_CLOSED_STEER_BYPASS = threading.local()
+
+
+@contextlib.contextmanager
+def late_result_nudge():
+    """Internal best-effort nudge, for the delegate late-result steer into its parent ONLY
+    (``tools/delegate_tool.py``): a ``steer()`` on this thread inside the block is buffered even when
+    the parent's steering is closed, and is delivered at the next turn's first drain, as on main
+    (t_2b16f0e6). A context, not a ``steer()`` keyword, so the instance wrappers the gateway and the
+    delegate ledger install over ``steer(text)`` pass it through unchanged."""
+    prev = getattr(_CLOSED_STEER_BYPASS, "on", False)
+    _CLOSED_STEER_BYPASS.on = True
+    try:
+        yield
+    finally:
+        _CLOSED_STEER_BYPASS.on = prev
+
 
 def interrupt_issuer(agent) -> Optional[str]:
     """Slug of the system producer behind the pending interrupt, or ``None`` for a human stop."""
@@ -259,12 +276,14 @@ class InterruptControlMixin:
 
     def steer(self, text: str) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
+        interrupt); multiple calls concatenate with newlines. Returns False for empty text, and once the
+        turn's last drain has closed steering (t_2b16f0e6) until the next turn opens it: the caller then
+        queues the text as the next turn. Only :func:`late_result_nudge` is buffered while closed."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
-            if getattr(self, "_steer_closed", False):
+            if getattr(self, "_steer_closed", False) and not getattr(_CLOSED_STEER_BYPASS, "on", False):
                 return False  # the turn has returned; the surface queues it as the next turn
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
