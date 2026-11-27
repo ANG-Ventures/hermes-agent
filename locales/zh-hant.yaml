@@ -827,7 +827,7 @@ gateway:
     moved: "已將佇列項目 {source} 移至 {destination}。"
     refused_command: "未排入佇列：/{command} 是指令，指令無法作為提示排入佇列。請單獨傳送。"
     cap_reached: "未排入佇列：佇列已滿（{cap} 個項目）。請使用 /queue list、/queue rm N 或 /queue clear。"
-    added_to_held: "已加入暫留佇列（暫留 {count} 則）。/queue run 會釋放它們。"
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "已釋放 {count} 則排入佇列的提示；接下來將依序執行。"
     released_interrupting: "正在中斷目前回合；依序釋放 {count} 則排入佇列的提示。"
     dropped_on_reset: "已隨舊對話捨棄 {count} 則排入佇列的提示。"

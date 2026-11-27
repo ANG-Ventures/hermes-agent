@@ -1,4 +1,4 @@
-"""Fork canary: the /queue + /stop contract (Ace rulings 2026-10-12, -13 and -18).
+"""Fork canary: the /queue + /stop contract (Ace rulings 2026-10-12, -13, -18 and 2026-11-26).
 
 Surface: CLI + every gateway surface (Telegram, Discord, Slack), busy and idle. Upstream has NEITHER
 ``gateway/queue_mgmt.py`` NOR ``hermes_cli/queue_verbs.py`` (checked 2026-10-18 against upstream/main), so a
@@ -231,3 +231,25 @@ def test_user_reset_drops_and_reports_auto_reset_carries(rig):
     runner._clear_conversation_scope(KEY, reason="session_reset")
     assert _held(runner) == []
     assert qm.take_reset_drop_suffix(runner, KEY) == "\nDropped 2 queued prompt(s) with the old conversation."
+
+
+# --------------------------------------------------------------------------- R7: a new /queue item is never held
+# Ace 2026-11-26 (Discord 1575705667786776607): with items held, a new `/queue <text>` still goes to the ACTIVE
+# queue (busy: armed to run after the turn; idle: runs now) and the held items stay held. Red if either entry
+# point appends the new item to `held_queue` again (the old D14 "joins held" rule).
+
+@pytest.mark.asyncio
+async def test_new_queue_item_goes_active_while_held(rig):
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    qm.hold_user_items(runner, KEY, adapter)
+    reply = await runner._busy_queue_command(_ev("/queue z"), KEY, _source())
+    assert reply.startswith("Queued for the next turn.") and "1 older prompt(s) still held" in reply
+    assert _held(runner) == ["a"] and adapter._pending_messages[KEY].text == "z"
+    adapter._pending_messages.pop(KEY)
+    async def _ack(*_a):
+        return None
+    runner._send_command_ack = _ack
+    ev = _ev("/queue y")
+    assert await runner._hm_cmd_queue(ev, _source(), KEY) == (False, None) and ev.text == "y"
+    assert _held(runner) == ["a"] and KEY not in adapter._pending_messages

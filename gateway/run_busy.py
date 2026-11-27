@@ -1762,12 +1762,10 @@ class GatewayBusySessionMixin:
                 internal=event.internal, timestamp=event.timestamp,
                 wake_kind=getattr(event, "wake_kind", None),
             )
-            held_reply = queue_mgmt.append_if_held(self, quick_key, _queued_event)
-            if held_reply:
-                return held_reply
             self._enqueue_fifo(quick_key, _queued_event, adapter)
         depth = self._queue_depth(quick_key, adapter=adapter)
-        return t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
+        return (t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
+                + queue_mgmt.held_note(self, quick_key))
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
         # /steer lands BETWEEN tool-call iterations of the same run (appended to the last tool

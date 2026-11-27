@@ -827,7 +827,7 @@ gateway:
     moved: "已将队列项 {source} 移至 {destination}。"
     refused_command: "未排队：/{command} 是命令，命令不能作为提示词排队。请单独发送。"
     cap_reached: "未排队：队列已满（{cap} 项）。请使用 /queue list、/queue rm N 或 /queue clear。"
-    added_to_held: "已加入暂留队列（暂留 {count} 条）。/queue run 会释放它们。"
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "已释放 {count} 条排队的提示词；它们将按顺序接着执行。"
     released_interrupting: "正在中断当前回合；按顺序释放 {count} 条排队的提示词。"
     dropped_on_reset: "已随旧对话丢弃 {count} 条排队的提示词。"

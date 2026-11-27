@@ -837,7 +837,7 @@ gateway:
     moved: "A(z) {source}. sorelem áthelyezve ide: {destination}."
     refused_command: "Nincs sorba állítva: a /{command} parancs, és parancsok nem állíthatók sorba promptként. Küldd el külön."
     cap_reached: "Nincs sorba állítva: a sor megtelt ({cap} elem). Használd a /queue list, /queue rm N vagy /queue clear parancsot."
-    added_to_held: "Hozzáadva a visszatartott sorhoz ({count} visszatartva). A /queue run elindítja őket."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "{count} sorban álló prompt elindítva; következőként futnak, sorrendben."
     released_interrupting: "Az aktuális kör megszakítása; {count} sorban álló prompt elindítása sorrendben."
     dropped_on_reset: "{count} sorban álló prompt eldobva a régi beszélgetéssel együtt."

@@ -827,7 +827,7 @@ gateway:
     moved: "대기열 항목 {source}을(를) {destination}으로 이동했어요."
     refused_command: "대기열에 추가하지 않았어요: /{command}은(는) 명령어이며, 명령어는 프롬프트로 대기열에 넣을 수 없어요. 따로 보내 주세요."
     cap_reached: "대기열에 추가하지 않았어요: 대기열이 가득 찼어요 ({cap}개). /queue list, /queue rm N 또는 /queue clear를 사용하세요."
-    added_to_held: "보류 중인 대기열에 추가했어요 ({count}개 보류 중). /queue run으로 해제할 수 있어요."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "대기 중인 프롬프트 {count}개를 해제했어요. 다음에 순서대로 실행돼요."
     released_interrupting: "현재 턴을 중단하고 대기 중인 프롬프트 {count}개를 순서대로 해제할게요."
     dropped_on_reset: "이전 대화와 함께 대기 중인 프롬프트 {count}개를 버렸어요."

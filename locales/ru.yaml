@@ -827,7 +827,7 @@ gateway:
     moved: "Элемент очереди {source} перемещён на {destination}."
     refused_command: "Не поставлено в очередь: /{command} — это команда, а команды нельзя ставить в очередь как промпты. Отправьте её отдельно."
     cap_reached: "Не поставлено в очередь: очередь заполнена ({cap} элементов). Используйте /queue list, /queue rm N или /queue clear."
-    added_to_held: "Добавлено в удержанную очередь (удержано: {count}). /queue run выпускает их."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "Выпущено промптов из очереди: {count}; они выполнятся следующими, по порядку."
     released_interrupting: "Прерываю текущий ход; выпускаю промпты из очереди по порядку: {count}."
     dropped_on_reset: "Удалено промптов из очереди вместе со старым разговором: {count}."

@@ -12,11 +12,12 @@ Stores (spec 2026-10-12_gateway-queue-management-spec.md):
   No drain, rescue, or promotion path reads it; only ``/queue run`` / ``/queue clear`` /
   a session boundary empty it.
 
-While ``held`` is non-empty, new ``/queue`` items append to it, and the verbs (list numbering, rm,
-edit, move, clear) operate on the held store. The active store can still gain user items at the
-same time: a plain message under ``busy_input_mode: queue`` is a normal message (D14: it runs
-normally; held items keep waiting). ``/queue list`` shows those in a second, unnumbered section and
-``/queue run`` restages oldest first: held, then those later active items.
+A new ``/queue <prompt>`` (and ``/queue add``) always joins the ACTIVE queue, held or not (D14,
+Ace 2026-11-26, Discord 1575705667786776607): busy it runs after the current turn, idle it runs now;
+held items stay held and the reply says how many. While ``held`` is non-empty the verbs (list
+numbering, rm, edit, move, clear) operate on the held store; ``/queue list`` shows later active
+items in a second, unnumbered section and ``/queue run`` restages oldest first: held, then those
+later active items.
 """
 
 from __future__ import annotations
@@ -312,14 +313,11 @@ def cap_reply(runner: Any, key: str, adapter: Any) -> Optional[str]:
     return None
 
 
-def append_if_held(runner: Any, key: str, event: Any) -> Optional[str]:
-    """D14: while held items exist, a new /queue item joins them (FIFO), never the active queue."""
+def held_note(runner: Any, key: str) -> str:
+    """D14 (Ace 2026-11-26): a new /queue item never joins the held store; this line tells the user
+    the older held prompts are still waiting. Empty when nothing is held."""
     held = held_list(runner, key)
-    if not held:
-        return None
-    held.append(event)
-    logger.info("queue_mgmt op=add store=held session=%s depth=%d", key, len(held))
-    return t("gateway.queue.added_to_held", count=len(held))
+    return ("\n" + t("gateway.queue.still_held", count=len(held))) if held else ""
 
 
 MERGE_SEPARATOR = "\n\n"

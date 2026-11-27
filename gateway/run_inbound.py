@@ -1128,7 +1128,7 @@ class GatewayInboundMixin:
     # payload as a regular user turn; an empty payload surfaces the usage hint.
     async def _hm_cmd_queue(self, event, source, _quick_key):
         # Idle /queue: management verbs (list/edit/rm/move/clear/run/help) are handled here; a prompt
-        # joins the held store if one exists (D14), else it is sent as a normal turn (unchanged).
+        # is sent as a normal turn now, even with items held (D14, Ace 2026-11-26); held items stay.
         from gateway import queue_mgmt
         adapter = self._delivery_adapter_for(source)
         op = queue_mgmt.classify(event)
@@ -1142,15 +1142,11 @@ class GatewayInboundMixin:
         refused = queue_mgmt.refuse_command_prompt(op.text)
         if refused:
             return True, refused
-        if queue_mgmt.held_list(self, _quick_key):
-            cap = queue_mgmt.cap_reply(self, _quick_key, adapter)
-            if cap:
-                return True, cap
-            with suppress(Exception):
-                event.text = op.text
-            return True, queue_mgmt.append_if_held(self, _quick_key, event)
         with suppress(Exception):
             event.text = op.text  # strips the /queue prefix (and an explicit `add`)
+        note = queue_mgmt.held_note(self, _quick_key)
+        if note:
+            await self._send_command_ack(source, note.lstrip("\n"), "queue")
         return False, None
 
     async def _hm_cmd_steer(self, event, source, _quick_key):

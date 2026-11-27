@@ -827,7 +827,7 @@ gateway:
     moved: "Bogadh mír scuaine {source} go {destination}."
     refused_command: "Níor cuireadh i scuaine: is ordú é /{command}, agus ní féidir orduithe a chur i scuaine mar leideanna. Seol é leis féin."
     cap_reached: "Níor cuireadh i scuaine: tá an scuaine lán ({cap} mír). Úsáid /queue list, /queue rm N nó /queue clear."
-    added_to_held: "Curtha leis an scuaine choinnithe ({count} á gcoinneáil). Scaoileann /queue run iad."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "Scaoileadh {count} leid scuainithe; ritheann siad ina dhiaidh seo, in ord."
     released_interrupting: "Ag cur isteach ar an seal reatha; {count} leid scuainithe á scaoileadh in ord."
     dropped_on_reset: "Glanadh {count} leid scuainithe in éineacht leis an seanchomhrá."

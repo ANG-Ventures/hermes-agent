@@ -827,7 +827,7 @@ gateway:
     moved: "Elemento {source} de la cola movido a {destination}."
     refused_command: "No se puso en cola: /{command} es un comando, y los comandos no se pueden poner en cola como prompts. Envíalo por separado."
     cap_reached: "No se puso en cola: la cola está llena ({cap} elementos). Usa /queue list, /queue rm N o /queue clear."
-    added_to_held: "Añadido a la cola retenida ({count} retenidos). /queue run los libera."
+    still_held: "{count} older prompt(s) still held: /queue run releases them, /queue clear drops them."
     released: "Se liberaron {count} prompt(s) en cola; se ejecutan a continuación, en orden."
     released_interrupting: "Interrumpiendo el turno actual; liberando {count} prompt(s) en cola en orden."
     dropped_on_reset: "Se descartaron {count} prompt(s) en cola junto con la conversación anterior."
